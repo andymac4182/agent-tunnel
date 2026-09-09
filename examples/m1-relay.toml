@@ -1,0 +1,31 @@
+# M1 ServeConfig example for tunnel-relay.
+# Run from the repository root when using these paths. Replace every
+# placeholder with deployment-specific values; authority and secret material
+# are referenced by URL/path and are never embedded in this file. The Redis
+# field names follow the active Redis authority contract and must match
+# ServeConfig.
+
+consumer_bind = "127.0.0.1:8443"
+device_bind = "127.0.0.1:9443"
+
+oidc_issuer = "https://issuer.example.test/"
+oidc_audience = ["agent-tunnel"]
+oidc_jwks_path = "examples/credentials/oidc-jwks.json"
+redis_url = "redis://127.0.0.1:6379/0"
+redis_namespace = "agent-tunnel/m1"
+
+device_tls_cert_chain = "examples/credentials/relay-device-cert-chain.pem"
+device_tls_private_key = "examples/credentials/relay-device-key.pem"
+device_tls_client_ca = "examples/credentials/device-ca.pem"
+consumer_tls_cert_chain = "examples/credentials/relay-consumer-cert-chain.pem"
+consumer_tls_private_key = "examples/credentials/relay-consumer-key.pem"
+
+# The public consumer listener uses bearer authentication in the M1 example.
+# Set this only when the deployment intentionally requires consumer mTLS too.
+# consumer_tls_client_ca = "examples/credentials/consumer-ca.pem"
+
+node_id = "relay-m1-local"
+boot_id = "replace-with-a-unique-boot-id"
+deployment_incarnation = "m1-local"
+max_devices_per_user = 16
+max_queue_bytes = 4194304

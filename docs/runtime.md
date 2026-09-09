@@ -1,6 +1,8 @@
 # Axum runtime, device mTLS, and CLI
 
-Status: implementation design, 2026-09-09. Current binaries validate configuration only. All listeners, identity handling, commands beyond `check-config`, and diagnostics below are planned.
+Status: runtime implementation design, 2026-09-09. M1 implements the client `config check`, `credentials create`, `credentials import` and foreground `connect` commands; the relay implements `serve` with Axum HTTPS, both device mTLS WebSockets and Redis/JWT authority. Legacy `check-config` remains supported. See [M1 evidence](m1-harness.md). Status/doctor IPC, enrollment, rotation, generic adapters and clustered forwarding below remain planned.
+
+The M1 relay uses one bounded actor for its finite echo sessions; the target per-device actor architecture below will isolate richer M2/M7 state. M1 owner fields expire logically within durable Redis device hashes; physical TTL lease namespaces are a later cluster change. Normal startup cannot initialize missing authority metadata. Recovery requires an operator to reconcile durable authorization history; changing the owner incarnation does not verify an arbitrary restored backup.
 
 This document fixes the runtime boundaries. [protocol.md](protocol.md) defines socket pairing and rotation; [cluster.md](cluster.md) defines peer trust, routing, ownership, and Redis failure behavior; [acp.md](acp.md) defines remotely controlled agent exports.
 
@@ -136,7 +138,7 @@ Supervise tasks in owned groups; a reader/writer panic or unexpected exit become
 
 Create crates at their implementation milestone; keep narrowly used helpers as modules until separation improves ownership or testing. Domain services accept typed authenticated principals and bounded request objects, not Axum request bodies or raw headers. Use typed errors in libraries and contextual cause chains at binary boundaries; a single error conversion table maps them to HTTP, WebSocket, peer, and CLI responses.
 
-Initial cluster operation uses the deliberately constrained authority profile in [cluster.md](cluster.md): several relays, one authoritative Redis primary, no automatic Redis failover, and explicit quiescence/new external incarnation after authority loss or restore. This trades automatic failover for a failure model that can be tested and explained. It does not claim a highly available coordination layer.
+Initial cluster operation uses the deliberately constrained authority profile in [cluster.md](cluster.md): several relays, one authoritative Redis primary, separate durable-catalog and ephemeral-coordination namespaces, no automatic Redis failover, and explicit quiescence plus a newly supplied externally approved incarnation after authority loss, restart or restore. Durable catalog records survive an incarnation change; leases, presence and tickets do not. AOF/fsync and verified backups are durability choices, not consensus or promotion authority. A missing, ambiguous or unverified Redis authority makes the service unready and stops admission. This trades automatic failover for a failure model that can be tested and explained. It does not claim a highly available coordination layer.
 
 ## Debugging and deployment contract
 
@@ -176,7 +178,7 @@ Initial runbooks should answer a bounded set of questions:
 3. **Rotation is draining:** inspect old-generation final sequence versus contiguous ACK for each pending stream direction, queued bytes, and remaining overlap time. Preserve the fixed deadline; a stuck adapter cannot keep the old socket alive forever.
 4. **Only cross-node requests fail:** check peer UDP reachability and ALPN, then mutual certificate identity, signed key membership freshness, owner fencing, and bounded forwarding capacity in that order.
 5. **A mutation disconnected:** query the authorized operation status. Report a known result or explicit ambiguity; neither reconnect nor a transport ACK authorizes repeating the mutation.
-6. **Redis authority was lost or restored:** fail closed and follow the quiescence/new-incarnation process in [cluster.md](cluster.md); do not restart relays independently using a remembered lease.
+6. **Redis authority was lost or restored:** fail closed and follow the quiescence, verified-backup and externally approved new-incarnation process in [cluster.md](cluster.md); do not restart relays independently using a remembered lease or local catalog snapshot.
 
 Each runbook must link a reproducible synthetic fixture and the expected event sequence before alpha release. Production debugging changes must not weaken authentication, increase unbounded buffers, or invoke a real desktop as a probe.
 

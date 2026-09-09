@@ -12,21 +12,48 @@ Agent in the cloud → Agent Tunnel Server → WebSocket tunnel → Desktop mach
 
 The desktop CLI initiates the tunnel with mTLS. Authorized cloud agents call server endpoints; no inbound desktop port is required. Service traffic flows in both directions over the data channel.
 
-**Status: project bootstrap and design.** The working code validates configuration. Networking, authentication, adapters, and remote execution are planned, not implemented. This repository starts private; MIT licensing prepares it for a future open-source release without changing its visibility.
+**Status: M1 is implemented and locally verified; hosted CI is pending.** On
+2026-09-09, macOS arm64 with Rust 1.95.0 and Redis 8.4 passed formatting,
+strict Clippy, 61 workspace tests, five real Redis integration tests, the
+five-client/two-tenant HTTPS/WSS/CLI acceptance harness, the private H3 probe
+and the Redis AOF restart check. See [the evidence and repeatable commands](docs/m1-harness.md).
+M2 rotation/replay, remote adapters and M7 cluster routing remain planned.
+The repository remains private; its MIT license prepares for a future OSS release.
 
 ## What we are building
 
 - An Axum relay cluster serving multiple users, with multiple connected devices and concurrent host/agent consumers per user.
-- A Rust client CLI authenticating to the relay with mTLS on both device WebSockets.
-- Peer-to-peer HTTP/3 connections with mTLS between relay servers; Redis distributes approved server public keys and routing presence.
-- One persistent control WebSocket and one active data WebSocket per device connection.
-- Data connection rotation every **300 seconds by default**, configurable per deployment. Explicit per-stream drain watermarks and acknowledgements precede handover; a bounded replacement overlap briefly permits a third socket.
-- Independent stream identities and sequence counters in each direction, preserved across scheduled socket rotation.
-- A **9P/WebSocket filesystem API** with native adapters for Files SDK, Mastra, AI SDK, and just-bash; separate MCP and [CUA](https://github.com/trycua/cua) services.
+- A Rust M1 client CLI authenticating to the relay with mandatory mTLS on both device WebSockets.
+- One control WebSocket and one data WebSocket per M1 device session. A transport failure closes the pair and requires a fresh session; M1 has no data-socket rotation or retained replay.
+- M1 catalog authority uses Redis for tenant, user, membership, device, service, grant, and credential records. Its persistence, restore, and fail-closed behavior are explicit deployment requirements.
+- A bounded private HTTP/3 mutual-TLS peer transport probe. The three-node relay cluster, Redis membership/key approval, ownership, and recovery are M7 work.
+- M2 data connection rotation every **300 seconds by default**, configurable per deployment, with explicit per-stream drain watermarks and acknowledgements before handover.
+- A reusable M1 acceptance harness using Redis-backed authority, with fixture PKI, configured JWT public keys, real relay listeners, and an echo export. Its local M1 verification is recorded above; hosted CI remains pending.
+- A **9P/WebSocket filesystem API** with native adapters for Files SDK, Mastra, AI SDK, and just-bash; separate MCP and [CUA](https://github.com/trycua/cua) services are planned milestones.
 - ACP over HTTP through the tunnel, so an authorized host can interact with an allowlisted agent supervised by the CLI.
 - Explicit grants for each device, service, filesystem mount, and computer-use capability.
 
-Cluster support is required for the private alpha. Development begins with a single-process test fixture, then proves three-node ownership/routing and failure behavior before release. Redis discovery alone does not establish identity or make failover strongly consistent; the trust and recovery profile is explicit in the cluster design.
+All authority records formerly assigned to PostgreSQL, including tenant, user,
+membership, device, service, grant, and credential records, live in the Redis
+catalog. Redis persistence is required for that catalog; relay sockets, queues,
+in-flight operations, and other process-local session state remain ephemeral
+and are not reconstructed by a Redis restart. The local AOF check proves the
+tested single-instance restart behavior, including revocations and a new owner
+incarnation; it does not prove HA failover. Redis discovery alone does not
+establish relay identity or make failover strongly consistent. M1 uses a bounded
+local authority profile; M7 adds signed relay membership/public-key records,
+ownership leases, fencing, and explicit recovery. A disposable Redis run is not
+evidence of multi-relay recovery. In the narrow M1 Redis profile, the durable
+device hash also stores lease fields and expiry; relay lease validation is
+logical, the hash has no Redis TTL, and complete `deployment_incarnation` plus
+`run_id` guards make stale owner fields non-authoritative. Separate TTL
+namespaces remain an M7 design. `connect_for_recovery` and `activate` are
+operator-only recovery actions: call them only after an external durable
+catalog is available, revocations have been reconciled, and a new approved
+incarnation has been established. A new incarnation fences owners but cannot
+by itself prove that revocations were not rolled back. The external checkpoint
+gate and safe backup/rollback handling remain M7 work; M1 does not claim safe
+restoration of arbitrary backups.
 
 ## Start here
 
@@ -35,6 +62,7 @@ Cluster support is required for the private alpha. Development begins with a sin
 | [Architecture](docs/architecture.md) | Components, users/devices, routing, trust boundaries, scaling |
 | [Tunnel protocol](docs/protocol.md) | Pairing, rotation, replay, failure semantics, limits |
 | [Runtime and client CLI](docs/runtime.md) | Axum listeners, device mTLS, commands, debug surfaces |
+| [M1 acceptance harness](docs/m1-harness.md) | Redis-backed real-socket verification, credentials, fixtures, and evidence |
 | [Relay cluster](docs/cluster.md) | HTTP/3 peers, mTLS, Redis key distribution, ownership, recovery |
 | [Filesystem API](docs/filesystem-api.md) | Endpoint, authentication, capabilities, paths, byte/operation semantics |
 | [SDK adapter contracts](docs/filesystem-adapters.md) | Files SDK, Mastra, AI SDK, just-bash, compatibility gaps and implementation slices |
@@ -52,7 +80,9 @@ Cluster support is required for the private alpha. Development begins with a sin
 Install Rust through rustup; the repository pins Rust 1.95.0. From the repository root:
 
 ```sh
+cargo build --workspace --locked --bins
 cargo run --locked -p tunnel-client -- --help
+cargo run --locked -p tunnel-client -- config check --config examples/m1-client.toml
 cargo run --locked -p tunnel-client -- check-config examples/client.toml
 cargo run --locked -p tunnel-relay -- check-config examples/relay.toml
 cargo fmt --all -- --check
@@ -60,14 +90,29 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 ```
 
-These commands check configuration and run starter tests. They do not open a tunnel or enable access to your computer. See the example TOML files for the exact supported configuration fields; service grants and adapter configuration will arrive with their milestones.
+The client `config check` command validates the M1 `RuntimeConfig`; the legacy
+`check-config` command validates the bootstrap `tunnel_core::ClientConfig` and
+its historical rotation fields. These validation commands are read-only; the
+M1 runtime path also starts real HTTPS/WSS listeners when `serve` or `connect`
+is run with credentials. The checked-in M1 relay file is a shape/reference file
+whose `redis_url`, `redis_namespace`, `deployment_incarnation`, OIDC JWKS, and
+TLS paths must be replaced before `serve`. See [the M1 harness guide](docs/m1-harness.md)
+for disposable Redis and the exact acceptance command. Local verification is
+recorded above; hosted CI remains pending.
 
 ## First implementation goal
 
-Connect three enrolled test devices belonging to two users to a relay, route concurrent echo streams only to authorized devices, and rotate their data sockets repeatedly while the control connection remains stable. Prove isolation, bounded memory, and reconnect behavior before connecting real files or desktops.
+The locally verified M1 slice connects five clients across two tenants to a
+relay, routes authorized echo streams over the two mTLS sockets, and covers
+isolation, bounded memory, authorization, quota, revocation, admission
+negative cases, and fresh-session behavior after transport failure. Its private
+H3 probe includes success and negative cases for the transport boundary only;
+it is not cluster routing. Redis membership recovery, HA failover, ownership,
+and fencing wait for M7. Data rotation/replay and remote adapters are later
+milestones.
 
 ## Development
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). Transport and privileged adapters are Rust. A shared TypeScript filesystem client and small native SDK adapters provide the application integration layer. Credentials stay in the runtime secret store, outside this repository.
+See [CONTRIBUTING.md](CONTRIBUTING.md). Transport and privileged adapters are Rust. A shared TypeScript filesystem client and small native SDK adapters provide the application integration layer. Create device keys and CSRs locally, use an approved external issuer, and import only a matching certificate chain plus explicit server trust bundle. Credentials stay in the runtime secret store, outside this repository.
 
 License: [MIT](LICENSE).

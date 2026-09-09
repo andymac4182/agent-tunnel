@@ -1,0 +1,23 @@
+# M1 RuntimeConfig example for tunnel-client.
+# Paths are resolved relative to this file. Replace every placeholder before
+# using `connect`; this file does not contain a credential or private key.
+
+device_id = "m1-device-a"
+relay_url = "wss://relay.example.test/v1/tunnel/control"
+
+[credentials]
+client_certificate = "credentials/device-cert-chain.pem"
+client_key = "credentials/device-key.pem"
+server_ca = "credentials/relay-ca.pem"
+
+# M1 exposes the synthetic echo service only.
+[exports.echo]
+type = "echo"
+device_canary = "m1-device-a-synthetic"
+
+[limits]
+max_streams = 64
+max_queue_frames = 128
+max_queue_bytes = 8388608
+grant_timeout_ms = 5000
+operation_timeout_ms = 30000

@@ -1,6 +1,8 @@
 # Design decisions
 
-Status: implementation baseline, revised 2026-09-09. User-selected requirements are fixed; proposed defaults and upstream library combinations require their documented gates. Nothing here changes the configuration-only runtime status.
+Status: implementation baseline, revised 2026-09-09. User-selected requirements are fixed; M1 echo, Redis authority, device mTLS and bounded H3 transport evidence are recorded in [m1-harness.md](m1-harness.md). Proposed cluster, rotation and adapter behavior requires its later milestone gates.
+
+M1 uses logically expiring owner fields in durable Redis device hashes; the table's separate ephemeral coordination layout is a cluster target. M1 does not implement automatic promotion or external catalog high-water verification for arbitrary backup restores.
 
 | Decision | Choice and rationale | Validation point |
 | --- | --- | --- |
@@ -16,9 +18,9 @@ Status: implementation baseline, revised 2026-09-09. User-selected requirements 
 | Ordering | Unique session/stream identity with independent direction counters; continuity across carrier rotation | M2 gap/duplicate/race tests |
 | Effects | Transport deduplication within retained state, explicit unknown/partial application effects, no general exactly-once claim | All adapter fault suites |
 | Multi-user scope | Explicit tenant memberships, per-device/service grants, many devices/consumers | M1/M7 |
-| Shared durable state | PostgreSQL from the first cluster design; authorization snapshots bounded to five seconds | M1/M7 |
+| Shared durable state | One authoritative Redis deployment; durable catalog and ephemeral leases use separate namespaces; authorization snapshots bounded to five seconds | M1/M7 |
 | Peer transport | Private HTTP/3 over QUIC with mTLS and explicit adapter to shared application services | M7 compatibility and UDP tests |
-| Redis role | Signed approved public-key membership, presence and fenced owner leases; no private keys/payloads | M7 forged/stale record tests |
+| Redis role | Single authoritative store for the durable catalog, signed approved public-key directory, presence and fenced owner leases; no private keys/payloads | M7 forged/stale record and restore tests |
 | Trust authority | External issuers and signed membership checkpoints independent of Redis; separate device/peer roles | M1/M7 |
 | Coordination limit | One authoritative Redis primary, no automatic promotion; quiesce/new incarnation after rollback/restart/promotion | M7 failure/recovery |
 | Cluster release scope | Three-node validation required before private alpha; one node is a development slice | M7 before M6 |
@@ -31,6 +33,12 @@ Status: implementation baseline, revised 2026-09-09. User-selected requirements 
 | Computer use | CUA typed adapter, one active controller lease per desktop, dedicated VM tests | M5 |
 | Debugging | Explicit state owners, bounded queues, typed errors, redacted transition/fence/lease diagnostics | Runtime/alpha gates |
 | Payload trust | Relay terminates TLS and is trusted with content; device still enforces local policy | M1/M7 |
+
+## Storage authority
+
+The initial supported profile has one authoritative Redis primary and no automatic promotion. Redis separates durable catalog records (tenants, memberships, devices, credentials, grants, services and revocation versions) from ephemeral coordination records (presence, owner leases and one-use tickets). Durable catalog keys have no lease TTL and are independent of deployment_incarnation; ephemeral coordination keys are TTL-bound and incarnation-scoped. A fresh deployment incarnation is supplied and approved externally after restart, restore, rollback or ambiguous authority, and is persisted outside Redis before new sessions are admitted.
+
+AOF/fsync settings and verified backups define Redis durability but do not provide consensus, linearizable failover or authority to promote another writer. Restore and rollback procedures stop admission, fence old writers, verify the durable catalog/signed directory, keep services unready on ambiguity, and require fresh relay/device sessions. Signed peer keys are accepted only under an operator-installed root/checkpoint; Redis key presence never bootstraps root trust. No alternate storage dependency or compatibility authority is retained in this profile.
 
 ## Rotation tradeoff
 
