@@ -5,13 +5,14 @@ the matching protocol/design document, and the [M1 harness guide](docs/m1-harnes
 Keep implementation, planned behavior, and verified evidence separate in code,
 tests, and documentation.
 
+Hosted verification: [M1 CI checks](https://github.com/andymac4182/agent-tunnel/pull/10/checks).
+
 ## Current verification evidence
 
 The local M1 gate passed on 2026-09-09 on macOS arm64 with Rust 1.95.0 and
 Redis 8.4: formatting, strict Clippy, 62 workspace tests, five explicit Redis
 integration tests, the full real-socket/CLI/H3 acceptance harness and the
-same-dataset Redis AOF restart check. Hosted CI remains pending until the PR
-runs. The [harness guide](docs/m1-harness.md) records the runnable boundary.
+same-dataset Redis AOF restart check. Hosted CI results are linked in this document. The [harness guide](docs/m1-harness.md) records the runnable boundary.
 
 ## M1 boundaries
 
@@ -147,7 +148,7 @@ Use `--locked` for Cargo validation and keep `Cargo.lock` committed. CI must run
 formatting, strict Clippy, and workspace tests on the supported Linux, macOS,
 and Windows jobs, build the workspace binaries, and keep the Redis-backed M1
 acceptance result visible. The local acceptance and AOF restart results are
-recorded above; hosted CI remains pending. A green configuration check alone
+recorded above; CI results are linked in this document. A green configuration check alone
 does not prove mTLS, tenant isolation, adapter compatibility, cluster routing,
 or release readiness.
 

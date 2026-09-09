@@ -12,13 +12,15 @@ Agent in the cloud → Agent Tunnel Server → WebSocket tunnel → Desktop mach
 
 The desktop CLI initiates the tunnel with mTLS. Authorized cloud agents call server endpoints; no inbound desktop port is required. Service traffic flows in both directions over the data channel.
 
-**Status: M1 is implemented and locally verified; hosted CI is pending.** On
+**Status: M1 is implemented and locally verified.** On
 2026-09-09, macOS arm64 with Rust 1.95.0 and Redis 8.4 passed formatting,
 strict Clippy, 62 workspace tests, five real Redis integration tests, the
 five-client/two-tenant HTTPS/WSS/CLI acceptance harness, the private H3 probe
 and the Redis AOF restart check. See [the evidence and repeatable commands](docs/m1-harness.md).
 M2 rotation/replay, remote adapters and M7 cluster routing remain planned.
 The repository remains private; its MIT license prepares for a future OSS release.
+
+Hosted verification: [M1 CI checks](https://github.com/andymac4182/agent-tunnel/pull/10/checks).
 
 ## What we are building
 
@@ -28,7 +30,7 @@ The repository remains private; its MIT license prepares for a future OSS releas
 - M1 catalog authority uses Redis for tenant, user, membership, device, service, grant, and credential records. Its persistence, restore, and fail-closed behavior are explicit deployment requirements.
 - A bounded private HTTP/3 mutual-TLS peer transport probe. The three-node relay cluster, Redis membership/key approval, ownership, and recovery are M7 work.
 - M2 data connection rotation every **300 seconds by default**, configurable per deployment, with explicit per-stream drain watermarks and acknowledgements before handover.
-- A reusable M1 acceptance harness using Redis-backed authority, with fixture PKI, configured JWT public keys, real relay listeners, and an echo export. Its local M1 verification is recorded above; hosted CI remains pending.
+- A reusable M1 acceptance harness using Redis-backed authority, with fixture PKI, configured JWT public keys, real relay listeners, and an echo export. Its local M1 verification is recorded above; CI results are linked in this document.
 - A **9P/WebSocket filesystem API** with native adapters for Files SDK, Mastra, AI SDK, and just-bash; separate MCP and [CUA](https://github.com/trycua/cua) services are planned milestones.
 - ACP over HTTP through the tunnel, so an authorized host can interact with an allowlisted agent supervised by the CLI.
 - Explicit grants for each device, service, filesystem mount, and computer-use capability.
@@ -98,7 +100,7 @@ is run with credentials. The checked-in M1 relay file is a shape/reference file
 whose `redis_url`, `redis_namespace`, `deployment_incarnation`, OIDC JWKS, and
 TLS paths must be replaced before `serve`. See [the M1 harness guide](docs/m1-harness.md)
 for disposable Redis and the exact acceptance command. Local verification is
-recorded above; hosted CI remains pending.
+recorded above; CI results are linked in this document.
 
 ## First implementation goal
 

@@ -1,6 +1,6 @@
 # Build roadmap
 
-Status: M1 local verification is complete; hosted CI and later cluster work remain.
+Status: M1 local verification is complete; later cluster work remains.
 On 2026-09-09 macOS arm64 with pinned Rust 1.95.0 and Redis 8.4, formatting,
 strict locked Clippy, 62 workspace tests, five explicitly executed real Redis integration tests, the AOF restart
 check, and the full real HTTPS/WSS CLI acceptance passed for five
@@ -24,9 +24,11 @@ GitHub tracking: [v0.1 Private alpha](https://github.com/andymac4182/agent-tunne
 | M8: ACP over HTTP to CLI-supervised agents | [#8](https://github.com/andymac4182/agent-tunnel/issues/8) |
 | CLI operations and diagnostics | [#9](https://github.com/andymac4182/agent-tunnel/issues/9) |
 
+Hosted verification: [M1 CI checks](https://github.com/andymac4182/agent-tunnel/pull/10/checks).
+
 ## M0 — Repository and executable configuration
 
-Delivered or under active implementation: private MIT-licensed repo, Rust workspace, strict legacy configuration validation, the M1 `RuntimeConfig` client CLI, local CSR/import commands for externally issued device credentials, Axum consumer/device listeners, configured Redis authority and JWT/JWKS authorization, pinned TLS/WSS/H3 transport helpers, and a reusable real-resource harness. Local evidence covers the locked checks, 62 workspace tests, five explicitly executed real Redis integration tests, AOF same-dataset restart, and full real M1 acceptance; hosted CI remains pending. Redis is the authority catalog for every tenant, user, membership, device, service, grant, and credential record formerly assigned to PostgreSQL. Relay sockets, queues, in-flight operations, and other process-local session state remain ephemeral. In the narrow M1 Redis profile, the durable device hash also stores lease fields and expiry without a Redis TTL; logical lease validation and complete `deployment_incarnation` plus `run_id` guards make stale owner fields non-authoritative. Separate TTL namespaces remain an M7 design. `redis_url`, `redis_namespace`, and `deployment_incarnation` remain deployment inputs whose persistence, restore, and fail-closed behavior require explicit evidence. Legacy configuration retains the documented 300-second/10-second/30-second rotation defaults for the future M2 profile; M1 itself does not rotate or replay.
+Delivered or under active implementation: private MIT-licensed repo, Rust workspace, strict legacy configuration validation, the M1 `RuntimeConfig` client CLI, local CSR/import commands for externally issued device credentials, Axum consumer/device listeners, configured Redis authority and JWT/JWKS authorization, pinned TLS/WSS/H3 transport helpers, and a reusable real-resource harness. Local evidence covers the locked checks, 62 workspace tests, five explicitly executed real Redis integration tests, AOF same-dataset restart, and full real M1 acceptance; CI results are linked in this document. Redis is the authority catalog for every tenant, user, membership, device, service, grant, and credential record formerly assigned to PostgreSQL. Relay sockets, queues, in-flight operations, and other process-local session state remain ephemeral. In the narrow M1 Redis profile, the durable device hash also stores lease fields and expiry without a Redis TTL; logical lease validation and complete `deployment_incarnation` plus `run_id` guards make stale owner fields non-authoritative. Separate TTL namespaces remain an M7 design. `redis_url`, `redis_namespace`, and `deployment_incarnation` remain deployment inputs whose persistence, restore, and fail-closed behavior require explicit evidence. Legacy configuration retains the documented 300-second/10-second/30-second rotation defaults for the future M2 profile; M1 itself does not rotate or replay.
 
 Gate: the local macOS arm64 run satisfies the formatting, strict Clippy,
 workspace test, Redis integration, AOF restart, and full M1 acceptance checks.
@@ -46,8 +48,7 @@ public HTTPS, both mTLS device sockets, echo isolation, authorization,
 revocation, quotas, disconnect behavior, admission negatives, and the bounded
 private H3 success/negative cases. Real WSS passes through a TCP load balancer
 with mTLS verified at the Rust listener; the desktop opens no inbound port.
-Public consumers cannot forge internal verified identity headers. Hosted CI and
-M7 multi-relay routing remain separate gates.
+Public consumers cannot forge internal verified identity headers. M7 multi-relay routing remains a separate gate.
 
 ## M2 — Independent ordering and drain before handover
 

@@ -1,13 +1,12 @@
 # M1 acceptance harness
 
-Status: the local M1 acceptance is verified; hosted CI is pending. On
+Status: the local M1 acceptance is verified. On
 2026-09-09 macOS arm64 with pinned Rust 1.95.0 and Redis 8.4, the locked
 formatting/Clippy checks, 62 workspace tests, five explicitly executed real Redis integration tests, and the
 Redis AOF restart check passed. Full real HTTPS/WSS CLI acceptance passed for
 five clients across two tenants, including admission certificate/ticket/stale
 epoch negatives and private H3 success/negative probes. This page records local
-evidence and preserves the M7 boundaries; it does not claim hosted CI or
-production HA readiness.
+evidence and preserves the M7 boundaries; production HA and multi-relay readiness remain later gates.
 
 The harness is the shared setup layer for M1 tests. It creates an isolated,
 randomly named Redis key namespace, seeds the production authority
@@ -16,6 +15,8 @@ production relay on ephemeral loopback listeners. Acceptance code drives those
 listeners through real TLS, HTTPS, and WebSocket clients. It must fail when
 Redis is absent or the production authority cannot be used; creating in-memory
 fixtures alone is not a successful run.
+
+Hosted verification: [M1 CI checks](https://github.com/andymac4182/agent-tunnel/pull/10/checks).
 
 ## Run it
 
@@ -220,7 +221,7 @@ cargo test --workspace --locked
 The local macOS arm64 checks and full M1 acceptance passed as recorded above.
 CI must run these locked checks on its supported Linux, macOS, and Windows
 jobs, build the workspace binaries, and keep the Redis-backed acceptance result
-visible. Hosted CI remains pending until the pull request runs there. Report
+visible. Hosted CI results are linked in this document. Report
 M7 cluster routing, HA failover, and any unexecuted platform job as pending.
 
 Diagnostics use a versioned structured envelope with `schema_version`, command,
