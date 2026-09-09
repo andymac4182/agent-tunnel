@@ -5,9 +5,10 @@ use std::{error::Error, fmt};
 
 /// Rotation policy. All durations are whole seconds.
 ///
-/// `overlap_seconds` is the total budget from opening a replacement data socket
-/// until the previous data socket must close, including its handshake. It is
-/// not an additional drain period after the handshake.
+/// `overlap_seconds` bounds coexistence from opening a replacement data socket,
+/// including its handshake. An abort before commit closes the replacement;
+/// after commit the old socket must close within this budget. It is not an
+/// additional drain period after the handshake.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RotationConfig {

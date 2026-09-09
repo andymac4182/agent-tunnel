@@ -2,6 +2,18 @@
 
 Status: bootstrap complete locally; future milestones are unimplemented. Sequence work by passing the acceptance gates below. No delivery-date or throughput claim is implied.
 
+GitHub tracking: [v0.1 Private alpha](https://github.com/andymac4182/agent-tunnel/milestone/1).
+
+| Work | Tracking issue |
+| --- | --- |
+| M1: authenticated multi-user tunnel | [#1](https://github.com/andymac4182/agent-tunnel/issues/1) |
+| M2: rotation and bounded recovery | [#2](https://github.com/andymac4182/agent-tunnel/issues/2) |
+| M3: MCP adapters | [#3](https://github.com/andymac4182/agent-tunnel/issues/3) |
+| M4: 9P/WebSocket and just-bash | [#4](https://github.com/andymac4182/agent-tunnel/issues/4) |
+| M5: CUA computer use | [#5](https://github.com/andymac4182/agent-tunnel/issues/5) |
+| M6: alpha reliability and artifacts | [#6](https://github.com/andymac4182/agent-tunnel/issues/6) |
+| M7: distributed relay, after alpha | [#7](https://github.com/andymac4182/agent-tunnel/issues/7) |
+
 ## M0 — Repository and executable configuration
 
 Deliver the private MIT-licensed repo, Rust workspace, config-only client/relay commands, strict default/override validation, cross-platform CI, architecture, protocol, integration research, and test plan. Default data rotation is 300s, handshake deadline 10s, overlap budget 30s.
