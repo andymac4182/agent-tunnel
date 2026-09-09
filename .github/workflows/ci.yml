@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: Rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Install Rust 1.95.0
+        run: rustup toolchain install 1.95.0 --profile minimal --component rustfmt --component clippy
+      - name: Check formatting
+        run: cargo +1.95.0 fmt --all -- --check
+      - name: Check lints
+        run: cargo +1.95.0 clippy --workspace --all-targets --locked -- -D warnings
+      - name: Run tests
+        run: cargo +1.95.0 test --workspace --all-targets --locked
+      - name: Validate example configurations
+        run: |
+          cargo +1.95.0 run --locked -p tunnel-client -- check-config examples/client.toml
+          cargo +1.95.0 run --locked -p tunnel-relay -- check-config examples/relay.toml

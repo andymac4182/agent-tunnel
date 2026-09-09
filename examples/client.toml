@@ -1,0 +1,11 @@
+# Configuration-only starter. This file does not establish a connection.
+# A label, not a credential or authorization claim.
+device_id = "workstation-1"
+
+[rotation]
+# Data socket replacement every 5 minutes; control socket stays connected.
+interval_seconds = 300
+handshake_timeout_seconds = 10
+# Total overlap including the handshake: temporarily at most 3 WebSockets.
+# Required: handshake_timeout_seconds < overlap_seconds < interval_seconds.
+overlap_seconds = 30

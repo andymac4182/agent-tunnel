@@ -1,0 +1,9 @@
+# Configuration-only starter. No listener or client-limit enforcement exists yet.
+max_connected_clients = 1024
+max_clients_per_user = 16
+
+[rotation]
+interval_seconds = 300
+handshake_timeout_seconds = 10
+# Total overlap including replacement handshake; steady state is 2 WebSockets.
+overlap_seconds = 30
