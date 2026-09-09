@@ -29,3 +29,10 @@ boot_id = "replace-with-a-unique-boot-id"
 deployment_incarnation = "m1-local"
 max_devices_per_user = 16
 max_queue_bytes = 4194304
+
+# M2 rotation policy. Values are validated now; scheduled data-socket
+# handover remains pending runtime integration.
+[rotation]
+interval_seconds = 300
+handshake_timeout_seconds = 10
+overlap_seconds = 30

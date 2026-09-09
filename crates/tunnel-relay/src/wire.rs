@@ -3,6 +3,7 @@
 use std::{fmt, time::Duration};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use tunnel_catalog::OwnerToken;
 use tunnel_protocol::{
     AuthorizationConfirmed, AuthorizationInvalidated, ControlError, ControlMessage, DataReady,
     Frame, FrameError, Open, Rejected, Welcome, decode_control, encode_control,
@@ -11,10 +12,19 @@ use uuid::Uuid;
 
 /// Maximum consumer/device payload in the M1 echo profile.
 pub const MAX_BODY_BYTES: usize = tunnel_protocol::MAX_PAYLOAD_LEN;
+/// Initial per-direction credit for a long-lived M2 stream.
+///
+/// This is deliberately bounded and leaves room for the record prefix and
+/// the maximum device canary while avoiding an 8 MiB per-stream allowance.
+pub const M2_INITIAL_WINDOW_BYTES: usize = 128 * 1024;
 /// Maximum control WebSocket message in the M1 profile.
 pub const MAX_CONTROL_BYTES: usize = tunnel_protocol::MAX_CONTROL_MESSAGE_BYTES;
 /// Maximum attachment-ticket lifetime.  A ticket is supplemental to mTLS.
 pub const TICKET_TTL: Duration = Duration::from_secs(10);
+/// The negotiated M2 profile.  It is deliberately additive so an M1 client
+/// can continue to receive the finite profile without rotation fields.
+pub const ORDERED_ROTATION_FEATURE: &str = "ordered-rotation-v1";
+pub const M1_PROFILE_FEATURE: &str = "m1-control-data";
 
 pub fn random_token() -> String {
     let mut bytes = [0_u8; 32];
@@ -66,6 +76,65 @@ pub fn welcome(
     ControlMessage::Welcome(welcome)
 }
 
+/// Build the negotiated M2 WELCOME.  The owner identity is a digest of the
+/// complete fencing token; no token fields or secret credentials are placed
+/// on the wire.  Rotation timing is supplied in milliseconds because that is
+/// the protocol representation, while deployment configuration remains in
+/// whole seconds.
+pub(crate) struct WelcomeM2Params<'a> {
+    pub message_id: &'a str,
+    pub reply_to: &'a str,
+    pub session_id: &'a str,
+    pub epoch: u64,
+    pub generation: u64,
+    pub connection_id: &'a str,
+    pub ticket: &'a str,
+    pub owner: &'a OwnerToken,
+    pub rotation_interval_ms: u64,
+    pub handshake_timeout_ms: u64,
+    pub overlap_timeout_ms: u64,
+}
+
+pub fn welcome_m2(params: WelcomeM2Params<'_>) -> ControlMessage {
+    let mut welcome = Welcome::new(
+        params.message_id,
+        params.reply_to,
+        params.session_id,
+        params.epoch,
+        params.generation,
+        params.connection_id,
+        params.ticket,
+        "",
+    );
+    welcome.supported_features = vec![
+        M1_PROFILE_FEATURE.to_owned(),
+        "authorization-challenge".to_owned(),
+        "echo".to_owned(),
+        ORDERED_ROTATION_FEATURE.to_owned(),
+    ];
+    welcome.owner_id = Some(owner_id(params.owner));
+    welcome.rotation_interval_ms = Some(params.rotation_interval_ms);
+    welcome.rotation_handshake_timeout_ms = Some(params.handshake_timeout_ms);
+    welcome.rotation_overlap_timeout_ms = Some(params.overlap_timeout_ms);
+    // Recovery is one immutable 30-second episode shared by all physical
+    // attempts.  It is deliberately independent of an accelerated overlap
+    // policy used by the handover harness.
+    welcome.rotation_recovery_timeout_ms = Some(30_000);
+    ControlMessage::Welcome(welcome)
+}
+
+/// Canonical owner identity used by every rotation message.  `OwnerToken` is
+/// serialized from a fixed-order struct, making this digest stable while
+/// avoiding exposure of the full tenant/device/node fencing context.
+pub fn owner_id(owner: &OwnerToken) -> String {
+    use sha2::{Digest, Sha256};
+    let canonical = serde_json::to_vec(owner).expect("OwnerToken is serializable");
+    Sha256::digest(canonical)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 pub fn data_ready(
     reply_to: &str,
     session_id: &str,
@@ -92,9 +161,18 @@ pub(crate) struct OpenRequest<'a> {
     pub(crate) body_len: usize,
     pub(crate) grant_revision: u64,
     pub(crate) digest: &'a str,
+    pub(crate) operation: &'a str,
 }
 
 pub(crate) fn open(request: OpenRequest<'_>) -> ControlMessage {
+    let (initial_send_window, initial_receive_window) = if request.operation == "echo_stream" {
+        (
+            M2_INITIAL_WINDOW_BYTES as u64,
+            M2_INITIAL_WINDOW_BYTES as u64,
+        )
+    } else {
+        (MAX_BODY_BYTES as u64, MAX_BODY_BYTES as u64)
+    };
     let mut open = Open::new(
         random_token(),
         request.session_id,
@@ -102,11 +180,9 @@ pub(crate) fn open(request: OpenRequest<'_>) -> ControlMessage {
         request.stream_id,
         request.operation_id,
         request.service_id,
-        // The local export name is `echo`; the durable grant operation remains
-        // `echo:invoke` and is checked before this OPEN is constructed.
-        "echo",
-        MAX_BODY_BYTES as u64,
-        MAX_BODY_BYTES as u64,
+        request.operation,
+        initial_send_window,
+        initial_receive_window,
     );
     open.metadata
         .insert("body_length".into(), request.body_len.to_string());
@@ -115,6 +191,199 @@ pub(crate) fn open(request: OpenRequest<'_>) -> ControlMessage {
     open.metadata
         .insert("permission_digest".into(), request.digest.to_owned());
     ControlMessage::Open(open)
+}
+
+pub(crate) fn rotate_prepare(
+    reply_to: &str,
+    attempt: tunnel_protocol::rotation_control::RotationAttemptIdentity,
+    attachment_purpose: tunnel_protocol::rotation_control::DataAttachmentPurpose,
+    attachment_ticket: &str,
+    remaining_ms: u64,
+) -> ControlMessage {
+    ControlMessage::RotatePrepare(tunnel_protocol::rotation_control::RotatePrepare {
+        message_id: random_token(),
+        reply_to: reply_to.to_owned(),
+        attempt,
+        attachment_purpose,
+        attachment_ticket: attachment_ticket.to_owned(),
+        reconnect_credential: None,
+        remaining_ms,
+    })
+}
+
+pub(crate) fn recovery_begin(
+    reply_to: &str,
+    attempt: tunnel_protocol::rotation_control::RotationAttemptIdentity,
+    episode_id: &str,
+    attempt_no: u64,
+    roster: tunnel_protocol::rotation_control::StreamRoster,
+    remaining_ms: u64,
+) -> ControlMessage {
+    ControlMessage::RecoveryBegin(tunnel_protocol::rotation_control::RecoveryBegin {
+        message_id: random_token(),
+        reply_to: reply_to.to_owned(),
+        attempt,
+        episode_id: episode_id.to_owned(),
+        attempt_no,
+        roster,
+        remaining_ms,
+    })
+}
+
+pub(crate) fn recovery_closed(
+    reply_to: &str,
+    attempt: tunnel_protocol::rotation_control::RotationAttemptIdentity,
+    episode_id: &str,
+    attempt_no: u64,
+    closed_connection_ids: Vec<String>,
+    closure_digest: &str,
+) -> ControlMessage {
+    ControlMessage::RecoveryClosed(tunnel_protocol::rotation_control::RecoveryClosed {
+        message_id: random_token(),
+        reply_to: reply_to.to_owned(),
+        attempt,
+        episode_id: episode_id.to_owned(),
+        attempt_no,
+        closed_connection_ids,
+        closure_digest: closure_digest.to_owned(),
+    })
+}
+
+pub(crate) fn resume(
+    reply_to: &str,
+    attempt: tunnel_protocol::rotation_control::RotationAttemptIdentity,
+    snapshot_id: &str,
+    stage: tunnel_protocol::rotation_control::ResumeStage,
+    direction: tunnel_protocol::Direction,
+    entries: Vec<tunnel_protocol::rotation_control::ResumeDirectionState>,
+    remaining_ms: u64,
+) -> ControlMessage {
+    ControlMessage::Resume(tunnel_protocol::rotation_control::Resume {
+        message_id: random_token(),
+        reply_to: reply_to.to_owned(),
+        attempt,
+        snapshot_id: snapshot_id.to_owned(),
+        stage,
+        direction,
+        reconnect_credential: None,
+        entries,
+        remaining_ms,
+    })
+}
+
+pub(crate) fn rotate_quiesce(
+    reply_to: &str,
+    attempt: tunnel_protocol::rotation_control::RotationAttemptIdentity,
+    roster: tunnel_protocol::rotation_control::StreamRoster,
+    remaining_ms: u64,
+) -> ControlMessage {
+    ControlMessage::RotateQuiesce(tunnel_protocol::rotation_control::RotateQuiesce {
+        message_id: random_token(),
+        reply_to: reply_to.to_owned(),
+        attempt,
+        roster,
+        remaining_ms,
+    })
+}
+
+pub(crate) fn rotate_frozen(
+    reply_to: &str,
+    attempt: tunnel_protocol::rotation_control::RotationAttemptIdentity,
+    snapshot: tunnel_protocol::rotation_control::FenceSnapshot,
+) -> ControlMessage {
+    ControlMessage::RotateFrozen(tunnel_protocol::rotation_control::RotateFrozen {
+        message_id: random_token(),
+        reply_to: reply_to.to_owned(),
+        attempt,
+        snapshot,
+    })
+}
+
+pub(crate) fn rotate_drained(
+    reply_to: &str,
+    attempt: tunnel_protocol::rotation_control::RotationAttemptIdentity,
+    proof: tunnel_protocol::rotation_control::DrainProof,
+) -> ControlMessage {
+    ControlMessage::RotateDrained(tunnel_protocol::rotation_control::RotateDrained {
+        message_id: random_token(),
+        reply_to: reply_to.to_owned(),
+        attempt,
+        proof,
+    })
+}
+
+pub(crate) fn rotate_commit(
+    reply_to: &str,
+    attempt: tunnel_protocol::rotation_control::RotationAttemptIdentity,
+    snapshot_id: &str,
+    drain_proofs: Vec<tunnel_protocol::rotation_control::DrainProofRef>,
+) -> ControlMessage {
+    ControlMessage::RotateCommit(tunnel_protocol::rotation_control::RotateCommit {
+        message_id: random_token(),
+        reply_to: reply_to.to_owned(),
+        attempt,
+        snapshot_id: snapshot_id.to_owned(),
+        drain_proofs,
+    })
+}
+
+pub(crate) fn rotate_retire(
+    reply_to: &str,
+    attempt: tunnel_protocol::rotation_control::RotationAttemptIdentity,
+    snapshot_id: &str,
+) -> ControlMessage {
+    ControlMessage::RotateRetire(tunnel_protocol::rotation_control::RotateRetire {
+        message_id: random_token(),
+        reply_to: reply_to.to_owned(),
+        attempt,
+        snapshot_id: snapshot_id.to_owned(),
+    })
+}
+
+pub(crate) fn rotate_complete(
+    reply_to: &str,
+    attempt: tunnel_protocol::rotation_control::RotationAttemptIdentity,
+    snapshot_id: &str,
+    forced: bool,
+    reason: Option<String>,
+) -> ControlMessage {
+    ControlMessage::RotateComplete(tunnel_protocol::rotation_control::RotateComplete {
+        message_id: random_token(),
+        reply_to: reply_to.to_owned(),
+        attempt,
+        snapshot_id: snapshot_id.to_owned(),
+        forced,
+        reason,
+    })
+}
+
+pub(crate) fn rotate_abort(
+    reply_to: &str,
+    attempt: tunnel_protocol::rotation_control::RotationAttemptIdentity,
+    reason: &str,
+    remaining_ms: u64,
+) -> ControlMessage {
+    ControlMessage::RotateAbort(tunnel_protocol::rotation_control::RotateAbort {
+        message_id: random_token(),
+        reply_to: reply_to.to_owned(),
+        attempt,
+        reason: reason.to_owned(),
+        remaining_ms,
+    })
+}
+
+pub(crate) fn rotate_aborted(
+    reply_to: &str,
+    attempt: tunnel_protocol::rotation_control::RotationAttemptIdentity,
+    reason: &str,
+) -> ControlMessage {
+    ControlMessage::RotateAborted(tunnel_protocol::rotation_control::RotateAborted {
+        message_id: random_token(),
+        reply_to: reply_to.to_owned(),
+        closed_connection_id: attempt.new_connection_id.clone(),
+        attempt,
+        reason: reason.to_owned(),
+    })
 }
 
 pub fn cancel(session_id: &str, epoch: u64, stream_id: u64, operation_id: &str) -> ControlMessage {

@@ -1,16 +1,17 @@
-//! M1 connector library.
+//! Connector library with explicit M1 and M2 transport profiles.
 //!
-//! A connector establishes exactly one mutually authenticated control WSS and
-//! one mutually authenticated data WSS for a session. M1 deliberately has no
-//! scheduled data rotation, resume/replay, or reconnect loop: any transport
-//! failure closes the pair and the caller must start a fresh session. This
-//! keeps application side effects from being replayed while the retained
-//! stream state needed by M2 is still being designed.
+//! Both profiles establish one mutually authenticated control WSS and one
+//! mutually authenticated data WSS for a session. M1 is the baseline profile:
+//! transport loss closes the pair and requires a fresh session. M2 adds
+//! ordered data-carrier rotation and bounded retained replay, while preserving
+//! logical stream identity across physical connections. Neither profile
+//! resubmits application operations after an ambiguous transport outcome.
 
 #![forbid(unsafe_code)]
 
 mod config;
 pub mod credentials;
+mod m2_runtime;
 
 use config::{ExportConfig, ExportKind, RuntimeConfig};
 use credentials::{CredentialError, load_client_config};
@@ -19,6 +20,7 @@ use std::{
     collections::{BTreeMap, VecDeque},
     error::Error,
     fmt,
+    net::SocketAddr,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -55,6 +57,19 @@ pub use tokio_util::sync::CancellationToken as ConnectCancellation;
 pub const M1_TRANSPORT_FAILURE_POLICY: &str =
     "close control and data and require a fresh session; no retained replay or automatic reconnect";
 
+/// The connector transport profile.  M1 is retained for the deterministic
+/// baseline harness; the foreground CLI and library constructor default to
+/// M2 so new sessions negotiate ordered rotation when the relay supports it.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TransportProfile {
+    /// One control and one data socket; any transport failure ends the epoch.
+    M1,
+    /// Ordered stream state with scheduled data-carrier rotation and bounded
+    /// retained recovery.
+    #[default]
+    M2,
+}
+
 const PROTOCOL_MAJOR: u16 = 1;
 const PROTOCOL_MINOR: u16 = 0;
 const DATA_CLOSE_AUTH_EXPIRED: u16 = 4_001;
@@ -72,6 +87,10 @@ type ClientStream = futures_util::stream::SplitStream<ClientWebSocket>;
 type ClientSink = futures_util::stream::SplitSink<ClientWebSocket, Message>;
 type SupervisorJoin = JoinHandle<Result<(), ClientError>>;
 
+fn socket_local_addr(socket: &ClientWebSocket) -> Option<SocketAddr> {
+    socket.get_ref().get_ref().local_addr().ok()
+}
+
 struct ConnectionLifecycle {
     cancellation: CancellationToken,
     join: Mutex<Option<SupervisorJoin>>,
@@ -85,6 +104,9 @@ pub struct ConnectOptions {
     /// Cancellation owned by the caller. Cancelling before or during
     /// admission closes both sockets and joins all connector tasks.
     pub cancellation: CancellationToken,
+    /// Explicit transport profile.  `M2` is the default for callers using
+    /// [`ConnectOptions::new`]; M1 callers must opt into the baseline policy.
+    pub profile: TransportProfile,
 }
 
 impl ConnectOptions {
@@ -93,6 +115,63 @@ impl ConnectOptions {
         Self {
             config,
             cancellation: CancellationToken::new(),
+            profile: TransportProfile::M2,
+        }
+    }
+}
+
+/// A bounded, payload-free status snapshot owned by the connector actor.
+/// Identifiers are useful for diagnosing a handover; credentials and frame
+/// bodies are deliberately absent.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConnectionStatus {
+    pub phase: String,
+    pub session_id: Option<String>,
+    pub epoch: Option<u64>,
+    pub active_generation: Option<u64>,
+    pub active_connection_id: Option<String>,
+    pub candidate_generation: Option<u64>,
+    pub candidate_connection_id: Option<String>,
+    pub rotation_id: Option<String>,
+    pub streams: usize,
+    pub emitted_sequences: u64,
+    pub received_sequences: u64,
+    pub drain_fences: usize,
+    pub drain_acks: usize,
+    pub replay_frames: usize,
+    pub replay_bytes: usize,
+    pub queue_frames: usize,
+    pub queue_bytes: usize,
+    pub rotations_completed: u64,
+    pub control_local_addr: Option<SocketAddr>,
+    pub active_local_addr: Option<SocketAddr>,
+    pub candidate_local_addr: Option<SocketAddr>,
+}
+
+impl Default for ConnectionStatus {
+    fn default() -> Self {
+        Self {
+            phase: "connecting".to_owned(),
+            session_id: None,
+            epoch: None,
+            active_generation: None,
+            active_connection_id: None,
+            candidate_generation: None,
+            candidate_connection_id: None,
+            rotation_id: None,
+            streams: 0,
+            emitted_sequences: 0,
+            received_sequences: 0,
+            drain_fences: 0,
+            drain_acks: 0,
+            replay_frames: 0,
+            replay_bytes: 0,
+            queue_frames: 0,
+            queue_bytes: 0,
+            rotations_completed: 0,
+            control_local_addr: None,
+            active_local_addr: None,
+            candidate_local_addr: None,
         }
     }
 }
@@ -127,6 +206,7 @@ impl Readiness {
 #[derive(Clone)]
 pub struct ConnectionHandle {
     readiness: watch::Receiver<Readiness>,
+    status: watch::Receiver<ConnectionStatus>,
     lifecycle: Arc<ConnectionLifecycle>,
 }
 
@@ -135,6 +215,7 @@ impl fmt::Debug for ConnectionHandle {
         formatter
             .debug_struct("ConnectionHandle")
             .field("readiness", &*self.readiness.borrow())
+            .field("status", &*self.status.borrow())
             .finish_non_exhaustive()
     }
 }
@@ -144,6 +225,18 @@ impl ConnectionHandle {
     #[must_use]
     pub fn readiness(&self) -> watch::Receiver<Readiness> {
         self.readiness.clone()
+    }
+
+    /// Subscribe to the actor-owned bounded status snapshot.
+    #[must_use]
+    pub fn status(&self) -> watch::Receiver<ConnectionStatus> {
+        self.status.clone()
+    }
+
+    /// Return the most recent redacted status snapshot.
+    #[must_use]
+    pub fn status_snapshot(&self) -> ConnectionStatus {
+        self.status.borrow().clone()
     }
 
     /// Wait for Ready or a terminal closed state.
@@ -171,14 +264,23 @@ impl ConnectionHandle {
     /// Stop both sockets and join the supervisor and writer tasks.
     pub async fn stop(&self) -> Result<(), ClientError> {
         self.lifecycle.cancellation.cancel();
-        let join = self.lifecycle.join.lock().await.take();
-        match join {
-            Some(join) => join
-                .await
-                .map_err(|_| ClientError::SupervisorPanicked)?
-                .map(|_| ()),
+        // Keep the lifecycle mutex held until the one supervisor join has
+        // completed. A second concurrent stop therefore waits for the first
+        // caller instead of observing `None` and returning early.
+        let mut lifecycle_join = self.lifecycle.join.lock().await;
+        let result = match lifecycle_join.as_mut() {
+            // Await through the option while holding the mutex. The handle is
+            // only removed after completion, so cancellation of this stop
+            // future leaves it available for a later caller to join.
+            Some(join) => match join.await {
+                Ok(result) => result.map(|_| ()),
+                Err(_) => Err(ClientError::SupervisorPanicked),
+            },
             None => Ok(()),
-        }
+        };
+        let _ = lifecycle_join.take();
+        drop(lifecycle_join);
+        result
     }
 
     /// Alias used by callers that model supervisor lifecycle as shutdown.
@@ -198,6 +300,9 @@ impl Drop for ConnectionHandle {
 /// Connect the control/data pair, perform HELLO/WELCOME and DATA_READY, then
 /// return a handle for the running session actor.
 pub async fn connect(options: ConnectOptions) -> Result<ConnectionHandle, ClientError> {
+    if options.profile == TransportProfile::M2 {
+        return m2_runtime::connect_m2(options).await;
+    }
     options.config.validate()?;
     if options.cancellation.is_cancelled() {
         return Err(ClientError::Cancelled);
@@ -206,6 +311,7 @@ pub async fn connect(options: ConnectOptions) -> Result<ConnectionHandle, Client
     let control_url = Url::parse(&options.config.relay_url)
         .map_err(|_| ClientError::Invalid("relay_url is not a valid URL"))?;
     let (readiness_tx, readiness_rx) = watch::channel(Readiness::Connecting);
+    let (_, status_rx) = watch::channel(ConnectionStatus::default());
 
     let mut control = open_socket(
         &control_url,
@@ -230,6 +336,7 @@ pub async fn connect(options: ConnectOptions) -> Result<ConnectionHandle, Client
             "echo".to_owned(),
         ],
         services: configured_services(&options.config),
+        rotation_policy: None,
     });
     tokio::select! {
         _ = options.cancellation.cancelled() => return Err(ClientError::Cancelled),
@@ -300,6 +407,7 @@ pub async fn connect(options: ConnectOptions) -> Result<ConnectionHandle, Client
     });
     Ok(ConnectionHandle {
         readiness: readiness_rx,
+        status: status_rx,
         lifecycle,
     })
 }
@@ -578,6 +686,10 @@ struct QueueBudget {
 }
 
 impl QueueBudget {
+    fn current(&self) -> usize {
+        self.bytes.load(Ordering::Acquire)
+    }
+
     fn reserve(self: &Arc<Self>, bytes: usize) -> Result<(), ClientError> {
         if bytes > self.maximum {
             return Err(ClientError::QueueLimit);
@@ -672,6 +784,37 @@ impl OutboundQueue {
                 _ = self.cancellation.cancelled() => Err(ClientError::Cancelled),
             }
         }
+    }
+
+    fn try_send(&self, message: Message) -> Result<(), ClientError> {
+        self.try_send_with_deadline(message, None)
+    }
+
+    /// Enqueue without waiting for capacity, while retaining the writer-side
+    /// deadline used by authorization-bearing control messages. M1 continues
+    /// to use [`Self::send`] and its cancellation/deadline-aware backpressure;
+    /// M2 actors use this bounded path so a full writer queue cannot stall the
+    /// actor.
+    fn try_send_with_deadline(
+        &self,
+        message: Message,
+        deadline: Option<DualDeadline>,
+    ) -> Result<(), ClientError> {
+        let bytes = message_size(&message);
+        self.budget.reserve(bytes)?;
+        let item = QueuedMessage {
+            message,
+            bytes,
+            budget: self.budget.clone(),
+            deadline,
+        };
+        self.sender.try_send(item).map_err(|error| match error {
+            mpsc::error::TrySendError::Full(_) => ClientError::QueueLimit,
+            mpsc::error::TrySendError::Closed(_) => ClientError::Transport {
+                scope: "writer",
+                detail: "writer stopped".to_owned(),
+            },
+        })
     }
 }
 
@@ -795,6 +938,10 @@ impl DualDeadline {
     fn expired(self) -> bool {
         self.expired_at(Instant::now(), SystemTime::now())
     }
+
+    fn remaining(self, monotonic_now: Instant) -> Duration {
+        self.monotonic.saturating_duration_since(monotonic_now)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -806,6 +953,10 @@ struct AuthContext {
     deadline: DualDeadline,
     operation_deadline: DualDeadline,
     confirmed: bool,
+    /// A fresh challenge is awaiting confirmation.  M2 sets this again for
+    /// each long-lived stream authorization refresh; the operation deadline
+    /// remains independent and is never extended by a confirmation.
+    refresh_in_flight: bool,
     invalidated: bool,
 }
 
@@ -1024,6 +1175,25 @@ impl SessionActor {
             | ControlMessage::Hello(_)
             | ControlMessage::Pong(_)
             | ControlMessage::AuthorizationChallenge(_) => Ok(()),
+            ControlMessage::RotateRequest(_)
+            | ControlMessage::RotatePrepare(_)
+            | ControlMessage::RotateQuiesce(_)
+            | ControlMessage::RotateFrozen(_)
+            | ControlMessage::RotateDrained(_)
+            | ControlMessage::RotateCommit(_)
+            | ControlMessage::RotateCommitted(_)
+            | ControlMessage::RotateRetire(_)
+            | ControlMessage::RotateRetired(_)
+            | ControlMessage::RotateComplete(_)
+            | ControlMessage::RotateAbort(_)
+            | ControlMessage::RotateAborted(_)
+            | ControlMessage::StreamForget(_)
+            | ControlMessage::Resume(_)
+            | ControlMessage::RecoveryBegin(_)
+            | ControlMessage::RecoveryClosed(_)
+            | ControlMessage::Resumed(_) => Err(ClientError::Protocol(
+                "M2 control message received while using the explicit M1 profile".to_owned(),
+            )),
         }
     }
 
@@ -1126,6 +1296,7 @@ impl SessionActor {
                 deadline,
                 operation_deadline,
                 confirmed: false,
+                refresh_in_flight: true,
                 invalidated: false,
             },
             inbound_sequence: 0,
@@ -1690,6 +1861,21 @@ fn sanitize_error(error: &str) -> String {
     "transport failure".to_owned()
 }
 
+fn safe_rotation_detail(detail: &str) -> &'static str {
+    // Only expose a closed set of state diagnostics.  Rotation details are
+    // otherwise intentionally opaque because transport errors can originate
+    // below the protocol boundary.
+    match detail {
+        "candidate abort owner decision not received before overlap deadline" => {
+            "owner abort decision deadline expired"
+        }
+        "rotation deadline requires retained recovery" => "retained recovery required",
+        "rotation state closed" => "rotation reached terminal state",
+        "recovery episode deadline expired" => "recovery episode deadline expired",
+        _ => "bounded rotation state failure",
+    }
+}
+
 /// Errors returned by the connector API. Display text is safe for CLI JSON;
 /// it does not include credentials, payloads, or endpoint query strings.
 #[derive(Debug)]
@@ -1734,6 +1920,11 @@ impl ClientError {
             Self::Credential(error) => error.to_string(),
             Self::Invalid(message) => (*message).to_owned(),
             Self::Protocol(message) => message.clone(),
+            Self::Transport { scope, detail }
+                if *scope == "data rotation" || *scope == "retained recovery" =>
+            {
+                format!("{scope} failed: {}", safe_rotation_detail(detail))
+            }
             Self::Transport { scope, .. } => format!("{scope} failed"),
             Self::HandshakeTimeout => "TLS/WebSocket handshake deadline exceeded".to_owned(),
             Self::AuthorizationExpired => "authorization confirmation deadline expired".to_owned(),
@@ -1799,6 +1990,132 @@ mod tests {
         budget.reserve(4).expect("exact limit");
         assert!(budget.reserve(1).is_err());
         budget.release(4);
+    }
+
+    #[tokio::test]
+    async fn try_send_with_deadline_is_bounded_and_preserves_deadline() {
+        let cancellation = CancellationToken::new();
+        let (queue, mut receiver) = OutboundQueue::new(1, 64, cancellation);
+        let deadline = DualDeadline::new(Instant::now(), SystemTime::now(), Duration::from_secs(1))
+            .expect("valid deadline");
+
+        queue
+            .try_send_with_deadline(Message::Text("first".to_owned().into()), Some(deadline))
+            .expect("first bounded enqueue");
+        assert!(matches!(
+            queue.try_send(Message::Text("second".to_owned().into())),
+            Err(ClientError::QueueLimit)
+        ));
+
+        let queued = receiver.recv().await.expect("queued message");
+        assert!(queued.deadline.is_some());
+        drop(queued);
+        queue
+            .try_send(Message::Text("second".to_owned().into()))
+            .expect("budget released after dequeue");
+    }
+
+    #[tokio::test]
+    async fn concurrent_stop_waits_for_existing_supervisor_join() {
+        let cancellation = CancellationToken::new();
+        let (readiness_tx, readiness_rx) = watch::channel(Readiness::Connecting);
+        let (status_tx, status_rx) = watch::channel(ConnectionStatus::default());
+        drop(readiness_tx);
+        drop(status_tx);
+
+        let release = Arc::new(tokio::sync::Notify::new());
+        let supervisor_release = release.clone();
+        let join = tokio::spawn(async move {
+            supervisor_release.notified().await;
+            Ok(())
+        });
+        let lifecycle = Arc::new(ConnectionLifecycle {
+            cancellation,
+            join: Mutex::new(Some(join)),
+        });
+        let handle = ConnectionHandle {
+            readiness: readiness_rx,
+            status: status_rx,
+            lifecycle: lifecycle.clone(),
+        };
+
+        let first_handle = handle.clone();
+        let first = tokio::spawn(async move { first_handle.stop().await });
+        let mut first_holds_join_lock = false;
+        for _ in 0..1_000 {
+            if lifecycle.join.try_lock().is_err() {
+                first_holds_join_lock = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(first_holds_join_lock, "first stop did not begin joining");
+
+        let second_handle = handle.clone();
+        let mut second = tokio::spawn(async move { second_handle.stop().await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut second)
+                .await
+                .is_err(),
+            "concurrent stop returned before the supervisor completed"
+        );
+
+        release.notify_one();
+        assert!(first.await.expect("first stop task").is_ok());
+        assert!(second.await.expect("second stop task").is_ok());
+    }
+
+    #[tokio::test]
+    async fn cancelled_stop_keeps_supervisor_join_for_next_caller() {
+        let cancellation = CancellationToken::new();
+        let (readiness_tx, readiness_rx) = watch::channel(Readiness::Connecting);
+        let (status_tx, status_rx) = watch::channel(ConnectionStatus::default());
+        drop(readiness_tx);
+        drop(status_tx);
+
+        let release = Arc::new(tokio::sync::Notify::new());
+        let supervisor_release = release.clone();
+        let join = tokio::spawn(async move {
+            supervisor_release.notified().await;
+            Ok(())
+        });
+        let lifecycle = Arc::new(ConnectionLifecycle {
+            cancellation,
+            join: Mutex::new(Some(join)),
+        });
+        let handle = ConnectionHandle {
+            readiness: readiness_rx,
+            status: status_rx,
+            lifecycle: lifecycle.clone(),
+        };
+
+        let first_handle = handle.clone();
+        let first = tokio::spawn(async move { first_handle.stop().await });
+        let mut first_holds_join_lock = false;
+        for _ in 0..1_000 {
+            if lifecycle.join.try_lock().is_err() {
+                first_holds_join_lock = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(first_holds_join_lock, "first stop did not begin joining");
+
+        first.abort();
+        let first_error = first.await.expect_err("first stop should be cancelled");
+        assert!(first_error.is_cancelled());
+
+        let second_handle = handle.clone();
+        let mut second = tokio::spawn(async move { second_handle.stop().await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut second)
+                .await
+                .is_err(),
+            "replacement stop returned before the supervisor completed"
+        );
+
+        release.notify_one();
+        assert!(second.await.expect("replacement stop task").is_ok());
     }
 
     #[test]

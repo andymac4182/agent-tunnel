@@ -12,11 +12,13 @@
 mod actor;
 mod config;
 mod http;
+mod runtime;
 mod wire;
 
 pub use actor::{Relay, RelayError, RelayHandle, RunningRelay};
 pub use config::{RelayLimits, RelayOptions, ServeConfig};
 pub use http::{consumer_router, device_router, router};
+pub use runtime::{RelayCarrierSnapshot, RelaySessionSnapshot, RelaySnapshot, RelayStreamSnapshot};
 pub use wire::{MAX_BODY_BYTES, MAX_CONTROL_BYTES};
 
 /// Protocol major supported by this relay.

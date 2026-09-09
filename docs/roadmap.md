@@ -1,6 +1,6 @@
 # Build roadmap
 
-Status: M1 local verification is complete; later cluster work remains.
+Status: M1 and M2 local verification are complete; M7 cluster implementation is next.
 On 2026-09-09 macOS arm64 with pinned Rust 1.95.0 and Redis 8.4, formatting,
 strict locked Clippy, 62 workspace tests, five explicitly executed real Redis integration tests, the AOF restart
 check, and the full real HTTPS/WSS CLI acceptance passed for five
@@ -51,6 +51,12 @@ with mTLS verified at the Rust listener; the desktop opens no inbound port.
 Public consumers cannot forge internal verified identity headers. M7 multi-relay routing remains a separate gate.
 
 ## M2 — Independent ordering and drain before handover
+
+Locally verified on 2026-09-10: 151 workspace tests, strict locked checks,
+five Redis tests, AOF restart and full M1 regression pass. The real-socket
+M2 suite passes three accelerated rotations, targeted recovery/abort/control
+loss/cancellation/revocation faults, and three actual 300-second rotations in
+903.05 seconds. See [M2 evidence](m2-verification.md). Hosted M2 CI is pending.
 
 Implement [protocol.md](protocol.md) as a pure state machine before real socket I/O. Each logical stream has independent sequence spaces per direction, tied to a unique session/stream identity and preserved through scheduled rotation. Physical connection IDs, generations and owner epochs fence carriers without resetting logical counters. Bound credits, queued bytes, replay, tombstones, roster snapshots and recovery time.
 

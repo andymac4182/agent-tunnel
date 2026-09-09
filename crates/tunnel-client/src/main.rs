@@ -209,6 +209,7 @@ async fn run_connect(path: PathBuf, json: bool) -> Result<(), CliError> {
     let options = ConnectOptions {
         config,
         cancellation: cancellation.clone(),
+        profile: tunnel_client::TransportProfile::M2,
     };
     let handle = match connect(options).await {
         Ok(handle) => handle,

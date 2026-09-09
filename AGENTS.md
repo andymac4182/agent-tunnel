@@ -1,6 +1,6 @@
 # Repository guidance
 
-- M1 provides authenticated echo tunneling and a reusable real-socket harness, verified locally against Redis. Remote service adapters, rotation/replay and multi-relay routing remain planned. Re-run the complete acceptance command when networking or authorization changes; keep status claims precise.
+- M1 authenticated echo and M2 ordered rotation/retained replay are locally verified against Redis, including real-socket faults and three actual 300-second rotations. Remote service adapters and M7 multi-relay routing remain planned. Re-run the complete acceptance commands when networking or authorization changes; keep status claims precise and distinguish local evidence from hosted CI.
 - Read README.md, docs/roadmap.md, and the relevant design document before implementing a milestone.
 - Rust 1.95.0 is pinned in rust-toolchain.toml. Use Cargo.lock and `--locked` for validation.
 - Required Rust checks: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, and `cargo test --workspace --locked`.

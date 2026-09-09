@@ -12,7 +12,7 @@ use axum::{
     routing::{get, post},
 };
 use chrono::Utc;
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
 use tokio::{sync::Semaphore, time::timeout};
 use tunnel_catalog::{DeviceListFilter, OidcVerifier, SharedCatalog};
@@ -21,6 +21,10 @@ use uuid::Uuid;
 
 const CONTROL_SUBPROTOCOL: &str = "agent-tunnel.control.v1";
 const DATA_SUBPROTOCOL: &str = "agent-tunnel.data.v1";
+const ECHO_STREAM_SUBPROTOCOL: &str = "agent-tunnel.echo.v1";
+const MAX_ECHO_CANARY_BYTES: usize = 256;
+// Includes the record prefix and the largest unmasked WebSocket frame header.
+const MAX_ECHO_WRITE_BYTES: usize = MAX_BODY_BYTES + MAX_ECHO_CANARY_BYTES + 4 + 10;
 
 use crate::{
     actor::{EchoOutcome, RelayHandle},
@@ -73,6 +77,10 @@ pub fn consumer_router(
         .route("/v1/devices", get(list_devices))
         .route("/v1/devices/{device}/services", get(list_services))
         .route("/v1/devices/{device}/services/{service}/echo", post(echo))
+        .route(
+            "/v1/devices/{device}/services/{service}/stream",
+            get(echo_stream),
+        )
         .with_state(state)
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES))
 }
@@ -303,6 +311,209 @@ async fn echo(
     }
 }
 
+async fn echo_stream(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Path((device, service)): Path<(String, String)>,
+    upgrade: WebSocketUpgrade,
+) -> Response {
+    if !subprotocol_offered(&headers, ECHO_STREAM_SUBPROTOCOL) {
+        return error_response(
+            StatusCode::UPGRADE_REQUIRED,
+            "SUBPROTOCOL_REQUIRED",
+            "consumer stream subprotocol is required",
+            "not_dispatched",
+        );
+    }
+    let Ok(permit) = state.admission.clone().try_acquire_owned() else {
+        return error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "ADMISSION_LIMIT",
+            "request capacity exhausted",
+            "not_dispatched",
+        );
+    };
+    let (Some(catalog), Some(oidc)) = (state.catalog.as_ref(), state.oidc.as_ref()) else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "AUTHORIZATION_UNAVAILABLE",
+            "catalog unavailable",
+            "not_dispatched",
+        );
+    };
+    let validated = match oidc
+        .authenticate_for_scope(&**catalog, bearer(&headers), None, crate::ECHO_OPERATION)
+        .await
+    {
+        Ok(value) => value,
+        Err(_) => {
+            return error_response(
+                StatusCode::UNAUTHORIZED,
+                "UNAUTHORIZED",
+                "consumer authentication failed",
+                "not_dispatched",
+            );
+        }
+    };
+    let device_id = match parse_uuid(&device) {
+        Ok(value) => value,
+        Err(()) => {
+            return error_response(
+                StatusCode::NOT_FOUND,
+                "NOT_FOUND",
+                "not found",
+                "not_dispatched",
+            );
+        }
+    };
+    let (service_id, mut grant) =
+        match service_and_grant(&state, &validated.consumer, device_id, &service).await {
+            Ok(value) => value,
+            Err(response) => return response,
+        };
+    if !grant.permissions.allows(crate::ECHO_OPERATION)
+        || grant.valid_until <= Utc::now()
+        || validated.expires_at <= Utc::now()
+    {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "FORBIDDEN",
+            "echo stream is not authorized",
+            "not_dispatched",
+        );
+    }
+    grant.valid_until = grant.valid_until.min(validated.expires_at);
+    let handle = state.handle.clone();
+    let consumer = validated.consumer;
+    let consumer_expires_at = validated.expires_at;
+    upgrade
+        .protocols([ECHO_STREAM_SUBPROTOCOL])
+        .max_message_size(MAX_BODY_BYTES.saturating_add(4))
+        .max_frame_size(MAX_BODY_BYTES.saturating_add(4))
+        .write_buffer_size(0)
+        .max_write_buffer_size(MAX_ECHO_WRITE_BYTES)
+        .on_upgrade(move |socket| async move {
+            let _permit = permit;
+            handle_consumer_stream(
+                socket,
+                handle,
+                consumer,
+                device_id,
+                service_id,
+                grant,
+                consumer_expires_at,
+            )
+            .await;
+        })
+        .into_response()
+}
+
+async fn handle_consumer_stream(
+    mut socket: WebSocket,
+    handle: RelayHandle,
+    consumer: tunnel_catalog::AuthenticatedConsumer,
+    device_id: Uuid,
+    service_id: Uuid,
+    grant: tunnel_catalog::GrantSnapshot,
+    consumer_expires_at: chrono::DateTime<Utc>,
+) {
+    let registration = match handle
+        .open_echo_stream(consumer, device_id, service_id, grant, consumer_expires_at)
+        .await
+    {
+        Ok(registration) => registration,
+        Err(_) => {
+            let _ = send_socket(&mut socket, Message::Close(None)).await;
+            return;
+        }
+    };
+    let key = registration.key.clone();
+    let stream_id = registration.stream_id;
+    let operation_id = registration.operation_id.clone();
+    let mut input = Vec::new();
+    let expires_in = (consumer_expires_at - Utc::now())
+        .to_std()
+        .unwrap_or_default();
+    let expires = tokio::time::sleep(expires_in);
+    tokio::pin!(expires);
+    'connection: loop {
+        let message = tokio::select! {
+            biased;
+            _ = registration.closed.cancelled() => break,
+            _ = &mut expires => break,
+            message = socket.next() => message,
+        };
+        let Some(message) = message else {
+            break;
+        };
+        let message = match message {
+            Ok(message) => message,
+            Err(_) => break,
+        };
+        match message {
+            Message::Binary(bytes) => {
+                if input.len().saturating_add(bytes.len()) > MAX_BODY_BYTES.saturating_add(4) {
+                    break;
+                }
+                input.extend_from_slice(&bytes);
+                loop {
+                    if input.len() < 4 {
+                        break;
+                    }
+                    let declared =
+                        u32::from_be_bytes([input[0], input[1], input[2], input[3]]) as usize;
+                    if declared > MAX_BODY_BYTES {
+                        break 'connection;
+                    }
+                    let Some(total) = declared.checked_add(4) else {
+                        break 'connection;
+                    };
+                    if input.len() < total {
+                        break;
+                    }
+                    let record: Vec<u8> = input.drain(..total).collect();
+                    let body = record[4..].to_vec();
+                    let result = handle
+                        .write_echo_stream(key.clone(), stream_id, operation_id.clone(), body)
+                        .await;
+                    let Ok(response) = result else {
+                        break 'connection;
+                    };
+                    if response.len() < 4 {
+                        break 'connection;
+                    }
+                    let response_len =
+                        u32::from_be_bytes([response[0], response[1], response[2], response[3]])
+                            as usize;
+                    if response_len > MAX_BODY_BYTES.saturating_add(MAX_ECHO_CANARY_BYTES)
+                        || response_len.saturating_add(4) != response.len()
+                    {
+                        break 'connection;
+                    }
+                    if !send_socket(&mut socket, Message::Binary(response.into())).await {
+                        break 'connection;
+                    }
+                }
+            }
+            Message::Ping(payload) => {
+                if !send_socket(&mut socket, Message::Pong(payload)).await {
+                    break;
+                }
+            }
+            Message::Close(_) => {
+                // Tungstenite queues the peer's close reply while reading.
+                // Flush it before dropping the upgraded TLS connection.
+                let _ = timeout(Duration::from_secs(5), socket.flush()).await;
+                break;
+            }
+            Message::Pong(_) => {}
+            Message::Text(_) => break,
+        }
+    }
+    let _ = send_socket(&mut socket, Message::Close(None)).await;
+    handle.close_echo_stream(key, stream_id, operation_id).await;
+}
+
 async fn service_and_grant(
     state: &HttpState,
     consumer: &tunnel_catalog::AuthenticatedConsumer,
@@ -361,6 +572,18 @@ async fn service_and_grant(
                 "not_dispatched",
             )
         })?;
+    if !device.services.iter().any(|candidate| {
+        candidate.service_id == service_id
+            && candidate.service_type == crate::ECHO_SERVICE_TYPE
+            && candidate.active
+    }) {
+        return Err(error_response(
+            StatusCode::NOT_FOUND,
+            "SERVICE_NOT_FOUND",
+            "not found",
+            "not_dispatched",
+        ));
+    }
     let read_started = Utc::now();
     let grant = catalog
         .authorize(consumer, device_id, service_id, read_started, Utc::now())
@@ -603,7 +826,7 @@ async fn handle_data(
         Ok(value) => value,
         Err(_) => return,
     };
-    let key = registration.key.clone();
+    let carrier = registration.carrier.clone();
     let mut rx = registration.rx;
     let queue_budget = registration.queue_budget;
     loop {
@@ -611,7 +834,7 @@ async fn handle_data(
             inbound = socket.next() => {
                 match inbound {
                     Some(Ok(Message::Binary(bytes))) if bytes.len() <= tunnel_protocol::frame::MAX_FRAME_LEN => {
-                        let _ = handle.inbound_data(key.clone(), bytes.to_vec()).await;
+                        let _ = handle.inbound_data(carrier.clone(), bytes.to_vec()).await;
                     }
                     Some(Ok(Message::Ping(payload))) => { if !send_socket(&mut socket, Message::Pong(payload)).await { break; } }
                     Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
@@ -626,6 +849,9 @@ async fn handle_data(
                         queue_budget.release(len);
                         if !sent { break; }
                     }
+                    Some(crate::actor::DataOutbound::Barrier(done)) => {
+                        let _ = done.send(());
+                    }
                     Some(crate::actor::DataOutbound::Close) | None => { let _ = send_socket(&mut socket, Message::Close(None)).await; break; }
                 }
             }
@@ -637,7 +863,7 @@ async fn handle_data(
             queue_budget.release(bytes.len());
         }
     }
-    handle.disconnect_data(key).await;
+    handle.disconnect_data(carrier).await;
 }
 
 async fn send_socket(socket: &mut WebSocket, message: Message) -> bool {

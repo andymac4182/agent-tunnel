@@ -82,3 +82,33 @@ jobs:
         run: cargo +1.95.0 run --locked -p tunnel-test-harness -- verify
       - name: Verify Redis AOF restart and explicit recovery
         run: bash scripts/m1-redis-restart-verify.sh
+
+  m2-acceptance:
+    name: M2 rotation and recovery (Redis)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    services:
+      redis:
+        image: redis:8.4.0-alpine@sha256:6cbef353e480a8a6e7f10ec545f13d7d3fa85a212cdcc5ffaf5a1c818b9d3798
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 20
+          --memory 256m
+    env:
+      RUST_LOG: info
+      TEST_REDIS_URL: redis://127.0.0.1:6379/
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Install Rust 1.95.0
+        run: rustup toolchain install 1.95.0 --profile minimal
+      - name: Verify accelerated rotations and transport faults
+        run: sh scripts/m2-harness-verify.sh accelerated
+      - name: Verify three rotations at the actual 300-second interval
+        run: sh scripts/m2-harness-verify.sh default

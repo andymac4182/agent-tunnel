@@ -16,17 +16,22 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio_rustls::TlsConnector;
 use tunnel_catalog::{ApprovedJwk, Catalog, OidcConfig, OidcVerifier, RedisCatalog};
-use tunnel_relay::{Relay, RelayLimits, RelayOptions, RunningRelay};
+use tunnel_core::RotationConfig;
+use tunnel_relay::{Relay, RelayLimits, RelayOptions, RelaySnapshot, RunningRelay};
 
 const FIXTURE_DEPLOYMENT_INCARNATION: &str = "m1-local";
 
-/// Inputs for one isolated M1 run.
+/// Inputs for one isolated real-socket harness run.
 #[derive(Clone, Debug)]
 pub struct HarnessOptions {
     pub redis_url: Option<String>,
     pub namespace_prefix: Option<String>,
     pub proxy_target: Option<SocketAddr>,
     pub proxy_config: ProxyConfig,
+    /// Effective data-carrier rotation policy used by the production relay.
+    /// M1 callers can keep the defaults; M2 acceptance overrides this with an
+    /// accelerated policy while preserving the same real runtime path.
+    pub rotation: RotationConfig,
 }
 
 impl Default for HarnessOptions {
@@ -36,6 +41,7 @@ impl Default for HarnessOptions {
             namespace_prefix: Some("m1-fixture".to_owned()),
             proxy_target: None,
             proxy_config: ProxyConfig::default(),
+            rotation: RotationConfig::default(),
         }
     }
 }
@@ -78,6 +84,11 @@ impl HarnessOptions {
 
     pub fn proxy_config(mut self, value: ProxyConfig) -> Self {
         self.proxy_config = value;
+        self
+    }
+
+    pub fn rotation(mut self, value: RotationConfig) -> Self {
+        self.rotation = value;
         self
     }
 }
@@ -175,6 +186,7 @@ impl Harness {
             proxy,
             production_catalog: Some(catalog),
             production_relay: None,
+            rotation: options.rotation,
         })
     }
 }
@@ -192,6 +204,7 @@ pub struct RunningHarness {
     pub proxy: Option<ProxyHandle>,
     production_catalog: Option<RedisCatalog>,
     production_relay: Option<RunningRelay>,
+    rotation: RotationConfig,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -270,6 +283,7 @@ impl RunningHarness {
         let mut options = RelayOptions::new(oidc);
         options.limits = limits;
         options.deployment_incarnation = FIXTURE_DEPLOYMENT_INCARNATION.to_owned();
+        options.rotation = self.rotation.clone();
         let shared_catalog: tunnel_catalog::SharedCatalog = Arc::new(catalog.clone());
         let relay = Relay::start(
             options,
@@ -291,6 +305,20 @@ impl RunningHarness {
         self.production_relay
             .as_ref()
             .map(|relay| (relay.consumer_addr, relay.device_addr))
+    }
+
+    /// Return the relay's bounded, payload-free runtime snapshot for
+    /// acceptance evidence.  This remains an in-process diagnostic call; all
+    /// exercised service traffic still crosses the public TLS/WebSocket
+    /// listeners.
+    pub async fn production_snapshot(&self) -> Result<RelaySnapshot> {
+        let relay = self.production_relay.as_ref().ok_or_else(|| {
+            HarnessError::InvalidInput("production relay is not running".to_owned())
+        })?;
+        relay
+            .snapshot()
+            .await
+            .map_err(|error| HarnessError::Process(format!("reading relay snapshot: {error}")))
     }
 
     /// Exercise the public HTTPS listener through a real TLS connection and

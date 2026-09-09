@@ -23,6 +23,7 @@ use tokio::{
 };
 use tokio_rustls::TlsConnector;
 use tunnel_client::{ConnectConfig, CredentialConfig, LimitsConfig, LocalExport, LocalExportKind};
+use tunnel_core::RotationConfig;
 use uuid::Uuid;
 
 // Echo responses include a device canary and a small JSON error envelope.  A
@@ -171,6 +172,7 @@ pub(crate) fn write_device_profile(
         .into_iter()
         .collect(),
         limits: LimitsConfig::default(),
+        rotation: RotationConfig::default(),
     };
     config.validate().map_err(|error| {
         HarnessError::InvalidInput(format!("generated client config is invalid: {error}"))

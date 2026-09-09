@@ -1,5 +1,13 @@
 [workspace]
-members = ["crates/*"]
+members = [
+    "crates/tunnel-catalog",
+    "crates/tunnel-client",
+    "crates/tunnel-core",
+    "crates/tunnel-protocol",
+    "crates/tunnel-relay",
+    "crates/tunnel-test-harness",
+    "crates/tunnel-transport",
+]
 resolver = "3"
 
 [workspace.package]

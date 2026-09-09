@@ -21,3 +21,10 @@ max_queue_frames = 128
 max_queue_bytes = 8388608
 grant_timeout_ms = 5000
 operation_timeout_ms = 30000
+
+# M2 rotation policy. Values are validated now; scheduled data-socket
+# handover remains pending runtime integration.
+[rotation]
+interval_seconds = 300
+handshake_timeout_seconds = 10
+overlap_seconds = 30

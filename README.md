@@ -17,7 +17,8 @@ The desktop CLI initiates the tunnel with mTLS. Authorized cloud agents call ser
 strict Clippy, 62 workspace tests, five real Redis integration tests, the
 five-client/two-tenant HTTPS/WSS/CLI acceptance harness, the private H3 probe
 and the Redis AOF restart check. See [the evidence and repeatable commands](docs/m1-harness.md).
-M2 rotation/replay, remote adapters and M7 cluster routing remain planned.
+M2 ordered rotation and bounded retained replay are also locally verified: 151 workspace tests, the real-socket fault suite, and three actual 300-second rotations in 903.05 seconds. See [M2 evidence and repeatable commands](docs/m2-verification.md).
+Remote adapters and M7 cluster routing remain planned.
 The repository remains private; its MIT license prepares for a future OSS release.
 
 Hosted verification: [M1 CI checks](https://github.com/andymac4182/agent-tunnel/pull/10/checks).
@@ -65,6 +66,7 @@ restoration of arbitrary backups.
 | [Tunnel protocol](docs/protocol.md) | Pairing, rotation, replay, failure semantics, limits |
 | [Runtime and client CLI](docs/runtime.md) | Axum listeners, device mTLS, commands, debug surfaces |
 | [M1 acceptance harness](docs/m1-harness.md) | Redis-backed real-socket verification, credentials, fixtures, and evidence |
+| [M2 verification](docs/m2-verification.md) | Rotation implementation status and required recovery/real-socket evidence |
 | [Relay cluster](docs/cluster.md) | HTTP/3 peers, mTLS, Redis key distribution, ownership, recovery |
 | [Filesystem API](docs/filesystem-api.md) | Endpoint, authentication, capabilities, paths, byte/operation semantics |
 | [SDK adapter contracts](docs/filesystem-adapters.md) | Files SDK, Mastra, AI SDK, just-bash, compatibility gaps and implementation slices |
@@ -110,8 +112,8 @@ isolation, bounded memory, authorization, quota, revocation, admission
 negative cases, and fresh-session behavior after transport failure. Its private
 H3 probe includes success and negative cases for the transport boundary only;
 it is not cluster routing. Redis membership recovery, HA failover, ownership,
-and fencing wait for M7. Data rotation/replay and remote adapters are later
-milestones.
+and expanded fencing wait for M7. M2 adds locally verified ordered rotation
+and bounded retained transport replay; remote adapters remain later milestones.
 
 ## Development
 

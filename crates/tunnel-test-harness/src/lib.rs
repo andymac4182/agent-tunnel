@@ -6,6 +6,7 @@
 
 pub mod acceptance;
 pub mod admission;
+pub mod m2_acceptance;
 pub mod peer;
 pub mod redis_restart;
 
@@ -31,7 +32,8 @@ pub use pki::{
 };
 pub use process::{ManagedProcess, ProcessSpec};
 pub use proxy::{
-    Direction, FaultAction, FaultRule, FaultScript, ProxyConfig, ProxyHandle, ProxyStats, TcpProxy,
+    ConnectionId, Direction, FaultAction, FaultRule, FaultScript, ProxyConfig, ProxyConnection,
+    ProxyDiagnostics, ProxyHandle, ProxyStats, TcpProxy,
 };
 
 /// The maximum authorization snapshot age required by the M1 design.

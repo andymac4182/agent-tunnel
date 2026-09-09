@@ -4,6 +4,7 @@ use serde::Deserialize;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tunnel_catalog::OidcVerifier;
+use tunnel_core::{ConfigError as CoreConfigError, RotationConfig};
 
 /// Runtime limits enforced before a request or WebSocket message allocates
 /// payload storage.  These are hard upper bounds for the M1 profile.
@@ -92,6 +93,7 @@ pub struct RelayOptions {
     pub oidc: Arc<OidcVerifier>,
     pub challenge_interval: Duration,
     pub owner_lease: Duration,
+    pub rotation: RotationConfig,
     pub shutdown: CancellationToken,
 }
 
@@ -105,6 +107,7 @@ impl RelayOptions {
             oidc,
             challenge_interval: Duration::from_secs(2),
             owner_lease: Duration::from_secs(30),
+            rotation: RotationConfig::default(),
             shutdown: CancellationToken::new(),
         }
     }
@@ -129,7 +132,8 @@ impl RelayOptions {
         if self.owner_lease < Duration::from_secs(6) || self.owner_lease > Duration::from_secs(30) {
             return Err(ConfigError::Invalid("owner_lease must be 6..=30 seconds"));
         }
-        self.limits.validate()
+        self.limits.validate()?;
+        self.rotation.validate().map_err(ConfigError::Rotation)
     }
 }
 
@@ -164,6 +168,8 @@ pub struct ServeConfig {
     pub max_devices_per_user: usize,
     #[serde(default = "default_max_queue_bytes")]
     pub max_queue_bytes: usize,
+    #[serde(default)]
+    pub rotation: RotationConfig,
 }
 
 impl ServeConfig {
@@ -206,6 +212,7 @@ impl ServeConfig {
                 "max_queue_bytes must be 256KiB..=64MiB",
             ));
         }
+        self.rotation.validate().map_err(ConfigError::Rotation)?;
         Ok(())
     }
 
@@ -234,6 +241,7 @@ impl ServeConfig {
         }
         options.limits.max_devices_per_user = self.max_devices_per_user;
         options.limits.max_queue_bytes = self.max_queue_bytes;
+        options.rotation = self.rotation.clone();
         crate::Relay::start(
             options,
             catalog,
@@ -265,6 +273,7 @@ fn default_max_queue_bytes() -> usize {
 #[derive(Debug)]
 pub enum ConfigError {
     Toml(toml::de::Error),
+    Rotation(CoreConfigError),
     Invalid(&'static str),
 }
 
@@ -272,9 +281,114 @@ impl std::fmt::Display for ConfigError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Toml(error) => write!(formatter, "invalid relay TOML: {error}"),
+            Self::Rotation(error) => write!(formatter, "invalid rotation policy: {error}"),
             Self::Invalid(message) => formatter.write_str(message),
         }
     }
 }
 
-impl std::error::Error for ConfigError {}
+impl std::error::Error for ConfigError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Toml(error) => Some(error),
+            Self::Rotation(error) => Some(error),
+            Self::Invalid(_) => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use jsonwebtoken::{Algorithm, DecodingKey};
+    use tunnel_catalog::{ApprovedJwk, OidcConfig, OidcVerifier};
+
+    fn oidc() -> Arc<OidcVerifier> {
+        let key = ApprovedJwk::from_decoding_key(
+            "test",
+            Algorithm::RS256,
+            DecodingKey::from_secret(b"test-only-key"),
+        )
+        .expect("test key");
+        let config = OidcConfig::new(
+            "https://issuer.example.test/",
+            ["agent-tunnel".to_owned()],
+            vec![key],
+        )
+        .expect("test OIDC config");
+        Arc::new(OidcVerifier::new(config).expect("test OIDC verifier"))
+    }
+
+    fn valid_toml() -> &'static str {
+        r#"
+oidc_issuer = "https://issuer.example.test/"
+oidc_audience = ["agent-tunnel"]
+oidc_jwks_path = "oidc-jwks.json"
+redis_url = "redis://127.0.0.1:6379/0"
+redis_namespace = "agent-tunnel/test"
+deployment_incarnation = "test-incarnation"
+device_tls_cert_chain = "device-cert.pem"
+device_tls_private_key = "device-key.pem"
+device_tls_client_ca = "device-ca.pem"
+consumer_tls_cert_chain = "consumer-cert.pem"
+consumer_tls_private_key = "consumer-key.pem"
+"#
+    }
+
+    #[test]
+    fn serve_defaults_to_shared_rotation_policy() {
+        let config = ServeConfig::parse(valid_toml()).expect("valid serve configuration");
+        assert_eq!(config.rotation, RotationConfig::default());
+    }
+
+    #[test]
+    fn relay_options_default_to_and_validate_shared_rotation_policy() {
+        let options = RelayOptions::new(oidc());
+        assert_eq!(options.rotation, RotationConfig::default());
+        options.validate().expect("default relay options");
+
+        let mut invalid = options;
+        invalid.rotation.interval_seconds = 0;
+        let error = invalid.validate().expect_err("invalid rotation interval");
+        assert!(error.to_string().contains("rotation.interval_seconds"));
+    }
+
+    #[test]
+    fn serve_accepts_partial_rotation_override() {
+        let input = format!(
+            "{}\n[rotation]\ninterval_seconds = 600\nhandshake_timeout_seconds = 15",
+            valid_toml()
+        );
+        let config = ServeConfig::parse(&input).expect("valid rotation override");
+        assert_eq!(config.rotation.interval_seconds, 600);
+        assert_eq!(config.rotation.handshake_timeout_seconds, 15);
+        assert_eq!(config.rotation.overlap_seconds, 30);
+    }
+
+    #[test]
+    fn serve_rejects_invalid_rotation_timing() {
+        for timing in [
+            "interval_seconds = 0",
+            "interval_seconds = 86401",
+            "handshake_timeout_seconds = 0",
+            "handshake_timeout_seconds = 301",
+            "overlap_seconds = 0",
+            "overlap_seconds = 3601",
+            "handshake_timeout_seconds = 30",
+            "interval_seconds = 30",
+        ] {
+            let input = format!("{}\n[rotation]\n{timing}", valid_toml());
+            assert!(ServeConfig::parse(&input).is_err(), "accepted {timing}");
+        }
+    }
+
+    #[test]
+    fn serve_rejects_unknown_rotation_keys() {
+        for input in [
+            format!("{}\nrotation_seconds = 10", valid_toml()),
+            format!("{}\n[rotation]\ninterval_second = 300", valid_toml()),
+        ] {
+            assert!(ServeConfig::parse(&input).is_err(), "accepted unknown key");
+        }
+    }
+}
