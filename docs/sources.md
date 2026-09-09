@@ -15,6 +15,18 @@ Specification snapshot: `aa8ce049f089f92618340190d4ece141f663310d`.
 - [2025-11-25 transports](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports): explicit legacy compatibility target.
 - [Official Rust SDK snapshot](https://github.com/modelcontextprotocol/rust-sdk/tree/744b9f904c7f17d589326e61ddbe126cb9d58888): candidate implementation dependency. Select an actual published version and run interoperability fixtures before M3.
 
+## Filesystem SDK APIs
+
+- [Files SDK research](research/files-sdk.md): `haydenbleasel/files-sdk` source 2.4.0, native `Adapter<Raw>` and separate HTTP gateway protocol; object semantics and error fidelity. [Project](https://files-sdk.dev/).
+- [Mastra research](research/mastra.md): `WorkspaceFilesystem`, real required methods, read-tracker timestamp behavior and explicit advisory compatibility policy. [Workspace documentation](https://mastra.ai/docs/workspace/filesystem).
+- [AI SDK research](research/ai-sdk.md): actual provider `FilesV4` upload/metadata/download/delete contract, model file parts, tools and separately gated experimental sandbox surfaces. [Source](https://github.com/vercel/ai).
+
+These records contain inspected immutable source references and distinguish source versions from unverified published-package compatibility. [filesystem-adapters.md](filesystem-adapters.md) maps those findings into the shared 9P/WSS endpoint without claiming all SDKs speak the same native protocol.
+
+## ACP
+
+[acp.md](acp.md) records the official Agent Client Protocol v1 method/schema sources and draft HTTP binding. The CLI HTTP-to-stdio bridge requires pinned official SDK interoperability, callback/permission routing and no ambiguous prompt replay. See [official ACP documentation](https://agentclientprotocol.com/).
+
 ## just-bash and CUA
 
 [integrations.md](integrations.md) records exact source revisions and method-level permalinks for both projects. The proposed TypeScript adapter follows the actual `IFileSystem` contract. CUA backend transport/authentication details and OS differences require a compatibility spike before release.
@@ -34,4 +46,6 @@ Specification snapshot: `aa8ce049f089f92618340190d4ece141f663310d`.
 - [Axum WebSocket support](https://docs.rs/axum/latest/axum/extract/ws/index.html): relay upgrades and message limits.
 - [tokio-tungstenite](https://docs.rs/tokio-tungstenite/latest/tokio_tungstenite/): outbound async WebSocket implementation.
 
-These mutable library links identify design candidates. The bootstrap only depends on configuration parsing libraries in Cargo.lock. Pin and record network dependencies when implementation starts.
+Axum is the selected web framework. [runtime.md](runtime.md) records the mTLS listener/CLI design and observed library versions; [cluster.md](cluster.md) cites HTTP/3, Redis consistency/ACL/notification behavior, rustls verification and membership-trust sources. The QUIC/H3 adapter is a separate listener sharing typed application services with Axum.
+
+These mutable library links identify implementation candidates. The bootstrap only depends on configuration parsing libraries in Cargo.lock. Pin and record network dependencies when implementation starts.

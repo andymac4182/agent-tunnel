@@ -1,18 +1,32 @@
 # Agent Tunnel
 
-A Rust reverse tunnel that will let agents access MCP servers, files, and computer-use services on enrolled computers through outbound connections.
+A Rust reverse tunnel that will let hosts and agents access MCP servers, virtual filesystems, computer-use services, and CLI agents on enrolled computers through outbound connections.
+
+```text
+Agent in the cloud → Agent Tunnel Server → WebSocket tunnel → Desktop machine
+                                                              ├─ ACP agent
+                                                              ├─ MCP services
+                                                              ├─ CUA computer use
+                                                              └─ Virtual filesystem
+```
+
+The desktop CLI initiates the tunnel with mTLS. Authorized cloud agents call server endpoints; no inbound desktop port is required. Service traffic flows in both directions over the data channel.
 
 **Status: project bootstrap and design.** The working code validates configuration. Networking, authentication, adapters, and remote execution are planned, not implemented. This repository starts private; MIT licensing prepares it for a future open-source release without changing its visibility.
 
 ## What we are building
 
-- A self-hostable relay serving multiple users, with multiple connected devices and concurrent agent consumers per user.
+- An Axum relay cluster serving multiple users, with multiple connected devices and concurrent host/agent consumers per user.
+- A Rust client CLI authenticating to the relay with mTLS on both device WebSockets.
+- Peer-to-peer HTTP/3 connections with mTLS between relay servers; Redis distributes approved server public keys and routing presence.
 - One persistent control WebSocket and one active data WebSocket per device connection.
-- Data connection rotation every **300 seconds by default**, configurable per deployment. A bounded replacement overlap briefly permits a third socket so streams can move without restarting work.
-- Protocol-neutral logical streams, with adapters for MCP, a **9P filesystem over WebSocket for just-bash**, and [CUA](https://github.com/trycua/cua).
+- Data connection rotation every **300 seconds by default**, configurable per deployment. Explicit per-stream drain watermarks and acknowledgements precede handover; a bounded replacement overlap briefly permits a third socket.
+- Independent stream identities and sequence counters in each direction, preserved across scheduled socket rotation.
+- A **9P/WebSocket filesystem API** with native adapters for Files SDK, Mastra, AI SDK, and just-bash; separate MCP and [CUA](https://github.com/trycua/cua) services.
+- ACP over HTTP through the tunnel, so an authorized host can interact with an allowlisted agent supervised by the CLI.
 - Explicit grants for each device, service, filesystem mount, and computer-use capability.
 
-The initial deployment is one relay process with durable identity/policy storage. Multi-user support is part of the first network milestone; distributed relay deployment follows later.
+Cluster support is required for the private alpha. Development begins with a single-process test fixture, then proves three-node ownership/routing and failure behavior before release. Redis discovery alone does not establish identity or make failover strongly consistent; the trust and recovery profile is explicit in the cluster design.
 
 ## Start here
 
@@ -20,6 +34,12 @@ The initial deployment is one relay process with durable identity/policy storage
 | --- | --- |
 | [Architecture](docs/architecture.md) | Components, users/devices, routing, trust boundaries, scaling |
 | [Tunnel protocol](docs/protocol.md) | Pairing, rotation, replay, failure semantics, limits |
+| [Runtime and client CLI](docs/runtime.md) | Axum listeners, device mTLS, commands, debug surfaces |
+| [Relay cluster](docs/cluster.md) | HTTP/3 peers, mTLS, Redis key distribution, ownership, recovery |
+| [Filesystem API](docs/filesystem-api.md) | Endpoint, authentication, capabilities, paths, byte/operation semantics |
+| [SDK adapter contracts](docs/filesystem-adapters.md) | Files SDK, Mastra, AI SDK, just-bash, compatibility gaps and implementation slices |
+| [ACP over HTTP](docs/acp.md) | Host-to-CLI-agent sessions, streaming, callbacks, permissions, cancellation |
+| [HTTP forwarding](docs/http-forwarding.md) | Bounded request/response records over ordered tunnel streams |
 | [MCP compatibility](docs/mcp.md) | Current and legacy protocol profiles, HTTP and stdio bridges |
 | [Filesystem and CUA integration](docs/integrations.md) | Upstream contracts, adapters, compatibility spikes |
 | [Build roadmap](docs/roadmap.md) | Ordered milestones with acceptance gates |
@@ -48,6 +68,6 @@ Connect three enrolled test devices belonging to two users to a relay, route con
 
 ## Development
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). Transport and privileged adapters are Rust. The just-bash integration will have a small TypeScript package implementing its native interface. Credentials stay in the runtime secret store, outside this repository.
+See [CONTRIBUTING.md](CONTRIBUTING.md). Transport and privileged adapters are Rust. A shared TypeScript filesystem client and small native SDK adapters provide the application integration layer. Credentials stay in the runtime secret store, outside this repository.
 
 License: [MIT](LICENSE).

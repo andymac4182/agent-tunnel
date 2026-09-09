@@ -1,0 +1,309 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:agent-tunnel:fs:capabilities:v1",
+  "title": "Agent Tunnel filesystem descriptor (planned v1 contract)",
+  "description": "Wire contract only; no server is implemented. Numeric fields are effective limits, at or below the initial profile ceilings.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "deviceId",
+    "serviceId",
+    "grantRevision",
+    "availability",
+    "capabilityStatus",
+    "transport",
+    "root",
+    "operations",
+    "features",
+    "limits"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": "agent-tunnel.fs.v1"
+    },
+    "deviceId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "serviceId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "grantRevision": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "availability": {
+      "enum": [
+        "online",
+        "offline"
+      ]
+    },
+    "capabilityStatus": {
+      "enum": [
+        "current",
+        "last-known"
+      ]
+    },
+    "transport": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "subprotocol",
+        "dialect"
+      ],
+      "properties": {
+        "type": {
+          "const": "websocket"
+        },
+        "subprotocol": {
+          "const": "agent-tunnel.9p.v1"
+        },
+        "dialect": {
+          "const": "9P2000.L"
+        }
+      }
+    },
+    "root": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "pathStyle",
+        "caseSensitivity",
+        "readOnly"
+      ],
+      "properties": {
+        "path": {
+          "const": "/"
+        },
+        "pathStyle": {
+          "const": "virtual-posix"
+        },
+        "caseSensitivity": {
+          "enum": [
+            "sensitive",
+            "insensitive-preserving"
+          ]
+        },
+        "readOnly": {
+          "type": "boolean"
+        }
+      }
+    },
+    "operations": {
+      "type": "array",
+      "uniqueItems": true,
+      "maxItems": 17,
+      "items": {
+        "enum": [
+          "readFile",
+          "readStream",
+          "writeFile",
+          "writeStream",
+          "appendFile",
+          "stat",
+          "readDirectory",
+          "mkdir",
+          "remove",
+          "copy",
+          "rename",
+          "chmod",
+          "utimes",
+          "symlink",
+          "link",
+          "readlink",
+          "realpath"
+        ]
+      }
+    },
+    "features": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "atomicRename",
+        "nativeAppend",
+        "exclusiveCreate",
+        "symlinks",
+        "hardLinks",
+        "birthTime",
+        "fsync",
+        "conditionalWrites",
+        "versioning",
+        "objectMetadata",
+        "publicUrls",
+        "signedUrls",
+        "serverCopy",
+        "serverSearch"
+      ],
+      "properties": {
+        "atomicRename": {
+          "type": "boolean"
+        },
+        "nativeAppend": {
+          "type": "boolean"
+        },
+        "exclusiveCreate": {
+          "type": "boolean"
+        },
+        "symlinks": {
+          "type": "boolean"
+        },
+        "hardLinks": {
+          "type": "boolean"
+        },
+        "birthTime": {
+          "type": "boolean"
+        },
+        "fsync": {
+          "type": "boolean"
+        },
+        "conditionalWrites": {
+          "type": "boolean"
+        },
+        "versioning": {
+          "type": "boolean"
+        },
+        "objectMetadata": {
+          "type": "boolean"
+        },
+        "publicUrls": {
+          "type": "boolean"
+        },
+        "signedUrls": {
+          "type": "boolean"
+        },
+        "serverCopy": {
+          "type": "boolean"
+        },
+        "serverSearch": {
+          "type": "boolean"
+        }
+      }
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "maxMessageBytes",
+        "maxInflightRequests",
+        "maxFids",
+        "maxQueuedBytes",
+        "maxBufferedFileBytes",
+        "maxTotalBufferedBytes",
+        "maxPathBytes",
+        "maxPathComponents",
+        "maxTraversalEntries",
+        "maxTraversalDepth",
+        "requestTimeoutSeconds",
+        "defaultOperationTimeoutSeconds",
+        "maxOperationTimeoutSeconds",
+        "sessionIdleSeconds"
+      ],
+      "properties": {
+        "maxMessageBytes": {
+          "type": "integer",
+          "minimum": 256,
+          "maximum": 65536
+        },
+        "maxInflightRequests": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 64
+        },
+        "maxFids": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 256
+        },
+        "maxQueuedBytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1048576
+        },
+        "maxBufferedFileBytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 16777216
+        },
+        "maxTotalBufferedBytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 33554432,
+          "description": "Concurrent client and adapter-owned materialization, conversion and cache bytes; excludes results after ownership transfers to callers."
+        },
+        "maxPathBytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4096
+        },
+        "maxPathComponents": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 256
+        },
+        "maxTraversalEntries": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10000
+        },
+        "maxTraversalDepth": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 64
+        },
+        "requestTimeoutSeconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 30
+        },
+        "defaultOperationTimeoutSeconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 300
+        },
+        "maxOperationTimeoutSeconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 3600
+        },
+        "sessionIdleSeconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 300
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "availability": {
+            "const": "online"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "capabilityStatus": {
+            "const": "current"
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "capabilityStatus": {
+            "const": "last-known"
+          }
+        }
+      }
+    }
+  ],
+  "$comment": "Cross-field limit ordering, readonly versus operation grants, feature implementations, and backend capability freshness require runtime checks in addition to JSON Schema validation."
+}

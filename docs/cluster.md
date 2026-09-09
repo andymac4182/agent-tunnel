@@ -1,0 +1,288 @@
+# Relay clustering, identity, and owner routing
+
+Status: implementation design, 2026-09-09. The repository currently validates configuration only. No listener, cluster, certificate enrollment, registry, or forwarding behavior described here is implemented. This document specifies the initial supported cluster profile; [protocol.md](protocol.md) specifies device framing and rotation.
+
+## Decisions and deployment boundary
+
+- The public web server is Axum. The Rust client CLI opens mutually authenticated TLS WebSockets to the device listener.
+- Each relay additionally exposes a private HTTP/3 listener over QUIC with mutual TLS. HTTP/3 support is a separate transport adapter; do not assume Axum's ordinary server listener supplies it.
+- Redis distributes signed relay membership and public-key records, node presence, and device owner leases. It never carries file contents, screenshots, MCP/ACP bodies, or tunnel replay buffers.
+- Shared PostgreSQL stores durable identities, grants, device certificate registrations, and membership authority versions. Independent per-node SQLite catalogs are not a supported cluster configuration.
+- One relay owns a device connection epoch. Any public ingress can forward to that owner over HTTP/3. The owner alone pairs control/data attachments, admits streams, and coordinates rotation.
+- Multiple relays, users, devices, and consumers are an initial product requirement. A single relay is a development configuration using the same interfaces.
+- Initially support one authoritative Redis primary without automatic promotion. Relay failure is recoverable through fresh device sessions; transparent coordination-store failover is a separate safety gate.
+- Cluster membership is operator authority. Device enrollment and user/service authorization are separate authorities; a relay certificate cannot enroll a device or substitute for a consumer grant.
+
+```mermaid
+flowchart LR
+    C[Consumer: VFS / MCP / ACP / computer API] -->|HTTPS or WSS| A[Axum ingress A]
+    D[Device CLI] -->|mTLS control WSS| B[Axum relay B: owner]
+    D -->|mTLS data WSS| E[Axum ingress C]
+    A <-->|Private mTLS HTTP/3| B
+    E <-->|Private mTLS HTTP/3: forwarded data socket| B
+    A --- R[(Redis: signed membership and owner leases)]
+    B --- R
+    E --- R
+    B --- P[(Durable identity and authorization catalog)]
+```
+
+The device still has two steady-state WebSockets and at most one replacement data socket during bounded rotation. HTTP/3 peer connections are shared infrastructure between servers. They do not add device sockets. Two peer segments can exist in an end-to-end operation: consumer ingress to owner, and device ingress to owner. Each segment routes directly to the owner; recursive forwarding is forbidden.
+
+## Identity types and ownership
+
+| Identity | Meaning and source |
+| --- | --- |
+| `deployment_id` | Operator-provisioned cluster trust domain; cannot be selected by a request. |
+| `deployment_incarnation` | Operator-controlled fencing namespace, durably recorded outside Redis; changes after uncertain coordination-store recovery. |
+| `node_id` | Stable opaque relay identity authorized by a deployment certificate and membership record. |
+| `boot_id` | Fresh random identifier for one relay process; prevents a restarted process claiming its predecessor's live state. |
+| `key_id` | Identifier for an explicitly authorized leaf public key; separate from node identity so keys can rotate. |
+| `tenant_id`, `device_id` | Durable device authorization scope from the identity catalog; independent of node membership. |
+| `epoch` | Increasing per-device owner generation within one deployment incarnation. |
+| `session_id`, `generation` | Live tunnel session and data-socket generation described in the tunnel protocol. |
+
+The full owner token is `(deployment_incarnation, tenant_id, device_id, node_id, boot_id, epoch, session_id)`. The epoch is not a distributed timestamp and must not wrap. Internal envelopes carry the complete owner token; the public binary frame remains bound to its authenticated session and existing epoch field. Consumers never receive private node addresses or registry credentials.
+
+The owner actor contains control and data bindings, rotation state, stream authorization, operation dispatch state, sequence/replay state, and quota accounting. An ingress actor can hold a socket and bounded forwarding buffers but cannot manufacture a replacement owner. Durable device records remain present when a lease or socket disappears. User listing is filtered through authorization before returning presence.
+
+## Durable catalog and authorization freshness
+
+Use shared PostgreSQL in the first cluster milestone, accessed through a narrow typed repository interface. The catalog contains tenants, users and memberships, consumer/device identities, service exports, grants and revocation versions, device certificate serial/key state, and separately privileged relay membership-authority records. Local tests can use an in-process fake; tests claiming cluster behavior must use the shared store.
+
+The membership publisher's database identity can change authorized node keys and advance deployment incarnations. Ordinary relays can read those records but cannot grant themselves that authority. The publisher's signing key and issuing CA keys remain outside both Redis and normal relay configuration. PostgreSQL stores authority metadata, not private keys.
+
+Authorization changes commit before acknowledgment. Use tenant-qualified primary/foreign keys, uniqueness constraints, and transactional version increments; perform policy evaluation against a consistent versioned snapshot. A concurrent removal cannot be lost through an unrelated grant edit. Database migrations must support the negotiated rolling-upgrade window.
+
+Planned authorization snapshots have a five-second maximum lifetime measured from the beginning of the authoritative database read, never extended by a cache hit. Reconcile active device/consumer grants within that bound, and propagate version invalidations as acceleration hints. On a failed authoritative refresh, stop new admission immediately and stop dispatch when the prior snapshot expires. A known revocation closes affected streams immediately. State this bounded propagation behavior in the public API documentation.
+
+Before dispatch, the device's effective permission is the intersection of the bound grant, an unexpired authorization snapshot, current ownership confirmation, and local allowlists. Transport replay does not bypass a revoked grant. Already executing operations follow adapter-specific cancellation/outcome semantics. SQL availability does not renew a failed Redis owner lease, and a Redis lease does not authorize work when the SQL policy snapshot expires.
+
+### Device authorization confirmation
+
+The device enforces this five-second authorization deadline independently of the longer ownership confirmation. A grant revision alone is insufficient. Each admitted logical stream has one frozen authorization context containing its principal, tenant/device/service, mount or capability scope, effective permission digest, and authorization revision. The initial `OPEN` may allocate a bounded pending context, but the device cannot dispatch an adapter request until that context receives the following confirmation.
+
+1. The device creates `AUTHORIZATION_CHALLENGE` with the current owner token, context ID, frozen permission digest/revision, and a fresh 128-bit nonce. Record local monotonic `challenge_started_at` when creating the challenge, before any control queue wait. Keep at most one outstanding nonce per context; replacement retires the previous nonce permanently.
+2. The owner verifies the exact context and current owner, then obtains an authoritative SQL snapshot or an already cached snapshot whose original read-start deadline has not expired. At confirmation construction time, calculate `remaining_ms = max(0, floor((snapshot_valid_until - owner_now) / 1ms))`, where `snapshot_valid_until` is no later than `snapshot_read_started_at + 5s` and may be earlier for credential/grant expiry. A cache lookup, enqueue, or retry cannot reset that timestamp. Refresh SQL when insufficient lifetime remains; never manufacture a five-second budget from response receipt.
+3. Only if the frozen scope, permission digest, and revision still match, return `AUTHORIZATION_CONFIRMED` with that context, nonce, owner token, revision, and `remaining_ms` in `1..=5000`. A denied, changed, expired, failed, or unknown authorization read produces no positive confirmation. A known revocation sends `AUTHORIZATION_INVALIDATED` and closes the affected stream immediately.
+4. The device accepts only its latest outstanding nonce for that still-live context and current owner. Compute `authorization_deadline = challenge_started_at + min(remaining_ms, 5000) milliseconds`. Discard a confirmation arriving at or after this deadline; retire the nonce on acceptance so duplicates cannot extend it. Anchoring at challenge creation conservatively includes request/response transit and queue delay, including when the SQL snapshot predates the challenge.
+5. Check both authorization and ownership deadlines immediately before each local adapter dispatch, after every await/queue wait, and after any process suspension. This includes every decoded 9P request waiting in a buffer and each subsequent privileged step of a long-running adapter. At authorization expiry, mark the context stale, stop further dispatch, reset the affected stream with `AUTHORIZATION_STALE`, and discard buffered undispatched work. Already executing work is cancelled best effort and keeps an explicit known/unknown outcome. A late confirmation cannot revive the closed stream; reopening requires fresh authorization.
+
+Refresh active contexts every two seconds with a bounded, staggered scheduler; a challenge times out after two seconds and its nonce is retired. An unanswered challenge never extends an earlier confirmation. Normal renewal is independent of data rotation and cannot broaden permissions or change frozen scope/revision. Any such change closes the stream and requires a newly authorized `OPEN`. Local policy removal invalidates the context immediately even if the relay's snapshot remains valid.
+
+Each challenge, confirmation, or invalidation carries exactly one context and fits within 2 KiB of encoded control JSON. The bounded control decoder enforces that tighter limit before per-context allocation; the WebSocket receiver still enforces the overall 32 KiB control-message ceiling. There is no unbounded multi-message snapshot. Limit the roster to the negotiated active-stream ceiling, initially 64 contexts per device, one outstanding challenge per context, and 256 bytes of fixed renewal bookkeeping per entry (16 KiB total). Context descriptors already belong to bounded stream state. Outgoing confirmation/challenge queues hold at most 16 messages/32 KiB each direction; a full queue delays or fails refresh and never extends a deadline. The rate limit must support the 64-context/two-second cadence; enforce a separate bounded renewal class, initially 64 messages per second with a 16-message burst, without starving cancellation or rotation control.
+
+Use monotonic durations on each endpoint; the formula requires no shared wall-clock timestamp. The underlying clocks must include suspend or invalidate all authorization confirmations on resume. Detect unsupported clock behavior and fail closed; bounded clock-rate error must be covered by the platform timing margin. Ordinary wall-clock correction cannot renew the monotonic deadline, and a wall-clock discontinuity affecting credential validity invalidates the context. The five-second authorization ceiling always takes precedence over a still-valid 20-second ownership permission.
+
+Start with one authoritative PostgreSQL writer and documented backup/recovery. An automatic database failover profile must independently demonstrate that acknowledged revocations and membership versions cannot silently roll back. A restored authorization snapshot requires coordinated recovery and fresh session authorization; the durable catalog does not make stream buffers persistent.
+
+## Relay trust bootstrap and Redis key distribution
+
+A public key in Redis is insufficient evidence that a machine belongs to this deployment. Redis distributes records whose authority was established elsewhere. TLS identity verification still uses normal certificate validation and proof of possession; never accept an arbitrary key merely because a Redis key exists.
+
+The deployment installation provisions a trusted relay CA bundle, a membership-signing verification key, `deployment_id`, and private-network address policy through operator-controlled configuration. An existing issuer provisions each relay's private key/certificate via a protected enrollment workflow. Private keys stay on their node or in its secret store. CA and membership signing private keys are unavailable to normal relay processes.
+
+Certificates must identify the deployment, node, and relay role using a documented SAN profile and appropriate client/server usage. Certificate names, validity, chain constraints, role, and allowed leaf SPKI SHA-256 digest must all match. A device-role certificate fails the peer listener even if it has a chain to another trusted deployment intermediate. Use distinct relay and device intermediates/listeners by default.
+
+An operator-authorized membership publisher signs records using a standard signature implementation and an unambiguous, versioned canonical encoding. It publishes current records to Redis over authenticated TLS with an ACL restricted to the membership namespace. A relay may renew only its scoped presence and owner leases; it cannot authorize a new peer key. Public keys are public data, but unauthorized registry modification is an integrity incident.
+
+| Signed membership field | Required interpretation |
+| --- | --- |
+| `schema_version`, `deployment_id`, `deployment_incarnation` | Exact recognized schema and configured deployment. |
+| `node_id`, `record_version` | Authorized node and monotonic membership version within the incarnation. |
+| `roles` | Explicit `relay_peer`; additional administrative permissions require separate policy. |
+| `peer_endpoint`, `server_name` | Approved private HTTP/3 address and certificate name; never a caller-provided destination. |
+| `keys[]` | At most current and next key, each with `key_id`, SPKI digest, activation, expiry, and revocation state. |
+| `issued_at`, `not_before`, `expires_at` | Bounded signed validity; Redis TTL cannot extend it. |
+| `publisher_key_id`, `signature` | Membership authority signature covering every field, including addresses and keys. |
+
+Proposed limits: 16 KiB per record, 32 authorized nodes, 60-second record lifetime, refresh every 20 seconds, and one-second maximum accepted clock skew. These are planned policy defaults, not current TOML fields. Reject unsupported algorithms, duplicate fields, excess keys, unknown mandatory fields, and records beyond the validity ceiling before peer admission.
+
+At startup, obtain a fresh nonce-bound signed checkpoint from the membership authority containing the deployment incarnation and a bounded map of authorized node IDs to current minimum record versions. Then load Redis records and verify them against that checkpoint. Persist the highest accepted versions in restricted local state; a lower version, equal version with different signed contents, or old incarnation fails closed. An unavailable checkpoint authority leaves a new process unready. This prevents a restarted verifier from treating an old signed Redis snapshot as fresh membership.
+
+Pub/Sub events are invalidation hints, followed by authenticated reads and signature checks. Reconcile all active peers at least every five seconds and revalidate before each new request. Redis Pub/Sub can lose messages, so a missed event cannot indefinitely preserve authorization. [Redis Pub/Sub delivery semantics](https://redis.io/docs/latest/develop/pubsub/)
+
+Do not renew trust freshness simply because a Redis read succeeds. The signed expiry remains the upper bound when the registry is stale or maliciously replaying still-valid records. Clock rollback, excessive skew, and an unreadable local checkpoint mark the node unready and stop new dispatch until verified recovery.
+
+## Certificate and key lifecycle
+
+Relay enrollment requires operator authorization and proof of possession of the requested private key. Never make “insert my public key into Redis” a public enrollment API. Bootstrap, issuance, and membership publication are separate, audited operations.
+
+For planned rotation, authorize the next key before use, publish a signed record containing current and next keys, wait for verification convergence, and switch new handshakes to the next certificate. Retire the previous key after a configured overlap, initially ten minutes. Replace existing peer connections before the old key expires; keep at most one outgoing replacement connection per peer during a 30-second drain budget.
+
+The membership record lifetime remains 60 seconds during the longer key overlap: the publisher must keep issuing fresh authorization. A key's presence in an older valid overlap record is not a reason to extend a connection past its current trust deadline. TLS 1.3 resumption tickets must be tied to the accepted node/key/version and invalidated on retirement or revocation. Disable peer resumption in the first profile if the stack cannot enforce that binding.
+
+Revocation publishes a higher-version signed record removing the key or marking it revoked. Every observing node immediately rejects new requests and closes affected peer connections. With a connected registry, the target propagation interval is five seconds. Under lost updates or registry partitions, trust lasts no longer than the previous signed record's remaining 60-second lifetime plus the allowed one-second clock skew; this is a bounded revocation delay, not instantaneous revocation.
+
+Already executing device actions can outlive transport closure and follow adapter cancellation/outcome rules. A key compromise triggers operator review of affected grants and operation audit records. Removing a Redis key alone is not sufficient revocation because caches and signed records may remain valid.
+
+Root or membership-signer rotation requires an operator-installed overlapping trust bundle and a new verified checkpoint, followed by old-root removal. A root downloaded only from Redis cannot replace a pinned root. Restoring a backup must not reset a locally observed version or deployment incarnation.
+
+## Device CLI mTLS is a separate contract
+
+Both control and data WSS handshakes require the CLI's device client certificate. Server certificate verification also remains mandatory. Consumer SDK requests use consumer credentials and grants; they do not need the device's private key. The private relay HTTP/3 certificate cannot authenticate as a device or an SDK consumer.
+
+The first networking implementation can import operator-issued device credentials from an existing PKI and register their public identity in the catalog. It must still verify both WSS handshakes and revocation. The interactive enrollment flow below is planned product behavior; do not create a new custom CA implementation merely to complete the echo fixture.
+
+Device enrollment starts through a distinct server-authenticated HTTPS bootstrap endpoint with an authenticated user's single-use, short-lived enrollment authorization. The CLI creates its private key locally and submits a CSR proving possession; the issuer binds the certificate to the catalog's tenant/device identity and device role. An unenrolled machine cannot already present its future device certificate, so this bootstrap exception is explicit and cannot open tunnels or invoke adapters.
+
+Renewal requires a currently valid device certificate, fresh proof of possession, and a non-revoked device catalog record. Bind any new key to the same durable identity through an explicit rotation operation. Expired or revoked devices repeat the authorized enrollment/recovery workflow; no insecure fallback or automatically trusted replacement key. Certificate validity, serial, key version, and grant revocation are checked independently.
+
+The device catalog, certificate registry, and grant versions are durable authorization state. Redis relay membership does not authorize devices. Revocation invalidates control ownership and all data tickets/streams; apply the five-second authorization snapshot ceiling above rather than depending only on a Pub/Sub event. Test the measured device authorization freshness limit alongside enrollment implementation.
+
+The data attachment ticket additionally binds the validated device SPKI digest, tenant/device, owner token, data generation, audience, one-use nonce, and expiry. A device with a different valid certificate cannot consume it. Existing sessions freeze their authenticated key binding: key renewal requiring a changed SPKI starts a new control session and invalidates previous attachments after the documented handover.
+
+Terminate device mTLS in the Rust device listener in the initial deployment. A public load balancer passes TLS through to that listener. External TLS termination requires a separately reviewed authenticated identity-forwarding deployment profile; plain forwarded certificate headers from the internet are never trusted. Separate hostnames/listeners may be needed for ordinary consumer HTTPS and mandatory device mTLS.
+
+## Peer topology and HTTP/3 listener
+
+Use bounded on-demand direct connections. Relay A opens one outgoing HTTP/3 connection to relay B when A needs to forward work; B may separately open one outgoing connection to A. Reuse each outgoing connection for many HTTP requests, and retire idle connections after 60 seconds. Limit simultaneous connection attempts per destination to one and aggregate attempts globally. Back off with jitter after failures.
+
+At 32 nodes, the steady-state ceiling is 31 outgoing plus 31 incoming peer connections per node. Permit at most four additional key-rotation replacement connections per node across both directions, each subject to the 30-second drain budget; additional work returns overload before allocating payload queues. A fully connected deployment is the maximum observed topology, not a requirement to eagerly dial every peer at startup. There is no gossip routing or transitive trust.
+
+Peer deployment requires private UDP reachability to each signed endpoint, initially configurable port 8443, QUIC connection-ID compatible network routing, and suitable stateful firewall/idle timeouts. Public device WSS continues to use TCP. The peer listener negotiates HTTP/3 with ALPN `h3` and TLS 1.3. QUIC uses TLS for authentication and key establishment; do not substitute a custom encryption layer. [RFC 9001](https://www.rfc-editor.org/rfc/rfc9001.html)
+
+Disable 0-RTT for all peer requests and device operations. Early application data has replay considerations, and even apparently read-only peer routes can allocate sessions or consume tickets. Admission starts only after handshake authentication completes. [TLS 1.3 early-data security](https://www.rfc-editor.org/rfc/rfc8446.html#section-8)
+
+Do not introduce an automatic HTTP/2 or plain-TCP fallback. A blocked HTTP/3 path is a typed deployment/routing failure, visible in readiness and diagnostics. A future fallback would need its own authenticated profile and tests. The public consumer API does not require browser HTTP/3 or WebSocket-over-HTTP/3 support.
+
+## Internal request contract
+
+HTTP/3 requests use reliable QUIC streams. Request and response bodies carry bounded, full-duplex framed bytes, with the receiver permitted to send response headers before the request body finishes. One long-lived forwarded public socket or consumer stream uses one HTTP request stream. This requires a real bidirectional streaming compatibility test before selecting the Rust HTTP/3 integration. HTTP/3 DATAGRAM extensions are not needed. [HTTP/3 message and stream mapping](https://www.rfc-editor.org/rfc/rfc9114.html)
+
+| Private route | Purpose |
+| --- | --- |
+| `GET /internal/v1/health` | Authenticated version/readiness metadata, bounded response. |
+| `POST /internal/v1/device/control` | Forward an authenticated control WebSocket to its selected owner. |
+| `POST /internal/v1/device/data` | Forward one ticket-bound active or candidate data WebSocket. |
+| `POST /internal/v1/streams` | Open and stream an authorized consumer service conversation to the device owner. |
+| `POST /internal/v1/operations/status` | Resolve a scoped operation outcome without retrying its invocation. |
+
+These are transport bridge routes, not arbitrary HTTP proxies. The request envelope has a version, request ID, source node/boot identity, destination owner token, tenant/device/service scope, principal and grant version, deadline, remaining hop count, and adapter metadata. Derive source identity from mTLS and compare it to the envelope. Reject a requested destination different from this authenticated owner.
+
+The owner rechecks the durable authorization/grant snapshot and local owner state; mTLS authenticates the forwarding server, not the originating user. In the initial token-based consumer profile, forward the independently verifiable consumer access token only to the owner over mTLS; the owner validates issuer, gateway audience, expiry, and requested scope itself. A future browser-session profile must define its verifiable internal delegation separately. Never forward that consumer credential to the device. Only allowlisted request/response headers and content types cross service bridges; strip hop-by-hop, caller-forged internal, and upstream credential headers.
+
+When public device mTLS terminates at an ingress different from the owner, forward an integrity-protected `DeviceAuthenticationContext` bound to that specific peer request: validated certificate identity, serial, SPKI digest, validity, ingress node, destination owner, and short expiry. The owner checks catalog authorization and ticket/key matching again. This delegates TLS identity verification to an authorized relay; it does not claim that the device's TLS handshake reached the owner end to end.
+
+Before upgrade/admission, the ingress checks auth, quotas, and the owner route. Internally frame complete WebSocket messages with the fixed eight-byte prefix defined under resource limits below; preserve text/binary distinctions and close semantics. The complete forwarded binary WebSocket ceiling is 65,600 bytes, including the tunnel's 64-byte header and its 65,536-byte payload. This differs from the 65,536-byte limit for ordinary consumer byte chunks. Do not tunnel an unbounded raw HTTP header block. One successful admission response is followed by streaming frames and one terminal outcome; an HTTP 200 is not completion of an adapter operation.
+
+The routing hop budget is exactly one. A peer receiving a request for a different owner returns `OWNER_CHANGED` with bounded authenticated routing metadata to the ingress; it never forwards onward. The ingress may reread the registry and retry admission once only when the previous owner proves `NOT_DISPATCHED`. After payload dispatch or an ambiguous admission response, reconnecting cannot silently reopen a side-effecting operation.
+
+## Stream identity, ordering, and scheduled rotation
+
+Each logical stream has a unique identity scoped to its device connection/session, plus an independent sequence in each direction. A physical WebSocket, QUIC connection, or HTTP/3 request-stream number is an attachment identity; none replaces the logical stream identity. Persist logical identity and sequence state in the retained owner/device actors through scheduled data-socket rotation. Do not infer a global order across independent streams.
+
+Ingress forwarding preserves complete tunnel frames and their per-stream sequence fields. QUIC's ordered delivery applies only within one QUIC stream; it does not order arrivals across old/replacement data sockets, different peer connections, or consumer streams. The owner and connector apply the tunnel's per-stream sequencing, duplicate suppression, and credit accounting before adapter delivery.
+
+Scheduled data rotation stays under the same owner and follows [protocol.md](protocol.md): prepare the replacement, quiesce each direction at an explicit per-stream watermark, drain and acknowledge old-socket work, commit handover, and retire the old socket within the configured overlap deadline. An ingress queue or peer-stream acknowledgment is not the required adapter-facing transport drain acknowledgment. Instrument which peer queue or stream watermark is preventing drain.
+
+Owner change is a different event: fresh ownership fencing and fresh sessions, with interruption/unknown outcomes as appropriate. Do not claim that scheduled WebSocket drain proves live migration of filesystem fids, ACP subprocesses, replay buffers, or other owner state to a new relay. Future migration would require an explicit adapter and ownership protocol.
+
+## Atomic leases and device fencing
+
+Use a Redis key hash tag derived from the canonical tenant/device scope for every key participating in an ownership script. Planned keys are `at:{scope}:owner`, `at:{scope}:epoch`, and bounded ticket nonce records. Include deployment incarnation in the namespace. Never trust a raw consumer-provided key fragment. Redis hash tags place related keys in one slot if a future supported deployment uses Redis Cluster. [Redis Cluster key placement](https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec/#hash-tags)
+
+Acquire, renew, compare-release, and ticket consumption are small atomic Lua scripts or Redis Functions with bounded work. Never implement a check-then-set across client round trips. An acquire observes an absent owner, increments a retained epoch counter, and installs the complete owner token and expiry. A reconnect to an existing owner follows explicit session replacement authorization; another process cannot simply overwrite its lease.
+
+Renewal compares the complete owner token and current deployment incarnation before extending expiry. Release deletes only an exact matching token. A stale node cannot delete its successor's lease. Ticket consumption verifies its owner/key/generation binding and lease before a one-use state transition. Retain spent markers only until ticket expiry and enforce a per-device count cap. Atomic script execution is useful within one authority; it does not make asynchronous failover linearizable. [Redis scripting guarantees](https://redis.io/docs/latest/develop/programmability/eval-intro/)
+
+An unknown acquire/renew result leaves the actor unready for dispatch. It can read back its exact token while sufficient verified lease lifetime remains; it must not assume success or acquire a competing token under another identity. Epoch counters are never expired during a deployment incarnation, and the Redis profile caps epochs at its signed 64-bit increment limit rather than wrapping. Exhaustion, missing previously established counters, Redis restart, or evidence of rollback enters coordination recovery.
+
+Proposed timing defaults:
+
+| Policy | Default and behavior |
+| --- | --- |
+| Owner lease TTL | 30 seconds on the authoritative Redis instance. |
+| Renewal interval | 10 seconds, serialized per device actor. |
+| Owner safety margin | 5 seconds; usable local lease ends before Redis expiry. |
+| Device dispatch permission | At most 20 seconds per successful challenge-bound lease confirmation. |
+| Owner route cache | At most 5 seconds; an owner still validates every admission. |
+| Registry RPC deadline | 2 seconds; timeout stops new admission immediately. |
+| Graceful relay drain | 30 seconds maximum; no new device owners while draining. |
+
+Compute the owner's local safe deadline from monotonic request-start time plus TTL minus safety margin, not response receipt. A late renewal response cannot manufacture a fresh 25 seconds of authority. Reject a response received after that deadline. Check the deadline immediately before every adapter dispatch and after every await or process suspension; a timer task alone is insufficient.
+
+The connector also enforces short-lived dispatch authority. It sends a fresh lease-confirmation challenge and remembers its monotonic send time. The owner must atomically renew its exact lease after receiving that challenge and return the nonce, owner token, and bounded permission only after verified success. The connector accepts work only until its challenge-send time plus at most 20 seconds. This avoids extending old authority by delaying a response in a queue. Loss of confirmation stops new side effects even if the public socket stays open. Serialize and coalesce these renewals with the owner's normal renewal loop.
+
+These timing arguments assume bounded clock rate error and expiry behavior. Use a monotonic clock that accounts for suspend, or invalidate authority after resume. Detect wall-clock steps affecting Redis/certificate expiry and enter recovery. Test long process pauses explicitly. Arbitrary clock jumps, malicious coordination storage, and two writable primaries are outside the single-authority lease proof.
+
+An owner is not ready merely because acquisition succeeded. Complete device authentication, send the new owner token/epoch, receive the connector's fencing acknowledgement, and attach an authorized data socket. The connector atomically rejects its old owner before acknowledging the new one. Every subsequent control operation and data delivery checks the active token; a stale owner may not restart a stream under a new operation ID.
+
+## Routing flows and failure behavior
+
+Initial control arrival selects the ingress as owner when no lease exists and it has capacity. A different live owner receives the control connection through the direct peer route and decides whether the reconnect is permitted. The new ingress cannot unilaterally take over an unexpired lease. A redirect to a private peer URL is never returned to the CLI.
+
+Data tickets are opaque random values with at least 256 bits of entropy. Their digests address bounded, short-lived registry records under the authenticated device scope; those records hold owner binding and one-use state. Include node ID and boot ID internally without exposing private addresses. Every ingress resolves this locator against verified membership, forwards to that exact owner, and lets the owner consume the ticket. A stale or reused ticket fails before stream-buffer allocation. Rotation candidates follow the same route and remain under the same owner.
+
+A consumer request arriving anywhere authenticates, authorizes its target, and resolves the device owner. The owner repeats the admission check and creates the logical stream. Device control and data may be physically held by different ingress processes, but their state belongs to this one owner actor. Consumer and device ingress failure is therefore also a possible stream interruption; clustering does not make the edge sockets durable.
+
+| Event | Required behavior |
+| --- | --- |
+| Peer connect fails before admission | Return `PEER_UNAVAILABLE`, `not_dispatched=true`; bounded retry is allowed. |
+| Peer stream fails after dispatch | Cancel best effort, retain available outcome, return an explicit interrupted/unknown result. |
+| Owner lease renewal times out | Stop new admission immediately; stop dispatch by safe deadline and invalidate tickets. |
+| Redis partition persists | Enter unready/draining state; close sessions by safe lease expiry. Cached membership cannot extend ownership. |
+| Membership verification expires | Reject peer work and close affected connections even if Redis presence is fresh. |
+| Relay owner dies | Consumers receive interruption; device establishes a fresh fenced owner after lease expiry. No in-memory replay migration. |
+| Device reconnects to a new owner | Reset adapter sessions whose recovery contract excludes owner change, including v0 filesystem fids. |
+| Device certificate revoked | Stop ownership/admission and terminate both WSS legs plus forwarded peer streams. |
+| UDP blocked or peer identity mismatches | Fail route readiness explicitly; never disable verification or downgrade transport. |
+| Local lease expires while action runs | Stop further dispatch; best-effort cancel; completed external effects are not rolled back. |
+
+Typed internal errors include `PEER_UNTRUSTED`, `PEER_UNAVAILABLE`, `OWNER_CHANGED`, `OWNER_EXPIRED`, `REGISTRY_UNAVAILABLE`, `AUTHORIZATION_STALE`, `RESOURCE_EXHAUSTED`, `DEADLINE_EXCEEDED`, and `OUTCOME_UNKNOWN`. Each contains scope, request/operation correlation, a retry hint, and execution certainty (`not_dispatched`, `dispatched`, or `unknown`). Public errors remove internal addresses and unauthorized identifiers.
+
+## Coordination-store recovery limits
+
+Redis replication is asynchronous and acknowledged writes can be lost across failover. `WAIT` improves acknowledgment of replication but does not turn Redis into a strongly consistent coordinator. A larger epoch from a failed primary can disappear, and two partitions can each appear authoritative. Do not describe CAS scripts, Redlock, replica acknowledgments, or Redis Cluster as a complete fencing proof. [Redis consistency limitations](https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec/), [WAIT guarantees](https://redis.io/docs/latest/commands/wait/)
+
+The initial supported deployment therefore disables automatic Redis promotion for ownership. Persist Redis state and monitor primary process identity/role, but treat restart, restore, promotion, or ambiguous authority as a cluster-wide recovery event. All relay instances stop admitting work, disconnect/fence their device sessions, and become unready. A Redis topology change cannot automatically resume old leases.
+
+The operator fences access to the old primary and quiesces every old relay incarnation before restarting service. Wait at least the maximum owner/device permission and membership trust lifetimes, including allowed clock skew, after fencing. If any old writer/relay cannot be fenced, remain unavailable. Issue a new deployment incarnation through the external membership authority, persist it outside Redis, obtain fresh checkpoints, and require all devices to establish fresh sessions. Restore catalog data independently; do not restore live tickets or replay buffers.
+
+This supports a cluster of web servers while honestly retaining a coordination dependency. Automatic highly available ownership needs a separate design backed by a consensus/transactional fencing authority and device-enforced takeover proof. Redis can continue distributing keys and route caches in that design. That work must pass split-primary, stale-snapshot, and paused-owner tests before the supported topology expands.
+
+## Bounded resources, cancellation, and operability
+
+Each forwarding hop accounts for its own bounded buffers as well as the owner's end-to-end tunnel budget. A peer record has an eight-byte prefix: four-byte unsigned big-endian body length, one-byte record kind, one-byte flags (initially zero), and two reserved zero bytes. Recognized kinds distinguish a complete device data WebSocket message, complete device control text message, ordinary consumer byte chunk, and close. Reject unknown kinds/flags, nonzero reserved fields, and over-limit lengths before body allocation. WebSocket ping/pong handling remains at the ingress transport.
+
+| Peer record kind | Maximum body | Maximum including eight-byte prefix |
+| --- | ---: | ---: |
+| Complete device data WebSocket message | 65,600 bytes = 64-byte tunnel header + 65,536-byte payload | 65,608 bytes |
+| Complete device control text message | 32,768 bytes | 32,776 bytes |
+| Ordinary consumer byte chunk | 65,536 bytes | 65,544 bytes |
+| Close message | 125 bytes, including close code and bounded reason | 133 bytes |
+
+Keep byte ceilings of 256 KiB (262,144 bytes) per peer stream and 8 MiB (8,388,608 bytes) per peer connection, with at most 128 concurrent request streams per peer. These budgets count encoded prefixes, queued bodies, and any in-progress reassembly reservation across both directions. A stream therefore holds at most three complete maximum-size data records (196,824 bytes); four would need 262,432 bytes and must block. A connection holds at most 127 such records (8,332,216 bytes); 128 would need 8,397,824 bytes and must block. The per-connection limit applies to the sum of all streams, not a full independent allocation for each stream.
+
+Reserve the complete record's charged size before reading/allocating its body, even when HTTP/3 splits it across many reads. Moving an owned buffer between parser and queue transfers its charge; any extra copy is charged separately. HTTP/3 implementation buffers, request-envelope allocations, task metadata, and socket windows need separate bounded budgets under the deployment-wide memory ceiling. Control forwarding has its own queue/admission class and may hold at most 16 queued records within a 64 KiB encoded-byte ceiling, whichever is reached first; two maximum control records already exceed that byte ceiling. Renewal messages retain their tighter 2 KiB limit and 32 KiB directional queue caps above.
+
+Read from an upstream body only when downstream credit and queue space exist. HTTP/3 flow control does not replace per-user/device limits or application credits. Reserve bounded room for terminal errors/cancellation; a saturated file transfer cannot prevent cancellation from being processed. Rate-limit rejected opens and authentication failures so they cannot exhaust tracing or CPU budgets.
+
+Cancellation maps to the protocol's operation cancellation plus HTTP/3 stream cancellation/closure. Releasing buffers and ending an HTTP stream is not proof that a local write, ACP turn, MCP tool, or click stopped. The owner records terminal state when known and preserves the ambiguity when it is not. Do not retry a partially forwarded request body automatically.
+
+Implement explicit state machines for peer trust, peer connection lifecycle, owner lease, forwarded stream, and tunnel rotation. Keep network handlers thin: parse bounded input, authenticate, call typed core operations, map errors. Use one owner actor per device, bounded channels, cancellation tokens, injected clocks/registry interfaces, and a task supervisor that joins children. Avoid shared mutable maps with authorization decisions spread across unrelated handlers.
+
+Structured spans follow `ingress -> peer stream -> owner -> tunnel stream -> adapter operation`. Record deployment/node/boot, owner epoch, socket generation, peer key ID, trace/request/operation IDs, membership version, admission decision, queue bytes, lease remaining time, and closure cause. Hash or restrict tenant/device identifiers where required by audit policy. Never record keys' private material, tokens, certificate PEM bodies, raw paths, file bytes, prompts, screenshots, or arbitrary forwarded headers.
+
+Metrics use bounded labels for state, error kind, and adapter. Include lease renewal latency/failure, ownership changes, stale-owner rejection, trust expiry, certificate rotation, peer RTT/reconnects, active streams, credit wait, buffer high-water marks, and unknown outcomes. Put node/device IDs in restricted traces or diagnostic snapshots, not unbounded metric labels.
+
+Planned relay diagnostics expose redacted peer status, certificate fingerprints/expiry, membership freshness, owner counts and lease margin, UDP probe results, and resource limits. Planned client CLI diagnostics expose server certificate validation, device certificate expiry, current epoch/generation, reconnect cause, local exports, and recent operation status. Status commands are read-only and must not trigger desktop actions or mount writes.
+
+## Implementation and acceptance gates
+
+1. Freeze typed identity/envelope/error schemas and pure lease/rotation models. Property-test token comparison, expiry, ticket consumption, deadline handling, and bounded queues with an injected clock. Review the single-authority assumptions explicitly.
+2. Build an Axum mTLS device listener and separate private HTTP/3 listener. Prove bidirectional bodies, cancellation, backpressure, handshake client authentication, ALPN, invalid-certificate rejection, and UDP deployment behavior with real sockets. Pin dependencies only after this spike.
+3. Implement the membership issuer/publisher integration, signed Redis records, bootstrap checkpoints, least-privilege ACLs, renewal/revocation, and key overlap. Test forged keys, stale versions, equal-version conflicts, wrong deployment/role, publisher loss, expired records, and cache restart.
+4. Add owner acquisition/CAS renewal/release and challenge-bound device fencing. Test duplicate daemon identity, stale boot IDs, lost replies, process pauses, clock/resume boundaries, lease partitions, registry restarts, and counter rollback. Fail closed on every uncertain authority path.
+5. Connect three relay nodes, three devices across two users, and concurrent consumers. Force control, active data, replacement data, and consumer ingress onto different nodes. Prove direct owner routing, ticket one-use/key binding, isolation, the socket bound, and rotation through at least three generations.
+6. Kill owner and ingress processes independently; partition UDP and Redis separately; saturate a file stream while cancelling an ACP/MCP fixture operation. Verify bounded memory, useful traces, explicit interruption, and no automatic replay of unknown side effects.
+7. Exercise a staged key rotation, revoke a connected peer/device, miss all Pub/Sub hints, and restart from stale Redis/local snapshots. Measure connected and partitioned revocation bounds. Demonstrate the documented quiesce/incarnation recovery procedure.
+8. Run rolling upgrades with negotiated versions, incompatible-peer rejection, `GOAWAY`, and bounded drains. Existing streams may end explicitly; do not require invisible migration of in-memory sessions. Keep the repository private and use only synthetic fixtures/disposable desktop VMs.
+
+Additional boundary tests required before admission of real adapters:
+
+- Forward a legal 65,600-byte data WebSocket message and a 32,768-byte control message byte-for-byte through different ingress and owner nodes. Test ordinary consumer chunks at 65,536 bytes, every eight-byte-prefix split, fragmented body reads, exact limits, limit-plus-one rejection before allocation, invalid record kind/flags, and bounded close reasons. Confirm the three-record stream and 127-record connection ceilings, prefix/copy accounting, and control-queue backpressure without truncating valid messages.
+- Keep the Redis ownership confirmation healthy for 20 seconds while partitioning SQL or stopping authorization replies. Advance the device clock to the five-second authorization deadline with decoded 9P mutations and an ACP/MCP fixture action queued behind an await. None may begin after expiry; already dispatched work retains its actual/unknown outcome. A late reply must not revive the reset stream.
+- Exercise fresh and nearly expired cached SQL snapshots, challenge queue delays, response queue delays, duplicate/stale nonces, out-of-order replies, owner changes, context reuse attempts, grant revision/scope changes, explicit revocation, and suspend/resume. Prove that every accepted deadline is at most challenge start plus returned remaining lifetime, never response receipt plus five seconds, and that refreshing one context cannot refresh another.
+- Run all 64 authorization contexts while rotating saturated data sockets. Measure the two-second refresh cadence and bounded roster/control queues; delayed or dropped control traffic must fail closed rather than accumulate snapshot fragments or extend permissions. Verify prompt local-policy invalidation and rejection of oversized/multi-context confirmations before per-context allocation.
+
+Cluster readiness requires valid local identity, a fresh membership checkpoint/record, verified coordination authority, reachable required peer routes, and capacity to honor limits. A liveness endpoint may remain healthy during a registry outage while readiness becomes false. The first release must publish measured limits and known interruption cases, not merely a three-process startup demonstration.

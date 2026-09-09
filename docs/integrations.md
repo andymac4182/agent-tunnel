@@ -1,30 +1,28 @@
 # Filesystem and computer-use integrations
 
-Status: proposed integration contracts, researched on 2026-09-09. No adapter or
-upstream interoperability is implemented by this document. The relay and device
-agent remain Rust; the just-bash consumer needs a small TypeScript adapter because
-`IFileSystem` is a JavaScript API. Its connection to the relay is an authenticated
-binary WebSocket carrying Plan 9's 9P filesystem protocol. CUA stays an optional
-local backend. MCP protocol
-versions and compatibility are specified separately in [mcp.md](mcp.md).
+Status: proposed integration contracts, researched on 2026-09-09. No adapter or upstream interoperability is implemented. Rust owns the relay, desktop CLI and privileged providers. A shared TypeScript filesystem client supplies native Files SDK, Mastra, AI SDK Files and just-bash adapters; the normative endpoint is in [filesystem-api.md](filesystem-api.md), and complete SDK mappings are in [filesystem-adapters.md](filesystem-adapters.md).
+
+This document retains the detailed just-bash/9P and CUA compatibility research. [mcp.md](mcp.md) specifies MCP versions; [acp.md](acp.md) specifies host HTTP control of a CLI-supervised agent.
 
 ## Boundaries
 
 ```text
-Agent application
-  ├── just-bash + TunnelFileSystem (TypeScript)
-  │     └── binary WebSocket carrying 9P2000.L
-  ├── computer.v1 client
-  │     └── typed actions / binary screenshots
-  └── MCP client
-        └── selected MCP compatibility profile
+Agent in the cloud
+  ├── Files SDK / Mastra / AI SDK Files / just-bash native adapter
+  │     └── shared client: HTTP capability discovery + binary 9P2000.L WSS
+  ├── computer.v1 API client → typed CUA operations
+  ├── MCP client → selected MCP HTTP profile
+  └── ACP HTTP client → request POST + streaming event GET
                    │
-          authenticated relay
-                   │ control WS + rotating data WS
-          Rust device agent
-            ├── logical mount stream → confined Rust 9P2000.L server
-            ├── CUA computer-server adapter → configured loopback backend
-            └── MCP adapter → configured CUA Driver stdio process
+          Agent Tunnel Server (Axum)
+                   │ optional private HTTP/3 peer hop with mTLS
+          owning relay
+                   │ control WS + draining/rotating data WS, both device mTLS
+          desktop Rust CLI (initiates both outbound connections)
+            ├── mount stream → confined Rust 9P2000.L provider
+            ├── computer adapter → configured local CUA backend
+            ├── MCP adapter → fixed stdio process or local HTTP service
+            └── in-process ACP HTTP bridge → allowlisted ACP stdio agent
 ```
 
 These are logical services multiplexed over the shared data transport. CUA's

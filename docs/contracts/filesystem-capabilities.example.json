@@ -1,0 +1,58 @@
+{
+  "schemaVersion": "agent-tunnel.fs.v1",
+  "deviceId": "device-123",
+  "serviceId": "workspace",
+  "grantRevision": "opaque-example-revision",
+  "availability": "online",
+  "capabilityStatus": "current",
+  "transport": {
+    "type": "websocket",
+    "subprotocol": "agent-tunnel.9p.v1",
+    "dialect": "9P2000.L"
+  },
+  "root": {
+    "path": "/",
+    "pathStyle": "virtual-posix",
+    "caseSensitivity": "sensitive",
+    "readOnly": true
+  },
+  "operations": [
+    "readFile",
+    "readStream",
+    "stat",
+    "readDirectory",
+    "realpath"
+  ],
+  "features": {
+    "atomicRename": false,
+    "nativeAppend": false,
+    "exclusiveCreate": false,
+    "symlinks": false,
+    "hardLinks": false,
+    "birthTime": false,
+    "fsync": false,
+    "conditionalWrites": false,
+    "versioning": false,
+    "objectMetadata": false,
+    "publicUrls": false,
+    "signedUrls": false,
+    "serverCopy": false,
+    "serverSearch": false
+  },
+  "limits": {
+    "maxMessageBytes": 65536,
+    "maxInflightRequests": 64,
+    "maxFids": 256,
+    "maxQueuedBytes": 1048576,
+    "maxBufferedFileBytes": 16777216,
+    "maxTotalBufferedBytes": 33554432,
+    "maxPathBytes": 4096,
+    "maxPathComponents": 256,
+    "maxTraversalEntries": 10000,
+    "maxTraversalDepth": 64,
+    "requestTimeoutSeconds": 30,
+    "defaultOperationTimeoutSeconds": 300,
+    "maxOperationTimeoutSeconds": 3600,
+    "sessionIdleSeconds": 300
+  }
+}

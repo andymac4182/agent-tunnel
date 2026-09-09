@@ -1,6 +1,6 @@
 # Architecture
 
-Status: initial design, 2026-09-09. Only configuration validation exists today. Normative tunnel details live in [protocol.md](protocol.md).
+Status: revised implementation design, 2026-09-09. Only configuration validation exists today. Normative tunnel/drain details live in [protocol.md](protocol.md), cluster trust/ownership in [cluster.md](cluster.md), and filesystem consumer semantics in [filesystem-api.md](filesystem-api.md).
 
 ## Product boundary
 
@@ -10,16 +10,19 @@ The inspiration is a cloud agent with access to several enrolled machines ([sour
 
 ```mermaid
 flowchart LR
-    A[Agent consumer A] -->|HTTPS MCP or computer API| R[Multi-user Rust relay]
-    B[just-bash with TypeScript adapter] -->|Binary WSS carrying 9P2000.L| R
-    R --- DB[(Identity, grants, device catalog)]
-    D1[User 1 laptop daemon] -->|Outbound control WSS| R
-    D1 -->|Outbound data WSS, rotated| R
+    A[Agent in the cloud] -->|HTTPS MCP, ACP or computer API| R[Agent Tunnel Server: Axum ingress]
+    B[Files SDK, Mastra, AI SDK, just-bash] -->|Shared client: WSS and 9P2000.L| R
+    R <-->|Peer HTTP/3 with mTLS| O[Owning relay]
+    R --- DB[(PostgreSQL identities and grants)]
+    O --- K[(Redis signed key registry and presence)]
+    D1[User 1 desktop CLI] -->|Outbound control WSS with mTLS| O
+    D1 -->|Data WSS with mTLS, drain and rotate| O
     D2[User 1 workstation daemon] -->|Own control and data pair| R
     D3[User 2 device daemon] -->|Own control and data pair| R
     D1 --> M[Allowlisted local MCP service]
     D1 --> F[Rust 9P server and confined mounts]
     D1 --> C[Local CUA adapter]
+    D1 --> ACP[CLI-owned ACP HTTP to agent stdio bridge]
 ```
 
 The two-socket requirement applies to each device-to-relay tunnel. Consumers, a local CUA backend, and local MCP services have their own transports. During rotation there may be one control plus old and replacement data sockets for at most the configured overlap budget. See [decisions.md](decisions.md) for the strict-two-socket alternative.
@@ -30,14 +33,16 @@ The two-socket requirement applies to each device-to-relay tunnel. Consumers, a 
 | --- | --- | --- |
 | `tunnel-core` | Validated configuration today; shared invariants, identifiers, errors later | Rust library |
 | `tunnel-protocol` | Versioned framing, logical streams, credits, deterministic rotation machine | Future Rust crate |
-| `tunnel-relay` | Enrollment, consumer auth, registry, grants, WS pairing, routing, quotas | Rust binary; config-only today |
-| `tunnel-client` | Device identity, outbound reconnect, local policy, service supervision | Rust binary; config-only today |
+| `tunnel-relay` | Axum ingress, mTLS device listener, HTTP/3 peers, enrollment, grants, routing, quotas | Rust binary; config-only today |
+| `tunnel-client` | mTLS device identity, CLI, outbound reconnect, local policy, service/agent supervision | Rust binary; config-only today |
 | `tunnel-mcp` | MCP HTTP/stdio bridge with explicit version profiles | Future Rust crate using RMCP |
 | `tunnel-vfs` | 9P2000.L server, directory-handle-confined mount operations and bytes | Future Rust crate |
 | `tunnel-cua` | Typed, authorized local CUA operations and desktop leases | Future Rust crate |
-| `packages/just-bash-fs` | Native `IFileSystem` implementation over binary WebSocket / 9P | Future TypeScript package |
+| `tunnel-http` / `tunnel-acp` | Bounded HTTP forwarding and CLI ACP HTTP-to-stdio lifecycle bridge | Future Rust modules/crates |
+| `packages/client` | Shared filesystem endpoint/9P client with scoped lifecycle and errors | Future TypeScript package |
+| `packages/files-sdk`, `packages/mastra`, `packages/just-bash`, `packages/ai-sdk` | Native framework adapters over one client API | Future TypeScript packages |
 
-Start with a small workspace and split crates when their milestone starts. Suggested network stack: Tokio for async tasks, Axum for relay HTTP/WS, tokio-tungstenite for the outbound client, rustls for TLS, tracing for diagnostics. These are design choices based on [upstream documentation](sources.md), not installed dependencies or a promise to use unverified latest versions. Pin selected dependencies in Cargo.lock and test feature/TLS/platform combinations in the network milestone.
+Start with a small workspace and split crates only when their milestone starts. Axum is the selected public HTTP/WebSocket server. Tokio, tokio-tungstenite, rustls and tracing are planned supporting libraries; HTTP/3 peers use a dedicated QUIC/H3 integration sharing typed services with Axum, not an assumption that Axum natively serves H3. See [runtime.md](runtime.md) for listener roles, TLS identity propagation, CLI commands, actor ownership and debugging. Pin and test the actual dependency combination before claiming support.
 
 ## Identity and multi-user model
 
@@ -62,13 +67,13 @@ Durable catalog and live presence are different records. An offline device remai
 ## Enrollment and authorization
 
 1. An authenticated user starts enrollment for their tenant. The relay issues a single-use, short-lived enrollment code scoped to that user and device creation operation.
-2. The daemon creates its device key locally. Enrollment binds the public identity to the tenant; private credentials go to the OS credential store or a restricted secret file. The device cannot declare its own trusted tenant ID.
-3. After proving device identity, the daemon establishes the control socket. The relay assigns a connection epoch and supplies a one-use, short-lived data attachment ticket, bound to tenant, device, control epoch, data generation, and audience.
-4. The data socket is admitted only after ticket verification and atomic consumption. Neither a caller-supplied device name nor a socket URL can grant routing access.
+2. The CLI creates its private key locally and obtains a role-constrained device certificate from the trusted enrollment authority. The first implementation supports operator-provisioned certificates; interactive code/CSR enrollment follows under the same trust rules. Private keys go to protected local storage and are never uploaded to Redis. The device cannot declare its own trusted tenant ID.
+3. The CLI establishes the control WSS connection with mTLS. The relay validates its chain, role, identity, active key, expiry and revocation before HTTP/stream admission. It assigns an ownership epoch and a one-use data attachment ticket bound to device certificate identity/SPKI, tenant, owner, control epoch, generation and audience.
+4. The data WSS connection independently performs mTLS using that device identity, then verifies and atomically consumes its attachment ticket. The ticket cannot replace certificate authentication. Peer relays use separate role-constrained mTLS identities over HTTP/3; device credentials cannot act as peers.
 5. Consumers authenticate independently. The relay authorizes each API request and stream admission; the daemon checks every local operation against the bound grant and local policy. For opaque 9P streams, per-operation enforcement is in the Rust filesystem server. Effective access is the intersection of consumer grants and local exports.
 6. Revoking a device, consumer, membership, or grant closes affected streams and prevents subsequent dispatch, including buffered/replayed work. A locally visible stop command can disable all exports immediately.
 
-Use an external OIDC/OAuth provider for human login rather than building password or SMS authentication. v0 development can use operator-provisioned test identities in a loopback-only harness. Public relay exposure requires real enrollment, consumer tokens, revocation, and validated WSS. Choose the supported provider through the M1 integration spike, preserving a self-hosted option.
+Use an external OIDC/OAuth provider for human/consumer login rather than building password or SMS authentication. Device authentication is mTLS, independent of those consumer tokens. Test with an ephemeral CA and synthetic issued identities; never add an insecure production fallback. Public exposure requires certified enrollment, revocation, peer trust and WSS flows.
 
 Device credentials and consumer access tokens are separate. Validate issuer, audience, lifetime, and scope. Keep bearer material out of URLs, logs, traces, and command-line arguments. Rotation refreshes a transport generation; it neither renews user permission nor replaces credential rotation.
 
@@ -80,22 +85,27 @@ Planned consumer endpoints, subject to M1 contract review:
 GET  /v1/devices
 GET  /v1/devices/{device_id}/services
 POST /v1/devices/{device_id}/services/{service_id}/mcp
-GET  /v1/devices/{device_id}/services/{service_id}/fs  (WebSocket upgrade)
+GET  /v1/devices/{device_id}/services/{service_id}/fs  (descriptor or WebSocket upgrade)
+GET  /v1/devices/{device_id}/services/{service_id}/acp  (ACP connection events)
+POST /v1/devices/{device_id}/services/{service_id}/acp  (ACP JSON-RPC)
+DELETE /v1/devices/{device_id}/services/{service_id}/acp  (ACP connection teardown)
 POST /v1/devices/{device_id}/services/{service_id}/computer/operations
 GET  /v1/operations/{operation_id}
 ```
 
 Every route derives tenant from authenticated context, then checks the grant for the addressed device/service. Operation status lookup is scoped to the original principal and grant. Directory enumeration and errors must not disclose another tenant's identifiers. Presence updates use a separate authenticated consumer event feed if needed; they do not add a third permanent device socket.
 
-For filesystem access, just-bash uses a persistent authenticated consumer WebSocket to the relay. The proposed subprotocol `agent-tunnel.9p.v1` carries binary 9P2000.L messages. Each consumer socket binds to a single granted mount and its own logical stream through the device tunnel. No per-operation HTTP filesystem calls are required. Multiple remote mounts use separate consumer sessions, composed by just-bash's MountableFs. The data tunnel multiplexes those sessions alongside MCP and computer use.
+Filesystem consumers use the shared API client and native SDK adapters specified in [filesystem-api.md](filesystem-api.md) and [filesystem-adapters.md](filesystem-adapters.md). GET `/fs` without Upgrade returns the authenticated capability descriptor; upgrading that same URL with `agent-tunnel.9p.v1` starts binary 9P2000.L. Each session binds to one granted export and logical stream. Separate framework interfaces do not require separate filesystem wire protocols. The native Files SDK HTTP gateway is a distinct optional compatibility surface, not this WebSocket URL.
 
-Authenticate Node consumers at upgrade using Authorization headers. Browser consumers use a secure, same-site session cookie with strict Origin checks; a browser WebSocket cannot set arbitrary Authorization headers. Limit unauthenticated upgrades and never put bearer tokens in query strings. A separate browser deployment profile must pass CSRF/Origin tests before release. 9P attach names and numeric user IDs select only within the already-authorized mount and cannot establish identity. 9P provides filesystem semantics, not encryption or multi-tenant authentication.
+Authenticate Node filesystem consumers at discovery/upgrade using Authorization headers. Browser-cookie transport is a separately gated future profile; device CLI mTLS requirements do not make browser consumers present device certificates. 9P attach names and numeric user IDs cannot establish identity or change the root. Endpoint limits, capability revisions and paths follow the filesystem API contract.
 
 9P tags correlate outstanding requests; fids represent server-side file handles. Both remain scoped to the consumer/mount session and survive scheduled device data-socket rotation through the stable logical stream. Consumer disconnect, control epoch loss, or process restart ends the mount session and invalidates its fids. Reconnect negotiates and attaches afresh, and ambiguous mutations fail explicitly without automatic replay. See [integrations.md](integrations.md) for operation mapping, limits, and error semantics.
 
 Service registration advertises locally configured IDs and capabilities, not arbitrary upstream URLs or commands provided by consumers. The relay opens logical streams only to authorized registered exports. MCP payloads, file bytes, images, and computer-operation request bodies travel on the data socket. Control carries only lifecycle, bounded metadata, authorization changes, health, stream admission, and rotation coordination.
 
-A generic service interface exposes capability discovery, open, chunk, finish, cancel, and status with bounded request metadata. New adapters can join without changing tunnel framing. Arbitrary TCP forwarding, arbitrary shell execution, and caller-selected local URLs are outside v0.
+A generic service interface exposes capability discovery, open, chunk, finish, cancel, and status with bounded request metadata. MCP and ACP can share bounded HTTP request/response forwarding without sharing their protocol lifecycles. ACP HTTP terminates in the CLI's in-process handler, which supervises an allowlisted ACP stdio agent; see [acp.md](acp.md). No inbound local HTTP port or caller-selected executable is needed. The controlling host uses scoped consumer auth; each agent owns only its granted workspace and approved capabilities.
+
+Every logical stream has its own ordered sequence space per direction; identity includes device/session/ownership context. Scheduled rotation freezes old-socket writers at immutable per-stream watermarks, drains acknowledged delivery through those fences, commits the prepared socket, and retires the old socket. Peer HTTP/3 stream ordering does not create global ordering across logical streams or authorize retries of application actions.
 
 ## Isolation and privileged operations
 
@@ -115,10 +125,10 @@ Emit structured audit events with principal, tenant, device, service, operation 
 
 ## Deployment and growth
 
-M1 uses one long-running Linux relay process behind a TLS reverse proxy with WS upgrades, suitable idle timeouts, and streaming responses. Use SQLite migrations for the first durable catalog/grant store; keep ephemeral sockets and replay buffers in memory. Database mutations affecting authorization commit before acknowledgment. Relay restart fences all prior epochs; consumers receive explicit interruptions and devices reconnect with jitter.
+The private alpha requires multiple Linux relay nodes, shared PostgreSQL for durable identities/grants, and Redis for signed peer-key distribution, presence and fenced owner leases. A one-node echo fixture is an implementation step using these same boundaries. PostgreSQL mutations affecting authorization commit before acknowledgment; authorization snapshots expire within five seconds and failed refresh stops new admission. See [cluster.md](cluster.md) for the authoritative trust and revocation bounds.
 
-Multiple users and devices work on this single node from the beginning. This is concurrency and isolation, not horizontal high availability.
+Public consumer traffic reaches Axum over HTTPS. Device control and data WebSockets perform mTLS at the Rust device listener; a load balancer must use TCP pass-through for this profile. Private relay-to-relay HTTP/3 runs on QUIC/UDP with separate peer mTLS. Verified ingress identity and bounded bytes are forwarded directly to the device's owner; arbitrary worker placement cannot be solved by a shared database alone.
 
-M7 introduces PostgreSQL for durable shared state and a leased ownership registry for device-to-relay placement. Both sockets for an epoch reach its owner; consumer ingress forwards internally to that owner. All ownership changes use fencing tokens, and internal relay traffic is authenticated. Do not place one socket on an arbitrary worker and expect a shared database to transport its bytes. Owner failure resets affected streams unless an explicitly tested persistence/recovery protocol exists.
+Redis stores approved public identity records, never private keys or payloads. Deployment issuers and signed membership checkpoints establish trust independently of Redis. The initial coordination profile requires one authoritative Redis primary with no automatic promotion; recovery after coordination rollback/promotion requires quiescing the deployment and advancing its durable incarnation. This supports a relay cluster while making the coordination availability limit explicit. Owner failure creates fresh sessions and reports interruptions/unknown effects; durable catalog data does not recover lost stream buffers or agent memory.
 
 Release Linux relay images plus macOS ARM64, Linux x86_64/ARM64, and Windows x86_64 device binaries as platform gates pass. Network compatibility does not imply CUA desktop support; publish adapter capability matrices separately.

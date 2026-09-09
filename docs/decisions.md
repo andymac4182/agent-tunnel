@@ -1,37 +1,52 @@
-# Initial design decisions
+# Design decisions
 
-Status: proposed baseline accepted for planning, 2026-09-09. Decisions become implemented only when the linked roadmap gate passes.
+Status: implementation baseline, revised 2026-09-09. User-selected requirements are fixed; proposed defaults and upstream library combinations require their documented gates. Nothing here changes the configuration-only runtime status.
 
 | Decision | Choice and rationale | Validation point |
 | --- | --- | --- |
-| Name and visibility | Agent Tunnel; private `andymac4182/agent-tunnel`, intended for OSS release | Repository bootstrap |
-| Language | Rust core, relay, daemon, and privileged adapters; thin TypeScript just-bash package | M0/M4 |
-| License | MIT initial project license; publication remains a separate decision | M0; review third-party notices before release |
-| Connectivity | Outbound WSS over commonly available HTTPS infrastructure | M1 proxy and TLS tests |
-| Channel separation | One control and one data socket per connected device, independent bounded queues | M1 load/fairness checks |
-| Data rotation | Default 300s configurable interval; monotonic timing and bounded preparation/overlap | M2 state-machine and real-socket tests |
-| Handover | Two steady-state sockets; maximum three during replacement overlap | M2; strict-two alternative below |
-| Stream lifecycle | Logical stream survives scheduled socket rotation; process restarts may interrupt it | M2 |
-| Delivery | Transport sequence deduplication, explicit operation status; no general exactly-once claim | M2/M3/M5 fault injection |
-| Multi-user scope | Personal tenant per user initially, explicit memberships/grants, many devices and consumers | M1 adversarial isolation fixture |
-| First deployment | Single relay process with SQLite durable catalog; horizontal ownership later | M1/M7 |
-| Trust | Relay terminates TLS and is trusted with payloads; device applies local allowlists | M1 |
-| Filesystem transport | just-bash connects via binary WebSocket, carrying 9P2000.L through a logical tunnel stream | M4 codec and adapter tests |
-| Filesystem access | Read-only named roots first, capability-confined writes after platform tests | M4 |
-| Computer use | CUA behind typed device adapter, one active controller lease per desktop | M5 compatibility spike |
-| MCP | Explicit 2026-07-28 profile and separate 2025-11-25 compatibility path | M3 official SDK tests |
+| Name / visibility | Agent Tunnel; private `andymac4182/agent-tunnel`, MIT, intended OSS publication later | M0/M6 |
+| Primary flow | Cloud agent → server → outbound device WebSocket tunnel → desktop ACP/MCP/CUA/VFS | Full alpha end-to-end fixture |
+| Language | Rust client/relay and privileged adapters; shared TS filesystem client and thin native SDK adapters | M1/M4 |
+| Server / CLI | Axum consumer and device listeners; existing `tunnel-client` binary evolves into connection supervisor | M1 and runtime gates |
+| Device authentication | Mandatory mTLS on both control and every data socket; certificate-bound one-use data attachment | M1 certificate/ticket tests |
+| Consumer authentication | Separate scoped OAuth credentials; no device certificate sharing with SDKs/cloud hosts | M1 isolation |
+| Channel separation | One control + one data WebSocket per device, independent bounded queues | M1/M2 |
+| Rotation | Default 300s configurable; one bounded candidate creates at most three device sockets temporarily | M2 |
+| Handover | Prepare, quiesce, drain immutable per-stream fences, commit, retire; absolute overlap deadline | M2 model and real sockets |
+| Ordering | Unique session/stream identity with independent direction counters; continuity across carrier rotation | M2 gap/duplicate/race tests |
+| Effects | Transport deduplication within retained state, explicit unknown/partial application effects, no general exactly-once claim | All adapter fault suites |
+| Multi-user scope | Explicit tenant memberships, per-device/service grants, many devices/consumers | M1/M7 |
+| Shared durable state | PostgreSQL from the first cluster design; authorization snapshots bounded to five seconds | M1/M7 |
+| Peer transport | Private HTTP/3 over QUIC with mTLS and explicit adapter to shared application services | M7 compatibility and UDP tests |
+| Redis role | Signed approved public-key membership, presence and fenced owner leases; no private keys/payloads | M7 forged/stale record tests |
+| Trust authority | External issuers and signed membership checkpoints independent of Redis; separate device/peer roles | M1/M7 |
+| Coordination limit | One authoritative Redis primary, no automatic promotion; quiesce/new incarnation after rollback/restart/promotion | M7 failure/recovery |
+| Cluster release scope | Three-node validation required before private alpha; one node is a development slice | M7 before M6 |
+| Filesystem endpoint | Authenticated descriptor GET plus binary 9P2000.L/WSS at one service URL; Node first | M4 |
+| Native filesystem views | Files SDK Adapter, Mastra WorkspaceFilesystem, just-bash IFileSystem, AI SDK FilesV4 | Installed-package conformance |
+| Filesystem semantics | Confined read-only roots first; bounded writes/composites, explicit capability gaps | M4 per-OS gates |
+| Conditional writes | No strong CAS baseline; Mastra timestamp precheck requires explicit advisory opt-in | M4 stale/race tests |
+| ACP | Versioned draft HTTP profile to CLI-owned in-process bridge and allowlisted stdio child | M8 upstream interoperability |
+| MCP | Explicit 2026-07-28 profile and separate 2025-11-25 compatibility | M3 actual SDK tests |
+| Computer use | CUA typed adapter, one active controller lease per desktop, dedicated VM tests | M5 |
+| Debugging | Explicit state owners, bounded queues, typed errors, redacted transition/fence/lease diagnostics | Runtime/alpha gates |
+| Payload trust | Relay terminates TLS and is trusted with content; device still enforces local policy | M1/M7 |
 
 ## Rotation tradeoff
 
-With a hard limit of two total sockets, the old data socket must close before the new one connects. This introduces a bounded pause and requires the same buffering/replay machinery. The recommended baseline allows a temporary third socket, because pre-authenticating its replacement reduces avoidable downtime. No long-running stream is allowed to pin the old physical socket indefinitely. A strict-two mode is deferred until there is a deployment need and dedicated failure tests.
+The baseline permits a temporary third socket to authenticate the replacement before stopping the old writer. It then explicitly drains old transport delivery before committing. Long-lived HTTP responses, file handles and agent operations continue on stable logical streams; they cannot pin the old physical socket indefinitely. Drain acknowledgements do not mean an agent task or filesystem mutation completed.
 
-The five-minute value is a scheduled rotation interval, not a security credential lifetime or an unconditional physical-connection maximum. A failed handover can delay rotation while the old connection is healthy; the protocol defines limits and explicit termination behavior. If infrastructure has a hard connection lifetime, add a separately enforced lifetime setting and start rotation early enough to meet it.
+A hard two-socket mode would require closing the old data socket before establishing the replacement, with a longer data pause and its own recovery tests. That optional mode is deferred. The configured five-minute interval schedules rotation; it is not a certificate lifetime or unconditional physical-connection maximum. Failed pre-commit attempts may return to a healthy old connection only by the protocol's serialized abort decision, preserving sequence state. A separate hard connection lifetime requires an explicit setting and early rotation budget.
 
-## Decisions still requiring experiments
+## Compatibility and experiment gates
 
-- Confirm CUA's most reliable local control path on each target OS: computer-server API first, native Rust driver as a candidate. Do not promise identical desktop capabilities on all platforms.
-- Choose and pin the Rust filesystem confinement implementation after Linux/macOS/Windows escape-race testing; platform support is a release gate.
-- Select the self-hostable OAuth/OIDC integration and device credential provisioning library. Do not implement cryptographic primitives or an authorization server from scratch.
-- Tune chunk sizes, windows, replay budgets, fairness, and load targets using measurements. Initial protocol numbers are bounded defaults, not benchmark results.
-- Determine when remote tree scans need dedicated safe search/list APIs to avoid just-bash issuing one network call per file. Do not use arbitrary shell execution as the optimization.
-- Design end-to-end encryption, mobile apps, continuous video/WebRTC, generic TCP exports, and VM provisioning only when prioritized separately.
+- Pin a proven Axum/rustls/WebSocket/QUIC/H3 combination. Axum's HTTP/1 and HTTP/2 server does not natively become an HTTP/3 peer server by enabling a flag.
+- Select an external CA/issuer integration and self-hostable consumer OAuth/OIDC provider. No custom cryptographic primitives or general authorization server.
+- Pin exact ACP HTTP SDK/schema versions; the HTTP transport is draft. Do not advertise support based only on similarly shaped JSON-RPC.
+- Compile native adapters against actual published packages and lockfiles; inspected source revisions alone are not interoperability evidence. The Files SDK native HTTP gateway and experimental AI sandbox are separate deferred profiles.
+- Select the Rust 9P codec and confinement abstraction after parser and Linux/macOS/Windows escape-race testing. Do not equate `.L` wire flags with host OS constants.
+- Confirm CUA backend transport and capabilities per OS. Confirm ACP process-tree cleanup and the actual OS sandbox guarantee; changing `cwd` alone does not confine a coding agent.
+- Measure chunk/window sizes, replay budgets, fairness and load limits. Defaults are safety bounds, not performance claims.
+- Automatic coordination failover, durable stream replay, strong filesystem CAS, browser auth, end-to-end encryption, mobile apps, continuous video/WebRTC, arbitrary TCP exports and VM provisioning require separately prioritized designs.
+
+See [runtime.md](runtime.md), [cluster.md](cluster.md), [protocol.md](protocol.md), [filesystem-api.md](filesystem-api.md), [filesystem-adapters.md](filesystem-adapters.md), and [acp.md](acp.md) for normative detail and open gates.
