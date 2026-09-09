@@ -6,18 +6,23 @@
 //! separately supplied server CA bundle.
 
 use crate::config::{CredentialConfig, RuntimeConfig};
+#[cfg(unix)]
 use rcgen::{CertificateParams, DnType, KeyPair};
-use rustls::{
-    pki_types::{CertificateDer, PrivateKeyDer},
-    sign::CertifiedKey,
-};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+#[cfg(unix)]
+use rustls::sign::CertifiedKey;
 use rustls_pemfile::{certs, private_key};
 use std::{
     error::Error,
     fmt,
-    fs::{self, File, OpenOptions},
-    io::{self, BufReader, Read, Write},
+    fs::{self, File},
+    io::{self, BufReader},
     path::{Path, PathBuf},
+};
+#[cfg(unix)]
+use std::{
+    fs::OpenOptions,
+    io::{Read, Write},
 };
 
 /// Result of creating a local key and CSR.
@@ -37,15 +42,11 @@ pub struct ImportedCredential {
 }
 
 /// Generate a local ECDSA key and a PEM CSR without overwriting files.
+#[cfg(unix)]
 pub fn create_csr(
     config: &RuntimeConfig,
     csr_path: impl AsRef<Path>,
 ) -> Result<CsrOutput, CredentialError> {
-    #[cfg(not(unix))]
-    return Err(CredentialError::UnsupportedPlatform(
-        "credential creation requires an owner-only filesystem ACL on this platform",
-    ));
-
     let csr_path = csr_path.as_ref().to_owned();
     let key_path = config.credentials.client_key.clone();
     if key_path.exists() {
@@ -80,16 +81,12 @@ pub fn create_csr(
 
 /// Validate and import an externally issued certificate and server trust
 /// bundle.  Destination files are never overwritten by this operation.
+#[cfg(unix)]
 pub fn import_certificate(
     config: &RuntimeConfig,
     certificate_source: impl AsRef<Path>,
     server_ca_source: impl AsRef<Path>,
 ) -> Result<ImportedCredential, CredentialError> {
-    #[cfg(not(unix))]
-    return Err(CredentialError::UnsupportedPlatform(
-        "credential import requires an owner-only filesystem ACL on this platform",
-    ));
-
     let certificate_source = certificate_source.as_ref();
     let server_ca_source = server_ca_source.as_ref();
     let key = load_private_key(&config.credentials.client_key)?;
@@ -134,6 +131,29 @@ pub fn import_certificate(
     })
 }
 
+/// Local key creation is disabled until this platform has an owner-only ACL implementation.
+#[cfg(not(unix))]
+pub fn create_csr(
+    _config: &RuntimeConfig,
+    _csr_path: impl AsRef<Path>,
+) -> Result<CsrOutput, CredentialError> {
+    Err(CredentialError::UnsupportedPlatform(
+        "credential creation requires an owner-only filesystem ACL on this platform",
+    ))
+}
+
+/// Local credential import is disabled until this platform has an owner-only ACL implementation.
+#[cfg(not(unix))]
+pub fn import_certificate(
+    _config: &RuntimeConfig,
+    _certificate_source: impl AsRef<Path>,
+    _server_ca_source: impl AsRef<Path>,
+) -> Result<ImportedCredential, CredentialError> {
+    Err(CredentialError::UnsupportedPlatform(
+        "credential import requires an owner-only filesystem ACL on this platform",
+    ))
+}
+
 /// Build a rustls client configuration from local PEM files.
 ///
 /// This helper is intentionally public for integration harnesses.  Every
@@ -173,6 +193,7 @@ pub fn load_private_key(path: impl AsRef<Path>) -> Result<PrivateKeyDer<'static>
         .ok_or_else(|| CredentialError::NoPrivateKey(path.as_ref().to_owned()))
 }
 
+#[cfg(unix)]
 fn ensure_parent(path: &Path, private: bool) -> Result<(), CredentialError> {
     match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => {
@@ -197,6 +218,7 @@ fn ensure_parent(path: &Path, private: bool) -> Result<(), CredentialError> {
     }
 }
 
+#[cfg(unix)]
 fn write_new(path: &Path, bytes: &[u8], private: bool) -> Result<(), CredentialError> {
     #[cfg(not(unix))]
     if private {
@@ -223,6 +245,7 @@ fn write_new(path: &Path, bytes: &[u8], private: bool) -> Result<(), CredentialE
     file.sync_all().map_err(CredentialError::Io)
 }
 
+#[cfg(unix)]
 fn copy_new(source: &Path, destination: &Path, private: bool) -> Result<(), CredentialError> {
     let mut bytes = Vec::new();
     File::open(source)
@@ -304,6 +327,7 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    #[cfg(unix)]
     fn csr_creation_is_non_overwriting_and_local() {
         let dir = tempdir().expect("temporary directory");
         let mut config = RuntimeConfig::default();
@@ -313,6 +337,26 @@ mod tests {
         assert_eq!(output.key_path, config.credentials.client_key);
         assert!(csr_path.exists());
         assert!(create_csr(&config, &csr_path).is_err());
+    }
+
+    #[test]
+    #[cfg(not(unix))]
+    fn provisioning_is_rejected_without_creating_files() {
+        let dir = tempdir().expect("temporary directory");
+        let config = RuntimeConfig::default();
+        assert!(matches!(
+            create_csr(&config, dir.path().join("device.csr")),
+            Err(CredentialError::UnsupportedPlatform(_))
+        ));
+        assert!(matches!(
+            import_certificate(
+                &config,
+                dir.path().join("cert.pem"),
+                dir.path().join("ca.pem")
+            ),
+            Err(CredentialError::UnsupportedPlatform(_))
+        ));
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
     #[test]

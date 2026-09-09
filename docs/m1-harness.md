@@ -2,7 +2,7 @@
 
 Status: the local M1 acceptance is verified; hosted CI is pending. On
 2026-09-09 macOS arm64 with pinned Rust 1.95.0 and Redis 8.4, the locked
-formatting/Clippy checks, 61 workspace tests, five explicitly executed real Redis integration tests, and the
+formatting/Clippy checks, 62 workspace tests, five explicitly executed real Redis integration tests, and the
 Redis AOF restart check passed. Full real HTTPS/WSS CLI acceptance passed for
 five clients across two tenants, including admission certificate/ticket/stale
 epoch negatives and private H3 success/negative probes. This page records local

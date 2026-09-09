@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
 env:
   CARGO_PROFILE_DEV_DEBUG: "0"
   CARGO_PROFILE_TEST_DEBUG: "0"
@@ -60,6 +64,7 @@ jobs:
           --health-retries 20
           --memory 256m
     env:
+      RUST_LOG: info
       TEST_REDIS_URL: redis://127.0.0.1:6379/
       TUNNEL_CATALOG_REDIS_URL: redis://127.0.0.1:6379/
     steps:

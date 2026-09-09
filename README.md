@@ -14,7 +14,7 @@ The desktop CLI initiates the tunnel with mTLS. Authorized cloud agents call ser
 
 **Status: M1 is implemented and locally verified; hosted CI is pending.** On
 2026-09-09, macOS arm64 with Rust 1.95.0 and Redis 8.4 passed formatting,
-strict Clippy, 61 workspace tests, five real Redis integration tests, the
+strict Clippy, 62 workspace tests, five real Redis integration tests, the
 five-client/two-tenant HTTPS/WSS/CLI acceptance harness, the private H3 probe
 and the Redis AOF restart check. See [the evidence and repeatable commands](docs/m1-harness.md).
 M2 rotation/replay, remote adapters and M7 cluster routing remain planned.

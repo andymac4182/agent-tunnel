@@ -693,6 +693,7 @@ async fn writer_loop(
 ) -> Result<(), ClientError> {
     loop {
         tokio::select! {
+            biased;
             _ = cancellation.cancelled() => {
                 close_writer_sink(sink).await;
                 return Ok(());
@@ -707,7 +708,9 @@ async fn writer_loop(
                     return Err(ClientError::AuthorizationExpired);
                 }
                 if let Err(error) = send_writer_message(&mut sink, item.message.clone(), &cancellation).await {
-                    let _ = failure.send(WriterFailure(kind)).await;
+                    if !matches!(&error, &ClientError::Cancelled) {
+                        let _ = failure.send(WriterFailure(kind)).await;
+                    }
                     return Err(error);
                 }
             }
@@ -721,6 +724,7 @@ async fn send_writer_message(
     cancellation: &CancellationToken,
 ) -> Result<(), ClientError> {
     tokio::select! {
+        biased;
         _ = cancellation.cancelled() => Err(ClientError::Cancelled),
         result = tokio::time::timeout(WRITER_WRITE_TIMEOUT, sink.send(message)) => {
             match result {
@@ -881,36 +885,46 @@ async fn run_session(
     };
     let result = loop {
         tokio::select! {
+            biased;
             _ = cancellation.cancelled() => break Ok(()),
             failure = writer_failure_rx.recv() => {
-                let kind = failure.map(|failure| failure.0);
-                let scope = match kind {
-                    Some(WriterKind::Control) => "control writer",
-                    Some(WriterKind::Data) => "data writer",
-                    None => "writer",
-                };
-                break Err(ClientError::Transport { scope, detail: "writer stopped".to_owned() });
+                break writer_failure_result(
+                    cancellation.is_cancelled(),
+                    failure.map(|failure| failure.0),
+                );
             }
             control = control_stream.next() => {
                 match control {
                     Some(Ok(message)) => {
                         if let Err(error) = actor.handle_control_message(message).await {
-                            break Err(error);
+                            break session_failure_result(cancellation.is_cancelled(), error);
                         }
                     }
-                    Some(Err(error)) => break Err(ClientError::Transport { scope: "control read", detail: sanitize_error(&error.to_string()) }),
-                    None => break Err(ClientError::Transport { scope: "control read", detail: "control socket closed".to_owned() }),
+                    Some(Err(error)) => break session_failure_result(
+                        cancellation.is_cancelled(),
+                        ClientError::Transport { scope: "control read", detail: sanitize_error(&error.to_string()) },
+                    ),
+                    None => break session_failure_result(
+                        cancellation.is_cancelled(),
+                        ClientError::Transport { scope: "control read", detail: "control socket closed".to_owned() },
+                    ),
                 }
             }
             data = data_stream.next() => {
                 match data {
                     Some(Ok(message)) => {
                         if let Err(error) = actor.handle_data_message(message).await {
-                            break Err(error);
+                            break session_failure_result(cancellation.is_cancelled(), error);
                         }
                     }
-                    Some(Err(error)) => break Err(ClientError::Transport { scope: "data read", detail: sanitize_error(&error.to_string()) }),
-                    None => break Err(ClientError::Transport { scope: "data read", detail: "data socket closed".to_owned() }),
+                    Some(Err(error)) => break session_failure_result(
+                        cancellation.is_cancelled(),
+                        ClientError::Transport { scope: "data read", detail: sanitize_error(&error.to_string()) },
+                    ),
+                    None => break session_failure_result(
+                        cancellation.is_cancelled(),
+                        ClientError::Transport { scope: "data read", detail: "data socket closed".to_owned() },
+                    ),
                 }
             }
         }
@@ -930,6 +944,38 @@ async fn run_session(
         })
         .ok();
     result
+}
+
+fn session_failure_result(
+    cancellation_requested: bool,
+    error: ClientError,
+) -> Result<(), ClientError> {
+    if cancellation_requested {
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
+
+fn writer_failure_result(
+    cancellation_requested: bool,
+    kind: Option<WriterKind>,
+) -> Result<(), ClientError> {
+    if cancellation_requested {
+        return Ok(());
+    }
+    let scope = match kind {
+        Some(WriterKind::Control) => "control writer",
+        Some(WriterKind::Data) => "data writer",
+        None => "writer",
+    };
+    session_failure_result(
+        cancellation_requested,
+        ClientError::Transport {
+            scope,
+            detail: "writer stopped".to_owned(),
+        },
+    )
 }
 
 impl SessionActor {
@@ -1812,5 +1858,33 @@ mod tests {
         assert!(output_len > MAX_PAYLOAD_LEN);
         assert_eq!(output_len.div_ceil(MAX_PAYLOAD_LEN), 2);
         assert!(checked_echo_output_len(usize::MAX, 1).is_none());
+    }
+
+    #[tokio::test]
+    async fn cancellation_wins_when_writer_failure_is_already_ready() {
+        let cancellation = CancellationToken::new();
+        let (failure_tx, mut failure_rx) = mpsc::channel(1);
+        cancellation.cancel();
+        failure_tx
+            .send(WriterFailure(WriterKind::Data))
+            .await
+            .expect("failure receiver remains available");
+
+        let result = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => Ok(()),
+            failure = failure_rx.recv() => writer_failure_result(
+                cancellation.is_cancelled(),
+                failure.map(|failure| failure.0),
+            ),
+        };
+
+        assert!(result.is_ok());
+        assert_eq!(
+            writer_failure_result(false, Some(WriterKind::Data))
+                .unwrap_err()
+                .code(),
+            "TRANSPORT_ERROR"
+        );
     }
 }
