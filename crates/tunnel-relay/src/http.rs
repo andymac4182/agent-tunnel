@@ -1845,34 +1845,46 @@ async fn service_and_grant(
                 "not_dispatched",
             )
         })?;
-    let service_id = service
-        .parse::<Uuid>()
-        .ok()
-        .or_else(|| {
-            device
+    let service_id = match service.parse::<Uuid>().ok().or_else(|| {
+        device
+            .services
+            .iter()
+            .find(|candidate| {
+                candidate.service_type == crate::ECHO_SERVICE_TYPE
+                    && candidate.service_id.to_string() == service
+            })
+            .map(|candidate| candidate.service_id)
+    }) {
+        Some(service_id) => service_id,
+        None => {
+            // A service-type label is not an identifier. When more than one
+            // active service of the requested type exists the target is
+            // ambiguous: resolve nothing and return the explicit bounded
+            // outcome instead of silently selecting the first match.
+            let mut matched = device
                 .services
                 .iter()
-                .find(|candidate| {
-                    candidate.service_type == crate::ECHO_SERVICE_TYPE
-                        && candidate.service_id.to_string() == service
-                })
-                .map(|candidate| candidate.service_id)
-        })
-        .or_else(|| {
-            device
-                .services
-                .iter()
-                .find(|candidate| candidate.service_type == service)
-                .map(|candidate| candidate.service_id)
-        })
-        .ok_or_else(|| {
-            error_response(
-                StatusCode::NOT_FOUND,
-                "SERVICE_NOT_FOUND",
-                "not found",
-                "not_dispatched",
-            )
-        })?;
+                .filter(|candidate| candidate.service_type == service && candidate.active)
+                .map(|candidate| candidate.service_id);
+            let Some(first) = matched.next() else {
+                return Err(error_response(
+                    StatusCode::NOT_FOUND,
+                    "SERVICE_NOT_FOUND",
+                    "not found",
+                    "not_dispatched",
+                ));
+            };
+            if matched.next().is_some() {
+                return Err(error_response(
+                    StatusCode::CONFLICT,
+                    "SERVICE_AMBIGUOUS",
+                    "service label matches more than one active service",
+                    "not_dispatched",
+                ));
+            }
+            first
+        }
+    };
     if !device.services.iter().any(|candidate| {
         candidate.service_id == service_id
             && candidate.service_type == crate::ECHO_SERVICE_TYPE

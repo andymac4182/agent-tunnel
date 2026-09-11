@@ -4,6 +4,12 @@
 //! authorities.  The matrix deliberately stops at the bootstrap boundary:
 //! malformed or unavailable trust inputs must produce bounded typed diagnostics,
 //! never ready/admitted listeners, and released ports.
+//!
+//! The matrix covers FP-10's bootstrap prerequisites: local peer identity,
+//! signed membership, signed checkpoint authority, Redis authority, and
+//! capacity.  Peer reachability has its own process case in
+//! `m7_deployment_port_binding.rs`; runtime loss of an authority after a ready
+//! start is `m7_deployment_runtime_faults.rs`.
 
 use std::{
     collections::BTreeMap,
@@ -51,10 +57,16 @@ enum Fault {
     ConflictingCheckpoint,
     RedisUnavailable,
     WrongLocalPeerCertificateKeyPair,
+    /// FP-10 capacity: a relay configured to admit no devices per user is a
+    /// partial bootstrap, not a serving gateway.
+    ZeroDeviceCapacity,
+    /// FP-10 capacity: a queue budget below the documented floor cannot honor
+    /// the bounded replay contract.
+    InsufficientQueueCapacity,
 }
 
 impl Fault {
-    const ALL: [Self; 9] = [
+    const ALL: [Self; 11] = [
         Self::InvalidMembership,
         Self::MissingMembership,
         Self::ExpiredMembership,
@@ -64,6 +76,8 @@ impl Fault {
         Self::ConflictingCheckpoint,
         Self::RedisUnavailable,
         Self::WrongLocalPeerCertificateKeyPair,
+        Self::ZeroDeviceCapacity,
+        Self::InsufficientQueueCapacity,
     ];
 
     fn name(self) -> &'static str {
@@ -77,6 +91,8 @@ impl Fault {
             Self::ConflictingCheckpoint => "conflicting-checkpoint",
             Self::RedisUnavailable => "redis-unavailable",
             Self::WrongLocalPeerCertificateKeyPair => "wrong-local-peer-certificate-key-pair",
+            Self::ZeroDeviceCapacity => "zero-device-capacity",
+            Self::InsufficientQueueCapacity => "insufficient-queue-capacity",
         }
     }
 
@@ -107,6 +123,13 @@ impl Fault {
             }
             Self::WrongLocalPeerCertificateKeyPair => {
                 lower.contains("rustls configuration error") && lower.contains("keymismatch")
+            }
+            // Capacity is validated while the configuration is parsed, so the
+            // executable never reaches a listener at all.  The bound itself is
+            // named in the typed diagnostic.
+            Self::ZeroDeviceCapacity => lower.contains("max_devices_per_user must be 1..=64"),
+            Self::InsufficientQueueCapacity => {
+                lower.contains("max_queue_bytes must be 256kib..=64mib")
             }
         }
     }
@@ -153,6 +176,9 @@ impl Fault {
             | Self::ConflictingCheckpoint
             | Self::RedisUnavailable
             | Self::WrongLocalPeerCertificateKeyPair => true,
+            // Capacity bounds are part of configuration validation, which
+            // `initialize` performs before any authority is contacted.
+            Self::ZeroDeviceCapacity | Self::InsufficientQueueCapacity => false,
         }
     }
 }
@@ -690,6 +716,18 @@ async fn apply_fault(fixture: &ProcessFixture, fault: Fault) -> Result<()> {
             fs::write(&fixture.peer_chain_path, wrong_chain)?;
             Ok(())
         }
+        // The capacity keys belong to the top-level table, so they are
+        // inserted immediately before the cluster table rather than appended.
+        Fault::ZeroDeviceCapacity => replace_config_value(
+            &fixture.config_path,
+            "\n\n[cluster]\n",
+            "\nmax_devices_per_user = 0\n\n[cluster]\n",
+        ),
+        Fault::InsufficientQueueCapacity => replace_config_value(
+            &fixture.config_path,
+            "\n\n[cluster]\n",
+            "\nmax_queue_bytes = 1024\n\n[cluster]\n",
+        ),
     }
 }
 

@@ -56,6 +56,77 @@ admission and expired-authority dispatch, then prove fresh authorized recovery.
 A command passing cannot close unrelated rows in [m7-edge-cases.md](m7-edge-cases.md).
 Record the tested revision and outcomes in [m7-verification.md](m7-verification.md).
 
+### Fail-closed admission with a request-body sentinel
+
+```sh
+cargo run -p tunnel-test-harness --locked -- verify-m7-i04-fail-closed
+```
+
+`verify-m7-i04-fail-closed` extends the three-relay admission family with the
+negative membership, body-consumption and fallback scopes. Its instrument is a
+*request-body sentinel*: an `http_body::Body` that declares a `content-length`
+and then delivers a controlled number of bytes. Reading the sentinel's own poll
+count is not enough, because the client transport polls a body regardless of
+whether the relay reads it; the evidence is the pair
+`declared_body_bytes > 0, delivered_body_bytes = 0` together with an exact typed
+response that arrives inside a bound far below the relay's ten-second body
+deadline.
+
+That inference is only sound with a control, so the gate always runs one first:
+the same withheld sentinel against a fully valid target must reach
+`408 BODY_TIMEOUT/not_dispatched` after roughly ten seconds. A passing control
+proves the body read really is on this route, which is what makes every
+zero-delivery rejection falsifiable. Treat a fast control as a gate failure, not
+as a faster machine.
+
+The same run records two further non-vacuity controls. A service-type label
+against a device with exactly one active service must still return the exact
+owner canary, otherwise the ambiguous-label rejection proves only that the label
+path is broken. And a successful remote echo through the non-owner ingress must
+precede the caller-named-peer-address check, otherwise zero honeypot datagrams
+only prove that no peer hop happened at all.
+
+Named scenarios and the rows they inform: absent, unknown-service, inactive,
+ambiguous-label and cross-device-destination targets (`EC-003`); a UDP and TCP
+honeypot that consumer headers name but no relay may reach (`EC-017`);
+cross-scope rejection before any body read or peer forward, with the owner-side
+`lifetime_consumer_chunk_reads` counter at zero (`EC-049`); a zero-byte body that
+stays live and is distinct from a failed body stream (`EC-031`); consumed,
+body-free and failed-body requests during a real owner process loss, each with a
+proven `not_dispatched` outcome and zero cluster-wide dispatch (`FP-04`,
+`IN-03`); a SIGKILLed owner connector with at most one committed effect and a
+mandatory fresh owner identity (`EC-023`, `EC-048`); and the explicit advertised
+route set with every excluded path typed, recorded as the route boundary for the
+excluded browser surface (`EC-009`).
+
+Two limits are deliberate. The relay performs **no** automatic reselection on
+any method: `routing::AdmissionRetryBudget` and
+`OwnerRouter::resolve_after_admission_failure` exist but have no production call
+site, so the gate proves zero reselection plus one bounded *consumer-driven*
+safe retry after the successor owner is committed. The gate also uses the policy
+rotation interval rather than the accelerated M2 one, because a three-second
+replacement carrier injects unrelated owner-readiness windows into admission
+outcomes; owner readiness is instead established by a bounded precondition
+helper before each must-succeed probe, never inside a measured window.
+
+### Process bootstrap and capacity fault matrix
+
+```sh
+cargo test -p tunnel-test-harness --test m7_deployment_failures --locked \
+  -- --ignored --test-threads=1
+```
+
+This process matrix drives the built relay executable through every FP-10
+bootstrap prerequisite: local peer identity, signed membership, signed
+checkpoint authority, Redis authority, and capacity. Each case must expose
+`/livez` as live while `/readyz` stays `503 unready`, emit a bounded typed
+credential-free diagnostic, and release all three listener ports. The capacity
+cases fail during configuration validation, so the executable never reaches a
+listener and the matrix requires `initialize` itself to fail with the exact
+named bound. Peer reachability has its own process case in
+`m7_deployment_port_binding.rs`, and loss of an authority *after* a ready start
+is `m7_deployment_runtime_faults.rs`.
+
 ## Deterministic transport and state-machine tests
 
 Keep protocol transitions separable from socket I/O so ordinary unit and property tests can drive them. Cover `Connecting`, `Active(g)`, `Preparing(g,n)`, `Quiescing(g,n)`, `Draining(g,n)`, `Committing(g,n)`, `Retiring(g,n)`, `Aborting(g,n)`, `Recovering`, and `Closed`, with control ownership, connection deadlines, and operation status modeled separately. Candidate `n` is fresh and greater than prior attempts, including aborted attempts. Use Tokio's paused clock and explicit advancement for rotation tests; wall-clock sleeps are unsuitable for these assertions.

@@ -140,6 +140,11 @@ mod admission;
 pub use admission::{
     AdmissionEvidence, validate_admission_evidence, verify as verify_public_admission,
 };
+mod i04_fail_closed;
+pub use i04_fail_closed::{
+    FailClosedEvidence, SentinelOutcome, validate_fail_closed_evidence,
+    verify as verify_fail_closed_admission,
+};
 mod device_revocation;
 pub use device_revocation::{
     DeviceRevocationEvidence, validate_device_revocation_evidence, verify_device_revocation,

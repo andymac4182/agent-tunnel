@@ -39,6 +39,11 @@ pub struct HarnessOptions {
     /// Explicit colliding device/service identity for an M7 tenant-isolation
     /// run. This takes precedence over `shared_device_uuid` when set.
     pub shared_fixture_identity: Option<SharedFixtureIdentity>,
+    /// Seed a second active `echo` service on the first tenant-A device so a
+    /// service-type label has more than one live target.  This is reserved for
+    /// the fail-closed admission matrix and stays disabled everywhere else, so
+    /// no existing gate's service or grant counts change.
+    pub ambiguous_echo_service: bool,
 }
 
 impl Default for HarnessOptions {
@@ -51,6 +56,7 @@ impl Default for HarnessOptions {
             rotation: RotationConfig::default(),
             shared_device_uuid: false,
             shared_fixture_identity: None,
+            ambiguous_echo_service: false,
         }
     }
 }
@@ -103,6 +109,13 @@ impl HarnessOptions {
 
     pub fn shared_device_uuid(mut self, value: bool) -> Self {
         self.shared_device_uuid = value;
+        self
+    }
+
+    /// Opt into the duplicate active `echo` service used by the fail-closed
+    /// admission matrix's ambiguous-target scenario.
+    pub fn ambiguous_echo_service(mut self, value: bool) -> Self {
+        self.ambiguous_echo_service = value;
         self
     }
 
@@ -201,6 +214,26 @@ impl Harness {
                 Ok(devices) => devices,
                 Err(error) => return Err(with_redis_cleanup(error, redis.close().await)),
             };
+        let ambiguous_echo_service = if options.ambiguous_echo_service {
+            // Deliberately the last tenant-A device: the first one can share
+            // its device and service UUID with tenant B, and an ambiguous
+            // label must be scoped to exactly one tenant's service list.
+            let device_id = match topology.devices_a.last() {
+                Some(device) => device.id,
+                None => {
+                    let error = HarnessError::InvalidInput(
+                        "ambiguous echo service requires a tenant-A device".to_owned(),
+                    );
+                    return Err(with_redis_cleanup(error, redis.close().await));
+                }
+            };
+            match topology.push_ambiguous_echo_service(&mut fixture, device_id) {
+                Ok(service_id) => Some(service_id),
+                Err(error) => return Err(with_redis_cleanup(error, redis.close().await)),
+            }
+        } else {
+            None
+        };
         if let Err(error) = catalog.seed_fixture(&fixture).await {
             let error = HarnessError::Redis(format!("seeding production Redis catalog: {error}"));
             // A seed is one-shot. Discard a failed fixture, including partial
@@ -217,6 +250,7 @@ impl Harness {
             oidc,
             topology,
             admission_devices,
+            ambiguous_echo_service,
             proxy,
             production_catalog: Some(catalog),
             production_relay: None,
@@ -235,6 +269,9 @@ pub struct RunningHarness {
     pub oidc: OidcFixture,
     pub topology: FixtureTopology,
     pub(crate) admission_devices: Vec<crate::admission::AdmissionDevice>,
+    /// The duplicate active `echo` service seeded for the fail-closed
+    /// admission matrix, present only when that option was requested.
+    pub ambiguous_echo_service: Option<uuid::Uuid>,
     pub proxy: Option<ProxyHandle>,
     production_catalog: Option<RedisCatalog>,
     production_relay: Option<RunningRelay>,

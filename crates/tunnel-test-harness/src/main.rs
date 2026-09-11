@@ -349,6 +349,83 @@ async fn main() -> ExitCode {
                 )),
             }
         }
+        [command] if command == "verify-m7-i04-fail-closed" => {
+            match tokio::time::timeout(
+                Duration::from_secs(300),
+                tunnel_test_harness::production_cluster::verify_fail_closed_admission(),
+            )
+            .await
+            {
+                Ok(result) => result.and_then(|evidence| {
+                    tunnel_test_harness::production_cluster::validate_fail_closed_evidence(
+                        &evidence,
+                    )?;
+                    println!(
+                        "M7 I04 fail-closed admission passed: relays={} remote_ingress_is_not_owner={} baseline_target_dispatches={} baseline_sibling_dispatches={} body_read_control={} body_read_control_dispatch_delta={} body_read_control_owner_chunk_read_delta={} absent_device={} unknown_service={} inactive_device={} ambiguous_service={} unambiguous_label_status={} unambiguous_label_response_exact={} caller_destination={} ec003_dispatch_delta={} ec003_owner_chunk_read_delta={} remote_route_proved={} forged_endpoint_response_exact={} forged_endpoint_udp_datagrams={} forged_endpoint_tcp_connections={} preflight_cross_scope={} preflight_dispatch_delta={} preflight_owner_chunk_read_delta={} empty_body_status={} empty_body_response_exact={} empty_body_dispatch_delta={} empty_body_owner_chunk_read_delta={} failed_body={} failed_body_dispatch_delta={} failed_body_owner_chunk_read_delta={} empty_and_failed_body_distinct={} safe_no_body_status={} owner_loss_consumed_mutation={} owner_loss_consumed_mutation_repeat={} owner_loss_safe_unpolled={} owner_loss_failed_body={} owner_loss_dispatch_delta={} owner_loss_owner_chunk_read_delta={} mutation_reselected={} safe_retry_attempts={} safe_retry_succeeded={} safe_retry_dispatch_delta={} owner_process_killed={} inflight_kill_dispatch_delta={} inflight_kill_outcome_classified={} post_kill_probe={} post_kill_dispatch_delta={} owner_identity_required_fresh={} sibling_dispatch_delta_after_owner_kill={} sibling_canary_survived={} advertised_public_routes={} excluded_public_routes_typed={} route_boundary_dispatch_delta={} excluded_browser_boundary_recorded={} elapsed_ms={} cleanup_joined={}",
+                        evidence.relay_count,
+                        evidence.remote_ingress_is_not_owner,
+                        evidence.baseline_target_dispatches,
+                        evidence.baseline_sibling_dispatches,
+                        fail_closed_outcome(&evidence.body_read_control),
+                        evidence.body_read_control_dispatch_delta,
+                        evidence.body_read_control_owner_chunk_read_delta,
+                        fail_closed_outcome(&evidence.absent_device),
+                        fail_closed_outcome(&evidence.unknown_service),
+                        fail_closed_outcome(&evidence.inactive_device),
+                        fail_closed_outcome(&evidence.ambiguous_service),
+                        evidence.unambiguous_label_status,
+                        evidence.unambiguous_label_response_exact,
+                        fail_closed_outcome(&evidence.caller_destination),
+                        evidence.ec003_dispatch_delta,
+                        evidence.ec003_owner_chunk_read_delta,
+                        evidence.remote_route_proved,
+                        evidence.forged_endpoint_response_exact,
+                        evidence.forged_endpoint_udp_datagrams,
+                        evidence.forged_endpoint_tcp_connections,
+                        fail_closed_outcome(&evidence.preflight_cross_scope),
+                        evidence.preflight_dispatch_delta,
+                        evidence.preflight_owner_chunk_read_delta,
+                        evidence.empty_body_status,
+                        evidence.empty_body_response_exact,
+                        evidence.empty_body_dispatch_delta,
+                        evidence.empty_body_owner_chunk_read_delta,
+                        fail_closed_outcome(&evidence.failed_body),
+                        evidence.failed_body_dispatch_delta,
+                        evidence.failed_body_owner_chunk_read_delta,
+                        evidence.empty_and_failed_body_distinct,
+                        evidence.safe_no_body_status,
+                        fail_closed_outcome(&evidence.owner_loss_consumed_mutation),
+                        fail_closed_outcome(&evidence.owner_loss_consumed_mutation_repeat),
+                        fail_closed_outcome(&evidence.owner_loss_safe_unpolled),
+                        fail_closed_outcome(&evidence.owner_loss_failed_body),
+                        evidence.owner_loss_dispatch_delta,
+                        evidence.owner_loss_owner_chunk_read_delta,
+                        evidence.mutation_reselected,
+                        evidence.safe_retry_attempts,
+                        evidence.safe_retry_succeeded,
+                        evidence.safe_retry_dispatch_delta,
+                        evidence.owner_process_killed,
+                        evidence.inflight_kill_dispatch_delta,
+                        evidence.inflight_kill_outcome_classified,
+                        fail_closed_outcome(&evidence.post_kill_probe),
+                        evidence.post_kill_dispatch_delta,
+                        evidence.owner_identity_required_fresh,
+                        evidence.sibling_dispatch_delta_after_owner_kill,
+                        evidence.sibling_canary_survived,
+                        evidence.advertised_public_routes,
+                        evidence.excluded_public_routes_typed,
+                        evidence.route_boundary_dispatch_delta,
+                        evidence.excluded_browser_boundary_recorded,
+                        evidence.elapsed_ms,
+                        evidence.cleanup_joined,
+                    );
+                    Ok(())
+                }),
+                Err(_) => Err(HarnessError::Timeout(
+                    "M7 I04 fail-closed admission acceptance exceeded 300 seconds".to_owned(),
+                )),
+            }
+        }
         [command] if command == "verify-m7-device-revocation" => {
             tunnel_test_harness::production_cluster::verify_device_revocation().await.and_then(
                 |evidence| {
@@ -1055,6 +1132,26 @@ async fn main() -> ExitCode {
 /// Keep the process-status decision shared by the binary entrypoint and the
 /// false-evidence regression tests. The acceptance command still prints the
 /// original bounded error before returning this status.
+/// Render one fail-closed sentinel outcome as a compact, payload-free field.
+/// Only the status, the allowlisted bounded code and execution, the declared
+/// and delivered body byte counts, and the elapsed milliseconds appear.
+fn fail_closed_outcome(
+    outcome: &tunnel_test_harness::production_cluster::SentinelOutcome,
+) -> String {
+    format!(
+        "{}/{}:{}:{}:declared={}:delivered={}:failed_stream={}:transport_failed={}:{}ms",
+        outcome.label,
+        outcome.status,
+        outcome.code.unwrap_or("none"),
+        outcome.execution.unwrap_or("none"),
+        outcome.declared_body_bytes,
+        outcome.delivered_body_bytes,
+        outcome.body_stream_failed,
+        outcome.transport_failed,
+        outcome.elapsed_ms,
+    )
+}
+
 fn command_exit_code(result: &Result<(), HarnessError>) -> ExitCode {
     acceptance_command_exit_code(result)
 }
@@ -1248,7 +1345,7 @@ fn require_m7_pressure_evidence(
 
 fn print_help() {
     println!(
-        "Usage: tunnel-test-harness verify\n       tunnel-test-harness verify-m2\n       tunnel-test-harness verify-m2-default\n       tunnel-test-harness verify-m2-faults\n       tunnel-test-harness verify-m7-transport\n       tunnel-test-harness verify-m7-redis-tls\n       tunnel-test-harness verify-m7-cluster\n       tunnel-test-harness verify-m7-production\n       tunnel-test-harness verify-m7-i08-synthetic-rotation\n       tunnel-test-harness verify-m7-i08-goaway-rotation\n       tunnel-test-harness verify-m7-i08-rotation-faults\n       tunnel-test-harness verify-m7-admission-framing\n       tunnel-test-harness verify-m7-admission\n       tunnel-test-harness verify-m7-device-revocation\n       tunnel-test-harness verify-m7-credential-expiry-rotation\n       tunnel-test-harness verify-m7-redis-partition\n       tunnel-test-harness verify-m7-process-pause\n       tunnel-test-harness verify-m7-pressure\n       tunnel-test-harness verify-m7-c11-diagnostics\n       tunnel-test-harness verify-m7-lifecycle\n       tunnel-test-harness verify-m7-side-effect\n       tunnel-test-harness verify-m7-side-effect-late\n       tunnel-test-harness verify-m7-public-abandoned-upgrade\n       tunnel-test-harness verify-m7-owner-loss-effect\n       tunnel-test-harness verify-m7-timing-boundaries\n       tunnel-test-harness verify-m7-peer-fragmentation\n       tunnel-test-harness verify-m7-pending-owner\n       tunnel-test-harness verify-m7-successor-pending-owner\n       tunnel-test-harness verify-m7-concurrent-load\n       tunnel-test-harness verify-m7-key-rotation\n       tunnel-test-harness verify-m7-peer-readiness\n       tunnel-test-harness verify-m7-peer-capacity\n       tunnel-test-harness verify-m7-owner-local-capacity\n       tunnel-test-harness verify-m7-owner-contention\n       tunnel-test-harness verify-m7-trust-expiry\n       tunnel-test-harness redis-restart-{{seed|check}} --redis-url URL --namespace NAME --receipt-file PATH\n\nverify, verify-m2, and verify-m7-redis-tls commands require TEST_REDIS_URL and built workspace binaries.\nRuns real Redis, HTTPS, device mTLS WebSocket, CLI and HTTP/3 acceptance checks.\nverify-m2 drives a long-lived public echo WebSocket through accelerated real rotations;\nverify-m2-default repeats the same flow at the 300-second policy.\nverify-m2-faults closes exact control/data/candidate sockets and checks explicit recovery outcomes.\nverify-m7-transport proves bounded peer mTLS/HTTP3 duplex exchange and negative identity cases.\nverify-m7-redis-tls proves the authenticated Redis TLS catalog connection and rejection cases.\nverify-m7-cluster connects three real relay peer listeners through signed membership,\nRedis owner fencing, control/data replacement generations and consumer ingress.\nverify-m7-production exercises the production relay actor, signed Redis directory,\nclient WebSockets and public consumer routing across three relays.\nverify-m7-i08-synthetic-rotation verifies a real CLI and checksummed synthetic Echo records across three same-owner rotations.\nverify-m7-admission exercises public negative admission, route allowlisting,\nforged identity-header rejection and selected-owner failure across three relays.\nverify-m7-device-revocation proves live Redis device-credential revocation,\nexisting-stream withdrawal, exact no-owner admission, and tenant sibling survival.\nverify-m7-credential-expiry-rotation proves a sixteen-second consumer credential\nexpires inside one exact candidate/old scheduled rotation and refresh challenge\nafter admitted baseline echo, with issuer/audience/subject identity and typed\nterminal checks.\nverify-m7-pressure exercises bounded production resource pressure, cancellation, and recovery.\nverify-m7-lifecycle holds one consumer response path and checks cancellation, sibling survival, and fresh-stream recovery.\nverify-m7-side-effect-late proves owner-side receipt and terminal rejection of one late DATA/FIN pair after a selected peer fault.\nverify-m7-public-abandoned-upgrade proves real owner-local and remote public WebSocket upgrades after admission, no 101 response, exact registration reclamation, capacity rejection, and sibling recovery.\nverify-m7-key-rotation exercises bounded recovery after peer-pin withdrawal during scheduled rotation.\nverify-m7-peer-readiness exercises authenticated peer path loss and fresh-path readiness recovery.\nverify-m7-owner-contention exercises concurrent CLI claims, terminal rejection and fenced successor cleanup.\nverify-m7-trust-expiry exercises signed peer-key expiry without a Redis invalidation hint,\npooled-stream closure, unrelated peer survival, and fresh signed-trust recovery.\nUses isolated Redis namespaces, ephemeral certificates and synthetic echo data.\nRun restart probes through scripts/m1-redis-restart-verify.sh.\nSet M2_HARNESS_TIMEOUT_SECONDS to override a bounded M2 command timeout."
+        "Usage: tunnel-test-harness verify\n       tunnel-test-harness verify-m2\n       tunnel-test-harness verify-m2-default\n       tunnel-test-harness verify-m2-faults\n       tunnel-test-harness verify-m7-transport\n       tunnel-test-harness verify-m7-redis-tls\n       tunnel-test-harness verify-m7-cluster\n       tunnel-test-harness verify-m7-production\n       tunnel-test-harness verify-m7-i08-synthetic-rotation\n       tunnel-test-harness verify-m7-i08-goaway-rotation\n       tunnel-test-harness verify-m7-i08-rotation-faults\n       tunnel-test-harness verify-m7-admission-framing\n       tunnel-test-harness verify-m7-admission\n       tunnel-test-harness verify-m7-i04-fail-closed\n       tunnel-test-harness verify-m7-device-revocation\n       tunnel-test-harness verify-m7-credential-expiry-rotation\n       tunnel-test-harness verify-m7-redis-partition\n       tunnel-test-harness verify-m7-process-pause\n       tunnel-test-harness verify-m7-pressure\n       tunnel-test-harness verify-m7-c11-diagnostics\n       tunnel-test-harness verify-m7-lifecycle\n       tunnel-test-harness verify-m7-side-effect\n       tunnel-test-harness verify-m7-side-effect-late\n       tunnel-test-harness verify-m7-public-abandoned-upgrade\n       tunnel-test-harness verify-m7-owner-loss-effect\n       tunnel-test-harness verify-m7-timing-boundaries\n       tunnel-test-harness verify-m7-peer-fragmentation\n       tunnel-test-harness verify-m7-pending-owner\n       tunnel-test-harness verify-m7-successor-pending-owner\n       tunnel-test-harness verify-m7-concurrent-load\n       tunnel-test-harness verify-m7-key-rotation\n       tunnel-test-harness verify-m7-peer-readiness\n       tunnel-test-harness verify-m7-peer-capacity\n       tunnel-test-harness verify-m7-owner-local-capacity\n       tunnel-test-harness verify-m7-owner-contention\n       tunnel-test-harness verify-m7-trust-expiry\n       tunnel-test-harness redis-restart-{{seed|check}} --redis-url URL --namespace NAME --receipt-file PATH\n\nverify, verify-m2, and verify-m7-redis-tls commands require TEST_REDIS_URL and built workspace binaries.\nRuns real Redis, HTTPS, device mTLS WebSocket, CLI and HTTP/3 acceptance checks.\nverify-m2 drives a long-lived public echo WebSocket through accelerated real rotations;\nverify-m2-default repeats the same flow at the 300-second policy.\nverify-m2-faults closes exact control/data/candidate sockets and checks explicit recovery outcomes.\nverify-m7-transport proves bounded peer mTLS/HTTP3 duplex exchange and negative identity cases.\nverify-m7-redis-tls proves the authenticated Redis TLS catalog connection and rejection cases.\nverify-m7-cluster connects three real relay peer listeners through signed membership,\nRedis owner fencing, control/data replacement generations and consumer ingress.\nverify-m7-production exercises the production relay actor, signed Redis directory,\nclient WebSockets and public consumer routing across three relays.\nverify-m7-i08-synthetic-rotation verifies a real CLI and checksummed synthetic Echo records across three same-owner rotations.\nverify-m7-admission exercises public negative admission, route allowlisting,\nforged identity-header rejection and selected-owner failure across three relays.\nverify-m7-i04-fail-closed proves the fail-closed admission, readiness, routing and\nfallback matrix with a request-body sentinel: absent/unknown/inactive/ambiguous and\ncaller-destination targets rejected before any body read or owner selection, a\ncaller-named peer address never reached, an empty body distinguished from a failed\nbody, consumed/unpolled/failed bodies under a real owner process loss with no\nreselection, one bounded safe retry bridging successor readiness, and the excluded\nbrowser route boundary recorded.\nverify-m7-device-revocation proves live Redis device-credential revocation,\nexisting-stream withdrawal, exact no-owner admission, and tenant sibling survival.\nverify-m7-credential-expiry-rotation proves a sixteen-second consumer credential\nexpires inside one exact candidate/old scheduled rotation and refresh challenge\nafter admitted baseline echo, with issuer/audience/subject identity and typed\nterminal checks.\nverify-m7-pressure exercises bounded production resource pressure, cancellation, and recovery.\nverify-m7-lifecycle holds one consumer response path and checks cancellation, sibling survival, and fresh-stream recovery.\nverify-m7-side-effect-late proves owner-side receipt and terminal rejection of one late DATA/FIN pair after a selected peer fault.\nverify-m7-public-abandoned-upgrade proves real owner-local and remote public WebSocket upgrades after admission, no 101 response, exact registration reclamation, capacity rejection, and sibling recovery.\nverify-m7-key-rotation exercises bounded recovery after peer-pin withdrawal during scheduled rotation.\nverify-m7-peer-readiness exercises authenticated peer path loss and fresh-path readiness recovery.\nverify-m7-owner-contention exercises concurrent CLI claims, terminal rejection and fenced successor cleanup.\nverify-m7-trust-expiry exercises signed peer-key expiry without a Redis invalidation hint,\npooled-stream closure, unrelated peer survival, and fresh signed-trust recovery.\nUses isolated Redis namespaces, ephemeral certificates and synthetic echo data.\nRun restart probes through scripts/m1-redis-restart-verify.sh.\nSet M2_HARNESS_TIMEOUT_SECONDS to override a bounded M2 command timeout."
     );
 }
 

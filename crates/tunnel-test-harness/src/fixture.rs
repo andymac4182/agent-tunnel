@@ -262,6 +262,65 @@ impl FixtureTopology {
         &self.devices_b[0]
     }
 
+    /// Append a second active `echo` service to `device_id` so the public
+    /// service-type label resolves to more than one live target.
+    ///
+    /// The duplicate receives the same grants as the device's primary service,
+    /// so neither candidate is less authorized than the other and the only
+    /// correct outcome for a label request is an explicit ambiguous rejection
+    /// rather than an arbitrary selection.  The caller must apply this before
+    /// the harness performs its single authoritative catalog seed; the
+    /// returned identifier is the duplicate, never the primary.
+    pub fn push_ambiguous_echo_service(
+        &self,
+        fixture: &mut CatalogFixture,
+        device_id: Uuid,
+    ) -> Result<Uuid> {
+        let device = self
+            .all_devices()
+            .find(|device| device.id == device_id)
+            .ok_or_else(|| {
+                HarnessError::InvalidInput(format!(
+                    "ambiguous echo service references unknown device {device_id}"
+                ))
+            })?;
+        let primary = self.service_ids.get(&device_id).copied().ok_or_else(|| {
+            HarnessError::InvalidInput(format!("device {device_id} has no service id"))
+        })?;
+        let duplicate = Uuid::new_v4();
+        if duplicate == primary {
+            return Err(HarnessError::InvalidInput(
+                "ambiguous echo service collided with the primary service id".to_owned(),
+            ));
+        }
+        fixture.services.push(ServiceSpec {
+            tenant_id: device.tenant_id,
+            device_id,
+            service_id: duplicate,
+            service_type: "echo".to_owned(),
+            display_name: "Synthetic duplicate binary echo".to_owned(),
+            capabilities: serde_json::json!({"operations": ["echo:invoke"]}),
+            version: 1,
+            active: true,
+        });
+        let mirrored = fixture
+            .grants
+            .iter()
+            .filter(|grant| grant.device_id == device_id && grant.service_id == primary)
+            .map(|grant| GrantSpec {
+                service_id: duplicate,
+                ..grant.clone()
+            })
+            .collect::<Vec<_>>();
+        if mirrored.is_empty() {
+            return Err(HarnessError::InvalidInput(format!(
+                "device {device_id} has no primary echo grant to mirror"
+            )));
+        }
+        fixture.grants.extend(mirrored);
+        Ok(duplicate)
+    }
+
     /// Convert the topology into the production catalog's seed contract.
     /// This does not write anything itself; callers must use the real
     /// `Catalog::seed_fixture` on the production Redis backend or another
