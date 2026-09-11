@@ -14,6 +14,7 @@ use tunnel_protocol::rotation_control::RotationAttemptIdentity;
 use crate::{
     consumer_write_diagnostics::ConsumerWriteDiagnosticSnapshot,
     peer_consumer_transport_diagnostics::PeerConsumerDiagnosticSnapshot,
+    peer_fault_diagnostics::PeerFaultDiagnosticSnapshot,
     peer_transport_diagnostics::PeerTransportDiagnosticSnapshot, wire,
 };
 
@@ -455,6 +456,10 @@ pub struct RelaySnapshot {
     /// This is separate from device-carrier diagnostics so a data-carrier
     /// failure cannot be misread as a public response-writer timeout.
     pub peer_consumer_diagnostics: PeerConsumerDiagnosticSnapshot,
+    /// Bounded `(role, stage, cause)` tuples for every peer fault this relay
+    /// observed as ingress or owner, with correlation identifiers only.  The
+    /// tuple is recorded before the owner state it refers to is removed.
+    pub peer_fault_diagnostics: PeerFaultDiagnosticSnapshot,
     /// Bounded deadline events retained after the corresponding owner session
     /// is removed.  The list is diagnostics-only and does not alter deadline
     /// or cleanup behavior.

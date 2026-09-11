@@ -512,7 +512,8 @@ fn peer_readiness_error(error: PeerReadinessError) -> PeerRuntimeError {
 }
 
 /// The bounded stage of one direct peer-open attempt.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 #[repr(u8)]
 pub enum PeerOpenDiagnosticStage {
     /// Validating readiness, route, and envelope identity locally.
@@ -529,11 +530,43 @@ pub enum PeerOpenDiagnosticStage {
     EnvelopeSend = 5,
     /// Returning a fully initialized exchange to the caller.
     Complete = 6,
+    /// Waiting for the owner's HTTP/3 response head after the envelope was
+    /// sent.  An owner admission decision observed here is attributed to
+    /// [`Self::Owner`] by the fault observer.
+    Head = 7,
+    /// Forwarding or receiving bounded consumer body records after the head
+    /// was accepted.
+    Body = 8,
+    /// Re-reading the authoritative owner claim or its lease before the public
+    /// stream is committed, or refusing a forwarded request whose owner lease
+    /// has lapsed.
+    Lease = 9,
+    /// The selected owner's own admission decision: owner-side routing,
+    /// scope, credential and stream-limit checks, or an owner status the
+    /// ingress observed after transport completed.
+    Owner = 10,
 }
 
-impl fmt::Display for PeerOpenDiagnosticStage {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
+impl PeerOpenDiagnosticStage {
+    /// Every stage in dispatch order, for bounded diagnostics tables.
+    pub const ALL: [Self; 11] = [
+        Self::Validation,
+        Self::PoolConnect,
+        Self::StreamPermitCheckout,
+        Self::SenderLock,
+        Self::H3Dispatch,
+        Self::EnvelopeSend,
+        Self::Complete,
+        Self::Head,
+        Self::Body,
+        Self::Lease,
+        Self::Owner,
+    ];
+
+    /// The stable redacted label used in snapshots and diagnostics.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
             Self::Validation => "validation",
             Self::PoolConnect => "pool_connect",
             Self::StreamPermitCheckout => "stream_permit_checkout",
@@ -541,7 +574,17 @@ impl fmt::Display for PeerOpenDiagnosticStage {
             Self::H3Dispatch => "h3_dispatch",
             Self::EnvelopeSend => "envelope_send",
             Self::Complete => "complete",
-        })
+            Self::Head => "head",
+            Self::Body => "body",
+            Self::Lease => "lease",
+            Self::Owner => "owner",
+        }
+    }
+}
+
+impl fmt::Display for PeerOpenDiagnosticStage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
     }
 }
 
@@ -580,8 +623,21 @@ impl PeerOpenDiagnostic {
             },
             5 => PeerOpenDiagnosticStage::EnvelopeSend,
             6 => PeerOpenDiagnosticStage::Complete,
+            7 => PeerOpenDiagnosticStage::Head,
+            8 => PeerOpenDiagnosticStage::Body,
+            9 => PeerOpenDiagnosticStage::Lease,
+            10 => PeerOpenDiagnosticStage::Owner,
             _ => PeerOpenDiagnosticStage::Validation,
         }
+    }
+
+    /// Mark a dispatch or owner stage outside the transport open path.
+    ///
+    /// The transport-owned checkout/lock/dispatch stages are set by
+    /// `open_with_diagnostics`; callers use this for the head, body, lease
+    /// and owner stages they reach themselves.
+    pub fn mark(&self, stage: PeerOpenDiagnosticStage) {
+        self.set_runtime_stage(stage);
     }
 
     fn set_runtime_stage(&self, stage: PeerOpenDiagnosticStage) {
@@ -1254,8 +1310,9 @@ impl PeerRuntime {
         barrier: &PeerAdmissionBarrier,
         scope: PeerAdmissionScope,
         budget: Duration,
+        diagnostic: Option<&PeerOpenDiagnostic>,
     ) -> Result<PeerExchange, PeerRuntimeError> {
-        self.open_inner(route, envelope, None, Some((barrier, scope, budget)))
+        self.open_inner(route, envelope, diagnostic, Some((barrier, scope, budget)))
             .await
     }
 
@@ -1486,14 +1543,43 @@ impl PeerRuntime {
         envelope: RequestEnvelope,
         body: &[u8],
     ) -> Result<Vec<u8>, PeerRuntimeError> {
+        self.forward_unary_inner(route, envelope, body, None).await
+    }
+
+    /// Forward one bounded consumer request while recording the head and
+    /// body stages on the caller's observer in addition to the open stages.
+    pub async fn forward_unary_with_diagnostics(
+        &self,
+        route: &OwnerRoute,
+        envelope: RequestEnvelope,
+        body: &[u8],
+        diagnostic: &PeerOpenDiagnostic,
+    ) -> Result<Vec<u8>, PeerRuntimeError> {
+        self.forward_unary_inner(route, envelope, body, Some(diagnostic))
+            .await
+    }
+
+    async fn forward_unary_inner(
+        &self,
+        route: &OwnerRoute,
+        envelope: RequestEnvelope,
+        body: &[u8],
+        diagnostic: Option<&PeerOpenDiagnostic>,
+    ) -> Result<Vec<u8>, PeerRuntimeError> {
         let framed_body = frame_consumer_unary_body(body)?;
-        let exchange = self.open(route, envelope).await?;
+        let exchange = self.open_inner(route, envelope, diagnostic, None).await?;
         let (mut send, mut recv) = exchange.split();
+        if let Some(diagnostic) = diagnostic {
+            diagnostic.mark(PeerOpenDiagnosticStage::Head);
+        }
         // The owner sends response headers before it consumes the request
         // body.  Accept them first so a committed-but-not-ready owner can
         // return its bounded retry classification without receiving any
         // application bytes.
         recv.accept_response().await?;
+        if let Some(diagnostic) = diagnostic {
+            diagnostic.mark(PeerOpenDiagnosticStage::Body);
+        }
         for chunk in framed_body.chunks(tunnel_cluster::peer_frame::MAX_CONSUMER_CHUNK_BODY) {
             send.send_message(PeerRecordKind::ConsumerChunk, chunk)
                 .await?;

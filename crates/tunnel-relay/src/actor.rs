@@ -55,7 +55,8 @@ use crate::{
         PeerConsumerDiagnosticContext, PeerConsumerDiagnosticH3Code, PeerConsumerDiagnosticRole,
         PeerConsumerDiagnostics,
     },
-    peer_runtime::peer_readiness::PeerListenerState,
+    peer_fault_diagnostics::{PeerFaultCause, PeerFaultDiagnostics, PeerFaultObserver},
+    peer_runtime::{PeerOpenDiagnosticStage, PeerRuntimeError, peer_readiness::PeerListenerState},
     peer_transport_diagnostics::{
         PeerTransportDiagnosticOutcome, PeerTransportDiagnosticRole, PeerTransportDiagnostics,
     },
@@ -1763,6 +1764,7 @@ pub struct RelayHandle {
     consumer_write_diagnostics: ConsumerWriteDiagnostics,
     peer_transport_diagnostics: PeerTransportDiagnostics,
     peer_consumer_diagnostics: PeerConsumerDiagnostics,
+    peer_fault_diagnostics: PeerFaultDiagnostics,
     actor_completion: ActorCompletion,
     maintenance_completion: ActorCompletion,
     background_failure: Arc<AtomicBool>,
@@ -1798,6 +1800,7 @@ impl RelayHandle {
             consumer_write_diagnostics: ConsumerWriteDiagnostics::default(),
             peer_transport_diagnostics: PeerTransportDiagnostics::default(),
             peer_consumer_diagnostics: PeerConsumerDiagnostics::default(),
+            peer_fault_diagnostics: PeerFaultDiagnostics::default(),
             actor_completion: actor_completion.clone(),
             maintenance_completion: maintenance_completion.clone(),
             background_failure: background_failure.clone(),
@@ -1828,6 +1831,7 @@ impl RelayHandle {
             consumer_write_diagnostics: handle.consumer_write_diagnostics.clone(),
             peer_transport_diagnostics: handle.peer_transport_diagnostics.clone(),
             peer_consumer_diagnostics: handle.peer_consumer_diagnostics.clone(),
+            peer_fault_diagnostics: handle.peer_fault_diagnostics.clone(),
             cleanup_dispatcher: Some(cleanup.dispatcher()),
             cleanup: Some(cleanup),
             background_tasks: JoinSet::new(),
@@ -2193,6 +2197,25 @@ impl RelayHandle {
             .record(context, role, outcome, h3_code);
     }
 
+    /// Record one bounded peer stage/cause tuple for the request tracked by
+    /// `observer`, at most once per observer, without entering the actor
+    /// mailbox.  Callers invoke this before the owner state the tuple refers
+    /// to is unregistered so the fault survives cleanup.
+    pub(crate) fn record_peer_fault(&self, observer: &PeerFaultObserver, error: &PeerRuntimeError) {
+        observer.record_error(&self.peer_fault_diagnostics, error);
+    }
+
+    /// Record an explicit peer stage/cause tuple that has no typed error, such
+    /// as an owner-side admission refusal answered with a bounded status.
+    pub(crate) fn record_peer_fault_tuple(
+        &self,
+        observer: &PeerFaultObserver,
+        stage: PeerOpenDiagnosticStage,
+        cause: PeerFaultCause,
+    ) {
+        observer.record_tuple(&self.peer_fault_diagnostics, stage, cause);
+    }
+
     /// Redacted diagnostics for an internal harness.  No route exposes this
     /// method; callers need a clone of the typed relay handle.
     pub async fn snapshot(&self) -> Result<RelaySnapshot, RelayError> {
@@ -2400,6 +2423,7 @@ struct RelayActor {
     consumer_write_diagnostics: ConsumerWriteDiagnostics,
     peer_transport_diagnostics: PeerTransportDiagnostics,
     peer_consumer_diagnostics: PeerConsumerDiagnostics,
+    peer_fault_diagnostics: PeerFaultDiagnostics,
     cleanup_dispatcher: Option<CleanupDispatcher>,
     cleanup: Option<CleanupWorker>,
     background_tasks: JoinSet<()>,
@@ -12120,6 +12144,7 @@ impl RelayActor {
             consumer_write_diagnostics: self.consumer_write_diagnostics.snapshot(),
             peer_transport_diagnostics: self.peer_transport_diagnostics.snapshot(),
             peer_consumer_diagnostics: self.peer_consumer_diagnostics.snapshot(),
+            peer_fault_diagnostics: self.peer_fault_diagnostics.snapshot(),
             rotation_deadline_events: self.rotation_deadline_events.iter().cloned().collect(),
             session_terminal_events: self.session_terminal_events.iter().cloned().collect(),
             stream_terminal_events: self.stream_terminal_events.iter().cloned().collect(),
@@ -13565,6 +13590,7 @@ mod stream_identity_tests {
             consumer_write_diagnostics: super::ConsumerWriteDiagnostics::default(),
             peer_transport_diagnostics: super::PeerTransportDiagnostics::default(),
             peer_consumer_diagnostics: super::PeerConsumerDiagnostics::default(),
+            peer_fault_diagnostics: super::PeerFaultDiagnostics::default(),
             cleanup_dispatcher: None,
             cleanup: None,
             background_tasks: tokio::task::JoinSet::new(),

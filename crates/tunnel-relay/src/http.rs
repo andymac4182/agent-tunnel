@@ -437,10 +437,12 @@ use crate::{
         PeerConsumerDiagnosticContext, PeerConsumerDiagnosticH3Code, PeerConsumerDiagnosticRole,
         classify_h3_code,
     },
+    peer_fault_diagnostics::{PeerFaultCause, PeerFaultContext, PeerFaultObserver, PeerFaultRole},
     peer_runtime::{
         InboundPeerRequest, OWNER_NOT_READY_RETRY_AFTER_MS, PeerExchangeRecv, PeerExchangeSend,
-        PeerIngressHandler, PeerRuntime, PeerRuntimeError, STREAM_LIMIT_RETRY_AFTER_MS,
-        device_authentication_context, forwarded_consumer_bearer,
+        PeerIngressHandler, PeerOpenDiagnostic, PeerOpenDiagnosticStage, PeerRuntime,
+        PeerRuntimeError, STREAM_LIMIT_RETRY_AFTER_MS, device_authentication_context,
+        forwarded_consumer_bearer,
     },
     peer_transport_diagnostics::{PeerTransportDiagnosticOutcome, PeerTransportDiagnosticRole},
     routing::{
@@ -958,9 +960,22 @@ async fn echo(
     let bearer_token = forwarded_bearer_token(&headers).to_owned();
     if let Some(peer) = state.peer.clone() {
         let scope = OwnerScope::new(grant.tenant_id, device_id);
+        // One bounded stage/cause tuple per dispatch attempt.  The observer
+        // starts unrouted and gains the owner identity once selected, so a
+        // routing fault and an owner fault carry exactly the identifiers the
+        // relay had at that stage.
+        let mut fault = PeerFaultObserver::new(
+            PeerFaultRole::Ingress,
+            PeerFaultContext::unrouted(grant.tenant_id, device_id, Some(service_id)),
+        );
         match peer.resolve(scope, Utc::now()).await {
             Ok(route @ OwnerRoute::Remote { .. }) => {
                 let request_id = Uuid::new_v4().to_string();
+                fault.set_context(PeerFaultContext::for_owner(
+                    route.owner_token(),
+                    Some(service_id),
+                    Some(request_id.clone()),
+                ));
                 let destination = Destination::new(route.owner_token().clone(), service_id);
                 let forwarded =
                     match forwarded_consumer_bearer(&bearer_token, route.owner_token().clone()) {
@@ -990,7 +1005,10 @@ async fn echo(
                         },
                     ),
                 );
-                match peer.forward_unary(&route, envelope, &body).await {
+                match peer
+                    .forward_unary_with_diagnostics(&route, envelope, &body, fault.diagnostic())
+                    .await
+                {
                     Ok(bytes) => {
                         return (
                             StatusCode::OK,
@@ -999,11 +1017,17 @@ async fn echo(
                         )
                             .into_response();
                     }
-                    Err(error) => return peer_failure_response(error),
+                    Err(error) => {
+                        state.handle.record_peer_fault(&fault, &error);
+                        return peer_failure_response(error);
+                    }
                 }
             }
             Ok(OwnerRoute::Local { .. }) => {}
-            Err(error) => return peer_failure_response(error),
+            Err(error) => {
+                state.handle.record_peer_fault(&fault, &error);
+                return peer_failure_response(error);
+            }
         }
     }
     let result = timeout(
@@ -1075,6 +1099,7 @@ impl Drop for RemoteConsumerAdmission {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn open_remote_consumer_admission(
     peer: &PeerRuntime,
     route: &OwnerRoute,
@@ -1083,6 +1108,7 @@ async fn open_remote_consumer_admission(
     request_id: String,
     peer_admission_barrier: Option<(&PeerAdmissionBarrier, PeerAdmissionScope)>,
     peer_admission_budget: Duration,
+    diagnostic: &PeerOpenDiagnostic,
 ) -> Result<RemoteConsumerAdmission, PeerRuntimeError> {
     let destination = Destination::new(route.owner_token().clone(), service_id);
     let bearer = forwarded_consumer_bearer(bearer_token, route.owner_token().clone())?;
@@ -1101,13 +1127,22 @@ async fn open_remote_consumer_admission(
         }),
     );
     let exchange = if let Some((barrier, scope)) = peer_admission_barrier {
-        peer.open_with_admission_barrier(route, envelope, barrier, scope, peer_admission_budget)
-            .await?
+        peer.open_with_admission_barrier(
+            route,
+            envelope,
+            barrier,
+            scope,
+            peer_admission_budget,
+            Some(diagnostic),
+        )
+        .await?
     } else {
-        peer.open(route, envelope).await?
+        peer.open_with_diagnostics(route, envelope, diagnostic)
+            .await?
     };
     let (send, recv) = exchange.split();
     let mut admission = RemoteConsumerAdmission::new(request_id, send, recv);
+    diagnostic.mark(PeerOpenDiagnosticStage::Head);
     admission.accept_response().await?;
     Ok(admission)
 }
@@ -1261,31 +1296,41 @@ async fn echo_stream(
     let dispatch_peer = state.peer.clone();
     let mut selected_route = None;
     let mut remote = None;
+    let mut fault = PeerFaultObserver::new(
+        PeerFaultRole::Ingress,
+        PeerFaultContext::unrouted(grant.tenant_id, device_id, Some(service_id)),
+    );
     if let Some(peer) = state.peer.clone() {
         match peer
             .resolve(OwnerScope::new(grant.tenant_id, device_id), Utc::now())
             .await
         {
             Ok(route @ OwnerRoute::Remote { .. }) => {
-                let peer_admission_barrier = if let Some(barrier) =
-                    state.peer_admission_barrier.as_ref()
-                {
-                    let scope = match PeerAdmissionScope::from_route(&route, service_id) {
-                        Some(scope) => scope,
-                        None => {
-                            return peer_failure_response(PeerRuntimeError::PeerIdentityMismatch);
-                        }
+                let request_id = Uuid::new_v4().to_string();
+                fault.set_context(PeerFaultContext::for_owner(
+                    route.owner_token(),
+                    Some(service_id),
+                    Some(request_id.clone()),
+                ));
+                let peer_admission_barrier =
+                    if let Some(barrier) = state.peer_admission_barrier.as_ref() {
+                        let scope = match PeerAdmissionScope::from_route(&route, service_id) {
+                            Some(scope) => scope,
+                            None => {
+                                let error = PeerRuntimeError::PeerIdentityMismatch;
+                                handle.record_peer_fault(&fault, &error);
+                                return peer_failure_response(error);
+                            }
+                        };
+                        Some((barrier.as_ref(), scope))
+                    } else {
+                        None
                     };
-                    Some((barrier.as_ref(), scope))
-                } else {
-                    None
-                };
                 // The public WebSocket is not upgraded until this authenticated
                 // peer admission completes.  Retain the same request identity
                 // on a typed planned-drain failure so the bounded diagnostic
                 // survives this pre-upgrade boundary; no payload or transport
                 // text crosses the snapshot boundary.
-                let request_id = Uuid::new_v4().to_string();
                 let admission = match timeout(
                     state.limits.operation_timeout,
                     open_remote_consumer_admission(
@@ -1296,6 +1341,7 @@ async fn echo_stream(
                         request_id.clone(),
                         peer_admission_barrier,
                         state.limits.operation_timeout,
+                        fault.diagnostic(),
                     ),
                 )
                 .await
@@ -1322,10 +1368,20 @@ async fn echo_stream(
                                     None,
                                 );
                             }
+                            handle.record_peer_fault(&fault, &error);
                             return peer_failure_response(error);
                         }
                     },
-                    Err(_) => return peer_failure_response(PeerRuntimeError::Closed),
+                    Err(_) => {
+                        // The relay's own operation deadline elapsed; the
+                        // observer still reports the exact stage reached.
+                        handle.record_peer_fault_tuple(
+                            &fault,
+                            fault.stage(),
+                            PeerFaultCause::Deadline,
+                        );
+                        return peer_failure_response(PeerRuntimeError::Closed);
+                    }
                 };
                 selected_route = Some(route.clone());
                 remote = Some((route, admission));
@@ -1333,7 +1389,10 @@ async fn echo_stream(
             Ok(route @ OwnerRoute::Local { .. }) => {
                 selected_route = Some(route);
             }
-            Err(error) => return peer_failure_response(error),
+            Err(error) => {
+                handle.record_peer_fault(&fault, &error);
+                return peer_failure_response(error);
+            }
         }
     }
     let local = if remote.is_none() {
@@ -1378,6 +1437,10 @@ async fn echo_stream(
         && let Err(error) =
             revalidate_owner_before_upgrade(catalog, route, state.limits.operation_timeout).await
     {
+        if matches!(route, OwnerRoute::Remote { .. }) {
+            fault.mark(PeerOpenDiagnosticStage::Lease);
+            handle.record_peer_fault(&fault, &error);
+        }
         return peer_failure_response(error);
     }
     upgrade
@@ -1570,6 +1633,11 @@ async fn handle_remote_consumer_stream(
 ) {
     let (request_id, mut send, mut recv) = admission.into_parts();
     let owner = route.owner_token();
+    let fault = PeerFaultObserver::new(
+        PeerFaultRole::Ingress,
+        PeerFaultContext::for_owner(owner, Some(service_id), Some(request_id.clone())),
+    );
+    fault.mark(PeerOpenDiagnosticStage::Body);
     let diagnostic_context = PeerConsumerDiagnosticContext {
         tenant_id: owner.tenant_id,
         device_id: owner.device_id,
@@ -1723,6 +1791,7 @@ async fn handle_remote_consumer_stream(
                             outcome,
                             h3_code,
                         );
+                        handle.record_peer_fault(&fault, &error);
                         tracing::debug!(
                             error = ?error,
                             body_len,
@@ -1798,6 +1867,7 @@ async fn handle_remote_consumer_stream(
                             outcome,
                             h3_code,
                         );
+                        handle.record_peer_fault(&fault, &error);
                         tracing::debug!(error = %error, phase = "consumer_peer_receive", "remote consumer receive failed");
                         break;
                     }
@@ -2396,6 +2466,50 @@ async fn handle_peer_ingress(
     local_node_id: &str,
     local_boot_id: &str,
 ) -> Result<(), PeerRuntimeError> {
+    // The owner-side observer starts at the `owner` stage: every check
+    // before the stream is split is this relay's own admission decision.
+    // Handlers that unregister owner state record their tuple themselves
+    // before that removal; this outer mapping only classifies faults that
+    // escaped without a recorded tuple.
+    let envelope = request.envelope();
+    let service_id = match &envelope.request {
+        InternalRequest::ConsumerStreams(_) => Some(envelope.destination.service_id),
+        _ => None,
+    };
+    let fault = PeerFaultObserver::new(
+        PeerFaultRole::Owner,
+        PeerFaultContext::for_owner(
+            &envelope.destination.owner_token,
+            service_id,
+            Some(envelope.request_id.clone()),
+        ),
+    );
+    fault.mark(PeerOpenDiagnosticStage::Owner);
+    let result = handle_peer_ingress_inner(
+        request,
+        &handle,
+        catalog,
+        oidc,
+        local_node_id,
+        local_boot_id,
+        &fault,
+    )
+    .await;
+    if let Err(error) = &result {
+        handle.record_peer_fault(&fault, error);
+    }
+    result
+}
+
+async fn handle_peer_ingress_inner(
+    request: InboundPeerRequest,
+    handle: &RelayHandle,
+    catalog: SharedCatalog,
+    oidc: Arc<OidcVerifier>,
+    local_node_id: &str,
+    local_boot_id: &str,
+    fault: &PeerFaultObserver,
+) -> Result<(), PeerRuntimeError> {
     let envelope = request.envelope().clone();
     let destination = envelope.destination.clone();
     let now = Utc::now();
@@ -2407,10 +2521,17 @@ async fn handle_peer_ingress(
     if owner.token != destination.owner_token
         || owner.token.node_id != local_node_id
         || owner.token.boot_id != local_boot_id
-        || owner.lease_expires_at <= now
     {
         return Err(PeerRuntimeError::Membership(
             "peer request is not for this owner".to_owned(),
+        ));
+    }
+    if owner.lease_expires_at <= now {
+        // The claim is this relay's, but its Redis lease has lapsed: a
+        // distinct bounded stage from an owner mismatch.
+        fault.mark(PeerOpenDiagnosticStage::Lease);
+        return Err(PeerRuntimeError::Membership(
+            "peer owner lease has expired".to_owned(),
         ));
     }
     let verified_peer = VerifiedPeerIdentity::from_verified_peer_binding(request.binding())
@@ -2440,11 +2561,11 @@ async fn handle_peer_ingress(
     match envelope.request.clone() {
         InternalRequest::DeviceControl(request_body) => {
             let device = resolve_peer_device(&catalog, &request_body.authentication, now).await?;
-            handle_peer_device_control(request, handle, device).await
+            handle_peer_device_control(request, handle.clone(), device, fault).await
         }
         InternalRequest::DeviceData(request_body) => {
             let device = resolve_peer_device(&catalog, &request_body.authentication, now).await?;
-            handle_peer_device_data(request, handle, device).await
+            handle_peer_device_data(request, handle.clone(), device, fault).await
         }
         InternalRequest::ConsumerStreams(request_body) => {
             let access = owner_access.ok_or_else(|| {
@@ -2460,13 +2581,14 @@ async fn handle_peer_ingress(
             .await?;
             handle_peer_consumer_stream(
                 request,
-                handle,
+                handle.clone(),
                 access.consumer,
                 destination.device_id,
                 destination.service_id,
                 grant,
                 access.expires_at,
                 request_body.stream_id,
+                fault,
             )
             .await
         }
@@ -2550,6 +2672,7 @@ async fn handle_peer_device_control(
     request: InboundPeerRequest,
     handle: RelayHandle,
     device: tunnel_catalog::DeviceIdentity,
+    fault: &PeerFaultObserver,
 ) -> Result<(), PeerRuntimeError> {
     let spki = device.spki_fingerprint.clone();
     let (mut send, mut recv) = request.split();
@@ -2601,7 +2724,9 @@ async fn handle_peer_device_control(
     .await;
     outbound.close();
     while outbound.try_recv().is_ok() {}
-    if result.is_err() {
+    if let Err(error) = &result {
+        // Recorded before the owner's control registration is removed.
+        handle.record_peer_fault(fault, error);
         send.cancel();
         recv.cancel();
     }
@@ -2621,6 +2746,7 @@ async fn handle_peer_device_data(
     request: InboundPeerRequest,
     handle: RelayHandle,
     device: tunnel_catalog::DeviceIdentity,
+    fault: &PeerFaultObserver,
 ) -> Result<(), PeerRuntimeError> {
     let device_id = device.device_id;
     let spki = device.spki_fingerprint.clone();
@@ -2723,7 +2849,9 @@ async fn handle_peer_device_data(
     .await;
     outbound.close();
     while outbound.try_recv().is_ok() {}
-    if result.is_err() {
+    if let Err(error) = &result {
+        // Recorded before the forwarded data carrier is disconnected.
+        handle.record_peer_fault(fault, error);
         send.cancel();
         recv.cancel();
     }
@@ -2760,6 +2888,7 @@ async fn handle_peer_consumer_stream(
     grant: tunnel_catalog::GrantSnapshot,
     consumer_expires_at: chrono::DateTime<Utc>,
     _stream_id: String,
+    fault: &PeerFaultObserver,
 ) -> Result<(), PeerRuntimeError> {
     let request_id = request.envelope().request_id.clone();
     // Keep the shared admission reason alive through request splitting. The
@@ -2793,9 +2922,21 @@ async fn handle_peer_consumer_stream(
             // while the authenticated owner carrier or fence is still
             // incomplete.  Return a bounded H3 admission response before the
             // peer request is split or any ConsumerChunk body is read.
+            handle.record_peer_fault_tuple(
+                fault,
+                PeerOpenDiagnosticStage::Owner,
+                PeerFaultCause::OwnerNotReady,
+            );
             return request.reject_owner_not_ready().await;
         }
-        Err(RelayError::StreamLimit) => return request.reject_stream_limit().await,
+        Err(RelayError::StreamLimit) => {
+            handle.record_peer_fault_tuple(
+                fault,
+                PeerOpenDiagnosticStage::Owner,
+                PeerFaultCause::Capacity,
+            );
+            return request.reject_stream_limit().await;
+        }
         Err(_) => return Err(PeerRuntimeError::Closed),
     };
     registration.claim_admission();
@@ -2844,6 +2985,7 @@ async fn handle_peer_consumer_stream(
             );
             return Err(error);
         }
+        fault.mark(PeerOpenDiagnosticStage::Body);
         'peer: loop {
             tokio::select! {
                 _ = &mut admission_cancelled => {
@@ -3055,7 +3197,10 @@ async fn handle_peer_consumer_stream(
         },
         Err(error) => Err(error),
     };
-    if result.is_err() {
+    if let Err(error) = &result {
+        // The tuple is recorded before the owner's stream registration is
+        // closed so the fault outlives the owner state it describes.
+        handle.record_peer_fault(fault, error);
         send.cancel();
         recv.cancel();
     }

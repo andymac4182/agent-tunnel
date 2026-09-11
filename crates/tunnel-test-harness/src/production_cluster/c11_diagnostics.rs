@@ -7,12 +7,17 @@
 
 #[path = "c11_window.rs"]
 mod c11_window;
+#[path = "og02_correlation.rs"]
+mod og02_correlation;
 
 use crate::{HarnessError, Result};
-pub use c11_window::C11MatrixReport;
 use c11_window::{
     C11EvidenceBundle, C11RunSpec, C11Window, FaultStage, RunOutcome, SafeField, Sentinel,
     SentinelKind,
+};
+pub use c11_window::{C11MatrixReport, PEER_FAULT_CAUSES, PEER_FAULT_STAGES};
+pub use og02_correlation::{
+    OG02_CORRELATION_FIELDS, Og02CorrelationReport, Og02RowReport, verify_og02_correlation,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -50,6 +55,10 @@ struct MatrixCase {
     required_inner_process_counts: &'static [(&'static str, usize)],
     required_snapshot_roles: &'static [&'static str],
     required_safe_fields: &'static [SafeField],
+    /// Exact `(role, stage, cause)` peer fault tuples the typed relay
+    /// snapshots must carry.  Only tuples structurally implied by the induced
+    /// fault are listed; timing-dependent tuples are reported, not required.
+    required_peer_faults: &'static [(&'static str, &'static str, &'static str)],
 }
 
 const PRODUCTION_SENTINELS: &[SentinelKind] = &[
@@ -114,6 +123,15 @@ const OWNER_LOSS_SAFE_FIELDS: &[SafeField] = &[
 // or owner keys.
 const WRITE_SAFE_FIELDS: &[SafeField] =
     &[SafeField::Relay, SafeField::Counter, SafeField::CloseCause];
+// The OG-02 correlation bundle enforces its own family set per declared row;
+// the shared scanner minimum is only what every production fixture emits.
+const PRODUCTION_SAFE_FIELDS_MINIMUM: &[SafeField] = &[SafeField::Relay, SafeField::Counter];
+// Key rotation withdraws the pooled peer pin mid-stream: the ingress and the
+// owner both observe the stream reset while forwarding body records.
+const KEY_ROTATION_PEER_FAULTS: &[(&str, &str, &str)] = &[
+    ("ingress", "body", "transport_h3"),
+    ("owner", "body", "transport_h3"),
+];
 
 const CASES: [MatrixCase; 8] = [
     MatrixCase {
@@ -129,6 +147,7 @@ const CASES: [MatrixCase; 8] = [
         required_inner_process_counts: &[],
         required_snapshot_roles: PRODUCTION_SNAPSHOT_ROLES,
         required_safe_fields: REDIS_PARTITION_SAFE_FIELDS,
+        required_peer_faults: &[],
     },
     MatrixCase {
         name: "redis-fault",
@@ -139,6 +158,7 @@ const CASES: [MatrixCase; 8] = [
         required_inner_process_counts: &[],
         required_snapshot_roles: &[],
         required_safe_fields: REDIS_TLS_SAFE_FIELDS,
+        required_peer_faults: &[],
     },
     MatrixCase {
         name: "peer-success",
@@ -149,6 +169,7 @@ const CASES: [MatrixCase; 8] = [
         required_inner_process_counts: &[("m7-production-cli", 1)],
         required_snapshot_roles: PRODUCTION_SNAPSHOT_ROLES,
         required_safe_fields: PEER_READINESS_SAFE_FIELDS,
+        required_peer_faults: &[],
     },
     MatrixCase {
         name: "peer-fault",
@@ -159,6 +180,7 @@ const CASES: [MatrixCase; 8] = [
         required_inner_process_counts: &[],
         required_snapshot_roles: PRODUCTION_SNAPSHOT_ROLES,
         required_safe_fields: KEY_ROTATION_SAFE_FIELDS,
+        required_peer_faults: KEY_ROTATION_PEER_FAULTS,
     },
     MatrixCase {
         name: "owner-success",
@@ -166,9 +188,18 @@ const CASES: [MatrixCase; 8] = [
         stage: FaultStage::Owner,
         outcome: RunOutcome::Success,
         required_sentinels: PRODUCTION_SENTINELS,
-        required_inner_process_counts: &[("m7-production-cli", 1)],
+        // The production gate composes the concurrent same-identifier tenant
+        // race (four managed CLI roles) with its single production CLI.
+        required_inner_process_counts: &[
+            ("m7-production-cli", 1),
+            ("m7-tenant-race-first", 1),
+            ("m7-tenant-race-second", 1),
+            ("m7-tenant-race-sibling", 1),
+            ("m7-tenant-race-successor", 1),
+        ],
         required_snapshot_roles: PRODUCTION_SNAPSHOT_ROLES,
         required_safe_fields: PRODUCTION_SAFE_FIELDS,
+        required_peer_faults: &[],
     },
     MatrixCase {
         name: "owner-fault",
@@ -179,6 +210,7 @@ const CASES: [MatrixCase; 8] = [
         required_inner_process_counts: &[],
         required_snapshot_roles: PRODUCTION_SNAPSHOT_ROLES,
         required_safe_fields: OWNER_LOSS_SAFE_FIELDS,
+        required_peer_faults: &[],
     },
     MatrixCase {
         name: "write-success",
@@ -189,6 +221,7 @@ const CASES: [MatrixCase; 8] = [
         required_inner_process_counts: &[("m7-production-cli", 1)],
         required_snapshot_roles: PRODUCTION_SNAPSHOT_ROLES,
         required_safe_fields: WRITE_SAFE_FIELDS,
+        required_peer_faults: &[],
     },
     MatrixCase {
         name: "write-fault",
@@ -199,6 +232,7 @@ const CASES: [MatrixCase; 8] = [
         required_inner_process_counts: &[("m7-production-cli", 2)],
         required_snapshot_roles: PRODUCTION_SNAPSHOT_ROLES,
         required_safe_fields: WRITE_SAFE_FIELDS,
+        required_peer_faults: &[],
     },
 ];
 
@@ -385,6 +419,8 @@ async fn run_case(
     // remains in place, while transport-only Redis TLS is not forced to
     // invent relay-owned fields it never captures.
     .with_required_fields(case.required_safe_fields.iter().copied())
+    .with_required_peer_faults(case.required_peer_faults)
+    .map_err(|error| HarnessError::Process(format!("C11 {} diagnostics: {error}", case.name)))?
     .with_stream_limit(MAX_CAPTURE)
     .map_err(|error| HarnessError::Process(format!("C11 {} diagnostics: {error}", case.name)))?;
     let mut window = C11Window::new(spec);

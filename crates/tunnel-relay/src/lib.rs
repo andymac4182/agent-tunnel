@@ -18,6 +18,7 @@ mod http;
 pub mod membership_runtime;
 pub mod membership_version_state;
 mod peer_consumer_transport_diagnostics;
+pub mod peer_fault_diagnostics;
 pub mod peer_runtime;
 mod peer_transport_diagnostics;
 pub mod recovery;
@@ -56,12 +57,17 @@ pub use peer_consumer_transport_diagnostics::{
     PeerConsumerDiagnosticEventSnapshot, PeerConsumerDiagnosticH3Code, PeerConsumerDiagnosticRole,
     PeerConsumerDiagnosticSnapshot,
 };
+pub use peer_fault_diagnostics::{
+    MAX_RECENT_PEER_FAULTS, PeerFaultCause, PeerFaultContext, PeerFaultDiagnosticSnapshot,
+    PeerFaultEventSnapshot, PeerFaultObserver, PeerFaultRole,
+};
 pub use peer_runtime::peer_readiness::{
     PeerListenerState, PeerProbeState, PeerReadiness, PeerReadinessError, PeerReadinessSnapshot,
     PeerRouteReadiness, PeerRouteTarget,
 };
 pub use peer_runtime::{
-    InboundPeerRequest, PeerBindingProvider, PeerIngressHandler, PeerRuntime, PeerRuntimeError,
+    InboundPeerRequest, PeerBindingProvider, PeerIngressHandler, PeerOpenDiagnosticStage,
+    PeerRuntime, PeerRuntimeError,
 };
 pub use peer_transport_diagnostics::{
     PeerTransportDiagnosticEventSnapshot, PeerTransportDiagnosticOutcome,

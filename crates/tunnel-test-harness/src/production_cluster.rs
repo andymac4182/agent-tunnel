@@ -73,7 +73,10 @@ mod i08_synthetic_rotation;
 mod m7_i08_recovery_attempts;
 mod m7_i08_rotation_faults;
 mod pending_owner;
-pub use c11_diagnostics::{C11MatrixReport, verify_c11_diagnostics};
+pub use c11_diagnostics::{
+    C11MatrixReport, OG02_CORRELATION_FIELDS, Og02CorrelationReport, Og02RowReport,
+    PEER_FAULT_CAUSES, PEER_FAULT_STAGES, verify_c11_diagnostics, verify_og02_correlation,
+};
 pub use concurrent_load::{
     ConcurrentLoadEvidence, validate_concurrent_load_evidence, verify as verify_concurrent_load,
 };

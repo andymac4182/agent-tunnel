@@ -9,6 +9,117 @@ use std::fmt;
 
 const MAX_TOKEN_BYTES: usize = 128;
 const MAX_SENTINEL_BYTES: usize = 256 * 1024;
+/// Stream roles whose bytes are typed relay snapshots and therefore carry the
+/// relay-owned peer fault tuples.
+const RELAY_SNAPSHOT_ROLE_PREFIX: &str = "snapshot-relay-";
+/// The relay's bounded ring size; a snapshot claiming more is not the relay's.
+const MAX_PEER_FAULT_RECENT: usize = 32;
+/// The relay's closed peer fault stage vocabulary, in dispatch order.
+pub const PEER_FAULT_STAGES: [&str; 11] = [
+    "validation",
+    "pool_connect",
+    "stream_permit_checkout",
+    "sender_lock",
+    "h3_dispatch",
+    "envelope_send",
+    "complete",
+    "head",
+    "body",
+    "lease",
+    "owner",
+];
+/// The relay's closed peer fault cause vocabulary.
+pub const PEER_FAULT_CAUSES: [&str; 25] = [
+    "no_live_owner",
+    "catalog",
+    "membership",
+    "invalid_endpoint",
+    "identity_mismatch",
+    "transport_timeout",
+    "transport_goaway",
+    "transport_cancelled",
+    "transport_h3",
+    "transport_quic",
+    "transport_capacity",
+    "transport_body_limit",
+    "transport_other",
+    "envelope",
+    "frame",
+    "remote_unauthorized",
+    "remote_forbidden",
+    "remote_status",
+    "invalid_route",
+    "unexpected_record",
+    "owner_not_ready",
+    "capacity",
+    "membership_expired",
+    "closed",
+    "deadline",
+];
+const PEER_FAULT_ROLES: [&str; 2] = ["ingress", "owner"];
+const PEER_FAULT_SNAPSHOT_KEYS: [&str; 7] = [
+    "fault_count",
+    "ingress_count",
+    "owner_count",
+    "stage_counts",
+    "cause_counts",
+    "last_by_stage",
+    "recent",
+];
+const PEER_FAULT_EVENT_KEYS: [&str; 12] = [
+    "sequence",
+    "observed_at_ms",
+    "role",
+    "stage",
+    "cause",
+    "tenant_id",
+    "device_id",
+    "session_id",
+    "owner_epoch",
+    "owner_node_id",
+    "service_id",
+    "request_id",
+];
+
+/// One exact `(role, stage, cause)` peer fault tuple observed in a typed relay
+/// snapshot.  Only closed vocabulary labels are ever stored.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct PeerFaultTuple {
+    pub role: String,
+    pub stage: String,
+    pub cause: String,
+}
+
+impl PeerFaultTuple {
+    pub fn new(role: &str, stage: &str, cause: &str) -> Result<Self, ScanFailure> {
+        if !PEER_FAULT_ROLES.contains(&role) {
+            return Err(ScanFailure::InvalidPeerFault {
+                reason: "role outside the closed vocabulary",
+            });
+        }
+        if !PEER_FAULT_STAGES.contains(&stage) {
+            return Err(ScanFailure::InvalidPeerFault {
+                reason: "stage outside the closed vocabulary",
+            });
+        }
+        if !PEER_FAULT_CAUSES.contains(&cause) {
+            return Err(ScanFailure::InvalidPeerFault {
+                reason: "cause outside the closed vocabulary",
+            });
+        }
+        Ok(Self {
+            role: role.to_owned(),
+            stage: stage.to_owned(),
+            cause: cause.to_owned(),
+        })
+    }
+}
+
+impl fmt::Display for PeerFaultTuple {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}/{}/{}", self.role, self.stage, self.cause)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum FaultStage {
@@ -116,7 +227,7 @@ impl SafeField {
         Self::CloseCause,
     ];
 
-    fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             Self::Relay => "relay",
             Self::Tenant => "tenant",
@@ -209,6 +320,8 @@ pub struct C11RunSpec {
     /// collector itself must not satisfy the matrix's diagnostic-field gate.
     pub safe_field_roles: BTreeSet<String>,
     pub required_fields: BTreeSet<SafeField>,
+    /// Exact peer fault tuples the typed relay snapshots must contain.
+    pub required_peer_faults: BTreeSet<PeerFaultTuple>,
     sentinels: Vec<Sentinel>,
     pub max_bytes_per_stream: usize,
 }
@@ -246,9 +359,22 @@ impl C11RunSpec {
             expected_roles,
             safe_field_roles,
             required_fields: SafeField::ALL.into_iter().collect(),
+            required_peer_faults: BTreeSet::new(),
             sentinels,
             max_bytes_per_stream: 1 << 20,
         })
+    }
+
+    /// Require exact `(role, stage, cause)` tuples in the relay snapshots.
+    pub fn with_required_peer_faults<'a>(
+        mut self,
+        tuples: impl IntoIterator<Item = &'a (&'a str, &'a str, &'a str)>,
+    ) -> Result<Self, ScanFailure> {
+        self.required_peer_faults = tuples
+            .into_iter()
+            .map(|(role, stage, cause)| PeerFaultTuple::new(role, stage, cause))
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        Ok(self)
     }
 
     pub fn with_required_fields(mut self, fields: impl IntoIterator<Item = SafeField>) -> Self {
@@ -388,6 +514,25 @@ impl C11Window {
             }
         }
 
+        // Every typed relay snapshot must carry a well-formed, closed
+        // vocabulary peer fault table even when it is empty; the tuples it
+        // holds are collected for the case's exact requirement and for the
+        // bundle report.  Adapter snapshots and process streams are never
+        // parsed here, so wrapper text cannot manufacture a tuple.
+        let mut peer_faults_present = BTreeSet::new();
+        for (role, stream) in &self.streams {
+            if role.starts_with(RELAY_SNAPSHOT_ROLE_PREFIX) {
+                peer_faults_present.extend(scan_peer_faults(&stream.bytes)?);
+            }
+        }
+        for required in &self.spec.required_peer_faults {
+            if !peer_faults_present.contains(required) {
+                return Err(ScanFailure::MissingPeerFault {
+                    tuple: required.clone(),
+                });
+            }
+        }
+
         let mut missing_fields = Vec::new();
         for field in &self.spec.required_fields {
             if !self
@@ -430,6 +575,7 @@ impl C11Window {
             ended_utc_ms,
             bytes_by_role,
             fields_present,
+            peer_faults_present,
         })
     }
 
@@ -457,6 +603,8 @@ pub struct C11ScanReport {
     pub ended_utc_ms: i64,
     pub bytes_by_role: BTreeMap<String, usize>,
     pub fields_present: BTreeSet<SafeField>,
+    /// Exact tuples found in the typed relay snapshots of this run.
+    pub peer_faults_present: BTreeSet<PeerFaultTuple>,
 }
 
 pub struct C11EvidenceBundle {
@@ -546,6 +694,12 @@ impl C11EvidenceBundle {
             .flat_map(|report| report.bytes_by_role.values())
             .sum();
         let runs = self.reports.len();
+        let peer_fault_tuples = self
+            .reports
+            .values()
+            .flat_map(|report| report.peer_faults_present.iter().cloned())
+            .collect::<BTreeSet<_>>()
+            .len();
         Ok(C11MatrixReport {
             matrix_started_utc_ms: self.matrix_started_utc_ms,
             matrix_ended_utc_ms,
@@ -555,6 +709,7 @@ impl C11EvidenceBundle {
             captured_streams,
             captured_bytes,
             runs,
+            peer_fault_tuples,
         })
     }
 }
@@ -569,6 +724,8 @@ pub struct C11MatrixReport {
     pub captured_streams: usize,
     pub captured_bytes: usize,
     pub runs: usize,
+    /// Distinct exact peer fault tuples observed across the matrix.
+    pub peer_fault_tuples: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -626,6 +783,15 @@ pub enum ScanFailure {
     MissingMatrixCase {
         stage: FaultStage,
         outcome: RunOutcome,
+    },
+    /// A required exact peer fault tuple was absent from every relay snapshot.
+    MissingPeerFault {
+        tuple: PeerFaultTuple,
+    },
+    /// A relay snapshot's peer fault table was malformed or outside the closed
+    /// vocabulary.  The reason is a fixed label; no snapshot bytes are copied.
+    InvalidPeerFault {
+        reason: &'static str,
     },
 }
 
@@ -685,8 +851,259 @@ impl fmt::Display for ScanFailure {
                     outcome.label()
                 )
             }
+            Self::MissingPeerFault { tuple } => {
+                write!(formatter, "missing peer fault tuple: {tuple}")
+            }
+            Self::InvalidPeerFault { reason } => {
+                write!(formatter, "invalid peer fault table: {reason}")
+            }
         }
     }
+}
+
+/// Parse every typed relay snapshot frame in `bytes` and return the exact
+/// peer fault tuples it carries.
+///
+/// The table is validated strictly: only the relay's key set, only closed
+/// vocabulary labels, bounded identifiers, consistent counters and the
+/// relay's ring bound are accepted.  A snapshot that carries anything else
+/// (an extra field, an unbounded string, an unknown cause) fails the window
+/// so a payload or credential cannot ride along inside a diagnostic table.
+fn scan_peer_faults(bytes: &[u8]) -> Result<BTreeSet<PeerFaultTuple>, ScanFailure> {
+    let mut tuples = BTreeSet::new();
+    let stream = serde_json::Deserializer::from_slice(bytes).into_iter::<serde_json::Value>();
+    for document in stream {
+        let document = document.map_err(|_| ScanFailure::InvalidPeerFault {
+            reason: "relay snapshot frame was not a JSON document",
+        })?;
+        let table =
+            document
+                .get("peer_fault_diagnostics")
+                .ok_or(ScanFailure::InvalidPeerFault {
+                    reason: "relay snapshot omitted peer_fault_diagnostics",
+                })?;
+        tuples.extend(validate_peer_fault_table(table)?);
+    }
+    Ok(tuples)
+}
+
+fn validate_peer_fault_table(
+    table: &serde_json::Value,
+) -> Result<BTreeSet<PeerFaultTuple>, ScanFailure> {
+    let object = table.as_object().ok_or(ScanFailure::InvalidPeerFault {
+        reason: "table was not an object",
+    })?;
+    require_exact_keys(object, &PEER_FAULT_SNAPSHOT_KEYS, "table")?;
+    let fault_count = json_u64(&object["fault_count"], "fault_count")?;
+    let ingress_count = json_u64(&object["ingress_count"], "ingress_count")?;
+    let owner_count = json_u64(&object["owner_count"], "owner_count")?;
+    if ingress_count.checked_add(owner_count) != Some(fault_count) {
+        return Err(ScanFailure::InvalidPeerFault {
+            reason: "role counters do not sum to fault_count",
+        });
+    }
+    let stage_counts = json_count_map(&object["stage_counts"], &PEER_FAULT_STAGES, "stage_counts")?;
+    let cause_counts = json_count_map(&object["cause_counts"], &PEER_FAULT_CAUSES, "cause_counts")?;
+    if stage_counts != fault_count || cause_counts != fault_count {
+        return Err(ScanFailure::InvalidPeerFault {
+            reason: "stage or cause counters do not sum to fault_count",
+        });
+    }
+    let recent = object["recent"]
+        .as_array()
+        .ok_or(ScanFailure::InvalidPeerFault {
+            reason: "recent was not an array",
+        })?;
+    if recent.len() > MAX_PEER_FAULT_RECENT || recent.len() as u64 > fault_count {
+        return Err(ScanFailure::InvalidPeerFault {
+            reason: "recent ring exceeds the relay bound",
+        });
+    }
+    let mut tuples = BTreeSet::new();
+    let mut last_sequence = 0_u64;
+    for event in recent {
+        let (tuple, sequence) = validate_peer_fault_event(event)?;
+        if sequence <= last_sequence {
+            return Err(ScanFailure::InvalidPeerFault {
+                reason: "recent ring is not strictly ordered",
+            });
+        }
+        last_sequence = sequence;
+        tuples.insert(tuple);
+    }
+    let last_by_stage =
+        object["last_by_stage"]
+            .as_object()
+            .ok_or(ScanFailure::InvalidPeerFault {
+                reason: "last_by_stage was not an object",
+            })?;
+    for (stage, event) in last_by_stage {
+        if !PEER_FAULT_STAGES.contains(&stage.as_str()) {
+            return Err(ScanFailure::InvalidPeerFault {
+                reason: "last_by_stage key outside the closed vocabulary",
+            });
+        }
+        let (tuple, _) = validate_peer_fault_event(event)?;
+        if tuple.stage != *stage {
+            return Err(ScanFailure::InvalidPeerFault {
+                reason: "last_by_stage entry stage mismatch",
+            });
+        }
+        tuples.insert(tuple);
+    }
+    Ok(tuples)
+}
+
+fn validate_peer_fault_event(
+    event: &serde_json::Value,
+) -> Result<(PeerFaultTuple, u64), ScanFailure> {
+    let object = event.as_object().ok_or(ScanFailure::InvalidPeerFault {
+        reason: "event was not an object",
+    })?;
+    require_exact_keys(object, &PEER_FAULT_EVENT_KEYS, "event")?;
+    let sequence = json_u64(&object["sequence"], "sequence")?;
+    if sequence == 0 {
+        return Err(ScanFailure::InvalidPeerFault {
+            reason: "event sequence was zero",
+        });
+    }
+    json_u64(&object["observed_at_ms"], "observed_at_ms")?;
+    let role = json_label(&object["role"], "role")?;
+    let stage = json_label(&object["stage"], "stage")?;
+    let cause = json_label(&object["cause"], "cause")?;
+    let tuple = PeerFaultTuple::new(role, stage, cause)?;
+    json_uuid(&object["tenant_id"], "tenant_id")?;
+    json_uuid(&object["device_id"], "device_id")?;
+    json_optional_token(&object["session_id"], "session_id")?;
+    if !object["owner_epoch"].is_null() {
+        json_u64(&object["owner_epoch"], "owner_epoch")?;
+    }
+    json_optional_token(&object["owner_node_id"], "owner_node_id")?;
+    if !object["service_id"].is_null() {
+        json_uuid(&object["service_id"], "service_id")?;
+    }
+    json_optional_token(&object["request_id"], "request_id")?;
+    Ok((tuple, sequence))
+}
+
+fn require_exact_keys(
+    object: &serde_json::Map<String, serde_json::Value>,
+    keys: &[&str],
+    what: &'static str,
+) -> Result<(), ScanFailure> {
+    if object.len() != keys.len() || !keys.iter().all(|key| object.contains_key(*key)) {
+        return Err(ScanFailure::InvalidPeerFault {
+            reason: match what {
+                "table" => "table keys differ from the relay schema",
+                _ => "event keys differ from the relay schema",
+            },
+        });
+    }
+    Ok(())
+}
+
+fn json_u64(value: &serde_json::Value, field: &'static str) -> Result<u64, ScanFailure> {
+    value.as_u64().ok_or(ScanFailure::InvalidPeerFault {
+        reason: match field {
+            "fault_count" | "ingress_count" | "owner_count" => "role counter was not a u64",
+            "sequence" => "event sequence was not a u64",
+            "observed_at_ms" => "event timestamp was not a u64",
+            "owner_epoch" => "owner_epoch was not a u64",
+            _ => "counter was not a u64",
+        },
+    })
+}
+
+fn json_count_map(
+    value: &serde_json::Value,
+    vocabulary: &[&str],
+    field: &'static str,
+) -> Result<u64, ScanFailure> {
+    let object = value.as_object().ok_or(ScanFailure::InvalidPeerFault {
+        reason: match field {
+            "stage_counts" => "stage_counts was not an object",
+            _ => "cause_counts was not an object",
+        },
+    })?;
+    let mut total = 0_u64;
+    for (key, count) in object {
+        if !vocabulary.contains(&key.as_str()) {
+            return Err(ScanFailure::InvalidPeerFault {
+                reason: match field {
+                    "stage_counts" => "stage_counts key outside the closed vocabulary",
+                    _ => "cause_counts key outside the closed vocabulary",
+                },
+            });
+        }
+        total = total.checked_add(json_u64(count, "counter")?).ok_or(
+            ScanFailure::InvalidPeerFault {
+                reason: "counter overflow",
+            },
+        )?;
+    }
+    Ok(total)
+}
+
+fn json_label<'a>(
+    value: &'a serde_json::Value,
+    field: &'static str,
+) -> Result<&'a str, ScanFailure> {
+    value.as_str().ok_or(ScanFailure::InvalidPeerFault {
+        reason: match field {
+            "role" => "event role was not a string",
+            "stage" => "event stage was not a string",
+            _ => "event cause was not a string",
+        },
+    })
+}
+
+fn json_uuid(value: &serde_json::Value, field: &'static str) -> Result<(), ScanFailure> {
+    let text = value.as_str().ok_or(ScanFailure::InvalidPeerFault {
+        reason: match field {
+            "tenant_id" => "tenant_id was not a string",
+            "device_id" => "device_id was not a string",
+            _ => "service_id was not a string",
+        },
+    })?;
+    let bytes = text.as_bytes();
+    let shaped = bytes.len() == 36
+        && bytes.iter().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => *byte == b'-',
+            _ => byte.is_ascii_hexdigit(),
+        });
+    if !shaped {
+        return Err(ScanFailure::InvalidPeerFault {
+            reason: match field {
+                "tenant_id" => "tenant_id was not a uuid",
+                "device_id" => "device_id was not a uuid",
+                _ => "service_id was not a uuid",
+            },
+        });
+    }
+    Ok(())
+}
+
+fn json_optional_token(value: &serde_json::Value, field: &'static str) -> Result<(), ScanFailure> {
+    if value.is_null() {
+        return Ok(());
+    }
+    let text = value.as_str().ok_or(ScanFailure::InvalidPeerFault {
+        reason: match field {
+            "session_id" => "session_id was not a string",
+            "owner_node_id" => "owner_node_id was not a string",
+            _ => "request_id was not a string",
+        },
+    })?;
+    if validate_token(field, text.to_owned()).is_err() {
+        return Err(ScanFailure::InvalidPeerFault {
+            reason: match field {
+                "session_id" => "session_id was not a bounded identifier",
+                "owner_node_id" => "owner_node_id was not a bounded identifier",
+                _ => "request_id was not a bounded identifier",
+            },
+        });
+    }
+    Ok(())
 }
 
 fn validate_token(field: &'static str, value: String) -> Result<String, ScanFailure> {
@@ -1057,6 +1474,113 @@ mod c17_validator_tests {
         bundle
     }
 
+    /// A relay snapshot document whose peer fault table carries exactly the
+    /// given tuples, in the relay's own serialized shape.
+    fn peer_fault_snapshot(tuples: &[(&str, &str, &str)]) -> String {
+        let mut recent = Vec::new();
+        let mut last_by_stage = BTreeMap::new();
+        let mut stage_counts: BTreeMap<&str, u64> = BTreeMap::new();
+        let mut cause_counts: BTreeMap<&str, u64> = BTreeMap::new();
+        let mut ingress = 0_u64;
+        let mut owner = 0_u64;
+        for (index, (role, stage, cause)) in tuples.iter().enumerate() {
+            let event = format!(
+                "{{\"sequence\":{seq},\"observed_at_ms\":{seq},\"role\":\"{role}\",\"stage\":\"{stage}\",\"cause\":\"{cause}\",\"tenant_id\":\"00000000-0000-0000-0000-000000000001\",\"device_id\":\"00000000-0000-0000-0000-000000000002\",\"session_id\":\"session-7\",\"owner_epoch\":9,\"owner_node_id\":\"relay-b\",\"service_id\":\"00000000-0000-0000-0000-000000000003\",\"request_id\":\"request-1\"}}",
+                seq = index + 1
+            );
+            recent.push(event.clone());
+            last_by_stage.insert(*stage, event);
+            *stage_counts.entry(stage).or_default() += 1;
+            *cause_counts.entry(cause).or_default() += 1;
+            match *role {
+                "ingress" => ingress += 1,
+                _ => owner += 1,
+            }
+        }
+        let map = |counts: &BTreeMap<&str, u64>| {
+            counts
+                .iter()
+                .map(|(key, count)| format!("\"{key}\":{count}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        format!(
+            "{{\"lifetime_application_dispatches\":1,\"peer_fault_diagnostics\":{{\"fault_count\":{},\"ingress_count\":{ingress},\"owner_count\":{owner},\"stage_counts\":{{{}}},\"cause_counts\":{{{}}},\"last_by_stage\":{{{}}},\"recent\":[{}]}},\"sessions\":[]}}",
+            tuples.len(),
+            map(&stage_counts),
+            map(&cause_counts),
+            last_by_stage
+                .iter()
+                .map(|(stage, event)| format!("\"{stage}\":{event}"))
+                .collect::<Vec<_>>()
+                .join(","),
+            recent.join(","),
+        )
+    }
+
+    /// Finish a window whose only relay snapshot role holds `snapshot`.
+    fn relay_snapshot_window(
+        required: &[(&str, &str, &str)],
+        snapshot: &str,
+    ) -> std::result::Result<(), ScanFailure> {
+        let spec = spec_with_roles(&["snapshot-relay-relay-a"])?
+            .with_required_fields(std::iter::empty::<SafeField>())
+            .with_required_peer_faults(required)?;
+        let mut window = C11Window::new(spec);
+        window.append("snapshot-relay-relay-a", snapshot.as_bytes())?;
+        window.close("snapshot-relay-relay-a")?;
+        window.mark_joined("snapshot-relay-relay-a")?;
+        window.finish(101).map(|_| ())
+    }
+
+    #[test]
+    fn relay_snapshot_tuples_satisfy_exact_requirements_and_are_reported() {
+        let spec = spec_with_roles(&["snapshot-relay-relay-a", "snapshot-relay-relay-b"])
+            .expect("spec")
+            .with_required_fields(std::iter::empty::<SafeField>())
+            .with_required_peer_faults(&[
+                ("ingress", "lease", "owner_not_ready"),
+                ("owner", "body", "membership_expired"),
+            ])
+            .expect("tuples");
+        let mut window = C11Window::new(spec);
+        window
+            .append(
+                "snapshot-relay-relay-a",
+                peer_fault_snapshot(&[("ingress", "lease", "owner_not_ready")]).as_bytes(),
+            )
+            .expect("append a");
+        // An empty table on a relay that saw no fault is valid.
+        window
+            .append(
+                "snapshot-relay-relay-b",
+                peer_fault_snapshot(&[]).as_bytes(),
+            )
+            .expect("append b empty");
+        window
+            .append(
+                "snapshot-relay-relay-b",
+                peer_fault_snapshot(&[("owner", "body", "membership_expired")]).as_bytes(),
+            )
+            .expect("append b second frame");
+        for role in ["snapshot-relay-relay-a", "snapshot-relay-relay-b"] {
+            window.close(role).expect("close");
+            window.mark_joined(role).expect("join");
+        }
+        let report = window.finish(101).expect("finish");
+        assert_eq!(report.peer_faults_present.len(), 2);
+        assert!(
+            report
+                .peer_faults_present
+                .contains(&PeerFaultTuple::new("ingress", "lease", "owner_not_ready").unwrap())
+        );
+        assert!(
+            report
+                .peer_faults_present
+                .contains(&PeerFaultTuple::new("owner", "body", "membership_expired").unwrap())
+        );
+    }
+
     #[test]
     fn complete_matrix_returns_a_bounded_report() {
         let report = complete_bundle().finish(200).expect("complete matrix");
@@ -1066,6 +1590,7 @@ mod c17_validator_tests {
         assert_eq!(report.captured_bytes, SAFE_LINE.len() * 8);
         assert_eq!(report.source_id, "source-1");
         assert_eq!(report.build_id, "build-1");
+        assert_eq!(report.peer_fault_tuples, 0);
     }
 
     #[test]
@@ -1320,6 +1845,102 @@ mod c17_validator_tests {
             ("matrix_invalid_window", "invalid diagnostic window", || {
                 C11EvidenceBundle::new(100).finish(99).map(|_| ())
             }),
+            (
+                "peer_fault_missing_required_tuple",
+                "missing peer fault tuple: ingress/pool_connect/transport_timeout",
+                || {
+                    relay_snapshot_window(
+                        &[("ingress", "pool_connect", "transport_timeout")],
+                        &peer_fault_snapshot(&[("ingress", "lease", "owner_not_ready")]),
+                    )
+                },
+            ),
+            (
+                "peer_fault_role_mismatch_is_not_the_required_tuple",
+                "missing peer fault tuple: owner/lease/membership",
+                || {
+                    relay_snapshot_window(
+                        &[("owner", "lease", "membership")],
+                        &peer_fault_snapshot(&[("ingress", "lease", "membership")]),
+                    )
+                },
+            ),
+            (
+                "peer_fault_cause_outside_vocabulary",
+                "invalid peer fault table: cause outside the closed vocabulary",
+                || {
+                    relay_snapshot_window(
+                        &[],
+                        &peer_fault_snapshot(&[("ingress", "lease", "owner_not_ready")]).replace(
+                            "\"cause\":\"owner_not_ready\"",
+                            "\"cause\":\"owner_not_ready_detail\"",
+                        ),
+                    )
+                },
+            ),
+            (
+                "peer_fault_stage_outside_vocabulary",
+                "invalid peer fault table: stage_counts key outside the closed vocabulary",
+                || {
+                    relay_snapshot_window(
+                        &[],
+                        &peer_fault_snapshot(&[("ingress", "lease", "owner_not_ready")])
+                            .replace("\"lease\"", "\"lease_text\""),
+                    )
+                },
+            ),
+            (
+                "peer_fault_extra_event_field_is_rejected",
+                "invalid peer fault table: event keys differ from the relay schema",
+                || {
+                    relay_snapshot_window(
+                        &[],
+                        &peer_fault_snapshot(&[("ingress", "lease", "owner_not_ready")])
+                            .replace("\"request_id\":", "\"payload\":\"x\",\"request_id\":"),
+                    )
+                },
+            ),
+            (
+                "peer_fault_unbounded_request_id_is_rejected",
+                "invalid peer fault table: request_id was not a bounded identifier",
+                || {
+                    relay_snapshot_window(
+                        &[],
+                        &peer_fault_snapshot(&[("ingress", "lease", "owner_not_ready")])
+                            .replace("request-1", "Bearer secret/token"),
+                    )
+                },
+            ),
+            (
+                "peer_fault_counter_mismatch_is_rejected",
+                "invalid peer fault table: role counters do not sum to fault_count",
+                || {
+                    relay_snapshot_window(
+                        &[],
+                        &peer_fault_snapshot(&[("ingress", "lease", "owner_not_ready")])
+                            .replace("\"ingress_count\":1", "\"ingress_count\":2"),
+                    )
+                },
+            ),
+            (
+                "peer_fault_table_missing_from_relay_snapshot",
+                "invalid peer fault table: relay snapshot omitted peer_fault_diagnostics",
+                || relay_snapshot_window(&[], "{\"sessions\":[]}"),
+            ),
+            (
+                "peer_fault_relay_snapshot_not_json",
+                "invalid peer fault table: relay snapshot frame was not a JSON document",
+                || relay_snapshot_window(&[], "relay=relay-a"),
+            ),
+            (
+                "peer_fault_required_tuple_outside_vocabulary",
+                "invalid peer fault table: stage outside the closed vocabulary",
+                || {
+                    spec()
+                        .with_required_peer_faults(&[("ingress", "handshake", "closed")])
+                        .map(|_| ())
+                },
+            ),
         ];
         for &(name, fragment, run) in cases {
             let result = cli_result(run());

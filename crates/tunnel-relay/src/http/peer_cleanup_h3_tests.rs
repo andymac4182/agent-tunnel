@@ -6,6 +6,7 @@
 
 use super::*;
 
+use crate::peer_fault_diagnostics::{PeerFaultContext, PeerFaultObserver, PeerFaultRole};
 use crate::runtime::{RelaySessionSnapshot, RelaySnapshot};
 use chrono::Duration as ChronoDuration;
 use tokio::task::JoinHandle;
@@ -336,7 +337,11 @@ impl PeerRequestHandler for DirectControlHandler {
                     .accept_inbound(identity, request, stream)
                     .await
                     .map_err(|error| PeerTransportError::H3(error.to_string()))?;
-                super::super::handle_peer_device_control(inbound, handle, device)
+                let fault = PeerFaultObserver::new(
+                    PeerFaultRole::Owner,
+                    PeerFaultContext::unrouted(Uuid::nil(), device.device_id, None),
+                );
+                super::super::handle_peer_device_control(inbound, handle, device, &fault)
                     .await
                     .map_err(|error| PeerTransportError::H3(error.to_string()))
             }
