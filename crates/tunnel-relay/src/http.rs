@@ -2126,7 +2126,20 @@ fn cluster_unready_response(state: &HttpState) -> Option<Response> {
 }
 
 fn cluster_is_ready(state: &HttpState) -> bool {
-    state.peer.as_ref().is_none_or(|peer| peer.is_ready())
+    peer_admits_public_work(state.peer.as_ref())
+}
+
+/// Whether public work may be admitted, given this relay's optional peer
+/// runtime.
+///
+/// Public admission and `/readyz` are deliberately the same single call to
+/// [`PeerRuntime::is_ready`], which reads membership readiness and the whole
+/// peer readiness state under one lock. There is therefore no second
+/// admission fence to raise or lower: readiness and admission withdraw
+/// together and recover together, and no observer can see one without the
+/// other. See `peer_readiness_and_admission_never_disagree`.
+pub(crate) fn peer_admits_public_work(peer: Option<&Arc<PeerRuntime>>) -> bool {
+    peer.is_none_or(|peer| peer.is_ready())
 }
 
 async fn cluster_readiness_gate(

@@ -1122,6 +1122,87 @@ async fn real_h3_dropped_admission_stream_cancels_without_poisoning_connection()
     fixture.shutdown().await;
 }
 
+/// Readiness and public admission must move together in both directions:
+/// a withdrawal must fence admission no later than it withdraws readiness,
+/// and a recovery must not report readiness before admission accepts.
+///
+/// They are one atomic read — `/readyz` is `health::ready_response(
+/// PeerRuntime::is_ready())` and public admission is
+/// `http::peer_admits_public_work`, which is the same call — so this samples
+/// both through their production entry points across repeated withdrawals and
+/// restorations, including while a concurrent reader is sampling, and requires
+/// that no observation ever sees one without the other.
+#[tokio::test]
+async fn peer_readiness_and_admission_never_disagree() {
+    let fixture = H3Fixture::new(ProbeMode::Runtime, 2);
+    fixture
+        .client_runtime
+        .refresh_required_routes(vec![fixture.target.clone()])
+        .await
+        .expect("seed a reachable route");
+
+    let runtime = Arc::clone(&fixture.client_runtime);
+    let sampler_stop = CancellationToken::new();
+    let sampler = tokio::spawn({
+        let runtime = Arc::clone(&runtime);
+        let stop = sampler_stop.clone();
+        async move {
+            let mut disagreements = 0usize;
+            let mut samples = 0usize;
+            while !stop.is_cancelled() {
+                let admits = crate::http::peer_admits_public_work(Some(&runtime));
+                let readyz =
+                    crate::health::ready_response(runtime.is_ready()).status() == StatusCode::OK;
+                if admits != readyz {
+                    disagreements += 1;
+                }
+                samples += 1;
+                tokio::task::yield_now().await;
+            }
+            (samples, disagreements)
+        }
+    });
+
+    for pass in 0..8 {
+        // Withdrawal: admission must be fenced no later than readiness.
+        fixture.client_runtime.withdraw_peer_readiness();
+        assert!(
+            !crate::http::peer_admits_public_work(Some(&runtime)),
+            "pass {pass}: admission survived a readiness withdrawal"
+        );
+        assert_eq!(
+            crate::health::ready_response(runtime.is_ready()).status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "pass {pass}: /readyz stayed ready through a withdrawal"
+        );
+
+        // Recovery: readiness must not be reported before admission accepts.
+        fixture.client_runtime.set_peer_capacity(1);
+        fixture
+            .client_runtime
+            .refresh_required_routes(vec![fixture.target.clone()])
+            .await
+            .expect("recovery probe");
+        let readyz = crate::health::ready_response(runtime.is_ready()).status() == StatusCode::OK;
+        let admits = crate::http::peer_admits_public_work(Some(&runtime));
+        assert!(readyz, "pass {pass}: readiness did not recover");
+        assert!(
+            admits,
+            "pass {pass}: readiness reported ready while admission still refused"
+        );
+    }
+
+    sampler_stop.cancel();
+    let (samples, disagreements) = sampler.await.expect("readiness sampler join");
+    assert!(samples > 0, "readiness sampler observed nothing");
+    assert_eq!(
+        disagreements, 0,
+        "readiness and admission disagreed in {disagreements} of {samples} samples"
+    );
+
+    fixture.shutdown().await;
+}
+
 /// A peer which is itself unready must still answer the authenticated
 /// reachability probe.  `GET /internal/v1/health` is "Authenticated
 /// version/readiness metadata, bounded response" (docs/cluster.md, internal

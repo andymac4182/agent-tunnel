@@ -6119,6 +6119,38 @@ mod tests {
         ));
     }
 
+    /// The peer-readiness recovery loop must retry the owner-not-ready
+    /// envelope the relay actually returns while the selected owner is still
+    /// re-establishing its device session. The partition classifier alone does
+    /// not cover it -- that is the gap which reported a correct, explicitly
+    /// retryable `PEER_UNAVAILABLE` as an unexpected 503 -- so the loop must
+    /// consult the peer-recovery classifier as well.
+    #[test]
+    fn recovery_loop_retries_the_relays_owner_not_ready_envelope() {
+        // The exact envelope pinned by tunnel-relay's
+        // `http::tests::owner_not_ready_response_is_retryable_before_dispatch`.
+        let owner_not_ready = br#"{"code":"PEER_UNAVAILABLE","execution":"not_dispatched","message":"selected owner is not ready; retry after the bounded hint","retryable":true,"retry_after_ms":250}"#;
+        assert!(
+            !is_partition_admission_response(503, Some(owner_not_ready)),
+            "the partition classifier must not be the only retry source"
+        );
+        assert!(
+            is_peer_recovery_response(503, Some(owner_not_ready)),
+            "recovery must retry the documented bounded owner-not-ready outcome"
+        );
+        // A dispatched or unknown outcome is never retried, and neither is an
+        // unrelated code: the recovery loop stays fail-closed for those.
+        assert!(!is_peer_recovery_response(
+            503,
+            Some(br#"{"code":"PEER_UNAVAILABLE","execution":"unknown"}"#)
+        ));
+        assert!(!is_peer_recovery_response(
+            503,
+            Some(br#"{"code":"RESOURCE_EXHAUSTED","execution":"not_dispatched"}"#)
+        ));
+        assert!(!is_partition_admission_response(500, Some(owner_not_ready)));
+    }
+
     #[test]
     fn restored_path_diagnostics_are_redacted_to_known_code_and_execution() {
         assert_eq!(

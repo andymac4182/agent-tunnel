@@ -8,7 +8,8 @@
 use super::{
     LIVEZ_BODY, ProductionCluster, RunningHarness, SCENARIO_TIMEOUT, STARTUP_TIMEOUT,
     UNREADYZ_BODY, assert_public_health_ready, is_partition_admission_response,
-    open_consumer_stream, start_cli_smoke, wait_for_public_health_ready,
+    is_peer_recovery_response, open_consumer_stream, redacted_admission_failure, start_cli_smoke,
+    wait_for_public_health_ready,
 };
 use crate::acceptance::helpers::write_device_profile;
 use crate::{Harness, HarnessError, HarnessOptions, ManagedProcess, Result};
@@ -435,13 +436,22 @@ async fn wait_for_recovery_stream(
         match open_consumer_stream(ingress_addr, server_ca_der, token, device_id, service_id).await
         {
             Ok(stream) => return Ok(stream),
+            // Route readiness recovers before the selected owner has finished
+            // re-establishing its device session, so the owner answers with the
+            // documented bounded retry: `PEER_UNAVAILABLE`, `not_dispatched`,
+            // with a retry hint. That is a correct typed outcome a consumer is
+            // allowed to retry, not a gate failure, so the recovery loop
+            // retries it under the same bounded deadline as the readiness and
+            // authorization refusals. Any other status or code still fails.
             Err(super::StreamConnectFailure::Status { status, body })
-                if is_partition_admission_response(status, body.as_deref())
+                if (is_partition_admission_response(status, body.as_deref())
+                    || is_peer_recovery_response(status, body.as_deref()))
                     && Instant::now() < deadline => {}
-            Err(super::StreamConnectFailure::Status { status, .. }) => {
+            Err(super::StreamConnectFailure::Status { status, body }) => {
                 let context = recovery_context(cluster, tenant_id, device_id).await;
+                let failure = redacted_admission_failure(body.as_deref());
                 return Err(HarnessError::Http(format!(
-                    "peer-readiness recovery returned unexpected HTTP status {status}; {context}"
+                    "peer-readiness recovery returned unexpected HTTP status {status} ({failure}); {context}"
                 )));
             }
             Err(super::StreamConnectFailure::Harness(error))
