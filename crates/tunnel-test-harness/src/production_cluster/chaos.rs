@@ -156,6 +156,18 @@ enum Fault {
     OwnerKill,
 }
 
+impl Fault {
+    /// Fixed label for diagnostics; never caller or payload data.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::RedisPause => "redis_pause",
+            Self::PeerLoss => "peer_loss",
+            Self::CliPause => "cli_pause",
+            Self::OwnerKill => "owner_kill",
+        }
+    }
+}
+
 /// Payload-free evidence from one bounded chaos run.  All fields are counters,
 /// bounds and booleans; no application payload or credential is retained.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -500,6 +512,17 @@ async fn run_chaos(
             Fault::CliPause => run_cli_pause(&mut session).await?,
             Fault::OwnerKill => run_owner_kill(&mut context, &mut session).await?,
         };
+        if class == InterruptionClass::Unclassified {
+            // Attribute the event to its exact round and fault so a single
+            // unreproducible occurrence can still be investigated from the
+            // log alone.  The per-classifier warnings name the typed shape.
+            tracing::warn!(
+                round = evidence.rounds + 1,
+                fault = fault.label(),
+                stage = "chaos_round_unclassified",
+                "chaos round produced an interruption the closed vocabulary does not explain"
+            );
+        }
         tally_class(&mut evidence, class);
         match fault {
             Fault::RedisPause => evidence.redis_pause_rounds += 1,
@@ -930,6 +953,10 @@ fn classify_admission(
     match admission {
         Err(_) => InterruptionClass::OutcomeUnknown,
         Ok(Ok(stream)) => {
+            tracing::warn!(
+                stage = "chaos_admission_succeeded_under_fault",
+                "chaos admission succeeded while the authority was paused"
+            );
             // Admission unexpectedly succeeded during a fault: unclassified.
             drop(stream);
             InterruptionClass::Unclassified
@@ -939,7 +966,37 @@ fn classify_admission(
                 InterruptionClass::AdmissionUnavailable
             } else if is_peer_recovery_response(status, body.as_deref()) {
                 InterruptionClass::PeerUnavailable
+            } else if is_peer_unknown_outcome_response(status, body.as_deref()) {
+                // The relay forwarded toward the owner and then lost the peer
+                // path, so whether the request was dispatched is genuinely
+                // unknown and it says so (`execution: "unknown"`).  That is a
+                // typed, explicitly preserved unknown outcome, not an
+                // unexplained close: a blackholed peer route produces it
+                // whenever the transport fails after the request was written.
+                InterruptionClass::OutcomeUnknown
             } else {
+                // Record the exact typed shape that the closed vocabulary
+                // does not explain.  Only the status and the allowlisted
+                // `code`/`execution` labels are copied; no body bytes.
+                let parsed = body
+                    .as_deref()
+                    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok());
+                tracing::warn!(
+                    status,
+                    code = parsed
+                        .as_ref()
+                        .and_then(|value| value.get("code"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("absent"),
+                    execution = parsed
+                        .as_ref()
+                        .and_then(|value| value.get("execution"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("absent"),
+                    body_parsed = parsed.is_some(),
+                    stage = "chaos_admission_unexplained_status",
+                    "chaos admission produced a typed response outside the closed vocabulary"
+                );
                 InterruptionClass::Unclassified
             }
         }
@@ -948,6 +1005,30 @@ fn classify_admission(
 }
 
 /// Map a paused-process probe outcome onto the closed vocabulary.
+/// A typed peer failure whose dispatch outcome the relay reports as unknown.
+///
+/// `is_peer_recovery_response` deliberately requires `not_dispatched`, because
+/// the gates that use it prove no side effect occurred.  Here the unknown
+/// variant is equally valid evidence: it is the documented outcome when the
+/// peer transport fails after the request may already have reached the owner.
+fn is_peer_unknown_outcome_response(status: u16, body: Option<&[u8]>) -> bool {
+    if status != 503 {
+        return false;
+    }
+    let Some(body) = body else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return false;
+    };
+    let code = value.get("code").and_then(serde_json::Value::as_str);
+    let execution = value.get("execution").and_then(serde_json::Value::as_str);
+    matches!(
+        code,
+        Some("PEER_UNAVAILABLE") | Some("PEER_UNTRUSTED") | Some("CLUSTER_UNREADY")
+    ) && execution == Some("unknown")
+}
+
 fn classify_probe(probe: ProcessPauseProbeOutcome) -> InterruptionClass {
     if probe.is_fail_closed() {
         InterruptionClass::BoundedClose
@@ -957,6 +1038,11 @@ fn classify_probe(probe: ProcessPauseProbeOutcome) -> InterruptionClass {
     ) {
         InterruptionClass::OutcomeUnknown
     } else {
+        tracing::warn!(
+            outcome = ?probe,
+            stage = "chaos_probe_unexplained_outcome",
+            "chaos pause probe produced an outcome outside the closed vocabulary"
+        );
         // EchoAfterSend / ProtocolAfterSend: a paused owner must not echo.
         InterruptionClass::Unclassified
     }
@@ -969,6 +1055,38 @@ mod tests {
         RECONNECT_RATE_THRESHOLD_MILLI, validate_chaos_evidence,
     };
     use crate::acceptance_test_support::assert_failed;
+
+    #[test]
+    fn a_typed_unknown_peer_outcome_is_preserved_not_unclassified() {
+        use super::is_peer_unknown_outcome_response;
+        // Exactly the shape the relay returns when the peer transport fails
+        // after the request may have been written (http.rs owner-forwarding
+        // failure mapping): the outcome is unknown and typed.
+        for code in ["PEER_UNAVAILABLE", "PEER_UNTRUSTED", "CLUSTER_UNREADY"] {
+            let body = format!(
+                r#"{{"code":"{code}","execution":"unknown","message":"owner forwarding did not complete"}}"#
+            );
+            assert!(
+                is_peer_unknown_outcome_response(503, Some(body.as_bytes())),
+                "{code}/unknown must be a preserved unknown outcome"
+            );
+        }
+        // Everything else stays outside this bucket: a not-dispatched peer
+        // failure is a concrete class, a different status is not a peer
+        // failure, and an absent or unparsable body proves nothing.
+        let not_dispatched = br#"{"code":"PEER_UNAVAILABLE","execution":"not_dispatched"}"#;
+        assert!(!is_peer_unknown_outcome_response(503, Some(not_dispatched)));
+        assert!(!is_peer_unknown_outcome_response(
+            500,
+            Some(br#"{"code":"PEER_UNAVAILABLE","execution":"unknown"}"#)
+        ));
+        assert!(!is_peer_unknown_outcome_response(
+            503,
+            Some(br#"{"code":"UNAUTHORIZED","execution":"unknown"}"#)
+        ));
+        assert!(!is_peer_unknown_outcome_response(503, Some(b"not json")));
+        assert!(!is_peer_unknown_outcome_response(503, None));
+    }
 
     fn valid_evidence() -> ChaosEvidence {
         // Schedule: peer-loss x2 -> peer_unavailable, redis-pause x1 ->

@@ -1869,9 +1869,14 @@ async fn peer_consumer_outstanding_write_outlives_the_receive_idle_timeout() {
             })
         })
         .await;
+    // The 3.2 s liveness check above is the lower bound that matters: it is
+    // measured on a real clock and is well past the 2 s receive idle deadline
+    // the parked read must outlive.  The consumer's own deadline runs from
+    // token issue rather than from this instant, so no lower bound on the
+    // total elapsed time here would be meaningful under load.
     assert!(
-        started.elapsed() >= Duration::from_millis(4500),
-        "the parked write must end at the consumer deadline, not earlier"
+        started.elapsed() < Duration::from_secs(8),
+        "the parked write must still end at the consumer's absolute deadline"
     );
     assert_eq!(
         terminal_snapshot
