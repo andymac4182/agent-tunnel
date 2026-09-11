@@ -200,6 +200,11 @@ pub struct RelaySessionSnapshot {
     /// Whether the old carrier was retired after the configured overlap
     /// deadline and therefore forced the state machine into recovery.
     pub rotation_deadline_forced_retirement: bool,
+    /// Whether the most recent attempt completed on the owner's forced
+    /// closure alone because the connector's `ROTATE_RETIRED` never arrived
+    /// within the bounded post-deadline grace.  Recorded distinctly from a
+    /// forced retirement whose connector attestation was present.
+    pub rotation_connector_retirement_missing: bool,
     pub rotation_diagnostics: Option<RelayRotationSnapshot>,
     pub streams: Vec<RelayStreamSnapshot>,
 }

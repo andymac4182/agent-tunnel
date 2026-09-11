@@ -1440,3 +1440,482 @@ async fn overlap_deadline_while_retiring_forces_retirement_and_keeps_serving() {
         "no path resumes writes on the old carrier after a commit"
     );
 }
+
+/// M7-C44.  protocol.md, "Abort, deadline and loss during handover": only a
+/// "Known uncommitted attempt, old healthy" may coordinate `ROTATE_ABORT`, and
+/// the state diagram's `Aborting --> Recovering: deadline or decision
+/// uncertain` edge covers the moment the old carrier disappears while that
+/// abort is still in flight.  The abort can no longer complete (its final
+/// owner ABORTED would resume old writes on a carrier that is gone), so the
+/// decision is uncertain: the candidate is closed, both abandoned identifiers
+/// are recorded, cursors and credits are retained and no write ever resumes
+/// on the old carrier.  A late connector ROTATE_ABORTED for the abandoned
+/// attempt is rejected deterministically once the episode has begun.
+#[tokio::test]
+async fn old_carrier_loss_while_aborting_enters_retained_recovery_and_fences_the_abort() {
+    let mut fixture = FreezeFixture::new("aborting-old-loss", false);
+    let _active = fixture.write(b"active-record");
+    assert_eq!(sequenced(&drain_data(&mut fixture.old_rx)).len(), 1);
+    fixture.quiesce();
+    assert!(fixture.complete_barrier().is_empty());
+    fixture.connector_frozen(0).await;
+    assert_eq!(fixture.phase(), RotationPhase::Draining);
+    let abort_message_id = fixture.abort_by_candidate_loss().await;
+    assert_eq!(fixture.phase(), RotationPhase::Aborting);
+    let retained_before = fixture.retained_cursors();
+    let abandoned_candidate_generation = fixture.attempt.new_generation;
+    let overlap_deadline_ms = fixture.overlap_deadline_ms();
+    let _ = fixture.drain_control();
+
+    fixture
+        .actor
+        .disconnect_data(fixture.old_carrier.clone())
+        .await;
+
+    assert!(
+        fixture.actor.sessions.contains_key(&fixture.key.scope()),
+        "losing the old carrier while an abort is in flight must not close the session"
+    );
+    let status = fixture.rotation_status();
+    assert_eq!(status.phase, RotationPhase::Recovering);
+    assert_eq!(
+        status.recovery_reason,
+        Some(tunnel_protocol::rotation::RecoveryReason::OldTransportLost)
+    );
+    assert_eq!(status.active_generation, fixture.attempt.old_generation);
+    assert_eq!(
+        status.active_connection_id,
+        fixture.attempt.old_connection_id
+    );
+    let recovery_attempt = status.attempt.clone().expect("recovery attempt identity");
+    assert!(
+        recovery_attempt.new_generation > abandoned_candidate_generation,
+        "recovery must use a fresh greater generation, got {} after candidate {}",
+        recovery_attempt.new_generation,
+        abandoned_candidate_generation
+    );
+    assert!(status.socket_count <= 3);
+    assert_eq!(fixture.retained_cursors(), retained_before);
+    assert!(fixture.session().data_tx.is_none());
+    assert!(fixture.session().active_carrier.is_none());
+    {
+        let rotation = fixture
+            .session()
+            .rotation
+            .as_ref()
+            .expect("rotation state retained");
+        assert!(rotation.recovery.is_some(), "a recovery episode is owned");
+        assert!(rotation.candidate.is_none());
+        assert!(
+            rotation.abort_message_id.is_none(),
+            "the in-flight abort is fenced by the episode"
+        );
+        assert!(rotation.pending_abort_ack.is_none());
+    }
+    assert!(
+        super::monotonic_millis() < overlap_deadline_ms,
+        "the abandoned attempt is retired before its original overlap deadline"
+    );
+    let control = fixture.drain_control();
+    assert!(
+        control
+            .iter()
+            .any(|message| matches!(message, ControlMessage::RecoveryBegin(_))),
+        "the coordinator begins the retained-state episode"
+    );
+    assert!(
+        !control
+            .iter()
+            .any(|message| matches!(message, ControlMessage::RotateAborted(_))),
+        "no final ABORTED is emitted once the decision became uncertain"
+    );
+    let closed = control
+        .iter()
+        .find_map(|message| match message {
+            ControlMessage::RecoveryClosed(closed) => Some(closed),
+            _ => None,
+        })
+        .expect("the coordinator attests its closure delta");
+    let mut expected_closed = vec![
+        fixture.attempt.old_connection_id.clone(),
+        fixture.attempt.new_connection_id.clone(),
+    ];
+    expected_closed.sort();
+    assert_eq!(closed.closed_connection_ids, expected_closed);
+
+    // The connector's ROTATE_ABORTED for the abandoned attempt may still be
+    // in flight.  Delivered through the authenticated inbound path and
+    // directly to the handler, it is rejected without closing the session,
+    // without a final owner ABORTED and without touching the episode.
+    let late_aborted = RotateAborted {
+        message_id: CONNECTOR_ABORTED_ID.to_owned(),
+        reply_to: abort_message_id,
+        attempt: fixture.attempt.clone(),
+        reason: "candidate transport lost".to_owned(),
+        closed_connection_id: fixture.attempt.new_connection_id.clone(),
+    };
+    fixture
+        .actor
+        .inbound_control(
+            fixture.key.clone(),
+            ControlMessage::RotateAborted(late_aborted.clone()),
+        )
+        .await;
+    fixture
+        .actor
+        .handle_rotate_aborted(&fixture.key, late_aborted)
+        .await;
+    assert!(fixture.actor.sessions.contains_key(&fixture.key.scope()));
+    let status = fixture.rotation_status();
+    assert_eq!(status.phase, RotationPhase::Recovering);
+    assert_eq!(status.attempt.as_ref(), Some(&recovery_attempt));
+    assert!(
+        !fixture
+            .drain_control()
+            .iter()
+            .any(|message| matches!(message, ControlMessage::RotateAborted(_))),
+        "a late connector ABORTED cannot revive the abandoned abort"
+    );
+
+    // The writer stays frozen and nothing is resumed on either abandoned
+    // carrier while the episode runs.
+    let mut held = fixture.write(b"recovering-record");
+    assert_held(&mut held, "recovering after old-carrier loss during abort");
+    assert_eq!(fixture.relay_last_emitted(), 1);
+    assert!(sequenced(&drain_data(&mut fixture.old_rx)).is_empty());
+    assert!(sequenced(&drain_data(&mut fixture.candidate_rx)).is_empty());
+}
+
+/// The same contract when the abort is half resolved: the connector has
+/// already acknowledged with ROTATE_ABORTED and only the owner's own candidate
+/// closure is outstanding.  The old carrier is lost before that closure, so
+/// the final owner ABORTED (which would resume old writes) is never sent; the
+/// pending acknowledgement is discarded and recovery begins instead.
+#[tokio::test]
+async fn old_carrier_loss_after_connector_aborted_but_before_owner_closure_enters_recovery() {
+    let mut fixture = FreezeFixture::new("aborting-acked-old-loss", false);
+    let _active = fixture.write(b"active-record");
+    assert_eq!(sequenced(&drain_data(&mut fixture.old_rx)).len(), 1);
+    // The coordinator decides ABORT (as it does at the candidate handshake
+    // deadline) while the candidate transport is still attached, so the
+    // owner-side closure proof stays outstanding until its physical close.
+    fixture
+        .actor
+        .with_rotation_mut(&fixture.key, |_session, rotation| {
+            let attempt = rotation.attempt.clone().expect("fixture attempt");
+            rotation.state.abort(
+                &attempt,
+                super::monotonic_millis(),
+                tunnel_protocol::rotation::RecoveryReason::CandidateTransportLost,
+            )
+        })
+        .expect("known uncommitted attempt aborts");
+    fixture
+        .actor
+        .emit_rotation_abort(&fixture.key, "candidate handshake timeout");
+    assert_eq!(fixture.phase(), RotationPhase::Aborting);
+    let abort_message_id = fixture
+        .drain_control()
+        .into_iter()
+        .find_map(|message| match message {
+            ControlMessage::RotateAbort(abort) => Some(abort.message_id),
+            _ => None,
+        })
+        .expect("relay queues ROTATE_ABORT for the attached candidate");
+    assert!(
+        has_close(&drain_data(&mut fixture.candidate_rx)),
+        "the coordinator asks the attached candidate to close"
+    );
+    assert!(
+        fixture
+            .session()
+            .rotation
+            .as_ref()
+            .is_some_and(|rotation| rotation.candidate.is_some()),
+        "the candidate transport is still attached until its physical close"
+    );
+    fixture
+        .actor
+        .handle_rotate_aborted(
+            &fixture.key,
+            RotateAborted {
+                message_id: CONNECTOR_ABORTED_ID.to_owned(),
+                reply_to: abort_message_id,
+                attempt: fixture.attempt.clone(),
+                reason: "candidate handshake timeout".to_owned(),
+                closed_connection_id: fixture.attempt.new_connection_id.clone(),
+            },
+        )
+        .await;
+    assert_eq!(
+        fixture.phase(),
+        RotationPhase::Aborting,
+        "the owner's own candidate closure is still outstanding"
+    );
+    assert!(
+        fixture
+            .session()
+            .rotation
+            .as_ref()
+            .is_some_and(|rotation| rotation.pending_abort_ack.is_some()),
+        "the connector acknowledgement is pending the owner closure"
+    );
+    let retained_before = fixture.retained_cursors();
+    let candidate_generation = fixture.attempt.new_generation;
+    let _ = fixture.drain_control();
+
+    fixture
+        .actor
+        .disconnect_data(fixture.old_carrier.clone())
+        .await;
+
+    assert!(fixture.actor.sessions.contains_key(&fixture.key.scope()));
+    let status = fixture.rotation_status();
+    assert_eq!(status.phase, RotationPhase::Recovering);
+    assert_eq!(status.active_generation, fixture.attempt.old_generation);
+    let recovery_attempt = status.attempt.clone().expect("recovery attempt identity");
+    assert!(recovery_attempt.new_generation > candidate_generation);
+    assert!(status.socket_count <= 3);
+    assert_eq!(fixture.retained_cursors(), retained_before);
+    {
+        let rotation = fixture
+            .session()
+            .rotation
+            .as_ref()
+            .expect("rotation state retained");
+        assert!(rotation.recovery.is_some());
+        assert!(rotation.candidate.is_none());
+        assert!(rotation.pending_abort_ack.is_none());
+        assert!(rotation.abort_message_id.is_none());
+    }
+    let control = fixture.drain_control();
+    assert!(
+        !control
+            .iter()
+            .any(|message| matches!(message, ControlMessage::RotateAborted(_))),
+        "the final owner ABORTED is never sent after the old carrier is gone"
+    );
+    let closed = control
+        .iter()
+        .find_map(|message| match message {
+            ControlMessage::RecoveryClosed(closed) => Some(closed),
+            _ => None,
+        })
+        .expect("closure delta");
+    let mut expected_closed = vec![
+        fixture.attempt.old_connection_id.clone(),
+        fixture.attempt.new_connection_id.clone(),
+    ];
+    expected_closed.sort();
+    assert_eq!(closed.closed_connection_ids, expected_closed);
+
+    // A late physical close of the already-abandoned candidate is absorbed.
+    fixture
+        .actor
+        .disconnect_data(fixture.candidate_carrier.clone())
+        .await;
+    assert!(fixture.actor.sessions.contains_key(&fixture.key.scope()));
+    assert_eq!(fixture.phase(), RotationPhase::Recovering);
+
+    let mut held = fixture.write(b"recovering-record");
+    assert_held(
+        &mut held,
+        "recovering after old-carrier loss during acked abort",
+    );
+    assert_eq!(fixture.relay_last_emitted(), 1);
+    assert!(sequenced(&drain_data(&mut fixture.old_rx)).is_empty());
+    assert!(sequenced(&drain_data(&mut fixture.candidate_rx)).is_empty());
+}
+
+/// M7-C45.  A connector that never sends `ROTATE_RETIRED` after a committed
+/// handover.  protocol.md: "Absolute overlap deadline: after commit, forcibly
+/// close any old transport still lingering" and "`ROTATE_COMPLETE` ends the
+/// attempt after retirement evidence; deadline-forced closure is recorded
+/// distinctly."  The forced closure is the owner's evidence: after one
+/// bounded post-deadline grace (the handshake budget) the attempt completes
+/// on the committed candidate with the missing attestation recorded
+/// distinctly, a later RETIRED is stale, and the session can rotate again.
+/// The stall is driven with an explicit clock; nothing waits and nothing
+/// hangs.
+#[tokio::test]
+async fn missing_connector_retirement_completes_after_bounded_grace_and_rotates_again() {
+    let mut fixture = FreezeFixture::new("retiring-missing-retired", false);
+    let _active = fixture.write(b"active-record");
+    assert_eq!(sequenced(&drain_data(&mut fixture.old_rx)).len(), 1);
+    fixture.quiesce();
+    assert!(fixture.complete_barrier().is_empty());
+    fixture.connector_frozen(0).await;
+    fixture.connector_drained().await;
+    fixture.connector_committed().await;
+    assert_eq!(fixture.phase(), RotationPhase::Retiring);
+    // The relay's own old transport closes; the connector never attests.
+    fixture
+        .actor
+        .disconnect_data(fixture.old_carrier.clone())
+        .await;
+    assert_eq!(fixture.phase(), RotationPhase::Retiring);
+    let new_generation = fixture.attempt.new_generation;
+    let overlap_deadline_ms = fixture.overlap_deadline_ms();
+    let grace_ms = fixture
+        .session()
+        .rotation
+        .as_ref()
+        .expect("rotation")
+        .state
+        .config()
+        .handshake_timeout_ms;
+    let retained_before = fixture.retained_cursors();
+    let _ = fixture.drain_control();
+
+    // At the deadline the forced closure is latched but the attestation is
+    // still awaited; the session keeps serving on the committed candidate.
+    assert!(
+        !fixture
+            .actor
+            .poll_rotation_deadline_at(&fixture.key, overlap_deadline_ms)
+    );
+    assert!(fixture.actor.sessions.contains_key(&fixture.key.scope()));
+    assert_eq!(fixture.phase(), RotationPhase::Retiring);
+    assert!(fixture.rotation_status().deadline_forced_retirement);
+    assert!(
+        !fixture
+            .drain_control()
+            .iter()
+            .any(|message| matches!(message, ControlMessage::RotateComplete(_))),
+        "no COMPLETE before the bounded grace elapses"
+    );
+    assert!(
+        !fixture
+            .actor
+            .poll_rotation_deadline_at(&fixture.key, overlap_deadline_ms + grace_ms - 1)
+    );
+    assert_eq!(fixture.phase(), RotationPhase::Retiring);
+
+    // The grace elapses with no RETIRED: the attempt completes on the forced
+    // closure alone and the missing attestation is recorded distinctly.
+    assert!(
+        !fixture
+            .actor
+            .poll_rotation_deadline_at(&fixture.key, overlap_deadline_ms + grace_ms)
+    );
+    assert!(fixture.actor.sessions.contains_key(&fixture.key.scope()));
+    let status = fixture.rotation_status();
+    assert_eq!(status.phase, RotationPhase::Active);
+    assert_eq!(status.active_generation, new_generation);
+    assert_eq!(
+        status.active_connection_id,
+        fixture.attempt.new_connection_id
+    );
+    assert!(status.deadline_forced_retirement);
+    assert!(
+        status.connector_retirement_missing,
+        "the missing connector attestation is recorded distinctly"
+    );
+    assert!(status.attempt.is_none(), "the attempt is complete");
+    assert_eq!(status.socket_count, 2);
+    assert_eq!(fixture.retained_cursors(), retained_before);
+    let complete = fixture
+        .drain_control()
+        .into_iter()
+        .find_map(|message| match message {
+            ControlMessage::RotateComplete(complete) => Some(complete),
+            _ => None,
+        })
+        .expect("the forced closure ends the attempt with ROTATE_COMPLETE");
+    assert!(complete.forced);
+    assert!(
+        complete.reply_to.is_empty(),
+        "there is no connector RETIRED to correlate to"
+    );
+    assert_eq!(
+        complete.reason.as_deref(),
+        Some("overlap deadline forced retirement without connector retirement evidence")
+    );
+    assert_eq!(complete.attempt, fixture.attempt);
+    let event = fixture
+        .actor
+        .rotation_deadline_events
+        .iter()
+        .find(|event| {
+            event.session_id == fixture.key.session_id
+                && event.reason == "missing_connector_retirement"
+        })
+        .expect("a payload-free missing-retirement record is latched");
+    assert_eq!(event.deadline_ms, overlap_deadline_ms);
+    assert!(event.fired_at_ms >= overlap_deadline_ms + grace_ms);
+
+    // A later RETIRED for the completed attempt is stale: absorbed through the
+    // authenticated inbound path and by the handler, with no second COMPLETE.
+    let stale = RotateRetired {
+        message_id: CONNECTOR_RETIRED_ID.to_owned(),
+        reply_to: fixture.retire_message_id.clone(),
+        attempt: fixture.attempt.clone(),
+        snapshot_id: fixture.snapshot_id.clone(),
+        closed_connection_id: fixture.attempt.old_connection_id.clone(),
+    };
+    fixture
+        .actor
+        .inbound_control(
+            fixture.key.clone(),
+            ControlMessage::RotateRetired(stale.clone()),
+        )
+        .await;
+    fixture
+        .actor
+        .handle_rotate_retired(&fixture.key, stale)
+        .await;
+    assert!(fixture.actor.sessions.contains_key(&fixture.key.scope()));
+    assert_eq!(fixture.phase(), RotationPhase::Active);
+    assert!(
+        !fixture
+            .drain_control()
+            .iter()
+            .any(|message| matches!(message, ControlMessage::RotateComplete(_))),
+        "a stale RETIRED cannot produce a second COMPLETE"
+    );
+
+    // Retained streams keep serving on the committed candidate and the old
+    // carrier never receives another sequenced frame.
+    let mut served = fixture.write(b"post-grace-record");
+    assert_held(
+        &mut served,
+        "served after the missing-retirement completion",
+    );
+    assert_eq!(
+        sequenced(&drain_data(&mut fixture.candidate_rx)),
+        vec![(FrameKind::Data, 2, new_generation)]
+    );
+    assert!(sequenced(&drain_data(&mut fixture.old_rx)).is_empty());
+
+    // The session can rotate again: the next scheduled attempt allocates a
+    // fresh greater generation on top of the committed carrier, and its
+    // status no longer carries the previous attempt's forced markers.
+    let started = fixture.actor.start_rotation_local_at(
+        &fixture.key,
+        None,
+        "timer",
+        overlap_deadline_ms + grace_ms + 1,
+    );
+    assert!(
+        matches!(started, super::RotationStart::Started(_)),
+        "a completed forced retirement must not leave the session unable to rotate"
+    );
+    let next = fixture.rotation_status();
+    assert_eq!(next.phase, RotationPhase::Preparing);
+    let next_attempt = next.attempt.expect("next scheduled attempt");
+    assert_eq!(next_attempt.old_generation, new_generation);
+    assert!(next_attempt.new_generation > new_generation);
+    assert_ne!(
+        next_attempt.new_connection_id, fixture.attempt.old_connection_id,
+        "the force-retired carrier identifier is never reused"
+    );
+    assert!(!next.deadline_forced_retirement);
+    assert!(!next.connector_retirement_missing);
+    assert!(
+        fixture
+            .drain_control()
+            .iter()
+            .any(|message| matches!(message, ControlMessage::RotatePrepare(_))),
+        "the next attempt's PREPARE is queued"
+    );
+}

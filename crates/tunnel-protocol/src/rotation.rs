@@ -407,6 +407,11 @@ pub struct RotationStatus {
     pub candidate_socket_closed: [bool; 2],
     pub recovery_reason: Option<RecoveryReason>,
     pub deadline_forced_retirement: bool,
+    /// The most recent attempt completed on the owner's deadline-forced
+    /// closure alone because the connector's `ROTATE_RETIRED` never arrived
+    /// within the bounded post-deadline grace.  Recorded distinctly from a
+    /// forced retirement whose connector attestation was present.
+    pub connector_retirement_missing: bool,
     pub socket_count: u8,
     /// Physical connection IDs claimed so far, including the active carrier.
     /// The bound is [`MAX_CONNECTION_ID_HISTORY`]; reaching it ends the
@@ -538,6 +543,7 @@ pub struct RotationState {
     /// Number of candidate attempts consumed in the current recovery episode.
     recovery_attempts: u8,
     deadline_forced_retirement: bool,
+    connector_retirement_missing: bool,
     last_time_ms: Option<RotationTime>,
     /// Typed reason when the machine closed itself; `None` after a
     /// runtime-initiated close.
@@ -583,6 +589,7 @@ impl RotationState {
             recovery_episode_deadline: None,
             recovery_attempts: 0,
             deadline_forced_retirement: false,
+            connector_retirement_missing: false,
             last_time_ms: None,
             terminal_reason: None,
         })
@@ -686,6 +693,7 @@ impl RotationState {
             candidate_socket_closed,
             recovery_reason,
             deadline_forced_retirement: self.deadline_forced_retirement,
+            connector_retirement_missing: self.connector_retirement_missing,
             socket_count: self.socket_count(),
             connection_history_used: self.used_connection_ids.len(),
             terminal_reason: self.terminal_reason,
@@ -796,6 +804,12 @@ impl RotationState {
             return Err(RotationError::ConnectionReuse);
         }
         self.generation_high_watermark = attempt.identity.new_generation;
+        // The forced-retirement markers describe the most recent attempt.  A
+        // fresh scheduled attempt starts clean so its own COMPLETE is not
+        // misreported as forced; the earlier forced closure stays recorded in
+        // the runtime's bounded deadline-event history.
+        self.deadline_forced_retirement = false;
+        self.connector_retirement_missing = false;
         self.attempt = Some(attempt);
         self.phase = RotationPhase::Preparing;
         self.assert_socket_bound();
@@ -1139,6 +1153,93 @@ impl RotationState {
         now_ms: RotationTime,
     ) -> Result<(), RotationError> {
         self.old_socket_closed(identity, side, evidence, now_ms)
+    }
+
+    /// Absolute time after which a committed handover in `Retiring` completes
+    /// on the owner's deadline-forced closure alone.  The old transport itself
+    /// is force-closed at the overlap deadline; this bounds only how long the
+    /// owner keeps waiting for the connector's `ROTATE_RETIRED` attestation,
+    /// by one handshake budget, before recording it as missing.  `None`
+    /// outside `Retiring`.
+    #[must_use]
+    pub fn missing_retirement_deadline_ms(&self) -> Option<RotationTime> {
+        if self.phase != RotationPhase::Retiring {
+            return None;
+        }
+        let attempt = self.attempt.as_ref()?;
+        attempt
+            .overlap_deadline_ms
+            .checked_add(self.config.handshake_timeout_ms)
+    }
+
+    /// Complete a committed handover whose connector never sent
+    /// `ROTATE_RETIRED`.
+    ///
+    /// protocol.md: "Absolute overlap deadline: after commit, forcibly close
+    /// any old transport still lingering" and "`ROTATE_COMPLETE` ends the
+    /// attempt after retirement evidence; deadline-forced closure is recorded
+    /// distinctly."  After the overlap deadline the owner has force-closed the
+    /// old transport; once the bounded post-deadline grace of
+    /// [`Self::missing_retirement_deadline_ms`] has also elapsed with no
+    /// connector attestation, that forced closure is the only retirement
+    /// evidence there will ever be.  The attempt then completes on the
+    /// committed candidate with `connector_retirement_missing` recorded
+    /// distinctly, the old identifier stays fenced in the immutable history,
+    /// and a later `ROTATE_RETIRED` for this attempt is stale.  This is never
+    /// a demotion: the old generation is not promoted again and no budget is
+    /// extended.  It is refused while the connector attestation is present
+    /// (the ordinary [`Self::old_socket_closed`] path completes those) or
+    /// before the grace has elapsed.
+    pub fn force_retire_without_connector_evidence(
+        &mut self,
+        identity: &RotationAttemptIdentity,
+        now_ms: RotationTime,
+    ) -> Result<(), RotationError> {
+        self.observe_time(now_ms)?;
+        self.ensure_attempt(identity, RotationPhase::Retiring)?;
+        let (old_connection_id, overlap_deadline_ms, retire_sent, connector_closed) = {
+            let attempt = self.attempt.as_ref().expect("phase checked above");
+            (
+                attempt.identity.old_connection_id.clone(),
+                attempt.overlap_deadline_ms,
+                attempt.retire_sent,
+                attempt.old_socket_closed[side_index(RotationSide::Connector)],
+            )
+        };
+        if !retire_sent {
+            return Err(RotationError::RetireNotSent);
+        }
+        if connector_closed {
+            return Err(RotationError::ConnectorRetirementPresent);
+        }
+        let grace_deadline_ms = overlap_deadline_ms
+            .checked_add(self.config.handshake_timeout_ms)
+            .ok_or(RotationError::DeadlineOverflow)?;
+        if now_ms < grace_deadline_ms {
+            return Err(RotationError::RetirementGraceNotElapsed {
+                now: now_ms,
+                deadline: grace_deadline_ms,
+            });
+        }
+        let (new_generation, new_connection_id) = {
+            let attempt = self.attempt.as_mut().expect("phase checked above");
+            attempt.old_socket_closed[side_index(RotationSide::Owner)] = true;
+            (
+                attempt.identity.new_generation,
+                attempt.identity.new_connection_id.clone(),
+            )
+        };
+        self.deadline_forced_retirement = true;
+        self.connector_retirement_missing = true;
+        self.allocated_connections.remove(&old_connection_id);
+        self.active_generation = new_generation;
+        self.active_connection_id = new_connection_id;
+        self.attempt = None;
+        self.phase = RotationPhase::Active;
+        self.recovery_episode_deadline = None;
+        self.recovery_attempts = 0;
+        self.assert_socket_bound();
+        Ok(())
     }
 
     /// Begin a coordinated abort while the old socket is still authoritative.
@@ -2042,6 +2143,15 @@ pub enum RotationError {
     CommitCannotRollback,
     CommitNotAccepted,
     RetireNotSent,
+    /// The connector's `ROTATE_RETIRED` is present, so the ordinary bilateral
+    /// closure path completes the attempt; forced completion is not needed.
+    ConnectorRetirementPresent,
+    /// The bounded post-deadline grace for the connector's retirement
+    /// attestation has not elapsed yet.
+    RetirementGraceNotElapsed {
+        now: u64,
+        deadline: u64,
+    },
     IncompleteClosureEvidence,
     ConnectionMismatch,
     SocketBoundExceeded,
@@ -2190,6 +2300,13 @@ impl fmt::Display for RotationError {
             }
             Self::CommitNotAccepted => formatter.write_str("retire requires an accepted commit"),
             Self::RetireNotSent => formatter.write_str("old close evidence arrived before retire"),
+            Self::ConnectorRetirementPresent => formatter.write_str(
+                "connector retirement evidence is present; bilateral closure completes the attempt",
+            ),
+            Self::RetirementGraceNotElapsed { now, deadline } => write!(
+                formatter,
+                "missing-retirement grace has not elapsed at {now} (deadline {deadline})"
+            ),
             Self::IncompleteClosureEvidence => {
                 formatter.write_str("incomplete physical closure evidence")
             }
@@ -2682,6 +2799,208 @@ mod tests {
             .expect("retiring loss");
         assert_eq!(retiring.phase(), RotationPhase::Recovering);
         assert_ne!(retiring.active_generation(), 4);
+    }
+
+    /// M7-C44.  protocol.md: only a "Known uncommitted attempt, old healthy"
+    /// may coordinate an abort, and the state diagram's `Aborting -->
+    /// Recovering: deadline or decision uncertain` edge covers the old
+    /// transport disappearing while that abort is in flight.  Recovery must
+    /// release both abandoned carriers, anchor on the retained old
+    /// generation, and fence the abandoned attempt so a late connector
+    /// ABORTED can neither complete the abort nor touch the episode.
+    #[test]
+    fn old_transport_loss_while_aborting_enters_recovery_and_fences_the_abort() {
+        let mut machine = state();
+        let identity = attempt(4);
+        prepare_to_quiesce(&mut machine, &identity);
+        machine
+            .abort(&identity, 5, RecoveryReason::CandidateTransportLost)
+            .expect("known uncommitted attempt aborts");
+        assert_eq!(machine.phase(), RotationPhase::Aborting);
+        // The connector has already released its candidate; the owner's own
+        // closure is still outstanding when the old transport is lost.
+        machine
+            .aborted(
+                &identity,
+                RotationSide::Connector,
+                ClosureEvidence::closed("data-4"),
+                6,
+            )
+            .expect("connector closure while aborting");
+        assert_eq!(machine.phase(), RotationPhase::Aborting);
+        machine
+            .transport_lost(&identity, 7, RecoveryReason::OldTransportLost)
+            .expect("old loss while aborting enters recovery");
+        assert_eq!(machine.phase(), RotationPhase::Recovering);
+        assert_eq!(
+            machine.status().recovery_reason,
+            Some(RecoveryReason::OldTransportLost)
+        );
+        // Both abandoned carriers are released with explicit closure evidence
+        // and the episode anchors on the retained old generation.
+        machine
+            .close_for_recovery("data-old", ClosureEvidence::closed("data-old"), 8)
+            .expect("old carrier released");
+        machine
+            .close_for_recovery("data-4", ClosureEvidence::closed("data-4"), 8)
+            .expect("abandoned candidate released");
+        assert_eq!(machine.active_generation(), 3);
+        assert_eq!(machine.active_connection_id(), "data-old");
+        let mut recovery = attempt(5);
+        recovery.new_connection_id = "data-recovery".to_owned();
+        machine
+            .begin_recovery(
+                recovery.clone(),
+                StreamRoster::new("episode", vec![11, 12]),
+                9,
+                RecoveryReason::OldTransportLost,
+                30,
+            )
+            .expect("fresh greater generation begins recovery");
+        assert_eq!(machine.phase(), RotationPhase::Recovering);
+        assert!(machine.socket_count() <= MAX_TOTAL_SOCKETS);
+        // A late connector ABORTED for the abandoned attempt is rejected
+        // deterministically: it names an attempt the machine no longer owns.
+        assert!(matches!(
+            machine.aborted(
+                &identity,
+                RotationSide::Owner,
+                ClosureEvidence::closed("data-4"),
+                10,
+            ),
+            Err(RotationError::AttemptMismatch)
+        ));
+        assert_eq!(machine.phase(), RotationPhase::Recovering);
+        assert_eq!(machine.status().attempt.as_ref(), Some(&recovery));
+        // Neither abandoned identifier can be reattached.
+        let mut reuses_candidate = attempt(6);
+        reuses_candidate.new_connection_id = "data-4".to_owned();
+        assert!(matches!(
+            machine.begin_recovery(
+                reuses_candidate,
+                StreamRoster::new("episode", vec![11, 12]),
+                11,
+                RecoveryReason::OldTransportLost,
+                30,
+            ),
+            Err(RotationError::InvalidPhase { .. }) | Err(RotationError::ConnectionReuse)
+        ));
+    }
+
+    /// M7-C45.  protocol.md: "Absolute overlap deadline: after commit,
+    /// forcibly close any old transport still lingering" and "`ROTATE_COMPLETE`
+    /// ends the attempt after retirement evidence; deadline-forced closure is
+    /// recorded distinctly."  When the connector never sends RETIRED, the
+    /// forced closure becomes the only retirement evidence after one bounded
+    /// handshake budget past the deadline: the attempt then completes on the
+    /// committed candidate, the missing attestation is recorded distinctly,
+    /// a later RETIRED is stale, and the session can rotate again.
+    #[test]
+    fn missing_connector_retirement_completes_after_the_bounded_grace() {
+        let mut machine = state();
+        let identity = attempt(4);
+        commit_to_retiring(&mut machine, &identity);
+        // overlap deadline 30 plus the 10 ms handshake budget of `state()`.
+        assert_eq!(machine.missing_retirement_deadline_ms(), Some(40));
+        // Before the deadline nothing is forced.
+        assert!(matches!(
+            machine.force_retire_without_connector_evidence(&identity, 29),
+            Err(RotationError::RetirementGraceNotElapsed {
+                now: 29,
+                deadline: 40
+            })
+        ));
+        assert_eq!(machine.tick(30), RotationPhase::Retiring);
+        assert!(machine.status().deadline_forced_retirement);
+        machine
+            .old_socket_closed(
+                &identity,
+                RotationSide::Owner,
+                ClosureEvidence::closed("data-old"),
+                30,
+            )
+            .expect("forced owner close");
+        // The grace is exact: one millisecond early is still refused, the
+        // phase stays Retiring and the committed candidate keeps serving.
+        assert!(matches!(
+            machine.force_retire_without_connector_evidence(&identity, 39),
+            Err(RotationError::RetirementGraceNotElapsed { .. })
+        ));
+        assert_eq!(machine.phase(), RotationPhase::Retiring);
+        assert!(!machine.status().connector_retirement_missing);
+        machine
+            .force_retire_without_connector_evidence(&identity, 40)
+            .expect("forced completion after the grace");
+        assert_eq!(machine.phase(), RotationPhase::Active);
+        assert_eq!(machine.active_generation(), 4);
+        assert_eq!(machine.active_connection_id(), "data-4");
+        assert!(machine.status().deadline_forced_retirement);
+        assert!(machine.status().connector_retirement_missing);
+        assert_eq!(machine.socket_count(), CONTROL_SOCKETS + 1);
+        assert!(machine.missing_retirement_deadline_ms().is_none());
+        // A later RETIRED for the completed attempt is stale.
+        assert!(matches!(
+            machine.retired(
+                &identity,
+                RotationSide::Connector,
+                ClosureEvidence::closed("data-old"),
+                41,
+            ),
+            Err(RotationError::InvalidPhase { .. })
+        ));
+        assert_eq!(machine.phase(), RotationPhase::Active);
+        // The session rotates again on a fresh greater generation; the next
+        // attempt starts without the previous attempt's forced markers, and the
+        // force-retired identifier is never reused.
+        let mut next = attempt(5);
+        next.old_generation = 4;
+        next.old_connection_id = "data-4".to_owned();
+        assert_eq!(
+            machine.prepare(next, 42).expect("next scheduled attempt"),
+            PrepareResult::Started
+        );
+        assert_eq!(machine.phase(), RotationPhase::Preparing);
+        assert!(!machine.status().deadline_forced_retirement);
+        assert!(!machine.status().connector_retirement_missing);
+        let mut reuses_retired = attempt(6);
+        reuses_retired.old_generation = 4;
+        reuses_retired.old_connection_id = "data-4".to_owned();
+        reuses_retired.new_connection_id = "data-old".to_owned();
+        assert!(matches!(
+            machine.prepare(reuses_retired, 43),
+            Err(RotationError::InvalidPhase { .. })
+        ));
+    }
+
+    /// The forced-completion path never bypasses a present attestation or a
+    /// pre-commit phase.
+    #[test]
+    fn forced_completion_without_connector_evidence_is_refused_outside_its_contract() {
+        let mut machine = state();
+        let identity = attempt(4);
+        drain_to_committing(&mut machine, &identity);
+        assert!(matches!(
+            machine.force_retire_without_connector_evidence(&identity, 40),
+            Err(RotationError::InvalidPhase { .. })
+        ));
+        assert_eq!(machine.phase(), RotationPhase::Committing);
+        let mut machine = state();
+        let identity = attempt(4);
+        commit_to_retiring(&mut machine, &identity);
+        machine
+            .retired(
+                &identity,
+                RotationSide::Connector,
+                ClosureEvidence::closed("data-old"),
+                31,
+            )
+            .expect("connector attestation");
+        assert!(matches!(
+            machine.force_retire_without_connector_evidence(&identity, 40),
+            Err(RotationError::ConnectorRetirementPresent)
+        ));
+        assert_eq!(machine.phase(), RotationPhase::Retiring);
+        assert!(!machine.status().connector_retirement_missing);
     }
 
     /// protocol.md, "Abort, deadline and loss during handover": "Absolute

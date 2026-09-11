@@ -5394,7 +5394,21 @@ impl RelayActor {
         reply_to: Option<String>,
         reason: &str,
     ) -> RotationStart {
-        let now_ms = monotonic_millis();
+        self.start_rotation_local_at(key, reply_to, reason, monotonic_millis())
+    }
+
+    /// Explicit-clock body of [`Self::start_rotation_local`].  Deterministic
+    /// regressions that drove an earlier deadline with an explicit sample use
+    /// this to prove the session rotates again without waiting on the process
+    /// monotonic clock; the production caller above always passes the real
+    /// sample.
+    fn start_rotation_local_at(
+        &mut self,
+        key: &SessionKey,
+        reply_to: Option<String>,
+        reason: &str,
+        now_ms: u64,
+    ) -> RotationStart {
         let journal_bytes = self.options.limits.max_queue_bytes.min(4 * 1024 * 1024);
         let (
             attempt,
@@ -5735,12 +5749,24 @@ impl RelayActor {
             // commit-uncertain rule is unchanged: COMMITTING has not accepted a
             // commit, so the episode anchors on the retained old generation and
             // allocates a fresh greater one instead of resuming either carrier.
-            // ABORTING keeps its bilateral closure protocol and stays
-            // fail-closed rather than letting RECOVERY_BEGIN overtake an
-            // in-flight ROTATE_ABORT.
+            // ABORTING is covered by the same rule: protocol.md permits an
+            // abort only for a "Known uncommitted attempt, old healthy", and
+            // the state diagram's `Aborting --> Recovering: deadline or
+            // decision uncertain` edge is exactly this loss.  The final owner
+            // ABORTED would have resumed old writes on a carrier that no
+            // longer exists, so the in-flight abort is fenced rather than
+            // overtaken: its message id and any pending connector
+            // acknowledgement are discarded below, the candidate is closed,
+            // both abandoned identifiers enter the closure delta, and a late
+            // ROTATE_ABORTED for the abandoned attempt is rejected at the
+            // session boundary because it names an attempt this session no
+            // longer owns.
             let abandoned_rotation_attempt = if matches!(
                 rotation.state.phase(),
-                RotationPhase::Quiescing | RotationPhase::Draining | RotationPhase::Committing
+                RotationPhase::Quiescing
+                    | RotationPhase::Draining
+                    | RotationPhase::Committing
+                    | RotationPhase::Aborting
             ) {
                 rotation.attempt.clone()
             } else {
@@ -7179,24 +7205,38 @@ impl RelayActor {
             let Some(attempt) = rotation.attempt.clone() else {
                 return Ok::<(), tunnel_protocol::rotation::RotationError>(());
             };
-            let forced = rotation.state.status().deadline_forced_retirement;
+            let status = rotation.state.status();
+            let forced = status.deadline_forced_retirement;
+            let retirement_missing = forced && status.connector_retirement_missing;
             let mut completed_diagnostics = rotation.completed_rotation_diagnostics.clone();
             if let Some(diagnostics) = completed_diagnostics.as_mut() {
                 diagnostics.attempt_active = false;
                 diagnostics.old_socket_closed = [true, true];
             }
-            let source = if rotation.peer_message_id.is_empty() {
+            // COMPLETE correlates to the connector's RETIRED.  When the
+            // connector never sent one and the attempt completed on the
+            // owner's forced closure after the bounded grace, there is nothing
+            // to correlate to: like the owner's unsolicited ABORT, the forced
+            // COMPLETE carries an empty reply target and a distinct reason.
+            // The last peer phase message in that case is COMMITTED, which
+            // must not be presented as retirement evidence.
+            let source = if retirement_missing {
+                String::new()
+            } else if rotation.peer_message_id.is_empty() {
                 return Ok::<(), tunnel_protocol::rotation::RotationError>(());
             } else {
                 rotation.peer_message_id.clone()
             };
-            let message = wire::rotate_complete(
-                &source,
-                attempt,
-                &rotation.snapshot_id,
-                forced,
-                forced.then(|| "overlap deadline forced retirement".to_owned()),
-            );
+            let reason = if retirement_missing {
+                Some(
+                    "overlap deadline forced retirement without connector retirement evidence"
+                        .to_owned(),
+                )
+            } else {
+                forced.then(|| "overlap deadline forced retirement".to_owned())
+            };
+            let message =
+                wire::rotate_complete(&source, attempt, &rotation.snapshot_id, forced, reason);
             let encoded = wire::encode_control_message(&message)
                 .map_err(|_| tunnel_protocol::rotation::RotationError::Closed)?;
             match Self::complete_rotation_reply(rotation, &message, &encoded) {
@@ -7552,8 +7592,20 @@ impl RelayActor {
     /// without it the session keeps serving the retained streams on the new
     /// generation with the forced closure visible in diagnostics.  Nothing here
     /// extends a budget and no path returns to the old generation.
+    ///
+    /// M7-C45: a connector that never sends `ROTATE_RETIRED` must not leave the
+    /// attempt open forever (an open attempt admits no next candidate, so the
+    /// session could never rotate again).  The old transport itself is already
+    /// force-closed at the deadline; after one further handshake budget with no
+    /// attestation ([`RotationState::missing_retirement_deadline_ms`]) the
+    /// forced closure is the only retirement evidence there will be, and the
+    /// attempt completes on it with the missing attestation recorded distinctly
+    /// (`missing_connector_retirement`).  A later RETIRED for that attempt is
+    /// stale.  The grace bounds only the wait for a control message, never the
+    /// old transport's lifetime.
     fn force_rotation_retirement(&mut self, key: &SessionKey, now_ms: u64) {
         let mut deadline_event = None;
+        let mut missing_retirement_event = None;
         let _ = self.with_rotation_mut(key, |_session, rotation| {
             if rotation.state.phase() != RotationPhase::Retiring {
                 return Ok::<(), tunnel_protocol::rotation::RotationError>(());
@@ -7583,14 +7635,38 @@ impl RelayActor {
                 let status_after_close = rotation.state.status();
                 Self::latch_rotation_lifecycle(rotation, &status_after_close);
             }
+            // Still Retiring here means the connector's attestation is absent
+            // (its presence would have completed the bilateral closure above).
+            // Complete on the forced closure once the bounded grace elapsed.
+            if rotation.state.phase() == RotationPhase::Retiring
+                && rotation
+                    .state
+                    .missing_retirement_deadline_ms()
+                    .is_some_and(|grace_deadline_ms| now_ms >= grace_deadline_ms)
+            {
+                missing_retirement_event = Self::rotation_deadline_event(key, rotation, now_ms)
+                    .map(|event| RotationDeadlineEvent {
+                        reason: "missing_connector_retirement",
+                        ..event
+                    });
+                rotation
+                    .state
+                    .force_retire_without_connector_evidence(&attempt, now_ms)?;
+                let status_after_forced = rotation.state.status();
+                Self::latch_rotation_lifecycle(rotation, &status_after_forced);
+            }
             Ok::<(), tunnel_protocol::rotation::RotationError>(())
         });
         if let Some(event) = deadline_event {
             self.retain_rotation_deadline_event(event);
         }
-        // A no-op unless the connector's RETIRED was already journaled: the
-        // forced owner closure alone leaves the attempt open while the session
-        // keeps serving on the committed candidate.
+        if let Some(event) = missing_retirement_event {
+            self.retain_rotation_deadline_event(event);
+        }
+        // A no-op unless the attempt is now complete: either the connector's
+        // RETIRED was already journaled, or the grace elapsed without it.
+        // Before that, the forced owner closure alone leaves the attempt open
+        // while the session keeps serving on the committed candidate.
         self.finish_rotation_if_ready(key);
     }
 
@@ -11411,6 +11487,9 @@ impl RelayActor {
             let rotation_deadline_forced_retirement = status
                 .as_ref()
                 .is_some_and(|status| status.deadline_forced_retirement);
+            let rotation_connector_retirement_missing = status
+                .as_ref()
+                .is_some_and(|status| status.connector_retirement_missing);
             let rotation_diagnostics = session.rotation.as_ref().and_then(|rotation| {
                 if rotation.attempt.is_none() {
                     return rotation.completed_rotation_diagnostics.clone();
@@ -11547,6 +11626,7 @@ impl RelayActor {
                 rotation_deadline_ms,
                 rotation_recovery_reason,
                 rotation_deadline_forced_retirement,
+                rotation_connector_retirement_missing,
                 rotation_diagnostics,
                 streams,
             });

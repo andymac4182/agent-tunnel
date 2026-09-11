@@ -1291,7 +1291,15 @@ pub(crate) fn validate_rotate_retired(message: &RotateRetired) -> Result<(), Con
 }
 
 pub(crate) fn validate_rotate_complete(message: &RotateComplete) -> Result<(), ControlError> {
-    validate_reply_header(&message.message_id, &message.reply_to, &message.attempt)?;
+    // COMPLETE replies to the connector's RETIRED.  A deadline-forced
+    // completion whose connector attestation never arrived has nothing to
+    // correlate to and, like the owner's unsolicited ABORT, carries an empty
+    // reply target; every other COMPLETE keeps the strict reply header.
+    if message.forced {
+        validate_header(&message.message_id, &message.reply_to, &message.attempt)?;
+    } else {
+        validate_reply_header(&message.message_id, &message.reply_to, &message.attempt)?;
+    }
     validate_id("snapshot_id", &message.snapshot_id)?;
     if let Some(reason) = &message.reason {
         validate_reason("reason", reason)?;
@@ -1622,6 +1630,42 @@ mod tests {
             Some(TerminalState::Reset { reason: u16::MAX }),
             Some(u64::MAX),
         )
+    }
+
+    /// M7-C45.  COMPLETE replies to the connector's RETIRED; only a forced
+    /// completion whose connector attestation never arrived may carry an
+    /// empty reply target, mirroring the owner's unsolicited ABORT.  The
+    /// ordinary COMPLETE keeps the strict reply header.
+    #[test]
+    fn forced_complete_without_connector_evidence_may_omit_reply_target() {
+        let forced = ControlMessage::RotateComplete(RotateComplete {
+            message_id: "complete".to_owned(),
+            reply_to: String::new(),
+            attempt: attempt(),
+            snapshot_id: "snap".to_owned(),
+            forced: true,
+            reason: Some(
+                "overlap deadline forced retirement without connector retirement evidence"
+                    .to_owned(),
+            ),
+        });
+        let encoded = encode_control(&forced).expect("forced COMPLETE encodes");
+        assert_eq!(
+            decode_control(&encoded).expect("forced COMPLETE decodes"),
+            forced
+        );
+        let unforced = ControlMessage::RotateComplete(RotateComplete {
+            message_id: "complete".to_owned(),
+            reply_to: String::new(),
+            attempt: attempt(),
+            snapshot_id: "snap".to_owned(),
+            forced: false,
+            reason: None,
+        });
+        assert!(
+            encode_control(&unforced).is_err(),
+            "an ordinary COMPLETE must correlate to the connector RETIRED"
+        );
     }
 
     #[test]
