@@ -1919,3 +1919,155 @@ async fn missing_connector_retirement_completes_after_bounded_grace_and_rotates_
         "the next attempt's PREPARE is queued"
     );
 }
+
+/// EC-044 post-drain rejection on the retiring carrier.  Once the connector
+/// has attested its immutable fence, a sequenced frame beyond that fence on
+/// the old carrier is a protocol violation: accepting it would move the
+/// relay's receive cursor above the fence and make its own DRAIN proof
+/// unprovable (`AckAboveFence`).  The validator must fence the session
+/// instead of admitting the frame into stream state.
+#[tokio::test]
+async fn beyond_fence_frame_on_the_old_carrier_after_frozen_fails_closed() {
+    let mut fixture = FreezeFixture::new("beyond-fence", false);
+    let _pending = fixture.write(b"before-fence");
+    assert_eq!(sequenced(&drain_data(&mut fixture.old_rx)).len(), 1);
+    fixture.quiesce();
+    assert!(fixture.complete_barrier().is_empty());
+    // The connector's fence covers exactly one in-flight frame.
+    fixture.connector_frozen(1).await;
+    let epoch = fixture.key.epoch;
+    let old_generation = fixture.attempt.old_generation;
+    let mut payload = 7_u32.to_be_bytes().to_vec();
+    payload.extend_from_slice(b"in-fenc");
+    fixture
+        .actor
+        .inbound_m2_stream_data(
+            fixture.old_carrier.clone(),
+            Frame::data(epoch, old_generation, STREAM_ID, 1, 1, payload.clone()),
+            false,
+        )
+        .await;
+    let old = drain_data(&mut fixture.old_rx);
+    assert!(
+        old.iter().any(|item| matches!(
+            item,
+            Observed::Frame(frame) if frame.kind == FrameKind::Ack && frame.ack == 1
+        )),
+        "the frame inside the fence is accepted and acknowledged"
+    );
+    assert!(
+        fixture
+            .drain_control()
+            .iter()
+            .any(|message| matches!(message, ControlMessage::RotateDrained(_))),
+        "the relay proves its drain exactly at the connector fence"
+    );
+    assert_eq!(fixture.phase(), RotationPhase::Draining);
+
+    // A second sequenced frame on the old carrier is beyond the attested
+    // fence: it must never advance the receive cursor past the fence.  The
+    // payload is a record prefix without its body, so nothing downstream of
+    // the sequence validator (record parsing, waiter matching) can reject it
+    // by accident: only the fence rule can.
+    fixture
+        .actor
+        .inbound_data(
+            fixture.old_carrier.clone(),
+            Frame::data(
+                epoch,
+                old_generation,
+                STREAM_ID,
+                2,
+                1,
+                32_u32.to_be_bytes().to_vec(),
+            )
+            .encode()
+            .expect("beyond-fence frame encodes"),
+        )
+        .await;
+    assert!(
+        !fixture.actor.sessions.contains_key(&fixture.key.scope()),
+        "a frame beyond the connector's own fence on the retiring carrier fails closed"
+    );
+    assert_eq!(
+        fixture
+            .actor
+            .session_terminal_events
+            .back()
+            .map(|event| event.reason),
+        Some("FENCE_VIOLATION")
+    );
+    assert!(
+        drain_data(&mut fixture.old_rx)
+            .iter()
+            .all(|item| !matches!(item, Observed::Frame(frame) if frame.kind == FrameKind::Ack)),
+        "the beyond-fence frame is never acknowledged"
+    );
+}
+
+/// EC-044 post-drain rejection after commit: delayed bytes on the retired
+/// generation are dropped at the carrier boundary and cannot reach stream
+/// state, acknowledge, or disturb the activated carrier.
+#[tokio::test]
+async fn retired_carrier_frames_after_commit_are_dropped_without_touching_stream_state() {
+    let mut fixture = FreezeFixture::new("retired-late", false);
+    fixture.quiesce();
+    assert!(fixture.complete_barrier().is_empty());
+    fixture.connector_frozen(0).await;
+    fixture.connector_drained().await;
+    fixture.connector_committed().await;
+    assert_eq!(fixture.phase(), RotationPhase::Retiring);
+    let cursors = fixture.retained_cursors();
+    let epoch = fixture.key.epoch;
+    let old_generation = fixture.attempt.old_generation;
+    let mut payload = 4_u32.to_be_bytes().to_vec();
+    payload.extend_from_slice(b"late");
+    for late in [
+        Frame::data(epoch, old_generation, STREAM_ID, 1, 0, payload),
+        Frame::fin(epoch, old_generation, STREAM_ID, 1, 0),
+        Frame::reset(epoch, old_generation, STREAM_ID, 1, 0, 4_002),
+        Frame::window_update(epoch, old_generation, STREAM_ID, u64::MAX / 2),
+    ] {
+        fixture
+            .actor
+            .inbound_data(
+                fixture.old_carrier.clone(),
+                late.encode().expect("late frame encodes"),
+            )
+            .await;
+        assert!(fixture.actor.sessions.contains_key(&fixture.key.scope()));
+    }
+    assert_eq!(
+        fixture.retained_cursors(),
+        cursors,
+        "late frames on the retired generation never reach stream state"
+    );
+    assert!(!fixture.stream().terminal);
+    assert!(
+        sequenced(&drain_data(&mut fixture.old_rx)).is_empty()
+            && drain_data(&mut fixture.candidate_rx).is_empty(),
+        "nothing is acknowledged or emitted for a retired-generation frame"
+    );
+    assert_eq!(fixture.phase(), RotationPhase::Retiring);
+
+    // The old generation on the activated connection is stale data, not a
+    // late event: it fails closed.
+    fixture
+        .actor
+        .inbound_data(
+            fixture.candidate_carrier.clone(),
+            Frame::fin(epoch, old_generation, STREAM_ID, 1, 0)
+                .encode()
+                .expect("stale frame encodes"),
+        )
+        .await;
+    assert!(!fixture.actor.sessions.contains_key(&fixture.key.scope()));
+    assert_eq!(
+        fixture
+            .actor
+            .session_terminal_events
+            .back()
+            .map(|event| event.reason),
+        Some("STALE_DATA")
+    );
+}

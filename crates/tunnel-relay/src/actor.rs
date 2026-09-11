@@ -4996,27 +4996,34 @@ impl RelayActor {
         let mut record = Vec::with_capacity(record_len);
         record.extend_from_slice(&record_len_u32.to_be_bytes());
         record.extend_from_slice(&body);
-        let mut response = Some(response);
+        // Sequence reservation and enqueue are one transaction for the whole
+        // record (docs/m7-edge-cases.md EC-030): the sequence numbers are
+        // taken on a candidate copy of the stream state, the stream and
+        // session budgets are reserved for every chunk, and the writer slots
+        // are reserved for every chunk before any frame is handed to the
+        // carrier.  A refusal at any step releases everything and leaves
+        // `last_emitted` and `sent_bytes` exactly where they were, so a frame
+        // the carrier never accepted can neither consume a sequence number
+        // (which would leave a permanent gap the connector waits on forever)
+        // nor leave a partial record on the wire.
+        let mut candidate_sequence = stream.sequence.clone();
+        let mut encoded_chunks =
+            Vec::with_capacity(record.len().div_ceil(tunnel_protocol::MAX_PAYLOAD_LEN));
+        let mut reserved_stream_bytes = 0usize;
+        let mut failure: Option<EchoOutcome> = None;
         for chunk in record.chunks(tunnel_protocol::MAX_PAYLOAD_LEN) {
-            let sequence = match stream
-                .sequence
+            let Some(sequence) = candidate_sequence
                 .direction(Direction::RelayToConnector)
                 .last_emitted()
                 .checked_add(1)
-            {
-                Some(sequence) => sequence,
-                None => {
-                    let _ = response.take().expect("response available").send(Err(
-                        EchoOutcome::Failure {
-                            code: "STREAM_LIMIT",
-                            execution: "not_dispatched",
-                        },
-                    ));
-                    return;
-                }
+            else {
+                failure = Some(EchoOutcome::Failure {
+                    code: "STREAM_LIMIT",
+                    execution: "not_dispatched",
+                });
+                break;
             };
-            let ack = stream
-                .sequence
+            let ack = candidate_sequence
                 .direction(Direction::ConnectorToRelay)
                 .recv_contiguous();
             let frame = Frame::data(
@@ -5028,59 +5035,74 @@ impl RelayActor {
                 chunk.to_vec(),
             );
             if !reserve_m2_bytes(&queue_budget, stream, chunk.len()) {
-                let _ =
-                    response
-                        .take()
-                        .expect("response available")
-                        .send(Err(EchoOutcome::Failure {
-                            code: "RESOURCE_EXHAUSTED",
-                            execution: "not_dispatched",
-                        }));
-                return;
+                failure = Some(EchoOutcome::Failure {
+                    code: "RESOURCE_EXHAUSTED",
+                    execution: "not_dispatched",
+                });
+                break;
             }
-            if stream
-                .sequence
+            reserved_stream_bytes = reserved_stream_bytes.saturating_add(chunk.len());
+            if candidate_sequence
                 .send_frame(Direction::RelayToConnector, &frame)
                 .is_err()
             {
-                release_m2_bytes(&queue_budget, stream, chunk.len());
-                let _ =
-                    response
-                        .take()
-                        .expect("response available")
-                        .send(Err(EchoOutcome::Failure {
-                            code: "RESOURCE_EXHAUSTED",
-                            execution: "not_dispatched",
-                        }));
-                return;
+                failure = Some(EchoOutcome::Failure {
+                    code: "RESOURCE_EXHAUSTED",
+                    execution: "not_dispatched",
+                });
+                break;
             }
-            let Ok(encoded) = frame.encode() else {
-                let _ =
-                    response
-                        .take()
-                        .expect("response available")
-                        .send(Err(EchoOutcome::Failure {
-                            code: "FRAME_LIMIT",
-                            execution: "not_dispatched",
-                        }));
-                return;
-            };
-            if queue_data(&data_tx, &queue_budget, encoded).is_err() {
-                let _ =
-                    response
-                        .take()
-                        .expect("response available")
-                        .send(Err(EchoOutcome::Failure {
-                            code: "REVERSE_CHANNEL_UNAVAILABLE",
-                            execution: "unknown",
-                        }));
-                return;
+            match frame.encode() {
+                Ok(encoded) => encoded_chunks.push(encoded),
+                Err(_) => {
+                    failure = Some(EchoOutcome::Failure {
+                        code: "FRAME_LIMIT",
+                        execution: "not_dispatched",
+                    });
+                    break;
+                }
             }
         }
+        if failure.is_none() {
+            let total_queued_bytes = encoded_chunks.iter().map(Vec::len).sum::<usize>();
+            if !queue_budget.reserve_data(total_queued_bytes) {
+                queue_budget.pressure().record_data_refusal();
+                failure = Some(EchoOutcome::Failure {
+                    code: "RESOURCE_EXHAUSTED",
+                    execution: "not_dispatched",
+                });
+            } else {
+                match data_tx.try_reserve_many(encoded_chunks.len()) {
+                    Ok(permits) => {
+                        let pressure = queue_budget.pressure();
+                        for (permit, encoded) in permits.zip(encoded_chunks.drain(..)) {
+                            permit.send(DataOutbound::Binary(QueuedBytes::new(
+                                encoded,
+                                queue_budget.clone(),
+                            )));
+                            pressure.record_data_enqueue();
+                        }
+                        pressure.latch_data_depth(data_occupancy(&data_tx).depth);
+                    }
+                    Err(_) => {
+                        queue_budget.release(total_queued_bytes);
+                        queue_budget.pressure().record_data_refusal();
+                        failure = Some(EchoOutcome::Failure {
+                            code: "REVERSE_CHANNEL_UNAVAILABLE",
+                            execution: "not_dispatched",
+                        });
+                    }
+                }
+            }
+        }
+        if let Some(outcome) = failure {
+            release_m2_bytes(&queue_budget, stream, reserved_stream_bytes);
+            let _ = response.send(Err(outcome));
+            return;
+        }
+        stream.sequence = candidate_sequence;
         stream.send_bytes = stream.send_bytes.saturating_add(body.len());
-        stream
-            .response_records
-            .push_back(response.take().expect("response available"));
+        stream.response_records.push_back(response);
         self.record_application_dispatch();
     }
 
@@ -10272,6 +10294,8 @@ impl RelayActor {
             .then_some(frame.stream_id);
         let mut invalid = false;
         let mut deferred_rejected = false;
+        let mut fence_violation = false;
+        let (frame_kind, frame_sequence) = (frame.kind, frame.sequence);
         let deferred_limit = self.options.limits.max_queue_messages;
         let mut queue: Option<(mpsc::Sender<DataOutbound>, QueueBudget, Vec<u8>)> = None;
         let mut window_queue: Option<(mpsc::Sender<DataOutbound>, QueueBudget, Vec<u8>)> = None;
@@ -10287,6 +10311,41 @@ impl RelayActor {
                 return;
             };
             let writer_frozen = Self::rotation_frozen(session);
+            // docs/protocol.md "Freeze each writer": once the connector has
+            // attested its immutable fence with ROTATE_FROZEN, no sequenced
+            // frame may follow it on the old carrier unless the coordinator
+            // aborts (which clears the fence).  Admitting one would move the
+            // receive cursor above the fence and make the relay's own drain
+            // proof unprovable (`AckAboveFence`), so it is a protocol
+            // violation on the retiring carrier, not a late event
+            // (docs/m7-edge-cases.md EC-044 post-drain rejection).
+            if !carrier_is_candidate
+                && matches!(
+                    frame.kind,
+                    FrameKind::Data | FrameKind::Fin | FrameKind::Reset
+                )
+                && session
+                    .rotation
+                    .as_ref()
+                    .and_then(|rotation| {
+                        rotation.remote_fences[direction_index(Direction::ConnectorToRelay)]
+                            .as_ref()
+                    })
+                    .is_some_and(|fence| {
+                        let attested = fence
+                            .entries
+                            .iter()
+                            .find(|entry| {
+                                entry.stream_id == frame.stream_id
+                                    && entry.direction == Direction::ConnectorToRelay
+                            })
+                            .map_or(0, |entry| entry.last_emitted);
+                        frame.sequence > attested
+                    })
+            {
+                fence_violation = true;
+                break 'data;
+            }
             let defer_candidate_data = carrier_is_candidate
                 && matches!(
                     frame.kind,
@@ -10669,6 +10728,21 @@ impl RelayActor {
             )
         {
             self.retain_stream_terminal_receipt_event(event);
+        }
+        if fence_violation {
+            tracing::warn!(
+                device_id = %key.device_id,
+                session_id = %key.session_id,
+                epoch = key.epoch,
+                stream_id = received_stream_id,
+                carrier_generation = carrier.generation,
+                carrier_connection_id = %carrier.connection_id,
+                frame_kind = ?frame_kind,
+                frame_sequence,
+                stage = "m2_receive_beyond_frozen_fence",
+            );
+            self.protocol_failure(&key, "FENCE_VIOLATION").await;
+            return;
         }
         if deferred_rejected {
             self.protocol_failure(&key, "RECOVERY_QUEUE_LIMIT").await;
@@ -18728,6 +18802,10 @@ mod challenge_mismatch_tests;
 #[cfg(test)]
 #[path = "actor_rotation_freeze_tests.rs"]
 mod rotation_freeze_tests;
+
+#[cfg(test)]
+#[path = "actor_late_frame_tests.rs"]
+mod late_frame_tests;
 
 #[cfg(test)]
 mod cleanup_tests {

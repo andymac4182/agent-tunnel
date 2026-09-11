@@ -389,6 +389,7 @@ pub(crate) fn terminal_close_reason(reason: &str) -> &'static str {
         "STALE_DATA",
         "UNKNOWN_STREAM",
         "INVALID_SEQUENCE",
+        "FENCE_VIOLATION",
         "DEVICE_OFFLINE",
         "REVERSE_CHANNEL_UNAVAILABLE",
         "STALE_ACK",
