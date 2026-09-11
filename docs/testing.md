@@ -45,6 +45,7 @@ cargo run -p tunnel-test-harness --locked -- verify-m7-transport
 cargo run -p tunnel-test-harness --locked -- verify-m7-cluster
 cargo run -p tunnel-test-harness --locked -- verify-m7-production
 cargo run -p tunnel-test-harness --locked -- verify-m7-redis-partition
+cargo run -p tunnel-test-harness --locked -- verify-m7-queue-saturation
 ```
 
 The transport command exercises real mTLS/H3 fault cases. The cluster command
@@ -53,6 +54,10 @@ CLI/device WebSockets and public consumers across three relays. The Redis
 partition command is being implemented under M7-I05/I17 and is not yet verified;
 it must block both existing and newly accepted Redis connections, reject new
 admission and expired-authority dispatch, then prove fresh authorized recovery.
+The queue-saturation command drives the configured bounded data message queue to
+its reachable physical bound behind a blackholed carrier; see
+"Physical versus logical queue occupancy" below for what it does and does not
+prove.
 A command passing cannot close unrelated rows in [m7-edge-cases.md](m7-edge-cases.md).
 Record the tested revision and outcomes in [m7-verification.md](m7-verification.md).
 
@@ -304,6 +309,41 @@ Assert maximum frame size, maximum operation size, per-stream and per-connection
 An in-flight operation limit that is only relay-global is not a tenant-isolation test. A capacity regression must prove that one tenant saturating its own allowance still leaves another tenant's public request admitted, that the relay-global bound independently refuses a tenant whose own scope is empty, and that every permit returns exactly once when a request is abandoned or an upgrade is cancelled. `crates/tunnel-relay/src/http/tenant_admission_tests.rs` runs two fully independent tenants through the real consumer route on a loopback listener for those invariants; a double release is detected by the released capacity readmitting more streams than the bound allows, not by inspecting a counter alone.
 
 Measure peak resident memory, queue high-water marks, end-to-end latency, fairness, and bytes transferred. A successful checksum proves content integrity; a successful return code alone does not. Use a streaming generator and sink so the harness does not conceal relay buffering by preloading entire files into memory.
+
+### Physical versus logical queue occupancy
+
+A session's logical admission count (`queue_messages`, which is pending
+operations plus streams) is not occupancy and must never be reported as
+saturation evidence. The relay publishes the physical counters a gate needs:
+`data_queue_depth`/`data_queue_capacity` and
+`control_queue_depth`/`control_queue_capacity` are live item counts taken from
+the bounded channels themselves, `*_depth_high_water` and
+`queue_bytes_high_water` are saturating latches that a bounded observation
+window cannot miss, `queue_bytes_limit` exposes the configured budget beside its
+use, and `control_queue_refusals`/`data_queue_refusals` plus
+`control_queue_enqueued`/`data_queue_enqueued` separate "never refused" from
+"actually still flowing". All are payload-free.
+
+`verify-m7-queue-saturation` is the configured-bound gate built on them. It runs
+through a non-owner ingress, admits the full `max_streams_per_device` cap and
+proves the next admission is refused, blackholes the exact correlated data
+carrier, and then requires physical residency, retained reserved control and
+data capacity with a byte headroom floor, an advancing accepted-control-enqueue
+count during the blackhole, a real cancellation with an immutable first-terminal
+observation, bounded physical drain, and the scheduled rotation of exactly the
+paused carrier.
+
+Two bounds make the nominal 128-entry data channel unreachable from the public
+echo route, and the gate asserts that rather than hiding it. The consumer
+ingress admits one in-flight record per stream, and
+`max_queue_messages = 2 * max_streams_per_device`, so residency is capped at 64
+entries for every admissible body size; a maximum 64 KiB record additionally
+spans two frames charging 131,208 bytes, so only 31 such records fit the 4 MiB
+budget (62 entries). Separately, the frames the kernel socket buffers absorb
+before the writer blocks are no longer charged, so the gate derives the absorbed
+count from the relay's own accepted-enqueue counter rather than assuming a
+buffer size. A workload that cannot fill the channel must say so with numbers;
+it must not be relabelled as success against a logical count.
 
 ## Filesystem API and framework interoperability
 

@@ -102,6 +102,8 @@ mod fp05;
 pub use fp05::{Fp05Evidence, validate_fp05_evidence};
 mod pressure;
 pub use pressure::PressureEvidence;
+mod queue_saturation;
+pub use queue_saturation::{QueueSaturationEvidence, validate_queue_saturation_evidence};
 mod lifecycle;
 pub use lifecycle::{LifecycleEvidence, validate_lifecycle_evidence, verify as verify_lifecycle};
 mod key_rotation;
@@ -624,6 +626,57 @@ pub async fn verify_pressure() -> Result<PressureEvidence> {
         Ok(Err(error)) => Err(error),
         Err(_) => Err(HarnessError::Timeout(
             "production pressure scenario exceeded its bounded deadline".into(),
+        )),
+    };
+    let mut cleanup_errors = Vec::new();
+    push_cleanup_error(
+        &mut cleanup_errors,
+        "relay cleanup",
+        cluster.shutdown().await,
+    );
+    push_cleanup_error(
+        &mut cleanup_errors,
+        "catalog cleanup",
+        harness.shutdown().await,
+    );
+    finish_scenario_with_cleanup(scenario, cleanup_errors)
+}
+
+/// Run the configured message-queue saturation gate.
+///
+/// The rotation schedule is deliberately slower than the shared production
+/// `ROTATION`: the saturation window must not collide with a scheduled
+/// handover, and the correlated rotation must still fire inside the scenario
+/// deadline.  See `queue_saturation` for the workload derivation.
+pub async fn verify_queue_saturation() -> Result<QueueSaturationEvidence> {
+    let options = HarnessOptions::from_env()?
+        .rotation(queue_saturation::SATURATION_ROTATION)
+        .shared_device_uuid(true);
+    let mut harness = timeout(STARTUP_TIMEOUT, Harness::start(options))
+        .await
+        .map_err(|_| {
+            HarnessError::Timeout("queue saturation harness startup timed out".into())
+        })??;
+    let mut cluster = match ProductionCluster::start(&mut harness).await {
+        Ok(cluster) => cluster,
+        Err(error) => {
+            let _ = harness.shutdown().await;
+            return Err(error);
+        }
+    };
+
+    let scenario = match timeout(
+        SCENARIO_TIMEOUT,
+        queue_saturation::run(&mut cluster, &harness),
+    )
+    .await
+    {
+        Ok(result) => result.and_then(|evidence| {
+            validate_queue_saturation_evidence(&evidence)?;
+            Ok(evidence)
+        }),
+        Err(_) => Err(HarnessError::Timeout(
+            "queue saturation scenario exceeded its bounded deadline".into(),
         )),
     };
     let mut cleanup_errors = Vec::new();

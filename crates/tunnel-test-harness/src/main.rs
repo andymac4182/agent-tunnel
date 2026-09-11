@@ -1061,6 +1061,70 @@ async fn main() -> ExitCode {
                 )),
             }
         }
+        [command] if command == "verify-m7-queue-saturation" => {
+            match tokio::time::timeout(
+                Duration::from_secs(240),
+                tunnel_test_harness::production_cluster::verify_queue_saturation(),
+            )
+            .await
+            {
+                Ok(result) => result.and_then(|evidence| {
+                    require_m7_queue_saturation_evidence(&evidence)?;
+                    println!(
+                        "M7 queue saturation passed: relays={} ready={} non_owner_ingress={} queue_bytes_limit={} data_slots={} control_slots={} max_streams={} record_bytes={} charge_per_record={} frames_per_record={} credit_records_per_stream={} reachable_entries={} route_maximum_entries={} streams_admitted={} stream_cap_refused_one_more={} data_depth_observed={} data_depth_high_water={} data_enqueues_during_blackhole={} physically_resident_frames={} absorbed_frames={} absorbed_wire_bytes={} reachable_bound_saturated={} reserved_free_data_slots={} reserved_data_slot_accepted={} queue_bytes_high_water={} headroom_at_peak={} control_depth_at_peak={} control_depth_high_water={} control_refusals={} control_enqueues_during_blackhole={} cancellation_accepted={} fresh_stream_admitted={} sibling_survived={} first_terminal_immutable={} terminal_observations={} paused_target_to_client={} paused_generation={} drain_observations={}/{} drained={} rotation_replaced_paused_carrier={} rotation_generation={} device_sockets={} dispatch_delta_after_drain={} elapsed_ms={}",
+                        evidence.relay_count,
+                        evidence.membership_ready_relays,
+                        evidence.non_owner_ingress,
+                        evidence.configured_queue_bytes_limit,
+                        evidence.configured_data_queue_capacity,
+                        evidence.configured_control_queue_capacity,
+                        evidence.configured_max_streams_per_device,
+                        evidence.workload_record_bytes,
+                        evidence.workload_charge_per_record_bytes,
+                        evidence.workload_frames_per_record,
+                        evidence.workload_records_per_stream_by_credit,
+                        evidence.workload_reachable_entries,
+                        evidence.route_maximum_reachable_entries,
+                        evidence.streams_admitted,
+                        evidence.stream_cap_refused_one_more,
+                        evidence.data_queue_depth_observed,
+                        evidence.data_queue_depth_high_water,
+                        evidence.data_enqueues_during_blackhole,
+                        evidence.physically_resident_frames,
+                        evidence.writer_absorbed_frames,
+                        evidence.writer_absorbed_wire_bytes,
+                        evidence.reachable_bound_saturated,
+                        evidence.reserved_free_data_slots_at_peak,
+                        evidence.reserved_data_slot_accepted_at_peak,
+                        evidence.queue_bytes_high_water,
+                        evidence.queue_bytes_headroom_at_peak,
+                        evidence.control_queue_depth_at_peak,
+                        evidence.control_queue_depth_high_water,
+                        evidence.control_queue_refusals,
+                        evidence.control_enqueues_during_blackhole,
+                        evidence.cancellation_accepted_after_resume,
+                        evidence.fresh_stream_admitted_after_cancellation,
+                        evidence.sibling_stream_survived,
+                        evidence.first_terminal_observation_immutable,
+                        evidence.terminal_observations,
+                        evidence.paused_target_to_client,
+                        evidence.paused_generation,
+                        evidence.physical_drain_observations,
+                        evidence.physical_drain_observation_bound,
+                        evidence.physical_drain_completed,
+                        evidence.rotation_replaced_paused_carrier,
+                        evidence.rotation_committed_generation,
+                        evidence.device_socket_peak_open,
+                        evidence.dispatch_delta_after_drain,
+                        evidence.elapsed_ms,
+                    );
+                    Ok(())
+                }),
+                Err(_) => Err(HarnessError::Timeout(
+                    "M7 queue saturation acceptance exceeded 240 seconds".to_owned(),
+                )),
+            }
+        }
         [command] if command == "verify-m7-c11-diagnostics" => {
             tunnel_test_harness::production_cluster::verify_c11_diagnostics()
                 .await
@@ -1343,9 +1407,117 @@ fn require_m7_pressure_evidence(
     )
 }
 
+/// Require the full configured message-queue saturation contract.
+///
+/// The module validator already checks every bound; this independent CLI gate
+/// re-states the flags and counts that must hold for the command to exit zero,
+/// so a validator regression cannot silently pass the command.
+fn require_m7_queue_saturation_evidence(
+    evidence: &tunnel_test_harness::production_cluster::QueueSaturationEvidence,
+) -> Result<(), HarnessError> {
+    tunnel_test_harness::production_cluster::validate_queue_saturation_evidence(evidence)?;
+    require_m7_acceptance_flags(
+        "M7 queue saturation",
+        &[
+            ("non_owner_ingress", evidence.non_owner_ingress),
+            (
+                "stream_cap_refused_one_more",
+                evidence.stream_cap_refused_one_more,
+            ),
+            (
+                "reachable_bound_saturated",
+                evidence.reachable_bound_saturated,
+            ),
+            (
+                "reserved_data_slot_accepted_at_peak",
+                evidence.reserved_data_slot_accepted_at_peak,
+            ),
+            (
+                "cancellation_accepted_after_resume",
+                evidence.cancellation_accepted_after_resume,
+            ),
+            (
+                "fresh_stream_admitted_after_cancellation",
+                evidence.fresh_stream_admitted_after_cancellation,
+            ),
+            (
+                "reserved_control_capacity_stayed_live",
+                evidence.control_enqueues_during_blackhole > 0,
+            ),
+            ("sibling_stream_survived", evidence.sibling_stream_survived),
+            (
+                "first_terminal_observation_immutable",
+                evidence.first_terminal_observation_immutable,
+            ),
+            (
+                "paused_connection_correlated",
+                evidence.paused_connection_correlated,
+            ),
+            (
+                "physical_drain_completed",
+                evidence.physical_drain_completed,
+            ),
+            (
+                "rotation_replaced_paused_carrier",
+                evidence.rotation_replaced_paused_carrier,
+            ),
+            ("relay_count_is_three", evidence.relay_count == 3),
+            (
+                "physical_residency_accounting_closes",
+                evidence.physically_resident_frames == evidence.data_queue_depth_high_water + 1
+                    && evidence.physically_resident_frames + evidence.writer_absorbed_frames
+                        == evidence.workload_reachable_entries
+                    && evidence.data_enqueues_during_blackhole
+                        == evidence.workload_reachable_entries as u64,
+            ),
+            (
+                "full_message_queue_bound_remains_unreachable",
+                evidence.route_maximum_reachable_entries < evidence.configured_data_queue_capacity,
+            ),
+            (
+                "workload_saturates_the_reachable_bound",
+                evidence.workload_reachable_entries == evidence.route_maximum_reachable_entries
+                    && evidence.streams_admitted == evidence.configured_max_streams_per_device,
+            ),
+            (
+                "reserved_control_capacity_retained",
+                evidence.control_queue_refusals == 0
+                    && evidence.control_queue_depth_high_water
+                        < evidence.configured_control_queue_capacity,
+            ),
+            (
+                "reserved_data_capacity_retained",
+                evidence.reserved_free_data_slots_at_peak
+                    >= evidence.configured_max_streams_per_device - 1,
+            ),
+            (
+                // One quarter of the configured budget, which is 32 times the
+                // 32 KiB `max_control_bytes` bound.
+                "byte_budget_headroom_retained",
+                evidence.queue_bytes_headroom_at_peak >= evidence.configured_queue_bytes_limit / 4,
+            ),
+            (
+                "drain_within_bounded_observations",
+                evidence.physical_drain_observations > 0
+                    && evidence.physical_drain_observations
+                        <= evidence.physical_drain_observation_bound,
+            ),
+            (
+                "no_replay_after_drain",
+                evidence.dispatch_delta_after_drain == 0,
+            ),
+            (
+                "device_socket_peak_within_bound",
+                evidence.device_socket_peak_open <= 3,
+            ),
+        ],
+    )
+}
+
 fn print_help() {
     println!(
-        "Usage: tunnel-test-harness verify\n       tunnel-test-harness verify-m2\n       tunnel-test-harness verify-m2-default\n       tunnel-test-harness verify-m2-faults\n       tunnel-test-harness verify-m7-transport\n       tunnel-test-harness verify-m7-redis-tls\n       tunnel-test-harness verify-m7-cluster\n       tunnel-test-harness verify-m7-production\n       tunnel-test-harness verify-m7-i08-synthetic-rotation\n       tunnel-test-harness verify-m7-i08-goaway-rotation\n       tunnel-test-harness verify-m7-i08-rotation-faults\n       tunnel-test-harness verify-m7-admission-framing\n       tunnel-test-harness verify-m7-admission\n       tunnel-test-harness verify-m7-i04-fail-closed\n       tunnel-test-harness verify-m7-device-revocation\n       tunnel-test-harness verify-m7-credential-expiry-rotation\n       tunnel-test-harness verify-m7-redis-partition\n       tunnel-test-harness verify-m7-process-pause\n       tunnel-test-harness verify-m7-pressure\n       tunnel-test-harness verify-m7-c11-diagnostics\n       tunnel-test-harness verify-m7-lifecycle\n       tunnel-test-harness verify-m7-side-effect\n       tunnel-test-harness verify-m7-side-effect-late\n       tunnel-test-harness verify-m7-public-abandoned-upgrade\n       tunnel-test-harness verify-m7-owner-loss-effect\n       tunnel-test-harness verify-m7-timing-boundaries\n       tunnel-test-harness verify-m7-peer-fragmentation\n       tunnel-test-harness verify-m7-pending-owner\n       tunnel-test-harness verify-m7-successor-pending-owner\n       tunnel-test-harness verify-m7-concurrent-load\n       tunnel-test-harness verify-m7-key-rotation\n       tunnel-test-harness verify-m7-peer-readiness\n       tunnel-test-harness verify-m7-peer-capacity\n       tunnel-test-harness verify-m7-owner-local-capacity\n       tunnel-test-harness verify-m7-owner-contention\n       tunnel-test-harness verify-m7-trust-expiry\n       tunnel-test-harness redis-restart-{{seed|check}} --redis-url URL --namespace NAME --receipt-file PATH\n\nverify, verify-m2, and verify-m7-redis-tls commands require TEST_REDIS_URL and built workspace binaries.\nRuns real Redis, HTTPS, device mTLS WebSocket, CLI and HTTP/3 acceptance checks.\nverify-m2 drives a long-lived public echo WebSocket through accelerated real rotations;\nverify-m2-default repeats the same flow at the 300-second policy.\nverify-m2-faults closes exact control/data/candidate sockets and checks explicit recovery outcomes.\nverify-m7-transport proves bounded peer mTLS/HTTP3 duplex exchange and negative identity cases.\nverify-m7-redis-tls proves the authenticated Redis TLS catalog connection and rejection cases.\nverify-m7-cluster connects three real relay peer listeners through signed membership,\nRedis owner fencing, control/data replacement generations and consumer ingress.\nverify-m7-production exercises the production relay actor, signed Redis directory,\nclient WebSockets and public consumer routing across three relays.\nverify-m7-i08-synthetic-rotation verifies a real CLI and checksummed synthetic Echo records across three same-owner rotations.\nverify-m7-admission exercises public negative admission, route allowlisting,\nforged identity-header rejection and selected-owner failure across three relays.\nverify-m7-i04-fail-closed proves the fail-closed admission, readiness, routing and\nfallback matrix with a request-body sentinel: absent/unknown/inactive/ambiguous and\ncaller-destination targets rejected before any body read or owner selection, a\ncaller-named peer address never reached, an empty body distinguished from a failed\nbody, consumed/unpolled/failed bodies under a real owner process loss with no\nreselection, one bounded safe retry bridging successor readiness, and the excluded\nbrowser route boundary recorded.\nverify-m7-device-revocation proves live Redis device-credential revocation,\nexisting-stream withdrawal, exact no-owner admission, and tenant sibling survival.\nverify-m7-credential-expiry-rotation proves a sixteen-second consumer credential\nexpires inside one exact candidate/old scheduled rotation and refresh challenge\nafter admitted baseline echo, with issuer/audience/subject identity and typed\nterminal checks.\nverify-m7-pressure exercises bounded production resource pressure, cancellation, and recovery.\nverify-m7-lifecycle holds one consumer response path and checks cancellation, sibling survival, and fresh-stream recovery.\nverify-m7-side-effect-late proves owner-side receipt and terminal rejection of one late DATA/FIN pair after a selected peer fault.\nverify-m7-public-abandoned-upgrade proves real owner-local and remote public WebSocket upgrades after admission, no 101 response, exact registration reclamation, capacity rejection, and sibling recovery.\nverify-m7-key-rotation exercises bounded recovery after peer-pin withdrawal during scheduled rotation.\nverify-m7-peer-readiness exercises authenticated peer path loss and fresh-path readiness recovery.\nverify-m7-owner-contention exercises concurrent CLI claims, terminal rejection and fenced successor cleanup.\nverify-m7-trust-expiry exercises signed peer-key expiry without a Redis invalidation hint,\npooled-stream closure, unrelated peer survival, and fresh signed-trust recovery.\nUses isolated Redis namespaces, ephemeral certificates and synthetic echo data.\nRun restart probes through scripts/m1-redis-restart-verify.sh.\nSet M2_HARNESS_TIMEOUT_SECONDS to override a bounded M2 command timeout."
+        "Usage: tunnel-test-harness verify\n       tunnel-test-harness verify-m2\n       tunnel-test-harness verify-m2-default\n       tunnel-test-harness verify-m2-faults\n       tunnel-test-harness verify-m7-transport\n       tunnel-test-harness verify-m7-redis-tls\n       tunnel-test-harness verify-m7-cluster\n       tunnel-test-harness verify-m7-production\n       tunnel-test-harness verify-m7-i08-synthetic-rotation\n       tunnel-test-harness verify-m7-i08-goaway-rotation\n       tunnel-test-harness verify-m7-i08-rotation-faults\n       tunnel-test-harness verify-m7-admission-framing\n       tunnel-test-harness verify-m7-admission\n       tunnel-test-harness verify-m7-i04-fail-closed\n       tunnel-test-harness verify-m7-queue-saturation\n       tunnel-test-harness verify-m7-device-revocation\n       tunnel-test-harness verify-m7-credential-expiry-rotation\n       tunnel-test-harness verify-m7-redis-partition\n       tunnel-test-harness verify-m7-process-pause\n       tunnel-test-harness verify-m7-pressure\n       tunnel-test-harness verify-m7-c11-diagnostics\n       tunnel-test-harness verify-m7-lifecycle\n       tunnel-test-harness verify-m7-side-effect\n       tunnel-test-harness verify-m7-side-effect-late\n       tunnel-test-harness verify-m7-public-abandoned-upgrade\n       tunnel-test-harness verify-m7-owner-loss-effect\n       tunnel-test-harness verify-m7-timing-boundaries\n       tunnel-test-harness verify-m7-peer-fragmentation\n       tunnel-test-harness verify-m7-pending-owner\n       tunnel-test-harness verify-m7-successor-pending-owner\n       tunnel-test-harness verify-m7-concurrent-load\n       tunnel-test-harness verify-m7-key-rotation\n       tunnel-test-harness verify-m7-peer-readiness\n       tunnel-test-harness verify-m7-peer-capacity\n       tunnel-test-harness verify-m7-owner-local-capacity\n       tunnel-test-harness verify-m7-owner-contention\n       tunnel-test-harness verify-m7-trust-expiry\n       tunnel-test-harness redis-restart-{{seed|check}} --redis-url URL --namespace NAME --receipt-file PATH\n\nverify, verify-m2, and verify-m7-redis-tls commands require TEST_REDIS_URL and built workspace binaries.\nRuns real Redis, HTTPS, device mTLS WebSocket, CLI and HTTP/3 acceptance checks.\nverify-m2 drives a long-lived public echo WebSocket through accelerated real rotations;\nverify-m2-default repeats the same flow at the 300-second policy.\nverify-m2-faults closes exact control/data/candidate sockets and checks explicit recovery outcomes.\nverify-m7-transport proves bounded peer mTLS/HTTP3 duplex exchange and negative identity cases.\nverify-m7-redis-tls proves the authenticated Redis TLS catalog connection and rejection cases.\nverify-m7-cluster connects three real relay peer listeners through signed membership,\nRedis owner fencing, control/data replacement generations and consumer ingress.\nverify-m7-production exercises the production relay actor, signed Redis directory,\nclient WebSockets and public consumer routing across three relays.\nverify-m7-i08-synthetic-rotation verifies a real CLI and checksummed synthetic Echo records across three same-owner rotations.\nverify-m7-admission exercises public negative admission, route allowlisting,\nforged identity-header rejection and selected-owner failure across three relays.\nverify-m7-i04-fail-closed proves the fail-closed admission, readiness, routing and\nfallback matrix with a request-body sentinel: absent/unknown/inactive/ambiguous and\ncaller-destination targets rejected before any body read or owner selection, a\ncaller-named peer address never reached, an empty body distinguished from a failed\nbody, consumed/unpolled/failed bodies under a real owner process loss with no\nreselection, one bounded safe retry bridging successor readiness, and the excluded\nbrowser route boundary recorded.\nverify-m7-device-revocation proves live Redis device-credential revocation,\nexisting-stream withdrawal, exact no-owner admission, and tenant sibling survival.\nverify-m7-credential-expiry-rotation proves a sixteen-second consumer credential\nexpires inside one exact candidate/old scheduled rotation and refresh challenge\nafter admitted baseline echo, with issuer/audience/subject identity and typed\nterminal checks.\nverify-m7-pressure exercises bounded production resource pressure, cancellation, and recovery.\nverify-m7-lifecycle holds one consumer response path and checks cancellation, sibling survival, and fresh-stream recovery.\nverify-m7-side-effect-late proves owner-side receipt and terminal rejection of one late DATA/FIN pair after a selected peer fault.\nverify-m7-public-abandoned-upgrade proves real owner-local and remote public WebSocket upgrades after admission, no 101 response, exact registration reclamation, capacity rejection, and sibling recovery.\nverify-m7-key-rotation exercises bounded recovery after peer-pin withdrawal during scheduled rotation.\nverify-m7-peer-readiness exercises authenticated peer path loss and fresh-path readiness recovery.\nverify-m7-owner-contention exercises concurrent CLI claims, terminal rejection and fenced successor cleanup.\nverify-m7-trust-expiry exercises signed peer-key expiry without a Redis invalidation hint,\npooled-stream closure, unrelated peer survival, and fresh signed-trust recovery.\nUses isolated Redis namespaces, ephemeral certificates and synthetic echo data.\nRun restart probes through scripts/m1-redis-restart-verify.sh.\nSet M2_HARNESS_TIMEOUT_SECONDS to override a bounded M2 command timeout."
+>>>>>>> cb35eec (test: add the configured message-queue saturation gate with physical occupancy diagnostics)
     );
 }
 
@@ -1498,6 +1670,59 @@ mod tests {
         }
     }
 
+    fn queue_saturation_evidence()
+    -> tunnel_test_harness::production_cluster::QueueSaturationEvidence {
+        tunnel_test_harness::production_cluster::QueueSaturationEvidence {
+            relay_count: 3,
+            membership_ready_relays: 3,
+            non_owner_ingress: true,
+            configured_queue_bytes_limit: 4 * 1024 * 1024,
+            configured_data_queue_capacity: 128,
+            configured_control_queue_capacity: 128,
+            configured_max_streams_per_device: 64,
+            workload_record_bytes: 20_000,
+            workload_charge_per_record_bytes: 40_072,
+            workload_frames_per_record: 1,
+            workload_streams: 64,
+            workload_records_per_stream_by_credit: 6,
+            workload_reachable_entries: 64,
+            route_maximum_reachable_entries: 64,
+            streams_admitted: 64,
+            stream_cap_refused_one_more: true,
+            data_queue_depth_observed: 43,
+            data_queue_depth_high_water: 43,
+            data_enqueues_during_blackhole: 64,
+            physically_resident_frames: 44,
+            writer_absorbed_frames: 20,
+            writer_absorbed_wire_bytes: 20 * 20_068,
+            reachable_bound_saturated: true,
+            reserved_free_data_slots_at_peak: 85,
+            reserved_data_slot_accepted_at_peak: true,
+            queue_bytes_high_water: 43 * 40_072,
+            queue_bytes_headroom_at_peak: 4 * 1024 * 1024 - 2_564_608,
+            control_queue_depth_at_peak: 1,
+            control_queue_depth_high_water: 4,
+            control_queue_refusals: 0,
+            control_enqueues_during_blackhole: 3,
+            cancellation_accepted_after_resume: true,
+            fresh_stream_admitted_after_cancellation: true,
+            sibling_stream_survived: true,
+            first_terminal_observation_immutable: true,
+            terminal_observations: 8,
+            paused_target_to_client: 1,
+            paused_connection_correlated: true,
+            paused_generation: 1,
+            physical_drain_observations: 9,
+            physical_drain_observation_bound: 200,
+            physical_drain_completed: true,
+            rotation_replaced_paused_carrier: true,
+            rotation_committed_generation: 2,
+            device_socket_peak_open: 3,
+            dispatch_delta_after_drain: 0,
+            elapsed_ms: 12_345,
+        }
+    }
+
     fn assert_rejected(result: Result<(), HarnessError>, expected_name: &str) {
         let message = result
             .as_ref()
@@ -1601,6 +1826,7 @@ mod tests {
         assert!(require_m7_process_pause_evidence(&process_pause_evidence()).is_ok());
         assert!(require_m7_redis_partition_evidence(&redis_partition_evidence()).is_ok());
         assert!(require_m7_pressure_evidence(&pressure_evidence()).is_ok());
+        assert!(require_m7_queue_saturation_evidence(&queue_saturation_evidence()).is_ok());
     }
 
     #[test]
@@ -1718,6 +1944,80 @@ mod tests {
             require_m7_redis_partition_evidence(&no_paused_connections),
             "paused_redis_connections_nonzero",
         );
+    }
+
+    #[test]
+    fn queue_saturation_gate_requires_each_flag_and_bound() {
+        assert!(require_m7_queue_saturation_evidence(&queue_saturation_evidence()).is_ok());
+
+        macro_rules! assert_saturation_flag {
+            ($field:ident) => {{
+                let mut evidence = queue_saturation_evidence();
+                evidence.$field = false;
+                assert_rejected(
+                    require_m7_queue_saturation_evidence(&evidence),
+                    stringify!($field),
+                );
+            }};
+        }
+
+        assert_saturation_flag!(non_owner_ingress);
+        assert_saturation_flag!(stream_cap_refused_one_more);
+        assert_saturation_flag!(reachable_bound_saturated);
+        assert_saturation_flag!(reserved_data_slot_accepted_at_peak);
+        assert_saturation_flag!(cancellation_accepted_after_resume);
+        assert_saturation_flag!(fresh_stream_admitted_after_cancellation);
+        assert_saturation_flag!(sibling_stream_survived);
+        assert_saturation_flag!(first_terminal_observation_immutable);
+        assert_saturation_flag!(paused_connection_correlated);
+        assert_saturation_flag!(physical_drain_completed);
+        assert_saturation_flag!(rotation_replaced_paused_carrier);
+
+        type Mutate = fn(&mut tunnel_test_harness::production_cluster::QueueSaturationEvidence);
+        let bounds: [Mutate; 16] = [
+            // A logical admission count must never satisfy the physical floor.
+            |e| {
+                e.data_queue_depth_observed = 1;
+                e.data_queue_depth_high_water = 1;
+                e.physically_resident_frames = 2;
+                e.writer_absorbed_frames = 62;
+                e.writer_absorbed_wire_bytes = 62 * 20_068;
+            },
+            // Residency that does not account for the writer-held frame.
+            |e| e.physically_resident_frames = 43,
+            // Fewer in-flight records admitted than the configured bound.
+            |e| e.data_enqueues_during_blackhole = 32,
+            // Absorption accounting that does not close.
+            |e| e.writer_absorbed_frames = 1,
+            // Control starvation, by refusal and by a filled control channel.
+            |e| e.control_queue_refusals = 1,
+            |e| e.control_enqueues_during_blackhole = 0,
+            |e| e.control_queue_depth_high_water = 128,
+            // No reserved free data slot.
+            |e| e.reserved_free_data_slots_at_peak = 1,
+            |e| e.queue_bytes_headroom_at_peak = 1,
+            // A route on which the full channel bound would be reachable must
+            // reopen the gate rather than keep asserting the smaller bound.
+            |e| e.route_maximum_reachable_entries = 128,
+            // A workload that does not saturate the reachable bound.
+            |e| {
+                e.workload_reachable_entries = 32;
+                e.route_maximum_reachable_entries = 32;
+            },
+            |e| e.streams_admitted = 16,
+            |e| e.relay_count = 2,
+            |e| e.physical_drain_observations = 201,
+            |e| e.dispatch_delta_after_drain = 1,
+            |e| e.device_socket_peak_open = 4,
+        ];
+        for mutate in bounds {
+            let mut evidence = queue_saturation_evidence();
+            mutate(&mut evidence);
+            assert_rejected(
+                require_m7_queue_saturation_evidence(&evidence),
+                "queue saturation",
+            );
+        }
     }
 
     #[test]

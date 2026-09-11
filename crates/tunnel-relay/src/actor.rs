@@ -909,6 +909,87 @@ pub(crate) struct DataRegistration {
     pub(crate) rx: mpsc::Receiver<DataOutbound>,
 }
 
+/// Bounded payload-free pressure counters for one device session's outbound
+/// queues.
+///
+/// A logical admission count (`pending.len() + streams.len()`) cannot show
+/// whether the bounded outbound *message* channels were physically occupied,
+/// and a sampled depth can miss the peak between two observations.  These
+/// saturating latches record the physical high-water marks and the typed
+/// refusal counts so an acceptance gate can prove actual occupancy and actual
+/// capacity refusal within a bounded number of observations.  Nothing here
+/// retains a frame body, control text, credential, or transport error.
+#[derive(Debug, Default)]
+pub(crate) struct QueuePressure {
+    bytes_high_water: AtomicUsize,
+    control_depth_high_water: AtomicUsize,
+    data_depth_high_water: AtomicUsize,
+    control_refusals: AtomicU64,
+    data_refusals: AtomicU64,
+    control_enqueued: AtomicU64,
+    data_enqueued: AtomicU64,
+}
+
+impl QueuePressure {
+    fn latch_bytes(&self, used: usize) {
+        self.bytes_high_water.fetch_max(used, Ordering::AcqRel);
+    }
+
+    fn latch_control_depth(&self, depth: usize) {
+        self.control_depth_high_water
+            .fetch_max(depth, Ordering::AcqRel);
+    }
+
+    fn latch_data_depth(&self, depth: usize) {
+        self.data_depth_high_water
+            .fetch_max(depth, Ordering::AcqRel);
+    }
+
+    fn record_control_refusal(&self) {
+        self.control_refusals.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn record_data_refusal(&self) {
+        self.data_refusals.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn record_control_enqueue(&self) {
+        self.control_enqueued.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn record_data_enqueue(&self) {
+        self.data_enqueued.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+/// Physical occupancy of one bounded outbound channel.
+///
+/// `depth` is the number of items the channel is actually holding, derived
+/// from the live sender permits, and `capacity` is its configured bound.  A
+/// `depth` equal to `capacity` is physical saturation; the logical admission
+/// count cannot express that.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ChannelOccupancy {
+    pub(crate) depth: usize,
+    pub(crate) capacity: usize,
+}
+
+fn control_occupancy(sender: &mpsc::Sender<ControlOutbound>) -> ChannelOccupancy {
+    let capacity = sender.max_capacity();
+    ChannelOccupancy {
+        depth: capacity.saturating_sub(sender.capacity()),
+        capacity,
+    }
+}
+
+fn data_occupancy(sender: &mpsc::Sender<DataOutbound>) -> ChannelOccupancy {
+    let capacity = sender.max_capacity();
+    ChannelOccupancy {
+        depth: capacity.saturating_sub(sender.capacity()),
+        capacity,
+    }
+}
+
 /// Shared per-device byte accounting for pending request bodies and encoded
 /// outbound control/data queue items.  Socket tasks release an item when they
 /// take ownership of it from a bounded channel.
@@ -916,6 +997,7 @@ pub(crate) struct DataRegistration {
 pub(crate) struct QueueBudget {
     used: Arc<AtomicUsize>,
     limit: usize,
+    pressure: Arc<QueuePressure>,
 }
 
 impl QueueBudget {
@@ -923,6 +1005,7 @@ impl QueueBudget {
         Self {
             used: Arc::new(AtomicUsize::new(0)),
             limit,
+            pressure: Arc::new(QueuePressure::default()),
         }
     }
 
@@ -930,11 +1013,18 @@ impl QueueBudget {
         if bytes > self.limit {
             return false;
         }
-        self.used
+        let reserved = self
+            .used
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 used.checked_add(bytes).filter(|next| *next <= self.limit)
-            })
-            .is_ok()
+            });
+        match reserved {
+            Ok(previous) => {
+                self.pressure.latch_bytes(previous.saturating_add(bytes));
+                true
+            }
+            Err(_) => false,
+        }
     }
 
     pub(crate) fn release(&self, bytes: usize) {
@@ -943,6 +1033,14 @@ impl QueueBudget {
 
     fn used(&self) -> usize {
         self.used.load(Ordering::Acquire)
+    }
+
+    fn limit(&self) -> usize {
+        self.limit
+    }
+
+    fn pressure(&self) -> &QueuePressure {
+        &self.pressure
     }
 }
 
@@ -11320,6 +11418,13 @@ impl RelayActor {
                 let status = status.as_ref()?;
                 Self::rotation_diagnostics_for(rotation, status, None)
             });
+            // Physical occupancy of the two bounded outbound channels, taken
+            // from the live senders.  `queue_messages` below remains the
+            // logical admission count; these are the actual item counts the
+            // channels hold, which is the only way to distinguish a saturated
+            // queue from a session that merely admitted many streams.
+            let control_queue = control_occupancy(&session.control_tx);
+            let data_queue = session.data_tx.as_ref().map(data_occupancy);
             let mut streams = Vec::with_capacity(session.pending.len() + session.streams.len());
             let mut replay_frames = 0usize;
             let mut replay_bytes = 0usize;
@@ -11392,6 +11497,46 @@ impl RelayActor {
                 sockets,
                 queue_bytes: session.queue_budget.used(),
                 queue_messages: session.pending.len() + session.streams.len(),
+                queue_bytes_limit: session.queue_budget.limit(),
+                queue_bytes_high_water: session
+                    .queue_budget
+                    .pressure()
+                    .bytes_high_water
+                    .load(Ordering::Acquire),
+                control_queue_depth: control_queue.depth,
+                control_queue_capacity: control_queue.capacity,
+                control_queue_depth_high_water: session
+                    .queue_budget
+                    .pressure()
+                    .control_depth_high_water
+                    .load(Ordering::Acquire),
+                data_queue_depth: data_queue.map(|queue| queue.depth),
+                data_queue_capacity: data_queue.map(|queue| queue.capacity),
+                data_queue_depth_high_water: session
+                    .queue_budget
+                    .pressure()
+                    .data_depth_high_water
+                    .load(Ordering::Acquire),
+                control_queue_refusals: session
+                    .queue_budget
+                    .pressure()
+                    .control_refusals
+                    .load(Ordering::Acquire),
+                data_queue_refusals: session
+                    .queue_budget
+                    .pressure()
+                    .data_refusals
+                    .load(Ordering::Acquire),
+                control_queue_enqueued: session
+                    .queue_budget
+                    .pressure()
+                    .control_enqueued
+                    .load(Ordering::Acquire),
+                data_queue_enqueued: session
+                    .queue_budget
+                    .pressure()
+                    .data_enqueued
+                    .load(Ordering::Acquire),
                 drain_fences,
                 drain_proofs,
                 replay_frames,
@@ -11733,14 +11878,19 @@ fn queue_control(
 ) -> Result<(), ()> {
     let bytes = text.len();
     if !budget.reserve(bytes) {
+        budget.pressure().record_control_refusal();
         return Err(());
     }
     if sender
         .try_send(ControlOutbound::Text(QueuedText::new(text, budget.clone())))
         .is_err()
     {
+        budget.pressure().record_control_refusal();
         return Err(());
     }
+    let pressure = budget.pressure();
+    pressure.record_control_enqueue();
+    pressure.latch_control_depth(control_occupancy(sender).depth);
     Ok(())
 }
 
@@ -11751,6 +11901,7 @@ fn queue_data(
 ) -> Result<(), ()> {
     let length = bytes.len();
     if !budget.reserve(length) {
+        budget.pressure().record_data_refusal();
         return Err(());
     }
     if sender
@@ -11760,8 +11911,12 @@ fn queue_data(
         )))
         .is_err()
     {
+        budget.pressure().record_data_refusal();
         return Err(());
     }
+    let pressure = budget.pressure();
+    pressure.record_data_enqueue();
+    pressure.latch_data_depth(data_occupancy(sender).depth);
     Ok(())
 }
 
@@ -18147,10 +18302,11 @@ mod cleanup_tests {
     use uuid::Uuid;
 
     use super::{
-        AbortOnDropJoinHandle, CLEANUP_QUEUE_CAPACITY, CarrierKey, CleanupDispatcher,
-        CleanupWorker, ControlOutbound, DataOutbound, OwnerCleanupItem, QueueBudget, SessionKey,
-        TERMINAL_CLEANUP_QUEUE_CAPACITY, TerminalCleanup, TerminalCleanupDispatcher, queue_control,
-        queue_data, send_registration,
+        AbortOnDropJoinHandle, CLEANUP_QUEUE_CAPACITY, CarrierKey, ChannelOccupancy,
+        CleanupDispatcher, CleanupWorker, ControlOutbound, DataOutbound, Ordering,
+        OwnerCleanupItem, QueueBudget, SessionKey, TERMINAL_CLEANUP_QUEUE_CAPACITY,
+        TerminalCleanup, TerminalCleanupDispatcher, control_occupancy, data_occupancy,
+        queue_control, queue_data, send_registration,
     };
 
     fn owner_token(epoch: u64) -> OwnerToken {
@@ -18358,6 +18514,112 @@ mod cleanup_tests {
             !worker
                 .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(1))
                 .await
+        );
+    }
+
+    /// Physical occupancy must come from the live channel, not from any
+    /// logical admission count, and the saturating latch must survive a drain
+    /// so a bounded observation window cannot miss the peak.
+    #[tokio::test]
+    async fn physical_queue_occupancy_latches_actual_channel_depth() {
+        let budget = QueueBudget::new(1_024);
+        let (data_tx, mut data_rx) = mpsc::channel(4);
+        let (control_tx, mut control_rx) = mpsc::channel(4);
+
+        assert_eq!(data_occupancy(&data_tx).depth, 0);
+        assert_eq!(data_occupancy(&data_tx).capacity, 4);
+        assert_eq!(control_occupancy(&control_tx).capacity, 4);
+
+        for _ in 0..4 {
+            assert!(queue_data(&data_tx, &budget, vec![0; 8]).is_ok());
+        }
+        assert_eq!(
+            data_occupancy(&data_tx),
+            ChannelOccupancy {
+                depth: 4,
+                capacity: 4
+            },
+            "four accepted items must make the bounded data channel physically full"
+        );
+        assert_eq!(
+            budget
+                .pressure()
+                .data_depth_high_water
+                .load(Ordering::Acquire),
+            4
+        );
+
+        // A fifth item is refused for want of a slot, not for want of bytes:
+        // the byte budget still has ample headroom.
+        assert!(budget.used() < budget.limit());
+        assert!(queue_data(&data_tx, &budget, vec![0; 8]).is_err());
+        assert_eq!(budget.pressure().data_refusals.load(Ordering::Acquire), 1);
+
+        // Control keeps its own reserved slots while data is physically full.
+        assert_eq!(control_occupancy(&control_tx).depth, 0);
+        assert!(queue_control(&control_tx, &budget, "rotate".to_owned()).is_ok());
+        assert_eq!(control_occupancy(&control_tx).depth, 1);
+        assert_eq!(
+            budget
+                .pressure()
+                .control_depth_high_water
+                .load(Ordering::Acquire),
+            1
+        );
+        assert_eq!(
+            budget.pressure().control_refusals.load(Ordering::Acquire),
+            0
+        );
+
+        // Draining returns the live depth to zero while the latch is retained.
+        for _ in 0..4 {
+            drop(data_rx.recv().await.expect("queued data item"));
+        }
+        drop(control_rx.recv().await.expect("queued control item"));
+        assert_eq!(data_occupancy(&data_tx).depth, 0);
+        assert_eq!(control_occupancy(&control_tx).depth, 0);
+        assert_eq!(
+            budget
+                .pressure()
+                .data_depth_high_water
+                .load(Ordering::Acquire),
+            4,
+            "the physical high-water latch must survive a complete drain"
+        );
+        assert_eq!(budget.used(), 0);
+    }
+
+    /// A byte-budget refusal is counted on the channel that was refused and
+    /// the latched byte high-water mark survives release.
+    #[tokio::test]
+    async fn queue_byte_exhaustion_is_counted_per_channel() {
+        let budget = QueueBudget::new(64);
+        let (data_tx, data_rx) = mpsc::channel(128);
+        let (control_tx, _control_rx) = mpsc::channel(128);
+
+        assert!(queue_data(&data_tx, &budget, vec![0; 64]).is_ok());
+        assert_eq!(budget.used(), 64);
+        assert_eq!(
+            budget.pressure().bytes_high_water.load(Ordering::Acquire),
+            64
+        );
+        // The data channel still has 127 free slots, so this refusal is purely
+        // a shared byte-budget exhaustion, and control is refused with it.
+        assert!(data_occupancy(&data_tx).depth < data_occupancy(&data_tx).capacity);
+        assert!(queue_data(&data_tx, &budget, vec![0; 1]).is_err());
+        assert!(queue_control(&control_tx, &budget, "c".to_owned()).is_err());
+        assert_eq!(budget.pressure().data_refusals.load(Ordering::Acquire), 1);
+        assert_eq!(
+            budget.pressure().control_refusals.load(Ordering::Acquire),
+            1
+        );
+
+        drop(data_rx);
+        assert_eq!(budget.used(), 0);
+        assert_eq!(
+            budget.pressure().bytes_high_water.load(Ordering::Acquire),
+            64,
+            "the latched byte high-water mark must survive release"
         );
     }
 

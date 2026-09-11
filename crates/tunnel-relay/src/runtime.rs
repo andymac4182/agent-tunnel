@@ -151,6 +151,37 @@ pub struct RelaySessionSnapshot {
     pub sockets: u8,
     pub queue_bytes: usize,
     pub queue_messages: usize,
+    /// Configured session byte budget (`limits.max_queue_bytes`).  Exposing the
+    /// bound alongside its use lets a gate prove saturation and headroom
+    /// without re-deriving the operator configuration.
+    pub queue_bytes_limit: usize,
+    /// Highest session byte charge ever reserved.  Sampling `queue_bytes` can
+    /// miss the peak between two observations; this saturating latch cannot.
+    pub queue_bytes_high_water: usize,
+    /// Items the bounded outbound **control** channel is physically holding,
+    /// and its configured bound.  `queue_messages` above is a logical
+    /// admission count (`pending + streams`) and cannot express occupancy.
+    pub control_queue_depth: usize,
+    pub control_queue_capacity: usize,
+    /// Highest physical control-channel occupancy ever latched.
+    pub control_queue_depth_high_water: usize,
+    /// Items the bounded outbound **data** channel is physically holding, and
+    /// its configured bound.  Absent while no data carrier is attached.
+    pub data_queue_depth: Option<usize>,
+    pub data_queue_capacity: Option<usize>,
+    /// Highest physical data-channel occupancy ever latched.  This is the
+    /// physical-occupancy proof a bounded observation window can rely on.
+    pub data_queue_depth_high_water: usize,
+    /// Saturating count of outbound enqueues refused for want of session byte
+    /// budget or a free channel slot, split by channel.  Payload-free.
+    pub control_queue_refusals: u64,
+    pub data_queue_refusals: u64,
+    /// Saturating count of outbound enqueues the relay accepted on each
+    /// channel.  An increase while the data channel is physically occupied is
+    /// positive evidence that control traffic kept flowing rather than merely
+    /// not being refused.  Payload-free.
+    pub control_queue_enqueued: u64,
+    pub data_queue_enqueued: u64,
     pub drain_fences: usize,
     pub drain_proofs: usize,
     pub replay_frames: usize,
