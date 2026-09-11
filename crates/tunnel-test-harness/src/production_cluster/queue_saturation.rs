@@ -207,7 +207,10 @@ const DRAIN_OBSERVATION_BOUND: usize = 200;
 /// Re-samples used to prove the first terminal observation is immutable.
 const TERMINAL_IMMUTABILITY_SAMPLES: usize = 8;
 const TERMINAL_SAMPLE_INTERVAL: Duration = Duration::from_millis(25);
-const ROTATION_TIMEOUT: Duration = Duration::from_secs(45);
+/// Three same-owner rotations at a fifteen-second interval, plus the
+/// saturation sequence, must fit inside the scenario deadline.
+const SATURATION_ROTATION_COUNT: u64 = 3;
+const ROTATION_TIMEOUT: Duration = Duration::from_secs(90);
 /// Bounded window for the live reserved-control-capacity observation, well
 /// inside the relay's five-second physical write bound on the paused carrier.
 const CONTROL_PROGRESS_TIMEOUT: Duration = Duration::from_secs(3);
@@ -360,11 +363,26 @@ pub struct QueueSaturationEvidence {
     pub physical_drain_observation_bound: usize,
     /// Physical occupancy reached zero within that bound.
     pub physical_drain_completed: bool,
-    /// The scheduled rotation that followed the drain replaced exactly the
+    /// The first scheduled rotation that followed the drain replaced exactly the
     /// carrier that had been paused.
     pub rotation_replaced_paused_carrier: bool,
-    /// Generation the correlated rotation committed.
+    /// Generation the first correlated rotation committed.
     pub rotation_committed_generation: u64,
+    /// Same-owner rotations completed after the drain.
+    pub rotations_completed_after_drain: u64,
+    /// Highest generation observed across those rotations.  Generations advance
+    /// by exactly one per rotation and never rewind.
+    pub final_generation: u64,
+    /// Rotation attempts whose absolute deadline was observed at least twice,
+    /// which is what makes "never extended" a measurement rather than a claim.
+    pub rotation_attempts_with_observed_deadline: usize,
+    /// Every observation of a given attempt reported the same start and the same
+    /// absolute deadline: no phase change or retry extended it.
+    pub rotation_deadline_never_extended: bool,
+    /// Each observed attempt's deadline stayed within the configured overlap of
+    /// that attempt's own start, so one absolute bound covers the whole attempt
+    /// rather than one bound per phase.
+    pub rotation_deadline_within_configured_overlap: bool,
     /// Peak simultaneously open device sockets at the controlling proxy.
     pub device_socket_peak_open: usize,
     /// Application dispatches recorded across a fixed window after the drain;
@@ -678,6 +696,14 @@ pub fn validate_queue_saturation_evidence(evidence: &QueueSaturationEvidence) ->
             "rotation_replaced_paused_carrier",
             evidence.rotation_replaced_paused_carrier,
         ),
+        (
+            "rotation_deadline_never_extended",
+            evidence.rotation_deadline_never_extended,
+        ),
+        (
+            "rotation_deadline_within_configured_overlap",
+            evidence.rotation_deadline_within_configured_overlap,
+        ),
     ];
     if let Some((name, false)) = required.into_iter().find(|(_, passed)| !passed) {
         return Err(HarnessError::Process(format!(
@@ -720,6 +746,30 @@ pub fn validate_queue_saturation_evidence(evidence: &QueueSaturationEvidence) ->
             "queue saturation rotation committed generation {} which does not follow the paused carrier generation {}",
             evidence.rotation_committed_generation, evidence.paused_generation
         )));
+    }
+    if evidence.rotations_completed_after_drain < SATURATION_ROTATION_COUNT {
+        return Err(HarnessError::Process(format!(
+            "queue saturation completed {} same-owner rotations after the drain, expected {}",
+            evidence.rotations_completed_after_drain, SATURATION_ROTATION_COUNT
+        )));
+    }
+    if evidence.final_generation
+        != evidence
+            .paused_generation
+            .saturating_add(evidence.rotations_completed_after_drain)
+    {
+        return Err(HarnessError::Process(format!(
+            "queue saturation ended at generation {} after {} rotations from generation {}; generations must advance by exactly one per rotation and never rewind",
+            evidence.final_generation,
+            evidence.rotations_completed_after_drain,
+            evidence.paused_generation
+        )));
+    }
+    if evidence.rotation_attempts_with_observed_deadline == 0 {
+        return Err(HarnessError::Process(
+            "queue saturation observed no rotation attempt deadline twice, so it cannot claim the deadline was never extended"
+                .into(),
+        ));
     }
     if evidence.device_socket_peak_open > 3 {
         return Err(HarnessError::Process(format!(
@@ -768,6 +818,8 @@ struct QueueObservation {
     active_generation: u64,
     candidate_generation: Option<u64>,
     rotations_completed: u64,
+    rotation_started_at_ms: Option<u64>,
+    rotation_deadline_ms: Option<u64>,
     sockets: u8,
     live_streams: usize,
 }
@@ -1249,6 +1301,11 @@ async fn run_saturation(
         physical_drain_completed: drain.completed,
         rotation_replaced_paused_carrier: rotation.replaced_paused_carrier,
         rotation_committed_generation: rotation.committed_generation,
+        rotations_completed_after_drain: rotation.rotations_completed,
+        final_generation: rotation.final_generation,
+        rotation_attempts_with_observed_deadline: rotation.attempts_with_observed_deadline,
+        rotation_deadline_never_extended: rotation.deadline_never_extended,
+        rotation_deadline_within_configured_overlap: rotation.deadline_within_configured_overlap,
         device_socket_peak_open,
         dispatch_delta_after_drain,
         elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -1522,21 +1579,38 @@ async fn wait_for_stream_retirement(
 struct RotationCorrelation {
     replaced_paused_carrier: bool,
     committed_generation: u64,
+    rotations_completed: u64,
+    final_generation: u64,
+    attempts_with_observed_deadline: usize,
+    deadline_never_extended: bool,
+    deadline_within_configured_overlap: bool,
 }
 
-/// Correlate the exact rotation attempt that follows the drain.
+/// Correlate the exact rotation attempt that follows the drain, then carry the
+/// same owner through three same-owner rotations.
 ///
-/// The carrier this gate paused must be the one the scheduled handover
-/// replaces: its generation is the immediate predecessor of the committed
-/// generation, a candidate was observed while it was still active, and the
-/// socket bound holds throughout.
+/// The carrier this gate paused must be the one the first scheduled handover
+/// replaces: its generation is the immediate predecessor of the first committed
+/// generation and a candidate was observed while it was still active.  Across
+/// every attempt the socket bound holds, generations advance by exactly one and
+/// never rewind, and each attempt keeps **one absolute deadline** that no phase
+/// change extends and that never exceeds the configured overlap measured from
+/// that attempt's own start.
 async fn wait_for_correlated_rotation(
     owner: &ProductionRelay,
     device_id: Uuid,
     paused_generation: u64,
 ) -> Result<RotationCorrelation> {
     let deadline = Instant::now() + ROTATION_TIMEOUT;
+    let overlap_ms = SATURATION_ROTATION.overlap_seconds.saturating_mul(1_000);
     let mut observed_candidate_for_paused_carrier = false;
+    let mut first_committed_generation = None;
+    let mut highest_generation = paused_generation;
+    // One entry per attempt, keyed by its candidate generation:
+    // (candidate, started_at_ms, deadline_ms, samples).
+    let mut attempts: Vec<(u64, u64, u64, usize)> = Vec::new();
+    let mut deadline_never_extended = true;
+    let mut deadline_within_configured_overlap = true;
     loop {
         let observation = read_queue_observation(owner, device_id).await?;
         if observation.sockets > 3 {
@@ -1545,28 +1619,72 @@ async fn wait_for_correlated_rotation(
                 observation.sockets
             )));
         }
+        if observation.active_generation < highest_generation {
+            return Err(HarnessError::Process(format!(
+                "queue saturation rotation rewound the active generation from {highest_generation} to {}",
+                observation.active_generation
+            )));
+        }
+        highest_generation = highest_generation.max(observation.active_generation);
         if observation.active_generation == paused_generation
             && observation.candidate_generation.is_some()
         {
             observed_candidate_for_paused_carrier = true;
         }
-        if observation.active_generation > paused_generation
-            && observation.candidate_generation.is_none()
-            && observation.rotations_completed > 0
+        if let (Some(candidate), Some(started), Some(attempt_deadline)) = (
+            observation.candidate_generation,
+            observation.rotation_started_at_ms,
+            observation.rotation_deadline_ms,
+        ) {
+            match attempts
+                .iter_mut()
+                .find(|(generation, _, _, _)| *generation == candidate)
+            {
+                Some((_, recorded_start, recorded_deadline, samples)) => {
+                    if *recorded_deadline != attempt_deadline || *recorded_start != started {
+                        deadline_never_extended = false;
+                    }
+                    *samples = samples.saturating_add(1);
+                }
+                None => {
+                    if attempt_deadline.saturating_sub(started) > overlap_ms {
+                        deadline_within_configured_overlap = false;
+                    }
+                    attempts.push((candidate, started, attempt_deadline, 1));
+                }
+            }
+        }
+        if observation.candidate_generation.is_none()
+            && observation.active_generation > paused_generation
         {
-            return Ok(RotationCorrelation {
-                replaced_paused_carrier: observed_candidate_for_paused_carrier
-                    && observation.active_generation == paused_generation.saturating_add(1),
-                committed_generation: observation.active_generation,
-            });
+            if first_committed_generation.is_none() {
+                first_committed_generation = Some(observation.active_generation);
+            }
+            if observation.rotations_completed >= SATURATION_ROTATION_COUNT {
+                let committed_generation =
+                    first_committed_generation.unwrap_or(observation.active_generation);
+                return Ok(RotationCorrelation {
+                    replaced_paused_carrier: observed_candidate_for_paused_carrier
+                        && committed_generation == paused_generation.saturating_add(1),
+                    committed_generation,
+                    rotations_completed: observation.rotations_completed,
+                    final_generation: observation.active_generation,
+                    attempts_with_observed_deadline: attempts
+                        .iter()
+                        .filter(|(_, _, _, samples)| *samples >= 2)
+                        .count(),
+                    deadline_never_extended,
+                    deadline_within_configured_overlap,
+                });
+            }
         }
         if Instant::now() >= deadline {
             return Err(HarnessError::Timeout(format!(
-                "queue saturation did not observe the scheduled rotation of the paused carrier: active={} candidate={:?} rotations={} paused={}",
+                "queue saturation did not observe {SATURATION_ROTATION_COUNT} same-owner rotations of the paused carrier: active={} candidate={:?} rotations={} paused={paused_generation} attempts_seen={}",
                 observation.active_generation,
                 observation.candidate_generation,
                 observation.rotations_completed,
-                paused_generation
+                attempts.len()
             )));
         }
         sleep(DRAIN_POLL_INTERVAL).await;
@@ -1604,6 +1722,8 @@ async fn read_queue_observation(
         active_generation: session.active_generation,
         candidate_generation: session.candidate_generation,
         rotations_completed: session.rotations_completed,
+        rotation_started_at_ms: session.rotation_started_at_ms,
+        rotation_deadline_ms: session.rotation_deadline_ms,
         sockets: session.sockets,
         live_streams: session
             .streams
@@ -1785,9 +1905,9 @@ mod tests {
         DRAIN_OBSERVATION_BOUND, EXPECTED_MAX_STREAMS_PER_DEVICE, EXPECTED_QUEUE_BYTES_LIMIT,
         EXPECTED_QUEUE_MESSAGES, M2_INITIAL_WINDOW_BYTES, MAX_ABSORBED_WIRE_BYTES,
         MAX_PAYLOAD_BYTES, MIN_RESIDENT_FRAMES, MIN_SATURATION_HEADROOM_BYTES,
-        QueueSaturationEvidence, SATURATION_RECORD_BYTES, TERMINAL_IMMUTABILITY_SAMPLES,
-        charge_per_record, frames_per_record, reachable_entries, records_per_stream_by_credit,
-        validate_queue_saturation_evidence, wire_bytes_per_record,
+        QueueSaturationEvidence, SATURATION_RECORD_BYTES, SATURATION_ROTATION_COUNT,
+        TERMINAL_IMMUTABILITY_SAMPLES, charge_per_record, frames_per_record, reachable_entries,
+        records_per_stream_by_credit, validate_queue_saturation_evidence, wire_bytes_per_record,
     };
     use crate::acceptance_test_support::assert_rejected;
 
@@ -1956,6 +2076,11 @@ mod tests {
             physical_drain_completed: true,
             rotation_replaced_paused_carrier: true,
             rotation_committed_generation: 2,
+            rotations_completed_after_drain: SATURATION_ROTATION_COUNT,
+            final_generation: 1 + SATURATION_ROTATION_COUNT,
+            rotation_attempts_with_observed_deadline: 3,
+            rotation_deadline_never_extended: true,
+            rotation_deadline_within_configured_overlap: true,
             device_socket_peak_open: 3,
             dispatch_delta_after_drain: 0,
             elapsed_ms: 12_345,
@@ -1970,7 +2095,7 @@ mod tests {
     #[test]
     fn every_queue_saturation_flag_and_bound_reaches_the_shared_exit_path() {
         type Disable = (&'static str, fn(&mut QueueSaturationEvidence));
-        let flags: [Disable; 11] = [
+        let flags: [Disable; 13] = [
             ("non_owner_ingress", |e| e.non_owner_ingress = false),
             ("stream_cap_refused_one_more", |e| {
                 e.stream_cap_refused_one_more = false
@@ -2001,6 +2126,12 @@ mod tests {
             }),
             ("rotation_replaced_paused_carrier", |e| {
                 e.rotation_replaced_paused_carrier = false
+            }),
+            ("rotation_deadline_never_extended", |e| {
+                e.rotation_deadline_never_extended = false
+            }),
+            ("rotation_deadline_within_configured_overlap", |e| {
+                e.rotation_deadline_within_configured_overlap = false
             }),
         ];
         for (name, disable) in flags {
@@ -2109,6 +2240,11 @@ mod tests {
             },
             |e: &mut QueueSaturationEvidence| e.rotation_committed_generation = e.paused_generation,
             |e: &mut QueueSaturationEvidence| e.device_socket_peak_open = 4,
+            |e: &mut QueueSaturationEvidence| {
+                e.rotations_completed_after_drain = SATURATION_ROTATION_COUNT - 1
+            },
+            |e: &mut QueueSaturationEvidence| e.final_generation = 2,
+            |e: &mut QueueSaturationEvidence| e.rotation_attempts_with_observed_deadline = 0,
             |e: &mut QueueSaturationEvidence| e.dispatch_delta_after_drain = 1,
         ] {
             let mut evidence = valid_evidence();

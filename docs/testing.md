@@ -330,8 +330,26 @@ proves the next admission is refused, blackholes the exact correlated data
 carrier, and then requires physical residency, retained reserved control and
 data capacity with a byte headroom floor, an advancing accepted-control-enqueue
 count during the blackhole, a real cancellation with an immutable first-terminal
-observation, bounded physical drain, and the scheduled rotation of exactly the
-paused carrier.
+observation, bounded physical drain, and three same-owner rotations beginning
+with the one that replaces exactly the paused carrier. Across those rotations it
+requires generations to advance by one and never rewind, the socket bound to
+hold, and each attempt to keep one absolute deadline: the same start and the same
+deadline across at least two observations of that attempt, and within the
+configured overlap of that attempt's own start.
+
+Two limits are deliberately **not** in this gate, with reasons recorded so the
+omission is not mistaken for coverage. Public body and length-prefix limits stay
+with M7-C24 and EC-007: while building this gate, a record whose length prefix
+declares one byte above `max_body_bytes` was observed not to fail closed on the
+**remote** consumer ingress. `handle_consumer_stream` breaks the connection on
+`declared > MAX_BODY_BYTES`, but the peer path in `handle_remote_consumer_stream`
+treats the same condition as an incomplete record and waits for more bytes, so an
+over-limit prefix stalls instead of being refused. A maximum-size body on that
+route also failed to complete in this fixture while the established production
+gate's maximum-body probe passes, so the difference needs its own diagnosis
+rather than an assertion bolted onto a saturation gate. Late, reordered and
+duplicate frames, GOAWAY, and active privileged-adapter traffic across rotations
+remain with their own tasks; echo rotation here is supporting evidence only.
 
 Two bounds make the nominal 128-entry data channel unreachable from the public
 echo route, and the gate asserts that rather than hiding it. The consumer
