@@ -121,6 +121,58 @@ impl fmt::Display for PeerFaultTuple {
     }
 }
 
+/// One required peer fault: an exact role and cause, satisfied by any one of
+/// a closed set of stages.  Row declarations spell alternatives as
+/// `"stage_a|stage_b"`; every alternative must be in the closed vocabulary.
+/// A fault whose stage is timing-dependent (a planned GOAWAY can land while
+/// the ingress relay checks out a stream permit or while it dispatches the
+/// HTTP/3 request) is declared once with both stages instead of pinning one.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct PeerFaultRequirement {
+    pub role: String,
+    pub stages: Vec<String>,
+    pub cause: String,
+}
+
+impl PeerFaultRequirement {
+    pub fn new(role: &str, stages: &str, cause: &str) -> Result<Self, ScanFailure> {
+        let mut alternatives = Vec::new();
+        for stage in stages.split('|') {
+            let tuple = PeerFaultTuple::new(role, stage, cause)?;
+            if !alternatives.contains(&tuple.stage) {
+                alternatives.push(tuple.stage);
+            }
+        }
+        Ok(Self {
+            role: role.to_owned(),
+            stages: alternatives,
+            cause: cause.to_owned(),
+        })
+    }
+
+    fn is_satisfied_by(&self, present: &BTreeSet<PeerFaultTuple>) -> bool {
+        self.stages.iter().any(|stage| {
+            present.contains(&PeerFaultTuple {
+                role: self.role.clone(),
+                stage: stage.clone(),
+                cause: self.cause.clone(),
+            })
+        })
+    }
+}
+
+impl fmt::Display for PeerFaultRequirement {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{}/{}/{}",
+            self.role,
+            self.stages.join("|"),
+            self.cause
+        )
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum FaultStage {
     Redis,
@@ -320,8 +372,9 @@ pub struct C11RunSpec {
     /// collector itself must not satisfy the matrix's diagnostic-field gate.
     pub safe_field_roles: BTreeSet<String>,
     pub required_fields: BTreeSet<SafeField>,
-    /// Exact peer fault tuples the typed relay snapshots must contain.
-    pub required_peer_faults: BTreeSet<PeerFaultTuple>,
+    /// Peer fault requirements the typed relay snapshots must satisfy: an
+    /// exact role and cause at one of the declared stages.
+    pub required_peer_faults: BTreeSet<PeerFaultRequirement>,
     sentinels: Vec<Sentinel>,
     pub max_bytes_per_stream: usize,
 }
@@ -365,14 +418,15 @@ impl C11RunSpec {
         })
     }
 
-    /// Require exact `(role, stage, cause)` tuples in the relay snapshots.
+    /// Require `(role, stages, cause)` peer faults in the relay snapshots; the
+    /// stage field may list `|`-separated closed-vocabulary alternatives.
     pub fn with_required_peer_faults<'a>(
         mut self,
         tuples: impl IntoIterator<Item = &'a (&'a str, &'a str, &'a str)>,
     ) -> Result<Self, ScanFailure> {
         self.required_peer_faults = tuples
             .into_iter()
-            .map(|(role, stage, cause)| PeerFaultTuple::new(role, stage, cause))
+            .map(|(role, stages, cause)| PeerFaultRequirement::new(role, stages, cause))
             .collect::<Result<BTreeSet<_>, _>>()?;
         Ok(self)
     }
@@ -526,9 +580,9 @@ impl C11Window {
             }
         }
         for required in &self.spec.required_peer_faults {
-            if !peer_faults_present.contains(required) {
+            if !required.is_satisfied_by(&peer_faults_present) {
                 return Err(ScanFailure::MissingPeerFault {
-                    tuple: required.clone(),
+                    requirement: required.clone(),
                 });
             }
         }
@@ -784,9 +838,10 @@ pub enum ScanFailure {
         stage: FaultStage,
         outcome: RunOutcome,
     },
-    /// A required exact peer fault tuple was absent from every relay snapshot.
+    /// A required peer fault (exact role and cause at any declared stage) was
+    /// absent from every relay snapshot.
     MissingPeerFault {
-        tuple: PeerFaultTuple,
+        requirement: PeerFaultRequirement,
     },
     /// A relay snapshot's peer fault table was malformed or outside the closed
     /// vocabulary.  The reason is a fixed label; no snapshot bytes are copied.
@@ -851,8 +906,8 @@ impl fmt::Display for ScanFailure {
                     outcome.label()
                 )
             }
-            Self::MissingPeerFault { tuple } => {
-                write!(formatter, "missing peer fault tuple: {tuple}")
+            Self::MissingPeerFault { requirement } => {
+                write!(formatter, "missing peer fault tuple: {requirement}")
             }
             Self::InvalidPeerFault { reason } => {
                 write!(formatter, "invalid peer fault table: {reason}")
@@ -1534,6 +1589,22 @@ mod c17_validator_tests {
     }
 
     #[test]
+    fn relay_snapshot_stage_alternatives_accept_either_declared_stage() {
+        let required = [(
+            "ingress",
+            "stream_permit_checkout|h3_dispatch",
+            "transport_goaway",
+        )];
+        for stage in ["stream_permit_checkout", "h3_dispatch"] {
+            relay_snapshot_window(
+                &required,
+                &peer_fault_snapshot(&[("ingress", stage, "transport_goaway")]),
+            )
+            .unwrap_or_else(|failure| panic!("{stage} should satisfy the requirement: {failure}"));
+        }
+    }
+
+    #[test]
     fn relay_snapshot_tuples_satisfy_exact_requirements_and_are_reported() {
         let spec = spec_with_roles(&["snapshot-relay-relay-a", "snapshot-relay-relay-b"])
             .expect("spec")
@@ -1853,6 +1924,33 @@ mod c17_validator_tests {
                         &[("ingress", "pool_connect", "transport_timeout")],
                         &peer_fault_snapshot(&[("ingress", "lease", "owner_not_ready")]),
                     )
+                },
+            ),
+            (
+                "peer_fault_stage_alternatives_still_require_the_exact_cause",
+                "missing peer fault tuple: ingress/stream_permit_checkout|h3_dispatch/transport_goaway",
+                || {
+                    relay_snapshot_window(
+                        &[(
+                            "ingress",
+                            "stream_permit_checkout|h3_dispatch",
+                            "transport_goaway",
+                        )],
+                        &peer_fault_snapshot(&[("ingress", "h3_dispatch", "transport_h3")]),
+                    )
+                },
+            ),
+            (
+                "peer_fault_stage_alternative_outside_vocabulary",
+                "invalid peer fault table: stage outside the closed vocabulary",
+                || {
+                    spec()
+                        .with_required_peer_faults(&[(
+                            "ingress",
+                            "h3_dispatch|handshake",
+                            "transport_goaway",
+                        )])
+                        .map(|_| ())
                 },
             ),
             (

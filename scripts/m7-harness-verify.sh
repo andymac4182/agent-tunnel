@@ -12,6 +12,13 @@ fi
 if [ -z "${TUNNEL_CATALOG_REDIS_URL:-}" ]; then
   export TUNNEL_CATALOG_REDIS_URL="$TEST_REDIS_URL"
 fi
+# The C11/OG-02 diagnostics gates label captures with bounded safe identifiers only.
+if [ -z "${C11_SOURCE_ID:-}" ]; then
+  export C11_SOURCE_ID="git-$(git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"
+fi
+if [ -z "${C11_BUILD_ID:-}" ]; then
+  export C11_BUILD_ID="local-$(date -u +%Y%m%dT%H%M%SZ)"
+fi
 
 gate() {
   label=$1
@@ -142,13 +149,24 @@ gate "M7 fail-closed admission, readiness, routing and fallback matrix" \
   cargo run --locked -p tunnel-test-harness -- verify-m7-i04-fail-closed
 gate "M7 configured message-queue saturation through non-owner ingress" \
   cargo run --locked -p tunnel-test-harness -- verify-m7-queue-saturation
-gate "M7 remote consumer ingress body and prefix limits" \
-  cargo run --locked -p tunnel-test-harness -- verify-m7-remote-body-limits
 gate "M7 exhausted and recovered same-session recovery attempts" \
   cargo run --locked -p tunnel-test-harness -- verify-m7-i08-recovery-attempts
 gate "M7 real Redis owner lease expiry without renewal" \
   cargo run --locked -p tunnel-test-harness -- verify-m7-owner-lease-expiry
 gate "M7 remote-route body-limit boundaries through non-owner ingress" \
   cargo run --locked -p tunnel-test-harness -- verify-m7-remote-body-limits
+
+gate "M7 admission framing and control-record boundaries" \
+  cargo run --locked -p tunnel-test-harness -- verify-m7-admission-framing
+gate "M7 GOAWAY-driven rotation through actual CLI" \
+  cargo run --locked -p tunnel-test-harness -- verify-m7-i08-goaway-rotation
+gate "M7 late DATA/FIN receipt after selected peer fault" \
+  cargo run --locked -p tunnel-test-harness -- verify-m7-side-effect-late
+gate "M7 public abandoned upgrade reclamation" \
+  cargo run --locked -p tunnel-test-harness -- verify-m7-public-abandoned-upgrade
+gate "M7 C11 payload-free diagnostics capture and mutation scan" \
+  cargo run --locked -p tunnel-test-harness -- verify-m7-c11-diagnostics
+gate "M7 OG-02 correlation completeness across fault gates" \
+  cargo run --locked -p tunnel-test-harness -- verify-m7-og02-correlation
 
 echo "m7-harness-verify: implemented M7 harness suite passed" >&2
