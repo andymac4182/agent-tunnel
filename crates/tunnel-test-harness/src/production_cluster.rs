@@ -152,6 +152,11 @@ mod c10;
 pub use c10::{
     C10ActualPathEvidence, validate_c10_actual_path_evidence, verify as verify_c10_actual_path,
 };
+mod ec041_device_attachment;
+pub use ec041_device_attachment::{
+    Ec041DeviceAttachmentEvidence, validate_ec041_device_attachment_evidence,
+    verify as verify_ec041_device_attachment,
+};
 mod public_abandoned_upgrade;
 pub use public_abandoned_upgrade::{
     PublicAbandonedUpgradeEvidence, validate_public_abandoned_upgrade_evidence,
