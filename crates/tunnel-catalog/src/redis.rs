@@ -40,6 +40,13 @@ const MAX_IDENTIFIER_BYTES: usize = 128;
 pub const MAX_REDIS_NAMESPACE_BYTES: usize = 96;
 const REDIS_OPERATION_TIMEOUT: Duration = Duration::from_secs(2);
 const AUTHORIZATION_CONNECTIONS: usize = 4;
+/// Physical lanes reserved for the relay's per-session maintenance reads
+/// (`resolve_device`) and owner renewals (`renew_owner`).  Two lanes keep
+/// that steady per-tick traffic off the catalog lane's atomic pipelines and
+/// off the authorization lanes; the relay bounds how many sessions it
+/// maintains per tick, so the lane count is a transport choice, not a
+/// concurrency limit.
+const MAINTENANCE_CONNECTIONS: usize = 2;
 const MAX_AUTHORITY_CLOCK_SKEW_US: i64 = 1_000_000;
 const MAX_TICKET_INDEX_ITEMS: usize = crate::MAX_ATTACHMENT_TICKETS_PER_DEVICE;
 const MAX_REDIS_TLS_PEM_BYTES: usize = 1024 * 1024;
@@ -64,6 +71,12 @@ pub struct RedisCatalog {
     /// isolated.
     authorization_connections: Arc<Vec<AuthorityLane>>,
     authorization_next: Arc<AtomicUsize>,
+    /// Maintenance identity reads and owner renewals use their own bounded
+    /// lanes for the same reason: the relay's tick must never wait behind a
+    /// seed, cleanup, membership publish, or authorization pipeline, and an
+    /// authority deadline observed there must mean the authority stalled.
+    maintenance_connections: Arc<Vec<AuthorityLane>>,
+    maintenance_next: Arc<AtomicUsize>,
     namespace: String,
     prefix: String,
     redis_run_id: String,
@@ -357,23 +370,28 @@ impl RedisCatalog {
         };
         let (connection, redis_run_id) = open_verified_connection(&client).await?;
         let lane_group = Arc::new(LaneGroup::default());
-        let mut authorization_connections = Vec::with_capacity(AUTHORIZATION_CONNECTIONS);
-        for _ in 0..AUTHORIZATION_CONNECTIONS {
-            let (authorization_connection, authorization_run_id) =
-                open_verified_connection(&client).await?;
-            if authorization_run_id != redis_run_id {
-                return Err(catalog_connection_error(
-                    CatalogConnectionStage::PrimaryIdentity,
-                    CatalogError::Conflict(lane::RUN_ID_CONFLICT),
-                ));
-            }
-            authorization_connections.push(AuthorityLane::new(
-                client.clone(),
-                authorization_connection,
-                redis_run_id.clone(),
-                Arc::clone(&lane_group),
-            ));
-        }
+        let open_lanes =
+            async |count: usize| -> Result<Vec<AuthorityLane>, CatalogConnectionError> {
+                let mut lanes = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let (lane_connection, lane_run_id) = open_verified_connection(&client).await?;
+                    if lane_run_id != redis_run_id {
+                        return Err(catalog_connection_error(
+                            CatalogConnectionStage::PrimaryIdentity,
+                            CatalogError::Conflict(lane::RUN_ID_CONFLICT),
+                        ));
+                    }
+                    lanes.push(AuthorityLane::new(
+                        client.clone(),
+                        lane_connection,
+                        redis_run_id.clone(),
+                        Arc::clone(&lane_group),
+                    ));
+                }
+                Ok(lanes)
+            };
+        let authorization_connections = open_lanes(AUTHORIZATION_CONNECTIONS).await?;
+        let maintenance_connections = open_lanes(MAINTENANCE_CONNECTIONS).await?;
         let connection = Arc::new(AuthorityLane::new(
             client.clone(),
             connection,
@@ -385,6 +403,8 @@ impl RedisCatalog {
             connection,
             authorization_connections: Arc::new(authorization_connections),
             authorization_next: Arc::new(AtomicUsize::new(0)),
+            maintenance_connections: Arc::new(maintenance_connections),
+            maintenance_next: Arc::new(AtomicUsize::new(0)),
             namespace: namespace.to_owned(),
             prefix: format!("tunnel-catalog:{namespace}:"),
             redis_run_id,
@@ -651,6 +671,20 @@ impl RedisCatalog {
         args: &[String],
     ) -> Result<T, CatalogError> {
         self.eval_on(&self.connection, script, keys, args).await
+    }
+
+    /// Run one maintenance script (`resolve_device`, `renew_owner`) on the
+    /// next maintenance lane, round-robin.
+    async fn eval_maintenance<T: FromRedisValue>(
+        &self,
+        script: &str,
+        keys: &[String],
+        args: &[String],
+    ) -> Result<T, CatalogError> {
+        let lane = self.maintenance_next.fetch_add(1, Ordering::Relaxed)
+            % self.maintenance_connections.len();
+        self.eval_on(&self.maintenance_connections[lane], script, keys, args)
+            .await
     }
 
     async fn eval_on<T: FromRedisValue>(
@@ -1004,7 +1038,7 @@ impl Catalog for RedisCatalog {
         }
         let at = datetime_micros(at)?;
         let reply: Vec<String> = self
-            .eval(
+            .eval_maintenance(
                 SCRIPT_RESOLVE_DEVICE,
                 &[self.fingerprint_index(spki_fingerprint)],
                 &[
@@ -1576,7 +1610,7 @@ impl Catalog for RedisCatalog {
             return Err(CatalogError::InvalidOwner);
         }
         let reply: Vec<String> = self
-            .eval(
+            .eval_maintenance(
                 SCRIPT_RENEW_OWNER,
                 &[
                     self.owner_key(incarnation, token.tenant_id, token.device_id),
@@ -1888,12 +1922,23 @@ pub fn validate_redis_namespace(namespace: &str) -> Result<(), CatalogError> {
     Ok(())
 }
 
+/// Open one lane connection and verify the primary's identity.
+///
+/// redis-rs applies its own per-command response deadline inside the
+/// multiplexed connection, measured from the moment the command is written
+/// until its reply arrives.  It is set to the documented two-second
+/// authority bound here (the library default is 500 ms) so that deadline,
+/// like the catalog's outer one, bounds the authority's reply and nothing
+/// else; a reply slower than that is reported as a timeout distinct from a
+/// severed connection.
 async fn open_verified_connection(
     client: &redis::Client,
 ) -> Result<(MultiplexedConnection, String), CatalogConnectionError> {
+    let config =
+        redis::AsyncConnectionConfig::new().set_response_timeout(Some(REDIS_OPERATION_TIMEOUT));
     let connection = tokio::time::timeout(
         REDIS_OPERATION_TIMEOUT,
-        client.get_multiplexed_async_connection(),
+        client.get_multiplexed_async_connection_with_config(&config),
     )
     .await
     .map_err(|_| {

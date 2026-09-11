@@ -1,6 +1,5 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
-    error::Error,
     future::Future,
     panic::AssertUnwindSafe,
     sync::{
@@ -98,6 +97,19 @@ const AUTHORITY_UNAVAILABLE: &str = "AUTHORITY_UNAVAILABLE";
 /// session, so the connector must establish a fresh session/epoch.
 const CONNECTION_HISTORY_EXHAUSTED: &str = "CONNECTION_HISTORY_EXHAUSTED";
 
+/// Upper bound on sessions whose maintenance authority work (owner renewal
+/// and device identity re-check) is in flight at once.  Each tick starts at
+/// most this many minus the work still outstanding, so the catalog's
+/// maintenance lanes never see an unbounded per-tick fan-out and a slow
+/// authority cannot pile up one command per session.  Renewals that are due
+/// are started before identity re-checks, oldest lease first; identity
+/// re-checks rotate through the remaining sessions so every session is
+/// visited within `ceil(sessions / bound)` ticks.  With the 500 ms tick and
+/// a 30 s lease renewed after 10 s, renewals stay ahead of the lease's
+/// remaining 20 s up to roughly `bound * 20` sessions, well beyond the
+/// default `max_devices`.
+const MAX_MAINTENANCE_AUTHORITY_IN_FLIGHT: usize = 64;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MaintenanceAuthorityOperation {
     RenewOwner,
@@ -144,6 +156,17 @@ impl MaintenanceAuthorityCategory {
     }
 }
 
+/// One session eligible for maintenance authority work on this tick.  Only
+/// the identifiers the background task needs leave the actor; the session
+/// itself is re-validated by key when the result returns.
+#[derive(Clone)]
+struct MaintenanceCandidate {
+    key: SessionKey,
+    spki_fingerprint: String,
+    owner: OwnerToken,
+    last_lease_renewal: Instant,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct MaintenanceAuthorityFailure {
     operation: MaintenanceAuthorityOperation,
@@ -168,12 +191,10 @@ impl MaintenanceAuthorityFailure {
 fn maintenance_authority_category(error: &CatalogError) -> MaintenanceAuthorityCategory {
     match error {
         CatalogError::Database(error) => {
-            let timed_out = error.source().and_then(|source| {
-                source
-                    .downcast_ref::<std::io::Error>()
-                    .map(std::io::Error::kind)
-            }) == Some(std::io::ErrorKind::TimedOut);
-            if timed_out {
+            // redis-rs wraps the I/O error behind a shared pointer, so the
+            // `source()` chain never downcasts to `std::io::Error`; ask the
+            // library directly whether this was a reply deadline.
+            if error.is_timeout() {
                 MaintenanceAuthorityCategory::Timeout
             } else if error
                 .detail()
@@ -738,7 +759,7 @@ impl From<WireError> for RelayError {
     }
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct DeviceScope {
     pub(crate) tenant_id: Uuid,
     pub(crate) device_id: Uuid,
@@ -1676,6 +1697,7 @@ impl RelayHandle {
             owner_forgets: HashMap::new(),
             lifetime_application_dispatches: 0,
             control_registration_conflicts: 0,
+            maintenance_cursor: None,
             rotation_deadline_events: VecDeque::new(),
             session_terminal_events: VecDeque::new(),
             stream_terminal_events: VecDeque::new(),
@@ -2228,6 +2250,10 @@ struct RelayActor {
     /// rejections.  This is deliberately global and payload-free so bounded
     /// diagnostics can prove a real conflict without retaining identities.
     control_registration_conflicts: u64,
+    /// The last session scope whose identity re-check was started by the
+    /// bounded maintenance tick; the next tick resumes after it so identity
+    /// re-checks rotate fairly when sessions exceed the per-tick bound.
+    maintenance_cursor: Option<DeviceScope>,
     /// Bounded relay-local latches for rotation deadlines that caused a
     /// fail-closed session removal.  These survive owner/session cleanup so a
     /// diagnostic reader cannot confuse an absent session with an unobserved
@@ -10689,6 +10715,7 @@ impl RelayActor {
             .values()
             .map(|session| session.key.clone())
             .collect();
+        let mut maintenance_candidates = Vec::with_capacity(keys.len());
         for key in keys {
             let owner_fence_expired = self.session_for(&key).is_some_and(|session| {
                 session.cluster_profile
@@ -10810,27 +10837,82 @@ impl RelayActor {
             for stream_id in expired {
                 self.fail_pending(&key, stream_id, "REVERSE_CHANNEL_INTERRUPTED", "unknown");
             }
-            let Some(snapshot) = self.session_for(&key).map(|session| {
-                (
-                    session.identity.spki_fingerprint.clone(),
-                    session.identity.device_version,
-                    session.owner.clone(),
-                    session.last_lease_renewal,
-                    session.maintenance_in_flight,
-                )
+            let Some(candidate) = self.session_for(&key).and_then(|session| {
+                (!session.maintenance_in_flight).then(|| MaintenanceCandidate {
+                    key: key.clone(),
+                    spki_fingerprint: session.identity.spki_fingerprint.clone(),
+                    owner: session.owner.clone(),
+                    last_lease_renewal: session.last_lease_renewal,
+                })
             }) else {
                 continue;
             };
-            if snapshot.4 {
-                continue;
-            }
-            if let Some(session) = self.session_mut(&key) {
+            maintenance_candidates.push(candidate);
+        }
+        self.start_bounded_maintenance(maintenance_candidates);
+        let wall_now = Utc::now();
+        self.tickets.retain(|_, ticket| {
+            ticket.expires_at > now
+                && wall_now >= ticket.issued_at_wall
+                && wall_now < ticket.expires_at_wall
+        });
+    }
+
+    /// Start maintenance authority work for at most
+    /// `MAX_MAINTENANCE_AUTHORITY_IN_FLIGHT - in_flight` of the candidate
+    /// sessions.  Renewals that are due go first (oldest lease first) so a
+    /// large session count delays identity re-checks before it delays lease
+    /// safety; identity re-checks resume after `maintenance_cursor` and wrap,
+    /// so every session is visited within `ceil(sessions / bound)` ticks.
+    fn start_bounded_maintenance(&mut self, mut candidates: Vec<MaintenanceCandidate>) {
+        if candidates.is_empty() {
+            return;
+        }
+        let in_flight = self
+            .sessions
+            .values()
+            .filter(|session| session.maintenance_in_flight)
+            .count();
+        let budget = MAX_MAINTENANCE_AUTHORITY_IN_FLIGHT.saturating_sub(in_flight);
+        if budget == 0 {
+            return;
+        }
+        let owner_lease = self.options.owner_lease;
+        let renewal_due = |candidate: &MaintenanceCandidate| {
+            candidate.last_lease_renewal.elapsed() >= owner_lease / 3
+        };
+        candidates.sort_by_key(|candidate| candidate.key.scope());
+        let (mut renewals, rechecks): (Vec<_>, Vec<_>) =
+            candidates.into_iter().partition(renewal_due);
+        renewals.sort_by_key(|candidate| candidate.last_lease_renewal);
+        let cursor = self.maintenance_cursor.clone();
+        let resume_at = cursor.as_ref().map_or(0, |cursor| {
+            rechecks.partition_point(|candidate| candidate.key.scope() <= *cursor)
+        });
+        let rotated = rechecks[resume_at..]
+            .iter()
+            .chain(rechecks[..resume_at].iter())
+            .cloned();
+        let selected: Vec<(MaintenanceCandidate, bool)> = renewals
+            .into_iter()
+            .map(|candidate| (candidate, true))
+            .chain(rotated.map(|candidate| (candidate, false)))
+            .take(budget)
+            .collect();
+        if let Some(last_recheck) = selected
+            .iter()
+            .rev()
+            .find(|(_, renew)| !renew)
+            .map(|(candidate, _)| candidate.key.scope())
+        {
+            self.maintenance_cursor = Some(last_recheck);
+        }
+        for (candidate, renew) in selected {
+            if let Some(session) = self.session_mut(&candidate.key) {
                 session.maintenance_in_flight = true;
             }
             let catalog = self.catalog.clone();
             let command_tx = self.command_tx.clone();
-            let owner_lease = self.options.owner_lease;
-            let renew = snapshot.3.elapsed() >= owner_lease / 3;
             let cancel = self.options.shutdown.clone();
             self.spawn_background(async move {
                 let renewed = if renew {
@@ -10840,7 +10922,7 @@ impl RelayActor {
                     let started = Instant::now();
                     Some(
                         catalog
-                            .renew_owner(&snapshot.2, lease_expires_at)
+                            .renew_owner(&candidate.owner, lease_expires_at)
                             .await
                             .map_err(|error| {
                                 MaintenanceAuthorityFailure::from_catalog(
@@ -10855,7 +10937,7 @@ impl RelayActor {
                 };
                 let started = Instant::now();
                 let identity = catalog
-                    .resolve_device(&snapshot.0, Utc::now())
+                    .resolve_device(&candidate.spki_fingerprint, Utc::now())
                     .await
                     .map_err(|error| {
                         MaintenanceAuthorityFailure::from_catalog(
@@ -10868,7 +10950,7 @@ impl RelayActor {
                     &cancel,
                     &command_tx,
                     Command::MaintenanceResult {
-                        key,
+                        key: candidate.key,
                         renewed,
                         identity,
                     },
@@ -10876,12 +10958,6 @@ impl RelayActor {
                 .await;
             });
         }
-        let wall_now = Utc::now();
-        self.tickets.retain(|_, ticket| {
-            ticket.expires_at > now
-                && wall_now >= ticket.issued_at_wall
-                && wall_now < ticket.expires_at_wall
-        });
     }
 
     fn expire_unclaimed_echo_streams(&mut self, key: &SessionKey, now: Instant) {
@@ -12471,10 +12547,11 @@ mod stream_identity_tests {
     use super::{
         AUTHORITY_UNAVAILABLE, CarrierKey, ChallengeAuthorizationResult, ControlOutbound,
         ControlRegistration, DataCarrier, DataOutbound, DataRegistration, DeviceChallenge,
-        DeviceSession, DispatchRequest, M2Stream, MAX_ROTATION_TOMBSTONES,
-        MaintenanceAuthorityCategory, MaintenanceAuthorityFailure, MaintenanceAuthorityOperation,
-        QueueBudget, RecoveryRuntime, RelayActor, RelayError, RelayHandle, RotationJournalDecision,
-        RotationRuntime, SessionKey, TerminalCleanupDispatcher, allocate_stream_id,
+        DeviceScope, DeviceSession, DispatchRequest, M2Stream, MAX_MAINTENANCE_AUTHORITY_IN_FLIGHT,
+        MAX_ROTATION_TOMBSTONES, MaintenanceAuthorityCategory, MaintenanceAuthorityFailure,
+        MaintenanceAuthorityOperation, QueueBudget, RecoveryRuntime, RelayActor, RelayError,
+        RelayHandle, RotationJournalDecision, RotationRuntime, SessionKey,
+        TerminalCleanupDispatcher, allocate_stream_id, maintenance_authority_category,
     };
     use chrono::{Duration, Utc};
     use tokio::sync::{mpsc, oneshot};
@@ -13074,6 +13151,7 @@ mod stream_identity_tests {
             owner_forgets: Default::default(),
             lifetime_application_dispatches: 0,
             control_registration_conflicts: 0,
+            maintenance_cursor: None,
             rotation_deadline_events: VecDeque::new(),
             session_terminal_events: VecDeque::new(),
             stream_terminal_events: VecDeque::new(),
@@ -16665,6 +16743,211 @@ mod stream_identity_tests {
         );
         assert_eq!(conflict_failure.category.as_str(), "conflict");
         assert!(!format!("{conflict_failure:?}").contains("device-id-and-owner-token-secret"));
+    }
+
+    /// A minimal admitted M1 session for actor-level maintenance tests.
+    fn test_device_session(
+        identity: DeviceIdentity,
+        key: SessionKey,
+        control_tx: mpsc::Sender<ControlOutbound>,
+        queue_budget: QueueBudget,
+    ) -> DeviceSession {
+        DeviceSession {
+            identity,
+            owner: OwnerToken {
+                deployment_incarnation: "test-incarnation".to_owned(),
+                tenant_id: key.tenant_id,
+                device_id: key.device_id,
+                node_id: "test-node".to_owned(),
+                boot_id: "test-boot".to_owned(),
+                session_id: key.session_id.clone(),
+                epoch: key.epoch,
+            },
+            key,
+            control_tx,
+            data_tx: None,
+            active_carrier: None,
+            generation: 1,
+            connection_id: "test-data".to_owned(),
+            profile: super::RuntimeProfile::M1,
+            cluster_profile: false,
+            owner_fence: None,
+            owner_fenced: true,
+            owner_fence_ack: None,
+            owner_fence_deadline: None,
+            next_stream_id: 1,
+            pending: HashMap::new(),
+            streams: HashMap::new(),
+            forgotten_stream_through: 0,
+            owner_forget_deadline: None,
+            terminal_fin_failure_deadline: None,
+            rotation: None,
+            last_rotation: std::time::Instant::now(),
+            rotations_completed: 0,
+            total_replayed_frames: 0,
+            queued_bytes: 0,
+            queue_budget,
+            last_lease_renewal: std::time::Instant::now(),
+            maintenance_in_flight: false,
+            closed: false,
+        }
+    }
+
+    /// M7-C32: one tick starts maintenance authority work for at most
+    /// `MAX_MAINTENANCE_AUTHORITY_IN_FLIGHT` sessions, starts overdue
+    /// renewals before identity re-checks regardless of where they sort,
+    /// starts nothing more while that work is outstanding, and rotates the
+    /// identity re-checks so every session is visited within
+    /// `ceil(sessions / bound)` ticks.
+    #[tokio::test]
+    async fn tick_bounds_maintenance_fan_out_and_rotates_identity_rechecks() {
+        const SESSIONS: usize = 2 * MAX_MAINTENANCE_AUTHORITY_IN_FLIGHT + 5;
+        const OVERDUE_RENEWALS: usize = 3;
+        let (fixture, device_id, tenant_id, _tenant_b, spki, _spki_b) = shared_device_fixture();
+        let catalog = MemoryCatalog::new();
+        catalog
+            .seed_fixture(&fixture)
+            .await
+            .expect("seed shared-device fixture");
+        let identity = catalog
+            .resolve_device(&spki, Utc::now())
+            .await
+            .expect("resolve identity")
+            .expect("identity");
+        let key = SessionKey {
+            tenant_id,
+            device_id,
+            session_id: "maintenance-budget".to_owned(),
+            epoch: 1,
+        };
+        let (mut actor, _registration) = admitted_control_actor(identity.clone(), key);
+        let mut control_receivers = Vec::with_capacity(SESSIONS);
+        for index in 1..SESSIONS {
+            let key = SessionKey {
+                tenant_id,
+                device_id: Uuid::from_u128(10_000 + index as u128),
+                session_id: format!("maintenance-budget-{index}"),
+                epoch: 1,
+            };
+            let (control_tx, control_rx) = mpsc::channel(actor.options.limits.max_queue_messages);
+            let queue_budget = QueueBudget::new(actor.options.limits.max_queue_bytes);
+            let session =
+                test_device_session(identity.clone(), key.clone(), control_tx, queue_budget);
+            actor.sessions.insert(key.scope(), session);
+            control_receivers.push(control_rx);
+        }
+        assert_eq!(actor.sessions.len(), SESSIONS);
+        let mut scopes: Vec<DeviceScope> = actor.sessions.keys().cloned().collect();
+        scopes.sort();
+        // The overdue renewals sort last, where a naive first-N selection
+        // would never reach them on the first tick.
+        let overdue: BTreeSet<DeviceScope> = scopes
+            .iter()
+            .rev()
+            .take(OVERDUE_RENEWALS)
+            .cloned()
+            .collect();
+        let overdue_since = std::time::Instant::now()
+            .checked_sub(actor.options.owner_lease / 2)
+            .expect("monotonic clock has run longer than half a lease");
+        for scope in &overdue {
+            actor
+                .sessions
+                .get_mut(scope)
+                .expect("overdue session")
+                .last_lease_renewal = overdue_since;
+        }
+        let in_flight = |actor: &RelayActor| -> BTreeSet<DeviceScope> {
+            actor
+                .sessions
+                .values()
+                .filter(|session| session.maintenance_in_flight)
+                .map(|session| session.key.scope())
+                .collect()
+        };
+        let complete = |actor: &mut RelayActor| {
+            for session in actor.sessions.values_mut() {
+                session.maintenance_in_flight = false;
+            }
+        };
+
+        actor.tick().await;
+        let first = in_flight(&actor);
+        assert_eq!(
+            first.len(),
+            MAX_MAINTENANCE_AUTHORITY_IN_FLIGHT,
+            "one tick starts exactly the bounded number of sessions"
+        );
+        assert!(
+            overdue.is_subset(&first),
+            "overdue renewals must be started on the first tick"
+        );
+
+        actor.tick().await;
+        assert_eq!(
+            in_flight(&actor),
+            first,
+            "a tick with the bound already in flight starts nothing more"
+        );
+
+        complete(&mut actor);
+        actor.tick().await;
+        let second = in_flight(&actor);
+        assert_eq!(second.len(), MAX_MAINTENANCE_AUTHORITY_IN_FLIGHT);
+        assert!(
+            overdue.is_subset(&second),
+            "renewals stay ahead of re-checks"
+        );
+        let repeated: Vec<_> = first
+            .intersection(&second)
+            .filter(|scope| !overdue.contains(scope))
+            .collect();
+        assert!(
+            repeated.is_empty(),
+            "identity re-checks must rotate to unvisited sessions: {repeated:?}"
+        );
+
+        complete(&mut actor);
+        actor.tick().await;
+        let third = in_flight(&actor);
+        let visited: BTreeSet<DeviceScope> = first
+            .iter()
+            .chain(second.iter())
+            .chain(third.iter())
+            .cloned()
+            .collect();
+        assert_eq!(
+            visited.len(),
+            SESSIONS,
+            "every session is visited within ceil(sessions / bound) ticks"
+        );
+        drop(control_receivers);
+    }
+
+    /// M7-C32: the closed maintenance vocabulary separates an authority that
+    /// did not answer within its deadline (`timeout`) from a connection that
+    /// was severed (`redis_io`).  redis-rs reports both as I/O errors, so the
+    /// classifier must ask for the timeout explicitly rather than inspect an
+    /// error source chain that the library does not expose.
+    #[test]
+    fn maintenance_authority_category_separates_timeout_from_transport_loss() {
+        let io_kind =
+            |kind: std::io::ErrorKind| CatalogError::Database(std::io::Error::from(kind).into());
+        assert_eq!(
+            maintenance_authority_category(&io_kind(std::io::ErrorKind::TimedOut)),
+            MaintenanceAuthorityCategory::Timeout
+        );
+        for kind in [
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::UnexpectedEof,
+        ] {
+            assert_eq!(
+                maintenance_authority_category(&io_kind(kind)),
+                MaintenanceAuthorityCategory::RedisIo,
+                "{kind:?} is a transport loss, not a timeout"
+            );
+        }
     }
 
     #[test]

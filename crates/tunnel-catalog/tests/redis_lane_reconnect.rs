@@ -40,9 +40,11 @@ const INCARNATION: &str = "m7-lane-reconnect";
 const OPERATION_DEADLINE: StdDuration = StdDuration::from_secs(5);
 const SCENARIO_DEADLINE: StdDuration = StdDuration::from_secs(40);
 const MAX_PROXY_CONNECTIONS: usize = 16;
-/// The catalog opens one catalog lane and four authorization lanes.
-const LANES: usize = 5;
+/// The catalog opens one catalog lane, four authorization lanes and two
+/// maintenance lanes (`resolve_device`, `renew_owner`).
+const LANES: usize = 7;
 const AUTHORIZATION_LANES: usize = 4;
+const MAINTENANCE_LANES: usize = 2;
 
 struct SeveringProxy {
     url: String,
@@ -312,6 +314,22 @@ async fn run_scenario(proxied: RedisCatalog, proxy: &SeveringProxy) {
         }
     };
 
+    let resolve_consumer = |catalog: &RedisCatalog| {
+        let catalog = catalog.clone();
+        let issuer = fixture.identities[0].issuer.clone();
+        let subject = fixture.identities[0].subject.clone();
+        async move {
+            timeout(
+                OPERATION_DEADLINE,
+                catalog.resolve_consumer(&issuer, &subject, Some(tenant_id)),
+            )
+            .await
+            .expect("bounded resolve_consumer")
+        }
+    };
+
+    // Baseline: maintenance lane 0 resolves the device, authorization lane 0
+    // authorizes, and the seed already used the catalog lane.
     let before = resolve(&proxied).await.expect("baseline device resolution");
     assert_eq!(before.map(|identity| identity.device_id), Some(device_id));
     let grant = authorize(&proxied).await.expect("baseline authorization");
@@ -322,32 +340,40 @@ async fn run_scenario(proxied: RedisCatalog, proxy: &SeveringProxy) {
     assert_eq!(
         proxy.accepted(),
         LANES,
-        "startup opens exactly one catalog lane and four authorization lanes"
+        "startup opens exactly one catalog lane, four authorization lanes and two maintenance lanes"
     );
 
     proxy.sever_all().await;
+    // Maintenance lane 1 discovers the loss: it fails closed exactly once
+    // and neither retries nor reconnects in place.
     let lost = resolve(&proxied)
         .await
-        .expect_err("the first catalog-lane command after the loss must fail closed");
-    assert_transport_loss(&lost, "catalog lane");
+        .expect_err("the first maintenance-lane command after the loss must fail closed");
+    assert_transport_loss(&lost, "maintenance lane");
     assert_eq!(
         proxy.accepted(),
         LANES,
-        "the failed catalog-lane command must neither retry nor reconnect"
+        "the failed maintenance-lane command must neither retry nor reconnect"
     );
-    let after = resolve(&proxied)
-        .await
-        .expect("the next catalog-lane command reconnects to the same primary");
-    assert_eq!(after.map(|identity| identity.device_id), Some(device_id));
-    assert_eq!(
-        proxy.accepted(),
-        LANES + 1,
-        "reconnection opens exactly one fresh catalog-lane connection"
-    );
+    // Maintenance lane 0 was severed by the same event; its loss-generation
+    // probe finds that out and it reconnects before its caller's command.
+    // Maintenance lane 1 then reconnects on its own next command.
+    for lane in 0..MAINTENANCE_LANES {
+        let after = resolve(&proxied).await.unwrap_or_else(|error| {
+            panic!("maintenance lane {lane} must reconnect to the same primary: {error}")
+        });
+        assert_eq!(after.map(|identity| identity.device_id), Some(device_id));
+        assert_eq!(
+            proxy.accepted(),
+            LANES + 1 + lane,
+            "maintenance lane {lane} reconnects exactly once"
+        );
+    }
+    let reconnected = LANES + MAINTENANCE_LANES;
 
-    // The authorization lanes rotate round-robin.  The catalog lane's loss
-    // told them to probe, so each severed lane reconnects before its first
-    // caller command instead of failing that caller closed.
+    // The authorization lanes rotate round-robin.  The maintenance lane's
+    // loss told them to probe, so each severed lane reconnects before its
+    // first caller command instead of failing that caller closed.
     for lane in 0..AUTHORIZATION_LANES {
         let grant = authorize(&proxied).await.unwrap_or_else(|error| {
             panic!("authorization lane {lane} must probe and reconnect: {error}")
@@ -358,15 +384,36 @@ async fn run_scenario(proxied: RedisCatalog, proxy: &SeveringProxy) {
         );
         assert_eq!(
             proxy.accepted(),
-            LANES + 2 + lane,
+            reconnected + 1 + lane,
             "authorization lane {lane} reconnects exactly once"
         );
     }
+    let reconnected = reconnected + AUTHORIZATION_LANES;
+
+    // The catalog lane probes and reconnects the same way.
+    let consumer_after = resolve_consumer(&proxied)
+        .await
+        .expect("the catalog lane must probe and reconnect");
+    assert_eq!(
+        consumer_after.map(|consumer| consumer.principal_id),
+        Some(user_id)
+    );
+    assert_eq!(
+        proxy.accepted(),
+        reconnected + 1,
+        "the catalog lane reconnects exactly once"
+    );
+    let reconnected = reconnected + 1;
+
     let reused = authorize(&proxied)
         .await
         .expect("reconnected lanes are reused");
     assert!(reused.is_some());
-    assert_eq!(proxy.accepted(), LANES + 1 + AUTHORIZATION_LANES);
+    let reused = resolve(&proxied)
+        .await
+        .expect("reconnected lanes are reused");
+    assert_eq!(reused.map(|identity| identity.device_id), Some(device_id));
+    assert_eq!(proxy.accepted(), reconnected, "no further reconnects");
 }
 
 #[tokio::test]

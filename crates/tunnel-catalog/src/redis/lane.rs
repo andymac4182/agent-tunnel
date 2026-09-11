@@ -17,6 +17,15 @@
 //! same event reconnects there instead of failing one more caller closed,
 //! while a live connection keeps its place.  The probe is never the caller's
 //! command.
+//!
+//! A lane does not serialize its callers.  The lane lock is held only across
+//! the bounded probe or reconnect that verifies the physical connection;
+//! every caller then runs its own command on a handle to that multiplexed
+//! connection, so concurrent commands pipeline on one socket and the
+//! per-command deadline measures the authority's reply, never the time spent
+//! waiting behind other callers.  A queueing delay therefore cannot be
+//! reported as an authority timeout, while a stalled or severed authority
+//! still fails exactly the commands that observed it.
 
 use std::sync::{
     Arc,
@@ -43,6 +52,10 @@ struct LaneState {
     connection: Option<MultiplexedConnection>,
     /// The group loss generation this connection was last verified against.
     verified_generation: u64,
+    /// Advanced whenever the connection slot is cleared or replaced, so a
+    /// caller that observed a loss on an older connection cannot release one
+    /// that a sibling caller has since re-established.
+    connection_generation: u64,
 }
 
 pub(super) struct AuthorityLane {
@@ -67,6 +80,7 @@ impl AuthorityLane {
             state: Mutex::new(LaneState {
                 connection: Some(connection),
                 verified_generation,
+                connection_generation: 0,
             }),
         }
     }
@@ -98,46 +112,82 @@ impl AuthorityLane {
         &self,
         operation: impl AsyncFnOnce(&mut MultiplexedConnection) -> Result<T, RedisError>,
     ) -> Result<T, CatalogError> {
-        tokio::time::timeout(REDIS_OPERATION_TIMEOUT, async {
-            let mut state = self.state.lock().await;
-            let loss_generation = self.group.loss_generation.load(Ordering::Acquire);
-            if state.verified_generation != loss_generation
-                && let Some(connection) = state.connection.as_mut()
-            {
-                // A sibling lane observed a transport loss since this
-                // connection was last verified.  Probe before the caller's
-                // command so a connection severed by the same event
-                // reconnects here instead of failing this caller closed.
-                match redis::cmd("PING").query_async::<String>(connection).await {
-                    Ok(_) => {}
-                    Err(error) if lane_lost(&error) => state.connection = None,
-                    Err(error) => return Err(CatalogError::Database(error)),
+        let (mut connection, connection_generation) = self.admit().await?;
+        // The lane lock is no longer held: this deadline covers only the
+        // authority's handling of the caller's own command.
+        match tokio::time::timeout(REDIS_OPERATION_TIMEOUT, operation(&mut connection)).await {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(error)) => {
+                if lane_lost(&error) {
+                    // Release the dead connection and tell sibling lanes to
+                    // probe theirs.  This command stays failed and is never
+                    // replayed.
+                    self.release_lost(connection_generation).await;
                 }
+                Err(CatalogError::Database(error))
             }
-            if state.connection.is_none() {
-                state.connection = Some(self.reconnect().await?);
-            }
-            state.verified_generation = loss_generation;
-            let connection = state
-                .connection
-                .as_mut()
-                .ok_or(CatalogError::Conflict("Redis authority lane"))?;
-            match operation(connection).await {
-                Ok(value) => Ok(value),
-                Err(error) => {
-                    if lane_lost(&error) {
-                        // Release the dead connection and tell sibling lanes
-                        // to probe theirs.  This command stays failed and is
-                        // never replayed.
-                        state.connection = None;
-                        self.group.loss_generation.fetch_add(1, Ordering::AcqRel);
-                    }
-                    Err(CatalogError::Database(error))
+            Err(_) => Err(CatalogError::Database(redis_timeout())),
+        }
+    }
+
+    /// Hand out a handle to this lane's verified physical connection.
+    ///
+    /// Waiting for the lane lock is not part of any authority deadline: the
+    /// lock is only ever held across the bounded probe or reconnect in
+    /// [`Self::verify`], so a caller queued behind a sibling waits at most one
+    /// such verification and then shares the same multiplexed connection.
+    /// A verification that exceeds its deadline keeps the connection exactly
+    /// as a timed-out command does.
+    async fn admit(&self) -> Result<(MultiplexedConnection, u64), CatalogError> {
+        let mut state = self.state.lock().await;
+        tokio::time::timeout(REDIS_OPERATION_TIMEOUT, self.verify(&mut state))
+            .await
+            .map_err(|_| CatalogError::Database(redis_timeout()))?
+    }
+
+    async fn verify(
+        &self,
+        state: &mut LaneState,
+    ) -> Result<(MultiplexedConnection, u64), CatalogError> {
+        let loss_generation = self.group.loss_generation.load(Ordering::Acquire);
+        if state.verified_generation != loss_generation
+            && let Some(connection) = state.connection.as_mut()
+        {
+            // A sibling lane observed a transport loss since this
+            // connection was last verified.  Probe before the caller's
+            // command so a connection severed by the same event
+            // reconnects here instead of failing this caller closed.
+            match redis::cmd("PING").query_async::<String>(connection).await {
+                Ok(_) => {}
+                Err(error) if lane_lost(&error) => {
+                    state.connection = None;
+                    state.connection_generation += 1;
                 }
+                Err(error) => return Err(CatalogError::Database(error)),
             }
-        })
-        .await
-        .map_err(|_| CatalogError::Database(redis_timeout()))?
+        }
+        if state.connection.is_none() {
+            state.connection = Some(self.reconnect().await?);
+            state.connection_generation += 1;
+        }
+        state.verified_generation = loss_generation;
+        let connection = state
+            .connection
+            .clone()
+            .ok_or(CatalogError::Conflict("Redis authority lane"))?;
+        Ok((connection, state.connection_generation))
+    }
+
+    /// Release the connection a caller observed a transport loss on, unless a
+    /// sibling caller already released or replaced it.  Only the first
+    /// observer of one loss advances the group loss generation.
+    async fn release_lost(&self, connection_generation: u64) {
+        let mut state = self.state.lock().await;
+        if state.connection_generation == connection_generation && state.connection.is_some() {
+            state.connection = None;
+            state.connection_generation += 1;
+            self.group.loss_generation.fetch_add(1, Ordering::AcqRel);
+        }
     }
 
     async fn reconnect(&self) -> Result<MultiplexedConnection, CatalogError> {
@@ -161,6 +211,7 @@ fn lane_lost(error: &RedisError) -> bool {
 mod tests {
     use super::*;
     use std::{
+        collections::VecDeque,
         sync::{
             Mutex as StdMutex,
             atomic::{AtomicUsize, Ordering},
@@ -176,6 +227,15 @@ mod tests {
 
     const TEST_DEADLINE: Duration = Duration::from_secs(5);
     const MAX_REQUEST_BYTES: usize = 16 * 1024;
+    const MAX_PENDING_REPLIES: usize = 1_024;
+    /// Concurrent callers on one lane in the queueing regression.  With the
+    /// per-reply delay below, serializing them takes three seconds while any
+    /// single reply arrives well inside the two-second operation deadline.
+    const QUEUED_CALLERS: usize = 20;
+    const QUEUED_REPLY_DELAY: Duration = Duration::from_millis(150);
+    /// A stalled authority: one reply takes longer than the operation
+    /// deadline even with no other caller queued.
+    const STALLED_REPLY_DELAY: Duration = Duration::from_millis(2_600);
 
     /// A bounded RESP2 authority double: answers the redis-rs handshake,
     /// `PING`, and `INFO` with a configurable `run_id`, and can sever any
@@ -183,6 +243,11 @@ mod tests {
     struct FakeAuthority {
         port: u16,
         run_id: Arc<AsyncMutex<String>>,
+        /// Delay applied to every reply, measured from the command's arrival.
+        /// Replies stay in command order but are delayed concurrently, like a
+        /// network path that adds latency to each reply rather than a server
+        /// that spends that long on each command.
+        reply_delay_ms: Arc<AtomicU64>,
         severs: Arc<StdMutex<Vec<Option<oneshot::Sender<()>>>>>,
         active: Arc<AtomicUsize>,
         shutdown: Option<oneshot::Sender<()>>,
@@ -191,6 +256,10 @@ mod tests {
 
     impl FakeAuthority {
         async fn start(run_id: &str) -> Self {
+            Self::start_with_reply_delay(run_id, Duration::ZERO).await
+        }
+
+        async fn start_with_reply_delay(run_id: &str, reply_delay: Duration) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0")
                 .await
                 .expect("bind fake authority");
@@ -199,12 +268,16 @@ mod tests {
                 .expect("fake authority address")
                 .port();
             let run_id = Arc::new(AsyncMutex::new(run_id.to_owned()));
+            let reply_delay_ms = Arc::new(AtomicU64::new(
+                u64::try_from(reply_delay.as_millis()).expect("bounded reply delay"),
+            ));
             let severs = Arc::new(StdMutex::new(Vec::new()));
             let active = Arc::new(AtomicUsize::new(0));
             let (shutdown_tx, shutdown_rx) = oneshot::channel();
             let task = tokio::spawn(run_fake_authority(
                 listener,
                 Arc::clone(&run_id),
+                Arc::clone(&reply_delay_ms),
                 Arc::clone(&severs),
                 Arc::clone(&active),
                 shutdown_rx,
@@ -212,11 +285,19 @@ mod tests {
             Self {
                 port,
                 run_id,
+                reply_delay_ms,
                 severs,
                 active,
                 shutdown: Some(shutdown_tx),
                 task: Some(task),
             }
+        }
+
+        fn set_reply_delay(&self, reply_delay: Duration) {
+            self.reply_delay_ms.store(
+                u64::try_from(reply_delay.as_millis()).expect("bounded reply delay"),
+                Ordering::Release,
+            );
         }
 
         fn url(&self) -> String {
@@ -289,6 +370,7 @@ mod tests {
     async fn run_fake_authority(
         listener: TcpListener,
         run_id: Arc<AsyncMutex<String>>,
+        reply_delay_ms: Arc<AtomicU64>,
         severs: Arc<StdMutex<Vec<Option<oneshot::Sender<()>>>>>,
         active: Arc<AtomicUsize>,
         mut shutdown: oneshot::Receiver<()>,
@@ -309,6 +391,7 @@ mod tests {
                     connections.spawn(serve_fake_connection(
                         stream,
                         Arc::clone(&run_id),
+                        Arc::clone(&reply_delay_ms),
                         sever_rx,
                         Arc::clone(&active),
                     ));
@@ -321,43 +404,60 @@ mod tests {
     async fn serve_fake_connection(
         mut stream: TcpStream,
         run_id: Arc<AsyncMutex<String>>,
+        reply_delay_ms: Arc<AtomicU64>,
         mut sever: oneshot::Receiver<()>,
         active: Arc<AtomicUsize>,
     ) {
         let mut pending = Vec::new();
         let mut buffer = [0_u8; 1024];
+        // Replies due in command order; each is written once its own delay,
+        // counted from the command's arrival, has elapsed.
+        let mut due: VecDeque<(tokio::time::Instant, Vec<u8>)> = VecDeque::new();
         loop {
-            let read = tokio::select! {
+            let next_due = due.front().map(|(at, _)| *at);
+            tokio::select! {
                 // Dropping the stream is the injected transport loss.
                 _ = &mut sever => break,
-                read = stream.read(&mut buffer) => match read {
-                    Ok(0) | Err(_) => break,
-                    Ok(read) => read,
-                },
-            };
-            pending.extend_from_slice(&buffer[..read]);
-            if pending.len() > MAX_REQUEST_BYTES {
-                break;
-            }
-            let mut failed = false;
-            while let Some((command, consumed)) = parse_command(&pending) {
-                pending.drain(..consumed);
-                let reply = match command.as_str() {
-                    "CLIENT" => b"+OK\r\n".to_vec(),
-                    "PING" => b"+PONG\r\n".to_vec(),
-                    "INFO" => {
-                        let body = format!("# Server\r\nrun_id:{}\r\n", run_id.lock().await);
-                        format!("${}\r\n{body}\r\n", body.len()).into_bytes()
+                read = stream.read(&mut buffer) => {
+                    let read = match read {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => read,
+                    };
+                    pending.extend_from_slice(&buffer[..read]);
+                    if pending.len() > MAX_REQUEST_BYTES {
+                        break;
                     }
-                    _ => b"-ERR unsupported fake authority command\r\n".to_vec(),
-                };
-                if stream.write_all(&reply).await.is_err() {
-                    failed = true;
-                    break;
+                    let delay = Duration::from_millis(reply_delay_ms.load(Ordering::Acquire));
+                    let arrived = tokio::time::Instant::now();
+                    while let Some((command, consumed)) = parse_command(&pending) {
+                        pending.drain(..consumed);
+                        let reply = match command.as_str() {
+                            "CLIENT" => b"+OK\r\n".to_vec(),
+                            "PING" => b"+PONG\r\n".to_vec(),
+                            "INFO" => {
+                                let body =
+                                    format!("# Server\r\nrun_id:{}\r\n", run_id.lock().await);
+                                format!("${}\r\n{body}\r\n", body.len()).into_bytes()
+                            }
+                            _ => b"-ERR unsupported fake authority command\r\n".to_vec(),
+                        };
+                        due.push_back((arrived + delay, reply));
+                    }
+                    if due.len() > MAX_PENDING_REPLIES {
+                        break;
+                    }
                 }
-            }
-            if failed {
-                break;
+                _ = async {
+                    match next_due {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    let Some((_, reply)) = due.pop_front() else { continue };
+                    if stream.write_all(&reply).await.is_err() {
+                        break;
+                    }
+                }
             }
         }
         active.fetch_sub(1, Ordering::AcqRel);
@@ -517,6 +617,138 @@ mod tests {
             assert_eq!(ping(lane).await.expect("verified lanes are reused"), "PONG");
         }
         assert_eq!(server.accepted(), 5, "no further probe reconnects");
+        server.shutdown().await;
+    }
+
+    fn timed_out(error: &RedisError) -> bool {
+        error.is_timeout()
+    }
+
+    /// M7-C32 regression: callers queued on one lane must be measured
+    /// against the authority's reply, not against each other.  Twenty
+    /// callers whose replies each take 150 ms would take three seconds if the
+    /// lane served them one at a time, so the last of them would report a
+    /// two-second "authority timeout" that Redis never caused.  A genuinely
+    /// stalled reply and a severed connection must still fail closed, with
+    /// distinguishable transport classes and no reconnect in place.
+    #[tokio::test]
+    async fn queued_callers_are_measured_against_the_authority_not_the_queue() {
+        let server = FakeAuthority::start_with_reply_delay("lane-run-a", QUEUED_REPLY_DELAY).await;
+        let client = redis::Client::open(server.url()).expect("fake authority URL");
+        let group = Arc::new(LaneGroup::default());
+        let lane = Arc::new(verified_lane(&client, "lane-run-a", &group).await);
+        assert_eq!(server.accepted(), 1);
+
+        let started = tokio::time::Instant::now();
+        let mut callers = JoinSet::new();
+        for _ in 0..QUEUED_CALLERS {
+            let lane = Arc::clone(&lane);
+            callers.spawn(async move { ping(&lane).await });
+        }
+        let mut replies = Vec::with_capacity(QUEUED_CALLERS);
+        while let Some(joined) = callers.join_next().await {
+            replies.push(joined.expect("queued caller task"));
+        }
+        let elapsed = started.elapsed();
+        let failures: Vec<String> = replies
+            .iter()
+            .filter_map(|reply| reply.as_ref().err().map(ToString::to_string))
+            .collect();
+        assert!(
+            failures.is_empty(),
+            "{} of {QUEUED_CALLERS} queued callers failed after {elapsed:?} although every \
+             reply took {QUEUED_REPLY_DELAY:?}: {failures:?}",
+            failures.len()
+        );
+        assert!(
+            elapsed < REDIS_OPERATION_TIMEOUT,
+            "queued callers took {elapsed:?}; the lane serialized them behind each other"
+        );
+        assert_eq!(server.accepted(), 1, "queueing must not open connections");
+
+        // A reply that genuinely exceeds the deadline is a timeout, reported
+        // as such rather than as a severed connection.  The stalled command
+        // is never retried; the lane releases the connection so the next
+        // command re-verifies the primary before it is trusted again.
+        server.set_reply_delay(STALLED_REPLY_DELAY);
+        let stalled_started = tokio::time::Instant::now();
+        match ping(&lane).await {
+            Err(CatalogError::Database(error)) => assert!(
+                timed_out(&error) && !error.is_connection_dropped(),
+                "stalled authority reported {error} instead of a timeout"
+            ),
+            other => panic!("stalled authority reported {other:?} instead of a timeout"),
+        }
+        assert!(
+            stalled_started.elapsed() >= REDIS_OPERATION_TIMEOUT,
+            "the authority deadline fired before the documented bound"
+        );
+        assert_eq!(server.accepted(), 1, "a timeout never reconnects in place");
+        server.set_reply_delay(Duration::ZERO);
+        assert_eq!(
+            ping(&lane)
+                .await
+                .expect("the command after a timeout re-verifies the same primary"),
+            "PONG"
+        );
+        assert_eq!(server.accepted(), 2);
+
+        // A severed connection is a transport loss, never a timeout, and the
+        // discovering command fails closed exactly once.
+        server.sever_all().await;
+        match ping(&lane).await {
+            Err(CatalogError::Database(error)) => assert!(
+                lane_lost(&error) && !timed_out(&error),
+                "severed lane reported {error} instead of a transport loss"
+            ),
+            other => panic!("severed lane reported {other:?} instead of a transport loss"),
+        }
+        assert_eq!(
+            server.accepted(),
+            2,
+            "the discovering command never reconnects"
+        );
+        assert_eq!(
+            ping(&lane).await.expect("the next command reconnects"),
+            "PONG"
+        );
+        assert_eq!(server.accepted(), 3);
+        server.shutdown().await;
+    }
+
+    /// Callers that observe the same loss concurrently release the lane once
+    /// and advance the group loss generation once; a sibling that has already
+    /// reconnected is never released by a late observer.
+    #[tokio::test]
+    async fn concurrent_loss_observers_release_the_lane_once() {
+        let server = FakeAuthority::start_with_reply_delay("lane-run-a", QUEUED_REPLY_DELAY).await;
+        let client = redis::Client::open(server.url()).expect("fake authority URL");
+        let group = Arc::new(LaneGroup::default());
+        let lane = Arc::new(verified_lane(&client, "lane-run-a", &group).await);
+
+        let mut callers = JoinSet::new();
+        for _ in 0..QUEUED_CALLERS {
+            let lane = Arc::clone(&lane);
+            callers.spawn(async move { ping(&lane).await });
+        }
+        // Every caller is in flight behind the delayed replies when the
+        // connection is severed, so all of them observe the same loss.
+        tokio::time::sleep(QUEUED_REPLY_DELAY / 3).await;
+        server.sever_all().await;
+        while let Some(joined) = callers.join_next().await {
+            assert_lost(joined.expect("queued caller task"), "concurrent observer");
+        }
+        assert_eq!(
+            group.loss_generation.load(Ordering::Acquire),
+            1,
+            "one loss event advances the group generation once"
+        );
+        assert_eq!(server.accepted(), 1, "no observer reconnects in place");
+        assert_eq!(
+            ping(&lane).await.expect("the next command reconnects once"),
+            "PONG"
+        );
+        assert_eq!(server.accepted(), 2);
         server.shutdown().await;
     }
 

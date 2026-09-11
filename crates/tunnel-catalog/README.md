@@ -62,6 +62,25 @@ with a typed conflict, so a Redis restart, restore or promotion remains an
 operator recovery event rather than a silent resume. Redis pub/sub is not part
 of the authority path.
 
+The catalog opens seven physical lanes to the primary: one catalog lane for
+owner claim/release, tickets, membership and fixture pipelines; four
+authorization lanes for `authorize`; and two maintenance lanes for the
+relay's per-session `resolve_device` re-checks and `renew_owner` renewals.
+A lane never serializes its callers. Its lock is held only across the
+bounded probe or reconnect that verifies the physical connection; each
+caller then runs its own command on that multiplexed connection, so
+concurrent commands pipeline on one socket and the two-second deadline
+(enforced both by redis-rs' per-command response timeout and by the catalog)
+measures the authority's reply, never the time spent behind other callers.
+A queueing delay therefore cannot surface as an authority timeout. A reply
+that is genuinely later than two seconds fails that command closed with an
+I/O `TimedOut` error (`RedisError::is_timeout()`), which the relay reports as
+`timeout`; a severed connection fails with a connection-dropped I/O error,
+reported as `redis_io`. Both release the lane so its next command
+re-verifies the primary; neither replays the failed command. The relay bounds
+how many sessions it maintains per tick (see `docs/cluster.md`), so the lane
+count is a transport choice rather than a concurrency limit.
+
 Owner lease comparisons and recovery quiescence checks use Redis server
 `TIME`; a caller-side clock skew can fail an operation closed. Authorization
 and credential expiry checks use the wall-clock instant supplied by the relay,
