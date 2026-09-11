@@ -11,7 +11,9 @@ device_bind = "127.0.0.1:9443"
 oidc_issuer = "https://issuer.example.test/"
 oidc_audience = ["agent-tunnel"]
 oidc_jwks_path = "examples/credentials/oidc-jwks.json"
-redis_url = "redis://127.0.0.1:6379/0"
+# Production relay startup requires Redis TLS. The disposable local harness
+# accepts TEST_REDIS_URL=redis://... through its low-level test-only path.
+redis_url = "rediss://redis.example.internal:6379/0"
 redis_namespace = "agent-tunnel/m1"
 
 device_tls_cert_chain = "examples/credentials/relay-device-cert-chain.pem"

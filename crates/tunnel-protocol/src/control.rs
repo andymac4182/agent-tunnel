@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::owner_fencing::{MAX_OWNER_FENCING_MESSAGE_BYTES, OwnerFence, OwnerFenced};
 use crate::rotation_control::{
     RecoveryBegin, RecoveryClosed, Resume, Resumed, RotateAbort, RotateAborted, RotateCommit,
     RotateCommitted, RotateComplete, RotateDrained, RotateFrozen, RotatePrepare, RotateQuiesce,
@@ -56,6 +57,12 @@ pub const DEFAULT_ROTATION_INTERVAL_MS: u64 = 300_000;
 pub const DEFAULT_ROTATION_HANDSHAKE_TIMEOUT_MS: u64 = 10_000;
 /// Default overlap timeout from the shared core policy.
 pub const DEFAULT_ROTATION_OVERLAP_TIMEOUT_MS: u64 = 30_000;
+/// WebSocket close status used when an authenticated device cannot acquire
+/// the single active owner slot for its exact tenant/device scope.
+pub const CONTROL_OWNER_BUSY_CLOSE_CODE: u16 = 1008;
+/// Bounded close reason for the owner-conflict admission result.  The reason
+/// is deliberately fixed so backend/catalog details never cross the socket.
+pub const CONTROL_OWNER_BUSY_CLOSE_REASON: &str = "OWNER_BUSY";
 
 /// Serde helper for u64 values represented as decimal JSON strings.
 pub mod decimal_u64 {
@@ -873,6 +880,8 @@ pub enum ControlMessage {
     AuthorizationChallenge(AuthorizationChallenge),
     AuthorizationConfirmed(AuthorizationConfirmed),
     AuthorizationInvalidated(AuthorizationInvalidated),
+    OwnerFence(OwnerFence),
+    OwnerFenced(OwnerFenced),
     RotateRequest(RotateRequest),
     RotatePrepare(RotatePrepare),
     RotateQuiesce(RotateQuiesce),
@@ -914,6 +923,8 @@ impl ControlMessage {
             Self::AuthorizationChallenge(message) => &message.message_id,
             Self::AuthorizationConfirmed(message) => &message.message_id,
             Self::AuthorizationInvalidated(message) => &message.message_id,
+            Self::OwnerFence(message) => &message.message_id,
+            Self::OwnerFenced(message) => &message.message_id,
             Self::RotateRequest(message) => &message.message_id,
             Self::RotatePrepare(message) => &message.message_id,
             Self::RotateQuiesce(message) => &message.message_id,
@@ -953,6 +964,7 @@ impl ControlMessage {
             Self::Rejected(message) => &message.reply_to,
             Self::Pong(message) => &message.reply_to,
             Self::AuthorizationConfirmed(message) => &message.reply_to,
+            Self::OwnerFenced(message) => &message.reply_to,
             Self::RotateRequest(message) => &message.reply_to,
             Self::RotatePrepare(message) => &message.reply_to,
             Self::RotateQuiesce(message) => &message.reply_to,
@@ -976,7 +988,8 @@ impl ControlMessage {
             | Self::Cancel(_)
             | Self::GoAway(_)
             | Self::AuthorizationChallenge(_)
-            | Self::AuthorizationInvalidated(_) => return None,
+            | Self::AuthorizationInvalidated(_)
+            | Self::OwnerFence(_) => return None,
         };
         (!value.is_empty()).then_some(value)
     }
@@ -998,6 +1011,8 @@ impl ControlMessage {
             Self::AuthorizationChallenge(_) => "AUTHORIZATION_CHALLENGE",
             Self::AuthorizationConfirmed(_) => "AUTHORIZATION_CONFIRMED",
             Self::AuthorizationInvalidated(_) => "AUTHORIZATION_INVALIDATED",
+            Self::OwnerFence(_) => "OWNER_FENCE",
+            Self::OwnerFenced(_) => "OWNER_FENCED",
             Self::RotateRequest(_) => "ROTATE_REQUEST",
             Self::RotatePrepare(_) => "ROTATE_PREPARE",
             Self::RotateQuiesce(_) => "ROTATE_QUIESCE",
@@ -1025,6 +1040,7 @@ impl ControlMessage {
             Self::AuthorizationChallenge(_)
             | Self::AuthorizationConfirmed(_)
             | Self::AuthorizationInvalidated(_) => MAX_AUTHORIZATION_MESSAGE_BYTES,
+            Self::OwnerFence(_) | Self::OwnerFenced(_) => MAX_OWNER_FENCING_MESSAGE_BYTES,
             _ => MAX_CONTROL_MESSAGE_BYTES,
         }
     }
@@ -1153,6 +1169,8 @@ impl ControlMessage {
                 validate_id("challenge_id", &message.challenge_id)?;
                 validate_reason("reason", &message.reason)?;
             }
+            Self::OwnerFence(message) => message.validate()?,
+            Self::OwnerFenced(message) => message.validate()?,
             Self::RotateRequest(message) => validate_rotate_request(message)?,
             Self::RotatePrepare(message) => validate_rotate_prepare(message)?,
             Self::RotateQuiesce(message) => validate_rotate_quiesce(message)?,
@@ -1437,6 +1455,7 @@ pub enum ControlError {
         field: &'static str,
     },
     InvalidAuthorizationLifetime(u64),
+    InvalidOwnerFenceLifetime(u64),
     InvalidRotationPolicy {
         field: &'static str,
         reason: &'static str,
@@ -1555,6 +1574,10 @@ impl fmt::Debug for ControlError {
                 .debug_tuple("InvalidAuthorizationLifetime")
                 .field(value)
                 .finish(),
+            Self::InvalidOwnerFenceLifetime(value) => formatter
+                .debug_tuple("InvalidOwnerFenceLifetime")
+                .field(value)
+                .finish(),
             Self::InvalidRotationPolicy { field, reason } => formatter
                 .debug_struct("InvalidRotationPolicy")
                 .field("field", field)
@@ -1664,6 +1687,10 @@ impl fmt::Display for ControlError {
             Self::InvalidAuthorizationLifetime(value) => write!(
                 f,
                 "authorization remaining_ms must be between 1 and 5000, got {value}"
+            ),
+            Self::InvalidOwnerFenceLifetime(value) => write!(
+                f,
+                "owner fence handshake remaining_ms must be between 1 and 20000, got {value}"
             ),
             Self::InvalidRotationPolicy { field, reason } => {
                 write!(f, "invalid rotation policy {field}: {reason}")

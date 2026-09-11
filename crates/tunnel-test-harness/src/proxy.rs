@@ -5,9 +5,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::sync::{Notify, broadcast, mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
+use tokio::time::{timeout, timeout_at};
 
 /// A stable identifier assigned to one accepted TCP connection.
 ///
@@ -119,6 +120,10 @@ pub struct ProxyConfig {
     pub bind_addr: SocketAddr,
     pub fault_script: FaultScript,
     pub read_buffer_bytes: usize,
+    /// Optional kernel receive-buffer request on the socket connected to the
+    /// target. Set before connect so paused response reads exert bounded
+    /// backpressure; the operating system may adjust the requested size.
+    pub target_receive_buffer_bytes: Option<u32>,
 }
 
 impl Default for ProxyConfig {
@@ -127,6 +132,7 @@ impl Default for ProxyConfig {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             fault_script: FaultScript::default(),
             read_buffer_bytes: 16 * 1024,
+            target_receive_buffer_bytes: None,
         }
     }
 }
@@ -236,6 +242,12 @@ enum ProxyCommand {
         connection_id: ConnectionId,
         reply: oneshot::Sender<Result<()>>,
     },
+    PauseAll {
+        reply: oneshot::Sender<Result<()>>,
+    },
+    ResumeAll {
+        reply: oneshot::Sender<Result<()>>,
+    },
 }
 
 enum ConnectionCommand {
@@ -254,10 +266,89 @@ enum ConnectionCommand {
 
 type CloseReply = Arc<std::sync::Mutex<Option<oneshot::Sender<Result<()>>>>>;
 
+#[derive(Clone)]
+struct GlobalPauseControls {
+    client_to_target: Arc<GlobalPauseGate>,
+    target_to_client: Arc<GlobalPauseGate>,
+}
+
+impl Default for GlobalPauseControls {
+    fn default() -> Self {
+        Self {
+            client_to_target: Arc::new(GlobalPauseGate::default()),
+            target_to_client: Arc::new(GlobalPauseGate::default()),
+        }
+    }
+}
+
+impl GlobalPauseControls {
+    async fn pause_all(&self) -> Result<()> {
+        let pause = async {
+            let client = self.client_to_target.barrier.write();
+            let target = self.target_to_client.barrier.write();
+            let (_client_guard, _target_guard) = tokio::join!(client, target);
+            self.client_to_target.paused.store(true, Ordering::Release);
+            self.target_to_client.paused.store(true, Ordering::Release);
+            self.client_to_target.changed.notify_waiters();
+            self.target_to_client.changed.notify_waiters();
+        };
+        tokio::time::timeout(COMMAND_TIMEOUT, pause)
+            .await
+            .map_err(|_| HarnessError::Timeout("global proxy pause timed out".to_owned()))
+    }
+
+    async fn resume_all(&self) -> Result<()> {
+        let resume = async {
+            let client = self.client_to_target.barrier.write();
+            let target = self.target_to_client.barrier.write();
+            let (_client_guard, _target_guard) = tokio::join!(client, target);
+            self.client_to_target.paused.store(false, Ordering::Release);
+            self.target_to_client.paused.store(false, Ordering::Release);
+            self.client_to_target.changed.notify_waiters();
+            self.target_to_client.changed.notify_waiters();
+        };
+        tokio::time::timeout(COMMAND_TIMEOUT, resume)
+            .await
+            .map_err(|_| HarnessError::Timeout("global proxy resume timed out".to_owned()))
+    }
+}
+
+struct GlobalPauseGate {
+    barrier: tokio::sync::RwLock<()>,
+    paused: AtomicBool,
+    changed: Notify,
+}
+
+impl Default for GlobalPauseGate {
+    fn default() -> Self {
+        Self {
+            barrier: tokio::sync::RwLock::new(()),
+            paused: AtomicBool::new(false),
+            changed: Notify::new(),
+        }
+    }
+}
+
+impl GlobalPauseGate {
+    fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Acquire)
+    }
+
+    async fn try_acquire_forward(&self) -> Option<tokio::sync::RwLockReadGuard<'_, ()>> {
+        let guard = self.barrier.read().await;
+        if self.is_paused() { None } else { Some(guard) }
+    }
+}
+
 struct ConnectionControl {
     shutdown: broadcast::Receiver<()>,
     commands: mpsc::Receiver<ConnectionCommand>,
     close_reply: CloseReply,
+}
+
+struct ConnectionBuffers {
+    read_buffer_bytes: usize,
+    target_receive_buffer_bytes: Option<u32>,
 }
 
 struct AcceptContext {
@@ -265,8 +356,10 @@ struct AcceptContext {
     target_addr: SocketAddr,
     faults: FaultScript,
     read_buffer_bytes: usize,
+    target_receive_buffer_bytes: Option<u32>,
     stats: Arc<StatsInner>,
     active_connections: ActiveConnections,
+    global_pause: GlobalPauseControls,
 }
 
 /// A TCP proxy that leaves TLS opaque and can inject bounded transport faults.
@@ -279,16 +372,31 @@ impl TcpProxy {
                 "proxy read_buffer_bytes must be between 1 and 1 MiB".to_owned(),
             ));
         }
+        if config
+            .target_receive_buffer_bytes
+            .is_some_and(|bytes| !(1024..=1024 * 1024).contains(&bytes))
+        {
+            return Err(HarnessError::InvalidInput(
+                "proxy target_receive_buffer_bytes must be between 1 KiB and 1 MiB".to_owned(),
+            ));
+        }
         let listener = TcpListener::bind(config.bind_addr).await?;
         let local_addr = listener.local_addr()?;
+        let target_text = target_addr.to_string();
+        let local_text = local_addr.to_string();
+        crate::c11_capture::record_sentinel("private_endpoint", target_text.as_bytes())?;
+        crate::c11_capture::record_sentinel("private_endpoint", local_text.as_bytes())?;
         let (shutdown_tx, _) = broadcast::channel(2);
         let (command_tx, command_rx) = mpsc::channel(PROXY_COMMAND_CAPACITY);
         let stats = Arc::new(StatsInner::default());
         let active_connections: ActiveConnections = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let global_pause = GlobalPauseControls::default();
         let accept_stats = Arc::clone(&stats);
         let accept_connections = Arc::clone(&active_connections);
+        let accept_global_pause = global_pause.clone();
         let accept_faults = config.fault_script.clone();
         let read_buffer_bytes = config.read_buffer_bytes;
+        let target_receive_buffer_bytes = config.target_receive_buffer_bytes;
         let accept_shutdown = shutdown_tx.subscribe();
         let accept_task = tokio::spawn(async move {
             accept_loop(
@@ -297,8 +405,10 @@ impl TcpProxy {
                     target_addr,
                     faults: accept_faults,
                     read_buffer_bytes,
+                    target_receive_buffer_bytes,
                     stats: accept_stats,
                     active_connections: accept_connections,
+                    global_pause: accept_global_pause,
                 },
                 accept_shutdown,
                 command_rx,
@@ -411,6 +521,22 @@ impl ProxyHandle {
         await_command_response(response).await
     }
 
+    /// Pause forwarding in both directions for every current connection and
+    /// for connections accepted while the pause remains active.  The bounded
+    /// command is acknowledged after both global barriers are installed.
+    pub async fn pause_all(&self) -> Result<()> {
+        let (reply, response) = oneshot::channel();
+        self.send_command(ProxyCommand::PauseAll { reply }).await?;
+        await_command_response(response).await
+    }
+
+    /// Resume both directions for every connection covered by [`Self::pause_all`].
+    pub async fn resume_all(&self) -> Result<()> {
+        let (reply, response) = oneshot::channel();
+        self.send_command(ProxyCommand::ResumeAll { reply }).await?;
+        await_command_response(response).await
+    }
+
     async fn send_command(&self, command: ProxyCommand) -> Result<()> {
         tokio::time::timeout(COMMAND_TIMEOUT, self.command_tx.send(command))
             .await
@@ -419,12 +545,58 @@ impl ProxyHandle {
     }
 
     pub async fn shutdown(mut self) -> Result<()> {
+        let _ = record_c11_proxy_snapshot(&self);
         let _ = self.shutdown_tx.send(());
         if let Some(task) = self.accept_task.take() {
             task.await
                 .map_err(|error| HarnessError::Proxy(error.to_string()))?;
         }
         Ok(())
+    }
+
+    /// Shut down the accept loop with a caller-owned absolute deadline.
+    ///
+    /// Unlike [`Self::shutdown`], this keeps the task in the handle when a
+    /// deadline or forced-join bound is exceeded.  A successor-owner fixture
+    /// can therefore retain the proxy until a later forced cleanup pass
+    /// instead of detaching its accept task when an outer scenario is
+    /// cancelled.
+    pub async fn shutdown_until(&mut self, deadline: tokio::time::Instant) -> Result<()> {
+        let _ = record_c11_proxy_snapshot(self);
+        let _ = self.shutdown_tx.send(());
+        let Some(task) = self.accept_task.as_mut() else {
+            return Ok(());
+        };
+        match timeout_at(deadline, &mut *task).await {
+            Ok(Ok(())) => {
+                self.accept_task.take();
+                Ok(())
+            }
+            Ok(Err(error)) => {
+                self.accept_task.take();
+                Err(HarnessError::Proxy(error.to_string()))
+            }
+            Err(_) => {
+                task.abort();
+                match timeout(Duration::from_secs(1), &mut *task).await {
+                    Ok(Ok(())) => {
+                        self.accept_task.take();
+                        Err(HarnessError::Timeout(
+                            "proxy accept task required forced abort cleanup".into(),
+                        ))
+                    }
+                    Ok(Err(error)) => {
+                        self.accept_task.take();
+                        Err(HarnessError::Proxy(format!(
+                            "proxy accept task forced abort join failed: {error}"
+                        )))
+                    }
+                    Err(_) => Err(HarnessError::Timeout(
+                        "proxy accept task did not join after forced abort".into(),
+                    )),
+                }
+            }
+        }
     }
 }
 
@@ -454,8 +626,10 @@ async fn accept_loop(
         target_addr,
         faults,
         read_buffer_bytes,
+        target_receive_buffer_bytes,
         stats,
         active_connections,
+        global_pause,
     } = context;
     let mut connections = JoinSet::new();
     let mut routes = HashMap::new();
@@ -470,7 +644,7 @@ async fn accept_loop(
             }
             command = commands.recv() => {
                 match command {
-                    Some(command) => route_command(command, &routes),
+                    Some(command) => route_command(command, &routes, &global_pause).await,
                     None => break,
                 }
                 continue;
@@ -502,6 +676,7 @@ async fn accept_loop(
             mpsc::channel(CONNECTION_COMMAND_CAPACITY);
         let close_reply: CloseReply = Arc::new(std::sync::Mutex::new(None));
         let connection_shutdown = shutdown.resubscribe();
+        let connection_global_pause = global_pause.clone();
         routes.insert(connection_id, connection_commands_tx);
         connections.spawn(async move {
             let connection_control = ConnectionControl {
@@ -513,9 +688,13 @@ async fn accept_loop(
                 client,
                 target_addr,
                 connection_faults,
-                read_buffer_bytes,
+                ConnectionBuffers {
+                    read_buffer_bytes,
+                    target_receive_buffer_bytes,
+                },
                 Arc::clone(&connection_stats),
                 connection_control,
+                connection_global_pause,
             )
             .await;
             if let Err(error) = &result {
@@ -576,6 +755,27 @@ fn remove_active_connection(active_connections: &ActiveConnections, connection_i
     }
 }
 
+fn record_c11_proxy_snapshot(proxy: &ProxyHandle) -> Result<()> {
+    let diagnostics = proxy.diagnostics();
+    let stats = diagnostics.stats;
+    let text = format!(
+        "route=tcp_proxy accepted={} active={} completed={} bytes_client_to_target={} bytes_target_to_client={} dropped_client_to_target={} dropped_target_to_client={} paused_client_to_target={} paused_target_to_client={} closes={} peak_active={} active_records={}",
+        stats.accepted,
+        stats.active,
+        stats.completed,
+        stats.bytes_client_to_target,
+        stats.bytes_target_to_client,
+        stats.dropped_client_to_target,
+        stats.dropped_target_to_client,
+        stats.paused_client_to_target,
+        stats.paused_target_to_client,
+        stats.closes,
+        diagnostics.peak_active,
+        diagnostics.active_connections.len(),
+    );
+    crate::c11_capture::record_snapshot("tcp_proxy", text.as_bytes())
+}
+
 fn snapshot_active_connections(active_connections: &ActiveConnections) -> Vec<ProxyConnection> {
     let mut snapshot: Vec<ProxyConnection> = active_connections
         .lock()
@@ -595,9 +795,10 @@ fn update_peak(peak: &AtomicU64, current: u64) {
     }
 }
 
-fn route_command(
+async fn route_command(
     command: ProxyCommand,
     routes: &HashMap<ConnectionId, mpsc::Sender<ConnectionCommand>>,
+    global_pause: &GlobalPauseControls,
 ) {
     let (connection_id, command) = match command {
         ProxyCommand::Close {
@@ -617,6 +818,14 @@ fn route_command(
             connection_id,
             ConnectionCommand::Resume { direction, reply },
         ),
+        ProxyCommand::PauseAll { reply } => {
+            let _ = reply.send(global_pause.pause_all().await);
+            return;
+        }
+        ProxyCommand::ResumeAll { reply } => {
+            let _ = reply.send(global_pause.resume_all().await);
+            return;
+        }
     };
     let sender = match routes.get(&connection_id) {
         Some(sender) => sender,
@@ -655,13 +864,30 @@ async fn proxy_connection(
     client: TcpStream,
     target_addr: SocketAddr,
     faults: FaultScript,
-    read_buffer_bytes: usize,
+    buffers: ConnectionBuffers,
     stats: Arc<StatsInner>,
     mut control: ConnectionControl,
+    global_pause: GlobalPauseControls,
 ) -> Result<()> {
+    let ConnectionBuffers {
+        read_buffer_bytes,
+        target_receive_buffer_bytes,
+    } = buffers;
     let client_to_target = Arc::new(DirectionControl::default());
     let target_to_client = Arc::new(DirectionControl::default());
-    let target_connect = TcpStream::connect(target_addr);
+    let target_connect = async {
+        if let Some(bytes) = target_receive_buffer_bytes {
+            let socket = if target_addr.is_ipv4() {
+                TcpSocket::new_v4()?
+            } else {
+                TcpSocket::new_v6()?
+            };
+            socket.set_recv_buffer_size(bytes)?;
+            socket.connect(target_addr).await
+        } else {
+            TcpStream::connect(target_addr).await
+        }
+    };
     tokio::pin!(target_connect);
     let connect_deadline = Instant::now() + CONNECT_TIMEOUT;
     let target = loop {
@@ -700,7 +926,10 @@ async fn proxy_connection(
         faults.for_direction(Direction::ClientToTarget),
         read_buffer_bytes,
         Arc::clone(&stats),
-        Arc::clone(&client_to_target),
+        DirectionControls {
+            local: Arc::clone(&client_to_target),
+            global: Arc::clone(&global_pause.client_to_target),
+        },
     );
     let down = copy_direction(
         target_read,
@@ -709,7 +938,10 @@ async fn proxy_connection(
         faults.for_direction(Direction::TargetToClient),
         read_buffer_bytes,
         Arc::clone(&stats),
-        Arc::clone(&target_to_client),
+        DirectionControls {
+            local: Arc::clone(&target_to_client),
+            global: Arc::clone(&global_pause.target_to_client),
+        },
     );
     let joined = async {
         tokio::pin!(up);
@@ -941,6 +1173,12 @@ struct DirectionFault {
     close_after: Option<u64>,
 }
 
+#[derive(Clone)]
+struct DirectionControls {
+    local: Arc<DirectionControl>,
+    global: Arc<GlobalPauseGate>,
+}
+
 async fn copy_direction<R, W>(
     reader: R,
     writer: W,
@@ -948,7 +1186,7 @@ async fn copy_direction<R, W>(
     fault: DirectionFault,
     read_buffer_bytes: usize,
     stats: Arc<StatsInner>,
-    control: Arc<DirectionControl>,
+    controls: DirectionControls,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin,
@@ -961,10 +1199,10 @@ where
         fault,
         read_buffer_bytes,
         stats,
-        Arc::clone(&control),
+        controls.clone(),
     )
     .await;
-    control.end(&result);
+    controls.local.end(&result);
     result
 }
 
@@ -975,21 +1213,25 @@ async fn copy_direction_inner<R, W>(
     mut fault: DirectionFault,
     read_buffer_bytes: usize,
     stats: Arc<StatsInner>,
-    control: Arc<DirectionControl>,
+    controls: DirectionControls,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    let control = &controls.local;
+    let global_control = &controls.global;
     let mut buffer = vec![0_u8; read_buffer_bytes];
     let mut observed = 0_u64;
     loop {
-        wait_if_paused(&control).await?;
+        wait_if_paused(control, global_control).await?;
         let read = loop {
             let notified = control.changed.notified();
             tokio::pin!(notified);
-            if control.is_paused() {
-                wait_if_paused(&control).await?;
+            let global_notified = global_control.changed.notified();
+            tokio::pin!(global_notified);
+            if controls_paused(control, global_control) {
+                wait_if_paused(control, global_control).await?;
                 continue;
             }
             tokio::select! {
@@ -998,6 +1240,11 @@ where
                     // A pause command must interrupt an otherwise idle read
                     // so its hard timeout remains effective even with no
                     // incoming application bytes.
+                    continue;
+                }
+                _ = &mut global_notified => {
+                    // A global pause or resume must interrupt an otherwise
+                    // idle read for every current and newly accepted route.
                     continue;
                 }
             }
@@ -1016,7 +1263,7 @@ where
         }
         // A command may have arrived while the read was in progress.  Check
         // again before writing so paused traffic never crosses the proxy.
-        wait_if_paused(&control).await?;
+        wait_if_paused(control, global_control).await?;
         let mut start = 0_usize;
         if fault.drop_bytes > 0 {
             let drop = fault.drop_bytes.min(read) as usize;
@@ -1032,30 +1279,62 @@ where
             return Ok(());
         }
         if start < read as usize {
-            write_with_control(&mut writer, &buffer[start..read as usize], &control).await?;
+            write_with_control(
+                &mut writer,
+                &buffer[start..read as usize],
+                control,
+                global_control,
+            )
+            .await?;
         }
     }
 }
 
-async fn wait_if_paused(control: &DirectionControl) -> Result<()> {
-    while control.is_paused() {
-        let remaining = control.pause_remaining().unwrap_or(PAUSE_TIMEOUT);
-        if remaining.is_zero() {
-            control.expire_pause();
+fn controls_paused(control: &DirectionControl, global_control: &GlobalPauseGate) -> bool {
+    control.is_paused() || global_control.is_paused()
+}
+
+async fn wait_if_paused(
+    control: &DirectionControl,
+    global_control: &GlobalPauseGate,
+) -> Result<()> {
+    while controls_paused(control, global_control) {
+        let remaining = control.pause_remaining();
+        if remaining.is_some_and(|remaining| remaining.is_zero()) {
+            if control.is_paused() {
+                control.expire_pause();
+            }
             return Err(HarnessError::Timeout(
                 "proxy direction pause exceeded its hard timeout".to_owned(),
             ));
         }
-        control.reach_barrier();
+        if control.is_paused() {
+            control.reach_barrier();
+        }
         let notified = control.changed.notified();
-        if !control.is_paused() {
+        let global_notified = global_control.changed.notified();
+        if !control.is_paused() && !global_control.is_paused() {
             continue;
         }
-        if tokio::time::timeout(remaining, notified).await.is_err() {
-            control.expire_pause();
-            return Err(HarnessError::Timeout(
-                "proxy direction pause exceeded its hard timeout".to_owned(),
-            ));
+        tokio::pin!(notified);
+        tokio::pin!(global_notified);
+        let notified = async {
+            tokio::select! {
+                _ = &mut notified => {},
+                _ = &mut global_notified => {},
+            }
+        };
+        if let Some(remaining) = remaining {
+            if tokio::time::timeout(remaining, notified).await.is_err() {
+                if control.is_paused() {
+                    control.expire_pause();
+                }
+                return Err(HarnessError::Timeout(
+                    "proxy direction pause exceeded its hard timeout".to_owned(),
+                ));
+            }
+        } else {
+            notified.await;
         }
     }
     Ok(())
@@ -1065,13 +1344,17 @@ async fn write_with_control<W>(
     writer: &mut W,
     bytes: &[u8],
     control: &DirectionControl,
+    global_control: &GlobalPauseGate,
 ) -> Result<()>
 where
     W: AsyncWrite + Unpin,
 {
     let mut offset = 0_usize;
     while offset < bytes.len() {
-        wait_if_paused(control).await?;
+        wait_if_paused(control, global_control).await?;
+        let Some(_forward_permit) = global_control.try_acquire_forward().await else {
+            continue;
+        };
         let written = writer.write(&bytes[offset..]).await?;
         if written == 0 {
             return Err(HarnessError::Proxy(
@@ -1136,6 +1419,7 @@ mod tests {
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+    use tokio::sync::{mpsc, oneshot};
     use tokio::task::JoinSet;
     use tokio::time::{Duration, sleep, timeout};
 
@@ -1357,6 +1641,17 @@ mod tests {
             );
         }
         wait_for_accepts(&proxy, 3).await;
+        // Accepted client sockets do not prove that every upstream target
+        // connection has completed yet.  Exercise one opaque byte on each
+        // route before teardown so the target helper cannot wait forever for
+        // an upstream accept that shutdown canceled before it started.
+        for (index, client) in clients.iter_mut().enumerate() {
+            let payload = [index as u8 + 1];
+            client.write_all(&payload).await.expect("client write");
+            let mut response = [0_u8; 1];
+            client.read_exact(&mut response).await.expect("client read");
+            assert_eq!(response, payload);
+        }
         let snapshot = proxy.diagnostics();
         assert_eq!(snapshot.peak_active, 3);
         assert_eq!(snapshot.last_connection_id, Some(ConnectionId::new(3)));
@@ -1382,7 +1677,147 @@ mod tests {
         }
 
         drop(clients);
-        proxy.shutdown().await.expect("shutdown");
-        target_task.await.expect("target task");
+        timeout(Duration::from_secs(2), proxy.shutdown())
+            .await
+            .expect("proxy shutdown bounded")
+            .expect("shutdown");
+        timeout(Duration::from_secs(2), target_task)
+            .await
+            .expect("target task bounded")
+            .expect("target task");
+    }
+
+    #[tokio::test]
+    async fn pause_all_blocks_existing_and_new_connections_until_resume() {
+        let target = TcpListener::bind(("127.0.0.1", 0)).await.expect("target");
+        let target_addr = target.local_addr().expect("target addr");
+        let (accepted_tx, mut accepted_rx) = mpsc::channel(2);
+        let (started_tx, mut started_rx) = mpsc::channel(2);
+        let (read_tx, mut read_rx) = mpsc::channel(2);
+        let (start_tx, start_rx) = oneshot::channel();
+        let target_task = tokio::spawn(async move {
+            let mut streams = Vec::new();
+            for index in 0..2 {
+                let (stream, _) = target.accept().await.expect("target accept");
+                accepted_tx
+                    .send(index)
+                    .await
+                    .expect("target accepted signal");
+                streams.push(stream);
+            }
+            start_rx.await.expect("target start");
+            let mut workers = JoinSet::new();
+            for (index, mut stream) in streams.into_iter().enumerate() {
+                let started_tx = started_tx.clone();
+                let read_tx = read_tx.clone();
+                workers.spawn(async move {
+                    started_tx.send(index).await.expect("target started signal");
+                    stream
+                        .write_all(&[0xa0 + index as u8])
+                        .await
+                        .expect("target write");
+                    let mut payload = [0_u8; 1];
+                    stream.read_exact(&mut payload).await.expect("target read");
+                    read_tx
+                        .send((index, payload[0]))
+                        .await
+                        .expect("target read signal");
+                    stream.write_all(&payload).await.expect("target echo");
+                });
+            }
+            drop(started_tx);
+            drop(read_tx);
+            while workers.join_next().await.is_some() {}
+        });
+        let proxy = TcpProxy::bind(target_addr, ProxyConfig::default())
+            .await
+            .expect("proxy");
+        let mut existing = tokio::net::TcpStream::connect(proxy.local_addr())
+            .await
+            .expect("existing client");
+        wait_for_accepts(&proxy, 1).await;
+        timeout(Duration::from_secs(1), accepted_rx.recv())
+            .await
+            .expect("existing target accepted")
+            .expect("existing target acceptance signal");
+
+        proxy.pause_all().await.expect("pause all");
+
+        let mut new = tokio::net::TcpStream::connect(proxy.local_addr())
+            .await
+            .expect("new client");
+        wait_for_accepts(&proxy, 2).await;
+        timeout(Duration::from_secs(1), accepted_rx.recv())
+            .await
+            .expect("new target accepted")
+            .expect("new target acceptance signal");
+        existing.write_all(&[0x11]).await.expect("existing write");
+        new.write_all(&[0x22]).await.expect("new write");
+        start_tx.send(()).expect("target start send");
+        timeout(Duration::from_secs(1), started_rx.recv())
+            .await
+            .expect("first target worker started")
+            .expect("first target worker signal");
+        timeout(Duration::from_secs(1), started_rx.recv())
+            .await
+            .expect("second target worker started")
+            .expect("second target worker signal");
+
+        let mut existing_blocked = [0_u8; 1];
+        assert!(
+            timeout(
+                Duration::from_millis(100),
+                existing.read(&mut existing_blocked)
+            )
+            .await
+            .is_err()
+        );
+        let mut new_blocked = [0_u8; 1];
+        assert!(
+            timeout(Duration::from_millis(100), new.read(&mut new_blocked))
+                .await
+                .is_err()
+        );
+        assert!(
+            timeout(Duration::from_millis(100), read_rx.recv())
+                .await
+                .is_err()
+        );
+
+        proxy.resume_all().await.expect("resume all");
+        let first_read = timeout(Duration::from_secs(1), read_rx.recv())
+            .await
+            .expect("first target read")
+            .expect("first target read signal");
+        let second_read = timeout(Duration::from_secs(1), read_rx.recv())
+            .await
+            .expect("second target read")
+            .expect("second target read signal");
+        assert_eq!(
+            vec![first_read, second_read]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            [(0, 0x11), (1, 0x22)].into_iter().collect()
+        );
+
+        let mut existing_response = [0_u8; 2];
+        existing
+            .read_exact(&mut existing_response)
+            .await
+            .expect("existing response");
+        assert_eq!(existing_response, [0xa0, 0x11]);
+        let mut new_response = [0_u8; 2];
+        new.read_exact(&mut new_response)
+            .await
+            .expect("new response");
+        assert_eq!(new_response, [0xa1, 0x22]);
+
+        drop(existing);
+        drop(new);
+        proxy.shutdown().await.expect("proxy shutdown");
+        timeout(Duration::from_secs(1), target_task)
+            .await
+            .expect("target task bounded")
+            .expect("target task");
     }
 }

@@ -62,6 +62,28 @@ pub struct GrantFixture {
     pub allowed: bool,
 }
 
+/// The deliberately colliding identity used by tenant-isolation fixtures.
+///
+/// Device and service identifiers are normally unique in the default M1
+/// topology. M7 also needs to prove that both identifiers are scoped by the
+/// tenant, so this value is opt-in and is applied before the one-shot catalog
+/// seed. The two certificates remain distinct because each tenant receives a
+/// separately generated device key pair.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SharedFixtureIdentity {
+    pub device_id: Uuid,
+    pub service_id: Uuid,
+}
+
+impl SharedFixtureIdentity {
+    pub const fn new(device_id: Uuid, service_id: Uuid) -> Self {
+        Self {
+            device_id,
+            service_id,
+        }
+    }
+}
+
 /// M1's minimum two-tenant/five-device topology.
 #[derive(Clone, Debug)]
 pub struct FixtureTopology {
@@ -163,6 +185,54 @@ impl FixtureTopology {
             service_ids,
             grants,
         })
+    }
+
+    /// Build the normal two-tenant topology while deliberately reusing one
+    /// device UUID in both tenant scopes.  Redis keys are tenant-qualified,
+    /// so this is a useful production authorization edge case: a tenant-B
+    /// credential must never reach tenant A's device merely because the
+    /// device UUID and service UUID are identical.
+    pub fn new_with_shared_device_uuid(pki: &FixturePki, shared_device_id: Uuid) -> Result<Self> {
+        let mut topology = Self::new(pki)?;
+        let source_device_id = topology
+            .devices_a
+            .first()
+            .ok_or_else(|| HarnessError::InvalidInput("tenant A has no fixture device".into()))?
+            .id;
+        let shared_service_id = topology
+            .service_ids
+            .get(&source_device_id)
+            .copied()
+            .ok_or_else(|| {
+                HarnessError::InvalidInput(format!(
+                    "device {source_device_id} has no fixture service id"
+                ))
+            })?;
+        replace_shared_identity(
+            pki,
+            &mut topology,
+            SharedFixtureIdentity {
+                device_id: shared_device_id,
+                service_id: shared_service_id,
+            },
+        )?;
+        Ok(topology)
+    }
+
+    /// Build the normal topology with the first device in each tenant sharing
+    /// an explicitly chosen device UUID and service UUID.
+    ///
+    /// This constructor is intended for M7 tenant-isolation scenarios. It
+    /// keeps the default five-device/four-consumer topology and performs all
+    /// records through [`Self::catalog_fixture`] before the caller performs
+    /// the production catalog's one-shot seed.
+    pub fn new_with_shared_device_and_service_uuid(
+        pki: &FixturePki,
+        shared: SharedFixtureIdentity,
+    ) -> Result<Self> {
+        let mut topology = Self::new(pki)?;
+        replace_shared_identity(pki, &mut topology, shared)?;
+        Ok(topology)
     }
 
     pub fn all_devices(&self) -> impl Iterator<Item = &DeviceFixture> {
@@ -306,14 +376,26 @@ impl FixtureTopology {
                         grant.device_id
                     ))
                 })?;
-            let tenant_id = if self
-                .devices_a
-                .iter()
-                .any(|device| device.id == grant.device_id)
+            let tenant_id = if grant.principal_id == self.owner_a.id
+                || grant.principal_id == self.limited_member_a.id
+                || self
+                    .consumers_a
+                    .iter()
+                    .any(|consumer| consumer.id == grant.principal_id)
             {
                 self.tenant_a.id
-            } else {
+            } else if grant.principal_id == self.owner_b.id
+                || self
+                    .consumers_b
+                    .iter()
+                    .any(|consumer| consumer.id == grant.principal_id)
+            {
                 self.tenant_b.id
+            } else {
+                return Err(HarnessError::InvalidInput(format!(
+                    "grant references unknown principal {}",
+                    grant.principal_id
+                )));
             };
             fixture.grants.push(GrantSpec {
                 tenant_id,
@@ -342,7 +424,15 @@ fn principal(tenant_id: Uuid, name: &str, role: PrincipalRole) -> PrincipalFixtu
 }
 
 fn make_device(pki: &FixturePki, tenant_id: Uuid, label: String) -> Result<DeviceFixture> {
-    let id = Uuid::new_v4();
+    make_device_with_id(pki, tenant_id, Uuid::new_v4(), label)
+}
+
+fn make_device_with_id(
+    pki: &FixturePki,
+    tenant_id: Uuid,
+    id: Uuid,
+    label: String,
+) -> Result<DeviceFixture> {
     let certificate = pki.issue_device(tenant_id, id)?;
     let mut binary_canary = Vec::with_capacity(256);
     for byte in 0_u16..=255 {
@@ -357,6 +447,69 @@ fn make_device(pki: &FixturePki, tenant_id: Uuid, label: String) -> Result<Devic
         certificate,
         binary_canary,
     })
+}
+
+fn replace_shared_identity(
+    pki: &FixturePki,
+    topology: &mut FixtureTopology,
+    shared: SharedFixtureIdentity,
+) -> Result<()> {
+    if shared.device_id.is_nil() {
+        return Err(HarnessError::InvalidInput(
+            "shared fixture device UUID must be non-nil".to_owned(),
+        ));
+    }
+    if shared.service_id.is_nil() {
+        return Err(HarnessError::InvalidInput(
+            "shared fixture service UUID must be non-nil".to_owned(),
+        ));
+    }
+
+    let tenant_a_device = topology
+        .devices_a
+        .first()
+        .ok_or_else(|| HarnessError::InvalidInput("tenant A has no fixture device".into()))?;
+    let tenant_b_device = topology
+        .devices_b
+        .first()
+        .ok_or_else(|| HarnessError::InvalidInput("tenant B has no fixture device".into()))?;
+    let previous_device_ids = [tenant_a_device.id, tenant_b_device.id];
+    if topology
+        .all_devices()
+        .any(|device| device.id == shared.device_id && !previous_device_ids.contains(&device.id))
+    {
+        return Err(HarnessError::InvalidInput(format!(
+            "shared fixture device UUID {} is already used by another device",
+            shared.device_id
+        )));
+    }
+    let replacement_a = make_device_with_id(
+        pki,
+        topology.tenant_a.id,
+        shared.device_id,
+        tenant_a_device.label.clone(),
+    )?;
+    let replacement_b = make_device_with_id(
+        pki,
+        topology.tenant_b.id,
+        shared.device_id,
+        tenant_b_device.label.clone(),
+    )?;
+    topology.devices_a[0] = replacement_a;
+    topology.devices_b[0] = replacement_b;
+
+    for previous_device_id in previous_device_ids {
+        topology.service_ids.remove(&previous_device_id);
+    }
+    topology
+        .service_ids
+        .insert(shared.device_id, shared.service_id);
+    for grant in &mut topology.grants {
+        if previous_device_ids.contains(&grant.device_id) {
+            grant.device_id = shared.device_id;
+        }
+    }
+    Ok(())
 }
 
 fn self_service_ids<'a>(devices: impl Iterator<Item = &'a DeviceFixture>) -> BTreeMap<Uuid, Uuid> {
@@ -395,6 +548,167 @@ mod tests {
         assert_eq!(
             topology.devices_a[0].binary_canary.len(),
             256 + topology.devices_a[0].label.len() + 16
+        );
+    }
+
+    #[test]
+    fn shared_device_uuid_remains_tenant_scoped_in_catalog_fixture() {
+        let pki = FixturePki::default();
+        let shared_device_id = uuid::Uuid::from_u128(0xfeed);
+        let shared_service_id = uuid::Uuid::from_u128(0xbeef);
+        let topology = FixtureTopology::new_with_shared_device_and_service_uuid(
+            &pki,
+            super::SharedFixtureIdentity {
+                device_id: shared_device_id,
+                service_id: shared_service_id,
+            },
+        )
+        .expect("shared topology");
+        assert_eq!(topology.devices_a[0].id, shared_device_id);
+        assert_eq!(topology.devices_b[0].id, shared_device_id);
+        assert_ne!(
+            topology.devices_a[0]
+                .certificate
+                .spki_fingerprint_sha256()
+                .expect("tenant A SPKI"),
+            topology.devices_b[0]
+                .certificate
+                .spki_fingerprint_sha256()
+                .expect("tenant B SPKI")
+        );
+        let oidc = crate::oidc::OidcFixture::new("https://fixture.test", "audience").expect("oidc");
+        let catalog = topology.catalog_fixture(&oidc).expect("catalog fixture");
+        assert_eq!(
+            catalog
+                .devices
+                .iter()
+                .filter(|device| device.device_id == shared_device_id)
+                .count(),
+            2
+        );
+        let shared_services = catalog
+            .services
+            .iter()
+            .filter(|service| service.device_id == shared_device_id)
+            .collect::<Vec<_>>();
+        assert_eq!(shared_services.len(), 2);
+        assert!(
+            shared_services
+                .iter()
+                .all(|service| service.service_id == shared_service_id)
+        );
+        assert_eq!(
+            catalog
+                .credentials
+                .iter()
+                .filter(|credential| credential.device_id == shared_device_id)
+                .count(),
+            2
+        );
+        let shared_credentials = catalog
+            .credentials
+            .iter()
+            .filter(|credential| credential.device_id == shared_device_id)
+            .collect::<Vec<_>>();
+        assert!(
+            shared_credentials
+                .iter()
+                .any(|credential| credential.tenant_id == topology.tenant_a.id)
+        );
+        assert!(
+            shared_credentials
+                .iter()
+                .any(|credential| credential.tenant_id == topology.tenant_b.id)
+        );
+        let tenant_a_spki = topology.devices_a[0]
+            .certificate
+            .spki_fingerprint_sha256()
+            .expect("tenant A SPKI");
+        let tenant_b_spki = topology.devices_b[0]
+            .certificate
+            .spki_fingerprint_sha256()
+            .expect("tenant B SPKI");
+        assert_eq!(
+            shared_credentials
+                .iter()
+                .find(|credential| credential.tenant_id == topology.tenant_a.id)
+                .expect("tenant A credential")
+                .spki_fingerprint
+                .as_str(),
+            tenant_a_spki.as_str()
+        );
+        assert_eq!(
+            shared_credentials
+                .iter()
+                .find(|credential| credential.tenant_id == topology.tenant_b.id)
+                .expect("tenant B credential")
+                .spki_fingerprint
+                .as_str(),
+            tenant_b_spki.as_str()
+        );
+        assert_ne!(
+            shared_credentials[0].spki_fingerprint,
+            shared_credentials[1].spki_fingerprint
+        );
+        let tenant_a_grants = catalog
+            .grants
+            .iter()
+            .filter(|grant| {
+                grant.tenant_id == topology.tenant_a.id && grant.device_id == shared_device_id
+            })
+            .count();
+        let tenant_b_grants = catalog
+            .grants
+            .iter()
+            .filter(|grant| {
+                grant.tenant_id == topology.tenant_b.id && grant.device_id == shared_device_id
+            })
+            .count();
+        assert!(tenant_a_grants > 0);
+        assert!(tenant_b_grants > 0);
+        assert!(catalog.grants.iter().any(|grant| {
+            grant.tenant_id == topology.tenant_a.id
+                && grant.principal_id == topology.consumers_a[0].id
+                && grant.device_id == shared_device_id
+                && grant.service_id == shared_service_id
+        }));
+        assert!(catalog.grants.iter().any(|grant| {
+            grant.tenant_id == topology.tenant_b.id
+                && grant.principal_id == topology.consumers_b[0].id
+                && grant.device_id == shared_device_id
+                && grant.service_id == shared_service_id
+        }));
+        assert!(!catalog.grants.iter().any(|grant| {
+            grant.tenant_id == topology.tenant_a.id
+                && grant.principal_id == topology.consumers_b[0].id
+                && grant.device_id == shared_device_id
+        }));
+        assert!(!catalog.grants.iter().any(|grant| {
+            grant.tenant_id == topology.tenant_b.id
+                && grant.principal_id == topology.consumers_a[0].id
+                && grant.device_id == shared_device_id
+        }));
+        assert_eq!(
+            catalog
+                .grants
+                .iter()
+                .filter(|grant| grant.device_id == shared_device_id)
+                .count(),
+            tenant_a_grants + tenant_b_grants
+        );
+    }
+
+    #[test]
+    fn generated_shared_device_constructor_reuses_a_service_uuid() {
+        let topology = FixtureTopology::new_with_shared_device_uuid(
+            &FixturePki::default(),
+            uuid::Uuid::from_u128(0xfeed),
+        )
+        .expect("shared topology");
+        assert_eq!(topology.devices_a[0].id, topology.devices_b[0].id);
+        assert_eq!(
+            topology.service_ids[&topology.devices_a[0].id],
+            topology.service_ids[&topology.devices_b[0].id]
         );
     }
 }

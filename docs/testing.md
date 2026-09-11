@@ -1,6 +1,6 @@
 # Verification plan
 
-This document defines acceptance gates across the project. M1's locked Rust checks, Redis catalog regressions, same-dataset AOF restart and real HTTPS/WSS/CLI/private-H3 harness have local evidence in [m1-harness.md](m1-harness.md). Rotation, clustered routing, remote adapters, backup rollback verification and performance/soak checks below remain future gates; they are not implied by the M1 result.
+This document defines acceptance gates across the project. M1's locked Rust checks, Redis catalog regressions, same-dataset AOF restart and real HTTPS/WSS/CLI/private-H3 harness have local evidence in [m1-harness.md](m1-harness.md). M2 rotation/replay has separate local evidence in [m2-verification.md](m2-verification.md). M7 cluster implementation and verification are in progress; remote adapters, backup rollback verification and performance/soak gates remain open. See [tasks.md](tasks.md) for current task status.
 
 Read [the protocol plan](protocol.md) for authoritative connection and rotation rules, [runtime.md](runtime.md) for mTLS/CLI behavior, [cluster.md](cluster.md) for peer trust and ownership, [the filesystem API](filesystem-api.md) and [adapters](filesystem-adapters.md) for filesystem contracts, and [acp.md](acp.md) for agent HTTP transport. [The integrations plan](integrations.md) also covers computer use. Every implementation milestone must update this document to identify which checks actually run and link to their test code or CI job.
 
@@ -25,6 +25,29 @@ Configuration tests must preserve these defaults and reject invalid values:
 - The cross-field rule is `handshake_timeout_seconds < overlap_seconds < interval_seconds`. An individually valid value can still violate this rule.
 - Client `device_id` accepts 1–128 ASCII characters from `[A-Za-z0-9._-]`. Relay limits default to 1,024 total connected clients and 16 per user, with per-user capacity no greater than total capacity.
 - Empty/default and partial configuration, unknown or duplicate keys, incorrect types, negative/overflowing values, valid boundaries, and the checked-in examples must be covered. Add boundary and cross-field cases whenever an invariant changes.
+
+## Repeatable M7 harness commands
+
+Build the workspace binaries with `cargo build --workspace --locked` before
+running the process-based fixtures. Use a dedicated Redis primary and set
+`TEST_REDIS_URL` to its URL; the harness creates isolated namespaces and uses
+synthetic payloads and ephemeral certificates.
+
+```sh
+cargo run -p tunnel-test-harness --locked -- verify-m7-transport
+cargo run -p tunnel-test-harness --locked -- verify-m7-cluster
+cargo run -p tunnel-test-harness --locked -- verify-m7-production
+cargo run -p tunnel-test-harness --locked -- verify-m7-redis-partition
+```
+
+The transport command exercises real mTLS/H3 fault cases. The cluster command
+uses a synthetic owner callback. The production command uses real relay actors,
+CLI/device WebSockets and public consumers across three relays. The Redis
+partition command is being implemented under M7-I05/I17 and is not yet verified;
+it must block both existing and newly accepted Redis connections, reject new
+admission and expired-authority dispatch, then prove fresh authorized recovery.
+A command passing cannot close unrelated rows in [m7-edge-cases.md](m7-edge-cases.md).
+Record the tested revision and outcomes in [m7-verification.md](m7-verification.md).
 
 ## Deterministic transport and state-machine tests
 
@@ -118,6 +141,65 @@ Use three real relay processes, one supported authoritative Redis primary with s
 | Lease deadlines | Test 30-second TTL, 10-second renewal, five-second owner margin, two-second registry RPC deadline and challenge-send-based device permission of at most 20 seconds. Delay replies, suspend/resume processes and race dispatch after await; authority is checked immediately before each dispatch and cannot be extended from reply receipt or heartbeat traffic. |
 | Forwarded admission | Reject forged source identity, destination owner, tenant/grant, internal headers, credential context and hop budget. The owner independently verifies consumer grants and ticket/device context. Retry route admission once only with proven `NOT_DISPATCHED`; lost/partial acknowledgments preserve uncertainty and never repeat effects. |
 | Coordination failure | Partition Redis, kill/restart/restore the primary, simulate missing/rolled-back epochs, unknown authority, two primaries and exhausted counters. Test AOF/fsync and verified backup restore as durability behavior only; neither backup success nor replica acknowledgment authorizes promotion. The initial profile rejects automatic promotion: stop admission, fence/close sessions, remain unready, verify the durable catalog/signed directory, and require operator quiescence plus a fresh externally authorized incarnation/checkpoint. Unfenced old writers or incomplete/ambiguous restores block recovery. |
+
+### Continuation verification checkpoint (2026-09-10T08:24:36+10:00)
+
+The maximum encoded-record fix is now linked: peer sends fragment transport
+chunks while preserving one complete record and its whole reservation. Current
+scoped results are recorded in [m7-verification.md](m7-verification.md): cluster
+47, protocol/core 85/8, relay/transport libraries 106/18, Redis catalog/cluster
+5/9, Redis recovery/races 10/2, live boot replacement 1, privileged RPC 7, and
+operator recovery workflow 3 tests pass. Rebuilt transport fault acceptance
+passes all flags; two full production acceptance runs and the process-pause
+fixture pass on that build. The first production revocation-recovery timeout
+remains unexplained, so I22 stays open. Pressure I23, readiness C20, the final
+workspace/Clippy/format gate, M1/M2 reruns and row-by-row matrix closure remain
+open. These counts do not imply current hosted CI or full milestone acceptance.
+
+The reusable M7 script includes both newly linked boot-replacement and operator
+recovery targets. Later readiness/runtime edits require affected acceptance
+reruns. The following older checkpoint remains as chronological evidence and
+must not be read as overriding this scoped update or [tasks.md](tasks.md).
+
+### Current M7 evidence boundaries (2026-09-10)
+
+The focused transport command is evidence for the HTTP/3 component path. The fixed `verify-m7-transport` runtime passes M7-C03's stated narrow gates in `/tmp/agent-tunnel-m7-runtime-verify-m7-transport-fixed.log`: duplex, role/pin, oversize, truncation, idle, cancellation, revocation, sibling, budget, UDP partition, no TCP fallback, 0-RTT disabled, joined shutdown, mutation positive control, and stable admissions. The root cause was test-only `ClientSessionMemoryCache(4)` ticket eviction; bounded size 16 preserves reuse. This closes the narrow transport component scope. The earlier `mutation_positive=false` run remains chronological; broader relay/production fallback evidence remains open.
+
+M7-C06's earlier health-route gap has an implementation in place: redacted `livez`/`readyz` routes and a readiness dispatch gate are now present. The focused log `/tmp/agent-tunnel-m7-validation-m7_health_endpoints.log` records one passing `livez_stays_observable_while_readiness_and_dispatch_fail_closed` test, which closes only the local endpoint/dispatch-gate slice. Test live configured `rediss` authority and both public liveness/readiness endpoints while Redis or membership authority is unavailable; synthetic readiness fixtures and Redis-directory tests do not establish startup checkpoint refresh, full dependency-loss behavior, or fail-closed admission in that process-level condition.
+
+M7-C07 requires direct returned-error cleanup from each relevant control, data, and peer handler. Receiver-drop, queue-budget, stale-successor, and cancellation regressions cover bounded cleanup components, but they do not close every handler path that returns an error after admission. The latest focused cleanup checkpoint passes 1/1 with a real H3 `PeerClientStream`: a valid envelope receives 200/OPEN, a declared one-byte consumer prefix with no payload is followed by FIN, `RecordingHandler` increments its error count before revocation, and the raw stream is terminal while the original stream queue remains charged. This closes the direct consumer returned-error cleanup and sibling-isolation subset. The staged control-cleanup fixture's two-catalog setup was rejected in review and is being corrected to one authority or explicitly scoped direct post-admission handler testing. The remaining control/data returned-error cases are staged by `peer_deadlines` after successful control registration and data admission, using malformed peer framing before actor cleanup; no new control/data result is claimed and broad all-exit coverage remains open. The earlier 86/87 and 0/1 failures remain chronological evidence in [m7-verification.md](m7-verification.md). See [tasks.md](tasks.md).
+
+M7-C16's Redis TLS API and real peer mTLS forwarder fixture passed build 40800 with all four flags true: authenticated catalog connection, wrong-CA rejection, wrong-server-name rejection, and wrong-client-identity rejection. This closes the narrow TLS fixture scope; full relay `rediss` deployment and health integration remain open. M7-C17's false-flag handling fix in `main` requires fresh production, transport, and partition command runs; earlier passing output remains dated baseline evidence.
+
+M7-C18 must bind each inbound and outbound peer flow to the actual authenticated certificate during signed key overlap. A first signed-valid SPKI is insufficient: an overlap certificate can be globally approved while failing equality against that first key. The focused log `/tmp/agent-tunnel-m7-validation-m7_live_membership.log` now records one test passed in 0.07 seconds, covering real H3 old/new positives, an unknown same-node certificate rejection, and no-hint signed removal/expiry. This closes the narrow certificate-binding slice; broader propagation remains M7-I06.
+
+M7-C19 is in handover. The generic encoded-record boundary is explicit: a valid `CompleteDeviceData` body of 65,600 bytes encodes to 65,608 bytes, above the 65,536-byte H3 chunk maximum. `peer_fault_harness` is frozen after changing only `crates/tunnel-transport/src/peer.rs`, where unvalidated `send_chunked(&[u8])` methods/helper sequentially split by the actual `BodyBudget.max_chunk_bytes`. Wire the two send helpers in `peer_runtime.rs`, remove the unused `Bytes` import, add focused tests, and run transport/maximum-size production validation. Consumer workaround bodies remain 65,528 bytes. Preserve the advertised limit and required auth/isolation behavior; runtime verification is pending and no pass is claimed. Dedicated security auditing is deferred to Daybreak when requested.
+
+The fresh local suite checkpoint records relay library 88 passed/0 failed,
+health endpoints 1/0, persistence 4/0, readiness 9/0, harness library 27
+passed with 1 ignored, harness main 6/0, live membership 1/0, and privileged
+RPC 4/0 in `/tmp/agent-tunnel-m7-validation-tests.log`. The standalone binary
+build passed in `/tmp/agent-tunnel-m7-validation-build.log`; this is local
+library/harness/build evidence and does not establish production three-relay
+acceptance or hosted CI.
+
+The task-owned fixture permission correction now gets the latest
+`verify-m7-production` run past the strict membership-state parent check, but
+the run fails later with `production echo closed before response`
+(`/tmp/agent-tunnel-m7-runtime-production-current.log`). Static phase diagnosis
+is active and has not identified whether the initial or maximum-size canary
+failed. No C19, canary-isolation, or complete production acceptance assertion
+is counted. `real_cluster_harness` repairs only its task-owned fixture
+directory while production private-path checks remain strict. Affected current
+production rows stay implemented-awaiting-verification under C06/I12/I20 until
+the focused diagnosis and required reruns pass; earlier startup and production
+passes remain dated history.
+
+The real signed key-rotation and expiry socket slice now has one narrow pass recorded above; M7-I06 remains active for propagation, expiry bounds, and deployment diagnostics. The M7-I07 production-pressure implementation is present and compiles, but no runtime pressure result is recorded; compile session 21471's fixture issues remain chronological evidence in [m7-verification.md](m7-verification.md). A read-only `verify_scope` audit is checking applicability, evidence scope, and circular adapter dependencies before the 98-row matrix is edited. The I20 verifier fix and production `new_with_store` wiring are implemented; the corrected persistence fixture must still prove save-before-publish behavior in a runtime rerun.
+
+The corrected catalog session 32255 passed 23 unit tests, including six approval and six full-schema tests, plus five `redis_catalog` and nine `redis_cluster` tests, with current-generation mutation regressions. The exclusive-validator recovery checkpoint then passed `redis_recovery_races` 2/2 (`/tmp/agent-tunnel-m7-validation-redis-recovery-races.log`) and `redis_recovery` 10/10 (`/tmp/agent-tunnel-m7-validation-redis-recovery.log`), including oversized-key, cumulative-key-byte, and dedicated-connection cases. These are bounded I19/I21 subsets; operator CLI recovery and post-EXEC ambiguity remain open. The staged operator module now has redacted `Debug`, supervised blocking phases, and staged Redis workflow tests. `recovery.rs.disabled` contains three ignored recovery test cases, but they are not linked into Cargo and have not run; `wiring.md` likewise has no integration evidence. The canonical recovery snapshot must include orphan, direct-lookup, and epoch keys and bind one catalog generation atomically. Avoid `WATCH` phantoms and pre-bound `HGETALL`/`SMEMBERS` allocation, reject a same-incarnation live-owner bypass, and retain bounded raw `SCAN` handling. The hardened I20 store uses standard OS sidecar locking, safe no-follow FD validation, and a private parent; its verifier fix and production `new_with_store` wiring are implemented. The local persistence/restart log `/tmp/agent-tunnel-m7-validation-m7_membership_persistence.log` records 4/4 passed, closing that local scope alongside prior `membership_version_state` unit coverage; full server-process deployment and configured health/readiness integration remain C06. The owned synthetic process-pause command passed with three relays and fresh-owner recovery; it does not exercise a desktop or close the broader lifecycle gate. The privileged RPC baseline is 4 passed/0 failed in the fresh suite; the expanded target passed 6/6 in `/tmp/agent-tunnel-m7-validation-m7_privileged_rpc-final.log`, including shared-pool same-ID isolation and deadline/retained-worker cleanup. Its source now has seven tests, with the corrected deadline assertion and a separate active-worker shutdown case awaiting validation; no fixed sleeps remain. A separate active synthetic state-admission slice covers EC065/EC066 without claiming production adapters, Redis, SQLite, or later adapter semantics. See [m7-verification.md](m7-verification.md).
+
+The `real_cluster_harness` EC011 public `/livez` 200, `/readyz` 503 during an actual Redis partition, then `/readyz` 200 after restore assertions and mandatory-flag mapping are implemented; Cargo/runtime verification remains pending. An active `verify_scope` synthetic RPC slice targets EC065/EC066 terminal/commit/success-ACK counts and frozen, fenced, pending, poisoned, stopped, and uncertain manager-state admission. That slice has no runtime result yet. `scripts/m7-harness-verify.sh` and the M7 CI job have passed only local script-syntax and workflow-YAML checks; no hosted CI result is claimed. Keep the M7 gate and 98-row matrix open until these scoped checks and the remaining lifecycle/adapter evidence are rerun.
 
 Verify independent device `AUTHORIZATION_CHALLENGE`/`AUTHORIZATION_CONFIRMED` for every frozen stream context: grant scope/digest/revision and owner binding, latest one-use nonce, and deadline anchored at device challenge creation before queueing. The owner supplies only remaining lifetime from the original Redis catalog read-start deadline; cached reads cannot renew it. Test the five-second authorization ceiling while ownership permission remains valid for 20 seconds, two-second refresh/timeout, delayed/duplicate/reordered confirmations, snapshot predating the challenge, and clock suspension. Buffered decoded 9P requests and later privileged steps must recheck after every await and expire without dispatch; reset stale streams, discard undispatched work, and preserve already-started outcomes. Late confirmation cannot revive a closed context, and changed grants require fresh OPEN. Exercise the 64-context, one-outstanding-nonce, 2 KiB single-context message and bounded renewal-queue limits during saturated rotation/cancellation traffic.
 

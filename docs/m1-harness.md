@@ -28,6 +28,10 @@ TEST_REDIS_URL=redis://127.0.0.1:56379 \
   cargo run --locked -p tunnel-test-harness -- verify
 ```
 
+`TEST_REDIS_URL` is an explicit disposable-harness input. It may use loopback
+plaintext Redis because it never starts the production `tunnel-relay serve`
+configuration; a serving configuration must use `rediss://`.
+
 `verify` is the single M1 entry point. It requires `TEST_REDIS_URL`, leases a
 fresh run namespace, and executes the full acceptance flow through
 `acceptance::verify`, `admission::verify`, and `peer::verify` as those modules

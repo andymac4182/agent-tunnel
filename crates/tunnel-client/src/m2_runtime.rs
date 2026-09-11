@@ -14,8 +14,9 @@ use super::{
 };
 use futures_util::{SinkExt, StreamExt};
 use std::{
-    collections::{BTreeMap, VecDeque},
-    sync::Arc,
+    collections::{BTreeMap, BTreeSet, VecDeque},
+    mem::size_of,
+    sync::{Arc, atomic::Ordering},
     time::{Duration, Instant, SystemTime},
 };
 use tokio::{
@@ -24,7 +25,10 @@ use tokio::{
 };
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
-use tunnel_protocol::control_journal::{ControlJournal, Observation as JournalObservation};
+use tunnel_protocol::control::{MAX_METADATA_VALUE_BYTES, MAX_ROTATION_RECOVERY_TIMEOUT_MS};
+use tunnel_protocol::control_journal::{
+    ControlJournal, MAX_JOURNAL_BYTES, MAX_JOURNAL_ENTRIES, Observation as JournalObservation,
+};
 use tunnel_protocol::rotation::{
     ClosureEvidence, RecoveryReason, RotationConfig, RotationPhase, RotationSide, RotationState,
     ValidatedRecovery,
@@ -40,28 +44,77 @@ use tunnel_protocol::sequence::{
 use tunnel_protocol::{
     AuthorizationChallenge, AuthorizationConfirmed, AuthorizationInvalidated, Cancel,
     ControlMessage, DataReady, Direction, Frame, FrameKind, Hello, MAX_CONTROL_MESSAGE_BYTES,
-    MAX_FRAME_LEN, MAX_PAYLOAD_LEN, Open, Opened, Ping, Pong, Rejected, RotateAbort, RotateAborted,
-    RotateCommit, RotateCommitted, RotateComplete, RotateDrained, RotateFrozen, RotatePrepare,
-    RotateQuiesce, RotateRequest, RotateRetire, RotateRetired, decode_control,
+    MAX_FRAME_LEN, MAX_PAYLOAD_LEN, Open, Opened, OwnerFence, OwnerFenceState, Ping, Pong,
+    Rejected, RotateAbort, RotateAborted, RotateCommit, RotateCommitted, RotateComplete,
+    RotateDrained, RotateFrozen, RotatePrepare, RotateQuiesce, RotateRequest, RotateRetire,
+    RotateRetired, decode_control,
 };
 use url::Url;
 
 const M2_FEATURE: &str = "ordered-rotation-v1";
+const OWNER_FENCING_FEATURE: &str = "owner-fencing-v1";
 const M1_FEATURES: [&str; 3] = ["m1-control-data", "authorization-challenge", "echo"];
 const M2_CONTROL_QUEUE_BYTES: usize = 64 * 1024;
+// Deferred critical replies use a separate, explicit spill bound alongside
+// the fixed writer queue: at most four messages and one maximum protocol
+// control frame (96 KiB aggregate with the 64 KiB writer queue). This is the
+// smallest spill that can retain any valid control response without silently
+// duplicating the full writer queue.
+const M2_PENDING_CRITICAL_CONTROL_FRAMES: usize = 4;
+const M2_PENDING_CRITICAL_CONTROL_BYTES: usize = MAX_CONTROL_MESSAGE_BYTES;
+const M2_CRITICAL_CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
+// A control STREAM_FORGET can legitimately overtake the final data-channel
+// ACK. Keep the authenticated terminal proof pending for one bounded window
+// while that ACK arrives; the final validator still runs before reclamation.
+const M2_STREAM_FORGET_REVALIDATION_TIMEOUT: Duration = M2_CRITICAL_CONTROL_TIMEOUT;
 const M2_WRITER_TIMEOUT: Duration = Duration::from_secs(5);
 const M2_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 const M2_DEADLINE_POLL: Duration = Duration::from_millis(100);
+const M2_RECOVERY_RESET_FENCED_SUCCESSOR: &str = "fenced_successor_activated";
 const M2_EVENT_CAPACITY: usize = 256;
 const M2_CARRIER_QUEUE_FRAMES: usize = 128;
+const M2_MAX_WEBSOCKET_CONTROL_PAYLOAD: usize = 125;
+// Keep a small part of the existing carrier queue available for cumulative
+// control and terminal frames while bulk DATA is backpressured.  This is a
+// reservation inside the fixed queue, not additional capacity.
+const M2_CARRIER_RESERVED_FRAMES: usize = 4;
+const M2_CARRIER_RESERVED_BYTES: usize = 256 * 1024;
 const M2_MAX_RECORD_BYTES: usize = 64 * 1024;
 const M2_MAX_CANARY_BYTES: usize = 256;
 const M2_RECORD_HEADER_BYTES: usize = 4;
 const M2_MAX_STREAM_RESPONSE_BYTES: usize =
     M2_RECORD_HEADER_BYTES + M2_MAX_RECORD_BYTES + M2_MAX_CANARY_BYTES;
+// A terminal M2 stream remains in the connector table until authenticated
+// STREAM_FORGET evidence arrives.  Keep the same bounded retained-table
+// factor as the relay: terminal entries do not consume active capacity, but
+// active plus retained entries may never exceed two times the live stream
+// ceiling (or the protocol journal bound).
+const M2_RETAINED_STREAM_FACTOR: usize = 2;
+
+fn retained_stream_limit(max_streams: usize) -> usize {
+    max_streams
+        .saturating_mul(M2_RETAINED_STREAM_FACTOR)
+        .min(M2_OPEN_JOURNAL_MAX_TOMBSTONES)
+}
+
 const M2_MAX_REASSEMBLY_BYTES: usize =
     M2_RECORD_HEADER_BYTES + M2_MAX_RECORD_BYTES + MAX_PAYLOAD_LEN;
 const M2_MAX_RESPONSE_BATCH_BYTES: usize = M2_MAX_REASSEMBLY_BYTES;
+// A deferred OPEN keeps its decoded request tree separately from the wire
+// journal.  Charge a conservative estimate for parsed strings, BTreeMap
+// nodes, allocator slack, and the authorization strings prepared before the
+// atomic OPENED/challenge pair is admitted.  The estimate is deliberately
+// independent of the journal's canonical-byte charge.
+const M2_PENDING_OPEN_GENERATED_ID_BYTES: usize = 36; // UUID v4 text
+const M2_PENDING_OPEN_METADATA_NODE_BYTES: usize = 192;
+const M2_PENDING_OPEN_STRING_HEADROOM_BYTES: usize = 64;
+const M2_PENDING_OPEN_CONTAINER_HEADROOM_BYTES: usize = 4 * 1024;
+const M2_PENDING_OPEN_MAX_ESTIMATE: usize = 2 * MAX_CONTROL_MESSAGE_BYTES
+    + 2 * MAX_METADATA_VALUE_BYTES
+    + 8 * M2_PENDING_OPEN_GENERATED_ID_BYTES
+    + 64 * M2_PENDING_OPEN_METADATA_NODE_BYTES
+    + 138 * M2_PENDING_OPEN_STRING_HEADROOM_BYTES
+    + M2_PENDING_OPEN_CONTAINER_HEADROOM_BYTES;
 /// Refresh stream authorization before its five-second confirmation window
 /// expires.  The relay still validates every new challenge against its live
 /// grant and device identity; this margin only prevents a long-lived stream
@@ -70,6 +123,90 @@ const M2_AUTH_REFRESH_MARGIN: Duration = Duration::from_millis(1_500);
 const M2_RESET_AUTH_EXPIRED: u16 = 4_001;
 const M2_RESET_PROTOCOL: u16 = 4_002;
 const M2_RESET_RECORD_LIMIT: u16 = 4_003;
+const OWNER_FENCE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
+
+fn critical_reserved_bytes(max_queue_bytes: usize) -> usize {
+    // Keep the reserve bounded at one quarter of the configured budget.  The
+    // minimum accepted budget is 256 KiB, so bulk still has 192 KiB for a
+    // maximum record plus its bounded sequence/reassembly copies while the
+    // critical path retains a useful 64 KiB floor.  Larger configurations
+    // retain the fixed 256 KiB reserve requested by the runtime contract.
+    M2_CARRIER_RESERVED_BYTES.min(max_queue_bytes / 4)
+}
+
+fn is_closed_data_writer(error: &ClientError) -> bool {
+    matches!(
+        error,
+        ClientError::Transport {
+            scope: "data writer",
+            detail,
+        } if detail == "data writer stopped"
+    )
+}
+
+/// The first carrier event that caused this M2 epoch to enter recovery.  The
+/// event class is deliberately closed and payload-free: the final CLI
+/// diagnostic must distinguish the physical failure that started recovery
+/// without copying a tungstenite error, endpoint, or frame into user output.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecoveryTriggerClass {
+    WriterFailed,
+    ReaderClosed,
+    WriterClosed,
+}
+
+impl RecoveryTriggerClass {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::WriterFailed => "data_writer_failed",
+            Self::ReaderClosed => "data_reader_closed",
+            Self::WriterClosed => "data_writer_closed",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CarrierRole {
+    Active,
+    Candidate,
+    Retiring,
+    PendingCandidate,
+    PendingCandidateClose,
+    RecoveryClosed,
+    Unknown,
+}
+
+impl CarrierRole {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Candidate => "candidate",
+            Self::Retiring => "retiring",
+            Self::PendingCandidate => "pending_candidate",
+            Self::PendingCandidateClose => "pending_candidate_close",
+            Self::RecoveryClosed => "recovery_closed",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RecoveryTrigger {
+    class: RecoveryTriggerClass,
+    role: CarrierRole,
+    generation: u64,
+}
+
+impl RecoveryTrigger {
+    fn append_to(self, detail: &str) -> String {
+        format!(
+            "{detail}; recovery_trigger={}; recovery_role={}; recovery_generation={}",
+            self.class.as_str(),
+            self.role.as_str(),
+            self.generation,
+        )
+    }
+}
 
 type M2SupervisorJoin = JoinHandle<Result<(), ClientError>>;
 
@@ -121,6 +258,15 @@ pub(super) async fn connect_m2(
             "relay did not negotiate ordered-rotation-v1".to_owned(),
         ));
     }
+    let owner_id = welcome
+        .owner_id
+        .clone()
+        .ok_or_else(|| ClientError::Protocol("M2 WELCOME omitted owner identity".to_owned()))?;
+    let owner_fence = if owner_fencing_selected(&welcome) {
+        Some(complete_owner_fence(&mut control, &welcome, &owner_id, &options.cancellation).await?)
+    } else {
+        None
+    };
     let session = SessionInfo {
         session_id: welcome.session_id.clone(),
         epoch: welcome.epoch,
@@ -141,10 +287,6 @@ pub(super) async fn connect_m2(
     .await?;
     let data_ready = super::receive_data_ready(&mut control, &options.cancellation).await?;
     validate_data_ready_m2(&data_ready, &session, &welcome)?;
-    let owner_id = welcome
-        .owner_id
-        .clone()
-        .ok_or_else(|| ClientError::Protocol("M2 WELCOME omitted owner identity".to_owned()))?;
     let rotation_config = negotiated_rotation_config(&options.config, &welcome)?;
     let control_local_addr = super::socket_local_addr(&control);
     let active_local_addr = super::socket_local_addr(&data);
@@ -175,6 +317,7 @@ pub(super) async fn connect_m2(
             session,
             welcome,
             owner_id,
+            owner_fence,
             rotation_config,
             control_sink,
             control_stream,
@@ -185,6 +328,7 @@ pub(super) async fn connect_m2(
             actor_status,
             control_local_addr,
             active_local_addr,
+            None,
         )
         .await
     });
@@ -208,6 +352,7 @@ fn m2_hello(config: &RuntimeConfig) -> ControlMessage {
         .map(|feature| (*feature).to_owned())
         .collect::<Vec<_>>();
     features.push(M2_FEATURE.to_owned());
+    features.push(OWNER_FENCING_FEATURE.to_owned());
     let hello = Hello {
         message_id: message_id(),
         connector_id: config.device_id.clone(),
@@ -225,6 +370,156 @@ fn m2_hello(config: &RuntimeConfig) -> ControlMessage {
         )),
     };
     ControlMessage::Hello(hello)
+}
+
+fn owner_fencing_selected(welcome: &tunnel_protocol::Welcome) -> bool {
+    welcome
+        .supported_features
+        .iter()
+        .any(|feature| feature == OWNER_FENCING_FEATURE)
+}
+
+fn validate_owner_fence_context(
+    fence: &OwnerFence,
+    welcome: &tunnel_protocol::Welcome,
+    owner_id: &str,
+) -> Result<(), ClientError> {
+    fence
+        .validate()
+        .map_err(|error| ClientError::Protocol(format!("invalid OWNER_FENCE: {error}")))?;
+    if fence.session_id != welcome.session_id {
+        return Err(ClientError::Protocol(
+            "OWNER_FENCE session identity mismatch".to_owned(),
+        ));
+    }
+    if fence.epoch != welcome.epoch {
+        return Err(ClientError::Protocol(
+            "OWNER_FENCE epoch does not match WELCOME".to_owned(),
+        ));
+    }
+    if fence.owner_id != owner_id {
+        return Err(ClientError::Protocol(
+            "OWNER_FENCE owner identity does not match WELCOME".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+async fn send_control_before_deadline(
+    socket: &mut ClientWebSocket,
+    message: &ControlMessage,
+    deadline: tokio::time::Instant,
+    cancellation: &CancellationToken,
+) -> Result<(), ClientError> {
+    tokio::select! {
+        _ = cancellation.cancelled() => Err(ClientError::Cancelled),
+        result = tokio::time::timeout_at(deadline, send_control_direct(socket, message)) => {
+            result.map_err(|_| ClientError::HandshakeTimeout)?
+        }
+    }
+}
+
+async fn complete_owner_fence(
+    socket: &mut ClientWebSocket,
+    welcome: &tunnel_protocol::Welcome,
+    owner_id: &str,
+    cancellation: &CancellationToken,
+) -> Result<OwnerFenceState, ClientError> {
+    // This is the only bootstrap path that can transition a fresh control
+    // session into an owner-authorized state.  No data carrier has been
+    // allocated yet, so a prior local owner has no resources to retain or
+    // accidentally reuse.  The typed state transition still invalidates any
+    // prior owner before the acknowledgement is sent.
+    let mut state = OwnerFenceState::new(welcome.session_id.clone())
+        .map_err(|error| ClientError::Protocol(format!("invalid owner-fence session: {error}")))?;
+    let started = Instant::now();
+    let deadline = tokio::time::Instant::now() + OWNER_FENCE_HANDSHAKE_TIMEOUT;
+    let timeout = tokio::time::sleep_until(deadline);
+    tokio::pin!(timeout);
+    loop {
+        let next = tokio::select! {
+            _ = &mut timeout => return Err(ClientError::HandshakeTimeout),
+            _ = cancellation.cancelled() => return Err(ClientError::Cancelled),
+            item = socket.next() => item,
+        };
+        match next {
+            Some(Ok(Message::Text(text))) => {
+                let message = decode_control(text.as_bytes())
+                    .map_err(|error| ClientError::Protocol(error.to_string()))?;
+                match message {
+                    ControlMessage::OwnerFence(fence) => {
+                        validate_owner_fence_context(&fence, welcome, owner_id)?;
+                        let now_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+                        let acknowledgement = state
+                            .accept_fence(&fence, message_id(), now_ms)
+                            .map_err(|error| {
+                                ClientError::Protocol(format!("OWNER_FENCE rejected: {error}"))
+                            })?;
+                        let message = ControlMessage::OwnerFenced(acknowledgement.clone());
+                        send_control_before_deadline(socket, &message, deadline, cancellation)
+                            .await?;
+                        let acknowledged_at =
+                            started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+                        state
+                            .acknowledgement_sent(&acknowledgement, acknowledged_at)
+                            .map_err(|error| {
+                                ClientError::Protocol(format!(
+                                    "OWNER_FENCED acknowledgement expired: {error}"
+                                ))
+                            })?;
+                        return Ok(state);
+                    }
+                    ControlMessage::Ping(ping) => {
+                        let pong = ControlMessage::Pong(Pong::new(
+                            message_id(),
+                            ping.message_id,
+                            ping.session_id,
+                            ping.epoch,
+                            ping.nonce,
+                        ));
+                        send_control_before_deadline(socket, &pong, deadline, cancellation).await?;
+                    }
+                    other => {
+                        return Err(ClientError::Protocol(format!(
+                            "expected OWNER_FENCE before data attachment, received {}",
+                            other.kind_name()
+                        )));
+                    }
+                }
+            }
+            Some(Ok(Message::Ping(payload))) => {
+                tokio::select! {
+                    _ = cancellation.cancelled() => return Err(ClientError::Cancelled),
+                    result = tokio::time::timeout_at(deadline, socket.send(Message::Pong(payload))) => {
+                        result
+                            .map_err(|_| ClientError::HandshakeTimeout)?
+                            .map_err(|error| ClientError::Transport {
+                                scope: "control pong",
+                                detail: sanitize_error(&error.to_string()),
+                            })?;
+                    }
+                }
+            }
+            Some(Ok(Message::Pong(_))) | Some(Ok(Message::Frame(_))) => {}
+            Some(Ok(Message::Close(_))) | None => {
+                return Err(ClientError::Transport {
+                    scope: "owner fencing handshake",
+                    detail: "relay closed the control socket".to_owned(),
+                });
+            }
+            Some(Ok(Message::Binary(_))) => {
+                return Err(ClientError::Protocol(
+                    "binary message on control socket during owner fencing".to_owned(),
+                ));
+            }
+            Some(Err(error)) => {
+                return Err(ClientError::Transport {
+                    scope: "control read",
+                    detail: sanitize_error(&error.to_string()),
+                });
+            }
+        }
+    }
 }
 
 fn negotiated_rotation_config(
@@ -277,7 +572,7 @@ fn validate_data_ready_m2(
     Ok(())
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct CarrierKey {
     generation: u64,
     connection_id: String,
@@ -359,6 +654,7 @@ struct Carrier {
     key: CarrierKey,
     local_addr: Option<std::net::SocketAddr>,
     tx: mpsc::Sender<CarrierCommand>,
+    pending_controls: BTreeMap<u64, PendingCarrierControl>,
     reader_cancel: CancellationToken,
     reader: Option<JoinHandle<()>>,
     writer: Option<JoinHandle<()>>,
@@ -392,6 +688,11 @@ struct RecoveryRuntime {
     /// This is separate from the immutable episode deadline and survives the
     /// pending-candidate bookkeeping until the recovery handshake activates.
     attempt_deadline_ms: Option<u64>,
+    /// Connection IDs whose closure was already authenticated by the prior
+    /// RECOVERY_CLOSED pair in this episode. They remain in the local fence
+    /// map for stale-event rejection but are omitted from the next bounded
+    /// wire closure list.
+    authenticated_closed_connection_ids: BTreeSet<String>,
     local_snapshots: [BTreeMap<u64, ResumeDirectionState>; 2],
     remote_snapshots: [BTreeMap<u64, ResumeDirectionState>; 2],
     /// Fresh peer snapshots carried by the READY pair.  The initial
@@ -409,6 +710,55 @@ struct RecoveryRuntime {
     ready_replies: [bool; 2],
     ready_reply_messages: [Option<Resumed>; 2],
     fresh_reconciled: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResumeContextMismatch {
+    Attempt,
+    Snapshot,
+    RemainingZero,
+    RemainingExceedsProtocolBound,
+    DeadlineExpired,
+}
+
+impl ResumeContextMismatch {
+    const fn detail(self) -> &'static str {
+        match self {
+            Self::Attempt => "RESUME recovery attempt mismatch",
+            Self::Snapshot => "RESUME recovery snapshot mismatch",
+            Self::RemainingZero => "RESUME recovery remaining budget is zero",
+            Self::RemainingExceedsProtocolBound => {
+                "RESUME recovery remaining budget exceeds protocol bound"
+            }
+            Self::DeadlineExpired => "RESUME recovery local deadline expired",
+        }
+    }
+}
+
+fn resume_context_mismatch(
+    resume: &Resume,
+    recovery: &RecoveryRuntime,
+    now_ms: u64,
+) -> Option<ResumeContextMismatch> {
+    if resume.attempt != recovery.begin.attempt {
+        return Some(ResumeContextMismatch::Attempt);
+    }
+    if resume.snapshot_id != recovery.begin.roster.snapshot_id {
+        return Some(ResumeContextMismatch::Snapshot);
+    }
+    if resume.remaining_ms == 0 {
+        return Some(ResumeContextMismatch::RemainingZero);
+    }
+    if resume.remaining_ms > MAX_ROTATION_RECOVERY_TIMEOUT_MS {
+        return Some(ResumeContextMismatch::RemainingExceedsProtocolBound);
+    }
+    if now_ms >= recovery.deadline_ms {
+        return Some(ResumeContextMismatch::DeadlineExpired);
+    }
+    // The sender samples remaining_ms before its control item reaches this
+    // actor.  Keep the receiver's episode deadline authoritative instead of
+    // rejecting a slightly larger stale duration or using it as an extension.
+    None
 }
 
 /// One completed rotation attempt retained until its immutable overlap
@@ -434,6 +784,458 @@ struct PendingOutput {
     kind: FrameKind,
     payload: Vec<u8>,
     reset_reason: Option<u16>,
+}
+
+/// The first response pair prepared for a deferred OPEN.  The IDs and grant
+/// deadline are retained so a retry cannot refresh an authorization window or
+/// nonce while waiting for bounded writer capacity.
+#[derive(Debug)]
+struct PendingAuthorization {
+    opened_message_id: String,
+    challenge_message_id: String,
+    challenge_id: String,
+    nonce: String,
+    permission_digest: String,
+    grant_revision: u64,
+    auth_deadline: DualDeadline,
+}
+
+/// An owned reservation in the parsed-OPEN pool. Keeping the reservation on
+/// the deferred item makes every move/drop path release exactly once,
+/// including an admission error after the item has been removed from the
+/// actor's head or FIFO. The underscore marks this field as intentionally
+/// drop-owned; it must not be manually read or released by admission code.
+struct PendingOpenReservation {
+    budget: Arc<QueueBudget>,
+    bytes: usize,
+}
+
+impl std::fmt::Debug for PendingOpenReservation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PendingOpenReservation")
+            .field("bytes", &self.bytes)
+            .finish()
+    }
+}
+
+impl Drop for PendingOpenReservation {
+    fn drop(&mut self) {
+        self.budget.release(self.bytes);
+    }
+}
+
+/// One OPEN whose bounded response admission was deferred. The actor keeps a
+/// single head for the atomic response pair and a bounded FIFO behind it, so
+/// later control reads cannot overwrite the head or turn a normal burst into
+/// a session-fatal protocol error. The operation deadline starts when the
+/// OPEN is received; authorization timing starts when its first challenge is
+/// prepared and is retained across retries.
+#[derive(Debug)]
+struct PendingOpen {
+    open: Open,
+    operation_deadline: DualDeadline,
+    authorization: Option<PendingAuthorization>,
+    _reservation: PendingOpenReservation,
+}
+
+fn pending_open_budget_max(max_streams: usize, max_queue_bytes: usize) -> usize {
+    // This is an independent parsed-OPEN pool. It is capped by the same
+    // configured ceiling, but is intentionally not folded into the journal
+    // or M2 data/output aggregate; each bounded pool accounts for its own
+    // representation and cannot borrow another pool's allowance.
+    max_queue_bytes.min(max_streams.saturating_mul(M2_PENDING_OPEN_MAX_ESTIMATE))
+}
+
+/// Estimate the retained heap for one decoded OPEN plus the authorization
+/// strings that may be prepared before its atomic response pair is admitted.
+/// The canonical wire bytes are charged separately by OpenJournal; this pool
+/// covers the second parsed representation and allocator/container headroom.
+fn pending_open_retained_bytes(open: &Open) -> Option<usize> {
+    let open_string_bytes = [
+        open.message_id.len(),
+        open.session_id.len(),
+        open.operation_id.len(),
+        open.service_id.len(),
+        open.operation.len(),
+    ]
+    .into_iter()
+    .try_fold(0usize, |total, bytes| total.checked_add(bytes))?
+    .checked_add(
+        open.metadata
+            .iter()
+            .try_fold(0usize, |total, (key, value)| {
+                total
+                    .checked_add(key.len())
+                    .and_then(|total| total.checked_add(value.len()))
+            })?,
+    )?;
+    let metadata_nodes = open
+        .metadata
+        .len()
+        .checked_mul(M2_PENDING_OPEN_METADATA_NODE_BYTES)?;
+    let permission_digest_bytes = open
+        .metadata
+        .get("permission_digest")
+        .map_or(0, String::len);
+    let generated_id_bytes = 4usize.checked_mul(M2_PENDING_OPEN_GENERATED_ID_BYTES)?;
+    let authorization_payload = permission_digest_bytes.checked_add(generated_id_bytes)?;
+    let retained_string_slots = 5usize
+        .checked_add(open.metadata.len().checked_mul(2)?)?
+        .checked_add(5)?;
+    let string_headroom =
+        retained_string_slots.checked_mul(M2_PENDING_OPEN_STRING_HEADROOM_BYTES)?;
+    let payload_headroom = open_string_bytes
+        .checked_add(authorization_payload)?
+        .checked_mul(2)?;
+    size_of::<PendingOpen>()
+        .checked_add(metadata_nodes)
+        .and_then(|total| total.checked_add(M2_PENDING_OPEN_CONTAINER_HEADROOM_BYTES))
+        .and_then(|total| total.checked_add(string_headroom))
+        .and_then(|total| total.checked_add(payload_headroom))
+}
+
+const M2_OPEN_JOURNAL_MAX_TOMBSTONES: usize = MAX_JOURNAL_ENTRIES;
+// The journal retains encoded wire messages and deadline metadata rather than
+// parsed response trees. Keep a conservative fixed charge for the enclosing
+// BTree/String/Vec/Message allocations in addition to their encoded bytes.
+const M2_OPEN_JOURNAL_ENTRY_OVERHEAD: usize = 256;
+const M2_OPEN_JOURNAL_RESPONSE_OVERHEAD: usize = 256;
+
+#[derive(Clone, Debug)]
+enum OpenJournalState {
+    Pending,
+    Completed {
+        // Retain the exact outbound wire messages so replay does not retain
+        // an uncharged parsed control tree or regenerate response identities.
+        responses: Vec<Message>,
+        deadlines: Vec<Option<DualDeadline>>,
+    },
+    Tombstone,
+}
+
+#[derive(Debug)]
+struct OpenJournalEntry {
+    canonical: Vec<u8>,
+    stream_id: u64,
+    operation_id: String,
+    /// Receive order is independent of the BTreeMap message-ID order.  It
+    /// reserves the first request for a stream for the whole session,
+    /// including rejected and compacted entries.
+    receive_ordinal: u64,
+    response_bytes: usize,
+    state: OpenJournalState,
+}
+
+#[derive(Debug)]
+enum OpenJournalObservation {
+    New,
+    PendingDuplicate,
+    CompletedDuplicate {
+        responses: Vec<Message>,
+        deadlines: Vec<Option<DualDeadline>>,
+    },
+    Tombstone,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OpenJournalError {
+    Capacity,
+    ConflictingMessage,
+    MissingMessage,
+    ConflictingResponse,
+    TombstoneCapacity,
+}
+
+#[derive(Debug)]
+struct OpenJournal {
+    entries: BTreeMap<String, OpenJournalEntry>,
+    next_receive_ordinal: u64,
+    active_entries: usize,
+    tombstones: usize,
+    used_bytes: usize,
+    max_active_entries: usize,
+    max_bytes: usize,
+}
+
+impl OpenJournal {
+    fn new(max_active_entries: usize, max_bytes: usize) -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            next_receive_ordinal: 0,
+            active_entries: 0,
+            tombstones: 0,
+            used_bytes: 0,
+            max_active_entries: max_active_entries.max(1),
+            max_bytes,
+        }
+    }
+
+    fn observe(
+        &mut self,
+        message_id: &str,
+        canonical: &[u8],
+        stream_id: u64,
+        operation_id: &str,
+    ) -> Result<OpenJournalObservation, OpenJournalError> {
+        if let Some(entry) = self.entries.get(message_id) {
+            if entry.canonical != canonical {
+                return Err(OpenJournalError::ConflictingMessage);
+            }
+            return Ok(match &entry.state {
+                OpenJournalState::Pending => OpenJournalObservation::PendingDuplicate,
+                OpenJournalState::Completed {
+                    responses,
+                    deadlines,
+                } => OpenJournalObservation::CompletedDuplicate {
+                    responses: responses.clone(),
+                    deadlines: deadlines.clone(),
+                },
+                OpenJournalState::Tombstone => OpenJournalObservation::Tombstone,
+            });
+        }
+        // Keep the total retained table bounded by the tombstone budget.  An
+        // active entry consumes one of the same fixed slots that its future
+        // tombstone needs, so every admitted stream can still complete
+        // STREAM_FORGET without discovering that no retention slot remains.
+        if self.active_entries >= self.max_active_entries
+            || self.entries.len() >= M2_OPEN_JOURNAL_MAX_TOMBSTONES
+        {
+            return Err(OpenJournalError::Capacity);
+        }
+        let charge = M2_OPEN_JOURNAL_ENTRY_OVERHEAD
+            .checked_add(message_id.len())
+            .and_then(|value| value.checked_add(canonical.len()))
+            .and_then(|value| value.checked_add(operation_id.len()))
+            .ok_or(OpenJournalError::Capacity)?;
+        if charge > self.max_bytes.saturating_sub(self.used_bytes) {
+            return Err(OpenJournalError::Capacity);
+        }
+        let receive_ordinal = self.next_receive_ordinal;
+        self.next_receive_ordinal = self
+            .next_receive_ordinal
+            .checked_add(1)
+            .ok_or(OpenJournalError::Capacity)?;
+        self.entries.insert(
+            message_id.to_owned(),
+            OpenJournalEntry {
+                canonical: canonical.to_vec(),
+                stream_id,
+                operation_id: operation_id.to_owned(),
+                receive_ordinal,
+                response_bytes: 0,
+                state: OpenJournalState::Pending,
+            },
+        );
+        self.active_entries += 1;
+        self.used_bytes += charge;
+        Ok(OpenJournalObservation::New)
+    }
+
+    fn ensure_response_capacity(
+        &self,
+        message_id: &str,
+        response_bytes: usize,
+    ) -> Result<(), OpenJournalError> {
+        let Some(entry) = self.entries.get(message_id) else {
+            return Err(OpenJournalError::MissingMessage);
+        };
+        if !matches!(&entry.state, OpenJournalState::Pending) {
+            return Err(OpenJournalError::ConflictingResponse);
+        }
+        if response_bytes > self.max_bytes.saturating_sub(self.used_bytes) {
+            return Err(OpenJournalError::Capacity);
+        }
+        Ok(())
+    }
+
+    fn complete(
+        &mut self,
+        message_id: &str,
+        responses: Vec<Message>,
+        deadlines: Vec<Option<DualDeadline>>,
+        response_bytes: usize,
+    ) -> Result<(), OpenJournalError> {
+        if responses.is_empty() || responses.len() != deadlines.len() {
+            return Err(OpenJournalError::ConflictingResponse);
+        }
+        self.ensure_response_capacity(message_id, response_bytes)?;
+        let entry = self
+            .entries
+            .get_mut(message_id)
+            .ok_or(OpenJournalError::MissingMessage)?;
+        entry.response_bytes = response_bytes;
+        entry.state = OpenJournalState::Completed {
+            responses,
+            deadlines,
+        };
+        self.used_bytes += response_bytes;
+        Ok(())
+    }
+
+    fn compact(&mut self, message_id: &str) -> Result<(), OpenJournalError> {
+        if !self.entries.contains_key(message_id) {
+            return Ok(());
+        }
+        if self
+            .entries
+            .get(message_id)
+            .is_some_and(|entry| matches!(&entry.state, OpenJournalState::Tombstone))
+        {
+            return Ok(());
+        }
+        if self.tombstones >= M2_OPEN_JOURNAL_MAX_TOMBSTONES {
+            return Err(OpenJournalError::TombstoneCapacity);
+        }
+        let released = {
+            let entry = self
+                .entries
+                .get_mut(message_id)
+                .expect("OPEN journal entry was checked above");
+            let released = entry.response_bytes;
+            entry.response_bytes = 0;
+            entry.state = OpenJournalState::Tombstone;
+            released
+        };
+        self.used_bytes = self.used_bytes.saturating_sub(released);
+        self.active_entries = self.active_entries.saturating_sub(1);
+        self.tombstones += 1;
+        Ok(())
+    }
+
+    fn compact_matching(
+        &mut self,
+        stream_id: u64,
+        operation_id: &str,
+    ) -> Result<(), OpenJournalError> {
+        let matching = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| {
+                entry.stream_id == stream_id
+                    && entry.operation_id == operation_id
+                    && !matches!(&entry.state, OpenJournalState::Tombstone)
+            })
+            .map(|(message_id, _)| message_id.clone())
+            .collect::<Vec<_>>();
+        if self
+            .tombstones
+            .checked_add(matching.len())
+            .is_none_or(|total| total > M2_OPEN_JOURNAL_MAX_TOMBSTONES)
+        {
+            return Err(OpenJournalError::TombstoneCapacity);
+        }
+        for message_id in matching {
+            self.compact(&message_id)?;
+        }
+        Ok(())
+    }
+
+    fn stream_message_is_reserved_by_other(&self, stream_id: u64, message_id: &str) -> bool {
+        self.entries
+            .iter()
+            .filter(|(_, entry)| entry.stream_id == stream_id)
+            .min_by_key(|(_, entry)| entry.receive_ordinal)
+            .is_some_and(|(first_message_id, _)| first_message_id != message_id)
+    }
+
+    fn retained_operation_matches(&self, stream_id: u64, operation_id: &str) -> Option<bool> {
+        let mut found = false;
+        for entry in self.entries.values() {
+            if entry.stream_id == stream_id && !matches!(&entry.state, OpenJournalState::Tombstone)
+            {
+                found = true;
+                if entry.operation_id == operation_id {
+                    return Some(true);
+                }
+            }
+        }
+        found.then_some(false)
+    }
+
+    #[cfg(test)]
+    fn used_bytes(&self) -> usize {
+        self.used_bytes
+    }
+}
+
+/// A refresh challenge prepared before the bounded control writer had room.
+/// The challenge and its absolute deadline are retained so a retry neither
+/// refreshes the authorization window nor marks a stream in-flight before its
+/// challenge is actually queued.
+#[derive(Debug)]
+struct PendingAuthorizationRefresh {
+    challenge: AuthorizationChallenge,
+    auth_deadline: DualDeadline,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct PendingCarrierControl {
+    acknowledged: Option<u64>,
+    released_window_bytes: usize,
+    window_limit: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
+struct PendingStreamForget {
+    forget: tunnel_protocol::rotation_control::StreamForget,
+    carriers: Vec<CarrierKey>,
+    barriers_queued: BTreeSet<CarrierKey>,
+    barriers_completed: BTreeSet<CarrierKey>,
+    /// The owner control message may arrive before the independent data
+    /// carrier delivers the final ACK. While this is set, late ACK/control
+    /// progress remains processable. The full proof is revalidated before
+    /// removal and expires at this absolute deadline if channels never
+    /// converge.
+    proof_pending: bool,
+    proof_deadline: Option<Instant>,
+    /// A FORGET received after QUIESCE must remain in the immutable roster
+    /// until the rotation returns to Active.  The stream can drain its
+    /// carriers now, but reclamation waits for the roster reference to end.
+    defer_reclamation: bool,
+}
+
+impl PendingCarrierControl {
+    fn record_ack(&mut self, acknowledged: u64) {
+        self.acknowledged = Some(
+            self.acknowledged
+                .map_or(acknowledged, |current| current.max(acknowledged)),
+        );
+    }
+
+    fn record_window(&mut self, released_bytes: usize) -> Result<(), ClientError> {
+        self.released_window_bytes = self
+            .released_window_bytes
+            .checked_add(released_bytes)
+            .ok_or_else(|| ClientError::Protocol("receive byte counter exhausted".to_owned()))?;
+        Ok(())
+    }
+
+    fn record_window_limit(&mut self, limit: u64) {
+        self.window_limit = Some(
+            self.window_limit
+                .map_or(limit, |current| current.max(limit)),
+        );
+    }
+
+    const fn is_empty(self) -> bool {
+        self.acknowledged.is_none()
+            && self.released_window_bytes == 0
+            && self.window_limit.is_none()
+    }
+}
+
+fn has_pending_output_for_stream(
+    pending_outputs: &VecDeque<PendingOutput>,
+    stream_id: u64,
+) -> bool {
+    pending_outputs
+        .iter()
+        .any(|output| output.stream_id == stream_id)
+}
+
+fn should_ack_incoming_frame(kind: FrameKind) -> bool {
+    matches!(kind, FrameKind::Data | FrameKind::Fin | FrameKind::Reset)
 }
 
 #[derive(Debug)]
@@ -577,8 +1379,11 @@ struct M2Actor {
     config: RuntimeConfig,
     session: SessionInfo,
     owner_id: String,
+    owner_fence: Option<OwnerFenceState>,
     rotation: RotationState,
     control_queue: OutboundQueue,
+    pending_critical_controls: VecDeque<PendingCriticalControl>,
+    pending_critical_control_bytes: usize,
     data_budget: Arc<QueueBudget>,
     events: mpsc::Sender<ActorEvent>,
     active: Carrier,
@@ -608,8 +1413,39 @@ struct M2Actor {
     completed_rotation: Option<RotationJournalTombstone>,
     pending_abort_reply_id: Option<String>,
     recovery_requested: bool,
+    /// The first active-carrier terminal event that started this recovery
+    /// episode.  It is retained until verified activation so a later
+    /// retained-recovery failure can explain the original data-loss trigger.
+    first_recovery_trigger: Option<RecoveryTrigger>,
+    /// Physical IDs released by RotationState during the current recovery
+    /// episode. Closure evidence remains in `closed_for_recovery` for late
+    /// event fencing, while this set prevents a later attempt from trying to
+    /// release an already released historical carrier again.
+    released_recovery_connections: BTreeSet<String>,
+    /// The last recovery reset that crossed the fenced successor activation
+    /// boundary.  This is retained as bounded identity metadata for the CLI
+    /// status stream; it is cleared when a new recovery episode begins.
+    last_recovery_reset_reason: Option<&'static str>,
+    last_recovery_successor: Option<RotationAttemptIdentity>,
+    /// Retain only the last bounded attempt timing after a verified reset so
+    /// a coalesced watch stream still carries terminal recovery metadata.
+    last_recovery_attempt: Option<u64>,
+    last_recovery_attempt_started_at_ms: Option<u64>,
+    last_recovery_attempt_deadline_ms: Option<u64>,
     closed_for_recovery: BTreeMap<String, ClosureEvidence>,
     streams: BTreeMap<u64, M2Stream>,
+    open_journal: OpenJournal,
+    // Parsed deferred OPEN trees are charged in a separate pool from the
+    // canonical wire journal and released by their owned reservation token.
+    pending_open_budget: Arc<QueueBudget>,
+    pending_open: Option<PendingOpen>,
+    // The head is retried atomically; later OPENs retain their receive-time
+    // operation deadlines in FIFO order and are bounded by max_streams.
+    pending_open_queue: VecDeque<PendingOpen>,
+    // At most one prepared refresh exists per admitted stream, so this map is
+    // bounded by the configured stream cap and cannot retain an unbounded
+    // control burst.
+    pending_authorization_refreshes: BTreeMap<u64, PendingAuthorizationRefresh>,
     accepting: bool,
     writes_frozen: bool,
     pending_outputs: VecDeque<PendingOutput>,
@@ -618,6 +1454,15 @@ struct M2Actor {
     local_fence: Option<FenceSnapshot>,
     sent_drain_proof: bool,
     pending_quiesce: Option<RotateQuiesce>,
+    barrier_queued: bool,
+    pending_retire: Option<RotateRetire>,
+    pending_pongs: BTreeMap<CarrierKey, Message>,
+    pending_forgets: BTreeMap<u64, PendingStreamForget>,
+    /// Highest terminal stream ID whose carrier barriers have completed.
+    /// Relay stream IDs are allocated monotonically for a session, so this
+    /// scalar keeps late frames from forgotten streams from creating an
+    /// unknown-stream RESET without retaining an unbounded tombstone set.
+    forgotten_stream_through: u64,
     peer_fence_message_id: Option<String>,
     rotation_started: Instant,
     rotations_completed: u64,
@@ -626,12 +1471,19 @@ struct M2Actor {
     control_local_addr: Option<std::net::SocketAddr>,
 }
 
+struct PendingCriticalControl {
+    message: Message,
+    deadline: DualDeadline,
+    bytes: usize,
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_m2_session(
     config: RuntimeConfig,
     session: SessionInfo,
     welcome: tunnel_protocol::Welcome,
     owner_id: String,
+    owner_fence: Option<OwnerFenceState>,
     rotation_config: RotationConfig,
     control_sink: ClientSink,
     mut control_stream: ClientStream,
@@ -642,6 +1494,7 @@ async fn run_m2_session(
     status: watch::Sender<ConnectionStatus>,
     control_local_addr: Option<std::net::SocketAddr>,
     active_local_addr: Option<std::net::SocketAddr>,
+    test_writer_gate: Option<super::WriterTestGate>,
 ) -> Result<(), ClientError> {
     let (events_tx, mut events_rx) = mpsc::channel(M2_EVENT_CAPACITY);
     let (writer_failure_tx, mut writer_failure_rx) = mpsc::channel(2);
@@ -656,6 +1509,7 @@ async fn run_m2_session(
         control_receiver,
         writer_failure_tx.clone(),
         cancellation.clone(),
+        test_writer_gate,
     ));
     let data_budget = Arc::new(QueueBudget {
         bytes: std::sync::atomic::AtomicUsize::new(0),
@@ -680,12 +1534,23 @@ async fn run_m2_session(
         rotation_config,
     )
     .map_err(|error| ClientError::Protocol(format!("invalid rotation state: {error}")))?;
+    let open_journal = OpenJournal::new(
+        retained_stream_limit(config.limits.max_streams).max(1),
+        config.limits.max_queue_bytes.min(MAX_JOURNAL_BYTES),
+    );
+    let pending_open_budget = Arc::new(QueueBudget {
+        bytes: std::sync::atomic::AtomicUsize::new(0),
+        maximum: pending_open_budget_max(config.limits.max_streams, config.limits.max_queue_bytes),
+    });
     let mut actor = M2Actor {
         config,
         session,
         owner_id,
+        owner_fence,
         rotation,
         control_queue,
+        pending_critical_controls: VecDeque::new(),
+        pending_critical_control_bytes: 0,
         data_budget,
         events: events_tx.clone(),
         active,
@@ -712,8 +1577,20 @@ async fn run_m2_session(
         completed_rotation: None,
         pending_abort_reply_id: None,
         recovery_requested: false,
+        first_recovery_trigger: None,
+        released_recovery_connections: BTreeSet::new(),
+        last_recovery_reset_reason: None,
+        last_recovery_successor: None,
+        last_recovery_attempt: None,
+        last_recovery_attempt_started_at_ms: None,
+        last_recovery_attempt_deadline_ms: None,
         closed_for_recovery: BTreeMap::new(),
         streams: BTreeMap::new(),
+        open_journal,
+        pending_open_budget,
+        pending_open: None,
+        pending_open_queue: VecDeque::new(),
+        pending_authorization_refreshes: BTreeMap::new(),
         accepting: true,
         writes_frozen: false,
         pending_outputs: VecDeque::new(),
@@ -722,6 +1599,11 @@ async fn run_m2_session(
         local_fence: None,
         sent_drain_proof: false,
         pending_quiesce: None,
+        barrier_queued: false,
+        pending_retire: None,
+        pending_pongs: BTreeMap::new(),
+        pending_forgets: BTreeMap::new(),
+        forgotten_stream_through: 0,
         peer_fence_message_id: None,
         rotation_started: Instant::now(),
         rotations_completed: 0,
@@ -747,6 +1629,36 @@ async fn run_m2_session(
                 detail: "writer stopped".to_owned(),
             }),
             _ = deadline_timer.tick() => {
+                if let Err(error) = actor.flush_pending_open() {
+                    break Err(error);
+                }
+                if let Err(error) = actor.flush_pending_critical_controls() {
+                    break Err(error);
+                }
+                if let Err(error) = actor.flush_pending_pongs() {
+                    break Err(error);
+                }
+                if let Err(error) = actor.flush_pending_carrier_controls() {
+                    break Err(error);
+                }
+                if let Err(error) = actor.flush_pending_outputs().await {
+                    break Err(error);
+                }
+                if let Err(error) = actor.apply_pending_quiesce() {
+                    break Err(error);
+                }
+                if actor.pending_open.is_none()
+                    && let Err(error) = actor.retry_pending_retire().await
+                {
+                    break Err(error);
+                }
+                if let Err(error) = actor.retry_pending_forget_barriers() {
+                    break Err(error);
+                }
+                // A deferred OPEN retains its own pair and deadline, while
+                // maintenance and inbound critical controls continue to make
+                // bounded progress. Refresh admission handles queue pressure
+                // without changing a stream's authorization state early.
                 if let Err(error) = actor.refresh_authorizations().await {
                     break Err(error);
                 }
@@ -755,7 +1667,13 @@ async fn run_m2_session(
                 }
             }
             control = control_stream.next() => {
-            match control {
+                if let Err(error) = actor.flush_pending_open() {
+                    break Err(error);
+                }
+                if let Err(error) = actor.flush_pending_critical_controls() {
+                    break Err(error);
+                }
+                match control {
                     Some(Ok(message)) => {
                         if let Err(error) = actor.handle_control_message(message).await {
                             break Err(error);
@@ -822,6 +1740,7 @@ fn spawn_carrier(
         key,
         local_addr,
         tx,
+        pending_controls: BTreeMap::new(),
         reader_cancel: reader_cancel_for_carrier,
         reader: Some(reader),
         writer: Some(writer),
@@ -971,6 +1890,73 @@ impl M2Actor {
             .min(u128::from(u64::MAX)) as u64
     }
 
+    fn carrier_role(&self, key: &CarrierKey) -> CarrierRole {
+        if self.active.key == *key {
+            return CarrierRole::Active;
+        }
+        if self
+            .candidate
+            .as_ref()
+            .is_some_and(|carrier| carrier.key == *key)
+        {
+            return CarrierRole::Candidate;
+        }
+        if self
+            .retiring
+            .as_ref()
+            .is_some_and(|carrier| carrier.key == *key)
+        {
+            return CarrierRole::Retiring;
+        }
+        if self.pending_candidate.as_ref().is_some_and(|pending| {
+            pending.attempt.new_generation == key.generation
+                && pending.attempt.new_connection_id == key.connection_id
+        }) {
+            return CarrierRole::PendingCandidate;
+        }
+        if self
+            .pending_candidate_close
+            .as_ref()
+            .is_some_and(|(attempt, _)| {
+                attempt.new_generation == key.generation
+                    && attempt.new_connection_id == key.connection_id
+            })
+        {
+            return CarrierRole::PendingCandidateClose;
+        }
+        if self.closed_for_recovery.contains_key(&key.connection_id) {
+            return CarrierRole::RecoveryClosed;
+        }
+        CarrierRole::Unknown
+    }
+
+    /// Record only the first active-carrier terminal event while the session
+    /// is still healthy.  Candidate/retiring events belong to a rotation
+    /// attempt and must never be reported as the cause of a later recovery.
+    fn remember_recovery_trigger(&mut self, class: RecoveryTriggerClass, key: &CarrierKey) {
+        if self.first_recovery_trigger.is_some()
+            || self.recovery_requested
+            || self.recovery.is_some()
+            || self.rotation.phase() != RotationPhase::Active
+        {
+            return;
+        }
+        let role = self.carrier_role(key);
+        if role != CarrierRole::Active {
+            return;
+        }
+        self.first_recovery_trigger = Some(RecoveryTrigger {
+            class,
+            role,
+            generation: key.generation,
+        });
+    }
+
+    fn retained_recovery_detail(&self, detail: &str) -> String {
+        self.first_recovery_trigger
+            .map_or_else(|| detail.to_owned(), |trigger| trigger.append_to(detail))
+    }
+
     /// Return the aggregate bytes retained by every M2 data path.  Sequence
     /// replay, receive gaps/ready frames, authorization buffering, record
     /// reassembly, deferred output and carrier queues all draw from the same
@@ -996,11 +1982,25 @@ impl M2Actor {
         total
     }
 
-    fn ensure_retained_capacity(&self, additional: usize) -> Result<(), ClientError> {
+    fn ensure_bulk_retained_capacity(&self, additional: usize) -> Result<(), ClientError> {
+        self.ensure_retained_capacity_with_reserve(additional, true)
+    }
+
+    fn ensure_retained_capacity_with_reserve(
+        &self,
+        additional: usize,
+        preserve_critical_bytes: bool,
+    ) -> Result<(), ClientError> {
+        let reserved = if preserve_critical_bytes {
+            critical_reserved_bytes(self.config.limits.max_queue_bytes)
+        } else {
+            0
+        };
+        let maximum = self.config.limits.max_queue_bytes.saturating_sub(reserved);
         if self
             .aggregate_retained_bytes()
             .checked_add(additional)
-            .is_none_or(|total| total > self.config.limits.max_queue_bytes)
+            .is_none_or(|total| total > maximum)
         {
             return Err(ClientError::QueueLimit);
         }
@@ -1026,7 +2026,7 @@ impl M2Actor {
             }
             return Err(ClientError::Transport {
                 scope: "retained recovery",
-                detail: "recovery candidate phase deadline expired".to_owned(),
+                detail: self.retained_recovery_detail("recovery candidate phase deadline expired"),
             });
         }
         let before = self.rotation.phase();
@@ -1061,7 +2061,7 @@ impl M2Actor {
             {
                 return Err(ClientError::Transport {
                     scope: "retained recovery",
-                    detail: "recovery episode deadline expired".to_owned(),
+                    detail: self.retained_recovery_detail("recovery episode deadline expired"),
                 });
             }
             RotationPhase::Closed => {
@@ -1110,6 +2110,49 @@ impl M2Actor {
                     .as_ref()
                     .and_then(|pending| pending.local_addr)
             });
+        let recovery_attempt = self
+            .recovery
+            .as_ref()
+            .map(|recovery| recovery.begin.attempt_no)
+            .or(self.last_recovery_attempt);
+        // These timestamps come directly from RotationState::status().  The
+        // state machine caps every recovery attempt with the immutable
+        // episode deadline, so diagnostics can measure observed spacing
+        // without mirroring a documented delay constant.
+        let recovery_attempt_started_at_ms = self
+            .recovery
+            .as_ref()
+            .and(rotation_status.started_at_ms)
+            .or(self.last_recovery_attempt_started_at_ms);
+        let recovery_attempt_deadline_ms = self
+            .recovery
+            .as_ref()
+            .and(rotation_status.deadline_ms)
+            .or(self.last_recovery_attempt_deadline_ms);
+        let recovery_episode_deadline_ms = self
+            .recovery
+            .as_ref()
+            .map(|recovery| recovery.deadline_ms)
+            .or_else(|| {
+                self.completed_recovery
+                    .as_ref()
+                    .map(|recovery| recovery.deadline_ms)
+            });
+        let recovery_closed_connection_ids = self
+            .recovery
+            .as_ref()
+            .map(|recovery| recovery.local_closed.closed_connection_ids.clone())
+            .or_else(|| {
+                self.completed_recovery
+                    .as_ref()
+                    .map(|recovery| recovery.local_closed.closed_connection_ids.clone())
+            })
+            .unwrap_or_default();
+        let recovery_identity = self
+            .recovery
+            .as_ref()
+            .map(|recovery| recovery.begin.attempt.clone())
+            .or_else(|| self.last_recovery_successor.clone());
         let phase = match rotation_status.phase {
             RotationPhase::Active => "active",
             RotationPhase::Preparing => "preparing",
@@ -1151,6 +2194,24 @@ impl M2Actor {
             queue_frames: self.pending_outputs.len(),
             queue_bytes: self.aggregate_retained_bytes(),
             rotations_completed: self.rotations_completed,
+            recovery_attempt,
+            recovery_attempt_started_at_ms,
+            recovery_attempt_deadline_ms,
+            recovery_episode_deadline_ms,
+            recovery_closed_connection_ids,
+            recovery_reset_reason: self.last_recovery_reset_reason,
+            recovery_old_generation: recovery_identity
+                .as_ref()
+                .map(|attempt| attempt.old_generation),
+            recovery_old_connection_id: recovery_identity
+                .as_ref()
+                .map(|attempt| attempt.old_connection_id.clone()),
+            recovery_successor_generation: recovery_identity
+                .as_ref()
+                .map(|attempt| attempt.new_generation),
+            recovery_successor_connection_id: recovery_identity
+                .as_ref()
+                .map(|attempt| attempt.new_connection_id.clone()),
             control_local_addr: self.control_local_addr,
             active_local_addr: self.active.local_addr,
             candidate_local_addr,
@@ -1168,18 +2229,224 @@ impl M2Actor {
         let _ = self.status.send(status);
     }
 
+    fn encode_control_message(message: &ControlMessage) -> Result<Message, ClientError> {
+        let bytes =
+            encode_control(message).map_err(|error| ClientError::Protocol(error.to_string()))?;
+        let text = String::from_utf8(bytes).map_err(|_| {
+            ClientError::Protocol("control codec produced non-UTF-8 JSON".to_owned())
+        })?;
+        Ok(Message::Text(text.into()))
+    }
+
     fn send_control(
         &self,
         message: ControlMessage,
         deadline: Option<DualDeadline>,
     ) -> Result<(), ClientError> {
-        let bytes =
-            encode_control(&message).map_err(|error| ClientError::Protocol(error.to_string()))?;
-        let text = String::from_utf8(bytes).map_err(|_| {
-            ClientError::Protocol("control codec produced non-UTF-8 JSON".to_owned())
-        })?;
+        // Preserve the response order established by a deferred OPEN or a
+        // previously spilled critical response. Callers that already have a
+        // bounded retry path (notably authorization refresh) convert this
+        // queue-full result into their retained state.
+        if self.pending_open.is_some() || !self.pending_critical_controls.is_empty() {
+            return Err(ClientError::QueueLimit);
+        }
         self.control_queue
-            .try_send_with_deadline(Message::Text(text.into()), deadline)
+            .try_send_with_deadline(Self::encode_control_message(&message)?, deadline)
+    }
+
+    fn critical_control_deadline(&self) -> Result<DualDeadline, ClientError> {
+        DualDeadline::new(
+            Instant::now(),
+            SystemTime::now(),
+            M2_CRITICAL_CONTROL_TIMEOUT,
+        )
+        .ok_or_else(|| ClientError::Protocol("critical control deadline overflow".to_owned()))
+    }
+
+    /// Queue a response that must remain ordered behind a deferred OPEN. The
+    /// writer queue stays fixed at its configured bound; only a bounded,
+    /// byte-accounted spill is retained while the atomic OPEN pair waits for
+    /// two permits. A full spill still fails closed instead of growing with
+    /// inbound control traffic. Every spilled response has an absolute
+    /// fallback deadline, including responses whose caller did not already
+    /// carry an authorization deadline.
+    fn send_critical_control(
+        &mut self,
+        message: ControlMessage,
+        deadline: Option<DualDeadline>,
+    ) -> Result<(), ClientError> {
+        self.send_critical_message(Self::encode_control_message(&message)?, deadline)
+    }
+
+    fn send_critical_message(
+        &mut self,
+        encoded: Message,
+        deadline: Option<DualDeadline>,
+    ) -> Result<(), ClientError> {
+        if self.pending_open.is_some() || !self.pending_critical_controls.is_empty() {
+            let deadline = match deadline {
+                Some(deadline) => deadline,
+                None => self.critical_control_deadline()?,
+            };
+            return self.defer_critical_control(encoded, deadline);
+        }
+        match self
+            .control_queue
+            .try_send_with_deadline(encoded.clone(), deadline)
+        {
+            Ok(()) => Ok(()),
+            Err(ClientError::QueueLimit) => {
+                let deadline = match deadline {
+                    Some(deadline) => deadline,
+                    None => self.critical_control_deadline()?,
+                };
+                self.defer_critical_control(encoded, deadline)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn defer_critical_control(
+        &mut self,
+        message: Message,
+        deadline: DualDeadline,
+    ) -> Result<(), ClientError> {
+        let bytes = super::message_size(&message);
+        if self.pending_critical_controls.len() >= M2_PENDING_CRITICAL_CONTROL_FRAMES
+            || self
+                .pending_critical_control_bytes
+                .checked_add(bytes)
+                .is_none_or(|total| total > M2_PENDING_CRITICAL_CONTROL_BYTES)
+        {
+            return Err(ClientError::QueueLimit);
+        }
+        self.pending_critical_control_bytes =
+            self.pending_critical_control_bytes.saturating_add(bytes);
+        self.pending_critical_controls
+            .push_back(PendingCriticalControl {
+                message,
+                deadline,
+                bytes,
+            });
+        Ok(())
+    }
+
+    fn open_response_bytes(responses: &[Message]) -> Result<usize, ClientError> {
+        responses.iter().try_fold(0_usize, |total, response| {
+            total
+                .checked_add(M2_OPEN_JOURNAL_RESPONSE_OVERHEAD)
+                .and_then(|value| value.checked_add(super::message_size(response)))
+                .ok_or(ClientError::QueueLimit)
+        })
+    }
+
+    fn complete_open_journal(
+        &mut self,
+        request_id: &str,
+        responses: Vec<Message>,
+        deadlines: Vec<Option<DualDeadline>>,
+    ) -> Result<(), ClientError> {
+        let response_bytes = match Self::open_response_bytes(&responses) {
+            Ok(response_bytes) => response_bytes,
+            Err(ClientError::QueueLimit) => {
+                return Err(self.open_retention_failure(request_id));
+            }
+            Err(error) => return Err(error),
+        };
+        match self
+            .open_journal
+            .complete(request_id, responses, deadlines, response_bytes)
+        {
+            Ok(()) => Ok(()),
+            Err(OpenJournalError::Capacity | OpenJournalError::TombstoneCapacity) => {
+                Err(self.open_retention_failure(request_id))
+            }
+            Err(
+                OpenJournalError::ConflictingMessage
+                | OpenJournalError::MissingMessage
+                | OpenJournalError::ConflictingResponse,
+            ) => Err(ClientError::Protocol(
+                "OPEN journal completion changed after response admission".to_owned(),
+            )),
+        }
+    }
+
+    fn open_retention_failure(&mut self, request_id: &str) -> ClientError {
+        match self.open_journal.compact(request_id) {
+            Ok(()) => ClientError::OpenRetentionFull,
+            Err(_) => ClientError::Protocol("OPEN journal retention transition failed".to_owned()),
+        }
+    }
+
+    fn replay_open_responses(
+        &mut self,
+        responses: Vec<Message>,
+        deadlines: Vec<Option<DualDeadline>>,
+    ) -> Result<(), ClientError> {
+        if responses.len() != 1 || deadlines.len() != 1 {
+            return Err(ClientError::Protocol(
+                "OPEN journal retained an invalid completed response".to_owned(),
+            ));
+        }
+        let response = responses
+            .into_iter()
+            .next()
+            .expect("one response was checked above");
+        self.send_critical_message(response, deadlines[0])
+    }
+
+    /// Inspect deferred critical controls for expiry even while a pending OPEN
+    /// remains the head. Enqueue them only after that atomic pair is admitted,
+    /// preserving inbound response order and preventing one-slot
+    /// PONG/rotation replies from starving the two-slot OPEN reservation;
+    /// expired spill is reported as a bounded control failure rather than
+    /// being reported as delivered.
+    fn flush_pending_critical_controls(&mut self) -> Result<(), ClientError> {
+        loop {
+            if self
+                .pending_critical_controls
+                .front()
+                .is_some_and(|pending| pending.deadline.expired())
+            {
+                let pending = self
+                    .pending_critical_controls
+                    .pop_front()
+                    .expect("critical spill front was checked above");
+                self.pending_critical_control_bytes = self
+                    .pending_critical_control_bytes
+                    .saturating_sub(pending.bytes);
+                return Err(ClientError::Transport {
+                    scope: "control response",
+                    detail: "critical response deadline expired".to_owned(),
+                });
+            }
+            if self.pending_open.is_some() {
+                return Ok(());
+            }
+            let Some(pending) = self.pending_critical_controls.pop_front() else {
+                return Ok(());
+            };
+            match self
+                .control_queue
+                .try_send_with_deadline(pending.message.clone(), Some(pending.deadline))
+            {
+                Ok(()) => {
+                    self.pending_critical_control_bytes = self
+                        .pending_critical_control_bytes
+                        .saturating_sub(pending.bytes);
+                }
+                Err(ClientError::QueueLimit) => {
+                    self.pending_critical_controls.push_front(pending);
+                    return Ok(());
+                }
+                Err(error) => {
+                    self.pending_critical_control_bytes = self
+                        .pending_critical_control_bytes
+                        .saturating_sub(pending.bytes);
+                    return Err(error);
+                }
+            }
+        }
     }
 
     fn is_rotation_journal_message(message: &ControlMessage) -> bool {
@@ -1547,7 +2814,7 @@ impl M2Actor {
         // already closing, the actor fails and no later duplicate can apply
         // the transition a second time.
         self.complete_rotation_message(request_id, Some(&response))?;
-        self.send_control(response, None)
+        self.send_critical_control(response, None)
     }
 
     fn resend_rotation_reply(
@@ -1563,7 +2830,7 @@ impl M2Actor {
                 .and_then(|completed| completed.replies.get(message_id).cloned()),
         };
         if let Some(response) = response {
-            self.send_control(response, None)?;
+            self.send_critical_control(response, None)?;
         }
         Ok(())
     }
@@ -1818,7 +3085,7 @@ impl M2Actor {
         self.complete_recovery_message(&request_id, None)
     }
 
-    fn resend_recovery_reply(&self, message: &ControlMessage) -> Result<(), ClientError> {
+    fn resend_recovery_reply(&mut self, message: &ControlMessage) -> Result<(), ClientError> {
         let recovery = self.recovery.as_ref().or(self.completed_recovery.as_ref());
         let reply = match message {
             ControlMessage::RecoveryBegin(_) => recovery
@@ -1837,7 +3104,7 @@ impl M2Actor {
             _ => None,
         };
         if let Some(reply) = reply {
-            self.send_control(reply, None)?;
+            self.send_critical_control(reply, None)?;
         }
         Ok(())
     }
@@ -1858,7 +3125,7 @@ impl M2Actor {
             Message::Binary(_) => Err(ClientError::Protocol(
                 "binary message on control socket".to_owned(),
             )),
-            Message::Ping(payload) => self.control_queue.try_send(Message::Pong(payload)),
+            Message::Ping(payload) => self.send_critical_message(Message::Pong(payload), None),
             Message::Pong(_) | Message::Frame(_) => Ok(()),
             Message::Close(_) => Err(ClientError::Transport {
                 scope: "control read",
@@ -1882,7 +3149,7 @@ impl M2Actor {
         message: ControlMessage,
     ) -> Result<(), ClientError> {
         match message {
-            ControlMessage::Open(open) => self.handle_open(open).await,
+            ControlMessage::Open(open) => self.handle_open(open),
             ControlMessage::AuthorizationConfirmed(confirmed) => {
                 self.handle_authorization_confirmed(confirmed).await
             }
@@ -1922,6 +3189,17 @@ impl M2Actor {
             ControlMessage::StreamForget(forget) => self.handle_stream_forget(forget),
             ControlMessage::RecoveryBegin(begin) => self.handle_recovery_begin(begin).await,
             ControlMessage::RecoveryClosed(closed) => self.handle_recovery_closed(closed),
+            ControlMessage::OwnerFence(_) | ControlMessage::OwnerFenced(_) => {
+                if self.owner_fence.is_some() {
+                    Err(ClientError::Protocol(
+                        "owner fencing requires a fresh control session".to_owned(),
+                    ))
+                } else {
+                    Err(ClientError::Protocol(
+                        "OWNER_FENCE was not negotiated for this session".to_owned(),
+                    ))
+                }
+            }
             ControlMessage::RotateRequest(_) => Err(ClientError::Protocol(
                 "connector received an unsolicited ROTATE_REQUEST".to_owned(),
             )),
@@ -2034,16 +3312,17 @@ impl M2Actor {
                 "RECOVERY_BEGIN duplicate has no matching retained state".to_owned(),
             ));
         }
-        let previous_closed_ids = if let Some(existing) = self.recovery.as_ref() {
+        let previous_authenticated_closed_ids = if let Some(existing) = self.recovery.as_ref() {
             if self.rotation.phase() != RotationPhase::Recovering {
                 return Err(ClientError::Protocol(
                     "RECOVERY_BEGIN changed an active recovery episode".to_owned(),
                 ));
             }
-            existing.local_closed.closed_connection_ids.clone()
+            existing.authenticated_closed_connection_ids.clone()
         } else {
-            Vec::new()
+            BTreeSet::new()
         };
+        let released_before_begin = self.released_recovery_connections.clone();
 
         // A recovery begin is the authenticated handoff point.  The state
         // machine must first enter Recovering, then every old carrier and
@@ -2067,10 +3346,8 @@ impl M2Actor {
         }
 
         let closed = self.close_all_carriers_for_recovery().await?;
-        let mut closed_connection_ids = Vec::with_capacity(closed.len());
         for (connection_id, evidence) in &closed {
-            if previous_closed_ids.iter().any(|id| id == connection_id) {
-                closed_connection_ids.push(connection_id.clone());
+            if released_before_begin.contains(connection_id) {
                 continue;
             }
             self.rotation
@@ -2078,9 +3355,30 @@ impl M2Actor {
                 .map_err(|error| {
                     ClientError::Protocol(format!("recovery closure rejected: {error}"))
                 })?;
-            closed_connection_ids.push(connection_id.clone());
+            self.released_recovery_connections
+                .insert(connection_id.clone());
+        }
+        let mut closed_connection_ids = closed
+            .keys()
+            .filter(|connection_id| {
+                !previous_authenticated_closed_ids.contains(connection_id.as_str())
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if closed_connection_ids.len() > 2 {
+            return Err(ClientError::Protocol(
+                "recovery closure set exceeds the current physical bound".to_owned(),
+            ));
         }
         closed_connection_ids.sort();
+        // A new episode invalidates the previous reset marker.  The status
+        // stream must describe the current attempt until a new fenced
+        // successor crosses the activation boundary.
+        self.last_recovery_reset_reason = None;
+        self.last_recovery_successor = None;
+        self.last_recovery_attempt = None;
+        self.last_recovery_attempt_started_at_ms = None;
+        self.last_recovery_attempt_deadline_ms = None;
         self.recovery = None;
         self.rotation
             .begin_recovery(
@@ -2112,6 +3410,7 @@ impl M2Actor {
             peer_closed: None,
             combined_digest: None,
             deadline_ms: episode_deadline_ms,
+            authenticated_closed_connection_ids: previous_authenticated_closed_ids,
             local_snapshots,
             remote_snapshots: [BTreeMap::new(), BTreeMap::new()],
             remote_ready_snapshots: [BTreeMap::new(), BTreeMap::new()],
@@ -2134,7 +3433,7 @@ impl M2Actor {
         self.accepting = false;
         self.writes_frozen = true;
         let response = ControlMessage::RecoveryClosed(local_closed);
-        self.send_control(response.clone(), None)?;
+        self.send_critical_control(response.clone(), None)?;
         self.complete_recovery_message(&begin.message_id, Some(&response))?;
         self.publish_status();
         Ok(())
@@ -2191,11 +3490,15 @@ impl M2Actor {
         // sorted set; accepting a digest for an extra, omitted, or duplicated
         // ID would let a failed candidate be silently dropped from the
         // bilateral closure proof.
-        let mut expected_ids = self.closed_for_recovery.keys().cloned().collect::<Vec<_>>();
+        let mut expected_ids = recovery.local_closed.closed_connection_ids.clone();
         expected_ids.sort();
         let mut peer_ids = closed.closed_connection_ids.clone();
         peer_ids.sort();
-        if peer_ids != expected_ids {
+        if peer_ids != expected_ids
+            || expected_ids
+                .iter()
+                .any(|connection_id| !self.closed_for_recovery.contains_key(connection_id))
+        {
             return Err(ClientError::Protocol(
                 "RECOVERY_CLOSED physical connection set mismatch".to_owned(),
             ));
@@ -2223,6 +3526,9 @@ impl M2Actor {
             let digest = combined_closure_digest(&closed, &recovery.local_closed)
                 .map_err(|error| ClientError::Protocol(error.to_string()))?;
             let message_id = closed.message_id.clone();
+            recovery
+                .authenticated_closed_connection_ids
+                .extend(closed.closed_connection_ids.iter().cloned());
             recovery.peer_closed = Some(closed);
             recovery.combined_digest = Some(digest);
             message_id
@@ -2256,21 +3562,228 @@ impl M2Actor {
         Ok(snapshots)
     }
 
-    async fn handle_open(&mut self, open: Open) -> Result<(), ClientError> {
+    fn validate_open_context(&self, open: &Open) -> Result<(), ClientError> {
         if open.session_id != self.session.session_id || open.epoch != self.session.epoch {
             return Err(ClientError::Protocol(
                 "OPEN context does not match the authenticated session".to_owned(),
             ));
         }
-        if !self.accepting {
-            return self.send_rejected(&open, "GOAWAY", "connector is draining");
+        Ok(())
+    }
+
+    fn reserve_pending_open(&self, open: &Open) -> Result<PendingOpenReservation, ClientError> {
+        let bytes = pending_open_retained_bytes(open).ok_or(ClientError::QueueLimit)?;
+        self.pending_open_budget.reserve(bytes)?;
+        Ok(PendingOpenReservation {
+            budget: Arc::clone(&self.pending_open_budget),
+            bytes,
+        })
+    }
+
+    fn prepare_pending_open(
+        &self,
+        open: Open,
+        reservation: PendingOpenReservation,
+    ) -> Result<PendingOpen, ClientError> {
+        self.validate_open_context(&open)?;
+        let started = Instant::now();
+        let started_wall = SystemTime::now();
+        let operation_deadline = DualDeadline::new(
+            started,
+            started_wall,
+            if open.operation == "echo_stream" {
+                Duration::from_secs(24 * 60 * 60)
+            } else {
+                Duration::from_millis(self.config.limits.operation_timeout_ms)
+            },
+        )
+        .ok_or_else(|| ClientError::Protocol("operation deadline overflow".to_owned()))?;
+        Ok(PendingOpen {
+            open,
+            operation_deadline,
+            authorization: None,
+            _reservation: reservation,
+        })
+    }
+
+    fn send_open_rejected_journaled(
+        &mut self,
+        open: &Open,
+        code: &str,
+        reason: &str,
+    ) -> Result<(), ClientError> {
+        let response = ControlMessage::Rejected(Rejected::new(
+            message_id(),
+            open.message_id.clone(),
+            self.session.session_id.clone(),
+            self.session.epoch,
+            open.stream_id,
+            open.operation_id.clone(),
+            code,
+            reason,
+        ));
+        let response = Self::encode_control_message(&response)?;
+        let response_bytes = match Self::open_response_bytes(std::slice::from_ref(&response)) {
+            Ok(response_bytes) => response_bytes,
+            Err(ClientError::QueueLimit) => {
+                return Err(self.open_retention_failure(&open.message_id));
+            }
+            Err(error) => return Err(error),
+        };
+        match self
+            .open_journal
+            .ensure_response_capacity(&open.message_id, response_bytes)
+        {
+            Ok(()) => {}
+            Err(OpenJournalError::Capacity | OpenJournalError::TombstoneCapacity) => {
+                return Err(self.open_retention_failure(&open.message_id));
+            }
+            Err(
+                OpenJournalError::ConflictingMessage
+                | OpenJournalError::MissingMessage
+                | OpenJournalError::ConflictingResponse,
+            ) => {
+                return Err(ClientError::Protocol(
+                    "OPEN journal rejected its response transition".to_owned(),
+                ));
+            }
         }
-        if self.streams.len() >= self.config.limits.max_streams {
-            return self.send_rejected(&open, "RESOURCE_EXHAUSTED", "stream limit reached");
+        self.send_critical_message(response.clone(), None)?;
+        self.complete_open_journal(&open.message_id, vec![response], vec![None])
+    }
+
+    fn active_stream_count(&self) -> usize {
+        self.streams
+            .values()
+            .filter(|stream| !stream.terminal())
+            .count()
+    }
+
+    fn handle_open(&mut self, open: Open) -> Result<(), ClientError> {
+        self.validate_open_context(&open)?;
+        let canonical = encode_control(&ControlMessage::Open(open.clone()))
+            .map_err(|error| ClientError::Protocol(error.to_string()))?;
+        let observation = match self.open_journal.observe(
+            &open.message_id,
+            &canonical,
+            open.stream_id,
+            &open.operation_id,
+        ) {
+            Ok(observation) => observation,
+            Err(OpenJournalError::ConflictingMessage) => {
+                return Err(ClientError::Protocol(
+                    "OPEN message ID reused with different contents".to_owned(),
+                ));
+            }
+            Err(OpenJournalError::Capacity | OpenJournalError::TombstoneCapacity) => {
+                return self.send_rejected(
+                    &open,
+                    "RESOURCE_EXHAUSTED",
+                    "OPEN idempotency retention is full; start a fresh session",
+                );
+            }
+            Err(OpenJournalError::MissingMessage | OpenJournalError::ConflictingResponse) => {
+                return Err(ClientError::Protocol(
+                    "OPEN journal observation failed".to_owned(),
+                ));
+            }
+        };
+        match observation {
+            OpenJournalObservation::PendingDuplicate => return Ok(()),
+            OpenJournalObservation::CompletedDuplicate {
+                responses,
+                deadlines,
+            } => return self.replay_open_responses(responses, deadlines),
+            OpenJournalObservation::Tombstone => {
+                return self.send_rejected(
+                    &open,
+                    "STALE_REQUEST",
+                    "OPEN was already forgotten; start a fresh session",
+                );
+            }
+            OpenJournalObservation::New => {}
+        }
+
+        let reservation = match self.reserve_pending_open(&open) {
+            Ok(reservation) => reservation,
+            Err(ClientError::QueueLimit) => {
+                return self.send_open_rejected_journaled(
+                    &open,
+                    "RESOURCE_EXHAUSTED",
+                    "parsed OPEN retention is full; start a fresh session",
+                );
+            }
+            Err(error) => return Err(error),
+        };
+        let mut pending = self.prepare_pending_open(open, reservation)?;
+        let pending_count =
+            self.pending_open_queue.len() + if self.pending_open.is_some() { 1 } else { 0 };
+        if pending_count > 0 || !self.pending_critical_controls.is_empty() {
+            let active_streams = self.active_stream_count();
+            let retained_limit = retained_stream_limit(self.config.limits.max_streams);
+            if active_streams.saturating_add(pending_count) >= self.config.limits.max_streams
+                || self.streams.len().saturating_add(pending_count) >= retained_limit
+            {
+                return self.send_open_rejected_journaled(
+                    &pending.open,
+                    "RESOURCE_EXHAUSTED",
+                    "bounded OPEN admission is full",
+                );
+            }
+            self.pending_open_queue.push_back(pending);
+            return Ok(());
+        }
+        match self.try_admit_open(&mut pending) {
+            Ok(()) => Ok(()),
+            Err(ClientError::QueueLimit) => {
+                self.pending_open = Some(pending);
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Retry the one deferred OPEN after the writer has made room. The
+    /// operation and first authorization deadlines are retained in the
+    /// pending item, so retries cannot extend either bounded lifetime.
+    fn flush_pending_open(&mut self) -> Result<(), ClientError> {
+        if self.pending_open.is_none() && self.pending_critical_controls.is_empty() {
+            self.pending_open = self.pending_open_queue.pop_front();
+        }
+        let Some(pending) = self.pending_open.take() else {
+            return Ok(());
+        };
+        let mut pending = pending;
+        match self.try_admit_open(&mut pending) {
+            Ok(()) => Ok(()),
+            Err(ClientError::QueueLimit) => {
+                self.pending_open = Some(pending);
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Validate and prepare an OPEN before publishing any state. Both
+    /// control responses are reserved atomically; a queue-full result leaves
+    /// the actor with neither a visible stream nor a half-written response.
+    fn try_admit_open(&mut self, pending: &mut PendingOpen) -> Result<(), ClientError> {
+        let open = &pending.open;
+        if !self.accepting {
+            return self.send_open_rejected_journaled(open, "GOAWAY", "connector is draining");
+        }
+        if self.active_stream_count() >= self.config.limits.max_streams
+            || self.streams.len() >= retained_stream_limit(self.config.limits.max_streams)
+        {
+            return self.send_open_rejected_journaled(
+                open,
+                "RESOURCE_EXHAUSTED",
+                "stream limit reached",
+            );
         }
         let Some(export) = self.config.exports.get(&open.service_id).cloned() else {
-            return self.send_rejected(
-                &open,
+            return self.send_open_rejected_journaled(
+                open,
                 "EXPORT_DENIED",
                 "service is not locally allowlisted",
             );
@@ -2278,51 +3791,79 @@ impl M2Actor {
         if export.kind != super::ExportKind::Echo
             || !matches!(open.operation.as_str(), "echo" | "echo_stream")
         {
-            return self.send_rejected(
-                &open,
+            return self.send_open_rejected_journaled(
+                open,
                 "OPERATION_DENIED",
                 "only the local echo operations are enabled",
             );
         }
-        if self.streams.contains_key(&open.stream_id) {
-            return self.send_rejected(&open, "STREAM_EXISTS", "stream ID is already active");
+        // The first received OPEN reserves a stream ID for the session even
+        // when it is rejected or later compacted. Compare its receive ordinal,
+        // not the journal's lexicographic message-ID order, so a later queued
+        // request cannot displace the original pending head.
+        if self.streams.contains_key(&open.stream_id)
+            || open.stream_id <= self.forgotten_stream_through
+            || self
+                .open_journal
+                .stream_message_is_reserved_by_other(open.stream_id, &open.message_id)
+        {
+            return self.send_open_rejected_journaled(
+                open,
+                "STREAM_EXISTS",
+                "stream ID is already active or was already forgotten",
+            );
         }
-        let started = Instant::now();
-        let started_wall = SystemTime::now();
-        let challenge_id = message_id();
-        let nonce = message_id();
-        let permission_digest = open
-            .metadata
-            .get("permission_digest")
-            .cloned()
-            .unwrap_or_else(|| "m2-echo".to_owned());
-        let grant_revision = open
-            .metadata
-            .get("grant_revision")
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(0);
-        let auth_deadline = DualDeadline::new(
-            started,
-            started_wall,
-            Duration::from_millis(self.config.limits.grant_timeout_ms),
-        )
-        .ok_or_else(|| ClientError::Protocol("authorization deadline overflow".to_owned()))?;
-        let operation_deadline = DualDeadline::new(
-            started,
-            started_wall,
-            if open.operation == "echo_stream" {
-                // A stream is bounded by transport/session lifetime.  Its
-                // individual dispatches still require fresh five-second
-                // authorization confirmations; this deadline only protects
-                // the finite echo operation from a forgotten peer.
-                Duration::from_secs(24 * 60 * 60)
-            } else {
-                Duration::from_millis(self.config.limits.operation_timeout_ms)
-            },
-        )
-        .ok_or_else(|| ClientError::Protocol("operation deadline overflow".to_owned()))?;
+        if pending.operation_deadline.expired() {
+            return self.send_open_rejected_journaled(
+                open,
+                "AUTHORIZATION_EXPIRED",
+                "OPEN authorization window expired before admission",
+            );
+        }
+        if pending.authorization.is_none() {
+            let started = Instant::now();
+            let started_wall = SystemTime::now();
+            let permission_digest = open
+                .metadata
+                .get("permission_digest")
+                .cloned()
+                .unwrap_or_else(|| "m2-echo".to_owned());
+            let grant_revision = open
+                .metadata
+                .get("grant_revision")
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(0);
+            let auth_deadline = DualDeadline::new(
+                started,
+                started_wall,
+                Duration::from_millis(self.config.limits.grant_timeout_ms),
+            )
+            .ok_or_else(|| ClientError::Protocol("authorization deadline overflow".to_owned()))?;
+            pending.authorization = Some(PendingAuthorization {
+                opened_message_id: message_id(),
+                challenge_message_id: message_id(),
+                challenge_id: message_id(),
+                nonce: message_id(),
+                permission_digest,
+                grant_revision,
+                auth_deadline,
+            });
+        }
+        let authorization = pending
+            .authorization
+            .as_ref()
+            .expect("OPEN authorization was prepared above");
+        if authorization.auth_deadline.expired() || pending.operation_deadline.expired() {
+            return self.send_open_rejected_journaled(
+                open,
+                "AUTHORIZATION_EXPIRED",
+                "OPEN authorization window expired before admission",
+            );
+        }
+        let auth_deadline = authorization.auth_deadline;
+        let operation_deadline = pending.operation_deadline;
         let opened = ControlMessage::Opened(Opened::new(
-            message_id(),
+            authorization.opened_message_id.clone(),
             open.message_id.clone(),
             self.session.session_id.clone(),
             self.session.epoch,
@@ -2331,18 +3872,49 @@ impl M2Actor {
             open.initial_receive_window,
             open.initial_send_window,
         ));
-        self.send_control(opened, None)?;
         let challenge = ControlMessage::AuthorizationChallenge(AuthorizationChallenge::new(
-            message_id(),
+            authorization.challenge_message_id.clone(),
             self.session.session_id.clone(),
             self.session.epoch,
             open.stream_id,
-            challenge_id.clone(),
-            nonce.clone(),
+            authorization.challenge_id.clone(),
+            authorization.nonce.clone(),
             open.service_id.clone(),
-            permission_digest.clone(),
-            grant_revision,
+            authorization.permission_digest.clone(),
+            authorization.grant_revision,
         ));
+        let opened_message = Self::encode_control_message(&opened)?;
+        let challenge_message = Self::encode_control_message(&challenge)?;
+        // The initial challenge is an independent grant-freshness event. Keep
+        // only OPENED in the completed OPEN journal so a retry after the
+        // stream is confirmed cannot accidentally trigger authorization
+        // refresh; the original atomic pair still owns first delivery.
+        let response_bytes = match Self::open_response_bytes(std::slice::from_ref(&opened_message))
+        {
+            Ok(response_bytes) => response_bytes,
+            Err(ClientError::QueueLimit) => {
+                return Err(self.open_retention_failure(&open.message_id));
+            }
+            Err(error) => return Err(error),
+        };
+        match self
+            .open_journal
+            .ensure_response_capacity(&open.message_id, response_bytes)
+        {
+            Ok(()) => {}
+            Err(OpenJournalError::Capacity | OpenJournalError::TombstoneCapacity) => {
+                return Err(self.open_retention_failure(&open.message_id));
+            }
+            Err(
+                OpenJournalError::ConflictingMessage
+                | OpenJournalError::MissingMessage
+                | OpenJournalError::ConflictingResponse,
+            ) => {
+                return Err(ClientError::Protocol(
+                    "OPEN journal admission changed before response reservation".to_owned(),
+                ));
+            }
+        }
         let initial_credit = open.initial_send_window.min(8 * 1024 * 1024);
         let receive_credit = open.initial_receive_window.min(8 * 1024 * 1024);
         // Partition the one session replay/reorder budget across the maximum
@@ -2365,42 +3937,47 @@ impl M2Actor {
             limits,
         )
         .map_err(|error| ClientError::Protocol(error.to_string()))?;
-        self.streams.insert(
-            open.stream_id,
-            M2Stream {
-                export,
-                operation_id: open.operation_id,
-                service_id: open.service_id,
-                operation: open.operation,
-                auth: AuthContext {
-                    challenge_id,
-                    nonce,
-                    permission_digest,
-                    grant_revision,
-                    deadline: auth_deadline,
-                    operation_deadline,
-                    confirmed: false,
-                    refresh_in_flight: true,
-                    invalidated: false,
-                },
-                sequence,
-                pending: VecDeque::new(),
-                pending_bytes: 0,
-                record_buffer: Vec::new(),
-                record_expected: None,
-                input_fin: false,
-                input_reset: false,
-                output_fin: false,
-                output_reset: false,
-                reset_queued: false,
+        let stream = M2Stream {
+            export,
+            operation_id: open.operation_id.clone(),
+            service_id: open.service_id.clone(),
+            operation: open.operation.clone(),
+            auth: AuthContext {
+                challenge_id: authorization.challenge_id.clone(),
+                nonce: authorization.nonce.clone(),
+                permission_digest: authorization.permission_digest.clone(),
+                grant_revision: authorization.grant_revision,
+                deadline: auth_deadline,
+                operation_deadline,
+                confirmed: false,
+                refresh_in_flight: true,
+                invalidated: false,
             },
-        );
+            sequence,
+            pending: VecDeque::new(),
+            pending_bytes: 0,
+            record_buffer: Vec::new(),
+            record_expected: None,
+            input_fin: false,
+            input_reset: false,
+            output_fin: false,
+            output_reset: false,
+            reset_queued: false,
+        };
+        self.control_queue.try_send_pair(
+            opened_message.clone(),
+            None,
+            challenge_message,
+            Some(auth_deadline),
+        )?;
+        self.complete_open_journal(&open.message_id, vec![opened_message], vec![None])?;
+        self.streams.insert(open.stream_id, stream);
         self.publish_status();
-        self.send_control(challenge, Some(auth_deadline))
+        Ok(())
     }
 
-    fn send_rejected(&self, open: &Open, code: &str, reason: &str) -> Result<(), ClientError> {
-        self.send_control(
+    fn send_rejected(&mut self, open: &Open, code: &str, reason: &str) -> Result<(), ClientError> {
+        self.send_critical_control(
             ControlMessage::Rejected(Rejected::new(
                 message_id(),
                 open.message_id.clone(),
@@ -2487,6 +4064,31 @@ impl M2Actor {
                 "ROTATE_COMMIT snapshot mismatch".to_owned(),
             ));
         }
+        let candidate_matches = self.candidate.as_ref().is_some_and(|candidate| {
+            candidate.key.matches(
+                commit.attempt.new_generation,
+                &commit.attempt.new_connection_id,
+            )
+        });
+        if !candidate_matches {
+            return Err(ClientError::Protocol(
+                "ROTATE_COMMIT without matching candidate carrier".to_owned(),
+            ));
+        }
+        // Flush any cumulative ACK/window debt while the old carrier is
+        // still active.  If its bounded writer queue is temporarily full,
+        // the debt remains attached to the carrier and the timer can finish
+        // it after the carrier becomes retiring; it must never migrate to
+        // the new generation.  A writer that has already closed is the
+        // explicit handoff case: the candidate is still authoritative after
+        // commit, and `reissue_active_receive_controls` below sends the
+        // cumulative state there.  Other transport failures remain fatal.
+        let active_key = self.active.key.clone();
+        if let Err(error) = self.flush_pending_carrier_controls_for_key(&active_key)
+            && !is_closed_data_writer(&error)
+        {
+            return Err(error);
+        }
         self.rotation
             .commit(&commit.attempt, self.now_ms())
             .map_err(|error| ClientError::Protocol(format!("commit decision rejected: {error}")))?;
@@ -2498,17 +4100,16 @@ impl M2Actor {
         let candidate = self.candidate.take().ok_or_else(|| {
             ClientError::Protocol("ROTATE_COMMIT without candidate carrier".to_owned())
         })?;
-        if !candidate.key.matches(
-            commit.attempt.new_generation,
-            &commit.attempt.new_connection_id,
-        ) {
-            return Err(ClientError::Protocol(
-                "candidate carrier identity mismatch".to_owned(),
-            ));
-        }
         let old = std::mem::replace(&mut self.active, candidate);
         self.retiring = Some(old);
+        // Reissue absolute receive state on the activated carrier.  The old
+        // writer may have accepted a control frame into its bounded queue and
+        // then failed before the peer observed it; retiring that carrier
+        // without this replay would silently lose credit/ACK progress.
+        self.reissue_active_receive_controls()?;
         self.pending_quiesce = None;
+        self.barrier_queued = false;
+        self.pending_retire = None;
         let can_resume = self.rotation.phase() == RotationPhase::Active;
         self.accepting = can_resume;
         self.writes_frozen = !can_resume;
@@ -2620,6 +4221,8 @@ impl M2Actor {
     async fn refresh_authorizations(&mut self) -> Result<(), ClientError> {
         let now = Instant::now();
         let wall_now = SystemTime::now();
+        self.flush_pending_authorization_refreshes(now, wall_now)
+            .await?;
         let expired_ids: Vec<u64> = self
             .streams
             .iter()
@@ -2640,6 +4243,9 @@ impl M2Actor {
                     || !stream.auth.confirmed
                     || stream.auth.refresh_in_flight
                     || stream.auth.invalidated
+                    || self
+                        .pending_authorization_refreshes
+                        .contains_key(&stream_id)
                     || stream.auth.operation_deadline.expired_at(now, wall_now)
                     || stream.auth.deadline.remaining(now) > M2_AUTH_REFRESH_MARGIN
                 {
@@ -2666,7 +4272,7 @@ impl M2Actor {
             };
             let challenge_id = message_id();
             let nonce = message_id();
-            let challenge = ControlMessage::AuthorizationChallenge(AuthorizationChallenge::new(
+            let challenge = AuthorizationChallenge::new(
                 message_id(),
                 self.session.session_id.clone(),
                 self.session.epoch,
@@ -2676,8 +4282,8 @@ impl M2Actor {
                 service_id,
                 permission_digest,
                 grant_revision,
-            ));
-            let Some(stream) = self.streams.get_mut(&stream_id) else {
+            );
+            let Some(stream) = self.streams.get(&stream_id) else {
                 continue;
             };
             if stream.operation != "echo_stream"
@@ -2687,12 +4293,91 @@ impl M2Actor {
             {
                 continue;
             }
-            stream.auth.challenge_id = challenge_id;
-            stream.auth.nonce = nonce;
-            stream.auth.deadline = auth_deadline;
-            stream.auth.refresh_in_flight = true;
-            stream.auth.confirmed = false;
-            self.send_control(challenge, Some(auth_deadline))?;
+            match self.send_control(
+                ControlMessage::AuthorizationChallenge(challenge.clone()),
+                Some(auth_deadline),
+            ) {
+                Ok(()) => {
+                    let Some(stream) = self.streams.get_mut(&stream_id) else {
+                        continue;
+                    };
+                    stream.auth.challenge_id = challenge_id;
+                    stream.auth.nonce = nonce;
+                    stream.auth.deadline = auth_deadline;
+                    stream.auth.refresh_in_flight = true;
+                    stream.auth.confirmed = false;
+                }
+                Err(ClientError::QueueLimit) => {
+                    self.pending_authorization_refreshes.insert(
+                        stream_id,
+                        PendingAuthorizationRefresh {
+                            challenge,
+                            auth_deadline,
+                        },
+                    );
+                    break;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    /// Retry prepared refreshes in stream order after the writer has drained.
+    /// A refresh remains confirmed until its challenge is actually queued, so
+    /// queue pressure cannot create a phantom in-flight authorization.
+    async fn flush_pending_authorization_refreshes(
+        &mut self,
+        now: Instant,
+        wall_now: SystemTime,
+    ) -> Result<(), ClientError> {
+        let stream_ids = self
+            .pending_authorization_refreshes
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        for stream_id in stream_ids {
+            let Some(pending) = self.pending_authorization_refreshes.remove(&stream_id) else {
+                continue;
+            };
+            let Some(stream) = self.streams.get(&stream_id) else {
+                continue;
+            };
+            if stream.operation != "echo_stream"
+                || !stream.auth.confirmed
+                || stream.auth.refresh_in_flight
+                || stream.auth.invalidated
+            {
+                continue;
+            }
+            if stream.auth.deadline.expired_at(now, wall_now)
+                || stream.auth.operation_deadline.expired_at(now, wall_now)
+                || pending.auth_deadline.expired_at(now, wall_now)
+            {
+                self.expire_stream(stream_id).await?;
+                continue;
+            }
+            match self.send_control(
+                ControlMessage::AuthorizationChallenge(pending.challenge.clone()),
+                Some(pending.auth_deadline),
+            ) {
+                Ok(()) => {
+                    let Some(stream) = self.streams.get_mut(&stream_id) else {
+                        continue;
+                    };
+                    stream.auth.challenge_id = pending.challenge.challenge_id;
+                    stream.auth.nonce = pending.challenge.nonce;
+                    stream.auth.deadline = pending.auth_deadline;
+                    stream.auth.refresh_in_flight = true;
+                    stream.auth.confirmed = false;
+                }
+                Err(ClientError::QueueLimit) => {
+                    self.pending_authorization_refreshes
+                        .insert(stream_id, pending);
+                    break;
+                }
+                Err(error) => return Err(error),
+            }
         }
         Ok(())
     }
@@ -2718,10 +4403,66 @@ impl M2Actor {
         Ok(())
     }
 
+    /// Remove deferred OPENs for the operation being forgotten before its
+    /// journal entries become tombstones.  A pending OPEN has no stream to
+    /// validate after the carrier barrier, so leaving it queued would make
+    /// the later retry observe a tombstone and fail the whole session.  Keep
+    /// all other operations in their original FIFO order and deadlines.
+    fn remove_pending_open_for_forget(&mut self, stream_id: u64, operation_id: &str) {
+        let matches = |pending: &PendingOpen| {
+            pending.open.stream_id == stream_id && pending.open.operation_id == operation_id
+        };
+        if self.pending_open.as_ref().is_some_and(matches) {
+            self.pending_open = None;
+        }
+        self.pending_open_queue.retain(|pending| !matches(pending));
+    }
+
+    fn remove_pending_open_for_cancel(&mut self, cancel: &Cancel) -> Result<(), ClientError> {
+        let matches = |pending: &PendingOpen| {
+            pending.open.stream_id == cancel.stream_id
+                && pending.open.operation_id == cancel.operation_id
+        };
+        let mut removed_message_ids = Vec::new();
+        if self.pending_open.as_ref().is_some_and(matches)
+            && let Some(pending) = self.pending_open.take()
+        {
+            removed_message_ids.push(pending.open.message_id);
+        }
+        self.pending_open_queue.retain(|pending| {
+            if matches(pending) {
+                removed_message_ids.push(pending.open.message_id.clone());
+                false
+            } else {
+                true
+            }
+        });
+        for message_id in removed_message_ids {
+            self.open_journal
+                .compact(&message_id)
+                .map_err(|error| match error {
+                    OpenJournalError::TombstoneCapacity | OpenJournalError::Capacity => {
+                        ClientError::QueueLimit
+                    }
+                    OpenJournalError::ConflictingMessage
+                    | OpenJournalError::MissingMessage
+                    | OpenJournalError::ConflictingResponse => {
+                        ClientError::Protocol("OPEN cancellation journal cleanup failed".to_owned())
+                    }
+                })?;
+        }
+        Ok(())
+    }
+
     async fn handle_cancel(&mut self, cancel: Cancel) -> Result<(), ClientError> {
         if cancel.session_id != self.session.session_id || cancel.epoch != self.session.epoch {
             return Err(ClientError::Protocol("CANCEL context mismatch".to_owned()));
         }
+        // A deferred OPEN has not created a stream or emitted OPENED yet, so
+        // cancellation removes only the matching admission state.  Keep the
+        // active-stream path below intact for a reused stream ID, and require
+        // the operation ID to match before dropping any pending request.
+        self.remove_pending_open_for_cancel(&cancel)?;
         let matches_operation = self.streams.get(&cancel.stream_id).is_some_and(|stream| {
             stream.operation_id == cancel.operation_id
                 && self.config.exports.contains_key(&stream.service_id)
@@ -2757,12 +4498,196 @@ impl M2Actor {
         &mut self,
         forget: tunnel_protocol::rotation_control::StreamForget,
     ) -> Result<(), ClientError> {
+        if forget.stream_id <= self.forgotten_stream_through
+            && !self.streams.contains_key(&forget.stream_id)
+            && self
+                .open_journal
+                .retained_operation_matches(forget.stream_id, &forget.operation_id)
+                .is_none()
+        {
+            return Ok(());
+        }
+        if let Some(pending) = self.pending_forgets.get(&forget.stream_id) {
+            if pending.forget == forget {
+                return Ok(());
+            }
+            return Err(ClientError::Protocol(
+                "STREAM_FORGET changed while carrier barriers were pending".to_owned(),
+            ));
+        }
+        // The control and data sockets are independent. An owner can publish
+        // a fully authenticated FORGET after it has observed the peer's
+        // terminal/ACK while this connector has not yet observed the final ACK
+        // carried by the peer's terminal frame.
+        // Keep the final validator strict, but retain this exact message for
+        // one bounded revalidation window instead of turning that legal
+        // cross-channel ordering into PROTOCOL_ERROR.
+        let (proof_pending, proof_deadline) = match self.validate_stream_forget(&forget) {
+            Ok(()) => (false, None),
+            Err(_error) if self.stream_forget_proof_may_converge(&forget) => (
+                true,
+                Some(Instant::now() + M2_STREAM_FORGET_REVALIDATION_TIMEOUT),
+            ),
+            Err(error) => return Err(error),
+        };
+        let defer_reclamation = !matches!(
+            self.rotation.phase(),
+            RotationPhase::Active | RotationPhase::Preparing
+        );
+        let mut carriers = vec![self.active.key.clone()];
+        if let Some(candidate) = self.candidate.as_ref() {
+            carriers.push(candidate.key.clone());
+        }
+        if let Some(retiring) = self.retiring.as_ref() {
+            carriers.push(retiring.key.clone());
+        }
+        carriers.sort();
+        carriers.dedup();
+        self.pending_forgets.insert(
+            forget.stream_id,
+            PendingStreamForget {
+                forget,
+                carriers,
+                barriers_queued: BTreeSet::new(),
+                barriers_completed: BTreeSet::new(),
+                proof_pending,
+                proof_deadline,
+                defer_reclamation,
+            },
+        );
+        self.retry_pending_forget_barriers()?;
+        self.publish_status();
+        Ok(())
+    }
+
+    /// Return whether a failed STREAM_FORGET proof can still become valid from
+    /// already authenticated data/control progress. This is intentionally
+    /// narrower than accepting arbitrary proof changes: immutable identity and
+    /// both terminal directions must already be valid, while only the final
+    /// ACK/replay release or bounded carrier-control debt may be pending.
+    fn stream_forget_proof_may_converge(
+        &self,
+        forget: &tunnel_protocol::rotation_control::StreamForget,
+    ) -> bool {
+        let Some(stream) = self.streams.get(&forget.stream_id) else {
+            return false;
+        };
+        if forget.session_id != self.session.session_id
+            || forget.epoch != self.session.epoch
+            || stream.operation_id != forget.operation_id
+            || forget.final_state.stream_id != forget.stream_id
+            || forget.direction != Direction::RelayToConnector
+            || (forget.final_state.send_terminal.is_none()
+                || forget.final_state.peer_acked != forget.final_state.last_emitted
+                || forget.final_state.replay_floor.is_some()
+                || forget.final_state.recv_contiguous != 0
+                || forget.final_state.delivered_contiguous != 0
+                || forget.final_state.received_bytes != 0
+                || forget.final_state.receive_terminal.is_some())
+            || !self.config.exports.contains_key(&stream.service_id)
+        {
+            return false;
+        }
+        // Adapter input debt is a local reclamation invariant, rather than
+        // cross-channel progress. Preserve the immediate fail-closed result
+        // for this case; only sequence/control evidence may converge here.
+        if !stream.pending.is_empty()
+            || stream.pending_bytes != 0
+            || !stream.record_buffer.is_empty()
+            || stream.record_expected.is_some()
+            || has_pending_output_for_stream(&self.pending_outputs, forget.stream_id)
+        {
+            return false;
+        }
+
+        let local = stream.sequence.snapshot();
+        let owner_sender = direction_snapshot_from_resume(&forget.final_state);
+        let local_receiver = local.direction(Direction::RelayToConnector);
+        // The owner can only publish this proof after the connector has
+        // acknowledged the owner's R2C terminal.  Its receive cursor, byte
+        // count, terminal, delivery cursor, and reorder state must therefore
+        // already match; deferring missing R2C receipt would accept a proof
+        // whose immutable sender evidence is not yet locally represented.
+        if owner_sender.last_emitted != local_receiver.recv_contiguous
+            || owner_sender.sent_bytes != local_receiver.received_bytes
+            || owner_sender.send_terminal != local_receiver.receive_terminal
+            || owner_sender.send_terminal_sequence != local_receiver.receive_terminal_sequence
+            || owner_sender.receive_credit < local_receiver.send_credit
+            || owner_sender.send_credit > local_receiver.receive_credit
+            || local_receiver.delivered_contiguous != local_receiver.recv_contiguous
+            || local_receiver.reorder_frames != 0
+            || local_receiver.reorder_bytes != 0
+            || !stream
+                .sequence
+                .ready_frames(Direction::RelayToConnector)
+                .is_empty()
+        {
+            return false;
+        }
+
+        let local_sender = local.direction(Direction::ConnectorToRelay);
+        // The connector must already have emitted its own terminal.  Only the
+        // relay's final ACK/replay release and bounded carrier debt may still
+        // converge on this side of the independent data/control channels.
+        if local_sender.send_terminal.is_none()
+            || local_sender.send_terminal_sequence != Some(local_sender.last_emitted)
+            || local_sender.reorder_frames != 0
+            || local_sender.reorder_bytes != 0
+            || !stream
+                .sequence
+                .ready_frames(Direction::ConnectorToRelay)
+                .is_empty()
+        {
+            return false;
+        }
+        let sender_ack_pending = local_sender.peer_acked < local_sender.last_emitted
+            || local_sender.replay_floor.is_some()
+            || local_sender.replay_bytes != 0;
+        let carrier_work_pending =
+            self.active.pending_controls.contains_key(&forget.stream_id)
+                || self.candidate.as_ref().is_some_and(|carrier| {
+                    carrier.pending_controls.contains_key(&forget.stream_id)
+                })
+                || self.retiring.as_ref().is_some_and(|carrier| {
+                    carrier.pending_controls.contains_key(&forget.stream_id)
+                });
+
+        sender_ack_pending || carrier_work_pending
+    }
+
+    fn validate_stream_forget(
+        &self,
+        forget: &tunnel_protocol::rotation_control::StreamForget,
+    ) -> Result<(), ClientError> {
         if forget.session_id != self.session.session_id || forget.epoch != self.session.epoch {
             return Err(ClientError::Protocol(
                 "STREAM_FORGET context mismatch".to_owned(),
             ));
         }
         let Some(stream) = self.streams.get(&forget.stream_id) else {
+            match self
+                .open_journal
+                .retained_operation_matches(forget.stream_id, &forget.operation_id)
+            {
+                Some(true) => {}
+                Some(false) => {
+                    return Err(ClientError::Protocol(
+                        "STREAM_FORGET operation identity mismatch".to_owned(),
+                    ));
+                }
+                None => {
+                    return Err(ClientError::Protocol(
+                        "STREAM_FORGET unknown stream or OPEN journal entry".to_owned(),
+                    ));
+                }
+            }
+            if forget.direction != Direction::RelayToConnector
+                || forget.final_state != no_stream_forget_state(forget.stream_id)
+            {
+                return Err(ClientError::Protocol(
+                    "STREAM_FORGET no-stream evidence mismatch".to_owned(),
+                ));
+            }
             return Ok(());
         };
         if stream.operation_id != forget.operation_id
@@ -2775,26 +4700,337 @@ impl M2Actor {
                 "STREAM_FORGET operation or terminal evidence mismatch".to_owned(),
             ));
         }
-        let expected = ResumeDirectionState::from_sequence_snapshot(
-            forget.stream_id,
-            stream.sequence.snapshot().direction(forget.direction),
-        )
-        .map_err(|error| ClientError::Protocol(error.to_string()))?;
-        if expected != forget.final_state {
+        Self::validate_owner_stream_forget_state(
+            &stream.sequence,
+            forget.direction,
+            &forget.final_state,
+        )?;
+        if !stream.pending.is_empty()
+            || stream.pending_bytes != 0
+            || !stream.record_buffer.is_empty()
+            || stream.record_expected.is_some()
+        {
             return Err(ClientError::Protocol(
-                "STREAM_FORGET final cursor mismatch".to_owned(),
+                "STREAM_FORGET before local adapter input debt drained".to_owned(),
             ));
         }
-        self.streams.remove(&forget.stream_id);
-        self.publish_status();
+        if has_pending_output_for_stream(&self.pending_outputs, forget.stream_id)
+            || self.active.pending_controls.contains_key(&forget.stream_id)
+            || self
+                .candidate
+                .as_ref()
+                .is_some_and(|carrier| carrier.pending_controls.contains_key(&forget.stream_id))
+            || self
+                .retiring
+                .as_ref()
+                .is_some_and(|carrier| carrier.pending_controls.contains_key(&forget.stream_id))
+        {
+            return Err(ClientError::Protocol(
+                "STREAM_FORGET before deferred output and control debt drained".to_owned(),
+            ));
+        }
         Ok(())
     }
 
-    fn handle_ping(&self, ping: Ping) -> Result<(), ClientError> {
+    /// Validate the owner's sender-direction proof against the connector's local
+    /// receiver-direction state.  `ResumeDirectionState` is a snapshot from the
+    /// relay's perspective: for `RelayToConnector`, its `last_emitted`, sent
+    /// bytes, and send terminal must match the connector's receive cursor,
+    /// received bytes, and receive terminal.  Comparing the wire value with the
+    /// same local direction would compare sender fields with receiver fields and
+    /// reject every real terminal exchange.
+    fn validate_owner_stream_forget_state(
+        sequence: &StreamState,
+        direction: Direction,
+        final_state: &ResumeDirectionState,
+    ) -> Result<(), ClientError> {
+        if direction != Direction::RelayToConnector {
+            return Err(ClientError::Protocol(
+                "STREAM_FORGET owner direction mismatch".to_owned(),
+            ));
+        }
+        if final_state.stream_id != sequence.stream_id()
+            || final_state.send_terminal.is_none()
+            || final_state.peer_acked != final_state.last_emitted
+            || final_state.replay_floor.is_some()
+            || final_state.recv_contiguous != 0
+            || final_state.delivered_contiguous != 0
+            || final_state.received_bytes != 0
+            || final_state.receive_terminal.is_some()
+        {
+            return Err(ClientError::Protocol(
+                "STREAM_FORGET owner sender evidence is incomplete".to_owned(),
+            ));
+        }
+
+        let local = sequence.snapshot();
+        let owner_sender = direction_snapshot_from_resume(final_state);
+        let local_receiver = local.direction(Direction::RelayToConnector);
+        if owner_sender.last_emitted != local_receiver.recv_contiguous
+            || owner_sender.sent_bytes != local_receiver.received_bytes
+            || owner_sender.send_terminal != local_receiver.receive_terminal
+            || owner_sender.send_terminal_sequence != local_receiver.receive_terminal_sequence
+            || local_receiver.delivered_contiguous != local_receiver.recv_contiguous
+            || local_receiver.reorder_frames != 0
+            || local_receiver.reorder_bytes != 0
+            || !sequence
+                .ready_frames(Direction::RelayToConnector)
+                .is_empty()
+        {
+            return Err(ClientError::Protocol(
+                "STREAM_FORGET owner and connector receive evidence mismatch".to_owned(),
+            ));
+        }
+
+        let local_sender = local.direction(Direction::ConnectorToRelay);
+        if local_sender.send_terminal.is_none()
+            || local_sender.peer_acked != local_sender.last_emitted
+            || local_sender.replay_floor.is_some()
+            || local_sender.reorder_frames != 0
+            || local_sender.reorder_bytes != 0
+            || !sequence
+                .ready_frames(Direction::ConnectorToRelay)
+                .is_empty()
+        {
+            return Err(ClientError::Protocol(
+                "STREAM_FORGET connector sender evidence is incomplete".to_owned(),
+            ));
+        }
+
+        // Reconcile the owner proof through the pure sequence validator as well.
+        // The wire message carries only the owner's R2C sender direction. The
+        // omitted C2R peer snapshot is synthesized from the connector's own
+        // fully acknowledged sender state only to exercise local consistency;
+        // it is not remote-direction proof. The relay must independently prove
+        // its C2R receive terminal and delivery before emitting STREAM_FORGET.
+        let opposite = local_sender;
+        let peer_opposite = DirectionSnapshot {
+            last_emitted: 0,
+            peer_acked: 0,
+            recv_contiguous: opposite.last_emitted,
+            delivered_contiguous: opposite.last_emitted,
+            send_credit: opposite.receive_credit,
+            sent_bytes: 0,
+            receive_credit: opposite.send_credit,
+            received_bytes: opposite.sent_bytes,
+            send_terminal: None,
+            send_terminal_sequence: None,
+            receive_terminal: opposite.send_terminal,
+            receive_terminal_sequence: opposite.send_terminal_sequence,
+            replay_floor: None,
+            replay_bytes: 0,
+            reorder_frames: 0,
+            reorder_bytes: 0,
+        };
+        let mut peer = local.clone();
+        peer.directions[direction_index(Direction::RelayToConnector)] = owner_sender;
+        peer.directions[direction_index(Direction::ConnectorToRelay)] = peer_opposite;
+        sequence.reconcile(&peer).map_err(|error| {
+            ClientError::Protocol(format!("STREAM_FORGET sequence mismatch: {error}"))
+        })?;
+        Ok(())
+    }
+
+    /// Revalidate deferred proofs independently of rotation reclamation. A
+    /// stream may become fully proven while QUIESCING or DRAINING still owns
+    /// the immutable roster; in that case clear only the proof lease and keep
+    /// the physical barriers/tombstone until the phase permits removal.
+    fn refresh_pending_forget_proofs(&mut self) -> Result<(), ClientError> {
+        let stream_ids = self
+            .pending_forgets
+            .iter()
+            .filter_map(|(&stream_id, pending)| pending.proof_pending.then_some(stream_id))
+            .collect::<Vec<_>>();
+        let now = Instant::now();
+        for stream_id in stream_ids {
+            let Some((forget, deadline)) = self
+                .pending_forgets
+                .get(&stream_id)
+                .map(|pending| (pending.forget.clone(), pending.proof_deadline))
+            else {
+                continue;
+            };
+            if deadline.is_none_or(|deadline| now >= deadline) {
+                return Err(ClientError::Protocol(
+                    "STREAM_FORGET terminal proof did not converge before its deadline".to_owned(),
+                ));
+            }
+            match self.validate_stream_forget(&forget) {
+                Ok(()) => {
+                    if let Some(pending) = self.pending_forgets.get_mut(&stream_id) {
+                        pending.proof_pending = false;
+                        pending.proof_deadline = None;
+                    }
+                }
+                Err(_) if self.stream_forget_proof_may_converge(&forget) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    fn retry_pending_forget_barriers(&mut self) -> Result<(), ClientError> {
+        self.refresh_pending_forget_proofs()?;
+        let stream_ids = self.pending_forgets.keys().copied().collect::<Vec<_>>();
+        for stream_id in stream_ids {
+            let carriers = self
+                .pending_forgets
+                .get(&stream_id)
+                .map(|pending| pending.carriers.clone())
+                .unwrap_or_default();
+            for key in carriers {
+                if self
+                    .pending_forgets
+                    .get(&stream_id)
+                    .is_some_and(|pending| pending.barriers_queued.contains(&key))
+                {
+                    continue;
+                }
+                // A rotation barrier already queued on the active carrier
+                // must complete first.  This keeps BarrierComplete events
+                // unambiguous and lets QUIESCE be retried after FORGET has
+                // drained every carrier, including a ready candidate.
+                if key == self.active.key && self.barrier_queued {
+                    continue;
+                }
+                let Some(tx) = self.carrier_for_key(&key).map(|carrier| carrier.tx.clone()) else {
+                    return Err(ClientError::Transport {
+                        scope: "stream forget barrier",
+                        detail: "carrier disappeared before barrier completion".to_owned(),
+                    });
+                };
+                let permit = match tx.try_reserve_owned() {
+                    Ok(permit) => permit,
+                    Err(mpsc::error::TrySendError::Full(_)) => continue,
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        return Err(ClientError::Transport {
+                            scope: "stream forget barrier",
+                            detail: "data writer stopped before barrier completion".to_owned(),
+                        });
+                    }
+                };
+                permit.send(CarrierCommand::Barrier);
+                if let Some(pending) = self.pending_forgets.get_mut(&stream_id) {
+                    pending.barriers_queued.insert(key);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn complete_pending_stream_forgets(&mut self, key: &CarrierKey) -> Result<(), ClientError> {
+        self.complete_pending_stream_forgets_matching(Some(key))
+    }
+
+    fn complete_ready_stream_forgets(&mut self) -> Result<(), ClientError> {
+        self.complete_pending_stream_forgets_matching(None)
+    }
+
+    fn complete_pending_stream_forgets_matching(
+        &mut self,
+        key: Option<&CarrierKey>,
+    ) -> Result<(), ClientError> {
+        self.refresh_pending_forget_proofs()?;
+        let phase = self.rotation.phase();
+        let ready = self
+            .pending_forgets
+            .iter()
+            .filter_map(|(&stream_id, pending)| {
+                (key.is_none_or(|key| pending.carriers.contains(key))
+                    && key.is_none_or(|key| pending.barriers_queued.contains(key))
+                    && key.is_none_or(|key| pending.barriers_completed.contains(key))
+                    && pending
+                        .carriers
+                        .iter()
+                        .all(|carrier| pending.barriers_completed.contains(carrier))
+                    && matches!(phase, RotationPhase::Active | RotationPhase::Preparing)
+                    && (!pending.defer_reclamation || phase == RotationPhase::Active))
+                    .then_some(stream_id)
+            })
+            .collect::<Vec<_>>();
+        let had_ready = !ready.is_empty();
+        for stream_id in ready {
+            let Some((forget, proof_pending, proof_deadline)) =
+                self.pending_forgets.get(&stream_id).map(|pending| {
+                    (
+                        pending.forget.clone(),
+                        pending.proof_pending,
+                        pending.proof_deadline,
+                    )
+                })
+            else {
+                continue;
+            };
+            if let Err(error) = self.validate_stream_forget(&forget) {
+                let can_retry = proof_pending
+                    && proof_deadline.is_some_and(|deadline| Instant::now() < deadline)
+                    && self.stream_forget_proof_may_converge(&forget);
+                if !can_retry {
+                    return Err(error);
+                }
+                // The barrier proved the current carrier ordering, but the
+                // independent data event/ACK has not converged yet. Reset the
+                // bounded barrier set; the existing deadline tick retries it
+                // without an immediate barrier/requeue loop.
+                if let Some(pending) = self.pending_forgets.get_mut(&stream_id) {
+                    pending.barriers_queued.clear();
+                    pending.barriers_completed.clear();
+                }
+                continue;
+            }
+            let operation_id = forget.operation_id.clone();
+            self.remove_pending_open_for_forget(stream_id, &operation_id);
+            self.open_journal
+                .compact_matching(stream_id, &operation_id)
+                .map_err(|error| match error {
+                    OpenJournalError::TombstoneCapacity | OpenJournalError::Capacity => {
+                        ClientError::QueueLimit
+                    }
+                    OpenJournalError::ConflictingMessage
+                    | OpenJournalError::MissingMessage
+                    | OpenJournalError::ConflictingResponse => ClientError::Protocol(
+                        "OPEN journal cleanup failed during STREAM_FORGET".to_owned(),
+                    ),
+                })?;
+            self.streams.remove(&stream_id);
+            self.pending_forgets.remove(&stream_id);
+            self.forgotten_stream_through = self.forgotten_stream_through.max(stream_id);
+        }
+        if had_ready {
+            self.publish_status();
+        }
+        Ok(())
+    }
+
+    fn mark_pending_forget_barrier_complete(&mut self, key: &CarrierKey) -> bool {
+        let mut matched = false;
+        for pending in self.pending_forgets.values_mut() {
+            if pending.barriers_queued.contains(key)
+                && pending.barriers_completed.insert(key.clone())
+            {
+                matched = true;
+            }
+        }
+        matched
+    }
+
+    fn has_pre_quiesce_forgets(&self) -> bool {
+        self.pending_forgets
+            .values()
+            .any(|pending| !pending.defer_reclamation)
+    }
+
+    fn carrier_has_pending_forget_barrier(&self, key: &CarrierKey) -> bool {
+        self.pending_forgets.values().any(|pending| {
+            pending.carriers.contains(key) && !pending.barriers_completed.contains(key)
+        })
+    }
+
+    fn handle_ping(&mut self, ping: Ping) -> Result<(), ClientError> {
         if ping.session_id != self.session.session_id || ping.epoch != self.session.epoch {
             return Err(ClientError::Protocol("PING context mismatch".to_owned()));
         }
-        self.send_control(
+        self.send_critical_control(
             ControlMessage::Pong(Pong::new(
                 message_id(),
                 ping.message_id,
@@ -2812,10 +5048,15 @@ impl M2Actor {
                 self.handle_carrier_message(key, *message).await
             }
             CarrierEvent::ReaderClosed { key, peer_closed } => {
+                self.remember_recovery_trigger(RecoveryTriggerClass::ReaderClosed, &key);
                 self.mark_carrier_closed(&key, false, peer_closed).await
             }
-            CarrierEvent::WriterClosed { key } => self.mark_carrier_closed(&key, true, false).await,
+            CarrierEvent::WriterClosed { key } => {
+                self.remember_recovery_trigger(RecoveryTriggerClass::WriterClosed, &key);
+                self.mark_carrier_closed(&key, true, false).await
+            }
             CarrierEvent::WriterFailed { key, detail } => {
+                self.remember_recovery_trigger(RecoveryTriggerClass::WriterFailed, &key);
                 // Reader/writer tasks can race their terminal event with
                 // replacement retirement.  Fence every physical identity
                 // already owned by this actor; a late failure from a
@@ -2969,15 +5210,31 @@ impl M2Actor {
             Message::Text(_) => Err(ClientError::Protocol(
                 "text message on data socket".to_owned(),
             )),
-            Message::Close(_) => self.mark_carrier_closed(&key, false, true).await,
+            Message::Close(_) => {
+                self.remember_recovery_trigger(RecoveryTriggerClass::ReaderClosed, &key);
+                self.mark_carrier_closed(&key, false, true).await
+            }
         }
     }
 
     async fn handle_frame(&mut self, key: CarrierKey, frame: Frame) -> Result<(), ClientError> {
         let stream_id = frame.stream_id;
+        // Once terminal cursor evidence has started STREAM_FORGET cleanup,
+        // late duplicate frames must not create fresh ACK/WINDOW debt or
+        // application output behind the physical drain barriers.
+        if self
+            .pending_forgets
+            .get(&stream_id)
+            .is_some_and(|pending| !pending.proof_pending)
+            || (stream_id <= self.forgotten_stream_through
+                && !self.streams.contains_key(&stream_id))
+        {
+            return Ok(());
+        }
+        let acknowledge_frame = should_ack_incoming_frame(frame.kind);
         let payload_bytes = frame.payload.len();
         if payload_bytes > 0 {
-            self.ensure_retained_capacity(payload_bytes)?;
+            self.ensure_bulk_retained_capacity(payload_bytes)?;
         }
         let Some(stream) = self.streams.get_mut(&stream_id) else {
             return self.send_raw_reset(&key, stream_id, M2_RESET_PROTOCOL, 0);
@@ -3075,9 +5332,11 @@ impl M2Actor {
         if reset_ready && !reset_delivered {
             self.handle_peer_reset(stream_id).await?;
         }
-        self.send_ack(&key, stream_id, received_cursor)?;
+        if acknowledge_frame {
+            self.defer_ack(&key, stream_id, received_cursor)?;
+        }
         if released_receive_bytes > 0 {
-            self.send_receive_window_update(&key, stream_id, released_receive_bytes)?;
+            self.defer_window_update(&key, stream_id, released_receive_bytes)?;
         }
         self.maybe_send_drain_proof()?;
         // Recovery READY may arrive before the peer's retained replay.  A
@@ -3087,6 +5346,7 @@ impl M2Actor {
         if self.recovery.is_some() {
             self.maybe_finish_recovery().await?;
         }
+        self.refresh_pending_forget_proofs()?;
         self.publish_status();
         Ok(())
     }
@@ -3108,59 +5368,312 @@ impl M2Actor {
         Ok(())
     }
 
-    fn send_ack(
-        &self,
+    fn carrier_for_key(&self, key: &CarrierKey) -> Option<&Carrier> {
+        if self.active.key == *key {
+            Some(&self.active)
+        } else if self
+            .candidate
+            .as_ref()
+            .is_some_and(|carrier| carrier.key == *key)
+        {
+            self.candidate.as_ref()
+        } else {
+            self.retiring.as_ref().filter(|carrier| carrier.key == *key)
+        }
+    }
+
+    fn carrier_for_key_mut(&mut self, key: &CarrierKey) -> Option<&mut Carrier> {
+        if self.active.key == *key {
+            Some(&mut self.active)
+        } else if self
+            .candidate
+            .as_ref()
+            .is_some_and(|carrier| carrier.key == *key)
+        {
+            self.candidate.as_mut()
+        } else {
+            self.retiring.as_mut().filter(|carrier| carrier.key == *key)
+        }
+    }
+
+    fn defer_ack(
+        &mut self,
         key: &CarrierKey,
         stream_id: u64,
         acknowledged: u64,
     ) -> Result<(), ClientError> {
-        let frame = Frame::ack(self.session.epoch, key.generation, stream_id, acknowledged);
-        let encoded = frame
-            .encode()
-            .map_err(|error| ClientError::Protocol(error.to_string()))?;
-        self.queue_carrier_bytes(key, encoded)
+        let carrier = self
+            .carrier_for_key_mut(key)
+            .ok_or_else(|| ClientError::Protocol("stale data carrier".to_owned()))?;
+        carrier
+            .pending_controls
+            .entry(stream_id)
+            .or_default()
+            .record_ack(acknowledged);
+        Ok(())
     }
 
-    /// Return byte credit for DATA that has left the sequence ready set.
-    ///
-    /// Window updates are absolute and monotonic.  The local sequence state
-    /// is advanced before enqueueing the frame so duplicate or delayed
-    /// updates cannot reduce the advertised limit; if the bounded carrier
-    /// queue is unavailable the actor fails the session instead of silently
-    /// claiming credit it could not transmit.
-    fn send_receive_window_update(
+    fn defer_window_update(
         &mut self,
         key: &CarrierKey,
         stream_id: u64,
         released_bytes: usize,
     ) -> Result<(), ClientError> {
-        let released_bytes = u64::try_from(released_bytes)
-            .map_err(|_| ClientError::Protocol("receive byte counter exhausted".to_owned()))?;
-        let current_credit = self
-            .streams
-            .get(&stream_id)
-            .ok_or_else(|| ClientError::Protocol("window update for unknown stream".to_owned()))?
-            .sequence
-            .direction(Direction::RelayToConnector)
-            .receive_credit();
-        let limit = current_credit
-            .checked_add(released_bytes)
-            .ok_or_else(|| ClientError::Protocol("receive credit exhausted".to_owned()))?;
-        let frame = Frame::window_update(self.session.epoch, key.generation, stream_id, limit);
-        if let Some(stream) = self.streams.get_mut(&stream_id) {
-            stream
-                .sequence
-                .send_frame(Direction::ConnectorToRelay, &frame)
-                .map_err(|error| ClientError::Protocol(error.to_string()))?;
-        } else {
+        if !self.streams.contains_key(&stream_id) {
             return Err(ClientError::Protocol(
                 "window update for unknown stream".to_owned(),
             ));
         }
-        let encoded = frame
-            .encode()
-            .map_err(|error| ClientError::Protocol(error.to_string()))?;
-        self.queue_carrier_bytes(key, encoded)
+        let carrier = self
+            .carrier_for_key_mut(key)
+            .ok_or_else(|| ClientError::Protocol("stale data carrier".to_owned()))?;
+        carrier
+            .pending_controls
+            .entry(stream_id)
+            .or_default()
+            .record_window(released_bytes)
+    }
+
+    /// Capture the absolute receive state that must survive a carrier
+    /// replacement.  A window update may already have advanced the logical
+    /// sequence state when it was accepted by the old writer queue, yet the
+    /// writer can still fail before putting that frame on the socket.  The
+    /// new carrier therefore receives the current cumulative ACK and credit
+    /// again; both are monotonic and idempotent on the wire.
+    fn snapshot_receive_controls(
+        &self,
+    ) -> Result<BTreeMap<u64, PendingCarrierControl>, ClientError> {
+        let mut snapshot = BTreeMap::new();
+        for (&stream_id, stream) in &self.streams {
+            if self
+                .pending_forgets
+                .get(&stream_id)
+                .is_some_and(|pending| !pending.proof_pending)
+            {
+                continue;
+            }
+            let direction = stream.sequence.direction(Direction::RelayToConnector);
+            let mut control = PendingCarrierControl::default();
+            if direction.recv_contiguous() > 0 {
+                control.record_ack(direction.recv_contiguous());
+            }
+            if direction.receive_credit() > 0 {
+                control.record_window_limit(direction.receive_credit());
+            }
+            for carrier in [
+                Some(&self.active),
+                self.candidate.as_ref(),
+                self.retiring.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                let Some(pending) = carrier.pending_controls.get(&stream_id) else {
+                    continue;
+                };
+                if let Some(acknowledged) = pending.acknowledged {
+                    control.record_ack(acknowledged);
+                }
+                let released = u64::try_from(pending.released_window_bytes).map_err(|_| {
+                    ClientError::Protocol("receive byte counter exhausted".to_owned())
+                })?;
+                let current = direction.receive_credit();
+                let released_limit = current
+                    .checked_add(released)
+                    .ok_or_else(|| ClientError::Protocol("receive credit exhausted".to_owned()))?;
+                if pending.window_limit.is_some() || released > 0 {
+                    control.record_window_limit(
+                        pending
+                            .window_limit
+                            .unwrap_or(released_limit)
+                            .max(released_limit),
+                    );
+                }
+            }
+            if !control.is_empty() {
+                snapshot.insert(stream_id, control);
+            }
+        }
+        Ok(snapshot)
+    }
+
+    fn reissue_active_receive_controls(&mut self) -> Result<(), ClientError> {
+        let snapshot = self.snapshot_receive_controls()?;
+        let stream_ids = snapshot.keys().copied().collect::<Vec<_>>();
+        for (stream_id, pending) in snapshot {
+            let control = self.active.pending_controls.entry(stream_id).or_default();
+            if let Some(acknowledged) = pending.acknowledged {
+                control.record_ack(acknowledged);
+            }
+            if let Some(limit) = pending.window_limit {
+                control.record_window_limit(limit);
+            }
+        }
+        let active_key = self.active.key.clone();
+        self.flush_pending_carrier_controls_for_key(&active_key)?;
+        // Retiring debt is cleared per stream and per control kind.  A
+        // bounded active queue may accept stream A's cumulative ACK while
+        // retaining stream B's controls; waiting for the entire active map to
+        // empty would replay A's relative window delta on every timer tick.
+        for stream_id in stream_ids {
+            let active_pending = self
+                .active
+                .pending_controls
+                .get(&stream_id)
+                .copied()
+                .unwrap_or_default();
+            if let Some(retiring) = self.retiring.as_mut()
+                && let Some(control) = retiring.pending_controls.get_mut(&stream_id)
+            {
+                if active_pending.acknowledged.is_none() {
+                    control.acknowledged = None;
+                }
+                if active_pending.released_window_bytes == 0
+                    && active_pending.window_limit.is_none()
+                {
+                    control.released_window_bytes = 0;
+                    control.window_limit = None;
+                }
+                let control_empty = control.is_empty();
+                if control_empty {
+                    retiring.pending_controls.remove(&stream_id);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn flush_pending_carrier_controls(&mut self) -> Result<(), ClientError> {
+        let mut keys = Vec::new();
+        if let Some(retiring) = self.retiring.as_ref() {
+            keys.push(retiring.key.clone());
+        }
+        keys.push(self.active.key.clone());
+        if let Some(candidate) = self.candidate.as_ref() {
+            keys.push(candidate.key.clone());
+        }
+        for key in keys {
+            self.flush_pending_carrier_controls_for_key(&key)?;
+        }
+        Ok(())
+    }
+
+    fn flush_pending_carrier_controls_for_key(
+        &mut self,
+        key: &CarrierKey,
+    ) -> Result<(), ClientError> {
+        let stream_ids = self
+            .carrier_for_key(key)
+            .map(|carrier| carrier.pending_controls.keys().copied().collect::<Vec<_>>())
+            .unwrap_or_default();
+        for stream_id in stream_ids {
+            let Some(pending) = self
+                .carrier_for_key(key)
+                .and_then(|carrier| carrier.pending_controls.get(&stream_id).copied())
+            else {
+                continue;
+            };
+            if !self.streams.contains_key(&stream_id) {
+                if let Some(carrier) = self.carrier_for_key_mut(key) {
+                    carrier.pending_controls.remove(&stream_id);
+                }
+                continue;
+            }
+
+            if let Some(acknowledged) = pending.acknowledged {
+                let frame = Frame::ack(self.session.epoch, key.generation, stream_id, acknowledged);
+                let encoded = frame
+                    .encode()
+                    .map_err(|error| ClientError::Protocol(error.to_string()))?;
+                match self.queue_reserved_carrier_bytes(key, encoded) {
+                    Ok(()) => {
+                        if let Some(carrier) = self.carrier_for_key_mut(key)
+                            && let Some(control) = carrier.pending_controls.get_mut(&stream_id)
+                            && control.acknowledged == Some(acknowledged)
+                        {
+                            control.acknowledged = None;
+                        }
+                    }
+                    Err(ClientError::QueueLimit) => continue,
+                    Err(error) => return Err(error),
+                }
+            }
+
+            if pending.released_window_bytes > 0 || pending.window_limit.is_some() {
+                let released_bytes =
+                    u64::try_from(pending.released_window_bytes).map_err(|_| {
+                        ClientError::Protocol("receive byte counter exhausted".to_owned())
+                    })?;
+                let current_credit = self
+                    .streams
+                    .get(&stream_id)
+                    .ok_or_else(|| {
+                        ClientError::Protocol("window update for unknown stream".to_owned())
+                    })?
+                    .sequence
+                    .direction(Direction::RelayToConnector)
+                    .receive_credit();
+                let released_limit = current_credit
+                    .checked_add(released_bytes)
+                    .ok_or_else(|| ClientError::Protocol("receive credit exhausted".to_owned()))?;
+                let limit = pending
+                    .window_limit
+                    .unwrap_or(current_credit)
+                    .max(released_limit);
+                let frame =
+                    Frame::window_update(self.session.epoch, key.generation, stream_id, limit);
+                let encoded = frame
+                    .encode()
+                    .map_err(|error| ClientError::Protocol(error.to_string()))?;
+                let encoded_len = encoded.len();
+                let (permit, budget) = match self.reserve_carrier_frame(key, encoded_len, false) {
+                    Ok(reservation) => reservation,
+                    Err(ClientError::QueueLimit) => continue,
+                    Err(error) => return Err(error),
+                };
+                {
+                    let Some(stream) = self.streams.get_mut(&stream_id) else {
+                        budget.release(encoded_len);
+                        drop(permit);
+                        return Err(ClientError::Protocol(
+                            "window update for unknown stream".to_owned(),
+                        ));
+                    };
+                    if let Err(error) = stream
+                        .sequence
+                        .send_frame(Direction::ConnectorToRelay, &frame)
+                    {
+                        budget.release(encoded_len);
+                        drop(permit);
+                        return Err(ClientError::Protocol(error.to_string()));
+                    }
+                }
+                permit.send(CarrierCommand::Frame(QueuedCarrierFrame {
+                    bytes: encoded,
+                    bytes_len: encoded_len,
+                    budget,
+                }));
+                if let Some(carrier) = self.carrier_for_key_mut(key)
+                    && let Some(control) = carrier.pending_controls.get_mut(&stream_id)
+                    && control.released_window_bytes == pending.released_window_bytes
+                {
+                    control.released_window_bytes = 0;
+                    if control.window_limit == pending.window_limit {
+                        control.window_limit = None;
+                    }
+                }
+            }
+
+            if let Some(carrier) = self.carrier_for_key_mut(key)
+                && carrier
+                    .pending_controls
+                    .get(&stream_id)
+                    .is_some_and(|control| control.is_empty())
+            {
+                carrier.pending_controls.remove(&stream_id);
+            }
+        }
+        Ok(())
     }
 
     fn send_raw_reset(
@@ -3181,62 +5694,170 @@ impl M2Actor {
         let encoded = frame
             .encode()
             .map_err(|error| ClientError::Protocol(error.to_string()))?;
-        self.queue_carrier_bytes(key, encoded)
+        self.queue_reserved_carrier_bytes(key, encoded)
     }
 
-    fn send_carrier_message(&self, key: &CarrierKey, message: Message) -> Result<(), ClientError> {
-        let carrier = if self.active.key == *key {
-            &self.active
-        } else if self
-            .candidate
-            .as_ref()
-            .is_some_and(|carrier| carrier.key == *key)
+    fn send_carrier_message(
+        &mut self,
+        key: &CarrierKey,
+        message: Message,
+    ) -> Result<(), ClientError> {
+        if let Message::Pong(payload) = &message
+            && payload.len() > M2_MAX_WEBSOCKET_CONTROL_PAYLOAD
         {
-            self.candidate.as_ref().expect("candidate checked")
-        } else {
+            return Err(ClientError::Protocol(
+                "data ping payload exceeds websocket control bound".to_owned(),
+            ));
+        }
+        let Some(tx) = self.carrier_for_key(key).map(|carrier| carrier.tx.clone()) else {
             return Ok(());
         };
-        carrier
-            .tx
-            .try_send(CarrierCommand::Message(message))
-            .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => ClientError::QueueLimit,
-                mpsc::error::TrySendError::Closed(_) => ClientError::Transport {
-                    scope: "data writer",
-                    detail: "data writer stopped".to_owned(),
-                },
-            })
+        // Heartbeats may use ordinary queue capacity, but never consume the
+        // four slots reserved for ACK/WINDOW/terminal traffic.  If the
+        // ordinary portion is full, retain only the latest bounded Pong and
+        // let the timer retry it after the writer drains.
+        let is_pong = matches!(&message, Message::Pong(_));
+        if is_pong && tx.capacity() <= M2_CARRIER_RESERVED_FRAMES {
+            self.pending_pongs.insert(key.clone(), message);
+            return Ok(());
+        }
+        match tx.try_reserve_owned() {
+            Ok(permit) => {
+                permit.send(CarrierCommand::Message(message));
+                Ok(())
+            }
+            Err(mpsc::error::TrySendError::Full(_)) if is_pong => {
+                self.pending_pongs.insert(key.clone(), message);
+                Ok(())
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => Err(ClientError::QueueLimit),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(ClientError::Transport {
+                scope: "data writer",
+                detail: "data writer stopped".to_owned(),
+            }),
+        }
+    }
+
+    fn flush_pending_pongs(&mut self) -> Result<(), ClientError> {
+        let pending = std::mem::take(&mut self.pending_pongs);
+        for (key, message) in pending {
+            let Some(tx) = self.carrier_for_key(&key).map(|carrier| carrier.tx.clone()) else {
+                continue;
+            };
+            if tx.capacity() <= M2_CARRIER_RESERVED_FRAMES {
+                self.pending_pongs.insert(key, message);
+                continue;
+            }
+            match tx.try_reserve_owned() {
+                Ok(permit) => {
+                    permit.send(CarrierCommand::Message(message));
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    self.pending_pongs.insert(key, message);
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    return Err(ClientError::Transport {
+                        scope: "data writer",
+                        detail: "data writer stopped".to_owned(),
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 
     fn queue_carrier_bytes(&self, key: &CarrierKey, bytes: Vec<u8>) -> Result<(), ClientError> {
-        let carrier = if self.active.key == *key {
-            &self.active
-        } else if self
-            .candidate
-            .as_ref()
-            .is_some_and(|carrier| carrier.key == *key)
-        {
-            self.candidate.as_ref().expect("candidate checked")
-        } else {
-            return Err(ClientError::Protocol("stale data carrier".to_owned()));
-        };
-        let length = bytes.len();
-        self.data_budget.reserve(length)?;
-        let item = QueuedCarrierFrame {
-            bytes,
-            bytes_len: length,
-            budget: self.data_budget.clone(),
-        };
-        carrier
+        self.send_reserved_carrier_bytes(key, bytes, true)
+    }
+
+    fn queue_reserved_carrier_bytes(
+        &self,
+        key: &CarrierKey,
+        bytes: Vec<u8>,
+    ) -> Result<(), ClientError> {
+        self.send_reserved_carrier_bytes(key, bytes, false)
+    }
+
+    fn reserve_carrier_frame(
+        &self,
+        key: &CarrierKey,
+        bytes_len: usize,
+        preserve_reserved_slots: bool,
+    ) -> Result<(mpsc::OwnedPermit<CarrierCommand>, Arc<QueueBudget>), ClientError> {
+        let carrier = self
+            .carrier_for_key(key)
+            .ok_or_else(|| ClientError::Protocol("stale data carrier".to_owned()))?;
+        if preserve_reserved_slots && carrier.tx.capacity() <= M2_CARRIER_RESERVED_FRAMES {
+            return Err(ClientError::QueueLimit);
+        }
+        let permit = carrier
             .tx
-            .try_send(CarrierCommand::Frame(item))
+            .clone()
+            .try_reserve_owned()
             .map_err(|error| match error {
                 mpsc::error::TrySendError::Full(_) => ClientError::QueueLimit,
                 mpsc::error::TrySendError::Closed(_) => ClientError::Transport {
                     scope: "data writer",
                     detail: "data writer stopped".to_owned(),
                 },
-            })
+            })?;
+        if let Err(error) = self.reserve_carrier_budget(bytes_len, preserve_reserved_slots) {
+            drop(permit);
+            return Err(error);
+        }
+        Ok((permit, self.data_budget.clone()))
+    }
+
+    fn reserve_carrier_budget(
+        &self,
+        bytes_len: usize,
+        preserve_critical_bytes: bool,
+    ) -> Result<(), ClientError> {
+        let reserved = if preserve_critical_bytes {
+            critical_reserved_bytes(self.data_budget.maximum)
+        } else {
+            0
+        };
+        let maximum = self.data_budget.maximum.saturating_sub(reserved);
+        if bytes_len > maximum {
+            return Err(ClientError::QueueLimit);
+        }
+        let mut current = self.data_budget.bytes.load(Ordering::Acquire);
+        loop {
+            let Some(next) = current.checked_add(bytes_len) else {
+                return Err(ClientError::QueueLimit);
+            };
+            if next > maximum {
+                return Err(ClientError::QueueLimit);
+            }
+            match self.data_budget.bytes.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    fn send_reserved_carrier_bytes(
+        &self,
+        key: &CarrierKey,
+        bytes: Vec<u8>,
+        preserve_reserved_slots: bool,
+    ) -> Result<(), ClientError> {
+        let bytes_len = bytes.len();
+        let (permit, budget) =
+            self.reserve_carrier_frame(key, bytes_len, preserve_reserved_slots)?;
+        let item = QueuedCarrierFrame {
+            bytes,
+            bytes_len,
+            budget,
+        };
+        permit.send(CarrierCommand::Frame(item));
+        Ok(())
     }
 
     async fn dispatch_payload(
@@ -3280,7 +5901,7 @@ impl M2Actor {
         payload: Vec<u8>,
     ) -> Result<(), ClientError> {
         if !payload.is_empty() {
-            self.ensure_retained_capacity(payload.len())?;
+            self.ensure_bulk_retained_capacity(payload.len())?;
         }
         let responses = {
             let Some(stream) = self.streams.get_mut(&stream_id) else {
@@ -3379,6 +6000,13 @@ impl M2Actor {
     }
 
     async fn emit_or_defer(&mut self, output: PendingOutput) -> Result<(), ClientError> {
+        if self
+            .pending_forgets
+            .get(&output.stream_id)
+            .is_some_and(|pending| !pending.proof_pending)
+        {
+            return Ok(());
+        }
         let is_reset = output.kind == FrameKind::Reset;
         let stream_terminal = self
             .streams
@@ -3395,53 +6023,79 @@ impl M2Actor {
                 return Ok(());
             }
         }
-        if self.writes_frozen {
-            if self.pending_outputs.len() >= self.config.limits.max_queue_frames.max(1) {
-                if is_reset && let Some(stream) = self.streams.get_mut(&output.stream_id) {
-                    stream.reset_queued = false;
-                }
-                return Err(ClientError::QueueLimit);
-            }
-            let bytes = output.payload.len();
-            if let Err(error) = self.ensure_retained_capacity(bytes) {
-                if is_reset && let Some(stream) = self.streams.get_mut(&output.stream_id) {
-                    stream.reset_queued = false;
-                }
-                return Err(error);
-            }
-            self.pending_output_bytes = self.pending_output_bytes.saturating_add(bytes);
-            self.pending_outputs.push_back(output);
-            self.publish_status();
-            return Ok(());
+        // A same-stream output already retained for the carrier must be sent
+        // first.  Keeping the new output deferred preserves sequence order;
+        // otherwise a newly available carrier slot could let FIN/RESET or a
+        // later DATA overtake the retained prefix.
+        if has_pending_output_for_stream(&self.pending_outputs, output.stream_id) {
+            return self.defer_pending_output(output);
         }
-        self.emit_output_now(output)
+        if self.writes_frozen {
+            return self.defer_pending_output(output);
+        }
+        match self.emit_output_now(&output) {
+            Ok(()) => Ok(()),
+            Err(ClientError::QueueLimit) => self.defer_pending_output(output),
+            Err(error) => {
+                if is_reset && let Some(stream) = self.streams.get_mut(&output.stream_id) {
+                    stream.reset_queued = false;
+                }
+                Err(error)
+            }
+        }
     }
 
-    fn emit_output_now(&mut self, output: PendingOutput) -> Result<(), ClientError> {
-        self.ensure_retained_capacity(output.payload.len())?;
+    fn defer_pending_output(&mut self, output: PendingOutput) -> Result<(), ClientError> {
+        if self.pending_outputs.len() >= self.config.limits.max_queue_frames.max(1) {
+            if output.kind == FrameKind::Reset
+                && let Some(stream) = self.streams.get_mut(&output.stream_id)
+            {
+                stream.reset_queued = false;
+            }
+            return Err(ClientError::QueueLimit);
+        }
+        let bytes = output.payload.len();
+        let critical = matches!(
+            output.kind,
+            FrameKind::Ack | FrameKind::WindowUpdate | FrameKind::Fin | FrameKind::Reset
+        );
+        if let Err(error) = self.ensure_retained_capacity_with_reserve(bytes, !critical) {
+            if output.kind == FrameKind::Reset
+                && let Some(stream) = self.streams.get_mut(&output.stream_id)
+            {
+                stream.reset_queued = false;
+            }
+            return Err(error);
+        }
+        self.pending_output_bytes = self.pending_output_bytes.saturating_add(bytes);
+        self.pending_outputs.push_back(output);
+        self.publish_status();
+        Ok(())
+    }
+
+    fn emit_output_now(&mut self, output: &PendingOutput) -> Result<(), ClientError> {
+        let critical = matches!(
+            output.kind,
+            FrameKind::Ack | FrameKind::WindowUpdate | FrameKind::Fin | FrameKind::Reset
+        );
+        self.ensure_retained_capacity_with_reserve(output.payload.len(), !critical)?;
         let (generation, key) = {
             let key = self.active.key.clone();
             (key.generation, key)
         };
-        let encoded = {
-            let Some(stream) = self.streams.get_mut(&output.stream_id) else {
+        let frame = {
+            let Some(stream) = self.streams.get(&output.stream_id) else {
                 return Ok(());
             };
             if stream.terminal() {
-                if output.kind == FrameKind::Reset {
-                    stream.reset_queued = false;
-                }
                 return Ok(());
             }
-            if output.kind == FrameKind::Reset {
+            if output.kind == FrameKind::Reset && !stream.reset_queued {
                 // Every RESET reaches this function through emit_or_defer,
                 // which marks it before either immediate send or deferral.
                 // A missing marker means a stale/internal duplicate and is
                 // therefore suppressed rather than allocating a sequence.
-                if !stream.reset_queued {
-                    return Ok(());
-                }
-                stream.reset_queued = false;
+                return Ok(());
             }
             let direction = Direction::ConnectorToRelay;
             let sequence = match output.kind {
@@ -3459,14 +6113,14 @@ impl M2Actor {
                 .sequence
                 .direction(Direction::RelayToConnector)
                 .recv_contiguous();
-            let frame = match output.kind {
+            match output.kind {
                 FrameKind::Data => Frame::data(
                     self.session.epoch,
                     generation,
                     output.stream_id,
                     sequence,
                     ack,
-                    output.payload,
+                    output.payload.clone(),
                 ),
                 FrameKind::Fin => Frame::fin(
                     self.session.epoch,
@@ -3487,23 +6141,41 @@ impl M2Actor {
                 FrameKind::WindowUpdate => {
                     Frame::window_update(self.session.epoch, generation, output.stream_id, 0)
                 }
+            }
+        };
+        let encoded = frame
+            .encode()
+            .map_err(|error| ClientError::Protocol(error.to_string()))?;
+        self.ensure_retained_capacity_with_reserve(encoded.len(), !critical)?;
+        let (permit, budget) = self.reserve_carrier_frame(&key, encoded.len(), !critical)?;
+        {
+            let Some(stream) = self.streams.get_mut(&output.stream_id) else {
+                budget.release(encoded.len());
+                drop(permit);
+                return Ok(());
             };
-            stream
+            if let Err(error) = stream
                 .sequence
-                .send_frame(direction, &frame)
-                .map_err(|error| ClientError::Protocol(error.to_string()))?;
+                .send_frame(Direction::ConnectorToRelay, &frame)
+            {
+                budget.release(encoded.len());
+                drop(permit);
+                return Err(ClientError::Protocol(error.to_string()));
+            }
             if output.kind == FrameKind::Fin {
                 stream.output_fin = true;
             }
             if output.kind == FrameKind::Reset {
                 stream.output_reset = true;
+                stream.reset_queued = false;
             }
-            frame
-                .encode()
-                .map_err(|error| ClientError::Protocol(error.to_string()))?
-        };
-        self.ensure_retained_capacity(encoded.len())?;
-        self.queue_carrier_bytes(&key, encoded)?;
+        }
+        let encoded_len = encoded.len();
+        permit.send(CarrierCommand::Frame(QueuedCarrierFrame {
+            bytes: encoded,
+            bytes_len: encoded_len,
+            budget,
+        }));
         self.publish_status();
         Ok(())
     }
@@ -3819,9 +6491,12 @@ impl M2Actor {
     /// socket reader event, so the immutable barrier is deliberately deferred
     /// until both pieces of readiness are owned by this actor.
     fn apply_pending_quiesce(&mut self) -> Result<(), ClientError> {
-        if self.rotation.phase() != RotationPhase::Preparing
-            || self.candidate.is_none()
+        if !matches!(
+            self.rotation.phase(),
+            RotationPhase::Preparing | RotationPhase::Quiescing
+        ) || self.candidate.is_none()
             || self.pending_quiesce.is_none()
+            || self.has_pre_quiesce_forgets()
         {
             return Ok(());
         }
@@ -3830,24 +6505,67 @@ impl M2Actor {
             .as_ref()
             .expect("pending quiesce checked")
             .clone();
-        self.rotation
-            .quiesce(&quiesce.attempt, quiesce.roster, self.now_ms())
-            .map_err(|error| {
-                ClientError::Protocol(format!("rotation quiesce rejected: {error}"))
-            })?;
-        self.active
-            .tx
-            .try_send(CarrierCommand::Barrier)
-            .map_err(|error| ClientError::Transport {
-                scope: "active data writer",
-                detail: format!("unable to schedule immutable fence barrier: {error}"),
-            })
+        if self.rotation.phase() == RotationPhase::Preparing {
+            self.rotation
+                .quiesce(&quiesce.attempt, quiesce.roster, self.now_ms())
+                .map_err(|error| {
+                    ClientError::Protocol(format!("rotation quiesce rejected: {error}"))
+                })?;
+        }
+        if self.barrier_queued {
+            return Ok(());
+        }
+        let permit = match self.active.tx.clone().try_reserve_owned() {
+            Ok(permit) => permit,
+            Err(mpsc::error::TrySendError::Full(_)) => return Ok(()),
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                return Err(ClientError::Transport {
+                    scope: "active data writer",
+                    detail: "unable to schedule immutable fence barrier: writer stopped".to_owned(),
+                });
+            }
+        };
+        // Barrier carries no payload and intentionally bypasses the byte
+        // budget; its bounded queue permit still preserves frame ordering.
+        permit.send(CarrierCommand::Barrier);
+        self.barrier_queued = true;
+        Ok(())
     }
 
     fn handle_barrier_complete(&mut self, key: &CarrierKey) -> Result<(), ClientError> {
+        let forget_barrier = self.mark_pending_forget_barrier_complete(key);
         if self.active.key != *key {
+            self.complete_pending_stream_forgets(key)?;
+            if !self.has_pre_quiesce_forgets() {
+                self.apply_pending_quiesce()?;
+            }
             return Ok(());
         }
+
+        // An active barrier is a rotation fence only while `barrier_queued` is
+        // set.  Forget barriers are queued after that fence has drained, and
+        // must never consume a pending QUIESCE as if they were the immutable
+        // rotation fence.
+        if !self.barrier_queued {
+            if forget_barrier {
+                self.complete_pending_stream_forgets(key)?;
+                if !self.has_pre_quiesce_forgets() {
+                    self.apply_pending_quiesce()?;
+                }
+            }
+            return Ok(());
+        }
+
+        self.barrier_queued = false;
+        if self.has_pre_quiesce_forgets() {
+            // STREAM_FORGET may arrive after the rotation barrier was queued.
+            // The physical barrier has drained, but the stream must be removed
+            // before taking the immutable roster snapshot.  Keep QUIESCE
+            // pending and retry the forget barriers first.
+            self.retry_pending_forget_barriers()?;
+            return Ok(());
+        }
+
         let Some(quiesce) = self.pending_quiesce.take() else {
             return Ok(());
         };
@@ -4016,6 +6734,15 @@ impl M2Actor {
                 "ROTATE_RETIRE snapshot mismatch".to_owned(),
             ));
         }
+        self.flush_pending_carrier_controls()?;
+        self.retry_pending_forget_barriers()?;
+        if self.retiring.as_ref().is_some_and(|carrier| {
+            !carrier.pending_controls.is_empty()
+                || self.carrier_has_pending_forget_barrier(&carrier.key)
+        }) {
+            self.pending_retire = Some(retire);
+            return Ok(());
+        }
         let old = self
             .retiring
             .take()
@@ -4050,6 +6777,22 @@ impl M2Actor {
         self.send_rotation_reply(&retire.message_id, response)?;
         self.publish_status();
         Ok(())
+    }
+
+    async fn retry_pending_retire(&mut self) -> Result<(), ClientError> {
+        let Some(retire) = self.pending_retire.take() else {
+            return Ok(());
+        };
+        self.flush_pending_carrier_controls()?;
+        self.retry_pending_forget_barriers()?;
+        if self.retiring.as_ref().is_some_and(|carrier| {
+            !carrier.pending_controls.is_empty()
+                || self.carrier_has_pending_forget_barrier(&carrier.key)
+        }) {
+            self.pending_retire = Some(retire);
+            return Ok(());
+        }
+        self.handle_rotate_retire(retire).await
     }
 
     fn handle_rotate_retired(&mut self, _retired: RotateRetired) -> Result<(), ClientError> {
@@ -4107,6 +6850,8 @@ impl M2Actor {
         self.local_fence = None;
         self.sent_drain_proof = false;
         self.pending_quiesce = None;
+        self.barrier_queued = false;
+        self.pending_retire = None;
         self.local_frozen_message_id = None;
         self.local_drained_message_id = None;
         self.local_committed_message_id = None;
@@ -4119,6 +6864,7 @@ impl M2Actor {
         self.accepting = true;
         self.writes_frozen = false;
         self.rotations_completed = self.rotations_completed.saturating_add(1);
+        self.complete_ready_stream_forgets()?;
         self.flush_pending_outputs().await?;
         self.publish_status();
         Ok(())
@@ -4193,6 +6939,8 @@ impl M2Actor {
                 ClientError::Protocol(format!("candidate closure rejected: {error}"))
             })?;
         self.pending_quiesce = None;
+        self.barrier_queued = false;
+        self.pending_retire = None;
         self.peer_fence_message_id = None;
         self.pending_candidate = None;
         let response = ControlMessage::RotateAborted(RotateAborted {
@@ -4252,6 +7000,7 @@ impl M2Actor {
         self.pending_abort_reply_id = None;
         self.accepting = true;
         self.writes_frozen = false;
+        self.complete_ready_stream_forgets()?;
         self.flush_pending_outputs().await?;
         self.publish_status();
         Ok(())
@@ -4275,7 +7024,7 @@ impl M2Actor {
                 || resume.attempt != completed.begin.attempt
                 || resume.snapshot_id != completed.begin.roster.snapshot_id
                 || resume.remaining_ms == 0
-                || resume.remaining_ms > completed.deadline_ms.saturating_sub(now)
+                || resume.remaining_ms > MAX_ROTATION_RECOVERY_TIMEOUT_MS
                 || entries.keys().copied().collect::<Vec<_>>() != completed.begin.roster.stream_ids
             {
                 return Err(ClientError::Protocol(
@@ -4314,13 +7063,9 @@ impl M2Actor {
                     "RESUME without RECOVERY_BEGIN".to_owned(),
                 ));
             };
-            if resume.attempt != recovery.begin.attempt
-                || resume.snapshot_id != recovery.begin.roster.snapshot_id
-                || resume.remaining_ms == 0
-                || resume.remaining_ms > recovery.deadline_ms.saturating_sub(now)
-            {
+            if let Some(mismatch) = resume_context_mismatch(&resume, recovery, now) {
                 return Err(ClientError::Protocol(
-                    "RESUME recovery context or deadline mismatch".to_owned(),
+                    self.retained_recovery_detail(mismatch.detail()),
                 ));
             }
             let valid_reply = if resume.stage == ResumeStage::Snapshot {
@@ -4344,6 +7089,21 @@ impl M2Actor {
             return Err(ClientError::Protocol(
                 "RESUME entries do not match the immutable roster".to_owned(),
             ));
+        }
+        // Control input can win the select before the maintenance tick. An
+        // expired candidate must not journal a new snapshot or emit replay.
+        if self.recovery.as_ref().is_some_and(|recovery| {
+            recovery
+                .attempt_deadline_ms
+                .is_some_and(|deadline| now >= deadline)
+        }) {
+            if self.pending_candidate.is_some() {
+                return self.expire_pending_candidate().await;
+            }
+            return Err(ClientError::Transport {
+                scope: "retained recovery",
+                detail: self.retained_recovery_detail("recovery candidate phase deadline expired"),
+            });
         }
         let deadline_ms = self
             .recovery
@@ -4490,7 +7250,7 @@ impl M2Actor {
                     let encoded = frame
                         .encode()
                         .map_err(|error| ClientError::Protocol(error.to_string()))?;
-                    self.ensure_retained_capacity(encoded.len())?;
+                    self.ensure_bulk_retained_capacity(encoded.len())?;
                     self.queue_carrier_bytes(&candidate_key, encoded)?;
                 }
             }
@@ -4619,7 +7379,7 @@ impl M2Actor {
         };
         for (message, request_id) in outbound {
             let response = message.clone();
-            self.send_control(message, None)?;
+            self.send_critical_control(message, None)?;
             self.complete_recovery_message(&request_id, Some(&response))?;
         }
         Ok(())
@@ -4663,7 +7423,7 @@ impl M2Actor {
             }
             return Err(ClientError::Transport {
                 scope: "retained recovery",
-                detail: "recovery candidate phase deadline expired".to_owned(),
+                detail: self.retained_recovery_detail("recovery candidate phase deadline expired"),
             });
         }
         let ready_to_finish = self.recovery.as_ref().is_some_and(|recovery| {
@@ -4721,6 +7481,12 @@ impl M2Actor {
             }
             verdicts
         };
+        let recovery_attempt_started_at_ms = self.rotation.status().started_at_ms;
+        let recovery_attempt_deadline_ms = self.rotation.status().deadline_ms;
+        let recovery_attempt = self
+            .recovery
+            .as_ref()
+            .map(|recovery| recovery.begin.attempt_no);
         let frozen_snapshots = self.local_resume_snapshots(&roster)?;
         self.rotation
             .reconcile_validated(&attempt, verdicts, self.now_ms())
@@ -4784,18 +7550,35 @@ impl M2Actor {
         }
         for (message, request_id) in &ready_messages {
             let response = message.clone();
-            self.send_control(response.clone(), None)?;
+            self.send_critical_control(response.clone(), None)?;
             self.complete_recovery_message(request_id, Some(&response))?;
         }
         if let Some(completed) = self.recovery.take() {
             self.completed_recovery = Some(completed);
         }
+        // The completed journal retains its immutable attestation and digest,
+        // while closure evidence belongs only to the episode that just ended.
+        // Clear it at the verified activation boundary so a later recovery
+        // cannot submit historical connection IDs to RotationState.
+        self.closed_for_recovery.clear();
+        self.released_recovery_connections.clear();
+        self.first_recovery_trigger = None;
         self.pending_candidate = None;
         self.recovery_requested = false;
         self.accepting = true;
         self.writes_frozen = false;
         self.rotations_completed = self.rotations_completed.saturating_add(1);
+        self.complete_ready_stream_forgets()?;
         self.flush_pending_outputs().await?;
+        // Only this path has completed sequence reconciliation, candidate
+        // identity validation, old-carrier closure, and both READY replies.
+        // Record the reset after the final flush so a failed activation cannot
+        // look like a successful recovery in the CLI status stream.
+        self.last_recovery_reset_reason = Some(M2_RECOVERY_RESET_FENCED_SUCCESSOR);
+        self.last_recovery_successor = Some(attempt);
+        self.last_recovery_attempt = recovery_attempt;
+        self.last_recovery_attempt_started_at_ms = recovery_attempt_started_at_ms;
+        self.last_recovery_attempt_deadline_ms = recovery_attempt_deadline_ms;
         self.publish_status();
         Ok(())
     }
@@ -4822,10 +7605,18 @@ impl M2Actor {
             let Some(output) = self.pending_outputs.pop_front() else {
                 break;
             };
-            self.pending_output_bytes = self
-                .pending_output_bytes
-                .saturating_sub(output.payload.len());
-            self.emit_output_now(output)?;
+            let output_bytes = output.payload.len();
+            self.pending_output_bytes = self.pending_output_bytes.saturating_sub(output_bytes);
+            match self.emit_output_now(&output) {
+                Ok(()) => {}
+                Err(ClientError::QueueLimit) => {
+                    self.pending_output_bytes =
+                        self.pending_output_bytes.saturating_add(output_bytes);
+                    self.pending_outputs.push_front(output);
+                    break;
+                }
+                Err(error) => return Err(error),
+            }
         }
         self.publish_status();
         Ok(())
@@ -4913,6 +7704,7 @@ impl M2Actor {
                 key: CarrierKey::new(0, "recovery-placeholder"),
                 local_addr: None,
                 tx: mpsc::channel(1).0,
+                pending_controls: BTreeMap::new(),
                 reader_cancel: CancellationToken::new(),
                 reader: None,
                 writer: None,
@@ -5040,6 +7832,10 @@ impl M2Actor {
             })?;
         self.closed_for_recovery
             .insert(evidence.connection_id.clone(), evidence);
+        // `candidate_closed` records only this connector's side of the
+        // bilateral closure.  RotationState still owns the physical
+        // allocation until the next RECOVERY_BEGIN consumes this evidence via
+        // `close_for_recovery`; do not mark it released before that handoff.
         if let Some(mut pending) = self.pending_candidate.take() {
             if let Some(dial) = pending.dial.take() {
                 dial.abort();
@@ -5097,6 +7893,7 @@ impl M2Actor {
                     key: CarrierKey::new(0, "recovery-placeholder"),
                     local_addr: None,
                     tx: mpsc::channel(1).0,
+                    pending_controls: BTreeMap::new(),
                     reader_cancel: CancellationToken::new(),
                     reader: None,
                     writer: None,
@@ -5126,7 +7923,7 @@ impl M2Actor {
                     desired_interval_ms: None,
                     reason: Some("data_loss".to_owned()),
                 });
-                self.send_control(request, None)?;
+                self.send_critical_control(request, None)?;
             }
             self.publish_status();
             return Ok(());
@@ -5147,6 +7944,7 @@ impl M2Actor {
                 key: CarrierKey::new(0, "shutdown"),
                 local_addr: None,
                 tx: mpsc::channel(1).0,
+                pending_controls: BTreeMap::new(),
                 reader_cancel: CancellationToken::new(),
                 reader: None,
                 writer: None,
@@ -5228,6 +8026,13 @@ fn direction_snapshot_from_resume(state: &ResumeDirectionState) -> DirectionSnap
     }
 }
 
+fn no_stream_forget_state(stream_id: u64) -> ResumeDirectionState {
+    ResumeDirectionState {
+        stream_id,
+        ..ResumeDirectionState::default()
+    }
+}
+
 async fn join_carrier_task(mut task: JoinHandle<()>) -> bool {
     join_carrier_task_with_timeout(&mut task, M2_CLOSE_TIMEOUT).await
 }
@@ -5286,12 +8091,992 @@ async fn close_carrier(mut carrier: Carrier) -> ClosureEvidence {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_hooks;
+    use futures_util::{SinkExt, StreamExt};
+    use std::sync::{Arc, atomic::AtomicBool};
+    use tokio::{
+        net::{TcpListener, TcpStream},
+        sync::{Notify, watch},
+        time::timeout,
+    };
+    use tokio_tungstenite::{WebSocketStream, accept_async, connect_async};
+
+    const TEST_OWNER_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    fn owner_fence_welcome() -> tunnel_protocol::Welcome {
+        let mut welcome = tunnel_protocol::Welcome::new(
+            "welcome",
+            "hello",
+            "session",
+            7,
+            1,
+            "connection",
+            "ticket",
+            "reconnect",
+        );
+        welcome.owner_id = Some(TEST_OWNER_ID.to_owned());
+        welcome.supported_features = vec![M2_FEATURE.to_owned(), OWNER_FENCING_FEATURE.to_owned()];
+        welcome
+    }
 
     fn record(body: &[u8]) -> Vec<u8> {
         let mut encoded = Vec::with_capacity(M2_RECORD_HEADER_BYTES + body.len());
         encoded.extend_from_slice(&(body.len() as u32).to_be_bytes());
         encoded.extend_from_slice(body);
         encoded
+    }
+
+    fn test_open(stream_id: u64) -> Open {
+        Open::new(
+            format!("open-message-{stream_id}"),
+            "session",
+            1,
+            stream_id,
+            format!("operation-{stream_id}"),
+            "echo",
+            "echo_stream",
+            1_024,
+            1_024,
+        )
+    }
+
+    fn drain_control_messages(
+        receiver: &mut mpsc::Receiver<crate::QueuedMessage>,
+    ) -> Vec<ControlMessage> {
+        let mut messages = Vec::new();
+        while let Ok(item) = receiver.try_recv() {
+            let Message::Text(text) = &item.message else {
+                continue;
+            };
+            messages.push(decode_control(text.as_bytes()).expect("queued control should decode"));
+        }
+        messages
+    }
+
+    fn test_actor_with_carrier(
+        capacity: usize,
+    ) -> (
+        M2Actor,
+        CarrierKey,
+        mpsc::Receiver<CarrierCommand>,
+        mpsc::Receiver<crate::QueuedMessage>,
+    ) {
+        test_actor_with_control_capacity(capacity, 8)
+    }
+
+    fn test_actor_with_control_capacity(
+        capacity: usize,
+        control_capacity: usize,
+    ) -> (
+        M2Actor,
+        CarrierKey,
+        mpsc::Receiver<CarrierCommand>,
+        mpsc::Receiver<crate::QueuedMessage>,
+    ) {
+        let cancellation = CancellationToken::new();
+        let config = RuntimeConfig::default();
+        let session = SessionInfo {
+            session_id: "session".to_owned(),
+            epoch: 1,
+            generation: 1,
+        };
+        let owner_id = "owner".to_owned();
+        let active_key = CarrierKey::new(session.generation, "active");
+        let (tx, receiver) = mpsc::channel(capacity);
+        let active = Carrier {
+            key: active_key.clone(),
+            local_addr: None,
+            tx,
+            pending_controls: BTreeMap::new(),
+            reader_cancel: CancellationToken::new(),
+            reader: None,
+            writer: None,
+        };
+        let rotation = RotationState::new(
+            session.session_id.clone(),
+            owner_id.clone(),
+            session.epoch,
+            session.generation,
+            active_key.connection_id.clone(),
+            RotationConfig::default(),
+        )
+        .expect("test rotation state");
+        let (control_queue, control_receiver) = OutboundQueue::new(
+            control_capacity,
+            M2_CONTROL_QUEUE_BYTES,
+            cancellation.clone(),
+        );
+        let data_budget = Arc::new(QueueBudget {
+            bytes: std::sync::atomic::AtomicUsize::new(0),
+            maximum: config.limits.max_queue_bytes,
+        });
+        let (status, _status_receiver) = watch::channel(ConnectionStatus::default());
+        let (events, _event_receiver) = mpsc::channel(M2_EVENT_CAPACITY);
+        let open_journal = OpenJournal::new(
+            retained_stream_limit(config.limits.max_streams).max(1),
+            config.limits.max_queue_bytes.min(MAX_JOURNAL_BYTES),
+        );
+        let pending_open_budget = Arc::new(QueueBudget {
+            bytes: std::sync::atomic::AtomicUsize::new(0),
+            maximum: pending_open_budget_max(
+                config.limits.max_streams,
+                config.limits.max_queue_bytes,
+            ),
+        });
+        let actor = M2Actor {
+            config,
+            session,
+            owner_id,
+            owner_fence: None,
+            rotation,
+            control_queue,
+            pending_critical_controls: VecDeque::new(),
+            pending_critical_control_bytes: 0,
+            data_budget,
+            events,
+            active,
+            candidate: None,
+            retiring: None,
+            pending_candidate: None,
+            pending_candidate_close: None,
+            recovery: None,
+            completed_recovery: None,
+            control_journal: None,
+            rotation_journal: None,
+            rotation_journal_attempt: None,
+            rotation_journal_deadline_ms: None,
+            rotation_prepare_message_id: None,
+            local_frozen_message_id: None,
+            local_drained_message_id: None,
+            local_committed_message_id: None,
+            local_retired_message_id: None,
+            peer_drained_message_id: None,
+            peer_committed_message_id: None,
+            peer_retire_message_id: None,
+            peer_abort_message_id: None,
+            rotation_reply_cache: BTreeMap::new(),
+            completed_rotation: None,
+            pending_abort_reply_id: None,
+            recovery_requested: false,
+            first_recovery_trigger: None,
+            released_recovery_connections: BTreeSet::new(),
+            last_recovery_reset_reason: None,
+            last_recovery_successor: None,
+            last_recovery_attempt: None,
+            last_recovery_attempt_started_at_ms: None,
+            last_recovery_attempt_deadline_ms: None,
+            closed_for_recovery: BTreeMap::new(),
+            streams: BTreeMap::new(),
+            open_journal,
+            pending_open_budget,
+            pending_open: None,
+            pending_open_queue: VecDeque::new(),
+            pending_authorization_refreshes: BTreeMap::new(),
+            accepting: true,
+            writes_frozen: false,
+            pending_outputs: VecDeque::new(),
+            pending_output_bytes: 0,
+            peer_fence: None,
+            local_fence: None,
+            sent_drain_proof: false,
+            pending_quiesce: None,
+            barrier_queued: false,
+            pending_retire: None,
+            pending_pongs: BTreeMap::new(),
+            pending_forgets: BTreeMap::new(),
+            forgotten_stream_through: 0,
+            peer_fence_message_id: None,
+            rotation_started: Instant::now(),
+            rotations_completed: 0,
+            status,
+            cancellation,
+            control_local_addr: None,
+        };
+        (actor, active_key, receiver, control_receiver)
+    }
+
+    async fn fill_control_queue_before_open(actor: &mut M2Actor) -> Result<(), ClientError> {
+        actor.streams.insert(1, test_stream());
+        for stream_id in 2..=8 {
+            actor
+                .handle_control(ControlMessage::Open(test_open(stream_id)))
+                .await?;
+        }
+        // Seven accepted OPENs consume fourteen bounded response slots.  A
+        // heartbeat reply occupies the fifteenth slot, making the next OPEN
+        // cross the exact two-response admission boundary.
+        actor
+            .handle_control(ControlMessage::Ping(Ping::new("ping", "session", 1, 1)))
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn terminal_stream_does_not_consume_active_open_capacity() {
+        let (mut actor, _active_key, _carrier_receiver, _control_receiver) =
+            test_actor_with_control_capacity(M2_CARRIER_QUEUE_FRAMES, 16);
+        let mut terminal = test_stream();
+        terminal.output_fin = true;
+        actor.streams.insert(1, terminal);
+        for stream_id in 2..=64 {
+            actor.streams.insert(stream_id, test_stream());
+        }
+        assert_eq!(actor.streams.len(), 64);
+        assert_eq!(
+            actor
+                .streams
+                .values()
+                .filter(|stream| !stream.terminal())
+                .count(),
+            63
+        );
+        for stream_id in 1..=64 {
+            let open = test_open(stream_id);
+            let canonical = encode_control(&ControlMessage::Open(open.clone()))
+                .expect("test OPEN should encode");
+            assert!(matches!(
+                actor.open_journal.observe(
+                    &open.message_id,
+                    &canonical,
+                    open.stream_id,
+                    &open.operation_id,
+                ),
+                Ok(OpenJournalObservation::New)
+            ));
+        }
+        assert_eq!(actor.open_journal.active_entries, 64);
+
+        let open = test_open(65);
+        actor
+            .handle_control(ControlMessage::Open(open.clone()))
+            .await
+            .expect("one terminal entry must leave one active OPEN slot");
+        assert!(actor.streams.contains_key(&open.stream_id));
+    }
+
+    #[tokio::test]
+    async fn retained_terminal_table_has_a_separate_bounded_limit() {
+        let (mut actor, _active_key, _carrier_receiver, mut control_receiver) =
+            test_actor_with_control_capacity(M2_CARRIER_QUEUE_FRAMES, 16);
+        for stream_id in 1..=128 {
+            let mut stream = test_stream();
+            if stream_id > 63 {
+                stream.output_fin = true;
+            }
+            actor.streams.insert(stream_id, stream);
+        }
+        assert_eq!(
+            actor
+                .streams
+                .values()
+                .filter(|stream| !stream.terminal())
+                .count(),
+            63
+        );
+        assert_eq!(actor.streams.len(), 128);
+
+        let open = test_open(129);
+        actor
+            .handle_control(ControlMessage::Open(open.clone()))
+            .await
+            .expect("retained-table exhaustion must be a typed rejection");
+        assert!(!actor.streams.contains_key(&open.stream_id));
+        assert!(matches!(
+            drain_control_messages(&mut control_receiver).last(),
+            Some(ControlMessage::Rejected(rejected))
+                if rejected.code == "RESOURCE_EXHAUSTED"
+                    && rejected.stream_id == open.stream_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn open_burst_defers_without_half_admission_and_delivers_after_writer_drain() {
+        let (mut actor, active_key, mut carrier_receiver, mut control_receiver) =
+            test_actor_with_control_capacity(M2_CARRIER_QUEUE_FRAMES, 16);
+        fill_control_queue_before_open(&mut actor)
+            .await
+            .expect("initial OPEN burst should be admitted");
+        assert_eq!(control_receiver.len(), 15);
+        let queued_bytes_before_open = actor.control_queue.budget.current();
+        let result = actor
+            .handle_control(ControlMessage::Open(test_open(9)))
+            .await;
+        result.expect("queue pressure should defer one bounded OPEN");
+        assert_eq!(control_receiver.len(), 15);
+        assert_eq!(
+            actor.control_queue.budget.current(),
+            queued_bytes_before_open
+        );
+        assert_eq!(actor.streams.len(), 8);
+        assert!(actor.streams.contains_key(&1));
+        assert!(!actor.streams.contains_key(&9));
+        assert!(actor.pending_open.is_some());
+        let pending_auth_deadline = actor
+            .pending_open
+            .as_ref()
+            .and_then(|pending| pending.authorization.as_ref())
+            .map(|authorization| authorization.auth_deadline.monotonic)
+            .expect("valid deferred OPEN should retain its challenge deadline");
+        let pending_operation_deadline = actor
+            .pending_open
+            .as_ref()
+            .expect("pending OPEN should retain its operation deadline")
+            .operation_deadline
+            .monotonic;
+        assert_eq!(actor.active.key, active_key);
+        assert!(actor.candidate.is_none());
+        assert!(actor.retiring.is_none());
+
+        // The carrier remains live while the control writer drains the two
+        // slots required by one OPEN. The operation deadline is anchored at
+        // receipt, and the first challenge deadline is retained rather than
+        // regenerated while the pair waits for bounded queue capacity.
+        assert!(matches!(
+            carrier_receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        control_receiver
+            .try_recv()
+            .expect("first queued control response should drain");
+        control_receiver
+            .try_recv()
+            .expect("second queued control response should drain");
+        assert_eq!(control_receiver.len(), 13);
+        actor
+            .flush_pending_open()
+            .expect("drained queue should admit the deferred OPEN");
+        assert!(actor.pending_open.is_none());
+        assert_eq!(actor.streams.len(), 9);
+        assert!(actor.streams.contains_key(&9));
+        assert_eq!(control_receiver.len(), 15);
+        assert_eq!(actor.active.key, active_key);
+        assert!(matches!(
+            carrier_receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        let stream = actor.streams.get(&9).expect("deferred stream admitted");
+        assert!(stream.auth.refresh_in_flight);
+        assert_eq!(
+            stream.auth.deadline.monotonic, pending_auth_deadline,
+            "admission retry must not refresh the authorization deadline"
+        );
+        assert_eq!(
+            stream.auth.operation_deadline.monotonic, pending_operation_deadline,
+            "admission retry must not refresh the operation deadline"
+        );
+        assert!(
+            !stream
+                .auth
+                .deadline
+                .expired_at(Instant::now(), SystemTime::now())
+        );
+
+        let mut queued_messages = Vec::new();
+        while let Ok(item) = control_receiver.try_recv() {
+            let Message::Text(text) = &item.message else {
+                continue;
+            };
+            queued_messages
+                .push(decode_control(text.as_bytes()).expect("queued control JSON should decode"));
+        }
+        assert!(matches!(
+            queued_messages.get(queued_messages.len().saturating_sub(2)),
+            Some(ControlMessage::Opened(opened)) if opened.stream_id == 9
+        ));
+        assert!(matches!(
+            queued_messages.last(),
+            Some(ControlMessage::AuthorizationChallenge(challenge)) if challenge.stream_id == 9
+        ));
+        assert_eq!(actor.control_queue.budget.current(), 0);
+    }
+
+    #[tokio::test]
+    async fn pending_open_fifo_preserves_deadlines_and_admits_without_protocol_failure() {
+        let (mut actor, _active_key, _carrier_receiver, mut control_receiver) =
+            test_actor_with_control_capacity(M2_CARRIER_QUEUE_FRAMES, 16);
+        fill_control_queue_before_open(&mut actor)
+            .await
+            .expect("initial OPEN burst should be admitted");
+        actor
+            .handle_control(ControlMessage::Open(test_open(9)))
+            .await
+            .expect("first OPEN should be retained at the atomic pair boundary");
+        let first_deadline = actor
+            .pending_open
+            .as_ref()
+            .expect("first deferred OPEN should occupy the atomic head")
+            .operation_deadline
+            .monotonic;
+
+        actor
+            .handle_control(ControlMessage::Open(test_open(10)))
+            .await
+            .expect("second OPEN should enter the bounded FIFO");
+        assert_eq!(actor.pending_open_queue.len(), 1);
+        let second_deadline = actor
+            .pending_open_queue
+            .front()
+            .expect("second OPEN should retain its queue entry")
+            .operation_deadline
+            .monotonic;
+        assert!(
+            second_deadline >= first_deadline,
+            "each queued OPEN must retain its receive-time operation deadline"
+        );
+        assert_eq!(actor.streams.len(), 8);
+
+        control_receiver
+            .try_recv()
+            .expect("first queued control response should drain");
+        control_receiver
+            .try_recv()
+            .expect("second queued control response should drain");
+        actor
+            .flush_pending_open()
+            .expect("head OPEN should admit after its pair has room");
+        assert!(actor.pending_open.is_none());
+        assert_eq!(actor.pending_open_queue.len(), 1);
+        assert_eq!(actor.streams.len(), 9);
+        assert_eq!(
+            actor
+                .streams
+                .get(&9)
+                .expect("head OPEN should be admitted")
+                .auth
+                .operation_deadline
+                .monotonic,
+            first_deadline
+        );
+
+        control_receiver
+            .try_recv()
+            .expect("first admitted pair should drain before the FIFO head");
+        control_receiver
+            .try_recv()
+            .expect("second admitted pair should drain before the FIFO head");
+        actor
+            .flush_pending_open()
+            .expect("FIFO OPEN should admit after its pair has room");
+        assert!(actor.pending_open.is_none());
+        assert!(actor.pending_open_queue.is_empty());
+        assert_eq!(actor.streams.len(), 10);
+        assert_eq!(
+            actor
+                .streams
+                .get(&10)
+                .expect("FIFO OPEN should be admitted")
+                .auth
+                .operation_deadline
+                .monotonic,
+            second_deadline
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_open_refuses_after_drain_without_closing_existing_carrier() {
+        let (mut actor, active_key, mut carrier_receiver, mut control_receiver) =
+            test_actor_with_control_capacity(M2_CARRIER_QUEUE_FRAMES, 16);
+        fill_control_queue_before_open(&mut actor)
+            .await
+            .expect("initial OPEN burst should be admitted");
+        let queued_bytes_before_open = actor.control_queue.budget.current();
+        let result = actor
+            .handle_control(ControlMessage::Open(test_open(9)))
+            .await;
+        result.expect("queue pressure should defer one bounded OPEN");
+        assert_eq!(control_receiver.len(), 15);
+        assert_eq!(
+            actor.control_queue.budget.current(),
+            queued_bytes_before_open
+        );
+        assert_eq!(actor.streams.len(), 8);
+        assert!(actor.streams.contains_key(&1));
+        assert!(actor.pending_open.is_some());
+        control_receiver
+            .try_recv()
+            .expect("first queued control response should drain");
+        control_receiver
+            .try_recv()
+            .expect("second queued control response should drain");
+        actor.accepting = false;
+        actor
+            .flush_pending_open()
+            .expect("drained queue should emit a bounded refusal");
+        assert!(actor.pending_open.is_none());
+        assert_eq!(actor.streams.len(), 8);
+        assert!(!actor.streams.contains_key(&9));
+        assert_eq!(control_receiver.len(), 14);
+        assert_eq!(actor.active.key, active_key);
+        assert!(actor.candidate.is_none());
+        assert!(actor.retiring.is_none());
+        assert!(matches!(
+            carrier_receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+
+        let mut rejected_stream = false;
+        while let Ok(item) = control_receiver.try_recv() {
+            let Message::Text(text) = &item.message else {
+                continue;
+            };
+            if let ControlMessage::Rejected(rejected) =
+                decode_control(text.as_bytes()).expect("queued control JSON should decode")
+                && rejected.stream_id == 9
+            {
+                assert_eq!(rejected.code, "GOAWAY");
+                rejected_stream = true;
+            }
+        }
+        assert!(
+            rejected_stream,
+            "deferred OPEN should receive a typed refusal"
+        );
+        assert_eq!(actor.control_queue.budget.current(), 0);
+    }
+
+    #[tokio::test]
+    async fn deferred_open_expiry_emits_bounded_refusal_without_admission() {
+        let (mut actor, active_key, mut carrier_receiver, mut control_receiver) =
+            test_actor_with_control_capacity(M2_CARRIER_QUEUE_FRAMES, 16);
+        fill_control_queue_before_open(&mut actor)
+            .await
+            .expect("initial OPEN burst should be admitted");
+        actor
+            .handle_control(ControlMessage::Open(test_open(9)))
+            .await
+            .expect("queue pressure should defer one bounded OPEN");
+        let pending = actor
+            .pending_open
+            .as_mut()
+            .expect("queue pressure should retain the OPEN");
+        let expired_started = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("test instant should support a bounded subtraction");
+        let expired_wall = SystemTime::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("test wall clock should support a bounded subtraction");
+        pending
+            .authorization
+            .as_mut()
+            .expect("valid deferred OPEN should retain its challenge")
+            .auth_deadline =
+            DualDeadline::new(expired_started, expired_wall, Duration::from_millis(1))
+                .expect("expired test deadline should be representable");
+
+        control_receiver
+            .try_recv()
+            .expect("first queued control response should drain");
+        control_receiver
+            .try_recv()
+            .expect("second queued control response should drain");
+        actor
+            .flush_pending_open()
+            .expect("expired OPEN should receive a bounded refusal");
+        assert!(actor.pending_open.is_none());
+        assert_eq!(actor.streams.len(), 8);
+        assert!(!actor.streams.contains_key(&9));
+        assert_eq!(control_receiver.len(), 14);
+        assert_eq!(actor.active.key, active_key);
+        assert!(matches!(
+            carrier_receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+
+        let mut saw_expired = false;
+        while let Ok(item) = control_receiver.try_recv() {
+            let Message::Text(text) = &item.message else {
+                continue;
+            };
+            if let ControlMessage::Rejected(rejected) =
+                decode_control(text.as_bytes()).expect("queued control JSON should decode")
+                && rejected.stream_id == 9
+            {
+                assert_eq!(rejected.code, "AUTHORIZATION_EXPIRED");
+                saw_expired = true;
+            }
+        }
+        assert!(saw_expired, "expired OPEN should receive a typed refusal");
+        assert_eq!(actor.control_queue.budget.current(), 0);
+    }
+
+    #[tokio::test]
+    async fn refresh_burst_does_not_fail_on_bounded_control_queue() {
+        let (mut actor, _active_key, _carrier_receiver, mut control_receiver) =
+            test_actor_with_control_capacity(M2_CARRIER_QUEUE_FRAMES, 16);
+        let operation_deadline =
+            DualDeadline::new(Instant::now(), SystemTime::now(), Duration::from_secs(60))
+                .expect("test operation deadline");
+        for stream_id in 1..=20 {
+            let mut stream = test_stream();
+            stream.sequence = StreamState::new(stream_id, 1_024).expect("test stream sequence");
+            stream.auth.confirmed = true;
+            stream.auth.refresh_in_flight = false;
+            stream.auth.operation_deadline = operation_deadline;
+            actor.streams.insert(stream_id, stream);
+        }
+
+        let result = actor.refresh_authorizations().await;
+        assert!(
+            result.is_ok(),
+            "refreshing many established streams must defer bounded queue pressure, got {result:?}"
+        );
+        assert_eq!(actor.streams.len(), 20);
+        assert_eq!(control_receiver.len(), 16);
+        assert_eq!(actor.pending_authorization_refreshes.len(), 1);
+        let first_pending_deadline = actor
+            .pending_authorization_refreshes
+            .get(&17)
+            .expect("the first deferred refresh should belong to stream 17")
+            .auth_deadline
+            .monotonic;
+
+        let mut queued_refresh_ids = BTreeSet::new();
+        for _ in 0..4 {
+            let item = control_receiver
+                .try_recv()
+                .expect("one queued challenge should drain before each retry");
+            let Message::Text(text) = &item.message else {
+                panic!("queued refresh should be a text control message");
+            };
+            if let ControlMessage::AuthorizationChallenge(challenge) =
+                decode_control(text.as_bytes()).expect("queued challenge should decode")
+            {
+                queued_refresh_ids.insert(challenge.stream_id);
+            }
+            actor
+                .refresh_authorizations()
+                .await
+                .expect("a drained control slot should release one refresh");
+            assert!(actor.pending_authorization_refreshes.len() <= 1);
+        }
+        while let Ok(item) = control_receiver.try_recv() {
+            let Message::Text(text) = &item.message else {
+                continue;
+            };
+            if let ControlMessage::AuthorizationChallenge(challenge) =
+                decode_control(text.as_bytes()).expect("queued challenge should decode")
+            {
+                queued_refresh_ids.insert(challenge.stream_id);
+            }
+        }
+        assert!(
+            actor.pending_authorization_refreshes.is_empty(),
+            "all prepared refreshes should drain without extending their deadlines"
+        );
+        assert_eq!(queued_refresh_ids.len(), 20);
+        assert_eq!(
+            actor
+                .streams
+                .get(&17)
+                .expect("stream 17 remains established")
+                .auth
+                .deadline
+                .monotonic,
+            first_pending_deadline,
+            "a deferred refresh must retain its original absolute deadline"
+        );
+        for (&stream_id, stream) in &actor.streams {
+            assert!(
+                stream.auth.refresh_in_flight && queued_refresh_ids.contains(&stream_id),
+                "stream {stream_id} was not marked in-flight only after its challenge queued"
+            );
+        }
+        assert_eq!(actor.control_queue.budget.current(), 0);
+    }
+
+    #[tokio::test]
+    async fn saturated_carrier_keeps_critical_slots_and_cancellation_responsive() {
+        let (sender, mut receiver) = mpsc::channel(M2_CARRIER_QUEUE_FRAMES);
+        for _ in 0..(M2_CARRIER_QUEUE_FRAMES - M2_CARRIER_RESERVED_FRAMES) {
+            sender
+                .try_send(CarrierCommand::Barrier)
+                .expect("bulk queue should accept its non-reserved capacity");
+        }
+        assert_eq!(sender.capacity(), M2_CARRIER_RESERVED_FRAMES);
+
+        let mut pending = PendingCarrierControl::default();
+        for acknowledged in 0..1_024 {
+            pending.record_ack(acknowledged);
+            pending
+                .record_window(1)
+                .expect("bounded test counter cannot overflow");
+        }
+        assert_eq!(pending.acknowledged, Some(1_023));
+        assert_eq!(pending.released_window_bytes, 1_024);
+
+        // Critical control messages can still make progress from the reserved
+        // part of the fixed carrier queue while bulk work remains saturated.
+        for _ in 0..M2_CARRIER_RESERVED_FRAMES {
+            sender
+                .try_send(CarrierCommand::Message(Message::Pong(Vec::new().into())))
+                .expect("reserved carrier slot should accept control traffic");
+        }
+        assert_eq!(sender.capacity(), 0);
+        assert!(
+            sender.try_send(CarrierCommand::Barrier).is_err(),
+            "the fixed queue must remain bounded"
+        );
+
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        assert!(cancellation.is_cancelled());
+
+        drop(sender);
+        while receiver.recv().await.is_some() {}
+    }
+
+    #[tokio::test]
+    async fn pong_flood_coalesces_without_consuming_critical_slots() {
+        let (mut actor, key, mut receiver, _control_receiver) =
+            test_actor_with_carrier(M2_CARRIER_QUEUE_FRAMES);
+        for _ in 0..(M2_CARRIER_QUEUE_FRAMES - M2_CARRIER_RESERVED_FRAMES) {
+            actor
+                .active
+                .tx
+                .try_send(CarrierCommand::Barrier)
+                .expect("bulk queue should accept its non-reserved capacity");
+        }
+        actor
+            .send_carrier_message(&key, Message::Pong(vec![1].into()))
+            .expect("first full heartbeat is deferred");
+        actor
+            .send_carrier_message(&key, Message::Pong(vec![2].into()))
+            .expect("later heartbeat replaces the pending one");
+        assert_eq!(actor.pending_pongs.len(), 1);
+
+        let ack = Frame::ack(1, 1, 1, 1).encode().expect("ACK frame encodes");
+        for _ in 0..M2_CARRIER_RESERVED_FRAMES {
+            actor
+                .queue_reserved_carrier_bytes(&key, ack.clone())
+                .expect("critical ACK uses the reserved slot");
+        }
+        assert_eq!(actor.active.tx.capacity(), 0);
+        assert_eq!(actor.pending_pongs.len(), 1);
+
+        drop(actor);
+        while receiver.recv().await.is_some() {}
+    }
+
+    #[tokio::test]
+    async fn saturated_carrier_preserves_data_fifo_and_reserved_feedback() {
+        let (mut actor, key, mut receiver, _control_receiver) =
+            test_actor_with_carrier(M2_CARRIER_QUEUE_FRAMES);
+        for _ in 0..(M2_CARRIER_QUEUE_FRAMES - M2_CARRIER_RESERVED_FRAMES) {
+            actor
+                .active
+                .tx
+                .try_send(CarrierCommand::Barrier)
+                .expect("bulk carrier queue should accept its non-reserved capacity");
+        }
+
+        let mut stream = test_stream();
+        stream.sequence = StreamState::new(7, 1_024).expect("test stream sequence");
+        stream.auth.confirmed = true;
+        stream.auth.refresh_in_flight = false;
+        actor.streams.insert(7, stream);
+        let first = record(b"first");
+        let second = record(b"second");
+
+        // Exercise the authenticated inbound path rather than appending
+        // PendingOutput values directly. The full carrier leaves only reserved
+        // capacity, so both DATA responses and the terminal FIN are retained
+        // in the same-stream FIFO while ACK/WINDOW feedback is coalesced.
+        actor
+            .handle_frame(key.clone(), Frame::data(1, 1, 7, 1, 0, first.clone()))
+            .await
+            .expect("first DATA should defer under carrier pressure");
+        actor
+            .handle_frame(key.clone(), Frame::data(1, 1, 7, 2, 0, second.clone()))
+            .await
+            .expect("second DATA should defer behind the first");
+        actor
+            .handle_frame(key.clone(), Frame::fin(1, 1, 7, 3, 0))
+            .await
+            .expect("FIN should defer behind both DATA records");
+
+        assert_eq!(actor.pending_outputs.len(), 3);
+        assert_eq!(
+            actor
+                .pending_outputs
+                .iter()
+                .map(|output| output.kind)
+                .collect::<Vec<_>>(),
+            vec![FrameKind::Data, FrameKind::Data, FrameKind::Fin]
+        );
+        let pending_control = actor
+            .active
+            .pending_controls
+            .get(&7)
+            .expect("inbound DATA/FIN should retain feedback for the full carrier");
+        assert_eq!(pending_control.acknowledged, Some(3));
+        assert_eq!(
+            pending_control.released_window_bytes,
+            first.len() + second.len()
+        );
+
+        while receiver.try_recv().is_ok() {}
+        actor
+            .flush_pending_outputs()
+            .await
+            .expect("drained carrier should flush the retained FIFO");
+        actor
+            .flush_pending_carrier_controls()
+            .expect("reserved ACK/WINDOW feedback should flush after the FIFO");
+        assert!(actor.pending_outputs.is_empty());
+        assert!(actor.active.pending_controls.is_empty());
+
+        let mut frames = Vec::new();
+        while let Ok(command) = receiver.try_recv() {
+            if let CarrierCommand::Frame(frame) = command {
+                frames.push(Frame::decode(&frame.bytes).expect("deferred frame should decode"));
+            }
+        }
+        assert_eq!(frames.len(), 5);
+        assert_eq!(frames[0].kind, FrameKind::Data);
+        assert_eq!(frames[1].kind, FrameKind::Data);
+        assert_eq!(frames[2].kind, FrameKind::Fin);
+        assert_eq!(frames[0].sequence, 1);
+        assert_eq!(frames[1].sequence, 2);
+        assert_eq!(frames[2].sequence, 3);
+        assert_eq!(frames[0].payload, first);
+        assert_eq!(frames[1].payload, second);
+        assert_eq!(frames[3].kind, FrameKind::Ack);
+        assert_eq!(frames[3].ack, 3);
+        assert_eq!(frames[4].kind, FrameKind::WindowUpdate);
+        assert_eq!(
+            frames[4].window,
+            1_024 + first.len() as u64 + second.len() as u64
+        );
+    }
+
+    #[test]
+    fn retained_same_stream_outputs_cannot_be_overtaken_by_terminal_frame() {
+        let mut pending = VecDeque::from([PendingOutput {
+            stream_id: 7,
+            kind: FrameKind::Data,
+            payload: vec![1],
+            reset_reason: None,
+        }]);
+        assert!(has_pending_output_for_stream(&pending, 7));
+        assert!(!has_pending_output_for_stream(&pending, 8));
+
+        pending.push_back(PendingOutput {
+            stream_id: 7,
+            kind: FrameKind::Data,
+            payload: vec![2],
+            reset_reason: None,
+        });
+        pending.push_back(PendingOutput {
+            stream_id: 7,
+            kind: FrameKind::Fin,
+            payload: Vec::new(),
+            reset_reason: None,
+        });
+        assert_eq!(
+            pending.iter().map(|output| output.kind).collect::<Vec<_>>(),
+            vec![FrameKind::Data, FrameKind::Data, FrameKind::Fin]
+        );
+    }
+
+    #[tokio::test]
+    async fn housekeeping_frames_do_not_generate_ack_feedback() {
+        let (mut actor, key, _receiver, _control_receiver) =
+            test_actor_with_carrier(M2_CARRIER_QUEUE_FRAMES);
+        actor.streams.insert(1, test_stream());
+        actor
+            .handle_frame(key.clone(), Frame::ack(1, 1, 1, 0))
+            .await
+            .expect("ACK is accepted without feedback");
+        actor
+            .handle_frame(key, Frame::window_update(1, 1, 1, 2_048))
+            .await
+            .expect("WINDOW_UPDATE is accepted without feedback");
+        assert!(actor.active.pending_controls.is_empty());
+    }
+
+    #[test]
+    fn minimum_queue_budget_retains_bulk_and_critical_capacity() {
+        let minimum = 256 * 1024;
+        let reserved = critical_reserved_bytes(minimum);
+        assert_eq!(reserved, minimum / 4);
+        let maximum_record = Frame::data(1, 1, 1, 1, 0, vec![0x5a; MAX_PAYLOAD_LEN])
+            .encode()
+            .expect("maximum record frame fits protocol bound");
+        assert!(
+            minimum - reserved >= maximum_record.len().saturating_mul(2),
+            "minimum budget must retain a record and its bounded carrier copy"
+        );
+        assert_eq!(
+            critical_reserved_bytes(8 * 1024 * 1024),
+            M2_CARRIER_RESERVED_BYTES
+        );
+    }
+
+    #[test]
+    fn m2_hello_advertises_owner_fencing_opt_in() {
+        let ControlMessage::Hello(hello) = m2_hello(&RuntimeConfig::default()) else {
+            panic!("M2 hello must be HELLO");
+        };
+        assert!(
+            hello
+                .features
+                .iter()
+                .any(|feature| feature == OWNER_FENCING_FEATURE)
+        );
+    }
+
+    #[test]
+    fn owner_fence_context_rejects_stale_welcome_identity() {
+        let welcome = owner_fence_welcome();
+        let fence = OwnerFence::new(
+            "fence",
+            "session",
+            7,
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "nonce",
+            20_000,
+        );
+        assert!(validate_owner_fence_context(&fence, &welcome, TEST_OWNER_ID).is_err());
+    }
+
+    #[test]
+    fn owner_fence_gate_blocks_admission_until_acknowledgement() {
+        let welcome = owner_fence_welcome();
+        let fence = OwnerFence::new(
+            "fence",
+            welcome.session_id.clone(),
+            welcome.epoch,
+            TEST_OWNER_ID,
+            "nonce",
+            20_000,
+        );
+        validate_owner_fence_context(&fence, &welcome, TEST_OWNER_ID).expect("fence context");
+        let mut state = OwnerFenceState::new(welcome.session_id.clone()).expect("state");
+        let acknowledgement = state.accept_fence(&fence, "ack", 100).expect("fence");
+        assert!(state.authorize(TEST_OWNER_ID, welcome.epoch, 101).is_err());
+        state
+            .acknowledgement_sent(&acknowledgement, 102)
+            .expect("acknowledgement");
+        state
+            .authorize(TEST_OWNER_ID, welcome.epoch, 20_000)
+            .expect("latched owner remains authorized");
+    }
+
+    #[test]
+    fn owner_fence_late_ack_is_rejected_without_data_admission() {
+        let welcome = owner_fence_welcome();
+        let fence = OwnerFence::new(
+            "fence",
+            welcome.session_id.clone(),
+            welcome.epoch,
+            TEST_OWNER_ID,
+            "nonce",
+            1,
+        );
+        let mut state = OwnerFenceState::new(welcome.session_id.clone()).expect("state");
+        let acknowledgement = state.accept_fence(&fence, "ack", 100).expect("fence");
+        assert!(state.acknowledgement_sent(&acknowledgement, 101).is_err());
+        assert!(state.authorize(TEST_OWNER_ID, welcome.epoch, 102).is_err());
     }
 
     #[test]
@@ -5354,6 +9139,50 @@ mod tests {
         assert!(buffer.is_empty());
     }
 
+    #[tokio::test]
+    async fn non_stream_echo_maximum_body_with_canary_stays_within_credit() {
+        let (mut actor, _active_key, mut carrier_receiver, _control_receiver) =
+            test_actor_with_carrier(M2_CARRIER_QUEUE_FRAMES);
+        let mut stream = test_stream();
+        stream.operation = "echo".to_owned();
+        stream.export.device_canary = Some("c".repeat(M2_MAX_CANARY_BYTES));
+        stream.auth.confirmed = true;
+        stream.auth.refresh_in_flight = false;
+        stream.sequence = StreamState::with_credits(
+            1,
+            (M2_MAX_RECORD_BYTES + M2_MAX_CANARY_BYTES) as u64,
+            (M2_MAX_RECORD_BYTES + M2_MAX_CANARY_BYTES) as u64,
+        )
+        .expect("maximum non-stream echo credit is valid");
+        actor.streams.insert(1, stream);
+
+        actor
+            .dispatch_payload(1, vec![0x5a; M2_MAX_RECORD_BYTES])
+            .await
+            .expect("maximum non-stream echo should emit both response frames");
+
+        let mut frames = Vec::new();
+        while let Ok(command) = carrier_receiver.try_recv() {
+            if let CarrierCommand::Frame(frame) = command {
+                frames.push(Frame::decode(&frame.bytes).expect("response frame decodes"));
+            }
+        }
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].kind, FrameKind::Data);
+        assert_eq!(frames[1].kind, FrameKind::Data);
+        assert_eq!(frames[0].payload.len(), MAX_PAYLOAD_LEN);
+        assert_eq!(frames[1].payload.len(), M2_MAX_CANARY_BYTES);
+        assert_eq!(frames[0].sequence, 1);
+        assert_eq!(frames[1].sequence, 2);
+        assert_eq!(
+            frames
+                .iter()
+                .map(|frame| frame.payload.len())
+                .sum::<usize>(),
+            M2_MAX_RECORD_BYTES + M2_MAX_CANARY_BYTES
+        );
+    }
+
     #[test]
     fn parser_rejects_record_length_above_bound() {
         let mut buffer = Vec::new();
@@ -5395,6 +9224,97 @@ mod tests {
         }
     }
 
+    fn test_owner_forget_sequence(stream_id: u64) -> (StreamState, ResumeDirectionState) {
+        let mut relay = StreamState::new(stream_id, 1_024).expect("relay sequence");
+        let mut connector = StreamState::new(stream_id, 1_024).expect("connector sequence");
+        let connector_fin = Frame::fin(1, 1, stream_id, 1, 0);
+        connector
+            .send_frame(Direction::ConnectorToRelay, &connector_fin)
+            .expect("connector FIN is admitted");
+        relay
+            .receive_frame(Direction::ConnectorToRelay, &connector_fin)
+            .expect("relay receives connector FIN");
+        relay
+            .mark_delivered(Direction::ConnectorToRelay, 1)
+            .expect("relay delivers connector FIN");
+        let relay_fin = Frame::fin(1, 1, stream_id, 1, 1);
+        relay
+            .send_frame(Direction::RelayToConnector, &relay_fin)
+            .expect("relay FIN is admitted");
+        connector
+            .receive_frame(Direction::RelayToConnector, &relay_fin)
+            .expect("connector receives relay FIN");
+        connector
+            .mark_delivered(Direction::RelayToConnector, 1)
+            .expect("connector delivers relay FIN");
+        let connector_ack = Frame::ack(1, 1, stream_id, 1);
+        connector
+            .send_frame(Direction::ConnectorToRelay, &connector_ack)
+            .expect("connector ACK is admitted");
+        relay
+            .receive_frame(Direction::ConnectorToRelay, &connector_ack)
+            .expect("relay receives connector ACK");
+        let owner_state = ResumeDirectionState::from_sequence_snapshot(
+            stream_id,
+            relay.snapshot().direction(Direction::RelayToConnector),
+        )
+        .expect("relay sender snapshot encodes");
+        (connector, owner_state)
+    }
+
+    fn test_stream_with_owner_forget_proof(stream_id: u64) -> (M2Stream, ResumeDirectionState) {
+        let (sequence, final_state) = test_owner_forget_sequence(stream_id);
+        let mut stream = test_stream();
+        stream.sequence = sequence;
+        stream.input_fin = true;
+        stream.output_fin = true;
+        (stream, final_state)
+    }
+
+    fn test_owner_forget_before_owner_ack(stream_id: u64) -> (StreamState, ResumeDirectionState) {
+        let mut relay = StreamState::new(stream_id, 1_024).expect("relay sequence");
+        let mut connector = StreamState::new(stream_id, 1_024).expect("connector sequence");
+
+        let connector_fin = Frame::fin(1, 1, stream_id, 1, 0);
+        connector
+            .send_frame(Direction::ConnectorToRelay, &connector_fin)
+            .expect("connector FIN is admitted");
+        relay
+            .receive_frame(Direction::ConnectorToRelay, &connector_fin)
+            .expect("relay receives connector FIN");
+        relay
+            .mark_delivered(Direction::ConnectorToRelay, 1)
+            .expect("relay delivers connector FIN");
+
+        // Keep the relay FIN's ACK cursor at zero. This leaves the connector's
+        // C2R sender awaiting the owner's data-channel ACK while the connector
+        // can still return its final C2R ACK to the owner.
+        let relay_fin = Frame::fin(1, 1, stream_id, 1, 0);
+        relay
+            .send_frame(Direction::RelayToConnector, &relay_fin)
+            .expect("relay FIN is admitted");
+        connector
+            .receive_frame(Direction::RelayToConnector, &relay_fin)
+            .expect("connector receives relay FIN");
+        connector
+            .mark_delivered(Direction::RelayToConnector, 1)
+            .expect("connector delivers relay FIN");
+
+        let connector_ack = Frame::ack(1, 1, stream_id, 1);
+        connector
+            .send_frame(Direction::ConnectorToRelay, &connector_ack)
+            .expect("connector final C2R ACK is admitted");
+        relay
+            .receive_frame(Direction::ConnectorToRelay, &connector_ack)
+            .expect("relay observes final C2R ACK");
+        let owner_state = ResumeDirectionState::from_sequence_snapshot(
+            stream_id,
+            relay.snapshot().direction(Direction::RelayToConnector),
+        )
+        .expect("owner terminal snapshot encodes");
+        (connector, owner_state)
+    }
+
     #[test]
     fn reset_admission_is_idempotent_before_and_after_flush() {
         let mut stream = test_stream();
@@ -5405,6 +9325,1205 @@ mod tests {
         stream.reset_queued = false;
         stream.output_reset = true;
         assert!(!queue_reset_once(&mut stream));
+    }
+
+    #[test]
+    fn stream_forget_accepts_complementary_sender_receiver_state() {
+        let stream_id = 7;
+        let mut relay = StreamState::new(stream_id, 128).expect("relay sequence");
+        let mut connector = StreamState::new(stream_id, 128).expect("connector sequence");
+
+        let request = Frame::data(1, 1, stream_id, 1, 0, b"req".to_vec());
+        connector
+            .send_frame(Direction::ConnectorToRelay, &request)
+            .expect("connector DATA is admitted");
+        relay
+            .receive_frame(Direction::ConnectorToRelay, &request)
+            .expect("relay receives connector DATA");
+        let request_fin = Frame::fin(1, 1, stream_id, 2, 0);
+        connector
+            .send_frame(Direction::ConnectorToRelay, &request_fin)
+            .expect("connector FIN is admitted");
+        relay
+            .receive_frame(Direction::ConnectorToRelay, &request_fin)
+            .expect("relay receives connector FIN");
+        relay
+            .mark_delivered(Direction::ConnectorToRelay, 2)
+            .expect("relay delivers connector request");
+
+        let response = Frame::data(1, 1, stream_id, 1, 2, b"resp".to_vec());
+        relay
+            .send_frame(Direction::RelayToConnector, &response)
+            .expect("relay DATA is admitted");
+        connector
+            .receive_frame(Direction::RelayToConnector, &response)
+            .expect("connector receives relay DATA");
+        let response_fin = Frame::fin(1, 1, stream_id, 2, 2);
+        relay
+            .send_frame(Direction::RelayToConnector, &response_fin)
+            .expect("relay FIN is admitted");
+        connector
+            .receive_frame(Direction::RelayToConnector, &response_fin)
+            .expect("connector receives relay FIN");
+        connector
+            .mark_delivered(Direction::RelayToConnector, 2)
+            .expect("connector delivers relay response");
+
+        let final_ack = Frame::ack(1, 1, stream_id, 2);
+        connector
+            .send_frame(Direction::ConnectorToRelay, &final_ack)
+            .expect("connector ACK is admitted");
+        relay
+            .receive_frame(Direction::ConnectorToRelay, &final_ack)
+            .expect("relay receives connector ACK");
+
+        let owner_state = ResumeDirectionState::from_sequence_snapshot(
+            stream_id,
+            relay.snapshot().direction(Direction::RelayToConnector),
+        )
+        .expect("relay sender snapshot encodes");
+        M2Actor::validate_owner_stream_forget_state(
+            &connector,
+            Direction::RelayToConnector,
+            &owner_state,
+        )
+        .expect("complementary endpoint state is valid");
+
+        let mut byte_mismatch = owner_state.clone();
+        byte_mismatch.sent_bytes += 1;
+        assert!(
+            M2Actor::validate_owner_stream_forget_state(
+                &connector,
+                Direction::RelayToConnector,
+                &byte_mismatch,
+            )
+            .is_err()
+        );
+
+        let mut terminal_mismatch = owner_state.clone();
+        terminal_mismatch.send_terminal =
+            Some(tunnel_protocol::rotation_control::TerminalState::Reset { reason: 9 });
+        assert!(
+            M2Actor::validate_owner_stream_forget_state(
+                &connector,
+                Direction::RelayToConnector,
+                &terminal_mismatch,
+            )
+            .is_err()
+        );
+
+        let mut replay_gap = owner_state.clone();
+        replay_gap.peer_acked = replay_gap.last_emitted - 1;
+        replay_gap.replay_floor = Some(replay_gap.last_emitted);
+        assert!(
+            M2Actor::validate_owner_stream_forget_state(
+                &connector,
+                Direction::RelayToConnector,
+                &replay_gap,
+            )
+            .is_err()
+        );
+
+        let mut wrong_direction = owner_state;
+        assert!(
+            M2Actor::validate_owner_stream_forget_state(
+                &connector,
+                Direction::ConnectorToRelay,
+                &wrong_direction,
+            )
+            .is_err()
+        );
+        wrong_direction.stream_id = stream_id + 1;
+        assert!(
+            M2Actor::validate_owner_stream_forget_state(
+                &connector,
+                Direction::RelayToConnector,
+                &wrong_direction,
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_forget_waits_for_owner_ack_on_independent_data_channel() {
+        let stream_id = 41;
+        let mut relay = StreamState::new(stream_id, 1_024).expect("relay sequence");
+        let mut connector = StreamState::new(stream_id, 1_024).expect("connector sequence");
+
+        // Complete both terminal directions, but deliberately send the relay's
+        // terminal frame without an ACK for the connector's C2R FIN. The
+        // connector can therefore send its final C2R ACK to the owner while
+        // its local C2R sender still has peer_acked < last_emitted. The owner
+        // observes that ACK and may publish STREAM_FORGET before its separate
+        // data-channel ACK reaches the connector.
+        let connector_fin = Frame::fin(1, 1, stream_id, 1, 0);
+        connector
+            .send_frame(Direction::ConnectorToRelay, &connector_fin)
+            .expect("connector FIN is admitted");
+        relay
+            .receive_frame(Direction::ConnectorToRelay, &connector_fin)
+            .expect("relay receives connector FIN");
+        relay
+            .mark_delivered(Direction::ConnectorToRelay, 1)
+            .expect("relay delivers connector FIN");
+
+        let relay_fin = Frame::fin(1, 1, stream_id, 1, 0);
+        relay
+            .send_frame(Direction::RelayToConnector, &relay_fin)
+            .expect("relay FIN is admitted");
+        connector
+            .receive_frame(Direction::RelayToConnector, &relay_fin)
+            .expect("connector receives relay FIN");
+        connector
+            .mark_delivered(Direction::RelayToConnector, 1)
+            .expect("connector delivers relay FIN");
+
+        let connector_ack = Frame::ack(1, 1, stream_id, 1);
+        connector
+            .send_frame(Direction::ConnectorToRelay, &connector_ack)
+            .expect("connector final C2R ACK is admitted");
+        relay
+            .receive_frame(Direction::ConnectorToRelay, &connector_ack)
+            .expect("relay observes the final C2R ACK");
+
+        let relay_snapshot = relay.snapshot();
+        assert_eq!(
+            relay_snapshot
+                .direction(Direction::ConnectorToRelay)
+                .receive_terminal,
+            Some(tunnel_protocol::sequence::Terminal::Fin)
+        );
+        assert_eq!(
+            relay_snapshot
+                .direction(Direction::ConnectorToRelay)
+                .delivered_contiguous,
+            1
+        );
+        let owner_state = ResumeDirectionState::from_sequence_snapshot(
+            stream_id,
+            relay_snapshot.direction(Direction::RelayToConnector),
+        )
+        .expect("owner terminal snapshot encodes");
+        assert_eq!(owner_state.stream_id, stream_id);
+        assert_eq!(
+            owner_state.send_terminal,
+            Some(tunnel_protocol::rotation_control::TerminalState::Fin)
+        );
+        assert_eq!(owner_state.peer_acked, owner_state.last_emitted);
+        assert_eq!(
+            connector
+                .direction(Direction::ConnectorToRelay)
+                .peer_acked(),
+            0,
+            "the connector has sent its final C2R ACK, but the owner's data ACK has not arrived"
+        );
+        assert_eq!(
+            connector
+                .direction(Direction::ConnectorToRelay)
+                .send_terminal(),
+            Some(tunnel_protocol::sequence::Terminal::Fin)
+        );
+        assert_eq!(
+            connector
+                .direction(Direction::RelayToConnector)
+                .receive_terminal(),
+            Some(tunnel_protocol::sequence::Terminal::Fin)
+        );
+
+        assert!(
+            M2Actor::validate_owner_stream_forget_state(
+                &connector,
+                Direction::RelayToConnector,
+                &owner_state,
+            )
+            .is_err(),
+            "the owner proof is valid while the connector sender is still awaiting its data ACK"
+        );
+
+        let (mut actor, key, mut carrier_receiver, _control_receiver) =
+            test_actor_with_carrier(M2_CARRIER_QUEUE_FRAMES);
+        let mut stream = test_stream();
+        stream.sequence = connector;
+        stream.input_fin = true;
+        stream.output_fin = true;
+        actor.streams.insert(stream_id, stream);
+        let forget = tunnel_protocol::rotation_control::StreamForget {
+            message_id: "forget-before-owner-ack".to_owned(),
+            reply_to: String::new(),
+            session_id: "session".to_owned(),
+            epoch: 1,
+            stream_id,
+            operation_id: "operation".to_owned(),
+            direction: Direction::RelayToConnector,
+            final_state: owner_state,
+        };
+        assert_eq!(forget.session_id, "session");
+        assert_eq!(forget.epoch, 1);
+        assert_eq!(forget.stream_id, stream_id);
+        assert_eq!(forget.operation_id, "operation");
+        assert_eq!(
+            actor
+                .streams
+                .get(&stream_id)
+                .expect("stream identity is retained")
+                .operation_id,
+            forget.operation_id
+        );
+
+        // This is the independent control-channel overtaking point. The proof
+        // is authenticated and terminal, but local C2R peer_acked is still
+        // behind; the staged runtime must retain the stream for revalidation.
+        actor
+            .handle_control(ControlMessage::StreamForget(forget))
+            .await
+            .expect("overtaking STREAM_FORGET enters bounded proof-pending state");
+        assert!(actor.streams.contains_key(&stream_id));
+        assert!(
+            actor
+                .pending_forgets
+                .get(&stream_id)
+                .is_some_and(|pending| {
+                    pending.barriers_queued.contains(&key) && pending.barriers_completed.is_empty()
+                })
+        );
+        assert!(matches!(
+            carrier_receiver
+                .try_recv()
+                .expect("proof-pending FORGET queues a carrier barrier"),
+            CarrierCommand::Barrier
+        ));
+
+        // The owner's final data-channel ACK arrives after STREAM_FORGET. It
+        // closes the exact C2R sender proof without changing the terminal
+        // identity or either stream cursor.
+        actor
+            .handle_frame(key.clone(), Frame::ack(1, 1, stream_id, 1))
+            .await
+            .expect("later owner ACK must converge the local sender proof");
+        let local = actor
+            .streams
+            .get(&stream_id)
+            .expect("stream remains until its barrier completes")
+            .sequence
+            .snapshot();
+        assert_eq!(
+            local.direction(Direction::ConnectorToRelay).peer_acked,
+            local.direction(Direction::ConnectorToRelay).last_emitted
+        );
+        assert_eq!(
+            local.direction(Direction::ConnectorToRelay).send_terminal,
+            Some(tunnel_protocol::sequence::Terminal::Fin)
+        );
+        assert_eq!(
+            local
+                .direction(Direction::RelayToConnector)
+                .receive_terminal,
+            Some(tunnel_protocol::sequence::Terminal::Fin)
+        );
+        assert!(actor.streams.contains_key(&stream_id));
+        let pending_proof = actor
+            .pending_forgets
+            .get(&stream_id)
+            .expect("proof remains retained until the barrier completes");
+        M2Actor::validate_owner_stream_forget_state(
+            &actor
+                .streams
+                .get(&stream_id)
+                .expect("stream remains for final validation")
+                .sequence,
+            Direction::RelayToConnector,
+            &pending_proof.forget.final_state,
+        )
+        .expect("the later owner ACK completes the exact terminal proof");
+
+        actor
+            .handle_barrier_complete(&key)
+            .expect("the retained carrier barrier completes after the ACK");
+        assert!(
+            !actor.streams.contains_key(&stream_id),
+            "reclamation must wait for both the later ACK and the carrier barrier"
+        );
+        assert!(!actor.pending_forgets.contains_key(&stream_id));
+        assert_eq!(actor.forgotten_stream_through, stream_id);
+    }
+
+    #[tokio::test]
+    async fn stream_forget_proof_deadline_is_absolute_and_not_reset_by_retry() {
+        let stream_id = 42;
+        let (sequence, final_state) = test_owner_forget_before_owner_ack(stream_id);
+        let (mut actor, key, mut carrier_receiver, _control_receiver) =
+            test_actor_with_carrier(M2_CARRIER_QUEUE_FRAMES);
+        let mut stream = test_stream();
+        stream.sequence = sequence;
+        stream.input_fin = true;
+        stream.output_fin = true;
+        actor.streams.insert(stream_id, stream);
+        let forget = tunnel_protocol::rotation_control::StreamForget {
+            message_id: "forget-deadline-fixed".to_owned(),
+            reply_to: String::new(),
+            session_id: "session".to_owned(),
+            epoch: 1,
+            stream_id,
+            operation_id: "operation".to_owned(),
+            direction: Direction::RelayToConnector,
+            final_state,
+        };
+
+        actor
+            .handle_control(ControlMessage::StreamForget(forget.clone()))
+            .await
+            .expect("incomplete but convergent proof is retained");
+        let initial_deadline = actor
+            .pending_forgets
+            .get(&stream_id)
+            .and_then(|pending| pending.proof_deadline)
+            .expect("proof-pending FORGET has an absolute deadline");
+        assert!(matches!(
+            carrier_receiver
+                .try_recv()
+                .expect("initial FORGET barrier is queued"),
+            CarrierCommand::Barrier
+        ));
+
+        actor
+            .handle_control(ControlMessage::StreamForget(forget))
+            .await
+            .expect("same proof is idempotent while it remains pending");
+        assert_eq!(
+            actor
+                .pending_forgets
+                .get(&stream_id)
+                .and_then(|pending| pending.proof_deadline),
+            Some(initial_deadline),
+            "a duplicate control message must not extend the proof window"
+        );
+
+        // Completing the physical barrier before the missing ACK only resets
+        // the bounded carrier barrier set; it must not renew the proof clock.
+        actor
+            .handle_barrier_complete(&key)
+            .expect("premature barrier completion remains bounded");
+        assert!(actor.streams.contains_key(&stream_id));
+        assert_eq!(
+            actor
+                .pending_forgets
+                .get(&stream_id)
+                .and_then(|pending| pending.proof_deadline),
+            Some(initial_deadline),
+            "barrier retry must retain the original absolute deadline"
+        );
+        assert!(
+            actor
+                .pending_forgets
+                .get(&stream_id)
+                .is_some_and(|pending| pending.barriers_queued.is_empty())
+        );
+
+        actor
+            .pending_forgets
+            .get_mut(&stream_id)
+            .expect("pending proof remains retained")
+            .proof_deadline = Some(Instant::now() - Duration::from_millis(1));
+        let error = actor
+            .retry_pending_forget_barriers()
+            .expect_err("an expired proof must fail closed");
+        assert!(matches!(
+            error,
+            ClientError::Protocol(message)
+                if message == "STREAM_FORGET terminal proof did not converge before its deadline"
+        ));
+        assert!(actor.streams.contains_key(&stream_id));
+        assert!(actor.pending_forgets.contains_key(&stream_id));
+    }
+
+    #[tokio::test]
+    async fn stream_forget_late_owner_ack_after_expiry_cannot_rescue_stream() {
+        let stream_id = 43;
+        let (sequence, final_state) = test_owner_forget_before_owner_ack(stream_id);
+        let (mut actor, key, mut carrier_receiver, _control_receiver) =
+            test_actor_with_carrier(M2_CARRIER_QUEUE_FRAMES);
+        let mut stream = test_stream();
+        stream.sequence = sequence;
+        stream.input_fin = true;
+        stream.output_fin = true;
+        actor.streams.insert(stream_id, stream);
+        actor
+            .handle_stream_forget(tunnel_protocol::rotation_control::StreamForget {
+                message_id: "forget-late-ack-after-expiry".to_owned(),
+                reply_to: String::new(),
+                session_id: "session".to_owned(),
+                epoch: 1,
+                stream_id,
+                operation_id: "operation".to_owned(),
+                direction: Direction::RelayToConnector,
+                final_state,
+            })
+            .expect("incomplete but convergent proof is retained");
+        assert!(matches!(
+            carrier_receiver
+                .try_recv()
+                .expect("initial FORGET barrier is queued"),
+            CarrierCommand::Barrier
+        ));
+        actor
+            .pending_forgets
+            .get_mut(&stream_id)
+            .expect("proof remains retained")
+            .proof_deadline = Some(Instant::now() - Duration::from_millis(1));
+
+        let error = actor
+            .handle_frame(key, Frame::ack(1, 1, stream_id, 1))
+            .await
+            .expect_err("an ACK after the fixed deadline must not rescue the proof");
+        assert!(matches!(
+            error,
+            ClientError::Protocol(message)
+                if message == "STREAM_FORGET terminal proof did not converge before its deadline"
+        ));
+        let stream = actor
+            .streams
+            .get(&stream_id)
+            .expect("late ACK cannot reclaim the stream");
+        assert_eq!(
+            stream
+                .sequence
+                .direction(Direction::ConnectorToRelay)
+                .peer_acked(),
+            stream
+                .sequence
+                .direction(Direction::ConnectorToRelay)
+                .last_emitted(),
+            "the ACK may be observed, but expiry remains terminal"
+        );
+        assert!(actor.pending_forgets.contains_key(&stream_id));
+        assert_eq!(actor.forgotten_stream_through, 0);
+    }
+
+    #[tokio::test]
+    async fn stream_forget_clears_ack_deadline_but_waits_for_active_roster_and_barriers() {
+        let (mut actor, active_key, mut active_receiver, _control_receiver) =
+            test_actor_with_carrier(M2_CARRIER_QUEUE_FRAMES);
+        let candidate_key = CarrierKey::new(2, "candidate");
+        let (candidate_tx, mut candidate_receiver) = mpsc::channel(M2_CARRIER_QUEUE_FRAMES);
+        actor.candidate = Some(Carrier {
+            key: candidate_key.clone(),
+            local_addr: None,
+            tx: candidate_tx,
+            pending_controls: BTreeMap::new(),
+            reader_cancel: CancellationToken::new(),
+            reader: None,
+            writer: None,
+        });
+        let attempt = RotationAttemptIdentity::new(
+            "session",
+            1,
+            "owner",
+            "rotation",
+            active_key.generation,
+            candidate_key.generation,
+            active_key.connection_id.clone(),
+            candidate_key.connection_id.clone(),
+        );
+        let now = actor.now_ms();
+        actor
+            .rotation
+            .prepare(attempt.clone(), now)
+            .expect("rotation prepares");
+        actor
+            .rotation
+            .candidate_ready(&attempt, now)
+            .expect("candidate is ready");
+        actor
+            .rotation
+            .quiesce(
+                &attempt,
+                tunnel_protocol::rotation_control::StreamRoster::new("snapshot", vec![1]),
+                now,
+            )
+            .expect("rotation enters quiescing");
+
+        let (sequence, final_state) = test_owner_forget_before_owner_ack(1);
+        let mut stream = test_stream();
+        stream.sequence = sequence;
+        stream.input_fin = true;
+        stream.output_fin = true;
+        actor.streams.insert(1, stream);
+        actor
+            .handle_stream_forget(tunnel_protocol::rotation_control::StreamForget {
+                message_id: "forget-converged-before-active".to_owned(),
+                reply_to: String::new(),
+                session_id: "session".to_owned(),
+                epoch: 1,
+                stream_id: 1,
+                operation_id: "operation".to_owned(),
+                direction: Direction::RelayToConnector,
+                final_state,
+            })
+            .expect("proof-pending FORGET queues both immutable barriers");
+        let pending = actor
+            .pending_forgets
+            .get(&1)
+            .expect("proof remains roster-retained");
+        assert!(pending.proof_pending);
+        assert!(pending.proof_deadline.is_some());
+        assert!(pending.defer_reclamation);
+        assert_eq!(pending.barriers_queued.len(), 2);
+        assert!(matches!(
+            active_receiver
+                .try_recv()
+                .expect("active carrier barrier is queued"),
+            CarrierCommand::Barrier
+        ));
+        assert!(matches!(
+            candidate_receiver
+                .try_recv()
+                .expect("candidate carrier barrier is queued"),
+            CarrierCommand::Barrier
+        ));
+
+        // The ACK converges the proof while the rotation still owns the
+        // immutable roster. Refresh must clear only the proof lease; the
+        // stream and both original carrier barriers remain retained.
+        actor
+            .handle_frame(active_key.clone(), Frame::ack(1, 1, 1, 1))
+            .await
+            .expect("timely owner ACK converges the proof");
+        let pending = actor
+            .pending_forgets
+            .get(&1)
+            .expect("proof remains retained after ACK");
+        assert!(!pending.proof_pending);
+        assert!(pending.proof_deadline.is_none());
+        assert!(actor.streams.contains_key(&1));
+
+        actor
+            .handle_barrier_complete(&candidate_key)
+            .expect("candidate barrier completes while quiescing");
+        actor
+            .handle_barrier_complete(&active_key)
+            .expect("active barrier completes while quiescing");
+        assert!(actor.streams.contains_key(&1));
+        let pending = actor
+            .pending_forgets
+            .get(&1)
+            .expect("stream remains in immutable roster");
+        assert!(pending.defer_reclamation);
+        assert!(pending.proof_deadline.is_none());
+        assert_eq!(pending.barriers_queued, pending.barriers_completed);
+        assert_eq!(actor.rotation.phase(), RotationPhase::Quiescing);
+
+        actor
+            .rotation
+            .abort(&attempt, actor.now_ms(), RecoveryReason::ControlLost)
+            .expect("test rotation aborts before commit");
+        let close_time = actor.now_ms();
+        actor
+            .rotation
+            .candidate_closed(
+                &attempt,
+                RotationSide::Connector,
+                ClosureEvidence::closed(candidate_key.connection_id.clone()),
+                close_time,
+            )
+            .expect("connector candidate closure is recorded");
+        actor
+            .rotation
+            .candidate_closed(
+                &attempt,
+                RotationSide::Owner,
+                ClosureEvidence::closed(candidate_key.connection_id),
+                close_time,
+            )
+            .expect("owner candidate closure activates the old carrier");
+        assert_eq!(actor.rotation.phase(), RotationPhase::Active);
+        actor
+            .complete_ready_stream_forgets()
+            .expect("active phase permits completed roster cleanup");
+        assert!(!actor.streams.contains_key(&1));
+        assert!(!actor.pending_forgets.contains_key(&1));
+        assert_eq!(actor.forgotten_stream_through, 1);
+    }
+
+    #[test]
+    fn stream_forget_rejects_immutable_nonconvergent_terminal_proof() {
+        let (mut actor, _key, mut carrier_receiver, _control_receiver) =
+            test_actor_with_carrier(M2_CARRIER_QUEUE_FRAMES);
+        let (sequence, mut final_state) = test_owner_forget_before_owner_ack(1);
+        let mut stream = test_stream();
+        stream.sequence = sequence;
+        stream.input_fin = true;
+        stream.output_fin = true;
+        final_state.send_terminal =
+            Some(tunnel_protocol::rotation_control::TerminalState::Reset { reason: 77 });
+        actor.streams.insert(1, stream);
+        let error = actor
+            .handle_stream_forget(tunnel_protocol::rotation_control::StreamForget {
+                message_id: "forget-immutable-terminal-mismatch".to_owned(),
+                reply_to: String::new(),
+                session_id: "session".to_owned(),
+                epoch: 1,
+                stream_id: 1,
+                operation_id: "operation".to_owned(),
+                direction: Direction::RelayToConnector,
+                final_state,
+            })
+            .expect_err("a terminal mismatch cannot converge from later ACK progress");
+        assert!(matches!(error, ClientError::Protocol(_)));
+        assert!(actor.streams.contains_key(&1));
+        assert!(actor.pending_forgets.is_empty());
+        assert!(carrier_receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn stream_forget_rejects_immutable_credit_mismatch() {
+        let (mut actor, _key, mut carrier_receiver, _control_receiver) =
+            test_actor_with_carrier(M2_CARRIER_QUEUE_FRAMES);
+        let (sequence, mut final_state) = test_owner_forget_before_owner_ack(1);
+        let mut stream = test_stream();
+        stream.sequence = sequence;
+        stream.input_fin = true;
+        stream.output_fin = true;
+        final_state.send_credit = final_state
+            .send_credit
+            .checked_add(1)
+            .expect("test credit remains bounded");
+        actor.streams.insert(1, stream);
+        let error = actor
+            .handle_stream_forget(tunnel_protocol::rotation_control::StreamForget {
+                message_id: "forget-immutable-credit-mismatch".to_owned(),
+                reply_to: String::new(),
+                session_id: "session".to_owned(),
+                epoch: 1,
+                stream_id: 1,
+                operation_id: "operation".to_owned(),
+                direction: Direction::RelayToConnector,
+                final_state,
+            })
+            .expect_err("a credit mismatch cannot converge from later ACK progress");
+        assert!(matches!(error, ClientError::Protocol(_)));
+        assert!(actor.streams.contains_key(&1));
+        assert!(actor.pending_forgets.is_empty());
+        assert!(carrier_receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn stream_forget_rejects_local_adapter_input_debt() {
+        for debt in 0..4 {
+            let (mut actor, _key, mut carrier_receiver, _control_receiver) =
+                test_actor_with_carrier(M2_CARRIER_QUEUE_FRAMES);
+            let (mut stream, final_state) = test_stream_with_owner_forget_proof(1);
+            match debt {
+                0 => {
+                    stream.pending.push_back(BufferedInput::Fin);
+                    stream.pending_bytes = 1;
+                }
+                1 => stream.pending_bytes = 1,
+                2 => stream.record_buffer.push(0),
+                3 => stream.record_expected = Some(1),
+                _ => unreachable!(),
+            }
+            actor.streams.insert(1, stream);
+            let error = actor
+                .handle_stream_forget(tunnel_protocol::rotation_control::StreamForget {
+                    message_id: format!("adapter-debt-{debt}"),
+                    reply_to: String::new(),
+                    session_id: "session".to_owned(),
+                    epoch: 1,
+                    stream_id: 1,
+                    operation_id: "operation".to_owned(),
+                    direction: Direction::RelayToConnector,
+                    final_state,
+                })
+                .expect_err("local adapter debt must block physical reclamation");
+            assert!(matches!(error, ClientError::Protocol(_)));
+            assert!(actor.pending_forgets.is_empty());
+            assert!(carrier_receiver.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_forget_waits_for_carrier_barrier_before_removal() {
+        let (mut actor, key, mut receiver, _control_receiver) =
+            test_actor_with_carrier(M2_CARRIER_QUEUE_FRAMES);
+        let (stream, final_state) = test_stream_with_owner_forget_proof(1);
+        actor.streams.insert(1, stream);
+        let forget = tunnel_protocol::rotation_control::StreamForget {
+            message_id: "forget".to_owned(),
+            reply_to: String::new(),
+            session_id: "session".to_owned(),
+            epoch: 1,
+            stream_id: 1,
+            operation_id: "operation".to_owned(),
+            direction: Direction::RelayToConnector,
+            final_state,
+        };
+        actor
+            .handle_stream_forget(forget)
+            .expect("forget barrier is scheduled");
+        assert!(actor.streams.contains_key(&1));
+        assert!(matches!(
+            receiver.try_recv().expect("barrier queued"),
+            CarrierCommand::Barrier
+        ));
+
+        actor
+            .handle_barrier_complete(&key)
+            .expect("completed barrier proves carrier drain");
+        assert!(!actor.streams.contains_key(&1));
+        actor
+            .handle_frame(key, Frame::data(1, 1, 1, 1, 0, vec![0x5a]))
+            .await
+            .expect("late forgotten frame is ignored");
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn stream_forget_drains_a_ready_candidate_before_removal() {
+        let (mut actor, active_key, mut active_receiver, _control_receiver) =
+            test_actor_with_carrier(M2_CARRIER_QUEUE_FRAMES);
+        let candidate_key = CarrierKey::new(2, "candidate");
+        let (candidate_tx, mut candidate_receiver) = mpsc::channel(M2_CARRIER_QUEUE_FRAMES);
+        actor.candidate = Some(Carrier {
+            key: candidate_key.clone(),
+            local_addr: None,
+            tx: candidate_tx,
+            pending_controls: BTreeMap::new(),
+            reader_cancel: CancellationToken::new(),
+            reader: None,
+            writer: None,
+        });
+
+        let (stream, final_state) = test_stream_with_owner_forget_proof(1);
+        actor.streams.insert(1, stream);
+        let forget = tunnel_protocol::rotation_control::StreamForget {
+            message_id: "forget-candidate".to_owned(),
+            reply_to: String::new(),
+            session_id: "session".to_owned(),
+            epoch: 1,
+            stream_id: 1,
+            operation_id: "operation".to_owned(),
+            direction: Direction::RelayToConnector,
+            final_state,
+        };
+        actor
+            .handle_stream_forget(forget)
+            .expect("forget barriers include candidate");
+        assert!(matches!(
+            active_receiver.try_recv().expect("active barrier queued"),
+            CarrierCommand::Barrier
+        ));
+        assert!(matches!(
+            candidate_receiver
+                .try_recv()
+                .expect("candidate barrier queued"),
+            CarrierCommand::Barrier
+        ));
+
+        actor
+            .handle_barrier_complete(&candidate_key)
+            .expect("candidate barrier proves candidate drain");
+        assert!(actor.streams.contains_key(&1));
+        actor
+            .handle_barrier_complete(&active_key)
+            .expect("active barrier completes forget");
+        assert!(!actor.streams.contains_key(&1));
+    }
+
+    #[test]
+    fn stream_forget_after_quiesce_stays_in_immutable_roster() {
+        let (mut actor, active_key, mut active_receiver, _control_receiver) =
+            test_actor_with_carrier(M2_CARRIER_QUEUE_FRAMES);
+        let candidate_key = CarrierKey::new(2, "candidate");
+        let (candidate_tx, mut candidate_receiver) = mpsc::channel(M2_CARRIER_QUEUE_FRAMES);
+        actor.candidate = Some(Carrier {
+            key: candidate_key.clone(),
+            local_addr: None,
+            tx: candidate_tx,
+            pending_controls: BTreeMap::new(),
+            reader_cancel: CancellationToken::new(),
+            reader: None,
+            writer: None,
+        });
+
+        let attempt = RotationAttemptIdentity::new(
+            "session",
+            1,
+            "owner",
+            "rotation",
+            active_key.generation,
+            candidate_key.generation,
+            active_key.connection_id.clone(),
+            candidate_key.connection_id.clone(),
+        );
+        let now = actor.now_ms();
+        actor
+            .rotation
+            .prepare(attempt.clone(), now)
+            .expect("rotation prepares");
+        actor
+            .rotation
+            .candidate_ready(&attempt, now)
+            .expect("candidate is ready");
+        actor
+            .rotation
+            .quiesce(
+                &attempt,
+                tunnel_protocol::rotation_control::StreamRoster::new("snapshot", vec![1]),
+                now,
+            )
+            .expect("rotation enters quiescing");
+
+        let (stream, final_state) = test_stream_with_owner_forget_proof(1);
+        actor.streams.insert(1, stream);
+        let forget = tunnel_protocol::rotation_control::StreamForget {
+            message_id: "forget-after-quiesce".to_owned(),
+            reply_to: String::new(),
+            session_id: "session".to_owned(),
+            epoch: 1,
+            stream_id: 1,
+            operation_id: "operation".to_owned(),
+            direction: Direction::RelayToConnector,
+            final_state,
+        };
+        actor
+            .handle_stream_forget(forget)
+            .expect("post-quiesce forget barriers are scheduled");
+        assert!(matches!(
+            active_receiver.try_recv().expect("active barrier queued"),
+            CarrierCommand::Barrier
+        ));
+        assert!(matches!(
+            candidate_receiver
+                .try_recv()
+                .expect("candidate barrier queued"),
+            CarrierCommand::Barrier
+        ));
+
+        actor
+            .handle_barrier_complete(&candidate_key)
+            .expect("candidate barrier completes");
+        actor
+            .handle_barrier_complete(&active_key)
+            .expect("active barrier completes");
+        assert!(actor.streams.contains_key(&1));
+        assert!(
+            actor
+                .pending_forgets
+                .get(&1)
+                .is_some_and(|pending| pending.defer_reclamation)
+        );
+    }
+
+    #[test]
+    fn receive_credit_is_reissued_after_old_writer_debt() {
+        let (mut actor, old_key, _old_receiver, _control_receiver) =
+            test_actor_with_carrier(M2_CARRIER_QUEUE_FRAMES);
+        actor.streams.insert(1, test_stream());
+        actor
+            .active
+            .pending_controls
+            .entry(1)
+            .or_default()
+            .record_window(64)
+            .expect("test credit remains bounded");
+
+        let new_key = CarrierKey::new(2, "candidate");
+        let (new_tx, mut new_receiver) = mpsc::channel(M2_CARRIER_QUEUE_FRAMES);
+        let new_carrier = Carrier {
+            key: new_key,
+            local_addr: None,
+            tx: new_tx,
+            pending_controls: BTreeMap::new(),
+            reader_cancel: CancellationToken::new(),
+            reader: None,
+            writer: None,
+        };
+        let old = std::mem::replace(&mut actor.active, new_carrier);
+        assert_eq!(old.key, old_key);
+        actor.retiring = Some(old);
+        actor
+            .reissue_active_receive_controls()
+            .expect("new carrier accepts absolute credit replay");
+
+        let CarrierCommand::Frame(frame) = new_receiver
+            .try_recv()
+            .expect("reissued window update queued")
+        else {
+            panic!("expected a reissued window update frame");
+        };
+        let decoded = Frame::decode(&frame.bytes).expect("window update decodes");
+        assert_eq!(decoded.kind, FrameKind::WindowUpdate);
+        assert!(decoded.window >= 1_088);
+        assert!(
+            actor
+                .retiring
+                .as_ref()
+                .expect("old carrier retained for retirement")
+                .pending_controls
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn partial_receive_control_migration_clears_only_accepted_stream_debt() {
+        let (mut actor, old_key, _old_receiver, _control_receiver) =
+            test_actor_with_carrier(M2_CARRIER_QUEUE_FRAMES);
+        actor.streams.insert(1, test_stream());
+        let mut stream_two = test_stream();
+        stream_two.sequence = StreamState::new(2, 1_024).expect("second stream sequence");
+        actor.streams.insert(2, stream_two);
+        for stream_id in [1, 2] {
+            let pending = actor.active.pending_controls.entry(stream_id).or_default();
+            pending.record_ack(1);
+            pending
+                .record_window(64)
+                .expect("test credit remains bounded");
+        }
+
+        let new_key = CarrierKey::new(2, "candidate");
+        let (new_tx, mut new_receiver) = mpsc::channel(1);
+        let new_carrier = Carrier {
+            key: new_key,
+            local_addr: None,
+            tx: new_tx,
+            pending_controls: BTreeMap::new(),
+            reader_cancel: CancellationToken::new(),
+            reader: None,
+            writer: None,
+        };
+        let old = std::mem::replace(&mut actor.active, new_carrier);
+        assert_eq!(old.key, old_key);
+        actor.retiring = Some(old);
+
+        actor
+            .reissue_active_receive_controls()
+            .expect("partial active queue remains a bounded retry");
+        let CarrierCommand::Frame(first) = new_receiver
+            .try_recv()
+            .expect("first stream ACK is accepted")
+        else {
+            panic!("expected first cumulative ACK");
+        };
+        assert_eq!(
+            Frame::decode(&first.bytes)
+                .expect("first ACK decodes")
+                .stream_id,
+            1
+        );
+        let retiring = actor.retiring.as_ref().expect("retiring carrier retained");
+        let stream_one = retiring
+            .pending_controls
+            .get(&1)
+            .expect("stream one window remains until accepted");
+        assert!(stream_one.acknowledged.is_none());
+        assert!(stream_one.released_window_bytes > 0);
+        assert!(
+            retiring
+                .pending_controls
+                .get(&2)
+                .is_some_and(|control| control.acknowledged.is_some())
+        );
+
+        actor
+            .reissue_active_receive_controls()
+            .expect("stream one window retries independently");
+        let CarrierCommand::Frame(second) = new_receiver
+            .try_recv()
+            .expect("stream one window is accepted")
+        else {
+            panic!("expected stream one window update");
+        };
+        assert_eq!(
+            Frame::decode(&second.bytes)
+                .expect("stream one window decodes")
+                .stream_id,
+            1
+        );
+        assert!(
+            !actor
+                .retiring
+                .as_ref()
+                .expect("retiring carrier retained")
+                .pending_controls
+                .contains_key(&1)
+        );
+        assert!(
+            actor
+                .retiring
+                .as_ref()
+                .expect("retiring carrier retained")
+                .pending_controls
+                .contains_key(&2)
+        );
+    }
+
+    #[tokio::test]
+    async fn rotate_commit_hands_off_after_closed_old_writer() {
+        let (mut actor, old_key, old_receiver, _control_receiver) =
+            test_actor_with_carrier(M2_CARRIER_QUEUE_FRAMES);
+        drop(old_receiver);
+        actor.streams.insert(1, test_stream());
+        actor
+            .active
+            .pending_controls
+            .entry(1)
+            .or_default()
+            .record_ack(1);
+
+        let candidate_key = CarrierKey::new(2, "candidate");
+        let (candidate_tx, mut candidate_receiver) = mpsc::channel(M2_CARRIER_QUEUE_FRAMES);
+        actor.candidate = Some(Carrier {
+            key: candidate_key.clone(),
+            local_addr: None,
+            tx: candidate_tx,
+            pending_controls: BTreeMap::new(),
+            reader_cancel: CancellationToken::new(),
+            reader: None,
+            writer: None,
+        });
+
+        let attempt = RotationAttemptIdentity::new(
+            "session",
+            1,
+            "owner",
+            "rotation",
+            old_key.generation,
+            candidate_key.generation,
+            old_key.connection_id.clone(),
+            candidate_key.connection_id.clone(),
+        );
+        let now = actor.now_ms();
+        actor
+            .rotation
+            .prepare(attempt.clone(), now)
+            .expect("rotation prepares");
+        actor
+            .rotation
+            .candidate_ready(&attempt, now)
+            .expect("candidate is ready");
+        actor
+            .rotation
+            .quiesce(
+                &attempt,
+                tunnel_protocol::rotation_control::StreamRoster::new("snapshot", vec![1]),
+                now,
+            )
+            .expect("rotation quiesces");
+        let local_fence = FenceSnapshot::new(
+            "snapshot",
+            vec![tunnel_protocol::rotation_control::StreamFence::new(
+                1,
+                Direction::ConnectorToRelay,
+                0,
+            )],
+        );
+        let peer_fence = FenceSnapshot::new(
+            "snapshot",
+            vec![tunnel_protocol::rotation_control::StreamFence::new(
+                1,
+                Direction::RelayToConnector,
+                0,
+            )],
+        );
+        actor
+            .rotation
+            .frozen(
+                &attempt,
+                local_fence.clone(),
+                Direction::ConnectorToRelay,
+                now,
+            )
+            .expect("local fence is accepted");
+        actor
+            .rotation
+            .frozen(
+                &attempt,
+                peer_fence.clone(),
+                Direction::RelayToConnector,
+                now,
+            )
+            .expect("peer fence is accepted");
+        actor
+            .rotation
+            .drained(
+                &attempt,
+                tunnel_protocol::rotation_control::DrainProof::new(
+                    "snapshot",
+                    peer_fence.digest().expect("peer fence digest"),
+                    Direction::RelayToConnector,
+                    vec![tunnel_protocol::rotation_control::StreamAck::new(1, 0)],
+                ),
+                now,
+            )
+            .expect("peer drain proof is accepted");
+        actor
+            .rotation
+            .drained(
+                &attempt,
+                tunnel_protocol::rotation_control::DrainProof::new(
+                    "snapshot",
+                    local_fence.digest().expect("local fence digest"),
+                    Direction::ConnectorToRelay,
+                    vec![tunnel_protocol::rotation_control::StreamAck::new(1, 0)],
+                ),
+                now,
+            )
+            .expect("local drain proof is accepted");
+        actor.local_fence = Some(local_fence.clone());
+        actor.local_drained_message_id = Some("drained".to_owned());
+
+        let commit = RotateCommit {
+            message_id: "commit".to_owned(),
+            reply_to: "drained".to_owned(),
+            attempt,
+            snapshot_id: "snapshot".to_owned(),
+            drain_proofs: vec![
+                tunnel_protocol::rotation_control::DrainProofRef {
+                    snapshot_id: "snapshot".to_owned(),
+                    fence_digest: local_fence.digest().expect("local fence digest"),
+                    direction: Direction::ConnectorToRelay,
+                },
+                tunnel_protocol::rotation_control::DrainProofRef {
+                    snapshot_id: "snapshot".to_owned(),
+                    fence_digest: peer_fence.digest().expect("peer fence digest"),
+                    direction: Direction::RelayToConnector,
+                },
+            ],
+        };
+        let scope = actor
+            .rotation_journal_scope(&ControlMessage::RotateCommit(commit.clone()))
+            .expect("commit belongs to active rotation");
+        actor
+            .observe_rotation_message(&ControlMessage::RotateCommit(commit.clone()), scope)
+            .expect("commit is journaled");
+        actor
+            .handle_rotate_commit(commit)
+            .await
+            .expect("closed old writer is handed off to candidate");
+
+        assert_eq!(actor.active.key, candidate_key);
+        assert_eq!(
+            actor
+                .retiring
+                .as_ref()
+                .expect("old carrier remains owned for joined retirement")
+                .key,
+            old_key
+        );
+        assert!(
+            actor
+                .retiring
+                .as_ref()
+                .expect("old carrier remains owned for joined retirement")
+                .pending_controls
+                .is_empty()
+        );
+        assert!(matches!(
+            candidate_receiver
+                .try_recv()
+                .expect("absolute credit reissued"),
+            CarrierCommand::Frame(_)
+        ));
     }
 
     #[test]
@@ -5453,6 +10572,929 @@ mod tests {
         assert!(bounded_candidate_deadline(u64::MAX, 1, u64::MAX).is_err());
     }
 
+    #[test]
+    fn first_recovery_trigger_is_specific_and_stable() {
+        let (mut actor, active_key, _receiver, _control_receiver) =
+            test_actor_with_carrier(M2_CARRIER_QUEUE_FRAMES);
+        actor.remember_recovery_trigger(RecoveryTriggerClass::WriterFailed, &active_key);
+        actor.remember_recovery_trigger(RecoveryTriggerClass::ReaderClosed, &active_key);
+        assert_eq!(
+            actor.first_recovery_trigger,
+            Some(RecoveryTrigger {
+                class: RecoveryTriggerClass::WriterFailed,
+                role: CarrierRole::Active,
+                generation: active_key.generation,
+            })
+        );
+        let detail = actor.retained_recovery_detail("recovery episode deadline expired");
+        assert_eq!(
+            detail,
+            format!(
+                "recovery episode deadline expired; recovery_trigger=data_writer_failed; recovery_role=active; recovery_generation={}",
+                active_key.generation,
+            )
+        );
+        assert_eq!(
+            ClientError::Transport {
+                scope: "retained recovery",
+                detail,
+            }
+            .to_string(),
+            format!(
+                "retained recovery failed: recovery episode deadline expired; recovery_trigger=data_writer_failed; recovery_role=active; recovery_generation={}",
+                active_key.generation,
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_context_mismatch_reports_wire_bound_category_and_first_trigger() {
+        let (mut actor, active_key, _receiver, _control_receiver) =
+            test_actor_with_carrier(M2_CARRIER_QUEUE_FRAMES);
+        let candidate_key = CarrierKey::new(active_key.generation + 1, "candidate");
+        let (candidate_tx, _candidate_receiver) = mpsc::channel(M2_CARRIER_QUEUE_FRAMES);
+        actor.candidate = Some(Carrier {
+            key: candidate_key.clone(),
+            local_addr: None,
+            tx: candidate_tx,
+            pending_controls: BTreeMap::new(),
+            reader_cancel: CancellationToken::new(),
+            reader: None,
+            writer: None,
+        });
+        actor.remember_recovery_trigger(RecoveryTriggerClass::WriterFailed, &active_key);
+
+        let attempt = RotationAttemptIdentity::new(
+            "session",
+            1,
+            "owner",
+            "resume-context-red",
+            active_key.generation,
+            candidate_key.generation,
+            active_key.connection_id.clone(),
+            candidate_key.connection_id.clone(),
+        );
+        let roster =
+            tunnel_protocol::rotation_control::StreamRoster::new("resume-context-snapshot", vec![]);
+        let now = actor.now_ms();
+        let recovery_deadline = now
+            .checked_add(1_000)
+            .expect("test recovery deadline does not overflow");
+        let begin = RecoveryBegin {
+            message_id: "resume-context-begin".to_owned(),
+            reply_to: String::new(),
+            attempt: attempt.clone(),
+            episode_id: "resume-context-episode".to_owned(),
+            attempt_no: 1,
+            roster: roster.clone(),
+            remaining_ms: 1_000,
+        };
+        let local_closed = RecoveryClosed {
+            message_id: "resume-context-closed".to_owned(),
+            reply_to: begin.message_id.clone(),
+            attempt: attempt.clone(),
+            episode_id: begin.episode_id.clone(),
+            attempt_no: begin.attempt_no,
+            closed_connection_ids: vec![active_key.connection_id.clone()],
+            closure_digest: "resume-context-digest".to_owned(),
+        };
+        actor.recovery = Some(RecoveryRuntime {
+            begin,
+            local_closed,
+            prepare_message_id: Some("resume-context-prepare".to_owned()),
+            peer_closed: None,
+            combined_digest: None,
+            deadline_ms: recovery_deadline,
+            attempt_deadline_ms: None,
+            authenticated_closed_connection_ids: BTreeSet::new(),
+            local_snapshots: [BTreeMap::new(), BTreeMap::new()],
+            remote_snapshots: [BTreeMap::new(), BTreeMap::new()],
+            remote_ready_snapshots: [BTreeMap::new(), BTreeMap::new()],
+            remote_snapshot_message_ids: [None, None],
+            snapshot_reply_message_ids: [None, None],
+            snapshot_reply_messages: [None, None],
+            remote_ready_message_ids: [None, None],
+            remote_ready: [false, false],
+            local_plans: BTreeMap::new(),
+            peer_snapshots: BTreeMap::new(),
+            snapshot_replies: [false, false],
+            ready_replies: [false, false],
+            ready_reply_messages: [None, None],
+            fresh_reconciled: false,
+        });
+
+        let error = actor
+            .handle_resume(Resume {
+                message_id: "resume-context-request".to_owned(),
+                reply_to: "resume-context-prepare".to_owned(),
+                attempt,
+                snapshot_id: roster.snapshot_id,
+                stage: ResumeStage::Snapshot,
+                direction: Direction::RelayToConnector,
+                reconnect_credential: None,
+                entries: Vec::new(),
+                remaining_ms: MAX_ROTATION_RECOVERY_TIMEOUT_MS + 1,
+            })
+            .await
+            .expect_err("the Resume budget must exceed the wire recovery bound");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "RESUME recovery remaining budget exceeds protocol bound; recovery_trigger=data_writer_failed; recovery_role=active; recovery_generation={}",
+                active_key.generation,
+            )
+        );
+        let rendered = error.to_string();
+        assert!(!rendered.contains("resume-context"));
+        assert!(!rendered.contains("candidate"));
+    }
+
+    #[tokio::test]
+    async fn resume_accepts_bounded_queue_staleness_without_extending_deadline() {
+        let (mut actor, active_key, _receiver, _control_receiver) =
+            test_actor_with_carrier(M2_CARRIER_QUEUE_FRAMES);
+        let (candidate_tx, _candidate_receiver) = mpsc::channel(M2_CARRIER_QUEUE_FRAMES);
+        actor.candidate = Some(Carrier {
+            key: CarrierKey::new(active_key.generation + 1, "candidate"),
+            local_addr: None,
+            tx: candidate_tx,
+            pending_controls: BTreeMap::new(),
+            reader_cancel: CancellationToken::new(),
+            reader: None,
+            writer: None,
+        });
+        actor.remember_recovery_trigger(RecoveryTriggerClass::WriterFailed, &active_key);
+
+        let attempt = RotationAttemptIdentity::new(
+            "session",
+            1,
+            "owner",
+            "resume-stale-valid",
+            active_key.generation,
+            active_key.generation + 1,
+            active_key.connection_id.clone(),
+            "candidate",
+        );
+        let roster =
+            tunnel_protocol::rotation_control::StreamRoster::new("resume-stale-snapshot", vec![]);
+        let now = actor.now_ms();
+        let local_deadline = now
+            .checked_add(1_000)
+            .expect("test recovery deadline does not overflow");
+        let begin = RecoveryBegin {
+            message_id: "resume-stale-begin".to_owned(),
+            reply_to: String::new(),
+            attempt: attempt.clone(),
+            episode_id: "resume-stale-episode".to_owned(),
+            attempt_no: 1,
+            roster: roster.clone(),
+            remaining_ms: 1_000,
+        };
+        let local_closed = RecoveryClosed {
+            message_id: "resume-stale-closed".to_owned(),
+            reply_to: begin.message_id.clone(),
+            attempt: attempt.clone(),
+            episode_id: begin.episode_id.clone(),
+            attempt_no: begin.attempt_no,
+            closed_connection_ids: vec![active_key.connection_id.clone()],
+            closure_digest: "resume-stale-digest".to_owned(),
+        };
+        let closed_evidence = ClosureEvidence::closed(active_key.connection_id.clone());
+        actor
+            .rotation
+            .transport_lost(&attempt, now, RecoveryReason::OldTransportLost)
+            .expect("valid fixture enters recovery from the active carrier");
+        actor
+            .rotation
+            .close_for_recovery(
+                active_key.connection_id.clone(),
+                closed_evidence.clone(),
+                now,
+            )
+            .expect("valid fixture records old-carrier closure");
+        actor
+            .rotation
+            .begin_recovery(
+                attempt.clone(),
+                roster.clone(),
+                now,
+                RecoveryReason::OldTransportLost,
+                local_deadline,
+            )
+            .expect("valid fixture starts the retained recovery episode");
+        actor
+            .rotation
+            .reserve_recovery_socket(now)
+            .expect("valid fixture reserves the candidate carrier");
+        actor
+            .closed_for_recovery
+            .insert(active_key.connection_id.clone(), closed_evidence);
+        actor.recovery = Some(RecoveryRuntime {
+            begin,
+            local_closed,
+            prepare_message_id: Some("resume-stale-prepare".to_owned()),
+            peer_closed: None,
+            combined_digest: None,
+            deadline_ms: local_deadline,
+            attempt_deadline_ms: None,
+            authenticated_closed_connection_ids: BTreeSet::new(),
+            local_snapshots: [BTreeMap::new(), BTreeMap::new()],
+            remote_snapshots: [BTreeMap::new(), BTreeMap::new()],
+            remote_ready_snapshots: [BTreeMap::new(), BTreeMap::new()],
+            remote_snapshot_message_ids: [None, None],
+            snapshot_reply_message_ids: [None, None],
+            snapshot_reply_messages: [None, None],
+            remote_ready_message_ids: [None, None],
+            remote_ready: [false, false],
+            local_plans: BTreeMap::new(),
+            peer_snapshots: BTreeMap::new(),
+            snapshot_replies: [false, false],
+            ready_replies: [false, false],
+            ready_reply_messages: [None, None],
+            fresh_reconciled: false,
+        });
+
+        // The relay sampled 1,001 ms before its bounded control queue delay;
+        // the connector still has a live 1,000 ms local deadline.  Accepting
+        // this exact identity/roster message must not move that local cap.
+        actor
+            .handle_resume(Resume {
+                message_id: "resume-stale-request".to_owned(),
+                reply_to: "resume-stale-prepare".to_owned(),
+                attempt,
+                snapshot_id: roster.snapshot_id,
+                stage: ResumeStage::Snapshot,
+                direction: Direction::RelayToConnector,
+                reconnect_credential: None,
+                entries: Vec::new(),
+                remaining_ms: 1_001,
+            })
+            .await
+            .expect("bounded sender queue staleness must not extend or fail the local deadline");
+        assert_eq!(
+            actor
+                .recovery
+                .as_ref()
+                .expect("recovery remains active")
+                .deadline_ms,
+            local_deadline
+        );
+        assert!(
+            actor
+                .recovery
+                .as_ref()
+                .expect("recovery remains active")
+                .snapshot_replies[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_rejects_expired_candidate_before_deadline_tick() {
+        let (mut actor, active_key, _receiver, mut control_receiver) =
+            test_actor_with_carrier(M2_CARRIER_QUEUE_FRAMES);
+        let candidate_key = CarrierKey::new(active_key.generation + 1, "candidate-expired");
+        let (candidate_tx, _candidate_receiver) = mpsc::channel(M2_CARRIER_QUEUE_FRAMES);
+        actor.candidate = Some(Carrier {
+            key: candidate_key.clone(),
+            local_addr: None,
+            tx: candidate_tx,
+            pending_controls: BTreeMap::new(),
+            reader_cancel: CancellationToken::new(),
+            reader: None,
+            writer: None,
+        });
+        actor.remember_recovery_trigger(RecoveryTriggerClass::WriterFailed, &active_key);
+
+        let attempt = RotationAttemptIdentity::new(
+            "session",
+            1,
+            "owner",
+            "resume-expired-candidate",
+            active_key.generation,
+            candidate_key.generation,
+            active_key.connection_id.clone(),
+            candidate_key.connection_id.clone(),
+        );
+        let roster = tunnel_protocol::rotation_control::StreamRoster::new(
+            "expired-candidate-snapshot",
+            vec![],
+        );
+        let now = actor.now_ms();
+        let episode_deadline = now
+            .checked_add(1_000)
+            .expect("test recovery deadline does not overflow");
+        let begin = RecoveryBegin {
+            message_id: "expired-candidate-begin".to_owned(),
+            reply_to: String::new(),
+            attempt: attempt.clone(),
+            episode_id: "expired-candidate-episode".to_owned(),
+            attempt_no: 1,
+            roster: roster.clone(),
+            remaining_ms: 1_000,
+        };
+        let local_closed = RecoveryClosed {
+            message_id: "expired-candidate-closed".to_owned(),
+            reply_to: begin.message_id.clone(),
+            attempt: attempt.clone(),
+            episode_id: begin.episode_id.clone(),
+            attempt_no: begin.attempt_no,
+            closed_connection_ids: vec![active_key.connection_id.clone()],
+            closure_digest: "expired-candidate-digest".to_owned(),
+        };
+        let closed_evidence = ClosureEvidence::closed(active_key.connection_id.clone());
+        actor
+            .rotation
+            .transport_lost(&attempt, now, RecoveryReason::OldTransportLost)
+            .expect("fixture enters recovery from the active carrier");
+        actor
+            .rotation
+            .close_for_recovery(
+                active_key.connection_id.clone(),
+                closed_evidence.clone(),
+                now,
+            )
+            .expect("fixture records old-carrier closure");
+        actor
+            .rotation
+            .begin_recovery(
+                attempt.clone(),
+                roster.clone(),
+                now,
+                RecoveryReason::OldTransportLost,
+                episode_deadline,
+            )
+            .expect("fixture starts the retained recovery episode");
+        actor
+            .rotation
+            .reserve_recovery_socket(now)
+            .expect("fixture reserves the matching candidate carrier");
+        actor
+            .closed_for_recovery
+            .insert(active_key.connection_id.clone(), closed_evidence);
+        let immutable_episode_deadline = actor
+            .rotation
+            .status()
+            .deadline_ms
+            .expect("recovery episode retains its absolute deadline");
+        assert_eq!(immutable_episode_deadline, episode_deadline);
+        actor.recovery = Some(RecoveryRuntime {
+            begin,
+            local_closed,
+            prepare_message_id: Some("expired-candidate-prepare".to_owned()),
+            peer_closed: None,
+            combined_digest: None,
+            deadline_ms: episode_deadline,
+            attempt_deadline_ms: Some(now.saturating_sub(1)),
+            authenticated_closed_connection_ids: BTreeSet::new(),
+            local_snapshots: [BTreeMap::new(), BTreeMap::new()],
+            remote_snapshots: [BTreeMap::new(), BTreeMap::new()],
+            remote_ready_snapshots: [BTreeMap::new(), BTreeMap::new()],
+            remote_snapshot_message_ids: [None, None],
+            snapshot_reply_message_ids: [None, None],
+            snapshot_reply_messages: [None, None],
+            remote_ready_message_ids: [None, None],
+            remote_ready: [false, false],
+            local_plans: BTreeMap::new(),
+            peer_snapshots: BTreeMap::new(),
+            snapshot_replies: [false, false],
+            ready_replies: [false, false],
+            ready_reply_messages: [None, None],
+            fresh_reconciled: false,
+        });
+
+        let error = actor
+            .handle_resume(Resume {
+                message_id: "expired-candidate-request".to_owned(),
+                reply_to: "expired-candidate-prepare".to_owned(),
+                attempt,
+                snapshot_id: roster.snapshot_id,
+                stage: ResumeStage::Snapshot,
+                direction: Direction::RelayToConnector,
+                reconnect_credential: None,
+                entries: Vec::new(),
+                remaining_ms: 900,
+            })
+            .await
+            .expect_err("an expired candidate must fail before the next deadline tick");
+        match error {
+            ClientError::Transport { scope, detail } => {
+                assert_eq!(scope, "retained recovery");
+                assert!(detail.contains("recovery candidate phase deadline expired"));
+            }
+            other => panic!("expired candidate returned the wrong error category: {other:?}"),
+        }
+        assert_eq!(
+            actor
+                .recovery
+                .as_ref()
+                .expect("recovery remains active")
+                .deadline_ms,
+            episode_deadline
+        );
+        assert_eq!(
+            actor.rotation.status().deadline_ms,
+            Some(immutable_episode_deadline)
+        );
+        let recovery = actor.recovery.as_ref().expect("recovery remains active");
+        assert!(
+            recovery
+                .remote_snapshot_message_ids
+                .iter()
+                .all(Option::is_none)
+        );
+        assert!(recovery.snapshot_replies.iter().all(|replied| !replied));
+        assert!(recovery.snapshot_reply_messages.iter().all(Option::is_none));
+        assert!(recovery.local_plans.is_empty());
+        assert!(actor.control_journal.is_none());
+        assert!(actor.pending_candidate.is_none());
+        assert_eq!(
+            actor.candidate.as_ref().map(|candidate| &candidate.key),
+            Some(&candidate_key)
+        );
+        assert!(matches!(
+            control_receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn resume_rejects_stale_budget_after_local_deadline_expires() {
+        let (mut actor, active_key, _receiver, _control_receiver) =
+            test_actor_with_carrier(M2_CARRIER_QUEUE_FRAMES);
+        let attempt = RotationAttemptIdentity::new(
+            "session",
+            1,
+            "owner",
+            "resume-expired-local",
+            active_key.generation,
+            active_key.generation + 1,
+            active_key.connection_id.clone(),
+            "candidate",
+        );
+        let roster =
+            tunnel_protocol::rotation_control::StreamRoster::new("resume-expired-snapshot", vec![]);
+        let now = actor.now_ms();
+        let begin = RecoveryBegin {
+            message_id: "resume-expired-begin".to_owned(),
+            reply_to: String::new(),
+            attempt: attempt.clone(),
+            episode_id: "resume-expired-episode".to_owned(),
+            attempt_no: 1,
+            roster: roster.clone(),
+            remaining_ms: 1,
+        };
+        let local_closed = RecoveryClosed {
+            message_id: "resume-expired-closed".to_owned(),
+            reply_to: begin.message_id.clone(),
+            attempt: attempt.clone(),
+            episode_id: begin.episode_id.clone(),
+            attempt_no: begin.attempt_no,
+            closed_connection_ids: vec![active_key.connection_id.clone()],
+            closure_digest: "resume-expired-digest".to_owned(),
+        };
+        actor.recovery = Some(RecoveryRuntime {
+            begin,
+            local_closed,
+            prepare_message_id: Some("resume-expired-prepare".to_owned()),
+            peer_closed: None,
+            combined_digest: None,
+            deadline_ms: now.saturating_sub(1),
+            attempt_deadline_ms: None,
+            authenticated_closed_connection_ids: BTreeSet::new(),
+            local_snapshots: [BTreeMap::new(), BTreeMap::new()],
+            remote_snapshots: [BTreeMap::new(), BTreeMap::new()],
+            remote_ready_snapshots: [BTreeMap::new(), BTreeMap::new()],
+            remote_snapshot_message_ids: [None, None],
+            snapshot_reply_message_ids: [None, None],
+            snapshot_reply_messages: [None, None],
+            remote_ready_message_ids: [None, None],
+            remote_ready: [false, false],
+            local_plans: BTreeMap::new(),
+            peer_snapshots: BTreeMap::new(),
+            snapshot_replies: [false, false],
+            ready_replies: [false, false],
+            ready_reply_messages: [None, None],
+            fresh_reconciled: false,
+        });
+
+        let error = actor
+            .handle_resume(Resume {
+                message_id: "resume-expired-request".to_owned(),
+                reply_to: "resume-expired-prepare".to_owned(),
+                attempt,
+                snapshot_id: roster.snapshot_id,
+                stage: ResumeStage::Snapshot,
+                direction: Direction::RelayToConnector,
+                reconnect_credential: None,
+                entries: Vec::new(),
+                remaining_ms: 1,
+            })
+            .await
+            .expect_err("expired local deadline must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("RESUME recovery local deadline expired")
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_candidate_loss_releases_each_retry_before_next_begin() {
+        let (mut actor, active_key, active_receiver, mut control_receiver) =
+            test_actor_with_carrier(M2_CARRIER_QUEUE_FRAMES);
+        // The production close path emits local closure evidence only for a
+        // carrier with owned reader/writer tasks.  The generic unit fixture has
+        // an intentionally task-free carrier, so install real joinable tasks
+        // rather than treating a dropped synthetic queue receiver as a close
+        // proof.
+        drop(active_receiver);
+        let (active_tx, mut active_commands) = mpsc::channel(M2_CARRIER_QUEUE_FRAMES);
+        let reader_cancel = actor.active.reader_cancel.clone();
+        actor.active.tx = active_tx;
+        actor.active.reader = Some(tokio::spawn(async move {
+            reader_cancel.cancelled().await;
+        }));
+        actor.active.writer = Some(tokio::spawn(async move {
+            while let Some(command) = active_commands.recv().await {
+                if let CarrierCommand::Close(reply) = command {
+                    let _ = reply.send(());
+                    break;
+                }
+            }
+        }));
+        actor.remember_recovery_trigger(RecoveryTriggerClass::WriterFailed, &active_key);
+
+        let roster =
+            tunnel_protocol::rotation_control::StreamRoster::new("retry-release-snapshot", vec![]);
+        let episode_id = "retry-release-episode".to_owned();
+        let first_attempt = RotationAttemptIdentity::new(
+            "session",
+            1,
+            "owner",
+            "retry-release-one",
+            active_key.generation,
+            active_key.generation + 1,
+            active_key.connection_id.clone(),
+            "candidate-one",
+        );
+        let recovery_timeout_ms = actor.rotation.config().recovery_timeout_ms;
+        let first_begin = RecoveryBegin {
+            message_id: "retry-release-begin-one".to_owned(),
+            reply_to: String::new(),
+            attempt: first_attempt.clone(),
+            episode_id: episode_id.clone(),
+            attempt_no: 1,
+            roster: roster.clone(),
+            remaining_ms: recovery_timeout_ms,
+        };
+        actor
+            .handle_recovery_begin(first_begin)
+            .await
+            .expect("first recovery begin closes the active carrier");
+        assert_eq!(
+            actor
+                .recovery
+                .as_ref()
+                .expect("first recovery remains active")
+                .local_closed
+                .closed_connection_ids,
+            vec![active_key.connection_id.clone()]
+        );
+        let _ = drain_control_messages(&mut control_receiver);
+
+        // Authenticate the owner's matching closure record before the first
+        // candidate is lost.  The next wire roster must then contain only the
+        // newly failed candidate, while the old ID remains fenced locally.
+        let relay_closed = |actor: &M2Actor, message_id: &str| {
+            let recovery = actor.recovery.as_ref().expect("recovery context");
+            let mut closed = RecoveryClosed {
+                message_id: message_id.to_owned(),
+                reply_to: recovery.begin.message_id.clone(),
+                attempt: recovery.begin.attempt.clone(),
+                episode_id: recovery.begin.episode_id.clone(),
+                attempt_no: recovery.begin.attempt_no,
+                closed_connection_ids: recovery.local_closed.closed_connection_ids.clone(),
+                closure_digest: String::new(),
+            };
+            closed.closure_digest = closed
+                .closure_digest_for(RecoverySide::Relay)
+                .expect("relay closure digest");
+            closed
+        };
+        let first_peer_closed = relay_closed(&actor, "retry-release-closed-one");
+        actor
+            .handle_recovery_closed(first_peer_closed)
+            .expect("owner closure proof authenticates the first pair");
+
+        let first_candidate = first_attempt.new_connection_id.clone();
+        let first_reserve_now = actor.now_ms();
+        actor
+            .rotation
+            .reserve_recovery_socket(first_reserve_now)
+            .expect("first candidate reserves the recovery socket");
+        actor
+            .finish_recovery_candidate_loss(
+                first_attempt.clone(),
+                ClosureEvidence::closed(first_candidate.clone()),
+            )
+            .await
+            .expect("first candidate loss records local closure");
+        assert!(
+            actor
+                .rotation
+                .status()
+                .attempt
+                .as_ref()
+                .is_some_and(|attempt| attempt.new_connection_id == first_candidate)
+        );
+
+        let second_candidate = "candidate-two".to_owned();
+        let second_attempt = RotationAttemptIdentity::new(
+            "session",
+            1,
+            "owner",
+            "retry-release-two",
+            active_key.generation,
+            active_key.generation + 2,
+            active_key.connection_id.clone(),
+            second_candidate.clone(),
+        );
+        let second_begin = RecoveryBegin {
+            message_id: "retry-release-begin-two".to_owned(),
+            reply_to: String::new(),
+            attempt: second_attempt.clone(),
+            episode_id: episode_id.clone(),
+            attempt_no: 2,
+            roster: roster.clone(),
+            remaining_ms: actor
+                .recovery
+                .as_ref()
+                .expect("first recovery deadline")
+                .deadline_ms
+                .saturating_sub(actor.now_ms())
+                .max(1),
+        };
+        actor
+            .handle_recovery_begin(second_begin)
+            .await
+            .expect("attempt two releases the failed candidate before allocation");
+        assert_eq!(
+            actor
+                .recovery
+                .as_ref()
+                .expect("second recovery remains active")
+                .local_closed
+                .closed_connection_ids,
+            vec![first_candidate.clone()]
+        );
+        assert!(
+            actor
+                .released_recovery_connections
+                .contains(&first_candidate),
+            "attempt two must mark the first candidate released only after close_for_recovery"
+        );
+        let _ = drain_control_messages(&mut control_receiver);
+        let second_peer_closed = relay_closed(&actor, "retry-release-closed-two");
+        actor
+            .handle_recovery_closed(second_peer_closed)
+            .expect("owner closure proof authenticates attempt two");
+
+        let second_reserve_now = actor.now_ms();
+        actor
+            .rotation
+            .reserve_recovery_socket(second_reserve_now)
+            .expect("second candidate reserves the recovery socket");
+        actor
+            .finish_recovery_candidate_loss(
+                second_attempt.clone(),
+                ClosureEvidence::closed(second_candidate.clone()),
+            )
+            .await
+            .expect("second candidate loss records local closure");
+
+        let third_candidate = "candidate-three".to_owned();
+        let third_attempt = RotationAttemptIdentity::new(
+            "session",
+            1,
+            "owner",
+            "retry-release-three",
+            active_key.generation,
+            active_key.generation + 3,
+            active_key.connection_id.clone(),
+            third_candidate,
+        );
+        let third_begin = RecoveryBegin {
+            message_id: "retry-release-begin-three".to_owned(),
+            reply_to: String::new(),
+            attempt: third_attempt,
+            episode_id,
+            attempt_no: 3,
+            roster,
+            remaining_ms: actor
+                .recovery
+                .as_ref()
+                .expect("second recovery deadline")
+                .deadline_ms
+                .saturating_sub(actor.now_ms())
+                .max(1),
+        };
+        actor
+            .handle_recovery_begin(third_begin)
+            .await
+            .expect("attempt three releases the second failed candidate before allocation");
+        assert_eq!(
+            actor
+                .recovery
+                .as_ref()
+                .expect("third recovery remains active")
+                .begin
+                .attempt_no,
+            3
+        );
+        assert_eq!(
+            actor
+                .recovery
+                .as_ref()
+                .expect("third recovery closure roster")
+                .local_closed
+                .closed_connection_ids,
+            vec![second_candidate]
+        );
+    }
+
+    #[tokio::test]
+    async fn successive_recovery_does_not_reuse_completed_episode_closures() {
+        let (mut actor, old_key, _old_receiver, _control_receiver) =
+            test_actor_with_carrier(M2_CARRIER_QUEUE_FRAMES);
+        let candidate_key = CarrierKey::new(2, "candidate");
+        let (candidate_tx, candidate_receiver) = mpsc::channel(M2_CARRIER_QUEUE_FRAMES);
+        actor.candidate = Some(Carrier {
+            key: candidate_key.clone(),
+            local_addr: None,
+            tx: candidate_tx,
+            pending_controls: BTreeMap::new(),
+            reader_cancel: CancellationToken::new(),
+            reader: None,
+            writer: None,
+        });
+        actor.remember_recovery_trigger(RecoveryTriggerClass::WriterFailed, &old_key);
+
+        let first_attempt = RotationAttemptIdentity::new(
+            "session",
+            1,
+            "owner",
+            "recovery-one",
+            old_key.generation,
+            candidate_key.generation,
+            old_key.connection_id.clone(),
+            candidate_key.connection_id.clone(),
+        );
+        let first_roster =
+            tunnel_protocol::rotation_control::StreamRoster::new("recovery-one-snapshot", vec![]);
+        let now = actor.now_ms();
+        let recovery_timeout_ms = actor.rotation.config().recovery_timeout_ms;
+        let first_deadline = now
+            .checked_add(recovery_timeout_ms)
+            .expect("test recovery deadline does not overflow");
+        actor
+            .rotation
+            .transport_lost(&first_attempt, now, RecoveryReason::OldTransportLost)
+            .expect("first carrier loss enters recovery");
+        let first_closed_evidence = ClosureEvidence::closed(old_key.connection_id.clone());
+        actor
+            .rotation
+            .close_for_recovery(
+                old_key.connection_id.clone(),
+                first_closed_evidence.clone(),
+                now,
+            )
+            .expect("first carrier closure releases its rotation allocation");
+        actor
+            .rotation
+            .begin_recovery(
+                first_attempt.clone(),
+                first_roster.clone(),
+                now,
+                RecoveryReason::OldTransportLost,
+                first_deadline,
+            )
+            .expect("first recovery attempt starts");
+        actor
+            .rotation
+            .reserve_recovery_socket(now)
+            .expect("first replacement is reserved");
+
+        let first_begin = RecoveryBegin {
+            message_id: "recovery-one-begin".to_owned(),
+            reply_to: String::new(),
+            attempt: first_attempt,
+            episode_id: "recovery-one-episode".to_owned(),
+            attempt_no: 1,
+            roster: first_roster,
+            remaining_ms: recovery_timeout_ms,
+        };
+        let first_closed = RecoveryClosed {
+            message_id: "recovery-one-closed".to_owned(),
+            reply_to: first_begin.message_id.clone(),
+            attempt: first_begin.attempt.clone(),
+            episode_id: first_begin.episode_id.clone(),
+            attempt_no: first_begin.attempt_no,
+            closed_connection_ids: vec![old_key.connection_id.clone()],
+            closure_digest: "recovery-one-digest".to_owned(),
+        };
+        actor
+            .closed_for_recovery
+            .insert(old_key.connection_id.clone(), first_closed_evidence);
+        actor.recovery = Some(RecoveryRuntime {
+            begin: first_begin,
+            local_closed: first_closed.clone(),
+            prepare_message_id: None,
+            peer_closed: None,
+            combined_digest: Some("recovery-one-combined".to_owned()),
+            deadline_ms: first_deadline,
+            attempt_deadline_ms: None,
+            authenticated_closed_connection_ids: BTreeSet::new(),
+            local_snapshots: [BTreeMap::new(), BTreeMap::new()],
+            remote_snapshots: [BTreeMap::new(), BTreeMap::new()],
+            remote_ready_snapshots: [BTreeMap::new(), BTreeMap::new()],
+            remote_snapshot_message_ids: [None, None],
+            snapshot_reply_message_ids: [None, None],
+            snapshot_reply_messages: [None, None],
+            remote_ready_message_ids: [None, None],
+            remote_ready: [true, true],
+            local_plans: BTreeMap::new(),
+            peer_snapshots: BTreeMap::new(),
+            snapshot_replies: [true, true],
+            ready_replies: [true, true],
+            ready_reply_messages: [None, None],
+            fresh_reconciled: true,
+        });
+
+        actor
+            .maybe_finish_recovery()
+            .await
+            .expect("first recovery activates its replacement");
+        let completed = actor
+            .completed_recovery
+            .as_ref()
+            .expect("first recovery attestation is retained after activation");
+        assert_eq!(completed.local_closed, first_closed);
+        assert!(
+            actor.closed_for_recovery.is_empty(),
+            "closure evidence from the completed episode must not enter the next episode"
+        );
+        assert!(
+            actor.first_recovery_trigger.is_none(),
+            "the next recovery must observe a new physical trigger"
+        );
+
+        // There is no carrier writer task in this unit fixture.  Drop the
+        // command receiver before the second close so `close_carrier` records
+        // immediate local teardown instead of waiting for an absent close ACK.
+        drop(candidate_receiver);
+        let second_old_key = actor.active.key.clone();
+        actor
+            .mark_carrier_closed(&second_old_key, false, false)
+            .await
+            .expect("second active carrier records local closure");
+        let second_candidate_key = CarrierKey::new(3, "second-candidate");
+        let second_attempt = RotationAttemptIdentity::new(
+            "session",
+            1,
+            "owner",
+            "recovery-two",
+            second_old_key.generation,
+            second_candidate_key.generation,
+            second_old_key.connection_id.clone(),
+            second_candidate_key.connection_id.clone(),
+        );
+        let second_begin = RecoveryBegin {
+            message_id: "recovery-two-begin".to_owned(),
+            reply_to: String::new(),
+            attempt: second_attempt,
+            episode_id: "recovery-two-episode".to_owned(),
+            attempt_no: 1,
+            roster: tunnel_protocol::rotation_control::StreamRoster::new(
+                "recovery-two-snapshot",
+                vec![],
+            ),
+            remaining_ms: recovery_timeout_ms,
+        };
+        actor
+            .handle_recovery_begin(second_begin.clone())
+            .await
+            .expect("second recovery starts from only the current closure");
+        let second_recovery = actor
+            .recovery
+            .as_ref()
+            .expect("second recovery remains in flight");
+        assert_eq!(second_recovery.begin, second_begin);
+        assert_eq!(
+            second_recovery.local_closed.closed_connection_ids,
+            vec![second_old_key.connection_id]
+        );
+    }
+
     #[tokio::test]
     async fn full_event_queue_send_cancels_without_detaching() {
         let (events, _receiver) = mpsc::channel(1);
@@ -5488,5 +11530,1854 @@ mod tests {
         assert!(join_carrier_task_with_timeout(&mut task, Duration::from_millis(1)).await);
         assert!(dropped_rx.await.is_err());
         assert!(task.is_finished());
+    }
+
+    #[tokio::test]
+    async fn critical_control_spill_waits_for_pending_open_pair() {
+        let (mut actor, _active_key, _carrier_receiver, mut control_receiver) =
+            test_actor_with_control_capacity(M2_CARRIER_QUEUE_FRAMES, 16);
+        fill_control_queue_before_open(&mut actor)
+            .await
+            .expect("initial OPEN burst should be admitted");
+        actor
+            .handle_control(ControlMessage::Open(test_open(9)))
+            .await
+            .expect("queue pressure should defer one bounded OPEN");
+        actor
+            .handle_control(ControlMessage::Ping(Ping::new(
+                "ping-spill",
+                "session",
+                1,
+                1,
+            )))
+            .await
+            .expect("critical PING should spill while the OPEN pair waits");
+        assert!(actor.pending_open.is_some());
+        assert_eq!(actor.pending_critical_controls.len(), 1);
+        let critical_deadline = actor
+            .pending_critical_controls
+            .front()
+            .expect("spilled PONG should have a retained deadline")
+            .deadline;
+        assert!(!critical_deadline.expired());
+        assert!(critical_deadline.remaining(Instant::now()) <= M2_CRITICAL_CONTROL_TIMEOUT);
+        assert_eq!(control_receiver.len(), 15);
+
+        control_receiver
+            .try_recv()
+            .expect("first queued response should drain");
+        control_receiver
+            .try_recv()
+            .expect("second queued response should drain");
+        actor
+            .flush_pending_open()
+            .expect("drained queue should admit the deferred OPEN");
+        actor
+            .flush_pending_critical_controls()
+            .expect("critical response should drain after the OPEN pair");
+        assert!(actor.pending_open.is_none());
+        assert!(actor.pending_critical_controls.is_empty());
+
+        let mut queued_messages = Vec::new();
+        while let Ok(item) = control_receiver.try_recv() {
+            let Message::Text(text) = &item.message else {
+                continue;
+            };
+            queued_messages
+                .push(decode_control(text.as_bytes()).expect("queued control should decode"));
+        }
+        assert!(matches!(
+            queued_messages.get(queued_messages.len().saturating_sub(3)),
+            Some(ControlMessage::Opened(opened)) if opened.stream_id == 9
+        ));
+        assert!(matches!(
+            queued_messages.get(queued_messages.len().saturating_sub(2)),
+            Some(ControlMessage::AuthorizationChallenge(challenge)) if challenge.stream_id == 9
+        ));
+        assert!(matches!(
+            queued_messages.last(),
+            Some(ControlMessage::Pong(pong)) if pong.reply_to == "ping-spill"
+        ));
+    }
+
+    #[test]
+    fn critical_control_spill_accepts_one_maximum_protocol_frame() {
+        let (mut actor, _active_key, _carrier_receiver, _control_receiver) =
+            test_actor_with_control_capacity(M2_CARRIER_QUEUE_FRAMES, 16);
+        let deadline = actor
+            .critical_control_deadline()
+            .expect("critical deadline should be representable");
+        let frame = Message::Text("x".repeat(MAX_CONTROL_MESSAGE_BYTES).into());
+        actor
+            .defer_critical_control(frame.clone(), deadline)
+            .expect("a maximum-size protocol control frame must fit the spill");
+        assert_eq!(
+            actor.pending_critical_control_bytes,
+            MAX_CONTROL_MESSAGE_BYTES
+        );
+        assert_eq!(actor.pending_critical_controls.len(), 1);
+        assert!(matches!(
+            actor.defer_critical_control(frame, deadline),
+            Err(ClientError::QueueLimit)
+        ));
+    }
+
+    #[tokio::test]
+    async fn critical_control_expiry_is_observed_while_open_pair_waits() {
+        let (mut actor, _active_key, _carrier_receiver, _control_receiver) =
+            test_actor_with_control_capacity(M2_CARRIER_QUEUE_FRAMES, 16);
+        fill_control_queue_before_open(&mut actor)
+            .await
+            .expect("initial OPEN burst should be admitted");
+        actor
+            .handle_control(ControlMessage::Open(test_open(9)))
+            .await
+            .expect("OPEN should wait for its atomic pair");
+        actor
+            .handle_control(ControlMessage::Ping(Ping::new(
+                "ping-expired",
+                "session",
+                1,
+                1,
+            )))
+            .await
+            .expect("PONG should enter bounded spill");
+        let expired_started = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("test instant should support a bounded subtraction");
+        let expired_wall = SystemTime::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("test wall clock should support a bounded subtraction");
+        actor
+            .pending_critical_controls
+            .front_mut()
+            .expect("PONG should remain in spill")
+            .deadline = DualDeadline::new(expired_started, expired_wall, Duration::from_millis(1))
+            .expect("expired test deadline should be representable");
+
+        assert!(matches!(
+            actor.flush_pending_critical_controls(),
+            Err(ClientError::Transport {
+                scope: "control response",
+                ..
+            })
+        ));
+        assert!(actor.pending_open.is_some());
+        assert!(actor.pending_critical_controls.is_empty());
+        assert_eq!(actor.pending_critical_control_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn multiple_pending_opens_preserve_head_deadline_and_fifo_order() {
+        let (mut actor, _active_key, _carrier_receiver, mut control_receiver) =
+            test_actor_with_control_capacity(M2_CARRIER_QUEUE_FRAMES, 16);
+        fill_control_queue_before_open(&mut actor)
+            .await
+            .expect("initial OPEN burst should be admitted");
+        actor
+            .handle_control(ControlMessage::Open(test_open(9)))
+            .await
+            .expect("first OPEN should be retained under queue pressure");
+
+        let (first_message_id, first_operation_deadline, first_auth_deadline) = {
+            let pending = actor
+                .pending_open
+                .as_ref()
+                .expect("first OPEN should be the pending head");
+            (
+                pending.open.message_id.clone(),
+                pending.operation_deadline.monotonic,
+                pending
+                    .authorization
+                    .as_ref()
+                    .expect("deferred OPEN should retain its authorization deadline")
+                    .auth_deadline
+                    .monotonic,
+            )
+        };
+
+        tokio::task::yield_now().await;
+        actor
+            .handle_control(ControlMessage::Open(test_open(10)))
+            .await
+            .expect("second OPEN should join the bounded pending FIFO");
+        tokio::task::yield_now().await;
+        actor
+            .handle_control(ControlMessage::Open(test_open(11)))
+            .await
+            .expect("third OPEN should join the bounded pending FIFO");
+
+        let head = actor
+            .pending_open
+            .as_ref()
+            .expect("later OPENs must not replace the pending head");
+        assert_eq!(head.open.message_id, first_message_id);
+        assert_eq!(head.operation_deadline.monotonic, first_operation_deadline);
+        assert_eq!(
+            head.authorization
+                .as_ref()
+                .expect("pending head authorization must be retained")
+                .auth_deadline
+                .monotonic,
+            first_auth_deadline
+        );
+        assert_eq!(actor.pending_open_queue.len(), 2);
+        assert_eq!(actor.pending_open_queue[0].open.stream_id, 10);
+        assert_eq!(actor.pending_open_queue[1].open.stream_id, 11);
+        assert!(
+            actor.pending_open_queue[0].operation_deadline.monotonic
+                <= actor.pending_open_queue[1].operation_deadline.monotonic,
+            "queued OPEN deadlines must retain receive order"
+        );
+        assert_eq!(actor.streams.len(), 8);
+
+        control_receiver
+            .try_recv()
+            .expect("first queued response should drain");
+        control_receiver
+            .try_recv()
+            .expect("second queued response should drain");
+        actor
+            .flush_pending_open()
+            .expect("the retained head should admit after its pair has room");
+        assert!(actor.pending_open.is_none());
+        assert_eq!(actor.pending_open_queue.len(), 2);
+        assert!(actor.streams.contains_key(&9));
+    }
+
+    #[tokio::test]
+    async fn expired_pending_open_does_not_block_spilled_critical_response() {
+        let (mut actor, _active_key, _carrier_receiver, mut control_receiver) =
+            test_actor_with_control_capacity(M2_CARRIER_QUEUE_FRAMES, 16);
+        fill_control_queue_before_open(&mut actor)
+            .await
+            .expect("initial OPEN burst should be admitted");
+        actor
+            .handle_control(ControlMessage::Open(test_open(9)))
+            .await
+            .expect("queue pressure should retain the OPEN");
+        actor
+            .handle_control(ControlMessage::Ping(Ping::new(
+                "expired-ping",
+                "session",
+                1,
+                1,
+            )))
+            .await
+            .expect("critical PING should spill behind the pending OPEN");
+
+        let expired_started = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("test instant should support bounded subtraction");
+        let expired_wall = SystemTime::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("test wall clock should support bounded subtraction");
+        let expired = DualDeadline::new(expired_started, expired_wall, Duration::from_millis(1))
+            .expect("expired test deadline should be representable");
+        let pending = actor
+            .pending_open
+            .as_mut()
+            .expect("queue pressure should retain the OPEN");
+        pending.operation_deadline = expired;
+        pending
+            .authorization
+            .as_mut()
+            .expect("deferred OPEN should retain authorization state")
+            .auth_deadline = expired;
+
+        control_receiver
+            .try_recv()
+            .expect("first queued response should drain");
+        control_receiver
+            .try_recv()
+            .expect("second queued response should drain");
+        actor
+            .flush_pending_open()
+            .expect("expired OPEN should produce a bounded refusal");
+        actor
+            .flush_pending_critical_controls()
+            .expect("the spilled critical response should still make progress");
+        assert!(actor.pending_open.is_none());
+        assert!(actor.pending_critical_controls.is_empty());
+
+        let mut queued = Vec::new();
+        while let Ok(item) = control_receiver.try_recv() {
+            let Message::Text(text) = &item.message else {
+                continue;
+            };
+            queued.push(decode_control(text.as_bytes()).expect("queued control should decode"));
+        }
+        let pong_index = queued.iter().position(|message| {
+            matches!(message, ControlMessage::Pong(pong) if pong.reply_to == "expired-ping")
+        });
+        let rejection_index = queued.iter().position(|message| {
+            matches!(
+                message,
+                ControlMessage::Rejected(rejected)
+                    if rejected.stream_id == 9 && rejected.code == "AUTHORIZATION_EXPIRED"
+            )
+        });
+        assert!(
+            pong_index.is_some(),
+            "spilled critical PING should be delivered"
+        );
+        assert!(
+            rejection_index.is_some(),
+            "expired pending OPEN should receive a typed refusal"
+        );
+        assert!(
+            pong_index.expect("spilled PING should have an index")
+                < rejection_index.expect("expired OPEN should have an index"),
+            "critical responses must retain their receive order"
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_websocket_ping_spills_at_full_control_capacity() {
+        let (mut actor, _active_key, _carrier_receiver, mut control_receiver) =
+            test_actor_with_control_capacity(M2_CARRIER_QUEUE_FRAMES, 16);
+        fill_control_queue_before_open(&mut actor)
+            .await
+            .expect("initial OPEN burst should be admitted");
+        actor
+            .handle_control(ControlMessage::Ping(Ping::new(
+                "fill-control-queue",
+                "session",
+                1,
+                1,
+            )))
+            .await
+            .expect("last control slot should accept the logical PING");
+        actor
+            .handle_control(ControlMessage::Open(test_open(9)))
+            .await
+            .expect("OPEN should be retained once its pair cannot fit");
+
+        actor
+            .handle_control_message(Message::Ping(b"ws-ping".to_vec().into()))
+            .await
+            .expect("raw WebSocket PING must use the bounded critical spill");
+        assert_eq!(control_receiver.len(), 16);
+        assert_eq!(actor.pending_critical_controls.len(), 1);
+        assert!(matches!(
+            actor
+                .pending_critical_controls
+                .front()
+                .map(|pending| &pending.message),
+            Some(Message::Pong(payload)) if payload.as_ref() == b"ws-ping"
+        ));
+
+        control_receiver
+            .try_recv()
+            .expect("first queued response should drain");
+        control_receiver
+            .try_recv()
+            .expect("second queued response should drain");
+        actor
+            .flush_pending_open()
+            .expect("drained queue should admit the pending OPEN");
+        control_receiver
+            .try_recv()
+            .expect("first OPEN response should drain");
+        control_receiver
+            .try_recv()
+            .expect("second OPEN response should drain");
+        actor
+            .flush_pending_critical_controls()
+            .expect("raw WebSocket PONG should drain after the OPEN pair");
+        assert!(actor.pending_critical_controls.is_empty());
+
+        let mut saw_pong = false;
+        while let Ok(item) = control_receiver.try_recv() {
+            if let Message::Pong(payload) = &item.message
+                && payload.as_ref() == b"ws-ping"
+            {
+                saw_pong = true;
+            }
+        }
+        assert!(saw_pong, "raw WebSocket PING should receive a bounded PONG");
+    }
+
+    #[tokio::test]
+    async fn cancel_removes_pending_open_head_and_queued_entry() {
+        let (mut actor, _active_key, _carrier_receiver, mut control_receiver) =
+            test_actor_with_control_capacity(M2_CARRIER_QUEUE_FRAMES, 16);
+        fill_control_queue_before_open(&mut actor)
+            .await
+            .expect("initial OPEN burst should be admitted");
+        let head_open = test_open(9);
+        let queued_open = test_open(10);
+        actor
+            .handle_control(ControlMessage::Open(head_open.clone()))
+            .await
+            .expect("first OPEN should be retained under queue pressure");
+        actor
+            .handle_control(ControlMessage::Open(queued_open.clone()))
+            .await
+            .expect("second OPEN should enter the bounded pending FIFO");
+        let retained_before_cancel = actor.pending_open_budget.current();
+        assert!(
+            retained_before_cancel > 0,
+            "the pending head and FIFO entry must hold parsed OPEN budget"
+        );
+        assert_eq!(
+            actor
+                .pending_open
+                .as_ref()
+                .expect("first OPEN should remain the pending head")
+                .open
+                .stream_id,
+            head_open.stream_id
+        );
+        assert_eq!(actor.pending_open_queue.len(), 1);
+
+        actor
+            .handle_control(ControlMessage::Cancel(Cancel::new(
+                "cancel-queued-open-wrong-operation",
+                "session",
+                1,
+                queued_open.stream_id,
+                "different-operation",
+            )))
+            .await
+            .expect("mismatched CANCEL should remain best effort");
+        assert_eq!(actor.pending_open_queue.len(), 1);
+
+        actor
+            .handle_control(ControlMessage::Cancel(Cancel::new(
+                "cancel-queued-open",
+                "session",
+                1,
+                queued_open.stream_id,
+                queued_open.operation_id.clone(),
+            )))
+            .await
+            .expect("CANCEL for a queued OPEN should be handled");
+        assert!(
+            actor
+                .pending_open_queue
+                .iter()
+                .all(|pending| pending.open.stream_id != queued_open.stream_id),
+            "CANCEL must remove a queued pending OPEN"
+        );
+        assert!(
+            actor.pending_open_budget.current() < retained_before_cancel,
+            "removing one queued OPEN must release only its parsed reservation"
+        );
+        assert!(actor.pending_open.is_some());
+
+        actor
+            .handle_control(ControlMessage::Cancel(Cancel::new(
+                "cancel-head-open",
+                "session",
+                1,
+                head_open.stream_id,
+                head_open.operation_id,
+            )))
+            .await
+            .expect("CANCEL for the pending head should be handled");
+        assert!(
+            actor.pending_open.is_none(),
+            "CANCEL must remove the deferred OPEN head"
+        );
+        assert!(actor.pending_open_queue.is_empty());
+        assert_eq!(
+            actor.pending_open_budget.current(),
+            0,
+            "removing the pending head must release the final parsed reservation"
+        );
+
+        actor
+            .flush_pending_open()
+            .expect("canceled OPENs must not fail or become admitted on retry");
+        assert_eq!(actor.streams.len(), 8);
+        assert!(!actor.streams.contains_key(&head_open.stream_id));
+        assert!(!actor.streams.contains_key(&queued_open.stream_id));
+        while let Ok(item) = control_receiver.try_recv() {
+            let Message::Text(text) = &item.message else {
+                continue;
+            };
+            let message = decode_control(text.as_bytes()).expect("queued control should decode");
+            assert!(!matches!(
+                &message,
+                ControlMessage::Opened(opened)
+                    if opened.stream_id == head_open.stream_id
+                        || opened.stream_id == queued_open.stream_id
+            ));
+            assert!(!matches!(
+                &message,
+                ControlMessage::AuthorizationChallenge(challenge)
+                    if challenge.stream_id == head_open.stream_id
+                        || challenge.stream_id == queued_open.stream_id
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_open_replays_original_responses_without_refreshing_admission() {
+        let (mut actor, _active_key, _carrier_receiver, mut control_receiver) =
+            test_actor_with_control_capacity(M2_CARRIER_QUEUE_FRAMES, 16);
+        let open = test_open(1);
+        actor
+            .handle_control(ControlMessage::Open(open.clone()))
+            .await
+            .expect("initial OPEN should be admitted");
+        let initial = drain_control_messages(&mut control_receiver);
+        assert_eq!(
+            initial.len(),
+            2,
+            "OPEN admission must emit OPENED plus challenge"
+        );
+        assert!(matches!(
+            initial.first(),
+            Some(ControlMessage::Opened(opened))
+                if opened.reply_to == open.message_id && opened.stream_id == open.stream_id
+        ));
+        assert!(matches!(
+            initial.get(1),
+            Some(ControlMessage::AuthorizationChallenge(challenge))
+                if challenge.stream_id == open.stream_id
+        ));
+        let before = {
+            let stream = actor
+                .streams
+                .get(&open.stream_id)
+                .expect("initial OPEN should create one stream");
+            (
+                stream.auth.challenge_id.clone(),
+                stream.auth.nonce.clone(),
+                stream.auth.deadline.monotonic,
+                stream.auth.deadline.wall,
+                stream.auth.operation_deadline.monotonic,
+                stream.auth.operation_deadline.wall,
+            )
+        };
+
+        actor
+            .handle_control(ControlMessage::Open(open.clone()))
+            .await
+            .expect("an identical OPEN retry should replay its bounded responses");
+        let replay = drain_control_messages(&mut control_receiver);
+        assert_eq!(
+            replay,
+            vec![initial[0].clone()],
+            "identical OPEN must replay only the immutable OPENED response"
+        );
+        assert_eq!(
+            actor.streams.len(),
+            1,
+            "a retry must not admit a second stream"
+        );
+        let after = {
+            let stream = actor
+                .streams
+                .get(&open.stream_id)
+                .expect("the original stream must remain admitted");
+            (
+                stream.auth.challenge_id.clone(),
+                stream.auth.nonce.clone(),
+                stream.auth.deadline.monotonic,
+                stream.auth.deadline.wall,
+                stream.auth.operation_deadline.monotonic,
+                stream.auth.operation_deadline.wall,
+            )
+        };
+        assert_eq!(
+            after, before,
+            "replay must not refresh challenge or operation deadlines"
+        );
+    }
+
+    #[tokio::test]
+    async fn confirmed_open_retry_does_not_replay_authorization_refresh() {
+        let (mut actor, _active_key, _carrier_receiver, mut control_receiver) =
+            test_actor_with_control_capacity(M2_CARRIER_QUEUE_FRAMES, 16);
+        // Use a short, valid grant window so the test observes the real
+        // initial-confirmation -> refresh-confirmation transition without a
+        // multi-second sleep.
+        actor.config.limits.grant_timeout_ms = 250;
+        let open = test_open(1);
+        actor
+            .handle_control(ControlMessage::Open(open.clone()))
+            .await
+            .expect("initial OPEN should be admitted");
+        let initial = drain_control_messages(&mut control_receiver);
+        assert_eq!(initial.len(), 2);
+        let initial_challenge = match initial.get(1) {
+            Some(ControlMessage::AuthorizationChallenge(challenge)) => challenge.clone(),
+            other => panic!("initial OPEN should emit its challenge, got {other:?}"),
+        };
+        let initial_challenge_deadline = actor
+            .streams
+            .get(&open.stream_id)
+            .expect("initial OPEN should create one stream")
+            .auth
+            .deadline;
+        actor
+            .handle_authorization_confirmed(AuthorizationConfirmed::new(
+                "initial-confirmation",
+                initial_challenge.message_id.clone(),
+                "session",
+                1,
+                open.stream_id,
+                initial_challenge.challenge_id.clone(),
+                initial_challenge.nonce.clone(),
+                initial_challenge.permission_digest.clone(),
+                initial_challenge.grant_revision,
+                250,
+            ))
+            .await
+            .expect("the initial challenge should confirm");
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        // Keep the original 250 ms challenge deadline as the historical
+        // boundary, but give the actual refreshed grant a full five seconds
+        // so scheduler load cannot make this assertion race its expiry.
+        actor.config.limits.grant_timeout_ms = 5_000;
+        actor
+            .refresh_authorizations()
+            .await
+            .expect("the confirmed stream should receive a real refresh challenge");
+        let refresh_messages = drain_control_messages(&mut control_receiver);
+        let refresh_challenge = refresh_messages.iter().find_map(|message| match message {
+            ControlMessage::AuthorizationChallenge(challenge) => Some(challenge.clone()),
+            _ => None,
+        });
+        let refresh_challenge = refresh_challenge.expect("refresh should emit one challenge");
+        actor
+            .handle_authorization_confirmed(AuthorizationConfirmed::new(
+                "refresh-confirmation",
+                refresh_challenge.message_id.clone(),
+                "session",
+                1,
+                open.stream_id,
+                refresh_challenge.challenge_id.clone(),
+                refresh_challenge.nonce.clone(),
+                refresh_challenge.permission_digest.clone(),
+                refresh_challenge.grant_revision,
+                5_000,
+            ))
+            .await
+            .expect("the refresh challenge should confirm");
+
+        // Let the original challenge window expire while retaining the newer
+        // confirmed grant. This is the state in which replaying the old
+        // challenge would incorrectly refresh authorization.
+        let wait = initial_challenge_deadline
+            .monotonic
+            .saturating_duration_since(Instant::now())
+            + Duration::from_millis(2);
+        tokio::time::sleep(wait).await;
+        assert!(initial_challenge_deadline.expired());
+        assert!(
+            !actor
+                .streams
+                .get(&open.stream_id)
+                .expect("the refreshed stream should remain active")
+                .auth
+                .deadline
+                .expired()
+        );
+        let before = {
+            let stream = actor
+                .streams
+                .get(&open.stream_id)
+                .expect("the refreshed stream should remain active");
+            (
+                stream.auth.challenge_id.clone(),
+                stream.auth.nonce.clone(),
+                stream.auth.permission_digest.clone(),
+                stream.auth.grant_revision,
+                stream.auth.deadline.monotonic,
+                stream.auth.deadline.wall,
+                stream.auth.operation_deadline.monotonic,
+                stream.auth.operation_deadline.wall,
+            )
+        };
+
+        actor
+            .handle_control(ControlMessage::Open(open))
+            .await
+            .expect("a confirmed OPEN retry should replay OPENED");
+        let replay = drain_control_messages(&mut control_receiver);
+        assert_eq!(
+            replay,
+            vec![initial[0].clone()],
+            "a confirmed retry must not replay the independent auth challenge"
+        );
+        assert!(
+            !replay
+                .iter()
+                .any(|message| matches!(message, ControlMessage::AuthorizationChallenge(_)))
+        );
+        let after = {
+            let stream = actor
+                .streams
+                .get(&1)
+                .expect("the refreshed stream should remain active");
+            (
+                stream.auth.challenge_id.clone(),
+                stream.auth.nonce.clone(),
+                stream.auth.permission_digest.clone(),
+                stream.auth.grant_revision,
+                stream.auth.deadline.monotonic,
+                stream.auth.deadline.wall,
+                stream.auth.operation_deadline.monotonic,
+                stream.auth.operation_deadline.wall,
+            )
+        };
+        assert_eq!(after, before, "a retry must not refresh any auth state");
+    }
+
+    #[tokio::test]
+    async fn duplicate_pending_open_coalesces_without_refreshing_deadlines() {
+        let (mut actor, _active_key, _carrier_receiver, control_receiver) =
+            test_actor_with_control_capacity(M2_CARRIER_QUEUE_FRAMES, 16);
+        fill_control_queue_before_open(&mut actor)
+            .await
+            .expect("initial OPEN burst should fill the bounded response queue");
+        let open = test_open(9);
+        actor
+            .handle_control(ControlMessage::Open(open.clone()))
+            .await
+            .expect("the first OPEN should wait for its atomic response pair");
+        let retained_bytes = pending_open_retained_bytes(&open).expect("bounded OPEN estimate");
+        assert_eq!(
+            actor.pending_open_budget.current(),
+            retained_bytes,
+            "a deferred OPEN must reserve its parsed representation"
+        );
+        let before = {
+            let pending = actor
+                .pending_open
+                .as_ref()
+                .expect("the first OPEN should be the pending head");
+            (
+                pending.open.message_id.clone(),
+                pending.operation_deadline.monotonic,
+                pending.operation_deadline.wall,
+                pending
+                    .authorization
+                    .as_ref()
+                    .expect("the pending OPEN should retain its challenge")
+                    .challenge_id
+                    .clone(),
+                pending
+                    .authorization
+                    .as_ref()
+                    .expect("the pending OPEN should retain its challenge")
+                    .nonce
+                    .clone(),
+                pending
+                    .authorization
+                    .as_ref()
+                    .expect("the pending OPEN should retain its challenge")
+                    .auth_deadline
+                    .monotonic,
+                pending
+                    .authorization
+                    .as_ref()
+                    .expect("the pending OPEN should retain its challenge")
+                    .auth_deadline
+                    .wall,
+            )
+        };
+        assert!(actor.pending_open_queue.is_empty());
+        assert_eq!(control_receiver.len(), 15);
+
+        actor
+            .handle_control(ControlMessage::Open(open))
+            .await
+            .expect("an identical pending OPEN should be coalesced");
+        assert_eq!(
+            actor.pending_open_budget.current(),
+            retained_bytes,
+            "an idempotent pending retry must not double-charge parsed state"
+        );
+        assert!(
+            actor.pending_open_queue.is_empty(),
+            "a duplicate pending OPEN must not consume another FIFO slot"
+        );
+        let after = {
+            let pending = actor
+                .pending_open
+                .as_ref()
+                .expect("the original pending OPEN must remain the head");
+            (
+                pending.open.message_id.clone(),
+                pending.operation_deadline.monotonic,
+                pending.operation_deadline.wall,
+                pending
+                    .authorization
+                    .as_ref()
+                    .expect("the pending OPEN should retain its challenge")
+                    .challenge_id
+                    .clone(),
+                pending
+                    .authorization
+                    .as_ref()
+                    .expect("the pending OPEN should retain its challenge")
+                    .nonce
+                    .clone(),
+                pending
+                    .authorization
+                    .as_ref()
+                    .expect("the pending OPEN should retain its challenge")
+                    .auth_deadline
+                    .monotonic,
+                pending
+                    .authorization
+                    .as_ref()
+                    .expect("the pending OPEN should retain its challenge")
+                    .auth_deadline
+                    .wall,
+            )
+        };
+        assert_eq!(
+            after, before,
+            "coalescing must preserve all original deadlines and IDs"
+        );
+        assert_eq!(
+            control_receiver.len(),
+            15,
+            "coalescing must not emit a duplicate response"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_open_budget_releases_after_deferred_pair_admission() {
+        let (mut actor, _active_key, _carrier_receiver, mut control_receiver) =
+            test_actor_with_control_capacity(M2_CARRIER_QUEUE_FRAMES, 16);
+        fill_control_queue_before_open(&mut actor)
+            .await
+            .expect("initial OPEN burst should fill the bounded response queue");
+        let open = test_open(9);
+        actor
+            .handle_control(ControlMessage::Open(open))
+            .await
+            .expect("the OPEN should be retained until both response slots fit");
+        assert!(actor.pending_open_budget.current() > 0);
+
+        for _ in 0..15 {
+            control_receiver
+                .try_recv()
+                .expect("the existing bounded responses should drain");
+        }
+        actor
+            .flush_pending_open()
+            .expect("the deferred atomic pair should admit after the drain");
+        assert!(actor.pending_open.is_none());
+        assert!(actor.pending_open_queue.is_empty());
+        assert_eq!(
+            actor.pending_open_budget.current(),
+            0,
+            "admission must release the parsed OPEN reservation exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_open_budget_exhaustion_is_a_typed_rejection() {
+        let (mut actor, _active_key, _carrier_receiver, mut control_receiver) =
+            test_actor_with_control_capacity(M2_CARRIER_QUEUE_FRAMES, 16);
+        fill_control_queue_before_open(&mut actor)
+            .await
+            .expect("initial OPEN burst should fill the bounded response queue");
+        let open = test_open(9);
+        let estimate = pending_open_retained_bytes(&open).expect("bounded OPEN estimate");
+        Arc::get_mut(&mut actor.pending_open_budget)
+            .expect("test actor should own the parsed OPEN budget")
+            .maximum = estimate.saturating_sub(1);
+
+        actor
+            .handle_control(ControlMessage::Open(open.clone()))
+            .await
+            .expect("parsed-OPEN exhaustion should return a bounded refusal");
+        let response = drain_control_messages(&mut control_receiver);
+        assert!(matches!(
+            response.last(),
+            Some(ControlMessage::Rejected(rejected))
+                if rejected.reply_to == open.message_id
+                    && rejected.code == "RESOURCE_EXHAUSTED"
+                    && rejected.reason.contains("parsed OPEN retention")
+        ));
+        assert!(actor.pending_open.is_none());
+        assert!(actor.pending_open_queue.is_empty());
+        assert_eq!(
+            actor.pending_open_budget.current(),
+            0,
+            "a typed parsed-OPEN refusal must not leave a reservation behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn changed_open_body_with_reused_message_id_is_a_protocol_error() {
+        let (mut actor, _active_key, _carrier_receiver, _control_receiver) =
+            test_actor_with_control_capacity(M2_CARRIER_QUEUE_FRAMES, 16);
+        let first = test_open(1);
+        actor
+            .handle_control(ControlMessage::Open(first.clone()))
+            .await
+            .expect("initial OPEN should be admitted");
+        let mut changed = test_open(2);
+        changed.message_id = first.message_id;
+        let error = actor
+            .handle_control(ControlMessage::Open(changed))
+            .await
+            .expect_err("reusing an OPEN message ID with a changed body must fail closed");
+        assert!(
+            matches!(error, ClientError::Protocol(_)),
+            "conflicting OPEN IDs must be typed as protocol errors: {error:?}"
+        );
+        assert_eq!(
+            actor.streams.len(),
+            1,
+            "conflicting content must not admit another stream"
+        );
+        assert!(!actor.streams.contains_key(&2));
+    }
+
+    #[tokio::test]
+    async fn new_open_message_id_reusing_stream_id_is_typed_stream_exists() {
+        let (mut actor, _active_key, _carrier_receiver, mut control_receiver) =
+            test_actor_with_control_capacity(M2_CARRIER_QUEUE_FRAMES, 16);
+        let first = test_open(1);
+        actor
+            .handle_control(ControlMessage::Open(first))
+            .await
+            .expect("initial OPEN should be admitted");
+        let mut duplicate_stream = test_open(2);
+        duplicate_stream.message_id = "open-message-new-stream-id-conflict".to_owned();
+        duplicate_stream.operation_id = "operation-new-stream-id-conflict".to_owned();
+        duplicate_stream.stream_id = 1;
+        actor
+            .handle_control(ControlMessage::Open(duplicate_stream.clone()))
+            .await
+            .expect("a new message ID may receive a typed stream conflict");
+        let messages = drain_control_messages(&mut control_receiver);
+        assert!(matches!(
+            messages.last(),
+            Some(ControlMessage::Rejected(rejected))
+                if rejected.reply_to == duplicate_stream.message_id
+                    && rejected.stream_id == duplicate_stream.stream_id
+                    && rejected.code == "STREAM_EXISTS"
+        ));
+        assert_eq!(
+            actor.streams.len(),
+            1,
+            "STREAM_EXISTS must not replace the original stream"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_forget_purges_matching_pending_open_before_journal_compaction() {
+        let (mut actor, active_key, mut carrier_receiver, mut control_receiver) =
+            test_actor_with_control_capacity(M2_CARRIER_QUEUE_FRAMES, 16);
+
+        // Leave one response slot available: the first OPEN needs an atomic
+        // two-message pair and therefore becomes the pending head. A second
+        // message ID for the same stream/operation is retained behind it.
+        for nonce in 0..15 {
+            actor
+                .handle_control(ControlMessage::Ping(Ping::new(
+                    format!("pending-forget-ping-{nonce}"),
+                    "session",
+                    1,
+                    nonce,
+                )))
+                .await
+                .expect("bounded PONG burst should fit the control queue");
+        }
+        assert_eq!(control_receiver.len(), 15);
+
+        let first = test_open(1);
+        actor
+            .handle_control(ControlMessage::Open(first.clone()))
+            .await
+            .expect("the first OPEN should wait for its atomic pair");
+        assert!(actor.pending_open.is_some());
+
+        let mut queued = first.clone();
+        queued.message_id = "pending-forget-queued".to_owned();
+        actor
+            .handle_control(ControlMessage::Open(queued))
+            .await
+            .expect("the correlated second OPEN should retain FIFO order");
+        let other = test_open(2);
+        actor
+            .handle_control(ControlMessage::Open(other.clone()))
+            .await
+            .expect("an independent OPEN should remain after the correlated one");
+        let tail = test_open(3);
+        actor
+            .handle_control(ControlMessage::Open(tail.clone()))
+            .await
+            .expect("a later independent OPEN should retain its FIFO position");
+        assert_eq!(actor.pending_open_queue.len(), 3);
+
+        let other_deadline = actor.pending_open_queue[1].operation_deadline;
+        for _ in 0..15 {
+            control_receiver
+                .try_recv()
+                .expect("the queued PONG burst should drain");
+        }
+        actor
+            .flush_pending_open()
+            .expect("the first OPEN should admit after the writer drains");
+        assert!(actor.streams.contains_key(&first.stream_id));
+        assert_eq!(actor.pending_open_queue.len(), 3);
+
+        let (sequence, final_state) = test_owner_forget_sequence(first.stream_id);
+        {
+            let stream = actor
+                .streams
+                .get_mut(&first.stream_id)
+                .expect("the first OPEN should own the stream");
+            stream.sequence = sequence;
+            stream.input_fin = true;
+            stream.output_fin = true;
+        }
+        actor
+            .handle_stream_forget(tunnel_protocol::rotation_control::StreamForget {
+                message_id: "pending-forget".to_owned(),
+                reply_to: String::new(),
+                session_id: "session".to_owned(),
+                epoch: 1,
+                stream_id: first.stream_id,
+                operation_id: first.operation_id.clone(),
+                direction: Direction::RelayToConnector,
+                final_state,
+            })
+            .expect("correlated FORGET should queue its carrier barrier");
+        assert!(matches!(
+            carrier_receiver
+                .try_recv()
+                .expect("FORGET should queue a carrier barrier"),
+            CarrierCommand::Barrier
+        ));
+        actor
+            .handle_barrier_complete(&active_key)
+            .expect("the carrier barrier should complete FORGET");
+        assert!(!actor.streams.contains_key(&first.stream_id));
+
+        assert_eq!(actor.pending_open_queue.len(), 2);
+        assert_eq!(
+            actor.pending_open_queue[0].open.message_id,
+            other.message_id
+        );
+        assert_eq!(actor.pending_open_queue[1].open.message_id, tail.message_id);
+        assert_eq!(
+            actor.pending_open_queue[0].operation_deadline.monotonic, other_deadline.monotonic,
+            "purging the matching OPEN must not extend the next operation deadline"
+        );
+
+        actor
+            .flush_pending_open()
+            .expect("the next independent OPEN should retain FIFO order");
+        assert!(actor.streams.contains_key(&other.stream_id));
+        assert!(actor.pending_open.is_none());
+        assert_eq!(actor.pending_open_queue.len(), 1);
+        assert_eq!(actor.pending_open_queue[0].open.message_id, tail.message_id);
+    }
+
+    #[tokio::test]
+    async fn stream_forget_releases_pending_open_budget_once() {
+        let (mut actor, active_key, mut carrier_receiver, _control_receiver) =
+            test_actor_with_control_capacity(M2_CARRIER_QUEUE_FRAMES, 16);
+        for nonce in 0..15 {
+            actor
+                .handle_control(ControlMessage::Ping(Ping::new(
+                    format!("pending-budget-forget-ping-{nonce}"),
+                    "session",
+                    1,
+                    nonce,
+                )))
+                .await
+                .expect("bounded PONG burst should fit the control queue");
+        }
+        let open = test_open(1);
+        actor
+            .handle_control(ControlMessage::Open(open.clone()))
+            .await
+            .expect("the OPEN should retain its parsed state while its pair waits");
+        assert!(actor.pending_open_budget.current() > 0);
+
+        let forget = tunnel_protocol::rotation_control::StreamForget {
+            message_id: "pending-budget-forget".to_owned(),
+            reply_to: String::new(),
+            session_id: "session".to_owned(),
+            epoch: 1,
+            stream_id: open.stream_id,
+            operation_id: open.operation_id,
+            direction: Direction::RelayToConnector,
+            final_state: no_stream_forget_state(open.stream_id),
+        };
+        actor
+            .handle_stream_forget(forget.clone())
+            .expect("FORGET should authenticate the retained pending OPEN");
+        assert!(matches!(
+            carrier_receiver
+                .try_recv()
+                .expect("FORGET should queue a carrier barrier"),
+            CarrierCommand::Barrier
+        ));
+        actor
+            .handle_barrier_complete(&active_key)
+            .expect("the carrier barrier should complete pending cleanup");
+        assert!(actor.pending_open.is_none());
+        assert!(actor.pending_open_queue.is_empty());
+        assert_eq!(
+            actor.pending_open_budget.current(),
+            0,
+            "pending-only FORGET must release the parsed reservation"
+        );
+
+        actor
+            .handle_stream_forget(forget)
+            .expect("repeated FORGET should remain idempotent");
+        assert_eq!(
+            actor.pending_open_budget.current(),
+            0,
+            "repeated FORGET must not release parsed budget twice"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_open_reserves_stream_id_for_new_message_ids() {
+        let (mut actor, _active_key, _carrier_receiver, mut control_receiver) =
+            test_actor_with_control_capacity(M2_CARRIER_QUEUE_FRAMES, 16);
+        let mut rejected_open = test_open(1);
+        rejected_open.service_id = "not-exported".to_owned();
+        actor
+            .handle_control(ControlMessage::Open(rejected_open.clone()))
+            .await
+            .expect("the first OPEN should receive a typed rejection");
+        let first_response = drain_control_messages(&mut control_receiver);
+        assert!(matches!(
+            first_response.last(),
+            Some(ControlMessage::Rejected(rejected))
+                if rejected.code == "EXPORT_DENIED"
+                    && rejected.stream_id == rejected_open.stream_id
+        ));
+        assert!(actor.streams.is_empty());
+        assert_eq!(
+            actor.pending_open_budget.current(),
+            0,
+            "an immediate OPEN rejection must release parsed admission state"
+        );
+
+        let mut reused = test_open(2);
+        reused.stream_id = rejected_open.stream_id;
+        reused.message_id = "reused-rejected-stream".to_owned();
+        actor
+            .handle_control(ControlMessage::Open(reused.clone()))
+            .await
+            .expect("a reused stream ID should receive a typed conflict");
+        let second_response = drain_control_messages(&mut control_receiver);
+        assert!(matches!(
+            second_response.last(),
+            Some(ControlMessage::Rejected(rejected))
+                if rejected.code == "STREAM_EXISTS"
+                    && rejected.stream_id == reused.stream_id
+                    && rejected.reply_to == reused.message_id
+        ));
+        assert!(
+            !actor.streams.contains_key(&reused.stream_id),
+            "a rejected OPEN must reserve its stream ID for the session"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_reservation_uses_first_receive_order_for_pending_opens() {
+        let (mut actor, _active_key, _carrier_receiver, mut control_receiver) =
+            test_actor_with_control_capacity(M2_CARRIER_QUEUE_FRAMES, 16);
+        fill_control_queue_before_open(&mut actor)
+            .await
+            .expect("the control queue should be full before the OPEN pair");
+        let first = test_open(9);
+        actor
+            .handle_control(ControlMessage::Open(first.clone()))
+            .await
+            .expect("the first OPEN should retain the pending head");
+        let mut second = first.clone();
+        second.message_id = "later-same-stream".to_owned();
+        actor
+            .handle_control(ControlMessage::Open(second.clone()))
+            .await
+            .expect("the later same-stream OPEN should retain FIFO order");
+        assert_eq!(actor.pending_open_queue.len(), 1);
+
+        for _ in 0..15 {
+            control_receiver
+                .try_recv()
+                .expect("the existing control responses should drain");
+        }
+        actor
+            .flush_pending_open()
+            .expect("the first received OPEN must be admitted");
+        assert!(actor.streams.contains_key(&first.stream_id));
+
+        actor
+            .flush_pending_open()
+            .expect("the later same-stream OPEN should receive a conflict");
+        assert!(actor.streams.contains_key(&first.stream_id));
+        let responses = drain_control_messages(&mut control_receiver);
+        assert!(matches!(
+            responses.last(),
+            Some(ControlMessage::Rejected(rejected))
+                if rejected.code == "STREAM_EXISTS"
+                    && rejected.reply_to == second.message_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancelled_pending_open_reserves_stream_id_for_new_message_ids() {
+        let (mut actor, _active_key, _carrier_receiver, mut control_receiver) =
+            test_actor_with_control_capacity(M2_CARRIER_QUEUE_FRAMES, 16);
+        fill_control_queue_before_open(&mut actor)
+            .await
+            .expect("the control queue should be full before the OPEN pair");
+        let cancelled = test_open(9);
+        actor
+            .handle_control(ControlMessage::Open(cancelled.clone()))
+            .await
+            .expect("the OPEN should retain a pending journal entry");
+        actor
+            .handle_control(ControlMessage::Cancel(Cancel::new(
+                "cancel-stream-reservation",
+                "session",
+                1,
+                cancelled.stream_id,
+                cancelled.operation_id.clone(),
+            )))
+            .await
+            .expect("CANCEL should compact the pending OPEN");
+        assert!(actor.pending_open.is_none());
+
+        let mut reused = test_open(10);
+        reused.stream_id = cancelled.stream_id;
+        reused.message_id = "reused-cancelled-stream".to_owned();
+        actor
+            .handle_control(ControlMessage::Open(reused.clone()))
+            .await
+            .expect("the reused stream should retain a bounded pending response");
+        for _ in 0..15 {
+            control_receiver
+                .try_recv()
+                .expect("the existing control responses should drain");
+        }
+        actor
+            .flush_pending_open()
+            .expect("the cancelled reservation should produce a typed conflict");
+        assert!(!actor.streams.contains_key(&reused.stream_id));
+        let responses = drain_control_messages(&mut control_receiver);
+        assert!(matches!(
+            responses.last(),
+            Some(ControlMessage::Rejected(rejected))
+                if rejected.code == "STREAM_EXISTS"
+                    && rejected.reply_to == reused.message_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn stream_forget_prioritizes_active_operation_over_rejected_entries() {
+        let (mut actor, active_key, mut carrier_receiver, mut control_receiver) =
+            test_actor_with_control_capacity(M2_CARRIER_QUEUE_FRAMES, 16);
+        let first = test_open(1);
+        actor
+            .handle_control(ControlMessage::Open(first.clone()))
+            .await
+            .expect("initial OPEN should be admitted");
+        let mut rejected = test_open(2);
+        rejected.message_id = "open-message-0-rejected".to_owned();
+        rejected.operation_id = "operation-rejected".to_owned();
+        rejected.stream_id = first.stream_id;
+        actor
+            .handle_control(ControlMessage::Open(rejected.clone()))
+            .await
+            .expect("a reused stream ID should receive a journaled rejection");
+        let responses = drain_control_messages(&mut control_receiver);
+        assert!(responses.iter().any(|message| matches!(
+            message,
+            ControlMessage::Rejected(rejected_response)
+                if rejected_response.reply_to == rejected.message_id
+                    && rejected_response.code == "STREAM_EXISTS"
+        )));
+        let used_before_forget = actor.open_journal.used_bytes();
+
+        let (sequence, final_state) = test_owner_forget_sequence(first.stream_id);
+        {
+            let stream = actor
+                .streams
+                .get_mut(&first.stream_id)
+                .expect("the original stream should remain active");
+            stream.sequence = sequence;
+            stream.input_fin = true;
+            stream.output_fin = true;
+        }
+        let original_forget = tunnel_protocol::rotation_control::StreamForget {
+            message_id: "forget-original-operation".to_owned(),
+            reply_to: String::new(),
+            session_id: "session".to_owned(),
+            epoch: 1,
+            stream_id: first.stream_id,
+            operation_id: first.operation_id.clone(),
+            direction: Direction::RelayToConnector,
+            final_state,
+        };
+        actor
+            .handle_stream_forget(original_forget)
+            .expect("the active stream operation must win over an earlier rejection");
+        assert!(matches!(
+            carrier_receiver
+                .try_recv()
+                .expect("active FORGET barrier should queue"),
+            CarrierCommand::Barrier
+        ));
+        actor
+            .handle_barrier_complete(&active_key)
+            .expect("active stream FORGET barrier should complete");
+        let used_after_original = actor.open_journal.used_bytes();
+        assert!(used_after_original < used_before_forget);
+        assert!(actor.streams.is_empty());
+
+        // The rejected entry has no M2Stream, but its exact operation remains
+        // independently forgettable even after the stream-ID watermark moves.
+        let rejected_forget = tunnel_protocol::rotation_control::StreamForget {
+            message_id: "forget-rejected-operation".to_owned(),
+            reply_to: String::new(),
+            session_id: "session".to_owned(),
+            epoch: 1,
+            stream_id: rejected.stream_id,
+            operation_id: rejected.operation_id,
+            direction: Direction::RelayToConnector,
+            final_state: no_stream_forget_state(rejected.stream_id),
+        };
+        actor
+            .handle_stream_forget(rejected_forget)
+            .expect("the rejected operation should retain its own cleanup identity");
+        assert!(matches!(
+            carrier_receiver
+                .try_recv()
+                .expect("rejected FORGET barrier should queue after watermark"),
+            CarrierCommand::Barrier
+        ));
+        actor
+            .handle_barrier_complete(&active_key)
+            .expect("rejected FORGET barrier should compact its own journal entry");
+        assert!(
+            actor.open_journal.used_bytes() < used_after_original,
+            "compacting the rejected entry must release only its own response charge"
+        );
+        assert!(
+            actor
+                .open_journal
+                .retained_operation_matches(first.stream_id, "operation-rejected")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_forget_compacts_open_journal_and_rejects_retries() {
+        let (mut actor, active_key, mut carrier_receiver, mut control_receiver) =
+            test_actor_with_control_capacity(M2_CARRIER_QUEUE_FRAMES, 16);
+        let open = test_open(1);
+        actor
+            .handle_control(ControlMessage::Open(open.clone()))
+            .await
+            .expect("initial OPEN should be admitted");
+        let _initial = drain_control_messages(&mut control_receiver);
+        let used_before_forget = actor.open_journal.used_bytes();
+        let (sequence, final_state) = test_owner_forget_sequence(open.stream_id);
+        {
+            let stream = actor
+                .streams
+                .get_mut(&open.stream_id)
+                .expect("admitted OPEN should have a stream");
+            stream.sequence = sequence;
+            stream.input_fin = true;
+            stream.output_fin = true;
+        }
+        let forget = tunnel_protocol::rotation_control::StreamForget {
+            message_id: "open-journal-forget".to_owned(),
+            reply_to: String::new(),
+            session_id: "session".to_owned(),
+            epoch: 1,
+            stream_id: open.stream_id,
+            operation_id: open.operation_id.clone(),
+            direction: Direction::RelayToConnector,
+            final_state,
+        };
+        actor
+            .handle_stream_forget(forget)
+            .expect("authenticated FORGET should queue its carrier barrier");
+        assert!(actor.streams.contains_key(&open.stream_id));
+        assert!(matches!(
+            carrier_receiver
+                .try_recv()
+                .expect("FORGET should queue a barrier"),
+            CarrierCommand::Barrier
+        ));
+        actor
+            .handle_barrier_complete(&active_key)
+            .expect("carrier barrier should complete FORGET");
+        assert!(!actor.streams.contains_key(&open.stream_id));
+        assert!(
+            actor.open_journal.used_bytes() < used_before_forget,
+            "FORGET should release cached response bytes while retaining its fingerprint"
+        );
+
+        actor
+            .handle_control(ControlMessage::Open(open.clone()))
+            .await
+            .expect("a forgotten request should receive a stale refusal");
+        let stale = drain_control_messages(&mut control_receiver);
+        assert!(matches!(
+            stale.last(),
+            Some(ControlMessage::Rejected(rejected))
+                if rejected.code == "STALE_REQUEST"
+                    && rejected.reply_to == open.message_id
+        ));
+
+        let mut changed = open;
+        changed.operation_id = "open-journal-changed".to_owned();
+        let error = actor
+            .handle_control(ControlMessage::Open(changed))
+            .await
+            .expect_err("a forgotten ID with changed content must remain a protocol conflict");
+        assert!(matches!(error, ClientError::Protocol(_)));
+    }
+
+    #[test]
+    fn stream_forget_unknown_future_id_is_rejected_without_watermark_advance() {
+        let (mut actor, _key, mut carrier_receiver, _control_receiver) =
+            test_actor_with_carrier(M2_CARRIER_QUEUE_FRAMES);
+        let error = actor
+            .handle_stream_forget(tunnel_protocol::rotation_control::StreamForget {
+                message_id: "unknown-future-forget".to_owned(),
+                reply_to: String::new(),
+                session_id: "session".to_owned(),
+                epoch: 1,
+                stream_id: 1,
+                operation_id: "unknown-operation".to_owned(),
+                direction: Direction::RelayToConnector,
+                final_state: no_stream_forget_state(1),
+            })
+            .expect_err("unknown future stream IDs must not create tombstones");
+        assert!(matches!(error, ClientError::Protocol(_)));
+        assert!(actor.pending_forgets.is_empty());
+        assert_eq!(actor.forgotten_stream_through, 0);
+        assert!(carrier_receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn rejected_open_stream_forget_releases_journal_response_once() {
+        let (mut actor, active_key, mut carrier_receiver, mut control_receiver) =
+            test_actor_with_control_capacity(M2_CARRIER_QUEUE_FRAMES, 16);
+        let mut rejected_open = test_open(1);
+        rejected_open.service_id = "not-exported".to_owned();
+        // Exercise the stale stream-ID fence as well: a retained REJECTED
+        // entry still needs its authenticated FORGET to reach compaction even
+        // when the monotonic watermark would normally return early.
+        actor.forgotten_stream_through = rejected_open.stream_id;
+        actor
+            .handle_control(ControlMessage::Open(rejected_open.clone()))
+            .await
+            .expect("a locally denied OPEN should emit a typed rejection");
+        let rejection = drain_control_messages(&mut control_receiver);
+        assert!(matches!(
+            rejection.last(),
+            Some(ControlMessage::Rejected(rejected))
+                if rejected.code == "EXPORT_DENIED"
+                    && rejected.stream_id == rejected_open.stream_id
+                    && rejected.operation_id == rejected_open.operation_id
+        ));
+        assert!(actor.streams.is_empty());
+        let used_before_forget = actor.open_journal.used_bytes();
+        assert!(used_before_forget > 0);
+
+        let forget = tunnel_protocol::rotation_control::StreamForget {
+            message_id: "rejected-open-forget".to_owned(),
+            reply_to: String::new(),
+            session_id: "session".to_owned(),
+            epoch: 1,
+            stream_id: rejected_open.stream_id,
+            operation_id: rejected_open.operation_id.clone(),
+            direction: Direction::RelayToConnector,
+            final_state: no_stream_forget_state(rejected_open.stream_id),
+        };
+        let mut wrong_forget = forget.clone();
+        wrong_forget.operation_id = "wrong-rejected-operation".to_owned();
+        let error = actor
+            .handle_stream_forget(wrong_forget)
+            .expect_err("wrong operation identity must not release a rejected OPEN");
+        assert!(matches!(error, ClientError::Protocol(_)));
+        assert!(carrier_receiver.try_recv().is_err());
+        assert_eq!(actor.open_journal.used_bytes(), used_before_forget);
+
+        actor
+            .handle_stream_forget(forget.clone())
+            .expect("STREAM_FORGET should authenticate the retained rejection");
+        assert!(matches!(
+            carrier_receiver
+                .try_recv()
+                .expect("forget barrier should be queued"),
+            CarrierCommand::Barrier
+        ));
+        actor
+            .handle_barrier_complete(&active_key)
+            .expect("forget barrier should compact the rejected journal entry");
+        assert!(actor.streams.is_empty());
+        let used_after_forget = actor.open_journal.used_bytes();
+        assert!(
+            used_after_forget < used_before_forget,
+            "STREAM_FORGET must release a rejected OPEN response even without an M2Stream"
+        );
+
+        actor
+            .handle_stream_forget(forget)
+            .expect("repeated STREAM_FORGET should be idempotent");
+        assert_eq!(
+            actor.open_journal.used_bytes(),
+            used_after_forget,
+            "repeated cleanup must not release the retained journal charge twice"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_journal_response_capacity_is_terminal_not_pending() {
+        let (mut actor, _active_key, _carrier_receiver, mut control_receiver) =
+            test_actor_with_control_capacity(M2_CARRIER_QUEUE_FRAMES, 16);
+        let open = test_open(1);
+        let canonical =
+            encode_control(&ControlMessage::Open(open.clone())).expect("test OPEN should encode");
+        let entry_bytes = M2_OPEN_JOURNAL_ENTRY_OVERHEAD
+            + open.message_id.len()
+            + canonical.len()
+            + open.operation_id.len();
+        // Let the request fingerprint fit, but leave less than one immutable
+        // OPENED response. This must be a typed terminal retention result,
+        // rather than an endlessly retried pending OPEN.
+        actor.open_journal.max_bytes = entry_bytes + 1;
+        let error = actor
+            .handle_control(ControlMessage::Open(open))
+            .await
+            .expect_err("permanent OPEN retention exhaustion must fail closed");
+        assert!(matches!(error, ClientError::OpenRetentionFull));
+        assert!(actor.pending_open.is_none());
+        assert!(actor.pending_open_queue.is_empty());
+        assert!(actor.streams.is_empty());
+        assert_eq!(actor.open_journal.active_entries, 0);
+        assert_eq!(actor.open_journal.tombstones, 1);
+        assert!(control_receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn full_open_tombstone_budget_rejects_new_ids_but_replays_known_open() {
+        let (mut actor, _active_key, _carrier_receiver, mut control_receiver) =
+            test_actor_with_control_capacity(M2_CARRIER_QUEUE_FRAMES, 16);
+        let known = test_open(1);
+        actor
+            .handle_control(ControlMessage::Open(known.clone()))
+            .await
+            .expect("known OPEN should be admitted");
+        let original = drain_control_messages(&mut control_receiver);
+        assert_eq!(original.len(), 2);
+        for index in 0..(M2_OPEN_JOURNAL_MAX_TOMBSTONES - 1) {
+            let message_id = format!("open-tombstone-{index}");
+            let canonical = format!("canonical-{index}");
+            assert!(matches!(
+                actor.open_journal.observe(
+                    &message_id,
+                    canonical.as_bytes(),
+                    index as u64 + 1,
+                    &format!("operation-old-{index}"),
+                ),
+                Ok(OpenJournalObservation::New)
+            ));
+            actor
+                .open_journal
+                .compact(&message_id)
+                .expect("bounded tombstone slot should compact");
+        }
+        let mut unknown = test_open(2);
+        unknown.message_id = "open-after-tombstone-cap".to_owned();
+        actor
+            .handle_control(ControlMessage::Open(unknown))
+            .await
+            .expect("new IDs should receive bounded RESOURCE_EXHAUSTED refusal");
+        let refusal = drain_control_messages(&mut control_receiver);
+        assert!(matches!(
+            refusal.last(),
+            Some(ControlMessage::Rejected(rejected))
+                if rejected.code == "RESOURCE_EXHAUSTED"
+                    && rejected.reason.contains("fresh session")
+        ));
+
+        actor
+            .handle_control(ControlMessage::Open(known))
+            .await
+            .expect("known retry must remain available when new IDs are refused");
+        let replay = drain_control_messages(&mut control_receiver);
+        assert_eq!(
+            replay,
+            vec![original[0].clone()],
+            "known OPEN must replay its immutable OPENED response without refreshing auth"
+        );
+        assert_eq!(actor.streams.len(), 1);
+    }
+
+    #[test]
+    fn open_journal_reserves_slots_for_active_forget_tombstones() {
+        let mut journal = OpenJournal::new(16, MAX_JOURNAL_BYTES);
+        for index in 0..(M2_OPEN_JOURNAL_MAX_TOMBSTONES - 16) {
+            let message_id = format!("open-old-tombstone-{index}");
+            let canonical = format!("old-canonical-{index}");
+            assert!(matches!(
+                journal.observe(
+                    &message_id,
+                    canonical.as_bytes(),
+                    index as u64 + 1,
+                    &format!("operation-old-{index}"),
+                ),
+                Ok(OpenJournalObservation::New)
+            ));
+            journal
+                .compact(&message_id)
+                .expect("reserved tombstone slot should compact");
+        }
+
+        let response = ControlMessage::Ping(Ping::new("open-journal-response", "session", 1, 1));
+        let response =
+            M2Actor::encode_control_message(&response).expect("test response should encode");
+        let response_bytes = crate::message_size(&response) + M2_OPEN_JOURNAL_RESPONSE_OVERHEAD;
+        let mut active_ids = Vec::new();
+        for index in 0..16 {
+            let message_id = format!("open-active-{index}");
+            let canonical = format!("active-canonical-{index}");
+            assert!(matches!(
+                journal.observe(
+                    &message_id,
+                    canonical.as_bytes(),
+                    index as u64 + 1,
+                    &format!("operation-active-{index}"),
+                ),
+                Ok(OpenJournalObservation::New)
+            ));
+            journal
+                .complete(
+                    &message_id,
+                    vec![response.clone()],
+                    vec![None],
+                    response_bytes,
+                )
+                .expect("active response should fit its reserved slot");
+            active_ids.push(message_id);
+        }
+        assert_eq!(journal.entries.len(), M2_OPEN_JOURNAL_MAX_TOMBSTONES);
+        assert_eq!(journal.active_entries, 16);
+        let before_forget = journal.used_bytes();
+        for message_id in &active_ids {
+            journal
+                .compact(message_id)
+                .expect("every active stream must retain a forget tombstone slot");
+        }
+        let after_forget = journal.used_bytes();
+        assert!(after_forget < before_forget);
+        assert_eq!(journal.active_entries, 0);
+        assert_eq!(journal.tombstones, M2_OPEN_JOURNAL_MAX_TOMBSTONES);
+        for message_id in &active_ids {
+            journal
+                .compact(message_id)
+                .expect("duplicate cleanup must be idempotent");
+        }
+        assert_eq!(journal.used_bytes(), after_forget);
+    }
+
+    const TEST_SETUP_TIMEOUT: Duration = Duration::from_secs(2);
+    const TEST_ASSERT_TIMEOUT: Duration = Duration::from_millis(750);
+    const TEST_ACTOR_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
+
+    async fn test_websocket_pair() -> Result<(ClientWebSocket, WebSocketStream<TcpStream>), String>
+    {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .map_err(|error| format!("test websocket listener should bind: {error}"))?;
+        let address = listener
+            .local_addr()
+            .map_err(|error| format!("test websocket listener should have an address: {error}"))?;
+        let result = timeout(TEST_SETUP_TIMEOUT, async {
+            let client = async {
+                connect_async(format!("ws://{address}"))
+                    .await
+                    .map_err(|error| format!("test websocket client handshake failed: {error}"))
+            };
+            let server = async {
+                let (socket, _) = listener
+                    .accept()
+                    .await
+                    .map_err(|error| format!("test websocket listener accept failed: {error}"))?;
+                accept_async(socket)
+                    .await
+                    .map_err(|error| format!("test websocket server handshake failed: {error}"))
+            };
+            tokio::try_join!(client, server)
+        })
+        .await
+        .map_err(|_| "test websocket setup exceeded its bounded deadline".to_owned())??;
+        Ok((result.0.0, result.1))
+    }
+
+    fn runtime_welcome() -> tunnel_protocol::Welcome {
+        let mut welcome = tunnel_protocol::Welcome::new(
+            "welcome",
+            "hello",
+            "session",
+            1,
+            1,
+            "connection",
+            "ticket",
+            "reconnect",
+        );
+        welcome.supported_features = vec![M2_FEATURE.to_owned()];
+        welcome
+    }
+
+    fn websocket_control(message: &ControlMessage) -> Message {
+        Message::Text(
+            String::from_utf8(encode_control(message).expect("test control should encode"))
+                .expect("test control should be UTF-8")
+                .into(),
+        )
+    }
+
+    struct ControlWriterGateGuard(Arc<test_hooks::ControlWriterGate>);
+
+    impl Drop for ControlWriterGateGuard {
+        fn drop(&mut self) {
+            self.0.release.notify_waiters();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_open_does_not_starve_cancel_on_real_session_control_loop() -> Result<(), String>
+    {
+        let gate = Arc::new(test_hooks::ControlWriterGate {
+            block_once: AtomicBool::new(true),
+            entered: Notify::new(),
+            release: Notify::new(),
+        });
+        let _gate_guard = ControlWriterGateGuard(gate.clone());
+
+        let (control_client, mut control_peer) = test_websocket_pair().await?;
+        let (data_client, mut data_peer) = test_websocket_pair().await?;
+        let (control_sink, control_stream) = control_client.split();
+        let (data_sink, data_stream) = data_client.split();
+        let cancellation = CancellationToken::new();
+        let (readiness, _readiness_receiver) = watch::channel(Readiness::Connecting);
+        let (status, _status_receiver) = watch::channel(ConnectionStatus::default());
+        let session = SessionInfo {
+            session_id: "session".to_owned(),
+            epoch: 1,
+            generation: 1,
+        };
+        let mut actor = tokio::spawn(run_m2_session(
+            RuntimeConfig::default(),
+            session,
+            runtime_welcome(),
+            "owner".to_owned(),
+            None,
+            RotationConfig::default(),
+            control_sink,
+            control_stream,
+            data_sink,
+            data_stream,
+            cancellation.clone(),
+            readiness,
+            status,
+            None,
+            None,
+            Some(gate.clone()),
+        ));
+
+        // The test-only writer gate holds the first control item after the
+        // real writer receives it. The actor can therefore admit seven more
+        // OPEN pairs, leaving one slot free, while the ninth pair requires
+        // two permits and becomes the pending head; the tenth is queued in
+        // the bounded OPEN FIFO.
+        let proof = async {
+            let entered = gate.entered.notified();
+            control_peer
+                .send(websocket_control(&ControlMessage::Open(test_open(1))))
+                .await
+                .map_err(|error| format!("first OPEN should reach the actor: {error}"))?;
+            timeout(TEST_SETUP_TIMEOUT, entered)
+                .await
+                .map_err(|_| "control writer did not enter the deterministic hold".to_owned())?;
+            for stream_id in 2..=10 {
+                control_peer
+                    .send(websocket_control(&ControlMessage::Open(test_open(
+                        stream_id,
+                    ))))
+                    .await
+                    .map_err(|error| format!("OPEN burst should reach the actor: {error}"))?;
+            }
+
+            // This CANCEL is ordered after the ninth and tenth OPENs on the
+            // real control socket. The ninth pair is pending and the tenth
+            // OPEN must enter the bounded FIFO rather than closing the
+            // session. A responsive control path must still cancel stream 1
+            // and emit its RESET on the independent data carrier without
+            // waiting for the control writer to drain.
+            control_peer
+                .send(websocket_control(&ControlMessage::Cancel(Cancel::new(
+                    "cancel-1",
+                    "session",
+                    1,
+                    1,
+                    "operation-1",
+                ))))
+                .await
+                .map_err(|error| format!("CANCEL should reach the actor: {error}"))?;
+
+            let reset_seen = timeout(TEST_ASSERT_TIMEOUT, async {
+                while let Some(message) = data_peer.next().await {
+                    let Ok(Message::Binary(bytes)) = message else {
+                        continue;
+                    };
+                    let Ok(frame) = Frame::decode(bytes.as_ref()) else {
+                        continue;
+                    };
+                    if frame.kind == FrameKind::Reset && frame.stream_id == 1 {
+                        return true;
+                    }
+                }
+                false
+            })
+            .await
+            .map_err(|_| "CANCEL did not produce RESET before the bounded deadline".to_owned())?;
+            Ok::<bool, String>(reset_seen)
+        }
+        .await;
+
+        // Always release the injected hold before joining the actor, including
+        // on the current red implementation where the proof above fails.
+        gate.release.notify_waiters();
+        cancellation.cancel();
+        let actor_result = match timeout(TEST_ACTOR_CLEANUP_TIMEOUT, &mut actor).await {
+            Ok(joined) => joined,
+            Err(_) => {
+                actor.abort();
+                (&mut actor).await
+            }
+        };
+        assert!(
+            matches!(&actor_result, Ok(Ok(()))),
+            "session actor must be joined cleanly after cancellation: {actor_result:?}"
+        );
+        assert!(
+            matches!(&proof, Ok(true)),
+            "CANCEL must be handled while one OPEN waits for a bounded control pair; result={proof:?}"
+        );
+        Ok(())
     }
 }

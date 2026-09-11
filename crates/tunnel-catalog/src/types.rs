@@ -10,6 +10,21 @@ pub type ServiceId = Uuid;
 pub type CredentialId = Uuid;
 pub type GrantRevision = u64;
 
+/// The maximum encoded size of one opaque signed membership record.  The
+/// record is intentionally kept as bytes here; signature parsing and
+/// verification belong to the cluster trust boundary.
+pub const MAX_SIGNED_MEMBERSHIP_BYTES: usize = 16 * 1024;
+/// The maximum number of signed relay records in the Redis membership
+/// directory.  This mirrors the cluster verifier's node bound while keeping
+/// the catalog crate independent of the cluster trust crate.
+pub const MAX_SIGNED_MEMBERSHIP_RECORDS: usize = 32;
+
+/// One device cannot have an unbounded set of outstanding attachment tickets.
+/// Redis enforces this cap atomically with ticket creation.
+pub const MAX_ATTACHMENT_TICKETS_PER_DEVICE: usize = 64;
+
+pub type AttachmentPurpose = String;
+
 /// Identity produced only after a consumer credential has passed issuer,
 /// subject, audience, lifetime, and scope validation and has been mapped to a
 /// durable membership.  There is intentionally no tenant claim here.
@@ -24,6 +39,16 @@ pub struct PrincipalIdentity {
     pub issuer: String,
     pub subject: String,
     pub user_id: UserId,
+}
+
+pub(crate) fn valid_principal_identity(issuer: &str, subject: &str) -> bool {
+    valid_opaque_identity_component(issuer, 2048) && valid_opaque_identity_component(subject, 1024)
+}
+
+fn valid_opaque_identity_component(value: &str, max_bytes: usize) -> bool {
+    !value.trim().is_empty()
+        && value.len() <= max_bytes
+        && !value.chars().any(|character| character.is_control())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -221,6 +246,114 @@ pub struct OwnerClaimRequest {
 pub struct OwnerClaim {
     pub token: OwnerToken,
     pub lease_expires_at: DateTime<Utc>,
+}
+
+/// The binding that an attachment ticket carries.  All fields are checked in
+/// one Redis operation at issue and consume time; none are inferred from a
+/// caller-controlled locator.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachmentTicketBinding {
+    pub tenant_id: TenantId,
+    pub device_id: DeviceId,
+    /// Lower-case SHA-256 hex of the authenticated device certificate SPKI.
+    pub spki_fingerprint: String,
+    pub owner: OwnerToken,
+    pub generation: u64,
+    pub connection_id: String,
+    pub purpose: AttachmentPurpose,
+    /// Digest of the request/attachment context, supplied by the owner and
+    /// compared byte-for-byte on consume.
+    pub binding_digest: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachmentTicketIssueRequest {
+    pub tenant_id: TenantId,
+    pub device_id: DeviceId,
+    pub spki_fingerprint: String,
+    pub owner: OwnerToken,
+    pub generation: u64,
+    pub connection_id: String,
+    pub purpose: AttachmentPurpose,
+    pub binding_digest: String,
+    pub expires_at: DateTime<Utc>,
+}
+
+impl AttachmentTicketIssueRequest {
+    pub fn binding(&self) -> AttachmentTicketBinding {
+        AttachmentTicketBinding {
+            tenant_id: self.tenant_id,
+            device_id: self.device_id,
+            spki_fingerprint: self.spki_fingerprint.clone(),
+            owner: self.owner.clone(),
+            generation: self.generation,
+            connection_id: self.connection_id.clone(),
+            purpose: self.purpose.clone(),
+            binding_digest: self.binding_digest.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachmentTicketConsumeRequest {
+    /// The opaque value returned by `issue_attachment_ticket`; it is never
+    /// persisted by the catalog.
+    pub ticket: String,
+    pub tenant_id: TenantId,
+    pub device_id: DeviceId,
+    pub spki_fingerprint: String,
+    pub owner: OwnerToken,
+    pub generation: u64,
+    pub connection_id: String,
+    pub purpose: AttachmentPurpose,
+    pub binding_digest: String,
+}
+
+impl AttachmentTicketConsumeRequest {
+    pub fn binding(&self) -> AttachmentTicketBinding {
+        AttachmentTicketBinding {
+            tenant_id: self.tenant_id,
+            device_id: self.device_id,
+            spki_fingerprint: self.spki_fingerprint.clone(),
+            owner: self.owner.clone(),
+            generation: self.generation,
+            connection_id: self.connection_id.clone(),
+            purpose: self.purpose.clone(),
+            binding_digest: self.binding_digest.clone(),
+        }
+    }
+}
+
+/// A bounded routing locator.  It contains the digest only; the opaque ticket
+/// itself must be presented separately to the owner for atomic consumption.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachmentTicketLocator {
+    pub tenant_id: TenantId,
+    pub device_id: DeviceId,
+    pub digest: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachmentTicket {
+    pub ticket: String,
+    pub locator: AttachmentTicketLocator,
+    pub expires_at: DateTime<Utc>,
+}
+
+/// The consumed binding returned after the one-use transition succeeds.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsumedAttachmentTicket {
+    pub binding: AttachmentTicketBinding,
+    pub expires_at: DateTime<Utc>,
+}
+
+/// One opaque, independently signed relay membership record.  This is a
+/// single-node value; the catalog's plural read API supplies the bounded
+/// deployment directory as a collection of these records.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedMembershipRecord {
+    pub version: u64,
+    pub bytes: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

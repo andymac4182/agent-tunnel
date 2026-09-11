@@ -12,13 +12,18 @@ Agent in the cloud → Agent Tunnel Server → WebSocket tunnel → Desktop mach
 
 The desktop CLI initiates the tunnel with mTLS. Authorized cloud agents call server endpoints; no inbound desktop port is required. Service traffic flows in both directions over the data channel.
 
-**Status: M1 is implemented and locally verified.** On
+**Status: M1 and M2 are locally verified. M7 implementation and integration
+verification are in progress.** On
 2026-09-09, macOS arm64 with Rust 1.95.0 and Redis 8.4 passed formatting,
 strict Clippy, 62 workspace tests, five real Redis integration tests, the
 five-client/two-tenant HTTPS/WSS/CLI acceptance harness, the private H3 probe
 and the Redis AOF restart check. See [the evidence and repeatable commands](docs/m1-harness.md).
 M2 ordered rotation and bounded retained replay are also locally verified: 151 workspace tests, the real-socket fault suite, and three actual 300-second rotations in 903.05 seconds. See [M2 evidence and repeatable commands](docs/m2-verification.md).
-Remote adapters and M7 cluster routing remain planned.
+M7 adds signed Redis membership, incarnation-scoped ownership/tickets, owner
+fencing, dynamic peer pins, private mTLS HTTP/3 routing, cluster startup
+wiring, and a reusable three-relay Redis acceptance harness. See [M7 evidence
+and repeatable commands](docs/m7-verification.md). M3/M4/M5/M8 adapters and
+M6 release packaging remain subsequent milestones.
 The repository remains private; its MIT license prepares for a future OSS release.
 
 Hosted verification: [M1 CI checks](https://github.com/andymac4182/agent-tunnel/pull/10/checks).
@@ -29,7 +34,7 @@ Hosted verification: [M1 CI checks](https://github.com/andymac4182/agent-tunnel/
 - A Rust M1 client CLI authenticating to the relay with mandatory mTLS on both device WebSockets.
 - One control WebSocket and one data WebSocket per M1 device session. A transport failure closes the pair and requires a fresh session; M1 has no data-socket rotation or retained replay.
 - M1 catalog authority uses Redis for tenant, user, membership, device, service, grant, and credential records. Its persistence, restore, and fail-closed behavior are explicit deployment requirements.
-- A bounded private HTTP/3 mutual-TLS peer transport probe. The three-node relay cluster, Redis membership/key approval, ownership, and recovery are M7 work.
+- A private HTTP/3 mutual-TLS peer transport with signed Redis membership/key approval, owner routing/fencing, dynamic pins, and a three-relay synthetic acceptance harness. Automatic Redis promotion and HA recovery remain outside the supported profile.
 - M2 data connection rotation every **300 seconds by default**, configurable per deployment, with explicit per-stream drain watermarks and acknowledgements before handover.
 - A reusable M1 acceptance harness using Redis-backed authority, with fixture PKI, configured JWT public keys, real relay listeners, and an echo export. Its local M1 verification is recorded above; CI results are linked in this document.
 - A **9P/WebSocket filesystem API** with native adapters for Files SDK, Mastra, AI SDK, and just-bash; separate MCP and [CUA](https://github.com/trycua/cua) services are planned milestones.
@@ -67,6 +72,7 @@ restoration of arbitrary backups.
 | [Runtime and client CLI](docs/runtime.md) | Axum listeners, device mTLS, commands, debug surfaces |
 | [M1 acceptance harness](docs/m1-harness.md) | Redis-backed real-socket verification, credentials, fixtures, and evidence |
 | [M2 verification](docs/m2-verification.md) | Rotation implementation status and required recovery/real-socket evidence |
+| [Task tracker](docs/tasks.md) | Stable milestone task IDs, owners, status, acceptance scope, and evidence |
 | [Relay cluster](docs/cluster.md) | HTTP/3 peers, mTLS, Redis key distribution, ownership, recovery |
 | [Filesystem API](docs/filesystem-api.md) | Endpoint, authentication, capabilities, paths, byte/operation semantics |
 | [SDK adapter contracts](docs/filesystem-adapters.md) | Files SDK, Mastra, AI SDK, just-bash, compatibility gaps and implementation slices |

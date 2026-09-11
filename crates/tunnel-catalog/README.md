@@ -33,6 +33,12 @@ store. Construct it with:
 let catalog = RedisCatalog::connect(redis_url, namespace).await?;
 ```
 
+The low-level constructor intentionally remains transport-agnostic for the
+disposable local test harness, which may use a loopback `redis://` URL. The
+production `tunnel-relay serve` configuration validates the boundary before
+connecting and requires `rediss://`; plaintext Redis is not a supported relay
+deployment profile.
+
 For a normal owner-enabled process, use
 `RedisCatalog::connect_with_deployment_incarnation(redis_url, namespace, incarnation)`.
 That constructor accepts only an already initialized active incarnation and

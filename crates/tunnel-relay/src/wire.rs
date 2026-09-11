@@ -6,12 +6,20 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use tunnel_catalog::OwnerToken;
 use tunnel_protocol::{
     AuthorizationConfirmed, AuthorizationInvalidated, ControlError, ControlMessage, DataReady,
-    Frame, FrameError, Open, Rejected, Welcome, decode_control, encode_control,
+    Frame, FrameError, Open, OwnerFence, Rejected, Welcome, decode_control, encode_control,
 };
 use uuid::Uuid;
 
 /// Maximum consumer/device payload in the M1 echo profile.
 pub const MAX_BODY_BYTES: usize = tunnel_protocol::MAX_PAYLOAD_LEN;
+/// Maximum canary prefix included in an authenticated echo response.
+///
+/// M1 request bodies remain capped at `MAX_BODY_BYTES`, while the connector's
+/// response also carries this bounded device canary.  The negotiated echo
+/// window must cover both portions so an exactly maximum request cannot make
+/// the connector close its control channel while emitting the second frame.
+pub const MAX_ECHO_CANARY_BYTES: usize = 256;
+pub const MAX_ECHO_WINDOW_BYTES: usize = MAX_BODY_BYTES + MAX_ECHO_CANARY_BYTES;
 /// Initial per-direction credit for a long-lived M2 stream.
 ///
 /// This is deliberately bounded and leaves room for the record prefix and
@@ -25,6 +33,10 @@ pub const TICKET_TTL: Duration = Duration::from_secs(10);
 /// can continue to receive the finite profile without rotation fields.
 pub const ORDERED_ROTATION_FEATURE: &str = "ordered-rotation-v1";
 pub const M1_PROFILE_FEATURE: &str = "m1-control-data";
+/// Negotiated cluster owner fencing.  A session advertising this feature
+/// remains closed to data admission until the exact OWNER_FENCED reply has
+/// been observed by the owner.
+pub const OWNER_FENCING_FEATURE: &str = "owner-fencing-v1";
 
 pub fn random_token() -> String {
     let mut bytes = [0_u8; 32];
@@ -48,6 +60,7 @@ pub fn encode_control_message(message: &ControlMessage) -> Result<String, Contro
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn welcome(
     message_id: &str,
     reply_to: &str,
@@ -56,6 +69,7 @@ pub fn welcome(
     generation: u64,
     connection_id: &str,
     ticket: &str,
+    owner_fencing: bool,
 ) -> ControlMessage {
     let mut welcome = Welcome::new_m1(
         message_id,
@@ -73,6 +87,11 @@ pub fn welcome(
         "authorization-challenge".to_owned(),
         "echo".to_owned(),
     ];
+    if owner_fencing {
+        welcome
+            .supported_features
+            .push(OWNER_FENCING_FEATURE.to_owned());
+    }
     ControlMessage::Welcome(welcome)
 }
 
@@ -93,6 +112,7 @@ pub(crate) struct WelcomeM2Params<'a> {
     pub rotation_interval_ms: u64,
     pub handshake_timeout_ms: u64,
     pub overlap_timeout_ms: u64,
+    pub owner_fencing: bool,
 }
 
 pub fn welcome_m2(params: WelcomeM2Params<'_>) -> ControlMessage {
@@ -112,6 +132,11 @@ pub fn welcome_m2(params: WelcomeM2Params<'_>) -> ControlMessage {
         "echo".to_owned(),
         ORDERED_ROTATION_FEATURE.to_owned(),
     ];
+    if params.owner_fencing {
+        welcome
+            .supported_features
+            .push(OWNER_FENCING_FEATURE.to_owned());
+    }
     welcome.owner_id = Some(owner_id(params.owner));
     welcome.rotation_interval_ms = Some(params.rotation_interval_ms);
     welcome.rotation_handshake_timeout_ms = Some(params.handshake_timeout_ms);
@@ -121,6 +146,25 @@ pub fn welcome_m2(params: WelcomeM2Params<'_>) -> ControlMessage {
     // policy used by the handover harness.
     welcome.rotation_recovery_timeout_ms = Some(30_000);
     ControlMessage::Welcome(welcome)
+}
+
+/// Build the owner-side fence sent immediately after WELCOME.  The nonce and
+/// message ID are fresh for this authenticated session; the full owner token
+/// remains local and only its canonical digest is carried on the wire.
+pub(crate) fn owner_fence(
+    session_id: &str,
+    epoch: u64,
+    owner_id: &str,
+    remaining_ms: u64,
+) -> ControlMessage {
+    ControlMessage::OwnerFence(OwnerFence::new(
+        random_token(),
+        session_id,
+        epoch,
+        owner_id,
+        random_token(),
+        remaining_ms,
+    ))
 }
 
 /// Canonical owner identity used by every rotation message.  `OwnerToken` is
@@ -165,13 +209,13 @@ pub(crate) struct OpenRequest<'a> {
 }
 
 pub(crate) fn open(request: OpenRequest<'_>) -> ControlMessage {
-    let (initial_send_window, initial_receive_window) = if request.operation == "echo_stream" {
-        (
+    let (initial_send_window, initial_receive_window) = match request.operation {
+        "echo_stream" => (
             M2_INITIAL_WINDOW_BYTES as u64,
             M2_INITIAL_WINDOW_BYTES as u64,
-        )
-    } else {
-        (MAX_BODY_BYTES as u64, MAX_BODY_BYTES as u64)
+        ),
+        "echo" => (MAX_ECHO_WINDOW_BYTES as u64, MAX_ECHO_WINDOW_BYTES as u64),
+        _ => (MAX_BODY_BYTES as u64, MAX_BODY_BYTES as u64),
     };
     let mut open = Open::new(
         random_token(),
@@ -191,6 +235,66 @@ pub(crate) fn open(request: OpenRequest<'_>) -> ControlMessage {
     open.metadata
         .insert("permission_digest".into(), request.digest.to_owned());
     ControlMessage::Open(open)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_BODY_BYTES, MAX_ECHO_CANARY_BYTES, MAX_ECHO_WINDOW_BYTES, OpenRequest, open};
+    use tunnel_protocol::{
+        ControlMessage, Frame,
+        sequence::{Direction, StreamState},
+    };
+
+    fn open_for(operation: &'static str) -> tunnel_protocol::Open {
+        let ControlMessage::Open(open) = open(OpenRequest {
+            session_id: "session",
+            epoch: 1,
+            stream_id: 1,
+            operation_id: "operation",
+            service_id: "service",
+            body_len: 0,
+            grant_revision: 1,
+            digest: "digest",
+            operation,
+        }) else {
+            panic!("wire::open must return an OPEN control message");
+        };
+        open
+    }
+
+    #[test]
+    fn echo_window_covers_maximum_body_and_canary() {
+        let open = open_for("echo");
+        assert_eq!(
+            MAX_ECHO_WINDOW_BYTES,
+            MAX_BODY_BYTES + MAX_ECHO_CANARY_BYTES
+        );
+        assert_eq!(open.initial_send_window as usize, MAX_ECHO_WINDOW_BYTES);
+        assert_eq!(open.initial_receive_window as usize, MAX_ECHO_WINDOW_BYTES);
+    }
+
+    #[test]
+    fn echo_window_accepts_maximum_canary_prefixed_response() {
+        let open = open_for("echo");
+        let mut state =
+            StreamState::with_credits(1, open.initial_send_window, open.initial_receive_window)
+                .expect("maximum echo window is a valid sequence credit");
+        let body = Frame::data(1, 1, 1, 1, 0, vec![0x5a; MAX_BODY_BYTES]);
+        let canary = Frame::data(1, 1, 1, 2, 0, vec![0x63; MAX_ECHO_CANARY_BYTES]);
+        state
+            .send_frame(Direction::ConnectorToRelay, &body)
+            .expect("maximum body fits the negotiated credit");
+        state
+            .send_frame(Direction::ConnectorToRelay, &canary)
+            .expect("canary suffix fits the remaining negotiated credit");
+    }
+
+    #[test]
+    fn unknown_operation_keeps_body_bound_until_admitted() {
+        let open = open_for("unsupported");
+        assert_eq!(open.initial_send_window as usize, MAX_BODY_BYTES);
+        assert_eq!(open.initial_receive_window as usize, MAX_BODY_BYTES);
+    }
 }
 
 pub(crate) fn rotate_prepare(

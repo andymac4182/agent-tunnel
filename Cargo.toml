@@ -2,6 +2,7 @@
 members = [
     "crates/tunnel-catalog",
     "crates/tunnel-client",
+    "crates/tunnel-cluster",
     "crates/tunnel-core",
     "crates/tunnel-protocol",
     "crates/tunnel-relay",
@@ -21,6 +22,15 @@ publish = false
 serde = { version = "1.0", features = ["derive"] }
 toml = "1.0"
 tunnel-core = { path = "crates/tunnel-core" }
+
+# h3-quinn 0.0.10 moves a pending Quinn receive stream into a reusable future
+# and then unwraps it from stop_sending/recv_id.  The local patch preserves the
+# upstream API while making idle-timeout cancellation stream-local and safe.
+[patch.crates-io]
+# h3 0.0.8 exposes validated remote GOAWAY to the bounded peer driver.
+h3 = { path = "vendor/h3" }
+h3-quinn = { path = "vendor/h3-quinn" }
+quinn-proto = { path = "vendor/quinn-proto" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

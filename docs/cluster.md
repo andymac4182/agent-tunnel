@@ -1,6 +1,11 @@
 # Relay clustering, identity, and owner routing
 
-Status: M7 cluster implementation design, 2026-09-09. M1 implements Axum consumer HTTPS, device mTLS WebSockets, Redis authorization/owner checks and a separate bounded HTTP/3 peer transport probe. Multi-relay routing, signed key distribution and production enrollment remain planned. See [M1 evidence](m1-harness.md); the cluster contracts below describe the M7 target.
+Status: M7 implementation in progress, 2026-09-10. Component and synthetic
+three-relay tests do not yet prove the complete production routing gate.
+M1 implements Axum consumer HTTPS and device mTLS WebSockets; M7 adds signed
+membership, owner routing/fencing, and the private HTTP/3 peer path. Automatic
+Redis promotion, rollback detection, and production enrollment remain outside
+the supported profile. See [M7 evidence](m7-verification.md).
 
 The current M1 Redis layout keeps owner fields and their expiry in durable device hashes without a Redis TTL. Complete incarnation/run-ID checks and logical expiry make stale owner fields non-authoritative; separate TTL-bound ownership/presence/ticket namespaces below remain M7 work. Ordinary startup only verifies existing authority metadata. Explicit bootstrap/recovery requires operator approval, a new incarnation after a changed Redis run, and external reconciliation of catalog and revocation history. M1 verifies same-dataset AOF restart; it cannot detect arbitrary backup rollback or prove catalog freshness from an incarnation change alone.
 
@@ -9,6 +14,7 @@ The current M1 Redis layout keeps owner fields and their expiry in durable devic
 - The public web server is Axum. The Rust client CLI opens mutually authenticated TLS WebSockets to the device listener.
 - Each relay additionally exposes a private HTTP/3 listener over QUIC with mutual TLS. HTTP/3 support is a separate transport adapter; do not assume Axum's ordinary server listener supplies it.
 - The single authoritative Redis deployment is the only shared storage authority. Its durable catalog namespace stores tenants, memberships, identities, grants, device certificate registrations and revocation versions; separate ephemeral namespaces store signed-directory cache state, presence, owner leases and one-use tickets. Redis never carries private keys, file contents, screenshots, MCP/ACP bodies, or tunnel replay buffers.
+- Relay serving configuration must use an authenticated `rediss://` Redis URL. The low-level catalog API remains transport-agnostic only so the disposable local test harness can use loopback plaintext Redis; `redis://` is rejected at the `tunnel-relay serve` configuration boundary and is not a production profile.
 - Durable catalog records have no lease TTL and remain independent of deployment incarnation. Ephemeral ownership/presence/ticket records are TTL-bound and incarnation-scoped. There is no second shared storage service or per-node local catalog dependency in the supported profile.
 - One relay owns a device connection epoch. Any public ingress can forward to that owner over HTTP/3. The owner alone pairs control/data attachments, admits streams, and coordinates rotation.
 - Multiple relays, users, devices, and consumers are an initial product requirement. A single relay is a development configuration using the same interfaces.
@@ -76,6 +82,8 @@ Use monotonic durations on each endpoint; the formula requires no shared wall-cl
 
 ## Redis durability, backup, and recovery
 
+The operator recovery commands (`recovery-initialize`, `recovery-observe`, and `recover`) and their fail-closed ordering are specified in [recovery-cli.md](recovery-cli.md).
+
 The initial profile uses one authoritative Redis primary for both durable catalog and ephemeral coordination, with separate key namespaces, retention, and access policies. Durable catalog entries (tenant, membership, device, credential, grant, service and revocation records) have no lease TTL and carry monotonic revisions. Presence, owner leases and one-use tickets are ephemeral, TTL-bound, and scoped by the current deployment_incarnation; they are never restored as authoritative state. The durable catalog namespace is independent of deployment incarnation so a new externally approved incarnation can fence old coordinators without erasing identity or authorization records.
 
 Configure AOF/fsync and backup retention for the deployment's durability objective. The authoritative profile should use appendfsync always, aof-load-truncated no, and maxmemory-policy noeviction, together with tested backups. These are durability choices only: AOF/fsync settings, replica acknowledgments and backup success do not provide consensus, linearizable failover, or permission to promote another writer. Backups must be verified offline and must not mix partial catalog records, signed-directory state or incompatible schema versions. Do not treat ephemeral leases, presence, ticket nonces or replay buffers as recoverable state.
@@ -87,6 +95,18 @@ On restart, restore, rollback or any ambiguous primary identity, stop admission,
 A public key in Redis is insufficient evidence that a machine belongs to this deployment or that Redis is the authority root. Redis distributes signed records whose authority was established elsewhere; the operator-installed root/checkpoint must already be trusted before any Redis key is accepted. TLS identity verification still uses normal certificate validation and proof of possession; never accept an arbitrary key merely because a Redis key exists.
 
 The deployment installation provisions a trusted relay CA bundle, a membership-signing verification key, `deployment_id`, and private-network address policy through operator-controlled configuration. An existing issuer provisions each relay's private key/certificate via a protected enrollment workflow. Private keys stay on their node or in its secret store. CA and membership signing private keys are unavailable to normal relay processes.
+
+The `tunnel-relay serve` cluster bootstrap accepts the membership signer trust
+file as a bounded JSON document of the form
+`{"keys":[{"key_id":"publisher-1","public_key":"..."}]}`. Each
+`public_key` is a 64-character hex or unpadded URL-safe base64 encoding of 32
+bytes. A direct `membership_signer_public_key_path` contains one such key (it
+may also be exactly 32 raw bytes) and requires the matching
+`membership_signer_key_id`; a named trust document is preferred when rotating
+publishers. These files contain public verification material only and are
+loaded before Redis records are considered. The
+checkpoint authority trust path remains a PEM CA bundle for the HTTPS
+authority and is independent from the Ed25519 membership signer keys.
 
 Certificates must identify the deployment, node, and relay role using a documented SAN profile and appropriate client/server usage. Certificate names, validity, chain constraints, role, and allowed leaf SPKI SHA-256 digest must all match. A device-role certificate fails the peer listener even if it has a chain to another trusted deployment intermediate. Use distinct relay and device intermediates/listeners by default.
 
@@ -182,7 +202,9 @@ Ingress forwarding preserves complete tunnel frames and their per-stream sequenc
 
 Scheduled data rotation stays under the same owner and follows [protocol.md](protocol.md): prepare the replacement, quiesce each direction at an explicit per-stream watermark, drain and acknowledge old-socket work, commit handover, and retire the old socket within the configured overlap deadline. An ingress queue or peer-stream acknowledgment is not the required adapter-facing transport drain acknowledgment. Instrument which peer queue or stream watermark is preventing drain.
 
-Owner change is a different event: fresh ownership fencing and fresh sessions, with interruption/unknown outcomes as appropriate. Do not claim that scheduled WebSocket drain proves live migration of filesystem fids, ACP subprocesses, replay buffers, or other owner state to a new relay. Future migration would require an explicit adapter and ownership protocol.
+The retained M2 carrier-recovery path is narrower than owner or session reconnect. While the authenticated control socket and the same owner/connector actors remain live, it closes failed data carriers, keeps their connection IDs in the retained fence/history, and admits fresh generations under one immutable episode deadline. The first recovery attempt is immediate after its closure barrier; later attempts use the shared 100 ms and 200 ms gaps, with no more than three physical attempts. Each `RECOVERY_CLOSED` roster is the newly released per-attempt delta after the preceding authenticated closure pair, so historical IDs are not repeated on the wire even though they remain fenced.
+
+Owner change is a different event: fresh ownership fencing and fresh sessions, with interruption/unknown outcomes as appropriate. Control-socket replacement, connector or relay process restart, owner migration, and recovery after retained-state expiry are also fresh-session boundaries; this in-session carrier path does not implement them. Do not claim that scheduled WebSocket drain or carrier recovery proves live migration of filesystem fids, ACP subprocesses, replay buffers, or other owner state to a new relay. Future migration would require an explicit adapter and ownership protocol.
 
 ## Atomic leases and device fencing
 

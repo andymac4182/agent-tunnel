@@ -620,8 +620,6 @@ dependencies = [
 [[package]]
 name = "h3"
 version = "0.0.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "10872b55cfb02a821b69dc7cf8dc6a71d6af25eb9a79662bec4a9d016056b3be"
 dependencies = [
  "bytes",
  "fastrand",
@@ -634,8 +632,6 @@ dependencies = [
 [[package]]
 name = "h3-quinn"
 version = "0.0.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b2e732c8d91a74731663ac8479ab505042fbf547b9a207213ab7fbcbfc4f8b4"
 dependencies = [
  "bytes",
  "futures",
@@ -1249,8 +1245,6 @@ dependencies = [
 [[package]]
 name = "quinn-proto"
 version = "0.11.17"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04759210543be93709136e28212294a659ef5001836ff4eab4d663e4529bba83"
 dependencies = [
  "bytes",
  "getrandom 0.4.3",
@@ -2236,11 +2230,14 @@ name = "tunnel-catalog"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64",
  "chrono",
  "jsonwebtoken",
  "redis",
+ "ring",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "uuid",
 ]
@@ -2268,6 +2265,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "tunnel-cluster"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "bytes",
+ "chrono",
+ "ring",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tokio-util",
+ "tunnel-catalog",
+ "uuid",
+]
+
+[[package]]
 name = "tunnel-core"
 version = "0.1.0"
 dependencies = [
@@ -2288,14 +2302,23 @@ dependencies = [
 name = "tunnel-relay"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum",
  "base64",
+ "bytes",
  "chrono",
  "futures-util",
+ "h3",
+ "h3-quinn",
+ "http",
+ "http-body",
  "http-body-util",
  "hyper",
  "hyper-util",
  "jsonwebtoken",
+ "libc",
+ "quinn",
+ "rcgen",
  "rustls",
  "rustls-pemfile",
  "serde",
@@ -2309,6 +2332,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tunnel-catalog",
+ "tunnel-cluster",
  "tunnel-core",
  "tunnel-protocol",
  "tunnel-transport",
@@ -2319,8 +2343,11 @@ dependencies = [
 name = "tunnel-test-harness"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "bytes",
  "chrono",
  "futures-util",
+ "http",
  "http-body-util",
  "hyper",
  "hyper-util",
@@ -2344,6 +2371,7 @@ dependencies = [
  "tracing-subscriber",
  "tunnel-catalog",
  "tunnel-client",
+ "tunnel-cluster",
  "tunnel-core",
  "tunnel-protocol",
  "tunnel-relay",
@@ -2363,10 +2391,12 @@ dependencies = [
  "hyper",
  "hyper-util",
  "quinn",
+ "rcgen",
  "rustls",
  "rustls-pemfile",
  "rustls-pki-types",
  "sha2",
+ "socket2",
  "thiserror",
  "tokio",
  "tokio-rustls",

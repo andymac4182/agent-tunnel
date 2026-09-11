@@ -49,6 +49,27 @@ pub const MAX_TOTAL_SOCKETS: u8 = CONTROL_SOCKETS + MAX_DATA_SOCKETS;
 pub const MAX_CONNECTION_ID_HISTORY: usize = 256;
 /// Maximum number of replacement candidates in one retained-state episode.
 pub const MAX_RECOVERY_ATTEMPTS: u8 = 3;
+/// Fixed gaps between successive physical candidates after an unexpected
+/// candidate loss.  The first recovery attempt starts immediately; only the
+/// second and third attempts are delayed.  These are protocol policy values,
+/// rather than client-side timers, so both peers observe one coordinator-owned
+/// schedule and the episode's absolute deadline remains authoritative.
+pub const RECOVERY_RETRY_DELAYS_MS: [RotationTime; 2] = [100, 200];
+
+/// Return the retry delay after a failed recovery attempt.
+///
+/// `completed_attempt_no` is the attempt that just lost its candidate.  A
+/// completed first attempt gates attempt two by 100 ms and a completed second
+/// attempt gates attempt three by 200 ms.  There is no delay after the final
+/// bounded attempt because the caller must fail closed.
+#[must_use]
+pub const fn recovery_retry_delay_ms(completed_attempt_no: u64) -> Option<RotationTime> {
+    match completed_attempt_no {
+        1 => Some(RECOVERY_RETRY_DELAYS_MS[0]),
+        2 => Some(RECOVERY_RETRY_DELAYS_MS[1]),
+        _ => None,
+    }
+}
 
 /// Configurable timing and roster policy for a rotation machine.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3342,5 +3363,14 @@ mod tests {
                 deadline: 5
             })
         ));
+    }
+
+    #[test]
+    fn recovery_retry_policy_delays_only_bounded_followup_attempts() {
+        assert_eq!(RECOVERY_RETRY_DELAYS_MS, [100, 200]);
+        assert_eq!(recovery_retry_delay_ms(1), Some(100));
+        assert_eq!(recovery_retry_delay_ms(2), Some(200));
+        assert_eq!(recovery_retry_delay_ms(3), None);
+        assert_eq!(recovery_retry_delay_ms(0), None);
     }
 }

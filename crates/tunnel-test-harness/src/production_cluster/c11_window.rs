@@ -1,0 +1,977 @@
+//! Complete bounded C11 diagnostic windows and redaction scanning.
+//!
+//! The collector reports only safe categories and stream roles. It scans all
+//! captured bytes for the exact values used by each fixture and checks required
+//! diagnostic fields across the joined window without retaining them in receipts.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+
+const MAX_TOKEN_BYTES: usize = 128;
+const MAX_SENTINEL_BYTES: usize = 256 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum FaultStage {
+    Redis,
+    Peer,
+    Owner,
+    Write,
+}
+
+impl FaultStage {
+    pub const ALL: [Self; 4] = [Self::Redis, Self::Peer, Self::Owner, Self::Write];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Redis => "redis",
+            Self::Peer => "peer",
+            Self::Owner => "owner",
+            Self::Write => "write",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum RunOutcome {
+    Success,
+    Failure,
+}
+
+impl RunOutcome {
+    pub const ALL: [Self; 2] = [Self::Success, Self::Failure];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Failure => "failure",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum SentinelKind {
+    Credential,
+    ApplicationPayload,
+    FilesystemPath,
+    PrivateEndpoint,
+}
+
+impl SentinelKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Credential => "credential",
+            Self::ApplicationPayload => "application_payload",
+            Self::FilesystemPath => "filesystem_path",
+            Self::PrivateEndpoint => "private_endpoint",
+        }
+    }
+}
+
+/// Exact run-specific value retained only by the in-memory scanner.
+///
+/// Deliberately does not implement `Debug` or `Display`: a `ScanFailure`
+/// cannot accidentally include the secret, payload, path, or endpoint.
+pub struct Sentinel {
+    kind: SentinelKind,
+    value: Vec<u8>,
+}
+
+impl Sentinel {
+    pub fn new(kind: SentinelKind, value: impl Into<Vec<u8>>) -> Result<Self, ScanFailure> {
+        let value = value.into();
+        if value.is_empty() || value.len() > MAX_SENTINEL_BYTES {
+            return Err(ScanFailure::InvalidSentinel { kind });
+        }
+        Ok(Self { kind, value })
+    }
+
+    pub fn kind(&self) -> SentinelKind {
+        self.kind
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum SafeField {
+    Relay,
+    Tenant,
+    Owner,
+    Route,
+    Phase,
+    EpochGenerationFence,
+    RevocationOwnerDeath,
+    Counter,
+    CloseCause,
+}
+
+impl SafeField {
+    pub const ALL: [Self; 9] = [
+        Self::Relay,
+        Self::Tenant,
+        Self::Owner,
+        Self::Route,
+        Self::Phase,
+        Self::EpochGenerationFence,
+        Self::RevocationOwnerDeath,
+        Self::Counter,
+        Self::CloseCause,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Relay => "relay",
+            Self::Tenant => "tenant",
+            Self::Owner => "owner",
+            Self::Route => "route",
+            Self::Phase => "phase",
+            Self::EpochGenerationFence => "epoch_generation_fence",
+            Self::RevocationOwnerDeath => "revocation_owner_death",
+            Self::Counter => "counter",
+            Self::CloseCause => "close_cause",
+        }
+    }
+
+    fn matches(self, bytes: &[u8]) -> bool {
+        let needles: &[&[u8]] = match self {
+            Self::Relay => &[b"relay", b"relays"],
+            Self::Tenant => &[b"tenant", b"tenants", b"tenant_id"],
+            Self::Owner => &[
+                b"owner",
+                b"owners",
+                b"owner_id",
+                b"owner_relay",
+                b"target_owner",
+                b"sibling_owner",
+            ],
+            Self::Route => &[
+                b"route",
+                b"peer_ready",
+                b"ingress",
+                b"ingress_node",
+                b"ingress_relays",
+            ],
+            Self::Phase => &[b"phase", b"stage"],
+            Self::EpochGenerationFence => &[
+                b"epoch",
+                b"generation",
+                b"active_generation",
+                b"candidate_generation",
+                b"fence",
+            ],
+            Self::RevocationOwnerDeath => &[
+                b"revocation",
+                b"owner_death",
+                b"owner-death",
+                b"owner_loss",
+                b"key_revocation",
+            ],
+            Self::Counter => &[
+                b"counter",
+                b"dispatch",
+                b"dispatches",
+                b"dispatch_counter",
+                b"queue_messages",
+                b"queue_bytes",
+                b"lifetime_application_dispatches",
+                b"active_connections",
+                b"streams",
+                b"sockets",
+            ],
+            Self::CloseCause => &[
+                b"reason",
+                b"close",
+                b"close_cause",
+                b"cause",
+                b"terminal",
+                b"terminal_reason",
+                b"terminal_event",
+                b"terminal_events",
+                b"session_terminal_events",
+                b"rotation_recovery_reason",
+                b"post_terminal",
+            ],
+        };
+        needles
+            .iter()
+            .any(|needle| contains_ascii_case_insensitive_key(bytes, needle))
+    }
+}
+
+pub struct C11RunSpec {
+    pub run_id: String,
+    pub source_id: String,
+    pub build_id: String,
+    pub stage: FaultStage,
+    pub outcome: RunOutcome,
+    pub started_utc_ms: i64,
+    pub expected_roles: BTreeSet<String>,
+    /// Roles whose bytes may establish a safe-field observation.  Adapter
+    /// snapshots remain captured and joined, but wrapper text produced by the
+    /// collector itself must not satisfy the matrix's diagnostic-field gate.
+    pub safe_field_roles: BTreeSet<String>,
+    pub required_fields: BTreeSet<SafeField>,
+    sentinels: Vec<Sentinel>,
+    pub max_bytes_per_stream: usize,
+}
+
+impl C11RunSpec {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        run_id: impl Into<String>,
+        source_id: impl Into<String>,
+        build_id: impl Into<String>,
+        stage: FaultStage,
+        outcome: RunOutcome,
+        started_utc_ms: i64,
+        expected_roles: impl IntoIterator<Item = impl Into<String>>,
+        sentinels: Vec<Sentinel>,
+    ) -> Result<Self, ScanFailure> {
+        let run_id = validate_token("run_id", run_id.into())?;
+        let source_id = validate_token("source_id", source_id.into())?;
+        let build_id = validate_token("build_id", build_id.into())?;
+        let expected_roles = expected_roles
+            .into_iter()
+            .map(|role| validate_token("stream_role", role.into()))
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        if expected_roles.is_empty() {
+            return Err(ScanFailure::NoExpectedStreams);
+        }
+        let safe_field_roles = expected_roles.clone();
+        Ok(Self {
+            run_id,
+            source_id,
+            build_id,
+            stage,
+            outcome,
+            started_utc_ms,
+            expected_roles,
+            safe_field_roles,
+            required_fields: SafeField::ALL.into_iter().collect(),
+            sentinels,
+            max_bytes_per_stream: 1 << 20,
+        })
+    }
+
+    pub fn with_required_fields(mut self, fields: impl IntoIterator<Item = SafeField>) -> Self {
+        self.required_fields = fields.into_iter().collect();
+        self
+    }
+
+    pub fn with_safe_field_roles(
+        mut self,
+        roles: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Result<Self, ScanFailure> {
+        let roles = roles
+            .into_iter()
+            .map(|role| validate_token("safe_field_role", role.into()))
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        if roles.iter().any(|role| !self.expected_roles.contains(role)) {
+            return Err(ScanFailure::SafeFieldRoleNotExpected);
+        }
+        self.safe_field_roles = roles;
+        Ok(self)
+    }
+
+    pub fn with_stream_limit(mut self, max_bytes_per_stream: usize) -> Result<Self, ScanFailure> {
+        if max_bytes_per_stream == 0 {
+            return Err(ScanFailure::InvalidStreamLimit);
+        }
+        self.max_bytes_per_stream = max_bytes_per_stream;
+        Ok(self)
+    }
+}
+
+struct StreamCapture {
+    bytes: Vec<u8>,
+    closed: bool,
+    joined: bool,
+}
+
+impl StreamCapture {
+    fn new() -> Self {
+        Self {
+            bytes: Vec::new(),
+            closed: false,
+            joined: false,
+        }
+    }
+}
+
+pub struct C11Window {
+    spec: C11RunSpec,
+    streams: BTreeMap<String, StreamCapture>,
+}
+
+impl C11Window {
+    pub fn new(spec: C11RunSpec) -> Self {
+        Self {
+            spec,
+            streams: BTreeMap::new(),
+        }
+    }
+
+    pub fn append(&mut self, role: &str, bytes: &[u8]) -> Result<(), ScanFailure> {
+        let limit = self.spec.max_bytes_per_stream;
+        {
+            let stream = self.stream_mut(role)?;
+            if stream.closed {
+                return Err(ScanFailure::AppendAfterClose {
+                    role: role.to_owned(),
+                });
+            }
+            let next_len = stream.bytes.len().checked_add(bytes.len()).ok_or_else(|| {
+                ScanFailure::CaptureOverflow {
+                    role: role.to_owned(),
+                    limit,
+                }
+            })?;
+            if next_len > limit {
+                return Err(ScanFailure::CaptureOverflow {
+                    role: role.to_owned(),
+                    limit,
+                });
+            }
+            stream.bytes.extend_from_slice(bytes);
+        }
+        let captured = &self
+            .streams
+            .get(role)
+            .expect("stream is registered by stream_mut")
+            .bytes;
+        for sentinel in &self.spec.sentinels {
+            if contains(captured, &sentinel.value) {
+                return Err(ScanFailure::SensitiveValue {
+                    role: role.to_owned(),
+                    kind: sentinel.kind,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    pub fn close(&mut self, role: &str) -> Result<(), ScanFailure> {
+        let stream = self.stream_mut(role)?;
+        if stream.closed {
+            return Err(ScanFailure::DuplicateClose {
+                role: role.to_owned(),
+            });
+        }
+        stream.closed = true;
+        Ok(())
+    }
+
+    pub fn mark_joined(&mut self, role: &str) -> Result<(), ScanFailure> {
+        let stream = self.stream_mut(role)?;
+        if !stream.closed {
+            return Err(ScanFailure::JoinedBeforeClose {
+                role: role.to_owned(),
+            });
+        }
+        stream.joined = true;
+        Ok(())
+    }
+
+    pub fn finish(self, ended_utc_ms: i64) -> Result<C11ScanReport, ScanFailure> {
+        if ended_utc_ms < self.spec.started_utc_ms {
+            return Err(ScanFailure::InvalidWindow);
+        }
+        for (role, stream) in &self.streams {
+            if !stream.closed {
+                return Err(ScanFailure::StreamNotClosed { role: role.clone() });
+            }
+            if !stream.joined {
+                return Err(ScanFailure::StreamNotJoined { role: role.clone() });
+            }
+        }
+        for role in &self.spec.expected_roles {
+            if !self.streams.contains_key(role) {
+                return Err(ScanFailure::MissingStream { role: role.clone() });
+            }
+        }
+
+        let mut missing_fields = Vec::new();
+        for field in &self.spec.required_fields {
+            if !self
+                .streams
+                .iter()
+                .filter(|(role, _)| self.spec.safe_field_roles.contains(*role))
+                .any(|(_, stream)| field.matches(&stream.bytes))
+            {
+                missing_fields.push(*field);
+            }
+        }
+        if !missing_fields.is_empty() {
+            return Err(ScanFailure::MissingSafeFields {
+                fields: missing_fields,
+            });
+        }
+
+        let fields_present = SafeField::ALL
+            .into_iter()
+            .filter(|field| {
+                self.streams
+                    .iter()
+                    .filter(|(role, _)| self.spec.safe_field_roles.contains(*role))
+                    .map(|(_, stream)| stream)
+                    .any(|stream| field.matches(&stream.bytes))
+            })
+            .collect();
+        let bytes_by_role = self
+            .streams
+            .into_iter()
+            .map(|(role, stream)| (role, stream.bytes.len()))
+            .collect();
+        Ok(C11ScanReport {
+            run_id: self.spec.run_id,
+            source_id: self.spec.source_id,
+            build_id: self.spec.build_id,
+            stage: self.spec.stage,
+            outcome: self.spec.outcome,
+            started_utc_ms: self.spec.started_utc_ms,
+            ended_utc_ms,
+            bytes_by_role,
+            fields_present,
+        })
+    }
+
+    fn stream_mut(&mut self, role: &str) -> Result<&mut StreamCapture, ScanFailure> {
+        if !self.spec.expected_roles.contains(role) {
+            return Err(ScanFailure::UnexpectedStream {
+                role: role.to_owned(),
+            });
+        }
+        Ok(self
+            .streams
+            .entry(role.to_owned())
+            .or_insert_with(StreamCapture::new))
+    }
+}
+
+#[derive(Debug)]
+pub struct C11ScanReport {
+    pub run_id: String,
+    pub source_id: String,
+    pub build_id: String,
+    pub stage: FaultStage,
+    pub outcome: RunOutcome,
+    pub started_utc_ms: i64,
+    pub ended_utc_ms: i64,
+    pub bytes_by_role: BTreeMap<String, usize>,
+    pub fields_present: BTreeSet<SafeField>,
+}
+
+pub struct C11EvidenceBundle {
+    matrix_started_utc_ms: i64,
+    reports: BTreeMap<(FaultStage, RunOutcome), C11ScanReport>,
+}
+
+impl C11EvidenceBundle {
+    pub fn new(matrix_started_utc_ms: i64) -> Self {
+        Self {
+            matrix_started_utc_ms,
+            reports: BTreeMap::new(),
+        }
+    }
+
+    pub fn add(&mut self, report: C11ScanReport) -> Result<(), ScanFailure> {
+        if report.started_utc_ms < self.matrix_started_utc_ms {
+            return Err(ScanFailure::RunOutsideMatrix {
+                run_id: report.run_id,
+            });
+        }
+        let key = (report.stage, report.outcome);
+        if self.reports.contains_key(&key) {
+            return Err(ScanFailure::DuplicateMatrixCase {
+                stage: report.stage,
+                outcome: report.outcome,
+            });
+        }
+        self.reports.insert(key, report);
+        Ok(())
+    }
+
+    pub fn finish(self, matrix_ended_utc_ms: i64) -> Result<C11MatrixReport, ScanFailure> {
+        if matrix_ended_utc_ms < self.matrix_started_utc_ms {
+            return Err(ScanFailure::InvalidWindow);
+        }
+        if self
+            .reports
+            .values()
+            .any(|report| report.ended_utc_ms > matrix_ended_utc_ms)
+        {
+            return Err(ScanFailure::RunOutsideMatrix {
+                run_id: "matrix-end".to_owned(),
+            });
+        }
+        for stage in FaultStage::ALL {
+            for outcome in RunOutcome::ALL {
+                if !self.reports.contains_key(&(stage, outcome)) {
+                    return Err(ScanFailure::MissingMatrixCase { stage, outcome });
+                }
+            }
+        }
+        let fields_present = self
+            .reports
+            .values()
+            .flat_map(|report| report.fields_present.iter().copied())
+            .collect::<BTreeSet<_>>();
+        let missing_fields = SafeField::ALL
+            .into_iter()
+            .filter(|field| !fields_present.contains(field))
+            .collect::<Vec<_>>();
+        if !missing_fields.is_empty() {
+            return Err(ScanFailure::MissingSafeFields {
+                fields: missing_fields,
+            });
+        }
+        let Some(first_report) = self.reports.values().next() else {
+            return Err(ScanFailure::NoExpectedStreams);
+        };
+        let source_id = first_report.source_id.clone();
+        let build_id = first_report.build_id.clone();
+        if self
+            .reports
+            .values()
+            .any(|report| report.source_id != source_id || report.build_id != build_id)
+        {
+            return Err(ScanFailure::MixedSourceBuild);
+        }
+        let captured_streams = self
+            .reports
+            .values()
+            .map(|report| report.bytes_by_role.len())
+            .sum();
+        let captured_bytes = self
+            .reports
+            .values()
+            .flat_map(|report| report.bytes_by_role.values())
+            .sum();
+        let runs = self.reports.len();
+        Ok(C11MatrixReport {
+            matrix_started_utc_ms: self.matrix_started_utc_ms,
+            matrix_ended_utc_ms,
+            source_id,
+            build_id,
+            safe_field_count: fields_present.len(),
+            captured_streams,
+            captured_bytes,
+            runs,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct C11MatrixReport {
+    pub matrix_started_utc_ms: i64,
+    pub matrix_ended_utc_ms: i64,
+    pub source_id: String,
+    pub build_id: String,
+    pub safe_field_count: usize,
+    pub captured_streams: usize,
+    pub captured_bytes: usize,
+    pub runs: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ScanFailure {
+    InvalidToken {
+        field: &'static str,
+    },
+    InvalidSentinel {
+        kind: SentinelKind,
+    },
+    InvalidStreamLimit,
+    NoExpectedStreams,
+    UnexpectedStream {
+        role: String,
+    },
+    AppendAfterClose {
+        role: String,
+    },
+    CaptureOverflow {
+        role: String,
+        limit: usize,
+    },
+    SensitiveValue {
+        role: String,
+        kind: SentinelKind,
+    },
+    DuplicateClose {
+        role: String,
+    },
+    JoinedBeforeClose {
+        role: String,
+    },
+    StreamNotClosed {
+        role: String,
+    },
+    StreamNotJoined {
+        role: String,
+    },
+    MissingStream {
+        role: String,
+    },
+    MissingSafeFields {
+        fields: Vec<SafeField>,
+    },
+    SafeFieldRoleNotExpected,
+    MixedSourceBuild,
+    InvalidWindow,
+    RunOutsideMatrix {
+        run_id: String,
+    },
+    DuplicateMatrixCase {
+        stage: FaultStage,
+        outcome: RunOutcome,
+    },
+    MissingMatrixCase {
+        stage: FaultStage,
+        outcome: RunOutcome,
+    },
+}
+
+impl fmt::Display for ScanFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidToken { field } => write!(formatter, "invalid bounded {field}"),
+            Self::InvalidSentinel { kind } => {
+                write!(formatter, "invalid {} sentinel", kind.label())
+            }
+            Self::InvalidStreamLimit => formatter.write_str("invalid stream capture limit"),
+            Self::NoExpectedStreams => formatter.write_str("no expected diagnostic streams"),
+            Self::UnexpectedStream { role } => write!(formatter, "unexpected stream role {role}"),
+            Self::AppendAfterClose { role } => write!(formatter, "append after close for {role}"),
+            Self::CaptureOverflow { role, limit } => {
+                write!(formatter, "capture overflow for {role} at {limit} bytes")
+            }
+            Self::SensitiveValue { role, kind } => {
+                write!(formatter, "sensitive {} value in {role}", kind.label())
+            }
+            Self::DuplicateClose { role } => write!(formatter, "duplicate close for {role}"),
+            Self::JoinedBeforeClose { role } => write!(formatter, "join before close for {role}"),
+            Self::StreamNotClosed { role } => write!(formatter, "stream not closed: {role}"),
+            Self::StreamNotJoined { role } => write!(formatter, "stream not joined: {role}"),
+            Self::MissingStream { role } => write!(formatter, "missing expected stream: {role}"),
+            Self::MissingSafeFields { fields } => {
+                write!(formatter, "missing safe fields: ")?;
+                for (index, field) in fields.iter().enumerate() {
+                    if index > 0 {
+                        formatter.write_str(",")?;
+                    }
+                    formatter.write_str(field.label())?;
+                }
+                Ok(())
+            }
+            Self::SafeFieldRoleNotExpected => {
+                formatter.write_str("safe-field role was not an expected stream")
+            }
+            Self::MixedSourceBuild => formatter.write_str("matrix mixed source/build identities"),
+            Self::InvalidWindow => formatter.write_str("invalid diagnostic window"),
+            Self::RunOutsideMatrix { run_id } => {
+                write!(formatter, "run outside matrix window: {run_id}")
+            }
+            Self::DuplicateMatrixCase { stage, outcome } => {
+                write!(
+                    formatter,
+                    "duplicate {} {} matrix case",
+                    stage.label(),
+                    outcome.label()
+                )
+            }
+            Self::MissingMatrixCase { stage, outcome } => {
+                write!(
+                    formatter,
+                    "missing {} {} matrix case",
+                    stage.label(),
+                    outcome.label()
+                )
+            }
+        }
+    }
+}
+
+fn validate_token(field: &'static str, value: String) -> Result<String, ScanFailure> {
+    if value.is_empty()
+        || value.len() > MAX_TOKEN_BYTES
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err(ScanFailure::InvalidToken { field });
+    }
+    Ok(value)
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+}
+
+/// Match a complete diagnostic key/category instead of an arbitrary substring.
+///
+/// Snapshot and harness records use ASCII identifiers separated by punctuation
+/// (`queue_messages=`, `owner-death`, JSON quotes, and similar forms). Treat
+/// ASCII letters, digits, and underscores as identifier bytes so a value such
+/// as `counterfeit` cannot satisfy the `counter` category while compound keys
+/// remain matched by their full needle.
+fn contains_ascii_case_insensitive_key(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .enumerate()
+            .any(|(offset, window)| {
+                window
+                    .iter()
+                    .zip(needle)
+                    .all(|(left, right)| left.eq_ignore_ascii_case(right))
+                    && is_identifier_boundary(haystack, offset, needle.len())
+            })
+}
+
+fn is_identifier_boundary(haystack: &[u8], offset: usize, needle_len: usize) -> bool {
+    let before_is_boundary = offset
+        .checked_sub(1)
+        .and_then(|index| haystack.get(index))
+        .is_none_or(|byte| !is_identifier_byte(*byte));
+    let after_is_boundary = haystack
+        .get(offset.saturating_add(needle_len))
+        .is_none_or(|byte| !is_identifier_byte(*byte));
+    before_is_boundary && after_is_boundary
+}
+
+fn is_identifier_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+#[cfg(test)]
+mod matcher_tests {
+    use super::{SafeField, contains_ascii_case_insensitive_key};
+
+    #[test]
+    fn field_needles_do_not_match_identifier_substrings() {
+        assert!(!contains_ascii_case_insensitive_key(
+            b"counterfeit=true",
+            b"counter"
+        ));
+        assert!(!contains_ascii_case_insensitive_key(
+            b"reroute=true",
+            b"route"
+        ));
+        assert!(!contains_ascii_case_insensitive_key(
+            b"terminality=true",
+            b"terminal"
+        ));
+    }
+
+    #[test]
+    fn field_needles_match_complete_compound_keys() {
+        assert!(contains_ascii_case_insensitive_key(
+            br#"{"queue_messages":1}"#,
+            b"queue_messages"
+        ));
+        assert!(contains_ascii_case_insensitive_key(
+            b"owner-death=true",
+            b"owner-death"
+        ));
+        assert!(contains_ascii_case_insensitive_key(
+            br#"{"session_terminal_events":1}"#,
+            b"session_terminal_events"
+        ));
+    }
+
+    #[test]
+    fn safe_field_categories_use_boundary_matching() {
+        assert!(!SafeField::Counter.matches(b"counterfeit=true"));
+        assert!(!SafeField::Route.matches(b"reroute=true"));
+        assert!(!SafeField::CloseCause.matches(b"terminality=true"));
+    }
+
+    #[test]
+    fn owner_death_requires_an_exact_emitted_field() {
+        // The FP-05 Debug field `owner_loss_close_observed` is intentionally
+        // not enough: boundary matching must reject the `owner_loss` prefix.
+        assert!(!SafeField::RevocationOwnerDeath.matches(b"owner_loss_close_observed=true"));
+        assert!(SafeField::RevocationOwnerDeath.matches(b"owner_death=true"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec() -> C11RunSpec {
+        C11RunSpec::new(
+            "run-1",
+            "source-1",
+            "build-1",
+            FaultStage::Peer,
+            RunOutcome::Success,
+            100,
+            ["relay-a"],
+            vec![Sentinel::new(SentinelKind::Credential, b"secret-token").unwrap()],
+        )
+        .unwrap()
+        .with_required_fields([
+            SafeField::Relay,
+            SafeField::Tenant,
+            SafeField::Owner,
+            SafeField::Route,
+            SafeField::Phase,
+            SafeField::EpochGenerationFence,
+            SafeField::RevocationOwnerDeath,
+            SafeField::Counter,
+            SafeField::CloseCause,
+        ])
+    }
+
+    const SAFE_LINE: &[u8] = b"relay=relay-a tenant=tenant-a owner=owner-a route=peer-route phase=ready epoch=2 generation=3 fence=4 revocation=false owner_death=false dispatch_counter=1 reason=CONTROL_CLOSED";
+
+    #[test]
+    fn complete_joined_window_returns_safe_report() {
+        let mut window = C11Window::new(spec());
+        window.append("relay-a", SAFE_LINE).unwrap();
+        window.close("relay-a").unwrap();
+        window.mark_joined("relay-a").unwrap();
+        let report = window.finish(101).unwrap();
+        assert_eq!(report.bytes_by_role["relay-a"], SAFE_LINE.len());
+        assert_eq!(report.stage, FaultStage::Peer);
+    }
+
+    #[test]
+    fn sensitive_value_failure_does_not_echo_value() {
+        let secret = b"secret-token";
+        let mut window = C11Window::new(spec());
+        let error = window
+            .append("relay-a", b"phase=ready secret-token")
+            .unwrap_err();
+        assert_eq!(
+            error,
+            ScanFailure::SensitiveValue {
+                role: "relay-a".to_owned(),
+                kind: SentinelKind::Credential,
+            }
+        );
+        assert!(
+            !error
+                .to_string()
+                .contains(std::str::from_utf8(secret).unwrap())
+        );
+        assert!(!format!("{error:?}").contains(std::str::from_utf8(secret).unwrap()));
+    }
+
+    #[test]
+    fn every_sensitive_category_is_scanned_without_value_disclosure() {
+        for (kind, value) in [
+            (SentinelKind::Credential, "credential-sentinel"),
+            (SentinelKind::ApplicationPayload, "payload-sentinel"),
+            (SentinelKind::FilesystemPath, "/private/c11/state"),
+            (
+                SentinelKind::PrivateEndpoint,
+                "https://private.invalid/peer",
+            ),
+        ] {
+            let sentinel = Sentinel::new(kind, value.as_bytes()).unwrap();
+            let spec = C11RunSpec::new(
+                "run-sensitive",
+                "source-1",
+                "build-1",
+                FaultStage::Write,
+                RunOutcome::Failure,
+                100,
+                ["harness"],
+                vec![sentinel],
+            )
+            .unwrap();
+            let mut window = C11Window::new(spec);
+            let error = window.append("harness", value.as_bytes()).unwrap_err();
+            assert_eq!(
+                error,
+                ScanFailure::SensitiveValue {
+                    role: "harness".to_owned(),
+                    kind,
+                }
+            );
+            assert!(!error.to_string().contains(value));
+            assert!(!format!("{error:?}").contains(value));
+        }
+    }
+
+    #[test]
+    fn overflow_is_a_failure_even_before_close() {
+        let spec = spec().with_stream_limit(4).unwrap();
+        let mut window = C11Window::new(spec);
+        let error = window.append("relay-a", b"12345").unwrap_err();
+        assert_eq!(
+            error,
+            ScanFailure::CaptureOverflow {
+                role: "relay-a".to_owned(),
+                limit: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn adapter_wrapper_labels_do_not_establish_safe_fields() {
+        let spec = C11RunSpec::new(
+            "run-safe-role",
+            "source-1",
+            "build-1",
+            FaultStage::Write,
+            RunOutcome::Success,
+            100,
+            ["runtime", "adapter"],
+            Vec::new(),
+        )
+        .unwrap()
+        .with_required_fields([SafeField::Relay])
+        .with_safe_field_roles(["runtime"])
+        .unwrap();
+        let mut window = C11Window::new(spec);
+        window
+            .append("adapter", b"route=relay-a relay=relay-a")
+            .unwrap();
+        window.append("runtime", b"phase=ready counter=1").unwrap();
+        window.close("adapter").unwrap();
+        window.close("runtime").unwrap();
+        window.mark_joined("adapter").unwrap();
+        window.mark_joined("runtime").unwrap();
+        assert_eq!(
+            window.finish(101).unwrap_err(),
+            ScanFailure::MissingSafeFields {
+                fields: vec![SafeField::Relay]
+            }
+        );
+    }
+
+    #[test]
+    fn joined_cleanup_is_required() {
+        let mut window = C11Window::new(spec());
+        window.append("relay-a", SAFE_LINE).unwrap();
+        window.close("relay-a").unwrap();
+        assert_eq!(
+            window.finish(101).unwrap_err(),
+            ScanFailure::StreamNotJoined {
+                role: "relay-a".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn matrix_requires_success_and_failure_for_each_fault_stage() {
+        let mut bundle = C11EvidenceBundle::new(100);
+        let mut window = C11Window::new(spec());
+        window.append("relay-a", SAFE_LINE).unwrap();
+        window.close("relay-a").unwrap();
+        window.mark_joined("relay-a").unwrap();
+        bundle.add(window.finish(101).unwrap()).unwrap();
+        let error = bundle.finish(102).unwrap_err();
+        assert_eq!(
+            error,
+            ScanFailure::MissingMatrixCase {
+                stage: FaultStage::Redis,
+                outcome: RunOutcome::Success,
+            }
+        );
+    }
+}

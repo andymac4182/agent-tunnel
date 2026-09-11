@@ -127,7 +127,9 @@ impl OidcFixture {
         };
         let mut header = Header::new(Algorithm::RS256);
         header.kid = Some(self.key_id.clone());
-        Ok(encode(&header, &claims, &self.encoding_key)?)
+        let token = encode(&header, &claims, &self.encoding_key)?;
+        crate::c11_capture::record_sentinel("credential", token.as_bytes())?;
+        Ok(token)
     }
 
     pub fn issue_expired(&self, subject: impl Into<String>) -> Result<String> {

@@ -94,6 +94,37 @@ Control messages use bounded UTF-8 JSON WebSocket messages for initial inspectab
 
 Control-plane state changes are idempotent for an identical `message_id` within a bounded retention period. A reused identifier with different contents is a protocol error. The relay is the only rotation coordinator: the connector may request rotation, but cannot independently commit a competing generation.
 
+An identical pending `OPEN` coalesces with the original request and retains its
+original operation and authorization deadlines. After admission, an identical
+retry replays only the exact retained `OPENED`; a refused request replays its
+retained `REJECTED`. The first admission queues `OPENED` and its independent
+authorization challenge atomically. Retrying `OPEN` never issues or replays an
+authorization challenge and never refreshes a grant. A new message ID cannot
+replace an existing stream or reuse a forgotten stream ID.
+
+The connector's OPEN journal is separate from the data replay budget. Its
+canonical requests and retained wire replies have explicit byte charges, at
+most the smaller of the configured queue budget and 4 MiB; its total active
+entries and tombstones are limited to 128. Uncompacted journal entries also obey the retained stream-table limit of
+twice the negotiated active stream limit, capped at128. Nonterminal streams
+separately obey the negotiated active limit. Retained terminal streams cannot
+consume a free active slot, and each journal entry reserves its future tombstone slot.
+Authenticated, operation-matched `STREAM_FORGET` releases retained reply bytes
+after the carrier barriers, including for refused requests with no stream.
+Canonical tombstones remain bounded for the session lifetime. The journal
+never evicts a known ID to admit a new one; exhaustion requires an explicit
+resource-exhausted/fresh-session outcome. A permanent retention failure must
+not wait indefinitely as if it were temporary writer backpressure.
+
+Decoded pending OPEN requests use a separate bounded pool. Each retained
+request reserves its parsed strings, metadata tree, authorization clones and
+conservative allocation overhead; dropping the pending request releases that
+reservation exactly once. Duplicate requests reuse the existing reservation
+and deadlines. The pool is capped by the configured queue budget and the
+negotiated stream count times a hard per-request estimate. This cap, the
+journal cap and the data replay/output cap are separate; the configured queue
+value is not a single combined process-memory limit.
+
 Every attempt-bearing rotation phase identifies `rotation_id`, owner, epoch, old/new generation and old/new connection ID. `ROTATE_REQUEST` carries only the currently active session, owner, generation and connection; the owner allocates the candidate attempt identity in `ROTATE_PREPARE`. Acknowledgements apply only to that exact attempt and phase. Encode 64-bit control counters as decimal strings so consumers cannot lose precision through JSON numbers. Bounded tombstones reject stale messages after an attempt finishes; expired context requires explicit recovery, never inference from a reused ID.
 
 For a fresh normal-phase message, `reply_to` must bind the preceding message
@@ -250,6 +281,12 @@ data loss with a current-context ROTATE_REQUEST whose reason is `data_loss`.
    30-second episode deadline includes resource closure, attachment, replay and
    readiness. Each endpoint retains its own monotonic deadline; subsequent
    messages can shorten but never restart or extend it.
+   A queued RESUME carries the sender's earlier remaining-duration sample.
+   Validate that sample as nonzero and within the protocol bound; it does not
+   replace the receiver's established absolute episode or candidate deadline.
+   ROTATE_PREPARE establishes the candidate deadline, capped by the retained
+   episode. An expired candidate rejects RESUME before journal updates or replay,
+   even when control input arrives before the maintenance timer runs.
 2. Both endpoints freeze admission and application writes and close every
    abandoned data carrier. RECOVERY_CLOSED is sent only after local reader,
    writer and dial tasks have released those resources. Its sorted connection
@@ -257,6 +294,13 @@ data loss with a current-context ROTATE_REQUEST whose reason is `data_loss`.
    digest binds the attempt, episode, attempt number and closed IDs. Both sides
    retain both closure records; their fixed-order combined digest binds the
    next attachment. An empty list is valid only when the recorded set is empty.
+   The list is a per-attempt closure delta: on attempt 1 it contains the
+   currently allocated abandoned carriers; on a retry it contains only the
+   newly released candidate since the preceding authenticated closure pair.
+   Connection IDs from earlier pairs remain authenticated in the immutable
+   recovery fence/history and cannot be reattached, but they are not repeated
+   on the next wire list. This keeps each closure message within the physical
+   bound while making every retry's failed candidate explicit.
 3. Only after both closure records agree does the relay issue ROTATE_PREPARE
    with attachment purpose `RECOVERY`, episode/attempt number and the combined
    closure digest. The one-use ticket record binds that purpose and complete
@@ -290,10 +334,15 @@ data loss with a current-context ROTATE_REQUEST whose reason is `data_loss`.
    remain bound to the same attempt. Uncertain readiness never permits a return
    to an abandoned generation.
 
-A failed candidate is fully released before the next attempt. M2 uses bounded
-100 ms and 200 ms retry delays within the same episode, with at most three
-physical attempts. Each attempt has fresh generation, connection and attempt
-IDs and a new ticket and closure binding. Exhaustion fails affected operations
+A failed candidate is fully released before the next attempt. The first
+attempt is eligible immediately after the closure and attachment barriers. If
+it fails, the relay's owned recovery timer waits 100 ms before attempt 2 and
+200 ms before attempt 3; those delays are measured from the completed preceding
+attempt and cannot extend the immutable episode deadline. M2 permits at most
+three physical attempts. Each attempt has fresh generation, connection and
+attempt IDs, a new ticket and a new closure binding. The closure list on each
+retry remains the per-attempt delta described above; prior authenticated IDs
+stay fenced in the retained episode state. Exhaustion fails affected operations
 explicitly, including unknown outcomes when necessary. Recovery cannot
 accumulate sockets or silently reset the last successful rotation timestamp;
 it is not a shortcut around the scheduled drain gate.
@@ -323,6 +372,8 @@ Read-only calls may be retried according to adapter policy. Non-idempotent calls
 | Session-owner relay process restarts or loses its fenced lease | Its sessions end; a new owner requires a fresh session. Other owners continue subject to cluster routing/lease health. No cross-owner transport replay is promised. |
 | Duplicate/stale socket attaches | Reject before binding or allocating stream buffers. |
 | Malformed/oversized data | Reject before payload allocation where possible; reset the scoped stream or close the connection for framing/authentication violations. |
+
+The recovery handshake above is in-session data-carrier recovery only: it requires the authenticated control socket, the same owner and connector actors, and retained logical stream state. It replaces failed data carriers inside that session/epoch; it does not reconnect the control socket, acquire a new owner, or recreate a session. Whole-session control reconnect, process restart, owner change, and recovery after retention expiry remain separate fresh-session lifecycle work and are not implemented by this retry path. A side-effecting operation that crosses one of those boundaries keeps its known/unknown result rules and is not automatically replayed.
 
 Control recovery must preserve the total socket bound: close the old control transport before establishing its replacement; close any rotation candidate before establishing replacement data sockets. A valid new epoch invalidates old-generation tickets and sockets. Whether to retain an existing operation result is separate from whether its old transport remains authorized.
 

@@ -11,14 +11,68 @@
 
 mod actor;
 mod config;
+mod consumer_write_diagnostics;
+mod health;
 mod http;
+pub mod membership_runtime;
+pub mod membership_version_state;
+mod peer_consumer_transport_diagnostics;
+pub mod peer_runtime;
+mod peer_transport_diagnostics;
+pub mod recovery;
+pub mod redis_connection;
+pub mod routing;
 mod runtime;
 mod wire;
 
-pub use actor::{Relay, RelayError, RelayHandle, RunningRelay};
-pub use config::{RelayLimits, RelayOptions, ServeConfig};
-pub use http::{consumer_router, device_router, router};
-pub use runtime::{RelayCarrierSnapshot, RelaySessionSnapshot, RelaySnapshot, RelayStreamSnapshot};
+pub use actor::{
+    ListenerSocketOptions, PeerListenerConfig, Relay, RelayError, RelayHandle, RunningRelay,
+};
+pub use config::{
+    ClusterConfig, PrivateEndpointPolicyConfig, RecoveryConfig, RelayLimits, RelayOptions,
+    ServeConfig,
+};
+pub use consumer_write_diagnostics::{
+    ConsumerIngressKind, ConsumerWriteDiagnosticSnapshot, ConsumerWriteScope,
+    ConsumerWriteTimeoutSnapshot,
+};
+pub use http::{
+    ConsumerUpgradeBarrier, PeerAdmissionBarrier, PeerAdmissionScope, consumer_router,
+    device_router, peer_ingress_handler, router, router_with_peer,
+};
+pub use membership_runtime::{
+    AdmissionDeadline, CheckpointAuthority, CheckpointAuthorityError, CheckpointRequest,
+    CheckpointResponse, HttpsCheckpointAuthority, MAX_MEMBERSHIP_PERSISTENCE_TIMEOUT,
+    MembershipReadiness, MembershipRecordSource, MembershipRuntime, MembershipRuntimeConfig,
+    MembershipRuntimeError, MembershipRuntimeHandle, MembershipSnapshot, MembershipUnreadyReason,
+    PeerAdmission, PeerIdentity as MembershipPeerIdentity, PeerInvalidationReason,
+};
+pub use membership_version_state::{
+    MembershipVersionStateIdentity, MembershipVersionStateStore, MembershipVersionStateStoreError,
+};
+pub use peer_consumer_transport_diagnostics::{
+    PeerConsumerDiagnosticEventSnapshot, PeerConsumerDiagnosticH3Code, PeerConsumerDiagnosticRole,
+    PeerConsumerDiagnosticSnapshot,
+};
+pub use peer_runtime::peer_readiness::{
+    PeerListenerState, PeerProbeState, PeerReadiness, PeerReadinessError, PeerReadinessSnapshot,
+    PeerRouteReadiness, PeerRouteTarget,
+};
+pub use peer_runtime::{
+    InboundPeerRequest, PeerBindingProvider, PeerIngressHandler, PeerRuntime, PeerRuntimeError,
+};
+pub use peer_transport_diagnostics::{
+    PeerTransportDiagnosticEventSnapshot, PeerTransportDiagnosticOutcome,
+    PeerTransportDiagnosticRole, PeerTransportDiagnosticSnapshot,
+};
+pub use recovery::{
+    QuiescenceAcknowledgement, QuiescenceStatus, RecoverRequest, RecoveryObservation,
+    RecoveryOutcome, RecoveryWorkflowConfig, RecoveryWorkflowError,
+};
+pub use runtime::{
+    RelayCarrierSnapshot, RelayRotationSnapshot, RelaySessionSnapshot, RelaySnapshot,
+    RelayStreamSnapshot, RotationDeadlineEvent, StreamTerminalCause, StreamTerminalEvent,
+};
 pub use wire::{MAX_BODY_BYTES, MAX_CONTROL_BYTES};
 
 /// Protocol major supported by this relay.
