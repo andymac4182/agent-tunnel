@@ -36,6 +36,8 @@ const MAX_CLEANUP_KEYS: usize = 100_000;
 const MAX_SEED_SCAN_KEYS: usize = 100_000;
 const DEFAULT_MAX_LIST_ITEMS: usize = 1_024;
 const MAX_IDENTIFIER_BYTES: usize = 128;
+/// Maximum accepted length of the authoritative Redis key namespace.
+pub const MAX_REDIS_NAMESPACE_BYTES: usize = 96;
 const REDIS_OPERATION_TIMEOUT: Duration = Duration::from_secs(2);
 const AUTHORIZATION_CONNECTIONS: usize = 4;
 const MAX_AUTHORITY_CLOCK_SKEW_US: i64 = 1_000_000;
@@ -314,7 +316,7 @@ impl RedisCatalog {
         namespace: &str,
         tls: Option<RedisTlsOptions>,
     ) -> Result<Self, CatalogConnectionError> {
-        validate_namespace(namespace).map_err(|error| {
+        validate_redis_namespace(namespace).map_err(|error| {
             catalog_connection_error(CatalogConnectionStage::AuthorityProfile, error)
         })?;
         if redis_url.trim().is_empty() {
@@ -1864,8 +1866,17 @@ impl Catalog for RedisCatalog {
     }
 }
 
-fn validate_namespace(namespace: &str) -> Result<(), CatalogError> {
-    if namespace.is_empty() || namespace.len() > 96 {
+/// The authoritative Redis namespace rule, applied without opening a
+/// connection.
+///
+/// `connect_inner` enforces exactly this before any socket is created, so a
+/// configuration validator can refuse an unusable namespace at parse time
+/// instead of discovering it after listeners are bound. Every key the catalog
+/// writes is prefixed with this value, so the charset stays restricted to
+/// characters that cannot introduce a second key separator or a glob
+/// metacharacter into a scan pattern.
+pub fn validate_redis_namespace(namespace: &str) -> Result<(), CatalogError> {
+    if namespace.is_empty() || namespace.len() > MAX_REDIS_NAMESPACE_BYTES {
         return Err(CatalogError::InvalidInput("Redis namespace"));
     }
     if !namespace
@@ -2815,6 +2826,86 @@ mod tests {
     };
 
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+
+    /// `examples/m1-relay.toml` shipped `agent-tunnel/m1`, which this rule
+    /// refuses: the documented `serve --config` therefore failed at startup.
+    /// The rule is the authority for every relay key prefix, so pin both the
+    /// accepted charset and the exact characters that broke the example.
+    #[test]
+    fn redis_namespace_rule_accepts_only_bounded_unambiguous_key_prefixes() {
+        for accepted in [
+            "agent-tunnel-m1",
+            "agent_tunnel.m1",
+            "AgentTunnel0",
+            "a",
+            "-",
+            ".",
+            "_",
+            &"n".repeat(super::MAX_REDIS_NAMESPACE_BYTES),
+        ] {
+            super::validate_redis_namespace(accepted)
+                .unwrap_or_else(|error| panic!("{accepted:?} must be accepted: {error}"));
+        }
+
+        for rejected in [
+            // The exact namespace the checked-in example shipped.
+            "agent-tunnel/m1",
+            "",
+            &"n".repeat(super::MAX_REDIS_NAMESPACE_BYTES + 1),
+            // A second key separator would let a namespace address another
+            // namespace's keys.
+            "agent:tunnel",
+            // Glob metacharacters would change which keys a scan pattern
+            // matches.
+            "agent*tunnel",
+            "agent?tunnel",
+            "agent[tunnel]",
+            // Whitespace, control bytes and non-ASCII are never key-safe.
+            " agent-tunnel",
+            "agent-tunnel ",
+            "agent\ttunnel",
+            "agent\ntunnel",
+            "agent\0tunnel",
+            "agent-tünnel",
+            "agent+tunnel",
+            "agent{tunnel}",
+        ] {
+            assert!(
+                super::validate_redis_namespace(rejected).is_err(),
+                "{rejected:?} must be rejected"
+            );
+        }
+    }
+
+    /// The namespace is refused before the catalog opens a socket, so a
+    /// configuration validator mirroring the rule loses no fidelity.
+    #[tokio::test]
+    async fn redis_namespace_is_rejected_before_any_connection_attempt() {
+        // Port 1 on loopback: a connection attempt fails with a distinct
+        // database error, so the namespace error cannot come from the network.
+        let namespace_error =
+            super::RedisCatalog::connect("redis://127.0.0.1:1/0", "bad/namespace")
+                .await
+                .expect_err("an invalid namespace must be refused");
+        assert!(
+            matches!(
+                namespace_error,
+                crate::CatalogError::InvalidInput("Redis namespace")
+            ),
+            "expected the namespace rule, observed {namespace_error:?}"
+        );
+        let connection_error =
+            super::RedisCatalog::connect("redis://127.0.0.1:1/0", "good-namespace")
+                .await
+                .expect_err("an unreachable authority must fail");
+        assert!(
+            !matches!(
+                connection_error,
+                crate::CatalogError::InvalidInput("Redis namespace")
+            ),
+            "a valid namespace must reach the connection attempt"
+        );
+    }
 
     #[test]
     fn malformed_list_counts_are_rejected_before_allocation() {

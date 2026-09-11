@@ -72,6 +72,11 @@ async fn run() -> Result<(), Box<dyn Error>> {
             println!("Relay configuration is valid.");
         }
         [command, flag, path]
+            if command == OsStr::new("check-serve-config") && flag == OsStr::new("--config") =>
+        {
+            check_serve_config(Path::new(path))?;
+        }
+        [command, flag, path]
             if command == OsStr::new("serve") && flag == OsStr::new("--config") =>
         {
             serve(Path::new(path)).await?;
@@ -92,10 +97,57 @@ async fn run() -> Result<(), Box<dyn Error>> {
         }
         _ => {
             return Err(
-                "usage: tunnel-relay [--help | check-config [PATH] | initialize --config PATH | recovery-initialize --config PATH | recovery-observe --config PATH | recover --config PATH --approval PATH --expected-nonce NONCE --acknowledgement-id ID --old-primary-fenced --old-relays-fenced | serve --config PATH]".into(),
+                "usage: tunnel-relay [--help | check-config [PATH] | check-serve-config --config PATH | initialize --config PATH | recovery-initialize --config PATH | recovery-observe --config PATH | recover --config PATH --approval PATH --expected-nonce NONCE --acknowledgement-id ID --old-primary-fenced --old-relays-fenced | serve --config PATH]".into(),
             );
         }
     }
+    Ok(())
+}
+
+/// Read-only dry run of the configuration `serve` actually serves with.
+///
+/// `check-config` parses only the legacy `tunnel_core::RelayConfig`, which
+/// cannot even represent a serving document, so nothing validated
+/// `serve --config` input before startup.  This command closes that gap with
+/// the same `ServeConfig::parse` that `serve` calls first, so every rule
+/// `serve` applies to the configuration document — the Redis authority
+/// namespace, the Redis TLS/scheme pairing, rotation timing, and the cluster
+/// and recovery cross-field rules — produces its verdict here.
+///
+/// The run is deliberately inert and deterministic: it reads the one
+/// configuration file named on the command line and nothing else.  It opens no
+/// listener, makes no Redis or peer connection, reads no credential, key or
+/// JWKS material, and creates or modifies no file, so it is safe against a
+/// production configuration and gives the same answer on a checkout whose
+/// placeholder credential paths do not exist.  Validating the referenced
+/// material is `serve`'s own startup work and stays there.
+///
+/// There is no flag to override a configured value: a dry run that could
+/// select a different authority file than `serve` would prove nothing about the
+/// deployment.
+///
+/// Exit codes follow the relay's implemented bootstrap behavior: `0` when the
+/// configuration is valid, `1` with a redacted field-level diagnostic on
+/// stderr when it is not.  The wider exit-code table in docs/runtime.md remains
+/// a proposal for the relay until CLI parsing and its compatibility tests land.
+fn check_serve_config(path: &Path) -> Result<(), Box<dyn Error>> {
+    let config = ServeConfig::parse(&fs::read_to_string(path)?)?;
+    println!(
+        "Relay serving configuration is valid: consumer_bind={} device_bind={} cluster={} recovery={}. \
+         This command validated the configuration document only; it opened no socket, contacted no Redis authority, and read no credential material.",
+        config.consumer_bind,
+        config.device_bind,
+        if config.cluster.is_some() {
+            "configured"
+        } else {
+            "absent"
+        },
+        if config.recovery.is_some() {
+            "configured"
+        } else {
+            "absent"
+        },
+    );
     Ok(())
 }
 
@@ -908,8 +960,12 @@ fn parse_jwks(bytes: &[u8]) -> Result<Vec<ApprovedJwk>, Box<dyn Error>> {
 fn print_help() {
     println!(
         "tunnel-relay — authenticated multi-user Agent Tunnel relay\n\n\
-         Usage: tunnel-relay [--help | check-config [PATH] | initialize --config PATH | recovery-initialize --config PATH | recovery-observe --config PATH | recover --config PATH --approval PATH --expected-nonce NONCE --acknowledgement-id ID --old-primary-fenced --old-relays-fenced | serve --config PATH]\n\n\
-         check-config [PATH]       Validate relay TOML without opening listeners.\n\
+         Usage: tunnel-relay [--help | check-config [PATH] | check-serve-config --config PATH | initialize --config PATH | recovery-initialize --config PATH | recovery-observe --config PATH | recover --config PATH --approval PATH --expected-nonce NONCE --acknowledgement-id ID --old-primary-fenced --old-relays-fenced | serve --config PATH]\n\n\
+         check-config [PATH]       Validate legacy relay TOML without opening listeners.\n\
+         check-serve-config --config PATH\n\
+                                  Dry-run the configuration serve uses: full validation,\n\
+                                  no socket, no Redis connection, no credential read.\n\
+                                  Exits 0 when valid and 1 with a field-level reason.\n\
          initialize --config PATH Create the empty cluster membership fence explicitly.\n\
          recovery-initialize --config PATH\n\
                                   Create the empty recovery approval fence explicitly.\n\

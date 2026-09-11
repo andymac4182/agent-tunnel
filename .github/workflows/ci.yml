@@ -44,9 +44,27 @@ jobs:
         run: cargo +1.95.0 test --workspace --all-targets --locked
       - name: Validate example configurations
         run: |
+          set -euo pipefail
           cargo +1.95.0 run --locked -p tunnel-client -- config check --config examples/m1-client.toml
           cargo +1.95.0 run --locked -p tunnel-client -- check-config examples/client.toml
           cargo +1.95.0 run --locked -p tunnel-relay -- check-config examples/relay.toml
+          # Dry-run every runnable serving example with the ServeConfig that
+          # `serve --config` itself constructs. The legacy `check-config` above
+          # parses a different type and cannot validate a serving document, so
+          # without this step an example that fails relay startup ships green.
+          # `serving_examples_are_exactly_the_files_the_ci_dry_run_glob_expands`
+          # in crates/tunnel-relay/tests/example_configs.rs keeps this glob and
+          # the classified serving examples in step.
+          shopt -s nullglob
+          serving_examples=(examples/*-relay.toml)
+          if [ "${#serving_examples[@]}" -eq 0 ]; then
+            echo "no examples/*-relay.toml serving example found; the dry run would validate nothing" >&2
+            exit 1
+          fi
+          for example in "${serving_examples[@]}"; do
+            echo "Dry-running serving configuration ${example}"
+            cargo +1.95.0 run --locked -p tunnel-relay -- check-serve-config --config "${example}"
+          done
 
   m1-acceptance:
     name: M1 real-socket acceptance (Redis)

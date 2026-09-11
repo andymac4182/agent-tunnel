@@ -189,6 +189,8 @@ analogous legacy `check-config [PATH]` command and a separate runtime command:
 ```sh
 cargo run --locked -p tunnel-relay -- check-config examples/relay.toml
 cargo run --locked -p tunnel-relay -- \
+  check-serve-config --config examples/m1-relay.toml
+cargo run --locked -p tunnel-relay -- \
   serve --config examples/m1-relay.toml
 ```
 
@@ -197,6 +199,24 @@ cargo run --locked -p tunnel-relay -- \
 listener plus the device mTLS listener. The checked-in relay example is a
 shape/reference file; its placeholder credentials, Redis endpoint/namespace,
 incarnation, and public keys must be replaced before starting a real relay.
+
+`check-serve-config --config PATH` is the read-only dry run for that same
+`ServeConfig`. It applies every rule `serve` applies to the configuration
+document, including the Redis authority namespace rule and the Redis TLS,
+rotation, cluster and recovery cross-field rules, and it opens no listener,
+makes no Redis or peer connection, reads no credential, key or JWKS material,
+and writes nothing. It exits 0 when the configuration is valid and 1 with a
+redacted field-level reason on stderr otherwise. Validating the referenced
+material is `serve`'s own startup work, so a successful dry run is evidence
+about the configuration document and not about the deployment's files.
+
+Use it, not `check-config`, for a serving document: the legacy
+`check-config [PATH]` parses `tunnel_core::RelayConfig`, which cannot represent
+a `ServeConfig` at all. `examples/m1-relay.toml` previously shipped
+`redis_namespace = "agent-tunnel/m1"`, a namespace the Redis authority refuses,
+so the `serve --config` command above failed at startup while CI's legacy
+`check-config examples/relay.toml` stayed green on a different file. CI now
+dry-runs every `examples/*-relay.toml`.
 
 ## Fault injection and later milestones
 

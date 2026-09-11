@@ -95,6 +95,7 @@ cargo run --locked -p tunnel-client -- --help
 cargo run --locked -p tunnel-client -- config check --config examples/m1-client.toml
 cargo run --locked -p tunnel-client -- check-config examples/client.toml
 cargo run --locked -p tunnel-relay -- check-config examples/relay.toml
+cargo run --locked -p tunnel-relay -- check-serve-config --config examples/m1-relay.toml
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
@@ -102,11 +103,16 @@ cargo test --workspace --locked
 
 The client `config check` command validates the M1 `RuntimeConfig`; the legacy
 `check-config` command validates the bootstrap `tunnel_core::ClientConfig` and
-its historical rotation fields. These validation commands are read-only; the
-M1 runtime path also starts real HTTPS/WSS listeners when `serve` or `connect`
-is run with credentials. The checked-in M1 relay file is a shape/reference file
-whose `redis_url`, `redis_namespace`, `deployment_incarnation`, OIDC JWKS, and
-TLS paths must be replaced before `serve`. See [the M1 harness guide](docs/m1-harness.md)
+its historical rotation fields. The relay's `check-serve-config --config PATH`
+is the dry run for the `ServeConfig` that `serve --config PATH` itself
+constructs, including the Redis authority namespace rule; the relay's legacy
+`check-config` parses a different type and cannot validate a serving document.
+These validation commands are read-only: they open no socket, contact no Redis
+authority, and read no credential material. The M1 runtime path starts real
+HTTPS/WSS listeners only when `serve` or `connect` is run with credentials. The
+checked-in M1 relay file is a shape/reference file whose `redis_url`,
+`redis_namespace`, `deployment_incarnation`, OIDC JWKS, and TLS paths must be
+replaced before `serve`. See [the M1 harness guide](docs/m1-harness.md)
 for disposable Redis and the exact acceptance command. Local verification is
 recorded above; CI results are linked in this document.
 

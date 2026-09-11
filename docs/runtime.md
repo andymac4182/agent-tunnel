@@ -1,6 +1,6 @@
 # Axum runtime, device mTLS, and CLI
 
-Status: runtime implementation design, 2026-09-09. M1 implements the client `config check`, `credentials create`, `credentials import` and foreground `connect` commands; the relay implements `serve` with Axum HTTPS, both device mTLS WebSockets and Redis/JWT authority. Legacy `check-config` remains supported. See [M1 evidence](m1-harness.md). Status/doctor IPC, enrollment and generic adapters below remain planned. M2 rotation and M7 cluster work have separate current evidence in their verification documents. The local-only doctor slice is implemented and locally verified as described below.
+Status: runtime implementation design, 2026-09-09. M1 implements the client `config check`, `credentials create`, `credentials import` and foreground `connect` commands; the relay implements `serve` with Axum HTTPS, both device mTLS WebSockets and Redis/JWT authority, plus the read-only `check-serve-config --config PATH` dry run for that serving configuration. Legacy `check-config` remains supported. See [M1 evidence](m1-harness.md). Status/doctor IPC, enrollment and generic adapters below remain planned. M2 rotation and M7 cluster work have separate current evidence in their verification documents. The local-only doctor slice is implemented and locally verified as described below.
 
 The M1 relay uses one bounded actor for its finite echo sessions; the target per-device actor architecture below will isolate richer M2/M7 state. M1 owner fields expire logically within durable Redis device hashes; physical TTL lease namespaces are a later cluster change. Normal startup cannot initialize missing authority metadata. Recovery requires an operator to reconcile durable authorization history; changing the owner incarnation does not verify an arbitrary restored backup.
 
@@ -123,6 +123,16 @@ Proposed stable exit codes:
 | 130 | Interrupted before an orderly completion could be recorded |
 
 Do not change the implemented bootstrap exit behavior until CLI parsing and its compatibility tests are added. Reconnectable network errors during `connect` remain supervised and visible rather than exiting immediately; permanent trust/configuration errors exit without an infinite retry loop.
+
+### Relay configuration dry run
+
+`tunnel-relay check-serve-config --config PATH` is implemented. It is the read-only dry run for the `ServeConfig` that `tunnel-relay serve --config PATH` constructs: it applies every rule `serve` applies to the configuration document, including the authoritative Redis namespace rule the catalog owns, the Redis TLS-material and `rediss://` scheme pairing, rotation timing, and the cluster and recovery cross-field rules.
+
+The command is inert and deterministic. It reads the one configuration file named on the command line and nothing else; it binds no listener, makes no Redis or peer connection, reads no credential, private key or JWKS material, and creates or modifies no file. It is therefore safe to run against a production configuration, and it returns the same verdict on a checkout whose placeholder credential paths do not exist. Validating the referenced material remains `serve`'s own startup work: a successful dry run is evidence about the configuration document, not about the deployment's files.
+
+It takes no flag other than `--config PATH`. A dry run that could select a different authority file, namespace or trust path than `serve` would prove nothing about the deployment, so no override exists.
+
+Exit codes follow the relay's implemented bootstrap behavior: `0` when the configuration is valid, `1` with a redacted field-level reason on stderr when it is not or when the file cannot be read. The proposed table above is not yet wired into the relay; per the paragraph above, that change waits for relay CLI parsing and its compatibility tests. The relay's legacy `check-config [PATH]` stays a `tunnel_core::RelayConfig` check and is not evidence for a serving document.
 
 `--json` emits versioned JSON on stdout and logs on stderr. Finite commands emit one result object; `connect --json` emits newline-delimited lifecycle events. Each result contains `schema_version`, `command`, `ok`, and either `result` or `error { code, message, retryable, operation_id? }`. Never interleave human progress text with JSON. `retryable` permits retrying safe admission/connection work, not replaying an ambiguous mutation.
 

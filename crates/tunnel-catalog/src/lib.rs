@@ -23,7 +23,8 @@ pub use recovery::{
     RecoveryPolicy, SignedRecoveryApproval, TrustedRecoveryKey, VerifiedRecoveryApproval,
 };
 pub use redis::{
-    DurableCatalogObservation, RedisCatalog, RedisMembershipPublisher, RedisTlsOptions,
+    DurableCatalogObservation, MAX_REDIS_NAMESPACE_BYTES, RedisCatalog, RedisMembershipPublisher,
+    RedisTlsOptions, validate_redis_namespace,
 };
 pub use types::{
     AttachmentPurpose, AttachmentTicket, AttachmentTicketBinding, AttachmentTicketConsumeRequest,

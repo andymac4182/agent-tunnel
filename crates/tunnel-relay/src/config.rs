@@ -9,7 +9,7 @@ use std::{
 use serde::Deserialize;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
-use tunnel_catalog::OidcVerifier;
+use tunnel_catalog::{OidcVerifier, validate_redis_namespace};
 use tunnel_core::{ConfigError as CoreConfigError, RotationConfig};
 
 use crate::redis_connection::RedisTlsMaterialPaths;
@@ -670,6 +670,16 @@ impl ServeConfig {
                 "redis_namespace must be at most 128 bytes",
             ));
         }
+        // The Redis authority owns this rule and previously applied it only
+        // once `connect` ran, after `serve` had already read JWKS material and
+        // was about to bind both listeners.  Applying it here means an
+        // unusable namespace fails configuration validation instead of startup,
+        // and the read-only dry run reaches the same verdict with no network.
+        validate_redis_namespace(&self.redis_namespace).map_err(|_| {
+            ConfigError::Invalid(
+                "redis_namespace must contain 1..=96 ASCII letters, digits, dots, hyphens, or underscores",
+            )
+        })?;
         if self.oidc_jwks_path.as_os_str().is_empty()
             || self.device_tls_cert_chain.as_os_str().is_empty()
             || self.device_tls_private_key.as_os_str().is_empty()
@@ -1216,7 +1226,7 @@ oidc_issuer = "https://issuer.example.test/"
 oidc_audience = ["agent-tunnel"]
 oidc_jwks_path = "oidc-jwks.json"
 redis_url = "rediss://redis.example.test:6379/0"
-redis_namespace = "agent-tunnel/test"
+redis_namespace = "agent-tunnel-test"
 deployment_incarnation = "test-incarnation"
 device_tls_cert_chain = "device-cert.pem"
 device_tls_private_key = "device-key.pem"
@@ -1237,6 +1247,46 @@ consumer_tls_private_key = "consumer-key.pem"
     fn serve_defaults_to_shared_rotation_policy() {
         let config = ServeConfig::parse(valid_toml()).expect("valid serve configuration");
         assert_eq!(config.rotation, RotationConfig::default());
+    }
+
+    /// The original M7-C35 breakage: the serving parser accepted a namespace
+    /// the Redis authority refuses, so `serve` read JWKS material and bound
+    /// both listeners before failing at `connect`.
+    #[test]
+    fn serve_rejects_a_namespace_the_redis_authority_refuses() {
+        for rejected in [
+            // The namespace `examples/m1-relay.toml` actually shipped.
+            "agent-tunnel/m1".to_owned(),
+            "agent:tunnel".to_owned(),
+            "agent*tunnel".to_owned(),
+            "agent tunnel".to_owned(),
+            "n".repeat(tunnel_catalog::MAX_REDIS_NAMESPACE_BYTES + 1),
+        ] {
+            let input = namespace_toml(&rejected);
+            let error = match ServeConfig::parse(&input) {
+                Ok(_) => panic!("namespace {rejected:?} must be rejected before serve binds"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains("redis_namespace"),
+                "the failure for {rejected:?} must name the field: {error}"
+            );
+        }
+
+        // The corrected example namespace and the other key-safe characters
+        // must still parse, so the rule cannot be satisfied by rejecting
+        // everything.
+        for accepted in ["agent-tunnel-m1", "agent_tunnel.m1", "AgentTunnel0"] {
+            ServeConfig::parse(&namespace_toml(accepted))
+                .unwrap_or_else(|error| panic!("namespace {accepted:?} must parse: {error}"));
+        }
+    }
+
+    fn namespace_toml(namespace: &str) -> String {
+        valid_toml().replace(
+            "redis_namespace = \"agent-tunnel-test\"",
+            &format!("redis_namespace = \"{namespace}\""),
+        )
     }
 
     #[test]

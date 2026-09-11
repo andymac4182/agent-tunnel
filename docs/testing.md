@@ -12,9 +12,15 @@ Run these commands from the repository root:
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --all-targets --locked
+cargo run --locked -p tunnel-client -- config check --config examples/m1-client.toml
 cargo run --locked -p tunnel-client -- check-config examples/client.toml
 cargo run --locked -p tunnel-relay -- check-config examples/relay.toml
+cargo run --locked -p tunnel-relay -- check-serve-config --config examples/m1-relay.toml
 ```
+
+Each checked-in example must be validated by the parser that actually loads it, not by a parser that merely accepts a similar shape. `examples/m1-relay.toml` is the relay's serving document, so only `check-serve-config --config PATH` — which constructs the same `ServeConfig` as `serve --config PATH` — is evidence for it; the relay's legacy `check-config [PATH]` parses `tunnel_core::RelayConfig` and cannot represent a serving document at all. CI expands `examples/*-relay.toml` and dry-runs every match, and `crates/tunnel-relay/tests/example_configs.rs` plus `crates/tunnel-client/tests/example_configs.rs` walk the examples directory and fail on any file not classified with its parser, so a newly added example cannot escape coverage. Keep a serving example's filename matching that glob.
+
+All four validation commands are read-only: they open no socket, contact no Redis authority, and read no credential, key or JWKS material. `check-serve-config` exits 0 when the configuration is valid and 1 with a redacted field-level reason on stderr when it is not; validating the referenced credential material stays in `serve`'s own startup.
 
 The initial CI runs formatting, linting, and Rust tests on Linux, macOS, and Windows. The executable scaffolds check configuration; a successful exit is evidence of configuration validation only. Record the exact commit and runner when reporting a check as passed. The initial CI does not establish network connectivity, tenant isolation, upstream compatibility, or release readiness.
 
