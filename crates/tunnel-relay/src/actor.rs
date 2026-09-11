@@ -943,6 +943,11 @@ pub(crate) struct DataRegistration {
 #[derive(Debug, Default)]
 pub(crate) struct QueuePressure {
     bytes_high_water: AtomicUsize,
+    /// Highest total session charge at the instant a **data** reservation was
+    /// admitted.  By construction this never exceeds `QueueBudget::data_limit`,
+    /// so `limit - data_bytes_high_water` is the least control byte capacity
+    /// that remained available at the data-byte peak.
+    data_bytes_high_water: AtomicUsize,
     control_depth_high_water: AtomicUsize,
     data_depth_high_water: AtomicUsize,
     control_refusals: AtomicU64,
@@ -954,6 +959,10 @@ pub(crate) struct QueuePressure {
 impl QueuePressure {
     fn latch_bytes(&self, used: usize) {
         self.bytes_high_water.fetch_max(used, Ordering::AcqRel);
+    }
+
+    fn latch_data_bytes(&self, used: usize) {
+        self.data_bytes_high_water.fetch_max(used, Ordering::AcqRel);
     }
 
     fn latch_control_depth(&self, depth: usize) {
@@ -1011,40 +1020,94 @@ fn data_occupancy(sender: &mpsc::Sender<DataOutbound>) -> ChannelOccupancy {
     }
 }
 
+/// Control message slots whose bytes are carved out of the shared session
+/// budget so that data admission can never consume them.
+///
+/// A rotation enqueues two control messages back to back (`RECOVERY_BEGIN`
+/// plus `RECOVERY_CLOSED`); a cancellation and a revocation close each need
+/// one.  Four slots of the 32 KiB control bound therefore cover rotation,
+/// cancellation and revocation simultaneously while data is saturated, with
+/// the fourth left for a control reply.
+pub(crate) const RESERVED_CONTROL_SLOTS: usize = 4;
+
+/// Bytes of the shared session budget reserved for control messages:
+/// `RESERVED_CONTROL_SLOTS * MAX_CONTROL_MESSAGE_BYTES = 131_072`.  The
+/// configured minimum `max_queue_bytes` of 256 KiB is exactly twice this
+/// reservation, so data always retains at least half of the smallest legal
+/// budget.
+pub(crate) const RESERVED_CONTROL_BYTES: usize =
+    RESERVED_CONTROL_SLOTS * tunnel_protocol::MAX_CONTROL_MESSAGE_BYTES;
+
 /// Shared per-device byte accounting for pending request bodies and encoded
 /// outbound control/data queue items.  Socket tasks release an item when they
 /// take ownership of it from a bounded channel.
+///
+/// The budget has one explicit total bound, `limit`, and one carve-out:
+/// `reserve_data` may only charge up to `limit - control_reserved`, while
+/// `reserve_control` may charge up to `limit`.  Data admission can therefore
+/// never consume the reserved control bytes, so a control message always has
+/// at least `control_reserved` bytes of room while data is saturated, and the
+/// total charged by both lanes never exceeds `limit`.  Both lanes release into
+/// the same counter.
 #[derive(Clone, Debug)]
 pub(crate) struct QueueBudget {
     used: Arc<AtomicUsize>,
     limit: usize,
+    control_reserved: usize,
     pressure: Arc<QueuePressure>,
 }
 
 impl QueueBudget {
     fn new(limit: usize) -> Self {
+        Self::with_control_reserve(limit, RESERVED_CONTROL_BYTES.min(limit / 2))
+    }
+
+    fn with_control_reserve(limit: usize, control_reserved: usize) -> Self {
         Self {
             used: Arc::new(AtomicUsize::new(0)),
             limit,
+            control_reserved: control_reserved.min(limit),
             pressure: Arc::new(QueuePressure::default()),
         }
     }
 
-    fn reserve(&self, bytes: usize) -> bool {
-        if bytes > self.limit {
-            return false;
+    fn reserve_up_to(&self, bytes: usize, ceiling: usize) -> Option<usize> {
+        if bytes > ceiling {
+            return None;
         }
-        let reserved = self
-            .used
+        self.used
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                used.checked_add(bytes).filter(|next| *next <= self.limit)
-            });
-        match reserved {
-            Ok(previous) => {
-                self.pressure.latch_bytes(previous.saturating_add(bytes));
+                used.checked_add(bytes).filter(|next| *next <= ceiling)
+            })
+            .ok()
+            .map(|previous| previous.saturating_add(bytes))
+    }
+
+    /// Charge a data-lane item (pending request body, retained replay chunk,
+    /// encoded data frame or reassembled response payload).  Refused once the
+    /// total charge would exceed `data_limit`, leaving the control reservation
+    /// untouched.
+    fn reserve_data(&self, bytes: usize) -> bool {
+        match self.reserve_up_to(bytes, self.data_limit()) {
+            Some(used) => {
+                self.pressure.latch_bytes(used);
+                self.pressure.latch_data_bytes(used);
                 true
             }
-            Err(_) => false,
+            None => false,
+        }
+    }
+
+    /// Charge a control-lane item (rotation, cancellation, revocation and
+    /// control replies).  Refused only once the total charge would exceed the
+    /// full `limit`.
+    fn reserve_control(&self, bytes: usize) -> bool {
+        match self.reserve_up_to(bytes, self.limit) {
+            Some(used) => {
+                self.pressure.latch_bytes(used);
+                true
+            }
+            None => false,
         }
     }
 
@@ -1058,6 +1121,16 @@ impl QueueBudget {
 
     fn limit(&self) -> usize {
         self.limit
+    }
+
+    /// Bytes of `limit` that only control-lane reservations may use.
+    fn control_reserved(&self) -> usize {
+        self.control_reserved
+    }
+
+    /// Greatest total charge at which a data-lane reservation is admitted.
+    fn data_limit(&self) -> usize {
+        self.limit.saturating_sub(self.control_reserved)
     }
 
     fn pressure(&self) -> &QueuePressure {
@@ -3934,7 +4007,7 @@ impl RelayActor {
                 return;
             }
         };
-        if !session.queue_budget.reserve(queued_len) {
+        if !session.queue_budget.reserve_data(queued_len) {
             let _ = response.send(EchoOutcome::Failure {
                 code: "RESOURCE_EXHAUSTED",
                 execution: "not_dispatched",
@@ -6391,7 +6464,7 @@ impl RelayActor {
             return;
         }
         let budget = session.queue_budget.clone();
-        if !budget.reserve(encoded.len()) {
+        if !budget.reserve_control(encoded.len()) {
             return;
         }
         let control_permit = match session.control_tx.try_reserve() {
@@ -10047,7 +10120,7 @@ impl RelayActor {
                                 .len()
                                 .saturating_add(frame.payload.len())
                                 > max_response_bytes
-                                || !queue_budget.reserve(frame.payload.len())));
+                                || !queue_budget.reserve_data(frame.payload.len())));
                     if invalid_frame {
                         (
                             ResponseFrameUpdate::Invalid,
@@ -11658,6 +11731,13 @@ impl RelayActor {
                     .pressure()
                     .bytes_high_water
                     .load(Ordering::Acquire),
+                control_reserved_bytes: session.queue_budget.control_reserved(),
+                data_bytes_limit: session.queue_budget.data_limit(),
+                data_bytes_high_water: session
+                    .queue_budget
+                    .pressure()
+                    .data_bytes_high_water
+                    .load(Ordering::Acquire),
                 control_queue_depth: control_queue.depth,
                 control_queue_capacity: control_queue.capacity,
                 control_queue_depth_high_water: session
@@ -11997,7 +12077,7 @@ fn reserve_m2_bytes(budget: &QueueBudget, stream: &mut M2Stream, bytes: usize) -
     if bytes == 0 {
         return true;
     }
-    if !budget.reserve(bytes) {
+    if !budget.reserve_data(bytes) {
         return false;
     }
     stream.budget_bytes = stream.budget_bytes.saturating_add(bytes);
@@ -12033,7 +12113,7 @@ fn queue_control(
     text: String,
 ) -> Result<(), ()> {
     let bytes = text.len();
-    if !budget.reserve(bytes) {
+    if !budget.reserve_control(bytes) {
         budget.pressure().record_control_refusal();
         return Err(());
     }
@@ -12056,7 +12136,7 @@ fn queue_data(
     bytes: Vec<u8>,
 ) -> Result<(), ()> {
     let length = bytes.len();
-    if !budget.reserve(length) {
+    if !budget.reserve_data(length) {
         budget.pressure().record_data_refusal();
         return Err(());
     }
@@ -18667,10 +18747,12 @@ mod cleanup_tests {
     use super::{
         AbortOnDropJoinHandle, CLEANUP_QUEUE_CAPACITY, CarrierKey, ChannelOccupancy,
         CleanupDispatcher, CleanupWorker, ControlOutbound, DataOutbound, Ordering,
-        OwnerCleanupItem, QueueBudget, SessionKey, TERMINAL_CLEANUP_QUEUE_CAPACITY,
+        OwnerCleanupItem, QueueBudget, RESERVED_CONTROL_BYTES, RESERVED_CONTROL_SLOTS,
+        RecoverySide, RotationAttemptIdentity, SessionKey, TERMINAL_CLEANUP_QUEUE_CAPACITY,
         TerminalCleanup, TerminalCleanupDispatcher, control_occupancy, data_occupancy,
         queue_control, queue_data, send_registration,
     };
+    use crate::wire;
 
     fn owner_token(epoch: u64) -> OwnerToken {
         OwnerToken {
@@ -18953,37 +19035,268 @@ mod cleanup_tests {
     }
 
     /// A byte-budget refusal is counted on the channel that was refused and
-    /// the latched byte high-water mark survives release.
+    /// the latched byte high-water mark survives release.  Data is refused at
+    /// the data limit (`limit - control_reserved`), control only at the full
+    /// limit, so the refusal counts stay per channel.
     #[tokio::test]
     async fn queue_byte_exhaustion_is_counted_per_channel() {
-        let budget = QueueBudget::new(64);
+        let budget = QueueBudget::with_control_reserve(64, 16);
         let (data_tx, data_rx) = mpsc::channel(128);
-        let (control_tx, _control_rx) = mpsc::channel(128);
+        let (control_tx, control_rx) = mpsc::channel(128);
+        assert_eq!(budget.limit(), 64);
+        assert_eq!(budget.control_reserved(), 16);
+        assert_eq!(budget.data_limit(), 48);
 
-        assert!(queue_data(&data_tx, &budget, vec![0; 64]).is_ok());
-        assert_eq!(budget.used(), 64);
+        assert!(queue_data(&data_tx, &budget, vec![0; 48]).is_ok());
+        assert_eq!(budget.used(), 48);
         assert_eq!(
             budget.pressure().bytes_high_water.load(Ordering::Acquire),
-            64
+            48
+        );
+        assert_eq!(
+            budget
+                .pressure()
+                .data_bytes_high_water
+                .load(Ordering::Acquire),
+            48
         );
         // The data channel still has 127 free slots, so this refusal is purely
-        // a shared byte-budget exhaustion, and control is refused with it.
+        // a data-lane byte exhaustion; control keeps its reserved bytes.
         assert!(data_occupancy(&data_tx).depth < data_occupancy(&data_tx).capacity);
         assert!(queue_data(&data_tx, &budget, vec![0; 1]).is_err());
-        assert!(queue_control(&control_tx, &budget, "c".to_owned()).is_err());
         assert_eq!(budget.pressure().data_refusals.load(Ordering::Acquire), 1);
+        assert!(queue_control(&control_tx, &budget, "c".repeat(16)).is_ok());
+        assert_eq!(budget.used(), 64);
+        // Control is refused only at the explicit total bound, and that refusal
+        // is counted on the control channel alone.
+        assert!(queue_control(&control_tx, &budget, "c".to_owned()).is_err());
         assert_eq!(
             budget.pressure().control_refusals.load(Ordering::Acquire),
             1
         );
+        assert_eq!(budget.pressure().data_refusals.load(Ordering::Acquire), 1);
+        assert_eq!(
+            budget
+                .pressure()
+                .data_bytes_high_water
+                .load(Ordering::Acquire),
+            48,
+            "a control reservation must not move the data-byte peak"
+        );
 
         drop(data_rx);
+        drop(control_rx);
         assert_eq!(budget.used(), 0);
         assert_eq!(
             budget.pressure().bytes_high_water.load(Ordering::Acquire),
             64,
             "the latched byte high-water mark must survive release"
         );
+    }
+
+    /// M7-C49 regression: with the production 4 MiB session budget, 64
+    /// concurrent one-frame records of 32,732 bytes charge exactly the whole
+    /// shared budget (each record is charged twice: the retained replay chunk
+    /// of `body + 4` bytes and the encoded frame of `body + 4 + 64` bytes, so
+    /// `65_536` bytes per record and `64 * 65_536 = 4_194_304`).  Without a
+    /// byte reservation every subsequent rotation, cancellation and revocation
+    /// control message is refused for want of bytes even though the control
+    /// channel has free slots.  With the reservation the data lane is refused
+    /// at `limit - RESERVED_CONTROL_BYTES` and each of those control messages
+    /// still enqueues; the accounting is explicit and uses no wall clock.
+    #[tokio::test]
+    async fn reserved_control_bytes_survive_data_byte_saturation() {
+        const LIMIT: usize = 4 * 1024 * 1024;
+        const BODY: usize = 32_732;
+        const RECORD_PREFIX: usize = 4;
+        const FRAME_HEADER: usize = 64;
+        const RETAINED_CHUNK: usize = BODY + RECORD_PREFIX;
+        const ENCODED_FRAME: usize = RETAINED_CHUNK + FRAME_HEADER;
+        const CHARGE_PER_RECORD: usize = RETAINED_CHUNK + ENCODED_FRAME;
+        const STREAMS: usize = 64;
+        const SLOTS: usize = 2 * STREAMS;
+        assert_eq!(CHARGE_PER_RECORD, 65_536);
+        assert_eq!(STREAMS * CHARGE_PER_RECORD, LIMIT);
+        assert_eq!(RESERVED_CONTROL_BYTES, 131_072);
+        assert_eq!(
+            RESERVED_CONTROL_BYTES,
+            RESERVED_CONTROL_SLOTS * tunnel_protocol::MAX_CONTROL_MESSAGE_BYTES
+        );
+
+        let budget = QueueBudget::new(LIMIT);
+        assert_eq!(budget.limit(), LIMIT);
+        let (data_tx, mut data_rx) = mpsc::channel(SLOTS);
+        let (control_tx, mut control_rx) = mpsc::channel(SLOTS);
+
+        // Saturate data bytes: one in-flight record per stream, charged the
+        // way the actor charges it (retained chunk, then encoded frame), until
+        // the budget refuses.
+        let mut admitted = 0usize;
+        let mut retained_bytes = 0usize;
+        for _ in 0..STREAMS {
+            if !budget.reserve_data(RETAINED_CHUNK) {
+                break;
+            }
+            retained_bytes += RETAINED_CHUNK;
+            if queue_data(&data_tx, &budget, vec![0; ENCODED_FRAME]).is_err() {
+                budget.release(RETAINED_CHUNK);
+                retained_bytes -= RETAINED_CHUNK;
+                break;
+            }
+            admitted += 1;
+        }
+        assert!(data_occupancy(&data_tx).depth < SLOTS);
+        assert_eq!(control_occupancy(&control_tx).depth, 0);
+        assert_eq!(budget.pressure().data_refusals.load(Ordering::Acquire), 0);
+
+        // Every reserved control class must still enqueue while data bytes
+        // are saturated: a rotation (recovery begin plus closed, queued back
+        // to back by the actor), a cancellation and a revocation close.
+        // Without the byte reservation this is where the shared budget
+        // refuses all of them for want of bytes despite 128 free control
+        // slots.
+        let attempt = RotationAttemptIdentity::new(
+            "session",
+            1,
+            "owner",
+            "rotation-c49",
+            1,
+            2,
+            "old-c49",
+            "new-c49",
+        );
+        let roster = tunnel_protocol::rotation_control::StreamRoster::new(
+            "snapshot-c49",
+            (1..=STREAMS as u64).collect(),
+        );
+        let begin = wire::encode_control_message(&wire::recovery_begin(
+            "reply",
+            attempt.clone(),
+            "episode-c49",
+            1,
+            roster,
+            5_000,
+        ))
+        .expect("recovery begin encodes");
+        let mut local_closed = tunnel_protocol::rotation_control::RecoveryClosed {
+            message_id: wire::random_token(),
+            reply_to: "reply".to_owned(),
+            attempt: attempt.clone(),
+            episode_id: "episode-c49".to_owned(),
+            attempt_no: 1,
+            closed_connection_ids: vec!["old-c49".to_owned()],
+            closure_digest: String::new(),
+        };
+        local_closed.closure_digest = local_closed
+            .closure_digest_for(RecoverySide::Relay)
+            .expect("closure digest derives");
+        let closed = wire::encode_control_message(&wire::recovery_closed(
+            "reply",
+            attempt,
+            "episode-c49",
+            1,
+            local_closed.closed_connection_ids.clone(),
+            &local_closed.closure_digest,
+        ))
+        .expect("recovery closed encodes");
+        let cancel = wire::encode_control_message(&wire::cancel("session", 1, 7, "operation-7"))
+            .expect("cancel encodes");
+        let revoked = wire::encode_control_message(&wire::rejected(
+            &wire::random_token(),
+            "session",
+            1,
+            1,
+            "session",
+            "AUTHORIZATION_REVOKED",
+            "device session closed",
+        ))
+        .expect("revocation close encodes");
+        let control_bytes: usize = [&begin, &closed, &cancel, &revoked]
+            .iter()
+            .map(|text| text.len())
+            .sum();
+        assert!(control_bytes <= RESERVED_CONTROL_BYTES);
+        let mut refused = Vec::new();
+        for (name, text) in [
+            ("rotation recovery begin", begin),
+            ("rotation recovery closed", closed),
+            ("cancellation", cancel),
+            ("revocation close", revoked),
+        ] {
+            assert!(
+                text.len() <= tunnel_protocol::MAX_CONTROL_MESSAGE_BYTES,
+                "control messages must stay within the 32 KiB control bound"
+            );
+            if queue_control(&control_tx, &budget, text).is_err() {
+                refused.push(name);
+            }
+        }
+        assert!(
+            refused.is_empty(),
+            "control must enqueue while data bytes are saturated; refused={refused:?} admitted={admitted} used={} limit={LIMIT} control_slots_free={} control_refusals={}",
+            budget.used(),
+            SLOTS - control_occupancy(&control_tx).depth,
+            budget.pressure().control_refusals.load(Ordering::Acquire)
+        );
+        assert_eq!(control_occupancy(&control_tx).depth, 4);
+        assert_eq!(
+            budget.pressure().control_refusals.load(Ordering::Acquire),
+            0
+        );
+
+        // The explicit accounting behind that result: exactly the records that
+        // fit the data limit were admitted, (4_194_304 - 131_072) / 65_536 =
+        // 62, so the reservation of four 32 KiB control slots was never
+        // charged by data and the total bound holds.
+        assert_eq!(budget.control_reserved(), RESERVED_CONTROL_BYTES);
+        assert_eq!(budget.data_limit(), LIMIT - RESERVED_CONTROL_BYTES);
+        assert_eq!(budget.data_limit() / CHARGE_PER_RECORD, 62);
+        assert_eq!(
+            admitted, 62,
+            "data admission must stop at the reservation boundary"
+        );
+        assert_eq!(budget.used(), admitted * CHARGE_PER_RECORD + control_bytes);
+        assert_eq!(budget.used(), budget.data_limit() + control_bytes);
+        assert!(budget.used() <= LIMIT, "the total bound stays explicit");
+        assert_eq!(
+            budget
+                .pressure()
+                .data_bytes_high_water
+                .load(Ordering::Acquire),
+            budget.data_limit()
+        );
+        // Control admission never moves the data-byte peak, so the least
+        // control capacity that remained at that peak is the full reservation.
+        assert_eq!(
+            LIMIT
+                - budget
+                    .pressure()
+                    .data_bytes_high_water
+                    .load(Ordering::Acquire),
+            RESERVED_CONTROL_BYTES
+        );
+
+        // Data at the reservation boundary is refused, typed on the data lane,
+        // and the refusal rolls back only its own charge; the 63rd record is
+        // refused even though 66 data slots remain free.
+        assert!(!budget.reserve_data(1));
+        assert!(queue_data(&data_tx, &budget, vec![0; 1]).is_err());
+        assert_eq!(budget.pressure().data_refusals.load(Ordering::Acquire), 1);
+        assert_eq!(
+            budget.pressure().control_refusals.load(Ordering::Acquire),
+            0
+        );
+        assert_eq!(budget.used(), budget.data_limit() + control_bytes);
+
+        // Draining returns every charge from both lanes to the one counter.
+        for _ in 0..admitted {
+            drop(data_rx.recv().await.expect("queued data frame"));
+        }
+        budget.release(retained_bytes);
+        for _ in 0..4 {
+            drop(control_rx.recv().await.expect("queued control message"));
+        }
+        assert_eq!(budget.used(), 0);
     }
 
     #[tokio::test]
@@ -19038,7 +19351,7 @@ mod cleanup_tests {
             "a closed queue must roll back the charge for its rejected item"
         );
 
-        assert!(budget.reserve(3));
+        assert!(budget.reserve_data(3));
         let (closed_control_tx, closed_control_rx) = mpsc::channel(1);
         drop(closed_control_rx);
         assert!(queue_control(&closed_control_tx, &budget, "closed".to_owned()).is_err());

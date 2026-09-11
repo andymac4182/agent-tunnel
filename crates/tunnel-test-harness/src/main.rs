@@ -1138,7 +1138,7 @@ async fn main() -> ExitCode {
                 Ok(result) => result.and_then(|evidence| {
                     require_m7_queue_saturation_evidence(&evidence)?;
                     println!(
-                        "M7 queue saturation passed: relays={} ready={} non_owner_ingress={} queue_bytes_limit={} data_slots={} control_slots={} max_streams={} record_bytes={} charge_per_record={} frames_per_record={} credit_records_per_stream={} reachable_entries={} route_maximum_entries={} streams_admitted={} stream_cap_refused_one_more={} data_depth_observed={} data_depth_high_water={} data_enqueues_during_blackhole={} physically_resident_frames={} absorbed_frames={} absorbed_wire_bytes={} reachable_bound_saturated={} reserved_free_data_slots={} reserved_data_slot_accepted={} queue_bytes_high_water={} headroom_at_peak={} control_depth_at_peak={} control_depth_high_water={} control_refusals={} control_enqueues_during_blackhole={} cancellation_accepted={} fresh_stream_admitted={} sibling_survived={} first_terminal_immutable={} terminal_observations={} paused_target_to_client={} paused_generation={} drain_observations={}/{} drained={} rotation_replaced_paused_carrier={} rotation_generation={} rotations_after_drain={} final_generation={} attempts_with_deadline={} deadline_never_extended={} deadline_within_overlap={} device_sockets={} dispatch_delta_after_drain={} elapsed_ms={}",
+                        "M7 queue saturation passed: relays={} ready={} non_owner_ingress={} queue_bytes_limit={} data_slots={} control_slots={} max_streams={} record_bytes={} charge_per_record={} frames_per_record={} credit_records_per_stream={} reachable_entries={} route_maximum_entries={} streams_admitted={} stream_cap_refused_one_more={} data_depth_observed={} data_depth_high_water={} data_enqueues_during_blackhole={} physically_resident_frames={} absorbed_frames={} absorbed_wire_bytes={} reachable_bound_saturated={} reserved_free_data_slots={} reserved_data_slot_accepted={} queue_bytes_high_water={} headroom_at_peak={} control_reserved_bytes={} data_bytes_limit={} data_bytes_high_water={} control_bytes_available_at_data_peak={} control_depth_at_peak={} control_depth_high_water={} control_refusals={} control_enqueues_during_blackhole={} cancellation_accepted={} fresh_stream_admitted={} sibling_survived={} first_terminal_immutable={} terminal_observations={} paused_target_to_client={} paused_generation={} drain_observations={}/{} drained={} rotation_replaced_paused_carrier={} rotation_generation={} rotations_after_drain={} final_generation={} attempts_with_deadline={} deadline_never_extended={} deadline_within_overlap={} device_sockets={} dispatch_delta_after_drain={} elapsed_ms={}",
                         evidence.relay_count,
                         evidence.membership_ready_relays,
                         evidence.non_owner_ingress,
@@ -1165,6 +1165,10 @@ async fn main() -> ExitCode {
                         evidence.reserved_data_slot_accepted_at_peak,
                         evidence.queue_bytes_high_water,
                         evidence.queue_bytes_headroom_at_peak,
+                        evidence.configured_control_reserved_bytes,
+                        evidence.configured_data_bytes_limit,
+                        evidence.data_bytes_high_water,
+                        evidence.control_bytes_available_at_data_peak,
                         evidence.control_queue_depth_at_peak,
                         evidence.control_queue_depth_high_water,
                         evidence.control_queue_refusals,
@@ -1766,6 +1770,8 @@ mod tests {
             membership_ready_relays: 3,
             non_owner_ingress: true,
             configured_queue_bytes_limit: 4 * 1024 * 1024,
+            configured_control_reserved_bytes: 4 * 32 * 1024,
+            configured_data_bytes_limit: 4 * 1024 * 1024 - 4 * 32 * 1024,
             configured_data_queue_capacity: 128,
             configured_control_queue_capacity: 128,
             configured_max_streams_per_device: 64,
@@ -1788,6 +1794,8 @@ mod tests {
             reserved_free_data_slots_at_peak: 85,
             reserved_data_slot_accepted_at_peak: true,
             queue_bytes_high_water: 43 * 40_072,
+            data_bytes_high_water: 43 * 40_072,
+            control_bytes_available_at_data_peak: 4 * 1024 * 1024 - 43 * 40_072,
             queue_bytes_headroom_at_peak: 4 * 1024 * 1024 - 2_564_608,
             control_queue_depth_at_peak: 1,
             control_queue_depth_high_water: 4,
@@ -2070,7 +2078,17 @@ mod tests {
         assert_saturation_flag!(rotation_deadline_within_configured_overlap);
 
         type Mutate = fn(&mut tunnel_test_harness::production_cluster::QueueSaturationEvidence);
-        let bounds: [Mutate; 19] = [
+        let bounds: [Mutate; 22] = [
+            // Reserved control bytes at the data-byte peak (M7-C49): no
+            // reservation, a data-lane peak that consumed the reservation, and
+            // a derived control capacity that does not follow from the bounds.
+            |e| e.configured_control_reserved_bytes = 0,
+            |e| {
+                e.data_bytes_high_water = 4 * 1024 * 1024 - 4 * 32 * 1024 + 1;
+                e.queue_bytes_high_water = e.data_bytes_high_water;
+                e.control_bytes_available_at_data_peak = 4 * 32 * 1024 - 1;
+            },
+            |e| e.control_bytes_available_at_data_peak += 1,
             // A logical admission count must never satisfy the physical floor.
             |e| {
                 e.data_queue_depth_observed = 1;

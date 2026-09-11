@@ -8,6 +8,8 @@
 //!
 //! ```text
 //! max_queue_bytes        = 4 MiB = 4_194_304   (one shared session byte budget)
+//! control reserve        = 4 * 32 KiB = 131_072 (RESERVED_CONTROL_BYTES, M7-C49)
+//! data byte limit        = 4_194_304 - 131_072 = 4_063_232
 //! max_queue_messages     = 128                 (separate control and data channel slots)
 //! max_streams_per_device = 64
 //! max_body_bytes         = MAX_PAYLOAD_LEN = 65_536
@@ -37,18 +39,19 @@
 //! before reading the next WebSocket message, and caps its reassembly buffer
 //! at `MAX_BODY_BYTES + 4`, so a consumer cannot pipeline a second record.
 //! Physical data-queue residency from consumer DATA is therefore bounded by
+//! the **data byte limit** (the session budget minus the control reservation),
 //!
 //! ```text
-//! entries(B) = min(64, floor(4_194_304 / charge(B))) * frames(B)
+//! entries(B) = min(64, floor(4_063_232 / charge(B))) * frames(B)
 //! ```
 //!
 //! Maximising over every admissible body size gives **64 entries**:
 //!
 //! ```text
-//! B <=     32_732 : charge <=    65_536 -> 64 streams admitted -> 64 entries
-//! B  = 32_733..65_532 : charge >  65_536 -> n = 4 MiB/charge < 64 -> < 64 entries
+//! B <=     31_708 : charge <=    63_488 -> 64 streams admitted -> 64 entries
+//! B  = 31_709..65_532 : charge >  63_488 -> n = data limit/charge < 64 -> < 64 entries
 //! B >=     65_533 : record spans 2 frames, charge = 131_208
-//!                   n = 4_194_304 / 131_208 = 31 -> 62 entries
+//!                   n = 4_063_232 / 131_208 = 30 -> 60 entries
 //! ```
 //!
 //! That is exactly the objection an independent review raised against the
@@ -84,7 +87,16 @@
 //!    32 times the 32 KiB control bound.  It additionally requires the relay's
 //!    accepted-control-enqueue counter to *advance* during the blackhole
 //!    window, which is positive evidence that control traffic kept flowing
-//!    rather than merely not being refused.
+//!    rather than merely not being refused.  Since M7-C49 the relay also
+//!    reserves control capacity in **bytes**: data-lane reservations are
+//!    refused above `data_bytes_limit = max_queue_bytes - 131_072`, and the
+//!    relay latches `data_bytes_high_water`, the highest total charge at which
+//!    a data reservation was admitted.  The gate requires that latch to stay
+//!    at or below the data byte limit and derives
+//!    `control_bytes_available_at_data_peak = max_queue_bytes -
+//!    data_bytes_high_water`, which must be at least the 131_072-byte
+//!    reservation: control bytes remained available at the data-byte peak,
+//!    not only control slots.
 //! 5. Prove real cancellation and fresh admission once the carrier is writable
 //!    again, with an immutable first-terminal observation for the cancelled
 //!    stream.  These run after the resume by necessity: the blackholed carrier
@@ -155,6 +167,13 @@ pub(super) const SATURATION_ROTATION: RotationConfig = RotationConfig {
 const EXPECTED_QUEUE_BYTES_LIMIT: usize = 4 * 1024 * 1024;
 const EXPECTED_QUEUE_MESSAGES: usize = 128;
 const EXPECTED_MAX_STREAMS_PER_DEVICE: usize = 64;
+/// `tunnel_relay::actor::RESERVED_CONTROL_BYTES`: four 32 KiB control slots
+/// carved out of the shared session budget for rotation, cancellation,
+/// revocation and control replies (M7-C49).  Data-lane reservations are
+/// refused above `EXPECTED_DATA_BYTES_LIMIT`, so data can never consume them.
+const EXPECTED_CONTROL_RESERVED_BYTES: usize = 4 * 32 * 1024;
+const EXPECTED_DATA_BYTES_LIMIT: usize =
+    EXPECTED_QUEUE_BYTES_LIMIT - EXPECTED_CONTROL_RESERVED_BYTES;
 
 /// `tunnel_protocol::HEADER_LEN`, `MAX_PAYLOAD_LEN`, and the four-byte record
 /// length prefix the relay prepends before chunking a record into frames.
@@ -242,10 +261,11 @@ const fn records_per_stream_by_credit(body: usize) -> usize {
 }
 
 /// Physical data-channel entries a one-in-flight-record-per-stream workload
-/// can make resident at this record size, under the shared byte budget and the
-/// per-device stream cap.
-const fn reachable_entries(body: usize, queue_bytes_limit: usize, max_streams: usize) -> usize {
-    let admissible = queue_bytes_limit / charge_per_record(body);
+/// can make resident at this record size, under the data byte limit (the
+/// shared session budget minus the control reservation) and the per-device
+/// stream cap.
+const fn reachable_entries(body: usize, data_bytes_limit: usize, max_streams: usize) -> usize {
+    let admissible = data_bytes_limit / charge_per_record(body);
     let streams = if admissible < max_streams {
         admissible
     } else {
@@ -265,6 +285,13 @@ pub struct QueueSaturationEvidence {
     pub non_owner_ingress: bool,
     /// Session byte budget the owner relay reported for the live session.
     pub configured_queue_bytes_limit: usize,
+    /// Bytes of that budget the relay reserves for control messages; data-lane
+    /// reservations can never consume them.
+    pub configured_control_reserved_bytes: usize,
+    /// Greatest total charge at which the relay admits a data-lane
+    /// reservation: `configured_queue_bytes_limit -
+    /// configured_control_reserved_bytes`.
+    pub configured_data_bytes_limit: usize,
     /// Configured bound of the owner's physical outbound data channel.
     pub configured_data_queue_capacity: usize,
     /// Configured bound of the owner's physical outbound control channel.
@@ -323,6 +350,14 @@ pub struct QueueSaturationEvidence {
     pub reserved_data_slot_accepted_at_peak: bool,
     /// Peak session byte charge the relay latched.
     pub queue_bytes_high_water: usize,
+    /// Highest total session charge at which the relay admitted a data-lane
+    /// reservation.  Bounded by the data byte limit by construction, so it is
+    /// the data-byte peak from which reserved control bytes are derived.
+    pub data_bytes_high_water: usize,
+    /// `configured_queue_bytes_limit - data_bytes_high_water`: the least
+    /// control byte capacity that remained available at the data-byte peak.
+    /// Must be at least the configured control reservation.
+    pub control_bytes_available_at_data_peak: usize,
     /// Free session byte budget at peak residency.
     pub queue_bytes_headroom_at_peak: usize,
     /// Physical control-channel occupancy at peak residency.
@@ -413,6 +448,26 @@ pub fn validate_queue_saturation_evidence(evidence: &QueueSaturationEvidence) ->
             evidence.configured_queue_bytes_limit, EXPECTED_QUEUE_BYTES_LIMIT
         )));
     }
+    if evidence.configured_control_reserved_bytes != EXPECTED_CONTROL_RESERVED_BYTES {
+        return Err(HarnessError::Process(format!(
+            "queue saturation relay reserved {} control bytes, expected {}",
+            evidence.configured_control_reserved_bytes, EXPECTED_CONTROL_RESERVED_BYTES
+        )));
+    }
+    if evidence.configured_data_bytes_limit != EXPECTED_DATA_BYTES_LIMIT
+        || evidence.configured_data_bytes_limit
+            != evidence
+                .configured_queue_bytes_limit
+                .saturating_sub(evidence.configured_control_reserved_bytes)
+    {
+        return Err(HarnessError::Process(format!(
+            "queue saturation relay reported a {} byte data limit, expected {} (budget {} minus reserved {})",
+            evidence.configured_data_bytes_limit,
+            EXPECTED_DATA_BYTES_LIMIT,
+            evidence.configured_queue_bytes_limit,
+            evidence.configured_control_reserved_bytes
+        )));
+    }
     if evidence.configured_data_queue_capacity != EXPECTED_QUEUE_MESSAGES
         || evidence.configured_control_queue_capacity != EXPECTED_QUEUE_MESSAGES
     {
@@ -468,7 +523,7 @@ pub fn validate_queue_saturation_evidence(evidence: &QueueSaturationEvidence) ->
     if evidence.workload_reachable_entries
         != reachable_entries(
             evidence.workload_record_bytes,
-            evidence.configured_queue_bytes_limit,
+            evidence.configured_data_bytes_limit,
             evidence.configured_max_streams_per_device,
         )
     {
@@ -484,7 +539,7 @@ pub fn validate_queue_saturation_evidence(evidence: &QueueSaturationEvidence) ->
         .map(|body| {
             reachable_entries(
                 body,
-                evidence.configured_queue_bytes_limit,
+                evidence.configured_data_bytes_limit,
                 evidence.configured_max_streams_per_device,
             )
         })
@@ -608,6 +663,54 @@ pub fn validate_queue_saturation_evidence(evidence: &QueueSaturationEvidence) ->
         return Err(HarnessError::Process(format!(
             "queue saturation exceeded its session byte budget: {} of {}",
             evidence.queue_bytes_high_water, evidence.configured_queue_bytes_limit
+        )));
+    }
+    // Reserved control **bytes** at the data-byte peak (M7-C49).  The data-lane
+    // latch must corroborate the channel-resident records the same way the
+    // total latch does, must never exceed the data byte limit (data never
+    // consumed the reservation), and the control capacity derived from it must
+    // be at least the reservation and must follow from the reported bounds.
+    if evidence.data_bytes_high_water
+        < evidence
+            .data_queue_depth_high_water
+            .saturating_mul(evidence.workload_charge_per_record_bytes)
+    {
+        return Err(HarnessError::Process(format!(
+            "queue saturation latched only {} peak data-lane bytes, below the {} that {} channel-resident records must charge",
+            evidence.data_bytes_high_water,
+            evidence
+                .data_queue_depth_high_water
+                .saturating_mul(evidence.workload_charge_per_record_bytes),
+            evidence.data_queue_depth_high_water
+        )));
+    }
+    if evidence.data_bytes_high_water > evidence.configured_data_bytes_limit
+        || evidence.data_bytes_high_water > evidence.queue_bytes_high_water
+    {
+        return Err(HarnessError::Process(format!(
+            "queue saturation data-lane peak {} consumed reserved control bytes: data limit {} (total peak {})",
+            evidence.data_bytes_high_water,
+            evidence.configured_data_bytes_limit,
+            evidence.queue_bytes_high_water
+        )));
+    }
+    if evidence.control_bytes_available_at_data_peak
+        != evidence
+            .configured_queue_bytes_limit
+            .saturating_sub(evidence.data_bytes_high_water)
+    {
+        return Err(HarnessError::Process(format!(
+            "queue saturation control bytes available at the data peak ({}) do not follow from the budget {} and the data-lane peak {}",
+            evidence.control_bytes_available_at_data_peak,
+            evidence.configured_queue_bytes_limit,
+            evidence.data_bytes_high_water
+        )));
+    }
+    if evidence.control_bytes_available_at_data_peak < evidence.configured_control_reserved_bytes {
+        return Err(HarnessError::Process(format!(
+            "queue saturation left only {} control bytes at the data-byte peak, below the {} byte reservation",
+            evidence.control_bytes_available_at_data_peak,
+            evidence.configured_control_reserved_bytes
         )));
     }
 
@@ -805,6 +908,9 @@ struct QueueObservation {
     queue_bytes: usize,
     queue_bytes_limit: usize,
     queue_bytes_high_water: usize,
+    control_reserved_bytes: usize,
+    data_bytes_limit: usize,
+    data_bytes_high_water: usize,
     control_depth: usize,
     control_capacity: usize,
     control_depth_high_water: usize,
@@ -1003,6 +1109,8 @@ async fn run_saturation(
 
     let baseline = read_queue_observation(owner_relay, device_id).await?;
     let queue_bytes_limit = baseline.queue_bytes_limit;
+    let control_reserved_bytes = baseline.control_reserved_bytes;
+    let data_bytes_limit = baseline.data_bytes_limit;
     let control_capacity = baseline.control_capacity;
     let data_capacity = baseline.data_capacity.ok_or_else(|| {
         HarnessError::Process(
@@ -1010,9 +1118,9 @@ async fn run_saturation(
         )
     })?;
     let max_streams = EXPECTED_MAX_STREAMS_PER_DEVICE;
-    let reachable = reachable_entries(SATURATION_RECORD_BYTES, queue_bytes_limit, max_streams);
+    let reachable = reachable_entries(SATURATION_RECORD_BYTES, data_bytes_limit, max_streams);
     let route_maximum = (1..=MAX_PAYLOAD_BYTES)
-        .map(|body| reachable_entries(body, queue_bytes_limit, max_streams))
+        .map(|body| reachable_entries(body, data_bytes_limit, max_streams))
         .max()
         .unwrap_or(0);
     if reachable != route_maximum {
@@ -1246,6 +1354,8 @@ async fn run_saturation(
         membership_ready_relays,
         non_owner_ingress,
         configured_queue_bytes_limit: queue_bytes_limit,
+        configured_control_reserved_bytes: control_reserved_bytes,
+        configured_data_bytes_limit: data_bytes_limit,
         configured_data_queue_capacity: data_capacity,
         configured_control_queue_capacity: control_capacity,
         configured_max_streams_per_device: max_streams,
@@ -1282,6 +1392,14 @@ async fn run_saturation(
         queue_bytes_high_water: measured
             .queue_bytes_high_water
             .max(drain.queue_bytes_high_water),
+        data_bytes_high_water: measured
+            .data_bytes_high_water
+            .max(drain.data_bytes_high_water),
+        control_bytes_available_at_data_peak: queue_bytes_limit.saturating_sub(
+            measured
+                .data_bytes_high_water
+                .max(drain.data_bytes_high_water),
+        ),
         queue_bytes_headroom_at_peak: queue_bytes_limit.saturating_sub(measured.queue_bytes),
         control_queue_depth_at_peak: measured.control_depth,
         control_queue_depth_high_water: drain
@@ -1520,6 +1638,7 @@ struct DrainOutcome {
     observations: usize,
     completed: bool,
     queue_bytes_high_water: usize,
+    data_bytes_high_water: usize,
     control_depth_high_water: usize,
     control_refusals: u64,
 }
@@ -1536,6 +1655,7 @@ async fn wait_for_physical_drain(owner: &ProductionRelay, device_id: Uuid) -> Re
                 observations: observation,
                 completed: true,
                 queue_bytes_high_water: current.queue_bytes_high_water,
+                data_bytes_high_water: current.data_bytes_high_water,
                 control_depth_high_water: current.control_depth_high_water,
                 control_refusals: current.control_refusals,
             });
@@ -1709,6 +1829,9 @@ async fn read_queue_observation(
         queue_bytes: session.queue_bytes,
         queue_bytes_limit: session.queue_bytes_limit,
         queue_bytes_high_water: session.queue_bytes_high_water,
+        control_reserved_bytes: session.control_reserved_bytes,
+        data_bytes_limit: session.data_bytes_limit,
+        data_bytes_high_water: session.data_bytes_high_water,
         control_depth: session.control_queue_depth,
         control_capacity: session.control_queue_capacity,
         control_depth_high_water: session.control_queue_depth_high_water,
@@ -1902,12 +2025,13 @@ async fn connect_client(config: tunnel_client::ConnectConfig) -> Result<Connecti
 #[cfg(test)]
 mod tests {
     use super::{
-        DRAIN_OBSERVATION_BOUND, EXPECTED_MAX_STREAMS_PER_DEVICE, EXPECTED_QUEUE_BYTES_LIMIT,
-        EXPECTED_QUEUE_MESSAGES, M2_INITIAL_WINDOW_BYTES, MAX_ABSORBED_WIRE_BYTES,
-        MAX_PAYLOAD_BYTES, MIN_RESIDENT_FRAMES, MIN_SATURATION_HEADROOM_BYTES,
-        QueueSaturationEvidence, SATURATION_RECORD_BYTES, SATURATION_ROTATION_COUNT,
-        TERMINAL_IMMUTABILITY_SAMPLES, charge_per_record, frames_per_record, reachable_entries,
-        records_per_stream_by_credit, validate_queue_saturation_evidence, wire_bytes_per_record,
+        DRAIN_OBSERVATION_BOUND, EXPECTED_CONTROL_RESERVED_BYTES, EXPECTED_DATA_BYTES_LIMIT,
+        EXPECTED_MAX_STREAMS_PER_DEVICE, EXPECTED_QUEUE_BYTES_LIMIT, EXPECTED_QUEUE_MESSAGES,
+        M2_INITIAL_WINDOW_BYTES, MAX_ABSORBED_WIRE_BYTES, MAX_PAYLOAD_BYTES, MIN_RESIDENT_FRAMES,
+        MIN_SATURATION_HEADROOM_BYTES, QueueSaturationEvidence, SATURATION_RECORD_BYTES,
+        SATURATION_ROTATION_COUNT, TERMINAL_IMMUTABILITY_SAMPLES, charge_per_record,
+        frames_per_record, reachable_entries, records_per_stream_by_credit,
+        validate_queue_saturation_evidence, wire_bytes_per_record,
     };
     use crate::acceptance_test_support::assert_rejected;
 
@@ -1924,6 +2048,17 @@ mod tests {
         assert_eq!(admissible, 31);
         assert_eq!(admissible * chunks.len(), 62);
         assert!(admissible * chunks.len() < EXPECTED_QUEUE_MESSAGES);
+        // Against the data byte limit that data admission actually sees, one
+        // fewer maximum record fits.
+        assert_eq!(EXPECTED_DATA_BYTES_LIMIT / charge, 30);
+        assert_eq!(
+            reachable_entries(
+                MAX_PAYLOAD_BYTES,
+                EXPECTED_DATA_BYTES_LIMIT,
+                EXPECTED_MAX_STREAMS_PER_DEVICE
+            ),
+            60
+        );
         // The 64 maximum records that would produce 128 entries need exactly
         // twice the configured budget.
         assert_eq!(EXPECTED_MAX_STREAMS_PER_DEVICE * charge, 8_397_312);
@@ -1944,7 +2079,7 @@ mod tests {
         for body in 1..=MAX_PAYLOAD_BYTES {
             let entries = reachable_entries(
                 body,
-                EXPECTED_QUEUE_BYTES_LIMIT,
+                EXPECTED_DATA_BYTES_LIMIT,
                 EXPECTED_MAX_STREAMS_PER_DEVICE,
             );
             assert!(
@@ -1958,9 +2093,10 @@ mod tests {
         }
         assert_eq!(best, EXPECTED_MAX_STREAMS_PER_DEVICE);
         assert_eq!(best, EXPECTED_QUEUE_MESSAGES / 2);
-        assert!(best_body <= 32_732);
-        // The exact body size at which the shared byte budget is consumed in
-        // full by 64 one-frame records, leaving no reserved control bytes.
+        assert!(best_body <= 31_708);
+        // The exact body size at which the whole shared byte budget would be
+        // consumed by 64 one-frame records, the M7-C49 defect: without a byte
+        // reservation this left zero control bytes.
         assert_eq!(
             EXPECTED_MAX_STREAMS_PER_DEVICE * charge_per_record(32_732),
             EXPECTED_QUEUE_BYTES_LIMIT
@@ -1968,6 +2104,20 @@ mod tests {
         assert!(
             EXPECTED_MAX_STREAMS_PER_DEVICE * charge_per_record(32_733)
                 > EXPECTED_QUEUE_BYTES_LIMIT
+        );
+        // With the reservation, the data byte limit is consumed in full by 64
+        // records of 31,708 bytes and the 131,072 reserved control bytes are
+        // untouched; a 32,732-byte workload now admits only 62 records.
+        assert_eq!(EXPECTED_CONTROL_RESERVED_BYTES, 131_072);
+        assert_eq!(EXPECTED_DATA_BYTES_LIMIT, 4_063_232);
+        assert_eq!(
+            EXPECTED_MAX_STREAMS_PER_DEVICE * charge_per_record(31_708),
+            EXPECTED_DATA_BYTES_LIMIT
+        );
+        assert_eq!(EXPECTED_DATA_BYTES_LIMIT / charge_per_record(32_732), 62);
+        assert!(
+            EXPECTED_QUEUE_BYTES_LIMIT - 62 * charge_per_record(32_732)
+                >= EXPECTED_CONTROL_RESERVED_BYTES
         );
     }
 
@@ -1982,12 +2132,23 @@ mod tests {
         assert_eq!(
             reachable_entries(
                 SATURATION_RECORD_BYTES,
-                EXPECTED_QUEUE_BYTES_LIMIT,
+                EXPECTED_DATA_BYTES_LIMIT,
                 EXPECTED_MAX_STREAMS_PER_DEVICE
             ),
             EXPECTED_MAX_STREAMS_PER_DEVICE
         );
         assert_eq!(records_per_stream_by_credit(SATURATION_RECORD_BYTES), 6);
+        // The workload's full data charge stays inside the data byte limit, so
+        // at its peak the whole control reservation is still available.
+        assert!(
+            EXPECTED_MAX_STREAMS_PER_DEVICE * charge_per_record(SATURATION_RECORD_BYTES)
+                <= EXPECTED_DATA_BYTES_LIMIT
+        );
+        assert!(
+            EXPECTED_QUEUE_BYTES_LIMIT
+                - EXPECTED_MAX_STREAMS_PER_DEVICE * charge_per_record(SATURATION_RECORD_BYTES)
+                >= EXPECTED_CONTROL_RESERVED_BYTES
+        );
         assert_eq!(M2_INITIAL_WINDOW_BYTES, 128 * 1024);
         let charge_at_peak =
             EXPECTED_MAX_STREAMS_PER_DEVICE * charge_per_record(SATURATION_RECORD_BYTES);
@@ -2035,6 +2196,8 @@ mod tests {
             membership_ready_relays: 3,
             non_owner_ingress: true,
             configured_queue_bytes_limit: EXPECTED_QUEUE_BYTES_LIMIT,
+            configured_control_reserved_bytes: EXPECTED_CONTROL_RESERVED_BYTES,
+            configured_data_bytes_limit: EXPECTED_DATA_BYTES_LIMIT,
             configured_data_queue_capacity: EXPECTED_QUEUE_MESSAGES,
             configured_control_queue_capacity: EXPECTED_QUEUE_MESSAGES,
             configured_max_streams_per_device: EXPECTED_MAX_STREAMS_PER_DEVICE,
@@ -2058,6 +2221,8 @@ mod tests {
             reserved_free_data_slots_at_peak: EXPECTED_QUEUE_MESSAGES - 43,
             reserved_data_slot_accepted_at_peak: true,
             queue_bytes_high_water: 43 * 40_072,
+            data_bytes_high_water: 43 * 40_072,
+            control_bytes_available_at_data_peak: EXPECTED_QUEUE_BYTES_LIMIT - 43 * 40_072,
             queue_bytes_headroom_at_peak: EXPECTED_QUEUE_BYTES_LIMIT - 2_564_608,
             control_queue_depth_at_peak: 1,
             control_queue_depth_high_water: 4,
@@ -2141,8 +2306,41 @@ mod tests {
         }
 
         type Mutate = (&'static str, fn(&mut QueueSaturationEvidence));
-        let bounds: [Mutate; 28] = [
+        let bounds: [Mutate; 36] = [
             ("relay_count", |e| e.relay_count = 2),
+            // M7-C49 reserved control bytes at the data-byte peak.
+            ("configured_control_reserved_bytes", |e| {
+                e.configured_control_reserved_bytes = 0
+            }),
+            ("configured_data_bytes_limit_not_derived", |e| {
+                e.configured_data_bytes_limit = EXPECTED_QUEUE_BYTES_LIMIT
+            }),
+            ("configured_data_bytes_limit_wrong", |e| {
+                e.configured_data_bytes_limit = EXPECTED_DATA_BYTES_LIMIT - 1;
+                e.configured_control_reserved_bytes = EXPECTED_CONTROL_RESERVED_BYTES + 1;
+            }),
+            ("data_bytes_high_water_too_small", |e| {
+                e.data_bytes_high_water = 1;
+                e.control_bytes_available_at_data_peak = EXPECTED_QUEUE_BYTES_LIMIT - 1;
+            }),
+            ("data_bytes_high_water_consumed_reserve", |e| {
+                e.data_bytes_high_water = EXPECTED_DATA_BYTES_LIMIT + 1;
+                e.queue_bytes_high_water = EXPECTED_DATA_BYTES_LIMIT + 1;
+                e.control_bytes_available_at_data_peak = EXPECTED_CONTROL_RESERVED_BYTES - 1;
+            }),
+            ("data_bytes_high_water_above_total_peak", |e| {
+                e.data_bytes_high_water = e.queue_bytes_high_water + 1;
+                e.control_bytes_available_at_data_peak =
+                    EXPECTED_QUEUE_BYTES_LIMIT - e.data_bytes_high_water;
+            }),
+            ("control_bytes_available_at_data_peak_not_derived", |e| {
+                e.control_bytes_available_at_data_peak += 1
+            }),
+            ("control_bytes_available_at_data_peak_below_reserve", |e| {
+                e.data_bytes_high_water = EXPECTED_QUEUE_BYTES_LIMIT - 1;
+                e.queue_bytes_high_water = EXPECTED_QUEUE_BYTES_LIMIT - 1;
+                e.control_bytes_available_at_data_peak = 1;
+            }),
             ("membership_ready_relays", |e| e.membership_ready_relays = 2),
             ("configured_queue_bytes_limit", |e| {
                 e.configured_queue_bytes_limit = 256 * 1024

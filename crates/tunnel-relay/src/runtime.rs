@@ -158,6 +158,16 @@ pub struct RelaySessionSnapshot {
     /// Highest session byte charge ever reserved.  Sampling `queue_bytes` can
     /// miss the peak between two observations; this saturating latch cannot.
     pub queue_bytes_high_water: usize,
+    /// Bytes of `queue_bytes_limit` reserved for control messages (rotation,
+    /// cancellation, revocation and control replies).  Data-lane reservations
+    /// are refused above `data_bytes_limit = queue_bytes_limit -
+    /// control_reserved_bytes`, so data can never consume these bytes.
+    pub control_reserved_bytes: usize,
+    pub data_bytes_limit: usize,
+    /// Highest total session charge at which a data-lane reservation was
+    /// admitted.  `queue_bytes_limit - data_bytes_high_water` is the least
+    /// control byte capacity that remained available at the data-byte peak.
+    pub data_bytes_high_water: usize,
     /// Items the bounded outbound **control** channel is physically holding,
     /// and its configured bound.  `queue_messages` above is a logical
     /// admission count (`pending + streams`) and cannot express occupancy.
