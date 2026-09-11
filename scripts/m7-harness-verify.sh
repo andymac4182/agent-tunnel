@@ -140,6 +140,8 @@ gate "M7 fail-closed admission, readiness, routing and fallback matrix" \
   cargo run --locked -p tunnel-test-harness -- verify-m7-i04-fail-closed
 gate "M7 configured message-queue saturation through non-owner ingress" \
   cargo run --locked -p tunnel-test-harness -- verify-m7-queue-saturation
+gate "M7 remote consumer ingress body and prefix limits" \
+  cargo run --locked -p tunnel-test-harness -- verify-m7-remote-body-limits
 gate "M7 remote-route body-limit boundaries through non-owner ingress" \
   cargo run --locked -p tunnel-test-harness -- verify-m7-remote-body-limits
 
