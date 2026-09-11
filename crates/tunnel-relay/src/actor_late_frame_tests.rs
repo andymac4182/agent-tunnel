@@ -1318,3 +1318,65 @@ async fn partial_late_response_keeps_its_framing_across_the_owner_close() {
     assert_eq!(closed.orphaned_response_records, 0);
     assert_eq!(fixture.recv_contiguous(STREAM_A), 2);
 }
+
+#[tokio::test]
+async fn connector_terminal_releases_a_partial_response_and_keeps_the_tombstone_reclaimable() {
+    // Audit finding on the orphan allowance: a connector that answers the
+    // owner's close with its own FIN while a response record is half
+    // received must not leave a tombstone that STREAM_FORGET can never
+    // reclaim.  The partial bytes and their charge are released on the
+    // connector terminal, the late-reply allowance closes, and the stream
+    // becomes a FORGET candidate once the relay's FIN is acknowledged.
+    let mut fixture = LateFixture::new("orphaned-terminal");
+    let mut a1 = fixture.write(STREAM_A, b"a1");
+    let _ = fixture.drain_frames();
+    let full = record(b"resp-a1-partial");
+    let (head, _tail) = full.split_at(6);
+    fixture
+        .inbound(Frame::data(
+            EPOCH,
+            GENERATION,
+            STREAM_A,
+            1,
+            1,
+            head.to_vec(),
+        ))
+        .await;
+    let _ = fixture.drain_frames();
+    assert!(fixture.close(STREAM_A));
+    assert!(matches!(resolved(&mut a1), Some(Err(_))));
+    let _ = fixture.drain_frames();
+    let budget_before = fixture.stream(STREAM_A).budget_bytes;
+    assert!(budget_before >= head.len());
+    assert_eq!(fixture.stream(STREAM_A).orphaned_response_records, 1);
+
+    // The connector acknowledges the relay's FIN (sequence 2) and ends its
+    // own direction without completing the record.
+    fixture
+        .inbound(Frame::fin(EPOCH, GENERATION, STREAM_A, 2, 2))
+        .await;
+    assert!(fixture.session_alive());
+    assert_eq!(fixture.close_reason(), None);
+    // Both terminals are now authenticated and nothing is retained, so the
+    // tombstone is reclaimed on this very ACK path: the stream is gone, the
+    // sibling is untouched and the session keeps serving.
+    assert!(
+        !fixture.has_stream(STREAM_A),
+        "the tombstone must be reclaimed once both terminals are in and no partial record is retained"
+    );
+    assert!(fixture.has_stream(STREAM_B));
+    let mut b1 = fixture.write(STREAM_B, b"b1");
+    let _ = fixture.drain_frames();
+    fixture
+        .inbound(Frame::data(
+            EPOCH,
+            GENERATION,
+            STREAM_B,
+            1,
+            1,
+            record(b"resp-b1"),
+        ))
+        .await;
+    assert_eq!(resolved_ok(&mut b1), Some(record(b"resp-b1")));
+    let _ = budget_before;
+}

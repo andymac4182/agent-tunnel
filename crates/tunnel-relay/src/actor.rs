@@ -10735,6 +10735,20 @@ impl RelayActor {
                     .sequence
                     .direction(Direction::ConnectorToRelay)
                     .receive_terminal();
+                if peer_terminal.is_some() {
+                    // The connector's terminal ends its side of the stream:
+                    // a half-received response record can never complete
+                    // and no orphaned reply can still arrive.  Release the
+                    // partial bytes and their charge now so the tombstone
+                    // is reclaimable by STREAM_FORGET instead of retained
+                    // forever, and close the late-reply allowance.
+                    let partial = stream.response_bytes.len();
+                    if partial > 0 {
+                        stream.response_bytes.clear();
+                        release_m2_bytes(&queue_budget, stream, partial);
+                    }
+                    stream.orphaned_response_records = 0;
+                }
             }
             if !invalid && Self::should_ack_m2_frame(frame.kind) {
                 let ack_sequence = stream
