@@ -269,14 +269,24 @@ cargo test -p tunnel-test-harness --test m7_deployment_failures --locked \
 
 This process matrix drives the built relay executable through every FP-10
 bootstrap prerequisite: local peer identity, signed membership, signed
-checkpoint authority, Redis authority, and capacity. Each case must expose
-`/livez` as live while `/readyz` stays `503 unready`, emit a bounded typed
-credential-free diagnostic, and release all three listener ports. The capacity
-cases fail during configuration validation, so the executable never reaches a
-listener and the matrix requires `initialize` itself to fail with the exact
-named bound. Peer reachability has its own process case in
-`m7_deployment_port_binding.rs`, and loss of an authority *after* a ready start
-is `m7_deployment_runtime_faults.rs`.
+checkpoint authority, Redis authority, peer reachability, and capacity. Each
+case must expose `/livez` as live while `/readyz` stays `503 unready`, emit a
+bounded typed credential-free diagnostic, and release all three listener ports.
+The capacity cases fail during configuration validation, so the executable
+never reaches a listener and the matrix requires `initialize` itself to fail
+with the exact named bound.
+
+The `unreachable-peer` case is the one fault whose documented outcome is not a
+bounded exit. Signed membership names a second relay whose advertised peer
+endpoint has no listener, and the relay must stay alive, live and unready while
+emitting its typed probe-failure diagnostic. The case then binds a real peer
+listener at that exact advertised address, presenting the second relay's own
+signed peer certificate and answering the reserved authenticated health route,
+and requires the same process (same pid, no restart) to converge to ready
+before releasing its ports. Requiring an exit instead would deadlock two relays
+booting together, so the matrix asserts convergence rather than failure there.
+Loss of an authority *after* a ready start is
+`m7_deployment_runtime_faults.rs`.
 
 ### Dynamic configured peer-SPKI replacement
 

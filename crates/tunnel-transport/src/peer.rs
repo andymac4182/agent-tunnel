@@ -1120,7 +1120,19 @@ impl PeerServerSend {
     /// The bytes remain one application payload; only the HTTP/3 body
     /// representation is fragmented at the configured transport limit.
     pub async fn send_chunked(&mut self, bytes: &[u8]) -> Result<(), PeerTransportError> {
-        send_server_chunks(&mut self.inner, &self.budget, self.idle_timeout, bytes).await
+        self.send_chunked_until(bytes, Instant::now() + self.idle_timeout)
+            .await
+    }
+
+    /// Send one logical response body under an absolute deadline supplied by
+    /// the caller's operation.  See
+    /// [`PeerClientSend::send_chunked_until`] for the shared contract.
+    pub async fn send_chunked_until(
+        &mut self,
+        bytes: &[u8],
+        deadline: Instant,
+    ) -> Result<(), PeerTransportError> {
+        send_server_chunks_until(&mut self.inner, &self.budget, deadline, bytes).await
     }
 
     /// Send one already bounded response body chunk.
@@ -1180,6 +1192,23 @@ async fn send_server_chunk<S>(
 where
     S: h3::quic::SendStream<Bytes>,
 {
+    send_server_chunk_until(stream, budget, Instant::now() + idle_timeout, chunk).await
+}
+
+/// Write one bounded body chunk against an already-created absolute deadline.
+///
+/// The deadline belongs to the caller's operation.  It is never recomputed
+/// here, so a multi-chunk body cannot renew its own bound one physical write
+/// at a time.  An elapsed deadline cancels the stream before returning.
+async fn send_server_chunk_until<S>(
+    stream: &mut h3::server::RequestStream<S, Bytes>,
+    budget: &BodyBudget,
+    deadline: Instant,
+    chunk: Bytes,
+) -> Result<(), PeerTransportError>
+where
+    S: h3::quic::SendStream<Bytes>,
+{
     if chunk.len() > budget.max_chunk_bytes {
         stream.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
         return Err(PeerTransportError::ChunkTooLarge {
@@ -1188,7 +1217,7 @@ where
         });
     }
     let charge = budget.reserve(chunk.len())?;
-    let result = match timeout(idle_timeout, stream.send_data(chunk)).await {
+    let result = match timeout_at(deadline, stream.send_data(chunk)).await {
         Ok(result) => result.map_err(|error| PeerTransportError::H3(error.to_string())),
         Err(_) => {
             stream.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
@@ -1208,8 +1237,23 @@ async fn send_server_chunks<S>(
 where
     S: h3::quic::SendStream<Bytes>,
 {
+    send_server_chunks_until(stream, budget, Instant::now() + idle_timeout, bytes).await
+}
+
+/// Write one logical body as bounded chunks that all share one absolute
+/// deadline.  The deadline is created once by the caller, so the total wall
+/// clock cost of the body cannot grow with its chunk count.
+async fn send_server_chunks_until<S>(
+    stream: &mut h3::server::RequestStream<S, Bytes>,
+    budget: &BodyBudget,
+    deadline: Instant,
+    bytes: &[u8],
+) -> Result<(), PeerTransportError>
+where
+    S: h3::quic::SendStream<Bytes>,
+{
     for chunk in bounded_body_chunks(bytes, budget.max_chunk_bytes) {
-        send_server_chunk(stream, budget, idle_timeout, Bytes::copy_from_slice(chunk)).await?;
+        send_server_chunk_until(stream, budget, deadline, Bytes::copy_from_slice(chunk)).await?;
     }
     Ok(())
 }
@@ -1385,8 +1429,23 @@ impl PeerClientSend {
     /// The bytes remain one application payload; only the HTTP/3 body
     /// representation is fragmented at the configured transport limit.
     pub async fn send_chunked(&mut self, bytes: &[u8]) -> Result<(), PeerTransportError> {
-        let result =
-            send_client_chunks(&mut self.inner, &self.budget, self.idle_timeout, bytes).await;
+        self.send_chunked_until(bytes, Instant::now() + self.idle_timeout)
+            .await
+    }
+
+    /// Send one logical body under an absolute deadline supplied by the
+    /// caller's operation.
+    ///
+    /// Every physical write of this body is bounded by the same instant, so a
+    /// blackholed peer cannot hold the writer past the operation's budget by
+    /// accepting one chunk at a time.  An elapsed deadline cancels the send
+    /// stream and returns [`PeerTransportError::Timeout`].
+    pub async fn send_chunked_until(
+        &mut self,
+        bytes: &[u8],
+        deadline: Instant,
+    ) -> Result<(), PeerTransportError> {
+        let result = send_client_chunks_until(&mut self.inner, &self.budget, deadline, bytes).await;
         self._connection.observe_stream_result(result)
     }
 
@@ -1463,6 +1522,20 @@ async fn send_client_chunk<S>(
 where
     S: h3::quic::SendStream<Bytes>,
 {
+    send_client_chunk_until(stream, budget, Instant::now() + idle_timeout, chunk).await
+}
+
+/// Write one bounded request body chunk against an already-created absolute
+/// deadline.  See [`send_server_chunk_until`] for the shared contract.
+async fn send_client_chunk_until<S>(
+    stream: &mut h3::client::RequestStream<S, Bytes>,
+    budget: &BodyBudget,
+    deadline: Instant,
+    chunk: Bytes,
+) -> Result<(), PeerTransportError>
+where
+    S: h3::quic::SendStream<Bytes>,
+{
     if chunk.len() > budget.max_chunk_bytes {
         stream.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
         return Err(PeerTransportError::ChunkTooLarge {
@@ -1471,7 +1544,7 @@ where
         });
     }
     let charge = budget.reserve(chunk.len())?;
-    let result = match timeout(idle_timeout, stream.send_data(chunk)).await {
+    let result = match timeout_at(deadline, stream.send_data(chunk)).await {
         Ok(result) => result.map_err(classify_client_stream_error),
         Err(_) => {
             stream.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
@@ -1491,8 +1564,22 @@ async fn send_client_chunks<S>(
 where
     S: h3::quic::SendStream<Bytes>,
 {
+    send_client_chunks_until(stream, budget, Instant::now() + idle_timeout, bytes).await
+}
+
+/// Write one logical request body as bounded chunks that all share one
+/// absolute deadline created by the caller.
+async fn send_client_chunks_until<S>(
+    stream: &mut h3::client::RequestStream<S, Bytes>,
+    budget: &BodyBudget,
+    deadline: Instant,
+    bytes: &[u8],
+) -> Result<(), PeerTransportError>
+where
+    S: h3::quic::SendStream<Bytes>,
+{
     for chunk in bounded_body_chunks(bytes, budget.max_chunk_bytes) {
-        send_client_chunk(stream, budget, idle_timeout, Bytes::copy_from_slice(chunk)).await?;
+        send_client_chunk_until(stream, budget, deadline, Bytes::copy_from_slice(chunk)).await?;
     }
     Ok(())
 }
@@ -2567,6 +2654,14 @@ where
 pub struct PeerServerConnectionStats {
     /// Verified peer role identity.
     pub peer_node_id: String,
+    /// The TLS server name the calling peer presented when it opened this
+    /// connection, when the handshake carried one.
+    ///
+    /// This is the caller's SNI as the listener observed it, not a value this
+    /// side chose.  It is a bounded identifier with no payload or credential
+    /// content, and it lets an observer check that a dialling relay used the
+    /// server name from its verified membership record.
+    pub observed_server_name: Option<String>,
     /// Listener-local diagnostic identifier for this connection lifetime.
     ///
     /// Identifiers are allocated from a monotonic counter starting at one, so
@@ -2627,6 +2722,7 @@ pub struct PeerServerStats {
 
 struct PeerServerConnectionDiagnostics {
     peer_node_id: String,
+    observed_server_name: Option<String>,
     connection_id: usize,
     connection: quinn::Connection,
     stream_permits: Arc<Semaphore>,
@@ -2675,6 +2771,7 @@ impl PeerServerDiagnostics {
                 let stats = connection.connection.stats();
                 PeerServerConnectionStats {
                     peer_node_id: connection.peer_node_id.clone(),
+                    observed_server_name: connection.observed_server_name.clone(),
                     connection_id: connection.connection_id,
                     accepted_streams: connection.accepted_streams.load(Ordering::Acquire),
                     resolving_streams: connection.resolving_streams.load(Ordering::Acquire),
@@ -2720,6 +2817,7 @@ impl PeerServerDiagnostics {
         }
         let observation = Arc::new(PeerServerConnectionDiagnostics {
             peer_node_id: peer_node_id.to_owned(),
+            observed_server_name: observed_server_name(connection),
             // Monotonic and non-zero: zero is the callers' "no connection"
             // sentinel, and a slab-indexed QUIC stable id could be reused by a
             // later connection while an earlier entry is still being drained.
@@ -2747,6 +2845,20 @@ impl PeerServerDiagnostics {
             connections.remove(&connection_id);
         }
     }
+}
+
+/// Read the TLS server name the calling peer presented on this connection.
+///
+/// The value comes from the completed handshake, so it is what the caller
+/// actually sent rather than anything this side derived. Returning `None`
+/// when the handshake carried no server name keeps the observation honest
+/// instead of substituting a local default.
+fn observed_server_name(connection: &quinn::Connection) -> Option<String> {
+    connection
+        .handshake_data()?
+        .downcast::<quinn::crypto::rustls::HandshakeData>()
+        .ok()?
+        .server_name
 }
 
 struct PeerServerDiagnosticsGuard {

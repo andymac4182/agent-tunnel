@@ -67,6 +67,10 @@ const MAX_ECHO_RESPONSE_BYTES: usize = 64 * 1024 + 256;
 /// relay body bound, large enough that a completed read is unmistakable.
 const WITHHELD_BODY_BYTES: usize = 512;
 const HONEYPOT_OBSERVATION: Duration = Duration::from_millis(750);
+/// The relay every remote scenario enters through.  It owns neither device, so
+/// a peer connection from it to an owner is the legitimate remote hop whose
+/// presented server name EC-017 constrains.
+const INGRESS_NODE_ID: &str = "relay-c";
 const SIBLING_CANARY_TIMEOUT: Duration = Duration::from_secs(15);
 /// Bound for the owner-readiness precondition before a must-succeed probe.
 const OWNER_READY_TIMEOUT: Duration = Duration::from_secs(20);
@@ -193,6 +197,15 @@ pub struct FailClosedEvidence {
     pub forged_endpoint_response_exact: bool,
     pub forged_endpoint_udp_datagrams: u64,
     pub forged_endpoint_tcp_connections: u64,
+    /// The other half of EC-017: the TLS server name observed on the
+    /// legitimate peer connection matched the owner's verified membership
+    /// record and none of the names the caller supplied in headers.
+    ///
+    /// Zero contact with a caller-named address proves only that the peer
+    /// *address* came from membership.  Without this flag a relay could still
+    /// dial the membership address while presenting a caller-chosen server
+    /// name, which is what the signed record is supposed to fix.
+    pub peer_connection_server_name_from_membership: bool,
     /// A cross-scope target is rejected before any body read or peer forward.
     pub preflight_cross_scope: SentinelOutcome,
     pub preflight_dispatch_delta: u64,
@@ -287,6 +300,10 @@ pub fn validate_fail_closed_evidence(evidence: &FailClosedEvidence) -> Result<()
         (
             "forged_endpoint_response_exact",
             evidence.forged_endpoint_response_exact,
+        ),
+        (
+            "peer_connection_server_name_from_membership",
+            evidence.peer_connection_server_name_from_membership,
         ),
         (
             "unambiguous_label_response_exact",
@@ -2137,6 +2154,55 @@ async fn matrix(context: MatrixContext<'_>) -> Result<FailClosedEvidence> {
     tokio::time::sleep(HONEYPOT_OBSERVATION).await;
     let forged_endpoint_udp_datagrams = honeypot.datagrams();
     let forged_endpoint_tcp_connections = honeypot.connections();
+    // The honeypot zeros above close the address half of EC-017.  This closes
+    // the server-name half on the connection that did happen: the owner's own
+    // peer listener reports the server name the ingress relay presented, and
+    // it must be the one in the owner's verified membership record rather than
+    // any name the consumer supplied.
+    let membership_server_name = cluster
+        .fixture
+        .membership(&owner_node)
+        .map(|membership| membership.payload.server_name.clone())
+        .ok_or_else(|| {
+            HarnessError::Process(
+                "fail-closed fixture held no signed membership for the owner relay".into(),
+            )
+        })?;
+    let caller_named_server_names = [
+        honeypot.tcp_addr.to_string(),
+        honeypot.tcp_addr.ip().to_string(),
+        honeypot.udp_addr.to_string(),
+        honeypot.udp_addr.ip().to_string(),
+    ];
+    let owner_peer_listener = cluster
+        .relay(&owner_node)?
+        .peer_server_stats()
+        .ok_or_else(|| {
+            HarnessError::Process(
+                "the owner relay exposed no peer listener diagnostics for the server-name assertion"
+                    .into(),
+            )
+        })?;
+    let ingress_peer_connections = owner_peer_listener
+        .connections
+        .iter()
+        .filter(|connection| connection.peer_node_id == INGRESS_NODE_ID)
+        .count();
+    if ingress_peer_connections == 0 {
+        return Err(HarnessError::Process(
+            "the remote hop left no peer connection from the ingress relay, so no server name could be observed".into(),
+        ));
+    }
+    let peer_connection_server_name_from_membership = owner_peer_listener
+        .connections
+        .iter()
+        .filter(|connection| connection.peer_node_id == INGRESS_NODE_ID)
+        .all(|connection| {
+            connection.observed_server_name.as_deref() == Some(membership_server_name.as_str())
+                && !caller_named_server_names
+                    .iter()
+                    .any(|named| connection.observed_server_name.as_deref() == Some(named.as_str()))
+        });
 
     // ---- EC-049: preflight completes before any body read or forward ----
     let before = counters(cluster).await?;
@@ -2543,6 +2609,7 @@ async fn matrix(context: MatrixContext<'_>) -> Result<FailClosedEvidence> {
         forged_endpoint_response_exact,
         forged_endpoint_udp_datagrams,
         forged_endpoint_tcp_connections,
+        peer_connection_server_name_from_membership,
         preflight_cross_scope,
         preflight_dispatch_delta,
         preflight_owner_chunk_read_delta,
@@ -2691,6 +2758,7 @@ mod c17_validator_tests {
             forged_endpoint_response_exact: true,
             forged_endpoint_udp_datagrams: 0,
             forged_endpoint_tcp_connections: 0,
+            peer_connection_server_name_from_membership: true,
             preflight_cross_scope: rejection("preflight_cross_scope", 404, "DEVICE_NOT_FOUND", 512),
             preflight_dispatch_delta: 0,
             preflight_owner_chunk_read_delta: 0,
@@ -2770,13 +2838,16 @@ mod c17_validator_tests {
     #[test]
     fn every_required_flag_reaches_the_shared_exit_path() {
         type Disable = (&'static str, fn(&mut FailClosedEvidence));
-        let flags: [Disable; 13] = [
+        let flags: [Disable; 14] = [
             ("remote_ingress_is_not_owner", |e| {
                 e.remote_ingress_is_not_owner = false
             }),
             ("remote_route_proved", |e| e.remote_route_proved = false),
             ("forged_endpoint_response_exact", |e| {
                 e.forged_endpoint_response_exact = false
+            }),
+            ("peer_connection_server_name_from_membership", |e| {
+                e.peer_connection_server_name_from_membership = false
             }),
             ("unambiguous_label_response_exact", |e| {
                 e.unambiguous_label_response_exact = false
@@ -2937,6 +3008,22 @@ mod c17_validator_tests {
         assert_rejected(
             validate_fail_closed_evidence(&tcp),
             "forged_endpoint_tcp_connections",
+        );
+    }
+
+    /// C17: the address half alone is not EC-017.  Evidence that reaches no
+    /// caller-named address is still rejected when the server name presented
+    /// on the legitimate peer connection did not come from the verified
+    /// membership record.
+    #[test]
+    fn a_membership_address_with_a_caller_chosen_server_name_must_be_rejected() {
+        let mut named = evidence();
+        assert_eq!(named.forged_endpoint_udp_datagrams, 0);
+        assert_eq!(named.forged_endpoint_tcp_connections, 0);
+        named.peer_connection_server_name_from_membership = false;
+        assert_rejected(
+            validate_fail_closed_evidence(&named),
+            "peer_connection_server_name_from_membership",
         );
     }
 

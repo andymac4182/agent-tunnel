@@ -30,6 +30,14 @@ pub const MAX_CLOSE_BODY: usize = 125;
 
 /// Maximum charged bytes retained by one peer stream.
 pub const STREAM_BYTE_BUDGET: usize = 256 * 1024;
+/// Wall-clock budget for writing one charged record to the wire.
+///
+/// This is the operation budget a caller turns into one absolute deadline
+/// before the first physical write of a record.  It is not a per-write idle
+/// allowance: all of a record's physical writes share the single deadline, so
+/// a stalled peer cannot extend the operation by accepting one chunk at a
+/// time.
+pub const RECORD_SEND_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 /// Maximum charged bytes retained by one peer connection.
 pub const CONNECTION_BYTE_BUDGET: usize = 8 * 1024 * 1024;
 /// Maximum simultaneously open request streams on a peer connection.
@@ -392,6 +400,16 @@ impl From<&StreamBudget> for StreamBudget {
 }
 
 impl StreamBudget {
+    /// Return this stream's wall-clock budget for one record send.
+    ///
+    /// Callers create the absolute send deadline from this once per record,
+    /// before the first physical write, and reuse that instant for every
+    /// chunk of the record.
+    #[must_use]
+    pub fn record_send_budget(&self) -> std::time::Duration {
+        RECORD_SEND_BUDGET
+    }
+
     /// Return the connection budget shared by this stream.
     #[must_use]
     pub fn connection_budget(&self) -> ConnectionBudget {

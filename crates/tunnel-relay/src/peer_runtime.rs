@@ -2153,16 +2153,50 @@ impl InboundPeerRecv {
     }
 }
 
+/// Create the absolute deadline for one peer record send.
+///
+/// The deadline comes from the record's own stream budget and is created once,
+/// before the first physical write, rather than as a fresh relative timer per
+/// physical write.  When the admission carries its own signed trust boundary
+/// the earlier instant wins, so a send can never outlive the authorization it
+/// was admitted under.  EC-029 requires exactly this: every physical write of
+/// a peer record is bounded by an instant fixed before the record started.
+fn record_send_deadline(
+    budget: &StreamBudget,
+    admission_cancellation: Option<&PeerAdmissionCancellation>,
+) -> TokioInstant {
+    let deadline = TokioInstant::now() + budget.record_send_budget();
+    match admission_cancellation.and_then(PeerAdmissionCancellation::expires_at) {
+        Some(expires_at) => deadline.min(TokioInstant::from_std(expires_at)),
+        None => deadline,
+    }
+}
+
+/// Whether a send outcome must cancel the stream before it is reported.
+///
+/// A bounded send that elapsed leaves a peer that is not reading: the stream
+/// is reset so the owning pump terminates and can be joined, instead of being
+/// left half open for the connection idle timeout to collect.
+fn send_failure_cancels_stream(result: &Result<(), PeerRuntimeError>) -> bool {
+    matches!(
+        result,
+        Err(PeerRuntimeError::Closed
+            | PeerRuntimeError::MembershipExpired
+            | PeerRuntimeError::Transport(PeerTransportError::Timeout))
+    )
+}
+
 async fn send_record(
     send: &mut PeerClientSend,
     budget: &StreamBudget,
     record: PeerRecord,
     admission_cancellation: Option<&PeerAdmissionCancellation>,
 ) -> Result<(), PeerRuntimeError> {
+    let deadline = record_send_deadline(budget, admission_cancellation);
     let encoded = record
         .encode_charged(budget)
         .map_err(|error| PeerRuntimeError::Frame(PeerFrameError::from(error)))?;
-    send_client_chunks(send, encoded.as_ref(), admission_cancellation).await
+    send_client_chunks(send, encoded.as_ref(), deadline, admission_cancellation).await
 }
 
 async fn send_server_record(
@@ -2171,72 +2205,77 @@ async fn send_server_record(
     record: PeerRecord,
     admission_cancellation: Option<&PeerAdmissionCancellation>,
 ) -> Result<(), PeerRuntimeError> {
+    let deadline = record_send_deadline(budget, admission_cancellation);
     let encoded = record
         .encode_charged(budget)
         .map_err(|error| PeerRuntimeError::Frame(PeerFrameError::from(error)))?;
-    send_server_chunks(send, encoded.as_ref(), admission_cancellation).await
+    send_server_chunks(send, encoded.as_ref(), deadline, admission_cancellation).await
 }
 
 async fn send_client_chunks(
     send: &mut PeerClientSend,
     bytes: &[u8],
+    deadline: TokioInstant,
     admission_cancellation: Option<&PeerAdmissionCancellation>,
 ) -> Result<(), PeerRuntimeError> {
-    if let Some(admission_cancellation) = admission_cancellation {
+    let result = if let Some(admission_cancellation) = admission_cancellation {
         if admission_cancellation.is_cancelled() {
             send.cancel();
             return Err(admission_cancellation_error(Some(admission_cancellation)));
         }
-        let result = tokio::select! {
+        tokio::select! {
             biased;
             _ = admission_cancellation.cancelled() => {
                 Err(admission_cancellation_error(Some(admission_cancellation)))
             },
-            result = send.send_chunked(bytes) => {
+            result = send.send_chunked_until(bytes, deadline) => {
                 attribute_admission_failure(result.map_err(Into::into), admission_cancellation)
             }
-        };
-        if matches!(
-            result,
-            Err(PeerRuntimeError::Closed | PeerRuntimeError::MembershipExpired)
-        ) {
-            send.cancel();
         }
-        result
     } else {
-        send.send_chunked(bytes).await.map_err(Into::into)
+        // The absolute deadline is the only bound on this branch, so it must
+        // not be omitted: there is no admission token to cancel the write.
+        send.send_chunked_until(bytes, deadline)
+            .await
+            .map_err(Into::into)
+    };
+    if send_failure_cancels_stream(&result) {
+        send.cancel();
     }
+    result
 }
 
 async fn send_server_chunks(
     send: &mut PeerServerSend,
     bytes: &[u8],
+    deadline: TokioInstant,
     admission_cancellation: Option<&PeerAdmissionCancellation>,
 ) -> Result<(), PeerRuntimeError> {
-    if let Some(admission_cancellation) = admission_cancellation {
+    let result = if let Some(admission_cancellation) = admission_cancellation {
         if admission_cancellation.is_cancelled() {
             send.cancel();
             return Err(admission_cancellation_error(Some(admission_cancellation)));
         }
-        let result = tokio::select! {
+        tokio::select! {
             biased;
             _ = admission_cancellation.cancelled() => {
                 Err(admission_cancellation_error(Some(admission_cancellation)))
             },
-            result = send.send_chunked(bytes) => {
+            result = send.send_chunked_until(bytes, deadline) => {
                 attribute_admission_failure(result.map_err(Into::into), admission_cancellation)
             }
-        };
-        if matches!(
-            result,
-            Err(PeerRuntimeError::Closed | PeerRuntimeError::MembershipExpired)
-        ) {
-            send.cancel();
         }
-        result
     } else {
-        send.send_chunked(bytes).await.map_err(Into::into)
+        // See `send_client_chunks`: the absolute deadline is the only bound
+        // when no admission context exists for this stream.
+        send.send_chunked_until(bytes, deadline)
+            .await
+            .map_err(Into::into)
+    };
+    if send_failure_cancels_stream(&result) {
+        send.cancel();
     }
+    result
 }
 
 async fn finish_client_send(
