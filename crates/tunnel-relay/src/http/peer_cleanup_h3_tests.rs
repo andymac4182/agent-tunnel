@@ -1620,6 +1620,12 @@ async fn peer_consumer_outstanding_write_is_bounded_by_consumer_expiry() {
         "staged-outstanding-write-stream",
     )
     .await;
+    // Admit the OPEN exactly as a real connector would.  The parked record
+    // below is waiting for the device's authorization confirmation, not for
+    // admission; an unadmitted OPEN would have its close deferred until the
+    // owner proves OPENED or REJECTED, so the bound under test would not be
+    // observable as this stream's terminal state.
+    admit_queued_open(&fixture, &mut target_rx, &target_session_id, target_epoch).await;
     let admitted = wait_snapshot(&fixture.handle, |snapshot| {
         find_session(snapshot, device_id()).is_some_and(|session| {
             session.session_id == target_session_id

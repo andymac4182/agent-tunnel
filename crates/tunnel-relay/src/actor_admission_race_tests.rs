@@ -309,6 +309,10 @@ impl PendingOpenFixture {
                 key: self.key.clone(),
                 stream_id,
                 operation_id: operation_id.to_owned(),
+                // A consumer that simply disappears carries no typed terminal
+                // cause; the trust-expiry guard supplies one only when its
+                // admission edge proved the expiry.
+                cause: None,
             })
             .await;
     }
