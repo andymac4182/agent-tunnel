@@ -134,6 +134,10 @@ pub use timing_boundaries::{
 };
 mod udp_proxy;
 use udp_proxy::UdpFaultProxy;
+mod chaos;
+pub use chaos::{
+    ChaosEvidence, InterruptionClass, validate_chaos_evidence, verify as verify_chaos,
+};
 mod ownership;
 pub use ownership::{
     OwnershipEvidence, validate_ownership_evidence, verify as verify_owner_contention,

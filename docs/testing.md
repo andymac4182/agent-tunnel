@@ -53,6 +53,53 @@ The transport command exercises real mTLS/H3 fault cases. The cluster command
 uses a synthetic owner callback. The production command uses real relay actors,
 CLI/device WebSockets and public consumers across three relays.
 
+### Bounded multi-fault chaos classification (`verify-m7-chaos`)
+
+```sh
+cargo run -p tunnel-test-harness --locked -- verify-m7-chaos
+```
+
+The chaos gate (OG-08) fronts Redis with an opaque TCP proxy, starts one real
+three-relay production cluster, and runs a fixed seven-round schedule that
+repeats owner kill, CLI process pause and peer UDP loss and exercises a full
+Redis pause once, each built from an existing fault injector: Redis pause
+(`ProxyHandle::pause_all`), non-owner peer UDP loss (`set_peer_path_drop`), CLI
+process pause (`SIGSTOP`/`SIGCONT` via `ProcessPauseGuard`) and owner kill
+(`SIGKILL` of the owning `tunnel-client`). A full Redis pause expires the
+in-process fixture's signed membership lease, which does not re-arm for a second
+full outage on the same long-lived cluster (a fixture limitation, not a protocol
+one), so Redis pause is scheduled once while the other three faults repeat.
+Every observed close or interruption is mapped into the closed vocabulary the
+diagnostics already use — `bounded_close`, `admission_unavailable`,
+`peer_unavailable`, `owner_released`, `outcome_unknown`, `unclassified`.
+Unknown outcomes (a timed-out or unsendable probe) are preserved as
+`outcome_unknown`, not discarded; an observation that matches no bucket (for
+example an echo from a killed or paused owner, or an unexpected HTTP status) is
+recorded as `unclassified`. Each round recycles the owner session, so
+device-fanout reconnect sockets are counted per round. `validate_chaos_evidence`
+blocks release when any interruption is unclassified, when the peak per-round
+reconnect rate exceeds the documented threshold of 12.000 sockets/second
+(`reconnect_rate_threshold_milli = 12000`), when the concurrent device-fanout
+socket peak exceeds four, when a fault type was never exercised, or when a
+per-round or final recovery echo did not succeed. The gate runs as part of
+`scripts/m7-harness-verify.sh`. Its structured validator and its table-driven
+M7-C17 mutation case live in `crates/tunnel-test-harness/src/production_cluster/chaos.rs`.
+
+### Evidence-promotion guard (`scripts/m7-evidence-guard.py`)
+
+```sh
+python3 scripts/m7-evidence-guard.py --verbose
+```
+
+A read-only IN-11 guard over `docs/m7-edge-cases.md` and `docs/tasks.md`. For
+every row whose status column says verified it fails when the row cites a
+`verify-*` harness gate that is neither a `tunnel-test-harness` command nor
+referenced by `scripts/m7-harness-verify.sh`, or a commit hash that git
+resolves to a real commit which is not an ancestor of `HEAD`. Hex tokens git
+cannot resolve to a commit (digests, blob ids, squashed short hashes) and
+gate fragments embedded in a longer path or log filename are ignored, so only
+real citations are checked. The guard never writes to the docs.
+
 ### Concurrent same-identifier tenants and the duplicate-owner race
 
 `verify-m7-production` keeps both tenants' device sessions online at the
@@ -719,3 +766,5 @@ Report expected errors caused by fault injection separately from unexplained fai
 Keep fast unit/config/codec tests in every pull request. Add protocol and adapter suites to required pull-request jobs as their implementations land. Schedule longer property, fuzz, real-interval rotation, soak, and VM runs separately, and make their relevant results release requirements. A skipped VM or upstream contract job must remain visible as unverified coverage.
 
 For release artifacts, build for every advertised OS/architecture, record checksums and provenance, then download and unpack those artifacts into clean temporary environments. Execute their help/version/config checks and launch the packaged relay and device for a real consumer-to-device operation and a rotation. Verify that expected configuration examples, notices, and required runtime assets are present and that no workspace-only dependency is masking a missing file. macOS/Linux/Windows CI success is not by itself evidence for every architecture on those systems.
+
+For the local macOS-arm64 CLI scope of IN-10/OG-05, `scripts/m7-local-source-parity-build.sh` builds the workspace binaries from an immutable copy of the current `HEAD` source inputs (crates, vendor, examples, root Cargo metadata) and emits an immutable `source-parity-receipt.txt` tying the copied source digest to each binary's sha256. `scripts/m7-local-artifact-verify.sh --build-receipt <receipt>` then cross-checks that receipt — the recorded base `HEAD`, tracked-diff digest and worktree-status digest must equal the current checkout's, and every supplied binary's sha256 must equal the receipt's digest — and only then records `binary_provenance=verified` and source-to-binary provenance as verified; any mismatch is fatal, so provenance is never falsely claimed. Without `--build-receipt` the verifier still records provenance as unverified. Both scripts are single-host, local macOS-arm64, this-source-only observers; they make no release, other-OS/architecture, hosted-CI or full-M7-row claim, and neither builds nor mutates the original checkout. Drive the source-matched CLI into an acceptance gate by exporting `TUNNEL_CLIENT_BIN=<bundle>/bin/tunnel-client` (the verifier writes a `tunnel-client-env.sh` for this) so `verify-m7-production` and `verify-m7-chaos`/`verify-m7-i08-recovery-attempts` record heartbeat, liveness, bounded shutdown and no-reconnect-storm evidence against the exact receipt-matched binary.

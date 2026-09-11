@@ -127,6 +127,8 @@ gate "M7 Redis partition acceptance" \
   cargo run --locked -p tunnel-test-harness -- verify-m7-redis-partition
 gate "M7 process-pause acceptance" \
   cargo run --locked -p tunnel-test-harness -- verify-m7-process-pause
+gate "M7 bounded multi-fault chaos classification" \
+  cargo run --locked -p tunnel-test-harness -- verify-m7-chaos
 gate "M7 resource-pressure acceptance" \
   cargo run --locked -p tunnel-test-harness -- verify-m7-pressure
 gate "M7 stalled consumer physical-write cleanup" \

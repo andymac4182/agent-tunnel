@@ -4,9 +4,13 @@ set -eu
 # This is an observation and unpacked-bundle check for the local macOS CLI
 # scope of IN-10/OG-05.  It deliberately does not build, publish, clean, or
 # reset anything.  The caller supplies binaries that it has already built.
-# Hashing a supplied binary beside a source snapshot does not prove that the
-# binary was built from that snapshot; this script records that provenance as
-# unverified because it does not consume a trusted build receipt.
+# Hashing a supplied binary beside a source snapshot does not by itself prove
+# that the binary was built from that snapshot; without a trusted build receipt
+# this script records provenance as unverified.  When --build-receipt supplies
+# a receipt from scripts/m7-local-source-parity-build.sh, this script instead
+# cross-checks that receipt (matching git state and per-binary sha256) and only
+# then records source-to-binary provenance as verified.  The build itself is
+# still owned by the parity-build script, never by this observer.
 
 usage() {
     cat >&2 <<'EOF'
@@ -14,6 +18,7 @@ Usage:
   scripts/m7-local-artifact-verify.sh \
     --client-bin PATH \
     [--harness-bin PATH] [--relay-bin PATH] [--profile NAME] \
+    [--build-receipt PATH] \
     [--output-dir DIR] [--] ACCEPTANCE_COMMAND [ARG...]
 
 The command must be run from the repository checkout or with repository-
@@ -21,6 +26,17 @@ relative binary paths.  --client-bin is required.  --harness-bin and
 --relay-bin are optional additional root-built binaries to put in the
 unpacked bundle.  --profile is normally debug or release and is inferred from
 the first binary path when omitted; pass it explicitly for a custom profile.
+
+--build-receipt consumes a trusted source-parity receipt produced by
+scripts/m7-local-source-parity-build.sh.  When supplied, the receipt is
+cross-checked: it must attest a local source-copy Cargo build, its recorded
+base HEAD, tracked-diff digest and worktree-status digest must equal this
+checkout's, and every supplied binary's sha256 must equal the receipt's
+binary digest for that binary.  Only when every check passes does this run
+record binary_provenance=verified and source-to-binary provenance as
+verified; the receipt is copied into the output and checksummed.  Any
+mismatch is fatal, so provenance is never falsely claimed.  Without
+--build-receipt provenance stays unverified, exactly as before.
 
 The output is an unpacked local bundle plus a read-only observation manifest,
 checksums, CLI help/version output, and metadata.  If --output-dir already
@@ -165,6 +181,7 @@ client_input=
 harness_input=
 relay_input=
 profile=
+build_receipt_input=
 output_base=$repo_root/work/m7-local-artifact-verify
 acceptance_requested=false
 
@@ -188,6 +205,11 @@ while [ "$#" -gt 0 ]; do
         --profile)
             [ "$#" -ge 2 ] || usage
             profile=$2
+            shift 2
+            ;;
+        --build-receipt)
+            [ "$#" -ge 2 ] || usage
+            build_receipt_input=$2
             shift 2
             ;;
         --output-dir|-o)
@@ -376,6 +398,66 @@ if [ -n "$relay_path" ]; then
     copy_binary tunnel-relay "$relay_path" "$relay_file_type"
 fi
 
+# Read one `key=value` line from the immutable source-parity receipt.  The
+# receipt is produced by scripts/m7-local-source-parity-build.sh and only
+# contains fixed ASCII keys and hex/identifier values.
+receipt_value() {
+    receipt_value_key=$1
+    awk -F= -v key="$receipt_value_key" \
+        'index($0, key "=") == 1 { print substr($0, length(key) + 2); found = 1; exit } END { if (!found) exit 1 }' \
+        "$build_receipt_path"
+}
+
+provenance_verified=false
+build_receipt_sha256=
+build_receipt_bundle_name=
+if [ -n "$build_receipt_input" ]; then
+    case "$build_receipt_input" in
+        /*) build_receipt_path=$build_receipt_input ;;
+        *) build_receipt_path=$caller_root/$build_receipt_input ;;
+    esac
+    [ -f "$build_receipt_path" ] || die "build receipt does not exist: $build_receipt_input"
+    [ -L "$build_receipt_path" ] && die "build receipt must be a regular file, not a symlink: $build_receipt_input"
+    build_receipt_path=$(CDPATH= cd -- "$(dirname -- "$build_receipt_path")" && pwd -P)/$(basename -- "$build_receipt_path")
+
+    receipt_kind=$(receipt_value kind) || die "build receipt is missing kind"
+    [ "$receipt_kind" = "local-source-copy-build-receipt" ] \
+        || die "build receipt kind is not a local source-copy build receipt: $receipt_kind"
+    receipt_provenance=$(receipt_value source_provenance) || die "build receipt is missing source_provenance"
+    [ "$receipt_provenance" = "verified-for-allowlisted-snapshot-by-local-cargo-build" ] \
+        || die "build receipt does not attest a verified local source-copy build: $receipt_provenance"
+
+    receipt_base_head=$(receipt_value base_head) || die "build receipt is missing base_head"
+    [ "$receipt_base_head" = "$base_head" ] \
+        || die "build receipt base_head ($receipt_base_head) does not match this checkout HEAD ($base_head)"
+    receipt_tracked_diff=$(receipt_value tracked_diff_from_base_sha256) \
+        || die "build receipt is missing tracked_diff_from_base_sha256"
+    [ "$receipt_tracked_diff" = "$tracked_diff_sha256" ] \
+        || die "build receipt tracked-diff digest does not match this checkout"
+    receipt_status_sha256=$(receipt_value worktree_status_sha256) \
+        || die "build receipt is missing worktree_status_sha256"
+    [ "$receipt_status_sha256" = "$status_sha256" ] \
+        || die "build receipt worktree-status digest does not match this checkout"
+
+    # Each copied bundle binary must be byte-identical to the binary the
+    # receipt attests was produced by the source-copy Cargo build.  This is the
+    # source-to-binary link: identical git state proves identical source, and
+    # matching sha256 proves the supplied binary is the receipt's build output.
+    tab_receipt=$(printf '\t')
+    while IFS="$tab_receipt" read -r receipt_bin_name receipt_bin_sha256 receipt_bin_type receipt_bin_input; do
+        expected=$(receipt_value "binary_${receipt_bin_name}_sha256") \
+            || die "build receipt is missing a digest for $receipt_bin_name"
+        [ "$expected" = "$receipt_bin_sha256" ] \
+            || die "supplied $receipt_bin_name sha256 ($receipt_bin_sha256) does not match the receipt digest ($expected); the binary was not produced by this source-parity build"
+    done < "$binary_records"
+
+    build_receipt_sha256=$(sha256_file "$build_receipt_path")
+    build_receipt_bundle_name=source-parity-receipt.txt
+    cp -p "$build_receipt_path" "$output_run/$build_receipt_bundle_name"
+    chmod 0444 "$output_run/$build_receipt_bundle_name"
+    provenance_verified=true
+fi
+
 # Build a bounded, deterministic list.  Do not use git archive/status output
 # as the source inventory: this checkout intentionally contains untracked
 # implementation files, while unrelated untracked files and credentials must
@@ -505,6 +587,9 @@ tab=$(printf '\t')
     if [ -n "$relay_path" ]; then
         printf '%s  %s\n' "$(sha256_file "$output_run/cli-help-tunnel-relay.txt")" cli-help-tunnel-relay.txt
     fi
+    if [ "$provenance_verified" = true ]; then
+        printf '%s  %s\n' "$build_receipt_sha256" "$build_receipt_bundle_name"
+    fi
 } | LC_ALL=C sort > "$checksum_file"
 chmod 0444 "$checksum_file"
 checksum_manifest_sha256=$(sha256_file "$checksum_file")
@@ -514,9 +599,17 @@ metadata_file=$output_run/artifact-metadata.txt
     printf '%s\n' 'schema_version=1'
     printf '%s\n' 'purpose=IN-10/OG-05 local macOS CLI artifact observation'
     printf '%s\n' 'scope=local-macos-observation-only'
-    printf '%s\n' 'claims=hashes-and-cli-smoke-only;source-provenance-unverified;not-release;not-other-os;not-source-parity;not-full-m7-row-closure'
-    printf '%s\n' 'binary_provenance=unverified;caller-supplied-binary-hashes-only;compiler-rebuild-not-performed'
-    printf '%s\n' 'build_receipt=none-consumed;source-to-binary-provenance-unverified'
+    if [ "$provenance_verified" = true ]; then
+        printf '%s\n' 'claims=hashes-and-cli-smoke-only;source-to-binary-provenance-verified-by-receipt;not-release;not-other-os;not-complete-repository-parity;not-full-m7-row-closure'
+        printf '%s\n' 'binary_provenance=verified;source-matched-to-parity-receipt;binary-sha256-equals-receipt'
+        printf 'build_receipt=%s;sha256=%s;source-to-binary-provenance-verified\n' \
+            "$build_receipt_bundle_name" "$build_receipt_sha256"
+        printf 'build_receipt_source_path=%s\n' "$build_receipt_path"
+    else
+        printf '%s\n' 'claims=hashes-and-cli-smoke-only;source-provenance-unverified;not-release;not-other-os;not-source-parity;not-full-m7-row-closure'
+        printf '%s\n' 'binary_provenance=unverified;caller-supplied-binary-hashes-only;compiler-rebuild-not-performed'
+        printf '%s\n' 'build_receipt=none-consumed;source-to-binary-provenance-unverified'
+    fi
     printf 'platform_os=%s\n' "$(uname -s)"
     printf 'platform_release=%s\n' "$platform_release"
     printf 'platform_arch=%s\n' "$(uname -m)"
@@ -619,8 +712,17 @@ echo "m7-local-artifact-verify: local macOS bundle prepared: $output_run"
 echo "m7-local-artifact-verify: source manifest: $output_run/source-manifest.tsv"
 echo "m7-local-artifact-verify: bundle client: $client_bundle"
 echo "m7-local-artifact-verify: source TUNNEL_CLIENT_BIN from: $env_file"
-echo "m7-local-artifact-verify: source provenance is unverified (no build receipt consumed)"
+if [ "$provenance_verified" = true ]; then
+    echo "m7-local-artifact-verify: source-to-binary provenance VERIFIED against receipt $build_receipt_bundle_name (sha256 $build_receipt_sha256)"
+    echo "m7-local-artifact-verify: every supplied binary sha256 matched the source-parity build receipt for HEAD $base_head"
+else
+    echo "m7-local-artifact-verify: source provenance is unverified (no build receipt consumed)"
+fi
 echo "m7-local-artifact-verify: codesign --verify preflight passed for copied bundle binaries"
 echo "m7-local-artifact-verify: codesign/CLI preflights are bounded at ${preflight_timeout_seconds}s; direct children are reaped after bounded TERM/KILL"
 echo "m7-local-artifact-verify: native local output such as /tmp is recommended for executable checks"
-echo "m7-local-artifact-verify: no release, other-OS, source-parity, or full-M7-row claim"
+if [ "$provenance_verified" = true ]; then
+    echo "m7-local-artifact-verify: local macOS arm64 source-matched scope only; no release, other-OS, or full-M7-row claim"
+else
+    echo "m7-local-artifact-verify: no release, other-OS, source-parity, or full-M7-row claim"
+fi
