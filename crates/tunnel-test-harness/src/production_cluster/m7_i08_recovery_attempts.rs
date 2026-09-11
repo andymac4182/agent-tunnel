@@ -517,29 +517,66 @@ pub fn validate_recovery_episode_evidence(evidence: &RecoveryEpisodeEvidence) ->
     }
     match mode {
         EpisodeMode::Exhaust => {
-            if evidence.outcome != "typed_terminal_failure"
-                || evidence.failure_code != Some("SESSION_CLOSED")
-                || evidence.failure_retryable != Some(true)
-                || !matches!(
+            // Itemize the terminal requirements so a mismatch names the exact
+            // field rather than collapsing into one opaque rejection.
+            let terminal = [
+                ("outcome", evidence.outcome == "typed_terminal_failure"),
+                // The owner ends the exhausted episode by closing the
+                // authenticated control socket with RECOVERY_CANDIDATE_FAILED,
+                // so the connector's terminal result is its typed retained
+                // recovery transport failure.  `parse_terminal_failure` has
+                // already required the closed diagnostic shape around this
+                // code, so accepting only TRANSPORT_ERROR stays exact.
+                (
+                    "failure_code",
+                    evidence.failure_code == Some("TRANSPORT_ERROR"),
+                ),
+                (
+                    "failure_retryable",
+                    evidence.failure_retryable == Some(true),
+                ),
+                (
+                    "failure_trigger",
+                    matches!(
+                        evidence.failure_trigger,
+                        Some("data_reader_closed" | "data_writer_closed" | "data_writer_failed")
+                    ),
+                ),
+                (
+                    "failure_generation",
+                    evidence.failure_generation == Some(evidence.fault_generation),
+                ),
+                (
+                    "failure_attempt",
+                    evidence.failure_attempt == Some(MAX_RECOVERY_ATTEMPTS),
+                ),
+                (
+                    "owner_terminal_reason",
+                    evidence.owner_terminal_reason.as_deref() == Some("RECOVERY_CANDIDATE_FAILED"),
+                ),
+                ("live_session_absent", evidence.live_session_absent),
+                ("catalog_owner_released", evidence.catalog_owner_released),
+                ("no_reset_reason", evidence.reset_reason.is_none()),
+                (
+                    "no_recovered_identity",
+                    evidence.recovered_generation.is_none()
+                        && evidence.recovered_connection_id.is_none()
+                        && evidence.recovered_route_index.is_none()
+                        && evidence.recovered_relay.is_none(),
+                ),
+                ("cli_exit_failed", evidence.cli_exit_success == Some(false)),
+            ];
+            if let Some((name, false)) = terminal.into_iter().find(|(_, value)| !value) {
+                return Err(HarnessError::Process(format!(
+                    "M7-I08 exhaustion did not end in the typed terminal failure after attempt 3: {name} (code={:?} retryable={:?} trigger={:?} generation={:?} attempt={:?} owner_reason={:?} exit_success={:?})",
+                    evidence.failure_code,
+                    evidence.failure_retryable,
                     evidence.failure_trigger,
-                    Some("data_reader_closed" | "data_writer_closed" | "data_writer_failed")
-                )
-                || evidence.failure_generation != Some(evidence.fault_generation)
-                || evidence.failure_attempt != Some(MAX_RECOVERY_ATTEMPTS)
-                || evidence.owner_terminal_reason.as_deref() != Some("RECOVERY_CANDIDATE_FAILED")
-                || !evidence.live_session_absent
-                || !evidence.catalog_owner_released
-                || evidence.reset_reason.is_some()
-                || evidence.recovered_generation.is_some()
-                || evidence.recovered_connection_id.is_some()
-                || evidence.recovered_route_index.is_some()
-                || evidence.recovered_relay.is_some()
-                || evidence.cli_exit_success != Some(false)
-            {
-                return Err(HarnessError::Process(
-                    "M7-I08 exhaustion did not end in the typed terminal failure after attempt 3"
-                        .into(),
-                ));
+                    evidence.failure_generation,
+                    evidence.failure_attempt,
+                    evidence.owner_terminal_reason,
+                    evidence.cli_exit_success,
+                )));
             }
             if evidence.post_fault_dispatch_delta != 0
                 || evidence.post_fault_dispatch_count != evidence.pre_fault_dispatch_count
@@ -693,6 +730,7 @@ fn parse_terminal_failure(
 /// status identity for a failed scenario.
 fn cli_context(process: &ManagedProcess) -> String {
     let stdout = process.stdout();
+    let mut first_error = None;
     let mut last_error = None;
     let mut last_status = None;
     for line in stdout.split(|byte| *byte == b'\n') {
@@ -704,7 +742,7 @@ fn cli_context(process: &ManagedProcess) -> String {
                 if value.get("ok").and_then(serde_json::Value::as_bool) == Some(false) =>
             {
                 let error = value.get("error");
-                last_error = Some(format!(
+                let described = format!(
                     "code={:?} message={:?}",
                     error
                         .and_then(|error| error.get("code"))
@@ -712,7 +750,13 @@ fn cli_context(process: &ManagedProcess) -> String {
                     error
                         .and_then(|error| error.get("message"))
                         .and_then(serde_json::Value::as_str),
-                ));
+                );
+                // The first failure is the root cause; later lines are often
+                // only the supervisor noticing that the actor already ended.
+                if first_error.is_none() {
+                    first_error = Some(described.clone());
+                }
+                last_error = Some(described);
             }
             Some("connect-status") => {
                 let result = value.get("result");
@@ -736,7 +780,8 @@ fn cli_context(process: &ManagedProcess) -> String {
         }
     }
     format!(
-        "cli_last_error=[{}] cli_last_status=[{}] cli_stderr_bytes={}",
+        "cli_first_error=[{}] cli_last_error=[{}] cli_last_status=[{}] cli_stderr_bytes={}",
+        first_error.unwrap_or_else(|| "none".to_owned()),
         last_error.unwrap_or_else(|| "none".to_owned()),
         last_status.unwrap_or_else(|| "none".to_owned()),
         process.stderr().len(),
@@ -821,8 +866,7 @@ async fn wait_for_attempt_status(
     loop {
         if let Some(status) = parse_statuses_from(process, stdout_offset)?
             .into_iter()
-            .filter(|status| status.recovery_attempt == Some(attempt))
-            .last()
+            .rfind(|status| status.recovery_attempt == Some(attempt))
             && status.recovery_successor_connection_id.is_some()
         {
             return Ok(status);
@@ -1150,10 +1194,15 @@ async fn run_episode(context: EpisodeContext<'_>) -> Result<RecoveryEpisodeEvide
 
         // Fail each armed attempt only after the owner attached it.
         let mut failed_attempts = Vec::new();
+        // Every attempt is observed while the original CLI process is still
+        // live, so a replacement process would be visible as a changed pid
+        // at the exact point the retry is running.
+        let mut attempt_pids_stable = true;
         for attempt in 1..=mode.failed_attempts() {
             let status =
                 wait_for_attempt_status(&mut process, fault_stdout_offset, attempt, outcome_deadline)
                     .await?;
+            attempt_pids_stable &= process.id() == process_pid;
             let candidate_connection_id = status
                 .recovery_successor_connection_id
                 .clone()
@@ -1440,7 +1489,13 @@ async fn run_episode(context: EpisodeContext<'_>) -> Result<RecoveryEpisodeEvide
         let cursors_never_rewound = cursor_samples
             .windows(2)
             .all(|window| window[1].never_rewound_from(&window[0]));
-        let cli_pid_stable = process.id() == process_pid;
+        // No whole-session retry: the authenticated CLI process is never
+        // replaced by a second one.  A reaped child reports no pid, which is
+        // the expected end state of the exhaustion episode, so absence is
+        // accepted here while a *different* pid is not.  Each attempt above
+        // additionally required the original live pid.
+        let cli_pid_stable =
+            attempt_pids_stable && process.id().is_none_or(|pid| Some(pid) == process_pid);
         Ok(RecoveryEpisodeEvidence {
             scope: mode.scope(),
             relay_count: 3,
@@ -1778,7 +1833,7 @@ mod tests {
             ],
             cursors_never_rewound: true,
             outcome: "typed_terminal_failure",
-            failure_code: Some("SESSION_CLOSED"),
+            failure_code: Some("TRANSPORT_ERROR"),
             failure_retryable: Some(true),
             failure_trigger: Some("data_reader_closed"),
             failure_generation: Some(1),
@@ -1912,13 +1967,22 @@ mod tests {
     fn rejects_untyped_or_wrong_terminal_failure() {
         let mut evidence = exhaustion();
         evidence.failure_attempt = Some(2);
-        rejects(evidence, "typed terminal failure after attempt 3");
+        rejects(evidence, "failure_attempt");
+        let mut evidence = exhaustion();
+        evidence.failure_code = Some("SESSION_CLOSED");
+        rejects(evidence, "failure_code");
+        let mut evidence = exhaustion();
+        evidence.failure_retryable = Some(false);
+        rejects(evidence, "failure_retryable");
+        let mut evidence = exhaustion();
+        evidence.cli_exit_success = Some(true);
+        rejects(evidence, "cli_exit_failed");
         let mut evidence = exhaustion();
         evidence.owner_terminal_reason = Some("ROTATION_DEADLINE_EXPIRED".into());
-        rejects(evidence, "typed terminal failure after attempt 3");
+        rejects(evidence, "owner_terminal_reason");
         let mut evidence = exhaustion();
         evidence.failure_trigger = None;
-        rejects(evidence, "typed terminal failure after attempt 3");
+        rejects(evidence, "failure_trigger");
     }
 
     #[test]

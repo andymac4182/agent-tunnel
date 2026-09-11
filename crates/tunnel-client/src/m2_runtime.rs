@@ -3295,19 +3295,26 @@ impl M2Actor {
             }
         }
         let previous_deadline = self.recovery.as_ref().map(|recovery| recovery.deadline_ms);
-        let exact_existing = self
-            .recovery
-            .as_ref()
-            .is_some_and(|recovery| recovery.begin == begin);
         let episode_deadline_ms = match previous_deadline {
             Some(deadline) => {
-                if now >= deadline
-                    || (!exact_existing && begin.remaining_ms > deadline.saturating_sub(now))
-                {
+                if now >= deadline {
                     return Err(ClientError::Protocol(
-                        "RECOVERY_BEGIN extends the existing recovery deadline".to_owned(),
+                        "RECOVERY_BEGIN arrived after the retained episode deadline".to_owned(),
                     ));
                 }
+                // The retained absolute episode deadline is authoritative and
+                // is returned unchanged, so a retry's remaining-duration
+                // sample can never extend this endpoint's budget; it is
+                // clamped here instead of failing the session.  The two
+                // endpoints keep independent monotonic clocks, and each
+                // attempt's RECOVERY_BEGIN is processed with its own latency
+                // -- attempt one is the slowest, because this actor is still
+                // releasing the lost carrier's reader/writer tasks while it
+                // arrives.  Comparing a later sample against the remaining
+                // budget therefore measures latency skew, not a coordinator
+                // trying to win more time.  `remaining_ms` is still required
+                // to be nonzero and within the protocol recovery bound above,
+                // and an already-expired episode still fails closed.
                 deadline
             }
             None => now
@@ -10733,6 +10740,139 @@ mod tests {
         actor.closed_for_recovery.insert(
             closed_candidate.to_owned(),
             ClosureEvidence::closed(closed_candidate),
+        );
+    }
+
+    /// EC-058: a retry's RECOVERY_BEGIN carries the coordinator's own
+    /// remaining-duration sample, taken on the coordinator's monotonic clock.
+    /// Attempt one is processed slowest here, because this actor is still
+    /// releasing the lost carrier's reader/writer tasks while it arrives, so a
+    /// later attempt's sample can legitimately exceed this endpoint's own
+    /// remaining budget by that latency difference.  The retained absolute
+    /// episode deadline must win by clamping rather than by failing the
+    /// session; an already-expired episode still fails closed.
+    #[tokio::test]
+    async fn recovery_retry_clamps_a_larger_remaining_sample_to_the_retained_deadline() {
+        let (mut actor, active_key, active_receiver, mut control_receiver) =
+            test_actor_with_carrier(M2_CARRIER_QUEUE_FRAMES);
+        drop(active_receiver);
+        let (active_tx, mut active_commands) = mpsc::channel(M2_CARRIER_QUEUE_FRAMES);
+        let reader_cancel = actor.active.reader_cancel.clone();
+        actor.active.tx = active_tx;
+        actor.active.reader = Some(tokio::spawn(async move {
+            reader_cancel.cancelled().await;
+        }));
+        actor.active.writer = Some(tokio::spawn(async move {
+            while let Some(command) = active_commands.recv().await {
+                if let CarrierCommand::Close(reply) = command {
+                    let _ = reply.send(());
+                    break;
+                }
+            }
+        }));
+        actor.remember_recovery_trigger(RecoveryTriggerClass::ReaderClosed, &active_key);
+
+        let roster = tunnel_protocol::rotation_control::StreamRoster::new("clamp-snapshot", vec![]);
+        let episode_id = "clamp-episode".to_owned();
+        let budget = actor.rotation.config().recovery_timeout_ms;
+        let first_attempt = RotationAttemptIdentity::new(
+            "session",
+            1,
+            "owner",
+            "clamp-one",
+            active_key.generation,
+            active_key.generation + 1,
+            active_key.connection_id.clone(),
+            "clamp-candidate-one",
+        );
+        actor
+            .handle_recovery_begin(RecoveryBegin {
+                message_id: "clamp-begin-one".to_owned(),
+                reply_to: String::new(),
+                attempt: first_attempt.clone(),
+                episode_id: episode_id.clone(),
+                attempt_no: 1,
+                roster: roster.clone(),
+                remaining_ms: budget,
+            })
+            .await
+            .expect("attempt one establishes the retained episode deadline");
+        let retained_deadline = actor
+            .recovery
+            .as_ref()
+            .expect("attempt one recovery context")
+            .deadline_ms;
+        let _ = drain_control_messages(&mut control_receiver);
+
+        let first_peer_closed = {
+            let recovery = actor.recovery.as_ref().expect("recovery context");
+            let mut closed = RecoveryClosed {
+                message_id: "clamp-closed-one".to_owned(),
+                reply_to: recovery.begin.message_id.clone(),
+                attempt: recovery.begin.attempt.clone(),
+                episode_id: recovery.begin.episode_id.clone(),
+                attempt_no: recovery.begin.attempt_no,
+                closed_connection_ids: recovery.local_closed.closed_connection_ids.clone(),
+                closure_digest: String::new(),
+            };
+            closed.closure_digest = closed
+                .closure_digest_for(RecoverySide::Relay)
+                .expect("relay closure digest");
+            closed
+        };
+        actor
+            .handle_recovery_closed(first_peer_closed)
+            .expect("owner closure proof authenticates the first pair");
+        let reserve_now = actor.now_ms();
+        actor
+            .rotation
+            .reserve_recovery_socket(reserve_now)
+            .expect("attempt one reserves the recovery socket");
+        actor
+            .finish_recovery_candidate_loss(
+                first_attempt,
+                ClosureEvidence::closed("clamp-candidate-one"),
+            )
+            .await
+            .expect("attempt one candidate loss records local closure");
+
+        // The coordinator's attempt-two sample is its full remaining budget,
+        // which exceeds this endpoint's remaining budget by the time attempt
+        // one spent being processed here.
+        let second_attempt = RotationAttemptIdentity::new(
+            "session",
+            1,
+            "owner",
+            "clamp-two",
+            active_key.generation,
+            active_key.generation + 2,
+            active_key.connection_id.clone(),
+            "clamp-candidate-two",
+        );
+        assert!(
+            budget > retained_deadline.saturating_sub(actor.now_ms()),
+            "the retry sample must exceed the retained remaining budget for this test to bite"
+        );
+        actor
+            .handle_recovery_begin(RecoveryBegin {
+                message_id: "clamp-begin-two".to_owned(),
+                reply_to: String::new(),
+                attempt: second_attempt,
+                episode_id,
+                attempt_no: 2,
+                roster,
+                remaining_ms: budget,
+            })
+            .await
+            .expect("a larger retry sample is clamped, not rejected");
+        assert_eq!(
+            actor
+                .recovery
+                .as_ref()
+                .expect("attempt two recovery context")
+                .deadline_ms,
+            retained_deadline,
+            "the retained absolute episode deadline is never extended"
         );
     }
 
