@@ -72,6 +72,7 @@ pub use recovery::{
 pub use runtime::{
     RelayCarrierSnapshot, RelayRotationSnapshot, RelaySessionSnapshot, RelaySnapshot,
     RelayStreamSnapshot, RotationDeadlineEvent, StreamTerminalCause, StreamTerminalEvent,
+    StreamTerminalReceiptEvent,
 };
 pub use wire::{MAX_BODY_BYTES, MAX_CONTROL_BYTES};
 

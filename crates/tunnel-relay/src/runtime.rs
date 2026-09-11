@@ -271,6 +271,51 @@ pub struct StreamTerminalEvent {
     pub cause: Option<StreamTerminalCause>,
 }
 
+/// A bounded, payload-free receipt for one actual connector `FIN`/`RESET`.
+///
+/// This is deliberately separate from [`StreamTerminalEvent`]: the latter
+/// records the first logical terminal transition and stays immutable for
+/// lifecycle and authorization diagnostics, so it may predate the connector's
+/// terminal frame (for example when the public side closed first). A late
+/// DATA/FIN receipt therefore needs its own record that proves the exact
+/// connector-to-relay final receive cursor, the terminal sequence and the
+/// physical carrier that accepted the frame. It survives STREAM_FORGET and
+/// session removal so an observer cannot read a fast reclamation as an absence
+/// of receipt.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct StreamTerminalReceiptEvent {
+    pub tenant_id: String,
+    pub device_id: String,
+    pub session_id: String,
+    pub epoch: u64,
+    /// Full owner fencing identity. These are bounded catalog IDs, not
+    /// credentials or payloads, and all are required for exact correlation.
+    pub deployment_incarnation: String,
+    pub node_id: String,
+    pub boot_id: String,
+    pub owner_id: String,
+    pub stream_id: u64,
+    pub operation_id: String,
+    /// The authenticated peer envelope request, when routed consumer ingress
+    /// supplied one. Local public streams leave this absent.
+    pub request_id: Option<String>,
+    /// The exact physical carrier that authenticated and processed the
+    /// terminal frame, captured from the `CarrierKey` rather than inferred
+    /// from mutable rotation state.
+    pub active_generation: u64,
+    pub active_connection_id: String,
+    pub recv_contiguous_connector_to_relay: u64,
+    pub delivered_contiguous_connector_to_relay: u64,
+    /// The connector-to-relay terminal sequence, which must equal the final
+    /// contiguous receive cursor for a complete, gap-free FIN/RESET.
+    pub receive_terminal_sequence: u64,
+    pub last_emitted_relay_to_connector: u64,
+    pub peer_acked_relay_to_connector: u64,
+    pub replay_bytes_relay_to_connector: usize,
+    pub queue_bytes: usize,
+    pub observed_at_ms: u64,
+}
+
 /// Keep terminal diagnostics stable and bounded even when a future caller
 /// passes a new internal close string.  Known protocol and lifecycle paths
 /// retain their exact allowlisted labels; everything else is deliberately
@@ -365,6 +410,10 @@ pub struct RelaySnapshot {
     pub session_terminal_events: Vec<SessionTerminalEvent>,
     /// Bounded per-stream terminal latches captured before STREAM_FORGET.
     pub stream_terminal_events: Vec<StreamTerminalEvent>,
+    /// Bounded receipts for an actual connector FIN/RESET. These are separate
+    /// from the immutable first-terminal latches above because a connector
+    /// terminal frame may arrive after the first logical terminal transition.
+    pub stream_terminal_receipt_events: Vec<StreamTerminalReceiptEvent>,
     pub sessions: Vec<RelaySessionSnapshot>,
 }
 

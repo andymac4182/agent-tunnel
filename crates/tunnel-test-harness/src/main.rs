@@ -477,7 +477,7 @@ async fn main() -> ExitCode {
                         &evidence,
                     )?;
                     println!(
-                        "M7 late DATA/FIN boundary passed: relays={} owner={} ingress={} tenant={} device={} session={} epoch={} generation={} connection={} stream={} operation={} service={} data_attempts={} data_accepted={} data_rejected={} fin_attempts={} fin_accepted={} fin_rejected={} owner_recv_before={} owner_recv_after={} owner_delivered_before={} owner_delivered_after={} owner_diagnostic_role={} owner_diagnostic_outcome={} owner_diagnostic_sequence={} consumer_terminal={} cleanup_joined={}",
+                        "M7 late DATA/FIN boundary passed: relays={} owner={} ingress={} tenant={} device={} session={} epoch={} generation={} connection={} stream={} operation={} service={} data_attempts={} data_accepted={} data_rejected={} fin_attempts={} fin_accepted={} fin_rejected={} owner_recv_before={} owner_recv_after={} owner_delivered_before={} owner_delivered_after={} owner_receive_terminal_sequence={} owner_receipt_request_id={} terminal_evidence_source={} terminal_stream_latched={} consumer_terminal={} cleanup_joined={}",
                         evidence.relay_count,
                         evidence.owner_relay,
                         evidence.ingress_relay,
@@ -500,9 +500,10 @@ async fn main() -> ExitCode {
                         evidence.owner_recv_contiguous_after,
                         evidence.owner_delivered_contiguous_before,
                         evidence.owner_delivered_contiguous_after,
-                        evidence.owner_diagnostic_role,
-                        evidence.owner_diagnostic_outcome,
-                        evidence.owner_diagnostic_sequence,
+                        evidence.owner_receive_terminal_sequence,
+                        evidence.owner_receipt_request_id,
+                        evidence.terminal_evidence_source,
+                        evidence.terminal_stream_latched,
                         evidence.consumer_terminal,
                         evidence.cleanup_joined,
                     );

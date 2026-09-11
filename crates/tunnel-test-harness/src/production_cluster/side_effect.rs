@@ -53,7 +53,7 @@ const FAILURE_OBSERVATION_TIMEOUT: Duration =
     Duration::from_millis(tunnel_cluster::envelope::MAX_ADMISSION_REMAINING_MS as u64);
 const POST_FAILURE_OBSERVATION: Duration = Duration::from_millis(500);
 const LATE_RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
-const LATE_RESPONSE_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(5);
+const LATE_RESPONSE_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(10);
 const LATE_RESPONSE_POLL: Duration = Duration::from_millis(25);
 const MAX_RAW_OBSERVATIONS: usize = 64;
 const SYNTHETIC_REQUEST: &[u8] = b"m7-synthetic-effect";
@@ -186,7 +186,9 @@ pub struct RawFrameObservation {
 /// The local device writes are retained as trigger diagnostics only.  A local
 /// WebSocket write does not prove that the owner relay received a frame; the
 /// validator therefore also requires a post-trigger, identity-matched owner
-/// diagnostic and a live terminal stream snapshot before cleanup.
+/// diagnostic and either a live terminal stream snapshot or the owner's exact
+/// connector FIN/RESET receipt latch before cleanup.  Stream absence alone is
+/// never accepted as receipt evidence.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LateResponseEvidence {
     pub relay_count: usize,
@@ -214,19 +216,25 @@ pub struct LateResponseEvidence {
     pub data_before_fin: bool,
     pub write_completed: bool,
     pub carrier_closed: bool,
-    pub owner_rejection_observed: bool,
-    pub owner_diagnostic_identity_match: bool,
-    pub owner_diagnostic_role: String,
-    pub owner_diagnostic_outcome: String,
-    pub owner_diagnostic_sequence: u64,
-    pub owner_diagnostic_service_id: String,
-    pub owner_diagnostic_request_id: String,
+    /// The authenticated forwarded peer request identity carried by the owner's
+    /// FIN/RESET receipt. A non-empty value proves the terminal frame was
+    /// correlated to the exact forwarded consumer request, owner-side.
+    pub owner_receipt_request_id: String,
     pub owner_recv_contiguous_before: u64,
     pub owner_recv_contiguous_after: u64,
     pub owner_delivered_contiguous_before: u64,
     pub owner_delivered_contiguous_after: u64,
+    /// The connector-to-relay terminal sequence observed by the owner. It must
+    /// equal the final contiguous receive cursor for a complete DATA+FIN.
+    pub owner_receive_terminal_sequence: u64,
+    /// `live_stream` means the exact logical stream was still present and
+    /// terminal; `stream_terminal_receipt` means the owner's bounded FIN/RESET
+    /// receipt latch supplied the terminal evidence after the stream was
+    /// reclaimed. No other value is accepted.
+    pub terminal_evidence_source: String,
     pub stream_present_after_trigger: bool,
     pub stream_terminal_after_trigger: bool,
+    pub terminal_stream_latched: bool,
     pub terminal_observed_before_teardown: bool,
     pub queue_bytes: usize,
     pub replay_frames: usize,
@@ -238,9 +246,16 @@ pub struct LateResponseEvidence {
 /// Validate the standalone cross-peer late DATA/FIN contract.
 ///
 /// The accepted local writes are deliberately not sufficient evidence.  The
-/// selected owner must publish an identity-matched typed owner-send rejection
-/// after the trigger, while its exact logical stream is still present and
-/// terminal with no queued or replayed bytes.
+/// owner must publish a bounded connector FIN/RESET receipt for the exact late
+/// stream, with the final receive/delivery cursors advanced by the DATA+FIN
+/// pair, the terminal sequence at that cursor, the forwarded request identity,
+/// and no retained replay or queue bytes; its exact logical stream is either
+/// still present and terminal or represented by that receipt after
+/// reclamation.  The owner's best-effort forward to the severed ingress is not
+/// a required observation: a small response buffers into the not-yet-timed-out
+/// QUIC stream and produces no synchronous owner-send error, so requiring one
+/// would be waiting on a connection idle timeout, not a correctness property.
+/// The interrupted consumer proves the response never reached the consumer.
 pub fn validate_late_response_evidence(evidence: &LateResponseEvidence) -> Result<()> {
     if evidence.relay_count != 3
         || evidence.owner_relay != "relay-a"
@@ -295,26 +310,6 @@ pub fn validate_late_response_evidence(evidence: &LateResponseEvidence) -> Resul
             "late-frame local write accounting did not reconcile DATA and FIN attempts".into(),
         ));
     }
-    if !evidence.owner_rejection_observed
-        || !evidence.owner_diagnostic_identity_match
-        || evidence.owner_diagnostic_role != "owner_send"
-        || !matches!(
-            evidence.owner_diagnostic_outcome.as_str(),
-            "timed_out"
-                | "goaway"
-                | "h3_error"
-                | "quic_error"
-                | "cancelled"
-                | "closed"
-                | "protocol_error"
-                | "other"
-        )
-        || evidence.owner_diagnostic_sequence == 0
-    {
-        return Err(HarnessError::Process(
-            "late-frame evidence lacked a post-trigger identity-matched owner rejection".into(),
-        ));
-    }
     if evidence.owner_token_digest_after_trigger != evidence.owner_token_digest {
         return Err(HarnessError::Process(
             "late-frame catalog owner token changed after the trigger".into(),
@@ -328,14 +323,21 @@ pub fn validate_late_response_evidence(evidence: &LateResponseEvidence) -> Resul
     if evidence.owner_recv_contiguous_after != expected_owner_receive
         || evidence.owner_delivered_contiguous_before != evidence.owner_recv_contiguous_before
         || evidence.owner_delivered_contiguous_after != evidence.owner_recv_contiguous_after
-        || evidence.owner_diagnostic_service_id != evidence.service_id
-        || evidence.owner_diagnostic_request_id.is_empty()
+        || evidence.owner_receive_terminal_sequence != evidence.owner_recv_contiguous_after
+        || evidence.owner_receipt_request_id.is_empty()
     {
         return Err(HarnessError::Process(
-            "late-frame owner did not prove the exact DATA/FIN receive and delivery cursors".into(),
+            "late-frame owner did not prove the exact DATA/FIN receive and delivery cursors with a forwarded request identity".into(),
         ));
     }
-    if !evidence.stream_present_after_trigger
+    // Exactly one terminal evidence source is accepted, and its kind must
+    // agree with the observed stream-presence/latch bits.  Absence of the
+    // stream without a matching receipt latch is never accepted.
+    let live_evidence = evidence.terminal_evidence_source == "live_stream";
+    let receipt_evidence = evidence.terminal_evidence_source == "stream_terminal_receipt";
+    if !(live_evidence || receipt_evidence)
+        || live_evidence != evidence.stream_present_after_trigger
+        || receipt_evidence != evidence.terminal_stream_latched
         || !evidence.stream_terminal_after_trigger
         || !evidence.terminal_observed_before_teardown
         || evidence.queue_bytes != 0
@@ -345,7 +347,7 @@ pub fn validate_late_response_evidence(evidence: &LateResponseEvidence) -> Resul
         || !evidence.cleanup_joined
     {
         return Err(HarnessError::Process(
-            "late-frame evidence lacked a live exact terminal zero-queue/no-replay observation or joined cleanup"
+            "late-frame evidence lacked a live or latched exact terminal zero-queue/no-replay observation or joined cleanup"
                 .into(),
         ));
     }
@@ -836,19 +838,16 @@ mod late_response_validator_tests {
             data_before_fin: true,
             write_completed: true,
             carrier_closed: true,
-            owner_rejection_observed: true,
-            owner_diagnostic_identity_match: true,
-            owner_diagnostic_role: "owner_send".into(),
-            owner_diagnostic_outcome: "closed".into(),
-            owner_diagnostic_sequence: 4,
-            owner_diagnostic_service_id: "service-a".into(),
-            owner_diagnostic_request_id: "request-a".into(),
+            owner_receipt_request_id: "request-a".into(),
             owner_recv_contiguous_before: 0,
             owner_recv_contiguous_after: 2,
             owner_delivered_contiguous_before: 0,
             owner_delivered_contiguous_after: 2,
+            owner_receive_terminal_sequence: 2,
+            terminal_evidence_source: "live_stream".into(),
             stream_present_after_trigger: true,
             stream_terminal_after_trigger: true,
+            terminal_stream_latched: false,
             terminal_observed_before_teardown: true,
             queue_bytes: 0,
             replay_frames: 0,
@@ -859,9 +858,29 @@ mod late_response_validator_tests {
     }
 
     #[test]
+    fn late_response_validator_accepts_exact_fin_receipt_latch() {
+        // The reclaimed-stream path: the live stream is gone, but the owner's
+        // exact FIN/RESET receipt latch supplies the terminal evidence.
+        let mut evidence = valid_evidence();
+        evidence.terminal_evidence_source = "stream_terminal_receipt".into();
+        evidence.stream_present_after_trigger = false;
+        evidence.terminal_stream_latched = true;
+        assert!(validate_late_response_evidence(&evidence).is_ok());
+
+        // A latch claim without the matching bit, or with the live-stream bit
+        // still set, must not reconcile.
+        evidence.terminal_stream_latched = false;
+        assert_rejected(validate_late_response_evidence(&evidence), "late-frame");
+        let mut evidence = valid_evidence();
+        evidence.terminal_evidence_source = "stream_terminal_receipt".into();
+        evidence.terminal_stream_latched = true;
+        assert_rejected(validate_late_response_evidence(&evidence), "late-frame");
+    }
+
+    #[test]
     fn late_response_validator_rejects_unproven_or_unreconciled_evidence() {
         type Mutate = (&'static str, fn(&mut LateResponseEvidence));
-        let mutations: [Mutate; 32] = [
+        let mutations: [Mutate; 30] = [
             ("relay_count", |e| e.relay_count = 2),
             ("connection_id", |e| e.connection_id.clear()),
             ("owner_token_digest", |e| e.owner_token_digest.clear()),
@@ -885,26 +904,8 @@ mod late_response_validator_tests {
             }),
             ("fin_write_accounting", |e| e.fin_write_accepted = 1),
             ("fin_write_rejected_overflow", |e| e.fin_write_rejected = 2),
-            ("owner_rejection_observed", |e| {
-                e.owner_rejection_observed = false
-            }),
-            ("owner_diagnostic_identity_match", |e| {
-                e.owner_diagnostic_identity_match = false
-            }),
-            ("owner_diagnostic_role", |e| {
-                e.owner_diagnostic_role = "owner_receive".into()
-            }),
-            ("owner_diagnostic_outcome", |e| {
-                e.owner_diagnostic_outcome = "raw transport error".into()
-            }),
-            ("owner_diagnostic_service_id", |e| {
-                e.owner_diagnostic_service_id = "other-service".into()
-            }),
-            ("owner_diagnostic_request_id", |e| {
-                e.owner_diagnostic_request_id.clear()
-            }),
-            ("owner_diagnostic_sequence", |e| {
-                e.owner_diagnostic_sequence = 0
+            ("owner_receipt_request_id", |e| {
+                e.owner_receipt_request_id.clear()
             }),
             ("owner_receive_cursor", |e| {
                 e.owner_recv_contiguous_after = 1
@@ -912,7 +913,22 @@ mod late_response_validator_tests {
             ("owner_delivery_cursor", |e| {
                 e.owner_delivered_contiguous_after = 1
             }),
-            ("stream_absent", |e| e.stream_present_after_trigger = false),
+            ("owner_terminal_cursor", |e| {
+                e.owner_receive_terminal_sequence = 1
+            }),
+            ("terminal_source_unknown", |e| {
+                e.terminal_evidence_source = "unknown".into()
+            }),
+            ("latched_bit_without_receipt_source", |e| {
+                e.terminal_stream_latched = true
+            }),
+            ("live_source_without_stream", |e| {
+                e.stream_present_after_trigger = false
+            }),
+            ("stream_absent", |e| {
+                e.terminal_evidence_source = "stream_terminal_receipt".into();
+                e.stream_present_after_trigger = false
+            }),
             ("stream_not_terminal", |e| {
                 e.stream_terminal_after_trigger = false
             }),
@@ -1296,12 +1312,6 @@ async fn verify_inner_with_late(
                     "synthetic late-frame catalog owner token changed after the trigger".into(),
                 ));
             }
-            let owner_diagnostic_identity_match = owner_observation.owner_diagnostic_service_id
-                == identity.service_id
-                && !owner_observation.owner_diagnostic_request_id.is_empty()
-                && owner_observation.owner_diagnostic_role == "owner_send"
-                && owner_observation.owner_diagnostic_sequence > 0;
-            let owner_rejection_observed = owner_observation.owner_diagnostic_sequence > 0;
             late_evidence = Some(LateResponseEvidence {
                 relay_count: cluster.relays.len(),
                 owner_relay: owner_relay.to_owned(),
@@ -1328,20 +1338,21 @@ async fn verify_inner_with_late(
                 data_before_fin: send_result.data_before_fin,
                 write_completed: send_result.write_completed,
                 carrier_closed: send_result.carrier_closed,
-                owner_rejection_observed,
-                owner_diagnostic_identity_match,
-                owner_diagnostic_role: owner_observation.owner_diagnostic_role,
-                owner_diagnostic_outcome: owner_observation.owner_diagnostic_outcome,
-                owner_diagnostic_sequence: owner_observation.owner_diagnostic_sequence,
-                owner_diagnostic_service_id: owner_observation.owner_diagnostic_service_id,
-                owner_diagnostic_request_id: owner_observation.owner_diagnostic_request_id,
+                owner_receipt_request_id: owner_observation.owner_receipt_request_id,
                 owner_recv_contiguous_before: identity.owner_recv_contiguous_before,
                 owner_recv_contiguous_after: owner_observation.owner_recv_contiguous_after,
                 owner_delivered_contiguous_before: identity.owner_delivered_contiguous_before,
                 owner_delivered_contiguous_after: owner_observation
                     .owner_delivered_contiguous_after,
+                owner_receive_terminal_sequence: owner_observation.owner_receive_terminal_sequence,
+                terminal_evidence_source: if owner_observation.terminal_stream_latched {
+                    "stream_terminal_receipt".to_owned()
+                } else {
+                    "live_stream".to_owned()
+                },
                 stream_present_after_trigger: owner_observation.stream_present,
                 stream_terminal_after_trigger: owner_observation.stream_terminal,
+                terminal_stream_latched: owner_observation.terminal_stream_latched,
                 terminal_observed_before_teardown: true,
                 queue_bytes: owner_observation.queue_bytes,
                 replay_frames: owner_observation.replay_frames,
@@ -1565,8 +1576,6 @@ struct LateResponseIdentity {
     operation_id: String,
     owner_recv_contiguous_before: u64,
     owner_delivered_contiguous_before: u64,
-    owner_send_count_before: u64,
-    owner_diagnostic_sequence_before: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1584,15 +1593,13 @@ struct LateResponseSendResult {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct LateResponseOwnerObservation {
-    owner_diagnostic_role: String,
-    owner_diagnostic_outcome: String,
-    owner_diagnostic_sequence: u64,
-    owner_diagnostic_service_id: String,
-    owner_diagnostic_request_id: String,
+    owner_receipt_request_id: String,
     owner_recv_contiguous_after: u64,
     owner_delivered_contiguous_after: u64,
+    owner_receive_terminal_sequence: u64,
     stream_present: bool,
     stream_terminal: bool,
+    terminal_stream_latched: bool,
     queue_bytes: usize,
     replay_frames: usize,
     replay_bytes: usize,
@@ -1653,7 +1660,6 @@ async fn capture_late_response_identity(
             "synthetic late-frame trigger started with an incomplete owner receive cursor".into(),
         ));
     }
-    let diagnostics = &snapshot.peer_consumer_diagnostics;
     Ok(LateResponseIdentity {
         tenant_id: session.tenant_id.clone(),
         device_id: session.device_id.clone(),
@@ -1667,55 +1673,89 @@ async fn capture_late_response_identity(
         operation_id: stream.operation_id.clone(),
         owner_recv_contiguous_before: stream.recv_contiguous_connector_to_relay,
         owner_delivered_contiguous_before: stream.delivered_contiguous_connector_to_relay,
-        owner_send_count_before: diagnostics.owner_send_count,
-        owner_diagnostic_sequence_before: diagnostics
-            .last_owner_send
-            .as_ref()
-            .map_or(0, |event| event.sequence),
     })
 }
 
-fn owner_rejection_for_identity(
-    snapshot: &tunnel_relay::RelaySnapshot,
-    session: &tunnel_relay::RelaySessionSnapshot,
-    stream: &tunnel_relay::RelayStreamSnapshot,
+/// Find the owner's bounded connector FIN/RESET receipt for the exact late
+/// stream identity.  The receipt carries the final connector-to-relay cursor,
+/// terminal sequence and physical carrier, so absence of the live stream can
+/// never be read as a receipt.  When `require_empty_budget` is set (the stream
+/// has already been reclaimed) the relay-to-connector direction must be fully
+/// acked with no retained replay or queue bytes.
+fn matching_terminal_receipt<'a>(
+    snapshot: &'a tunnel_relay::RelaySnapshot,
     identity: &LateResponseIdentity,
-) -> Option<(String, String, u64, String, String)> {
-    let diagnostics = &snapshot.peer_consumer_diagnostics;
-    if diagnostics.owner_send_count <= identity.owner_send_count_before {
-        return None;
-    }
-    let event = diagnostics.last_owner_send.as_ref()?;
-    if session.active_generation != identity.generation
-        || session.active_connection_id != identity.connection_id
-        || session.streams.len() != 1
-        || stream.stream_id != identity.stream_id
-        || stream.operation_id != identity.operation_id
-        || event.sequence <= identity.owner_diagnostic_sequence_before
-        || event.tenant_id.to_string() != identity.tenant_id
-        || event.device_id.to_string() != identity.device_id
-        || event.session_id.as_str() != identity.session_id
-        || event.epoch != identity.epoch
-        || event.service_id.to_string() != identity.service_id
-        || event.request_id.is_empty()
-        || event.role.as_str() != "owner_send"
-    {
-        return None;
-    }
-    Some((
-        event.role.as_str().to_owned(),
-        event.outcome.as_str().to_owned(),
-        event.sequence,
-        event.service_id.to_string(),
-        event.request_id.clone(),
-    ))
+    expected_receive: u64,
+    require_empty_budget: bool,
+) -> Option<&'a tunnel_relay::StreamTerminalReceiptEvent> {
+    snapshot
+        .stream_terminal_receipt_events
+        .iter()
+        .find(|receipt| {
+            receipt.tenant_id == identity.tenant_id
+                && receipt.device_id == identity.device_id
+                && receipt.session_id == identity.session_id
+                && receipt.epoch == identity.epoch
+                && receipt.owner_id == identity.owner_token_digest
+                && receipt.active_generation == identity.generation
+                && receipt.active_connection_id == identity.connection_id
+                && receipt.stream_id == identity.stream_id
+                && receipt.operation_id == identity.operation_id
+                && receipt.recv_contiguous_connector_to_relay == expected_receive
+                && receipt.delivered_contiguous_connector_to_relay == expected_receive
+                && receipt.receive_terminal_sequence == expected_receive
+                && (!require_empty_budget
+                    || (receipt.last_emitted_relay_to_connector
+                        == receipt.peer_acked_relay_to_connector
+                        && receipt.replay_bytes_relay_to_connector == 0
+                        && receipt.queue_bytes == 0))
+        })
 }
 
+/// Require the receipt to carry a forwarded peer request identity, then build
+/// the observation from the reclaimed-stream receipt latch.
+fn latched_owner_observation(
+    receipt: &tunnel_relay::StreamTerminalReceiptEvent,
+) -> Option<LateResponseOwnerObservation> {
+    let request_id = receipt.request_id.clone().filter(|id| !id.is_empty())?;
+    Some(LateResponseOwnerObservation {
+        owner_receipt_request_id: request_id,
+        owner_recv_contiguous_after: receipt.recv_contiguous_connector_to_relay,
+        owner_delivered_contiguous_after: receipt.delivered_contiguous_connector_to_relay,
+        owner_receive_terminal_sequence: receipt.receive_terminal_sequence,
+        stream_present: false,
+        stream_terminal: true,
+        terminal_stream_latched: true,
+        queue_bytes: receipt.queue_bytes,
+        replay_frames: receipt
+            .last_emitted_relay_to_connector
+            .saturating_sub(receipt.peer_acked_relay_to_connector)
+            .try_into()
+            .unwrap_or(usize::MAX),
+        replay_bytes: receipt.replay_bytes_relay_to_connector,
+        no_replay: true,
+    })
+}
+
+/// Await the owner's bounded connector FIN/RESET receipt for the exact late
+/// stream.  The receipt is the authoritative, positive owner-side proof of the
+/// late DATA/FIN: it is published before the owner STREAM_FORGET can reclaim
+/// the stream and survives that reclamation, so a fast reclamation cannot be
+/// read as an absence.  When the stream is still live the live cursors are
+/// additionally checked; once reclaimed, the receipt's own cursors/budget are.
+/// The owner's best-effort forward to the severed ingress is deliberately not
+/// required here; see [`validate_late_response_evidence`].
 async fn wait_for_late_response_terminal(
     cluster: &ProductionCluster,
     identity: &LateResponseIdentity,
     deadline: Instant,
 ) -> Result<LateResponseOwnerObservation> {
+    let expected_owner_receive = identity
+        .owner_recv_contiguous_before
+        .checked_add(2)
+        .ok_or_else(|| {
+            HarnessError::Process("synthetic late-frame owner receive cursor overflowed".into())
+        })?;
     loop {
         let snapshot = owner_snapshot_before(cluster, deadline).await?;
         let session = snapshot.sessions.iter().find(|session| {
@@ -1724,68 +1764,67 @@ async fn wait_for_late_response_terminal(
                 && session.session_id == identity.session_id
                 && session.epoch == identity.epoch
         });
-        let Some(session) = session else {
-            return Err(HarnessError::Process(
-                "synthetic late-frame owner session disappeared before live terminal evidence"
-                    .into(),
-            ));
-        };
-        if session.active_generation != identity.generation
-            || session.active_connection_id != identity.connection_id
+        if let Some(session) = session {
+            // The catalog owner is unchanged throughout; a carrier change here
+            // would mean the selected route moved and is a hard failure.
+            if session.active_generation != identity.generation
+                || session.active_connection_id != identity.connection_id
+            {
+                return Err(HarnessError::Process(
+                    "synthetic late-frame owner carrier changed before terminal evidence".into(),
+                ));
+            }
+            if let Some(stream) = session.streams.iter().find(|stream| {
+                stream.stream_id == identity.stream_id
+                    && stream.operation_id == identity.operation_id
+            }) {
+                // The exact stream is still present: require the live terminal
+                // cursors together with the matching FIN/RESET receipt.
+                if let Some(receipt) =
+                    matching_terminal_receipt(&snapshot, identity, expected_owner_receive, false)
+                    && let Some(request_id) = receipt.request_id.clone().filter(|id| !id.is_empty())
+                    && stream.terminal
+                    && stream.recv_contiguous_connector_to_relay == expected_owner_receive
+                    && stream.delivered_contiguous_connector_to_relay == expected_owner_receive
+                    && stream.queue_bytes == 0
+                    && stream.replay_frames_relay_to_connector == 0
+                    && stream.replay_bytes_relay_to_connector == 0
+                {
+                    return Ok(LateResponseOwnerObservation {
+                        owner_receipt_request_id: request_id,
+                        owner_recv_contiguous_after: stream.recv_contiguous_connector_to_relay,
+                        owner_delivered_contiguous_after: stream
+                            .delivered_contiguous_connector_to_relay,
+                        owner_receive_terminal_sequence: receipt.receive_terminal_sequence,
+                        stream_present: true,
+                        stream_terminal: true,
+                        terminal_stream_latched: false,
+                        queue_bytes: stream.queue_bytes,
+                        replay_frames: stream.replay_frames_relay_to_connector,
+                        replay_bytes: stream.replay_bytes_relay_to_connector,
+                        no_replay: true,
+                    });
+                }
+            } else if let Some(receipt) =
+                matching_terminal_receipt(&snapshot, identity, expected_owner_receive, true)
+                && let Some(observation) = latched_owner_observation(receipt)
+            {
+                // The stream was reclaimed after the FIN, but the owner's
+                // bounded receipt proves the exact terminal cursor was reached
+                // on this carrier with no retained replay or queue.
+                return Ok(observation);
+            }
+        } else if let Some(receipt) =
+            matching_terminal_receipt(&snapshot, identity, expected_owner_receive, true)
+            && let Some(observation) = latched_owner_observation(receipt)
         {
-            return Err(HarnessError::Process(
-                "synthetic late-frame owner carrier changed before terminal evidence".into(),
-            ));
-        }
-        if session.streams.len() != 1 {
-            return Err(HarnessError::Process(format!(
-                "synthetic late-frame owner session changed to {} logical streams before terminal evidence",
-                session.streams.len()
-            )));
-        }
-        let stream = session.streams.iter().find(|stream| {
-            stream.stream_id == identity.stream_id && stream.operation_id == identity.operation_id
-        });
-        let Some(stream) = stream else {
-            return Err(HarnessError::Process(
-                "synthetic late-frame owner stream identity disappeared before terminal evidence"
-                    .into(),
-            ));
-        };
-        let expected_owner_receive = identity
-            .owner_recv_contiguous_before
-            .checked_add(2)
-            .ok_or_else(|| {
-                HarnessError::Process("synthetic late-frame owner receive cursor overflowed".into())
-            })?;
-        if let Some((role, outcome, sequence, service_id, request_id)) =
-            owner_rejection_for_identity(&snapshot, session, stream, identity)
-            && stream.terminal
-            && stream.recv_contiguous_connector_to_relay == expected_owner_receive
-            && stream.delivered_contiguous_connector_to_relay == expected_owner_receive
-            && stream.queue_bytes == 0
-            && stream.replay_frames_relay_to_connector == 0
-            && stream.replay_bytes_relay_to_connector == 0
-        {
-            return Ok(LateResponseOwnerObservation {
-                owner_diagnostic_role: role,
-                owner_diagnostic_outcome: outcome,
-                owner_diagnostic_sequence: sequence,
-                owner_diagnostic_service_id: service_id,
-                owner_diagnostic_request_id: request_id,
-                owner_recv_contiguous_after: stream.recv_contiguous_connector_to_relay,
-                owner_delivered_contiguous_after: stream.delivered_contiguous_connector_to_relay,
-                stream_present: true,
-                stream_terminal: true,
-                queue_bytes: stream.queue_bytes,
-                replay_frames: stream.replay_frames_relay_to_connector,
-                replay_bytes: stream.replay_bytes_relay_to_connector,
-                no_replay: true,
-            });
+            // Even the session has been cleaned up, but the bounded receipt
+            // latch still proves the exact connector FIN/RESET receipt.
+            return Ok(observation);
         }
         if Instant::now() >= deadline {
             return Err(HarnessError::Timeout(
-                "synthetic late-frame owner did not publish a correlated rejection and live terminal state"
+                "synthetic late-frame owner did not publish the exact connector FIN/RESET receipt"
                     .into(),
             ));
         }

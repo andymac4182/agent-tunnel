@@ -62,7 +62,7 @@ use crate::{
     runtime::{
         self, CarrierContext, RelayRotationSnapshot, RelaySessionSnapshot, RelaySnapshot,
         RelayStreamSnapshot, RotationDeadlineEvent, RuntimeProfile, SessionTerminalEvent,
-        StreamTerminalCause, StreamTerminalEvent,
+        StreamTerminalCause, StreamTerminalEvent, StreamTerminalReceiptEvent,
     },
     wire::{self, WireError},
 };
@@ -79,6 +79,7 @@ const TERMINAL_CLEANUP_QUEUE_CAPACITY: usize = 64;
 const MAX_ROTATION_DEADLINE_EVENTS: usize = 8;
 const MAX_SESSION_TERMINAL_EVENTS: usize = 16;
 const MAX_STREAM_TERMINAL_EVENTS: usize = 32;
+const MAX_STREAM_TERMINAL_RECEIPT_EVENTS: usize = 32;
 const OWNER_FORGET_FAILURE_TIMEOUT: Duration = Duration::from_secs(5);
 // Terminal stream state is retained until the connector proves its final
 // cursors with STREAM_FORGET.  A failed/closed writer cannot deliver that
@@ -1539,6 +1540,7 @@ impl RelayHandle {
             rotation_deadline_events: VecDeque::new(),
             session_terminal_events: VecDeque::new(),
             stream_terminal_events: VecDeque::new(),
+            stream_terminal_receipt_events: VecDeque::new(),
             consumer_chunk_reads,
             consumer_write_diagnostics: handle.consumer_write_diagnostics.clone(),
             peer_transport_diagnostics: handle.peer_transport_diagnostics.clone(),
@@ -2101,6 +2103,12 @@ struct RelayActor {
     /// can prove the transition without treating generic session shutdown as
     /// stream expiry.
     stream_terminal_events: VecDeque<StreamTerminalEvent>,
+    /// Bounded receipts for the actual connector FIN/RESET cursor. These are
+    /// separate from the immutable first-terminal latches above because a
+    /// connector terminal frame may arrive after the logical stream's first
+    /// terminal transition, and a fast STREAM_FORGET could otherwise remove
+    /// the only live evidence of that receipt.
+    stream_terminal_receipt_events: VecDeque<StreamTerminalReceiptEvent>,
     consumer_chunk_reads: Arc<AtomicU64>,
     consumer_write_diagnostics: ConsumerWriteDiagnostics,
     peer_transport_diagnostics: PeerTransportDiagnostics,
@@ -6923,6 +6931,69 @@ impl RelayActor {
         }
     }
 
+    /// Build a bounded, payload-free receipt for a connector FIN/RESET that
+    /// was just accepted on `carrier`.  Unlike the first-terminal latch this
+    /// may be captured on a later frame, so it records the final connector
+    /// receive cursor, terminal sequence and the exact physical carrier that
+    /// authenticated the frame.  It returns `None` unless the stream still
+    /// matches the operation and the connector direction carries a terminal
+    /// sequence, so an absence of receipt can never be synthesized.
+    fn stream_terminal_receipt_event(
+        &self,
+        key: &SessionKey,
+        carrier: &CarrierKey,
+        stream_id: u64,
+        operation_id: &str,
+    ) -> Option<StreamTerminalReceiptEvent> {
+        let session = self.session_for(key)?;
+        let stream = session.streams.get(&stream_id)?;
+        if stream.operation_id != operation_id {
+            return None;
+        }
+        // Only the authenticated active or candidate carrier reaches stream
+        // state in `inbound_data`; record the physical carrier that processed
+        // the frame rather than inferring it from mutable rotation state.
+        let carrier_is_active = session
+            .active_carrier
+            .as_ref()
+            .is_some_and(|active| active.context == carrier.context());
+        let carrier_is_candidate = session
+            .rotation
+            .as_ref()
+            .and_then(|rotation| rotation.candidate.as_ref())
+            .is_some_and(|candidate| candidate.context == carrier.context());
+        if !carrier_is_active && !carrier_is_candidate {
+            return None;
+        }
+        let snapshot = stream.sequence.snapshot();
+        let relay = snapshot.direction(Direction::RelayToConnector);
+        let connector = snapshot.direction(Direction::ConnectorToRelay);
+        let receive_terminal_sequence = connector.receive_terminal_sequence?;
+        Some(StreamTerminalReceiptEvent {
+            tenant_id: session.identity.tenant_id.to_string(),
+            device_id: key.device_id.to_string(),
+            session_id: key.session_id.clone(),
+            epoch: key.epoch,
+            deployment_incarnation: session.owner.deployment_incarnation.clone(),
+            node_id: session.owner.node_id.clone(),
+            boot_id: session.owner.boot_id.clone(),
+            owner_id: runtime::owner_id(&session.owner),
+            stream_id,
+            operation_id: stream.operation_id.clone(),
+            request_id: stream.request_id.clone(),
+            active_generation: carrier.generation,
+            active_connection_id: carrier.connection_id.clone(),
+            recv_contiguous_connector_to_relay: connector.recv_contiguous,
+            delivered_contiguous_connector_to_relay: connector.delivered_contiguous,
+            receive_terminal_sequence,
+            last_emitted_relay_to_connector: relay.last_emitted,
+            peer_acked_relay_to_connector: relay.peer_acked,
+            replay_bytes_relay_to_connector: relay.replay_bytes,
+            queue_bytes: stream.budget_bytes,
+            observed_at_ms: monotonic_millis(),
+        })
+    }
+
     fn stream_terminal_event(
         &self,
         key: &SessionKey,
@@ -6986,6 +7057,13 @@ impl RelayActor {
 
     fn retain_stream_terminal_event(&mut self, event: StreamTerminalEvent) {
         retain_bounded_stream_terminal_event(&mut self.stream_terminal_events, event);
+    }
+
+    fn retain_stream_terminal_receipt_event(&mut self, event: StreamTerminalReceiptEvent) {
+        retain_bounded_stream_terminal_receipt_event(
+            &mut self.stream_terminal_receipt_events,
+            event,
+        );
     }
 
     /// Advance the attempt deadline independently of the writer barrier.  A
@@ -9488,6 +9566,7 @@ impl RelayActor {
         let mut replayed_inbound = false;
         let mut peer_terminal: Option<Terminal> = None;
         let mut stream_terminal_transitioned = false;
+        let mut stream_terminal_receipt_observed = false;
         'data: {
             let Some(session) = self.session_mut(&key) else {
                 return;
@@ -9561,9 +9640,13 @@ impl RelayActor {
                     && let Some(recovery) = rotation.recovery.as_mut()
                 {
                     recovery.deferred_bytes = recovery.deferred_bytes.saturating_add(input_bytes);
+                    // Clone the carrier identity so the owned value stays
+                    // available for the post-'data terminal receipt capture;
+                    // this deferral path returns immediately below, so the
+                    // clone is only paid on recovery-deferred frames.
                     recovery
                         .deferred_frames
-                        .push_back((carrier, frame, input_bytes));
+                        .push_back((carrier.clone(), frame, input_bytes));
                 }
                 if !deferred_rejected {
                     return;
@@ -9676,11 +9759,16 @@ impl RelayActor {
                             .response_bytes
                             .extend_from_slice(&ready_frame.payload);
                     }
-                    if matches!(ready_frame.kind, FrameKind::Fin | FrameKind::Reset)
-                        && !stream.terminal
-                    {
-                        stream_terminal_transitioned = true;
-                        stream.terminal = true;
+                    if matches!(ready_frame.kind, FrameKind::Fin | FrameKind::Reset) {
+                        // The connector's terminal frame may arrive after the
+                        // first logical terminal transition (for example when
+                        // the public side closed first). Record a receipt for
+                        // the actual FIN/RESET independently of that latch.
+                        stream_terminal_receipt_observed = true;
+                        if !stream.terminal {
+                            stream_terminal_transitioned = true;
+                            stream.terminal = true;
+                        }
                     }
                 }
                 if let Some(through) = delivered_through
@@ -9840,6 +9928,25 @@ impl RelayActor {
             )
         {
             self.retain_stream_terminal_event(event);
+        }
+        // Capture an independent receipt for the actual connector FIN/RESET.
+        // The first-terminal latch above is intentionally immutable and may
+        // predate this frame, so a late DATA/FIN receipt needs its own record
+        // with the final receive cursor before STREAM_FORGET can reclaim the
+        // stream on the following ACK.
+        if stream_terminal_receipt_observed
+            && let Some(operation_id) = self
+                .session_for(&key)
+                .and_then(|session| session.streams.get(&received_stream_id))
+                .map(|stream| stream.operation_id.clone())
+            && let Some(event) = self.stream_terminal_receipt_event(
+                &key,
+                &carrier,
+                received_stream_id,
+                &operation_id,
+            )
+        {
+            self.retain_stream_terminal_receipt_event(event);
         }
         if deferred_rejected {
             self.protocol_failure(&key, "RECOVERY_QUEUE_LIMIT").await;
@@ -10845,6 +10952,11 @@ impl RelayActor {
             rotation_deadline_events: self.rotation_deadline_events.iter().cloned().collect(),
             session_terminal_events: self.session_terminal_events.iter().cloned().collect(),
             stream_terminal_events: self.stream_terminal_events.iter().cloned().collect(),
+            stream_terminal_receipt_events: self
+                .stream_terminal_receipt_events
+                .iter()
+                .cloned()
+                .collect(),
             sessions,
         }
     }
@@ -11059,6 +11171,38 @@ fn retain_bounded_stream_terminal_event(
         return;
     }
     if events.len() >= MAX_STREAM_TERMINAL_EVENTS {
+        events.pop_front();
+    }
+    events.push_back(event);
+}
+
+fn retain_bounded_stream_terminal_receipt_event(
+    events: &mut VecDeque<StreamTerminalReceiptEvent>,
+    event: StreamTerminalReceiptEvent,
+) {
+    // A connector terminal frame is idempotent on the retained stream. Dedup
+    // on the complete owner/carrier/stream/request identity so a repeated late
+    // FIN/RESET cannot grow the bounded ring, while a genuinely distinct
+    // carrier or request still records its own receipt.
+    let duplicate = events.iter().any(|existing| {
+        existing.tenant_id == event.tenant_id
+            && existing.device_id == event.device_id
+            && existing.session_id == event.session_id
+            && existing.epoch == event.epoch
+            && existing.deployment_incarnation == event.deployment_incarnation
+            && existing.node_id == event.node_id
+            && existing.boot_id == event.boot_id
+            && existing.owner_id == event.owner_id
+            && existing.stream_id == event.stream_id
+            && existing.operation_id == event.operation_id
+            && existing.request_id == event.request_id
+            && existing.active_generation == event.active_generation
+            && existing.active_connection_id == event.active_connection_id
+    });
+    if duplicate {
+        return;
+    }
+    if events.len() >= MAX_STREAM_TERMINAL_RECEIPT_EVENTS {
         events.pop_front();
     }
     events.push_back(event);
@@ -12219,6 +12363,7 @@ mod stream_identity_tests {
             rotation_deadline_events: VecDeque::new(),
             session_terminal_events: VecDeque::new(),
             stream_terminal_events: VecDeque::new(),
+            stream_terminal_receipt_events: VecDeque::new(),
             consumer_chunk_reads: Arc::new(AtomicU64::new(0)),
             consumer_write_diagnostics: super::ConsumerWriteDiagnostics::default(),
             peer_transport_diagnostics: super::PeerTransportDiagnostics::default(),
@@ -12884,6 +13029,288 @@ mod stream_identity_tests {
         assert_eq!(event.active_generation, 3);
         assert_eq!(event.reason, "STREAM_CLOSED");
         assert!(event.cause.is_none());
+
+        // The first-terminal latch above was captured by the relay-initiated
+        // close, which predates the connector FIN.  The separate receipt must
+        // prove the actual connector FIN was accepted with the final receive
+        // cursor and exact forwarded identity, and it must survive the later
+        // STREAM_FORGET/removal just like the first-terminal latch.
+        let receipt = snapshot
+            .stream_terminal_receipt_events
+            .iter()
+            .find(|receipt| receipt.stream_id == registration.stream_id)
+            .expect("connector FIN receipt survives STREAM_FORGET");
+        assert_eq!(receipt.tenant_id, tenant_id.to_string());
+        assert_eq!(receipt.device_id, device_id.to_string());
+        assert_eq!(receipt.session_id, key.session_id);
+        assert_eq!(receipt.epoch, key.epoch);
+        assert_eq!(
+            receipt.deployment_incarnation,
+            expected_owner.deployment_incarnation
+        );
+        assert_eq!(receipt.node_id, expected_owner.node_id);
+        assert_eq!(receipt.boot_id, expected_owner.boot_id);
+        assert_eq!(receipt.owner_id, super::runtime::owner_id(&expected_owner));
+        assert_eq!(receipt.operation_id, registration.operation_id);
+        assert_eq!(receipt.request_id.as_deref(), Some("forwarded-request-601"));
+        assert_eq!(receipt.active_generation, 3);
+        assert_eq!(receipt.active_connection_id, "terminal-latch-carrier");
+        assert_eq!(receipt.recv_contiguous_connector_to_relay, 1);
+        assert_eq!(receipt.delivered_contiguous_connector_to_relay, 1);
+        assert_eq!(receipt.receive_terminal_sequence, 1);
+        assert_eq!(receipt.replay_bytes_relay_to_connector, 0);
+        assert_eq!(receipt.queue_bytes, 0);
+    }
+
+    /// The connector FIN receipt must be observable while the exact terminal
+    /// stream is still present, before the owner STREAM_FORGET reclaims it on
+    /// the following ACK, and must then persist across that reclamation with
+    /// the same exact identity and a gap-free, replay-free terminal cursor.
+    #[tokio::test]
+    async fn stream_terminal_receipt_observable_before_reclamation() {
+        let wait = std::time::Duration::from_secs(1);
+        let now = Utc::now();
+        let tenant_id = Uuid::from_u128(621);
+        let device_id = Uuid::from_u128(622);
+        let principal_id = Uuid::from_u128(623);
+        let service_id = Uuid::from_u128(624);
+        let identity = DeviceIdentity {
+            tenant_id,
+            device_id,
+            owner_user_id: principal_id,
+            credential_id: Uuid::from_u128(625),
+            spki_fingerprint: "receipt-order-spki".to_owned(),
+            credential_not_before: now - Duration::minutes(1),
+            expires_at: now + Duration::minutes(1),
+            credential_revoked_at: None,
+            device_active: true,
+            credential_active: true,
+            device_version: 1,
+            owner_epoch: 1,
+            last_seen_at: Some(now),
+        };
+        let key = SessionKey {
+            tenant_id,
+            device_id,
+            session_id: "receipt-order".to_owned(),
+            epoch: 9,
+        };
+        let (mut actor, mut control) = admitted_control_actor(identity, key.clone());
+        let (data_tx, mut data_rx) = mpsc::channel(actor.options.limits.max_queue_messages);
+        let carrier = CarrierKey {
+            session: key.clone(),
+            generation: 4,
+            connection_id: "receipt-order-carrier".to_owned(),
+        };
+        if let Some(session) = actor.sessions.get_mut(&key.scope()) {
+            session.profile = super::RuntimeProfile::M2;
+            session.generation = carrier.generation;
+            session.connection_id = carrier.connection_id.clone();
+            session.data_tx = Some(data_tx.clone());
+            session.active_carrier = Some(DataCarrier {
+                context: carrier.context(),
+                tx: data_tx,
+            });
+        }
+        let consumer = AuthenticatedConsumer {
+            tenant_id,
+            principal_id,
+        };
+        let grant = GrantSnapshot {
+            tenant_id,
+            principal_id,
+            device_id,
+            service_id,
+            revision: 9,
+            permissions: PermissionSet {
+                operations: BTreeSet::from(["echo:invoke".to_owned()]),
+            },
+            constraints: serde_json::json!({}),
+            valid_until: now + Duration::minutes(1),
+            read_started_at: now,
+        };
+        let (open_tx, open_rx) = oneshot::channel();
+        actor.open_echo_stream_with_request_id(
+            consumer,
+            device_id,
+            service_id,
+            grant,
+            now + Duration::minutes(1),
+            Some("forwarded-request-621".to_owned()),
+            open_tx,
+        );
+        let registration = tokio::time::timeout(wait, open_rx)
+            .await
+            .expect("echo registration response timed out")
+            .expect("echo registration response")
+            .expect("echo stream admitted");
+        registration.claim_admission();
+        let Some(ControlOutbound::Text(mut open)) = tokio::time::timeout(wait, control.rx.recv())
+            .await
+            .expect("echo OPEN wait timed out")
+        else {
+            panic!("echo OPEN was not queued");
+        };
+        open.release();
+        let open_message_id = actor
+            .sessions
+            .get(&key.scope())
+            .and_then(|session| session.streams.get(&registration.stream_id))
+            .map(|stream| stream.open_message_id.clone())
+            .expect("OPEN correlation");
+        tokio::time::timeout(
+            wait,
+            actor.inbound_control(
+                key.clone(),
+                ControlMessage::Opened(tunnel_protocol::Opened::new(
+                    "receipt-order-opened",
+                    open_message_id,
+                    key.session_id.clone(),
+                    key.epoch,
+                    registration.stream_id,
+                    registration.operation_id.clone(),
+                    crate::wire::M2_INITIAL_WINDOW_BYTES as u64,
+                    crate::wire::M2_INITIAL_WINDOW_BYTES as u64,
+                )),
+            ),
+        )
+        .await
+        .expect("OPENED handling timed out");
+
+        let expected_owner = actor
+            .sessions
+            .get(&key.scope())
+            .expect("owner session remains after OPENED")
+            .owner
+            .clone();
+
+        // The connector half-closes first with a FIN that acks nothing, so
+        // the relay replies with its own FIN that stays unacknowledged. The
+        // stream therefore remains live and terminal, not yet reclaimable.
+        tokio::time::timeout(
+            wait,
+            actor.inbound_m2_stream_data(
+                carrier.clone(),
+                Frame::fin(key.epoch, carrier.generation, registration.stream_id, 1, 0),
+                false,
+            ),
+        )
+        .await
+        .expect("connector FIN handling timed out");
+        // Drain the relay's ACK and its own FIN reply from the data writer.
+        for _ in 0..2 {
+            let Some(DataOutbound::Binary(mut frame)) = tokio::time::timeout(wait, data_rx.recv())
+                .await
+                .expect("relay terminal writer frame timed out")
+            else {
+                panic!("relay terminal writer frame was not queued");
+            };
+            frame.release();
+        }
+
+        // The exact terminal stream is still present, so a mismatched carrier
+        // must not be able to forge a receipt for it.
+        let mismatched_carrier = CarrierKey {
+            session: key.clone(),
+            generation: 99,
+            connection_id: "unrelated-carrier".to_owned(),
+        };
+        assert!(
+            actor
+                .stream_terminal_receipt_event(
+                    &key,
+                    &mismatched_carrier,
+                    registration.stream_id,
+                    &registration.operation_id,
+                )
+                .is_none()
+        );
+
+        let before = actor.snapshot();
+        let live_stream = before
+            .sessions
+            .iter()
+            .flat_map(|session| session.streams.iter())
+            .find(|stream| stream.stream_id == registration.stream_id)
+            .expect("terminal stream is still present before reclamation");
+        assert!(live_stream.terminal);
+        assert_eq!(live_stream.recv_contiguous_connector_to_relay, 1);
+        assert_eq!(live_stream.delivered_contiguous_connector_to_relay, 1);
+        let receipt_before = before
+            .stream_terminal_receipt_events
+            .iter()
+            .find(|receipt| receipt.stream_id == registration.stream_id)
+            .expect("connector FIN receipt observable before reclamation");
+        assert_eq!(receipt_before.tenant_id, tenant_id.to_string());
+        assert_eq!(receipt_before.device_id, device_id.to_string());
+        assert_eq!(receipt_before.session_id, key.session_id);
+        assert_eq!(receipt_before.epoch, key.epoch);
+        assert_eq!(
+            receipt_before.owner_id,
+            super::runtime::owner_id(&expected_owner)
+        );
+        assert_eq!(receipt_before.operation_id, registration.operation_id);
+        assert_eq!(
+            receipt_before.request_id.as_deref(),
+            Some("forwarded-request-621")
+        );
+        assert_eq!(receipt_before.active_generation, carrier.generation);
+        assert_eq!(receipt_before.active_connection_id, carrier.connection_id);
+        assert_eq!(receipt_before.recv_contiguous_connector_to_relay, 1);
+        assert_eq!(receipt_before.delivered_contiguous_connector_to_relay, 1);
+        assert_eq!(receipt_before.receive_terminal_sequence, 1);
+        // The receipt is captured before the relay queues its own FIN, so the
+        // relay-to-connector direction is fully acked with no replay backlog.
+        assert_eq!(receipt_before.last_emitted_relay_to_connector, 0);
+        assert_eq!(receipt_before.peer_acked_relay_to_connector, 0);
+        assert_eq!(receipt_before.replay_bytes_relay_to_connector, 0);
+        assert_eq!(receipt_before.queue_bytes, 0);
+        let receipt_snapshot = receipt_before.clone();
+
+        // The connector now acks the relay FIN, which makes both directions
+        // terminal and fully acked: the owner queues STREAM_FORGET and removes
+        // the live stream.
+        tokio::time::timeout(
+            wait,
+            actor.inbound_m2_stream_data(
+                carrier.clone(),
+                Frame::ack(key.epoch, carrier.generation, registration.stream_id, 1),
+                false,
+            ),
+        )
+        .await
+        .expect("connector ACK handling timed out");
+        let Some(ControlOutbound::Text(mut forget)) = tokio::time::timeout(wait, control.rx.recv())
+            .await
+            .expect("owner STREAM_FORGET wait timed out")
+        else {
+            panic!("owner STREAM_FORGET was not queued");
+        };
+        let forget_message =
+            super::wire::parse_control(forget.as_bytes()).expect("owner STREAM_FORGET decodes");
+        forget.release();
+        assert!(matches!(
+            forget_message,
+            ControlMessage::StreamForget(ref value)
+                if value.stream_id == registration.stream_id
+                    && value.operation_id == registration.operation_id
+        ));
+
+        let after = actor.snapshot();
+        assert!(
+            after
+                .sessions
+                .iter()
+                .flat_map(|session| session.streams.iter())
+                .all(|stream| stream.stream_id != registration.stream_id),
+            "terminal stream must be reclaimed after the acked FIN"
+        );
+        let receipt_after = after
+            .stream_terminal_receipt_events
+            .iter()
+            .find(|receipt| receipt.stream_id == registration.stream_id)
+            .expect("connector FIN receipt persists across reclamation");
+        assert_eq!(*receipt_after, receipt_snapshot);
     }
 
     #[tokio::test]
