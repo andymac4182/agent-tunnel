@@ -326,6 +326,7 @@ pub(crate) fn terminal_close_reason(reason: &str) -> &'static str {
         "ATTACHMENT_TICKET_EXPIRED",
         "ROTATION_PREPARE_INVALID",
         "ROTATION_PREPARE_QUEUE",
+        "CONNECTION_HISTORY_EXHAUSTED",
         "RECOVERY_READY_CONFLICT",
         "RECOVERY_READY_FAILED",
         "RECOVERY_STATE_LOST",

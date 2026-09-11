@@ -155,28 +155,37 @@ struct Claims {
 }
 
 fn oidc_fixture() -> (Arc<OidcVerifier>, String) {
+    let (verifier, token, _signer) = oidc_fixture_with_signer();
+    (verifier, token)
+}
+
+/// Build the verifier and a 60-second consumer token, and keep the signing
+/// key so a test can mint a second token with a deliberately short lifetime
+/// without re-seeding the verifier.
+fn oidc_fixture_with_signer() -> (Arc<OidcVerifier>, String, EncodingKey) {
     let key = KeyPair::generate_for(&rcgen::PKCS_ED25519).expect("OIDC signing key");
     let approved = tunnel_catalog::ApprovedJwk::from_ed25519_der("cleanup", key.public_key_raw())
         .expect("OIDC verification key");
     let config =
         OidcConfig::new(ISSUER, [AUDIENCE.to_owned()], vec![approved]).expect("OIDC config");
     let verifier = Arc::new(OidcVerifier::new(config).expect("OIDC verifier"));
+    let signer = EncodingKey::from_ed_der(key.serialized_der());
+    let token = mint_consumer_token(&signer, 60);
+    (verifier, token, signer)
+}
+
+/// Mint a consumer bearer token that expires `lifetime_secs` from now.
+fn mint_consumer_token(signer: &EncodingKey, lifetime_secs: i64) -> String {
     let mut header = Header::new(Algorithm::EdDSA);
     header.kid = Some("cleanup".to_owned());
     let claims = Claims {
         iss: ISSUER.to_owned(),
         sub: SUBJECT.to_owned(),
         aud: AUDIENCE.to_owned(),
-        exp: (Utc::now().timestamp() + 60) as usize,
+        exp: (Utc::now().timestamp() + lifetime_secs) as usize,
         scope: crate::ECHO_OPERATION.to_owned(),
     };
-    let token = encode(
-        &header,
-        &claims,
-        &EncodingKey::from_ed_der(key.serialized_der()),
-    )
-    .expect("OIDC token");
-    (verifier, token)
+    encode(&header, &claims, signer).expect("OIDC token")
 }
 
 fn catalog_fixture(now: chrono::DateTime<Utc>) -> CatalogFixture {

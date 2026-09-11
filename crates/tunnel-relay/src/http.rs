@@ -1307,9 +1307,27 @@ async fn handle_consumer_stream(
                     }
                     let record: Vec<u8> = input.drain(..total).collect();
                     let body = record[4..].to_vec();
-                    let result = handle
-                        .write_echo_stream(key.clone(), stream_id, operation_id.clone(), body)
-                        .await;
+                    // The write stays inside the same closure/deadline scope
+                    // as the read loop: a parked record cannot hold this
+                    // stream past its absolute authorization deadline or past
+                    // the owner closing it.
+                    let result = match write_until_closed_or_expired(
+                        handle.write_echo_stream(
+                            key.clone(),
+                            stream_id,
+                            operation_id.clone(),
+                            body,
+                        ),
+                        &registration.closed,
+                        &mut expires,
+                    )
+                    .await
+                    {
+                        BoundedStreamWrite::Completed(result) => result,
+                        BoundedStreamWrite::StreamClosed | BoundedStreamWrite::Expired => {
+                            break 'connection;
+                        }
+                    };
                     let Ok(response) = result else {
                         break 'connection;
                     };
@@ -2637,6 +2655,13 @@ async fn handle_peer_consumer_stream(
     let mut input = Vec::new();
     let mut registration_closed = false;
     let mut terminal_cause = None;
+    // The owner bounds this stream by the consumer's absolute authorization
+    // deadline itself; the forwarding relay's own timer is not relied upon.
+    let expires_in = (consumer_expires_at - Utc::now())
+        .to_std()
+        .unwrap_or_default();
+    let expires = tokio::time::sleep(expires_in);
+    tokio::pin!(expires);
     let result: Result<(), PeerRuntimeError> = async {
         if let Err(error) = send.respond(StatusCode::OK).await {
             if matches!(error, PeerRuntimeError::MembershipExpired) {
@@ -2663,6 +2688,11 @@ async fn handle_peer_consumer_stream(
                 }
                 _ = registration.closed.cancelled() => {
                     registration_closed = true;
+                    break;
+                }
+                _ = &mut expires => {
+                    // Authorization expiry ends the idle owner-side stream on
+                    // the same graceful path as owner-initiated closure.
                     break;
                 }
                 inbound = recv.recv_message() => {
@@ -2725,19 +2755,44 @@ async fn handle_peer_consumer_stream(
                                 }
                                 return Err(PeerRuntimeError::Closed);
                             }
-                            response = handle.write_echo_stream(
-                                key.clone(),
-                                stream_id,
-                                operation_id.clone(),
-                                body,
-                            ) => match response {
-                                Ok(response) => response,
-                                Err(error) => {
+                            waited = write_until_closed_or_expired(
+                                handle.write_echo_stream(
+                                    key.clone(),
+                                    stream_id,
+                                    operation_id.clone(),
+                                    body,
+                                ),
+                                &registration.closed,
+                                &mut expires,
+                            ) => match waited {
+                                BoundedStreamWrite::Completed(Ok(response)) => response,
+                                BoundedStreamWrite::Completed(Err(error)) => {
                                     tracing::debug!(
                                         error = ?error,
                                         body_len,
                                         phase = "consumer_actor_response",
                                         "consumer actor response failed"
+                                    );
+                                    return Err(PeerRuntimeError::Closed);
+                                }
+                                BoundedStreamWrite::StreamClosed => {
+                                    // The owner closed the stream while this
+                                    // record was outstanding.  Its outcome is
+                                    // unknown, exactly like a failed actor
+                                    // reply, so the same typed error applies.
+                                    registration_closed = true;
+                                    tracing::debug!(
+                                        body_len,
+                                        phase = "consumer_actor_stream_closed",
+                                        "owner closed the stream while a record was outstanding"
+                                    );
+                                    return Err(PeerRuntimeError::Closed);
+                                }
+                                BoundedStreamWrite::Expired => {
+                                    tracing::debug!(
+                                        body_len,
+                                        phase = "consumer_actor_write_expired",
+                                        "consumer authorization expired while a record was outstanding"
                                     );
                                     return Err(PeerRuntimeError::Closed);
                                 }
@@ -2997,6 +3052,37 @@ async fn send_socket_outcome_until(
         deadline,
     )
     .await
+}
+
+/// Outcome of awaiting one actor stream write while the stream's closure
+/// token and the consumer's absolute authorization deadline stay observable.
+enum BoundedStreamWrite<T> {
+    Completed(T),
+    StreamClosed,
+    Expired,
+}
+
+/// Await one actor stream write without losing sight of the stream.  The
+/// actor fails waiters when it closes a stream, but a record parked behind a
+/// pending device authorization is otherwise bounded by nothing the handler
+/// observes.  Closure and the absolute deadline are checked first, matching
+/// the handlers' read loops, so a ready or late response cannot outlive the
+/// consumer's authorization.  An abandoned write has an unknown outcome; the
+/// caller classifies it exactly as a failed actor reply.
+async fn write_until_closed_or_expired<F>(
+    write: F,
+    closed: &tokio_util::sync::CancellationToken,
+    expires: &mut std::pin::Pin<&mut tokio::time::Sleep>,
+) -> BoundedStreamWrite<F::Output>
+where
+    F: std::future::Future,
+{
+    tokio::select! {
+        biased;
+        _ = closed.cancelled() => BoundedStreamWrite::StreamClosed,
+        _ = expires.as_mut() => BoundedStreamWrite::Expired,
+        result = write => BoundedStreamWrite::Completed(result),
+    }
 }
 
 fn peer_transport_diagnostic_outcome(error: &PeerRuntimeError) -> PeerTransportDiagnosticOutcome {
@@ -3464,6 +3550,97 @@ mod tests {
             h3_code,
             Some(crate::peer_consumer_transport_diagnostics::PeerConsumerDiagnosticH3Code::FrameUnexpected)
         );
+    }
+
+    type EchoWrite = Result<Vec<u8>, crate::actor::EchoOutcome>;
+
+    // The relay's tokio build has no paused test clock, so these bounds use
+    // short real timers with generous upper margins, like the response-write
+    // deadline tests in `consumer_write_diagnostics`.
+
+    #[tokio::test]
+    async fn outstanding_stream_write_observes_stream_closure() {
+        let closed = tokio_util::sync::CancellationToken::new();
+        let expires = tokio::time::sleep(std::time::Duration::from_secs(60));
+        tokio::pin!(expires);
+        let waiter = super::write_until_closed_or_expired(
+            std::future::pending::<EchoWrite>(),
+            &closed,
+            &mut expires,
+        );
+        let closer = async {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            closed.cancel();
+        };
+        let (outcome, ()) = tokio::join!(waiter, closer);
+        assert!(matches!(outcome, super::BoundedStreamWrite::StreamClosed));
+    }
+
+    #[tokio::test]
+    async fn outstanding_stream_write_is_bounded_by_the_absolute_deadline() {
+        let closed = tokio_util::sync::CancellationToken::new();
+        let expires = tokio::time::sleep(std::time::Duration::from_millis(50));
+        tokio::pin!(expires);
+        let started = tokio::time::Instant::now();
+        let outcome = super::write_until_closed_or_expired(
+            std::future::pending::<EchoWrite>(),
+            &closed,
+            &mut expires,
+        )
+        .await;
+        assert!(matches!(outcome, super::BoundedStreamWrite::Expired));
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= std::time::Duration::from_millis(50)
+                && elapsed < std::time::Duration::from_secs(5),
+            "the wait must end at the stream's absolute deadline, observed {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_stream_write_is_returned_while_the_stream_is_live() {
+        let closed = tokio_util::sync::CancellationToken::new();
+        let expires = tokio::time::sleep(std::time::Duration::from_secs(60));
+        tokio::pin!(expires);
+        let outcome = super::write_until_closed_or_expired(
+            async { Ok::<Vec<u8>, crate::actor::EchoOutcome>(vec![0, 0, 0, 1, 7]) },
+            &closed,
+            &mut expires,
+        )
+        .await;
+        assert!(matches!(
+            outcome,
+            super::BoundedStreamWrite::Completed(Ok(bytes)) if bytes == vec![0, 0, 0, 1, 7]
+        ));
+    }
+
+    #[tokio::test]
+    async fn closure_and_expiry_take_precedence_over_a_ready_write() {
+        let closed = tokio_util::sync::CancellationToken::new();
+        closed.cancel();
+        let expires = tokio::time::sleep(std::time::Duration::from_secs(60));
+        tokio::pin!(expires);
+        let outcome = super::write_until_closed_or_expired(
+            std::future::ready(Ok::<Vec<u8>, crate::actor::EchoOutcome>(Vec::new())),
+            &closed,
+            &mut expires,
+        )
+        .await;
+        assert!(matches!(outcome, super::BoundedStreamWrite::StreamClosed));
+
+        // A deadline that has already fired stays observable: the handlers
+        // poll the same pinned timer again after their read loop saw it.
+        let live = tokio_util::sync::CancellationToken::new();
+        let expired = tokio::time::sleep(std::time::Duration::ZERO);
+        tokio::pin!(expired);
+        expired.as_mut().await;
+        let outcome = super::write_until_closed_or_expired(
+            std::future::ready(Ok::<Vec<u8>, crate::actor::EchoOutcome>(Vec::new())),
+            &live,
+            &mut expired,
+        )
+        .await;
+        assert!(matches!(outcome, super::BoundedStreamWrite::Expired));
     }
 
     #[tokio::test]

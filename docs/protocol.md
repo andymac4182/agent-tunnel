@@ -349,6 +349,8 @@ it is not a shortcut around the scheduled drain gate.
 
 Rotation limits socket lifetime; it is not a substitute for authorization expiry or application credential rotation. Revoking a user grant, connector credential or capability takes effect independently of the five-minute timer.
 
+A session retains every physical connection identifier it has claimed, including aborted and recovery candidates, in a bounded immutable history of 256 entries; identifiers are never evicted or reused because delayed closure evidence references them. The claim that would exceed that bound, whether for a scheduled candidate or a recovery attempt, is an explicit resource-exhausted outcome: the owner closes the session with the typed reason `CONNECTION_HISTORY_EXHAUSTED`, surfaces the used-history counter and terminal reason in its payload-free diagnostics, and the connector establishes a fresh session rather than continuing on a carrier that can no longer rotate.
+
 ## Delivery guarantees and side effects
 
 Transport sequence tracking provides ordered, duplicate-suppressed delivery within a retained live session. It cannot provide exactly-once execution across process crashes or ambiguous application failures.

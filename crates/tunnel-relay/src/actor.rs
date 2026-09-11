@@ -88,6 +88,10 @@ const OWNER_FORGET_FAILURE_TIMEOUT: Duration = Duration::from_secs(5);
 // below, making this an explicit total-entry bound of at most 2 * N.
 const RETAINED_ECHO_STREAM_FACTOR: usize = 2;
 const AUTHORITY_UNAVAILABLE: &str = "AUTHORITY_UNAVAILABLE";
+/// Typed session close reason when the pure rotation machine has claimed its
+/// bounded connection-ID history.  Identifiers are never reused within a
+/// session, so the connector must establish a fresh session/epoch.
+const CONNECTION_HISTORY_EXHAUSTED: &str = "CONNECTION_HISTORY_EXHAUSTED";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MaintenanceAuthorityOperation {
@@ -1241,6 +1245,11 @@ enum RotationStart {
     Started(String),
     Pending,
     Rejected,
+    /// The pure machine consumed an attempt that can never be published to
+    /// the connector, or closed itself.  The caller must end the session with
+    /// this typed reason; leaving the machine as is would strand an
+    /// attempt-less `Preparing` state or a never-rotating `Active` carrier.
+    Failed(&'static str),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4895,7 +4904,18 @@ impl RelayActor {
             return self.start_catalog_rotation(key, reply_to, reason, request);
         }
         self.start_rotation_local(key, reply_to, reason)
-            .map_or(RotationStart::Rejected, RotationStart::Started)
+    }
+
+    /// Map a refused pure-machine PREPARE to the start outcome.  History
+    /// exhaustion has already closed the machine, so it is a typed session
+    /// termination; every other refusal leaves the machine `Active`.
+    fn rotation_prepare_failure(error: tunnel_protocol::rotation::RotationError) -> RotationStart {
+        match error {
+            tunnel_protocol::rotation::RotationError::ConnectionHistoryExhausted { .. } => {
+                RotationStart::Failed(CONNECTION_HISTORY_EXHAUSTED)
+            }
+            _ => RotationStart::Rejected,
+        }
     }
 
     fn start_catalog_rotation(
@@ -4941,13 +4961,15 @@ impl RelayActor {
                 session.connection_id.clone(),
                 wire::random_token(),
             );
-            if rotation.state.prepare(attempt.clone(), now_ms).is_err() {
-                return RotationStart::Rejected;
+            if let Err(error) = rotation.state.prepare(attempt.clone(), now_ms) {
+                return Self::rotation_prepare_failure(error);
             }
             let journal_deadline = rotation.state.status().deadline_ms.unwrap_or(now_ms);
             let Ok(journal) = ControlJournal::new(128, journal_bytes, now_ms, journal_deadline)
             else {
-                return RotationStart::Rejected;
+                // The pure machine has already consumed this attempt; an
+                // unjournaled attempt cannot be left `Preparing`.
+                return RotationStart::Failed("ROTATION_PREPARE_INVALID");
             };
             rotation.journal = journal;
             rotation.attempt_deadline_ms = Some(journal_deadline);
@@ -5046,7 +5068,7 @@ impl RelayActor {
         key: &SessionKey,
         reply_to: Option<String>,
         reason: &str,
-    ) -> Option<String> {
+    ) -> RotationStart {
         let now_ms = monotonic_millis();
         let journal_bytes = self.options.limits.max_queue_bytes.min(4 * 1024 * 1024);
         let (
@@ -5060,21 +5082,28 @@ impl RelayActor {
             control_tx,
             budget,
         ) = {
-            let session = self.session_mut(key)?;
+            let Some(session) = self.session_mut(key) else {
+                return RotationStart::Rejected;
+            };
             if !session.profile.supports_rotation()
                 || session.data_tx.is_none()
                 || session.rotation.as_ref().is_some_and(|rotation| {
                     !matches!(rotation.state.phase(), RotationPhase::Active)
                 })
             {
-                return None;
+                return RotationStart::Rejected;
             }
-            let rotation = session.rotation.as_mut()?;
+            let Some(rotation) = session.rotation.as_mut() else {
+                return RotationStart::Rejected;
+            };
             if !Self::rotation_tombstone_capacity_available(rotation, now_ms) {
-                return None;
+                return RotationStart::Rejected;
             }
             let overlap_ms = rotation.state.config().overlap_timeout_ms;
-            let new_generation = rotation.state.generation_high_watermark().checked_add(1)?;
+            let Some(new_generation) = rotation.state.generation_high_watermark().checked_add(1)
+            else {
+                return RotationStart::Rejected;
+            };
             let rotation_id = wire::random_token();
             let new_connection_id = wire::random_token();
             let attempt = RotationAttemptIdentity::new(
@@ -5087,9 +5116,14 @@ impl RelayActor {
                 session.connection_id.clone(),
                 new_connection_id,
             );
-            if rotation.state.prepare(attempt.clone(), now_ms).is_err() {
-                return None;
+            if let Err(error) = rotation.state.prepare(attempt.clone(), now_ms) {
+                return Self::rotation_prepare_failure(error);
             }
+            // From here on the pure machine has consumed this attempt.  Any
+            // failure before PREPARE is queued must fail closed: returning
+            // `Rejected` would strand an attempt-less `Preparing` machine
+            // that only ROTATION_DEADLINE_EXPIRED could end.
+            //
             // Journal retention belongs to this attempt, not to the session
             // admission instant.  A session may remain active past the
             // previous overlap deadline before its policy timer fires; using
@@ -5098,7 +5132,7 @@ impl RelayActor {
             let journal_deadline = rotation.state.status().deadline_ms.unwrap_or(now_ms);
             let Ok(journal) = ControlJournal::new(128, journal_bytes, now_ms, journal_deadline)
             else {
-                return None;
+                return RotationStart::Failed("ROTATION_PREPARE_INVALID");
             };
             rotation.journal = journal;
             rotation.attempt_deadline_ms = Some(journal_deadline);
@@ -5111,7 +5145,7 @@ impl RelayActor {
                 overlap_ms,
             );
             let Ok(encoded) = wire::encode_control_message(&prepare) else {
-                return None;
+                return RotationStart::Failed("ROTATION_PREPARE_INVALID");
             };
             let prepare_message_id = prepare.message_id().to_owned();
             (
@@ -5157,8 +5191,12 @@ impl RelayActor {
         );
         let journal_response = encoded.clone();
         if queue_control(&control_tx, &budget, encoded).is_err() {
+            // The connector can never learn about this consumed attempt.
+            // Fail closed with the same typed outcome as the catalog-ticket
+            // path instead of leaving the machine `Preparing` without an
+            // attempt the abort/deadline paths could act on.
             self.tickets.remove(&ticket);
-            return None;
+            return RotationStart::Failed("ROTATION_PREPARE_QUEUE");
         }
         let new_generation = attempt.new_generation;
         if let Some(session) = self.session_mut(key)
@@ -5185,7 +5223,7 @@ impl RelayActor {
             reason = %reason,
             phase = "rotation_prepare",
         );
-        Some(journal_response)
+        RotationStart::Started(journal_response)
     }
 
     /// Finish one asynchronous catalog ticket issue without holding the actor
@@ -8490,10 +8528,15 @@ impl RelayActor {
                             RotationStart::Rejected => {
                                 self.protocol_failure(&key, "ROTATION_START_FAILED").await;
                             }
+                            RotationStart::Failed(close_reason) => {
+                                self.protocol_failure(&key, close_reason).await;
+                            }
                         }
                     } else if matches!(response, RotationStart::Started(_)) {
                         self.protocol_failure(&key, "ROTATION_DUPLICATE_STATE")
                             .await;
+                    } else if let RotationStart::Failed(close_reason) = response {
+                        self.protocol_failure(&key, close_reason).await;
                     }
                 }
             }
@@ -10154,8 +10197,12 @@ impl RelayActor {
                                 )
                     })
             });
-            if rotation_due {
-                let _ = self.start_rotation(&key, None, "policy_timer", None);
+            if rotation_due
+                && let RotationStart::Failed(close_reason) =
+                    self.start_rotation(&key, None, "policy_timer", None)
+            {
+                self.close_session(&key, close_reason).await;
+                continue;
             }
             let expired: Vec<_> = self
                 .session_for(&key)
@@ -17333,6 +17380,215 @@ mod stream_identity_tests {
             ));
             assert_eq!(pinned.as_deref(), Some(first));
         }
+    }
+
+    /// Install an M2 session whose pure rotation machine is `Active` on
+    /// `old_connection_id` with no attempt, a live data carrier, and a policy
+    /// timer that is already due, so the next maintenance tick starts a
+    /// local (non-catalog) rotation.
+    fn install_rotation_due_session(
+        actor: &mut RelayActor,
+        key: &SessionKey,
+        rotation: RotationRuntime,
+        old_connection_id: &str,
+        queue_budget: QueueBudget,
+    ) -> mpsc::Receiver<DataOutbound> {
+        let (data_tx, data_rx) = mpsc::channel(actor.options.limits.max_queue_messages);
+        let session = actor
+            .sessions
+            .get_mut(&key.scope())
+            .expect("rotation-due session");
+        session.profile = super::RuntimeProfile::M2;
+        session.generation = 1;
+        session.connection_id = old_connection_id.to_owned();
+        session.data_tx = Some(data_tx.clone());
+        session.active_carrier = Some(DataCarrier {
+            context: CarrierContext::new(
+                key.session_id.clone(),
+                key.epoch,
+                1,
+                old_connection_id.to_owned(),
+            ),
+            tx: data_tx,
+        });
+        session.queue_budget = queue_budget;
+        session.rotation = Some(rotation);
+        session.last_rotation = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(600))
+            .expect("monotonic clock predates one rotation interval");
+        data_rx
+    }
+
+    #[tokio::test]
+    async fn local_prepare_queue_failure_fails_closed_with_typed_reason() {
+        let now_ms = super::monotonic_millis();
+        let (fixture, device_id, tenant_id, _tenant_b, spki, _spki_b) = shared_device_fixture();
+        let catalog = MemoryCatalog::new();
+        catalog
+            .seed_fixture(&fixture)
+            .await
+            .expect("seed prepare-queue fixture");
+        let identity = catalog
+            .resolve_device(&spki, Utc::now())
+            .await
+            .expect("resolve prepare-queue identity")
+            .expect("prepare-queue identity present");
+        let key = SessionKey {
+            tenant_id,
+            device_id,
+            session_id: "local-prepare-queue".to_owned(),
+            epoch: 1,
+        };
+        let (mut actor, _registration) = admitted_control_actor(identity, key.clone());
+        let owner_id = actor
+            .sessions
+            .get(&key.scope())
+            .map(|session| super::runtime::owner_id(&session.owner))
+            .expect("owner identity");
+        let attempt = session_attempt(&key, &owner_id, "local-prepare-queue", 1);
+        let old_connection_id = attempt.old_connection_id.clone();
+        let mut rotation = test_rotation_runtime(now_ms, attempt, now_ms + 60_000);
+        rotation.attempt = None;
+        rotation.attempt_deadline_ms = None;
+        rotation.old_connection_id = old_connection_id.clone();
+        // A budget smaller than any encoded PREPARE makes the bounded control
+        // queue refuse the message deterministically.
+        let _data_rx = install_rotation_due_session(
+            &mut actor,
+            &key,
+            rotation,
+            &old_connection_id,
+            QueueBudget::new(1),
+        );
+
+        actor.tick().await;
+
+        assert!(
+            !actor.sessions.contains_key(&key.scope()),
+            "a local PREPARE that cannot be queued must fail closed immediately instead of \
+             stranding an attempt-less Preparing machine until ROTATION_DEADLINE_EXPIRED"
+        );
+        assert_eq!(
+            actor
+                .session_terminal_events
+                .back()
+                .map(|event| event.reason),
+            Some("ROTATION_PREPARE_QUEUE"),
+            "the local path must report the same typed outcome as the catalog ticket path"
+        );
+        assert!(
+            actor.tickets.is_empty(),
+            "the never-published candidate ticket must be withdrawn"
+        );
+    }
+
+    #[tokio::test]
+    async fn exhausted_connection_history_terminates_session_with_typed_reason() {
+        let now_ms = super::monotonic_millis();
+        let (fixture, device_id, tenant_id, _tenant_b, spki, _spki_b) = shared_device_fixture();
+        let catalog = MemoryCatalog::new();
+        catalog
+            .seed_fixture(&fixture)
+            .await
+            .expect("seed history-exhaustion fixture");
+        let identity = catalog
+            .resolve_device(&spki, Utc::now())
+            .await
+            .expect("resolve history-exhaustion identity")
+            .expect("history-exhaustion identity present");
+        let key = SessionKey {
+            tenant_id,
+            device_id,
+            session_id: "connection-history-exhausted".to_owned(),
+            epoch: 1,
+        };
+        let (mut actor, _registration) = admitted_control_actor(identity, key.clone());
+        let owner_id = actor
+            .sessions
+            .get(&key.scope())
+            .map(|session| super::runtime::owner_id(&session.owner))
+            .expect("owner identity");
+        let attempt = session_attempt(&key, &owner_id, "connection-history-exhausted", 1);
+        let old_connection_id = attempt.old_connection_id.clone();
+        let mut rotation = test_rotation_runtime(now_ms, attempt, now_ms + 60_000);
+        rotation.attempt = None;
+        rotation.attempt_deadline_ms = None;
+        rotation.old_connection_id = old_connection_id.clone();
+        // Drive the pure machine to its bounded connection-ID history with
+        // coordinated aborts on the same old carrier.  Every step observes
+        // the same instant: the machine accepts equal timestamps, no attempt
+        // deadline can expire, and the actor's later real prepare cannot be
+        // seen as a clock going backwards.
+        let clock = now_ms;
+        for index in 0..(tunnel_protocol::rotation::MAX_CONNECTION_ID_HISTORY - 1) {
+            let identity = RotationAttemptIdentity::new(
+                key.session_id.clone(),
+                key.epoch,
+                owner_id.clone(),
+                format!("history-{index}"),
+                1,
+                2 + index as u64,
+                old_connection_id.clone(),
+                format!("history-candidate-{index}"),
+            );
+            rotation
+                .state
+                .prepare(identity.clone(), clock)
+                .expect("prepare history attempt");
+            rotation
+                .state
+                .abort(
+                    &identity,
+                    clock,
+                    tunnel_protocol::rotation::RecoveryReason::CandidateTransportLost,
+                )
+                .expect("abort history attempt");
+            for side in [
+                tunnel_protocol::rotation::RotationSide::Owner,
+                tunnel_protocol::rotation::RotationSide::Connector,
+            ] {
+                rotation
+                    .state
+                    .candidate_closed(
+                        &identity,
+                        side,
+                        tunnel_protocol::rotation::ClosureEvidence::closed(
+                            identity.new_connection_id.clone(),
+                        ),
+                        clock,
+                    )
+                    .expect("release history candidate");
+            }
+        }
+        assert_eq!(rotation.state.phase(), RotationPhase::Active);
+        assert_eq!(
+            rotation.state.connection_history_used(),
+            tunnel_protocol::rotation::MAX_CONNECTION_ID_HISTORY
+        );
+        let queue_budget = QueueBudget::new(actor.options.limits.max_queue_bytes);
+        let _data_rx = install_rotation_due_session(
+            &mut actor,
+            &key,
+            rotation,
+            &old_connection_id,
+            queue_budget,
+        );
+
+        actor.tick().await;
+
+        assert!(
+            !actor.sessions.contains_key(&key.scope()),
+            "an exhausted connection-ID history must end the session explicitly rather than \
+             leaving a never-rotating data socket that looks healthy"
+        );
+        assert_eq!(
+            actor
+                .session_terminal_events
+                .back()
+                .map(|event| event.reason),
+            Some("CONNECTION_HISTORY_EXHAUSTED")
+        );
+        assert!(actor.tickets.is_empty(), "no candidate ticket may survive");
     }
 }
 

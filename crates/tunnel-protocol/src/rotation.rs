@@ -45,7 +45,10 @@ pub const MAX_TOTAL_SOCKETS: u8 = CONTROL_SOCKETS + MAX_DATA_SOCKETS;
 /// A physical connection ID is single-use for the lifetime of the session so
 /// delayed close evidence can never target a later carrier.  Once this bound
 /// is exhausted the caller must establish a fresh session/epoch rather than
-/// evicting tombstones and risking ID reuse.
+/// evicting tombstones and risking ID reuse.  The machine enforces that: the
+/// claim that would exceed the bound closes it with
+/// [`RotationTerminalReason::ConnectionHistoryExhausted`] instead of leaving a
+/// never-rotating carrier `Active`.
 pub const MAX_CONNECTION_ID_HISTORY: usize = 256;
 /// Maximum number of replacement candidates in one retained-state episode.
 pub const MAX_RECOVERY_ATTEMPTS: u8 = 3;
@@ -182,6 +185,18 @@ pub enum RecoveryReason {
     CommitUncertain,
     ReconciliationConflict,
     MissingRetainedBytes,
+}
+
+/// Why the pure machine closed itself.  A runtime-initiated
+/// [`RotationState::close`] records no reason; only a bounded-resource
+/// exhaustion detected inside the machine does, so diagnostics can
+/// distinguish a required fresh session from an ordinary teardown.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RotationTerminalReason {
+    /// [`MAX_CONNECTION_ID_HISTORY`] physical connection IDs have been claimed
+    /// in this session.  Identifiers are never evicted or reused, so no further
+    /// candidate can be allocated and a fresh session/epoch is required.
+    ConnectionHistoryExhausted,
 }
 
 /// A bounded closure evidence record for one physical data connection.
@@ -393,6 +408,12 @@ pub struct RotationStatus {
     pub recovery_reason: Option<RecoveryReason>,
     pub deadline_forced_retirement: bool,
     pub socket_count: u8,
+    /// Physical connection IDs claimed so far, including the active carrier.
+    /// The bound is [`MAX_CONNECTION_ID_HISTORY`]; reaching it ends the
+    /// session's ability to rotate.
+    pub connection_history_used: usize,
+    /// Set only when the machine closed itself for a typed reason.
+    pub terminal_reason: Option<RotationTerminalReason>,
 }
 
 /// Results for repeated rotation requests.  Requests for the active attempt
@@ -518,6 +539,9 @@ pub struct RotationState {
     recovery_attempts: u8,
     deadline_forced_retirement: bool,
     last_time_ms: Option<RotationTime>,
+    /// Typed reason when the machine closed itself; `None` after a
+    /// runtime-initiated close.
+    terminal_reason: Option<RotationTerminalReason>,
 }
 
 impl RotationState {
@@ -560,12 +584,26 @@ impl RotationState {
             recovery_attempts: 0,
             deadline_forced_retirement: false,
             last_time_ms: None,
+            terminal_reason: None,
         })
     }
 
     #[must_use]
     pub const fn phase(&self) -> RotationPhase {
         self.phase
+    }
+
+    /// Number of physical connection IDs claimed for this session, including
+    /// the active carrier.  Bounded by [`MAX_CONNECTION_ID_HISTORY`].
+    #[must_use]
+    pub fn connection_history_used(&self) -> usize {
+        self.used_connection_ids.len()
+    }
+
+    /// Typed reason when the machine closed itself.
+    #[must_use]
+    pub const fn terminal_reason(&self) -> Option<RotationTerminalReason> {
+        self.terminal_reason
     }
 
     #[must_use]
@@ -649,6 +687,8 @@ impl RotationState {
             recovery_reason,
             deadline_forced_retirement: self.deadline_forced_retirement,
             socket_count: self.socket_count(),
+            connection_history_used: self.used_connection_ids.len(),
+            terminal_reason: self.terminal_reason,
         }
     }
 
@@ -707,6 +747,9 @@ impl RotationState {
         now_ms: RotationTime,
         deadline_cap_ms: Option<RotationTime>,
     ) -> Result<PrepareResult, RotationError> {
+        if self.phase == RotationPhase::Closed {
+            return Err(RotationError::Closed);
+        }
         if self.phase != RotationPhase::Active {
             let matching_deadline = self.attempt.as_ref().and_then(|attempt| {
                 (attempt.identity == identity).then_some(attempt.overlap_deadline_ms)
@@ -1608,6 +1651,12 @@ impl RotationState {
             return Err(RotationError::ConnectionReuse);
         }
         if self.used_connection_ids.len() >= MAX_CONNECTION_ID_HISTORY {
+            // Identifiers are never evicted or reused within a session, so
+            // the session can no longer replace its carrier.  Fail closed
+            // with a typed fresh-session reason rather than staying `Active`
+            // on a socket that will never rotate again.
+            self.close();
+            self.terminal_reason = Some(RotationTerminalReason::ConnectionHistoryExhausted);
             return Err(RotationError::ConnectionHistoryExhausted {
                 maximum: MAX_CONNECTION_ID_HISTORY,
             });
@@ -3372,5 +3421,138 @@ mod tests {
         assert_eq!(recovery_retry_delay_ms(2), Some(200));
         assert_eq!(recovery_retry_delay_ms(3), None);
         assert_eq!(recovery_retry_delay_ms(0), None);
+    }
+
+    /// Consume one connection-ID history slot with a coordinated abort.  The
+    /// candidate is never reused, so the machine returns to `Active` on the
+    /// same old carrier with one fewer identifier available.
+    fn abort_attempt_consuming_history(
+        machine: &mut RotationState,
+        identity: &RotationAttemptIdentity,
+        now: RotationTime,
+    ) {
+        assert_eq!(
+            machine.prepare(identity.clone(), now),
+            Ok(PrepareResult::Started),
+            "attempt {} must still be admitted",
+            identity.new_generation
+        );
+        machine
+            .abort(identity, now + 1, RecoveryReason::CandidateTransportLost)
+            .expect("abort uncommitted attempt");
+        machine
+            .candidate_closed(
+                identity,
+                RotationSide::Owner,
+                ClosureEvidence::closed(identity.new_connection_id.clone()),
+                now + 2,
+            )
+            .expect("owner candidate closure");
+        machine
+            .candidate_closed(
+                identity,
+                RotationSide::Connector,
+                ClosureEvidence::closed(identity.new_connection_id.clone()),
+                now + 3,
+            )
+            .expect("connector candidate closure");
+        assert_eq!(machine.phase(), RotationPhase::Active);
+    }
+
+    #[test]
+    fn connection_history_exhaustion_closes_the_session_explicitly() {
+        let mut machine = state();
+        // The active carrier already occupies one slot; every aborted attempt
+        // tombstones its candidate ID for the session lifetime.
+        let attempts_until_full = MAX_CONNECTION_ID_HISTORY - 1;
+        let mut now = 0;
+        for index in 0..attempts_until_full {
+            let identity = attempt(4 + index as u64);
+            abort_attempt_consuming_history(&mut machine, &identity, now);
+            now += 10;
+        }
+
+        assert_eq!(machine.connection_history_used(), MAX_CONNECTION_ID_HISTORY);
+        assert_eq!(machine.status().terminal_reason, None);
+
+        let exhausted = attempt(4 + attempts_until_full as u64);
+        assert_eq!(
+            machine.prepare(exhausted.clone(), now),
+            Err(RotationError::ConnectionHistoryExhausted {
+                maximum: MAX_CONNECTION_ID_HISTORY,
+            })
+        );
+        // Exhaustion is a typed fresh-session outcome, never silent inaction
+        // on a carrier that can no longer rotate.
+        assert_eq!(machine.phase(), RotationPhase::Closed);
+        let status = machine.status();
+        assert_eq!(
+            status.terminal_reason,
+            Some(RotationTerminalReason::ConnectionHistoryExhausted)
+        );
+        assert_eq!(status.connection_history_used, MAX_CONNECTION_ID_HISTORY);
+        assert_eq!(status.socket_count, 0);
+        assert!(status.attempt.is_none());
+        assert_eq!(
+            machine.prepare(exhausted, now + 1),
+            Err(RotationError::Closed)
+        );
+    }
+
+    #[test]
+    fn connection_history_exhaustion_during_recovery_closes_explicitly() {
+        let mut machine = state();
+        let mut now = 0;
+        for index in 0..(MAX_CONNECTION_ID_HISTORY - 1) {
+            abort_attempt_consuming_history(&mut machine, &attempt(4 + index as u64), now);
+            now += 10;
+        }
+        assert_eq!(machine.connection_history_used(), MAX_CONNECTION_ID_HISTORY);
+
+        // Losing the old carrier with a full history: the abandoned transport
+        // is released, but no recovery candidate can ever be identified.
+        let recovery = attempt(4 + (MAX_CONNECTION_ID_HISTORY - 1) as u64);
+        machine
+            .transport_lost(&recovery, now, RecoveryReason::OldTransportLost)
+            .expect("enter retained-state recovery");
+        machine
+            .close_for_recovery("data-old", ClosureEvidence::closed("data-old"), now + 1)
+            .expect("release the lost carrier");
+        assert_eq!(
+            machine.begin_recovery(
+                recovery.clone(),
+                recovery_roster(),
+                now + 2,
+                RecoveryReason::OldTransportLost,
+                now + 2 + 20_000,
+            ),
+            Err(RotationError::ConnectionHistoryExhausted {
+                maximum: MAX_CONNECTION_ID_HISTORY,
+            })
+        );
+        assert_eq!(machine.phase(), RotationPhase::Closed);
+        assert_eq!(
+            machine.status().terminal_reason,
+            Some(RotationTerminalReason::ConnectionHistoryExhausted)
+        );
+        assert_eq!(
+            machine.begin_recovery(
+                recovery,
+                recovery_roster(),
+                now + 3,
+                RecoveryReason::OldTransportLost,
+                now + 2 + 20_000,
+            ),
+            Err(RotationError::Closed)
+        );
+    }
+
+    #[test]
+    fn runtime_close_records_no_terminal_reason() {
+        let mut machine = state();
+        machine.close();
+        assert_eq!(machine.phase(), RotationPhase::Closed);
+        assert_eq!(machine.terminal_reason(), None);
+        assert_eq!(machine.status().connection_history_used, 1);
     }
 }

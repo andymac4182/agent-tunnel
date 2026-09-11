@@ -107,6 +107,7 @@ struct H3PeerFixture {
     server_task: Option<JoinHandle<Result<(), PeerTransportError>>>,
     returned_errors: Arc<AtomicUsize>,
     consumer_token: String,
+    consumer_signer: jsonwebtoken::EncodingKey,
 }
 
 impl H3PeerFixture {
@@ -164,7 +165,7 @@ impl H3PeerFixture {
             .await
             .expect("seed shared cleanup catalog");
 
-        let (oidc, consumer_token) = oidc_fixture();
+        let (oidc, consumer_token, consumer_signer) = oidc_fixture_with_signer();
         let mut options = RelayOptions::new(oidc.clone());
         options.node_id = DESTINATION_NODE.to_owned();
         options.boot_id = DESTINATION_BOOT.to_owned();
@@ -271,7 +272,15 @@ impl H3PeerFixture {
             server_task: Some(server_task),
             returned_errors,
             consumer_token,
+            consumer_signer,
         }
+    }
+
+    /// Mint a consumer token whose `exp` is `lifetime_secs` from now.  The
+    /// owner derives the stream's absolute authorization deadline from that
+    /// claim, so a short lifetime bounds the stream deterministically.
+    fn mint_consumer_token(&self, lifetime_secs: i64) -> String {
+        mint_consumer_token(&self.consumer_signer, lifetime_secs)
     }
 
     async fn stop_server(&mut self) {
@@ -1510,6 +1519,125 @@ async fn peer_consumer_idle_deadline_closes_exact_stream_and_preserves_sibling()
     })
     .await;
     assert_sibling_preserved(&final_snapshot, &sibling_session_id, sibling_epoch);
+
+    stream.cancel();
+    drop(stream);
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn peer_consumer_outstanding_write_is_bounded_by_consumer_expiry() {
+    // Full top-level consumer scope: the owner handler awaits an actor write
+    // that can never complete because the device never confirms the stream's
+    // authorization, so the actor parks the record.  Neither the H3 receive
+    // idle deadline (the handler is not reading) nor registration closure (no
+    // one closes the stream) can end that wait.  The consumer's absolute
+    // authorization deadline must bound the outstanding write and terminalize
+    // exactly this stream while the sibling stays untouched.
+    let fixture = H3PeerFixture::new().await;
+    let target = register_control(
+        &fixture,
+        DEVICE_SPKI,
+        device_id(),
+        "staged-outstanding-write-target",
+    )
+    .await;
+    let target_session_id = target.session_id.clone();
+    let target_epoch = target.epoch;
+    let target_ticket = target.ticket.clone();
+    let mut target_rx = target.rx;
+    let target_device = fixture
+        .catalog
+        .resolve_device(DEVICE_SPKI, Utc::now())
+        .await
+        .expect("resolve outstanding-write target device")
+        .expect("outstanding-write target device identity");
+    let target_data = fixture
+        .handle
+        .attach_forwarded_data(target_device, DEVICE_SPKI.to_owned(), target_ticket)
+        .await
+        .expect("attach outstanding-write target carrier");
+    let mut target_data_rx = target_data.rx;
+
+    let sibling = register_control(
+        &fixture,
+        SIBLING_SPKI,
+        sibling_device_id(),
+        "staged-outstanding-write-sibling",
+    )
+    .await;
+    let sibling_session_id = sibling.session_id.clone();
+    let sibling_epoch = sibling.epoch;
+    let _sibling_rx = sibling.rx;
+
+    let owner = current_target_owner(&fixture).await;
+    let short_lived_token = fixture.mint_consumer_token(2);
+    let mut stream = open_raw(&fixture, InternalRoute::ConsumerStreams).await;
+    admit_consumer(
+        &mut stream,
+        &owner.token,
+        &short_lived_token,
+        "staged-outstanding-write-request",
+        "staged-outstanding-write-stream",
+    )
+    .await;
+    let admitted = wait_snapshot(&fixture.handle, |snapshot| {
+        find_session(snapshot, device_id()).is_some_and(|session| {
+            session.session_id == target_session_id
+                && session.epoch == target_epoch
+                && session.streams.len() == 1
+        }) && find_session(snapshot, sibling_device_id()).is_some()
+    })
+    .await;
+    let target_stream_before = find_session(&admitted, device_id())
+        .expect("outstanding-write target session after admission")
+        .streams
+        .first()
+        .expect("outstanding-write target stream after admission")
+        .clone();
+    assert!(!target_stream_before.terminal);
+    let sibling_before = find_session(&admitted, sibling_device_id())
+        .expect("outstanding-write sibling after admission")
+        .clone();
+    drain_queues(&mut target_rx, &mut target_data_rx).await;
+
+    // One complete length-prefixed application record.  Without a device
+    // authorization confirmation the actor cannot dispatch it, so the owner
+    // handler's write stays outstanding.
+    let body = b"outstanding-write";
+    let mut record = (body.len() as u32).to_be_bytes().to_vec();
+    record.extend_from_slice(body);
+    stream
+        .send_chunk(encode_peer_record(PeerRecordKind::ConsumerChunk, &record))
+        .await
+        .expect("send parked consumer record");
+
+    // Keep the client stream open: only the consumer's two-second absolute
+    // deadline may end the outstanding write.  A stranded handler would keep
+    // this stream live far beyond the bound below.
+    let started = tokio::time::Instant::now();
+    let terminal_snapshot =
+        wait_snapshot_for(&fixture.handle, Duration::from_secs(6), &mut |snapshot| {
+            find_session(snapshot, device_id()).is_some_and(|session| {
+                session.session_id == target_session_id
+                    && session.epoch == target_epoch
+                    && session.streams.iter().any(|stream| {
+                        stream.stream_id == target_stream_before.stream_id
+                            && stream.operation_id == target_stream_before.operation_id
+                            && stream.terminal
+                    })
+            }) && find_session(snapshot, sibling_device_id()).is_some_and(|session| {
+                session.session_id == sibling_before.session_id
+                    && session.epoch == sibling_before.epoch
+            })
+        })
+        .await;
+    assert!(
+        started.elapsed() < Duration::from_secs(6),
+        "the outstanding write must be bounded by the consumer's absolute deadline"
+    );
+    assert_sibling_preserved(&terminal_snapshot, &sibling_session_id, sibling_epoch);
+    drain_queues(&mut target_rx, &mut target_data_rx).await;
 
     stream.cancel();
     drop(stream);
