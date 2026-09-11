@@ -46,6 +46,7 @@ cargo run -p tunnel-test-harness --locked -- verify-m7-cluster
 cargo run -p tunnel-test-harness --locked -- verify-m7-production
 cargo run -p tunnel-test-harness --locked -- verify-m7-redis-partition
 cargo run -p tunnel-test-harness --locked -- verify-m7-queue-saturation
+cargo run -p tunnel-test-harness --locked -- verify-m7-remote-body-limits
 ```
 
 The transport command exercises real mTLS/H3 fault cases. The cluster command
@@ -58,6 +59,16 @@ The queue-saturation command drives the configured bounded data message queue to
 its reachable physical bound behind a blackholed carrier; see
 "Physical versus logical queue occupancy" below for what it does and does not
 prove.
+The remote-body-limits command drives the public echo stream through a
+non-owner ingress and checks the maximum, zero, limit-plus-one (whole and split
+prefix), truncated and coalesced record boundaries against owner-only peer
+chunk reads and dispatch counters, so the forwarded and owner-local ingress
+paths cannot drift on the bounded body-limit decision. Its final stage pins
+the forwarded route's idle bound: a stream that completed a maximum record and
+then carries no traffic is closed by the relay only after the fixture's
+10-second peer HTTP/3 idle timeout. A remote exchange that idles or stalls
+past that bound therefore fails to complete by design, which the owner-local
+route does not enforce.
 A command passing cannot close unrelated rows in [m7-edge-cases.md](m7-edge-cases.md).
 Record the tested revision and outcomes in [m7-verification.md](m7-verification.md).
 

@@ -11,6 +11,7 @@
 
 mod actor;
 mod config;
+mod consumer_framing;
 mod consumer_write_diagnostics;
 mod health;
 mod http;

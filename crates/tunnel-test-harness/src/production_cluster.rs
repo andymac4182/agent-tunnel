@@ -142,6 +142,11 @@ mod admission;
 pub use admission::{
     AdmissionEvidence, validate_admission_evidence, verify as verify_public_admission,
 };
+mod remote_body_limits;
+pub use remote_body_limits::{
+    RemoteBodyLimitEvidence, validate_remote_body_limit_evidence,
+    verify as verify_remote_body_limits,
+};
 mod i04_fail_closed;
 pub use i04_fail_closed::{
     FailClosedEvidence, SentinelOutcome, validate_fail_closed_evidence,
@@ -169,6 +174,11 @@ const ROTATION: RotationConfig = RotationConfig {
 };
 const ROTATION_COUNT: u64 = 3;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+/// Peer HTTP/3 idle timeout applied to every production-fixture relay.  A
+/// pooled consumer stream with no transport operation in either direction
+/// for this long is cancelled by the transport, so the fixture keeps it short
+/// and names it so gates can assert the bound rather than rediscover it.
+pub(crate) const PRODUCTION_PEER_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 const SCENARIO_TIMEOUT: Duration = Duration::from_secs(120);
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
 const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -4217,7 +4227,7 @@ async fn start_relay(
     )
     .map_err(|error| HarnessError::Pki(format!("peer client TLS {}: {error}", node.node_id)))?;
     let peer_limits = PeerTransportLimits::default()
-        .with_timeouts(Duration::from_secs(10), Duration::from_secs(5))
+        .with_timeouts(PRODUCTION_PEER_IDLE_TIMEOUT, Duration::from_secs(5))
         .map_err(|error| HarnessError::Process(format!("peer limits: {error}")))?;
     peer_limits
         .apply_to_server_config(&mut peer_server)

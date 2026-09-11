@@ -45,6 +45,9 @@ const MAX_ADMISSION_LIMIT_RETRY_AFTER_MS: u64 = 5_000;
 // across bounded HTTP/3 body chunks. The public framing can still require
 // multiple ordered ConsumerChunk records when its length prefix is included.
 const MAX_CONSUMER_PEER_BODY: usize = tunnel_cluster::peer_frame::MAX_CONSUMER_CHUNK_BODY;
+/// The one bounded body-limit decision shared by the owner-local WebSocket
+/// handler, the forwarding ingress and the owner side of the peer stream.
+const STREAM_RECORD_LIMIT: ConsumerRecordLimit = ConsumerRecordLimit::new(MAX_BODY_BYTES);
 // Includes the record prefix and the largest unmasked WebSocket frame header.
 const MAX_ECHO_WRITE_BYTES: usize = MAX_BODY_BYTES + MAX_ECHO_CANARY_BYTES + 4 + 10;
 
@@ -424,6 +427,7 @@ use crate::{
         ConsumerStreamRegistration, EchoOutcome, RelayError, RelayHandle, TerminalCleanupGuard,
     },
     config::RelayLimits,
+    consumer_framing::{ConsumerRecordAssembler, ConsumerRecordCursor, ConsumerRecordLimit},
     consumer_write_diagnostics::{
         ConsumerIngressKind, ConsumerWriteOutcome, ConsumerWriteScope, send_until,
         send_until_or_expired,
@@ -1429,7 +1433,7 @@ async fn handle_consumer_stream(
     let key = registration.key.clone();
     let stream_id = registration.stream_id;
     let operation_id = registration.operation_id.clone();
-    let mut input = Vec::new();
+    let mut assembler = ConsumerRecordAssembler::new(STREAM_RECORD_LIMIT);
     let expires_in = (consumer_expires_at - Utc::now())
         .to_std()
         .unwrap_or_default();
@@ -1451,27 +1455,32 @@ async fn handle_consumer_stream(
         };
         match message {
             Message::Binary(bytes) => {
-                if input.len().saturating_add(bytes.len()) > MAX_BODY_BYTES.saturating_add(4) {
-                    break;
+                // The shared bounded decision: the input window is checked
+                // before any copy and an over-limit prefix is rejected as soon
+                // as it is complete, even without a body.
+                if let Err(rejection) = assembler.push(&bytes) {
+                    tracing::debug!(
+                        rejection = ?rejection,
+                        phase = rejection.phase(),
+                        ingress = "local",
+                        "consumer record rejected"
+                    );
+                    break 'connection;
                 }
-                input.extend_from_slice(&bytes);
                 loop {
-                    if input.len() < 4 {
-                        break;
-                    }
-                    let declared =
-                        u32::from_be_bytes([input[0], input[1], input[2], input[3]]) as usize;
-                    if declared > MAX_BODY_BYTES {
-                        break 'connection;
-                    }
-                    let Some(total) = declared.checked_add(4) else {
-                        break 'connection;
+                    let body = match assembler.next_body() {
+                        Ok(Some(body)) => body,
+                        Ok(None) => break,
+                        Err(rejection) => {
+                            tracing::debug!(
+                                rejection = ?rejection,
+                                phase = rejection.phase(),
+                                ingress = "local",
+                                "consumer record rejected"
+                            );
+                            break 'connection;
+                        }
                     };
-                    if input.len() < total {
-                        break;
-                    }
-                    let record: Vec<u8> = input.drain(..total).collect();
-                    let body = record[4..].to_vec();
                     // The write stays inside the same closure/deadline scope
                     // as the read loop: a parked record cannot hold this
                     // stream past its absolute authorization deadline or past
@@ -1621,6 +1630,10 @@ async fn handle_remote_consumer_stream(
     });
     let mut forwarder_finished = false;
     let mut prefer_remote = true;
+    // Same bounded decision as the owner-local handler, taken on the ingress
+    // before any byte is queued for the peer: an over-limit prefix closes the
+    // public stream here and is never forwarded.
+    let mut cursor = ConsumerRecordCursor::new(STREAM_RECORD_LIMIT);
 
     enum RemoteConsumerEvent<Inbound, Remote> {
         Expired,
@@ -1729,11 +1742,22 @@ async fn handle_remote_consumer_stream(
                     break;
                 };
                 match message {
-                    Message::Binary(bytes) if bytes.len() <= MAX_BODY_BYTES.saturating_add(4) => {
-                        if !bytes.is_empty() {
-                            pending_forward = Some(bytes.to_vec());
+                    Message::Binary(bytes) => match cursor.forward(&bytes) {
+                        Ok(forwardable) => {
+                            if !forwardable.is_empty() {
+                                pending_forward = Some(forwardable);
+                            }
                         }
-                    }
+                        Err(rejection) => {
+                            tracing::debug!(
+                                rejection = ?rejection,
+                                phase = rejection.phase(),
+                                ingress = "forwarded",
+                                "consumer record rejected"
+                            );
+                            break;
+                        }
+                    },
                     Message::Ping(payload) => {
                         if !send_socket_until(
                             &mut socket,
@@ -1748,7 +1772,6 @@ async fn handle_remote_consumer_stream(
                     Message::Close(_) => break,
                     Message::Pong(_) => {}
                     Message::Text(_) => break,
-                    Message::Binary(_) => break,
                 }
             }
             RemoteConsumerEvent::Remote(remote) => {
@@ -2784,7 +2807,7 @@ async fn handle_peer_consumer_stream(
         operation_id.clone(),
         admission_context.clone(),
     );
-    let mut input = Vec::new();
+    let mut assembler = ConsumerRecordAssembler::new(STREAM_RECORD_LIMIT);
     let mut registration_closed = false;
     let mut terminal_cause = None;
     // The owner bounds this stream by the consumer's absolute authorization
@@ -2808,7 +2831,7 @@ async fn handle_peer_consumer_stream(
             );
             return Err(error);
         }
-        loop {
+        'peer: loop {
             tokio::select! {
                 _ = &mut admission_cancelled => {
                     if admission_context.as_ref().is_some_and(|admission| {
@@ -2861,21 +2884,33 @@ async fn handle_peer_consumer_stream(
                     // Count the authenticated peer record synchronously before
                     // any bounded input parsing or application dispatch.
                     handle.record_consumer_chunk_read();
-                    if input.len().saturating_add(record.body_len()) > MAX_BODY_BYTES.saturating_add(4) {
+                    // The same shared decision as both public ingress paths:
+                    // an over-limit prefix from a peer is rejected as soon as
+                    // it is complete instead of being retained as an
+                    // incomplete record.
+                    if let Err(rejection) = assembler.push(record.body()) {
                         tracing::debug!(
-                            input_len = input.len(),
-                            body_len = record.body_len(),
-                            phase = "consumer_peer_input_limit",
-                            "consumer peer input exceeded bounded record limit"
+                            rejection = ?rejection,
+                            phase = rejection.phase(),
+                            ingress = "owner_peer",
+                            "consumer peer record rejected"
                         );
                         break;
                     }
-                    input.extend_from_slice(record.body());
-                    while input.len() >= 4 {
-                        let declared = u32::from_be_bytes([input[0], input[1], input[2], input[3]]) as usize;
-                        if declared > MAX_BODY_BYTES || declared.saturating_add(4) > input.len() { break; }
-                        let body = input[4..declared + 4].to_vec();
-                        input.drain(..declared + 4);
+                    loop {
+                        let body = match assembler.next_body() {
+                            Ok(Some(body)) => body,
+                            Ok(None) => break,
+                            Err(rejection) => {
+                                tracing::debug!(
+                                    rejection = ?rejection,
+                                    phase = rejection.phase(),
+                                    ingress = "owner_peer",
+                                    "consumer peer record rejected"
+                                );
+                                break 'peer;
+                            }
+                        };
                         let body_len = body.len();
                         let response = tokio::select! {
                             _ = &mut admission_cancelled => {
