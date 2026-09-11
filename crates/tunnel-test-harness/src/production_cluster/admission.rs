@@ -834,50 +834,6 @@ async fn run(
         )));
     }
 
-    let lookup_before = dispatch_snapshot(cluster).await?;
-    let pause_result = redis_proxy.pause_all().await;
-    let lookup_probe = match pause_result {
-        Ok(()) => {
-            target_public
-                .open(target.id, target_service_path.as_str(), &[])
-                .await
-        }
-        Err(error) => Err(error),
-    };
-    let resume_result = redis_proxy.resume_all().await;
-    let lookup_error_rejected = match lookup_probe {
-        Ok(PublicStreamProbe::Rejected(failure)) if is_lookup_failure(&failure) => true,
-        Ok(PublicStreamProbe::Rejected(failure)) => {
-            let _ = resume_result;
-            return Err(HarnessError::Process(format!(
-                "Redis lookup negative returned status {} and bounded code {:?}",
-                failure.status, failure.code
-            )));
-        }
-        Ok(PublicStreamProbe::Accepted(mut stream)) => {
-            let _ = stream.close().await;
-            let _ = resume_result;
-            return Err(HarnessError::Process(
-                "Redis lookup failure unexpectedly upgraded a consumer stream".into(),
-            ));
-        }
-        Err(error) => {
-            let _ = resume_result;
-            return Err(error);
-        }
-    };
-    resume_result?;
-    super::wait_for_public_health_ready(target_ingress, &harness.pki.server_ca.certificate_der)
-        .await?;
-    let lookup_after = dispatch_snapshot(cluster).await?;
-    let lookup_error_dispatch_delta = common_dispatch_delta(&lookup_before, &lookup_after);
-    if !lookup_error_rejected || lookup_error_dispatch_delta != 0 {
-        return Err(HarnessError::Process(format!(
-            "Redis lookup failure was not a typed no-dispatch result: rejected={}, delta={lookup_error_dispatch_delta}",
-            lookup_error_rejected
-        )));
-    }
-
     let owner_loss_before = dispatch_snapshot(cluster).await?;
     let selected_owner = cluster
         .catalog
@@ -1005,6 +961,67 @@ async fn run(
         )));
     }
     cluster.set_peer_path_drop_from(&target_owner_node, &surviving_ingress_node, false)?;
+
+    // The Redis lookup-failure row runs last of the fault rows because its
+    // fault is a *global* authority outage, not a scoped one: `pause_all`
+    // stalls every relay's Redis connections, and the row must hold the pause
+    // until the relay's own 2 second authority deadline elapses for the typed
+    // lookup failure to be produced at all (measured: a 2009 ms window). The
+    // relay's maintenance tick runs every 500 ms, so several ticks always fall
+    // inside that window; per docs/cluster.md a maintenance read that exceeds
+    // the 2 second deadline correctly closes its session with
+    // `AUTHORITY_UNAVAILABLE`. Running this row earlier therefore let it close
+    // the very device sessions the selected-owner and sibling-canary rows then
+    // depended on -- nondeterministically, according to which maintenance
+    // commands happened to be in flight when the pause opened -- so those rows
+    // failed with "selected owner disappeared"/"cleared or changed the owner"
+    // or a dead retained sibling stream. Ordering the global-outage row after
+    // every row that needs a live pre-existing session removes that coupling
+    // without relaxing anything either row asserts.
+    let lookup_before = dispatch_snapshot(cluster).await?;
+    let pause_result = redis_proxy.pause_all().await;
+    let lookup_probe = match pause_result {
+        Ok(()) => {
+            target_public
+                .open(target.id, target_service_path.as_str(), &[])
+                .await
+        }
+        Err(error) => Err(error),
+    };
+    let resume_result = redis_proxy.resume_all().await;
+    let lookup_error_rejected = match lookup_probe {
+        Ok(PublicStreamProbe::Rejected(failure)) if is_lookup_failure(&failure) => true,
+        Ok(PublicStreamProbe::Rejected(failure)) => {
+            let _ = resume_result;
+            return Err(HarnessError::Process(format!(
+                "Redis lookup negative returned status {} and bounded code {:?}",
+                failure.status, failure.code
+            )));
+        }
+        Ok(PublicStreamProbe::Accepted(mut stream)) => {
+            let _ = stream.close().await;
+            let _ = resume_result;
+            return Err(HarnessError::Process(
+                "Redis lookup failure unexpectedly upgraded a consumer stream".into(),
+            ));
+        }
+        Err(error) => {
+            let _ = resume_result;
+            return Err(error);
+        }
+    };
+    resume_result?;
+    super::wait_for_public_health_ready(target_ingress, &harness.pki.server_ca.certificate_der)
+        .await?;
+    let lookup_after = dispatch_snapshot(cluster).await?;
+    let lookup_error_dispatch_delta = common_dispatch_delta(&lookup_before, &lookup_after);
+    if !lookup_error_rejected || lookup_error_dispatch_delta != 0 {
+        return Err(HarnessError::Process(format!(
+            "Redis lookup failure was not a typed no-dispatch result: rejected={}, delta={lookup_error_dispatch_delta}",
+            lookup_error_rejected
+        )));
+    }
+
     let absent_target_rejected = absent_probe_remote && absent_probe_local;
     let inactive_target_rejected = inactive_probe_remote && inactive_probe_local;
     let unknown_target_rejected =

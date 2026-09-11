@@ -47,7 +47,28 @@ const AUTHORIZATION_CONNECTIONS: usize = 4;
 /// maintains per tick, so the lane count is a transport choice, not a
 /// concurrency limit.
 const MAINTENANCE_CONNECTIONS: usize = 2;
+/// How far a caller's clock may run *ahead* of the authority before a
+/// timestamped read is refused. This is the genuine clock-skew direction: the
+/// scripts evaluate validity at `math.max(caller_at, now)`, so a caller ahead of
+/// the authority would otherwise extend a validity window past its real expiry.
 const MAX_AUTHORITY_CLOCK_SKEW_US: i64 = 1_000_000;
+/// How far a caller's timestamp may lag the authority's clock before a
+/// timestamped read is refused.
+///
+/// A script only ever sees the timestamp the caller sampled before dispatching
+/// its command, so it cannot separate a slow caller clock from time the command
+/// spent in flight. Bounding this direction below the authority deadline
+/// therefore creates a latency band in which a reply the transport accepted is
+/// deterministically refused, and refused as a `Conflict` rather than a timeout
+/// -- the relay's maintenance tick escalates that into `AUTHORITY_UNAVAILABLE`
+/// and closes a healthy session whose lease is still being renewed. The budget
+/// is the authority deadline so that the deadline stays the single boundary
+/// docs/cluster.md documents; a command in flight longer than that fails as a
+/// `timeout` before any script runs. Lag needs no tighter bound to stay fail
+/// closed: validity is evaluated at `math.max(caller_at, now)` and the returned
+/// windows are translated back into the caller's frame, so a lagging caller
+/// timestamp can only shorten a window, never extend one.
+const MAX_AUTHORITY_CALLER_LAG_US: i64 = REDIS_OPERATION_TIMEOUT.as_micros() as i64;
 const MAX_TICKET_INDEX_ITEMS: usize = crate::MAX_ATTACHMENT_TICKETS_PER_DEVICE;
 const MAX_REDIS_TLS_PEM_BYTES: usize = 1024 * 1024;
 
@@ -1046,6 +1067,7 @@ impl Catalog for RedisCatalog {
                     at.to_string(),
                     self.prefix.clone(),
                     MAX_AUTHORITY_CLOCK_SKEW_US.to_string(),
+                    MAX_AUTHORITY_CALLER_LAG_US.to_string(),
                 ],
             )
             .await?;
@@ -1128,6 +1150,7 @@ impl Catalog for RedisCatalog {
                     at_us.to_string(),
                     read_started_us.to_string(),
                     MAX_AUTHORITY_CLOCK_SKEW_US.to_string(),
+                    MAX_AUTHORITY_CALLER_LAG_US.to_string(),
                 ],
             )
             .await?;
@@ -1180,6 +1203,7 @@ impl Catalog for RedisCatalog {
                     self.max_list_items.to_string(),
                     (self.max_list_items.saturating_mul(32)).to_string(),
                     MAX_AUTHORITY_CLOCK_SKEW_US.to_string(),
+                    MAX_AUTHORITY_CALLER_LAG_US.to_string(),
                 ],
             )
             .await?;
@@ -2348,7 +2372,8 @@ local device_key = ARGV[3] .. 'device:' .. tenant_id .. ':' .. device_id
 local caller_at = tonumber(ARGV[2])
 local clock = redis.call('TIME')
 local now = tonumber(clock[1]) * 1000000 + tonumber(clock[2])
-if not caller_at or math.abs(now - caller_at) > tonumber(ARGV[4]) then return {'clock_skew'} end
+if not caller_at or caller_at - now > tonumber(ARGV[4])
+   or now - caller_at > tonumber(ARGV[5]) then return {'clock_skew'} end
 local at = math.max(caller_at, now)
 local translation = math.max(0, now - caller_at)
 local active = h(credential_key, 'active')
@@ -2404,7 +2429,8 @@ local at = tonumber(ARGV[1])
 local start = tonumber(ARGV[2])
 local clock = redis.call('TIME')
 local now = tonumber(clock[1]) * 1000000 + tonumber(clock[2])
-if not at or math.abs(now - at) > tonumber(ARGV[3]) then return {'clock_skew'} end
+if not at or at - now > tonumber(ARGV[3])
+   or now - at > tonumber(ARGV[4]) then return {'clock_skew'} end
 local effective_at = math.max(at, now)
 local expiry_string = h(KEYS[1], 'expires_at_us')
 local expiry
@@ -2437,7 +2463,8 @@ local include_inactive = ARGV[6] == '1'
 local caller_at = tonumber(ARGV[7])
 local clock = redis.call('TIME')
 local now = tonumber(clock[1]) * 1000000 + tonumber(clock[2])
-if not caller_at or math.abs(now - caller_at) > tonumber(ARGV[10]) then return {'clock_skew'} end
+if not caller_at or caller_at - now > tonumber(ARGV[10])
+   or now - caller_at > tonumber(ARGV[11]) then return {'clock_skew'} end
 local at = math.max(caller_at, now)
 local max_devices = tonumber(ARGV[8])
 local max_services = tonumber(ARGV[9])
