@@ -663,6 +663,15 @@ pub struct CredentialExpiryRotationEvidence {
     pub challenge_active_at_expiry: bool,
     pub challenge_started_at_ms: u64,
     pub challenge_deadline_ms: u64,
+    /// Monotonic expiry of the grant confirmed *before* the held refresh
+    /// challenge (`RelayStreamSnapshot::authorization_admission_deadline_ms`).
+    /// The owner computes it as the floored minimum of the challenge, catalog
+    /// snapshot, consumer token, owner lease and device credential remaining
+    /// lifetimes, so it never postdates the consumer token deadline that this
+    /// fixture makes the earliest.  It is a dispatch gate, not a timer: the
+    /// relay defers records after it while the refresh is in flight and only
+    /// marks `AUTHORIZATION_EXPIRED` once a real credential deadline has
+    /// passed (ingress token timer, write path, or the late refresh result).
     pub challenge_admission_deadline_ms: u64,
     /// Exactly one probe is attempted after token expiry while the
     /// authorization gate is still held.  The outcome is writer-side only and
@@ -852,9 +861,26 @@ pub fn validate_credential_expiry_rotation_evidence(
             .into(),
         ));
     }
+    // Required monotonic ordering, all on the owner relay's clock:
+    //
+    //   challenge_started_at_ms < challenge_admission_deadline_ms
+    //       <= expiry_observed_at_ms < challenge_deadline_ms
+    //
+    // The refresh challenge must have started while the previously confirmed
+    // grant was still live (the device refreshes with margin before its own
+    // deadline), the `AUTHORIZATION_EXPIRED` terminal may only be observed
+    // once that grant has expired (an earlier observation would be premature
+    // invalidation of a still-valid grant), and it must land before the held
+    // challenge's own lifetime ends so the cause is the consumer credential
+    // rather than the challenge timing out.  The relay has no poll or timer
+    // for this transition: the public ingress arms a one-shot sleep at the
+    // verified token deadline and the owner records the code on the resulting
+    // close, on the next record, or on the late refresh result, so the only
+    // relay-guaranteed lag bound is the challenge lifetime encoded here.
     if evidence.expiry_observed_at_ms < evidence.challenge_started_at_ms
         || evidence.expiry_observed_at_ms >= evidence.challenge_deadline_ms
-        || evidence.challenge_admission_deadline_ms <= evidence.expiry_observed_at_ms
+        || evidence.challenge_admission_deadline_ms <= evidence.challenge_started_at_ms
+        || evidence.challenge_admission_deadline_ms > evidence.expiry_observed_at_ms
         || evidence.consumer_token_expires_at_unix_ms == 0
         || evidence.post_expiry_probe_at_unix_ms == 0
         || evidence.post_expiry_probe_at_unix_ms < evidence.consumer_token_expires_at_unix_ms
@@ -3332,7 +3358,10 @@ mod evidence_tests {
             challenge_active_at_expiry: true,
             challenge_started_at_ms: 100,
             challenge_deadline_ms: 2_100,
-            challenge_admission_deadline_ms: 3_000,
+            // The previously confirmed grant outlives the refresh challenge
+            // start and has expired by the time the terminal is observed,
+            // while the held challenge itself is still live.
+            challenge_admission_deadline_ms: 150,
             post_expiry_probe_attempted: true,
             post_expiry_probe_after_expiry: true,
             post_expiry_probe_at_unix_ms: 1_725_000_000_000,
@@ -3483,6 +3512,60 @@ mod evidence_tests {
     }
 
     #[test]
+    fn accepts_expiry_observed_exactly_at_previous_grant_admission_deadline() {
+        let mut evidence = valid_evidence();
+        evidence.challenge_admission_deadline_ms = evidence.expiry_observed_at_ms;
+        validate_credential_expiry_rotation_evidence(&evidence).unwrap();
+    }
+
+    #[test]
+    fn rejects_expiry_observed_before_previous_grant_admission_deadline() {
+        // A terminal observed while the previously confirmed grant is still
+        // live would be premature invalidation, not credential expiry.
+        let mut evidence = valid_evidence();
+        evidence.challenge_admission_deadline_ms = evidence.expiry_observed_at_ms + 1;
+        let diagnostic = assert_failed(validate_credential_expiry_rotation_evidence(&evidence));
+        assert!(diagnostic.contains("post-expiry probe observation"));
+        // The old inverted fixture value (after the challenge deadline) is
+        // impossible for a grant confirmed before that challenge started.
+        evidence.challenge_admission_deadline_ms = evidence.challenge_deadline_ms + 900;
+        assert_failed(validate_credential_expiry_rotation_evidence(&evidence));
+    }
+
+    #[test]
+    fn rejects_previous_grant_admission_deadline_not_after_challenge_start() {
+        // The device refreshes with margin before its confirmed deadline, so
+        // a held challenge that started at or after the old grant expired
+        // was not a refresh of a live grant.
+        for admission_deadline_ms in [100, 99] {
+            let mut evidence = valid_evidence();
+            assert_eq!(evidence.challenge_started_at_ms, 100);
+            evidence.challenge_admission_deadline_ms = admission_deadline_ms;
+            assert_failed(validate_credential_expiry_rotation_evidence(&evidence));
+        }
+    }
+
+    #[test]
+    fn rejects_expiry_observed_at_or_after_held_challenge_deadline() {
+        // Place the whole challenge window inside the rotation window so the
+        // challenge-lifetime bound is the only predicate under test.  An
+        // observation at the challenge deadline could have been caused by the
+        // challenge timing out rather than by the consumer credential.
+        let mut evidence = valid_evidence();
+        evidence.rotation_started_at_ms = 100;
+        evidence.rotation_deadline_ms = 3_000;
+        evidence.challenge_started_at_ms = 1;
+        evidence.challenge_deadline_ms = 2_001;
+        evidence.challenge_admission_deadline_ms = 150;
+        evidence.expiry_observed_at_ms = 2_000;
+        evidence.rotation_remaining_ms = 1_000;
+        validate_credential_expiry_rotation_evidence(&evidence).unwrap();
+        evidence.expiry_observed_at_ms = 2_001;
+        evidence.rotation_remaining_ms = 999;
+        assert_failed(validate_credential_expiry_rotation_evidence(&evidence));
+    }
+
+    #[test]
     fn rejects_expiry_without_an_active_authorization_challenge() {
         let mut evidence = valid_evidence();
         evidence.challenge_active_at_expiry = false;
@@ -3575,7 +3658,7 @@ mod evidence_tests {
         }
 
         type Mutate = (&'static str, fn(&mut CredentialExpiryRotationEvidence));
-        let bounds: [Mutate; 25] = [
+        let bounds: [Mutate; 26] = [
             ("relay_count", |e| e.relay_count = 2),
             ("actual_cli_processes", |e| e.actual_cli_processes = 1),
             ("rotation_epoch", |e| e.rotation_epoch = 0),
@@ -3599,8 +3682,11 @@ mod evidence_tests {
             ("challenge_deadline_ms", |e| {
                 e.challenge_deadline_ms = e.challenge_started_at_ms
             }),
-            ("challenge_admission_deadline_ms", |e| {
-                e.challenge_admission_deadline_ms = e.expiry_observed_at_ms
+            ("challenge_admission_deadline_after_observation", |e| {
+                e.challenge_admission_deadline_ms = e.expiry_observed_at_ms + 1
+            }),
+            ("challenge_admission_deadline_at_challenge_start", |e| {
+                e.challenge_admission_deadline_ms = e.challenge_started_at_ms
             }),
             ("consumer_remaining_ms", |e| e.consumer_remaining_ms = 1),
             ("grant_remaining_ms", |e| e.grant_remaining_ms = 0),

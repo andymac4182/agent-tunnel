@@ -8987,6 +8987,12 @@ impl RelayActor {
             self.invalidate_stream_challenge(&key, &challenge, "device authorization unavailable");
             return;
         };
+        // Anchor the confirmation before reading the wall clock that bounds
+        // `remaining_ms`.  The retained admission deadline and dispatch gate
+        // then never postdate the earliest real deadline they were derived
+        // from, so an `AUTHORIZATION_EXPIRED` terminal can only be observed
+        // at or after the retained deadline, never before it.
+        let confirmed_at = Instant::now();
         let now_wall = Utc::now();
         let valid = self.session_for(&key).is_some_and(|session| {
             owner.token == session.owner
@@ -9060,9 +9066,9 @@ impl RelayActor {
             stream.authorization_in_flight = false;
             stream.authorization_started_at_ms = None;
             stream.authorization_deadline_ms = None;
-            let authorized_until = Instant::now() + Duration::from_millis(remaining_ms);
+            let authorized_until = confirmed_at + Duration::from_millis(remaining_ms);
             stream.authorization_admission_deadline_ms =
-                Some(monotonic_millis().saturating_add(remaining_ms));
+                Some(runtime::monotonic_millis_at(confirmed_at).saturating_add(remaining_ms));
             stream.authorized_until = Some(authorized_until);
             stream.challenge_id = Some(challenge.challenge_id);
             stream.grant = current;
@@ -13700,6 +13706,159 @@ mod stream_identity_tests {
             );
             assert!(data_rx.try_recv().is_err());
         }
+    }
+
+    #[tokio::test]
+    async fn stream_challenge_confirmation_never_postdates_the_earliest_grant_deadline() {
+        let now = Utc::now();
+        let tenant_id = Uuid::from_u128(601);
+        let device_id = Uuid::from_u128(602);
+        let principal_id = Uuid::from_u128(603);
+        let service_id = Uuid::from_u128(604);
+        let identity = DeviceIdentity {
+            tenant_id,
+            device_id,
+            owner_user_id: principal_id,
+            credential_id: Uuid::from_u128(605),
+            spki_fingerprint: "admission-anchor-spki".to_owned(),
+            credential_not_before: now - Duration::minutes(1),
+            expires_at: now + Duration::minutes(1),
+            credential_revoked_at: None,
+            device_active: true,
+            credential_active: true,
+            device_version: 1,
+            owner_epoch: 1,
+            last_seen_at: Some(now),
+        };
+        let consumer = AuthenticatedConsumer {
+            tenant_id,
+            principal_id,
+        };
+        let grant = GrantSnapshot {
+            tenant_id,
+            principal_id,
+            device_id,
+            service_id,
+            revision: 1,
+            permissions: PermissionSet {
+                operations: BTreeSet::from(["echo:invoke".to_owned()]),
+            },
+            constraints: serde_json::json!({}),
+            valid_until: now + Duration::minutes(1),
+            read_started_at: now,
+        };
+        let key = SessionKey {
+            tenant_id,
+            device_id,
+            session_id: "admission-anchor".to_owned(),
+            epoch: 1,
+        };
+        let (mut actor, mut control) = admitted_control_actor(identity.clone(), key.clone());
+        let (data_tx, _data_rx) = mpsc::channel(actor.options.limits.max_queue_messages);
+        let session = actor.sessions.get_mut(&key.scope()).expect("test session");
+        session.profile = super::RuntimeProfile::M2;
+        session.data_tx = Some(data_tx.clone());
+        session.active_carrier = Some(DataCarrier {
+            context: CarrierContext::new(
+                key.session_id.clone(),
+                key.epoch,
+                1,
+                "admission-anchor-data".to_owned(),
+            ),
+            tx: data_tx,
+        });
+        // The consumer credential is the earliest deadline by a wide margin;
+        // the challenge lifetime, grant, owner lease and device credential
+        // all remain valid for far longer.
+        let consumer_expires_at = now + Duration::milliseconds(1_200);
+        let (open_tx, open_rx) = oneshot::channel();
+        actor.open_echo_stream(
+            consumer,
+            device_id,
+            service_id,
+            grant.clone(),
+            consumer_expires_at,
+            open_tx,
+        );
+        let admitted = open_rx
+            .await
+            .expect("open response")
+            .expect("stream admitted");
+        drop(control.rx.try_recv().expect("OPEN queued"));
+        let challenge_id = "admission-anchor-challenge";
+        let started_at_ms = super::monotonic_millis();
+        {
+            let stream = actor
+                .sessions
+                .get_mut(&key.scope())
+                .expect("test session")
+                .streams
+                .get_mut(&admitted.stream_id)
+                .expect("admitted stream");
+            stream.open_pending = false;
+            stream.authorization_in_flight = true;
+            stream.authorization_started_at_ms = Some(started_at_ms);
+            stream.authorization_deadline_ms = Some(started_at_ms + 2_000);
+            stream.challenge_id = Some(challenge_id.to_owned());
+        }
+        let owner_token = actor.sessions[&key.scope()].owner.clone();
+        actor.finish_stream_challenge(
+            key.clone(),
+            DeviceChallenge {
+                message_id: "admission-anchor-auth".to_owned(),
+                stream_id: admitted.stream_id,
+                service_id: service_id.to_string(),
+                challenge_id: challenge_id.to_owned(),
+                nonce: "admission-anchor-nonce".to_owned(),
+                permission_digest: super::wire::permission_digest(&grant, &service_id.to_string()),
+                grant_revision: grant.revision,
+                received_at: std::time::Instant::now(),
+                lifetime: std::time::Duration::from_secs(2),
+            },
+            Ok((
+                Some(grant.clone()),
+                Some(OwnerClaim {
+                    token: owner_token,
+                    lease_expires_at: now + Duration::minutes(1),
+                }),
+                Some(identity),
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(60)),
+            )),
+        );
+        // Sample the wall clock first: this projection of the credential
+        // deadline onto the monotonic clock can then only be later than the
+        // real instant, never earlier, so the bounds below are exact rather
+        // than probabilistic.
+        let wall_now = Utc::now();
+        let projected_token_expiry = std::time::Instant::now()
+            + (consumer_expires_at - wall_now)
+                .to_std()
+                .unwrap_or_default();
+        let stream = &actor.sessions[&key.scope()].streams[&admitted.stream_id];
+        assert!(!stream.authorization_in_flight && !stream.terminal);
+        assert_eq!(stream.authorization_failure_code, None);
+        assert!(
+            control.rx.try_recv().is_ok(),
+            "AUTHORIZATION_CONFIRMED must be queued"
+        );
+        let admission_deadline_ms = stream
+            .authorization_admission_deadline_ms
+            .expect("confirmed grant retains its admission deadline");
+        assert!(
+            admission_deadline_ms > started_at_ms,
+            "admission deadline {admission_deadline_ms} must follow challenge start {started_at_ms}"
+        );
+        let projected_ms = super::runtime::monotonic_millis_at(projected_token_expiry);
+        assert!(
+            admission_deadline_ms <= projected_ms,
+            "admission deadline {admission_deadline_ms} postdates the consumer deadline {projected_ms}"
+        );
+        assert!(
+            stream
+                .authorized_until
+                .is_some_and(|until| until <= projected_token_expiry),
+            "dispatch gate must not outlive the consumer credential"
+        );
     }
 
     #[tokio::test]
