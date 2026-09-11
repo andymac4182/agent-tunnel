@@ -14,7 +14,7 @@ oidc_jwks_path = "examples/credentials/oidc-jwks.json"
 # Production relay startup requires Redis TLS. The disposable local harness
 # accepts TEST_REDIS_URL=redis://... through its low-level test-only path.
 redis_url = "rediss://redis.example.internal:6379/0"
-redis_namespace = "agent-tunnel/m1"
+redis_namespace = "agent-tunnel-m1"
 
 device_tls_cert_chain = "examples/credentials/relay-device-cert-chain.pem"
 device_tls_private_key = "examples/credentials/relay-device-key.pem"
