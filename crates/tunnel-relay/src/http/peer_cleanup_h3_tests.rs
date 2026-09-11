@@ -1825,3 +1825,325 @@ async fn peer_consumer_transport_shutdown_closes_exact_stream_and_preserves_sibl
     drop(stream);
     fixture.shutdown().await;
 }
+
+// ---------------------------------------------------------------------------
+// EC-049 owner-side negative: a peer whose envelope owner, scope, digest, or
+// declared length is invalid must be refused before the owner reads or
+// forwards any request body.  Each case drives the real production
+// `peer_ingress_handler` behind a real HTTP/3 `PeerClient`, sends a body
+// sentinel record immediately after the (invalid) envelope, and proves through
+// the payload-free relay snapshot counters that the owner performed zero
+// `ConsumerChunk` body reads and zero application dispatches before the typed
+// rejection.  The consumer-ingress preflight is proven separately by
+// `verify-m7-i04-fail-closed`; this closes the owner peer-leg negative.
+
+/// One sentinel body record that must never be read or dispatched by the owner.
+const OWNER_NEGATIVE_SENTINEL: &[u8] = b"ec049-owner-negative-body-sentinel";
+
+/// Build a `ConsumerStreams` envelope with an explicit source identity and
+/// owner token so a single case can corrupt exactly one field.
+fn consumer_envelope_with_source(
+    request_id: &str,
+    stream_id: &str,
+    source: PeerIdentity,
+    owner: &OwnerToken,
+    token: &str,
+) -> RequestEnvelope {
+    let destination = Destination::new(owner.clone(), service_id());
+    let bearer =
+        ForwardedConsumerBearer::new(token.to_owned(), owner.clone()).expect("consumer bearer");
+    RequestEnvelope::new(
+        InternalRoute::ConsumerStreams,
+        request_id,
+        source,
+        destination,
+        20_000,
+        Some(20_000),
+        InternalRequest::ConsumerStreams(ConsumerStreamsRequest {
+            stream_id: stream_id.to_owned(),
+            required_scope: crate::ECHO_OPERATION.to_owned(),
+            bearer,
+            bytes: Vec::new(),
+        }),
+    )
+}
+
+/// Read the payload-free owner-side reads/dispatch counters.
+async fn owner_leg_counters(handle: &RelayHandle) -> (u64, u64) {
+    let snapshot = handle.snapshot().await.expect("owner-negative snapshot");
+    (
+        snapshot.lifetime_consumer_chunk_reads,
+        snapshot.lifetime_application_dispatches,
+    )
+}
+
+/// Drive one owner-side negative case: open a fresh raw peer stream, send the
+/// pre-encoded first peer record (an invalid envelope, or an over-length
+/// record), then the body sentinel, then finish.  Returns whether the owner
+/// refused the request (a non-OK response, a response body error, or the raw
+/// send failing because the owner reset the stream).
+async fn drive_owner_negative_case(
+    fixture: &H3PeerFixture,
+    first_record: Bytes,
+    sentinel_kind: PeerRecordKind,
+) -> bool {
+    let mut stream = open_raw(fixture, InternalRoute::ConsumerStreams).await;
+    let mut refused = false;
+    if timeout(Duration::from_secs(3), stream.send_chunk(first_record))
+        .await
+        .expect("owner-negative first-record deadline")
+        .is_err()
+    {
+        refused = true;
+    }
+    if !refused {
+        let sentinel = encode_peer_record(sentinel_kind, OWNER_NEGATIVE_SENTINEL);
+        if timeout(Duration::from_secs(3), stream.send_chunk(sentinel))
+            .await
+            .expect("owner-negative sentinel deadline")
+            .is_err()
+        {
+            refused = true;
+        }
+    }
+    if !refused {
+        let _ = timeout(Duration::from_secs(3), stream.finish()).await;
+    }
+    match timeout(Duration::from_secs(3), stream.recv_response()).await {
+        Ok(Ok(response)) => {
+            if !response.status().is_success() {
+                refused = true;
+            } else {
+                // A 200 head is only acceptable if the owner nonetheless
+                // failed the request before any body read; drain the body and
+                // require it to error or end without ever dispatching.
+                loop {
+                    match timeout(Duration::from_secs(3), stream.recv_chunk()).await {
+                        Ok(Ok(Some(_))) => {}
+                        Ok(Ok(None)) => break,
+                        Ok(Err(_)) => {
+                            refused = true;
+                            break;
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
+        }
+        Ok(Err(_)) => refused = true,
+        Err(_) => {}
+    }
+    stream.cancel();
+    drop(stream);
+    refused
+}
+
+#[tokio::test]
+async fn peer_owner_refuses_body_before_preflight_on_invalid_envelope() {
+    let fixture = H3PeerFixture::new().await;
+    // A live owner exists so a valid destination lookup is possible; the
+    // negatives below still fail closed before any body is read.
+    let _target = register_control(
+        &fixture,
+        DEVICE_SPKI,
+        device_id(),
+        "ec049-owner-negative-owner",
+    )
+    .await;
+    let owner = current_target_owner(&fixture).await;
+
+    // Baseline: nothing has been read or dispatched from any peer body yet.
+    let (reads_before, dispatches_before) = owner_leg_counters(&fixture.handle).await;
+    assert_eq!(
+        (reads_before, dispatches_before),
+        (0, 0),
+        "owner-negative baseline must start with zero peer body reads and dispatches"
+    );
+
+    // Case 1: a mismatched owner token (wrong session id) is refused before
+    // the peer stream is split or any body sentinel is read.
+    let mut wrong_owner = owner.token.clone();
+    wrong_owner.session_id = format!("{}-mismatch", wrong_owner.session_id);
+    let wrong_owner_envelope = consumer_envelope_with_source(
+        "ec049-wrong-owner-request",
+        "ec049-wrong-owner-stream",
+        PeerIdentity::new(SOURCE_NODE, SOURCE_BOOT),
+        &wrong_owner,
+        &fixture.consumer_token,
+    );
+    let refused = drive_owner_negative_case(
+        &fixture,
+        encode_peer_record(
+            PeerRecordKind::CompleteControlText,
+            &wrong_owner_envelope
+                .encode()
+                .expect("encode wrong-owner envelope"),
+        ),
+        PeerRecordKind::ConsumerChunk,
+    )
+    .await;
+    assert!(refused, "mismatched owner token must be refused");
+
+    // Case 2: a bearer the owner cannot authenticate is refused; the owner
+    // validates the JWT itself and never reads the request body on failure.
+    let bad_bearer_envelope = consumer_envelope_with_source(
+        "ec049-bad-bearer-request",
+        "ec049-bad-bearer-stream",
+        PeerIdentity::new(SOURCE_NODE, SOURCE_BOOT),
+        &owner.token,
+        "ec049-not-a-valid-consumer-token",
+    );
+    let refused = drive_owner_negative_case(
+        &fixture,
+        encode_peer_record(
+            PeerRecordKind::CompleteControlText,
+            &bad_bearer_envelope
+                .encode()
+                .expect("encode bad-bearer envelope"),
+        ),
+        PeerRecordKind::ConsumerChunk,
+    )
+    .await;
+    assert!(refused, "unauthenticated consumer bearer must be refused");
+
+    // Case 3: a source identity that does not match the authenticated peer
+    // certificate is refused by the runtime before owner lookup.
+    let wrong_source_envelope = consumer_envelope_with_source(
+        "ec049-wrong-source-request",
+        "ec049-wrong-source-stream",
+        PeerIdentity::new("ec049-not-the-authenticated-node", SOURCE_BOOT),
+        &owner.token,
+        &fixture.consumer_token,
+    );
+    let refused = drive_owner_negative_case(
+        &fixture,
+        encode_peer_record(
+            PeerRecordKind::CompleteControlText,
+            &wrong_source_envelope
+                .encode()
+                .expect("encode wrong-source envelope"),
+        ),
+        PeerRecordKind::ConsumerChunk,
+    )
+    .await;
+    assert!(refused, "mismatched source identity must be refused");
+
+    // Case 4: an over-length first record (declared length above the envelope
+    // ceiling of 8 KiB) is refused before the JSON is decoded and before the
+    // body sentinel is read.  The record is a legal control-text kind whose
+    // body exceeds the envelope-record bound.
+    let oversized_body = vec![0x5a_u8; 9_000];
+    let refused = drive_owner_negative_case(
+        &fixture,
+        encode_peer_record(PeerRecordKind::CompleteControlText, &oversized_body),
+        PeerRecordKind::ConsumerChunk,
+    )
+    .await;
+    assert!(refused, "over-length envelope declaration must be refused");
+
+    // Every negative case must have left the owner-side body-read and dispatch
+    // counters untouched: no peer body was read and nothing was forwarded.
+    let (reads_after, dispatches_after) = owner_leg_counters(&fixture.handle).await;
+    assert_eq!(
+        reads_after, 0,
+        "owner performed a peer ConsumerChunk read despite an invalid envelope"
+    );
+    assert_eq!(
+        dispatches_after, 0,
+        "owner dispatched an application record despite an invalid envelope"
+    );
+
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn peer_owner_refuses_device_body_on_bad_certificate_digest() {
+    // The device routes resolve the forwarded certificate digest against the
+    // active device catalog before any control/data record is read.  A digest
+    // that does not resolve to an active device is refused with zero reads and
+    // zero dispatches.
+    let fixture = H3PeerFixture::new().await;
+    let _target = register_control(&fixture, DEVICE_SPKI, device_id(), "ec049-digest-owner").await;
+    let owner = current_target_owner(&fixture).await;
+
+    let (reads_before, dispatches_before) = owner_leg_counters(&fixture.handle).await;
+    assert_eq!((reads_before, dispatches_before), (0, 0));
+
+    // A device-control envelope whose forwarded certificate carries a digest
+    // that is not a registered active device.
+    let now = Utc::now();
+    let source = PeerIdentity::new(SOURCE_NODE, SOURCE_BOOT);
+    let destination = Destination::new(owner.token.clone(), Uuid::nil());
+    let authentication = DeviceAuthenticationContext {
+        certificate: VerifiedDeviceCertificate {
+            certificate_identity: device_id().to_string(),
+            spki_fingerprint: "ec049eec049eec049eec049eec049eec049eec049eec049eec049eec049eec04"
+                .to_owned(),
+            serial: "ec049-bad-digest".to_owned(),
+            not_before: now - ChronoDuration::seconds(1),
+            expires_at: now + ChronoDuration::minutes(5),
+            tenant_id: tenant_id(),
+            device_id: device_id(),
+        },
+        ingress: IngressRequestBinding {
+            request_id: "ec049-bad-digest-request".to_owned(),
+            source: source.clone(),
+            destination: destination.clone(),
+            expires_at: now + ChronoDuration::seconds(10),
+        },
+    };
+    let envelope = RequestEnvelope::new(
+        InternalRoute::DeviceControl,
+        "ec049-bad-digest-request",
+        source,
+        destination,
+        20_000,
+        None,
+        InternalRequest::DeviceControl(DeviceControlRequest {
+            stream_id: "ec049-bad-digest-stream".to_owned(),
+            authentication,
+        }),
+    );
+
+    let mut stream = open_raw(&fixture, InternalRoute::DeviceControl).await;
+    let mut refused = false;
+    if timeout(
+        Duration::from_secs(3),
+        stream.send_chunk(encode_peer_record(
+            PeerRecordKind::CompleteControlText,
+            &envelope.encode().expect("encode bad-digest envelope"),
+        )),
+    )
+    .await
+    .expect("bad-digest envelope deadline")
+    .is_err()
+    {
+        refused = true;
+    }
+    if !refused {
+        // A control-text body sentinel that must never be dispatched.
+        let sentinel = encode_peer_record(PeerRecordKind::CompleteControlText, b"{}");
+        let _ = timeout(Duration::from_secs(3), stream.send_chunk(sentinel)).await;
+        let _ = timeout(Duration::from_secs(3), stream.finish()).await;
+    }
+    match timeout(Duration::from_secs(3), stream.recv_response()).await {
+        Ok(Ok(response)) => refused = refused || !response.status().is_success(),
+        Ok(Err(_)) => refused = true,
+        Err(_) => {}
+    }
+    stream.cancel();
+    drop(stream);
+    assert!(
+        refused,
+        "a device certificate with a bad digest must be refused"
+    );
+
+    let (reads_after, dispatches_after) = owner_leg_counters(&fixture.handle).await;
+    assert_eq!(reads_after, 0);
+    assert_eq!(
+        dispatches_after, 0,
+        "a bad device digest must not reach application dispatch"
+    );
+
+    fixture.shutdown().await;
+}

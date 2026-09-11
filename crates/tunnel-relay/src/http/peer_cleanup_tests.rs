@@ -864,6 +864,99 @@ async fn peer_consumer_error_reclaims_scoped_stream_and_queue_charge() {
     handle.shutdown().await.expect("relay shutdown");
 }
 
+/// EC-035 device HELLO version negotiation: a device advertising a protocol
+/// major this relay does not speak is refused with a typed protocol outcome
+/// before any owner lease, session, or dispatch state is created, and there is
+/// no silent fallback to the supported generation.
+#[tokio::test]
+async fn device_hello_unsupported_or_missing_major_is_refused_before_state() {
+    let now = Utc::now();
+    let catalog = Arc::new(MemoryCatalog::new());
+    catalog
+        .seed_fixture(&catalog_fixture(now))
+        .await
+        .expect("seed cleanup catalog");
+    let (oidc, _token) = oidc_fixture();
+    let mut options = RelayOptions::new(oidc);
+    options.node_id = DESTINATION_NODE.to_owned();
+    options.boot_id = DESTINATION_BOOT.to_owned();
+    options.deployment_incarnation = DEPLOYMENT_INCARNATION.to_owned();
+    let handle = RelayHandle::spawn(options, catalog.clone());
+
+    let device = catalog
+        .resolve_device(DEVICE_SPKI, Utc::now())
+        .await
+        .expect("resolve device")
+        .expect("device identity");
+
+    // A HELLO from an incompatible protocol generation.  Even with every
+    // required feature advertised, the exact major-version check refuses it;
+    // there is no fallback branch that downgrades it to the supported major.
+    let unsupported_major = u16::from(crate::PROTOCOL_MAJOR) + 1;
+    let mut hello = Hello::new(
+        "ec035-unsupported-hello",
+        device_id().to_string(),
+        unsupported_major,
+        0,
+    );
+    hello.features = vec![
+        wire::M1_PROFILE_FEATURE.to_owned(),
+        wire::ORDERED_ROTATION_FEATURE.to_owned(),
+        wire::OWNER_FENCING_FEATURE.to_owned(),
+        "echo".to_owned(),
+    ];
+    let outcome = handle
+        .register_forwarded_control(device.clone(), DEVICE_SPKI.to_owned(), hello)
+        .await;
+    match outcome {
+        Err(crate::RelayError::Protocol(_)) => {}
+        Err(other) => panic!("expected a typed protocol outcome, got {other:?}"),
+        Ok(_) => panic!("an unsupported protocol major must be refused"),
+    }
+
+    // No owner lease was taken and no session state was created for the
+    // refused device.
+    assert!(
+        catalog
+            .current_owner(tenant_id(), device_id(), Utc::now())
+            .await
+            .expect("read owner after refusal")
+            .is_none(),
+        "a refused HELLO must not create an owner lease"
+    );
+    let snapshot = handle.snapshot().await.expect("snapshot after refusal");
+    assert!(
+        snapshot
+            .sessions
+            .iter()
+            .all(|session| session.device_id != device_id().to_string()),
+        "a refused HELLO must not create a session"
+    );
+    assert_eq!(
+        snapshot.lifetime_application_dispatches, 0,
+        "a refused HELLO must not dispatch"
+    );
+
+    // A version-0 HELLO (a missing/zero major) is refused the same way.
+    let mut zero_major = Hello::new("ec035-zero-hello", device_id().to_string(), 0, 0);
+    zero_major.features = vec![
+        wire::M1_PROFILE_FEATURE.to_owned(),
+        wire::ORDERED_ROTATION_FEATURE.to_owned(),
+        wire::OWNER_FENCING_FEATURE.to_owned(),
+        "echo".to_owned(),
+    ];
+    match handle
+        .register_forwarded_control(device, DEVICE_SPKI.to_owned(), zero_major)
+        .await
+    {
+        Err(crate::RelayError::Protocol(_)) => {}
+        Err(other) => panic!("expected a typed protocol outcome, got {other:?}"),
+        Ok(_) => panic!("a zero protocol major must be refused"),
+    }
+
+    handle.shutdown().await.expect("relay shutdown");
+}
+
 #[cfg(test)]
 #[path = "peer_cleanup_h3_tests.rs"]
 mod peer_cleanup_h3_tests;

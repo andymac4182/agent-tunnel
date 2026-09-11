@@ -598,8 +598,21 @@ impl RequestEnvelope {
 /// JSON/size errors from the bounded envelope codec.
 #[derive(Debug)]
 pub enum EnvelopeError {
-    MessageTooLarge { length: usize, maximum: usize },
+    MessageTooLarge {
+        length: usize,
+        maximum: usize,
+    },
     Json(serde_json::Error),
+    /// The envelope declared a schema version this relay does not speak.
+    ///
+    /// Version negotiation is explicit and fail-closed: the only accepted
+    /// value is [`ENVELOPE_SCHEMA_VERSION`], and a mismatch is refused at the
+    /// codec boundary before any membership, owner, catalog, or bearer state
+    /// is consulted.  There is no fallback to another envelope generation.
+    UnsupportedSchemaVersion {
+        expected: u16,
+        actual: u16,
+    },
 }
 
 impl fmt::Display for EnvelopeError {
@@ -612,6 +625,10 @@ impl fmt::Display for EnvelopeError {
                 )
             }
             Self::Json(_) => formatter.write_str("invalid internal envelope JSON"),
+            Self::UnsupportedSchemaVersion { expected, actual } => write!(
+                formatter,
+                "unsupported envelope schema version {actual}; this relay speaks {expected}"
+            ),
         }
     }
 }
@@ -620,13 +637,20 @@ impl std::error::Error for EnvelopeError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Json(error) => Some(error),
-            Self::MessageTooLarge { .. } => None,
+            Self::MessageTooLarge { .. } | Self::UnsupportedSchemaVersion { .. } => None,
         }
     }
 }
 
 /// Decode one complete envelope.  The byte bound is checked before invoking
 /// serde so an attacker cannot allocate a parser tree from an oversized body.
+///
+/// The schema version is checked here, at the codec boundary, and not only in
+/// [`RequestEnvelope::validate`]: a peer from an incompatible protocol
+/// generation is refused before the receiver consults membership bindings, the
+/// owner catalog, or a forwarded bearer.  A missing `schema_version` field is a
+/// JSON error for the same reason; compatibility is never inferred from an
+/// absent field.
 pub fn decode_envelope(encoded: &[u8]) -> Result<RequestEnvelope, EnvelopeError> {
     if encoded.len() > MAX_ENVELOPE_BYTES {
         return Err(EnvelopeError::MessageTooLarge {
@@ -634,7 +658,14 @@ pub fn decode_envelope(encoded: &[u8]) -> Result<RequestEnvelope, EnvelopeError>
             maximum: MAX_ENVELOPE_BYTES,
         });
     }
-    serde_json::from_slice(encoded).map_err(EnvelopeError::Json)
+    let envelope: RequestEnvelope = serde_json::from_slice(encoded).map_err(EnvelopeError::Json)?;
+    if envelope.schema_version != ENVELOPE_SCHEMA_VERSION {
+        return Err(EnvelopeError::UnsupportedSchemaVersion {
+            expected: ENVELOPE_SCHEMA_VERSION,
+            actual: envelope.schema_version,
+        });
+    }
+    Ok(envelope)
 }
 
 /// Short function-oriented aliases for callers that use codec terminology.
@@ -1014,6 +1045,48 @@ mod tests {
                 admission_ms: 4_000,
                 lifetime_ms: 3_000,
             })
+        );
+    }
+
+    #[test]
+    fn unsupported_or_missing_schema_version_is_refused_at_decode() {
+        // A well-formed envelope from a newer protocol generation is refused
+        // by the codec itself, with the typed version outcome, before any
+        // caller could reach `validate` or owner state.
+        let mut envelope = health();
+        envelope.schema_version = ENVELOPE_SCHEMA_VERSION + 1;
+        let encoded = serde_json::to_vec(&envelope).expect("encode newer envelope");
+        assert!(matches!(
+            decode_envelope(&encoded),
+            Err(EnvelopeError::UnsupportedSchemaVersion { expected, actual })
+                if expected == ENVELOPE_SCHEMA_VERSION && actual == ENVELOPE_SCHEMA_VERSION + 1
+        ));
+        let mut envelope = health();
+        envelope.schema_version = 0;
+        let encoded = serde_json::to_vec(&envelope).expect("encode zero-version envelope");
+        assert!(matches!(
+            decode_envelope(&encoded),
+            Err(EnvelopeError::UnsupportedSchemaVersion { actual: 0, .. })
+        ));
+
+        // An absent version is never treated as "compatible by default".
+        let mut value: serde_json::Value =
+            serde_json::to_value(health()).expect("envelope as JSON value");
+        value
+            .as_object_mut()
+            .expect("envelope object")
+            .remove("schema_version");
+        let encoded = serde_json::to_vec(&value).expect("encode versionless envelope");
+        assert!(matches!(
+            decode_envelope(&encoded),
+            Err(EnvelopeError::Json(_))
+        ));
+
+        // The current version round-trips unchanged.
+        let encoded = health().encode().expect("encode current envelope");
+        assert_eq!(
+            decode_envelope(&encoded).expect("decode current envelope"),
+            health()
         );
     }
 
