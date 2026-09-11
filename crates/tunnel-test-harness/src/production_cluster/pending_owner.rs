@@ -1636,9 +1636,22 @@ fn spawn_backend(
             let mut receive_window_limit = None;
             let mut pending_data = None;
             let mut response_attempted = false;
+            // The relay's FIN ends this backend's stream work, but it must not
+            // end the backend: the scenario samples the catalog owner while
+            // both device sockets are still attached, and returning here would
+            // drop them, close the control socket and release the owner lease
+            // before that sample.  Keep draining both sockets until the
+            // scenario cancels this task.
+            let mut stream_stopped = false;
             let mut response_attempted_tx = Some(response_attempted_tx);
             loop {
-                if authorized && let Some(frame) = pending_data.take() {
+                if stream_stopped {
+                    pending_data = None;
+                }
+                if authorized
+                    && !stream_stopped
+                    && let Some(frame) = pending_data.take()
+                {
                     let Some(stream_id) = stream_id else {
                         return Err(HarnessError::Http(
                             "pending-owner buffered data lost its OPEN context".into(),
@@ -1661,7 +1674,7 @@ fn spawn_backend(
                                 let _ = signal.send(());
                             }
                         }
-                        BackendFrameOutcome::Stop => return Ok(response_attempted),
+                        BackendFrameOutcome::Stop => stream_stopped = true,
                     }
                     continue;
                 }
@@ -1827,7 +1840,7 @@ fn spawn_backend(
                                             let _ = signal.send(());
                                         }
                                     }
-                                    BackendFrameOutcome::Stop => return Ok(response_attempted),
+                                    BackendFrameOutcome::Stop => stream_stopped = true,
                                 }
                             }
                         Some(Ok(Message::Ping(payload))) => { data.send(Message::Pong(payload)).await.map_err(|error| HarnessError::Http(format!("pending-owner backend data pong: {error}")))?; }
