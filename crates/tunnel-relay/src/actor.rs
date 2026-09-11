@@ -68,6 +68,11 @@ use crate::{
 };
 
 const AUTHORIZATION_LIFETIME: Duration = Duration::from_secs(5);
+/// Reason recorded when a device answers with a challenge whose frozen
+/// identity does not match the in-flight authorization.  It is outside the
+/// narrower reasons mapped in `authorization_failure_code`, so it carries the
+/// existing `AUTHORIZATION_INVALIDATED` code rather than adding a new one.
+const CHALLENGE_MISMATCH_REASON: &str = "challenge mismatch";
 const OWNER_LEASE_SAFETY_MARGIN: Duration = Duration::from_secs(5);
 const MAX_ECHO_RESPONSE_EXTRA_BYTES: usize = 256;
 const INITIAL_ATTACHMENT_PURPOSE: &str = "initial";
@@ -8956,48 +8961,58 @@ impl RelayActor {
         let authorization_started_at_ms = monotonic_millis();
         let authorization_deadline_ms = authorization_started_at_ms
             .saturating_add(u64::try_from(challenge.lifetime.as_millis()).unwrap_or(u64::MAX));
+        // Which in-flight record rejected a mismatched challenge.  The pending
+        // and admitted-stream paths carry different typed refusals, and both
+        // must be applied after the session borrow below ends.
+        enum MismatchedChallenge {
+            Pending,
+            Stream,
+        }
+        let mut mismatched = None;
         let Some(session) = self.session_mut(&key) else {
             return;
         };
-        let (consumer, service_id, read_started_at, spki) =
-            if let Some(pending) = session.pending.get_mut(&message.stream_id) {
-                if pending.dispatched || pending.authorization_in_flight {
-                    return;
-                }
-                let expected_digest =
-                    wire::permission_digest(&pending.grant, &pending.service_id.to_string());
-                if challenge.permission_digest != expected_digest
-                    || challenge.grant_revision != pending.grant.revision
-                    || challenge.service_id != pending.service_id.to_string()
-                {
-                    return;
-                }
+        let resolved = if let Some(pending) = session.pending.get_mut(&message.stream_id) {
+            if pending.dispatched || pending.authorization_in_flight {
+                return;
+            }
+            let expected_digest =
+                wire::permission_digest(&pending.grant, &pending.service_id.to_string());
+            if challenge.permission_digest != expected_digest
+                || challenge.grant_revision != pending.grant.revision
+                || challenge.service_id != pending.service_id.to_string()
+            {
+                mismatched = Some(MismatchedChallenge::Pending);
+                None
+            } else {
                 pending.authorization_in_flight = true;
                 pending.challenge_id = Some(challenge.challenge_id.clone());
-                (
+                Some((
                     pending.consumer.clone(),
                     pending.service_id,
                     pending.grant.read_started_at,
                     session.identity.spki_fingerprint.clone(),
-                )
-            } else if let Some(stream) = session.streams.get_mut(&message.stream_id) {
-                if stream.authorization_in_flight || stream.terminal {
-                    return;
-                }
-                let expected_digest =
-                    wire::permission_digest(&stream.grant, &stream.service_id.to_string());
-                if challenge.permission_digest != expected_digest
-                    || challenge.grant_revision != stream.grant.revision
-                    || challenge.service_id != stream.service_id.to_string()
-                {
-                    return;
-                }
+                ))
+            }
+        } else if let Some(stream) = session.streams.get_mut(&message.stream_id) {
+            if stream.authorization_in_flight || stream.terminal {
+                return;
+            }
+            let expected_digest =
+                wire::permission_digest(&stream.grant, &stream.service_id.to_string());
+            if challenge.permission_digest != expected_digest
+                || challenge.grant_revision != stream.grant.revision
+                || challenge.service_id != stream.service_id.to_string()
+            {
+                mismatched = Some(MismatchedChallenge::Stream);
+                None
+            } else {
                 stream.open_pending = false;
                 stream.authorization_in_flight = true;
                 stream.authorization_started_at_ms = Some(authorization_started_at_ms);
                 stream.authorization_deadline_ms = Some(authorization_deadline_ms);
                 stream.challenge_id = Some(challenge.challenge_id.clone());
-                (
+                Some((
                     stream.consumer.clone(),
                     stream.service_id,
                     // A streaming challenge is a fresh authorization read.
@@ -9007,10 +9022,32 @@ impl RelayActor {
                     // when the consumer and grant are still valid.
                     Utc::now(),
                     session.identity.spki_fingerprint.clone(),
-                )
-            } else {
-                return;
-            };
+                ))
+            }
+        } else {
+            return;
+        };
+        // A mismatched challenge can never be confirmed, so the operation must
+        // not keep waiting for its authorization deadline.  Both refusals reuse
+        // the existing closed authorization-failure vocabulary: the reason maps
+        // to `AUTHORIZATION_INVALIDATED` and the waiters receive the existing
+        // `AUTHORIZATION_REVOKED` outcome.  The reason is a fixed literal, so no
+        // payload or credential reaches the diagnostic.
+        let Some((consumer, service_id, read_started_at, spki)) = resolved else {
+            match mismatched {
+                Some(MismatchedChallenge::Pending) => self.invalidate_pending(
+                    &key,
+                    message.stream_id,
+                    &challenge,
+                    CHALLENGE_MISMATCH_REASON,
+                ),
+                Some(MismatchedChallenge::Stream) => {
+                    self.invalidate_stream_challenge(&key, &challenge, CHALLENGE_MISMATCH_REASON);
+                }
+                None => {}
+            }
+            return;
+        };
         let catalog = self.catalog.clone();
         let command_tx = self.command_tx.clone();
         let cancel = self.options.shutdown.clone();
@@ -17957,6 +17994,10 @@ mod lifecycle_tests;
 #[cfg(test)]
 #[path = "actor_admission_race_tests.rs"]
 mod admission_race_tests;
+
+#[cfg(test)]
+#[path = "actor_challenge_mismatch_tests.rs"]
+mod challenge_mismatch_tests;
 
 #[cfg(test)]
 #[path = "actor_rotation_freeze_tests.rs"]

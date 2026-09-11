@@ -4243,6 +4243,11 @@ async fn start_relay(
         boot_id: String::new(),
         deployment_incarnation: fixture.deployment_incarnation.clone(),
         max_devices_per_user: 16,
+        // The production fixture keeps the documented per-owner consumer
+        // admission bound; scenarios that need a narrower relay-global bound
+        // override `limits.max_pending_operations` below, and the effective
+        // per-owner bound is clamped to it.
+        max_pending_operations_per_owner: tunnel_relay::DEFAULT_MAX_PENDING_OPERATIONS_PER_OWNER,
         max_queue_bytes: 4 * 1024 * 1024,
         rotation: harness.rotation_config(),
         cluster: Some(cluster_config),

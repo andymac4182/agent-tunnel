@@ -50,6 +50,8 @@ The device still has two steady-state WebSockets and at most one replacement dat
 
 The full owner token is `(deployment_incarnation, tenant_id, device_id, node_id, boot_id, epoch, session_id)`. The epoch is not a distributed timestamp and must not wrap. Internal envelopes carry the complete owner token; the public binary frame remains bound to its authenticated session and existing epoch field. Consumers never receive private node addresses or registry credentials.
 
+Public consumer admission permits are bounded per `(tenant_id, device_id)` owner scope as well as relay-globally. The scope is the same canonical tenant/device scope the durable catalog keys, the owner token and owner resolution already use: it is exactly the owner an admitted operation targets, its cardinality is bounded by the existing device limits, and a tenant cannot widen its own allowance by minting additional principals. A relay-global-only bound is not tenant isolation, because that permit is held for the whole operation round trip: one tenant's in-flight operations would refuse every other tenant's public request. The two bounds and their defaults are specified in [runtime.md](runtime.md).
+
 The owner actor contains control and data bindings, rotation state, stream authorization, operation dispatch state, sequence/replay state, and quota accounting. An ingress actor can hold a socket and bounded forwarding buffers but cannot manufacture a replacement owner. Durable device records remain present when a lease or socket disappears. User listing is filtered through authorization before returning presence.
 
 ## Durable catalog and authorization freshness

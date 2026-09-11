@@ -230,6 +230,8 @@ Listener connection permits need real-socket evidence, not a counter assertion. 
 
 Assert maximum frame size, maximum operation size, per-stream and per-connection queue limits, in-flight operation limits, and per-user/device quotas. Test admission at the limit and one unit over it, cancellation of a blocked writer, disk-full errors, exhausted file handles, and memory-pressure behavior. Verify that heartbeat, cancellation, revocation, and rotation control messages remain responsive while the data path is saturated.
 
+An in-flight operation limit that is only relay-global is not a tenant-isolation test. A capacity regression must prove that one tenant saturating its own allowance still leaves another tenant's public request admitted, that the relay-global bound independently refuses a tenant whose own scope is empty, and that every permit returns exactly once when a request is abandoned or an upgrade is cancelled. `crates/tunnel-relay/src/http/tenant_admission_tests.rs` runs two fully independent tenants through the real consumer route on a loopback listener for those invariants; a double release is detected by the released capacity readmitting more streams than the bound allows, not by inspecting a counter alone.
+
 Measure peak resident memory, queue high-water marks, end-to-end latency, fairness, and bytes transferred. A successful checksum proves content integrity; a successful return code alone does not. Use a streaming generator and sink so the harness does not conceal relay buffering by preloading entire files into memory.
 
 ## Filesystem API and framework interoperability

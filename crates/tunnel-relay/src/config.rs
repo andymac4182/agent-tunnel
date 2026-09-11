@@ -14,6 +14,15 @@ use tunnel_core::{ConfigError as CoreConfigError, RotationConfig};
 
 use crate::redis_connection::RedisTlsMaterialPaths;
 
+/// Default per-owner consumer admission bound.  Three quarters of the
+/// relay-global `max_pending_operations` default; see the field documentation
+/// on [`RelayLimits::max_pending_operations_per_owner`].
+pub const DEFAULT_MAX_PENDING_OPERATIONS_PER_OWNER: usize = 48;
+/// Hard ceiling for the per-owner consumer admission bound.  It matches the
+/// relay-global ceiling so the configuration cannot advertise a per-owner
+/// allowance the process bound could never grant.
+pub const MAX_PENDING_OPERATIONS_PER_OWNER_CEILING: usize = 64;
+
 /// Runtime limits enforced before a request or WebSocket message allocates
 /// payload storage.  These are hard upper bounds for the M1 profile.
 #[derive(Clone, Debug)]
@@ -21,7 +30,23 @@ pub struct RelayLimits {
     pub max_body_bytes: usize,
     pub max_control_bytes: usize,
     pub max_streams_per_device: usize,
+    /// Relay-global consumer ingress admission permits.  This is a process
+    /// bound: it is not tenant-scoped and must not be the only admission
+    /// bound, or one tenant's in-flight operations refuse every other
+    /// tenant's public request.
     pub max_pending_operations: usize,
+    /// Consumer admission permits one `(tenant_id, device_id)` owner scope may
+    /// hold at once.  Layered *under* `max_pending_operations`: the global cap
+    /// still bounds the process, and the effective per-owner bound is
+    /// `min(max_pending_operations_per_owner, max_pending_operations)` because
+    /// the global permit is always reserved first.  The default keeps three
+    /// quarters of the relay-global permits available to one owner scope, so a
+    /// single owner retains headroom for its documented
+    /// `max_streams_per_device` allowance spread across a cluster's non-owner
+    /// ingress relays, while at least a quarter of relay ingress capacity can
+    /// never be consumed by one tenant/device.  Deployments serving many
+    /// concurrent tenants should lower it.
+    pub max_pending_operations_per_owner: usize,
     pub max_devices: usize,
     pub max_devices_per_user: usize,
     pub max_queue_messages: usize,
@@ -36,6 +61,7 @@ impl Default for RelayLimits {
             max_control_bytes: 32 * 1024,
             max_streams_per_device: 64,
             max_pending_operations: 64,
+            max_pending_operations_per_owner: DEFAULT_MAX_PENDING_OPERATIONS_PER_OWNER,
             max_devices: 1_024,
             max_devices_per_user: 16,
             max_queue_messages: 128,
@@ -61,6 +87,13 @@ impl RelayLimits {
         if self.max_pending_operations == 0 || self.max_pending_operations > 64 {
             return Err(ConfigError::Invalid(
                 "max_pending_operations must be 1..=64",
+            ));
+        }
+        if self.max_pending_operations_per_owner == 0
+            || self.max_pending_operations_per_owner > MAX_PENDING_OPERATIONS_PER_OWNER_CEILING
+        {
+            return Err(ConfigError::Invalid(
+                "max_pending_operations_per_owner must be 1..=64",
             ));
         }
         if self.max_devices == 0 || self.max_devices > 1_000_000 {
@@ -620,6 +653,11 @@ pub struct ServeConfig {
     pub deployment_incarnation: String,
     #[serde(default = "default_max_devices_per_user")]
     pub max_devices_per_user: usize,
+    /// Per-`(tenant, device)` consumer admission permits, layered under the
+    /// relay-global bound.  Absence keeps the documented default so existing
+    /// M1/M2 configuration files stay valid.
+    #[serde(default = "default_max_pending_operations_per_owner")]
+    pub max_pending_operations_per_owner: usize,
     #[serde(default = "default_max_queue_bytes")]
     pub max_queue_bytes: usize,
     #[serde(default)]
@@ -691,6 +729,13 @@ impl ServeConfig {
         }
         if self.max_devices_per_user == 0 || self.max_devices_per_user > 64 {
             return Err(ConfigError::Invalid("max_devices_per_user must be 1..=64"));
+        }
+        if self.max_pending_operations_per_owner == 0
+            || self.max_pending_operations_per_owner > MAX_PENDING_OPERATIONS_PER_OWNER_CEILING
+        {
+            return Err(ConfigError::Invalid(
+                "max_pending_operations_per_owner must be 1..=64",
+            ));
         }
         if self.max_queue_bytes < 256 * 1024 || self.max_queue_bytes > 64 * 1024 * 1024 {
             return Err(ConfigError::Invalid(
@@ -766,6 +811,7 @@ impl ServeConfig {
             options.deployment_incarnation = self.deployment_incarnation.clone();
         }
         options.limits.max_devices_per_user = self.max_devices_per_user;
+        options.limits.max_pending_operations_per_owner = self.max_pending_operations_per_owner;
         options.limits.max_queue_bytes = self.max_queue_bytes;
         options.rotation = self.rotation.clone();
         crate::Relay::start(
@@ -836,6 +882,7 @@ impl ServeConfig {
             options.deployment_incarnation = self.deployment_incarnation.clone();
         }
         options.limits.max_devices_per_user = self.max_devices_per_user;
+        options.limits.max_pending_operations_per_owner = self.max_pending_operations_per_owner;
         options.limits.max_queue_bytes = self.max_queue_bytes;
         options.rotation = self.rotation.clone();
         options.cluster = self.cluster.clone();
@@ -864,6 +911,10 @@ fn default_device_bind() -> SocketAddr {
 
 fn default_max_devices_per_user() -> usize {
     16
+}
+
+fn default_max_pending_operations_per_owner() -> usize {
+    DEFAULT_MAX_PENDING_OPERATIONS_PER_OWNER
 }
 
 fn default_max_queue_bytes() -> usize {
@@ -1241,6 +1292,70 @@ consumer_tls_private_key = "consumer-key.pem"
             "{}\nnode_id = \"relay-a\"\n\n[cluster]\ndeployment_id = \"deployment-a\"\npeer_bind = \"127.0.0.1:8443\"\npeer_tls_cert_chain = \"peer-cert.pem\"\npeer_tls_private_key = \"peer-key.pem\"\npeer_tls_client_ca = \"peer-ca.pem\"\nmembership_signer_public_key_path = \"membership-signer.pub\"\nmembership_signer_trust_path = \"membership-trust.pem\"\ncheckpoint_authority_endpoint = \"https://checkpoint.example.test/v1/checkpoint\"\ncheckpoint_authority_trust_path = \"checkpoint-ca.pem\"\nmembership_version_state_path = \"state/membership-version-state.json\"\n\n[cluster.endpoint_policy]\nallowed_ports = [8443]\nrequire_private_ip = true\n",
             valid_toml()
         )
+    }
+
+    #[test]
+    fn per_owner_admission_bound_defaults_below_the_relay_global_bound() {
+        let limits = RelayLimits::default();
+        limits.validate().expect("default limits validate");
+        assert_eq!(
+            limits.max_pending_operations_per_owner,
+            DEFAULT_MAX_PENDING_OPERATIONS_PER_OWNER
+        );
+        assert!(
+            limits.max_pending_operations_per_owner < limits.max_pending_operations,
+            "the per-owner bound must leave relay-global capacity for other tenants"
+        );
+        assert!(
+            limits.max_pending_operations_per_owner <= MAX_PENDING_OPERATIONS_PER_OWNER_CEILING,
+            "the per-owner bound must respect its hard ceiling"
+        );
+    }
+
+    #[test]
+    fn per_owner_admission_bound_rejects_zero_and_above_the_ceiling() {
+        let limits = |max_pending_operations_per_owner| RelayLimits {
+            max_pending_operations_per_owner,
+            ..RelayLimits::default()
+        };
+        for invalid in [0, MAX_PENDING_OPERATIONS_PER_OWNER_CEILING + 1] {
+            let error = limits(invalid)
+                .validate()
+                .expect_err("accepted an out-of-range per-owner admission bound");
+            assert_eq!(
+                error.to_string(),
+                "max_pending_operations_per_owner must be 1..=64"
+            );
+        }
+        for valid in [1, MAX_PENDING_OPERATIONS_PER_OWNER_CEILING] {
+            limits(valid)
+                .validate()
+                .expect("in-range per-owner bound validates");
+        }
+    }
+
+    #[test]
+    fn serve_config_defaults_and_validates_the_per_owner_admission_bound() {
+        let config = ServeConfig::parse(valid_toml()).expect("valid serve configuration");
+        assert_eq!(
+            config.max_pending_operations_per_owner,
+            DEFAULT_MAX_PENDING_OPERATIONS_PER_OWNER
+        );
+        let configured = format!("{}max_pending_operations_per_owner = 4\n", valid_toml());
+        let config = ServeConfig::parse(&configured).expect("explicit per-owner bound parses");
+        assert_eq!(config.max_pending_operations_per_owner, 4);
+        for invalid in ["0", "65"] {
+            let input = format!(
+                "{}max_pending_operations_per_owner = {invalid}\n",
+                valid_toml()
+            );
+            let error = ServeConfig::parse(&input)
+                .expect_err("accepted an out-of-range per-owner admission bound");
+            assert_eq!(
+                error.to_string(),
+                "max_pending_operations_per_owner must be 1..=64"
+            );
+        }
     }
 
     #[test]

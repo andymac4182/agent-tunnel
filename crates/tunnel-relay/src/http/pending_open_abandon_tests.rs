@@ -37,7 +37,9 @@ use tunnel_protocol::{
 };
 use uuid::Uuid;
 
-use super::{ConsumerUpgradeBarrier, ECHO_STREAM_SUBPROTOCOL, HttpState, echo_stream, wire};
+use super::{
+    ConsumerUpgradeBarrier, ECHO_STREAM_SUBPROTOCOL, HttpState, ScopedAdmission, echo_stream, wire,
+};
 use crate::{
     actor::{CarrierKey, ControlOutbound, DataOutbound, RelayHandle, SessionKey},
     config::RelayOptions,
@@ -305,6 +307,10 @@ impl AbandonedUpgradeStage {
             oidc: Some(oidc),
             limits: limits.clone(),
             admission: admission.clone(),
+            scoped_admission: ScopedAdmission::new(
+                limits.max_pending_operations_per_owner,
+                limits.max_pending_operations,
+            ),
             peer: None,
             consumer_upgrade_barrier: Some(barrier.clone()),
             peer_admission_barrier: None,

@@ -1,6 +1,7 @@
 use std::{
+    collections::HashMap,
     sync::{
-        Arc,
+        Arc, Mutex, MutexGuard,
         atomic::{AtomicU8, AtomicU64, Ordering},
     },
     time::Duration,
@@ -22,7 +23,7 @@ use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
 use tokio::{
-    sync::{Semaphore, mpsc, oneshot},
+    sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot},
     time::{timeout, timeout_at},
 };
 use tunnel_catalog::{DeviceListFilter, OidcVerifier, SharedCatalog};
@@ -34,6 +35,11 @@ const CONTROL_SUBPROTOCOL: &str = "agent-tunnel.control.v1";
 const DATA_SUBPROTOCOL: &str = "agent-tunnel.data.v1";
 const ECHO_STREAM_SUBPROTOCOL: &str = "agent-tunnel.echo.v1";
 const MAX_ECHO_CANARY_BYTES: usize = 256;
+/// Bounded retry hint for a consumer admission refusal.  It matches the
+/// existing owner-not-ready and stream-limit hints: admission capacity is
+/// released by an in-flight operation completing, not by a lease or a clock.
+const ADMISSION_LIMIT_RETRY_AFTER_MS: u64 = 250;
+const MAX_ADMISSION_LIMIT_RETRY_AFTER_MS: u64 = 5_000;
 // A ConsumerChunk body may use the full protocol-defined 64 KiB bound. The
 // transport fragments its encoded record (including the eight-byte prefix)
 // across bounded HTTP/3 body chunks. The public framing can still require
@@ -438,6 +444,134 @@ use crate::{
     wire::{self, MAX_BODY_BYTES, MAX_CONTROL_BYTES},
 };
 
+/// Per-owner-scope consumer admission permits.
+///
+/// The relay-global [`Semaphore`] bounds the process but not a tenant, so one
+/// tenant's in-flight operations could refuse every other tenant's public
+/// request for the whole operation round trip.  The scope chosen here is the
+/// canonical `(tenant_id, device_id)` owner scope already used by owner
+/// resolution, the durable catalog keys and the owner token in
+/// docs/cluster.md: it is exactly the owner an admitted operation targets, its
+/// cardinality is already bounded by `max_devices`, and a tenant cannot widen
+/// its own allowance by minting additional principals.
+///
+/// A scope entry exists only while it holds at least one permit, so the map is
+/// bounded by the relay-global permit count rather than by the catalog.
+pub(crate) struct ScopedAdmission {
+    permits: usize,
+    scopes: Mutex<HashMap<OwnerScope, Arc<Semaphore>>>,
+}
+
+impl ScopedAdmission {
+    /// Build a registry whose effective per-scope bound is
+    /// `min(per_owner, global)`.  The relay-global permit is always reserved
+    /// first, so a configured per-owner allowance above the process bound
+    /// could never be granted; clamping keeps the refusal attributable to the
+    /// bound that actually applies.
+    pub(crate) fn new(per_owner: usize, global: usize) -> Arc<Self> {
+        Arc::new(Self {
+            permits: per_owner.min(global).max(1),
+            scopes: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// The effective per-scope bound after clamping.
+    #[cfg(test)]
+    pub(crate) fn permits(&self) -> usize {
+        self.permits
+    }
+
+    /// Reserve one permit for `scope`, or return `None` when this scope already
+    /// holds its full allowance.  The lookup, the entry creation and the
+    /// acquisition all happen under one lock, so a concurrent release cannot
+    /// reclaim an entry a caller is about to acquire from.
+    pub(crate) fn try_acquire(
+        self: &Arc<Self>,
+        scope: OwnerScope,
+    ) -> Option<ScopedAdmissionPermit> {
+        let mut scopes = self.lock();
+        let semaphore = Arc::clone(
+            scopes
+                .entry(scope)
+                .or_insert_with(|| Arc::new(Semaphore::new(self.permits))),
+        );
+        match Arc::clone(&semaphore).try_acquire_owned() {
+            Ok(permit) => Some(ScopedAdmissionPermit {
+                registry: Arc::clone(self),
+                scope,
+                permit: Some(permit),
+            }),
+            Err(_) => {
+                Self::reclaim(&mut scopes, scope, self.permits);
+                None
+            }
+        }
+    }
+
+    /// Permits currently held for `scope`.
+    #[cfg(test)]
+    pub(crate) fn in_flight(&self, scope: OwnerScope) -> usize {
+        self.lock().get(&scope).map_or(0, |semaphore| {
+            self.permits.saturating_sub(semaphore.available_permits())
+        })
+    }
+
+    /// Scope entries currently tracked.  An entry without a held permit is a
+    /// leak, so this is the bound the release path must keep.
+    #[cfg(test)]
+    pub(crate) fn tracked_scopes(&self) -> usize {
+        self.lock().len()
+    }
+
+    fn lock(&self) -> MutexGuard<'_, HashMap<OwnerScope, Arc<Semaphore>>> {
+        // A permit bound must not be lost to a poisoned lock: the map holds no
+        // invariant beyond "an entry exists while it has holders", and every
+        // path below rebuilds that from the semaphore itself.
+        self.scopes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Drop an idle entry.  `strong_count == 1` means only the map still
+    /// references the semaphore, so no outstanding permit can be released into
+    /// an entry that has already been removed.
+    fn reclaim(
+        scopes: &mut HashMap<OwnerScope, Arc<Semaphore>>,
+        scope: OwnerScope,
+        permits: usize,
+    ) {
+        if scopes.get(&scope).is_some_and(|semaphore| {
+            Arc::strong_count(semaphore) == 1 && semaphore.available_permits() >= permits
+        }) {
+            scopes.remove(&scope);
+        }
+    }
+}
+
+/// One reserved per-scope admission permit.  It is released exactly once, on
+/// drop, which covers every handler exit path including cancellation: an
+/// abandoned request drops the handler future, and an abandoned upgrade drops
+/// the guard the upgrade closure captured.
+pub(crate) struct ScopedAdmissionPermit {
+    registry: Arc<ScopedAdmission>,
+    scope: OwnerScope,
+    permit: Option<OwnedSemaphorePermit>,
+}
+
+impl Drop for ScopedAdmissionPermit {
+    fn drop(&mut self) {
+        // `take` makes the release idempotent in the type: the owned permit
+        // returns its capacity when this statement's temporary is dropped, and
+        // only then is the now-idle entry reclaimed.
+        if self.permit.take().is_none() {
+            return;
+        }
+        let permits = self.registry.permits;
+        let mut scopes = self.registry.lock();
+        ScopedAdmission::reclaim(&mut scopes, self.scope, permits);
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct HttpState {
     pub(crate) handle: RelayHandle,
@@ -445,7 +579,17 @@ pub(crate) struct HttpState {
     pub(crate) oidc: Option<Arc<OidcVerifier>>,
     pub(crate) limits: RelayLimits,
     /// Reserved before reading a request body; bounds aggregate materialization.
+    /// This is the relay-global process bound and is deliberately not
+    /// tenant-scoped, so it is always paired with `scoped_admission` below.
     pub(crate) admission: Arc<Semaphore>,
+    /// Per-`(tenant_id, device_id)` consumer admission bound, reserved after
+    /// the authenticated catalog identity is known and layered under
+    /// `admission`.  Without it, one tenant's in-flight operations hold every
+    /// relay-global permit for their whole round trip and every other tenant's
+    /// public request receives the typed admission-limit refusal, which
+    /// contradicts the multi-user isolation requirement in AGENTS.md and the
+    /// tenant-scoped invariants in docs/cluster.md.
+    pub(crate) scoped_admission: Arc<ScopedAdmission>,
     /// Optional cluster forwarding context.  `None` preserves the local M1/M2
     /// listener behavior for single-relay deployments and existing tests.
     pub(crate) peer: Option<Arc<PeerRuntime>>,
@@ -549,6 +693,10 @@ pub(crate) fn consumer_router_with_peer_and_barriers(
         catalog: Some(catalog),
         oidc: Some(oidc),
         admission: Arc::new(Semaphore::new(limits.max_pending_operations)),
+        scoped_admission: ScopedAdmission::new(
+            limits.max_pending_operations_per_owner,
+            limits.max_pending_operations,
+        ),
         limits: limits.clone(),
         peer,
         consumer_upgrade_barrier,
@@ -585,6 +733,13 @@ pub fn device_router_with_peer(
         catalog,
         oidc: None,
         admission: Arc::new(Semaphore::new(limits.max_devices.saturating_mul(2))),
+        // Device sockets authenticate with their own mTLS identity and are
+        // already bounded per device by the actor; the consumer-side per-owner
+        // bound is carried here only so both routers share one state type.
+        scoped_admission: ScopedAdmission::new(
+            limits.max_pending_operations_per_owner,
+            limits.max_pending_operations,
+        ),
         limits,
         peer,
         consumer_upgrade_barrier: None,
@@ -602,12 +757,7 @@ pub fn device_router_with_peer(
 
 async fn list_devices(State(state): State<HttpState>, headers: HeaderMap) -> Response {
     let Ok(_permit) = state.admission.clone().try_acquire_owned() else {
-        return error_response(
-            StatusCode::TOO_MANY_REQUESTS,
-            "ADMISSION_LIMIT",
-            "request capacity exhausted",
-            "not_dispatched",
-        );
+        return admission_limit_response(ADMISSION_LIMIT_RETRY_AFTER_MS);
     };
     let principal = match authenticate(&state, &headers, None).await {
         Ok(principal) => principal,
@@ -636,12 +786,7 @@ async fn list_services(
     Path(device): Path<String>,
 ) -> Response {
     let Ok(_permit) = state.admission.clone().try_acquire_owned() else {
-        return error_response(
-            StatusCode::TOO_MANY_REQUESTS,
-            "ADMISSION_LIMIT",
-            "request capacity exhausted",
-            "not_dispatched",
-        );
+        return admission_limit_response(ADMISSION_LIMIT_RETRY_AFTER_MS);
     };
     let principal = match authenticate(&state, &headers, None).await {
         Ok(principal) => principal,
@@ -701,12 +846,7 @@ async fn echo(
         return response;
     }
     let Ok(_permit) = state.admission.clone().try_acquire_owned() else {
-        return error_response(
-            StatusCode::TOO_MANY_REQUESTS,
-            "ADMISSION_LIMIT",
-            "request capacity exhausted",
-            "not_dispatched",
-        );
+        return admission_limit_response(ADMISSION_LIMIT_RETRY_AFTER_MS);
     };
     let (Some(catalog), Some(oidc)) = (state.catalog.as_ref(), state.oidc.as_ref()) else {
         return error_response(
@@ -754,6 +894,17 @@ async fn echo(
             "not_dispatched",
         );
     }
+    // The relay-global permit above is already held; this second, tenant-scoped
+    // reservation is what stops one owner scope from holding every permit for
+    // the whole round trip.  It is taken only once the authenticated catalog
+    // identity fixes the scope, and it is released on drop, so an abandoned or
+    // cancelled request cannot leak it.
+    let Some(_scope_permit) = state
+        .scoped_admission
+        .try_acquire(OwnerScope::new(grant.tenant_id, device_id))
+    else {
+        return admission_limit_response(ADMISSION_LIMIT_RETRY_AFTER_MS);
+    };
     let body = match timeout(
         Duration::from_secs(10),
         to_bytes(
@@ -1026,12 +1177,7 @@ async fn echo_stream(
         );
     }
     let Ok(permit) = state.admission.clone().try_acquire_owned() else {
-        return error_response(
-            StatusCode::TOO_MANY_REQUESTS,
-            "ADMISSION_LIMIT",
-            "request capacity exhausted",
-            "not_dispatched",
-        );
+        return admission_limit_response(ADMISSION_LIMIT_RETRY_AFTER_MS);
     };
     let (Some(catalog), Some(oidc)) = (state.catalog.as_ref(), state.oidc.as_ref()) else {
         return error_response(
@@ -1083,6 +1229,17 @@ async fn echo_stream(
         );
     }
     grant.valid_until = grant.valid_until.min(validated.expires_at);
+    // Layered under the relay-global permit taken above: the public stream is
+    // long-lived, so without a tenant-scoped bound one owner scope's streams
+    // refuse every other tenant's public request.  The guard travels into the
+    // upgrade closure below and is released on drop, so an abandoned upgrade,
+    // a failed peer admission and a normal close all release it exactly once.
+    let Some(scope_permit) = state
+        .scoped_admission
+        .try_acquire(OwnerScope::new(grant.tenant_id, device_id))
+    else {
+        return admission_limit_response(ADMISSION_LIMIT_RETRY_AFTER_MS);
+    };
     if let Some(response) = cluster_unready_response(&state) {
         return response;
     }
@@ -1220,6 +1377,7 @@ async fn echo_stream(
         .max_write_buffer_size(MAX_ECHO_WRITE_BYTES)
         .on_upgrade(move |socket| async move {
             let _permit = permit;
+            let _scope_permit = scope_permit;
             if dispatch_peer.as_ref().is_some_and(|peer| !peer.is_ready()) {
                 let mut socket = socket;
                 let _ = send_socket(&mut socket, Message::Close(None)).await;
@@ -3234,6 +3392,32 @@ fn retryable_peer_failure_response(retry_after_ms: u64) -> Response {
     response
 }
 
+/// The typed consumer admission refusal, used for both the relay-global and
+/// the per-owner bound.  Both are capacity, both are `not_dispatched`, and both
+/// clear as soon as an in-flight operation completes, so the existing closed
+/// refusal vocabulary already covers them: reusing `ADMISSION_LIMIT` with the
+/// bounded retry hint keeps one typed outcome instead of inventing a second
+/// code for the same condition.
+fn admission_limit_response(retry_after_ms: u64) -> Response {
+    let retry_after_ms = retry_after_ms.clamp(1, MAX_ADMISSION_LIMIT_RETRY_AFTER_MS);
+    let mut response = (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(ErrorBody {
+            code: "ADMISSION_LIMIT",
+            execution: "not_dispatched",
+            message: "request capacity exhausted",
+            retryable: Some(true),
+            retry_after_ms: Some(retry_after_ms),
+        }),
+    )
+        .into_response();
+    let retry_after_seconds = retry_after_ms.saturating_add(999) / 1_000;
+    if let Ok(value) = HeaderValue::from_str(&retry_after_seconds.to_string()) {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    response
+}
+
 fn stream_limit_response(retry_after_ms: u64) -> Response {
     let retry_after_ms = retry_after_ms.clamp(1, STREAM_LIMIT_RETRY_AFTER_MS.max(1));
     let mut response = (
@@ -3695,3 +3879,6 @@ mod peer_cleanup_tests;
 
 #[cfg(test)]
 mod pending_open_abandon_tests;
+
+#[cfg(test)]
+mod tenant_admission_tests;
