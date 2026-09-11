@@ -10751,6 +10751,10 @@ mod tests {
     /// remaining budget by that latency difference.  The retained absolute
     /// episode deadline must win by clamping rather than by failing the
     /// session; an already-expired episode still fails closed.
+    /// Fixed gap between the first episode sample and a retry's larger
+    /// sample, so the clamp is exercised without depending on elapsed time.
+    const CLAMP_SAMPLE_GAP_MS: u64 = 500;
+
     #[tokio::test]
     async fn recovery_retry_clamps_a_larger_remaining_sample_to_the_retained_deadline() {
         let (mut actor, active_key, active_receiver, mut control_receiver) =
@@ -10775,6 +10779,12 @@ mod tests {
         let roster = tunnel_protocol::rotation_control::StreamRoster::new("clamp-snapshot", vec![]);
         let episode_id = "clamp-episode".to_owned();
         let budget = actor.rotation.config().recovery_timeout_ms;
+        // Attempt one establishes the retained deadline from a sample that is
+        // deliberately shorter than the coordinator's full budget, so the retry
+        // below presents a larger sample by construction.  Deriving the gap
+        // from elapsed wall-clock time instead makes the precondition vanish on
+        // a fast machine, which is how this test failed in the workspace run.
+        let first_sample = budget - CLAMP_SAMPLE_GAP_MS;
         let first_attempt = RotationAttemptIdentity::new(
             "session",
             1,
@@ -10793,7 +10803,7 @@ mod tests {
                 episode_id: episode_id.clone(),
                 attempt_no: 1,
                 roster: roster.clone(),
-                remaining_ms: budget,
+                remaining_ms: first_sample,
             })
             .await
             .expect("attempt one establishes the retained episode deadline");
@@ -10852,6 +10862,11 @@ mod tests {
         assert!(
             budget > retained_deadline.saturating_sub(actor.now_ms()),
             "the retry sample must exceed the retained remaining budget for this test to bite"
+        );
+        assert_eq!(
+            budget - first_sample,
+            CLAMP_SAMPLE_GAP_MS,
+            "the gap between the two samples is fixed, not a function of elapsed time"
         );
         actor
             .handle_recovery_begin(RecoveryBegin {
