@@ -1415,7 +1415,17 @@ impl PeerRuntime {
                 .or_insert_with(ConnectionBudget::new)
                 .clone()
         };
-        let exchange = PeerExchange::new(stream, envelope, budget, admission_cancellation).await?;
+        // A stream that raced the peer's GOAWAY may still be refused after it
+        // was opened; the hook withdraws this route's readiness on that typed
+        // outcome exactly as an open-time failure does above.
+        let route_hook = self.readiness.as_ref().map(|readiness| {
+            Arc::new(RouteUnreachableHook {
+                readiness: Arc::clone(readiness),
+                target: readiness_target.clone(),
+            })
+        });
+        let exchange =
+            PeerExchange::new(stream, envelope, budget, admission_cancellation, route_hook).await?;
         if let Some(diagnostic) = diagnostic {
             diagnostic.set_runtime_stage(PeerOpenDiagnosticStage::Complete);
         }
@@ -1570,6 +1580,36 @@ impl PeerRuntime {
     }
 }
 
+/// Withdraws a selected route's readiness when a request on it observes the
+/// peer's typed graceful-close outcome after the stream was already opened.
+///
+/// `open_inner` withdraws readiness for open-time failures itself; a stream
+/// that raced the peer's GOAWAY can still be refused with `H3_REQUEST_REJECTED`
+/// at the envelope-send or response boundary, and that peer is equally not a
+/// viable route until it is re-probed.  The hook carries only the bounded route
+/// target already validated for this request.
+struct RouteUnreachableHook {
+    readiness: Arc<PeerReadiness>,
+    target: PeerRouteTarget,
+}
+
+impl RouteUnreachableHook {
+    fn observe(&self, error: &PeerRuntimeError) {
+        if matches!(
+            error,
+            PeerRuntimeError::Transport(PeerTransportError::GoAway)
+        ) {
+            self.readiness.mark_route_unreachable(&self.target);
+        }
+    }
+}
+
+fn observe_route_error(hook: Option<&Arc<RouteUnreachableHook>>, error: &PeerRuntimeError) {
+    if let Some(hook) = hook {
+        hook.observe(error);
+    }
+}
+
 /// A live direct peer request after the initial envelope has been sent.
 pub struct PeerExchange {
     send: PeerClientSend,
@@ -1577,6 +1617,7 @@ pub struct PeerExchange {
     budget: StreamBudget,
     admission_cancellation: Option<CancellationToken>,
     admission_context: Option<PeerAdmissionCancellation>,
+    route_hook: Option<Arc<RouteUnreachableHook>>,
 }
 
 impl PeerExchange {
@@ -1585,6 +1626,7 @@ impl PeerExchange {
         envelope: RequestEnvelope,
         connection_budget: ConnectionBudget,
         admission_context: Option<PeerAdmissionCancellation>,
+        route_hook: Option<Arc<RouteUnreachableHook>>,
     ) -> Result<Self, PeerRuntimeError> {
         let (mut send, recv) = stream.split();
         let budget = connection_budget
@@ -1603,13 +1645,19 @@ impl PeerExchange {
             ));
         }
         let record = budget.record_from_slice(PeerRecordKind::CompleteControlText, &bytes)?;
-        send_record(&mut send, &budget, record, admission_context.as_ref()).await?;
+        if let Err(error) =
+            send_record(&mut send, &budget, record, admission_context.as_ref()).await
+        {
+            observe_route_error(route_hook.as_ref(), &error);
+            return Err(error);
+        }
         Ok(Self {
             send,
             recv,
             budget,
             admission_cancellation,
             admission_context,
+            route_hook,
         })
     }
 
@@ -1623,12 +1671,14 @@ impl PeerExchange {
             budget,
             admission_cancellation,
             admission_context,
+            route_hook,
         } = self;
         (
             PeerExchangeSend {
                 send,
                 budget: budget.clone(),
                 admission_context: admission_context.clone(),
+                route_hook: route_hook.clone(),
             },
             PeerExchangeRecv {
                 recv,
@@ -1638,6 +1688,7 @@ impl PeerExchange {
                 budget,
                 admission_cancellation,
                 admission_context,
+                route_hook,
             },
         )
     }
@@ -1654,6 +1705,7 @@ pub struct PeerExchangeSend {
     send: PeerClientSend,
     budget: StreamBudget,
     admission_context: Option<PeerAdmissionCancellation>,
+    route_hook: Option<Arc<RouteUnreachableHook>>,
 }
 
 impl PeerExchangeSend {
@@ -1665,18 +1717,26 @@ impl PeerExchangeSend {
         body: &[u8],
     ) -> Result<(), PeerRuntimeError> {
         let record = self.budget.record_from_slice(kind, body)?;
-        send_record(
+        let result = send_record(
             &mut self.send,
             &self.budget,
             record,
             self.admission_context.as_ref(),
         )
-        .await
+        .await;
+        if let Err(error) = &result {
+            observe_route_error(self.route_hook.as_ref(), error);
+        }
+        result
     }
 
     /// Finish the request direction.
     pub async fn finish(&mut self) -> Result<(), PeerRuntimeError> {
-        finish_client_send(&mut self.send, self.admission_context.as_ref()).await
+        let result = finish_client_send(&mut self.send, self.admission_context.as_ref()).await;
+        if let Err(error) = &result {
+            observe_route_error(self.route_hook.as_ref(), error);
+        }
+        result
     }
 
     /// Cancel the request direction.
@@ -1694,13 +1754,20 @@ pub struct PeerExchangeRecv {
     budget: StreamBudget,
     admission_cancellation: Option<CancellationToken>,
     admission_context: Option<PeerAdmissionCancellation>,
+    route_hook: Option<Arc<RouteUnreachableHook>>,
 }
 
 impl PeerExchangeRecv {
     /// Accept the owner's response headers before reading records.
     pub async fn accept_response(&mut self) -> Result<Response<()>, PeerRuntimeError> {
         let response =
-            recv_client_response(&mut self.recv, self.admission_context.as_ref()).await?;
+            match recv_client_response(&mut self.recv, self.admission_context.as_ref()).await {
+                Ok(response) => response,
+                Err(error) => {
+                    observe_route_error(self.route_hook.as_ref(), &error);
+                    return Err(error);
+                }
+            };
         if !response.status().is_success() {
             if let Some(retry_after_ms) = owner_not_ready_retry_after(&response) {
                 return Err(PeerRuntimeError::OwnerNotReady { retry_after_ms });
@@ -1744,9 +1811,15 @@ impl PeerExchangeRecv {
                 }
                 return Ok(Some(record));
             }
-            let Some(chunk) =
-                recv_client_chunk(&mut self.recv, self.admission_context.as_ref()).await?
-            else {
+            let chunk =
+                match recv_client_chunk(&mut self.recv, self.admission_context.as_ref()).await {
+                    Ok(chunk) => chunk,
+                    Err(error) => {
+                        observe_route_error(self.route_hook.as_ref(), &error);
+                        return Err(error);
+                    }
+                };
+            let Some(chunk) = chunk else {
                 self.decoder.finish()?;
                 return Ok(None);
             };

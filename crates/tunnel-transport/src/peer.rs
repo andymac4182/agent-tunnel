@@ -715,11 +715,15 @@ pub enum PeerTransportError {
     /// An HTTP/3 operation failed.
     #[error("peer HTTP/3 operation failed: {0}")]
     H3(String),
-    /// The peer sent HTTP/3 GOAWAY before this request stream was created.
+    /// The peer is gracefully closing and did not process this request.
     ///
-    /// This is a pre-dispatch outcome: the request never reached the peer's
-    /// request-stream admission boundary.  A stream that was already opened
-    /// may still report [`Self::H3`] or [`Self::Quic`] while it drains.
+    /// This is a pre-dispatch outcome: either the request never reached the
+    /// peer's request-stream admission boundary (HTTP/3 GOAWAY observed before
+    /// the stream was created), or a raced stream was refused with
+    /// `H3_REQUEST_REJECTED`, which per RFC 9114 means the peer did not process
+    /// it.  Both are safe to report as `not_dispatched`.  A stream the peer
+    /// reset for any other reason after it may have been dispatched still
+    /// reports [`Self::H3`] or [`Self::Quic`], preserving `unknown` certainty.
     #[error("peer HTTP/3 connection is gracefully closing")]
     GoAway,
     /// A bounded operation exceeded its deadline.
@@ -748,6 +752,27 @@ fn planned_idle_result(
         Ok(())
     } else {
         Err(PeerTransportError::H3(connection_result.to_string()))
+    }
+}
+
+/// Classify an HTTP/3 client stream error raised after a request stream was
+/// created.  A peer that is gracefully closing refuses or resets the stream
+/// with `RemoteClosing` or a `H3_REQUEST_REJECTED` terminate code; per
+/// [RFC 9114 §8.1](https://www.rfc-editor.org/rfc/rfc9114.html#section-8.1)
+/// `H3_REQUEST_REJECTED` means the owner did not process the request, so both
+/// map to the typed pre-dispatch [`PeerTransportError::GoAway`]
+/// (`not_dispatched`).  An already admitted stream that the owner reset for any
+/// other reason keeps its generic HTTP/3 classification, preserving the
+/// `unknown`-certainty contract for work that may have been dispatched.
+fn classify_client_stream_error(error: h3::error::StreamError) -> PeerTransportError {
+    match &error {
+        h3::error::StreamError::RemoteClosing { .. } => PeerTransportError::GoAway,
+        h3::error::StreamError::RemoteTerminate { code, .. }
+            if *code == h3::error::Code::H3_REQUEST_REJECTED =>
+        {
+            PeerTransportError::GoAway
+        }
+        _ => PeerTransportError::H3(error.to_string()),
     }
 }
 
@@ -1257,13 +1282,14 @@ impl PeerClientStream {
 
     /// Send one bounded request body chunk.
     pub async fn send_chunk(&mut self, chunk: Bytes) -> Result<(), PeerTransportError> {
-        send_client_chunk(
+        let result = send_client_chunk(
             self.inner.as_mut().expect("peer client stream is present"),
             &self.budget,
             self.idle_timeout,
             chunk,
         )
-        .await
+        .await;
+        self._connection.observe_stream_result(result)
     }
 
     /// Send one logical body as bounded HTTP/3 body chunks.
@@ -1273,13 +1299,14 @@ impl PeerClientStream {
     /// chunk limit.  The peer record decoder reassembles records across these
     /// arbitrary HTTP/3 chunk boundaries.
     pub async fn send_chunked(&mut self, bytes: &[u8]) -> Result<(), PeerTransportError> {
-        send_client_chunks(
+        let result = send_client_chunks(
             self.inner.as_mut().expect("peer client stream is present"),
             &self.budget,
             self.idle_timeout,
             bytes,
         )
-        .await
+        .await;
+        self._connection.observe_stream_result(result)
     }
 
     /// Send one already bounded request body chunk.
@@ -1293,36 +1320,39 @@ impl PeerClientStream {
     /// Finish the request body.
     pub async fn finish(&mut self) -> Result<(), PeerTransportError> {
         let inner = self.inner.as_mut().expect("peer client stream is present");
-        match timeout(self.idle_timeout, inner.finish()).await {
-            Ok(result) => result.map_err(|error| PeerTransportError::H3(error.to_string())),
+        let result = match timeout(self.idle_timeout, inner.finish()).await {
+            Ok(result) => result.map_err(classify_client_stream_error),
             Err(_) => {
                 inner.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
                 Err(PeerTransportError::Timeout)
             }
-        }
+        };
+        self._connection.observe_stream_result(result)
     }
 
     /// Receive response headers.  This may complete before the request body
     /// has been finished.
     pub async fn recv_response(&mut self) -> Result<Response<()>, PeerTransportError> {
         let inner = self.inner.as_mut().expect("peer client stream is present");
-        match timeout(self.idle_timeout, inner.recv_response()).await {
-            Ok(result) => result.map_err(|error| PeerTransportError::H3(error.to_string())),
+        let result = match timeout(self.idle_timeout, inner.recv_response()).await {
+            Ok(result) => result.map_err(classify_client_stream_error),
             Err(_) => {
                 inner.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
                 Err(PeerTransportError::Timeout)
             }
-        }
+        };
+        self._connection.observe_stream_result(result)
     }
 
     /// Receive one bounded response body chunk.
     pub async fn recv_chunk(&mut self) -> Result<Option<PeerBodyChunk>, PeerTransportError> {
-        recv_client_chunk(
+        let result = recv_client_chunk(
             self.inner.as_mut().expect("peer client stream is present"),
             &self.budget,
             self.idle_timeout,
         )
-        .await
+        .await;
+        self._connection.observe_stream_result(result)
     }
 
     /// Cancel both directions of this stream.
@@ -1345,7 +1375,9 @@ pub struct PeerClientSend {
 impl PeerClientSend {
     /// Send one bounded request body chunk.
     pub async fn send_chunk(&mut self, chunk: Bytes) -> Result<(), PeerTransportError> {
-        send_client_chunk(&mut self.inner, &self.budget, self.idle_timeout, chunk).await
+        let result =
+            send_client_chunk(&mut self.inner, &self.budget, self.idle_timeout, chunk).await;
+        self._connection.observe_stream_result(result)
     }
 
     /// Send one logical body as bounded HTTP/3 body chunks.
@@ -1353,7 +1385,9 @@ impl PeerClientSend {
     /// The bytes remain one application payload; only the HTTP/3 body
     /// representation is fragmented at the configured transport limit.
     pub async fn send_chunked(&mut self, bytes: &[u8]) -> Result<(), PeerTransportError> {
-        send_client_chunks(&mut self.inner, &self.budget, self.idle_timeout, bytes).await
+        let result =
+            send_client_chunks(&mut self.inner, &self.budget, self.idle_timeout, bytes).await;
+        self._connection.observe_stream_result(result)
     }
 
     /// Send one already bounded request body chunk.
@@ -1366,14 +1400,15 @@ impl PeerClientSend {
 
     /// Finish the request body.
     pub async fn finish(&mut self) -> Result<(), PeerTransportError> {
-        match timeout(self.idle_timeout, self.inner.finish()).await {
-            Ok(result) => result.map_err(|error| PeerTransportError::H3(error.to_string())),
+        let result = match timeout(self.idle_timeout, self.inner.finish()).await {
+            Ok(result) => result.map_err(classify_client_stream_error),
             Err(_) => {
                 self.inner
                     .stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
                 Err(PeerTransportError::Timeout)
             }
-        }
+        };
+        self._connection.observe_stream_result(result)
     }
 
     /// Cancel the request direction.
@@ -1395,19 +1430,21 @@ pub struct PeerClientRecv {
 impl PeerClientRecv {
     /// Receive response headers before request-end.
     pub async fn recv_response(&mut self) -> Result<Response<()>, PeerTransportError> {
-        match timeout(self.idle_timeout, self.inner.recv_response()).await {
-            Ok(result) => result.map_err(|error| PeerTransportError::H3(error.to_string())),
+        let result = match timeout(self.idle_timeout, self.inner.recv_response()).await {
+            Ok(result) => result.map_err(classify_client_stream_error),
             Err(_) => {
                 self.inner
                     .stop_sending(h3::error::Code::H3_REQUEST_CANCELLED);
                 Err(PeerTransportError::Timeout)
             }
-        }
+        };
+        self._connection.observe_stream_result(result)
     }
 
     /// Receive one bounded response body chunk.
     pub async fn recv_chunk(&mut self) -> Result<Option<PeerBodyChunk>, PeerTransportError> {
-        recv_client_chunk(&mut self.inner, &self.budget, self.idle_timeout).await
+        let result = recv_client_chunk(&mut self.inner, &self.budget, self.idle_timeout).await;
+        self._connection.observe_stream_result(result)
     }
 
     /// Ask the peer to stop sending the response body.
@@ -1435,7 +1472,7 @@ where
     }
     let charge = budget.reserve(chunk.len())?;
     let result = match timeout(idle_timeout, stream.send_data(chunk)).await {
-        Ok(result) => result.map_err(|error| PeerTransportError::H3(error.to_string())),
+        Ok(result) => result.map_err(classify_client_stream_error),
         Err(_) => {
             stream.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
             Err(PeerTransportError::Timeout)
@@ -1473,7 +1510,7 @@ where
     S: h3::quic::RecvStream,
 {
     let chunk = match timeout(idle_timeout, stream.recv_data()).await {
-        Ok(result) => result.map_err(|error| PeerTransportError::H3(error.to_string()))?,
+        Ok(result) => result.map_err(classify_client_stream_error)?,
         Err(_) => {
             stream.stop_sending(h3::error::Code::H3_REQUEST_CANCELLED);
             return Err(PeerTransportError::Timeout);
@@ -1517,6 +1554,23 @@ struct ClientConnection {
 }
 
 impl ClientConnection {
+    /// Record a stream-level outcome on its pooled connection.
+    ///
+    /// A typed [`PeerTransportError::GoAway`] observed on an already opened
+    /// stream means the peer is closing this connection, so later opens are
+    /// gated pre-dispatch here exactly as they are after a GOAWAY observed at
+    /// request open; the existing driver still owns the bounded
+    /// acknowledgement and lease drain.  Every other result passes through.
+    fn observe_stream_result<T>(
+        &self,
+        result: Result<T, PeerTransportError>,
+    ) -> Result<T, PeerTransportError> {
+        if matches!(result, Err(PeerTransportError::GoAway)) {
+            self.planned_remote_closing.cancel();
+        }
+        result
+    }
+
     async fn open(
         self: &Arc<Self>,
         request: Request<()>,
@@ -1577,15 +1631,17 @@ impl ClientConnection {
         }
         let stream = with_checkout_deadline(&self.cancel, deadline, sender.send_request(request))
             .await?
-            .map_err(|error| match error {
-                h3::error::StreamError::RemoteClosing { .. } => {
-                    // Do not reuse the emergency token: the failed open has
-                    // not dispatched a request, while existing streams must
-                    // remain alive until their leases are returned.
+            .map_err(|error| {
+                let classified = classify_client_stream_error(error);
+                if matches!(classified, PeerTransportError::GoAway) {
+                    // Do not reuse the emergency token: a peer that is closing
+                    // has not dispatched this request (`RemoteClosing`, or an
+                    // `H3_REQUEST_REJECTED` reset of a raced stream), while
+                    // existing streams must remain alive until their leases are
+                    // returned.
                     self.planned_remote_closing.cancel();
-                    PeerTransportError::GoAway
                 }
-                error => PeerTransportError::H3(error.to_string()),
+                classified
             })?;
         drop(sender);
 
@@ -1698,6 +1754,30 @@ async fn drain_peer_tasks(
         first_error,
         label,
         true,
+        true,
+    )
+    .await
+}
+
+/// Drain a task group without recording an individual task's own error as the
+/// group's failure.  Used for forwarded-stream groups, where a stream ending
+/// with an error is a stream-local lifecycle event (exactly as in normal
+/// serving) and only a forced-deadline abort or a task panic fails the drain.
+async fn drain_peer_tasks_without_recording_task_errors(
+    tasks: &mut JoinSet<Result<(), PeerTransportError>>,
+    deadline: Instant,
+    cancellation_requested: bool,
+    first_error: &mut Option<PeerTransportError>,
+    label: &'static str,
+) -> DrainOutcome {
+    drain_peer_tasks_with_grace(
+        tasks,
+        deadline,
+        cancellation_requested,
+        first_error,
+        label,
+        true,
+        false,
     )
     .await
 }
@@ -1709,6 +1789,7 @@ async fn drain_peer_tasks_with_grace(
     first_error: &mut Option<PeerTransportError>,
     label: &'static str,
     reserve_grace: bool,
+    record_task_errors: bool,
 ) -> DrainOutcome {
     let wait_deadline = if cancellation_requested || !reserve_grace {
         deadline
@@ -1724,7 +1805,7 @@ async fn drain_peer_tasks_with_grace(
     loop {
         match timeout_at(wait_deadline, tasks.join_next()).await {
             Ok(Some(Ok(Ok(())))) => {}
-            Ok(Some(Ok(Err(error)))) if cancellation_requested => {
+            Ok(Some(Ok(Err(error)))) if cancellation_requested || !record_task_errors => {
                 tracing::debug!(
                     ?error,
                     task_group = label,
@@ -2486,7 +2567,12 @@ where
 pub struct PeerServerConnectionStats {
     /// Verified peer role identity.
     pub peer_node_id: String,
-    /// Stable Quinn connection identifier for this connection lifetime.
+    /// Listener-local diagnostic identifier for this connection lifetime.
+    ///
+    /// Identifiers are allocated from a monotonic counter starting at one, so
+    /// zero always means "no connection" to callers and an identifier is never
+    /// reused by a later connection on the same listener, unlike the QUIC
+    /// stack's slab-indexed stable id.
     pub connection_id: usize,
     /// H3 requests accepted by the target connection.
     pub accepted_streams: u64,
@@ -2564,6 +2650,7 @@ struct PeerServerConnectionDiagnostics {
 /// completed connection entries are removed when a replacement is registered.
 pub struct PeerServerDiagnostics {
     max_connections: usize,
+    next_connection_id: AtomicUsize,
     connections: StdMutex<HashMap<usize, Arc<PeerServerConnectionDiagnostics>>>,
 }
 
@@ -2571,6 +2658,7 @@ impl PeerServerDiagnostics {
     fn new(max_connections: usize) -> Arc<Self> {
         Arc::new(Self {
             max_connections,
+            next_connection_id: AtomicUsize::new(1),
             connections: StdMutex::new(HashMap::new()),
         })
     }
@@ -2632,7 +2720,10 @@ impl PeerServerDiagnostics {
         }
         let observation = Arc::new(PeerServerConnectionDiagnostics {
             peer_node_id: peer_node_id.to_owned(),
-            connection_id: connection.stable_id(),
+            // Monotonic and non-zero: zero is the callers' "no connection"
+            // sentinel, and a slab-indexed QUIC stable id could be reused by a
+            // later connection while an earlier entry is still being drained.
+            connection_id: self.next_connection_id.fetch_add(1, Ordering::AcqRel),
             connection: connection.clone(),
             stream_permits,
             max_stream_permits,
@@ -3028,6 +3119,7 @@ where
                 &mut supervisor_error,
                 "peer-connections",
                 false,
+                true,
             )
             .await;
             // All connection tasks have either drained or been joined/aborted
@@ -3244,14 +3336,15 @@ where
                         Ok(Some(resolver)) => {
                             // h3 rejects streams above the GOAWAY boundary
                             // before returning a resolver. If a resolver does
-                            // surface here, consume and reset it without
+                            // surface here, consume and reset it with
+                            // H3_REQUEST_REJECTED ("not processed") without
                             // dispatching; it is a bounded late-admission
                             // observation, not an application success.
                             if let Ok(Ok((_request, mut stream))) =
                                 timeout_at(drain_wait_deadline, resolver.resolve_request()).await
                             {
-                                stream.stop_sending(h3::error::Code::H3_REQUEST_CANCELLED);
-                                stream.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
+                                stream.stop_sending(h3::error::Code::H3_REQUEST_REJECTED);
+                                stream.stop_stream(h3::error::Code::H3_REQUEST_REJECTED);
                             }
                         }
                         Ok(None) => h3_complete = true,
@@ -3264,8 +3357,18 @@ where
                     },
                     Some(result) = stream_tasks.join_next() => match result {
                         Ok(Ok(())) => {}
+                        // A forwarded stream ending with an error is a
+                        // stream-local lifecycle event, exactly as in normal
+                        // serving.  Peers tearing down around GOAWAY reset
+                        // their streams (H3_REQUEST_CANCELLED/REJECTED); that
+                        // is the expected drain outcome, not a listener
+                        // failure.  Only a task panic or the forced-deadline
+                        // path above fails the drain.
                         Ok(Err(error)) => {
-                            connection_error.get_or_insert(error);
+                            tracing::debug!(
+                                ?error,
+                                "peer stream closed during planned drain"
+                            );
                         }
                         Err(error) => {
                             connection_error = Some(PeerTransportError::Task(error));
@@ -3296,8 +3399,15 @@ where
                     }
                     Some(result) = stream_tasks.join_next() => match result {
                         Ok(Ok(())) => {}
+                        // A forwarded stream's own error is stream-local, as in
+                        // normal serving; the drain joins it rather than
+                        // treating an expected GOAWAY-induced reset as a
+                        // listener failure.
                         Ok(Err(error)) => {
-                            connection_error.get_or_insert(error);
+                            tracing::debug!(
+                                ?error,
+                                "peer stream closed during planned drain"
+                            );
                         }
                         Err(error) => {
                             connection_error = Some(PeerTransportError::Task(error));
@@ -3311,7 +3421,10 @@ where
             connection_closed = true;
         }
         stream_cancel.cancel();
-        let stream_drain = drain_peer_tasks(
+        // Join any stragglers.  Stream-handler errors here are stream-local and
+        // must not fail the listener (matching normal serving); only a forced
+        // abort at the shared deadline is reported as incomplete cleanup.
+        let stream_drain = drain_peer_tasks_without_recording_task_errors(
             &mut stream_tasks,
             deadline,
             false,
@@ -3353,7 +3466,11 @@ where
         {
             tracing::warn!("HTTP/3 peer connection drain deadline exceeded");
         }
-        let stream_drain = drain_peer_tasks(
+        // A forwarded stream's own terminal error is stream-local; the
+        // emergency close already cancelled it, and an expected reset must not
+        // be promoted to a listener failure.  Only a forced-deadline abort is
+        // reported as incomplete cleanup below.
+        let stream_drain = drain_peer_tasks_without_recording_task_errors(
             &mut stream_tasks,
             deadline,
             cancel.is_cancelled() && !planned_deadline_published,
@@ -3442,9 +3559,13 @@ where
             }
         };
         if planned.admission_closed.load(Ordering::Acquire) {
+            // A planned drain closed admission before this stream was
+            // dispatched.  Reset with H3_REQUEST_REJECTED ("not processed")
+            // so the caller classifies it as a pre-dispatch GoAway rather than
+            // an ambiguous cancellation.
             let mut stream = stream;
-            stream.stop_sending(h3::error::Code::H3_REQUEST_CANCELLED);
-            stream.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
+            stream.stop_sending(h3::error::Code::H3_REQUEST_REJECTED);
+            stream.stop_stream(h3::error::Code::H3_REQUEST_REJECTED);
             return Ok(());
         }
         diagnostics.mark_active();
@@ -3455,9 +3576,11 @@ where
             return Err(PeerTransportError::PolicyRejected);
         }
         if !planned.begin_admission() {
+            // The planned-drain admission boundary closed while this stream was
+            // resolving; it was never dispatched, so signal not-processed.
             let mut stream = stream;
-            stream.stop_sending(h3::error::Code::H3_REQUEST_CANCELLED);
-            stream.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
+            stream.stop_sending(h3::error::Code::H3_REQUEST_REJECTED);
+            stream.stop_stream(h3::error::Code::H3_REQUEST_REJECTED);
             return Ok(());
         }
         let budget = body_budget(&limits, connection_bytes);

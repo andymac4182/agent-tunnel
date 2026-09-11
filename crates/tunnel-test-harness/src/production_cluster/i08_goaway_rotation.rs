@@ -10,6 +10,15 @@
 //! proves an already admitted stream completed afterward.  A later public
 //! request is required to return the existing typed 503/not-dispatched class.
 //!
+//! The rotation evidence is correlated deterministically: one complete
+//! candidate-to-commit transition is tracked at its own boundary before the
+//! drain is requested (the scheduled rotation keeps running, so an early
+//! candidate snapshot would be stale), and the drain is then requested while a
+//! fresh candidate is live.  After the GOAWAY assertions the CLI is retired
+//! through its normal stop path so the owner's admitted device carriers finish
+//! inside the documented drain budget, and the listener-wide drain is observed
+//! to complete before the joined cluster cleanup.
+//!
 //! This is a narrow listener-drain/rotation integration.  It does not claim a
 //! browser close contract, a future adapter, or a successful successor after
 //! the planned owner listener has stopped accepting new peer connections.
@@ -103,39 +112,72 @@ pub fn validate_i08_goaway_rotation_evidence(evidence: &I08GoawayRotationEvidenc
             "I08 GOAWAY evidence has an unexpected scope".into(),
         ));
     }
-    if evidence.relay_count != 3
-        || !evidence.actual_cli_process
-        || evidence.owner_relay != OWNER_NODE
-        || evidence.ingress_relay != PEER_NODE
-        || evidence.tenant_id.is_empty()
-        || evidence.device_id.is_empty()
-        || evidence.service_id.is_empty()
-        || evidence.session_id.is_empty()
-        || evidence.epoch == 0
-        || evidence.stream_id == 0
-        || evidence.operation_id.is_empty()
-        || evidence.candidate_generation == 0
-        || evidence.candidate_connection_id.is_empty()
-        || evidence.rotation_after <= evidence.rotation_before
-        || evidence.goaway_peer_node_id != PEER_NODE
-        || evidence.goaway_connection_id == 0
-        || !evidence.active_stream_observed
-        || !evidence.planned_goaway_sent
-        || !evidence.admitted_response_completed
-        || !evidence.pre_admission_goaway_not_dispatched
-        || !evidence.post_goaway_not_dispatched
-        || !evidence.ingress_goaway_observed
-        || evidence.post_goaway_dispatch_delta != 1
-        || evidence.later_request_dispatch_delta != 0
-        || !evidence.cli_survived
-        || evidence.socket_high_water == 0
-        || evidence.socket_high_water > 3
-        || !evidence.cleanup_joined
-    {
-        return Err(HarnessError::Process(
-            "I08 GOAWAY evidence omitted a required three-relay, rotation, identity, dispatch, or joined-drain invariant"
-                .into(),
-        ));
+    // Each required invariant is named so a rejected run reports exactly which
+    // bounded field failed; the names carry no payload or credential material.
+    let violations: Vec<&'static str> = [
+        ("relay_count", evidence.relay_count != 3),
+        ("actual_cli_process", !evidence.actual_cli_process),
+        ("owner_relay", evidence.owner_relay != OWNER_NODE),
+        ("ingress_relay", evidence.ingress_relay != PEER_NODE),
+        ("tenant_id", evidence.tenant_id.is_empty()),
+        ("device_id", evidence.device_id.is_empty()),
+        ("service_id", evidence.service_id.is_empty()),
+        ("session_id", evidence.session_id.is_empty()),
+        ("epoch", evidence.epoch == 0),
+        ("stream_id", evidence.stream_id == 0),
+        ("operation_id", evidence.operation_id.is_empty()),
+        ("candidate_generation", evidence.candidate_generation == 0),
+        (
+            "candidate_connection_id",
+            evidence.candidate_connection_id.is_empty(),
+        ),
+        (
+            "rotation_order",
+            evidence.rotation_after <= evidence.rotation_before,
+        ),
+        (
+            "goaway_peer_node_id",
+            evidence.goaway_peer_node_id != PEER_NODE,
+        ),
+        ("goaway_connection_id", evidence.goaway_connection_id == 0),
+        ("active_stream_observed", !evidence.active_stream_observed),
+        ("planned_goaway_sent", !evidence.planned_goaway_sent),
+        (
+            "admitted_response_completed",
+            !evidence.admitted_response_completed,
+        ),
+        (
+            "pre_admission_goaway_not_dispatched",
+            !evidence.pre_admission_goaway_not_dispatched,
+        ),
+        (
+            "post_goaway_not_dispatched",
+            !evidence.post_goaway_not_dispatched,
+        ),
+        ("ingress_goaway_observed", !evidence.ingress_goaway_observed),
+        (
+            "post_goaway_dispatch_delta",
+            evidence.post_goaway_dispatch_delta != 1,
+        ),
+        (
+            "later_request_dispatch_delta",
+            evidence.later_request_dispatch_delta != 0,
+        ),
+        ("cli_survived", !evidence.cli_survived),
+        (
+            "socket_high_water",
+            evidence.socket_high_water == 0 || evidence.socket_high_water > 3,
+        ),
+        ("cleanup_joined", !evidence.cleanup_joined),
+    ]
+    .into_iter()
+    .filter_map(|(name, violated)| violated.then_some(name))
+    .collect();
+    if !violations.is_empty() {
+        return Err(HarnessError::Process(format!(
+            "I08 GOAWAY evidence omitted a required three-relay, rotation, identity, dispatch, or joined-drain invariant: {}",
+            violations.join(", "),
+        )));
     }
     Ok(())
 }
@@ -539,21 +581,106 @@ async fn wait_for_goaway(
     }
 }
 
-async fn wait_for_committed_rotation(
+/// Wait until the owner's planned private-listener drain has finished every
+/// established peer connection.
+///
+/// A connection entry is unregistered from the owner's bounded peer-server
+/// diagnostics only when its drain task has exited, so an empty connection set
+/// is the deterministic completion observation for the listener-wide GOAWAY
+/// drain.  Whether that drain finished its admitted streams or had to force
+/// them is proven separately by the joined relay shutdown: a forced drain
+/// returns a typed timeout there and fails `cleanup_joined`.
+async fn wait_for_planned_drain_complete(
+    cluster: &ProductionCluster,
+    scope: GoawayScope<'_>,
+    deadline: Instant,
+) -> Result<()> {
+    loop {
+        let stats = cluster.relay(OWNER_NODE)?.peer_server_stats();
+        if stats
+            .as_ref()
+            .is_some_and(|stats| stats.connections.is_empty())
+        {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            let remaining = stats.as_ref().map_or_else(
+                || "peer_stats=unavailable".to_owned(),
+                |stats| {
+                    stats
+                        .connections
+                        .iter()
+                        .map(|connection| {
+                            peer_context(
+                                Some(stats),
+                                &connection.peer_node_id,
+                                connection.connection_id,
+                                "drain",
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                },
+            );
+            return Err(HarnessError::Timeout(format!(
+                "{}; owner planned drain did not finish its peer connections: {remaining}",
+                scope_context(scope, "drain"),
+            )));
+        }
+        sleep(POLL).await;
+    }
+}
+
+/// Record one bounded, payload-free phase timing for the scenario so a
+/// timing-only failure can be attributed to a phase rather than guessed.
+fn log_phase(started: Instant, phase: &'static str) {
+    tracing::info!(
+        phase,
+        elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        "I08 GOAWAY phase"
+    );
+}
+
+/// Wait for one complete, same-owner rotation and return the candidate that it
+/// activated together with the committed session snapshot.
+///
+/// The scheduled M2 rotation schedule runs continuously and independently of
+/// the GOAWAY window, so a candidate captured early is stale by the time a
+/// later snapshot is read.  This helper instead tracks the candidate observed
+/// immediately before each commit and returns only when that exact candidate
+/// (generation and connection) becomes the active generation, with the
+/// candidate retired and the session back in the `active` phase.  Polling at
+/// [`POLL`] (well under the rotation interval) makes the correlation
+/// deterministic rather than a race against the commit.
+async fn wait_for_candidate_commit(
     cluster: &ProductionCluster,
     scope: GoawayScope<'_>,
     previous_rotation: u64,
     deadline: Instant,
-) -> Result<RelaySessionSnapshot> {
+) -> Result<(u64, String, RelaySessionSnapshot)> {
+    let mut pending_candidate: Option<(u64, String)> = None;
     loop {
         let snapshot = owner_snapshot_before(cluster, deadline).await?;
         let session = session_for(&snapshot, scope, "commit")?;
+        if let (Some(generation), Some(connection_id)) = (
+            session.candidate_generation,
+            session.candidate_connection_id.clone(),
+        ) && generation > session.active_generation
+            && !connection_id.is_empty()
+        {
+            pending_candidate = Some((generation, connection_id));
+        }
         if session.rotations_completed > previous_rotation
             && session.candidate_generation.is_none()
             && session.active_generation > 1
             && session.phase == "active"
+            && let Some((generation, connection_id)) = pending_candidate.as_ref()
+            && session.active_generation == *generation
+            && &session.active_connection_id == connection_id
         {
-            return Ok(session);
+            let generation = *generation;
+            let connection_id = connection_id.clone();
+            return Ok((generation, connection_id, session));
         }
         if Instant::now() >= deadline {
             return Err(HarnessError::Timeout(owner_context(
@@ -982,23 +1109,6 @@ async fn run_scenario(
             owner_snapshot_before(cluster, scenario_deadline)
                 .await?
                 .lifetime_application_dispatches;
-        let candidate = wait_for_candidate(
-            cluster,
-            device.tenant_id,
-            device.id,
-            service_id,
-            &session_id,
-            epoch,
-            scenario_deadline,
-        )
-        .await?;
-        let candidate_generation = candidate
-            .candidate_generation
-            .ok_or_else(|| HarnessError::Process("I08 GOAWAY candidate disappeared".into()))?;
-        let candidate_connection_id =
-            candidate.candidate_connection_id.clone().ok_or_else(|| {
-                HarnessError::Process("I08 GOAWAY candidate connection missing".into())
-            })?;
         // One maximum-sized, valid Echo record keeps the admitted H3 stream
         // observable while the response remains unread.  The fixture does
         // not use an unbounded pump or an arbitrary sleep to manufacture a
@@ -1031,6 +1141,52 @@ async fn run_scenario(
                 post_goaway_dispatch_delta, scope_label
             )));
         }
+        // Correlate one complete same-owner rotation BEFORE the planned drain.
+        // The scheduled M2 rotation runs continuously, so the candidate that
+        // commits must be captured at its own transition rather than compared
+        // to a stale early snapshot; draining the owner's peer listener then
+        // refuses the next replacement carrier, so a post-drain rotation cannot
+        // be the one under test.  The held consumer stream stays admitted and
+        // unread throughout, so this adds no application dispatch.
+        let (candidate_generation, candidate_connection_id, committed) =
+            wait_for_candidate_commit(cluster, scope, rotation_before, scenario_deadline).await?;
+        let rotation_after = committed.rotations_completed;
+        // The committed rotation must remain under the original owner token.
+        let owner_after = timeout_at(
+            tokio::time::Instant::from_std(scenario_deadline),
+            cluster
+                .catalog
+                .current_owner(device.tenant_id, device.id, Utc::now()),
+        )
+        .await
+        .map_err(|_| {
+            HarnessError::Timeout(format!(
+                "I08 GOAWAY phase=commit owner-after lookup timed out; {scope_label}"
+            ))
+        })?
+        .map_err(|error| HarnessError::Redis(format!("I08 GOAWAY owner-after lookup: {error}")))?
+        .ok_or_else(|| {
+            HarnessError::Process(format!(
+                "I08 GOAWAY phase=commit owner disappeared after rotation; {scope_label}"
+            ))
+        })?;
+        if owner_after.token != owner_before.token {
+            return Err(HarnessError::Process(format!(
+                "I08 GOAWAY phase=commit owner token changed during planned rotation; {scope_label}"
+            )));
+        }
+        // A fresh candidate must be live when the planned drain is requested,
+        // so the GOAWAY is exercised during an active rotation window.
+        wait_for_candidate(
+            cluster,
+            device.tenant_id,
+            device.id,
+            service_id,
+            &session_id,
+            epoch,
+            scenario_deadline,
+        )
+        .await?;
         let pre_admission_scope = PeerAdmissionScope::for_owner(&owner_before.token, service_id);
         if !peer_admission_barrier.arm(pre_admission_scope.clone()) {
             return Err(HarnessError::Process(
@@ -1104,7 +1260,9 @@ async fn run_scenario(
             ));
         }
         cluster.relay(OWNER_NODE)?.request_peer_planned_drain()?;
+        log_phase(started, "drain-requested");
         wait_for_goaway(cluster, active_connection_id, scope, scenario_deadline).await?;
+        log_phase(started, "goaway-observed");
         let seam_before_dispatches =
             owner_snapshot_before(cluster, scenario_deadline)
                 .await?
@@ -1150,6 +1308,7 @@ async fn run_scenario(
                 });
             }
         };
+        log_phase(started, "pre-admission-rejected");
         let after_pre_admission = owner_snapshot_before(cluster, scenario_deadline).await?;
         if after_pre_admission
             .lifetime_application_dispatches
@@ -1169,6 +1328,7 @@ async fn run_scenario(
         )
         .await?;
         let admitted_response_completed = true;
+        log_phase(started, "admitted-response-completed");
         let later_request_before_dispatches = after_pre_admission.lifetime_application_dispatches;
         // A fresh request that has not crossed the pre-resolution seam must
         // still stop at listener readiness and return CLUSTER_UNREADY. This
@@ -1185,6 +1345,7 @@ async fn run_scenario(
         )
         .await?;
         let post_goaway_not_dispatched = true;
+        log_phase(started, "post-drain-unready");
         let after_later_request = owner_snapshot_before(cluster, scenario_deadline).await?;
         let later_request_dispatch_delta = after_later_request
             .lifetime_application_dispatches
@@ -1222,43 +1383,54 @@ async fn run_scenario(
         .map_err(|error| HarnessError::Http(format!(
             "I08 GOAWAY phase=response admitted stream close failed; {scope_label}: {error}"
         )))?;
+        log_phase(started, "admitted-stream-closed");
         let ingress_goaway_observed = true;
-        let committed = wait_for_committed_rotation(cluster, scope, rotation_before, scenario_deadline)
-        .await?;
-        if committed.active_generation != candidate_generation
-            || committed.active_connection_id != candidate_connection_id
-        {
-            return Err(HarnessError::Process(
-                "I08 GOAWAY committed rotation did not activate the observed candidate".into(),
-            ));
-        }
-        let owner_after = timeout_at(
-            tokio::time::Instant::from_std(scenario_deadline),
-            cluster
-                .catalog
-                .current_owner(device.tenant_id, device.id, Utc::now()),
-        )
-        .await
-        .map_err(|_| HarnessError::Timeout(format!("I08 GOAWAY phase=commit owner-after lookup timed out; {scope_label}")))?
-        .map_err(|error| HarnessError::Redis(format!("I08 GOAWAY owner-after lookup: {error}")))?
-        .ok_or_else(|| HarnessError::Process(format!("I08 GOAWAY phase=commit owner disappeared after rotation; {scope_label}")))?;
-        if owner_after.token != owner_before.token
-        {
-            return Err(HarnessError::Process(format!(
-                "I08 GOAWAY phase=commit owner token changed during planned rotation; {scope_label}"
-            )));
-        }
         let cli_survived = cli_process.try_wait()?.is_none();
         if !cli_survived {
             return Err(HarnessError::Process(
                 "I08 GOAWAY CLI exited after the planned peer drain".into(),
             ));
         }
+        // The OS process identity is only observable while the child is
+        // live; capture it before the deliberate retirement below reaps it.
+        let actual_cli_process = cli_process.id().is_some();
+        // Retire the actual CLI through its normal SIGINT stop path now that it
+        // has survived the planned drain.  Its admitted device carriers are the
+        // only streams still holding the owner's draining peer listener open;
+        // the drain contract is to finish admitted streams inside its bounded
+        // budget, so the device is retired deterministically here and the
+        // listener-wide drain is observed to complete before cleanup, rather
+        // than racing the drain budget against a forced process stop.  A
+        // planned drain must not end the device session on its own: the CLI
+        // must still exit cleanly on request.
+        cli_process.request_stop().await.map_err(|error| {
+            HarnessError::Process(format!(
+                "I08 GOAWAY phase=retire CLI stop request failed: {error}; {scope_label}"
+            ))
+        })?;
+        let cli_exit = timeout_at(
+            tokio::time::Instant::from_std(scenario_deadline),
+            cli_process.wait(),
+        )
+        .await
+        .map_err(|_| {
+            HarnessError::Timeout(format!(
+                "I08 GOAWAY phase=retire CLI did not exit after its stop request; {scope_label}"
+            ))
+        })??;
+        if !cli_exit.success() {
+            return Err(HarnessError::Process(format!(
+                "I08 GOAWAY phase=retire CLI exited with {cli_exit} after the planned drain; {scope_label}"
+            )));
+        }
+        log_phase(started, "cli-retired");
+        wait_for_planned_drain_complete(cluster, scope, scenario_deadline).await?;
+        log_phase(started, "owner-drain-complete");
         let socket_high_water = cluster.device_fanout.diagnostics().peak_open;
         Ok(I08GoawayRotationEvidence {
             scope: "three_relay_rotation_planned_goaway",
             relay_count: cluster.relays.len(),
-            actual_cli_process: cli_process.id().is_some(),
+            actual_cli_process,
             owner_relay: OWNER_NODE.into(),
             ingress_relay: PEER_NODE.into(),
             tenant_id: device.tenant_id.to_string(),
@@ -1271,7 +1443,7 @@ async fn run_scenario(
             candidate_generation,
             candidate_connection_id,
             rotation_before,
-            rotation_after: committed.rotations_completed,
+            rotation_after,
             goaway_peer_node_id: PEER_NODE.into(),
             goaway_connection_id: active_connection_id,
             active_stream_observed: true,
@@ -1307,9 +1479,22 @@ async fn run_scenario(
                 "I08 GOAWAY CLI cleanup timed out".into(),
             ))
         } else {
-            cli_process
+            // Ask the CLI to stop through its normal path first (a no-op once
+            // it has already been retired), so a scenario that failed before
+            // the retirement step still lets the owner's admitted device
+            // carriers finish instead of waiting the whole grace period for a
+            // forced kill; the bounded shutdown below then reaps it.
+            let stop = cli_process.request_stop().await;
+            let shutdown = cli_process
                 .shutdown(remaining.min(Duration::from_secs(5)))
-                .await
+                .await;
+            match (stop, shutdown) {
+                (Ok(()), Ok(status)) => Ok(status),
+                (Err(error), Ok(_)) | (Ok(()), Err(error)) => Err(error),
+                (Err(stop), Err(shutdown)) => {
+                    Err(HarnessError::Process(format!("{stop}; {shutdown}")))
+                }
+            }
         }
     };
     if let Err(error) = cli_cleanup {

@@ -491,6 +491,19 @@ struct PlannedPeerServerFixture {
 
 impl PlannedPeerServerFixture {
     fn start(pki: &FixturePki, server_leaf: &Leaf, client_leaf: &Leaf) -> Self {
+        Self::start_with_body_read(pki, server_leaf, client_leaf, false)
+    }
+
+    /// Start the planned server.  With `read_request_body` set, the handler
+    /// consumes the request body before responding, so a peer reset of an
+    /// admitted stream is observed by the handler itself (as an owner's
+    /// forwarding handler would) rather than only at response time.
+    fn start_with_body_read(
+        pki: &FixturePki,
+        server_leaf: &Leaf,
+        client_leaf: &Leaf,
+        read_request_body: bool,
+    ) -> Self {
         let mut server_config = load_peer_server_config_from_pem(
             pki.chain(server_leaf).as_bytes(),
             server_leaf.private_key_pem.as_bytes(),
@@ -563,6 +576,11 @@ impl PlannedPeerServerFixture {
                 }
                 accepted.fetch_add(1, Ordering::AcqRel);
                 admitted.notify_one();
+                if read_request_body {
+                    // A peer reset of the request body surfaces here as the
+                    // handler's own typed error, before any response is sent.
+                    while stream.recv_chunk().await?.is_some() {}
+                }
                 while !*release.borrow() {
                     release
                         .changed()
@@ -1005,4 +1023,263 @@ async fn peer_client_passively_acknowledges_goaway_without_post_goaway_open() ->
     server_join?;
     client_shutdown?;
     Ok(())
+}
+
+/// Shutdown-after-GOAWAY regression: an admitted stream that its peer tears
+/// down during the planned drain (the `H3_REQUEST_CANCELLED` reset a relay
+/// ingress sends when its forwarded consumer or device socket closes) is a
+/// stream-local outcome.  The owner's planned drain must join it and complete
+/// cleanly; it previously surfaced as the listener result
+/// `peer HTTP/3 operation failed: Remote reset: H3_REQUEST_CANCELLED` and
+/// failed the relay shutdown.
+#[tokio::test]
+async fn peer_server_planned_drain_joins_cleanly_when_peer_resets_admitted_stream() -> TestResult {
+    let pki = FixturePki::new();
+    let client_leaf = pki.issue_peer("reset-drain-client");
+    let server_leaf = pki.issue_peer("reset-drain-server");
+    let server =
+        PlannedPeerServerFixture::start_with_body_read(&pki, &server_leaf, &client_leaf, true);
+
+    let mut client_endpoint = quinn::Endpoint::client(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .expect("reset-drain client endpoint");
+    let client_config = load_peer_client_config_from_pem(
+        pki.chain(&client_leaf).as_bytes(),
+        client_leaf.private_key_pem.as_bytes(),
+        pki.ca_pem.as_bytes(),
+    )
+    .expect("reset-drain client TLS config");
+    client_endpoint.set_default_client_config(client_config);
+    let pins = ApprovedPeerPins::new([
+        spki_sha256_from_der(&server_leaf.der).expect("reset-drain server pin")
+    ])
+    .expect("reset-drain client pins");
+    let client = PeerClient::new(client_endpoint, pins, limits()).expect("reset-drain client");
+
+    let scenario = async {
+        let connection = client.connect(server.destination.clone()).await?;
+        // The request body is deliberately left open: the admitted handler is
+        // reading it and observes the peer's reset directly.
+        let mut admitted = connection.open(request()).await?;
+        timeout(CASE_TIMEOUT, server.admitted.notified())
+            .await
+            .map_err(|_| "reset-drain handler did not admit the stream")?;
+
+        server.cancel.cancel();
+        server.wait_for_goaway_sent().await?;
+        if server.accepted.load(Ordering::Acquire) != 1 {
+            return Err("reset-drain admitted request count changed".into());
+        }
+
+        // The ingress side tears its admitted stream down after GOAWAY with
+        // the same H3_REQUEST_CANCELLED reset the relay uses; the handler
+        // ends with that typed error while the drain is still in progress.
+        admitted.cancel();
+        server.wait_for_handler_drop().await?;
+        if server.handler_completed.load(Ordering::Acquire) != 0 {
+            return Err("reset-drain handler completed after the peer reset".into());
+        }
+        if server.post_goaway_admitted.load(Ordering::Acquire) != 0 {
+            return Err("a request after planned GOAWAY reached the reset-drain handler".into());
+        }
+        // Returning the lease lets the client acknowledge GOAWAY so the
+        // server's accept boundary completes and its planned drain joins.
+        drop(admitted);
+        Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+    }
+    .await;
+
+    // A clean planned drain is the regression assertion: the stream-local
+    // reset must not become the listener's typed failure, while the join
+    // still completes inside the shared drain deadline.
+    let server_join = server.join().await;
+    let client_shutdown = client.shutdown().await;
+    scenario?;
+    server_join?;
+    client_shutdown?;
+    Ok(())
+}
+
+/// A raw authenticated HTTP/3 owner that refuses its first request without
+/// processing it.  This is the wire shape an ingress observes when it opens a
+/// stream after the owner closed planned admission but before the ingress
+/// processed the GOAWAY control frame.
+struct ResetServerFixture {
+    destination: PeerDestination,
+    cancel: CancellationToken,
+    task: JoinHandle<TestResult>,
+}
+
+impl ResetServerFixture {
+    fn start(pki: &FixturePki, server_leaf: &Leaf, code: h3::error::Code) -> Self {
+        let server_config = load_peer_server_config_from_pem(
+            pki.chain(server_leaf).as_bytes(),
+            server_leaf.private_key_pem.as_bytes(),
+            pki.ca_pem.as_bytes(),
+        )
+        .expect("reset server TLS config");
+        let endpoint =
+            quinn::Endpoint::server(server_config, SocketAddr::from(([127, 0, 0, 1], 0)))
+                .expect("reset server endpoint");
+        let address = endpoint.local_addr().expect("reset server address");
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(serve_reset_one(endpoint, code, cancel.clone()));
+        Self {
+            destination: PeerDestination::new(address, SERVER_NAME),
+            cancel,
+            task,
+        }
+    }
+
+    async fn shutdown(mut self) -> TestResult {
+        self.cancel.cancel();
+        match timeout(CASE_TIMEOUT, &mut self.task).await {
+            Ok(joined) => {
+                joined??;
+                Ok(())
+            }
+            Err(_) => {
+                self.task.abort();
+                let _ = timeout(CASE_TIMEOUT, &mut self.task).await;
+                Err("reset server exceeded its join deadline".into())
+            }
+        }
+    }
+}
+
+impl Drop for ResetServerFixture {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        self.task.abort();
+    }
+}
+
+async fn serve_reset_one(
+    endpoint: quinn::Endpoint,
+    code: h3::error::Code,
+    cancel: CancellationToken,
+) -> TestResult {
+    let incoming = tokio::select! {
+        _ = cancel.cancelled() => {
+            endpoint.close(quinn::VarInt::from_u32(0), b"test cancelled");
+            return Ok(())
+        }
+        incoming = timeout(CASE_TIMEOUT, endpoint.accept()) => incoming?,
+    };
+    let Some(incoming) = incoming else {
+        endpoint.close(quinn::VarInt::from_u32(0), b"test no incoming");
+        return Ok(());
+    };
+    let connection = timeout(CASE_TIMEOUT, incoming).await??;
+    let quic = h3_quinn::Connection::new(connection.clone());
+    let builder = h3::server::builder();
+    let mut h3_connection = timeout(CASE_TIMEOUT, builder.build::<_, Bytes>(quic)).await??;
+    let resolver = timeout(CASE_TIMEOUT, h3_connection.accept())
+        .await??
+        .ok_or("reset server ended before the first request")?;
+    let (request, mut stream) = resolver.resolve_request().await?;
+    if request.uri().path() != GOAWAY_PATH {
+        return Err(format!("unexpected reset fixture path: {}", request.uri().path()).into());
+    }
+    // Refuse the resolved request without reading its body or sending any
+    // response, mirroring the owner's admission-closed reset.
+    stream.stop_sending(code);
+    stream.stop_stream(code);
+    // Keep driving the connection so the reset is delivered and later client
+    // frames are processed until the case cancels the fixture.
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            result = h3_connection.accept() => match result? {
+                Some(resolver) => {
+                    let (_, mut rejected) =
+                        timeout(CASE_TIMEOUT, resolver.resolve_request()).await??;
+                    rejected.stop_stream(h3::error::Code::H3_REQUEST_REJECTED);
+                }
+                None => break,
+            },
+        }
+    }
+    let _ = timeout(CASE_TIMEOUT, h3_connection.shutdown(0)).await;
+    let clean_close_code = quinn::VarInt::from_u64(h3::error::Code::H3_NO_ERROR.value())
+        .expect("H3_NO_ERROR fits a QUIC application close code");
+    connection.close(clean_close_code, b"test cleanup after reset");
+    endpoint.close(clean_close_code, b"test server shutdown");
+    Ok(())
+}
+
+/// Open one request against a refusing owner and return the typed outcome the
+/// pooled client reports at its response boundary.
+async fn refused_request_outcome(
+    label: &str,
+    code: h3::error::Code,
+) -> TestResult<Result<Response<()>, PeerTransportError>> {
+    let pki = FixturePki::new();
+    let client_leaf = pki.issue_peer(&format!("{label}-client"));
+    let server_leaf = pki.issue_peer(&format!("{label}-server"));
+    let server = ResetServerFixture::start(&pki, &server_leaf, code);
+
+    let mut client_endpoint = quinn::Endpoint::client(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .expect("reset case client endpoint");
+    let client_config = load_peer_client_config_from_pem(
+        pki.chain(&client_leaf).as_bytes(),
+        client_leaf.private_key_pem.as_bytes(),
+        pki.ca_pem.as_bytes(),
+    )
+    .expect("reset case client TLS config");
+    client_endpoint.set_default_client_config(client_config);
+    let pins = ApprovedPeerPins::new([
+        spki_sha256_from_der(&server_leaf.der).expect("reset case server pin")
+    ])
+    .expect("reset case client pins");
+    let client = PeerClient::new(client_endpoint, pins, limits()).expect("reset case client");
+
+    let outcome = async {
+        let connection = client.connect(server.destination.clone()).await?;
+        // The request stream exists before the owner refuses it, so the typed
+        // outcome must be observed at the response boundary, exactly where a
+        // relay ingress reads the owner's admission response.
+        let mut stream = connection.open(request()).await?;
+        let response = timeout(CASE_TIMEOUT, stream.recv_response())
+            .await
+            .map_err(|_| "refused request exceeded its response deadline")?;
+        drop(stream);
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(response)
+    }
+    .await;
+
+    let server_shutdown = server.shutdown().await;
+    let client_shutdown = client.shutdown().await;
+    let response = outcome?;
+    server_shutdown?;
+    client_shutdown?;
+    Ok(response)
+}
+
+/// An owner that refuses a raced stream with `H3_REQUEST_REJECTED` did not
+/// process it (RFC 9114 §8.1), so the pooled client must report the typed
+/// pre-dispatch `GoAway` that the relay maps to `PEER_UNAVAILABLE` /
+/// `not_dispatched`, not a generic HTTP/3 error with `unknown` certainty.
+#[tokio::test]
+async fn peer_client_types_request_rejected_reset_as_goaway_not_dispatched() -> TestResult {
+    match refused_request_outcome("reject-reset", h3::error::Code::H3_REQUEST_REJECTED).await? {
+        Err(PeerTransportError::GoAway) => Ok(()),
+        Err(error) => Err(format!("H3_REQUEST_REJECTED was not typed as GoAway: {error}").into()),
+        Ok(_) => Err("refused request unexpectedly received a response".into()),
+    }
+}
+
+/// A `H3_REQUEST_CANCELLED` reset may follow dispatch, so it must keep the
+/// generic HTTP/3 classification and its `unknown` execution certainty.
+#[tokio::test]
+async fn peer_client_keeps_request_cancelled_reset_as_generic_h3() -> TestResult {
+    match refused_request_outcome("cancel-reset", h3::error::Code::H3_REQUEST_CANCELLED).await? {
+        Err(PeerTransportError::H3(_)) => Ok(()),
+        Err(PeerTransportError::GoAway) => {
+            Err("H3_REQUEST_CANCELLED was misreported as a pre-dispatch GoAway".into())
+        }
+        Err(error) => {
+            Err(format!("H3_REQUEST_CANCELLED had an unexpected typed outcome: {error}").into())
+        }
+        Ok(_) => Err("cancelled request unexpectedly received a response".into()),
+    }
 }
