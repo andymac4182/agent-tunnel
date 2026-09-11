@@ -35,8 +35,8 @@ use super::{
 };
 
 const PLANNED_ROTATION_COUNT: u64 = 2;
-const POLL: Duration = Duration::from_millis(50);
-const PROCESS_GRACE: Duration = Duration::from_secs(5);
+pub(super) const POLL: Duration = Duration::from_millis(50);
+pub(super) const PROCESS_GRACE: Duration = Duration::from_secs(5);
 const FAULT_RECOVERY_TIMEOUT: Duration = Duration::from_secs(35);
 
 /// Payload-free evidence for the planned and unexpected active-carrier paths.
@@ -470,46 +470,46 @@ pub fn validate_i08_rotation_fault_evidence(evidence: &I08RotationFaultEvidence)
 }
 
 #[derive(Clone, Debug)]
-struct CliStatus {
-    phase: String,
-    session_id: String,
-    epoch: u64,
-    generation: u64,
-    active_connection_id: String,
-    rotations_completed: u64,
-    control_local_addr: String,
-    recovery_attempt: Option<u64>,
-    recovery_attempt_started_at_ms: Option<u64>,
-    recovery_attempt_deadline_ms: Option<u64>,
-    recovery_episode_deadline_ms: Option<u64>,
-    recovery_closed_connection_ids: Vec<String>,
-    recovery_reset_reason: Option<&'static str>,
-    recovery_old_generation: Option<u64>,
-    recovery_old_connection_id: Option<String>,
-    recovery_successor_generation: Option<u64>,
-    recovery_successor_connection_id: Option<String>,
+pub(super) struct CliStatus {
+    pub(super) phase: String,
+    pub(super) session_id: String,
+    pub(super) epoch: u64,
+    pub(super) generation: u64,
+    pub(super) active_connection_id: String,
+    pub(super) rotations_completed: u64,
+    pub(super) control_local_addr: String,
+    pub(super) recovery_attempt: Option<u64>,
+    pub(super) recovery_attempt_started_at_ms: Option<u64>,
+    pub(super) recovery_attempt_deadline_ms: Option<u64>,
+    pub(super) recovery_episode_deadline_ms: Option<u64>,
+    pub(super) recovery_closed_connection_ids: Vec<String>,
+    pub(super) recovery_reset_reason: Option<&'static str>,
+    pub(super) recovery_old_generation: Option<u64>,
+    pub(super) recovery_old_connection_id: Option<String>,
+    pub(super) recovery_successor_generation: Option<u64>,
+    pub(super) recovery_successor_connection_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
-struct RecoveryStatusEvidence {
-    attempts: Vec<u64>,
-    attempt_starts_ms: Vec<u64>,
-    attempt_deadlines_ms: Vec<u64>,
-    episode_deadline_ms: Option<u64>,
-    closed_connection_ids: Vec<Vec<String>>,
-    successor_connection_ids: Vec<Option<String>>,
-    reset_reason: Option<&'static str>,
-    old_generation: Option<u64>,
-    old_connection_id: Option<String>,
-    successor_generation: Option<u64>,
-    successor_connection_id: Option<String>,
+pub(super) struct RecoveryStatusEvidence {
+    pub(super) attempts: Vec<u64>,
+    pub(super) attempt_starts_ms: Vec<u64>,
+    pub(super) attempt_deadlines_ms: Vec<u64>,
+    pub(super) episode_deadline_ms: Option<u64>,
+    pub(super) closed_connection_ids: Vec<Vec<String>>,
+    pub(super) successor_connection_ids: Vec<Option<String>>,
+    pub(super) reset_reason: Option<&'static str>,
+    pub(super) old_generation: Option<u64>,
+    pub(super) old_connection_id: Option<String>,
+    pub(super) successor_generation: Option<u64>,
+    pub(super) successor_connection_id: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug)]
-struct CliFailure {
-    code: &'static str,
-    retryable: Option<bool>,
-    trigger: Option<&'static str>,
+pub(super) struct CliFailure {
+    pub(super) code: &'static str,
+    pub(super) retryable: Option<bool>,
+    pub(super) trigger: Option<&'static str>,
 }
 
 fn optional_u64(result: &serde_json::Value, name: &str) -> Result<Option<u64>> {
@@ -573,7 +573,10 @@ fn parse_statuses(process: &ManagedProcess) -> Result<Vec<CliStatus>> {
     parse_statuses_from(process, 0)
 }
 
-fn parse_statuses_from(process: &ManagedProcess, stdout_offset: usize) -> Result<Vec<CliStatus>> {
+pub(super) fn parse_statuses_from(
+    process: &ManagedProcess,
+    stdout_offset: usize,
+) -> Result<Vec<CliStatus>> {
     let mut statuses = Vec::new();
     let stdout = process.stdout();
     let output = stdout.get(stdout_offset..).ok_or_else(|| {
@@ -671,7 +674,7 @@ fn parse_statuses_from(process: &ManagedProcess, stdout_offset: usize) -> Result
     Ok(statuses)
 }
 
-fn assert_recovery_metadata_clear(status: &CliStatus, stage: &str) -> Result<()> {
+pub(super) fn assert_recovery_metadata_clear(status: &CliStatus, stage: &str) -> Result<()> {
     if status.recovery_attempt.is_some()
         || status.recovery_attempt_started_at_ms.is_some()
         || status.recovery_attempt_deadline_ms.is_some()
@@ -690,7 +693,7 @@ fn assert_recovery_metadata_clear(status: &CliStatus, stage: &str) -> Result<()>
     Ok(())
 }
 
-fn collect_recovery_status_evidence(
+pub(super) fn collect_recovery_status_evidence(
     process: &ManagedProcess,
     stdout_offset: usize,
     previous: &CliStatus,
@@ -888,7 +891,7 @@ fn parse_recovery_trigger(message: &str, expected_generation: u64) -> Option<&'s
     }
 }
 
-fn parse_failure_since(
+pub(super) fn parse_failure_since(
     process: &ManagedProcess,
     stdout_offset: usize,
     expected_generation: u64,
@@ -932,7 +935,10 @@ fn parse_failure_since(
     None
 }
 
-async fn wait_for_status(process: &mut ManagedProcess, deadline: Instant) -> Result<CliStatus> {
+pub(super) async fn wait_for_status(
+    process: &mut ManagedProcess,
+    deadline: Instant,
+) -> Result<CliStatus> {
     loop {
         if let Some(status) = parse_statuses(process)?.into_iter().last() {
             return Ok(status);
@@ -951,7 +957,10 @@ async fn wait_for_status(process: &mut ManagedProcess, deadline: Instant) -> Res
     }
 }
 
-fn latest_status(process: &ManagedProcess, initial: &CliStatus) -> Result<Option<CliStatus>> {
+pub(super) fn latest_status(
+    process: &ManagedProcess,
+    initial: &CliStatus,
+) -> Result<Option<CliStatus>> {
     let statuses = parse_statuses(process)?;
     for status in &statuses {
         if status.session_id != initial.session_id
@@ -966,7 +975,7 @@ fn latest_status(process: &ManagedProcess, initial: &CliStatus) -> Result<Option
     Ok(statuses.into_iter().last())
 }
 
-fn session_for_status(
+pub(super) fn session_for_status(
     snapshot: RelaySnapshot,
     status: &CliStatus,
     device_id: Uuid,
@@ -984,7 +993,7 @@ fn session_for_status(
         })
 }
 
-async fn relay_snapshot_until(
+pub(super) async fn relay_snapshot_until(
     cluster: &ProductionCluster,
     node_id: &str,
     deadline: Instant,
@@ -1425,7 +1434,7 @@ async fn wait_for_terminal_observation(
     }
 }
 
-async fn send_record(
+pub(super) async fn send_record(
     stream: &mut ConsumerStream,
     sequence: u64,
     canary: &[u8],
@@ -1443,7 +1452,7 @@ async fn send_record(
     Ok(())
 }
 
-async fn shutdown_cli(mut process: ManagedProcess, deadline: Instant) -> Result<()> {
+pub(super) async fn shutdown_cli(mut process: ManagedProcess, deadline: Instant) -> Result<()> {
     let stop = process.request_stop().await;
     // ManagedProcess::shutdown owns the child and output-drain handles.  Do
     // not cancel its consuming future at the shared deadline: that would
@@ -1481,7 +1490,7 @@ async fn shutdown_node_until(
         .await
 }
 
-async fn shutdown_cluster(cluster: ProductionCluster, deadline: Instant) -> Result<()> {
+pub(super) async fn shutdown_cluster(cluster: ProductionCluster, deadline: Instant) -> Result<()> {
     cluster
         .shutdown_until(tokio::time::Instant::from_std(deadline))
         .await

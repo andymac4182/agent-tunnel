@@ -38,7 +38,7 @@ pub use database::{RedisLease, RedisLeaseOptions};
 pub use error::{HarnessError, Result};
 pub use fanout_proxy::{
     FanoutConnection, FanoutProxy, FanoutProxyConfig, FanoutProxyDiagnostics, FanoutProxyHandle,
-    TcpFanoutProxy, TcpFanoutProxyConfig, TcpFanoutProxyHandle,
+    FanoutRouteFault, FanoutRouteFlow, TcpFanoutProxy, TcpFanoutProxyConfig, TcpFanoutProxyHandle,
 };
 pub use fixture::{
     ConsumerFixture, DeviceFixture, FixtureTopology, PrincipalFixture, SharedFixtureIdentity,

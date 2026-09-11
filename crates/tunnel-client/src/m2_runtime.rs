@@ -1679,8 +1679,8 @@ async fn run_m2_session(
                             break Err(error);
                         }
                     }
-                    Some(Err(error)) => break Err(ClientError::Transport { scope: "control read", detail: sanitize_error(&error.to_string()) }),
-                    None => break Err(ClientError::Transport { scope: "control read", detail: "control socket closed".to_owned() }),
+                    Some(Err(error)) => break Err(actor.control_lost_error(sanitize_error(&error.to_string()))),
+                    None => break Err(actor.control_lost_error("control socket closed".to_owned())),
                 }
             }
             event = events_rx.recv() => {
@@ -3127,10 +3127,29 @@ impl M2Actor {
             )),
             Message::Ping(payload) => self.send_critical_message(Message::Pong(payload), None),
             Message::Pong(_) | Message::Frame(_) => Ok(()),
-            Message::Close(_) => Err(ClientError::Transport {
+            Message::Close(_) => Err(self.control_lost_error("control socket closed".to_owned())),
+        }
+    }
+
+    /// Classify a lost control socket.  Outside recovery it is the generic
+    /// control transport failure.  During a retained recovery episode the
+    /// coordinator (relay) is the only endpoint that can end the episode,
+    /// for example after the last permitted candidate attempt failed, so
+    /// the terminal diagnostic must keep the original data-carrier trigger
+    /// and the attempt number instead of collapsing into an anonymous
+    /// control failure that looks like a fresh abnormal close.
+    fn control_lost_error(&self, detail: String) -> ClientError {
+        let Some(recovery) = self.recovery.as_ref() else {
+            return ClientError::Transport {
                 scope: "control read",
-                detail: "control socket closed".to_owned(),
-            }),
+                detail,
+            };
+        };
+        let detail =
+            self.retained_recovery_detail("control socket closed during retained recovery");
+        ClientError::Transport {
+            scope: "retained recovery",
+            detail: format!("{detail}; recovery_attempt={}", recovery.begin.attempt_no),
         }
     }
 
@@ -6372,8 +6391,24 @@ impl M2Actor {
             return Ok(());
         }
         let Some(pending) = self.pending_candidate.as_mut() else {
-            // The initial DATA_READY is consumed before the actor starts. A
-            // stale candidate readiness must not attach an untracked socket.
+            // A recovery candidate can attach at the relay and then be lost
+            // before its handshake response reaches this connector.  The
+            // relay's DATA_READY for that exact released candidate is then
+            // late, not foreign: it names a carrier this episode already
+            // closed, so it is ignored and the retry proceeds.  Any other
+            // readiness without a pending candidate remains a protocol
+            // violation; the initial DATA_READY is consumed before the actor
+            // starts and a stale readiness must not attach an untracked
+            // socket.
+            let released_recovery_candidate = self.recovery.is_some()
+                && ready.session_id == self.session.session_id
+                && ready.epoch == self.session.epoch
+                && self
+                    .closed_for_recovery
+                    .contains_key(ready.connection_id.as_str());
+            if released_recovery_candidate {
+                return Ok(());
+            }
             return Err(ClientError::Protocol("unexpected DATA_READY".to_owned()));
         };
         ready
@@ -6431,7 +6466,12 @@ impl M2Actor {
         );
         self.candidate = Some(carrier);
         if recovery {
+            // The candidate carrier is now installed.  Re-drive any recovery
+            // snapshot work that deferred while control RESUME was ahead of
+            // this data socket, then flush the snapshot replies it was
+            // waiting to back with a real carrier.
             self.maybe_prepare_recovery_plans(true)?;
+            self.send_recovery_snapshot_replies()?;
         } else {
             self.apply_pending_quiesce()?;
         }
@@ -7212,6 +7252,17 @@ impl M2Actor {
                 !queue_replay && recovery.remote_ready.iter().all(|ready| *ready),
             )
         };
+        if queue_replay && self.candidate.is_none() {
+            // Control RESUME can win the select against the candidate data
+            // socket's own handshake completion, so snapshots can arrive
+            // before this actor has installed the candidate carrier that
+            // must carry the replay frames.  Defer replay queuing and the
+            // snapshot replies rather than failing the session: the install
+            // path (`maybe_install_candidate`) re-drives this, and if the
+            // candidate never attaches the episode's candidate deadline
+            // converts the stall into a clean candidate loss and retry.
+            return Ok(());
+        }
         let peer_snapshots = self.recovery_peer_snapshots(use_ready_snapshots)?;
         let mut plans = BTreeMap::new();
         for stream_id in stream_ids {
@@ -7306,6 +7357,15 @@ impl M2Actor {
     }
 
     fn send_recovery_snapshot_replies(&mut self) -> Result<(), ClientError> {
+        // A snapshot reply commits to the replay ranges this connector will
+        // push over the candidate carrier, so it must not be sent until that
+        // carrier is installed.  When control RESUME raced ahead of the data
+        // socket, the reply is deferred here and re-driven once the candidate
+        // installs; an unattached candidate therefore produces a clean
+        // candidate-deadline loss instead of a premature, unbacked reply.
+        if self.candidate.is_none() {
+            return Ok(());
+        }
         let outbound = {
             let Some(recovery) = self.recovery.as_mut() else {
                 return Ok(());
@@ -10605,6 +10665,159 @@ mod tests {
                 active_key.generation,
             )
         );
+    }
+
+    /// Build a minimal retained-recovery context for attempt `attempt_no`
+    /// whose first candidate `closed_candidate` has already been released.
+    fn installed_recovery_context(
+        actor: &mut M2Actor,
+        active_key: &CarrierKey,
+        attempt_no: u64,
+        closed_candidate: &str,
+    ) {
+        let attempt = RotationAttemptIdentity::new(
+            "session",
+            1,
+            "owner",
+            format!("control-lost-{attempt_no}"),
+            active_key.generation,
+            active_key.generation + attempt_no,
+            active_key.connection_id.clone(),
+            format!("candidate-{attempt_no}"),
+        );
+        let roster =
+            tunnel_protocol::rotation_control::StreamRoster::new("control-lost-snapshot", vec![]);
+        let now = actor.now_ms();
+        let begin = RecoveryBegin {
+            message_id: format!("control-lost-begin-{attempt_no}"),
+            reply_to: String::new(),
+            attempt: attempt.clone(),
+            episode_id: "control-lost-episode".to_owned(),
+            attempt_no,
+            roster: roster.clone(),
+            remaining_ms: 1_000,
+        };
+        let local_closed = RecoveryClosed {
+            message_id: format!("control-lost-closed-{attempt_no}"),
+            reply_to: begin.message_id.clone(),
+            attempt,
+            episode_id: begin.episode_id.clone(),
+            attempt_no,
+            closed_connection_ids: vec![closed_candidate.to_owned()],
+            closure_digest: "control-lost-digest".to_owned(),
+        };
+        actor.recovery = Some(RecoveryRuntime {
+            begin,
+            local_closed,
+            prepare_message_id: None,
+            peer_closed: None,
+            combined_digest: None,
+            deadline_ms: now.checked_add(1_000).expect("deadline"),
+            attempt_deadline_ms: None,
+            authenticated_closed_connection_ids: BTreeSet::new(),
+            local_snapshots: [BTreeMap::new(), BTreeMap::new()],
+            remote_snapshots: [BTreeMap::new(), BTreeMap::new()],
+            remote_ready_snapshots: [BTreeMap::new(), BTreeMap::new()],
+            remote_snapshot_message_ids: [None, None],
+            snapshot_reply_message_ids: [None, None],
+            snapshot_reply_messages: [None, None],
+            remote_ready_message_ids: [None, None],
+            remote_ready: [false, false],
+            local_plans: BTreeMap::new(),
+            peer_snapshots: BTreeMap::new(),
+            snapshot_replies: [false, false],
+            ready_replies: [false, false],
+            ready_reply_messages: [None, None],
+            fresh_reconciled: false,
+        });
+        actor.closed_for_recovery.insert(
+            closed_candidate.to_owned(),
+            ClosureEvidence::closed(closed_candidate),
+        );
+    }
+
+    /// EC-057/IN-09: the coordinator ends an exhausted episode by closing
+    /// control.  The connector must keep the data-carrier trigger and the
+    /// attempt number in its typed terminal diagnostic instead of reporting
+    /// an anonymous control failure; outside recovery the generic control
+    /// diagnostic is unchanged.
+    #[test]
+    fn control_loss_during_retained_recovery_keeps_trigger_and_attempt() {
+        let (mut actor, active_key, _receiver, _control_receiver) =
+            test_actor_with_carrier(M2_CARRIER_QUEUE_FRAMES);
+        assert_eq!(
+            actor
+                .control_lost_error("control socket closed".to_owned())
+                .to_string(),
+            "control read failed"
+        );
+        actor.remember_recovery_trigger(RecoveryTriggerClass::ReaderClosed, &active_key);
+        installed_recovery_context(&mut actor, &active_key, 3, "candidate-2");
+        let error = actor.control_lost_error("control socket closed".to_owned());
+        assert_eq!(error.code(), "TRANSPORT_ERROR");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "retained recovery failed: control socket closed during retained recovery; recovery_trigger=data_reader_closed; recovery_role=active; recovery_generation={}; recovery_attempt=3",
+                active_key.generation,
+            )
+        );
+        // An out-of-range attempt in a detail string cannot leak through the
+        // closed diagnostic set.
+        assert_eq!(
+            ClientError::Transport {
+                scope: "retained recovery",
+                detail: "control socket closed during retained recovery; recovery_trigger=data_reader_closed; recovery_role=active; recovery_generation=1; recovery_attempt=4".to_owned(),
+            }
+            .to_string(),
+            "retained recovery failed: control socket closed during retained recovery"
+        );
+    }
+
+    /// A DATA_READY for a recovery candidate this connector already released
+    /// (the relay attached it before the handshake response was lost) is late
+    /// rather than foreign and must not end the session; readiness for any
+    /// unknown carrier without a pending candidate remains a violation.
+    #[tokio::test]
+    async fn late_data_ready_for_released_recovery_candidate_is_ignored() {
+        let (mut actor, active_key, _receiver, _control_receiver) =
+            test_actor_with_carrier(M2_CARRIER_QUEUE_FRAMES);
+        installed_recovery_context(&mut actor, &active_key, 2, "candidate-1");
+        assert!(actor.pending_candidate.is_none());
+        let released = DataReady {
+            message_id: "late-ready".to_owned(),
+            reply_to: "late-prepare".to_owned(),
+            session_id: "session".to_owned(),
+            epoch: 1,
+            generation: active_key.generation + 1,
+            connection_id: "candidate-1".to_owned(),
+        };
+        actor
+            .handle_candidate_ready(released.clone())
+            .await
+            .expect("late readiness for a released candidate is ignored");
+        assert!(actor.candidate.is_none() && actor.pending_candidate.is_none());
+        let foreign = DataReady {
+            connection_id: "candidate-9".to_owned(),
+            ..released.clone()
+        };
+        assert!(matches!(
+            actor.handle_candidate_ready(foreign).await,
+            Err(ClientError::Protocol(message)) if message == "unexpected DATA_READY"
+        ));
+        let other_session = DataReady {
+            session_id: "other-session".to_owned(),
+            ..released.clone()
+        };
+        assert!(matches!(
+            actor.handle_candidate_ready(other_session).await,
+            Err(ClientError::Protocol(message)) if message == "unexpected DATA_READY"
+        ));
+        actor.recovery = None;
+        assert!(matches!(
+            actor.handle_candidate_ready(released).await,
+            Err(ClientError::Protocol(message)) if message == "unexpected DATA_READY"
+        ));
     }
 
     #[tokio::test]

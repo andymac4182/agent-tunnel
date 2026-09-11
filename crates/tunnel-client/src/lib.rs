@@ -2035,6 +2035,9 @@ fn safe_rotation_detail(detail: &str) -> String {
         "recovery candidate phase deadline expired" => {
             "recovery candidate phase deadline expired".to_owned()
         }
+        "control socket closed during retained recovery" => {
+            "control socket closed during retained recovery".to_owned()
+        }
         _ => "bounded rotation state failure".to_owned(),
     };
     let Some(metadata) = metadata else {
@@ -2045,6 +2048,20 @@ fn safe_rotation_detail(detail: &str) -> String {
     };
     let Some((role, generation)) = metadata.split_once("; recovery_generation=") else {
         return safe_base;
+    };
+    // An optional bounded attempt number follows the generation when the
+    // episode itself was ended by the coordinator.
+    let (generation, attempt) = generation
+        .split_once("; recovery_attempt=")
+        .map_or((generation, None), |(generation, attempt)| {
+            (generation, Some(attempt))
+        });
+    let attempt = match attempt {
+        None => None,
+        Some(attempt) => match attempt.parse::<u64>() {
+            Ok(attempt) if (1..=3).contains(&attempt) => Some(attempt),
+            _ => return safe_base,
+        },
     };
     let trigger = match trigger {
         "data_writer_failed" | "data_reader_closed" | "data_writer_closed" => trigger,
@@ -2063,9 +2080,13 @@ fn safe_rotation_detail(detail: &str) -> String {
     let Ok(generation) = generation.parse::<u64>() else {
         return safe_base;
     };
-    format!(
+    let mut message = format!(
         "{safe_base}; recovery_trigger={trigger}; recovery_role={role}; recovery_generation={generation}"
-    )
+    );
+    if let Some(attempt) = attempt {
+        message.push_str(&format!("; recovery_attempt={attempt}"));
+    }
+    message
 }
 
 /// Errors returned by the connector API. Display text is safe for CLI JSON;

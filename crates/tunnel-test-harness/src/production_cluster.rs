@@ -70,6 +70,7 @@ mod c11_diagnostics;
 mod concurrent_load;
 mod i08_goaway_rotation;
 mod i08_synthetic_rotation;
+mod m7_i08_recovery_attempts;
 mod m7_i08_rotation_faults;
 mod pending_owner;
 pub use c11_diagnostics::{C11MatrixReport, verify_c11_diagnostics};
@@ -83,6 +84,11 @@ pub use i08_goaway_rotation::{
 pub use i08_synthetic_rotation::{
     I08Evidence, I08RotationEvidence, validate_i08_evidence,
     verify as verify_i08_synthetic_rotation,
+};
+pub use m7_i08_recovery_attempts::{
+    AttemptObservation, CursorSample, I08RecoveryAttemptEvidence, RecoveryEpisodeEvidence,
+    validate_i08_recovery_attempt_evidence, validate_recovery_episode_evidence,
+    verify as verify_i08_recovery_attempts,
 };
 pub use m7_i08_rotation_faults::{
     I08RotationFaultEvidence, validate_i08_rotation_fault_evidence,

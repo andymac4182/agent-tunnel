@@ -94,6 +94,8 @@ gate "M7 synthetic Echo through actual CLI same-owner rotations" \
   cargo run --locked -p tunnel-test-harness -- verify-m7-i08-synthetic-rotation
 gate "M7 planned retirement and unexpected active-carrier recovery/failure" \
   cargo run --locked -p tunnel-test-harness -- verify-m7-i08-rotation-faults
+gate "M7 three failed recovery attempts and second-attempt recovery" \
+  cargo run --locked -p tunnel-test-harness -- verify-m7-i08-recovery-attempts
 gate "M7 public negative-admission acceptance" \
   cargo run --locked -p tunnel-test-harness -- verify-m7-admission
 gate "M7 live device credential revocation" \
