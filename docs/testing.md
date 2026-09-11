@@ -24,6 +24,7 @@ Configuration tests must preserve these defaults and reject invalid values:
 - `handshake_timeout_seconds` defaults to 10 and accepts 1–300 seconds. `overlap_seconds` defaults to 30 and accepts 1–3,600 seconds. Overlap begins when the candidate connection attempt starts, including its handshake.
 - The cross-field rule is `handshake_timeout_seconds < overlap_seconds < interval_seconds`. An individually valid value can still violate this rule.
 - Client `device_id` accepts 1–128 ASCII characters from `[A-Za-z0-9._-]`. Relay limits default to 1,024 total connected clients and 16 per user, with per-user capacity no greater than total capacity.
+- Listener `handshake_timeout` defaults to 10 seconds, `pre_request_timeout` to 15 seconds and `http1_header_read_timeout` to 10 seconds. Each accepts 100 ms–300 seconds inclusive, and the cross-field rule is `http1_header_read_timeout <= pre_request_timeout`. A zero value is rejected rather than treated as "disabled", and an invalid value must return a typed error and release the listener instead of accepting connections with an unbounded permit. See the [bounded listener connection permits](runtime.md#bounded-listener-connection-permits) contract.
 - Empty/default and partial configuration, unknown or duplicate keys, incorrect types, negative/overflowing values, valid boundaries, and the checked-in examples must be covered. Add boundary and cross-field cases whenever an invariant changes.
 
 ## Repeatable M7 harness commands
@@ -218,6 +219,8 @@ Test deduplication identifiers within their declared scope, duplicate terminal r
 ## Flow control and resource limits
 
 Use generated binary files and synthetic screenshots, including empty data, invalid text bytes, and payloads above every configured threshold. Transfer small interactive responses concurrently with large file reads, file writes, and screenshot streams. Slow or stop an individual reader and verify that its queues are bounded and other users and devices continue to make progress.
+
+Listener connection permits need real-socket evidence, not a counter assertion. Fill every one of the 64 permits with connections that complete an actual TLS 1.3 handshake and then send no application byte, and prove that a further connection is refused while they are held, that each silent connection is closed within the configured pre-request bound, that the permit count returns to full, and that a further connection is then served. Separately prove the bound cannot kill an established connection: an in-flight request lasting several times the bound must still complete, and a keep-alive connection that already dispatched a request must still serve a second request after the bound elapsed. `crates/tunnel-transport/tests/m7_listener_permits.rs` holds these regressions.
 
 Assert maximum frame size, maximum operation size, per-stream and per-connection queue limits, in-flight operation limits, and per-user/device quotas. Test admission at the limit and one unit over it, cancellation of a blocked writer, disk-full errors, exhausted file handles, and memory-pressure behavior. Verify that heartbeat, cancellation, revocation, and rotation control messages remain responsive while the data path is saturated.
 

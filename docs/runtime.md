@@ -18,6 +18,18 @@ Ports above are examples, configurable independently. Separate sockets/listener 
 
 Axum is the web framework for public HTTP and device WebSockets. Its documented `serve` path supports HTTP/1 and HTTP/2; HTTP/3 needs a distinct integration, not a configuration flag on `axum::serve`. Implement a small peer HTTP/3 transport adapter calling shared typed application services. Do not require public Axum routes, WebSocket extractors, or Tower body assumptions to work unchanged over HTTP/3. Sources: [Axum serve](https://docs.rs/axum/latest/axum/fn.serve.html), [Axum WebSockets](https://docs.rs/axum/latest/axum/extract/ws/), [h3](https://docs.rs/h3/latest/h3/), [h3-quinn](https://docs.rs/h3-quinn/latest/h3_quinn/).
 
+### Bounded listener connection permits
+
+Both public listeners supervise at most 64 concurrent TLS handshakes and HTTP connections, and one permit is held for the whole HTTP connection. A permit is therefore bounded in time as well as in count by three validated `ListenerTimeouts` values, so an anonymous consumer connection (or a connection presenting one valid device certificate) cannot hold a permit by completing the TLS handshake and then staying silent:
+
+| Bound | Default | Accepted range | Phase it covers |
+| --- | --- | --- | --- |
+| `handshake_timeout` | 10 s | 100 ms..=300 s | TCP accept until the TLS 1.3 handshake completes |
+| `pre_request_timeout` | 15 s | 100 ms..=300 s | Handshake completion until the connection dispatches its first complete HTTP request: HTTP/1-versus-HTTP/2 sniffing, the HTTP/2 preamble, and the first request head |
+| `http1_header_read_timeout` | 10 s | 100 ms..=300 s, not above `pre_request_timeout` | Each single HTTP/1 request-head read, including an idle keep-alive gap between requests |
+
+A silent connection therefore holds a permit for at most 25 seconds by default, then is closed and returns it. The pre-request bound is disarmed permanently by the first dispatched request, so an established device WebSocket upgrade, an in-flight consumer request, and a streaming response body are never closed by it; `http1_header_read_timeout` is armed by Hyper only when it can read a new request head, so it does not apply during an in-flight request, a streaming body, or after an upgrade. HTTP/2 has no header-read deadline of its own, and `hyper_util`'s protocol sniffer has no deadline at all, which is why the pre-request bound is enforced by the listener rather than delegated to Hyper. Hyper discards a configured header-read deadline unless a timer is installed on its builder, so the listener installs a Tokio timer on both the HTTP/1 and HTTP/2 builders. Raising the permit count is not a substitute for these deadlines. An invalid value fails closed: the listener returns a typed error and releases the socket instead of accepting with an unbounded permit.
+
 The two steady-state WebSockets belong to each CLI device connection. Peer QUIC connections and consumer connections are separate. Private HTTP/3 forwarding does not add a third steady-state device socket. During data rotation, one control plus old and candidate data sockets remain bounded by the existing overlap deadline.
 
 ## Rust stack and dependency gate
