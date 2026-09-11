@@ -49,6 +49,11 @@ gate "Redis recovery integration tests" \
 gate "Redis recovery-race integration tests" \
   cargo test -p tunnel-catalog --test redis_recovery_races --locked -- --ignored --test-threads=1
 
+gate "catalog authority lane reconnect tests" \
+  cargo test -p tunnel-catalog --test redis_lane_reconnect --locked -- --ignored --test-threads=1
+gate "catalog maintenance queue tests" \
+  cargo test -p tunnel-catalog --test redis_maintenance_queue --locked -- --ignored --test-threads=1
+
 gate "operator recovery CLI tests" \
   cargo test -p tunnel-relay --test recovery_cli --locked -- --test-threads=1
 gate "operator recovery workflow tests" \
@@ -67,6 +72,10 @@ gate "relay membership persistence tests" \
   cargo test -p tunnel-relay --test m7_membership_persistence --locked -- --test-threads=1
 gate "configured relay process Redis TLS and checkpoint acceptance" \
   cargo test -p tunnel-test-harness --test m7_deployment_process --locked -- --ignored --test-threads=1
+gate "configured relay dependency restore and fresh authenticated echo" \
+  cargo test -p tunnel-test-harness --test m7_deployment_dependency_restore --locked -- --ignored --test-threads=1
+gate "configured relay dynamic SPKI replacement" \
+  cargo test -p tunnel-test-harness --test m7_deployment_spki_replacement --locked -- --ignored --test-threads=1
 gate "configured relay bootstrap fault matrix" \
   cargo test -p tunnel-test-harness --test m7_deployment_failures --locked -- --ignored --test-threads=1
 gate "configured relay runtime dependency loss and liveness" \

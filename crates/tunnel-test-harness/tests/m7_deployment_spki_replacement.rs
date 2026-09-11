@@ -6,9 +6,14 @@
 //! while a harness peer client presents the old, the replacement, and a rogue
 //! certificate to A's private listener, and an impostor QUIC server with the
 //! retired certificate sits at B's endpoint after the overlap ends.  Public
-//! canaries enter A and are answered by a device attached to B before and
-//! after B's certificate is replaced.  Every assertion is local to this
-//! source build; evidence is payload-free.
+//! canaries enter A and are answered by a device attached to B at the initial
+//! and overlap phases.  After the replacement, relay A's readiness recovering
+//! is the evidence that A adopted the new pin without restarting; the
+//! replacement process's own public admission is deliberately not exercised
+//! (see the readiness-convergence limitation in docs/testing.md and the
+//! phase 5 comment below), so this gate does not prove a post-replacement
+//! public canary.  Every assertion is local to this source build; evidence is
+//! payload-free.
 
 use std::{
     collections::BTreeMap,
