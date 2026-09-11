@@ -1727,6 +1727,121 @@ async fn old_carrier_loss_after_connector_aborted_but_before_owner_closure_enter
     assert!(sequenced(&drain_data(&mut fixture.candidate_rx)).is_empty());
 }
 
+/// The overlap budget can elapse before the maintenance tick observes it, and
+/// a candidate carrier's physical close can be processed inside that window.
+/// protocol.md scopes the recover-or-fail rule at the absolute deadline to "an
+/// unfinished abort or drain", and the tick's own path is to latch the typed
+/// deadline event and end the attempt with `ROTATION_DEADLINE_EXPIRED`.  A
+/// close that lands first must take exactly that path; it must not be
+/// misclassified as a fresh candidate failure with the deadline event lost.
+/// The drain is stalled the way the M7 timing sweep stalled it: the
+/// connector's fence advertises a sequence the relay never received, so the
+/// relay owes a receive cursor it cannot reach before the budget runs out.
+#[tokio::test]
+async fn candidate_loss_after_overlap_deadline_takes_the_deadline_path() {
+    let mut fixture = FreezeFixture::new("post-deadline-candidate-loss", false);
+    let _active = fixture.write(b"active-record");
+    assert_eq!(sequenced(&drain_data(&mut fixture.old_rx)).len(), 1);
+    fixture.quiesce();
+    assert!(fixture.complete_barrier().is_empty());
+    fixture.connector_frozen(2).await;
+    assert_eq!(fixture.phase(), RotationPhase::Draining);
+    let candidate_generation = fixture.attempt.new_generation;
+    let overlap_deadline_ms = fixture.overlap_deadline_ms();
+    let _ = fixture.drain_control();
+
+    fixture
+        .actor
+        .disconnect_data_at(fixture.candidate_carrier.clone(), overlap_deadline_ms)
+        .await;
+
+    assert!(
+        !fixture.actor.sessions.contains_key(&fixture.key.scope()),
+        "an expired overlap budget ends the unfinished drain"
+    );
+    let terminal = fixture
+        .actor
+        .session_terminal_events
+        .iter()
+        .rev()
+        .find(|event| {
+            event.session_id == fixture.key.session_id && event.epoch == fixture.key.epoch
+        })
+        .expect("the session records its typed terminal cause");
+    assert_eq!(
+        terminal.reason, "ROTATION_DEADLINE_EXPIRED",
+        "a post-deadline candidate close is the deadline outcome, not a candidate failure"
+    );
+    assert_eq!(terminal.candidate_generation, Some(candidate_generation));
+    let event = fixture
+        .actor
+        .rotation_deadline_events
+        .iter()
+        .find(|event| event.session_id == fixture.key.session_id)
+        .expect("the typed deadline event is latched exactly as the tick would latch it");
+    assert_eq!(event.reason, "deadline");
+    assert_eq!(event.deadline_ms, overlap_deadline_ms);
+    assert_eq!(event.fired_at_ms, overlap_deadline_ms);
+    assert_eq!(event.candidate_generation, candidate_generation);
+}
+
+/// The same close one millisecond inside the budget is still an ordinary
+/// candidate transport loss: the owner queues a bounded `ROTATE_ABORT` with
+/// the remaining budget, the session stays up in `Aborting`, and neither a
+/// terminal cause nor a deadline event is recorded.  This pins that the
+/// post-deadline path above does not widen into the in-budget case.
+#[tokio::test]
+async fn candidate_loss_with_budget_remaining_keeps_the_bounded_abort() {
+    let mut fixture = FreezeFixture::new("in-budget-candidate-loss", false);
+    let _active = fixture.write(b"active-record");
+    assert_eq!(sequenced(&drain_data(&mut fixture.old_rx)).len(), 1);
+    fixture.quiesce();
+    assert!(fixture.complete_barrier().is_empty());
+    fixture.connector_frozen(2).await;
+    assert_eq!(fixture.phase(), RotationPhase::Draining);
+    let overlap_deadline_ms = fixture.overlap_deadline_ms();
+    let _ = fixture.drain_control();
+
+    fixture
+        .actor
+        .disconnect_data_at(fixture.candidate_carrier.clone(), overlap_deadline_ms - 1)
+        .await;
+
+    assert!(
+        fixture.actor.sessions.contains_key(&fixture.key.scope()),
+        "a candidate loss inside the budget never ends the session by itself"
+    );
+    assert_eq!(fixture.phase(), RotationPhase::Aborting);
+    let abort = fixture
+        .drain_control()
+        .into_iter()
+        .find_map(|message| match message {
+            ControlMessage::RotateAbort(abort) => Some(abort),
+            _ => None,
+        })
+        .expect("the owner queues a bounded ROTATE_ABORT after in-budget candidate loss");
+    assert_eq!(
+        abort.remaining_ms, 1,
+        "the abort carries exactly the budget that was left"
+    );
+    assert!(
+        !fixture
+            .actor
+            .session_terminal_events
+            .iter()
+            .any(|event| event.session_id == fixture.key.session_id),
+        "no terminal cause is recorded while the budget remains"
+    );
+    assert!(
+        !fixture
+            .actor
+            .rotation_deadline_events
+            .iter()
+            .any(|event| event.session_id == fixture.key.session_id),
+        "no deadline event is latched while the budget remains"
+    );
+}
+
 /// M7-C45.  A connector that never sends `ROTATE_RETIRED` after a committed
 /// handover.  protocol.md: "Absolute overlap deadline: after commit, forcibly
 /// close any old transport still lingering" and "`ROTATE_COMPLETE` ends the

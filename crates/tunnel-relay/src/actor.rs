@@ -11476,12 +11476,21 @@ impl RelayActor {
     }
 
     async fn disconnect_data(&mut self, carrier: CarrierKey) {
+        self.disconnect_data_at(carrier, monotonic_millis()).await
+    }
+
+    /// Explicit-clock body of [`Self::disconnect_data`].  Deterministic
+    /// regressions drive a physical close against an absolute overlap
+    /// deadline directly; the production caller above always passes the
+    /// real monotonic sample.
+    async fn disconnect_data_at(&mut self, carrier: CarrierKey, now_ms: u64) {
         let key = carrier.session.clone();
         let mut old_closed = false;
         let mut active_lost = false;
         let mut recovery_candidate_lost = false;
         let mut candidate_abort: Option<(RotationAttemptIdentity, String, u64)> = None;
         let mut candidate_failure = false;
+        let mut candidate_lost_after_deadline = false;
         if let Some(session) = self.sessions.get_mut(&key.scope()) {
             if session.key != key {
                 return;
@@ -11515,7 +11524,6 @@ impl RelayActor {
                     rotation.candidate = None;
                     recovery_candidate_lost = true;
                 } else {
-                    let now_ms = monotonic_millis();
                     let phase = rotation.state.phase();
                     let known_uncommitted = matches!(
                         phase,
@@ -11531,6 +11539,25 @@ impl RelayActor {
                             // carrier or silently continue with a partial handover.
                             candidate_failure = true;
                             rotation.candidate = None;
+                        } else if rotation
+                            .state
+                            .status()
+                            .deadline_ms
+                            .is_some_and(|deadline_ms| now_ms >= deadline_ms)
+                        {
+                            // The absolute overlap budget already elapsed
+                            // before this physical close was processed: the
+                            // maintenance tick that would have latched the
+                            // typed deadline event simply has not run yet
+                            // (it fires every 500 ms).  Take the tick's path
+                            // instead of treating the loss as a fresh
+                            // candidate failure -- `abort` would reject the
+                            // elapsed clock, and the deadline event would
+                            // never be recorded.  The carrier is released
+                            // here; the deadline outcome is applied once the
+                            // session borrow ends.
+                            rotation.candidate = None;
+                            candidate_lost_after_deadline = true;
                         } else {
                             if phase != RotationPhase::Aborting
                                 && rotation
@@ -11591,7 +11618,7 @@ impl RelayActor {
                         &attempt,
                         RotationSide::Owner,
                         ClosureEvidence::closed(carrier.connection_id.clone()),
-                        monotonic_millis(),
+                        now_ms,
                     );
                     if close_result.is_ok() {
                         let status_after_close = rotation.state.status();
@@ -11611,6 +11638,17 @@ impl RelayActor {
                     });
                 }
             }
+        }
+        if candidate_lost_after_deadline {
+            // Mirror the maintenance tick exactly: latch the typed deadline
+            // event, then end the attempt with the deadline reason.  The
+            // fallback can only fire if the attempt vanished underneath us.
+            if self.poll_rotation_deadline_at(&key, now_ms) {
+                self.close_session(&key, "ROTATION_DEADLINE_EXPIRED").await;
+            } else {
+                self.close_session(&key, "ROTATION_CANDIDATE_FAILED").await;
+            }
+            return;
         }
         if let Some((attempt, reply_to, remaining_ms)) = candidate_abort {
             if remaining_ms == 0 {
