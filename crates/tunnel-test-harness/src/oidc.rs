@@ -181,7 +181,115 @@ fn unix_seconds(time: SystemTime) -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::{OidcFixture, OidcTokenOptions};
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime};
+    use tunnel_catalog::{ApprovedJwk, OidcConfig, OidcError, OidcVerifier};
+
+    /// The relay's real verifier, approving the fixture's RSA key under `kid`.
+    fn production_verifier(fixture: &OidcFixture, kid: &str) -> OidcVerifier {
+        let key = ApprovedJwk::from_rsa_pem(kid, fixture.public_key_pem().as_bytes())
+            .expect("approved fixture RSA key");
+        let config = OidcConfig::new(
+            fixture.issuer.clone(),
+            [fixture.audience.clone()],
+            vec![key],
+        )
+        .expect("OIDC config")
+        .with_required_scopes(["echo:invoke".to_owned()])
+        .expect("required scope");
+        OidcVerifier::new(config).expect("OIDC verifier")
+    }
+
+    fn rejected(result: Result<tunnel_catalog::ValidatedClaims, OidcError>) -> OidcError {
+        match result {
+            Ok(claims) => panic!("token was accepted: {claims:?}"),
+            Err(error) => error,
+        }
+    }
+
+    #[test]
+    fn production_verifier_accepts_fixture_rs256_tokens_and_rejects_claim_variants() {
+        let fixture = OidcFixture::new("https://issuer.test", "agent-tunnel").expect("fixture");
+        let verifier = production_verifier(&fixture, &fixture.key_id);
+        let token = fixture.issue("consumer-a").expect("token");
+        let validated = verifier
+            .validate_bearer(&format!("Bearer {token}"))
+            .expect("fixture RS256 token validates");
+        assert_eq!(validated.issuer, fixture.issuer);
+        assert_eq!(validated.subject, "consumer-a");
+        assert!(validated.scopes.contains("echo:invoke"));
+
+        let expired = fixture.issue_expired("consumer-a").expect("expired token");
+        assert!(matches!(
+            rejected(verifier.validate_token(&expired)),
+            OidcError::InvalidToken
+        ));
+        let wrong_issuer = fixture
+            .issue_with_wrong_issuer("consumer-a")
+            .expect("wrong issuer token");
+        assert!(matches!(
+            rejected(verifier.validate_token(&wrong_issuer)),
+            OidcError::InvalidToken
+        ));
+        let wrong_audience = fixture
+            .issue_with_wrong_audience("consumer-a")
+            .expect("wrong audience token");
+        assert!(matches!(
+            rejected(verifier.validate_token(&wrong_audience)),
+            OidcError::InvalidToken
+        ));
+        let not_yet_valid = fixture
+            .issue_with(
+                "consumer-a",
+                OidcTokenOptions {
+                    not_before: Some(SystemTime::now() + Duration::from_secs(120)),
+                    ..Default::default()
+                },
+            )
+            .expect("future nbf token");
+        assert!(matches!(
+            rejected(verifier.validate_token(&not_yet_valid)),
+            OidcError::InvalidToken
+        ));
+        let already_valid = fixture
+            .issue_with(
+                "consumer-a",
+                OidcTokenOptions {
+                    not_before: Some(SystemTime::now() - Duration::from_secs(60)),
+                    ..Default::default()
+                },
+            )
+            .expect("past nbf token");
+        verifier
+            .validate_token(&already_valid)
+            .expect("past nbf validates");
+        let other_scope = fixture
+            .issue_with(
+                "consumer-a",
+                OidcTokenOptions {
+                    scope: Some("devices:read".to_owned()),
+                    ..Default::default()
+                },
+            )
+            .expect("other scope token");
+        assert!(matches!(
+            rejected(verifier.validate_token(&other_scope)),
+            OidcError::InsufficientScope
+        ));
+
+        // The same RSA key approved under another kid does not serve the
+        // fixture's kid, and another fixture's key cannot sign for it.
+        let rotated = production_verifier(&fixture, "rotated-fixture-key");
+        assert!(matches!(
+            rejected(rotated.validate_token(&token)),
+            OidcError::UnknownKey
+        ));
+        let impostor = OidcFixture::new("https://issuer.test", "agent-tunnel").expect("impostor");
+        let forged = impostor.issue("consumer-a").expect("impostor token");
+        assert!(matches!(
+            rejected(verifier.validate_token(&forged)),
+            OidcError::InvalidToken
+        ));
+    }
 
     #[test]
     fn rsa_fixture_issues_claim_variants_for_production_verifier() {

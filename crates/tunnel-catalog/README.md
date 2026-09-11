@@ -85,6 +85,11 @@ expiry, not-before, subject, and configured scopes, and then asks the catalog
 to map `(issuer, subject, tenant)` to an active membership. JWT tenant claims
 are ignored. `authenticate_for_scope` is the route helper for an explicit
 scope such as `echo:invoke`; the resulting service grant remains required.
+Approved RSA keys must be 2048–4096-bit public keys (PEM or JWK `n`/`e`) and
+approved Ed25519 keys are the raw 32-byte public key; key material that does
+not match its approved algorithm family, or an RSA key outside that range, is
+rejected when the verifier is configured rather than failing every token at
+request time. Signature verification uses jsonwebtoken's RustCrypto backend.
 
 `MemoryCatalog` is available for pure unit tests and fixture wiring. Redis
 integration coverage is intentionally ignored by the default workspace suite

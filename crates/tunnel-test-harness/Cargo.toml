@@ -17,7 +17,7 @@ chrono = { version = "0.4", features = ["clock", "serde"] }
 http-body-util = "0.1"
 hyper = { version = "1.7", features = ["http1", "client"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
-jsonwebtoken = "9.3"
+jsonwebtoken = { version = "10.3.0", features = ["rust_crypto"] }
 rcgen = "0.13"
 rsa = { version = "0.9", features = ["pem"] }
 quinn = { version = "0.11.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }

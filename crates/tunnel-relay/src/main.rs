@@ -926,8 +926,96 @@ fn print_help() {
 mod tests {
     use super::{
         MembershipReadiness, MembershipRuntimeError, MembershipUnreadyReason,
-        membership_bootstrap_error, membership_readiness_code,
+        membership_bootstrap_error, membership_readiness_code, parse_jwks,
     };
+    use jsonwebtoken::Algorithm;
+    use serde_json::{Value, json};
+
+    /// JWK `n` of a throwaway 2048-bit RSA key generated with OpenSSL; the
+    /// private half was discarded.
+    const RSA_2048_MODULUS: &str = "wpzxK4YhVbeIGQkBFuC8Lwc5iX4NpKHeWN6c1zg6xBCJ2oDK-KD_Q19VR-_OeOcQvzeWHPnHM1c6Mg2vrBm-6obc5R4gNQd-CZz9H4QS6SUQ-S2rjWVzCWpx0SWIzS4Uw7_yu_qHsoUWQVBVZIBQ49AUBNLg6pCr-r6dwkxcr67-m5Jjw1-E9-Vq54tgGMzRocZWU79N75jXzLRzDOLbOJex-CrCcek2owQ-Cv5f61-5gacszQjnu8kjt2Zsmnr0PVzNcaBwvbt66qJLAnXLZghu6JmWEGoeGYpG7XjX9S_A8n_9pA58xDnrsxSNnlRTy3LQMUtlDcDCd0jLvBLw3w";
+    /// JWK `n` of a throwaway 1024-bit RSA key: too small to approve.
+    const RSA_1024_MODULUS: &str = "0bud3ILQKZXasKMJB10Q-QJZ1O9Ru63NITg3Zt2opp9wK5I985oc65LYKTCmIKPkFGNSa7CZyTbUbqyKoaz8E0nGY0ZoZj8G301LpcSbCV3wE9bE_dVjqvdUqapSDIxzsiCFKojsDnDai1YQnxGnMGeQ8yaJhadKAC9QpMFRaxE";
+
+    fn jwks(keys: &[Value]) -> Vec<u8> {
+        serde_json::to_vec(&json!({ "keys": keys })).expect("JWKS document")
+    }
+
+    fn rsa_jwk(kid: &str, modulus: &str) -> Value {
+        json!({ "kid": kid, "kty": "RSA", "alg": "RS256", "use": "sig", "n": modulus, "e": "AQAB" })
+    }
+
+    #[test]
+    fn parse_jwks_approves_only_rs256_rsa_keys_of_verifiable_size() {
+        let approved = parse_jwks(&jwks(&[
+            rsa_jwk("primary", RSA_2048_MODULUS),
+            // `alg` is optional and defaults to RS256.
+            json!({ "kid": "next", "kty": "RSA", "n": RSA_2048_MODULUS, "e": "AQAB" }),
+        ]))
+        .expect("RS256 JWKS parses");
+        assert_eq!(approved.len(), 2);
+        assert_eq!(approved[0].kid, "primary");
+        assert_eq!(approved[1].kid, "next");
+        assert!(approved.iter().all(|key| key.algorithm == Algorithm::RS256));
+
+        let rejected: [(&str, Vec<u8>); 13] = [
+            ("empty key set", jwks(&[])),
+            ("not a JWKS document", b"[]".to_vec()),
+            (
+                "EC key",
+                jwks(&[
+                    json!({ "kid": "ec", "kty": "EC", "alg": "ES256", "crv": "P-256", "x": "AA", "y": "AA" }),
+                ]),
+            ),
+            (
+                "octet key",
+                jwks(&[json!({ "kid": "oct", "kty": "oct", "alg": "HS256", "k": "c2VjcmV0" })]),
+            ),
+            (
+                "RS384",
+                jwks(&[
+                    json!({ "kid": "k", "kty": "RSA", "alg": "RS384", "n": RSA_2048_MODULUS, "e": "AQAB" }),
+                ]),
+            ),
+            (
+                "PS256",
+                jwks(&[
+                    json!({ "kid": "k", "kty": "RSA", "alg": "PS256", "n": RSA_2048_MODULUS, "e": "AQAB" }),
+                ]),
+            ),
+            (
+                "missing modulus",
+                jwks(&[json!({ "kid": "k", "kty": "RSA", "e": "AQAB" })]),
+            ),
+            (
+                "missing exponent",
+                jwks(&[json!({ "kid": "k", "kty": "RSA", "n": RSA_2048_MODULUS })]),
+            ),
+            (
+                "modulus is not base64url",
+                jwks(&[json!({ "kid": "k", "kty": "RSA", "n": "not base64!", "e": "AQAB" })]),
+            ),
+            (
+                "1024-bit modulus",
+                jwks(&[rsa_jwk("small", RSA_1024_MODULUS)]),
+            ),
+            (
+                "even exponent",
+                jwks(&[json!({ "kid": "k", "kty": "RSA", "n": RSA_2048_MODULUS, "e": "AQAC" })]),
+            ),
+            ("empty kid", jwks(&[rsa_jwk("", RSA_2048_MODULUS)])),
+            (
+                "one unusable key rejects the whole set",
+                jwks(&[
+                    rsa_jwk("primary", RSA_2048_MODULUS),
+                    rsa_jwk("small", RSA_1024_MODULUS),
+                ]),
+            ),
+        ];
+        for (name, document) in rejected {
+            assert!(parse_jwks(&document).is_err(), "{name} was approved");
+        }
+    }
 
     #[test]
     fn membership_bootstrap_reason_codes_are_stable() {

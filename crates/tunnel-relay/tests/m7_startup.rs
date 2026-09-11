@@ -147,9 +147,22 @@ impl StartupFixture {
             .as_bytes(),
         );
         let private_key = files.write("startup-key.pem", leaf_key.serialize_pem().as_bytes());
+        // A throwaway 2048-bit RSA public modulus generated with OpenSSL (the
+        // private half was discarded).  The verifier refuses placeholder keys
+        // at startup, and these tests must get past OIDC configuration to
+        // reach the Redis and membership checks they target.
         let oidc_jwks = files.write(
             "startup-jwks.json",
-            br#"{"keys":[{"kid":"startup-fixture","kty":"RSA","alg":"RS256","n":"AQ","e":"AQ"}]}"#,
+            concat!(
+                r#"{"keys":[{"kid":"startup-fixture","kty":"RSA","alg":"RS256","n":""#,
+                "wpzxK4YhVbeIGQkBFuC8Lwc5iX4NpKHeWN6c1zg6xBCJ2oDK-KD_Q19VR-_OeOcQvzeWHPnHM1c6Mg2vrBm-",
+                "6obc5R4gNQd-CZz9H4QS6SUQ-S2rjWVzCWpx0SWIzS4Uw7_yu_qHsoUWQVBVZIBQ49AUBNLg6pCr-r6dwkxc",
+                "r67-m5Jjw1-E9-Vq54tgGMzRocZWU79N75jXzLRzDOLbOJex-CrCcek2owQ-Cv5f61-5gacszQjnu8kjt2Zs",
+                "mnr0PVzNcaBwvbt66qJLAnXLZghu6JmWEGoeGYpG7XjX9S_A8n_9pA58xDnrsxSNnlRTy3LQMUtlDcDCd0jL",
+                "vBLw3w",
+                r#"","e":"AQAB"}]}"#
+            )
+            .as_bytes(),
         );
         let membership_key =
             KeyPair::generate_for(&rcgen::PKCS_ED25519).expect("startup membership key");

@@ -1195,16 +1195,12 @@ impl std::error::Error for ConfigError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jsonwebtoken::{Algorithm, DecodingKey};
     use tunnel_catalog::{ApprovedJwk, OidcConfig, OidcVerifier};
 
     fn oidc() -> Arc<OidcVerifier> {
-        let key = ApprovedJwk::from_decoding_key(
-            "test",
-            Algorithm::RS256,
-            DecodingKey::from_secret(b"test-only-key"),
-        )
-        .expect("test key");
+        // A placeholder Ed25519 public key: these tests never validate a
+        // token, and an HMAC secret can no longer be approved as an RSA key.
+        let key = ApprovedJwk::from_ed25519_der("test", &[0_u8; 32]).expect("test key");
         let config = OidcConfig::new(
             "https://issuer.example.test/",
             ["agent-tunnel".to_owned()],
