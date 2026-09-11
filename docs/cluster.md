@@ -251,7 +251,7 @@ A consumer request arriving anywhere authenticates, authorizes its target, and r
 | Peer connect fails before admission | Return `PEER_UNAVAILABLE`, `not_dispatched=true`; bounded retry is allowed. |
 | Peer stream fails after dispatch | Cancel best effort, retain available outcome, return an explicit interrupted/unknown result. |
 | Owner lease renewal times out | Stop new admission immediately; stop dispatch by safe deadline and invalidate tickets. |
-| Redis partition persists | Enter unready/draining state; close sessions by safe lease expiry. Cached membership cannot extend ownership. |
+| Redis partition persists | Enter unready/draining state; close sessions by safe lease expiry. Cached membership cannot extend ownership. When connectivity returns, the catalog reconnects only to the same verified primary `run_id`, never replays the failed command, and readiness recovers in place; a changed `run_id` stays fail-closed recovery. |
 | Membership verification expires | Reject peer work and close affected connections even if Redis presence is fresh. |
 | Relay owner dies | Consumers receive interruption; device establishes a fresh fenced owner after lease expiry. No in-memory replay migration. |
 | Device reconnects to a new owner | Reset adapter sessions whose recovery contract excludes owner change, including v0 filesystem fids. |

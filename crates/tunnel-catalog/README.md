@@ -54,8 +54,13 @@ does not infer safe rollback state from a backup.
 The crate deliberately uses redis-rs `MultiplexedConnection`, without the
 reconnecting `ConnectionManager`. Every connection acquisition and command is
 bounded by two seconds. Redis errors are returned to the caller so relay
-authorization and ownership fail closed during an authority outage. Redis
-pub/sub is not part of the authority path.
+authorization and ownership fail closed during an authority outage, and no
+command is ever replayed. A lane whose connection was lost reconnects only for
+a later command, after repeating the startup PING/INFO identity check; a
+primary whose `run_id` differs from the verified startup identity is refused
+with a typed conflict, so a Redis restart, restore or promotion remains an
+operator recovery event rather than a silent resume. Redis pub/sub is not part
+of the authority path.
 
 Owner lease comparisons and recovery quiescence checks use Redis server
 `TIME`; a caller-side clock skew can fail an operation closed. Authorization

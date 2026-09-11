@@ -21,12 +21,13 @@ use std::{
     },
     time::Duration,
 };
-use tokio::sync::Mutex;
 use uuid::Uuid;
 
+mod lane;
 mod recovery;
 mod recovery_scanner;
 mod recovery_schema;
+use lane::{AuthorityLane, LaneGroup};
 pub use recovery::DurableCatalogObservation;
 
 const MAX_SAFE_REDIS_TIME: i64 = 9_000_000_000_000_000;
@@ -42,20 +43,24 @@ const MAX_TICKET_INDEX_ITEMS: usize = crate::MAX_ATTACHMENT_TICKETS_PER_DEVICE;
 const MAX_REDIS_TLS_PEM_BYTES: usize = 1024 * 1024;
 
 /// The authoritative M1 catalog. Redis is the only durable state authority;
-/// this type deliberately uses a plain multiplexed connection and does not
+/// this type deliberately uses plain multiplexed connections and does not
 /// enable redis-rs' reconnecting `ConnectionManager`. A connection error is
-/// therefore surfaced to callers and authorization/ownership fail closed.
+/// surfaced to the caller that observed it and authorization/ownership fail
+/// closed; no command is ever replayed. Each lane re-establishes a lost
+/// connection only for a later command, and only to a primary whose `run_id`
+/// still matches the identity verified at startup (see `lane.rs`), so a Redis
+/// restart, restore or promotion remains a fail-closed recovery event.
 #[derive(Clone)]
 pub struct RedisCatalog {
     client: redis::Client,
-    connection: Arc<Mutex<MultiplexedConnection>>,
+    connection: Arc<AuthorityLane>,
     /// Authorization snapshots use a bounded set of separate physical
     /// connections so a delayed atomic authorization EVAL cannot
     /// head-of-line block owner, recovery, or fixture transactions on the
     /// catalog connection (or every other authorization read). The Lua
     /// operation itself remains atomic on Redis; only its transport lanes are
     /// isolated.
-    authorization_connections: Arc<Vec<Arc<Mutex<MultiplexedConnection>>>>,
+    authorization_connections: Arc<Vec<AuthorityLane>>,
     authorization_next: Arc<AtomicUsize>,
     namespace: String,
     prefix: String,
@@ -349,6 +354,7 @@ impl RedisCatalog {
             })?,
         };
         let (connection, redis_run_id) = open_verified_connection(&client).await?;
+        let lane_group = Arc::new(LaneGroup::default());
         let mut authorization_connections = Vec::with_capacity(AUTHORIZATION_CONNECTIONS);
         for _ in 0..AUTHORIZATION_CONNECTIONS {
             let (authorization_connection, authorization_run_id) =
@@ -356,14 +362,25 @@ impl RedisCatalog {
             if authorization_run_id != redis_run_id {
                 return Err(catalog_connection_error(
                     CatalogConnectionStage::PrimaryIdentity,
-                    CatalogError::Conflict("Redis server run id"),
+                    CatalogError::Conflict(lane::RUN_ID_CONFLICT),
                 ));
             }
-            authorization_connections.push(Arc::new(Mutex::new(authorization_connection)));
+            authorization_connections.push(AuthorityLane::new(
+                client.clone(),
+                authorization_connection,
+                redis_run_id.clone(),
+                Arc::clone(&lane_group),
+            ));
         }
+        let connection = Arc::new(AuthorityLane::new(
+            client.clone(),
+            connection,
+            redis_run_id.clone(),
+            lane_group,
+        ));
         Ok(Self {
             client,
-            connection: Arc::new(Mutex::new(connection)),
+            connection,
             authorization_connections: Arc::new(authorization_connections),
             authorization_next: Arc::new(AtomicUsize::new(0)),
             namespace: namespace.to_owned(),
@@ -577,12 +594,7 @@ impl RedisCatalog {
                     .arg(format!("{}*", self.prefix))
                     .arg("COUNT")
                     .arg(256_i64);
-                tokio::time::timeout(REDIS_OPERATION_TIMEOUT, async {
-                    let mut connection = self.connection.lock().await;
-                    command.query_async(&mut *connection).await
-                })
-                .await
-                .map_err(|_| redis_timeout())??
+                self.connection.query(&command).await?
             };
             batch.retain(|key| key != &guard_key);
             keys.append(&mut batch);
@@ -600,21 +612,11 @@ impl RedisCatalog {
             for key in keys {
                 pipeline.cmd("DEL").arg(key).ignore();
             }
-            tokio::time::timeout(REDIS_OPERATION_TIMEOUT, async {
-                let mut connection = self.connection.lock().await;
-                pipeline.query_async::<()>(&mut *connection).await
-            })
-            .await
-            .map_err(|_| redis_timeout())??;
+            self.connection.query_pipeline::<()>(&pipeline).await?;
         }
         let mut delete_guard = redis::cmd("DEL");
         delete_guard.arg(&guard_key);
-        tokio::time::timeout(REDIS_OPERATION_TIMEOUT, async {
-            let mut connection = self.connection.lock().await;
-            delete_guard.query_async::<()>(&mut *connection).await
-        })
-        .await
-        .map_err(|_| redis_timeout())??;
+        self.connection.query::<()>(&delete_guard).await?;
         Ok(())
     }
 
@@ -651,7 +653,7 @@ impl RedisCatalog {
 
     async fn eval_on<T: FromRedisValue>(
         &self,
-        connection: &Arc<Mutex<MultiplexedConnection>>,
+        lane: &AuthorityLane,
         script: &str,
         keys: &[String],
         args: &[String],
@@ -664,13 +666,7 @@ impl RedisCatalog {
         for arg in args {
             command.arg(arg);
         }
-        let result = tokio::time::timeout(REDIS_OPERATION_TIMEOUT, async {
-            let mut connection = connection.lock().await;
-            command.query_async(&mut *connection).await
-        })
-        .await
-        .map_err(|_| redis_timeout())??;
-        Ok(result)
+        lane.query(&command).await
     }
 
     async fn eval_membership_publish(
@@ -686,13 +682,7 @@ impl RedisCatalog {
             .arg(version)
             .arg(bytes)
             .arg(cluster::MEMBERSHIP_TTL_SECONDS.to_string());
-        let result = tokio::time::timeout(REDIS_OPERATION_TIMEOUT, async {
-            let mut connection = self.connection.lock().await;
-            command.query_async(&mut *connection).await
-        })
-        .await
-        .map_err(|_| redis_timeout())??;
-        Ok(result)
+        self.connection.query(&command).await
     }
 
     async fn eval_membership_publish_directory(
@@ -713,13 +703,7 @@ impl RedisCatalog {
             .arg(envelope)
             .arg(MAX_SIGNED_MEMBERSHIP_RECORDS.to_string())
             .arg(cluster::MEMBERSHIP_TTL_SECONDS.to_string());
-        let result = tokio::time::timeout(REDIS_OPERATION_TIMEOUT, async {
-            let mut connection = self.connection.lock().await;
-            command.query_async(&mut *connection).await
-        })
-        .await
-        .map_err(|_| redis_timeout())??;
-        Ok(result)
+        self.connection.query(&command).await
     }
 
     async fn read_signed_membership_directory(
@@ -781,17 +765,12 @@ impl RedisCatalog {
         &self,
     ) -> Result<Option<SignedMembershipRecord>, CatalogError> {
         let key = self.signed_membership_key();
+        let mut pipeline = redis::pipe();
+        pipeline.atomic();
+        pipeline.cmd("HGET").arg(&key).arg("version");
+        pipeline.cmd("HGET").arg(&key).arg("bytes");
         let reply: (Option<String>, Option<Vec<u8>>) =
-            tokio::time::timeout(REDIS_OPERATION_TIMEOUT, async {
-                let mut pipeline = redis::pipe();
-                pipeline.atomic();
-                pipeline.cmd("HGET").arg(&key).arg("version");
-                pipeline.cmd("HGET").arg(&key).arg("bytes");
-                let mut connection = self.connection.lock().await;
-                pipeline.query_async(&mut *connection).await
-            })
-            .await
-            .map_err(|_| redis_timeout())??;
+            self.connection.query_pipeline(&pipeline).await?;
         match reply {
             (None, None) => Ok(None),
             (Some(version), Some(bytes)) => {
@@ -811,13 +790,7 @@ impl RedisCatalog {
     }
 
     async fn execute_seed_pipeline(&self, pipeline: redis::Pipeline) -> Result<(), CatalogError> {
-        tokio::time::timeout(REDIS_OPERATION_TIMEOUT, async {
-            let mut connection = self.connection.lock().await;
-            pipeline.query_async::<()>(&mut *connection).await
-        })
-        .await
-        .map_err(|_| redis_timeout())??;
-        Ok(())
+        self.connection.query_pipeline::<()>(&pipeline).await
     }
 
     fn tenant_key(&self, tenant: Uuid) -> String {

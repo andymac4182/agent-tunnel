@@ -5,10 +5,18 @@
 //! This is deliberately an ignored integration target.  It runs the
 //! root-built relay executable, an authenticated in-process device client,
 //! the public TLS echo route, and a Redis TLS forwarder whose listener and
-//! certificate stay stable while active Redis connections are withdrawn and
-//! then allowed to reconnect.  It proves same-PID readiness withdrawal and
-//! recovery only; it does not inject OS writes or claim dynamic peer SPKI
-//! replacement.
+//! certificate stay stable while active Redis connections are severed and
+//! then allowed to reconnect.  It proves, for one same-PID relay: readiness
+//! withdrawal with liveness intact; the relay's own typed
+//! `AUTHORITY_UNAVAILABLE` close of the pre-fault device session, observed
+//! both as the client's clean control close and as the relay's structured
+//! `owner_check_failed`/`session_closed` diagnostics for that exact session;
+//! the typed `CLUSTER_UNREADY` admission boundary; catalog reconnection to
+//! the same verified Redis primary with readiness recovery; the fenced stale
+//! owner token clearing only by lease expiry; and a fresh authenticated
+//! session/echo afterwards.  It does not inject OS writes, does not restart
+//! Redis (a changed `run_id` is a separate fail-closed catalog case), and does
+//! not claim dynamic peer SPKI replacement.
 
 use std::{
     collections::BTreeMap,
@@ -22,6 +30,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use chrono::Utc;
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::{Request, body::Bytes};
 use hyper_util::rt::TokioIo;
@@ -35,8 +44,8 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tokio_util::sync::CancellationToken;
 use tunnel_catalog::{Catalog, RedisCatalog, RedisMembershipPublisher};
 use tunnel_client::{
-    ConnectConfig, ConnectOptions, CredentialConfig, LimitsConfig, LocalExport, LocalExportKind,
-    connect,
+    ClientError, ConnectConfig, ConnectOptions, CredentialConfig, LimitsConfig, LocalExport,
+    LocalExportKind, Readiness, SessionInfo, connect,
 };
 use tunnel_core::RotationConfig;
 use tunnel_test_harness::{
@@ -52,7 +61,7 @@ use common::{
     AUXILIARY_CONNECTION_DEADLINE, AUXILIARY_CONNECTION_LIMIT, AUXILIARY_SHUTDOWN_DEADLINE,
     CheckpointServer, FixtureFiles, ProcessConfigFixture, free_tcp_addr, health_request,
     hex_encode, jwks_json, parse_plaintext_upstream, process_diagnostic, relay_binary_path,
-    send_sigint, wait_for_exit, wait_for_ports_released, wait_for_ready,
+    send_sigint, truncate, wait_for_exit, wait_for_ports_released, wait_for_ready,
 };
 
 const PROCESS_DEADLINE: Duration = Duration::from_secs(8);
@@ -61,6 +70,26 @@ const CLIENT_DEADLINE: Duration = Duration::from_secs(20);
 const ECHO_DEADLINE: Duration = Duration::from_secs(20);
 const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(8);
 const SHUTDOWN_GRACE: Duration = Duration::from_millis(100);
+/// The relay's default owner lease is 30 seconds; a stale token left by a
+/// session closed while Redis was unreachable clears only by that expiry.
+const OWNER_LEASE_CLEAR_DEADLINE: Duration = Duration::from_secs(40);
+/// Bounded wait for the relay's structured close diagnostics to reach the
+/// harness stderr capture after the client observed the close.
+const RELAY_EVIDENCE_DEADLINE: Duration = Duration::from_secs(5);
+/// The relay logs structured JSON at `info` by default; pin the filter so an
+/// inherited `RUST_LOG` cannot hide the typed close evidence.
+const RELAY_LOG_FILTER: &str = "info";
+/// The relay's closed terminal reason for a failed owner/authority check.
+const DEPENDENCY_CLOSE_REASON: &str = "AUTHORITY_UNAVAILABLE";
+/// The relay maintenance operations that can observe the injected loss.
+const DEPENDENCY_CLOSE_OPERATIONS: &[&str] = &["resolve_device", "renew_owner"];
+/// The relay authority-failure categories that a severed or stalled Redis
+/// connection produces; any other category is not the injected fault.
+const DEPENDENCY_CLOSE_CATEGORIES: &[&str] = &["redis_io", "timeout"];
+/// The client's exact typed error for a relay-initiated clean control close.
+const CLIENT_CONTROL_CLOSE_SCOPE: &str = "control read";
+const CLIENT_CONTROL_CLOSE_DETAIL: &str = "control socket closed";
+const CLIENT_CONTROL_CLOSE_REASON: &str = "control read failed";
 const LIVE_BODY: &[u8] = br#"{"status":"live"}"#;
 const READY_BODY: &[u8] = br#"{"status":"ready"}"#;
 const UNREADY_BODY: &[u8] = br#"{"status":"unready"}"#;
@@ -84,6 +113,7 @@ struct RestorationFixture {
     config_path: PathBuf,
     client_config: ConnectConfig,
     token: String,
+    tenant_id: Uuid,
     device_id: Uuid,
     service_id: Uuid,
     consumer_bind: SocketAddr,
@@ -163,11 +193,17 @@ async fn run_restoration_gate() -> Result<()> {
             .ok_or_else(|| HarnessError::Process("relay PID missing after readiness".into()))?;
 
         client = Some(connect_fresh(&fixture.client_config).await?);
-        wait_for_client_ready(client.as_mut().expect("device client retained")).await?;
+        let session =
+            wait_for_client_ready(client.as_mut().expect("device client retained")).await?;
         expect_echo(&fixture, "before-redis-loss").await?;
 
         fixture.proxy.set_available(false)?;
         wait_for_unready(relay, &fixture).await?;
+        // The relay must itself close the pre-fault device session once its
+        // owner/authority maintenance check fails. Observe that close before
+        // stopping the handle so a clean cancellation cannot stand in for it.
+        let client_close_reason =
+            wait_for_dependency_close(client.as_ref().expect("device client retained")).await?;
         let blocked = attempt_echo(&fixture, "while-redis-unready").await?;
         let blocked_boundary = validate_unready_boundary(&blocked)?;
 
@@ -188,15 +224,30 @@ async fn run_restoration_gate() -> Result<()> {
         )
         .await?;
 
-        stop_client(&mut client).await?;
+        stop_dependency_closed_client(&mut client).await?;
+        let relay_close =
+            wait_for_relay_dependency_close(relay, &session, fixture.device_id).await?;
         fixture.proxy.set_available(true)?;
         wait_for_ready_after_restore(relay, &fixture).await?;
+        // The closed session's owner token could not be released while Redis
+        // was unreachable; lease expiry is its documented fencing fallback and
+        // a fresh session must not be able to take the slot before then.
+        let stale_owner_cleared_ms = wait_for_stale_owner_clear(&fixture, &session).await?;
 
         // A new authenticated device session is deliberate evidence for a
         // fresh route after restoration. The pre-fault handle is not treated
         // as proof that a control socket survived the dependency fault.
         client = Some(connect_fresh(&fixture.client_config).await?);
-        wait_for_client_ready(client.as_mut().expect("fresh device client retained")).await?;
+        let fresh =
+            wait_for_client_ready(client.as_mut().expect("fresh device client retained")).await?;
+        if fresh.session_id == session.session_id || fresh.epoch <= session.epoch {
+            return Err(HarnessError::Process(format!(
+                "post-restore device session did not use a fresh fenced owner: old_epoch={} new_epoch={} same_session={}",
+                session.epoch,
+                fresh.epoch,
+                fresh.session_id == session.session_id
+            )));
+        }
         expect_echo(&fixture, "after-redis-restore").await?;
 
         let pid_after = relay
@@ -208,12 +259,19 @@ async fn run_restoration_gate() -> Result<()> {
             )));
         }
         eprintln!(
-            "scope=configured_process_redis_restoration same_pid=true live_after_fault=true ready_withdrawn=true ready_restored=true authenticated_echo_before=true blocked_echo_status={} blocked_code={} blocked_execution={} blocked_body_len={} no_premature_dispatch={} authenticated_echo_after=true",
+            "scope=configured_process_redis_restoration same_pid=true live_after_fault=true ready_withdrawn=true ready_restored=true authenticated_echo_before=true blocked_echo_status={} blocked_code={} blocked_execution={} blocked_body_len={} no_premature_dispatch={} dependency_close_reason={} dependency_close_operation={} dependency_close_category={} client_close_reason={:?} client_close_detail={:?} stale_owner_cleared_ms={} fresh_owner_epoch={} authenticated_echo_after=true",
             blocked_boundary.status,
             blocked_boundary.code,
             blocked_boundary.execution,
             blocked_boundary.body_len,
             blocked_boundary.no_premature_dispatch,
+            relay_close.reason,
+            relay_close.operation,
+            relay_close.category,
+            client_close_reason,
+            CLIENT_CONTROL_CLOSE_DETAIL,
+            stale_owner_cleared_ms,
+            fresh.epoch,
         );
         Ok::<(), HarnessError>(())
     }
@@ -467,6 +525,7 @@ async fn create_fixture_inner(
         config_path,
         client_config,
         token,
+        tenant_id: active_device.tenant_id,
         device_id,
         service_id,
         consumer_bind,
@@ -518,7 +577,8 @@ async fn start_relay(fixture: &RestorationFixture) -> Result<ManagedProcess> {
         ProcessSpec::new(&fixture.relay_binary)
             .arg("serve")
             .arg("--config")
-            .arg(fixture.config_path.display().to_string()),
+            .arg(fixture.config_path.display().to_string())
+            .env("RUST_LOG", RELAY_LOG_FILTER),
     )
     .await?;
     if let Err(error) =
@@ -685,12 +745,245 @@ async fn connect_fresh(config: &ConnectConfig) -> Result<tunnel_client::Connecti
     .map_err(|error| HarnessError::Process(format!("restoration device connect: {error}")))
 }
 
-async fn wait_for_client_ready(client: &mut tunnel_client::ConnectionHandle) -> Result<()> {
+async fn wait_for_client_ready(
+    client: &mut tunnel_client::ConnectionHandle,
+) -> Result<SessionInfo> {
     timeout(CLIENT_DEADLINE, client.wait_ready())
         .await
         .map_err(|_| HarnessError::Timeout("restoration device DataReady deadline".into()))?
-        .map(|_| ())
         .map_err(|error| HarnessError::Process(format!("restoration device DataReady: {error}")))
+}
+
+/// Wait for the relay to close the pre-fault device session after Redis
+/// loss.  The client reports a relay-initiated control close as
+/// `Readiness::Closed` with its typed transport reason; any other terminal
+/// reason, or no close before the bounded deadline, fails the gate.
+async fn wait_for_dependency_close(client: &tunnel_client::ConnectionHandle) -> Result<String> {
+    let mut readiness = client.readiness();
+    let deadline = tokio::time::Instant::now() + DEPENDENCY_DEADLINE;
+    loop {
+        let state = readiness.borrow().clone();
+        if let Readiness::Closed { reason } = state {
+            if reason != CLIENT_CONTROL_CLOSE_REASON {
+                return Err(HarnessError::Process(format!(
+                    "pre-fault device session closed with reason {reason:?} instead of the relay control close {CLIENT_CONTROL_CLOSE_REASON:?}"
+                )));
+            }
+            return Ok(reason);
+        }
+        match timeout_at(deadline, readiness.changed()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                return Err(HarnessError::Process(
+                    "pre-fault device readiness channel ended before the relay closed the session"
+                        .into(),
+                ));
+            }
+            Err(_) => {
+                return Err(HarnessError::Timeout(
+                    "relay did not close the pre-fault device session after Redis loss".into(),
+                ));
+            }
+        }
+    }
+}
+
+/// Join the pre-fault device supervisor.  Only the exact typed error for a
+/// relay-initiated clean control close is accepted here, and only because
+/// Redis was deliberately made unavailable first: a clean `Ok` means the
+/// relay never closed the session, and any other error is a different fault.
+async fn stop_dependency_closed_client(
+    client: &mut Option<tunnel_client::ConnectionHandle>,
+) -> Result<()> {
+    let Some(handle) = client.as_ref() else {
+        return Err(HarnessError::Process(
+            "pre-fault device handle was missing before its dependency close was joined".into(),
+        ));
+    };
+    match timeout(CLIENT_DEADLINE, handle.stop()).await {
+        Ok(Err(ClientError::Transport {
+            scope: CLIENT_CONTROL_CLOSE_SCOPE,
+            detail,
+        })) if detail == CLIENT_CONTROL_CLOSE_DETAIL => {
+            let _ = client.take();
+            Ok(())
+        }
+        Ok(Err(ClientError::Transport { scope, detail })) => {
+            let _ = client.take();
+            Err(HarnessError::Process(format!(
+                "pre-fault device stop reported transport scope={scope:?} detail={:?} instead of the relay's clean control close",
+                truncate(&detail)
+            )))
+        }
+        Ok(Err(error)) => {
+            let _ = client.take();
+            Err(HarnessError::Process(format!(
+                "pre-fault device stop reported {} ({error}) instead of the relay's clean control close",
+                error.code()
+            )))
+        }
+        Ok(Ok(())) => {
+            let _ = client.take();
+            Err(HarnessError::Process(
+                "pre-fault device stop completed cleanly; the relay did not close the session after Redis loss"
+                    .into(),
+            ))
+        }
+        Err(_) => Err(HarnessError::Timeout(
+            "pre-fault device stop exceeded its bounded deadline; handle retained for cleanup"
+                .into(),
+        )),
+    }
+}
+
+/// The relay's typed close evidence for one exact device session.
+struct RelayDependencyClose {
+    reason: &'static str,
+    operation: String,
+    category: String,
+}
+
+/// Bounded structured fields of one relay JSON log line, or `None` when the
+/// line is not a JSON event.
+fn relay_log_fields(line: &str) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let value: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+    let object = value.as_object()?;
+    match object.get("fields").and_then(serde_json::Value::as_object) {
+        Some(fields) => Some(fields.clone()),
+        None => Some(object.clone()),
+    }
+}
+
+fn field_str<'a>(
+    fields: &'a serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Option<&'a str> {
+    fields.get(key).and_then(serde_json::Value::as_str)
+}
+
+/// Wait for the relay's own structured diagnostics to attribute the close of
+/// the exact pre-fault session to a failed authority check.  The relay logs
+/// `owner_check_failed` with its closed reason/operation/category vocabulary
+/// and then `session_closed`; both must name this session, epoch and device,
+/// and the reason must be the authority-loss reason rather than a fence,
+/// revocation or protocol close.
+async fn wait_for_relay_dependency_close(
+    process: &ManagedProcess,
+    session: &SessionInfo,
+    device_id: Uuid,
+) -> Result<RelayDependencyClose> {
+    let deadline = Instant::now() + RELAY_EVIDENCE_DEADLINE;
+    let device_id = device_id.to_string();
+    loop {
+        let stderr = process.stderr();
+        let stderr = String::from_utf8_lossy(&stderr);
+        let mut check_failed: Option<(String, String)> = None;
+        let mut closed = false;
+        let mut other_reasons = Vec::new();
+        for fields in stderr.lines().filter_map(relay_log_fields) {
+            if field_str(&fields, "session_id") != Some(session.session_id.as_str())
+                || fields.get("epoch").and_then(serde_json::Value::as_u64) != Some(session.epoch)
+                || field_str(&fields, "device_id") != Some(device_id.as_str())
+            {
+                continue;
+            }
+            let reason = field_str(&fields, "reason").map(str::to_owned);
+            match field_str(&fields, "phase") {
+                Some("owner_check_failed") => match reason.as_deref() {
+                    Some(DEPENDENCY_CLOSE_REASON) => {
+                        let operation = field_str(&fields, "authority_operation")
+                            .unwrap_or("missing")
+                            .to_owned();
+                        let category = field_str(&fields, "authority_category")
+                            .unwrap_or("missing")
+                            .to_owned();
+                        check_failed = Some((operation, category));
+                    }
+                    Some(other) => other_reasons.push(format!("owner_check_failed:{other}")),
+                    None => other_reasons.push("owner_check_failed:missing".to_owned()),
+                },
+                Some("session_closed") => match reason.as_deref() {
+                    Some(DEPENDENCY_CLOSE_REASON) => closed = true,
+                    Some(other) => other_reasons.push(format!("session_closed:{other}")),
+                    None => other_reasons.push("session_closed:missing".to_owned()),
+                },
+                _ => {}
+            }
+        }
+        if !other_reasons.is_empty() {
+            return Err(HarnessError::Process(format!(
+                "relay attributed the pre-fault session terminal path to {} instead of {DEPENDENCY_CLOSE_REASON}",
+                other_reasons.join(",")
+            )));
+        }
+        let check_failed_seen = check_failed.is_some();
+        if let Some((operation, category)) = check_failed
+            && closed
+        {
+            if !DEPENDENCY_CLOSE_OPERATIONS.contains(&operation.as_str()) {
+                return Err(HarnessError::Process(format!(
+                    "relay authority check failed in unexpected operation {operation}"
+                )));
+            }
+            if !DEPENDENCY_CLOSE_CATEGORIES.contains(&category.as_str()) {
+                return Err(HarnessError::Process(format!(
+                    "relay authority failure category {category} is not the injected Redis transport loss"
+                )));
+            }
+            return Ok(RelayDependencyClose {
+                reason: DEPENDENCY_CLOSE_REASON,
+                operation,
+                category,
+            });
+        }
+        if Instant::now() >= deadline {
+            return Err(HarnessError::Timeout(format!(
+                "relay diagnostics did not record the {DEPENDENCY_CLOSE_REASON} close of the pre-fault session (check_failed={check_failed_seen} session_closed={closed})"
+            )));
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Wait for the pre-fault session's owner token to disappear from Redis.
+/// The relay could not release it while Redis was unreachable, so only lease
+/// expiry may clear it; a different live owner would mean an unexpected
+/// takeover and fails the gate.
+async fn wait_for_stale_owner_clear(
+    fixture: &RestorationFixture,
+    session: &SessionInfo,
+) -> Result<u64> {
+    let started = Instant::now();
+    let deadline = started + OWNER_LEASE_CLEAR_DEADLINE;
+    loop {
+        let owner = timeout(
+            Duration::from_secs(5),
+            fixture
+                .catalog
+                .current_owner(fixture.tenant_id, fixture.device_id, Utc::now()),
+        )
+        .await
+        .map_err(|_| HarnessError::Timeout("stale owner read exceeded its deadline".into()))?
+        .map_err(|error| HarnessError::Redis(format!("reading stale owner token: {error}")))?;
+        match owner {
+            None => return Ok(started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64),
+            Some(owner)
+                if owner.token.session_id == session.session_id
+                    && owner.token.epoch == session.epoch => {}
+            Some(owner) => {
+                return Err(HarnessError::Process(format!(
+                    "unexpected owner token during restoration: node={} epoch={} expected_stale_epoch={}",
+                    owner.token.node_id, owner.token.epoch, session.epoch
+                )));
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(HarnessError::Timeout(
+                "stale owner token did not clear within the owner lease bound".into(),
+            ));
+        }
+        sleep(Duration::from_millis(200)).await;
+    }
 }
 
 async fn stop_client(client: &mut Option<tunnel_client::ConnectionHandle>) -> Result<()> {
@@ -746,11 +1039,30 @@ async fn expect_echo(fixture: &RestorationFixture, phase: &str) -> Result<()> {
     expected.extend_from_slice(PAYLOAD);
     if status != 200 || body != expected {
         return Err(HarnessError::Http(format!(
-            "{phase} authenticated echo mismatch: status={status} body_len={}",
-            body.len()
+            "{phase} authenticated echo mismatch: status={status} body_len={} typed={}",
+            body.len(),
+            typed_error_summary(&body)
         )));
     }
     Ok(())
+}
+
+/// The closed `code`/`execution` fields of a relay typed error body, when the
+/// response is one.  Only those fixed fields are reported; the message and
+/// any other content stay out of the diagnostic.
+fn typed_error_summary(body: &[u8]) -> String {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return "none".to_owned();
+    };
+    let code = value
+        .get("code")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("missing");
+    let execution = value
+        .get("execution")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("missing");
+    format!("{code}/{execution}")
 }
 
 async fn attempt_echo(fixture: &RestorationFixture, phase: &str) -> Result<EchoOutcome> {
