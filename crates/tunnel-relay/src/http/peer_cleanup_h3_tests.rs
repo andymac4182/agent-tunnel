@@ -7,7 +7,13 @@
 use super::*;
 
 use crate::peer_fault_diagnostics::{PeerFaultContext, PeerFaultObserver, PeerFaultRole};
-use crate::runtime::{RelaySessionSnapshot, RelaySnapshot};
+use crate::{
+    peer_consumer_transport_diagnostics::{
+        PeerConsumerDiagnosticH3Code, PeerConsumerDiagnosticRole,
+    },
+    peer_transport_diagnostics::PeerTransportDiagnosticOutcome,
+    runtime::{RelaySessionSnapshot, RelaySnapshot, RelayStreamSnapshot},
+};
 use chrono::Duration as ChronoDuration;
 use tokio::task::JoinHandle;
 use tunnel_catalog::{Catalog, DeviceIdentity, MemoryCatalog, OwnerClaim, OwnerToken};
@@ -1313,12 +1319,15 @@ async fn peer_device_data_transport_shutdown_reclaims_exact_carrier_and_preserve
 /// registration and admit it exactly as a real connector would.  The cleanup
 /// paths under test close an admitted stream and emit its terminal FIN; the
 /// owner defers the close of an unadmitted OPEN until its outcome instead.
+/// Admit the queued OPEN exactly as a real connector would and return it so a
+/// caller can later answer the owner's authorization challenge for the same
+/// stream.
 async fn admit_queued_open(
     fixture: &H3PeerFixture,
     control_rx: &mut mpsc::Receiver<ControlOutbound>,
     session_id: &str,
     epoch: u64,
-) {
+) -> tunnel_protocol::Open {
     let open = loop {
         let item = timeout(Duration::from_secs(3), control_rx.recv())
             .await
@@ -1343,6 +1352,7 @@ async fn admit_queued_open(
         epoch,
     };
     admit_open(&fixture.handle, &key, &open).await;
+    open
 }
 
 #[tokio::test]
@@ -1573,10 +1583,12 @@ async fn peer_consumer_idle_deadline_closes_exact_stream_and_preserves_sibling()
 async fn peer_consumer_outstanding_write_is_bounded_by_consumer_expiry() {
     // Full top-level consumer scope: the owner handler awaits an actor write
     // that can never complete because the device never confirms the stream's
-    // authorization, so the actor parks the record.  Neither the H3 receive
-    // idle deadline (the handler is not reading) nor registration closure (no
-    // one closes the stream) can end that wait.  The consumer's absolute
-    // authorization deadline must bound the outstanding write and terminalize
+    // authorization, so the actor parks the record.  Registration closure (no
+    // one closes the stream) cannot end that wait, and the consumer's
+    // one-second absolute deadline is deliberately below the fixture's
+    // two-second H3 receive idle deadline, which the handler keeps observing
+    // while parked (EC-045).  The consumer's absolute authorization deadline
+    // must therefore bound the outstanding write itself and terminalize
     // exactly this stream while the sibling stays untouched.
     let fixture = H3PeerFixture::new().await;
     let target = register_control(
@@ -1615,7 +1627,7 @@ async fn peer_consumer_outstanding_write_is_bounded_by_consumer_expiry() {
     let _sibling_rx = sibling.rx;
 
     let owner = current_target_owner(&fixture).await;
-    let short_lived_token = fixture.mint_consumer_token(2);
+    let short_lived_token = fixture.mint_consumer_token(1);
     let mut stream = open_raw(&fixture, InternalRoute::ConsumerStreams).await;
     admit_consumer(
         &mut stream,
@@ -1662,9 +1674,16 @@ async fn peer_consumer_outstanding_write_is_bounded_by_consumer_expiry() {
         .await
         .expect("send parked consumer record");
 
-    // Keep the client stream open: only the consumer's two-second absolute
+    // Keep the client stream open: only the consumer's one-second absolute
     // deadline may end the outstanding write.  A stranded handler would keep
     // this stream live far beyond the bound below.
+    let owner_receive_before = fixture
+        .handle
+        .snapshot()
+        .await
+        .expect("outstanding-write baseline snapshot")
+        .peer_consumer_diagnostics
+        .owner_receive_count;
     let started = tokio::time::Instant::now();
     let terminal_snapshot =
         wait_snapshot_for(&fixture.handle, Duration::from_secs(6), &mut |snapshot| {
@@ -1685,6 +1704,15 @@ async fn peer_consumer_outstanding_write_is_bounded_by_consumer_expiry() {
     assert!(
         started.elapsed() < Duration::from_secs(6),
         "the outstanding write must be bounded by the consumer's absolute deadline"
+    );
+    // The bound came from the consumer deadline, not from the receive idle
+    // deadline: no owner receive outcome was recorded.
+    assert_eq!(
+        terminal_snapshot
+            .peer_consumer_diagnostics
+            .owner_receive_count,
+        owner_receive_before,
+        "the consumer deadline, not a receive failure, must end the parked write"
     );
     assert_sibling_preserved(&terminal_snapshot, &sibling_session_id, sibling_epoch);
     drain_queues(&mut target_rx, &mut target_data_rx).await;
@@ -2150,5 +2178,544 @@ async fn peer_owner_refuses_device_body_on_bad_certificate_digest() {
         "a bad device digest must not reach application dispatch"
     );
 
+    fixture.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// EC-045 / EC-046: duplex independence on the owner-side peer path.
+// ---------------------------------------------------------------------------
+
+/// One admitted forwarded consumer stream with its connector-side queues, the
+/// accepted OPEN, and an independently live sibling.  Both duplex cases below
+/// start from exactly this state.
+struct AdmittedConsumerStream {
+    target_session_id: String,
+    target_epoch: u64,
+    target_rx: mpsc::Receiver<ControlOutbound>,
+    target_data_rx: mpsc::Receiver<DataOutbound>,
+    sibling_session_id: String,
+    sibling_epoch: u64,
+    _sibling_rx: mpsc::Receiver<ControlOutbound>,
+    stream: Option<PeerClientStream>,
+    open: tunnel_protocol::Open,
+    request_id: String,
+    target_stream: RelayStreamSnapshot,
+    sibling_before: RelaySessionSnapshot,
+}
+
+async fn admit_consumer_with_open(
+    fixture: &H3PeerFixture,
+    token: &str,
+    label: &str,
+) -> AdmittedConsumerStream {
+    let target = register_control(
+        fixture,
+        DEVICE_SPKI,
+        device_id(),
+        &format!("{label}-target"),
+    )
+    .await;
+    let target_session_id = target.session_id.clone();
+    let target_epoch = target.epoch;
+    let target_ticket = target.ticket.clone();
+    let mut target_rx = target.rx;
+    let target_device = fixture
+        .catalog
+        .resolve_device(DEVICE_SPKI, Utc::now())
+        .await
+        .expect("resolve duplex target device")
+        .expect("duplex target device identity");
+    let target_data = fixture
+        .handle
+        .attach_forwarded_data(target_device, DEVICE_SPKI.to_owned(), target_ticket)
+        .await
+        .expect("attach duplex target carrier");
+    let mut target_data_rx = target_data.rx;
+
+    let sibling = register_control(
+        fixture,
+        SIBLING_SPKI,
+        sibling_device_id(),
+        &format!("{label}-sibling"),
+    )
+    .await;
+    let sibling_session_id = sibling.session_id.clone();
+    let sibling_epoch = sibling.epoch;
+    let sibling_rx = sibling.rx;
+
+    let owner = current_target_owner(fixture).await;
+    let request_id = format!("{label}-request");
+    let mut stream = open_raw(fixture, InternalRoute::ConsumerStreams).await;
+    admit_consumer(
+        &mut stream,
+        &owner.token,
+        token,
+        &request_id,
+        &format!("{label}-stream"),
+    )
+    .await;
+    let open = admit_queued_open(fixture, &mut target_rx, &target_session_id, target_epoch).await;
+    let admitted = wait_snapshot(&fixture.handle, |snapshot| {
+        find_session(snapshot, device_id()).is_some_and(|session| {
+            session.session_id == target_session_id
+                && session.epoch == target_epoch
+                && session.streams.len() == 1
+        }) && find_session(snapshot, sibling_device_id()).is_some()
+    })
+    .await;
+    let target_stream = find_session(&admitted, device_id())
+        .expect("duplex target session after admission")
+        .streams
+        .first()
+        .expect("duplex target stream after admission")
+        .clone();
+    assert!(!target_stream.terminal);
+    assert_eq!(target_stream.stream_id, open.stream_id);
+    let sibling_before = find_session(&admitted, sibling_device_id())
+        .expect("duplex sibling after admission")
+        .clone();
+    drain_queues(&mut target_rx, &mut target_data_rx).await;
+
+    AdmittedConsumerStream {
+        target_session_id,
+        target_epoch,
+        target_rx,
+        target_data_rx,
+        sibling_session_id,
+        sibling_epoch,
+        _sibling_rx: sibling_rx,
+        stream: Some(stream),
+        open,
+        request_id,
+        target_stream,
+        sibling_before,
+    }
+}
+
+/// One complete length-prefixed application record carried as a peer
+/// ConsumerChunk.  The body is synthetic test data.
+fn application_record(body: &[u8]) -> Bytes {
+    let mut record = (body.len() as u32).to_be_bytes().to_vec();
+    record.extend_from_slice(body);
+    encode_peer_record(PeerRecordKind::ConsumerChunk, &record)
+}
+
+/// Wait until the connector data carrier receives a frame of `kind` for
+/// `stream_id`, releasing every queue charge on the way.
+async fn wait_data_frame(
+    data_rx: &mut mpsc::Receiver<DataOutbound>,
+    stream_id: u64,
+    kind: tunnel_protocol::frame::FrameKind,
+    deadline: Duration,
+) {
+    timeout(deadline, async {
+        loop {
+            match data_rx
+                .recv()
+                .await
+                .expect("duplex data carrier remains live")
+            {
+                DataOutbound::Binary(bytes) => {
+                    let (bytes, mut charge) = bytes.into_parts();
+                    charge.release();
+                    let frame = wire::decode_frame(&bytes).expect("carrier frame decodes");
+                    if frame.stream_id == stream_id && frame.kind == kind {
+                        break;
+                    }
+                }
+                DataOutbound::Barrier(done) => {
+                    let _ = done.send(());
+                }
+                DataOutbound::Close => panic!("duplex data carrier closed before {kind:?}"),
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("connector carrier must receive {kind:?} for stream {stream_id}"));
+}
+
+fn assert_owner_receive_recorded(
+    snapshot: &RelaySnapshot,
+    admitted: &AdmittedConsumerStream,
+    owner_receive_before: u64,
+    owner_send_before: u64,
+    outcome: PeerTransportDiagnosticOutcome,
+    h3_code: Option<PeerConsumerDiagnosticH3Code>,
+) {
+    let diagnostics = &snapshot.peer_consumer_diagnostics;
+    assert_eq!(
+        diagnostics.owner_receive_count,
+        owner_receive_before + 1,
+        "exactly one owner receive outcome must be recorded"
+    );
+    let last = diagnostics
+        .last_owner_receive
+        .as_ref()
+        .expect("owner receive diagnostic");
+    assert_eq!(last.role, PeerConsumerDiagnosticRole::OwnerReceive);
+    assert_eq!(last.outcome, outcome);
+    assert_eq!(last.h3_code, h3_code);
+    assert_eq!(last.request_id, admitted.request_id);
+    assert_eq!(last.session_id, admitted.target_session_id);
+    assert_eq!(last.epoch, admitted.target_epoch);
+    assert_eq!(last.device_id, device_id());
+    assert_eq!(last.service_id, service_id());
+    // The owner cancelled its own send direction; that local cancellation is
+    // never recorded as a failed remote write.
+    assert_eq!(
+        diagnostics.owner_send_count, owner_send_before,
+        "a locally cancelled send direction must not be reported as a remote send failure"
+    );
+}
+
+fn assert_stream_closed_event(snapshot: &RelaySnapshot, admitted: &AdmittedConsumerStream) {
+    assert!(
+        snapshot.stream_terminal_events.iter().any(|event| {
+            event.stream_id == admitted.open.stream_id
+                && event.operation_id == admitted.target_stream.operation_id
+                && event.session_id == admitted.target_session_id
+                && event.epoch == admitted.target_epoch
+                && event.request_id.as_deref() == Some(admitted.request_id.as_str())
+                && event.reason == "STREAM_CLOSED"
+                && event.cause.is_none()
+        }),
+        "the owner must retain the exact STREAM_CLOSED event for the cancelled stream"
+    );
+}
+
+/// EC-045: a cancellation on the receive direction while the send direction is
+/// parked on an actor write.  The parked write can never complete because the
+/// connector never answers the stream's authorization challenge, so only the
+/// owner's own handling of the receive direction can end it before the
+/// consumer's absolute deadline.
+#[tokio::test]
+async fn peer_consumer_receive_cancel_releases_parked_send_direction_before_deadline() {
+    let fixture = H3PeerFixture::new().await;
+    // The consumer deadline is deliberately far beyond the prompt bound below;
+    // a handler that only honours the cancel at that deadline fails the case.
+    let token = fixture.mint_consumer_token(8);
+    let mut admitted = admit_consumer_with_open(&fixture, &token, "ec045").await;
+    let before = fixture
+        .handle
+        .snapshot()
+        .await
+        .expect("duplex baseline snapshot");
+    let reads_before = before.lifetime_consumer_chunk_reads;
+    let dispatches_before = before.lifetime_application_dispatches;
+    let owner_receive_before = before.peer_consumer_diagnostics.owner_receive_count;
+    let owner_send_before = before.peer_consumer_diagnostics.owner_send_count;
+    let returned_before = fixture.returned_errors.load(Ordering::Acquire);
+
+    // Park the send direction: the owner reads the record and awaits the actor
+    // write that waits for an authorization confirmation which never comes.
+    admitted
+        .stream
+        .as_mut()
+        .expect("client stream is still whole")
+        .send_chunk(application_record(b"ec045-parked-record"))
+        .await
+        .expect("send the record that parks the owner write");
+    let parked = wait_snapshot(&fixture.handle, |snapshot| {
+        snapshot.lifetime_consumer_chunk_reads > reads_before
+    })
+    .await;
+    assert_eq!(parked.lifetime_application_dispatches, dispatches_before);
+    assert!(
+        find_session(&parked, device_id()).is_some_and(|session| {
+            session
+                .streams
+                .iter()
+                .any(|stream| stream.stream_id == admitted.open.stream_id && !stream.terminal)
+        }),
+        "the stream must still be live while the write is parked"
+    );
+
+    // Cancel only the receive direction (the request body).  The response
+    // direction stays open on the client so nothing but the owner itself can
+    // release the parked send direction.
+    let (mut client_send, mut client_recv) = admitted
+        .stream
+        .take()
+        .expect("client stream is still whole")
+        .split();
+    let cancelled_at = tokio::time::Instant::now();
+    client_send.cancel();
+
+    // The parked direction is released: the handler exits, the exact stream
+    // is terminal, and both happen well below the eight-second deadline.
+    wait_handler_error(&fixture, returned_before).await;
+    let terminal_snapshot = wait_snapshot(&fixture.handle, |snapshot| {
+        find_session(snapshot, device_id()).is_some_and(|session| {
+            session.session_id == admitted.target_session_id
+                && session.epoch == admitted.target_epoch
+                && session.streams.iter().any(|stream| {
+                    stream.stream_id == admitted.open.stream_id
+                        && stream.operation_id == admitted.target_stream.operation_id
+                        && stream.terminal
+                })
+        }) && find_session(snapshot, sibling_device_id()).is_some()
+    })
+    .await;
+    let honoured_after = cancelled_at.elapsed();
+    assert!(
+        honoured_after < Duration::from_millis(1500),
+        "the receive-direction cancel must be honoured promptly, not at the deadline; observed {honoured_after:?}"
+    );
+
+    // The owner records the cancellation outcome on the receive direction and
+    // never dispatched the parked record with an unknown outcome.
+    assert_owner_receive_recorded(
+        &terminal_snapshot,
+        &admitted,
+        owner_receive_before,
+        owner_send_before,
+        PeerTransportDiagnosticOutcome::H3Error,
+        Some(PeerConsumerDiagnosticH3Code::RequestCancelled),
+    );
+    assert_eq!(
+        terminal_snapshot.lifetime_application_dispatches, dispatches_before,
+        "a record abandoned by the cancel must not be dispatched"
+    );
+
+    // The blocked send direction was released by the cancel: the client's
+    // still-open response half observes the owner's reset promptly instead of
+    // idling until the consumer deadline.
+    let response_half = timeout(Duration::from_millis(1500), client_recv.recv_chunk())
+        .await
+        .expect("the owner must release the parked send direction promptly");
+    assert!(
+        matches!(
+            &response_half,
+            Err(PeerTransportError::H3(message)) if message.contains("H3_REQUEST_CANCELLED")
+        ),
+        "the released send direction must be a local cancellation, observed {response_half:?}"
+    );
+
+    // Close and owner events were not suppressed by the blocked direction: the
+    // connector carrier receives the stream's FIN and the owner retains the
+    // exact terminal event, while the sibling is untouched.
+    wait_data_frame(
+        &mut admitted.target_data_rx,
+        admitted.open.stream_id,
+        tunnel_protocol::frame::FrameKind::Fin,
+        Duration::from_millis(1500),
+    )
+    .await;
+    assert_stream_closed_event(&terminal_snapshot, &admitted);
+    assert_eq!(
+        find_session(&terminal_snapshot, sibling_device_id())
+            .expect("sibling survives")
+            .session_id,
+        admitted.sibling_before.session_id
+    );
+    assert_sibling_preserved(
+        &terminal_snapshot,
+        &admitted.sibling_session_id,
+        admitted.sibling_epoch,
+    );
+    drain_queues(&mut admitted.target_rx, &mut admitted.target_data_rx).await;
+
+    client_recv.cancel();
+    drop(client_send);
+    drop(client_recv);
+    fixture.shutdown().await;
+}
+
+/// EC-046 in one scenario on the owner-side peer path: a safe record is
+/// decoded and delivered to the connector carrier, then a malformed record
+/// surfaces the decoder's typed bounded failure while the safe record's write
+/// is still outstanding.  The owner must cancel both halves, join the
+/// handler, and report its own cancellation as local rather than as a remote
+/// rejection.
+#[tokio::test]
+async fn peer_consumer_decode_failure_drains_safe_events_and_cancels_both_halves() {
+    let fixture = H3PeerFixture::new().await;
+    let token = fixture.mint_consumer_token(8);
+    let mut admitted = admit_consumer_with_open(&fixture, &token, "ec046").await;
+    let before = fixture
+        .handle
+        .snapshot()
+        .await
+        .expect("duplex baseline snapshot");
+    let reads_before = before.lifetime_consumer_chunk_reads;
+    let dispatches_before = before.lifetime_application_dispatches;
+    let owner_receive_before = before.peer_consumer_diagnostics.owner_receive_count;
+    let owner_send_before = before.peer_consumer_diagnostics.owner_send_count;
+    let returned_before = fixture.returned_errors.load(Ordering::Acquire);
+
+    // 1. One safe record.  The owner decodes it and starts the actor write.
+    admitted
+        .stream
+        .as_mut()
+        .expect("client stream is still whole")
+        .send_chunk(application_record(b"ec046-safe-record"))
+        .await
+        .expect("send the safe record");
+    wait_snapshot(&fixture.handle, |snapshot| {
+        snapshot.lifetime_consumer_chunk_reads > reads_before
+    })
+    .await;
+
+    // 2. The connector answers the authorization challenge, so the safe
+    //    record is dispatched to the carrier.  The connector never echoes, so
+    //    the owner's write for it stays outstanding.
+    let open = &admitted.open;
+    let challenge = tunnel_protocol::AuthorizationChallenge::new(
+        "ec046-challenge",
+        admitted.target_session_id.clone(),
+        admitted.target_epoch,
+        open.stream_id,
+        "ec046-challenge-id",
+        "ec046-nonce",
+        open.service_id.clone(),
+        open.metadata
+            .get("permission_digest")
+            .expect("OPEN permission digest")
+            .clone(),
+        open.metadata
+            .get("grant_revision")
+            .expect("OPEN grant revision")
+            .parse()
+            .expect("grant revision"),
+    );
+    let key = crate::actor::SessionKey {
+        tenant_id: tenant_id(),
+        device_id: device_id(),
+        session_id: admitted.target_session_id.clone(),
+        epoch: admitted.target_epoch,
+    };
+    fixture
+        .handle
+        .inbound_control(key, ControlMessage::AuthorizationChallenge(challenge))
+        .await
+        .expect("deliver authorization challenge");
+    wait_data_frame(
+        &mut admitted.target_data_rx,
+        open.stream_id,
+        tunnel_protocol::frame::FrameKind::Data,
+        Duration::from_secs(3),
+    )
+    .await;
+    let delivered = wait_snapshot(&fixture.handle, |snapshot| {
+        snapshot.lifetime_application_dispatches > dispatches_before
+    })
+    .await;
+    assert_eq!(
+        delivered.lifetime_application_dispatches,
+        dispatches_before + 1
+    );
+    assert_eq!(
+        fixture.returned_errors.load(Ordering::Acquire),
+        returned_before
+    );
+
+    // 3. A malformed record (unassigned kind byte) followed, in the same
+    //    chunk, by a well-formed record that must never be dispatched.
+    let mut malformed = Vec::with_capacity(8);
+    malformed.extend_from_slice(&0_u32.to_be_bytes());
+    malformed.extend_from_slice(&[0x7f, 0, 0, 0]);
+    malformed.extend_from_slice(&application_record(b"ec046-must-not-dispatch"));
+    admitted
+        .stream
+        .as_mut()
+        .expect("client stream is still whole")
+        .send_chunk(Bytes::from(malformed))
+        .await
+        .expect("send the malformed record");
+
+    // The decoder surfaces its typed bounded failure while the safe record's
+    // write is outstanding; the handler returns and the stream is terminal.
+    wait_handler_error(&fixture, returned_before).await;
+    let terminal_snapshot = wait_snapshot(&fixture.handle, |snapshot| {
+        find_session(snapshot, device_id()).is_some_and(|session| {
+            session.session_id == admitted.target_session_id
+                && session.epoch == admitted.target_epoch
+                && session.streams.iter().any(|stream| {
+                    stream.stream_id == admitted.open.stream_id
+                        && stream.operation_id == admitted.target_stream.operation_id
+                        && stream.terminal
+                })
+        }) && find_session(snapshot, sibling_device_id()).is_some()
+    })
+    .await;
+    assert_owner_receive_recorded(
+        &terminal_snapshot,
+        &admitted,
+        owner_receive_before,
+        owner_send_before,
+        PeerTransportDiagnosticOutcome::ProtocolError,
+        None,
+    );
+    // Exactly the safe record was read and dispatched; nothing after the
+    // malformed record was counted or dispatched.
+    assert_eq!(
+        terminal_snapshot.lifetime_consumer_chunk_reads,
+        reads_before + 1
+    );
+    assert_eq!(
+        terminal_snapshot.lifetime_application_dispatches,
+        dispatches_before + 1
+    );
+
+    // Both halves are cancelled.  On the client each half observes the
+    // owner's local cancellation as a reset, never as a not-processed
+    // rejection (GoAway) or a transport timeout.
+    let (mut client_send, mut client_recv) = admitted
+        .stream
+        .take()
+        .expect("client stream is still whole")
+        .split();
+    let response_half = timeout(Duration::from_secs(3), client_recv.recv_chunk())
+        .await
+        .expect("the owner must cancel its send half promptly");
+    assert!(
+        matches!(
+            &response_half,
+            Err(PeerTransportError::H3(message)) if message.contains("H3_REQUEST_CANCELLED")
+        ),
+        "the owner's send half must be a local cancellation, observed {response_half:?}"
+    );
+    let request_half = timeout(Duration::from_secs(3), async {
+        loop {
+            match client_send
+                .send_chunk(application_record(b"ec046-after-cancel"))
+                .await
+            {
+                Ok(()) => tokio::task::yield_now().await,
+                Err(error) => break error,
+            }
+        }
+    })
+    .await
+    .expect("the owner must cancel its receive half promptly");
+    assert!(
+        !matches!(
+            request_half,
+            PeerTransportError::GoAway | PeerTransportError::Timeout
+        ),
+        "the owner's receive half must not be reported as a rejection or timeout, observed {request_half:?}"
+    );
+
+    // The close reached the connector and the owner retained the exact
+    // terminal event; the sibling is untouched.
+    wait_data_frame(
+        &mut admitted.target_data_rx,
+        admitted.open.stream_id,
+        tunnel_protocol::frame::FrameKind::Fin,
+        Duration::from_secs(3),
+    )
+    .await;
+    assert_stream_closed_event(&terminal_snapshot, &admitted);
+    assert_sibling_preserved(
+        &terminal_snapshot,
+        &admitted.sibling_session_id,
+        admitted.sibling_epoch,
+    );
+    drain_queues(&mut admitted.target_rx, &mut admitted.target_data_rx).await;
+
+    // Joined: the handler already returned; the server and runtime shut down
+    // within their bounded deadlines with no stranded stream task.
+    drop(client_send);
+    drop(client_recv);
     fixture.shutdown().await;
 }
