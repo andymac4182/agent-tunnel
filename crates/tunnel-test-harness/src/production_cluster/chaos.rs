@@ -891,7 +891,18 @@ async fn run_owner_kill(
     let stream_class = match probe {
         Ok(Ok(())) => InterruptionClass::Unclassified, // a killed owner must not echo
         Ok(Err(error)) if is_expected_revocation_close(&error) => InterruptionClass::BoundedClose,
-        Ok(Err(_)) => InterruptionClass::BoundedClose,
+        // Any other error after the kill (protocol error, unexpected status,
+        // harness I/O failure) is an abnormal close the vocabulary does not
+        // explain.  It must surface as unclassified and fail the gate rather
+        // than be folded into the bounded-close bucket.
+        Ok(Err(error)) => {
+            tracing::warn!(
+                error = %error,
+                stage = "chaos_owner_kill_unexplained_close",
+                "owner kill produced a close outside the expected revocation vocabulary"
+            );
+            InterruptionClass::Unclassified
+        }
         Err(_) => InterruptionClass::OutcomeUnknown,
     };
     if stream_class == InterruptionClass::Unclassified {
