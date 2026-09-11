@@ -1128,6 +1128,15 @@ struct M2Stream {
     /// released when a writer takes ownership.
     budget_bytes: usize,
     terminal: bool,
+    /// A relay->connector terminal frame (relay FIN or the reply to a peer
+    /// FIN/RESET) that arrived while the relay writer was frozen at its
+    /// rotation fence.  It is held behind any deferred application records and
+    /// emitted after COMMITTED on the activated carrier with the continuing
+    /// sequence, or resumed on the old carrier after a coordinated ABORTED.
+    /// docs/protocol.md "Freeze each writer": a frozen writer emits no
+    /// sequenced frame, so the terminal waits rather than being dropped or
+    /// emitted on the old carrier.
+    pending_terminal: Option<Terminal>,
     /// The relay attempted to close this stream but could not publish its
     /// terminal FIN. This debt is separate from owner FORGET queue debt so an
     /// unrelated successful FORGET cannot clear its fail-closed deadline.
@@ -1254,6 +1263,20 @@ enum RotationStart {
     /// this typed reason; leaving the machine as is would strand an
     /// attempt-less `Preparing` state or a never-rotating `Active` carrier.
     Failed(&'static str),
+}
+
+/// Outcome of attempting to publish one relay->connector terminal frame.
+#[derive(Debug)]
+enum TerminalDisposition {
+    /// Queued on the session's active carrier.
+    Emitted,
+    /// Held because the relay writer is frozen at its rotation fence; the
+    /// terminal is emitted after activation (or resumed after a coordinated
+    /// abort).  This is bounded backpressure, never a publication failure.
+    Deferred,
+    /// A genuine publication failure on an unfrozen writer; the tombstone is
+    /// retained and its fail-closed deadline armed.
+    Failed,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3722,6 +3745,18 @@ impl RelayActor {
             });
             return;
         }
+        if Self::rotation_frozen(session) {
+            // The finite echo also enters `session.pending`, which is part of
+            // the immutable QUIESCE roster.  Pause its admission during a
+            // rotation/recovery freeze with the retryable overload the protocol
+            // permits (docs/protocol.md "Quiesce admission") so a late pending
+            // entry cannot drift the roster.
+            let _ = response.send(EchoOutcome::Failure {
+                code: "RESOURCE_EXHAUSTED",
+                execution: "not_dispatched",
+            });
+            return;
+        }
         if session.pending.len() >= self.options.limits.max_pending_operations
             || session.pending.len() >= self.options.limits.max_streams_per_device
         {
@@ -3886,6 +3921,21 @@ impl RelayActor {
             let _ = response.send(Err(RelayError::OwnerNotReady));
             return;
         }
+        if Self::rotation_frozen(session) {
+            // docs/protocol.md "Quiesce admission": new OPEN admission is paused
+            // from QUIESCE until COMMITTED/ABORTED (and throughout recovery) so
+            // the immutable roster fixed at quiesce cannot drift.  An OPEN
+            // landing mid-attempt would be excluded from the roster and make
+            // the pure machine's `frozen()` roster-equality check fail with
+            // RosterMismatch, stalling the attempt until the deadline.  The
+            // protocol permits a "retryable overload" here; `OwnerNotReady` is
+            // the existing pending-owner outcome (the owner is live but
+            // momentarily not admitting) and already carries `not_dispatched`
+            // plus a bounded retry-after, so no new code or HTTP mapping is
+            // needed.  Streams already admitted continue unaffected.
+            let _ = response.send(Err(RelayError::OwnerNotReady));
+            return;
+        }
         let active_streams = session
             .streams
             .values()
@@ -3996,6 +4046,7 @@ impl RelayActor {
                 pending_record_bytes: 0,
                 budget_bytes: 0,
                 terminal: false,
+                pending_terminal: None,
                 terminal_fin_failure: false,
                 open_pending: true,
                 registration_dropped: false,
@@ -4246,6 +4297,19 @@ impl RelayActor {
             return true;
         }
 
+        // FORGET is serialized with QUIESCE: an entry leaves a snapshot only
+        // when its FORGET precedes QUIESCE (docs/protocol.md RESET/terminal
+        // paragraph).  While the immutable roster is frozen
+        // (QUIESCE..COMMITTED/ABORTED, and recovery), publishing a FORGET would
+        // remove a roster entry mid-attempt and fail the pure machine's
+        // roster-equality check; keep every staged FORGET pending — including a
+        // REJECTED-open reclamation — until the attempt releases the roster.
+        // `begin_rotation_quiesce` flushes while still `Preparing`, before this
+        // guard engages, preserving the pre-QUIESCE serialization.
+        if self.session_for(key).is_some_and(Self::rotation_frozen) {
+            return true;
+        }
+
         let candidates = self
             .session_for(key)
             .map(|session| {
@@ -4385,6 +4449,149 @@ impl RelayActor {
         true
     }
 
+    /// True while the relay->connector sequenced-frame writer is frozen at its
+    /// immutable rotation fence and new stream admission is paused.  Per
+    /// docs/protocol.md "Rotation state machine", the `Quiescing`, `Draining`,
+    /// `Committing` and `Aborting` rows freeze both old sequenced-frame writers
+    /// and new OPEN admission; the old writer stays frozen until the candidate
+    /// is activated by COMMITTED (phase advances to `Retiring`) or the old
+    /// carrier resumes after the final ABORTED (phase returns to `Active`).
+    /// The "Recovery control handshake" freezes admission and application
+    /// writes the same way for the duration of `Recovering`.  DATA/FIN/RESET
+    /// are held in the bounded per-stream FIFO while this holds; ACKs, window
+    /// updates, heartbeats and rotation control remain responsive.
+    fn rotation_frozen(session: &DeviceSession) -> bool {
+        session.rotation.as_ref().is_some_and(|rotation| {
+            matches!(
+                rotation.state.phase(),
+                RotationPhase::Quiescing
+                    | RotationPhase::Draining
+                    | RotationPhase::Committing
+                    | RotationPhase::Aborting
+                    | RotationPhase::Recovering
+            )
+        })
+    }
+
+    /// Build, sequence and queue one relay->connector terminal frame on the
+    /// session's current data carrier.  Returns false only on a genuine
+    /// publication failure (no writable carrier or a rejected writer queue);
+    /// the sequence cursor is committed on the stream only after the encoded
+    /// frame is accepted, so a full writer never leaves a phantom terminal.
+    /// An already-terminal send direction is treated as done.
+    fn queue_stream_terminal_frame(
+        session: &mut DeviceSession,
+        stream_id: u64,
+        terminal: Terminal,
+    ) -> bool {
+        let Some(data_tx) = session.data_tx.clone() else {
+            return false;
+        };
+        let queue_budget = session.queue_budget.clone();
+        let generation = session.generation;
+        let epoch = session.key.epoch;
+        let Some(stream) = session.streams.get_mut(&stream_id) else {
+            return true;
+        };
+        let send_direction = stream.sequence.direction(Direction::RelayToConnector);
+        if send_direction.send_terminal().is_some() {
+            return true;
+        }
+        let Some(sequence) = send_direction.last_emitted().checked_add(1) else {
+            return false;
+        };
+        let ack = stream
+            .sequence
+            .direction(Direction::ConnectorToRelay)
+            .recv_contiguous();
+        let frame = match terminal {
+            Terminal::Fin => Frame::fin(epoch, generation, stream_id, sequence, ack),
+            Terminal::Reset(reason) => {
+                Frame::reset(epoch, generation, stream_id, sequence, ack, reason)
+            }
+        };
+        let mut candidate_sequence = stream.sequence.clone();
+        if candidate_sequence
+            .send_frame(Direction::RelayToConnector, &frame)
+            .is_err()
+        {
+            return false;
+        }
+        let Ok(encoded) = frame.encode() else {
+            return false;
+        };
+        if queue_data(&data_tx, &queue_budget, encoded).is_err() {
+            return false;
+        }
+        stream.sequence = candidate_sequence;
+        true
+    }
+
+    /// After the relay writer resumes on a writable carrier (the candidate
+    /// after COMMITTED, or the old carrier after a coordinated ABORTED), emit
+    /// every frame held while the writer was frozen: deferred application
+    /// records first, in FIFO order, then any deferred terminal, each with the
+    /// continuing sequence.  A no-op while still frozen or without an active
+    /// carrier, so it is safe to call opportunistically.
+    fn flush_frozen_writes(&mut self, key: &SessionKey) {
+        let ready = self
+            .session_for(key)
+            .is_some_and(|session| !Self::rotation_frozen(session) && session.data_tx.is_some());
+        if !ready {
+            return;
+        }
+        let stream_ids = self
+            .session_for(key)
+            .map(|session| {
+                let mut ids: Vec<u64> = session.streams.keys().copied().collect();
+                ids.sort_unstable();
+                ids
+            })
+            .unwrap_or_default();
+        for stream_id in stream_ids {
+            self.retry_pending_echo_records(key, stream_id);
+            self.flush_pending_terminal(key, stream_id);
+        }
+    }
+
+    /// Emit one stream's deferred terminal once every deferred application
+    /// record ahead of it has been emitted and the writer is unfrozen.  The
+    /// terminal keeps its place at the tail of the stream's sequence space.
+    fn flush_pending_terminal(&mut self, key: &SessionKey, stream_id: u64) {
+        let terminal = self.session_for(key).and_then(|session| {
+            if Self::rotation_frozen(session) || session.data_tx.is_none() {
+                return None;
+            }
+            let stream = session.streams.get(&stream_id)?;
+            if !stream.pending_records.is_empty() {
+                return None;
+            }
+            stream.pending_terminal
+        });
+        let Some(terminal) = terminal else {
+            return;
+        };
+        let emitted = self
+            .session_mut(key)
+            .is_some_and(|session| Self::queue_stream_terminal_frame(session, stream_id, terminal));
+        if emitted {
+            if let Some(session) = self.session_mut(key)
+                && let Some(stream) = session.streams.get_mut(&stream_id)
+            {
+                stream.pending_terminal = None;
+                stream.terminal_fin_failure = false;
+            }
+            self.clear_terminal_fin_failure_deadline_if_clear(key);
+        } else {
+            if let Some(session) = self.session_mut(key)
+                && let Some(stream) = session.streams.get_mut(&stream_id)
+            {
+                stream.terminal_fin_failure = true;
+            }
+            self.arm_terminal_fin_failure_deadline(key);
+        }
+    }
+
     /// Queue one length-prefixed application record without waiting for a
     /// socket writer.  The shared queue budget charges every encoded frame;
     /// a dropped/retired candidate therefore cannot create a second budget.
@@ -4430,6 +4637,7 @@ impl RelayActor {
             .rotation
             .as_ref()
             .is_some_and(|rotation| rotation.state.phase() == RotationPhase::Recovering);
+        let writer_frozen = Self::rotation_frozen(session);
         if data_tx.is_none() && !recovering {
             let _ = response.send(Err(EchoOutcome::Failure {
                 code: "DEVICE_OFFLINE",
@@ -4459,6 +4667,31 @@ impl RelayActor {
                 code: "AUTHORIZATION_EXPIRED",
                 execution: "not_dispatched",
             }));
+            return;
+        }
+        if writer_frozen {
+            // docs/protocol.md "Freeze each writer": from QUIESCE until the
+            // candidate is activated by COMMITTED (or the old carrier resumes
+            // after a coordinated ABORTED), and throughout recovery, the
+            // relay->connector writer emits no sequenced frame.  Hold the
+            // record in the existing bounded FIFO, charged to the session queue
+            // budget, and flush it on the writable carrier afterwards with the
+            // continuing sequence.  The record is never emitted on the frozen
+            // carrier and never silently dropped; the bound produces the same
+            // typed capacity refusal used elsewhere.
+            if stream.pending_records.len() >= max_pending_operations
+                || stream.pending_record_bytes.saturating_add(body.len()) > max_queue_bytes
+                || !reserve_m2_bytes(&queue_budget, stream, body.len())
+            {
+                let _ = response.send(Err(EchoOutcome::Failure {
+                    code: "RESOURCE_EXHAUSTED",
+                    execution: "not_dispatched",
+                }));
+            } else {
+                stream.pending_record_bytes =
+                    stream.pending_record_bytes.saturating_add(body.len());
+                stream.pending_records.push_back((body, response));
+            }
             return;
         }
         if stream
@@ -4657,6 +4890,12 @@ impl RelayActor {
             let Some((body_len, record_fits_credit, operation_id)) = self
                 .session_for(key)
                 .and_then(|session| {
+                    // While the writer is frozen at its rotation fence, held
+                    // records stay queued; flushing would emit on the old
+                    // carrier past the fence.  They flush after activation.
+                    if Self::rotation_frozen(session) {
+                        return None;
+                    }
                     session.data_tx.as_ref()?;
                     session.streams.get(&stream_id)
                 })
@@ -4747,67 +4986,51 @@ impl RelayActor {
                 return true;
             }
         }
-        let fin_queued = {
+        let disposition = {
             let Some(session) = self.session_mut(key) else {
                 return true;
             };
-            let data_tx = session.data_tx.clone();
-            let queue_budget = session.queue_budget.clone();
-            let generation = session.generation;
-            let Some(stream) = session.streams.get_mut(&stream_id) else {
-                return true;
-            };
-            if stream.operation_id != operation_id || stream.terminal {
-                return true;
-            }
-            // The public ingress also enforces the verified token deadline
-            // and can close its peer stream before an in-flight authorization
-            // refresh returns. Preserve the owner-held expiry at this first
-            // terminal transition instead of losing it as a generic close.
-            // An earlier explicit failure or terminal result remains final.
-            if stream.consumer_expires_at <= Utc::now()
-                && stream.authorization_failure_code.is_none()
+            // The relay->connector writer is frozen at its immutable rotation
+            // fence from QUIESCE until the candidate is activated (or the old
+            // carrier resumes after a coordinated ABORTED); recovery freezes it
+            // the same way.  docs/protocol.md "Freeze each writer".
+            let writer_frozen = Self::rotation_frozen(session);
             {
-                stream.authorization_failure_code = Some("AUTHORIZATION_EXPIRED");
-            }
-            if let Some(data_tx) = data_tx {
-                match stream
-                    .sequence
-                    .direction(Direction::RelayToConnector)
-                    .last_emitted()
-                    .checked_add(1)
-                {
-                    Some(sequence) => {
-                        let ack = stream
-                            .sequence
-                            .direction(Direction::ConnectorToRelay)
-                            .recv_contiguous();
-                        let frame = Frame::fin(key.epoch, generation, stream_id, sequence, ack);
-                        // `send_frame` mutates replay and terminal cursors.
-                        // Validate on a bounded clone and commit only after
-                        // the encoded FIN is accepted by the writer queue;
-                        // otherwise a full/closed writer would leave a
-                        // phantom FIN that STREAM_FORGET could never prove.
-                        let mut candidate_sequence = stream.sequence.clone();
-                        if candidate_sequence
-                            .send_frame(Direction::RelayToConnector, &frame)
-                            .is_ok()
-                            && let Ok(encoded) = frame.encode()
-                            && queue_data(&data_tx, &queue_budget, encoded).is_ok()
-                        {
-                            stream.sequence = candidate_sequence;
-                            true
-                        } else {
-                            false
-                        }
-                    }
-                    None => false,
+                let Some(stream) = session.streams.get_mut(&stream_id) else {
+                    return true;
+                };
+                if stream.operation_id != operation_id || stream.terminal {
+                    return true;
                 }
+                // The public ingress also enforces the verified token deadline
+                // and can close its peer stream before an in-flight
+                // authorization refresh returns. Preserve the owner-held expiry
+                // at this first terminal transition instead of losing it as a
+                // generic close. An earlier explicit failure or terminal result
+                // remains final.
+                if stream.consumer_expires_at <= Utc::now()
+                    && stream.authorization_failure_code.is_none()
+                {
+                    stream.authorization_failure_code = Some("AUTHORIZATION_EXPIRED");
+                }
+                if writer_frozen {
+                    // Hold the terminal behind any deferred application
+                    // records; it is emitted after activation with the
+                    // continuing sequence, never on the frozen carrier.  This
+                    // is bounded backpressure, not a publication failure.
+                    stream.pending_terminal.get_or_insert(Terminal::Fin);
+                }
+            }
+            if writer_frozen {
+                TerminalDisposition::Deferred
+            } else if Self::queue_stream_terminal_frame(session, stream_id, Terminal::Fin) {
+                TerminalDisposition::Emitted
             } else {
-                false
+                TerminalDisposition::Failed
             }
         };
-        if !fin_queued {
+        let fin_queued = !matches!(disposition, TerminalDisposition::Failed);
+        if matches!(disposition, TerminalDisposition::Failed) {
             tracing::debug!(
                 stream_id,
                 operation_id = %operation_id,
@@ -4819,6 +5042,7 @@ impl RelayActor {
             // fail-closed window used by a blocked STREAM_FORGET so a closed
             // writer cannot retain the session indefinitely. The transactional
             // sequence above remains unchanged; no phantom FIN is published.
+            // A *deferred* terminal is not a failure and arms no deadline.
             self.arm_terminal_fin_failure_deadline(key);
         }
         // Keep the exact stream sequence as a bounded terminal tombstone so
@@ -4862,57 +5086,27 @@ impl RelayActor {
         stream_id: u64,
         terminal: Terminal,
     ) -> bool {
-        let queued = (|| {
+        let queued = {
             let Some(session) = self.session_mut(key) else {
                 return true;
             };
-            let Some(data_tx) = session.data_tx.clone() else {
-                return false;
-            };
-            let queue_budget = session.queue_budget.clone();
-            let generation = session.generation;
-            let Some(stream) = session.streams.get_mut(&stream_id) else {
-                return true;
-            };
-            let send_direction = stream.sequence.direction(Direction::RelayToConnector);
-            if send_direction.send_terminal().is_some() {
-                return true;
-            }
-            let Some(sequence) = send_direction.last_emitted().checked_add(1) else {
-                return false;
-            };
-            let ack = stream
-                .sequence
-                .direction(Direction::ConnectorToRelay)
-                .recv_contiguous();
-            let frame = match terminal {
-                Terminal::Fin => Frame::fin(key.epoch, generation, stream_id, sequence, ack),
-                Terminal::Reset(reason) => {
-                    Frame::reset(key.epoch, generation, stream_id, sequence, ack, reason)
+            // While the relay writer is frozen at its rotation fence, the
+            // reply to a peer FIN/RESET is held (behind any deferred records)
+            // and emitted after activation with the continuing sequence, never
+            // on the frozen carrier.  docs/protocol.md "Freeze each writer".
+            if Self::rotation_frozen(session) {
+                if let Some(stream) = session.streams.get_mut(&stream_id) {
+                    stream.pending_terminal.get_or_insert(terminal);
                 }
-            };
-            let mut candidate_sequence = stream.sequence.clone();
-            if candidate_sequence
-                .send_frame(Direction::RelayToConnector, &frame)
-                .is_err()
-            {
-                return false;
+                return true;
             }
-            let Ok(encoded) = frame.encode() else {
-                return false;
-            };
-            if queue_data(&data_tx, &queue_budget, encoded).is_err() {
-                return false;
-            }
-            stream.sequence = candidate_sequence;
-            true
-        })();
-        if !queued {
-            if let Some(session) = self.session_mut(key)
-                && let Some(stream) = session.streams.get_mut(&stream_id)
-            {
+            let queued = Self::queue_stream_terminal_frame(session, stream_id, terminal);
+            if !queued && let Some(stream) = session.streams.get_mut(&stream_id) {
                 stream.terminal_fin_failure = true;
             }
+            queued
+        };
+        if !queued {
             self.arm_terminal_fin_failure_deadline(key);
         }
         queued
@@ -6786,6 +6980,10 @@ impl RelayActor {
             rotation.last_message_id = message.message_id().to_owned();
             Ok::<(), tunnel_protocol::rotation::RotationError>(())
         });
+        // The candidate is now the active carrier and the relay writer has
+        // resumed on the new generation (phase Retiring).  Emit every frame
+        // held while the writer was frozen, each with the continuing sequence.
+        self.flush_frozen_writes(key);
     }
 
     async fn handle_rotate_retired(
@@ -7374,6 +7572,12 @@ impl RelayActor {
                 stage = "owner_aborted",
                 error = %error,
             );
+        } else {
+            // If the final ABORTED just returned the session to Active, the old
+            // carrier resumes: flush frames held while the writer was frozen
+            // back onto it with the continuing sequence (no gap).  A no-op
+            // while the bilateral abort is still completing.
+            self.flush_frozen_writes(key);
         }
     }
 
@@ -9653,6 +9857,7 @@ impl RelayActor {
             let Some(session) = self.session_mut(&key) else {
                 return;
             };
+            let writer_frozen = Self::rotation_frozen(session);
             let defer_candidate_data = carrier_is_candidate
                 && matches!(
                     frame.kind,
@@ -9956,12 +10161,18 @@ impl RelayActor {
             if !invalid
                 && frame.kind == FrameKind::Reset
                 && disposition == ReceiveDisposition::Accepted
+                && !writer_frozen
                 && stream
                     .sequence
                     .direction(Direction::RelayToConnector)
                     .send_terminal()
                     .is_none()
             {
+                // While the writer is frozen, the relay's RESET reply is
+                // deferred like any other terminal: the inline fast path is
+                // skipped and `peer_terminal` (the connector's RESET) routes
+                // through `queue_peer_terminal_reply`, which holds it until
+                // activation.  docs/protocol.md "Freeze each writer".
                 let reason = frame.reset_reason().ok().flatten().unwrap_or(4_002);
                 let send_direction = stream.sequence.direction(Direction::RelayToConnector);
                 let Some(sequence) = send_direction.last_emitted().checked_add(1) else {
@@ -10076,6 +10287,9 @@ impl RelayActor {
         }
         if let Some(stream_id) = retry_stream {
             self.retry_pending_echo_records(&key, stream_id);
+            // A WINDOW_UPDATE after activation may unblock a deferred terminal
+            // that was held behind credit-bound records.
+            self.flush_pending_terminal(&key, stream_id);
         }
         // A peer FIN/RESET may have accounted for the final receive cursor.
         // Publish FORGET before rotation progress can enqueue QUIESCE.
@@ -10225,6 +10439,11 @@ impl RelayActor {
                     error = %error,
                 );
             }
+            // Safety net for frames held while the writer was frozen: once the
+            // carrier is writable again, flush any that a transiently full
+            // writer queue (or a recovery reactivation) could not emit at the
+            // activation/abort callback.  A no-op while still frozen.
+            self.flush_frozen_writes(&key);
             let rotation_due = self.session_for(&key).is_some_and(|session| {
                 session.profile.supports_rotation()
                     && session.data_tx.is_some()
@@ -10640,6 +10859,11 @@ impl RelayActor {
                 error = %error,
             );
         }
+        // A completed owner-side abort resumes the old carrier; flush any
+        // frames held while the writer was frozen.  A no-op unless the session
+        // is back to Active with a live carrier (e.g. active-loss recovery
+        // leaves data_tx cleared and is handled by the recovery path instead).
+        self.flush_frozen_writes(&key);
         if old_closed {
             self.finish_rotation_if_ready(&key);
         }
@@ -11975,6 +12199,7 @@ mod stream_identity_tests {
                     pending_record_bytes: 0,
                     budget_bytes: 0,
                     terminal: false,
+                    pending_terminal: None,
                     terminal_fin_failure: false,
                     open_pending: false,
                     registration_dropped: false,
@@ -12129,6 +12354,7 @@ mod stream_identity_tests {
                     pending_record_bytes: 0,
                     budget_bytes: 0,
                     terminal: false,
+                    pending_terminal: None,
                     terminal_fin_failure: false,
                     open_pending: false,
                     registration_dropped: false,
@@ -17731,6 +17957,10 @@ mod lifecycle_tests;
 #[cfg(test)]
 #[path = "actor_admission_race_tests.rs"]
 mod admission_race_tests;
+
+#[cfg(test)]
+#[path = "actor_rotation_freeze_tests.rs"]
+mod rotation_freeze_tests;
 
 #[cfg(test)]
 mod cleanup_tests {

@@ -1373,6 +1373,34 @@ mod tests {
         }
     }
 
+    fn continuous_traffic_evidence() -> m2_acceptance::ContinuousTrafficEvidence {
+        m2_acceptance::ContinuousTrafficEvidence {
+            rotations_required: 3,
+            rotations_observed: 3,
+            records_round_tripped: 900,
+            records_during_freeze: 12,
+            handover_phases_observed: [
+                "quiescing".to_owned(),
+                "draining".to_owned(),
+                "committing".to_owned(),
+                "retiring".to_owned(),
+            ]
+            .into_iter()
+            .collect(),
+            relay_emitted_delta: 900,
+            relay_received_delta: 900,
+            relay_last_emitted: 920,
+            relay_peer_acked: 920,
+            relay_recv_contiguous: 920,
+            relay_delivered_contiguous: 920,
+            client_emitted_sequences: 920,
+            client_received_sequences: 920,
+            total_replayed_frames: 0,
+            connector_terminal_phase_observed: false,
+            stray_response_observed: false,
+        }
+    }
+
     fn assert_rejected(result: Result<(), HarnessError>, expected_name: &str) {
         let message = result
             .as_ref()
@@ -1415,6 +1443,58 @@ mod tests {
         assert!(!message.contains(CREDENTIAL_SENTINEL));
         assert!(!message.contains("private-key-pem"));
         assert!(!message.contains("bearer-token"));
+    }
+
+    #[test]
+    fn m2_continuous_traffic_gate_requires_each_flag_and_bound() {
+        assert!(
+            m2_acceptance::require_m2_continuous_traffic_evidence(&continuous_traffic_evidence())
+                .is_ok()
+        );
+        macro_rules! assert_traffic_mutation {
+            ($field:ident = $value:expr, $flag:expr) => {{
+                let mut evidence = continuous_traffic_evidence();
+                evidence.$field = $value;
+                assert_rejected(
+                    m2_acceptance::require_m2_continuous_traffic_evidence(&evidence),
+                    $flag,
+                );
+            }};
+        }
+
+        assert_traffic_mutation!(
+            rotations_observed = 2,
+            "rotations_observed_at_least_required"
+        );
+        assert_traffic_mutation!(
+            rotations_required = 0,
+            "rotations_observed_at_least_required"
+        );
+        assert_traffic_mutation!(records_round_tripped = 0, "records_round_tripped_nonzero");
+        assert_traffic_mutation!(records_during_freeze = 0, "records_during_freeze_nonzero");
+        assert_traffic_mutation!(relay_emitted_delta = 899, "relay_emitted_contiguous");
+        assert_traffic_mutation!(relay_emitted_delta = 901, "relay_emitted_contiguous");
+        assert_traffic_mutation!(relay_received_delta = 899, "relay_received_contiguous");
+        assert_traffic_mutation!(relay_received_delta = 901, "relay_received_contiguous");
+        assert_traffic_mutation!(
+            relay_peer_acked = 919,
+            "relay_peer_acked_reaches_last_emitted"
+        );
+        assert_traffic_mutation!(
+            relay_delivered_contiguous = 919,
+            "relay_delivered_reaches_received"
+        );
+        assert_traffic_mutation!(
+            client_received_sequences = 919,
+            "client_relay_cursors_agree"
+        );
+        assert_traffic_mutation!(client_emitted_sequences = 921, "client_relay_cursors_agree");
+        assert_traffic_mutation!(total_replayed_frames = 1, "no_replayed_frames");
+        assert_traffic_mutation!(
+            connector_terminal_phase_observed = true,
+            "connector_never_terminal"
+        );
+        assert_traffic_mutation!(stray_response_observed = true, "no_stray_response");
     }
 
     #[test]

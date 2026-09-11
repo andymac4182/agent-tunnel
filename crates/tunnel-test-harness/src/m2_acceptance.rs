@@ -51,6 +51,14 @@ const CLIENT_QUEUE_LIMIT_BYTES: usize = 8 * 1024 * 1024;
 const RELAY_QUEUE_LIMIT_BYTES: usize = 4 * 1024 * 1024;
 const CLIENT_QUEUE_LIMIT_FRAMES: usize = 128;
 const RELAY_QUEUE_LIMIT_MESSAGES: usize = 128;
+// Pacing between continuous consumer records.  The relay observes its writer
+// barrier on a 500 ms maintenance tick, so every rotation keeps the relay
+// writer frozen long enough for several paced records to land inside the
+// quiesce/drain/commit window.
+const CONTINUOUS_TRAFFIC_PACING: Duration = Duration::from_millis(5);
+// After every request has received exactly one validated response, any
+// further record within this window is a duplicate adapter delivery.
+const STRAY_RESPONSE_WINDOW: Duration = Duration::from_millis(250);
 
 type ConsumerSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -367,45 +375,93 @@ async fn run_connected_scenario(context: ConnectedScenario<'_>) -> Result<()> {
         .await
         .map_err(|error| stage_error("faults", error));
     }
-    let mut generation = first.relay.active_generation;
-
-    // Send a record only after each observed generation commits.  This makes
-    // every handover carry application traffic and catches a stream that is
-    // accidentally recreated or replayed on the replacement socket.
-    for index in 1..=plan.rotations {
-        let observed = wait_for_next_generation(NextGenerationWait {
-            harness,
-            handle,
-            device_id,
-            session_id,
-            stream,
-            evidence: &mut evidence,
-            previous_generation: generation,
-            budget: plan.clean_rotation_wait(),
-        })
+    // Keep consumer traffic flowing continuously across every handover.  At
+    // least one record is written while the relay writer is quiesced,
+    // draining or committing in each rotation, so the immutable fence and
+    // frozen-writer contract is exercised by real sockets rather than only by
+    // post-commit probes.  The strict validator below proves contiguous
+    // per-stream sequences, no duplicate delivery, no counter reset and no
+    // drain rejection across the whole stage.
+    let baseline = wait_for_quiet_snapshot(
+        harness,
+        handle,
+        device_id,
+        session_id,
+        stream_id_hint(stream),
+        Duration::from_secs(10),
+        true,
+    )
+    .await
+    .map_err(|error| stage_error("continuous baseline", error))?;
+    let mut traffic = run_continuous_traffic_rotations(ContinuousTraffic {
+        harness,
+        handle,
+        stream,
+        device_id,
+        session_id,
+        canary,
+        evidence: &mut evidence,
+        baseline: &baseline,
+        plan: &plan,
+    })
+    .await?;
+    let settled = wait_for_quiet_snapshot(
+        harness,
+        handle,
+        device_id,
+        session_id,
+        stream_id_hint(stream),
+        Duration::from_secs(10),
+        true,
+    )
+    .await
+    .map_err(|error| stage_error("continuous settle", error))?;
+    evidence
+        .observe(&settled, session_id, stream)
+        .map_err(|error| stage_error("continuous settle evidence", error))?;
+    traffic.relay_emitted_delta = settled
+        .stream
+        .last_emitted_relay_to_connector
+        .saturating_sub(baseline.stream.last_emitted_relay_to_connector);
+    traffic.relay_received_delta = settled
+        .stream
+        .recv_contiguous_connector_to_relay
+        .saturating_sub(baseline.stream.recv_contiguous_connector_to_relay);
+    traffic.relay_last_emitted = settled.stream.last_emitted_relay_to_connector;
+    traffic.relay_peer_acked = settled.stream.peer_acked_relay_to_connector;
+    traffic.relay_recv_contiguous = settled.stream.recv_contiguous_connector_to_relay;
+    traffic.relay_delivered_contiguous = settled.stream.delivered_contiguous_connector_to_relay;
+    traffic.client_emitted_sequences = settled.client.emitted_sequences;
+    traffic.client_received_sequences = settled.client.received_sequences;
+    traffic.total_replayed_frames = settled.relay.total_replayed_frames;
+    traffic.stray_response_observed = stream
+        .observe_stray_response(STRAY_RESPONSE_WINDOW)
         .await
-        .map_err(|error| stage_error(&format!("rotation {index} generation"), error))?;
-        generation = observed.relay.active_generation;
-        let payload = record_payload(index);
-        stream
-            .round_trip(&payload, canary)
-            .await
-            .map_err(|error| stage_error(&format!("rotation {index} echo"), error))?;
-        let after = wait_for_quiet_snapshot(
-            harness,
-            handle,
-            device_id,
-            session_id,
-            stream_id_hint(stream),
-            Duration::from_secs(10),
-            true,
-        )
-        .await
-        .map_err(|error| stage_error(&format!("rotation {index} snapshot"), error))?;
-        evidence
-            .observe(&after, session_id, stream)
-            .map_err(|error| stage_error(&format!("rotation {index} evidence"), error))?;
-    }
+        .map_err(|error| stage_error("continuous stray-response window", error))?;
+    require_m2_continuous_traffic_evidence(&traffic)
+        .map_err(|error| stage_error("continuous traffic", error))?;
+    tracing::info!(
+        target: "tunnel_test_harness::m2",
+        plan = plan.name,
+        rotations_observed = traffic.rotations_observed,
+        records_round_tripped = traffic.records_round_tripped,
+        records_during_freeze = traffic.records_during_freeze,
+        handover_phases = ?traffic.handover_phases_observed,
+        relay_last_emitted = traffic.relay_last_emitted,
+        relay_recv_contiguous = traffic.relay_recv_contiguous,
+        "M2 continuous traffic evidence"
+    );
+    println!(
+        "M2 continuous traffic passed: plan={} rotations={} records={} records_during_freeze={} handover_phases={:?} relay_emitted_delta={} relay_received_delta={} replayed_frames={}",
+        plan.name,
+        traffic.rotations_observed,
+        traffic.records_round_tripped,
+        traffic.records_during_freeze,
+        traffic.handover_phases_observed,
+        traffic.relay_emitted_delta,
+        traffic.relay_received_delta,
+        traffic.total_replayed_frames,
+    );
 
     let final_status = handle.status_snapshot();
     if final_status.rotations_completed < plan.rotations {
@@ -514,6 +570,189 @@ async fn run_connected_scenario(context: ConnectedScenario<'_>) -> Result<()> {
     .await
     .map_err(|error| stage_error("consumer authorization", error))?;
     Ok(())
+}
+
+/// Payload-free evidence for the continuous-traffic rotation stage.  Counts
+/// and cursors come from the redacted relay/client snapshots and the
+/// harness's own record accounting; no record body is retained.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ContinuousTrafficEvidence {
+    pub rotations_required: u64,
+    pub rotations_observed: u64,
+    pub records_round_tripped: u64,
+    /// Records written while the relay reported `quiescing`, `draining` or
+    /// `committing`, i.e. while its old writer had to be frozen.
+    pub records_during_freeze: u64,
+    pub handover_phases_observed: BTreeSet<String>,
+    pub relay_emitted_delta: u64,
+    pub relay_received_delta: u64,
+    pub relay_last_emitted: u64,
+    pub relay_peer_acked: u64,
+    pub relay_recv_contiguous: u64,
+    pub relay_delivered_contiguous: u64,
+    pub client_emitted_sequences: u64,
+    pub client_received_sequences: u64,
+    pub total_replayed_frames: u64,
+    pub connector_terminal_phase_observed: bool,
+    pub stray_response_observed: bool,
+}
+
+/// Every mandatory continuous-traffic condition.  A false flag or a count
+/// below its bound fails the command with a bounded, payload-free diagnostic
+/// naming each failed condition.
+pub fn require_m2_continuous_traffic_evidence(evidence: &ContinuousTrafficEvidence) -> Result<()> {
+    let checks = [
+        (
+            "rotations_observed_at_least_required",
+            evidence.rotations_required > 0
+                && evidence.rotations_observed >= evidence.rotations_required,
+        ),
+        (
+            "records_round_tripped_nonzero",
+            evidence.records_round_tripped > 0,
+        ),
+        (
+            "records_during_freeze_nonzero",
+            evidence.records_during_freeze > 0,
+        ),
+        (
+            "relay_emitted_contiguous",
+            evidence.relay_emitted_delta == evidence.records_round_tripped,
+        ),
+        (
+            "relay_received_contiguous",
+            evidence.relay_received_delta == evidence.records_round_tripped,
+        ),
+        (
+            "relay_peer_acked_reaches_last_emitted",
+            evidence.relay_peer_acked == evidence.relay_last_emitted,
+        ),
+        (
+            "relay_delivered_reaches_received",
+            evidence.relay_delivered_contiguous == evidence.relay_recv_contiguous,
+        ),
+        (
+            "client_relay_cursors_agree",
+            evidence.client_received_sequences == evidence.relay_last_emitted
+                && evidence.client_emitted_sequences == evidence.relay_recv_contiguous,
+        ),
+        ("no_replayed_frames", evidence.total_replayed_frames == 0),
+        (
+            "connector_never_terminal",
+            !evidence.connector_terminal_phase_observed,
+        ),
+        ("no_stray_response", !evidence.stray_response_observed),
+    ];
+    let failed = checks
+        .iter()
+        .filter_map(|(name, passed)| (!*passed).then_some(*name))
+        .collect::<Vec<_>>();
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(HarnessError::Process(format!(
+            "M2 continuous traffic returned incomplete acceptance evidence: {}",
+            failed.join(", ")
+        )))
+    }
+}
+
+struct ContinuousTraffic<'a> {
+    harness: &'a RunningHarness,
+    handle: &'a ConnectionHandle,
+    stream: &'a mut ConsumerStream,
+    device_id: Uuid,
+    session_id: &'a str,
+    canary: &'a [u8],
+    evidence: &'a mut RotationEvidence,
+    baseline: &'a StreamSnapshot,
+    plan: &'a RunPlan,
+}
+
+/// Round-trip paced records without pause until the required number of
+/// clean generation advances has been observed.  The relay phase is sampled
+/// immediately before each write so a record can be attributed to the frozen
+/// window it entered; each response is validated byte-for-byte in order, so a
+/// lost, duplicated or reordered delivery fails at the record that exposed
+/// it.  Sequence cursors are filled in by the caller from the settled
+/// snapshot.
+async fn run_continuous_traffic_rotations(
+    context: ContinuousTraffic<'_>,
+) -> Result<ContinuousTrafficEvidence> {
+    let ContinuousTraffic {
+        harness,
+        handle,
+        stream,
+        device_id,
+        session_id,
+        canary,
+        evidence,
+        baseline,
+        plan,
+    } = context;
+    let mut traffic = ContinuousTrafficEvidence {
+        rotations_required: plan.rotations,
+        ..ContinuousTrafficEvidence::default()
+    };
+    let mut generation = baseline.relay.active_generation;
+    let mut record_index = 0_u64;
+    let rotation_budget = plan.clean_rotation_wait();
+    let mut last_rotation = Instant::now();
+    while traffic.rotations_observed < plan.rotations {
+        let sampled = wait_for_stream_snapshot(
+            harness,
+            handle,
+            device_id,
+            session_id,
+            stream.stream_id_hint(),
+            SNAPSHOT_POLL,
+        )
+        .await
+        .map_err(|error| stage_error("continuous snapshot", error))?;
+        evidence
+            .observe(&sampled, session_id, stream)
+            .map_err(|error| stage_error("continuous evidence", error))?;
+        if matches!(sampled.client.phase.as_str(), "closed" | "failed") {
+            traffic.connector_terminal_phase_observed = true;
+            return Err(HarnessError::Process(format!(
+                "M2 connector reached terminal phase {} during continuous traffic after {} records ({} during freeze)",
+                sampled.client.phase, traffic.records_round_tripped, traffic.records_during_freeze
+            )));
+        }
+        let phase = sampled.relay.phase.clone();
+        let frozen_phase = matches!(phase.as_str(), "quiescing" | "draining" | "committing");
+        if phase != "active" {
+            traffic.handover_phases_observed.insert(phase.clone());
+        }
+        let payload = record_payload(record_index);
+        stream.round_trip(&payload, canary).await.map_err(|error| {
+            stage_error(
+                &format!("continuous record {record_index} written in relay phase {phase}"),
+                error,
+            )
+        })?;
+        record_index = record_index.saturating_add(1);
+        traffic.records_round_tripped = traffic.records_round_tripped.saturating_add(1);
+        if frozen_phase {
+            traffic.records_during_freeze = traffic.records_during_freeze.saturating_add(1);
+        }
+        if sampled.relay.active_generation > generation
+            && sampled.relay.candidate_generation.is_none()
+            && sampled.relay.sockets <= 2
+        {
+            generation = sampled.relay.active_generation;
+            traffic.rotations_observed = traffic.rotations_observed.saturating_add(1);
+            last_rotation = Instant::now();
+        }
+        if last_rotation.elapsed() >= rotation_budget {
+            return Err(HarnessError::Timeout(format!(
+                "M2 data generation did not advance beyond {generation} while continuous traffic flowed ({} records)",
+                traffic.records_round_tripped
+            )));
+        }
+        sleep(CONTINUOUS_TRAFFIC_PACING).await;
+    }
+    Ok(traffic)
 }
 
 fn stage_error(stage: &str, error: HarnessError) -> HarnessError {
@@ -2029,61 +2268,6 @@ async fn wait_for_stream_snapshot(
     }
 }
 
-struct NextGenerationWait<'a> {
-    harness: &'a RunningHarness,
-    handle: &'a ConnectionHandle,
-    device_id: Uuid,
-    session_id: &'a str,
-    stream: &'a ConsumerStream,
-    evidence: &'a mut RotationEvidence,
-    previous_generation: u64,
-    budget: Duration,
-}
-
-async fn wait_for_next_generation(context: NextGenerationWait<'_>) -> Result<StreamSnapshot> {
-    let NextGenerationWait {
-        harness,
-        handle,
-        device_id,
-        session_id,
-        stream,
-        evidence,
-        previous_generation,
-        budget,
-    } = context;
-    let started = Instant::now();
-    loop {
-        let snapshot = wait_for_stream_snapshot(
-            harness,
-            handle,
-            device_id,
-            session_id,
-            stream.stream_id_hint(),
-            SNAPSHOT_POLL,
-        )
-        .await;
-        match snapshot {
-            Ok(snapshot) => {
-                evidence.observe(&snapshot, session_id, stream)?;
-                if snapshot.relay.active_generation > previous_generation
-                    && snapshot.relay.candidate_generation.is_none()
-                    && snapshot.relay.sockets <= 2
-                {
-                    return Ok(snapshot);
-                }
-            }
-            Err(HarnessError::Timeout(_)) => {}
-            Err(error) => return Err(error),
-        }
-        if started.elapsed() >= budget {
-            return Err(HarnessError::Timeout(format!(
-                "M2 data generation did not advance beyond {previous_generation}"
-            )));
-        }
-        sleep(SNAPSHOT_POLL).await;
-    }
-}
-
 async fn wait_for_quiet_snapshot(
     harness: &RunningHarness,
     handle: &ConnectionHandle,
@@ -2212,6 +2396,54 @@ impl ConsumerStream {
         .await
         .map_err(|_| HarnessError::Timeout("M2 echo record response timed out".to_owned()))??;
         Ok(bytes)
+    }
+
+    /// Return true when an unsolicited binary record arrives within `window`.
+    /// Every request has already received exactly one validated response, so
+    /// any further record is a duplicate adapter delivery or a replay.  The
+    /// window is bounded; silence is the expected outcome.
+    async fn observe_stray_response(&mut self, window: Duration) -> Result<bool> {
+        let deadline = Instant::now() + window;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(false);
+            }
+            match timeout(remaining, self.socket.next()).await {
+                Err(_) => return Ok(false),
+                Ok(Some(Ok(Message::Binary(_)))) => return Ok(true),
+                Ok(Some(Ok(Message::Ping(bytes)))) => {
+                    self.socket
+                        .send(Message::Pong(bytes))
+                        .await
+                        .map_err(|error| {
+                            HarnessError::Http(format!("replying to M2 ping: {error}"))
+                        })?;
+                }
+                Ok(Some(Ok(Message::Pong(_)))) | Ok(Some(Ok(Message::Frame(_)))) => {}
+                Ok(Some(Ok(Message::Text(_)))) => {
+                    return Err(HarnessError::Http(
+                        "M2 consumer stream returned a text message".to_owned(),
+                    ));
+                }
+                Ok(Some(Ok(Message::Close(_)))) => {
+                    self.peer_close_received = true;
+                    return Err(HarnessError::Http(
+                        "M2 consumer stream closed while checking for stray responses".to_owned(),
+                    ));
+                }
+                Ok(None) => {
+                    return Err(HarnessError::Http(
+                        "M2 consumer stream ended while checking for stray responses".to_owned(),
+                    ));
+                }
+                Ok(Some(Err(error))) => {
+                    return Err(HarnessError::Http(format!(
+                        "reading M2 stray-response window: {error}"
+                    )));
+                }
+            }
+        }
     }
 
     fn validate_response(&self, response: &[u8], canary: &[u8], payload: &[u8]) -> Result<()> {
