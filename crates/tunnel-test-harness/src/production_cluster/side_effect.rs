@@ -44,11 +44,16 @@ const PROTOCOL_MAJOR: u16 = 1;
 const PROTOCOL_MINOR: u16 = 0;
 const DEVICE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const DEVICE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
-// The forwarded consumer envelope carries a maximum 20-second admission
-// budget.  The production fixture's peer transport idle timeout is 10
-// seconds, so the envelope budget is the controlling bound here.  Keep this
-// as one bounded observation window; an observer deadline is evidence of an
-// unresolved outcome, not an interruption result.
+// Consumer-interruption observation window.  The forwarded consumer envelope
+// carries a maximum 20-second admission budget (`MAX_ADMISSION_REMAINING_MS`).
+// The production fixture's effective peer transport idle timeout is 10 seconds
+// (`production_cluster::start_relay` builds the peer limits with
+// `with_timeouts(Duration::from_secs(10), ..)`; `ClusterConfig::
+// peer_idle_timeout_seconds` is membership-only and does not drive the QUIC
+// transport), so the blackholed owner->ingress path interrupts the consumer no
+// later than that idle timeout, well inside this window.  Keep this as one
+// bounded window; an observer deadline is an unresolved outcome, not an
+// interruption result.
 const FAILURE_OBSERVATION_TIMEOUT: Duration =
     Duration::from_millis(tunnel_cluster::envelope::MAX_ADMISSION_REMAINING_MS as u64);
 const POST_FAILURE_OBSERVATION: Duration = Duration::from_millis(500);
