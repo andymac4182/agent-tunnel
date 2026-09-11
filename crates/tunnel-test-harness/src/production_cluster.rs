@@ -5344,6 +5344,32 @@ async fn open_consumer_stream(
     device_id: Uuid,
     service_id: Uuid,
 ) -> std::result::Result<ConsumerStream, StreamConnectFailure> {
+    open_consumer_stream_target(
+        consumer_addr,
+        server_ca_der,
+        token,
+        device_id,
+        &service_id.to_string(),
+    )
+    .await
+}
+
+/// Open the public stream route with a raw service path segment, which may be
+/// a service-type label rather than an identifier.  Used to prove the stream
+/// upgrade resolves labels through the same fail-closed path as the echo
+/// route.
+async fn open_consumer_stream_target(
+    consumer_addr: SocketAddr,
+    server_ca_der: &[u8],
+    token: &str,
+    device_id: Uuid,
+    service: &str,
+) -> std::result::Result<ConsumerStream, StreamConnectFailure> {
+    if service.is_empty() || service.len() > 128 || service.contains(['/', '?', '#']) {
+        return Err(StreamConnectFailure::Harness(HarnessError::InvalidInput(
+            "consumer stream service segment is outside its bound".into(),
+        )));
+    }
     let mut roots = rustls::RootCertStore::empty();
     roots
         .add(CertificateDer::from(server_ca_der.to_vec()))
@@ -5360,7 +5386,7 @@ async fn open_consumer_stream(
     .with_root_certificates(roots)
     .with_no_client_auth();
     let url = format!(
-        "wss://localhost:{}/v1/devices/{device_id}/services/{service_id}/stream",
+        "wss://localhost:{}/v1/devices/{device_id}/services/{service}/stream",
         consumer_addr.port()
     );
     let mut request = url.into_client_request().map_err(|error| {

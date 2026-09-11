@@ -439,7 +439,10 @@ use crate::{
         device_authentication_context, forwarded_consumer_bearer,
     },
     peer_transport_diagnostics::{PeerTransportDiagnosticOutcome, PeerTransportDiagnosticRole},
-    routing::{OwnerRoute, OwnerRoutingError, OwnerScope},
+    routing::{
+        OwnerRoute, OwnerRoutingError, OwnerScope, ServiceResolutionError, ServiceTarget,
+        resolve_echo_service,
+    },
     runtime::StreamTerminalCause,
     wire::{self, MAX_BODY_BYTES, MAX_CONTROL_BYTES},
 };
@@ -711,6 +714,10 @@ pub(crate) fn consumer_router_with_peer_and_barriers(
             "/v1/devices/{device}/services/{service}/stream",
             get(echo_stream),
         )
+        // A known path with an unserved method is a typed not-dispatched
+        // rejection, so a GET/HEAD/OPTIONS shape at the POST-only echo route
+        // is proven never to select, reselect or dispatch to an owner.
+        .method_not_allowed_fallback(method_not_allowed)
         .with_state(state)
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES))
 }
@@ -1845,58 +1852,11 @@ async fn service_and_grant(
                 "not_dispatched",
             )
         })?;
-    let service_id = match service.parse::<Uuid>().ok().or_else(|| {
-        device
-            .services
-            .iter()
-            .find(|candidate| {
-                candidate.service_type == crate::ECHO_SERVICE_TYPE
-                    && candidate.service_id.to_string() == service
-            })
-            .map(|candidate| candidate.service_id)
-    }) {
-        Some(service_id) => service_id,
-        None => {
-            // A service-type label is not an identifier. When more than one
-            // active service of the requested type exists the target is
-            // ambiguous: resolve nothing and return the explicit bounded
-            // outcome instead of silently selecting the first match.
-            let mut matched = device
-                .services
-                .iter()
-                .filter(|candidate| candidate.service_type == service && candidate.active)
-                .map(|candidate| candidate.service_id);
-            let Some(first) = matched.next() else {
-                return Err(error_response(
-                    StatusCode::NOT_FOUND,
-                    "SERVICE_NOT_FOUND",
-                    "not found",
-                    "not_dispatched",
-                ));
-            };
-            if matched.next().is_some() {
-                return Err(error_response(
-                    StatusCode::CONFLICT,
-                    "SERVICE_AMBIGUOUS",
-                    "service label matches more than one active service",
-                    "not_dispatched",
-                ));
-            }
-            first
-        }
-    };
-    if !device.services.iter().any(|candidate| {
-        candidate.service_id == service_id
-            && candidate.service_type == crate::ECHO_SERVICE_TYPE
-            && candidate.active
-    }) {
-        return Err(error_response(
-            StatusCode::NOT_FOUND,
-            "SERVICE_NOT_FOUND",
-            "not found",
-            "not_dispatched",
-        ));
-    }
+    // The shared resolver decides identifier-versus-label, existence and
+    // ambiguity for every path; this route only maps its typed outcome onto
+    // the public response and never selects a first match itself.
+    let service_id = resolve_echo_service(&device.services, ServiceTarget::parse(service))
+        .map_err(service_resolution_response)?;
     let read_started = Utc::now();
     let grant = catalog
         .authorize(consumer, device_id, service_id, read_started, Utc::now())
@@ -2521,18 +2481,20 @@ async fn owner_stream_grant(
         .list_devices_filtered(consumer, &DeviceListFilter::default(), Utc::now())
         .await
         .map_err(|_| PeerRuntimeError::Membership("device catalog unavailable".to_owned()))?;
-    let Some(_device) = devices.into_iter().find(|device| {
-        device.device_id == device_id
-            && device.services.iter().any(|service| {
-                service.service_id == service_id
-                    && service.service_type == crate::ECHO_SERVICE_TYPE
-                    && service.active
-            })
-    }) else {
+    let Some(device) = devices
+        .into_iter()
+        .find(|device| device.device_id == device_id)
+    else {
         return Err(PeerRuntimeError::Membership(
             "service is not available".to_owned(),
         ));
     };
+    // The owner repeats the ingress decision through the same resolver.  The
+    // envelope carries an identifier, never a label, so a duplicate label
+    // cannot reach dispatch here either: an ambiguous or missing target is
+    // refused before any stream is opened.
+    let service_id = resolve_echo_service(&device.services, ServiceTarget::Id(service_id))
+        .map_err(|error| PeerRuntimeError::Membership(error.to_string()))?;
     let grant = catalog
         .authorize(consumer, device_id, service_id, Utc::now(), Utc::now())
         .await
@@ -3461,6 +3423,41 @@ struct ErrorBody<'a> {
     retry_after_ms: Option<u64>,
 }
 
+/// The single public mapping of a shared service-resolution outcome.  Every
+/// consumer route that names a service reports the same code for the same
+/// decision, so a duplicate label is `409 SERVICE_AMBIGUOUS` on the echo route
+/// and on the stream upgrade alike.
+fn service_resolution_response(error: ServiceResolutionError) -> Response {
+    match error {
+        ServiceResolutionError::NotFound => error_response(
+            StatusCode::NOT_FOUND,
+            "SERVICE_NOT_FOUND",
+            "not found",
+            "not_dispatched",
+        ),
+        ServiceResolutionError::Ambiguous => error_response(
+            StatusCode::CONFLICT,
+            "SERVICE_AMBIGUOUS",
+            "service label matches more than one active service",
+            "not_dispatched",
+        ),
+    }
+}
+
+/// A known public path reached with a method it does not serve.  The relay
+/// performs no automatic reselection on any method, so a GET, HEAD or OPTIONS
+/// shaped request at the POST-only echo route ends here with a typed
+/// `not_dispatched` outcome before authentication, owner selection or any
+/// body read.
+async fn method_not_allowed() -> Response {
+    error_response(
+        StatusCode::METHOD_NOT_ALLOWED,
+        "METHOD_NOT_ALLOWED",
+        "method is not served on this route",
+        "not_dispatched",
+    )
+}
+
 fn error_response(
     status: StatusCode,
     code: &'static str,
@@ -3484,12 +3481,13 @@ fn error_response(
 mod tests {
     use super::{
         ConsumerUpgradeBarrier, PeerAdmissionBarrier, PeerAdmissionBarrierError,
-        PeerAdmissionScope, forwarded_bearer_token, is_no_live_owner, owner_busy_close,
-        peer_consumer_diagnostic_outcome, peer_failure_response, stream_limit_response,
+        PeerAdmissionScope, forwarded_bearer_token, is_no_live_owner, method_not_allowed,
+        owner_busy_close, peer_consumer_diagnostic_outcome, peer_failure_response,
+        service_resolution_response, stream_limit_response,
     };
     use crate::{
         peer_runtime::PeerRuntimeError,
-        routing::{OwnerRoutingError, OwnerScope},
+        routing::{OwnerRoutingError, OwnerScope, ServiceResolutionError},
     };
     use axum::{
         extract::ws::Message,
@@ -3727,6 +3725,46 @@ mod tests {
         assert_eq!(capacity_body["code"], "STREAM_LIMIT");
         assert_eq!(capacity_body["execution"], "not_dispatched");
         assert_eq!(capacity_body["retryable"], true);
+    }
+
+    #[tokio::test]
+    async fn shared_service_resolution_outcomes_map_to_one_public_code_each() {
+        // M7-C47: the ambiguous and missing outcomes have exactly one public
+        // envelope, so every route that uses the shared resolver reports the
+        // same code for the same decision.
+        let ambiguous = service_resolution_response(ServiceResolutionError::Ambiguous);
+        assert_eq!(ambiguous.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(ambiguous.into_body(), 1024)
+            .await
+            .expect("bounded ambiguous body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("ambiguous JSON");
+        assert_eq!(body["code"], "SERVICE_AMBIGUOUS");
+        assert_eq!(body["execution"], "not_dispatched");
+        assert!(body.get("retryable").is_none());
+
+        let missing = service_resolution_response(ServiceResolutionError::NotFound);
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(missing.into_body(), 1024)
+            .await
+            .expect("bounded not-found body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("not-found JSON");
+        assert_eq!(body["code"], "SERVICE_NOT_FOUND");
+        assert_eq!(body["execution"], "not_dispatched");
+    }
+
+    #[tokio::test]
+    async fn unserved_method_on_a_known_route_is_a_typed_not_dispatched_rejection() {
+        // M7-C46: the relay never reselects on any method; a safe method shape
+        // at the POST-only echo route ends here with a typed envelope.
+        let response = method_not_allowed().await;
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .expect("bounded method body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("method JSON");
+        assert_eq!(body["code"], "METHOD_NOT_ALLOWED");
+        assert_eq!(body["execution"], "not_dispatched");
+        assert!(body.get("retryable").is_none());
     }
 
     #[test]

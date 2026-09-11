@@ -19,10 +19,8 @@ use std::{
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use tokio::sync::Mutex;
-use tunnel_catalog::{Catalog, CatalogError, OwnerClaim, OwnerToken, SharedCatalog};
-use tunnel_cluster::{
-    envelope::REQUIRED_HOP_BUDGET, error::ClusterError, membership::VerifiedPeerBinding,
-};
+use tunnel_catalog::{Catalog, CatalogError, OwnerClaim, OwnerToken, ServiceRecord, SharedCatalog};
+use tunnel_cluster::{envelope::REQUIRED_HOP_BUDGET, membership::VerifiedPeerBinding};
 use uuid::Uuid;
 
 /// The maximum time a route observation may be reused.
@@ -168,58 +166,92 @@ impl OwnerRoute {
     }
 }
 
-/// A single admission retry budget for one request.
+/// How a consumer named the target service on one device.
 ///
-/// The underlying [`ClusterError`] is the canonical policy source.  Its
-/// `can_retry_admission` method already requires an authenticated request, an
-/// admission-class error, `NotDispatched` certainty, and the `AdmissionOnce`
-/// hint.  This wrapper adds the per-request state that prevents two such
-/// errors from producing two retries.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct AdmissionRetryBudget {
-    consumed: bool,
-    sealed: bool,
-}
-
-impl AdmissionRetryBudget {
-    #[must_use]
-    pub const fn new() -> Self {
-        Self {
-            consumed: false,
-            sealed: false,
-        }
-    }
-
-    #[must_use]
-    pub const fn consumed(self) -> bool {
-        self.consumed
-    }
-
-    /// Decide whether this error authorises the one bounded admission retry.
-    ///
-    /// A dispatched or unknown operation, an unauthenticated error, and a
-    /// second retry request all return [`AdmissionRetryDecision::DoNotRetry`].
-    pub fn decide(&mut self, error: &ClusterError) -> AdmissionRetryDecision {
-        if self.sealed {
-            return AdmissionRetryDecision::DoNotRetry;
-        }
-        // A request gets exactly one admission decision.  Sealing before
-        // examining the error prevents a later contradictory error from
-        // turning a dispatched/unknown attempt into a replay.
-        self.sealed = true;
-        if !error.can_retry_admission() {
-            return AdmissionRetryDecision::DoNotRetry;
-        }
-        self.consumed = true;
-        AdmissionRetryDecision::RetryAdmission
-    }
-}
-
-/// The pure result of applying an [`AdmissionRetryBudget`] to an error.
+/// A UUID is an identifier and resolves exactly.  Anything else is a
+/// service-type label, which is a description rather than an identity: it may
+/// match zero, one, or several active services.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AdmissionRetryDecision {
-    RetryAdmission,
-    DoNotRetry,
+pub enum ServiceTarget<'a> {
+    Id(Uuid),
+    Label(&'a str),
+}
+
+impl<'a> ServiceTarget<'a> {
+    /// Classify one raw path segment.  Parsing is the only difference between
+    /// the two forms; no route may decide this independently.
+    #[must_use]
+    pub fn parse(raw: &'a str) -> Self {
+        raw.parse::<Uuid>().map_or(Self::Label(raw), Self::Id)
+    }
+}
+
+/// Why a service target did not resolve to exactly one active echo service.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ServiceResolutionError {
+    /// No active echo service matches the identifier or label.
+    NotFound,
+    /// A label matches more than one active service.  This is an explicit
+    /// bounded outcome; the relay never selects the first match.
+    Ambiguous,
+}
+
+impl fmt::Display for ServiceResolutionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotFound => formatter.write_str("service is not an active echo service"),
+            Self::Ambiguous => {
+                formatter.write_str("service label matches more than one active service")
+            }
+        }
+    }
+}
+
+impl Error for ServiceResolutionError {}
+
+/// Resolve one service target against a device's catalog services.
+///
+/// This is the only place that maps a consumer-supplied service segment or a
+/// peer-forwarded service identifier onto a service the relay may dispatch
+/// to.  Every public route and the owner-side peer ingress go through it so
+/// the ambiguity and existence rules cannot drift between paths.
+///
+/// Rules:
+/// - an identifier resolves only to that exact service, and only when it is
+///   an active echo service;
+/// - a label resolves only when exactly one active service carries that
+///   service type, and that type is the echo export;
+/// - a label matching several active services is
+///   [`ServiceResolutionError::Ambiguous`] even when every candidate would be
+///   authorized.
+pub fn resolve_echo_service(
+    services: &[ServiceRecord],
+    target: ServiceTarget<'_>,
+) -> Result<Uuid, ServiceResolutionError> {
+    let service_id = match target {
+        ServiceTarget::Id(service_id) => service_id,
+        ServiceTarget::Label(label) => {
+            let mut matched = services
+                .iter()
+                .filter(|candidate| candidate.active && candidate.service_type == label)
+                .map(|candidate| candidate.service_id);
+            let first = matched.next().ok_or(ServiceResolutionError::NotFound)?;
+            if matched.next().is_some() {
+                return Err(ServiceResolutionError::Ambiguous);
+            }
+            first
+        }
+    };
+    let dispatchable = services.iter().any(|candidate| {
+        candidate.service_id == service_id
+            && candidate.active
+            && candidate.service_type == crate::ECHO_SERVICE_TYPE
+    });
+    if dispatchable {
+        Ok(service_id)
+    } else {
+        Err(ServiceResolutionError::NotFound)
+    }
 }
 
 /// Configuration failures for the local routing policy.
@@ -250,7 +282,6 @@ pub enum OwnerRoutingError {
     MalformedOwner,
     DestinationTrustExpired,
     DestinationMismatch,
-    AdmissionRetryDenied,
 }
 
 impl fmt::Display for OwnerRoutingError {
@@ -267,7 +298,6 @@ impl fmt::Display for OwnerRoutingError {
             Self::DestinationMismatch => {
                 formatter.write_str("verified destination does not match owner token")
             }
-            Self::AdmissionRetryDenied => formatter.write_str("admission retry is not permitted"),
         }
     }
 }
@@ -419,24 +449,6 @@ where
                 .await;
         }
         Ok(route)
-    }
-
-    /// Re-read the authoritative owner after an authenticated owner-admission
-    /// failure.  This consumes the one retry budget and invalidates the stale
-    /// route first; it never retries a dispatched or ambiguous operation.
-    pub async fn resolve_after_admission_failure(
-        &self,
-        scope: OwnerScope,
-        now: DateTime<Utc>,
-        destination: Option<&VerifiedPeerBinding>,
-        budget: &mut AdmissionRetryBudget,
-        error: &ClusterError,
-    ) -> Result<OwnerRoute, OwnerRoutingError> {
-        if budget.decide(error) != AdmissionRetryDecision::RetryAdmission {
-            return Err(OwnerRoutingError::AdmissionRetryDenied);
-        }
-        self.invalidate(scope).await;
-        self.resolve(scope, now, destination).await
     }
 
     /// Drop one cached route.  This is used after a peer returns an
@@ -640,7 +652,6 @@ fn bounded_cache_lifetime(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use tunnel_cluster::error::{ErrorScope, ExecutionCertainty, InternalErrorCode, RetryHint};
 
     fn identity() -> RelayIdentity {
         RelayIdentity::new("inc-1", "node-a", "boot-a").expect("identity")
@@ -964,193 +975,87 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn admission_reselection_invalidates_stale_route_once() {
-        let now = Utc::now();
-        let scope = OwnerScope::new(Uuid::from_u128(1), Uuid::from_u128(2));
-        let directory = Arc::new(TestDirectory::new(owner_with_epoch(
-            "node-a",
-            "boot-a",
-            1,
-            now + ChronoDuration::seconds(30),
-        )));
-        let router =
-            OwnerRouter::with_cache_ttl(directory.clone(), identity(), Duration::from_secs(5))
-                .expect("cache policy");
-        let first = router.resolve(scope, now, None).await.expect("first route");
-        assert_eq!(first.owner_token().epoch, 1);
-
-        directory.set_owner(Some(owner_with_epoch(
-            "node-b",
-            "boot-b",
-            2,
-            now + ChronoDuration::seconds(30),
-        )));
-        let error = ClusterError::new(
-            InternalErrorCode::OwnerChanged,
-            ErrorScope::default(),
-            "request-1",
-            None,
-            ExecutionCertainty::NotDispatched,
-            RetryHint::AdmissionOnce,
-            true,
-        );
-        let mut budget = AdmissionRetryBudget::new();
-        let replacement = router
-            .resolve_after_admission_failure(scope, now, None, &mut budget, &error)
-            .await
-            .expect("one bounded reselection");
-        assert_eq!(replacement.owner_token().epoch, 2);
-        assert_eq!(replacement.node_id(), "node-b");
-        assert!(budget.consumed());
-        assert_eq!(directory.lookups(), 2);
-
-        assert_eq!(
-            router
-                .resolve_after_admission_failure(scope, now, None, &mut budget, &error)
-                .await
-                .expect_err("second reselection is forbidden")
-                .to_string(),
-            "admission retry is not permitted"
-        );
-        assert_eq!(directory.lookups(), 2);
-    }
-
-    #[tokio::test]
-    async fn postdispatch_or_ambiguous_failure_keeps_cached_route() {
-        let now = Utc::now();
-        let scope = OwnerScope::new(Uuid::from_u128(1), Uuid::from_u128(2));
-        let directory = Arc::new(TestDirectory::new(owner(
-            "node-a",
-            "boot-a",
-            now + ChronoDuration::seconds(30),
-        )));
-        let router =
-            OwnerRouter::with_cache_ttl(directory.clone(), identity(), Duration::from_secs(5))
-                .expect("cache policy");
-        let _ = router.resolve(scope, now, None).await.expect("route");
-        directory.set_owner(Some(owner_with_epoch(
-            "node-b",
-            "boot-b",
-            2,
-            now + ChronoDuration::seconds(30),
-        )));
-
-        for certainty in [ExecutionCertainty::Dispatched, ExecutionCertainty::Unknown] {
-            let error = ClusterError::new(
-                InternalErrorCode::PeerUnavailable,
-                ErrorScope::default(),
-                "request-1",
-                None,
-                certainty,
-                RetryHint::AdmissionOnce,
-                true,
-            );
-            let mut budget = AdmissionRetryBudget::new();
-            assert!(matches!(
-                router
-                    .resolve_after_admission_failure(scope, now, None, &mut budget, &error)
-                    .await,
-                Err(OwnerRoutingError::AdmissionRetryDenied)
-            ));
-            assert!(!budget.consumed());
-            assert_eq!(
-                router
-                    .try_cached(scope, now, None)
-                    .await
-                    .expect("post-dispatch failures retain route")
-                    .owner_token()
-                    .epoch,
-                1
-            );
+    fn service(id: u128, service_type: &str, active: bool) -> ServiceRecord {
+        ServiceRecord {
+            tenant_id: Uuid::from_u128(1),
+            device_id: Uuid::from_u128(2),
+            service_id: Uuid::from_u128(id),
+            service_type: service_type.to_owned(),
+            display_name: format!("service-{id}"),
+            capabilities: serde_json::json!({}),
+            version: 1,
+            active,
         }
-        assert_eq!(directory.lookups(), 1);
     }
 
     #[test]
-    fn retry_policy_allows_one_authenticated_not_dispatched_attempt() {
-        let scope = ErrorScope {
-            tenant_id: Some(Uuid::from_u128(1)),
-            device_id: Some(Uuid::from_u128(2)),
-            service_id: None,
-        };
-        let error = ClusterError::new(
-            InternalErrorCode::PeerUnavailable,
-            scope,
-            "request-1",
-            None,
-            ExecutionCertainty::NotDispatched,
-            RetryHint::AdmissionOnce,
-            true,
-        );
-        let mut budget = AdmissionRetryBudget::new();
-        assert_eq!(
-            budget.decide(&error),
-            AdmissionRetryDecision::RetryAdmission
-        );
-        assert_eq!(budget.decide(&error), AdmissionRetryDecision::DoNotRetry);
+    fn service_target_parses_identifiers_and_labels_exactly_once() {
+        let id = Uuid::from_u128(7);
+        let raw = id.to_string();
+        assert_eq!(ServiceTarget::parse(&raw), ServiceTarget::Id(id));
+        assert_eq!(ServiceTarget::parse("echo"), ServiceTarget::Label("echo"));
+        assert_eq!(ServiceTarget::parse(""), ServiceTarget::Label(""));
     }
 
     #[test]
-    fn retry_policy_refuses_effects_unknown_and_unauthenticated() {
-        let scope = ErrorScope::default();
-        for certainty in [ExecutionCertainty::Dispatched, ExecutionCertainty::Unknown] {
-            let error = ClusterError::new(
-                InternalErrorCode::PeerUnavailable,
-                scope.clone(),
-                "request-1",
-                None,
-                certainty,
-                RetryHint::AdmissionOnce,
-                true,
-            );
-            let mut budget = AdmissionRetryBudget::new();
-            assert_eq!(budget.decide(&error), AdmissionRetryDecision::DoNotRetry);
-        }
-        let unauthenticated = ClusterError::new(
-            InternalErrorCode::PeerUnavailable,
-            scope,
-            "request-1",
-            None,
-            ExecutionCertainty::NotDispatched,
-            RetryHint::AdmissionOnce,
-            false,
-        );
-        let mut budget = AdmissionRetryBudget::new();
+    fn duplicate_active_label_is_ambiguous_on_every_resolution_path() {
+        let services = [service(10, "echo", true), service(11, "echo", true)];
         assert_eq!(
-            budget.decide(&unauthenticated),
-            AdmissionRetryDecision::DoNotRetry
+            resolve_echo_service(&services, ServiceTarget::Label("echo")),
+            Err(ServiceResolutionError::Ambiguous)
+        );
+        // An identifier stays exact even while the label is ambiguous, which
+        // is what makes the ambiguous outcome a label outcome rather than a
+        // broken device.
+        assert_eq!(
+            resolve_echo_service(&services, ServiceTarget::Id(Uuid::from_u128(11))),
+            Ok(Uuid::from_u128(11))
+        );
+        // The raw path form reaches the same decision through `parse`.
+        assert_eq!(
+            resolve_echo_service(&services, ServiceTarget::parse("echo")),
+            Err(ServiceResolutionError::Ambiguous)
         );
     }
 
     #[test]
-    fn retry_budget_cannot_be_reopened_after_a_denied_attempt() {
-        let scope = ErrorScope::default();
-        let dispatched = ClusterError::new(
-            InternalErrorCode::PeerUnavailable,
-            scope.clone(),
-            "request-1",
-            None,
-            ExecutionCertainty::Dispatched,
-            RetryHint::AdmissionOnce,
-            true,
-        );
-        let safe = ClusterError::new(
-            InternalErrorCode::OwnerChanged,
-            scope,
-            "request-1",
-            None,
-            ExecutionCertainty::NotDispatched,
-            RetryHint::AdmissionOnce,
-            true,
-        );
-        let mut budget = AdmissionRetryBudget::new();
+    fn inactive_duplicates_do_not_make_a_label_ambiguous() {
+        let services = [service(10, "echo", true), service(11, "echo", false)];
         assert_eq!(
-            budget.decide(&dispatched),
-            AdmissionRetryDecision::DoNotRetry
+            resolve_echo_service(&services, ServiceTarget::Label("echo")),
+            Ok(Uuid::from_u128(10))
         );
-        assert_eq!(budget.decide(&safe), AdmissionRetryDecision::DoNotRetry);
-        assert!(!budget.consumed());
+        assert_eq!(
+            resolve_echo_service(&services, ServiceTarget::Id(Uuid::from_u128(11))),
+            Err(ServiceResolutionError::NotFound)
+        );
+    }
+
+    #[test]
+    fn unknown_labels_identifiers_and_non_echo_types_are_not_found() {
+        let services = [service(10, "echo", true), service(12, "files", true)];
+        assert_eq!(
+            resolve_echo_service(&services, ServiceTarget::Label("missing")),
+            Err(ServiceResolutionError::NotFound)
+        );
+        assert_eq!(
+            resolve_echo_service(&services, ServiceTarget::Id(Uuid::from_u128(99))),
+            Err(ServiceResolutionError::NotFound)
+        );
+        // A single active non-echo service is unambiguous but not
+        // dispatchable through the fixed echo export.
+        assert_eq!(
+            resolve_echo_service(&services, ServiceTarget::Label("files")),
+            Err(ServiceResolutionError::NotFound)
+        );
+        assert_eq!(
+            resolve_echo_service(&services, ServiceTarget::Id(Uuid::from_u128(12))),
+            Err(ServiceResolutionError::NotFound)
+        );
+        assert_eq!(
+            resolve_echo_service(&[], ServiceTarget::Label("echo")),
+            Err(ServiceResolutionError::NotFound)
+        );
     }
 
     struct TestDirectory {

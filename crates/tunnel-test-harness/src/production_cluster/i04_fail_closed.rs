@@ -22,7 +22,7 @@
 //! retained.
 
 use super::{
-    ProductionCluster, RunningHarness, assert_public_health_ready, open_consumer_stream,
+    ProductionCluster, RunningHarness, assert_public_health_ready, open_consumer_stream_target,
     public_health_request, start_cli_smoke, validate_public_health_response,
 };
 use crate::acceptance::helpers::write_device_profile;
@@ -93,6 +93,9 @@ const ADVERTISED_PUBLIC_ROUTES: [&str; 5] = [
     "/v1/devices/{device}/services",
     "/v1/devices/{device}/services/{service}/echo",
 ];
+/// Safe method shapes probed at the POST-only echo route during owner loss.
+/// The relay serves none of them there and reselects for none of them.
+const SAFE_METHOD_SHAPES: [&str; 3] = ["GET", "HEAD", "OPTIONS"];
 /// Paths that must stay outside the public consumer surface.
 const EXCLUDED_PUBLIC_ROUTES: [&str; 6] = [
     "/v1/tunnel/control",
@@ -170,6 +173,14 @@ pub struct FailClosedEvidence {
     /// A service identifier belonging to a different device is a
     /// caller-supplied destination and must never be used.
     pub caller_destination: SentinelOutcome,
+    /// The same duplicate label through the public stream upgrade: the same
+    /// typed ambiguous outcome, no 101, no owner selection (M7-C47).
+    pub ambiguous_stream: SentinelOutcome,
+    /// The service listing for the device with the duplicate label stays
+    /// live and exposes both active echo services, so the ambiguity is
+    /// visible to a consumer rather than hidden by the listing route.
+    pub ambiguous_listing_status: u16,
+    pub ambiguous_listing_active_echo_services: usize,
     pub ec003_dispatch_delta: u64,
     pub ec003_owner_chunk_read_delta: u64,
 
@@ -208,6 +219,17 @@ pub struct FailClosedEvidence {
     pub owner_loss_safe_unpolled: SentinelOutcome,
     /// A failed body under the same fault.
     pub owner_loss_failed_body: SentinelOutcome,
+    /// GET, HEAD and OPTIONS shaped requests at the POST-only echo route of
+    /// the lost owner's device, in that order.  Each is a typed
+    /// `not_dispatched` rejection: the relay performs no automatic
+    /// reselection on any method (M7-C46).
+    pub owner_loss_safe_methods: Vec<SentinelOutcome>,
+    /// The HEAD rejection mirrored the GET's typed envelope: same status and
+    /// the same declared content length with no body bytes on the wire.
+    pub owner_loss_head_mirrors_typed_get: bool,
+    /// Dispatches attributable to the three safe-method probes alone.
+    pub owner_loss_safe_method_dispatch_delta: u64,
+    pub owner_loss_safe_method_owner_chunk_read_delta: u64,
     /// Cluster-wide application dispatches during the whole fault window.
     pub owner_loss_dispatch_delta: u64,
     pub owner_loss_owner_chunk_read_delta: u64,
@@ -360,6 +382,36 @@ pub fn validate_fail_closed_evidence(evidence: &FailClosedEvidence) -> Result<()
             evidence.unambiguous_label_status
         )));
     }
+    // M7-C47: the stream upgrade resolves the same duplicate label through
+    // the same resolver, so it must report the identical typed outcome, carry
+    // no body and never reach 101.
+    require_typed(
+        &evidence.ambiguous_stream,
+        409,
+        "SERVICE_AMBIGUOUS",
+        "not_dispatched",
+    )?;
+    if evidence.ambiguous_stream.declared_body_bytes != 0
+        || evidence.ambiguous_stream.delivered_body_bytes != 0
+    {
+        return Err(HarnessError::Process(format!(
+            "fail-closed ambiguous_stream must carry no request body, observed declared={} delivered={}",
+            evidence.ambiguous_stream.declared_body_bytes,
+            evidence.ambiguous_stream.delivered_body_bytes
+        )));
+    }
+    if evidence.ambiguous_listing_status != 200 {
+        return Err(HarnessError::Process(format!(
+            "fail-closed ambiguous_listing_status was {}; the service listing must stay live for a device with a duplicate label",
+            evidence.ambiguous_listing_status
+        )));
+    }
+    if evidence.ambiguous_listing_active_echo_services != 2 {
+        return Err(HarnessError::Process(format!(
+            "fail-closed ambiguous_listing_active_echo_services was {}, expected both active echo services to be listed",
+            evidence.ambiguous_listing_active_echo_services
+        )));
+    }
     zero_delta("ec003_dispatch_delta", evidence.ec003_dispatch_delta)?;
     zero_delta(
         "ec003_owner_chunk_read_delta",
@@ -463,6 +515,59 @@ pub fn validate_fail_closed_evidence(evidence: &FailClosedEvidence) -> Result<()
             evidence.owner_loss_safe_unpolled.delivered_body_bytes
         )));
     }
+    // M7-C46: the relay never reselects an owner for any method.  Each safe
+    // method shape at the lost owner's echo route ends as one typed
+    // `not_dispatched` rejection with no body and no dispatch anywhere.
+    if evidence.owner_loss_safe_methods.len() != SAFE_METHOD_SHAPES.len() {
+        return Err(HarnessError::Process(format!(
+            "fail-closed owner_loss_safe_methods recorded {} outcomes, expected {}",
+            evidence.owner_loss_safe_methods.len(),
+            SAFE_METHOD_SHAPES.len()
+        )));
+    }
+    for (outcome, method) in evidence
+        .owner_loss_safe_methods
+        .iter()
+        .zip(SAFE_METHOD_SHAPES)
+    {
+        if outcome.label != method {
+            return Err(HarnessError::Process(format!(
+                "fail-closed owner_loss_safe_methods outcome {} is out of order, expected {method}",
+                outcome.label
+            )));
+        }
+        if outcome.declared_body_bytes != 0 || outcome.delivered_body_bytes != 0 {
+            return Err(HarnessError::Process(format!(
+                "fail-closed owner_loss_safe_methods {method} must carry no request body, observed declared={} delivered={}",
+                outcome.declared_body_bytes, outcome.delivered_body_bytes
+            )));
+        }
+        if method == "HEAD" {
+            // A HEAD response carries no body, so its envelope is proved by
+            // mirroring the GET's typed envelope instead of by parsing one.
+            if outcome.status != 405 || outcome.transport_failed {
+                return Err(HarnessError::Process(format!(
+                    "fail-closed owner_loss_safe_methods HEAD returned status={} transport_failed={}, expected 405",
+                    outcome.status, outcome.transport_failed
+                )));
+            }
+            continue;
+        }
+        require_typed(outcome, 405, "METHOD_NOT_ALLOWED", "not_dispatched")?;
+    }
+    if !evidence.owner_loss_head_mirrors_typed_get {
+        return Err(HarnessError::Process(
+            "fail-closed owner_loss_head_mirrors_typed_get was false; the HEAD rejection did not mirror the GET's typed envelope".into(),
+        ));
+    }
+    zero_delta(
+        "owner_loss_safe_method_dispatch_delta",
+        evidence.owner_loss_safe_method_dispatch_delta,
+    )?;
+    zero_delta(
+        "owner_loss_safe_method_owner_chunk_read_delta",
+        evidence.owner_loss_safe_method_owner_chunk_read_delta,
+    )?;
     if !evidence.owner_loss_failed_body.body_stream_failed {
         return Err(HarnessError::Process(
             "fail-closed owner_loss_failed_body did not actually fail its request-body stream"
@@ -625,6 +730,7 @@ fn known_failure_code(value: &str) -> Option<&'static str> {
         "DEVICE_NOT_FOUND" => Some("DEVICE_NOT_FOUND"),
         "SERVICE_NOT_FOUND" => Some("SERVICE_NOT_FOUND"),
         "SERVICE_AMBIGUOUS" => Some("SERVICE_AMBIGUOUS"),
+        "METHOD_NOT_ALLOWED" => Some("METHOD_NOT_ALLOWED"),
         "BODY_LIMIT" => Some("BODY_LIMIT"),
         "BODY_TIMEOUT" => Some("BODY_TIMEOUT"),
         "ADMISSION_LIMIT" => Some("ADMISSION_LIMIT"),
@@ -1182,6 +1288,50 @@ async fn authenticated_get_status(
     token: Option<&str>,
     path: &str,
 ) -> Result<u16> {
+    authenticated_request(consumer_addr, server_ca_der, token, "GET", path)
+        .await
+        .map(|response| response.status)
+}
+
+/// One bounded body-free response.  The body is retained only up to the echo
+/// response bound so a typed envelope or a listing can be inspected; it is
+/// never reported as evidence itself.
+struct ProbeResponse {
+    status: u16,
+    content_length: Option<u64>,
+    body: Vec<u8>,
+}
+
+impl ProbeResponse {
+    /// The allowlisted `(code, execution)` pair of a typed envelope, or
+    /// `(None, None)` when the body is absent or not a bounded envelope.
+    fn typed_envelope(&self) -> (Option<&'static str>, Option<&'static str>) {
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&self.body) else {
+            return (None, None);
+        };
+        (
+            value
+                .get("code")
+                .and_then(serde_json::Value::as_str)
+                .and_then(known_failure_code),
+            value
+                .get("execution")
+                .and_then(serde_json::Value::as_str)
+                .and_then(known_execution),
+        )
+    }
+}
+
+/// A bounded authenticated request with the given method and no request body
+/// at all.  The sentinel body plan is `None`, so any body poll is impossible
+/// by construction.
+async fn authenticated_request(
+    consumer_addr: SocketAddr,
+    server_ca_der: &[u8],
+    token: Option<&str>,
+    method: &str,
+    path: &str,
+) -> Result<ProbeResponse> {
     let deadline = TokioInstant::now() + REQUEST_TIMEOUT;
     let mut roots = rustls::RootCertStore::empty();
     roots
@@ -1215,9 +1365,9 @@ async fn authenticated_get_status(
     let mut connection_task = tokio::spawn(async move {
         let _ = connection.await;
     });
-    let result: Result<u16> = async {
+    let result: Result<ProbeResponse> = async {
         let mut builder = Request::builder()
-            .method("GET")
+            .method(method)
             .uri(format!("https://localhost{path}"))
             .header("host", "localhost");
         if let Some(token) = token {
@@ -1236,14 +1386,25 @@ async fn authenticated_get_status(
             .map_err(|_| HarnessError::Timeout("fail-closed GET timed out".into()))?
             .map_err(|error| HarnessError::Http(format!("fail-closed GET failed: {error}")))?;
         let status = response.status().as_u16();
-        let _ = timeout_at(
+        let content_length = response
+            .headers()
+            .get(hyper::header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok());
+        let body = timeout_at(
             deadline,
             Limited::new(response.into_body(), MAX_ECHO_RESPONSE_BYTES).collect(),
         )
         .await
         .map_err(|_| HarnessError::Timeout("reading fail-closed GET timed out".into()))?
-        .map_err(|_| HarnessError::Http("fail-closed GET body exceeded its bound".into()))?;
-        Ok(status)
+        .map_err(|_| HarnessError::Http("fail-closed GET body exceeded its bound".into()))?
+        .to_bytes()
+        .to_vec();
+        Ok(ProbeResponse {
+            status,
+            content_length,
+            body,
+        })
     }
     .await;
     drop(sender);
@@ -1263,11 +1424,11 @@ async fn safe_stream_probe(
     server_ca_der: &[u8],
     token: &str,
     device_id: Uuid,
-    service_id: Uuid,
+    service: &str,
 ) -> Result<SentinelOutcome> {
     let started = TokioInstant::now();
     let probe =
-        open_consumer_stream(consumer_addr, server_ca_der, token, device_id, service_id).await;
+        open_consumer_stream_target(consumer_addr, server_ca_der, token, device_id, service).await;
     let elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
     match probe {
         Ok(mut stream) => {
@@ -1609,6 +1770,7 @@ async fn run(
         sibling_tenant: sibling.tenant_id,
         sibling_service,
         sibling_service_path: &sibling_service_path,
+        duplicate_service,
         sibling_canary: sibling_canary.as_bytes(),
         inactive_id: inactive.id,
         inactive_tenant: inactive.tenant_id,
@@ -1648,6 +1810,9 @@ struct MatrixContext<'a> {
     sibling_tenant: Uuid,
     sibling_service: Uuid,
     sibling_service_path: &'a str,
+    /// The seeded second active echo service on the sibling device.  Never
+    /// addressed by identifier; it exists so the bare label is ambiguous.
+    duplicate_service: Uuid,
     sibling_canary: &'a [u8],
     inactive_id: Uuid,
     inactive_tenant: Uuid,
@@ -1674,6 +1839,7 @@ async fn matrix(context: MatrixContext<'_>) -> Result<FailClosedEvidence> {
         sibling_tenant,
         sibling_service,
         sibling_service_path,
+        duplicate_service,
         sibling_canary,
         inactive_id,
         inactive_tenant,
@@ -1849,6 +2015,58 @@ async fn matrix(context: MatrixContext<'_>) -> Result<FailClosedEvidence> {
     })
     .await?
     .outcome;
+    // M7-C47: the same duplicate label through the stream upgrade must reach
+    // the same typed ambiguous outcome through the shared resolver, with no
+    // 101 and no owner selection.
+    let ambiguous_stream = safe_stream_probe(
+        "ambiguous_stream",
+        remote_ingress,
+        server_ca,
+        token_a,
+        sibling_id,
+        "echo",
+    )
+    .await?;
+    if ambiguous_stream.status == 101 {
+        return Err(HarnessError::Process(
+            "fail-closed ambiguous stream upgrade reached 101; the duplicate label selected a service".into(),
+        ));
+    }
+    // The listing route resolves nothing: it stays live and shows both
+    // active echo services, so the consumer can see why the label is
+    // ambiguous and address one by identifier instead.
+    let listing = authenticated_request(
+        remote_ingress,
+        server_ca,
+        Some(token_a),
+        "GET",
+        &format!("/v1/devices/{sibling_id}/services"),
+    )
+    .await?;
+    let ambiguous_listing_status = listing.status;
+    let ambiguous_listing_active_echo_services =
+        serde_json::from_slice::<serde_json::Value>(&listing.body)
+            .ok()
+            .and_then(|value| value.as_array().cloned())
+            .map(|services| {
+                services
+                    .iter()
+                    .filter(|service| {
+                        service
+                            .get("service_type")
+                            .and_then(serde_json::Value::as_str)
+                            == Some("echo")
+                            && service.get("active").and_then(serde_json::Value::as_bool)
+                                == Some(true)
+                            && service
+                                .get("service_id")
+                                .and_then(serde_json::Value::as_str)
+                                .and_then(|id| id.parse::<Uuid>().ok())
+                                .is_some_and(|id| id == sibling_service || id == duplicate_service)
+                    })
+                    .count()
+            })
+            .unwrap_or_default();
     let after = counters(cluster).await?;
     let ec003_dispatch_delta = before.dispatch_delta(&after);
     let ec003_owner_chunk_read_delta = before.chunk_read_delta(&after);
@@ -2153,7 +2371,7 @@ async fn matrix(context: MatrixContext<'_>) -> Result<FailClosedEvidence> {
         server_ca,
         token_a,
         target_id,
-        target_service,
+        target_service_path,
     )
     .await?;
     if owner_loss_safe_unpolled.status == 101 {
@@ -2161,6 +2379,59 @@ async fn matrix(context: MatrixContext<'_>) -> Result<FailClosedEvidence> {
             "fail-closed safe stream upgrade reached 101 during owner loss; the owner token was not revalidated before attachment".into(),
         ));
     }
+    // M7-C46: GET, HEAD and OPTIONS shaped requests at the lost owner's
+    // POST-only echo route.  The relay serves none of them and reselects for
+    // none of them: each is one typed not-dispatched rejection with no body,
+    // and the counters prove no relay dispatched anything for any of them.
+    let safe_method_before = counters(cluster).await?;
+    let mut owner_loss_safe_methods = Vec::with_capacity(SAFE_METHOD_SHAPES.len());
+    let mut get_envelope: Option<(u16, Option<u64>)> = None;
+    let mut owner_loss_head_mirrors_typed_get = false;
+    for method in SAFE_METHOD_SHAPES {
+        let probe_started = TokioInstant::now();
+        let response = authenticated_request(
+            remote_ingress,
+            server_ca,
+            Some(token_a),
+            method,
+            &format!("/v1/devices/{target_id}/services/{target_service_path}/echo"),
+        )
+        .await?;
+        let elapsed_ms = probe_started
+            .elapsed()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
+        let (code, execution) = response.typed_envelope();
+        match method {
+            "GET" => get_envelope = Some((response.status, response.content_length)),
+            "HEAD" => {
+                owner_loss_head_mirrors_typed_get = response.body.is_empty()
+                    && get_envelope.is_some_and(|(status, content_length)| {
+                        status == response.status
+                            && content_length.is_some()
+                            && content_length == response.content_length
+                    });
+            }
+            _ => {}
+        }
+        owner_loss_safe_methods.push(SentinelOutcome {
+            label: method,
+            status: response.status,
+            code,
+            execution,
+            declared_body_bytes: 0,
+            delivered_body_bytes: 0,
+            body_polls: 0,
+            body_stream_failed: false,
+            transport_failed: false,
+            elapsed_ms,
+        });
+    }
+    let safe_method_after = counters(cluster).await?;
+    let owner_loss_safe_method_dispatch_delta =
+        safe_method_before.dispatch_delta(&safe_method_after);
+    let owner_loss_safe_method_owner_chunk_read_delta =
+        safe_method_before.chunk_read_delta(&safe_method_after);
     let owner_loss_failed_body = sentinel_echo(SentinelRequest {
         label: "owner_loss_failed_body",
         consumer_addr: remote_ingress,
@@ -2263,6 +2534,9 @@ async fn matrix(context: MatrixContext<'_>) -> Result<FailClosedEvidence> {
         unambiguous_label_status,
         unambiguous_label_response_exact,
         caller_destination,
+        ambiguous_stream,
+        ambiguous_listing_status,
+        ambiguous_listing_active_echo_services,
         ec003_dispatch_delta,
         ec003_owner_chunk_read_delta,
         remote_route_proved,
@@ -2285,6 +2559,10 @@ async fn matrix(context: MatrixContext<'_>) -> Result<FailClosedEvidence> {
         owner_loss_consumed_mutation_repeat,
         owner_loss_safe_unpolled,
         owner_loss_failed_body,
+        owner_loss_safe_methods,
+        owner_loss_head_mirrors_typed_get,
+        owner_loss_safe_method_dispatch_delta,
+        owner_loss_safe_method_owner_chunk_read_delta,
         owner_loss_dispatch_delta,
         owner_loss_owner_chunk_read_delta,
         mutation_reselected,
@@ -2311,8 +2589,8 @@ async fn matrix(context: MatrixContext<'_>) -> Result<FailClosedEvidence> {
 #[cfg(test)]
 mod c17_validator_tests {
     use super::{
-        ADVERTISED_PUBLIC_ROUTES, EXCLUDED_PUBLIC_ROUTES, FailClosedEvidence, SentinelOutcome,
-        validate_fail_closed_evidence,
+        ADVERTISED_PUBLIC_ROUTES, EXCLUDED_PUBLIC_ROUTES, FailClosedEvidence, SAFE_METHOD_SHAPES,
+        SentinelOutcome, validate_fail_closed_evidence,
     };
     use crate::acceptance_test_support::{assert_failed, assert_rejected};
 
@@ -2392,6 +2670,20 @@ mod c17_validator_tests {
             ambiguous_service: rejection("ambiguous_service", 409, "SERVICE_AMBIGUOUS", 512),
             unambiguous_label_status: 200,
             unambiguous_label_response_exact: true,
+            ambiguous_stream: SentinelOutcome {
+                label: "ambiguous_stream",
+                status: 409,
+                code: Some("SERVICE_AMBIGUOUS"),
+                execution: Some("not_dispatched"),
+                declared_body_bytes: 0,
+                delivered_body_bytes: 0,
+                body_polls: 0,
+                body_stream_failed: false,
+                transport_failed: false,
+                elapsed_ms: 20,
+            },
+            ambiguous_listing_status: 200,
+            ambiguous_listing_active_echo_services: 2,
             caller_destination: rejection("caller_destination", 404, "SERVICE_NOT_FOUND", 512),
             ec003_dispatch_delta: 0,
             ec003_owner_chunk_read_delta: 0,
@@ -2429,6 +2721,24 @@ mod c17_validator_tests {
                 elapsed_ms: 18,
             },
             owner_loss_failed_body: failed("owner_loss_failed_body"),
+            owner_loss_safe_methods: SAFE_METHOD_SHAPES
+                .into_iter()
+                .map(|method| SentinelOutcome {
+                    label: method,
+                    status: 405,
+                    code: (method != "HEAD").then_some("METHOD_NOT_ALLOWED"),
+                    execution: (method != "HEAD").then_some("not_dispatched"),
+                    declared_body_bytes: 0,
+                    delivered_body_bytes: 0,
+                    body_polls: 0,
+                    body_stream_failed: false,
+                    transport_failed: false,
+                    elapsed_ms: 5,
+                })
+                .collect(),
+            owner_loss_head_mirrors_typed_get: true,
+            owner_loss_safe_method_dispatch_delta: 0,
+            owner_loss_safe_method_owner_chunk_read_delta: 0,
             owner_loss_dispatch_delta: 0,
             owner_loss_owner_chunk_read_delta: 0,
             mutation_reselected: false,
@@ -2701,6 +3011,88 @@ mod c17_validator_tests {
             validate_fail_closed_evidence(&reselected),
             "mutation_reselected",
         );
+    }
+
+    #[test]
+    fn every_safe_method_shape_is_a_typed_not_dispatched_rejection() {
+        // M7-C46: the relay never reselects on any method, so each safe
+        // method shape must be exactly one typed rejection with no dispatch.
+        type Mutate = (&'static str, fn(&mut FailClosedEvidence));
+        let cases: [Mutate; 9] = [
+            ("owner_loss_safe_methods", |e| {
+                e.owner_loss_safe_methods.pop();
+            }),
+            ("owner_loss_safe_methods", |e| {
+                e.owner_loss_safe_methods.swap(0, 2)
+            }),
+            ("GET", |e| e.owner_loss_safe_methods[0].status = 200),
+            ("GET", |e| e.owner_loss_safe_methods[0].code = None),
+            ("GET", |e| {
+                e.owner_loss_safe_methods[0].execution = Some("unknown")
+            }),
+            ("HEAD", |e| e.owner_loss_safe_methods[1].status = 404),
+            ("OPTIONS", |e| {
+                e.owner_loss_safe_methods[2].code = Some("NOT_FOUND")
+            }),
+            ("OPTIONS", |e| {
+                e.owner_loss_safe_methods[2].declared_body_bytes = 1
+            }),
+            ("owner_loss_head_mirrors_typed_get", |e| {
+                e.owner_loss_head_mirrors_typed_get = false
+            }),
+        ];
+        for (label, mutate) in cases {
+            let mut value = evidence();
+            mutate(&mut value);
+            assert_rejected(validate_fail_closed_evidence(&value), label);
+        }
+        for (name, mutate) in [
+            (
+                "owner_loss_safe_method_dispatch_delta",
+                (|e| e.owner_loss_safe_method_dispatch_delta = 1) as fn(&mut FailClosedEvidence),
+            ),
+            ("owner_loss_safe_method_owner_chunk_read_delta", |e| {
+                e.owner_loss_safe_method_owner_chunk_read_delta = 1
+            }),
+        ] {
+            let mut value = evidence();
+            mutate(&mut value);
+            assert_rejected(validate_fail_closed_evidence(&value), name);
+        }
+    }
+
+    #[test]
+    fn a_duplicate_label_is_ambiguous_through_the_stream_upgrade_too() {
+        // M7-C47: a 101, a different code, a body, or a listing that hides
+        // one of the duplicates each fail the gate.
+        type Mutate = (&'static str, fn(&mut FailClosedEvidence));
+        let cases: [Mutate; 6] = [
+            ("ambiguous_stream", |e| {
+                e.ambiguous_stream.status = 101;
+                e.ambiguous_stream.code = None;
+                e.ambiguous_stream.execution = None;
+            }),
+            ("ambiguous_stream", |e| {
+                e.ambiguous_stream.code = Some("SERVICE_NOT_FOUND")
+            }),
+            ("ambiguous_stream", |e| {
+                e.ambiguous_stream.execution = Some("unknown")
+            }),
+            ("ambiguous_stream", |e| {
+                e.ambiguous_stream.delivered_body_bytes = 1
+            }),
+            ("ambiguous_listing_status", |e| {
+                e.ambiguous_listing_status = 409
+            }),
+            ("ambiguous_listing_active_echo_services", |e| {
+                e.ambiguous_listing_active_echo_services = 1
+            }),
+        ];
+        for (label, mutate) in cases {
+            let mut value = evidence();
+            mutate(&mut value);
+            assert_rejected(validate_fail_closed_evidence(&value), label);
+        }
     }
 
     #[test]

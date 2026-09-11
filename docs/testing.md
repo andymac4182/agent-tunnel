@@ -92,7 +92,9 @@ precede the caller-named-peer-address check, otherwise zero honeypot datagrams
 only prove that no peer hop happened at all.
 
 Named scenarios and the rows they inform: absent, unknown-service, inactive,
-ambiguous-label and cross-device-destination targets (`EC-003`); a UDP and TCP
+ambiguous-label and cross-device-destination targets, with the same duplicate
+label rejected identically through the stream upgrade and both candidates still
+visible in the service listing (`EC-003`, M7-C47); a UDP and TCP
 honeypot that consumer headers name but no relay may reach (`EC-017`);
 cross-scope rejection before any body read or peer forward, with the owner-side
 `lifetime_consumer_chunk_reads` counter at zero (`EC-049`); a zero-byte body that
@@ -105,10 +107,12 @@ route set with every excluded path typed, recorded as the route boundary for the
 excluded browser surface (`EC-009`).
 
 Two limits are deliberate. The relay performs **no** automatic reselection on
-any method: `routing::AdmissionRetryBudget` and
-`OwnerRouter::resolve_after_admission_failure` exist but have no production call
-site, so the gate proves zero reselection plus one bounded *consumer-driven*
-safe retry after the successor owner is committed. The gate also uses the policy
+any method; the former unreachable admission retry budget was removed rather
+than wired to a route, and [cluster.md](cluster.md) records that decision. The
+gate proves zero reselection (including typed `405 METHOD_NOT_ALLOWED` /
+`not_dispatched` for GET, HEAD and OPTIONS shapes at the lost owner's echo
+route with zero dispatch) plus one bounded *consumer-driven* safe retry after
+the successor owner is committed. The gate also uses the policy
 rotation interval rather than the accelerated M2 one, because a three-second
 replacement carrier injects unrelated owner-readiness windows into admission
 outcomes; owner readiness is instead established by a bounded precondition
@@ -222,7 +226,7 @@ Use three real relay processes, one supported authoritative Redis primary with s
 | Shared authorization | Redis-native tenant/device key scoping, durable catalog revisions, concurrent grant/revocation updates, bounded atomic scripts/functions, least-privilege publisher versus relay identities, and rolling schema/version changes. Durable-catalog read/write failure stops new admission immediately; snapshot lifetime starts at catalog-read initiation and never exceeds five seconds or renews through cache hits. Inject catalog-operation failures independently from ephemeral lease/coordination failures even though both use the same authoritative Redis. |
 | Ownership and tickets | Exercise atomic acquire/increment/renew/compare-release/one-use consumption under races, lost replies and stale node/boot/session tokens. Validate the complete owner token, exact credential/ticket binding, connector fencing ACK before readiness, and rejection before buffer allocation. Old cleanup cannot delete the successor; unknown acquisition/renewal cannot assume authority. |
 | Lease deadlines | Test 30-second TTL, 10-second renewal, five-second owner margin, two-second registry RPC deadline and challenge-send-based device permission of at most 20 seconds. Delay replies, suspend/resume processes and race dispatch after await; authority is checked immediately before each dispatch and cannot be extended from reply receipt or heartbeat traffic. |
-| Forwarded admission | Reject forged source identity, destination owner, tenant/grant, internal headers, credential context and hop budget. The owner independently verifies consumer grants and ticket/device context. Retry route admission once only with proven `NOT_DISPATCHED`; lost/partial acknowledgments preserve uncertainty and never repeat effects. |
+| Forwarded admission | Reject forged source identity, destination owner, tenant/grant, internal headers, credential context and hop budget. The owner independently verifies consumer grants and ticket/device context. The relay performs no automatic route-admission retry; prove zero reselection on every method and that only a consumer-driven retry of a proven `NOT_DISPATCHED` request bridges an owner change. Lost/partial acknowledgments preserve uncertainty and never repeat effects. |
 | Coordination failure | Partition Redis, kill/restart/restore the primary, simulate missing/rolled-back epochs, unknown authority, two primaries and exhausted counters. Test AOF/fsync and verified backup restore as durability behavior only; neither backup success nor replica acknowledgment authorizes promotion. The initial profile rejects automatic promotion: stop admission, fence/close sessions, remain unready, verify the durable catalog/signed directory, and require operator quiescence plus a fresh externally authorized incarnation/checkpoint. Unfenced old writers or incomplete/ambiguous restores block recovery. |
 
 ### Continuation verification checkpoint (2026-09-10T08:24:36+10:00)
