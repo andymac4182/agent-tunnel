@@ -101,14 +101,6 @@ impl RelayLimits {
                 "max_pending_operations_per_owner must be 1..=128",
             ));
         }
-        // A per-owner bound below the per-device stream allowance would make
-        // that documented allowance unreachable through one relay, which is how
-        // the configured saturation gate first exposed this.
-        if self.max_pending_operations_per_owner < self.max_streams_per_device {
-            return Err(ConfigError::Invalid(
-                "max_pending_operations_per_owner must be at least max_streams_per_device",
-            ));
-        }
         if self.max_devices == 0 || self.max_devices > 1_000_000 {
             return Err(ConfigError::Invalid("max_devices must be 1..=1000000"));
         }
@@ -1326,6 +1318,25 @@ consumer_tls_private_key = "consumer-key.pem"
     }
 
     #[test]
+    fn default_limits_keep_the_per_device_stream_allowance_reachable() {
+        // A single device holding one in-flight operation per stream needs as
+        // many per-owner admission permits as its stream allowance; the
+        // defaults shipped 48 permits against 64 streams, so the configured
+        // saturation workload refused an authorized consumer with 429.
+        let limits = RelayLimits::default();
+        assert!(
+            limits.max_pending_operations_per_owner >= limits.max_streams_per_device,
+            "default per-owner admission bound {} must not sit below the default stream allowance {}",
+            limits.max_pending_operations_per_owner,
+            limits.max_streams_per_device
+        );
+        assert!(
+            limits.max_pending_operations >= limits.max_pending_operations_per_owner,
+            "the relay-global bound must be able to grant the per-owner bound"
+        );
+    }
+
+    #[test]
     fn per_owner_admission_bound_rejects_zero_and_above_the_ceiling() {
         let limits = |max_pending_operations_per_owner| RelayLimits {
             max_pending_operations_per_owner,
@@ -1337,14 +1348,23 @@ consumer_tls_private_key = "consumer-key.pem"
                 .expect_err("accepted an out-of-range per-owner admission bound");
             assert_eq!(
                 error.to_string(),
-                "max_pending_operations_per_owner must be 1..=64"
+                "max_pending_operations_per_owner must be 1..=128"
             );
         }
-        for valid in [1, MAX_PENDING_OPERATIONS_PER_OWNER_CEILING] {
+        for valid in [
+            RelayLimits::default().max_streams_per_device,
+            MAX_PENDING_OPERATIONS_PER_OWNER_CEILING,
+        ] {
             limits(valid)
                 .validate()
                 .expect("in-range per-owner bound validates");
         }
+        // A deployment may deliberately choose a lower per-owner bound as
+        // backpressure; only the defaults must keep the documented per-device
+        // stream allowance reachable, which the test below pins.
+        limits(1)
+            .validate()
+            .expect("a deliberate lower bound validates");
     }
 
     #[test]
@@ -1354,10 +1374,10 @@ consumer_tls_private_key = "consumer-key.pem"
             config.max_pending_operations_per_owner,
             DEFAULT_MAX_PENDING_OPERATIONS_PER_OWNER
         );
-        let configured = format!("{}max_pending_operations_per_owner = 4\n", valid_toml());
+        let configured = format!("{}max_pending_operations_per_owner = 96\n", valid_toml());
         let config = ServeConfig::parse(&configured).expect("explicit per-owner bound parses");
-        assert_eq!(config.max_pending_operations_per_owner, 4);
-        for invalid in ["0", "65"] {
+        assert_eq!(config.max_pending_operations_per_owner, 96);
+        for invalid in ["0", "129"] {
             let input = format!(
                 "{}max_pending_operations_per_owner = {invalid}\n",
                 valid_toml()
@@ -1366,7 +1386,7 @@ consumer_tls_private_key = "consumer-key.pem"
                 .expect_err("accepted an out-of-range per-owner admission bound");
             assert_eq!(
                 error.to_string(),
-                "max_pending_operations_per_owner must be 1..=64"
+                "max_pending_operations_per_owner must be 1..=128"
             );
         }
     }
