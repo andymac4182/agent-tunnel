@@ -222,6 +222,28 @@ Renewal compares the complete owner token and current deployment incarnation bef
 
 An unknown acquire/renew result leaves the actor unready for dispatch. It can read back its exact token while sufficient verified lease lifetime remains; it must not assume success or acquire a competing token under another identity. Epoch counters are never expired during a deployment incarnation, and the Redis profile caps epochs at its signed 64-bit increment limit rather than wrapping. Exhaustion, missing previously established counters, Redis restart, or evidence of rollback enters coordination recovery.
 
+Both halves of this contract are exercised against a real relay and a real
+owner process by `verify-m7-owner-lease-expiry`. Pausing every relay Redis
+socket leaves the relay unable to renew *or* release, so the owner hash
+disappears only through its own expiry deadline; a direct unproxied catalog
+handle observes that disappearance at or after the deadline carried in the
+predecessor's claim, with at least one Redis socket still paused. The
+predecessor's exact compare-and-release is then refused both immediately and
+again once a successor holds the lease, and the successor resumes above a
+retained epoch seeded over 2^53 rather than restarting at one. The gate proves
+fencing and no-forward behaviour only; it is not a failover or HA claim, since
+the successor is a fresh process started after the predecessor is joined.
+
+An operator's fencing declaration is likewise not proof that no writer remains.
+`m7_recovery_process` therefore lets a never-fenced writer move durable catalog
+state after the operator observed its digest: the approval signed against that
+earlier digest is refused with the bounded `CatalogDigestMismatch` diagnostic,
+and after the corrected approval activates the candidate incarnation the same
+still-connected writer is refused an ownership claim with the typed
+`active deployment incarnation` conflict rather than only failing a fresh
+connect-time check. Both refusals happen inside the same run as the measured
+lifetime-plus-skew quiescence wait.
+
 Proposed timing defaults:
 
 | Policy | Default and behavior |

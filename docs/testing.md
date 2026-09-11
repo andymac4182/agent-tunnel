@@ -72,6 +72,88 @@ route does not enforce.
 A command passing cannot close unrelated rows in [m7-edge-cases.md](m7-edge-cases.md).
 Record the tested revision and outcomes in [m7-verification.md](m7-verification.md).
 
+### Real owner-lease expiry, epoch retention and stale-release fencing
+
+```sh
+cargo run -p tunnel-test-harness --locked -- verify-m7-owner-lease-expiry
+```
+
+The owner-contention command only ever observes a *graceful* owner
+disappearance: the CLI exits, the relay releases its lease and a successor
+claims the retained epoch. That path never exercises the durable lease
+deadline. This command does.
+
+Every relay reaches Redis through an opaque TCP proxy. Once a real CLI owner
+session is serving and has echoed, the proxy pauses both directions of every
+Redis socket, including sockets accepted after the barrier. The relay can then
+neither renew nor release the lease and logs its documented "lease expiry
+remains the fencing fallback" path, so the owner hash can only disappear
+through the `PEXPIREAT` deadline written by the claim script. A second catalog
+handle, connected directly to the upstream Redis rather than through the proxy,
+is the only authority reader that still works during the barrier; it watches
+that disappearance and then attempts the predecessor's exact
+compare-and-release.
+
+The gate asserts, payload-free:
+
+- the predecessor's exact owner token was still present after the barrier, so
+  the later absence is an expiry rather than a pre-existing condition;
+- the disappearance was observed at or after the lease deadline carried in the
+  predecessor's own claim, with the measured margin recorded, and no earlier
+  than one missed renewal tick (the relay renews at a third of the lease);
+- at least one Redis socket was still paused when the absence was observed, so
+  no relay release or delete could have removed the hash;
+- the relay's monotonic lifetime application-dispatch counter did not advance
+  across the expiry. The per-device counter legitimately drops to zero once the
+  expired session is unregistered, so equality would be the wrong contract
+  there and only "did not advance" is required of it;
+- the predecessor's exact compare-and-release is refused both immediately after
+  expiry and again once a successor holds the lease, leaving the successor's
+  complete token unchanged;
+- the retained epoch, seeded above 2^53 before any claim, is honoured: the
+  predecessor claims above the seed and the successor strictly above the
+  predecessor. The epoch key carries no TTL, so a reset to one would fail here.
+
+This is relay no-forward and authority evidence. It is not a claim about device
+side effects, and it does not establish any HA or automatic-failover behaviour:
+the successor is a fresh CLI process started after the predecessor is joined.
+
+### Configured recovery with an unfenced writer
+
+```sh
+cargo test -p tunnel-test-harness --locked --test m7_recovery_process -- \
+  --ignored --test-threads=1
+```
+
+This process-bound gate crosses the executable and socket boundaries: a
+configured relay serves an authenticated device, the operator recovery CLI
+consumes a signed approval after the measured lifetime-plus-skew quiescence
+wait, and a fresh candidate-incarnation relay serves a new device session. A
+separate device is revoked before the approval and stays unauthorized
+afterwards.
+
+Because an operator's fencing declaration is a claim rather than a proof, the
+gate also keeps one writer deliberately unfenced:
+
+- after the operator observes the durable catalog digest, that writer revokes a
+  third device through its still-open handle on the old incarnation. The next
+  observation must report a different digest, and an approval bound to the
+  earlier digest must be refused with the bounded
+  `recovery approval does not match the live catalog observation` diagnostic —
+  the sole `Display` text for `CatalogDigestMismatch`, so no other refusal can
+  satisfy it. The refusal precedes approval-version persistence, so the
+  corrected approval reuses that version and changes only the bound digest;
+- after the corrected approval activates the candidate incarnation, the same
+  still-connected writer attempts an ownership claim. Redis itself must refuse
+  it with the typed `active deployment incarnation` conflict. This is stronger
+  than the existing fresh-connect refusal, which a process holding an open
+  connection would never reach.
+
+The gate returns payload-free evidence and a strict validator re-checks every
+flag plus the measured quiescence floor, so neither half can silently regress
+to a declaration. Operator fencing remains a prerequisite: nothing here
+discovers external writers automatically.
+
 ### Fail-closed admission with a request-body sentinel
 
 ```sh

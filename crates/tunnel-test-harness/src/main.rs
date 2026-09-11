@@ -1828,6 +1828,34 @@ mod tests {
         }
     }
 
+    fn owner_lease_expiry_evidence()
+    -> tunnel_test_harness::production_cluster::OwnerLeaseExpiryEvidence {
+        const SEEDED: u64 = 1_u64 << 53;
+        tunnel_test_harness::production_cluster::OwnerLeaseExpiryEvidence {
+            relay_count: 3,
+            seeded_epoch: SEEDED,
+            original_epoch: SEEDED + 1,
+            catalog_generation_preserved: true,
+            baseline_echo: true,
+            paused_redis_connections: 4,
+            owner_present_after_barrier: true,
+            owner_expired_while_partitioned: true,
+            owner_absent_after_lease_deadline: true,
+            lease_expiry_elapsed_ms: 29_800,
+            lease_deadline_margin_ms: 120,
+            expired_owner_dispatch_unchanged: true,
+            stale_release_refused_after_expiry: true,
+            successor_scope_matched: true,
+            successor_epoch: SEEDED + 2,
+            successor_fresh_session: true,
+            stale_release_refused_after_successor: true,
+            successor_token_unchanged: true,
+            successor_echo: true,
+            fanout_peak_open: 2,
+            elapsed_ms: 90_000,
+        }
+    }
+
     fn redis_partition_evidence() -> tunnel_test_harness::production_cluster::RedisPartitionEvidence
     {
         tunnel_test_harness::production_cluster::RedisPartitionEvidence {
@@ -2137,6 +2165,70 @@ mod tests {
         assert_rejected(
             require_m7_process_pause_evidence(&excessive_fanout),
             "fanout_peak_open_within_bound",
+        );
+    }
+
+    #[test]
+    fn owner_lease_expiry_gate_requires_each_flag_and_bound() {
+        macro_rules! assert_lease_flag {
+            ($field:ident) => {{
+                let mut evidence = owner_lease_expiry_evidence();
+                evidence.$field = false;
+                assert_rejected(
+                    require_m7_owner_lease_expiry_evidence(&evidence),
+                    stringify!($field),
+                );
+            }};
+        }
+
+        assert_lease_flag!(catalog_generation_preserved);
+        assert_lease_flag!(baseline_echo);
+        assert_lease_flag!(owner_present_after_barrier);
+        assert_lease_flag!(owner_expired_while_partitioned);
+        assert_lease_flag!(owner_absent_after_lease_deadline);
+        assert_lease_flag!(expired_owner_dispatch_unchanged);
+        assert_lease_flag!(stale_release_refused_after_expiry);
+        assert_lease_flag!(successor_scope_matched);
+        assert_lease_flag!(successor_fresh_session);
+        assert_lease_flag!(stale_release_refused_after_successor);
+        assert_lease_flag!(successor_token_unchanged);
+        assert_lease_flag!(successor_echo);
+
+        let mut wrong_relay_count = owner_lease_expiry_evidence();
+        wrong_relay_count.relay_count = 2;
+        assert_rejected(
+            require_m7_owner_lease_expiry_evidence(&wrong_relay_count),
+            "three relays",
+        );
+        let mut no_paused_sockets = owner_lease_expiry_evidence();
+        no_paused_sockets.paused_redis_connections = 0;
+        assert_rejected(
+            require_m7_owner_lease_expiry_evidence(&no_paused_sockets),
+            "paused no Redis connections",
+        );
+        let mut reset_epoch = owner_lease_expiry_evidence();
+        reset_epoch.successor_epoch = reset_epoch.original_epoch;
+        assert_rejected(
+            require_m7_owner_lease_expiry_evidence(&reset_epoch),
+            "predecessor epoch",
+        );
+        let mut unretained_epoch = owner_lease_expiry_evidence();
+        unretained_epoch.original_epoch = unretained_epoch.seeded_epoch;
+        assert_rejected(
+            require_m7_owner_lease_expiry_evidence(&unretained_epoch),
+            "retained seed",
+        );
+        let mut early_expiry = owner_lease_expiry_evidence();
+        early_expiry.lease_expiry_elapsed_ms = 9_999;
+        assert_rejected(
+            require_m7_owner_lease_expiry_evidence(&early_expiry),
+            "before one renewal tick",
+        );
+        let mut excessive_fanout = owner_lease_expiry_evidence();
+        excessive_fanout.fanout_peak_open = 4;
+        assert_rejected(
+            require_m7_owner_lease_expiry_evidence(&excessive_fanout),
+            "three-socket peak",
         );
     }
 

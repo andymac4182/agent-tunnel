@@ -28,7 +28,8 @@ use sha2::{Digest, Sha256};
 use tokio::time::{sleep, timeout, timeout_at};
 use tokio_rustls::TlsConnector;
 use tunnel_catalog::{
-    Catalog, RecoveryApproval, RecoveryApprovalIssuer, RedisCatalog, RedisMembershipPublisher,
+    Catalog, CatalogError, OwnerClaimRequest, RecoveryApproval, RecoveryApprovalIssuer,
+    RedisCatalog, RedisMembershipPublisher,
 };
 use tunnel_client::{
     ConnectConfig, ConnectOptions, CredentialConfig, LimitsConfig, LocalExport, LocalExportKind,
@@ -63,6 +64,20 @@ const DEPLOYMENT_ID_PREFIX: &str = "m7-recovery-process-deployment";
 const INITIAL_INCARC_PREFIX: &str = "m7-recovery-process-initial";
 const CANDIDATE_INCARC_PREFIX: &str = "m7-recovery-process-candidate";
 const APPROVAL_NONCE: &str = "m7-recovery-process-nonce-0001";
+/// Quiescence acknowledgement identifier used only for the refused
+/// older-digest attempt, so the accepted run keeps its own identifier.
+const STALE_DIGEST_ACKNOWLEDGEMENT: &str = "m7-recovery-process-stale-digest";
+/// The acknowledgement identifier for the accepted recovery.
+const RECOVERY_ACKNOWLEDGEMENT: &str = "m7-recovery-process-quiescence";
+/// The bounded operator diagnostic for an approval bound to a catalog digest
+/// that no longer matches the observed durable catalog. This is the sole
+/// `Display` text for `RecoveryWorkflowError::CatalogDigestMismatch`, so
+/// matching it distinguishes the digest fence from every other refusal.
+const CATALOG_DIGEST_MISMATCH_DIAGNOSTIC: &str =
+    "recovery approval does not match the live catalog observation";
+/// The typed catalog conflict cause for a write against a superseded
+/// deployment incarnation.
+const ACTIVE_INCARNATION_CONFLICT: &str = "active deployment incarnation";
 const OPERATOR_KEY_ID: &str = "m7-recovery-process-operator";
 const CANARY: &str = "m7-recovery-process-canary";
 const PAYLOAD: &[u8] = b"post-recovery-configured-serve";
@@ -71,14 +86,129 @@ const PAYLOAD: &[u8] = b"post-recovery-configured-serve";
 #[tokio::test]
 #[ignore = "requires TEST_REDIS_URL; run explicitly as the configured recovery process gate"]
 async fn m7_configured_recovery_process_preserves_revocation_and_fresh_echo() {
-    timeout(TEST_DEADLINE, run_process_recovery_gate())
+    let evidence = timeout(TEST_DEADLINE, run_process_recovery_gate())
         .await
         .expect("configured recovery process gate exceeded its overall deadline")
         .expect("configured recovery process gate");
+    validate_configured_recovery_evidence(&evidence)
+        .expect("configured recovery evidence contract");
+    println!(
+        "M7 configured recovery passed: quiescence_ms={} revocation_before_recovery={} \
+         digest_drift_observed={} stale_digest_approval_refused={} \
+         unfenced_writer_claim_refused={} stale_writer_connect_refused={} \
+         stale_serve_failed_closed={} candidate_revocation_retained={} \
+         fresh_session_generation={} fresh_candidate_echo={} revoked_device_refused={}",
+        evidence.quiescence_wait_ms,
+        evidence.revocation_enforced_before_recovery,
+        evidence.digest_drift_observed,
+        evidence.stale_digest_approval_refused,
+        evidence.unfenced_writer_claim_refused,
+        evidence.stale_writer_connect_refused,
+        evidence.stale_serve_process_failed_closed,
+        evidence.candidate_revocation_retained,
+        evidence.fresh_session_generation,
+        evidence.fresh_candidate_echo,
+        evidence.revoked_device_refused_after_recovery,
+    );
+}
+
+/// Payload-free evidence from the configured recovery process gate.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ConfiguredRecoveryEvidence {
+    /// Measured wall-clock milliseconds waited after both the old relay and
+    /// the old checkpoint stopped, covering the configured owner/device
+    /// permission lifetime, the signed membership trust lifetime and the
+    /// configured clock skew.
+    quiescence_wait_ms: u64,
+    /// The retained device revocation was already enforced before recovery.
+    revocation_enforced_before_recovery: bool,
+    /// An unfenced writer moved durable catalog state after the operator
+    /// observed its digest, and the next observation reported a different one.
+    digest_drift_observed: bool,
+    /// An approval bound to the earlier catalog digest was refused with the
+    /// bounded catalog-digest cause.
+    stale_digest_approval_refused: bool,
+    /// A never-fenced writer that still held its connection and its old
+    /// configured incarnation was refused an ownership claim after activation,
+    /// with the typed active-incarnation conflict.
+    unfenced_writer_claim_refused: bool,
+    /// A fresh connect on the superseded incarnation was refused.
+    stale_writer_connect_refused: bool,
+    /// A stale configured serve process failed closed without exposing
+    /// readiness and released its listeners.
+    stale_serve_process_failed_closed: bool,
+    /// The candidate incarnation still refused the revoked device credential.
+    candidate_revocation_retained: bool,
+    /// Generation reported by the fresh post-recovery device session.
+    fresh_session_generation: u64,
+    /// The fresh candidate session returned its canary over public HTTP.
+    fresh_candidate_echo: bool,
+    /// The revoked device could not establish an authenticated session after
+    /// recovery.
+    revoked_device_refused_after_recovery: bool,
+}
+
+/// Validate the configured recovery evidence contract.
+fn validate_configured_recovery_evidence(evidence: &ConfiguredRecoveryEvidence) -> Result<()> {
+    let required = [
+        (
+            "revocation_enforced_before_recovery",
+            evidence.revocation_enforced_before_recovery,
+        ),
+        ("digest_drift_observed", evidence.digest_drift_observed),
+        (
+            "stale_digest_approval_refused",
+            evidence.stale_digest_approval_refused,
+        ),
+        (
+            "unfenced_writer_claim_refused",
+            evidence.unfenced_writer_claim_refused,
+        ),
+        (
+            "stale_writer_connect_refused",
+            evidence.stale_writer_connect_refused,
+        ),
+        (
+            "stale_serve_process_failed_closed",
+            evidence.stale_serve_process_failed_closed,
+        ),
+        (
+            "candidate_revocation_retained",
+            evidence.candidate_revocation_retained,
+        ),
+        ("fresh_candidate_echo", evidence.fresh_candidate_echo),
+        (
+            "revoked_device_refused_after_recovery",
+            evidence.revoked_device_refused_after_recovery,
+        ),
+    ];
+    for (field, satisfied) in required {
+        if !satisfied {
+            return Err(HarnessError::Process(format!(
+                "configured recovery evidence is incomplete: {field}"
+            )));
+        }
+    }
+    if evidence.fresh_session_generation == 0 {
+        return Err(HarnessError::Process(
+            "configured recovery fresh session reported generation zero".into(),
+        ));
+    }
+    let minimum_quiescence = MEMBERSHIP_TRUST_LIFETIME
+        .saturating_add(ALLOWED_MEMBERSHIP_CLOCK_SKEW)
+        .max(OWNER_DEVICE_PERMISSION_LIFETIME);
+    let minimum_quiescence_ms = u64::try_from(minimum_quiescence.as_millis()).unwrap_or(u64::MAX);
+    if evidence.quiescence_wait_ms < minimum_quiescence_ms {
+        return Err(HarnessError::Process(format!(
+            "configured recovery waited only {} ms, below the {minimum_quiescence_ms} ms lifetime-plus-skew boundary",
+            evidence.quiescence_wait_ms
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
-async fn run_process_recovery_gate() -> Result<()> {
+async fn run_process_recovery_gate() -> Result<ConfiguredRecoveryEvidence> {
     let relay_binary = relay_binary_path()?;
     let upstream_url = env::var("TEST_REDIS_URL").map_err(|_| HarnessError::MissingRedisUrl {
         env_var: "TEST_REDIS_URL",
@@ -111,6 +241,12 @@ async fn run_process_recovery_gate() -> Result<()> {
         .devices_a
         .get(1)
         .ok_or_else(|| HarnessError::InvalidInput("missing revoked device".into()))?;
+    // A third device exists only so an unfenced writer can move durable
+    // catalog state after the operator observed its digest.
+    let drift_device = topology
+        .devices_a
+        .get(2)
+        .ok_or_else(|| HarnessError::InvalidInput("missing digest-drift device".into()))?;
     let active_service = *topology
         .service_ids
         .get(&active_device.id)
@@ -355,6 +491,7 @@ async fn run_process_recovery_gate() -> Result<()> {
             "revoked device remained authorized before recovery".into(),
         ));
     }
+    let revocation_enforced_before_recovery = true;
 
     // The initial cluster registration consumes its one-use catalog
     // attachment ticket. Redis marks the ticket hash spent and removes its
@@ -375,22 +512,80 @@ async fn run_process_recovery_gate() -> Result<()> {
         .saturating_add(ALLOWED_MEMBERSHIP_CLOCK_SKEW)
         .max(OWNER_DEVICE_PERMISSION_LIFETIME);
     sleep(fencing_quiescence.saturating_sub(fenced_at.elapsed())).await;
+    let quiescence_wait_ms = u64::try_from(fenced_at.elapsed().as_millis()).unwrap_or(u64::MAX);
 
     initialize_recovery(&relay_binary, &old_config_path).await?;
-    let observation = observe_recovery(&relay_binary, &old_config_path).await?;
-    let redis_run_id = observation["redis_run_id"]
+    let first_observation = observe_recovery(&relay_binary, &old_config_path).await?;
+    let redis_run_id = first_observation["redis_run_id"]
         .as_str()
         .ok_or_else(|| HarnessError::Process("recovery observation omitted Redis run ID".into()))?
         .to_owned();
-    let catalog_digest = observation["catalog_digest"]
+    let stale_catalog_digest = first_observation["catalog_digest"]
         .as_str()
         .ok_or_else(|| HarnessError::Process("recovery observation omitted catalog digest".into()))?
         .to_owned();
-    if observation["deployment_incarnation"] != candidate_incarnation {
+    if first_observation["deployment_incarnation"] != candidate_incarnation {
         return Err(HarnessError::Process(
             "recovery observation did not bind candidate incarnation".into(),
         ));
     }
+
+    // An operator's fencing declaration is not proof. A writer that was never
+    // fenced still holds this catalog handle on the *initial* incarnation, and
+    // it mutates durable state after the digest above was observed. The
+    // approval the operator signed against that earlier digest must therefore
+    // be refused rather than activated against a catalog that has since moved.
+    catalog
+        .revoke_device(drift_device.tenant_id, drift_device.id, Utc::now())
+        .await
+        .map_err(|error| {
+            HarnessError::Redis(format!("unfenced writer drift revocation: {error}"))
+        })?;
+    let drifted_observation = observe_recovery(&relay_binary, &old_config_path).await?;
+    let catalog_digest = drifted_observation["catalog_digest"]
+        .as_str()
+        .ok_or_else(|| {
+            HarnessError::Process("drifted recovery observation omitted catalog digest".into())
+        })?
+        .to_owned();
+    if catalog_digest == stale_catalog_digest {
+        return Err(HarnessError::Process(
+            "unfenced writer drift did not change the observed catalog digest".into(),
+        ));
+    }
+    let digest_drift_observed = true;
+    write_approval(
+        &trusted_keys_path,
+        &approval_path,
+        &namespace,
+        &deployment_id,
+        &candidate_incarnation,
+        &redis_run_id,
+        &stale_catalog_digest,
+    )?;
+    let stale_digest_refusal = run_recover_cli(
+        &relay_binary,
+        &old_config_path,
+        &approval_path,
+        STALE_DIGEST_ACKNOWLEDGEMENT,
+    )
+    .await?;
+    if stale_digest_refusal.status.success() {
+        return Err(HarnessError::Process(
+            "recover accepted an approval bound to an older catalog digest".into(),
+        ));
+    }
+    let stale_digest_diagnostic = String::from_utf8_lossy(&stale_digest_refusal.stderr).to_string();
+    if !stale_digest_diagnostic.contains(CATALOG_DIGEST_MISMATCH_DIAGNOSTIC) {
+        return Err(HarnessError::Process(format!(
+            "older-digest approval was refused without the catalog-digest cause: {stale_digest_diagnostic}"
+        )));
+    }
+    let stale_digest_approval_refused = true;
+
+    // The digest refusal happens before the approval version is persisted, so
+    // the operator's corrected approval may reuse that version. Binding the
+    // current digest is the only change.
     write_approval(
         &trusted_keys_path,
         &approval_path,
@@ -401,6 +596,43 @@ async fn run_process_recovery_gate() -> Result<()> {
         &catalog_digest,
     )?;
     recover_relay(&relay_binary, &old_config_path, &approval_path).await?;
+
+    // This handle was opened before recovery and was never fenced: it still
+    // holds its connection and its configured initial incarnation. A durable
+    // ownership claim through it must now be refused by Redis itself, not only
+    // by a fresh connect-time check.
+    let unfenced_claim = catalog
+        .claim_owner(&OwnerClaimRequest {
+            deployment_incarnation: initial_incarnation.clone(),
+            tenant_id: active_device.tenant_id,
+            device_id: active_device.id,
+            node_id: node_id.clone(),
+            boot_id: format!("m7-recovery-unfenced-boot-{run_id}"),
+            session_id: format!("m7-recovery-unfenced-session-{run_id}"),
+            lease_expires_at: Utc::now() + ChronoDuration::seconds(10),
+        })
+        .await;
+    let unfenced_writer_claim_refused = match unfenced_claim {
+        Err(CatalogError::Conflict(cause)) => {
+            if cause != ACTIVE_INCARNATION_CONFLICT {
+                return Err(HarnessError::Process(format!(
+                    "unfenced writer claim was refused with an unexpected cause: {cause}"
+                )));
+            }
+            true
+        }
+        Err(error) => {
+            return Err(HarnessError::Process(format!(
+                "unfenced writer claim was refused without the incarnation fence: {error}"
+            )));
+        }
+        Ok(claim) => {
+            return Err(HarnessError::Process(format!(
+                "unfenced writer claimed ownership at epoch {} after approved recovery",
+                claim.token.epoch
+            )));
+        }
+    };
 
     drop(catalog);
     if RedisCatalog::connect_with_deployment_incarnation(
@@ -415,6 +647,7 @@ async fn run_process_recovery_gate() -> Result<()> {
             "old writer incarnation connected after approved recovery".into(),
         ));
     }
+    let stale_writer_connect_refused = true;
 
     // A stale configured process must fail closed before the new membership is
     // published. This isolates the writer-fence proof from membership refresh.
@@ -427,6 +660,7 @@ async fn run_process_recovery_gate() -> Result<()> {
         &pki.server_ca.certificate_der,
     )
     .await?;
+    let stale_serve_process_failed_closed = true;
 
     let candidate_membership =
         signer.sign_membership(&deployment_id, &candidate_incarnation, &node, 2, Utc::now())?;
@@ -522,6 +756,7 @@ async fn run_process_recovery_gate() -> Result<()> {
             "candidate serve silently re-authorized the revoked device".into(),
         ));
     }
+    let candidate_revocation_retained = true;
 
     let mut fresh_client = connect_fresh(&active_client_config).await?;
     let fresh_session = timeout(CONNECT_DEADLINE, fresh_client.wait_ready())
@@ -533,6 +768,7 @@ async fn run_process_recovery_gate() -> Result<()> {
             "fresh device session reported generation zero".into(),
         ));
     }
+    let fresh_session_generation = fresh_session.generation;
     echo_http(EchoProbe {
         consumer_bind,
         server_ca_der: &pki.server_ca.certificate_der,
@@ -544,6 +780,7 @@ async fn run_process_recovery_gate() -> Result<()> {
         phase: "fresh-candidate",
     })
     .await?;
+    let fresh_candidate_echo = true;
     fresh_client.stop().await.map_err(|error| {
         HarnessError::Process(format!("stopping fresh device session: {error}"))
     })?;
@@ -571,6 +808,7 @@ async fn run_process_recovery_gate() -> Result<()> {
             "revoked device established an authenticated session after recovery".into(),
         ));
     }
+    let revoked_device_refused_after_recovery = true;
 
     stop_relay(
         candidate_process,
@@ -588,7 +826,19 @@ async fn run_process_recovery_gate() -> Result<()> {
             HarnessError::Redis(format!("cleaning recovery process fixture: {error}"))
         })?;
     redis_proxy.shutdown().await?;
-    Ok(())
+    Ok(ConfiguredRecoveryEvidence {
+        quiescence_wait_ms,
+        revocation_enforced_before_recovery,
+        digest_drift_observed,
+        stale_digest_approval_refused,
+        unfenced_writer_claim_refused,
+        stale_writer_connect_refused,
+        stale_serve_process_failed_closed,
+        candidate_revocation_retained,
+        fresh_session_generation,
+        fresh_candidate_echo,
+        revoked_device_refused_after_recovery,
+    })
 }
 
 fn distinct_tcp_addr(other: std::net::SocketAddr) -> std::net::SocketAddr {
@@ -966,8 +1216,18 @@ async fn observe_recovery(binary: &Path, config: &Path) -> Result<serde_json::Va
         .map_err(|error| HarnessError::Process(format!("recovery-observe JSON: {error}")))
 }
 
-async fn recover_relay(binary: &Path, config: &Path, approval: &Path) -> Result<()> {
-    let output = run_relay_cli(
+/// Run one `recover` invocation and return its raw output.
+///
+/// Both the refused older-digest attempt and the accepted recovery go through
+/// this single path, so the refusal cannot come from a differently shaped
+/// command line.
+async fn run_recover_cli(
+    binary: &Path,
+    config: &Path,
+    approval: &Path,
+    acknowledgement_id: &str,
+) -> Result<Output> {
+    run_relay_cli(
         binary,
         &[
             "recover".to_owned(),
@@ -978,12 +1238,16 @@ async fn recover_relay(binary: &Path, config: &Path, approval: &Path) -> Result<
             "--expected-nonce".to_owned(),
             APPROVAL_NONCE.to_owned(),
             "--acknowledgement-id".to_owned(),
-            "m7-recovery-process-quiescence".to_owned(),
+            acknowledgement_id.to_owned(),
             "--old-primary-fenced".to_owned(),
             "--old-relays-fenced".to_owned(),
         ],
     )
-    .await?;
+    .await
+}
+
+async fn recover_relay(binary: &Path, config: &Path, approval: &Path) -> Result<()> {
+    let output = run_recover_cli(binary, config, approval, RECOVERY_ACKNOWLEDGEMENT).await?;
     if !output.status.success() {
         return Err(HarnessError::Process(format!(
             "recover failed: {}",
@@ -1129,5 +1393,98 @@ async fn assert_old_writer_refused(
             )));
         }
         sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// C17 mutation coverage for the configured recovery evidence contract.
+///
+/// The gate itself needs a Redis primary and two relay processes, so these
+/// cases are the only cheap guard against the validator drifting into
+/// accepting an incomplete run.
+mod c17_validator_tests {
+    use super::{
+        ALLOWED_MEMBERSHIP_CLOCK_SKEW, ConfiguredRecoveryEvidence, MEMBERSHIP_TRUST_LIFETIME,
+        OWNER_DEVICE_PERMISSION_LIFETIME, validate_configured_recovery_evidence,
+    };
+
+    fn valid_evidence() -> ConfiguredRecoveryEvidence {
+        let quiescence = MEMBERSHIP_TRUST_LIFETIME
+            .saturating_add(ALLOWED_MEMBERSHIP_CLOCK_SKEW)
+            .max(OWNER_DEVICE_PERMISSION_LIFETIME);
+        ConfiguredRecoveryEvidence {
+            quiescence_wait_ms: u64::try_from(quiescence.as_millis()).unwrap_or(u64::MAX),
+            revocation_enforced_before_recovery: true,
+            digest_drift_observed: true,
+            stale_digest_approval_refused: true,
+            unfenced_writer_claim_refused: true,
+            stale_writer_connect_refused: true,
+            stale_serve_process_failed_closed: true,
+            candidate_revocation_retained: true,
+            fresh_session_generation: 1,
+            fresh_candidate_echo: true,
+            revoked_device_refused_after_recovery: true,
+        }
+    }
+
+    fn assert_rejected(evidence: &ConfiguredRecoveryEvidence, expected: &str) {
+        let diagnostic = validate_configured_recovery_evidence(evidence)
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| {
+                panic!("incomplete configured recovery evidence unexpectedly passed: {expected}")
+            });
+        assert!(
+            diagnostic.contains(expected),
+            "{expected} missing from bounded diagnostic: {diagnostic}"
+        );
+    }
+
+    #[test]
+    fn configured_recovery_validator_accepts_complete_evidence() {
+        validate_configured_recovery_evidence(&valid_evidence())
+            .expect("complete configured recovery evidence is valid");
+    }
+
+    #[test]
+    fn every_configured_recovery_flag_and_bound_reaches_the_shared_exit_path() {
+        type Disable = (&'static str, fn(&mut ConfiguredRecoveryEvidence));
+        let flags: [Disable; 9] = [
+            ("revocation_enforced_before_recovery", |e| {
+                e.revocation_enforced_before_recovery = false
+            }),
+            ("digest_drift_observed", |e| e.digest_drift_observed = false),
+            ("stale_digest_approval_refused", |e| {
+                e.stale_digest_approval_refused = false
+            }),
+            ("unfenced_writer_claim_refused", |e| {
+                e.unfenced_writer_claim_refused = false
+            }),
+            ("stale_writer_connect_refused", |e| {
+                e.stale_writer_connect_refused = false
+            }),
+            ("stale_serve_process_failed_closed", |e| {
+                e.stale_serve_process_failed_closed = false
+            }),
+            ("candidate_revocation_retained", |e| {
+                e.candidate_revocation_retained = false
+            }),
+            ("fresh_candidate_echo", |e| e.fresh_candidate_echo = false),
+            ("revoked_device_refused_after_recovery", |e| {
+                e.revoked_device_refused_after_recovery = false
+            }),
+        ];
+        for (name, disable) in flags {
+            let mut evidence = valid_evidence();
+            disable(&mut evidence);
+            assert_rejected(&evidence, name);
+        }
+
+        let mut zero_generation = valid_evidence();
+        zero_generation.fresh_session_generation = 0;
+        assert_rejected(&zero_generation, "generation zero");
+
+        let mut short_wait = valid_evidence();
+        short_wait.quiescence_wait_ms -= 1;
+        assert_rejected(&short_wait, "lifetime-plus-skew boundary");
     }
 }
