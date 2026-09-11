@@ -429,15 +429,24 @@ async fn redis_authority_clock_bounds_expiry_checks() {
     };
     let device = fixture.devices[0].device_id;
     let service = fixture.services[0].service_id;
-    let too_old = Utc::now() - Duration::seconds(2);
-    assert!(matches!(
-        catalog
-            .resolve_device(&fixture.credentials[0].spki_fingerprint, too_old)
-            .await,
-        Err(tunnel_catalog::CatalogError::Conflict(
-            "authority clock skew"
-        ))
-    ));
+    // A caller clock behind the authority is tolerated up to the Redis
+    // operation timeout (a slow reply must not be refused as skew), so the
+    // refusal boundary is that lag bound, not the one-second ahead bound.
+    // Thirty seconds is far beyond both and is immune to the sub-second
+    // drift between the host clock and the containerised authority.
+    let too_old = Utc::now() - Duration::seconds(30);
+    let skewed = catalog
+        .resolve_device(&fixture.credentials[0].spki_fingerprint, too_old)
+        .await;
+    assert!(
+        matches!(
+            skewed,
+            Err(tunnel_catalog::CatalogError::Conflict(
+                "authority clock skew"
+            ))
+        ),
+        "a caller clock far behind the authority must be refused as clock skew, observed {skewed:?}"
+    );
     assert!(matches!(
         catalog
             .authorize(&principal, device, service, too_old, too_old)
