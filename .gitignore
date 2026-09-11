@@ -6,3 +6,4 @@
 *.pem
 *.key
 /work/
+/.claude/worktrees/
