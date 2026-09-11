@@ -62,7 +62,7 @@ use self::peer_readiness::{
 };
 use crate::{
     http::{PeerAdmissionBarrier, PeerAdmissionScope},
-    membership_runtime::{PeerAdmissionCancellation, PeerInvalidationReason},
+    membership_runtime::PeerAdmissionCancellation,
     routing::{OwnerRoute, OwnerRouter, OwnerRoutingError, OwnerScope},
 };
 
@@ -438,13 +438,37 @@ impl From<PeerFrameError> for PeerRuntimeError {
 fn admission_cancellation_error(
     cancellation: Option<&PeerAdmissionCancellation>,
 ) -> PeerRuntimeError {
-    if cancellation.is_some_and(|cancellation| {
-        cancellation.is_cancelled()
-            && cancellation.reason() == Some(PeerInvalidationReason::TrustExpired)
-    }) {
+    if cancellation.is_some_and(PeerAdmissionCancellation::trust_expired) {
         PeerRuntimeError::MembershipExpired
     } else {
         PeerRuntimeError::Closed
+    }
+}
+
+/// Attribute a peer reset or close observed after this admission's signed
+/// trust deadline to membership expiry.
+///
+/// Both relays on a pooled HTTP/3 stream enforce the same signed deadline,
+/// and the remote side may cancel first.  Without this, the local observer
+/// would record a generic transport close a few milliseconds before its own
+/// invalidation dispatcher runs, and the exact stream's first terminal cause
+/// would be lost.  Only the peer-reset family is reclassified: `GoAway`,
+/// timeouts, limit and authentication failures keep their own typed
+/// classification, and no error is reclassified before the deadline.
+fn attribute_admission_failure<T>(
+    result: Result<T, PeerRuntimeError>,
+    cancellation: &PeerAdmissionCancellation,
+) -> Result<T, PeerRuntimeError> {
+    match result {
+        Err(
+            PeerRuntimeError::Transport(
+                PeerTransportError::H3(_)
+                | PeerTransportError::Quic(_)
+                | PeerTransportError::Cancelled,
+            )
+            | PeerRuntimeError::Closed,
+        ) if cancellation.trust_expired() => Err(PeerRuntimeError::MembershipExpired),
+        other => other,
     }
 }
 
@@ -2053,7 +2077,9 @@ async fn send_client_chunks(
             _ = admission_cancellation.cancelled() => {
                 Err(admission_cancellation_error(Some(admission_cancellation)))
             },
-            result = send.send_chunked(bytes) => result.map_err(Into::into),
+            result = send.send_chunked(bytes) => {
+                attribute_admission_failure(result.map_err(Into::into), admission_cancellation)
+            }
         };
         if matches!(
             result,
@@ -2082,7 +2108,9 @@ async fn send_server_chunks(
             _ = admission_cancellation.cancelled() => {
                 Err(admission_cancellation_error(Some(admission_cancellation)))
             },
-            result = send.send_chunked(bytes) => result.map_err(Into::into),
+            result = send.send_chunked(bytes) => {
+                attribute_admission_failure(result.map_err(Into::into), admission_cancellation)
+            }
         };
         if matches!(
             result,
@@ -2110,7 +2138,9 @@ async fn finish_client_send(
             _ = admission_cancellation.cancelled() => {
                 Err(admission_cancellation_error(Some(admission_cancellation)))
             },
-            result = send.finish() => result.map_err(Into::into),
+            result = send.finish() => {
+                attribute_admission_failure(result.map_err(Into::into), admission_cancellation)
+            }
         };
         if matches!(
             result,
@@ -2138,7 +2168,9 @@ async fn finish_server_send(
             _ = admission_cancellation.cancelled() => {
                 Err(admission_cancellation_error(Some(admission_cancellation)))
             },
-            result = send.finish() => result.map_err(Into::into),
+            result = send.finish() => {
+                attribute_admission_failure(result.map_err(Into::into), admission_cancellation)
+            }
         };
         if matches!(
             result,
@@ -2167,7 +2199,9 @@ async fn send_server_response(
             _ = admission_cancellation.cancelled() => {
                 Err(admission_cancellation_error(Some(admission_cancellation)))
             },
-            result = send.send_response(response) => result.map_err(Into::into),
+            result = send.send_response(response) => {
+                attribute_admission_failure(result.map_err(Into::into), admission_cancellation)
+            }
         };
         if matches!(
             result,
@@ -2195,7 +2229,9 @@ async fn recv_client_response(
             _ = admission_cancellation.cancelled() => {
                 Err(admission_cancellation_error(Some(admission_cancellation)))
             },
-            result = recv.recv_response() => result.map_err(Into::into),
+            result = recv.recv_response() => {
+                attribute_admission_failure(result.map_err(Into::into), admission_cancellation)
+            }
         };
         if matches!(
             result,
@@ -2223,7 +2259,9 @@ async fn recv_client_chunk(
             _ = admission_cancellation.cancelled() => {
                 Err(admission_cancellation_error(Some(admission_cancellation)))
             },
-            result = recv.recv_chunk() => result.map_err(Into::into),
+            result = recv.recv_chunk() => {
+                attribute_admission_failure(result.map_err(Into::into), admission_cancellation)
+            }
         };
         if matches!(
             result,
@@ -2251,7 +2289,9 @@ async fn recv_server_chunk(
             _ = admission_cancellation.cancelled() => {
                 Err(admission_cancellation_error(Some(admission_cancellation)))
             },
-            result = recv.recv_chunk() => result.map_err(Into::into),
+            result = recv.recv_chunk() => {
+                attribute_admission_failure(result.map_err(Into::into), admission_cancellation)
+            }
         };
         if matches!(
             result,
@@ -2347,6 +2387,101 @@ mod tests {
         PeerRecordDecoder,
     };
     use tunnel_transport::DEFAULT_PEER_BODY_CHUNK_BYTES;
+
+    #[test]
+    fn peer_reset_after_admission_deadline_is_attributed_to_membership_expiry() {
+        let expired = PeerAdmissionCancellation::from_token_with_deadline(
+            tokio_util::sync::CancellationToken::new(),
+            std::time::Instant::now() - std::time::Duration::from_millis(1),
+        );
+        let live = PeerAdmissionCancellation::from_token_with_deadline(
+            tokio_util::sync::CancellationToken::new(),
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+        );
+        let reset = || -> Result<(), PeerRuntimeError> {
+            Err(PeerRuntimeError::Transport(PeerTransportError::H3(
+                "H3_REQUEST_CANCELLED".to_owned(),
+            )))
+        };
+
+        // After the signed deadline, the peer-reset family is the observable
+        // effect of expiry on the other relay; it is attributed as such even
+        // though this edge has not been cancelled by the local dispatcher.
+        assert!(!expired.is_cancelled());
+        assert!(matches!(
+            attribute_admission_failure(reset(), &expired),
+            Err(PeerRuntimeError::MembershipExpired)
+        ));
+        for error in [
+            PeerRuntimeError::Transport(PeerTransportError::Quic("closed".to_owned())),
+            PeerRuntimeError::Transport(PeerTransportError::Cancelled),
+            PeerRuntimeError::Closed,
+        ] {
+            assert!(matches!(
+                attribute_admission_failure(Err::<(), _>(error), &expired),
+                Err(PeerRuntimeError::MembershipExpired)
+            ));
+        }
+
+        // Nothing is reclassified before the deadline.
+        assert!(matches!(
+            attribute_admission_failure(reset(), &live),
+            Err(PeerRuntimeError::Transport(PeerTransportError::H3(_)))
+        ));
+
+        // Typed non-reset outcomes keep their own classification after the
+        // deadline, and success is untouched.
+        assert!(matches!(
+            attribute_admission_failure(
+                Err::<(), _>(PeerRuntimeError::Transport(PeerTransportError::GoAway)),
+                &expired
+            ),
+            Err(PeerRuntimeError::Transport(PeerTransportError::GoAway))
+        ));
+        assert!(matches!(
+            attribute_admission_failure(
+                Err::<(), _>(PeerRuntimeError::Transport(PeerTransportError::Timeout)),
+                &expired
+            ),
+            Err(PeerRuntimeError::Transport(PeerTransportError::Timeout))
+        ));
+        assert!(matches!(
+            attribute_admission_failure(
+                Err::<(), _>(PeerRuntimeError::OwnerNotReady {
+                    retry_after_ms: 250
+                }),
+                &expired
+            ),
+            Err(PeerRuntimeError::OwnerNotReady {
+                retry_after_ms: 250
+            })
+        ));
+        assert_eq!(
+            attribute_admission_failure(Ok::<u8, PeerRuntimeError>(7), &expired).ok(),
+            Some(7)
+        );
+
+        // The cancellation error follows the same evidence: a passed
+        // deadline without a dispatched reason is expiry; a live edge, an
+        // unclassified cancellation of it, or no edge is a generic close.
+        assert!(matches!(
+            admission_cancellation_error(Some(&expired)),
+            PeerRuntimeError::MembershipExpired
+        ));
+        assert!(matches!(
+            admission_cancellation_error(Some(&live)),
+            PeerRuntimeError::Closed
+        ));
+        live.token().cancel();
+        assert!(matches!(
+            admission_cancellation_error(Some(&live)),
+            PeerRuntimeError::Closed
+        ));
+        assert!(matches!(
+            admission_cancellation_error(None),
+            PeerRuntimeError::Closed
+        ));
+    }
 
     #[test]
     fn maximum_device_record_reassembles_across_transport_chunks() {

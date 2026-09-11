@@ -33,7 +33,7 @@ use tunnel_client::{ConnectOptions, ConnectionHandle, TransportProfile};
 use tunnel_cluster::membership::SignedMembershipRecord;
 use tunnel_relay::{
     MembershipReadiness, MembershipUnreadyReason, PeerConsumerDiagnosticRole, PeerProbeState,
-    PeerTransportDiagnosticOutcome, RelaySnapshot, StreamTerminalEvent,
+    PeerTransportDiagnosticOutcome, RelaySnapshot, StreamTerminalCause, StreamTerminalEvent,
 };
 
 const TARGET_NODE: &str = "relay-a";
@@ -960,11 +960,10 @@ async fn run_inner(
         .fixture
         .memberships
         .insert(TARGET_NODE.to_owned(), recovery_record);
-    if !affected_session_correlated? {
-        return Err(HarnessError::Process(
-            "expired target pooled stream was not observed with its exact owner session/cursor before reclamation"
-                .into(),
-        ));
+    if let Err(last_sample) = affected_session_correlated? {
+        return Err(HarnessError::Process(format!(
+            "expired target pooled stream was not observed with its exact owner session/cursor before reclamation; last sample: {last_sample:?}"
+        )));
     }
     evidence.affected_stream_interrupted = true;
     Ok(evidence)
@@ -1258,40 +1257,68 @@ fn verified_terminal_carrier_transition(
         && event.total_replayed_frames == before.total_replayed_frames
 }
 
-fn exact_trust_expiry_diagnostic(
-    source_snapshot: &RelaySnapshot,
-    owner: &OwnerToken,
-    event: &StreamTerminalEvent,
-) -> bool {
-    let Some(request_id) = event.request_id.as_deref() else {
-        return false;
-    };
-    source_snapshot
-        .peer_consumer_diagnostics
-        .last_ingress_receive
-        .as_ref()
-        .is_some_and(|diagnostic| {
-            diagnostic.role == PeerConsumerDiagnosticRole::IngressReceive
-                && diagnostic.outcome == PeerTransportDiagnosticOutcome::TrustExpired
-                && diagnostic.tenant_id == owner.tenant_id
-                && diagnostic.device_id == owner.device_id
-                && diagnostic.session_id == owner.session_id
-                && diagnostic.epoch == owner.epoch
-                && diagnostic.request_id == request_id
-        })
+/// Payload-free record of one exact-observation sample.  Every field is a
+/// boolean, a counter, or a closed diagnostic label, so a failed gate can name
+/// the first unmet correlation condition without retaining payloads,
+/// credentials, or free-form transport text.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct AffectedObservationSample {
+    target_deadline_passed: bool,
+    matching_terminal_events: usize,
+    stream_removed: bool,
+    baseline_owner_identity_matches: bool,
+    event_owner_identity_matches: bool,
+    reason: Option<&'static str>,
+    cause: Option<StreamTerminalCause>,
+    authorization_failure_code: Option<&'static str>,
+    closed_after_deadline: bool,
+    cursors_monotonic: bool,
+    carrier_transition_verified: bool,
+    event_request_id_present: bool,
+    ingress_receive_count: u64,
+    ingress_last_receive: Option<(PeerConsumerDiagnosticRole, PeerTransportDiagnosticOutcome)>,
+    ingress_owner_identity_matches: bool,
+    ingress_request_id_matches: bool,
 }
 
-fn affected_owner_stream_interrupted(
+impl AffectedObservationSample {
+    /// Every condition must hold on one sample.  A missing stream, a missing
+    /// latch, or a generic close never satisfies the gate.
+    fn satisfied(&self) -> bool {
+        self.target_deadline_passed
+            && self.matching_terminal_events == 1
+            && self.stream_removed
+            && self.baseline_owner_identity_matches
+            && self.event_owner_identity_matches
+            && self.reason == Some("STREAM_CLOSED")
+            && self.cause == Some(StreamTerminalCause::PeerMembershipExpired)
+            && self.authorization_failure_code.is_none()
+            && self.closed_after_deadline
+            && self.cursors_monotonic
+            && self.carrier_transition_verified
+            && self.event_request_id_present
+            && self.ingress_last_receive
+                == Some((
+                    PeerConsumerDiagnosticRole::IngressReceive,
+                    PeerTransportDiagnosticOutcome::TrustExpired,
+                ))
+            && self.ingress_owner_identity_matches
+            && self.ingress_request_id_matches
+    }
+}
+
+fn sample_affected_owner_stream(
     target_snapshot: &RelaySnapshot,
     source_snapshot: &RelaySnapshot,
     owner: &OwnerToken,
     before: &OwnerSessionCursor,
     authoritative_deadline_ms: u64,
-) -> bool {
-    if target_snapshot.monotonic_now_ms < authoritative_deadline_ms {
-        return false;
+) -> AffectedObservationSample {
+    let mut sample = AffectedObservationSample {
+        target_deadline_passed: target_snapshot.monotonic_now_ms >= authoritative_deadline_ms,
+        ..AffectedObservationSample::default()
     };
-    let mut matching_events = target_snapshot
+    let matching_events = target_snapshot
         .stream_terminal_events
         .iter()
         .filter(|event| {
@@ -1301,44 +1328,67 @@ fn affected_owner_stream_interrupted(
                 && event.epoch == owner.epoch
                 && event.stream_id == before.stream.stream_id
                 && event.operation_id == before.stream.operation_id
-        });
-    let Some(event) = matching_events.next() else {
-        return false;
-    };
-    // A second terminal record for the same exact stream identity is an
-    // ambiguous lifecycle trace. Never reverse-search past an earlier
-    // conflicting record to manufacture an expiry proof.
-    if matching_events.next().is_some() {
-        return false;
-    }
-    let stream_removed = target_snapshot.sessions.iter().all(|session| {
+        })
+        .collect::<Vec<_>>();
+    sample.matching_terminal_events = matching_events.len();
+    sample.stream_removed = target_snapshot.sessions.iter().all(|session| {
         !session.streams.iter().any(|stream| {
             stream.stream_id == before.stream.stream_id
                 && stream.operation_id == before.stream.operation_id
         })
     });
-    stream_removed
-        && before.deployment_incarnation == owner.deployment_incarnation
+    sample.baseline_owner_identity_matches = before.deployment_incarnation
+        == owner.deployment_incarnation
         && before.node_id == owner.node_id
         && before.boot_id == owner.boot_id
-        && before.owner_id == owner_id_digest(owner)
-        && event.deployment_incarnation == owner.deployment_incarnation
+        && before.owner_id == owner_id_digest(owner);
+    let ingress = &source_snapshot.peer_consumer_diagnostics;
+    sample.ingress_receive_count = ingress.ingress_receive_count;
+    sample.ingress_last_receive = ingress
+        .last_ingress_receive
+        .as_ref()
+        .map(|diagnostic| (diagnostic.role, diagnostic.outcome));
+    sample.ingress_owner_identity_matches =
+        ingress
+            .last_ingress_receive
+            .as_ref()
+            .is_some_and(|diagnostic| {
+                diagnostic.tenant_id == owner.tenant_id
+                    && diagnostic.device_id == owner.device_id
+                    && diagnostic.session_id == owner.session_id
+                    && diagnostic.epoch == owner.epoch
+            });
+    // A second terminal record for the same exact stream identity is an
+    // ambiguous lifecycle trace. Never reverse-search past an earlier
+    // conflicting record to manufacture an expiry proof.
+    let [event] = matching_events.as_slice() else {
+        return sample;
+    };
+    sample.event_owner_identity_matches = event.deployment_incarnation
+        == owner.deployment_incarnation
         && event.node_id == owner.node_id
         && event.boot_id == owner.boot_id
-        && event.owner_id == owner_id_digest(owner)
-        && event.reason == "STREAM_CLOSED"
-        && event.cause == Some(tunnel_relay::StreamTerminalCause::PeerMembershipExpired)
-        && event.authorization_failure_code.is_none()
-        && event.closed_at_ms >= authoritative_deadline_ms
-        && event.active_generation >= before.active_generation
+        && event.owner_id == owner_id_digest(owner);
+    sample.reason = Some(event.reason);
+    sample.cause = event.cause;
+    sample.authorization_failure_code = event.authorization_failure_code;
+    sample.closed_after_deadline = event.closed_at_ms >= authoritative_deadline_ms;
+    sample.cursors_monotonic = event.active_generation >= before.active_generation
         && event.last_emitted_relay_to_connector >= before.stream.last_emitted
         && event.peer_acked_relay_to_connector >= before.stream.peer_acked
         && event.recv_contiguous_connector_to_relay >= before.stream.recv_contiguous
         && event.delivered_contiguous_connector_to_relay >= before.stream.delivered
         && event.rotations_completed >= before.rotations_completed
-        && event.total_replayed_frames == before.total_replayed_frames
-        && verified_terminal_carrier_transition(before, event)
-        && exact_trust_expiry_diagnostic(source_snapshot, owner, event)
+        && event.total_replayed_frames == before.total_replayed_frames;
+    sample.carrier_transition_verified = verified_terminal_carrier_transition(before, event);
+    sample.event_request_id_present = event.request_id.is_some();
+    sample.ingress_request_id_matches = event.request_id.as_deref().is_some_and(|request_id| {
+        ingress
+            .last_ingress_receive
+            .as_ref()
+            .is_some_and(|diagnostic| diagnostic.request_id == request_id)
+    });
+    sample
 }
 
 fn sibling_owner_stream_advanced(
@@ -1374,32 +1424,35 @@ async fn wait_for_affected_owner_stream_interrupted(
     before: &OwnerSessionCursor,
     expires_at: DateTime<Utc>,
     authoritative_deadline_ms: u64,
-) -> Result<bool> {
+) -> Result<std::result::Result<(), AffectedObservationSample>> {
     // The observer starts before the credential deadline, so its budget must
     // cover the expiry instant and the bounded membership/route convergence
     // window.  A short post-expiry grace remains for the terminal FIN/ACK
     // snapshot before STREAM_FORGET reclaims the exact logical stream.
     let remaining = (expires_at - Utc::now()).to_std().unwrap_or_default();
     let deadline = Instant::now() + remaining + MEMBERSHIP_RECONCILIATION_BOUND + EXPIRY_GRACE;
+    let mut last_sample = AffectedObservationSample::default();
     loop {
         let target_snapshot = cluster.relay(TARGET_NODE)?.snapshot().await?;
         let source_snapshot = cluster.relay(AFFECTED_INGRESS)?.snapshot().await?;
         // A pre-expiry close is a fixture/liveness failure, not credential
         // expiry evidence.  Start sampling now, but latch only after the
         // authoritative credential deadline has passed.
-        if Utc::now() >= expires_at
-            && affected_owner_stream_interrupted(
+        if Utc::now() >= expires_at {
+            last_sample = sample_affected_owner_stream(
                 &target_snapshot,
                 &source_snapshot,
                 owner,
                 before,
                 authoritative_deadline_ms,
-            )
-        {
-            return Ok(true);
+            );
+            if last_sample.satisfied() {
+                return Ok(Ok(()));
+            }
         }
         if Instant::now() >= deadline {
-            return Ok(false);
+            // The last payload-free sample names the unmet conditions.
+            return Ok(Err(last_sample));
         }
         sleep(POLL).await;
     }

@@ -662,21 +662,41 @@ impl PeerInvalidationReason {
 /// Cancellation state for one authenticated peer admission.  The token
 /// remains compatible with transport cancellation while the bounded reason
 /// lets a caller distinguish signed trust expiry from an unrelated close.
+/// The optional monotonic deadline is the admission's own signed trust
+/// boundary; it lets a stream observer attribute a failure that arrives after
+/// that boundary to expiry even when this process's invalidation dispatcher
+/// has not run yet.
 #[derive(Clone)]
 pub struct PeerAdmissionCancellation {
     token: CancellationToken,
     reason: Arc<AtomicU8>,
+    expires_at: Option<Instant>,
 }
 
 impl PeerAdmissionCancellation {
     /// Construct an unclassified cancellation edge for providers that only
     /// expose the legacy token. MembershipRuntime uses the private reason
-    /// cell populated by its invalidation dispatcher.
+    /// cell populated by its invalidation dispatcher.  No deadline is known,
+    /// so only an explicit trust-expiry invalidation counts as expiry.
     #[must_use]
     pub fn from_token(token: CancellationToken) -> Self {
         Self {
             token,
             reason: Arc::new(AtomicU8::new(0)),
+            expires_at: None,
+        }
+    }
+
+    /// Construct an unclassified cancellation edge bound to one monotonic
+    /// trust deadline.  Providers without an invalidation dispatcher can use
+    /// this so a failure observed after the deadline is still attributed to
+    /// trust expiry.
+    #[must_use]
+    pub fn from_token_with_deadline(token: CancellationToken, expires_at: Instant) -> Self {
+        Self {
+            token,
+            reason: Arc::new(AtomicU8::new(0)),
+            expires_at: Some(expires_at),
         }
     }
 
@@ -697,6 +717,34 @@ impl PeerAdmissionCancellation {
     #[must_use]
     pub fn reason(&self) -> Option<PeerInvalidationReason> {
         PeerInvalidationReason::from_code(self.reason.load(Ordering::Acquire))
+    }
+
+    /// Return the admission's monotonic trust deadline when the provider
+    /// exposed one.  It is never extended after construction.
+    #[must_use]
+    pub fn expires_at(&self) -> Option<Instant> {
+        self.expires_at
+    }
+
+    /// Return whether signed trust for this admission has ended.
+    ///
+    /// This is positive evidence, not absence: either the invalidation
+    /// dispatcher recorded `TrustExpired` for this edge, or the admission's
+    /// own monotonic deadline has passed before the dispatcher ran.  The peer
+    /// relay enforces the same signed boundary and may reset or end a pooled
+    /// stream first; the observer of that failure must still attribute it to
+    /// the earlier trust deadline rather than to a generic transport close.
+    /// An explicit different invalidation reason is never reinterpreted as
+    /// expiry.
+    #[must_use]
+    pub fn trust_expired(&self) -> bool {
+        match self.reason() {
+            Some(PeerInvalidationReason::TrustExpired) => true,
+            Some(_) => false,
+            None => self
+                .expires_at
+                .is_some_and(|deadline| Instant::now() >= deadline),
+        }
     }
 }
 
@@ -785,12 +833,14 @@ impl PeerAdmission {
         self.invalidation.clone()
     }
 
-    /// Return the token and its live invalidation cause as one bounded value.
+    /// Return the token, its live invalidation cause, and the admission's
+    /// monotonic trust deadline as one bounded value.
     #[must_use]
     pub fn cancellation(&self) -> PeerAdmissionCancellation {
         PeerAdmissionCancellation {
             token: self.invalidation.clone(),
             reason: self.invalidation_reason.clone(),
+            expires_at: Some(self.deadline.expires_at),
         }
     }
 
@@ -2343,6 +2393,7 @@ mod tests {
         let cancellation = PeerAdmissionCancellation {
             token: token.clone(),
             reason: reason_cell.clone(),
+            expires_at: None,
         };
 
         runtime.dispatch_invalidations(vec![Invalidation {
@@ -2378,6 +2429,7 @@ mod tests {
         let cancellation = PeerAdmissionCancellation {
             token: token.clone(),
             reason: reason.clone(),
+            expires_at: None,
         };
         assert!(
             reason
@@ -2404,6 +2456,52 @@ mod tests {
             cancellation.reason(),
             Some(PeerInvalidationReason::TrustExpired)
         );
+    }
+
+    #[test]
+    fn trust_expired_uses_typed_reason_or_passed_admission_deadline_only() {
+        // No deadline and no invalidation: nothing is expired.
+        let fresh = PeerAdmissionCancellation::from_token(CancellationToken::new());
+        assert!(!fresh.trust_expired());
+        assert_eq!(fresh.expires_at(), None);
+
+        // A future monotonic deadline is not expiry, and neither is an
+        // unclassified cancellation (for example a closed connection).
+        let future = PeerAdmissionCancellation::from_token_with_deadline(
+            CancellationToken::new(),
+            Instant::now() + Duration::from_secs(60),
+        );
+        assert!(!future.trust_expired());
+        future.token().cancel();
+        assert!(!future.trust_expired());
+
+        // A passed deadline is positive evidence even before the dispatcher
+        // cancels the edge.
+        let passed = PeerAdmissionCancellation::from_token_with_deadline(
+            CancellationToken::new(),
+            Instant::now() - Duration::from_millis(1),
+        );
+        assert!(!passed.is_cancelled());
+        assert!(passed.trust_expired());
+
+        // The dispatcher's typed trust-expiry reason counts without a
+        // deadline, while a different explicit reason is never reinterpreted
+        // as expiry even after the deadline has passed.
+        let typed = PeerAdmissionCancellation {
+            token: CancellationToken::new(),
+            reason: Arc::new(AtomicU8::new(PeerInvalidationReason::TrustExpired.code())),
+            expires_at: None,
+        };
+        assert!(typed.trust_expired());
+        let revoked_after_deadline = PeerAdmissionCancellation {
+            token: CancellationToken::new(),
+            reason: Arc::new(AtomicU8::new(
+                PeerInvalidationReason::MembershipRevoked.code(),
+            )),
+            expires_at: Some(Instant::now() - Duration::from_millis(1)),
+        };
+        revoked_after_deadline.token().cancel();
+        assert!(!revoked_after_deadline.trust_expired());
     }
 
     #[test]

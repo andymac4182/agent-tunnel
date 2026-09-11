@@ -226,9 +226,13 @@ pub struct SessionTerminalEvent {
 /// The cause is deliberately closed and payload-free. A generic terminal
 /// close remains unclassified; callers must prove the corresponding
 /// membership/route transition separately before attributing expiry.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StreamTerminalCause {
+    /// The forwarded stream's peer membership admission reached its signed
+    /// trust deadline or was invalidated for trust expiry.  The cause is
+    /// resolved from the admission edge itself, never from later absence of
+    /// the stream or session.
     PeerMembershipExpired,
 }
 

@@ -966,6 +966,7 @@ async fn admit_local_consumer_stream(
         registration.key.clone(),
         registration.stream_id,
         registration.operation_id.clone(),
+        None,
     );
     Ok((registration, cleanup))
 }
@@ -2624,7 +2625,15 @@ async fn handle_peer_consumer_stream(
     let stream_id = registration.stream_id;
     let operation_id = registration.operation_id.clone();
     let (mut send, mut recv) = request.split();
-    let mut cleanup = handle.echo_cleanup_guard(key.clone(), stream_id, operation_id.clone());
+    // The guard carries the admission edge: if membership invalidation drops
+    // this future before the loop below can classify the exit, the enqueued
+    // cleanup still resolves the typed first cause from that edge.
+    let mut cleanup = handle.echo_cleanup_guard(
+        key.clone(),
+        stream_id,
+        operation_id.clone(),
+        admission_context.clone(),
+    );
     let mut input = Vec::new();
     let mut registration_closed = false;
     let mut terminal_cause = None;
@@ -2778,6 +2787,20 @@ async fn handle_peer_consumer_stream(
         Ok(())
     }
     .await;
+    // Context-aware first cause, sampled at loop exit: the ingress relay
+    // enforces the same signed trust deadline and may reset or end this
+    // pooled stream before the owner's invalidation dispatcher runs.  The
+    // admission edge's typed reason or its own passed monotonic deadline is
+    // positive evidence of the earlier cause; a stream the actor closed
+    // itself keeps the actor's recorded reason.
+    if terminal_cause.is_none()
+        && !registration_closed
+        && admission_context
+            .as_ref()
+            .is_some_and(|admission| admission.trust_expired())
+    {
+        terminal_cause = Some(StreamTerminalCause::PeerMembershipExpired);
+    }
     let result = match result {
         Ok(()) => match send.finish().await {
             Ok(()) => Ok(()),

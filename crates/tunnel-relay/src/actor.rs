@@ -50,6 +50,7 @@ use crate::{
     config::{RelayLimits, RelayOptions},
     consumer_write_diagnostics::{ConsumerWriteDiagnostics, ConsumerWriteScope},
     http,
+    membership_runtime::PeerAdmissionCancellation,
     peer_consumer_transport_diagnostics::{
         PeerConsumerDiagnosticContext, PeerConsumerDiagnosticH3Code, PeerConsumerDiagnosticRole,
         PeerConsumerDiagnostics,
@@ -481,6 +482,10 @@ enum TerminalCleanup {
         key: SessionKey,
         stream_id: u64,
         operation_id: String,
+        /// First terminal cause resolved when the guard fired.  A forwarded
+        /// stream whose handler was dropped at the membership cancellation
+        /// edge still records its typed expiry cause on the stream latch.
+        cause: Option<StreamTerminalCause>,
     },
 }
 
@@ -507,6 +512,22 @@ impl TerminalCleanupDispatcher {
         TerminalCleanupGuard {
             dispatcher: self.clone(),
             cleanup: Some(cleanup),
+            admission: None,
+        }
+    }
+
+    /// Guard a forwarded echo stream together with its membership admission
+    /// edge so a drop at the cancellation boundary can still attribute the
+    /// first terminal cause.
+    fn guard_with_admission(
+        &self,
+        cleanup: TerminalCleanup,
+        admission: Option<PeerAdmissionCancellation>,
+    ) -> TerminalCleanupGuard {
+        TerminalCleanupGuard {
+            dispatcher: self.clone(),
+            cleanup: Some(cleanup),
+            admission,
         }
     }
 
@@ -541,6 +562,12 @@ impl TerminalCleanupDispatcher {
 pub(crate) struct TerminalCleanupGuard {
     dispatcher: TerminalCleanupDispatcher,
     cleanup: Option<TerminalCleanup>,
+    /// Membership admission edge of a forwarded echo stream.  When the
+    /// handler future is dropped immediately at that edge, the first cause is
+    /// read from the edge itself at drop time: a typed trust-expiry
+    /// invalidation or a passed monotonic trust deadline.  It is never
+    /// inferred from a later missing stream or session.
+    admission: Option<PeerAdmissionCancellation>,
 }
 
 impl TerminalCleanupGuard {
@@ -551,7 +578,16 @@ impl TerminalCleanupGuard {
 
 impl Drop for TerminalCleanupGuard {
     fn drop(&mut self) {
-        if let Some(cleanup) = self.cleanup.take() {
+        if let Some(mut cleanup) = self.cleanup.take() {
+            if let TerminalCleanup::EchoStream { cause, .. } = &mut cleanup
+                && cause.is_none()
+                && self
+                    .admission
+                    .as_ref()
+                    .is_some_and(PeerAdmissionCancellation::trust_expired)
+            {
+                *cause = Some(StreamTerminalCause::PeerMembershipExpired);
+            }
             self.dispatcher.enqueue(cleanup);
         }
     }
@@ -1571,17 +1607,25 @@ impl RelayHandle {
         self.terminal_cleanup.guard(TerminalCleanup::Data(carrier))
     }
 
+    /// Guard one admitted echo stream.  Forwarded consumer streams pass their
+    /// membership admission edge so a handler dropped at that edge still
+    /// records the typed first cause; local public streams pass `None`.
     pub(crate) fn echo_cleanup_guard(
         &self,
         key: SessionKey,
         stream_id: u64,
         operation_id: String,
+        admission: Option<PeerAdmissionCancellation>,
     ) -> TerminalCleanupGuard {
-        self.terminal_cleanup.guard(TerminalCleanup::EchoStream {
-            key,
-            stream_id,
-            operation_id,
-        })
+        self.terminal_cleanup.guard_with_admission(
+            TerminalCleanup::EchoStream {
+                key,
+                stream_id,
+                operation_id,
+                cause: None,
+            },
+            admission,
+        )
     }
 
     pub(crate) async fn register_control(
@@ -2199,8 +2243,9 @@ impl RelayActor {
                 key,
                 stream_id,
                 operation_id,
+                cause,
             } => {
-                let _ = self.close_echo_stream(&key, stream_id, &operation_id);
+                let _ = self.close_echo_stream_with_cause(&key, stream_id, &operation_id, cause);
             }
         }
     }
@@ -12192,6 +12237,436 @@ mod stream_identity_tests {
                 rx: control_rx,
             },
         )
+    }
+
+    /// One admitted forwarded M2 echo stream after the real OPEN/OPENED
+    /// exchange, so terminal-latch regressions start from a live logical
+    /// stream with a committed data carrier.
+    struct TerminalLatchFixture {
+        actor: RelayActor,
+        control: ControlRegistration,
+        data_rx: mpsc::Receiver<DataOutbound>,
+        key: SessionKey,
+        carrier: CarrierKey,
+        registration: super::ConsumerStreamRegistration,
+    }
+
+    async fn open_terminal_latch_stream(label: &str, request_id: &str) -> TerminalLatchFixture {
+        let wait = std::time::Duration::from_secs(1);
+        let now = Utc::now();
+        let tenant_id = Uuid::from_u128(701);
+        let device_id = Uuid::from_u128(702);
+        let principal_id = Uuid::from_u128(703);
+        let service_id = Uuid::from_u128(704);
+        let identity = DeviceIdentity {
+            tenant_id,
+            device_id,
+            owner_user_id: principal_id,
+            credential_id: Uuid::from_u128(705),
+            spki_fingerprint: format!("{label}-spki"),
+            credential_not_before: now - Duration::minutes(1),
+            expires_at: now + Duration::minutes(1),
+            credential_revoked_at: None,
+            device_active: true,
+            credential_active: true,
+            device_version: 1,
+            owner_epoch: 1,
+            last_seen_at: Some(now),
+        };
+        let key = SessionKey {
+            tenant_id,
+            device_id,
+            session_id: label.to_owned(),
+            epoch: 7,
+        };
+        let (mut actor, mut control) = admitted_control_actor(identity, key.clone());
+        let (data_tx, data_rx) = mpsc::channel(actor.options.limits.max_queue_messages);
+        let carrier = CarrierKey {
+            session: key.clone(),
+            generation: 3,
+            connection_id: format!("{label}-carrier"),
+        };
+        if let Some(session) = actor.sessions.get_mut(&key.scope()) {
+            session.profile = super::RuntimeProfile::M2;
+            session.generation = carrier.generation;
+            session.connection_id = carrier.connection_id.clone();
+            session.data_tx = Some(data_tx.clone());
+            session.active_carrier = Some(DataCarrier {
+                context: carrier.context(),
+                tx: data_tx,
+            });
+        }
+        let consumer = AuthenticatedConsumer {
+            tenant_id,
+            principal_id,
+        };
+        let grant = GrantSnapshot {
+            tenant_id,
+            principal_id,
+            device_id,
+            service_id,
+            revision: 9,
+            permissions: PermissionSet {
+                operations: BTreeSet::from(["echo:invoke".to_owned()]),
+            },
+            constraints: serde_json::json!({}),
+            valid_until: now + Duration::minutes(1),
+            read_started_at: now,
+        };
+        let (open_tx, open_rx) = oneshot::channel();
+        actor.open_echo_stream_with_request_id(
+            consumer,
+            device_id,
+            service_id,
+            grant,
+            now + Duration::minutes(1),
+            Some(request_id.to_owned()),
+            open_tx,
+        );
+        let registration = tokio::time::timeout(wait, open_rx)
+            .await
+            .expect("echo registration response timed out")
+            .expect("echo registration response")
+            .expect("echo stream admitted");
+        registration.claim_admission();
+        let Some(ControlOutbound::Text(mut open)) = tokio::time::timeout(wait, control.rx.recv())
+            .await
+            .expect("echo OPEN wait timed out")
+        else {
+            panic!("echo OPEN was not queued");
+        };
+        open.release();
+        let open_message_id = actor
+            .sessions
+            .get(&key.scope())
+            .and_then(|session| session.streams.get(&registration.stream_id))
+            .map(|stream| stream.open_message_id.clone())
+            .expect("OPEN correlation");
+        tokio::time::timeout(
+            wait,
+            actor.inbound_control(
+                key.clone(),
+                ControlMessage::Opened(tunnel_protocol::Opened::new(
+                    format!("{label}-opened"),
+                    open_message_id,
+                    key.session_id.clone(),
+                    key.epoch,
+                    registration.stream_id,
+                    registration.operation_id.clone(),
+                    crate::wire::M2_INITIAL_WINDOW_BYTES as u64,
+                    crate::wire::M2_INITIAL_WINDOW_BYTES as u64,
+                )),
+            ),
+        )
+        .await
+        .expect("OPENED handling timed out");
+        TerminalLatchFixture {
+            actor,
+            control,
+            data_rx,
+            key,
+            carrier,
+            registration,
+        }
+    }
+
+    /// Consume the relay FIN already queued by a close, answer it with the
+    /// connector's terminal FIN, observe the relay ACK, then observe the owner
+    /// STREAM_FORGET.  Queuing that FORGET is the real path that removes the
+    /// live logical stream from the session table.
+    async fn drive_connector_fin_and_owner_forget(fixture: &mut TerminalLatchFixture) {
+        let wait = std::time::Duration::from_secs(1);
+        let stream_id = fixture.registration.stream_id;
+        let Some(DataOutbound::Binary(mut fin)) =
+            tokio::time::timeout(wait, fixture.data_rx.recv())
+                .await
+                .expect("relay FIN wait timed out")
+        else {
+            panic!("relay FIN was not queued");
+        };
+        let fin_frame = Frame::decode(fin.as_slice()).expect("relay FIN decodes");
+        assert_eq!(fin_frame.kind, FrameKind::Fin);
+        assert_eq!(fin_frame.stream_id, stream_id);
+        fin.release();
+        tokio::time::timeout(
+            wait,
+            fixture.actor.inbound_m2_stream_data(
+                fixture.carrier.clone(),
+                Frame::fin(
+                    fixture.key.epoch,
+                    fixture.carrier.generation,
+                    stream_id,
+                    1,
+                    fin_frame.sequence,
+                ),
+                false,
+            ),
+        )
+        .await
+        .expect("connector FIN handling timed out");
+        let Some(DataOutbound::Binary(mut ack)) =
+            tokio::time::timeout(wait, fixture.data_rx.recv())
+                .await
+                .expect("connector FIN ACK wait timed out")
+        else {
+            panic!("connector FIN ACK was not queued");
+        };
+        assert_eq!(
+            Frame::decode(ack.as_slice())
+                .expect("connector FIN ACK decodes")
+                .kind,
+            FrameKind::Ack
+        );
+        ack.release();
+        let Some(ControlOutbound::Text(mut forget)) =
+            tokio::time::timeout(wait, fixture.control.rx.recv())
+                .await
+                .expect("owner STREAM_FORGET wait timed out")
+        else {
+            panic!("owner STREAM_FORGET was not queued");
+        };
+        let forget_message =
+            super::wire::parse_control(forget.as_bytes()).expect("owner STREAM_FORGET decodes");
+        forget.release();
+        assert!(matches!(
+            forget_message,
+            ControlMessage::StreamForget(ref value)
+                if value.stream_id == stream_id
+                    && value.operation_id == fixture.registration.operation_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn dropped_forwarded_stream_guard_latches_membership_expiry_cause_before_forget() {
+        let mut fixture =
+            open_terminal_latch_stream("terminal-latch-expiry", "forwarded-request-701").await;
+        let stream_id = fixture.registration.stream_id;
+        let operation_id = fixture.registration.operation_id.clone();
+
+        // The forwarded handler is dropped at the membership cancellation
+        // edge before its loop can classify the exit.  The admission's own
+        // monotonic trust deadline has passed while the local invalidation
+        // dispatcher has not cancelled the edge yet (the ingress relay
+        // enforces the same deadline and may reset first).  The guard must
+        // still resolve the typed first cause instead of a generic close.
+        let (cleanup_tx, mut cleanup_rx) = mpsc::channel(super::TERMINAL_CLEANUP_QUEUE_CAPACITY);
+        let dispatcher = TerminalCleanupDispatcher::new(cleanup_tx);
+        let admission = super::PeerAdmissionCancellation::from_token_with_deadline(
+            tokio_util::sync::CancellationToken::new(),
+            std::time::Instant::now() - std::time::Duration::from_millis(1),
+        );
+        assert!(!admission.is_cancelled());
+        drop(dispatcher.guard_with_admission(
+            super::TerminalCleanup::EchoStream {
+                key: fixture.key.clone(),
+                stream_id,
+                operation_id: operation_id.clone(),
+                cause: None,
+            },
+            Some(admission),
+        ));
+        let cleanup = cleanup_rx
+            .try_recv()
+            .expect("dropped guard enqueued exact cleanup without awaiting");
+        assert_eq!(
+            cleanup,
+            super::TerminalCleanup::EchoStream {
+                key: fixture.key.clone(),
+                stream_id,
+                operation_id: operation_id.clone(),
+                cause: Some(super::StreamTerminalCause::PeerMembershipExpired),
+            }
+        );
+        fixture.actor.handle_terminal_cleanup(cleanup).await;
+
+        // A later cause-less close of the same logical stream (for example
+        // the handler's own cleanup racing the guard) is accepted but can
+        // never replace the first terminal transition or queue a second FIN.
+        assert!(
+            fixture
+                .actor
+                .close_echo_stream(&fixture.key, stream_id, &operation_id)
+        );
+
+        drive_connector_fin_and_owner_forget(&mut fixture).await;
+
+        // STREAM_FORGET reclaimed the exact logical stream while the owner
+        // session itself is still live: the latch, not the stream table, is
+        // the only remaining evidence and it must carry the typed cause.
+        let session = fixture
+            .actor
+            .sessions
+            .get(&fixture.key.scope())
+            .expect("owner session remains live after STREAM_FORGET");
+        assert!(!session.streams.contains_key(&stream_id));
+        let expected_owner = session.owner.clone();
+        let snapshot = fixture.actor.snapshot();
+        assert!(
+            snapshot
+                .sessions
+                .iter()
+                .flat_map(|session| session.streams.iter())
+                .all(|stream| stream.stream_id != stream_id)
+        );
+        let events = snapshot
+            .stream_terminal_events
+            .iter()
+            .filter(|event| event.stream_id == stream_id && event.operation_id == operation_id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            events.len(),
+            1,
+            "exactly one terminal latch per logical stream"
+        );
+        let event = events[0];
+        assert_eq!(
+            event.cause,
+            Some(super::StreamTerminalCause::PeerMembershipExpired)
+        );
+        assert_eq!(event.reason, "STREAM_CLOSED");
+        assert!(event.authorization_failure_code.is_none());
+        assert_eq!(event.tenant_id, fixture.key.tenant_id.to_string());
+        assert_eq!(event.device_id, fixture.key.device_id.to_string());
+        assert_eq!(event.session_id, fixture.key.session_id);
+        assert_eq!(event.epoch, fixture.key.epoch);
+        assert_eq!(
+            event.deployment_incarnation,
+            expected_owner.deployment_incarnation
+        );
+        assert_eq!(event.node_id, expected_owner.node_id);
+        assert_eq!(event.boot_id, expected_owner.boot_id);
+        assert_eq!(event.owner_id, super::runtime::owner_id(&expected_owner));
+        assert_eq!(event.request_id.as_deref(), Some("forwarded-request-701"));
+        assert_eq!(event.active_generation, fixture.carrier.generation);
+        assert_eq!(event.active_connection_id, fixture.carrier.connection_id);
+        assert_eq!(event.last_emitted_relay_to_connector, 1);
+        assert_eq!(event.recv_contiguous_connector_to_relay, 0);
+    }
+
+    #[test]
+    fn dropped_guard_without_trust_expiry_evidence_keeps_unclassified_close() {
+        let (cleanup_tx, mut cleanup_rx) = mpsc::channel(super::TERMINAL_CLEANUP_QUEUE_CAPACITY);
+        let dispatcher = TerminalCleanupDispatcher::new(cleanup_tx);
+        let key = SessionKey {
+            tenant_id: Uuid::from_u128(1),
+            device_id: Uuid::from_u128(2),
+            session_id: "guard-unclassified".to_owned(),
+            epoch: 3,
+        };
+        let cleanup = super::TerminalCleanup::EchoStream {
+            key,
+            stream_id: 11,
+            operation_id: "operation-11".to_owned(),
+            cause: None,
+        };
+
+        // A local public stream has no admission edge.
+        drop(dispatcher.guard(cleanup.clone()));
+        // A live admission with a future deadline is not expiry, and neither
+        // is an unclassified cancellation of that edge (a closed connection).
+        let live = super::PeerAdmissionCancellation::from_token_with_deadline(
+            tokio_util::sync::CancellationToken::new(),
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+        );
+        live.token().cancel();
+        drop(dispatcher.guard_with_admission(cleanup.clone(), Some(live)));
+
+        for _ in 0..2 {
+            assert_eq!(
+                cleanup_rx.try_recv().expect("guard enqueued cleanup"),
+                cleanup,
+                "no trust-expiry evidence must leave the terminal cause unclassified"
+            );
+        }
+    }
+
+    fn terminal_latch_event(
+        stream_id: u64,
+        closed_at_ms: u64,
+        cause: Option<super::StreamTerminalCause>,
+    ) -> super::StreamTerminalEvent {
+        super::StreamTerminalEvent {
+            tenant_id: "tenant-1".to_owned(),
+            device_id: "device-1".to_owned(),
+            session_id: "session-1".to_owned(),
+            epoch: 7,
+            deployment_incarnation: "incarnation-1".to_owned(),
+            node_id: "node-1".to_owned(),
+            boot_id: "boot-1".to_owned(),
+            owner_id: "owner-1".to_owned(),
+            stream_id,
+            operation_id: format!("operation-{stream_id}"),
+            request_id: Some(format!("request-{stream_id}")),
+            active_generation: 3,
+            active_connection_id: "carrier-3".to_owned(),
+            rotations_completed: 2,
+            total_replayed_frames: 0,
+            last_emitted_relay_to_connector: 11,
+            peer_acked_relay_to_connector: 10,
+            recv_contiguous_connector_to_relay: 9,
+            delivered_contiguous_connector_to_relay: 9,
+            closed_at_ms,
+            authorization_failure_code: None,
+            reason: "STREAM_CLOSED",
+            cause,
+        }
+    }
+
+    #[test]
+    fn stream_terminal_latch_retention_is_bounded_and_first_transition_only() {
+        let capacity = super::MAX_STREAM_TERMINAL_EVENTS as u64;
+        let mut events = VecDeque::new();
+        for stream_id in 1..=capacity + 1 {
+            super::retain_bounded_stream_terminal_event(
+                &mut events,
+                terminal_latch_event(stream_id, stream_id, None),
+            );
+        }
+        // Memory stays bounded: the oldest latch is evicted first and the
+        // most recent transition is always present.
+        assert_eq!(events.len(), super::MAX_STREAM_TERMINAL_EVENTS);
+        assert_eq!(events.front().map(|event| event.stream_id), Some(2));
+        assert_eq!(
+            events.back().map(|event| event.stream_id),
+            Some(capacity + 1)
+        );
+
+        // One logical stream has one terminal latch.  A later record for the
+        // same exact identity, even one carrying a typed cause, neither
+        // replaces the first transition nor consumes retention capacity.
+        super::retain_bounded_stream_terminal_event(
+            &mut events,
+            terminal_latch_event(
+                10,
+                9_999,
+                Some(super::StreamTerminalCause::PeerMembershipExpired),
+            ),
+        );
+        assert_eq!(events.len(), super::MAX_STREAM_TERMINAL_EVENTS);
+        let retained = events
+            .iter()
+            .filter(|event| event.stream_id == 10)
+            .collect::<Vec<_>>();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].closed_at_ms, 10);
+        assert!(retained[0].cause.is_none());
+
+        // A first transition that carries the typed cause keeps it across
+        // later eviction pressure until it is itself the oldest entry.
+        super::retain_bounded_stream_terminal_event(
+            &mut events,
+            terminal_latch_event(
+                capacity + 2,
+                capacity + 2,
+                Some(super::StreamTerminalCause::PeerMembershipExpired),
+            ),
+        );
+        assert_eq!(events.len(), super::MAX_STREAM_TERMINAL_EVENTS);
+        assert_eq!(events.front().map(|event| event.stream_id), Some(3));
+        assert_eq!(
+            events.back().and_then(|event| event.cause),
+            Some(super::StreamTerminalCause::PeerMembershipExpired)
+        );
     }
 
     #[tokio::test]
