@@ -340,14 +340,20 @@ async fn run_connect(path: PathBuf, json: bool) -> Result<(), CliError> {
                 return Ok(());
             }
             changed = readiness.changed() => {
-                changed.map_err(|_| CliError { code: "SUPERVISOR_FAILED", message: "connector supervisor stopped".to_owned(), retryable: false })?;
+                if changed.is_err() {
+                    return Err(stopped_connector_error(&mut readiness, &handle, "connector supervisor stopped").await);
+                }
                 let state = readiness.borrow_and_update().clone();
                 if let tunnel_client::Readiness::Closed { reason } = state {
                     return Err(closed_session_error(reason, handle.stop().await));
                 }
             }
             changed = status.changed() => {
-                changed.map_err(|_| CliError { code: "SUPERVISOR_FAILED", message: "connector status publisher stopped".to_owned(), retryable: false })?;
+                if changed.is_err() {
+                    // The status publisher stopping must not outrank the
+                    // typed terminal cause the readiness channel still holds.
+                    return Err(stopped_connector_error(&mut readiness, &handle, "connector status publisher stopped").await);
+                }
                 let current = status.borrow_and_update().clone();
                 if json && should_emit_connect_status(&last_status, &current) {
                     print_connect_status(&current);
@@ -418,6 +424,48 @@ fn print_connect_status(status: &tunnel_client::ConnectionStatus) {
             drain_acks: status.drain_acks,
         },
     );
+}
+
+/// Recover the connector's typed terminal cause after one of its channels
+/// has stopped.
+///
+/// The supervisor publishes its closed status and then `Readiness::Closed`
+/// with the typed reason, and only afterwards returns, which drops both watch
+/// senders.  Both channels therefore become ready at the same moment, and
+/// `tokio::select!` picks a ready branch at random: whichever branch observes
+/// its sender drop first would otherwise report a generic supervisor failure
+/// and discard the typed reason the other channel is still holding.  That is
+/// how an exhausted recovery episode lost its diagnostic under load.
+///
+/// A dropped sender does not erase a watch channel's last value, so the
+/// retained readiness remains authoritative and is consulted first.  `None`
+/// means there really is no terminal reason to report — a panicked or aborted
+/// supervisor that never published one — and the caller's generic failure
+/// stands.
+fn retained_closed_reason(
+    readiness: &mut tokio::sync::watch::Receiver<tunnel_client::Readiness>,
+) -> Option<String> {
+    match readiness.borrow_and_update().clone() {
+        tunnel_client::Readiness::Closed { reason } => Some(reason),
+        _ => None,
+    }
+}
+
+/// Terminal error for a connector channel that has stopped, preferring the
+/// retained typed cause over the generic supervisor failure.
+async fn stopped_connector_error(
+    readiness: &mut tokio::sync::watch::Receiver<tunnel_client::Readiness>,
+    handle: &tunnel_client::ConnectionHandle,
+    fallback_message: &'static str,
+) -> CliError {
+    match retained_closed_reason(readiness) {
+        Some(reason) => closed_session_error(reason, handle.stop().await),
+        None => CliError {
+            code: "SUPERVISOR_FAILED",
+            message: fallback_message.to_owned(),
+            retryable: false,
+        },
+    }
 }
 
 fn closed_session_error(reason: String, stop_result: Result<(), ClientError>) -> CliError {
@@ -736,5 +784,84 @@ mod tests {
         assert_eq!(error.code, "SESSION_CLOSED");
         assert!(error.retryable);
         assert_eq!(error.message, "stopped");
+    }
+
+    /// IN-09: an exhausted recovery episode must report its typed cause even
+    /// when the connector's channels have already stopped.
+    ///
+    /// The supervisor publishes `Readiness::Closed` with the typed reason and
+    /// then returns, dropping both watch senders at once, so the CLI's select
+    /// loop can observe a stopped status publisher in the same poll as the
+    /// retained terminal readiness.  This drops the publisher *before* the
+    /// terminal is consulted -- the exact ordering that made a loaded sweep
+    /// report `SUPERVISOR_FAILED` for an episode that had really exhausted
+    /// its third attempt -- and requires the typed diagnostic to survive.
+    #[test]
+    fn stopped_status_publisher_still_reports_the_typed_terminal_cause() {
+        let terminal = concat!(
+            "retained recovery failed: control socket closed during retained recovery; ",
+            "recovery_trigger=data_reader_closed; recovery_role=active; ",
+            "recovery_generation=1; recovery_attempt=3"
+        );
+        let (readiness_tx, mut readiness) =
+            tokio::sync::watch::channel(tunnel_client::Readiness::Connecting);
+        readiness_tx
+            .send(tunnel_client::Readiness::Closed {
+                reason: terminal.to_owned(),
+            })
+            .expect("the supervisor publishes its typed terminal readiness");
+        // The publisher stops before the caller classifies the failure.
+        drop(readiness_tx);
+
+        let reason = retained_closed_reason(&mut readiness)
+            .expect("a stopped publisher must not erase the retained terminal cause");
+        assert_eq!(reason, terminal);
+
+        // Joining the already-finished supervisor normally yields its own
+        // typed error, which is the same retained-recovery cause.
+        let joined = closed_session_error(
+            reason.clone(),
+            Err(ClientError::Transport {
+                scope: "retained recovery",
+                detail: concat!(
+                    "control socket closed during retained recovery; ",
+                    "recovery_trigger=data_reader_closed; recovery_role=active; ",
+                    "recovery_generation=1; recovery_attempt=3"
+                )
+                .to_owned(),
+            }),
+        );
+        assert_eq!(joined.code, "TRANSPORT_ERROR");
+        assert!(joined.message.contains("recovery_attempt=3"));
+        assert!(
+            joined
+                .message
+                .contains("recovery_trigger=data_reader_closed")
+        );
+
+        // A supervisor that was already reaped reports a clean stop, and the
+        // retained reason is then the diagnostic itself.
+        let reaped = closed_session_error(reason, Ok(()));
+        assert_eq!(reaped.code, "SESSION_CLOSED");
+        assert!(reaped.message.contains("recovery_attempt=3"));
+
+        for error in [joined, reaped] {
+            assert_ne!(error.code, "SUPERVISOR_FAILED");
+            assert!(!error.message.contains("status publisher stopped"));
+        }
+    }
+
+    /// The generic supervisor failure is still the right answer when the
+    /// connector stopped without ever publishing a terminal reason, so the
+    /// fix above cannot invent a typed cause for a panicked supervisor.
+    #[test]
+    fn stopped_publisher_without_a_terminal_reason_stays_a_supervisor_failure() {
+        let (readiness_tx, mut readiness) =
+            tokio::sync::watch::channel(tunnel_client::Readiness::Connecting);
+        readiness_tx
+            .send(tunnel_client::Readiness::Stopping)
+            .expect("a non-terminal readiness is published");
+        drop(readiness_tx);
+        assert!(retained_closed_reason(&mut readiness).is_none());
     }
 }
