@@ -157,6 +157,11 @@ pub use ec041_device_attachment::{
     Ec041DeviceAttachmentEvidence, validate_ec041_device_attachment_evidence,
     verify as verify_ec041_device_attachment,
 };
+mod owner_death_admission;
+pub use owner_death_admission::{
+    Ec023OwnerDeathEvidence, validate_ec023_owner_death_evidence,
+    verify as verify_ec023_owner_death,
+};
 mod public_abandoned_upgrade;
 pub use public_abandoned_upgrade::{
     PublicAbandonedUpgradeEvidence, validate_public_abandoned_upgrade_evidence,
@@ -1579,6 +1584,35 @@ impl ProductionCluster {
             BTreeMap::new(),
             None,
             Some((target_node_id, barrier)),
+        )
+        .await
+    }
+
+    /// Start a three-relay cluster with both a one-shot pre-H3-admission
+    /// barrier and one-shot public-upgrade barriers on the same ingress relay.
+    /// The EC-023 owner-death fixture arms one seam per phase so it can hold a
+    /// real public request either before the owner sees it (peer admission) or
+    /// after admission and before the 101 (upgrade), then kill the owner.
+    pub(super) async fn start_with_peer_and_upgrade_barriers(
+        harness: &mut RunningHarness,
+        target_node_id: &'static str,
+        peer_admission_barrier: Arc<PeerAdmissionBarrier>,
+        upgrade_barriers: BTreeMap<String, Arc<ConsumerUpgradeBarrier>>,
+        max_pending_operations: usize,
+    ) -> Result<Self> {
+        if !(1..=128).contains(&max_pending_operations) {
+            return Err(HarnessError::InvalidInput(
+                "peer/upgrade barrier max_pending_operations must be 1..=128".into(),
+            ));
+        }
+        let catalog = Arc::new(harness.production_catalog()?.clone()) as SharedCatalog;
+        Self::start_with_catalog_send_buffer_and_barriers(
+            harness,
+            catalog,
+            None,
+            upgrade_barriers,
+            Some(max_pending_operations),
+            Some((target_node_id, peer_admission_barrier)),
         )
         .await
     }
