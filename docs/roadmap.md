@@ -2,7 +2,7 @@
 
 The [task tracker](tasks.md) records task status, ownership, discovered defects, and acceptance evidence within each milestone.
 
-Status: M1 and M2 are locally verified. M7 is in progress; component and synthetic three-relay checks do not yet satisfy its production integration gate.
+Status: M1 is merged to main and M2 is locally verified and contained in the M7 branch. M7 is in progress: its component, configured-process and real three-relay checks now cover admission, rotation, recovery, saturation, peer trust and tenant isolation, and the 98-row edge-case matrix stands at 57 rows verified locally. The production integration gate is not yet satisfied; see [the task tracker](tasks.md) for the open rows and [the matrix](m7-edge-cases.md) for the remaining row scopes.
 On 2026-09-09 macOS arm64 with pinned Rust 1.95.0 and Redis 8.4, formatting,
 strict locked Clippy, 62 workspace tests, five explicitly executed real Redis integration tests, the AOF restart
 check, and the full real HTTPS/WSS CLI acceptance passed for five
