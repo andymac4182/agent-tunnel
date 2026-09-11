@@ -2641,4 +2641,526 @@ mod tests {
         validate_i08_rotation_fault_evidence(&value)
             .expect("terminal evidence does not require a watch event");
     }
+
+    fn with_recovery_attempts(
+        evidence: &mut I08RotationFaultEvidence,
+        attempts: &[u64],
+        starts_ms: &[u64],
+        deadlines_ms: &[u64],
+    ) {
+        evidence.unexpected_recovery_attempts = attempts.to_vec();
+        evidence.unexpected_recovery_attempt_starts_ms = starts_ms.to_vec();
+        evidence.unexpected_recovery_attempt_deadlines_ms = deadlines_ms.to_vec();
+        evidence.unexpected_recovery_closed_connection_ids = (0..attempts.len())
+            .map(|index| vec![format!("connection-{}", index + 3)])
+            .collect();
+        evidence.unexpected_recovery_successor_connection_ids = (0..attempts.len())
+            .map(|index| Some(format!("connection-{}", index + 4)))
+            .collect();
+    }
+
+    #[test]
+    fn every_rotation_fault_condition_names_its_rejection_on_the_shared_exit_path() {
+        use crate::acceptance_test_support::assert_failed;
+
+        const RECOVERED: &str = "recovered_same_session";
+        const TERMINAL: &str = "typed_terminal_failure";
+        const IDENTITY: &str = "omitted a stable identity or ordered record";
+        const RECOVERED_INCOMPLETE: &str =
+            "same-session recovery evidence was incomplete or mixed with failure";
+        const TERMINAL_RESET: &str = "claimed a fenced-successor reset";
+        const TERMINAL_OBSERVATION: &str =
+            "lacked an actual post-fault owner/session/stream observation";
+        type Case = (
+            &'static str,
+            &'static str,
+            &'static str,
+            fn(&mut I08RotationFaultEvidence),
+        );
+        let cases: &[Case] = &[
+            ("scope", RECOVERED, "unexpected scope", |e| {
+                e.scope = "widened_scope"
+            }),
+            (
+                "relay_count",
+                RECOVERED,
+                "three relays and a real CLI",
+                |e| e.relay_count = 2,
+            ),
+            (
+                "actual_cli_process",
+                RECOVERED,
+                "three relays and a real CLI",
+                |e| e.actual_cli_process = false,
+            ),
+            (
+                "planned_retirement_verified",
+                RECOVERED,
+                "incomplete: planned_retirement_verified",
+                |e| e.planned_retirement_verified = false,
+            ),
+            (
+                "planned_fence_acknowledged",
+                RECOVERED,
+                "incomplete: planned_fence_acknowledged",
+                |e| e.planned_fence_acknowledged = false,
+            ),
+            (
+                "planned_old_carrier_closed",
+                RECOVERED,
+                "incomplete: planned_old_carrier_closed",
+                |e| e.planned_old_carrier_closed = false,
+            ),
+            (
+                "planned_process_stayed_alive",
+                RECOVERED,
+                "incomplete: planned_process_stayed_alive",
+                |e| e.planned_process_stayed_alive = false,
+            ),
+            (
+                "planned_no_whole_session_retry",
+                RECOVERED,
+                "incomplete: planned_no_whole_session_retry",
+                |e| e.planned_no_whole_session_retry = false,
+            ),
+            (
+                "planned_recovery_diagnostics_clean",
+                RECOVERED,
+                "incomplete: planned_recovery_diagnostics_clean",
+                |e| e.planned_recovery_diagnostics_clean = false,
+            ),
+            (
+                "unexpected_active_carrier_closed",
+                RECOVERED,
+                "incomplete: unexpected_active_carrier_closed",
+                |e| e.unexpected_active_carrier_closed = false,
+            ),
+            (
+                "control_route_remained_open",
+                RECOVERED,
+                "incomplete: control_route_remained_open",
+                |e| e.control_route_remained_open = false,
+            ),
+            (
+                "control_socket_stable",
+                RECOVERED,
+                "incomplete: control_socket_stable",
+                |e| e.control_socket_stable = false,
+            ),
+            (
+                "post_fault_owner_snapshot_observed",
+                RECOVERED,
+                "incomplete: post_fault_owner_snapshot_observed",
+                |e| e.post_fault_owner_snapshot_observed = false,
+            ),
+            (
+                "post_fault_stream_state_observed",
+                RECOVERED,
+                "incomplete: post_fault_stream_state_observed",
+                |e| e.post_fault_stream_state_observed = false,
+            ),
+            (
+                "control_route_observed_after_fault",
+                RECOVERED,
+                "incomplete: control_route_observed_after_fault",
+                |e| e.control_route_observed_after_fault = false,
+            ),
+            (
+                "goaway_is_separate_scope",
+                RECOVERED,
+                "incomplete: goaway_is_separate_scope",
+                |e| e.goaway_is_separate_scope = false,
+            ),
+            (
+                "cleanup_joined",
+                RECOVERED,
+                "incomplete: cleanup_joined",
+                |e| e.cleanup_joined = false,
+            ),
+            (
+                "goaway_tested",
+                RECOVERED,
+                "GOAWAY as a separate case",
+                |e| e.goaway_tested = true,
+            ),
+            ("planned_rotations", RECOVERED, IDENTITY, |e| {
+                e.planned_rotations = 1
+            }),
+            ("session_id", RECOVERED, IDENTITY, |e| e.session_id.clear()),
+            ("epoch", RECOVERED, IDENTITY, |e| e.epoch = 0),
+            ("stream_id", RECOVERED, IDENTITY, |e| e.stream_id = 0),
+            ("tunnel_operation_id", RECOVERED, IDENTITY, |e| {
+                e.tunnel_operation_id.clear()
+            }),
+            ("planned_generation", RECOVERED, IDENTITY, |e| {
+                e.planned_generation = 1
+            }),
+            ("planned_connection_id", RECOVERED, IDENTITY, |e| {
+                e.planned_connection_id.clear()
+            }),
+            ("unexpected_fault_relay", RECOVERED, IDENTITY, |e| {
+                e.unexpected_fault_relay.clear()
+            }),
+            ("unexpected_fault_route_index", RECOVERED, IDENTITY, |e| {
+                e.unexpected_fault_route_index = 2
+            }),
+            (
+                "unexpected_fault_generation_zero",
+                RECOVERED,
+                IDENTITY,
+                |e| e.unexpected_fault_generation = 0,
+            ),
+            (
+                "unexpected_fault_generation_mismatch",
+                RECOVERED,
+                IDENTITY,
+                |e| e.unexpected_fault_generation = 4,
+            ),
+            (
+                "unexpected_fault_connection_id_empty",
+                RECOVERED,
+                IDENTITY,
+                |e| e.unexpected_fault_connection_id.clear(),
+            ),
+            (
+                "unexpected_fault_connection_id_mismatch",
+                RECOVERED,
+                IDENTITY,
+                |e| e.unexpected_fault_connection_id = "connection-9".into(),
+            ),
+            ("pre_fault_dispatch_count", RECOVERED, IDENTITY, |e| {
+                e.pre_fault_dispatch_count = 0
+            }),
+            ("ordered_records", RECOVERED, IDENTITY, |e| {
+                e.ordered_records = 2
+            }),
+            ("recovery_attempts_over_bound", TERMINAL, IDENTITY, |e| {
+                with_recovery_attempts(
+                    e,
+                    &[1, 2, 3, 4],
+                    &[1_000, 1_100, 1_300, 1_400],
+                    &[3_000, 3_100, 3_300, 3_400],
+                )
+            }),
+            ("recovery_attempt_starts_len", RECOVERED, IDENTITY, |e| {
+                e.unexpected_recovery_attempt_starts_ms.push(1_100)
+            }),
+            ("recovery_attempt_deadlines_len", RECOVERED, IDENTITY, |e| {
+                e.unexpected_recovery_attempt_deadlines_ms.push(3_100)
+            }),
+            ("recovery_closed_rosters_len", RECOVERED, IDENTITY, |e| {
+                e.unexpected_recovery_closed_connection_ids.push(Vec::new())
+            }),
+            ("recovery_successor_ids_len", RECOVERED, IDENTITY, |e| {
+                e.unexpected_recovery_successor_connection_ids.push(None)
+            }),
+            (
+                "recovery_episode_deadline_missing",
+                RECOVERED,
+                IDENTITY,
+                |e| e.unexpected_recovery_episode_deadline_ms = None,
+            ),
+            (
+                "unexpected_no_whole_session_retry",
+                RECOVERED,
+                IDENTITY,
+                |e| e.unexpected_no_whole_session_retry = false,
+            ),
+            (
+                "recovery_attempts_not_monotonic",
+                TERMINAL,
+                "attempt observations were not monotonic",
+                |e| with_recovery_attempts(e, &[2, 1], &[1_000, 1_100], &[3_000, 3_250]),
+            ),
+            (
+                "recovery_starts_not_monotonic",
+                TERMINAL,
+                "timestamps were not monotonic and bounded",
+                |e| with_recovery_attempts(e, &[1, 2], &[1_100, 1_000], &[3_000, 3_250]),
+            ),
+            (
+                "recovery_deadline_before_start",
+                TERMINAL,
+                "timestamps were not monotonic and bounded",
+                |e| with_recovery_attempts(e, &[1, 2], &[1_000, 1_100], &[900, 3_250]),
+            ),
+            (
+                "recovery_attempt_exceeds_episode_deadline",
+                TERMINAL,
+                "exceeded its immutable episode deadline",
+                |e| with_recovery_attempts(e, &[1], &[1_000], &[4_001]),
+            ),
+            (
+                "recovery_attempt_deadline_not_after_start",
+                TERMINAL,
+                "invalid attempt deadline",
+                |e| with_recovery_attempts(e, &[1], &[1_000], &[1_000]),
+            ),
+            (
+                "recovery_retry_attempt_out_of_range",
+                TERMINAL,
+                "out-of-range retry attempt",
+                |e| with_recovery_attempts(e, &[3, 4], &[1_000, 2_000], &[3_000, 3_500]),
+            ),
+            (
+                "recovery_retry_before_backoff",
+                TERMINAL,
+                "before its protocol backoff elapsed",
+                |e| with_recovery_attempts(e, &[1, 2], &[1_000, 1_099], &[3_000, 3_250]),
+            ),
+            (
+                "recovery_adjacent_attempt_after_predecessor_deadline",
+                TERMINAL,
+                "after its predecessor deadline",
+                |e| with_recovery_attempts(e, &[1, 2], &[1_000, 3_001], &[3_000, 3_250]),
+            ),
+            (
+                "recovery_old_generation_mismatch",
+                RECOVERED,
+                "exact faulted-carrier identity",
+                |e| e.unexpected_recovery_old_generation = Some(2),
+            ),
+            (
+                "recovery_old_connection_mismatch",
+                RECOVERED,
+                "exact faulted-carrier identity",
+                |e| e.unexpected_recovery_old_connection_id = Some("connection-2".into()),
+            ),
+            (
+                "first_roster_omits_faulted_carrier",
+                RECOVERED,
+                "first recovery closure roster omitted",
+                |e| {
+                    e.unexpected_recovery_closed_connection_ids =
+                        vec![vec!["connection-other".into()]]
+                },
+            ),
+            (
+                "retry_without_previous_successor_identity",
+                TERMINAL,
+                "omitted the candidate identity",
+                |e| {
+                    with_recovery_attempts(e, &[1, 2], &[1_000, 1_100], &[3_000, 3_250]);
+                    e.unexpected_recovery_successor_connection_ids[0] = None;
+                },
+            ),
+            (
+                "retry_roster_not_bound_to_failed_candidate",
+                TERMINAL,
+                "not bound to the preceding failed candidate",
+                |e| {
+                    with_recovery_attempts(e, &[1, 2], &[1_000, 1_100], &[3_000, 3_250]);
+                    e.unexpected_recovery_closed_connection_ids[1] =
+                        vec!["unrelated-connection".into()];
+                },
+            ),
+            (
+                "recovered_same_session_false",
+                RECOVERED,
+                RECOVERED_INCOMPLETE,
+                |e| e.same_session_recovered = false,
+            ),
+            (
+                "recovered_without_recovery_attempts",
+                RECOVERED,
+                RECOVERED_INCOMPLETE,
+                |e| with_recovery_attempts(e, &[], &[], &[]),
+            ),
+            (
+                "recovered_generation_not_higher",
+                RECOVERED,
+                RECOVERED_INCOMPLETE,
+                |e| {
+                    e.recovered_generation = Some(3);
+                    e.unexpected_recovery_successor_generation = Some(3);
+                },
+            ),
+            (
+                "recovered_generation_missing",
+                RECOVERED,
+                RECOVERED_INCOMPLETE,
+                |e| e.recovered_generation = None,
+            ),
+            (
+                "recovered_with_failure_code",
+                RECOVERED,
+                RECOVERED_INCOMPLETE,
+                |e| e.unexpected_failure_code = Some("TRANSPORT_ERROR"),
+            ),
+            (
+                "recovered_stream_identity_unstable",
+                RECOVERED,
+                RECOVERED_INCOMPLETE,
+                |e| e.stream_identity_stable = false,
+            ),
+            (
+                "recovered_with_failure_trigger",
+                RECOVERED,
+                RECOVERED_INCOMPLETE,
+                |e| e.unexpected_failure_trigger = Some("data_reader_closed"),
+            ),
+            (
+                "recovered_reset_reason_wrong",
+                RECOVERED,
+                RECOVERED_INCOMPLETE,
+                |e| e.unexpected_recovery_reset_reason = Some("other_reason"),
+            ),
+            (
+                "recovered_successor_generation_mismatch",
+                RECOVERED,
+                RECOVERED_INCOMPLETE,
+                |e| e.unexpected_recovery_successor_generation = Some(5),
+            ),
+            (
+                "recovered_connection_id_empty",
+                RECOVERED,
+                RECOVERED_INCOMPLETE,
+                |e| {
+                    e.recovered_connection_id = Some(String::new());
+                    e.unexpected_recovery_successor_connection_id = Some(String::new());
+                },
+            ),
+            (
+                "recovered_session_terminal_observed",
+                RECOVERED,
+                RECOVERED_INCOMPLETE,
+                |e| e.post_fault_session_terminal_observed = true,
+            ),
+            (
+                "recovered_live_session_absent",
+                RECOVERED,
+                RECOVERED_INCOMPLETE,
+                |e| e.post_fault_live_session_absent = true,
+            ),
+            (
+                "recovered_catalog_owner_released",
+                RECOVERED,
+                RECOVERED_INCOMPLETE,
+                |e| e.post_fault_catalog_owner_released = true,
+            ),
+            (
+                "recovered_control_route_closed_after_observation",
+                RECOVERED,
+                RECOVERED_INCOMPLETE,
+                |e| e.control_route_open_after_observation = false,
+            ),
+            (
+                "recovered_dispatch_delta_not_one",
+                RECOVERED,
+                "missing or duplicate post-fault record",
+                |e| {
+                    e.post_fault_dispatch_delta = 2;
+                    e.post_fault_dispatch_count = 5;
+                },
+            ),
+            (
+                "recovered_dispatch_count_mismatch",
+                RECOVERED,
+                "missing or duplicate post-fault record",
+                |e| e.post_fault_dispatch_count = 5,
+            ),
+            (
+                "terminal_claims_reset_reason",
+                TERMINAL,
+                TERMINAL_RESET,
+                |e| e.unexpected_recovery_reset_reason = Some("fenced_successor_activated"),
+            ),
+            (
+                "terminal_claims_successor_generation",
+                TERMINAL,
+                TERMINAL_RESET,
+                |e| e.unexpected_recovery_successor_generation = Some(4),
+            ),
+            (
+                "terminal_claims_successor_connection",
+                TERMINAL,
+                TERMINAL_RESET,
+                |e| e.unexpected_recovery_successor_connection_id = Some("connection-4".into()),
+            ),
+            (
+                "terminal_claims_recovered_generation",
+                TERMINAL,
+                TERMINAL_RESET,
+                |e| e.recovered_generation = Some(4),
+            ),
+            (
+                "terminal_claims_recovered_connection",
+                TERMINAL,
+                TERMINAL_RESET,
+                |e| e.recovered_connection_id = Some("connection-4".into()),
+            ),
+            (
+                "terminal_missing_code",
+                TERMINAL,
+                "omitted its typed terminal code",
+                |e| e.unexpected_failure_code = None,
+            ),
+            (
+                "terminal_unapproved_code",
+                TERMINAL,
+                "unapproved terminal code",
+                |e| e.unexpected_failure_code = Some("SOMETHING_ELSE"),
+            ),
+            (
+                "terminal_missing_retryability",
+                TERMINAL,
+                "omitted its retryability policy",
+                |e| e.unexpected_failure_retryable = None,
+            ),
+            (
+                "terminal_missing_trigger",
+                TERMINAL,
+                "omitted its active-data recovery trigger",
+                |e| e.unexpected_failure_trigger = None,
+            ),
+            (
+                "terminal_missing_session_terminal_observation",
+                TERMINAL,
+                TERMINAL_OBSERVATION,
+                |e| e.post_fault_session_terminal_observed = false,
+            ),
+            (
+                "terminal_missing_live_session_absence",
+                TERMINAL,
+                TERMINAL_OBSERVATION,
+                |e| e.post_fault_live_session_absent = false,
+            ),
+            (
+                "terminal_missing_catalog_owner_release",
+                TERMINAL,
+                TERMINAL_OBSERVATION,
+                |e| e.post_fault_catalog_owner_released = false,
+            ),
+            (
+                "terminal_post_fault_dispatch",
+                TERMINAL,
+                "post-fault dispatch or replay",
+                |e| {
+                    e.post_fault_dispatch_delta = 1;
+                    e.post_fault_dispatch_count = 4;
+                },
+            ),
+            (
+                "terminal_post_fault_count_mismatch",
+                TERMINAL,
+                "post-fault dispatch or replay",
+                |e| e.post_fault_dispatch_count = 4,
+            ),
+            (
+                "unknown_outcome",
+                RECOVERED,
+                "not a typed recovery/failure",
+                |e| e.unexpected_outcome = "something_else",
+            ),
+        ];
+        for &(name, outcome, fragment, mutate) in cases {
+            let mut value = evidence(outcome);
+            mutate(&mut value);
+            let diagnostic = assert_failed(validate_i08_rotation_fault_evidence(&value));
+            assert!(
+                diagnostic.contains(fragment),
+                "{name}: expected {fragment:?} in diagnostic {diagnostic}"
+            );
+        }
+    }
 }

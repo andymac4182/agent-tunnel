@@ -283,6 +283,12 @@ mod c17_validator_tests {
             let _ = name;
         }
     }
+
+    #[test]
+    fn owner_local_capacity_validator_accepts_complete_evidence() {
+        validate_owner_local_capacity_evidence(&valid_evidence())
+            .expect("complete owner-local capacity evidence is valid");
+    }
 }
 
 /// Run the bounded owner-local public capacity gate.

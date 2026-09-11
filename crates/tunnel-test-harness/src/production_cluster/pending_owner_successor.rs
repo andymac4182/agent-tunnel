@@ -1691,4 +1691,10 @@ mod c17_validator_tests {
             );
         }
     }
+
+    #[test]
+    fn successor_pending_owner_validator_accepts_complete_evidence() {
+        validate_successor_pending_owner_evidence(&valid_evidence())
+            .expect("complete successor pending-owner evidence is valid");
+    }
 }

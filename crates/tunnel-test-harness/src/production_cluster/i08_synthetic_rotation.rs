@@ -1741,4 +1741,123 @@ mod envelope_and_evidence_tests {
         assert_eq!(admitted.stream_id, 7);
         assert_eq!(admitted.operation_id, "operation");
     }
+
+    #[test]
+    fn i08_validator_accepts_complete_evidence() {
+        validate_i08_evidence(&valid_evidence()).expect("complete I08 evidence is valid");
+    }
+
+    #[test]
+    fn every_i08_identity_bound_and_rotation_chain_condition_names_its_rejection() {
+        use crate::acceptance_test_support::assert_failed;
+
+        const IDENTITY: &str = "stable session/stream/operation identity";
+        const CHAIN: &str = "immutable fence/ACK identity";
+        type Case = (&'static str, &'static str, fn(&mut I08Evidence));
+        let cases: &[Case] = &[
+            ("scope", "unexpected scope", |e| e.scope = "widened_scope"),
+            ("session_id_empty", IDENTITY, |e| e.session_id.clear()),
+            ("stream_id_zero", IDENTITY, |e| e.stream_id = 0),
+            ("tunnel_operation_id_empty", IDENTITY, |e| {
+                e.tunnel_operation_id.clear()
+            }),
+            ("synthetic_operation_id", IDENTITY, |e| {
+                e.synthetic_operation_id = "synthetic.other.v1".to_owned()
+            }),
+            ("synthetic_fid", IDENTITY, |e| e.synthetic_fid = I08_FID + 1),
+            (
+                "records_echoed_mismatch",
+                "echoed checksummed records",
+                |e| e.records_echoed += 1,
+            ),
+            (
+                "checksums_verified_mismatch",
+                "echoed checksummed records",
+                |e| e.checksums_verified += 1,
+            ),
+            ("rotations_extra_proof", "rotation proofs", |e| {
+                let extra = e.rotations[2].clone();
+                e.rotations.push(extra);
+            }),
+            (
+                "socket_high_water_over_bound",
+                "outside the bounded 2..=3 shape",
+                |e| e.socket_high_water = 4,
+            ),
+            ("rotation_snapshot_id_empty", CHAIN, |e| {
+                e.rotations[0].snapshot_id.clear()
+            }),
+            ("rotation_connector_fence_digest_empty", CHAIN, |e| {
+                e.rotations[1].connector_fence_digest.clear()
+            }),
+            ("rotation_relay_ack_mismatch", CHAIN, |e| {
+                e.rotations[1].relay_ack_sequence += 1
+            }),
+            ("rotation_connector_fence_sequence_mismatch", CHAIN, |e| {
+                e.rotations[2].connector_fence_sequence += 1
+            }),
+            ("attempt_session_mismatch", CHAIN, |e| {
+                e.rotations[0].attempt.session_id = "other-session".to_owned()
+            }),
+            ("attempt_epoch_mismatch", CHAIN, |e| {
+                e.rotations[0].attempt.epoch += 1
+            }),
+            ("attempt_owner_id_empty", CHAIN, |e| {
+                e.rotations[0].attempt.owner_id.clear()
+            }),
+            ("attempt_new_generation_mismatch", CHAIN, |e| {
+                e.rotations[0].attempt.new_generation += 1
+            }),
+            ("attempt_new_connection_mismatch", CHAIN, |e| {
+                e.rotations[0].attempt.new_connection_id = "connection-other".to_owned()
+            }),
+            ("attempt_old_connection_empty", CHAIN, |e| {
+                e.rotations[0].attempt.old_connection_id.clear()
+            }),
+            ("attempt_old_equals_new_connection", CHAIN, |e| {
+                let new_connection_id = e.rotations[0].attempt.new_connection_id.clone();
+                e.rotations[0].attempt.old_connection_id = new_connection_id;
+            }),
+            ("active_connection_reused", CHAIN, |e| {
+                let previous = e.rotations[0].active_connection_id.clone();
+                e.rotations[1].attempt.new_connection_id = previous.clone();
+                e.rotations[1].active_connection_id = previous;
+            }),
+            ("active_generation_not_monotonic", CHAIN, |e| {
+                let previous = e.rotations[0].active_generation;
+                e.rotations[1].attempt.new_generation = previous;
+                e.rotations[1].active_generation = previous;
+            }),
+            ("generation_chain_break", CHAIN, |e| {
+                e.rotations[1].attempt.old_generation = 1
+            }),
+            ("connection_chain_break", CHAIN, |e| {
+                e.rotations[1].attempt.old_connection_id = "connection-stale".to_owned()
+            }),
+            (
+                "later_rotation_second_writer_barrier",
+                "omitted writer_barrier_flushed",
+                |e| e.rotations[2].writer_barrier_flushed[1] = false,
+            ),
+            (
+                "later_rotation_candidate_ready",
+                "omitted candidate_ready",
+                |e| e.rotations[2].candidate_ready = false,
+            ),
+            (
+                "later_rotation_replay_frames",
+                "observed 1 replay frames",
+                |e| e.rotations[2].replay_frames = 1,
+            ),
+        ];
+        for &(name, fragment, mutate) in cases {
+            let mut evidence = valid_evidence();
+            mutate(&mut evidence);
+            let diagnostic = assert_failed(validate_i08_evidence(&evidence));
+            assert!(
+                diagnostic.contains(fragment),
+                "{name}: expected {fragment:?} in diagnostic {diagnostic}"
+            );
+        }
+    }
 }

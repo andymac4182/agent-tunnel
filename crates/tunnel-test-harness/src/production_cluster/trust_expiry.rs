@@ -247,6 +247,12 @@ mod c17_validator_tests {
             assert_rejected(validate_trust_expiry_evidence(&evidence), "trust-expiry");
         }
     }
+
+    #[test]
+    fn trust_expiry_validator_accepts_complete_evidence() {
+        validate_trust_expiry_evidence(&valid_evidence())
+            .expect("complete trust-expiry evidence is valid");
+    }
 }
 
 /// Run the bounded real Redis-backed signed peer-key expiry fixture.

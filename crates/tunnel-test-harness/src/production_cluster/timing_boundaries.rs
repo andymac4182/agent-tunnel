@@ -405,6 +405,137 @@ mod c17_validator_tests {
             assert!(!diagnostic.is_empty());
         }
     }
+
+    #[test]
+    fn timing_validator_accepts_complete_evidence() {
+        validate_timing_boundary_evidence(&valid_evidence())
+            .expect("complete timing-boundary evidence is valid");
+    }
+
+    #[test]
+    fn every_timing_condition_names_its_rejection() {
+        const SAFE_WAIT: &str = "for the safe lease deadline";
+        const PARTITION_ELAPSED: &str = "inconsistent with the safe-deadline wait";
+        const WITHDRAWN: &str = "did not withdraw readiness and owner";
+        const RECOVERY: &str = "higher-epoch fresh recovery canary";
+        const ROTATION_PHASE: &str = "not sampled in a valid phase";
+        type Case = (&'static str, &'static str, fn(&mut TimingBoundaryEvidence));
+        let cases: &[Case] = &[
+            ("relay_count", "expected three relays", |e| {
+                e.relay_count = 2
+            }),
+            (
+                "authorization_probe_elapsed_ms",
+                "exceeded the bounded grant window",
+                |e| e.authorization_probe_elapsed_ms = 6_001,
+            ),
+            (
+                "authorization_result_delay_injected",
+                "scoped real-Redis result delay",
+                |e| e.authorization_result_delay_injected = false,
+            ),
+            (
+                "authorization_owner_remaining_ms",
+                "still-usable owner lease sample",
+                |e| e.authorization_owner_remaining_ms = 5_000,
+            ),
+            (
+                "authorization_expired_before_owner_safe_deadline",
+                "not observed before the owner safe deadline",
+                |e| e.authorization_expired_before_owner_safe_deadline = false,
+            ),
+            (
+                "authorization_dispatch",
+                "paused authorization probe advanced",
+                |e| e.authorization_dispatch_after += 1,
+            ),
+            (
+                "lease_remaining_below_margin",
+                "began without a usable owner lease sample",
+                |e| e.lease_remaining_before_partition_ms = 5_000,
+            ),
+            (
+                "lease_remaining_above_ttl",
+                "exceeded the configured",
+                |e| e.lease_remaining_before_partition_ms = 31_001,
+            ),
+            ("lease_safe_deadline_wait_low", SAFE_WAIT, |e| {
+                e.lease_safe_deadline_wait_ms = 3_499
+            }),
+            ("lease_safe_deadline_wait_high", SAFE_WAIT, |e| {
+                e.lease_safe_deadline_wait_ms = 7_501
+            }),
+            (
+                "lease_partition_elapsed_below_wait",
+                PARTITION_ELAPSED,
+                |e| e.lease_partition_elapsed_ms = 5_499,
+            ),
+            (
+                "lease_partition_elapsed_above_lease",
+                PARTITION_ELAPSED,
+                |e| e.lease_partition_elapsed_ms = 12_001,
+            ),
+            ("lease_owner_withdrawn_after_expiry", WITHDRAWN, |e| {
+                e.lease_owner_withdrawn_after_expiry = false
+            }),
+            ("lease_readiness_withdrawn", WITHDRAWN, |e| {
+                e.lease_readiness_withdrawn = false
+            }),
+            ("lease_dispatch", "post-deadline probe advanced", |e| {
+                e.lease_dispatch_after += 1
+            }),
+            ("lease_recovery_epoch_advanced", RECOVERY, |e| {
+                e.lease_recovery_epoch_advanced = false
+            }),
+            ("lease_recovery_echo", RECOVERY, |e| {
+                e.lease_recovery_echo = false
+            }),
+            ("rotation_phase", ROTATION_PHASE, |e| {
+                e.rotation_phase = "active".into()
+            }),
+            ("rotation_candidate_generation", ROTATION_PHASE, |e| {
+                e.rotation_candidate_generation = 0
+            }),
+            (
+                "rotation_overlap_elapsed_ms",
+                "exact configured overlap window",
+                |e| e.rotation_overlap_elapsed_ms = 1_999,
+            ),
+            ("rotation_terminal_phase", "typed terminal phase", |e| {
+                e.rotation_terminal_phase = "active".into()
+            }),
+            (
+                "rotation_dispatch",
+                "expired rotation candidate advanced",
+                |e| e.rotation_dispatch_after += 1,
+            ),
+            ("rotation_recovery_epoch_advanced", RECOVERY, |e| {
+                e.rotation_recovery_epoch_advanced = false
+            }),
+            ("rotation_recovery_echo", RECOVERY, |e| {
+                e.rotation_recovery_echo = false
+            }),
+            (
+                "authorization_typed_expiry_cause_observed",
+                "authorization invalidation cause",
+                |e| e.authorization_typed_expiry_cause_observed = false,
+            ),
+            (
+                "rotation_typed_deadline_cause_observed",
+                "rotation RecoveryReason::Deadline",
+                |e| e.rotation_typed_deadline_cause_observed = false,
+            ),
+        ];
+        for &(name, fragment, mutate) in cases {
+            let mut evidence = valid_evidence();
+            mutate(&mut evidence);
+            let diagnostic = assert_failed(validate_timing_boundary_evidence(&evidence));
+            assert!(
+                diagnostic.contains(fragment),
+                "{name}: expected {fragment:?} in diagnostic {diagnostic}"
+            );
+        }
+    }
 }
 
 /// Run the bounded real timing-boundary fixture.

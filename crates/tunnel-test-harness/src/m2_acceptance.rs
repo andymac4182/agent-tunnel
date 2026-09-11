@@ -2718,3 +2718,55 @@ async fn expect_consumer_status(
 fn stream_id_hint(stream: &ConsumerStream) -> Option<u64> {
     stream.stream_id_hint()
 }
+
+#[cfg(test)]
+mod c17_validator_tests {
+    use super::assert_expected_control_loss;
+    use crate::acceptance_test_support::assert_rejected;
+    use tunnel_client::{ClientError, Readiness};
+
+    fn control_read_loss() -> ClientError {
+        ClientError::Transport {
+            scope: "control read",
+            detail: "control socket closed".to_owned(),
+        }
+    }
+
+    fn closed(reason: &str) -> Readiness {
+        Readiness::Closed {
+            reason: reason.to_owned(),
+        }
+    }
+
+    #[test]
+    fn m2_control_loss_gate_accepts_the_exact_terminal_pair() {
+        assert_expected_control_loss(Err(control_read_loss()), &closed("control read failed"))
+            .expect("exact control-loss terminal pair passes");
+    }
+
+    #[test]
+    fn m2_control_loss_gate_rejects_every_other_outcome_on_the_shared_exit_path() {
+        assert_rejected(
+            assert_expected_control_loss(Ok(()), &closed("control read failed")),
+            "completed cleanly",
+        );
+        assert_rejected(
+            assert_expected_control_loss(
+                Err(ClientError::Transport {
+                    scope: "data read",
+                    detail: "data socket closed".to_owned(),
+                }),
+                &closed("control read failed"),
+            ),
+            "unexpected client error",
+        );
+        assert_rejected(
+            assert_expected_control_loss(Err(control_read_loss()), &closed("cancelled")),
+            "unexpected terminal readiness reason",
+        );
+        assert_rejected(
+            assert_expected_control_loss(Err(control_read_loss()), &Readiness::Stopping),
+            "did not publish a closed readiness state",
+        );
+    }
+}

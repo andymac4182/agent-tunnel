@@ -3722,4 +3722,123 @@ mod evidence_tests {
         terminal.expired_transport_terminal = false;
         assert_failed(validate_credential_expiry_rotation_evidence(&terminal));
     }
+
+    #[test]
+    fn every_expiry_identity_window_and_typed_outcome_condition_names_its_rejection() {
+        const ROTATION_WINDOW: &str = "strictly inside one rotation attempt";
+        const PROBE: &str = "exact post-expiry probe observation";
+        const TYPED: &str = "exact typed authorization outcome";
+        type Case = (
+            &'static str,
+            &'static str,
+            fn(&mut CredentialExpiryRotationEvidence),
+        );
+        let cases: &[Case] = &[
+            (
+                "scope",
+                "scope was not the bounded consumer/rotation case",
+                |e| e.scope = "widened_scope",
+            ),
+            ("rotation_id_empty", ROTATION_WINDOW, |e| {
+                e.rotation_id.clear()
+            }),
+            ("rotation_session_id_empty", ROTATION_WINDOW, |e| {
+                e.rotation_session_id.clear()
+            }),
+            ("rotation_owner_id_empty", ROTATION_WINDOW, |e| {
+                e.rotation_owner_id.clear()
+            }),
+            ("rotation_old_connection_id_empty", ROTATION_WINDOW, |e| {
+                e.rotation_old_connection_id.clear()
+            }),
+            ("rotation_new_connection_id_empty", ROTATION_WINDOW, |e| {
+                e.rotation_new_connection_id.clear()
+            }),
+            ("rotation_connection_ids_equal", ROTATION_WINDOW, |e| {
+                e.rotation_new_connection_id = e.rotation_old_connection_id.clone()
+            }),
+            (
+                "rotation_completion_session_id_mismatch",
+                ROTATION_WINDOW,
+                |e| e.rotation_completion_session_id = "session-2".to_owned(),
+            ),
+            (
+                "rotation_completion_owner_id_mismatch",
+                ROTATION_WINDOW,
+                |e| e.rotation_completion_owner_id = "owner-2".to_owned(),
+            ),
+            (
+                "rotation_completion_old_connection_id_mismatch",
+                ROTATION_WINDOW,
+                |e| e.rotation_completion_old_connection_id = "connection-stale".to_owned(),
+            ),
+            (
+                "rotation_completion_new_connection_id_mismatch",
+                ROTATION_WINDOW,
+                |e| e.rotation_completion_new_connection_id = "connection-other".to_owned(),
+            ),
+            ("token_issuer_empty", ROTATION_WINDOW, |e| {
+                e.token_issuer.clear()
+            }),
+            ("token_audience_empty", ROTATION_WINDOW, |e| {
+                e.token_audience.clear()
+            }),
+            ("token_subject_empty", ROTATION_WINDOW, |e| {
+                e.token_subject.clear()
+            }),
+            ("challenge_interval_mismatch", ROTATION_WINDOW, |e| {
+                e.challenge_deadline_ms = e.challenge_started_at_ms + 1_999
+            }),
+            ("challenge_admission_deadline_zero", ROTATION_WINDOW, |e| {
+                e.challenge_admission_deadline_ms = 0
+            }),
+            ("expiry_before_challenge_start", PROBE, |e| {
+                e.challenge_started_at_ms = 250;
+                e.challenge_deadline_ms = 2_250;
+            }),
+            ("expiry_at_or_after_challenge_deadline", PROBE, |e| {
+                e.rotation_deadline_ms = 5_000;
+                e.expiry_observed_at_ms = 2_100;
+            }),
+            ("probe_before_token_expiry", PROBE, |e| {
+                e.post_expiry_probe_at_unix_ms = e.consumer_token_expires_at_unix_ms - 1
+            }),
+            ("post_expiry_probe_outcome", PROBE, |e| {
+                e.post_expiry_probe_outcome = "local_write_timeout"
+            }),
+            ("expired_stream_cause", TYPED, |e| {
+                e.expired_stream_cause = "SESSION_CLOSED"
+            }),
+            ("expired_terminal_kind", TYPED, |e| {
+                e.expired_terminal_kind = "observer_deadline"
+            }),
+            ("expired_transport_terminal_disagrees", TYPED, |e| {
+                e.expired_transport_terminal = false
+            }),
+            ("expired_ingress_status", TYPED, |e| {
+                e.expired_ingress_status = 403
+            }),
+            ("expired_ingress_code", TYPED, |e| {
+                e.expired_ingress_code = "FORBIDDEN"
+            }),
+            ("expired_ingress_execution", TYPED, |e| {
+                e.expired_ingress_execution = "dispatched"
+            }),
+            (
+                "owner_dispatch_advanced",
+                "advanced owner application dispatch",
+                |e| e.owner_dispatch_after += 1,
+            ),
+            ("elapsed_ms", "zero elapsed time", |e| e.elapsed_ms = 0),
+        ];
+        for &(name, fragment, mutate) in cases {
+            let mut evidence = valid_evidence();
+            mutate(&mut evidence);
+            let diagnostic = assert_failed(validate_credential_expiry_rotation_evidence(&evidence));
+            assert!(
+                diagnostic.contains(fragment),
+                "{name}: expected {fragment:?} in diagnostic {diagnostic}"
+            );
+        }
+    }
 }

@@ -5613,4 +5613,117 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn production_and_partition_validators_accept_complete_evidence() {
+        validate_production_evidence(&valid_evidence())
+            .expect("complete production evidence is valid");
+        validate_redis_partition_evidence(&valid_partition_evidence())
+            .expect("complete Redis partition evidence is valid");
+    }
+
+    #[test]
+    fn every_redis_partition_flag_and_bound_names_its_rejection() {
+        type Case = (&'static str, &'static str, fn(&mut RedisPartitionEvidence));
+        let cases: &[Case] = &[
+            ("baseline_echo", "baseline_echo", |e| {
+                e.baseline_echo = false
+            }),
+            (
+                "partition_admission_rejected",
+                "partition_admission_rejected",
+                |e| e.partition_admission_rejected = false,
+            ),
+            (
+                "partition_dispatch_interrupted",
+                "partition_dispatch_interrupted",
+                |e| e.partition_dispatch_interrupted = false,
+            ),
+            ("recovery_owner_verified", "recovery_owner_verified", |e| {
+                e.recovery_owner_verified = false
+            }),
+            ("recovery_echo", "recovery_echo", |e| {
+                e.recovery_echo = false
+            }),
+            ("relay_count", "exactly three relays", |e| e.relay_count = 2),
+            (
+                "paused_redis_connections",
+                "paused no Redis connections",
+                |e| e.paused_redis_connections = 0,
+            ),
+        ];
+        for &(name, fragment, mutate) in cases {
+            let mut evidence = valid_partition_evidence();
+            mutate(&mut evidence);
+            let diagnostic = assert_failed(validate_redis_partition_evidence(&evidence));
+            assert!(
+                diagnostic.contains(fragment),
+                "{name}: expected {fragment:?} in diagnostic {diagnostic}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_production_count_names_its_rejection() {
+        type Case = (
+            &'static str,
+            &'static str,
+            fn(&mut ProductionClusterEvidence),
+        );
+        let cases: &[Case] = &[
+            ("relay_count", "exactly three relays", |e| e.relay_count = 2),
+            (
+                "signed_membership_records",
+                "signed_membership_records=2 is below required minimum 3",
+                |e| e.signed_membership_records = 2,
+            ),
+            (
+                "membership_ready_relays",
+                "membership_ready_relays=2 is below required minimum 3",
+                |e| e.membership_ready_relays = 2,
+            ),
+            (
+                "h3_ingress_relays",
+                "h3_ingress_relays=1 is below required minimum 2",
+                |e| e.h3_ingress_relays = 1,
+            ),
+            (
+                "control_sockets",
+                "control_sockets=2 is below required minimum 3",
+                |e| e.control_sockets = 2,
+            ),
+            (
+                "data_sockets",
+                "data_sockets=5 is below required minimum 6",
+                |e| e.data_sockets = 5,
+            ),
+            (
+                "device_ingress_relays",
+                "device_ingress_relays=2 is below required minimum 3",
+                |e| e.device_ingress_relays = 2,
+            ),
+            (
+                "replacement_generations",
+                "replacement_generations=2 is below required minimum 3",
+                |e| e.replacement_generations = 2,
+            ),
+            (
+                "ordered_records",
+                "ordered_records=3 is below required minimum 4",
+                |e| e.ordered_records = 3,
+            ),
+            ("elapsed_seconds", "below the real rotation bound 9", |e| {
+                e.elapsed_seconds = 8
+            }),
+        ];
+        for &(name, fragment, mutate) in cases {
+            let mut evidence = valid_evidence();
+            mutate(&mut evidence);
+            let diagnostic = assert_failed(validate_production_evidence(&evidence));
+            assert!(
+                diagnostic.contains(fragment),
+                "{name}: expected {fragment:?} in diagnostic {diagnostic}"
+            );
+        }
+    }
 }

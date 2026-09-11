@@ -2596,4 +2596,14 @@ mod tests {
             assert_eq!(classify_protocol_cause(message), category);
         }
     }
+
+    #[test]
+    fn lifecycle_rejects_more_than_three_baseline_owner_sockets() {
+        let mut evidence = valid_evidence();
+        evidence.baseline_owner_sockets = 4;
+        assert_rejected(
+            validate_lifecycle_evidence(&evidence),
+            "expected two or three",
+        );
+    }
 }

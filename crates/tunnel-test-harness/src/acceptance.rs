@@ -1352,3 +1352,57 @@ fn assert_named(condition: bool, name: &str) -> Result<()> {
         )))
     }
 }
+
+#[cfg(test)]
+mod c17_validator_tests {
+    use super::{HttpResponse, assert_echo, assert_named, assert_status};
+    use crate::acceptance_test_support::assert_rejected;
+
+    fn echo_response(canary: &str, body: &[u8]) -> HttpResponse {
+        let mut bytes = canary.as_bytes().to_vec();
+        bytes.extend_from_slice(body);
+        HttpResponse {
+            status: hyper::StatusCode::OK,
+            body: bytes,
+        }
+    }
+
+    #[test]
+    fn m1_named_assertions_accept_matching_observations() {
+        assert_named(true, "gate").expect("true condition passes");
+        let response = echo_response("canary-", b"fixture-secret-token");
+        assert_status(&response, hyper::StatusCode::OK, "status").expect("matching status passes");
+        assert_echo(&response, "canary-", b"fixture-secret-token", "echo")
+            .expect("matching echo passes");
+    }
+
+    #[test]
+    fn m1_named_assertions_reach_the_shared_exit_path_without_echoing_bodies() {
+        assert_rejected(assert_named(false, "named-gate"), "named-gate");
+        let response = echo_response("canary-", b"fixture-secret-token");
+        assert_rejected(
+            assert_status(&response, hyper::StatusCode::FORBIDDEN, "status-gate"),
+            "status-gate: expected 403",
+        );
+        assert_rejected(
+            assert_echo(
+                &response,
+                "other-canary-",
+                b"fixture-secret-token",
+                "echo-gate",
+            ),
+            "echo-gate",
+        );
+        let mut wrong_status = echo_response("canary-", b"fixture-secret-token");
+        wrong_status.status = hyper::StatusCode::SERVICE_UNAVAILABLE;
+        assert_rejected(
+            assert_echo(
+                &wrong_status,
+                "canary-",
+                b"fixture-secret-token",
+                "echo-status-gate",
+            ),
+            "echo-status-gate",
+        );
+    }
+}

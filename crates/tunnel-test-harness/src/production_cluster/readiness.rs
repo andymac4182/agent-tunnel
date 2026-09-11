@@ -985,4 +985,10 @@ mod tests {
         let error = HarnessError::Http("production echo closed before response".into());
         assert_eq!(recovery_echo_stage(&error), "awaiting_response_close");
     }
+
+    #[test]
+    fn peer_readiness_validator_accepts_complete_evidence() {
+        validate_peer_readiness_evidence(&valid_evidence())
+            .expect("complete peer-readiness evidence is valid");
+    }
 }

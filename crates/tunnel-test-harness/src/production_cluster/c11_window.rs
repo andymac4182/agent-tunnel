@@ -975,3 +975,359 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod c17_validator_tests {
+    use super::*;
+    use crate::HarnessError;
+    use crate::acceptance_test_support::assert_rejected;
+
+    const SAFE_LINE: &[u8] = b"relay=relay-a tenant=tenant-a owner=owner-a route=peer-route phase=ready epoch=2 generation=3 fence=4 revocation=false owner_death=false dispatch_counter=1 reason=CONTROL_CLOSED";
+    const RELAY_ONLY_LINE: &[u8] = b"relay=relay-a";
+
+    /// Map a scanner failure through the same bounded `HarnessError` that
+    /// `verify-m7-c11-diagnostics` returns, so every case proves the nonzero
+    /// CLI exit path and the payload-free diagnostic rather than only the
+    /// typed variant.
+    fn cli_result(
+        result: std::result::Result<(), ScanFailure>,
+    ) -> std::result::Result<(), HarnessError> {
+        result.map_err(|error| HarnessError::Process(format!("C11 diagnostics: {error}")))
+    }
+
+    fn spec_with_roles(roles: &[&str]) -> std::result::Result<C11RunSpec, ScanFailure> {
+        C11RunSpec::new(
+            "run-1",
+            "source-1",
+            "build-1",
+            FaultStage::Peer,
+            RunOutcome::Success,
+            100,
+            roles.iter().copied(),
+            vec![Sentinel::new(
+                SentinelKind::Credential,
+                b"fixture-secret-token".to_vec(),
+            )?],
+        )
+    }
+
+    fn spec() -> C11RunSpec {
+        spec_with_roles(&["relay-a"]).expect("valid spec")
+    }
+
+    fn report(
+        stage: FaultStage,
+        outcome: RunOutcome,
+        source_id: &str,
+        build_id: &str,
+        started_utc_ms: i64,
+        ended_utc_ms: i64,
+        line: &[u8],
+    ) -> C11ScanReport {
+        let spec = C11RunSpec::new(
+            format!("run-{}-{}", stage.label(), outcome.label()),
+            source_id,
+            build_id,
+            stage,
+            outcome,
+            started_utc_ms,
+            ["relay-a"],
+            Vec::new(),
+        )
+        .expect("valid report spec")
+        .with_required_fields([SafeField::Relay]);
+        let mut window = C11Window::new(spec);
+        window.append("relay-a", line).expect("append");
+        window.close("relay-a").expect("close");
+        window.mark_joined("relay-a").expect("join");
+        window.finish(ended_utc_ms).expect("finish")
+    }
+
+    fn complete_bundle() -> C11EvidenceBundle {
+        let mut bundle = C11EvidenceBundle::new(100);
+        for stage in FaultStage::ALL {
+            for outcome in RunOutcome::ALL {
+                bundle
+                    .add(report(
+                        stage, outcome, "source-1", "build-1", 100, 101, SAFE_LINE,
+                    ))
+                    .expect("add");
+            }
+        }
+        bundle
+    }
+
+    #[test]
+    fn complete_matrix_returns_a_bounded_report() {
+        let report = complete_bundle().finish(200).expect("complete matrix");
+        assert_eq!(report.runs, 8);
+        assert_eq!(report.safe_field_count, SafeField::ALL.len());
+        assert_eq!(report.captured_streams, 8);
+        assert_eq!(report.captured_bytes, SAFE_LINE.len() * 8);
+        assert_eq!(report.source_id, "source-1");
+        assert_eq!(report.build_id, "build-1");
+    }
+
+    #[test]
+    fn every_c11_window_spec_and_matrix_failure_reaches_the_shared_exit_path() {
+        type Case = (
+            &'static str,
+            &'static str,
+            fn() -> std::result::Result<(), ScanFailure>,
+        );
+        let cases: &[Case] = &[
+            ("unexpected_stream", "unexpected stream role", || {
+                C11Window::new(spec()).append("relay-z", SAFE_LINE)
+            }),
+            ("append_after_close", "append after close", || {
+                let mut window = C11Window::new(spec());
+                window.append("relay-a", SAFE_LINE)?;
+                window.close("relay-a")?;
+                window.append("relay-a", SAFE_LINE)
+            }),
+            ("capture_overflow", "capture overflow", || {
+                let mut window = C11Window::new(spec().with_stream_limit(4)?);
+                window.append("relay-a", b"12345")
+            }),
+            ("sensitive_value", "sensitive credential value", || {
+                C11Window::new(spec()).append("relay-a", b"phase=ready fixture-secret-token")
+            }),
+            ("duplicate_close", "duplicate close", || {
+                let mut window = C11Window::new(spec());
+                window.append("relay-a", SAFE_LINE)?;
+                window.close("relay-a")?;
+                window.close("relay-a")
+            }),
+            ("joined_before_close", "join before close", || {
+                let mut window = C11Window::new(spec());
+                window.append("relay-a", SAFE_LINE)?;
+                window.mark_joined("relay-a")
+            }),
+            ("stream_not_closed", "stream not closed", || {
+                let mut window = C11Window::new(spec());
+                window.append("relay-a", SAFE_LINE)?;
+                window.finish(101).map(|_| ())
+            }),
+            ("stream_not_joined", "stream not joined", || {
+                let mut window = C11Window::new(spec());
+                window.append("relay-a", SAFE_LINE)?;
+                window.close("relay-a")?;
+                window.finish(101).map(|_| ())
+            }),
+            ("missing_stream", "missing expected stream: relay-b", || {
+                let mut window = C11Window::new(spec_with_roles(&["relay-a", "relay-b"])?);
+                window.append("relay-a", SAFE_LINE)?;
+                window.close("relay-a")?;
+                window.mark_joined("relay-a")?;
+                window.finish(101).map(|_| ())
+            }),
+            ("missing_safe_fields", "missing safe fields", || {
+                let mut window = C11Window::new(spec());
+                window.append("relay-a", RELAY_ONLY_LINE)?;
+                window.close("relay-a")?;
+                window.mark_joined("relay-a")?;
+                window.finish(101).map(|_| ())
+            }),
+            ("invalid_window", "invalid diagnostic window", || {
+                let mut window = C11Window::new(spec());
+                window.append("relay-a", SAFE_LINE)?;
+                window.close("relay-a")?;
+                window.mark_joined("relay-a")?;
+                window.finish(99).map(|_| ())
+            }),
+            ("invalid_run_id", "invalid bounded run_id", || {
+                C11RunSpec::new(
+                    "",
+                    "source-1",
+                    "build-1",
+                    FaultStage::Peer,
+                    RunOutcome::Success,
+                    100,
+                    ["relay-a"],
+                    Vec::new(),
+                )
+                .map(|_| ())
+            }),
+            ("invalid_source_id", "invalid bounded source_id", || {
+                C11RunSpec::new(
+                    "run-1",
+                    "source 1",
+                    "build-1",
+                    FaultStage::Peer,
+                    RunOutcome::Success,
+                    100,
+                    ["relay-a"],
+                    Vec::new(),
+                )
+                .map(|_| ())
+            }),
+            ("invalid_build_id", "invalid bounded build_id", || {
+                C11RunSpec::new(
+                    "run-1",
+                    "source-1",
+                    "b".repeat(MAX_TOKEN_BYTES + 1),
+                    FaultStage::Peer,
+                    RunOutcome::Success,
+                    100,
+                    ["relay-a"],
+                    Vec::new(),
+                )
+                .map(|_| ())
+            }),
+            ("invalid_stream_role", "invalid bounded stream_role", || {
+                spec_with_roles(&["relay/a"]).map(|_| ())
+            }),
+            (
+                "no_expected_streams",
+                "no expected diagnostic streams",
+                || spec_with_roles(&[]).map(|_| ()),
+            ),
+            (
+                "invalid_sentinel_empty",
+                "invalid credential sentinel",
+                || Sentinel::new(SentinelKind::Credential, Vec::new()).map(|_| ()),
+            ),
+            (
+                "invalid_sentinel_too_long",
+                "invalid application_payload sentinel",
+                || {
+                    Sentinel::new(
+                        SentinelKind::ApplicationPayload,
+                        vec![b'x'; MAX_SENTINEL_BYTES + 1],
+                    )
+                    .map(|_| ())
+                },
+            ),
+            (
+                "invalid_stream_limit",
+                "invalid stream capture limit",
+                || spec().with_stream_limit(0).map(|_| ()),
+            ),
+            (
+                "safe_field_role_not_expected",
+                "safe-field role was not an expected stream",
+                || spec().with_safe_field_roles(["relay-z"]).map(|_| ()),
+            ),
+            (
+                "invalid_safe_field_role",
+                "invalid bounded safe_field_role",
+                || spec().with_safe_field_roles([""]).map(|_| ()),
+            ),
+            (
+                "run_outside_matrix_start",
+                "run outside matrix window",
+                || {
+                    C11EvidenceBundle::new(100).add(report(
+                        FaultStage::Peer,
+                        RunOutcome::Success,
+                        "source-1",
+                        "build-1",
+                        99,
+                        101,
+                        SAFE_LINE,
+                    ))
+                },
+            ),
+            (
+                "run_outside_matrix_end",
+                "run outside matrix window: matrix-end",
+                || complete_bundle().finish(100).map(|_| ()),
+            ),
+            (
+                "duplicate_matrix_case",
+                "duplicate peer success matrix case",
+                || {
+                    let mut bundle = C11EvidenceBundle::new(100);
+                    bundle.add(report(
+                        FaultStage::Peer,
+                        RunOutcome::Success,
+                        "source-1",
+                        "build-1",
+                        100,
+                        101,
+                        SAFE_LINE,
+                    ))?;
+                    bundle.add(report(
+                        FaultStage::Peer,
+                        RunOutcome::Success,
+                        "source-1",
+                        "build-1",
+                        100,
+                        101,
+                        SAFE_LINE,
+                    ))
+                },
+            ),
+            (
+                "missing_matrix_case",
+                "missing redis success matrix case",
+                || {
+                    let mut bundle = C11EvidenceBundle::new(100);
+                    bundle.add(report(
+                        FaultStage::Peer,
+                        RunOutcome::Success,
+                        "source-1",
+                        "build-1",
+                        100,
+                        101,
+                        SAFE_LINE,
+                    ))?;
+                    bundle.finish(200).map(|_| ())
+                },
+            ),
+            (
+                "matrix_missing_safe_fields",
+                "missing safe fields: tenant",
+                || {
+                    let mut bundle = C11EvidenceBundle::new(100);
+                    for stage in FaultStage::ALL {
+                        for outcome in RunOutcome::ALL {
+                            bundle.add(report(
+                                stage,
+                                outcome,
+                                "source-1",
+                                "build-1",
+                                100,
+                                101,
+                                RELAY_ONLY_LINE,
+                            ))?;
+                        }
+                    }
+                    bundle.finish(200).map(|_| ())
+                },
+            ),
+            (
+                "matrix_mixed_source_build",
+                "mixed source/build identities",
+                || {
+                    let mut bundle = C11EvidenceBundle::new(100);
+                    for stage in FaultStage::ALL {
+                        for outcome in RunOutcome::ALL {
+                            let source_id =
+                                if stage == FaultStage::Write && outcome == RunOutcome::Failure {
+                                    "source-2"
+                                } else {
+                                    "source-1"
+                                };
+                            bundle.add(report(
+                                stage, outcome, source_id, "build-1", 100, 101, SAFE_LINE,
+                            ))?;
+                        }
+                    }
+                    bundle.finish(200).map(|_| ())
+                },
+            ),
+            ("matrix_invalid_window", "invalid diagnostic window", || {
+                C11EvidenceBundle::new(100).finish(99).map(|_| ())
+            }),
+        ];
+        for &(name, fragment, run) in cases {
+            let result = cli_result(run());
+            assert!(
+                result.is_err(),
+                "{name}: C11 scanner failure unexpectedly passed"
+            );
+            assert_rejected(result, fragment);
+        }
+    }
+}

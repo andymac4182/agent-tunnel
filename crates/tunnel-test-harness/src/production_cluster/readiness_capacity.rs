@@ -2353,4 +2353,32 @@ mod c17_validator_tests {
             assert_rejected(validate_peer_capacity_evidence(&evidence), "peer capacity");
         }
     }
+
+    #[test]
+    fn peer_capacity_validator_accepts_complete_evidence() {
+        validate_peer_capacity_evidence(&valid_evidence())
+            .expect("complete peer-capacity evidence is valid");
+    }
+
+    #[test]
+    fn peer_capacity_rejects_elapsed_and_per_device_upper_bounds_with_named_diagnostics() {
+        use crate::acceptance_test_support::assert_failed;
+
+        let mut over_elapsed = valid_evidence();
+        over_elapsed.elapsed_ms =
+            u64::try_from(super::SCENARIO_TIMEOUT.as_millis()).expect("bounded timeout") + 1;
+        let diagnostic = assert_failed(validate_peer_capacity_evidence(&over_elapsed));
+        assert!(
+            diagnostic.contains("outside its bounded nonzero range"),
+            "elapsed upper bound: {diagnostic}"
+        );
+
+        let mut over_device_bound = valid_evidence();
+        over_device_bound.per_device_streams = [65, 64, 63];
+        let diagnostic = assert_failed(validate_peer_capacity_evidence(&over_device_bound));
+        assert!(
+            diagnostic.contains("exceeds the configured actor bound"),
+            "per-device upper bound: {diagnostic}"
+        );
+    }
 }

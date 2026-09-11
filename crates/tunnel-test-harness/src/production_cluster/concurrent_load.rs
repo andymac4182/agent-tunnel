@@ -324,6 +324,115 @@ mod c17_validator_tests {
         evidence.fanout_peak_open = 4;
         assert!(!assert_failed(validate_concurrent_load_evidence(&evidence)).is_empty());
     }
+
+    #[test]
+    fn concurrent_load_validator_accepts_complete_evidence() {
+        validate_concurrent_load_evidence(&valid_evidence())
+            .expect("complete concurrent-load evidence is valid");
+    }
+
+    #[test]
+    fn every_concurrent_load_rejection_names_its_condition() {
+        const ACCOUNTING: &str = "stream-admission accounting was inconsistent";
+        const MIXED: &str =
+            "mixed capacity with reconnecting, transport, timeout, or unknown failures";
+        const QUEUE: &str = "bounded queue observations";
+        type Case = (&'static str, &'static str, fn(&mut ConcurrentLoadEvidence));
+        let cases: &[Case] = &[
+            ("relay_count", "expected three relays", |e| {
+                e.relay_count = 2
+            }),
+            ("membership_ready_relays", "three Ready memberships", |e| {
+                e.membership_ready_relays = 2
+            }),
+            (
+                "non_owner_ingress_relays",
+                "two non-owner ingress relays",
+                |e| e.non_owner_ingress_relays = 1,
+            ),
+            ("attempted_streams", ACCOUNTING, |e| e.attempted_streams = 1),
+            ("cap_fill_attempts", ACCOUNTING, |e| e.cap_fill_attempts = 1),
+            ("over_cap_attempts", ACCOUNTING, |e| e.over_cap_attempts = 1),
+            (
+                "accepted_streams",
+                "stream device cap including the CLI stream",
+                |e| e.accepted_streams = 1,
+            ),
+            (
+                "fill_capacity_rejections",
+                "exactly one typed capacity refusal",
+                |e| e.fill_capacity_rejections = 0,
+            ),
+            (
+                "over_cap_capacity_rejections",
+                "typed capacity refusals for every over-cap attempt",
+                |e| e.over_cap_capacity_rejections = 0,
+            ),
+            ("reconnecting_failures", MIXED, |e| {
+                e.reconnecting_failures = 1
+            }),
+            ("transport_failures", MIXED, |e| e.transport_failures = 1),
+            ("timeout_failures", MIXED, |e| e.timeout_failures = 1),
+            ("unknown_failures", MIXED, |e| e.unknown_failures = 1),
+            ("observed_stream_peak", "snapshot saw only", |e| {
+                e.observed_stream_peak = 1
+            }),
+            ("queue_samples", QUEUE, |e| e.queue_samples = 0),
+            ("bounded_queue", QUEUE, |e| e.bounded_queue = false),
+            ("max_queue_bytes", "exceeded its 4 MiB budget", |e| {
+                e.max_queue_bytes = 4 * 1024 * 1024 + 1
+            }),
+            (
+                "max_queue_messages",
+                "exceeded its 128-message budget",
+                |e| e.max_queue_messages = 129,
+            ),
+            ("ordered_streams", "completed", |e| e.ordered_streams = 1),
+            ("ordered_records", "completed", |e| e.ordered_records = 1),
+            ("same_stream_producers", "same-stream producers", |e| {
+                e.same_stream_producers = 1
+            }),
+            (
+                "same_stream_ordered",
+                "required gate same_stream_ordered was false",
+                |e| e.same_stream_ordered = false,
+            ),
+            (
+                "tenant_b_progress",
+                "required gate tenant_b_progress was false",
+                |e| e.tenant_b_progress = false,
+            ),
+            (
+                "sibling_progress",
+                "required gate sibling_progress was false",
+                |e| e.sibling_progress = false,
+            ),
+            (
+                "cancellation_responsive",
+                "required gate cancellation_responsive was false",
+                |e| e.cancellation_responsive = false,
+            ),
+            (
+                "cleanup_joined",
+                "required gate cleanup_joined was false",
+                |e| e.cleanup_joined = false,
+            ),
+            (
+                "fanout_peak_open",
+                "device fanout exceeded three sockets",
+                |e| e.fanout_peak_open = 4,
+            ),
+        ];
+        for &(name, fragment, mutate) in cases {
+            let mut evidence = valid_evidence();
+            mutate(&mut evidence);
+            let diagnostic = assert_failed(validate_concurrent_load_evidence(&evidence));
+            assert!(
+                diagnostic.contains(fragment),
+                "{name}: expected {fragment:?} in diagnostic {diagnostic}"
+            );
+        }
+    }
 }
 
 /// Run the bounded real three-relay concurrent producer and stream-cap gate.

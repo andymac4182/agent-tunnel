@@ -1103,4 +1103,11 @@ mod c17_validator_tests {
             assert!(diagnostic.contains("peer-fragmentation"));
         }
     }
+
+    #[test]
+    fn fragmentation_validator_accepts_complete_evidence() {
+        valid_evidence()
+            .validate()
+            .expect("complete peer-fragmentation evidence is valid");
+    }
 }

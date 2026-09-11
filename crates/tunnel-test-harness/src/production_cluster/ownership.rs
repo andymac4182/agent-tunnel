@@ -224,6 +224,12 @@ mod c17_validator_tests {
             let _ = name;
         }
     }
+
+    #[test]
+    fn owner_contention_validator_accepts_complete_evidence() {
+        validate_ownership_evidence(&valid_evidence())
+            .expect("complete owner-contention evidence is valid");
+    }
 }
 
 /// Run the bounded real three-relay owner contention and stale cleanup gate.

@@ -2087,4 +2087,16 @@ mod tests {
             "public admission",
         );
     }
+
+    #[test]
+    fn admission_validator_accepts_complete_evidence() {
+        validate_admission_evidence(&evidence()).expect("complete admission evidence is valid");
+    }
+
+    #[test]
+    fn sibling_dispatch_after_owner_loss_must_be_exactly_one() {
+        let mut value = evidence();
+        value.sibling_dispatch_delta_after_owner_loss = 2;
+        assert_rejected(validate_admission_evidence(&value), "expected one");
+    }
 }

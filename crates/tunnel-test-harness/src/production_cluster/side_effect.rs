@@ -727,6 +727,81 @@ mod c17_validator_tests {
             "synthetic side-effect",
         );
     }
+
+    #[test]
+    fn side_effect_validator_accepts_complete_evidence() {
+        validate_side_effect_evidence(&valid_evidence())
+            .expect("complete synthetic side-effect evidence is valid");
+    }
+
+    #[test]
+    fn every_side_effect_route_terminal_and_raw_frame_condition_names_its_rejection() {
+        use crate::acceptance_test_support::assert_failed;
+
+        const ROUTE: &str = "rather than relay-c -> relay-a";
+        const DATA_CONTEXT: &str = "DATA context or 4-byte record boundary was invalid";
+        const FIN: &str = "FIN was not the contiguous terminal frame";
+        type Case = (&'static str, &'static str, fn(&mut SideEffectEvidence));
+        let cases: &[Case] = &[
+            (
+                "unsupported_terminal",
+                "terminal classification was unsupported",
+                |e| e.consumer_terminal = "weird".into(),
+            ),
+            (
+                "success_terminal_disagrees_with_interruption",
+                "disagreed with interrupted_or_unknown",
+                |e| e.consumer_terminal = "success".into(),
+            ),
+            (
+                "success_flag_disagrees_with_terminal",
+                "disagreed with success",
+                |e| e.consumer_success = true,
+            ),
+            ("owner_relay", ROUTE, |e| e.owner_relay = "relay-b".into()),
+            ("ingress_relay", ROUTE, |e| {
+                e.ingress_relay = "relay-a".into()
+            }),
+            (
+                "backend_effect_invocations_duplicate",
+                "expected exactly one invocation",
+                |e| e.backend_effect_invocations = 2,
+            ),
+            ("data_payload_boundary", DATA_CONTEXT, |e| {
+                e.raw_observations[0].payload_len = SYNTHETIC_REQUEST.len()
+            }),
+            ("data_epoch_zero", DATA_CONTEXT, |e| {
+                e.raw_observations[0].epoch = 0
+            }),
+            ("data_generation_not_one", DATA_CONTEXT, |e| {
+                e.raw_observations[0].generation = 2
+            }),
+            ("data_stream_id_zero", DATA_CONTEXT, |e| {
+                e.raw_observations[0].stream_id = 0
+            }),
+            (
+                "fin_context_drift",
+                "changed epoch/generation/stream context",
+                |e| e.raw_observations[1].epoch = 2,
+            ),
+            ("fin_sequence", FIN, |e| e.raw_observations[1].sequence = 3),
+            ("fin_payload", FIN, |e| {
+                e.raw_observations[1].payload_len = 1
+            }),
+            ("no_data_observation", "carried 0 DATA observations", |e| {
+                e.raw_observations[0].kind = "Fin".into()
+            }),
+        ];
+        for &(name, fragment, mutate) in cases {
+            let mut evidence = valid_evidence();
+            mutate(&mut evidence);
+            let diagnostic = assert_failed(validate_side_effect_evidence(&evidence));
+            assert!(
+                diagnostic.contains(fragment),
+                "{name}: expected {fragment:?} in diagnostic {diagnostic}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -861,6 +936,57 @@ mod late_response_validator_tests {
                 "late-frame mutation {name} must be rejected"
             );
             assert_rejected(result, "late-frame");
+        }
+    }
+
+    #[test]
+    fn late_response_validator_accepts_complete_evidence() {
+        validate_late_response_evidence(&valid_evidence())
+            .expect("complete late-frame evidence is valid");
+    }
+
+    #[test]
+    fn every_late_response_identity_and_cursor_condition_names_its_rejection() {
+        use crate::acceptance_test_support::assert_failed;
+
+        const IDENTITY: &str = "owner/session/carrier/stream identity";
+        type Case = (&'static str, &'static str, fn(&mut LateResponseEvidence));
+        let cases: &[Case] = &[
+            ("owner_relay", IDENTITY, |e| {
+                e.owner_relay = "relay-b".into()
+            }),
+            ("ingress_relay", IDENTITY, |e| {
+                e.ingress_relay = "relay-a".into()
+            }),
+            ("tenant_id_empty", IDENTITY, |e| e.tenant_id.clear()),
+            ("device_id_empty", IDENTITY, |e| e.device_id.clear()),
+            ("session_id_empty", IDENTITY, |e| e.session_id.clear()),
+            ("epoch_zero", IDENTITY, |e| e.epoch = 0),
+            ("generation_zero", IDENTITY, |e| e.generation = 0),
+            ("stream_id_zero", IDENTITY, |e| e.stream_id = 0),
+            ("operation_id_empty", IDENTITY, |e| e.operation_id.clear()),
+            (
+                "owner_delivered_before_mismatch",
+                "exact DATA/FIN receive and delivery cursors",
+                |e| e.owner_delivered_contiguous_before = 1,
+            ),
+            (
+                "owner_receive_cursor_overflow",
+                "receive cursor overflowed",
+                |e| {
+                    e.owner_recv_contiguous_before = u64::MAX - 1;
+                    e.owner_delivered_contiguous_before = u64::MAX - 1;
+                },
+            ),
+        ];
+        for &(name, fragment, mutate) in cases {
+            let mut evidence = valid_evidence();
+            mutate(&mut evidence);
+            let diagnostic = assert_failed(validate_late_response_evidence(&evidence));
+            assert!(
+                diagnostic.contains(fragment),
+                "{name}: expected {fragment:?} in diagnostic {diagnostic}"
+            );
         }
     }
 }

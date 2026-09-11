@@ -1150,4 +1150,10 @@ mod terminal_cleanup_tests {
             "zero elapsed time",
         );
     }
+
+    #[test]
+    fn revocation_validator_accepts_complete_evidence() {
+        validate_device_revocation_evidence(&valid_evidence())
+            .expect("complete device-revocation evidence is valid");
+    }
 }

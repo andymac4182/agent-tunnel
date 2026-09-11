@@ -343,6 +343,61 @@ mod c17_validator_tests {
             assert_rejected(validate_fp05_evidence(&evidence), "FP-05");
         }
     }
+
+    #[test]
+    fn fp05_validator_accepts_complete_evidence_for_both_typed_terminals() {
+        validate_fp05_evidence(&valid_evidence()).expect("HTTP 503 explicit unknown is valid");
+        let mut transport_error = valid_evidence();
+        transport_error.post_terminal = "transport-error".into();
+        transport_error.post_status = None;
+        validate_fp05_evidence(&transport_error)
+            .expect("transport error without a status is valid");
+    }
+
+    #[test]
+    fn every_fp05_route_and_terminal_shape_names_its_rejection() {
+        use crate::acceptance_test_support::assert_failed;
+
+        const ROUTE: &str = "rather than relay-c -> relay-a";
+        const TERMINAL: &str = "expected HTTP 503 explicit unknown or transport error";
+        type Case = (&'static str, &'static str, fn(&mut Fp05Evidence));
+        let cases: &[Case] = &[
+            ("owner_relay", ROUTE, |e| e.owner_relay = "relay-b".into()),
+            ("ingress_relay", ROUTE, |e| {
+                e.ingress_relay = "relay-a".into()
+            }),
+            ("transport_error_with_status", TERMINAL, |e| {
+                e.post_terminal = "transport-error".into();
+                e.post_status = Some(503);
+            }),
+            ("http_unknown_without_status", TERMINAL, |e| {
+                e.post_status = None
+            }),
+            ("success_terminal", TERMINAL, |e| {
+                e.post_terminal = "success".into()
+            }),
+            ("observer_deadline", "only an observer deadline", |e| {
+                e.post_terminal = "observer-deadline".into()
+            }),
+            ("post_elapsed_over_bound", "exceeded its bound", |e| {
+                e.post_elapsed_ms = duration_millis(POST_OBSERVATION_TIMEOUT) + 1
+            }),
+            (
+                "post_observation_deadline_mismatch",
+                "POST observation bound was",
+                |e| e.post_observation_deadline_ms = 1,
+            ),
+        ];
+        for &(name, fragment, mutate) in cases {
+            let mut evidence = valid_evidence();
+            mutate(&mut evidence);
+            let diagnostic = assert_failed(validate_fp05_evidence(&evidence));
+            assert!(
+                diagnostic.contains(fragment),
+                "{name}: expected {fragment:?} in diagnostic {diagnostic}"
+            );
+        }
+    }
 }
 
 /// Run the bounded admitted non-idempotent owner-loss scenario.

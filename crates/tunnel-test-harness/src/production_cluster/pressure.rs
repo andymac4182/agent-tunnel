@@ -1195,4 +1195,10 @@ mod tests {
         assert!(validate_pressure_message_budget(256).is_ok());
         assert!(validate_pressure_message_budget(257).is_err());
     }
+
+    #[test]
+    fn pressure_validator_accepts_complete_evidence() {
+        validate_pressure_evidence(&valid_evidence())
+            .expect("complete production pressure evidence is valid");
+    }
 }
