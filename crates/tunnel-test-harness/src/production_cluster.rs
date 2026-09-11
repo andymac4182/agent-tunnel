@@ -1477,9 +1477,9 @@ impl ProductionCluster {
         barriers: BTreeMap<String, Arc<ConsumerUpgradeBarrier>>,
         max_pending_operations: usize,
     ) -> Result<Self> {
-        if !(1..=64).contains(&max_pending_operations) {
+        if !(1..=128).contains(&max_pending_operations) {
             return Err(HarnessError::InvalidInput(
-                "public upgrade barrier max_pending_operations must be 1..=64".into(),
+                "public upgrade barrier max_pending_operations must be 1..=128".into(),
             ));
         }
         let catalog = Arc::new(harness.production_catalog()?.clone()) as SharedCatalog;

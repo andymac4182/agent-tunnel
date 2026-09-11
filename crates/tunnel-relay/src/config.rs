@@ -14,14 +14,19 @@ use tunnel_core::{ConfigError as CoreConfigError, RotationConfig};
 
 use crate::redis_connection::RedisTlsMaterialPaths;
 
-/// Default per-owner consumer admission bound.  Three quarters of the
-/// relay-global `max_pending_operations` default; see the field documentation
-/// on [`RelayLimits::max_pending_operations_per_owner`].
-pub const DEFAULT_MAX_PENDING_OPERATIONS_PER_OWNER: usize = 48;
+/// Default per-owner consumer admission bound.  It equals the default
+/// `max_streams_per_device`, because one device must be able to use the whole
+/// per-device stream allowance it is documented to have; a lower per-owner
+/// bound makes that allowance unreachable through a single relay.  Fairness
+/// still holds by default because the relay-global `max_pending_operations`
+/// default is twice this value, so one owner scope can never take more than
+/// half of a relay's concurrent ingress.  A deployment with many tenants per
+/// relay can lower it deliberately.
+pub const DEFAULT_MAX_PENDING_OPERATIONS_PER_OWNER: usize = 64;
 /// Hard ceiling for the per-owner consumer admission bound.  It matches the
 /// relay-global ceiling so the configuration cannot advertise a per-owner
 /// allowance the process bound could never grant.
-pub const MAX_PENDING_OPERATIONS_PER_OWNER_CEILING: usize = 64;
+pub const MAX_PENDING_OPERATIONS_PER_OWNER_CEILING: usize = 128;
 
 /// Runtime limits enforced before a request or WebSocket message allocates
 /// payload storage.  These are hard upper bounds for the M1 profile.
@@ -60,7 +65,7 @@ impl Default for RelayLimits {
             max_body_bytes: 64 * 1024,
             max_control_bytes: 32 * 1024,
             max_streams_per_device: 64,
-            max_pending_operations: 64,
+            max_pending_operations: 128,
             max_pending_operations_per_owner: DEFAULT_MAX_PENDING_OPERATIONS_PER_OWNER,
             max_devices: 1_024,
             max_devices_per_user: 16,
@@ -84,16 +89,24 @@ impl RelayLimits {
                 "max_streams_per_device must be 1..=64",
             ));
         }
-        if self.max_pending_operations == 0 || self.max_pending_operations > 64 {
+        if self.max_pending_operations == 0 || self.max_pending_operations > 128 {
             return Err(ConfigError::Invalid(
-                "max_pending_operations must be 1..=64",
+                "max_pending_operations must be 1..=128",
             ));
         }
         if self.max_pending_operations_per_owner == 0
             || self.max_pending_operations_per_owner > MAX_PENDING_OPERATIONS_PER_OWNER_CEILING
         {
             return Err(ConfigError::Invalid(
-                "max_pending_operations_per_owner must be 1..=64",
+                "max_pending_operations_per_owner must be 1..=128",
+            ));
+        }
+        // A per-owner bound below the per-device stream allowance would make
+        // that documented allowance unreachable through one relay, which is how
+        // the configured saturation gate first exposed this.
+        if self.max_pending_operations_per_owner < self.max_streams_per_device {
+            return Err(ConfigError::Invalid(
+                "max_pending_operations_per_owner must be at least max_streams_per_device",
             ));
         }
         if self.max_devices == 0 || self.max_devices > 1_000_000 {
@@ -734,7 +747,7 @@ impl ServeConfig {
             || self.max_pending_operations_per_owner > MAX_PENDING_OPERATIONS_PER_OWNER_CEILING
         {
             return Err(ConfigError::Invalid(
-                "max_pending_operations_per_owner must be 1..=64",
+                "max_pending_operations_per_owner must be 1..=128",
             ));
         }
         if self.max_queue_bytes < 256 * 1024 || self.max_queue_bytes > 64 * 1024 * 1024 {
