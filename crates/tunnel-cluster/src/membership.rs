@@ -2127,4 +2127,133 @@ mod tests {
             Err(MembershipError::NodeLimit { .. })
         ));
     }
+
+    /// Walk one node's signed records through old -> old+new -> new and pin
+    /// the exact acceptance at every step.  This is the deterministic
+    /// statement of the peer-certificate replacement rule that the configured
+    /// two-relay process gate exercises over real sockets: the replacement
+    /// key binds only from the record that approves it, both keys bind during
+    /// the overlap, the retired key stops binding as soon as the replacement
+    /// record drops it, and an unapproved key never binds at any version.
+    #[test]
+    fn peer_key_replacement_walks_old_then_overlap_then_new() {
+        let (issuer, _) = MembershipIssuer::generate("publisher-a").expect("issuer");
+        let mut verifier = verifier(&issuer);
+        let now = now();
+        verify_test_checkpoint(&issuer, &mut verifier, now);
+        let old_spki = "00".repeat(32);
+        let new_spki = "11".repeat(32);
+        let rogue_spki = "22".repeat(32);
+        let key = |key_id: &str, spki: &str| RelayKey {
+            key_id: key_id.into(),
+            spki_sha256: spki.into(),
+            not_before: now - Duration::seconds(1),
+            expires_at: now + Duration::seconds(59),
+            revoked: false,
+        };
+        let signed_at = |record: MembershipRecord| {
+            issuer
+                .sign_membership(record)
+                .expect("record")
+                .encode()
+                .expect("record bytes")
+        };
+
+        // Version 2 approves the old key only.  The record fixture already
+        // carries exactly that key.
+        let old_only = signed_at(record(now, "node-a", 2));
+        let verified = verifier
+            .verify_membership(&old_only, now)
+            .expect("old-only record");
+        assert_eq!(
+            verified
+                .bind_peer("node-a", "boot-a", &old_spki, now)
+                .expect("old key binds")
+                .key_id(),
+            "node-a-current"
+        );
+        assert!(matches!(
+            verified.bind_peer("node-a", "boot-a", &new_spki, now),
+            Err(MembershipError::PeerKeyMismatch)
+        ));
+
+        // Version 3 is the overlap: both keys are approved simultaneously.
+        let mut overlap = record(now, "node-a", 3);
+        overlap.keys = vec![
+            key("node-a-current", &old_spki),
+            key("node-a-replacement", &new_spki),
+        ];
+        let overlap = signed_at(overlap);
+        let verified = verifier
+            .verify_membership(&overlap, now)
+            .expect("overlap record");
+        assert_eq!(verified.keys().len(), 2);
+        assert_eq!(
+            verified
+                .bind_peer("node-a", "boot-a", &old_spki, now)
+                .expect("old key still binds during the overlap")
+                .key_id(),
+            "node-a-current"
+        );
+        assert_eq!(
+            verified
+                .bind_peer("node-a", "boot-a", &new_spki, now)
+                .expect("replacement key binds during the overlap")
+                .key_id(),
+            "node-a-replacement"
+        );
+        // `active_key` deliberately selects the latest valid key, which is
+        // the replacement: an overlap never keeps the retired key preferred.
+        assert_eq!(
+            verified.active_key(now).map(|key| key.key_id.as_str()),
+            Some("node-a-replacement")
+        );
+        assert!(matches!(
+            verified.bind_peer("node-a", "boot-a", &rogue_spki, now),
+            Err(MembershipError::PeerKeyMismatch)
+        ));
+
+        // Version 4 ends the overlap by approving the replacement alone.
+        let mut replacement = record(now, "node-a", 4);
+        replacement.keys = vec![key("node-a-replacement", &new_spki)];
+        let replacement = signed_at(replacement);
+        let verified = verifier
+            .verify_membership(&replacement, now)
+            .expect("replacement record");
+        assert_eq!(
+            verified
+                .bind_peer("node-a", "boot-a", &new_spki, now)
+                .expect("replacement key binds after the overlap")
+                .key_id(),
+            "node-a-replacement"
+        );
+        for retired in [&old_spki, &rogue_spki] {
+            assert!(matches!(
+                verified.bind_peer("node-a", "boot-a", retired, now),
+                Err(MembershipError::PeerKeyMismatch)
+            ));
+        }
+        // The verifier's retained state for this node follows the newest
+        // accepted record, so the retired key stops binding there too.
+        assert!(matches!(
+            verifier.bind_peer("node-a", "boot-a", &old_spki, now),
+            Err(MembershipError::PeerKeyMismatch)
+        ));
+        assert_eq!(
+            verifier
+                .bind_peer("node-a", "boot-a", &new_spki, now)
+                .expect("verifier binds the replacement key")
+                .key_id(),
+            "node-a-replacement"
+        );
+        // A rollback to the overlap record cannot re-approve the retired key.
+        assert!(matches!(
+            verifier.verify_membership(&overlap, now),
+            Err(MembershipError::VersionRollback { .. })
+        ));
+        assert!(matches!(
+            verifier.bind_peer("node-a", "boot-a", &old_spki, now),
+            Err(MembershipError::PeerKeyMismatch)
+        ));
+    }
 }

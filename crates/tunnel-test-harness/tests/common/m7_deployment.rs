@@ -686,7 +686,10 @@ pub(crate) struct CheckpointContext {
     minimum_versions: BTreeMap<String, u64>,
     version: AtomicU64,
     requests: Arc<AtomicUsize>,
-    signing_time: DateTime<Utc>,
+    /// A fixed signing instant reproduces the bounded-lifetime scenarios; a
+    /// live signer stamps every response at request time so a longer staged
+    /// process test stays within the 60-second record lifetime.
+    signing_time: Option<DateTime<Utc>>,
 }
 
 pub(crate) struct CheckpointServer {
@@ -704,13 +707,13 @@ impl CheckpointServer {
         deployment_incarnation: String,
         minimum_versions: BTreeMap<String, u64>,
     ) -> Result<Self> {
-        Self::bind_at(
+        Self::bind_with_signing_time(
             server_config,
             authority,
             deployment_id,
             deployment_incarnation,
             minimum_versions,
-            Utc::now(),
+            Some(Utc::now()),
         )
         .await
     }
@@ -722,6 +725,47 @@ impl CheckpointServer {
         deployment_incarnation: String,
         minimum_versions: BTreeMap<String, u64>,
         signing_time: DateTime<Utc>,
+    ) -> Result<Self> {
+        Self::bind_with_signing_time(
+            server_config,
+            authority,
+            deployment_id,
+            deployment_incarnation,
+            minimum_versions,
+            Some(signing_time),
+        )
+        .await
+    }
+
+    /// Bind a checkpoint authority that signs every response at request
+    /// time.  Each checkpoint still carries the bounded fixture lifetime and
+    /// the caller's nonce; only the issuance instant follows the wall clock,
+    /// so a staged multi-phase process test stays inside the 60-second bound.
+    pub(crate) async fn bind_live(
+        server_config: Arc<rustls::ServerConfig>,
+        authority: Arc<TestMembershipAuthority>,
+        deployment_id: String,
+        deployment_incarnation: String,
+        minimum_versions: BTreeMap<String, u64>,
+    ) -> Result<Self> {
+        Self::bind_with_signing_time(
+            server_config,
+            authority,
+            deployment_id,
+            deployment_incarnation,
+            minimum_versions,
+            None,
+        )
+        .await
+    }
+
+    async fn bind_with_signing_time(
+        server_config: Arc<rustls::ServerConfig>,
+        authority: Arc<TestMembershipAuthority>,
+        deployment_id: String,
+        deployment_incarnation: String,
+        minimum_versions: BTreeMap<String, u64>,
+        signing_time: Option<DateTime<Utc>>,
     ) -> Result<Self> {
         let listener = TokioTcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
@@ -753,6 +797,11 @@ impl CheckpointServer {
 
     pub(crate) fn address(&self) -> SocketAddr {
         self.address
+    }
+
+    /// Number of signed checkpoints fully written to a relay so far.
+    pub(crate) fn request_count(&self) -> usize {
+        self.requests.load(Ordering::Acquire)
     }
 
     pub(crate) async fn shutdown(self) -> Result<()> {
@@ -901,7 +950,7 @@ pub(crate) async fn run_checkpoint_connection(
             next_version,
             request.nonce,
             context.minimum_versions.clone(),
-            context.signing_time,
+            context.signing_time.unwrap_or_else(Utc::now),
         ) else {
             return;
         };

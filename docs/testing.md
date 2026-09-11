@@ -278,6 +278,54 @@ named bound. Peer reachability has its own process case in
 `m7_deployment_port_binding.rs`, and loss of an authority *after* a ready start
 is `m7_deployment_runtime_faults.rs`.
 
+### Dynamic configured peer-SPKI replacement
+
+```sh
+cargo test -p tunnel-test-harness --test m7_deployment_spki_replacement --locked \
+  -- --ignored --test-threads=1
+```
+
+Two configured relay executables run over separate `rediss://` forwarders and a
+live signed checkpoint authority. Relay A is **never restarted** and is the
+subject: the signed relay-B record walks old -> old+new -> new while a harness
+peer client presents the retired, the replacement and an unapproved certificate
+to A's private listener, and an impostor QUIC server presents the retired
+certificate at relay B's endpoint after the overlap ends. The gate requires, in
+order: the replacement SPKI is refused before any record approves it; both keys
+are accepted during the overlap while the established device session keeps its
+original generation and a public canary still returns the exact canary plus
+payload bytes; A's readiness stays ready for every sample across the overlap;
+the retired SPKI is refused once the replacement-only record is adopted, with
+A's readiness reflecting that pin transition while relay B is still running; the
+relay whose own key was retired surrenders its owner claim and closes its device
+session; a public request across the retired route returns
+`503 CLUSTER_UNREADY` / `not_dispatched` and the impostor receives a connection
+from A but never a request stream; an untrusted signer naming a rogue SPKI
+leaves A unready with both the rogue and the replacement certificate refused;
+and a trusted record restores the replacement-only key set. Every transition
+asserts payload-free, credential-free process diagnostics, and cleanup joins
+both relay processes, the impostor, the checkpoint authority, both Redis
+forwarders and the catalog namespace. The deterministic statement of the same
+replacement rule is `tunnel-cluster`'s
+`membership::tests::peer_key_replacement_walks_old_then_overlap_then_new`.
+
+Two boundaries are deliberate and not claimed by this gate. The typed public
+outcome across the retired route is the readiness boundary rather than
+`PEER_UNTRUSTED`, because the relay withdraws that route from readiness before a
+consumer request reaches peer resolution; the pin failure itself is observed on
+the authenticated probe path, where A dials the retired certificate, refuses it
+and opens no stream. And the **replacement process's own public admission is not
+exercised**: a relay that boots while its already-running peer is flapping
+between ready and unready never converged to `/readyz` ready within 20 s in this
+fixture (0 of 123 samples), because each relay's probe admission requires the
+receiving relay's own readiness route set, which is cleared while that relay is
+unready. Restoring a fresh version-state file and holding the peer's record at a
+single version both failed to break that coupling. The replacement boot is
+therefore asserted only through relay A: A's readiness recovers on the
+replacement route and A accepts the replacement certificate on the private path.
+A device session and consumer request served *by* a replaced process remain
+uncovered; see the M7-C06 tracker row.
+
 ## Deterministic transport and state-machine tests
 
 Keep protocol transitions separable from socket I/O so ordinary unit and property tests can drive them. Cover `Connecting`, `Active(g)`, `Preparing(g,n)`, `Quiescing(g,n)`, `Draining(g,n)`, `Committing(g,n)`, `Retiring(g,n)`, `Aborting(g,n)`, `Recovering`, and `Closed`, with control ownership, connection deadlines, and operation status modeled separately. Candidate `n` is fresh and greater than prior attempts, including aborted attempts. Use Tokio's paused clock and explicit advancement for rotation tests; wall-clock sleeps are unsuitable for these assertions.
