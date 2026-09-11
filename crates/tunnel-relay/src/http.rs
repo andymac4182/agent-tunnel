@@ -3692,3 +3692,6 @@ mod tests {
 
 #[cfg(test)]
 mod peer_cleanup_tests;
+
+#[cfg(test)]
+mod pending_open_abandon_tests;

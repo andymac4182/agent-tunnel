@@ -429,6 +429,32 @@ async fn drain_queues(
     }
 }
 
+/// Reply OPENED for one queued consumer OPEN exactly as a real connector
+/// would.  Cleanup paths that emit a terminal FIN require an admitted stream;
+/// the owner defers the close of an unadmitted OPEN until its outcome.
+async fn admit_open(
+    handle: &RelayHandle,
+    key: &crate::actor::SessionKey,
+    open: &tunnel_protocol::Open,
+) {
+    handle
+        .inbound_control(
+            key.clone(),
+            ControlMessage::Opened(tunnel_protocol::Opened::new(
+                format!("{}-opened", open.message_id),
+                open.message_id.clone(),
+                key.session_id.clone(),
+                key.epoch,
+                open.stream_id,
+                open.operation_id.clone(),
+                open.initial_send_window,
+                open.initial_receive_window,
+            )),
+        )
+        .await
+        .expect("deliver OPENED for the queued OPEN");
+}
+
 #[tokio::test]
 async fn peer_consumer_error_reclaims_scoped_stream_and_queue_charge() {
     let now = Utc::now();
@@ -623,6 +649,10 @@ async fn peer_consumer_error_reclaims_scoped_stream_and_queue_charge() {
             ControlOutbound::Close => {}
         }
     };
+    // The connector admits the OPEN.  The cleanup paths below must close an
+    // admitted stream through the real terminal FIN path; an unadmitted OPEN
+    // is deferred until the owner outcome instead.
+    admit_open(&handle, &key, &open).await;
 
     let mut record = (7_u32).to_be_bytes().to_vec();
     record.extend_from_slice(b"drop-me");
@@ -711,6 +741,7 @@ async fn peer_consumer_error_reclaims_scoped_stream_and_queue_charge() {
             ControlOutbound::Close => {}
         }
     };
+    admit_open(&handle, &key, &raw_open).await;
     let returned_errors_before_raw = returned_errors.load(Ordering::Acquire);
     let mut truncated = Vec::with_capacity(8);
     truncated.extend_from_slice(&1_u32.to_be_bytes());

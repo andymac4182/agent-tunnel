@@ -1139,6 +1139,10 @@ struct M2Stream {
     /// OPEN remains live until the owner proves either rejection or admission;
     /// after admission the relay emits a real local FIN/RESET before FORGET.
     registration_dropped: bool,
+    /// Typed cause supplied by a close that arrived while OPEN was still
+    /// pending.  It is applied to the deferred terminal transition once the
+    /// connector admits the stream; a rejected OPEN never has a terminal.
+    deferred_terminal_cause: Option<StreamTerminalCause>,
     closed: CancellationToken,
     /// The public WebSocket upgrade owns this lease until Axum invokes its
     /// callback.  The actor tick expires an unclaimed lease so a client that
@@ -3614,6 +3618,13 @@ impl RelayActor {
                 }
             }
         }
+        if !ticket.candidate && ticket.generation != session.generation {
+            // A stale initial-generation ticket cannot attach once the session
+            // has moved on.  Refuse it before DATA_READY is queued so the
+            // connector never observes readiness for a carrier that was not
+            // installed.
+            return Err(RelayError::Unauthorized);
+        }
         let ready = wire::encode_control_message(&wire::data_ready(
             &ticket.welcome_message_id,
             &session.key.session_id,
@@ -3641,9 +3652,6 @@ impl RelayActor {
                 recovery.candidate_ready = true;
             }
         } else {
-            if ticket.generation != session.generation {
-                return Err(RelayError::Unauthorized);
-            }
             session.active_carrier = Some(DataCarrier {
                 context,
                 tx: data_tx.clone(),
@@ -3991,6 +3999,7 @@ impl RelayActor {
                 terminal_fin_failure: false,
                 open_pending: true,
                 registration_dropped: false,
+                deferred_terminal_cause: None,
                 closed: closed.clone(),
                 admission_lease: admission_lease.clone(),
                 admission_deadline,
@@ -4040,15 +4049,9 @@ impl RelayActor {
             // A dropped registration does not prove that the connector
             // rejected OPEN. Keep the exact OPEN identity until OPENED or a
             // matching REJECTED arrives; after OPENED, the branch below uses
-            // the normal transactional FIN path.
-            if let Some(session) = self.session_mut(key)
-                && let Some(stream) = session.streams.get_mut(&stream_id)
-                && stream.operation_id == operation_id
-            {
-                stream.registration_dropped = true;
-                stream.admission_lease.cancel();
-                Self::release_echo_stream_state(stream, &session.queue_budget, false);
-            }
+            // the normal transactional FIN path.  The close path performs
+            // exactly this deferral for a pending OPEN.
+            let _ = self.close_echo_stream(key, stream_id, operation_id);
             return;
         }
 
@@ -4719,6 +4722,31 @@ impl RelayActor {
         operation_id: &str,
         cause: Option<StreamTerminalCause>,
     ) -> bool {
+        // A consumer can disappear while its OPEN is still pending admission:
+        // the public handler was dropped before the 101, the socket closed
+        // before OPENED, or the unclaimed lease expired.  No sequenced frame
+        // and no terminal result may exist for a stream the connector has not
+        // admitted.  Keep the exact OPEN identity, stop the unclaimed-lease
+        // path, and defer the real terminal transition until the owner proves
+        // OPENED (a real FIN) or REJECTED (a no-stream FORGET).  The actor
+        // tick fails the fenced session closed if neither arrives by the
+        // admission deadline.  Repeated closes are idempotent here.
+        if let Some(session) = self.session_mut(key) {
+            let queue_budget = session.queue_budget.clone();
+            if let Some(stream) = session.streams.get_mut(&stream_id)
+                && stream.operation_id == operation_id
+                && stream.open_pending
+                && !stream.terminal
+            {
+                stream.registration_dropped = true;
+                stream.admission_lease.cancel();
+                if stream.deferred_terminal_cause.is_none() {
+                    stream.deferred_terminal_cause = cause;
+                }
+                Self::release_echo_stream_state(stream, &queue_budget, false);
+                return true;
+            }
+        }
         let fin_queued = {
             let Some(session) = self.session_mut(key) else {
                 return true;
@@ -8365,7 +8393,18 @@ impl RelayActor {
                         // The OPEN was admitted after the public registration
                         // disappeared. Reconcile it with a real local FIN;
                         // only a matching REJECTED may use no-stream FORGET.
-                        self.close_echo_stream(&key, opened.stream_id, &opened.operation_id);
+                        // The cause recorded by the deferred close, if any,
+                        // labels this exact terminal transition.
+                        let cause = self
+                            .session_for(&key)
+                            .and_then(|session| session.streams.get(&opened.stream_id))
+                            .and_then(|stream| stream.deferred_terminal_cause);
+                        self.close_echo_stream_with_cause(
+                            &key,
+                            opened.stream_id,
+                            &opened.operation_id,
+                            cause,
+                        );
                         let _ = self.flush_owner_stream_forgets(&key);
                     }
                 }
@@ -11939,6 +11978,7 @@ mod stream_identity_tests {
                     terminal_fin_failure: false,
                     open_pending: false,
                     registration_dropped: false,
+                    deferred_terminal_cause: None,
                     closed: tokio_util::sync::CancellationToken::new(),
                     admission_lease: tokio_util::sync::CancellationToken::new(),
                     admission_deadline: std::time::Instant::now()
@@ -12092,6 +12132,7 @@ mod stream_identity_tests {
                     terminal_fin_failure: false,
                     open_pending: false,
                     registration_dropped: false,
+                    deferred_terminal_cause: None,
                     closed: tokio_util::sync::CancellationToken::new(),
                     admission_lease: tokio_util::sync::CancellationToken::new(),
                     admission_deadline: std::time::Instant::now()
@@ -12191,7 +12232,7 @@ mod stream_identity_tests {
         drop(response_receivers);
     }
 
-    fn shared_device_fixture() -> (CatalogFixture, Uuid, Uuid, Uuid, String, String) {
+    pub(super) fn shared_device_fixture() -> (CatalogFixture, Uuid, Uuid, Uuid, String, String) {
         let tenant_a = Uuid::from_u128(1);
         let tenant_b = Uuid::from_u128(2);
         let user_a = Uuid::from_u128(11);
@@ -12330,7 +12371,7 @@ mod stream_identity_tests {
         hello
     }
 
-    fn admitted_control_actor(
+    pub(super) fn admitted_control_actor(
         identity: DeviceIdentity,
         key: SessionKey,
     ) -> (RelayActor, ControlRegistration) {
@@ -14894,6 +14935,30 @@ mod stream_identity_tests {
                 .expect("OPEN control response queued"),
         );
         let admitted_stream_id = admitted.stream_id;
+        // The connector admits the OPEN before the public lease expires: an
+        // unadmitted OPEN is deferred rather than terminalized, so the failed
+        // FIN reservation below requires an admitted stream.
+        let admitted_open_message_id = actor
+            .sessions
+            .get(&key.scope())
+            .and_then(|session| session.streams.get(&admitted_stream_id))
+            .map(|stream| stream.open_message_id.clone())
+            .expect("admitted OPEN correlation");
+        actor
+            .inbound_control(
+                key.clone(),
+                ControlMessage::Opened(tunnel_protocol::Opened::new(
+                    "writer-missing-opened",
+                    admitted_open_message_id,
+                    key.session_id.clone(),
+                    key.epoch,
+                    admitted_stream_id,
+                    admitted.operation_id.clone(),
+                    crate::wire::M2_INITIAL_WINDOW_BYTES as u64,
+                    crate::wire::M2_INITIAL_WINDOW_BYTES as u64,
+                )),
+            )
+            .await;
         if let Some(stream) = actor
             .sessions
             .get_mut(&key.scope())
@@ -15001,6 +15066,27 @@ mod stream_identity_tests {
             .await
             .expect("retained stream registration response")
             .expect("a removed rejection frees one active slot");
+        let retained_open_message_id = actor
+            .sessions
+            .get(&key.scope())
+            .and_then(|session| session.streams.get(&retained.stream_id))
+            .map(|stream| stream.open_message_id.clone())
+            .expect("retained OPEN correlation");
+        actor
+            .inbound_control(
+                key.clone(),
+                ControlMessage::Opened(tunnel_protocol::Opened::new(
+                    "retained-opened",
+                    retained_open_message_id,
+                    key.session_id.clone(),
+                    key.epoch,
+                    retained.stream_id,
+                    retained.operation_id.clone(),
+                    crate::wire::M2_INITIAL_WINDOW_BYTES as u64,
+                    crate::wire::M2_INITIAL_WINDOW_BYTES as u64,
+                )),
+            )
+            .await;
         assert!(actor.close_echo_stream(&key, retained.stream_id, &retained.operation_id));
         let (bounded_tx, bounded_rx) = oneshot::channel();
         actor.open_echo_stream(
@@ -15068,6 +15154,29 @@ mod stream_identity_tests {
                 .try_recv()
                 .expect("OPEN control response queued"),
         );
+        // Admit the OPEN first: only an admitted stream reaches the terminal
+        // FIN reservation that the closed writer must fail.
+        let closed_writer_open_message_id = actor
+            .sessions
+            .get(&key.scope())
+            .and_then(|session| session.streams.get(&admitted.stream_id))
+            .map(|stream| stream.open_message_id.clone())
+            .expect("closed-writer OPEN correlation");
+        actor
+            .inbound_control(
+                key.clone(),
+                ControlMessage::Opened(tunnel_protocol::Opened::new(
+                    "closed-writer-opened",
+                    closed_writer_open_message_id,
+                    key.session_id.clone(),
+                    key.epoch,
+                    admitted.stream_id,
+                    admitted.operation_id.clone(),
+                    crate::wire::M2_INITIAL_WINDOW_BYTES as u64,
+                    crate::wire::M2_INITIAL_WINDOW_BYTES as u64,
+                )),
+            )
+            .await;
         assert!(actor.close_echo_stream(&key, admitted.stream_id, &admitted.operation_id));
         assert!(actor.sessions.get(&key.scope()).is_some_and(|session| {
             session
@@ -15675,6 +15784,29 @@ mod stream_identity_tests {
         };
         open.release();
 
+        // The connector admits the OPEN; an unadmitted OPEN would be deferred
+        // instead of reaching the FIN reservation below.
+        let opened_message_id = actor
+            .sessions
+            .get(&key.scope())
+            .and_then(|session| session.streams.get(&registration.stream_id))
+            .map(|stream| stream.open_message_id.clone())
+            .expect("failed-relay-fin OPEN correlation");
+        actor
+            .inbound_control(
+                key.clone(),
+                ControlMessage::Opened(tunnel_protocol::Opened::new(
+                    "failed-relay-fin-opened",
+                    opened_message_id,
+                    key.session_id.clone(),
+                    key.epoch,
+                    registration.stream_id,
+                    registration.operation_id.clone(),
+                    crate::wire::M2_INITIAL_WINDOW_BYTES as u64,
+                    crate::wire::M2_INITIAL_WINDOW_BYTES as u64,
+                )),
+            )
+            .await;
         // Removing the active writer before close forces the relay's FIN
         // publication to fail. The terminal tombstone and its independent
         // failure deadline must remain retained until the owner proof path
@@ -15946,7 +16078,7 @@ mod stream_identity_tests {
         )
     }
 
-    fn session_attempt(
+    pub(super) fn session_attempt(
         key: &SessionKey,
         owner_id: &str,
         label: &str,
@@ -15964,7 +16096,7 @@ mod stream_identity_tests {
         )
     }
 
-    fn test_rotation_runtime(
+    pub(super) fn test_rotation_runtime(
         now: u64,
         attempt: RotationAttemptIdentity,
         deadline: u64,
@@ -17595,6 +17727,10 @@ mod stream_identity_tests {
 #[cfg(test)]
 #[path = "actor_lifecycle_tests.rs"]
 mod lifecycle_tests;
+
+#[cfg(test)]
+#[path = "actor_admission_race_tests.rs"]
+mod admission_race_tests;
 
 #[cfg(test)]
 mod cleanup_tests {

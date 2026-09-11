@@ -1304,6 +1304,42 @@ async fn peer_device_data_transport_shutdown_reclaims_exact_carrier_and_preserve
     fixture.shutdown().await;
 }
 
+/// Read the one queued consumer OPEN from a staged target control
+/// registration and admit it exactly as a real connector would.  The cleanup
+/// paths under test close an admitted stream and emit its terminal FIN; the
+/// owner defers the close of an unadmitted OPEN until its outcome instead.
+async fn admit_queued_open(
+    fixture: &H3PeerFixture,
+    control_rx: &mut mpsc::Receiver<ControlOutbound>,
+    session_id: &str,
+    epoch: u64,
+) {
+    let open = loop {
+        let item = timeout(Duration::from_secs(3), control_rx.recv())
+            .await
+            .expect("staged OPEN queue deadline")
+            .expect("staged control registration remains live");
+        match item {
+            ControlOutbound::Text(text) => {
+                let (text, mut charge) = text.into_parts();
+                let parsed = wire::parse_control(text.as_bytes()).expect("staged OPEN control");
+                charge.release();
+                if let ControlMessage::Open(open) = parsed {
+                    break open;
+                }
+            }
+            ControlOutbound::Close => {}
+        }
+    };
+    let key = crate::actor::SessionKey {
+        tenant_id: tenant_id(),
+        device_id: device_id(),
+        session_id: session_id.to_owned(),
+        epoch,
+    };
+    admit_open(&fixture.handle, &key, &open).await;
+}
+
 #[tokio::test]
 async fn peer_consumer_cancel_closes_exact_stream_and_preserves_sibling() {
     // Full top-level consumer scope: owner lookup, JWT/catalog validation,
@@ -1316,7 +1352,7 @@ async fn peer_consumer_cancel_closes_exact_stream_and_preserves_sibling() {
     let target_session_id = target.session_id.clone();
     let target_epoch = target.epoch;
     let target_ticket = target.ticket.clone();
-    let _target_rx = target.rx;
+    let mut target_rx = target.rx;
     let target_device = fixture
         .catalog
         .resolve_device(DEVICE_SPKI, Utc::now())
@@ -1376,6 +1412,8 @@ async fn peer_consumer_cancel_closes_exact_stream_and_preserves_sibling() {
     let sibling_before = find_session(&admitted, sibling_device_id())
         .expect("consumer sibling session after admission")
         .clone();
+
+    admit_queued_open(&fixture, &mut target_rx, &target_session_id, target_epoch).await;
 
     // Cancel both HTTP/3 directions and drop the client handle. The owner's
     // exact stream identity must be terminalized without touching the sibling.
@@ -1474,6 +1512,7 @@ async fn peer_consumer_idle_deadline_closes_exact_stream_and_preserves_sibling()
     let sibling_before = find_session(&admitted, sibling_device_id())
         .expect("idle consumer sibling after admission")
         .clone();
+    admit_queued_open(&fixture, &mut target_rx, &target_session_id, target_epoch).await;
     drain_queues(&mut target_rx, &mut target_data_rx).await;
 
     // Keep the client stream open so the configured two-second H3 receive
@@ -1723,6 +1762,7 @@ async fn peer_consumer_transport_shutdown_closes_exact_stream_and_preserves_sibl
     let sibling_before = find_session(&admitted, sibling_device_id())
         .expect("shutdown sibling after target admission")
         .clone();
+    admit_queued_open(&fixture, &mut target_rx, &target_session_id, target_epoch).await;
     drain_queues(&mut target_rx, &mut target_data_rx).await;
 
     // This cancels the server-side H3 transport and waits for its bounded

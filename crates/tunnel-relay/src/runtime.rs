@@ -349,6 +349,7 @@ pub(crate) fn terminal_close_reason(reason: &str) -> &'static str {
         "INVALID_RESET",
         "RECOVERY_QUEUE_LIMIT",
         "OWNER_FENCE_TIMEOUT",
+        "OPEN_ADMISSION_TIMEOUT",
         "OWNER_FORGET_TIMEOUT",
         "TERMINAL_FIN_TIMEOUT",
         "UNEXPECTED_STREAM_FORGET",
