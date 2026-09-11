@@ -1,6 +1,14 @@
 # Build roadmap
 
-Status: bootstrap is implemented; networking and the milestones below are planned. Work passes through concrete acceptance gates, without delivery-date or throughput claims. Primary scenario: **cloud agent → Agent Tunnel Server → outbound WebSocket tunnel → desktop ACP/MCP/CUA or filesystem export**.
+Status: M1 local verification is complete; later cluster work remains.
+On 2026-09-09 macOS arm64 with pinned Rust 1.95.0 and Redis 8.4, formatting,
+strict locked Clippy, 62 workspace tests, five explicitly executed real Redis integration tests, the AOF restart
+check, and the full real HTTPS/WSS CLI acceptance passed for five
+clients across two tenants. The acceptance included admission certificate,
+ticket, and stale-epoch negatives plus private H3 success/negative probes.
+Work passes through concrete acceptance gates, without delivery-date or
+throughput claims. Primary scenario: **cloud agent → Agent Tunnel Server →
+outbound WebSocket tunnel → desktop ACP/MCP/CUA or filesystem export**.
 
 GitHub tracking: [v0.1 Private alpha](https://github.com/andymac4182/agent-tunnel/milestone/1). Existing milestone identifiers remain stable, but their numbers are not execution order. **M7 clustering is required before M6 alpha release**, and its trust/routing foundations begin alongside M1.
 
@@ -16,19 +24,31 @@ GitHub tracking: [v0.1 Private alpha](https://github.com/andymac4182/agent-tunne
 | M8: ACP over HTTP to CLI-supervised agents | [#8](https://github.com/andymac4182/agent-tunnel/issues/8) |
 | CLI operations and diagnostics | [#9](https://github.com/andymac4182/agent-tunnel/issues/9) |
 
+Hosted verification: [M1 CI checks](https://github.com/andymac4182/agent-tunnel/pull/10/checks).
+
 ## M0 — Repository and executable configuration
 
-Delivered: private MIT-licensed repo, Rust workspace, config-only client/relay commands, strict configuration validation and cross-platform CI. Default rotation is 300s, handshake deadline 10s, overlap budget 30s. The expanded documents define interfaces, boundaries and tests; they do not implement them.
+Delivered or under active implementation: private MIT-licensed repo, Rust workspace, strict legacy configuration validation, the M1 `RuntimeConfig` client CLI, local CSR/import commands for externally issued device credentials, Axum consumer/device listeners, configured Redis authority and JWT/JWKS authorization, pinned TLS/WSS/H3 transport helpers, and a reusable real-resource harness. Local evidence covers the locked checks, 62 workspace tests, five explicitly executed real Redis integration tests, AOF same-dataset restart, and full real M1 acceptance; CI results are linked in this document. Redis is the authority catalog for every tenant, user, membership, device, service, grant, and credential record formerly assigned to PostgreSQL. Relay sockets, queues, in-flight operations, and other process-local session state remain ephemeral. In the narrow M1 Redis profile, the durable device hash also stores lease fields and expiry without a Redis TTL; logical lease validation and complete `deployment_incarnation` plus `run_id` guards make stale owner fields non-authoritative. Separate TTL namespaces remain an M7 design. `redis_url`, `redis_namespace`, and `deployment_incarnation` remain deployment inputs whose persistence, restore, and fail-closed behavior require explicit evidence. Legacy configuration retains the documented 300-second/10-second/30-second rotation defaults for the future M2 profile; M1 itself does not rotate or replay.
 
-Gate: formatting, strict Clippy, workspace tests, CLI example checks and hosted Linux/macOS/Windows CI pass on committed source. The README identifies what actually runs. New fields/commands in [runtime.md](runtime.md) remain proposals until implemented and tested.
+Gate: the local macOS arm64 run satisfies the formatting, strict Clippy,
+workspace test, Redis integration, AOF restart, and full M1 acceptance checks.
+Hosted Linux/macOS/Windows CI must repeat the locked checks and keep the
+acceptance result visible; that evidence remains pending until the pull request
+runs there. New fields/commands in [runtime.md](runtime.md) remain proposals
+unless the source and acceptance evidence say otherwise.
 
 ## M1 — Axum and authenticated multi-user tunnel
 
-First prove compatible pinned Axum/rustls/WebSocket and QUIC/H3 dependencies under Rust 1.95.0. Implement separate consumer HTTPS, mandatory device mTLS WSS, and private peer listeners from [runtime.md](runtime.md). Initially provision device credentials through an approved external issuer and explicit local CSR/import; automate enrollment only after its issuer and recovery gates pass. No token-only fallback for either device socket.
+Verified local slice: pinned Axum/rustls/WebSocket and QUIC/H3 dependencies run under Rust 1.95.0. The runnable M1 path has separate consumer HTTPS and mandatory device mTLS WSS listeners, external-issuer credential provisioning through local CSR/import, configured JWT public keys, Redis-backed authority for all tenant/user/membership/device/service/grant/credential records, and the synthetic `echo` export. The client uses one mTLS control socket and one mTLS data socket; a transport failure closes both and requires a fresh session. There is no M1 data rotation, retained replay, or automatic replay of effects. No token-only fallback is allowed for either device socket.
 
-Implement shared PostgreSQL tenant/user/membership/device/service/grant/credential records, consumer authentication, bounded authorization snapshots, revocation, one-use certificate-bound attachment tickets, owner identities and local export policy. Keep sockets and replay buffers in memory; include the cluster ownership abstraction from the first slice. One relay with an echo adapter is the first runnable fixture, not the alpha deployment architecture.
+The reusable harness seeds the production Redis authority with two tenants, five devices, four consumers, grants, and fixture credentials in an isolated run namespace, then drives real listeners. The local acceptance passed the live CLI echo/list/authentication, quota, revocation, disconnect, admission-negative, proxy, and private H3 checks. Its H3 peer check proves peer mTLS/role/pin/body transport only. It does not implement M7's three-relay routing, signed Redis membership/public-key distribution, ownership leases, fencing, HA failover, or recovery. One relay with an echo adapter is the first runnable fixture, not the alpha deployment architecture. Remote MCP, filesystem, ACP, and CUA adapters remain later work.
 
-Gate: two users, three enrolled devices, and at least two simultaneous consumers for one user. Only authorized streams reach their export. Reject cross-user discovery, wrong-role/expired/revoked certificates, stolen tickets with another certificate, ticket reuse, stale epochs and exceeded quotas. Real WSS passes through a TCP load balancer with mTLS verified at the Rust listener; the desktop opens no inbound port. Public consumers cannot forge internal verified identity headers.
+Gate: the local run verifies two tenants, five devices, multiple consumers, real
+public HTTPS, both mTLS device sockets, echo isolation, authorization,
+revocation, quotas, disconnect behavior, admission negatives, and the bounded
+private H3 success/negative cases. Real WSS passes through a TCP load balancer
+with mTLS verified at the Rust listener; the desktop opens no inbound port.
+Public consumers cannot forge internal verified identity headers. M7 multi-relay routing remains a separate gate.
 
 ## M2 — Independent ordering and drain before handover
 
@@ -42,11 +62,23 @@ M1/M2 gate remotely usable service adapters. Adapter/codec research can run in p
 
 ## M7 — Cluster foundations and three-node integration
 
-This is required for alpha, despite its retained issue number. Implement [cluster.md](cluster.md): direct owner routing over bounded bidirectional HTTP/3 streams, mandatory peer mTLS, externally signed Redis membership/public keys, approved trust anchors, shared PostgreSQL authorization, owner leases and connector-enforced fencing. Use separate device and peer roles. Redis mutation alone cannot enroll a server.
+This is required for alpha, despite its retained issue number. Implement [cluster.md](cluster.md): direct owner routing over bounded bidirectional HTTP/3 streams, mandatory peer mTLS, externally signed Redis membership/public keys, approved trust anchors, Redis-backed authorization authority, owner leases and connector-enforced fencing. Use separate device and peer roles. Redis mutation alone cannot enroll a server.
 
-The supported first coordination profile is one authoritative Redis primary with no automatic promotion. Test and document quiesce/incarnation recovery after Redis restart, rollback or promotion; do not describe Redis replication as consensus. Membership expiry, authorization expiry, owner lease expiry and certificate expiry are distinct deadlines. Coordination high availability is a separate future gate.
+The supported first coordination profile is one authoritative Redis primary with
+no automatic promotion. The local AOF check proves same-dataset restart
+persistence, including catalog conflict, revocation, and new-owner-incarnation
+assertions; it does not implement automatic HA or backup-rollback detection.
+`connect_for_recovery` and `activate` remain operator-only actions that require
+an external durable catalog, reconciled revocations, and a new approved
+incarnation before they are called. A new incarnation fences owners but cannot
+by itself prove that revocations were not rolled back. Test and document the
+external checkpoint gate, quiesce/incarnation recovery, rollback detection,
+and promotion behavior in M7; do not describe Redis replication as consensus.
+Membership expiry, authorization expiry, owner lease expiry and certificate
+expiry are distinct deadlines. Coordination high availability is a separate
+future gate, and M1 does not claim safe restoration of arbitrary backups.
 
-Gate: three real relays, two users, three or more devices, control/data/replacement/consumer ingress deliberately placed on different nodes. Test direct routing, peer key rotation/revocation, expired/forged/replayed membership, lost notifications, stale snapshots, owner death, UDP/Redis/PostgreSQL partitions and process pauses. Prove fencing, memory bounds, useful traces and no cross-tenant delivery. Repeat full stream drains through peer forwarding. Lost owner state creates fresh sessions, not invisible recovery of agent memory.
+Gate: three real relays, two users, three or more devices, control/data/replacement/consumer ingress deliberately placed on different nodes. Test direct routing, peer key rotation/revocation, expired/forged/replayed membership, lost notifications, stale snapshots, owner death, UDP/Redis partitions and process pauses. Prove fencing, memory bounds, useful traces and no cross-tenant delivery. Repeat full stream drains through peer forwarding. Lost owner state creates fresh sessions, not invisible recovery of agent memory.
 
 ## M3 — MCP service adapter
 
@@ -96,7 +128,7 @@ Gate: clean-machine release binaries on advertised OS/architectures, checksums/p
 
 1. Pure protocol identifiers, codec bounds, stream ordering and drain state machine with fixtures/property tests.
 2. Pinned Axum device-mTLS and bidirectional HTTP/3 transport spikes; shared identity and verified TLS types.
-3. Shared PostgreSQL schema, issuer integration, signed Redis membership and owner/fencing model.
+3. Redis authority schema, issuer integration, signed Redis membership and owner/fencing model.
 4. Real two-user echo slice, initially one relay then forced three-node routing.
 5. Integrate drain/recovery/backpressure and CLI status into that slice.
 6. Independently implement MCP, filesystem, ACP and CUA fixtures; enable each only after its transport/auth/platform gates pass.

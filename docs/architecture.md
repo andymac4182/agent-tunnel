@@ -1,6 +1,8 @@
 # Architecture
 
-Status: revised implementation design, 2026-09-09. Only configuration validation exists today. Normative tunnel/drain details live in [protocol.md](protocol.md), cluster trust/ownership in [cluster.md](cluster.md), and filesystem consumer semantics in [filesystem-api.md](filesystem-api.md).
+Status: revised implementation design, 2026-09-09. M1's authenticated multi-user echo tunnel and real-socket harness are implemented and locally verified; see [M1 evidence](m1-harness.md). Rotation, remote service adapters and multi-relay routing below remain planned. Normative tunnel/drain details live in [protocol.md](protocol.md), cluster trust/ownership in [cluster.md](cluster.md), and filesystem consumer semantics in [filesystem-api.md](filesystem-api.md).
+
+Redis holds all M1 shared authorization and ownership state. The current device hash stores logically expiring owner fields without a TTL; distinct ephemeral lease namespaces are a target cluster layout. Same-dataset AOF restart is tested. Arbitrary backup rollback verification and automatic promotion require later recovery gates.
 
 ## Product boundary
 
@@ -13,8 +15,8 @@ flowchart LR
     A[Agent in the cloud] -->|HTTPS MCP, ACP or computer API| R[Agent Tunnel Server: Axum ingress]
     B[Files SDK, Mastra, AI SDK, just-bash] -->|Shared client: WSS and 9P2000.L| R
     R <-->|Peer HTTP/3 with mTLS| O[Owning relay]
-    R --- DB[(PostgreSQL identities and grants)]
-    O --- K[(Redis signed key registry and presence)]
+    R --- K[(Single authoritative Redis: trust, durable catalog and leases)]
+    O --- K
     D1[User 1 desktop CLI] -->|Outbound control WSS with mTLS| O
     D1 -->|Data WSS with mTLS, drain and rotate| O
     D2[User 1 workstation daemon] -->|Own control and data pair| R
@@ -125,10 +127,10 @@ Emit structured audit events with principal, tenant, device, service, operation 
 
 ## Deployment and growth
 
-The private alpha requires multiple Linux relay nodes, shared PostgreSQL for durable identities/grants, and Redis for signed peer-key distribution, presence and fenced owner leases. A one-node echo fixture is an implementation step using these same boundaries. PostgreSQL mutations affecting authorization commit before acknowledgment; authorization snapshots expire within five seconds and failed refresh stops new admission. See [cluster.md](cluster.md) for the authoritative trust and revocation bounds.
+The private alpha requires multiple Linux relay nodes and one authoritative Redis deployment. Redis holds the durable tenant/device/grant catalog and the signed peer-key directory in separate durable namespaces, while presence, owner leases and one-use tickets live in separate incarnation-scoped ephemeral namespaces. Durable catalog records do not use lease TTLs and remain valid when a deployment incarnation changes; ephemeral records never substitute for catalog authorization. A one-node echo fixture is an implementation step using these same boundaries. Catalog mutations affecting authorization commit before acknowledgment; authorization snapshots expire within five seconds and failed refresh stops new admission. If the authoritative Redis endpoint is unavailable or its role or restore state is ambiguous, services fail closed and remain unready. Redis AOF/fsync and backups are durability choices, not consensus or permission to promote another writer. See [cluster.md](cluster.md) for the authoritative trust and revocation bounds.
 
 Public consumer traffic reaches Axum over HTTPS. Device control and data WebSockets perform mTLS at the Rust device listener; a load balancer must use TCP pass-through for this profile. Private relay-to-relay HTTP/3 runs on QUIC/UDP with separate peer mTLS. Verified ingress identity and bounded bytes are forwarded directly to the device's owner; arbitrary worker placement cannot be solved by a shared database alone.
 
-Redis stores approved public identity records, never private keys or payloads. Deployment issuers and signed membership checkpoints establish trust independently of Redis. The initial coordination profile requires one authoritative Redis primary with no automatic promotion; recovery after coordination rollback/promotion requires quiescing the deployment and advancing its durable incarnation. This supports a relay cluster while making the coordination availability limit explicit. Owner failure creates fresh sessions and reports interruptions/unknown effects; durable catalog data does not recover lost stream buffers or agent memory.
+The single authoritative Redis deployment stores the durable catalog, signed approved-public-key records, presence, owner leases and one-use tickets in separate namespaces; it never stores private keys or payloads. Deployment issuers, operator-installed roots and signed membership checkpoints establish trust independently of Redis: a signed peer key or a Redis key's presence can never bootstrap root trust. The initial coordination profile has one Redis primary with no automatic promotion; restart, restore, rollback or ambiguous primary identity requires quiescence and an externally approved new deployment incarnation. If that recovery proof is missing, relays remain unready and reject new admission. Owner failure creates fresh sessions and reports interruptions/unknown effects; durable catalog data does not recover lost stream buffers or agent memory.
 
 Release Linux relay images plus macOS ARM64, Linux x86_64/ARM64, and Windows x86_64 device binaries as platform gates pass. Network compatibility does not imply CUA desktop support; publish adapter capability matrices separately.

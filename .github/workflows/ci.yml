@@ -8,11 +8,20 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+env:
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  CARGO_INCREMENTAL: "0"
+
 jobs:
   rust:
     name: Rust (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
@@ -35,5 +44,41 @@ jobs:
         run: cargo +1.95.0 test --workspace --all-targets --locked
       - name: Validate example configurations
         run: |
+          cargo +1.95.0 run --locked -p tunnel-client -- config check --config examples/m1-client.toml
           cargo +1.95.0 run --locked -p tunnel-client -- check-config examples/client.toml
           cargo +1.95.0 run --locked -p tunnel-relay -- check-config examples/relay.toml
+
+  m1-acceptance:
+    name: M1 real-socket acceptance (Redis)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      redis:
+        image: redis:8.4.0-alpine@sha256:6cbef353e480a8a6e7f10ec545f13d7d3fa85a212cdcc5ffaf5a1c818b9d3798
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 20
+          --memory 256m
+    env:
+      RUST_LOG: info
+      TEST_REDIS_URL: redis://127.0.0.1:6379/
+      TUNNEL_CATALOG_REDIS_URL: redis://127.0.0.1:6379/
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Install Rust 1.95.0
+        run: rustup toolchain install 1.95.0 --profile minimal
+      - name: Build runnable workspace binaries
+        run: cargo +1.95.0 build --workspace --bins --locked
+      - name: Test authoritative Redis catalog
+        run: cargo +1.95.0 test -p tunnel-catalog --test redis_catalog --locked -- --ignored
+      - name: Verify production relay, client, authorization and transport failures
+        run: cargo +1.95.0 run --locked -p tunnel-test-harness -- verify
+      - name: Verify Redis AOF restart and explicit recovery
+        run: bash scripts/m1-redis-restart-verify.sh

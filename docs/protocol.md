@@ -1,6 +1,12 @@
 # Tunnel protocol and data socket rotation
 
-Status: proposed v0 design. This document specifies intended behavior and acceptance tests; it does not describe a completed implementation. Wire constants and defaults remain subject to the first protocol implementation and review.
+Status: the full rotation and recovery protocol below is the M2 design. M1 implements the bounded codec and the finite echo profile described here; its acceptance result is recorded in [m1-harness.md](m1-harness.md).
+
+## M1 finite echo profile
+
+M1 negotiates `m1-control-data`, `authorization-challenge`, and `echo`. It uses exactly one control and one data socket. Each admitted logical stream starts each direction at sequence 1. A request is one DATA frame followed by FIN; the response contains one or two DATA frames (at most 65,536 request bytes plus a 256-byte device canary), followed by FIN. The relay completes the HTTP result only after receiving the response FIN. ACKs are cumulative transport receipt evidence and cannot acknowledge a sequence not assigned by the sender.
+
+M1 rejects gapped or duplicate DATA/FIN, DATA after FIN, and stale session/generation/context fields. It has no replay, rotation, reconnect, or resume feature. A correctly sequenced RESET can abort an open direction; the finite profile rejects RESET after that direction's FIN. Control CANCEL remains available for a pending operation. A queued-frame authorization deadline failure interrupts the socket pair, since silently dropping an assigned frame would create a sequence gap. A fresh connection establishes new session/stream identities. M2 must implement the richer FIN/RESET, duplicate fingerprint, retained terminal, and replay rules below before generic adapters or rotation use them.
 
 ## Connection model
 
@@ -50,7 +56,7 @@ The relay derives tenant and principal from validated credentials. A client-supp
 
 Only one control owner is active for a connector at a time. A replacement connection with valid reconnect credentials acquires a greater epoch atomically. Frames, tickets and control messages from an earlier epoch are rejected, including messages from a previously partitioned connection that becomes reachable again. An unrelated second process presenting the same connector identity must receive an explicit conflict unless the replacement policy and credentials authorize takeover; it must not silently split ownership.
 
-Cluster ownership is part of the first usable core. Both device sockets route to the same session owner, directly or through authenticated relay peers. [Cluster design](cluster.md) defines HTTP/3 peer mTLS, Redis-distributed server public-key records, ownership leases and fencing. Peer authentication does not grant tenant access or replace stream admission. The owner serializes stream and rotation state; an ingress proxy must not originate independent sequence numbers. Owner process loss ends its in-memory sessions; catalog durability does not provide transport continuity.
+Cluster ownership is part of the first usable core. Both device sockets route to the same session owner, directly or through authenticated relay peers. [Cluster design](cluster.md) defines HTTP/3 peer mTLS, Redis-distributed server public-key records, ownership leases and fencing. Peer authentication does not grant tenant access or replace stream admission. The owner serializes stream and rotation state; an ingress proxy must not originate independent sequence numbers. Owner process loss ends its in-memory sessions; Redis durable-catalog persistence does not provide transport continuity.
 
 ## Bootstrap and attachment
 
