@@ -4888,15 +4888,17 @@ async fn peer_refresh_loop(
                 // Pin publication is driven by verified membership invalidation
                 // above.  Avoid refreshing it here so a focused key-revocation
                 // fixture can hold an explicit withdrawal until restoration.
-                if !matches!(membership.readiness(), MembershipReadiness::Ready)
-                    || pins.snapshot().is_empty()
-                {
-                    if let Some(readiness) = peer.peer_readiness() {
-                        readiness.clear_available_capacity();
-                        let _ = readiness.replace_required_routes(
-                            std::iter::empty::<PeerRouteTarget>(),
-                        );
-                    }
+                if pins.snapshot().is_empty() {
+                    // No approved peer key material is published, so there is
+                    // no trust evidence to admit any peer.
+                    peer.withdraw_peer_trust();
+                    continue;
+                }
+                if !matches!(membership.readiness(), MembershipReadiness::Ready) {
+                    // Readiness and admission fail closed, but the verified
+                    // route and pin set stays installed so an authenticated
+                    // peer's bounded reachability probe is still answered.
+                    peer.withdraw_peer_readiness();
                     continue;
                 }
                 peer.set_peer_capacity(configured_capacity);

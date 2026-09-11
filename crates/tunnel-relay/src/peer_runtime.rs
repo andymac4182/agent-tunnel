@@ -939,6 +939,33 @@ impl PeerRuntime {
         }
     }
 
+    /// Withdraw peer readiness because this relay's own cluster prerequisites
+    /// are not currently satisfied.
+    ///
+    /// Reachability and capacity evidence is dropped and the route revision is
+    /// fenced, so `/readyz` and public admission fail closed immediately. The
+    /// verified route and pin set stays installed: it is this relay's signed
+    /// evidence of which peer certificates are approved, and it is what lets
+    /// an authenticated peer's bounded reachability probe still be answered
+    /// while this relay is unready. Discarding it instead couples each
+    /// relay's readiness to the other's, which cannot converge.
+    pub fn withdraw_peer_readiness(&self) {
+        if let Some(readiness) = &self.readiness {
+            readiness.reset_route_probes();
+        }
+    }
+
+    /// Withdraw peer readiness and the verified route set together, because no
+    /// current signed peer key material could be published at all. Without
+    /// approved pins there is no trust evidence to admit any peer, so probe
+    /// admission must fail closed as well.
+    pub fn withdraw_peer_trust(&self) {
+        if let Some(readiness) = &self.readiness {
+            readiness.clear_available_capacity();
+            let _ = readiness.replace_required_routes(std::iter::empty::<PeerRouteTarget>());
+        }
+    }
+
     /// Replace the required route set from current verified membership and
     /// probe it with bounded authenticated mTLS connections.  A failure is
     /// retained in readiness even when this method returns the first typed
@@ -1093,8 +1120,23 @@ impl PeerRuntime {
         request: Request<()>,
         stream: PeerServerStream,
     ) -> Result<(), PeerRuntimeError> {
-        if !self.bindings.is_ready()
-            || !identity.role().is_peer()
+        // Probe admission deliberately does not consult this relay's own
+        // cluster readiness. `GET /internal/v1/health` is "Authenticated
+        // version/readiness metadata, bounded response": a route whose purpose
+        // is to report readiness cannot require the responder to already be
+        // ready. Requiring it makes the two relays' readiness mutually
+        // dependent, so a relay booting next to a flapping peer can never
+        // converge, and it makes "peer starting" indistinguishable from "peer
+        // unreachable" to the prober.
+        //
+        // Every fail-closed check still applies: the transport has already
+        // completed mTLS against the approved pin set, and the caller must be
+        // an authenticated relay-role certificate whose node identifier and
+        // SPKI digest match one of the currently verified signed route
+        // targets. The exchange allocates one bounded stream, carries no
+        // application payload, and grants no owner, ticket, or dispatch state,
+        // so it is not a way to bypass admission.
+        if !identity.role().is_peer()
             || self.readiness.as_ref().is_none_or(|readiness| {
                 !readiness.accepts_probe(identity.role_id(), &identity.spki_sha256().to_hex())
             })

@@ -315,13 +315,18 @@ outcome across the retired route is the readiness boundary rather than
 consumer request reaches peer resolution; the pin failure itself is observed on
 the authenticated probe path, where A dials the retired certificate, refuses it
 and opens no stream. And the **replacement process's own public admission is not
-exercised**: a relay that boots while its already-running peer is flapping
-between ready and unready never converged to `/readyz` ready within 20 s in this
-fixture (0 of 123 samples), because each relay's probe admission requires the
-receiving relay's own readiness route set, which is cleared while that relay is
-unready. Restoring a fresh version-state file and holding the peer's record at a
-single version both failed to break that coupling. The replacement boot is
-therefore asserted only through relay A: A's readiness recovers on the
+exercised**. The non-convergence originally recorded here — a relay booting
+beside a peer flapping between ready and unready never reaching `/readyz` ready
+within 20 s (0 of 123 samples) — was a product defect and has been fixed: probe
+admission required the *receiving* relay's readiness-derived route set, which
+was cleared whenever that relay's membership readiness dropped, so a peer which
+was reachable but momentarily unready refused the probe and the prober observed
+`H3_FRAME_UNEXPECTED` ("Stream finished without receiving response headers").
+Reachability is now measured independently of the responder's own readiness; see
+the readiness paragraph in [cluster.md](cluster.md) and the deterministic
+regressions `real_h3_probe_converges_while_peer_cluster_readiness_is_withdrawn`
+and `real_h3_probe_converges_across_a_peer_readiness_flap`. The replacement boot
+is still asserted only through relay A: A's readiness recovers on the
 replacement route and A accepts the replacement certificate on the private path.
 A device session and consumer request served *by* a replaced process remain
 uncovered; see the M7-C06 tracker row.

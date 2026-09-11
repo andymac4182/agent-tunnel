@@ -788,13 +788,19 @@ async fn peer_refresh_loop(
                 if let Err(error) = peer.refresh_peer_pins().await {
                     tracing::warn!(?error, "stale peer pin connection cleanup failed");
                 }
-                if !matches!(membership.readiness(), MembershipReadiness::Ready)
-                    || pins.snapshot().is_empty()
-                {
-                    if let Some(readiness) = peer.peer_readiness() {
-                        readiness.clear_available_capacity();
-                        let _ = readiness.replace_required_routes([]);
-                    }
+                if pins.snapshot().is_empty() {
+                    // No current signed peer key material could be published,
+                    // so there is no trust evidence for any peer at all.
+                    peer.withdraw_peer_trust();
+                    continue;
+                }
+                if !matches!(membership.readiness(), MembershipReadiness::Ready) {
+                    // This relay's own cluster prerequisites are unmet, so
+                    // readiness and admission fail closed. The verified route
+                    // and pin set stays installed so an authenticated peer's
+                    // bounded reachability probe is still answered; otherwise
+                    // two relays wait on each other and neither converges.
+                    peer.withdraw_peer_readiness();
                     continue;
                 }
                 // The configured ceiling supplies the global capacity floor;

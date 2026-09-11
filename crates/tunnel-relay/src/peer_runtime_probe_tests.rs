@@ -4,7 +4,7 @@ use std::{
     net::SocketAddr,
     sync::{
         Arc,
-        atomic::{AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -58,8 +58,30 @@ impl ProbeMode {
     }
 }
 
-#[derive(Clone, Default)]
-struct ReadyProvider;
+/// A binding provider whose own cluster readiness can be flapped.
+///
+/// Membership readiness is the *receiving* relay's own state.  The probe
+/// fixtures drive it explicitly instead of hard-coding `true` so a
+/// reachability probe can be tested against a peer which is starting,
+/// degraded, or flapping.
+#[derive(Clone)]
+struct ReadyProvider {
+    ready: Arc<AtomicBool>,
+}
+
+impl Default for ReadyProvider {
+    fn default() -> Self {
+        Self {
+            ready: Arc::new(AtomicBool::new(true)),
+        }
+    }
+}
+
+impl ReadyProvider {
+    fn set_ready(&self, ready: bool) {
+        self.ready.store(ready, Ordering::Release);
+    }
+}
 
 impl PeerBindingProvider for ReadyProvider {
     fn binding<'a>(
@@ -76,7 +98,7 @@ impl PeerBindingProvider for ReadyProvider {
     }
 
     fn is_ready(&self) -> bool {
-        true
+        self.ready.load(Ordering::Acquire)
     }
 }
 
@@ -250,6 +272,9 @@ struct H3Fixture {
     client_runtime: Arc<PeerRuntime>,
     server_runtime: Arc<PeerRuntime>,
     client_readiness: Arc<PeerReadiness>,
+    server_readiness: Arc<PeerReadiness>,
+    server_provider: ReadyProvider,
+    server_route: PeerRouteTarget,
     target: PeerRouteTarget,
     mode: Arc<AtomicU8>,
     customer_started: Arc<tokio::sync::Notify>,
@@ -337,13 +362,17 @@ impl H3Fixture {
             "localhost",
             vec![destination_pin.clone()],
         ));
-        let server_readiness = readiness(PeerRouteTarget::for_test(
+        let server_route = PeerRouteTarget::for_test(
             SOURCE_NODE,
             source_address.to_string(),
             "localhost",
             vec![source_pin.clone()],
-        ));
-        let provider: Arc<dyn PeerBindingProvider> = Arc::new(ReadyProvider);
+        );
+        let server_readiness = readiness(server_route.clone());
+        let client_provider = ReadyProvider::default();
+        let server_provider = ReadyProvider::default();
+        let client_bindings: Arc<dyn PeerBindingProvider> = Arc::new(client_provider);
+        let server_bindings: Arc<dyn PeerBindingProvider> = Arc::new(server_provider.clone());
         let client_router = owner_router(SOURCE_NODE, SOURCE_BOOT);
         let server_router = owner_router(DESTINATION_NODE, DESTINATION_BOOT);
         let client = PeerClient::new(
@@ -365,7 +394,7 @@ impl H3Fixture {
         let client_runtime = Arc::new(PeerRuntime::new_with_readiness(
             client,
             client_router,
-            Arc::clone(&provider),
+            client_bindings,
             SOURCE_NODE,
             SOURCE_BOOT,
             Arc::clone(&client_readiness),
@@ -373,10 +402,10 @@ impl H3Fixture {
         let server_runtime = Arc::new(PeerRuntime::new_with_readiness(
             server_client,
             server_router,
-            provider,
+            server_bindings,
             DESTINATION_NODE,
             DESTINATION_BOOT,
-            server_readiness,
+            Arc::clone(&server_readiness),
         ));
         let mode = Arc::new(AtomicU8::new(mode as u8));
         let customer_started = Arc::new(tokio::sync::Notify::new());
@@ -414,6 +443,9 @@ impl H3Fixture {
             client_runtime,
             server_runtime,
             client_readiness,
+            server_readiness,
+            server_provider,
+            server_route,
             target: PeerRouteTarget::for_test(
                 DESTINATION_NODE,
                 destination_address.to_string(),
@@ -434,6 +466,47 @@ impl H3Fixture {
 
     fn set_mode(&self, mode: ProbeMode) {
         self.mode.store(mode as u8, Ordering::Release);
+    }
+
+    /// Drive the destination relay through exactly the withdrawal the
+    /// configured relay's peer refresh loop performs when its own membership
+    /// readiness is not `Ready`: membership readiness goes false and the
+    /// product's [`PeerRuntime::withdraw_peer_readiness`] withdraws its peer
+    /// readiness evidence.
+    fn withdraw_server_cluster_readiness(&self) {
+        self.server_provider.set_ready(false);
+        self.server_runtime.withdraw_peer_readiness();
+        assert!(
+            !self.server_runtime.is_ready(),
+            "destination relay stayed ready after a membership withdrawal"
+        );
+    }
+
+    /// Restore the destination relay the way the refresh loop does once its
+    /// membership readiness returns.
+    fn restore_server_cluster_readiness(&self) {
+        self.server_provider.set_ready(true);
+        self.server_runtime.set_peer_capacity(1);
+        self.server_readiness
+            .replace_required_routes([self.server_route.clone()])
+            .expect("destination route reinstall");
+        self.server_readiness
+            .record_probe(&self.server_route, PeerProbeState::Reachable)
+            .expect("destination route probe");
+    }
+
+    /// Install a route set on the destination which does not approve the
+    /// source's authenticated certificate.  Used to show that withdrawing
+    /// readiness did not loosen probe admission.
+    fn install_unapproved_server_route(&self) {
+        self.server_readiness
+            .replace_required_routes([PeerRouteTarget::for_test(
+                SOURCE_NODE,
+                self.server_route.peer_endpoint(),
+                self.server_route.server_name(),
+                vec!["00".repeat(32)],
+            )])
+            .expect("unapproved destination route");
     }
 
     fn destination(&self) -> PeerDestination {
@@ -1044,6 +1117,177 @@ async fn real_h3_dropped_admission_stream_cancels_without_poisoning_connection()
             .await
             .expect("health response body after admission cancellation")
             .is_none()
+    );
+
+    fixture.shutdown().await;
+}
+
+/// A peer which is itself unready must still answer the authenticated
+/// reachability probe.  `GET /internal/v1/health` is "Authenticated
+/// version/readiness metadata, bounded response" (docs/cluster.md, internal
+/// request contract): a route whose purpose is to report readiness cannot
+/// require the responder to already be ready, because then the prober cannot
+/// distinguish a peer which is starting from one which is unreachable.
+#[tokio::test]
+async fn real_h3_probe_converges_while_peer_cluster_readiness_is_withdrawn() {
+    let fixture = H3Fixture::new(ProbeMode::Runtime, 2);
+    fixture.withdraw_server_cluster_readiness();
+
+    let result = fixture
+        .client_runtime
+        .refresh_required_routes(vec![fixture.target.clone()])
+        .await;
+    assert!(
+        result.is_ok(),
+        "probe to an unready peer did not converge: {result:?}"
+    );
+    assert!(
+        fixture.client_readiness.is_ready(),
+        "source relay stayed unready behind an unready peer"
+    );
+    assert_eq!(
+        fixture
+            .client_readiness
+            .route_readiness(DESTINATION_NODE)
+            .map(|route| route.state),
+        Some(PeerProbeState::Reachable)
+    );
+    // The peer's own readiness is unchanged by answering the probe: admitting
+    // a reachability probe is not admitting cluster work.
+    assert!(!fixture.server_runtime.is_ready());
+
+    fixture.shutdown().await;
+}
+
+/// Two relays must not wait on each other.  The destination flaps through
+/// withdrawal and restoration while the source probes; the source's route
+/// readiness must converge on each pass rather than starve.
+#[tokio::test]
+async fn real_h3_probe_converges_across_a_peer_readiness_flap() {
+    let fixture = H3Fixture::new(ProbeMode::Runtime, 2);
+    for pass in 0..4 {
+        if pass % 2 == 0 {
+            fixture.withdraw_server_cluster_readiness();
+        } else {
+            fixture.restore_server_cluster_readiness();
+        }
+        let result = fixture
+            .client_runtime
+            .refresh_required_routes(vec![fixture.target.clone()])
+            .await;
+        assert!(
+            result.is_ok(),
+            "probe pass {pass} failed while the peer flapped: {result:?}"
+        );
+        assert!(
+            fixture.client_readiness.is_ready(),
+            "source readiness starved on flap pass {pass}"
+        );
+    }
+    fixture.shutdown().await;
+}
+
+/// Withdrawing readiness must not loosen probe admission.  A peer whose
+/// authenticated certificate is not one of the currently approved pins is
+/// still refused, withdrawn or not, and the refusal is recorded as an
+/// explicit route failure rather than silently accepted.
+#[tokio::test]
+async fn real_h3_probe_still_refuses_an_unapproved_peer_while_withdrawn() {
+    let fixture = H3Fixture::new(ProbeMode::Runtime, 2);
+    for withdrawn in [false, true] {
+        if withdrawn {
+            fixture.withdraw_server_cluster_readiness();
+        }
+        fixture.install_unapproved_server_route();
+        let result = fixture
+            .client_runtime
+            .refresh_required_routes(vec![fixture.target.clone()])
+            .await;
+        assert!(
+            result.is_err(),
+            "unapproved peer probe was admitted (withdrawn={withdrawn}): {result:?}"
+        );
+        assert!(
+            !fixture.client_readiness.is_ready(),
+            "source readiness survived an unapproved peer (withdrawn={withdrawn})"
+        );
+        assert_eq!(
+            fixture
+                .client_readiness
+                .route_readiness(DESTINATION_NODE)
+                .map(|route| route.state),
+            Some(PeerProbeState::Unreachable)
+        );
+    }
+    fixture.shutdown().await;
+}
+
+/// A relay with no installed route set has no verified pin evidence at all
+/// and must refuse every probe, withdrawn or not.  This is the fail-closed
+/// boundary the withdrawal path must not cross.
+#[tokio::test]
+async fn real_h3_probe_is_refused_without_a_known_route_set() {
+    let fixture = H3Fixture::new(ProbeMode::Runtime, 2);
+    fixture.withdraw_server_cluster_readiness();
+    fixture
+        .server_readiness
+        .replace_required_routes(std::iter::empty::<PeerRouteTarget>())
+        .expect("empty destination route set");
+
+    let result = fixture
+        .client_runtime
+        .refresh_required_routes(vec![fixture.target.clone()])
+        .await;
+    assert!(
+        result.is_err(),
+        "probe was admitted without any approved peer route: {result:?}"
+    );
+    assert!(!fixture.client_readiness.is_ready());
+
+    fixture.shutdown().await;
+}
+
+/// The withdrawal itself must make peer readiness false and drop stale probe
+/// evidence, so a relay cannot keep serving on a probe result recorded before
+/// its membership authority was lost.
+#[tokio::test]
+async fn peer_readiness_withdrawal_drops_stale_probe_evidence() {
+    let fixture = H3Fixture::new(ProbeMode::Runtime, 2);
+    fixture
+        .server_readiness
+        .record_probe(&fixture.server_route, PeerProbeState::Reachable)
+        .expect("seed reachable route");
+    assert_eq!(
+        fixture
+            .server_readiness
+            .route_readiness(SOURCE_NODE)
+            .map(|route| route.state),
+        Some(PeerProbeState::Reachable)
+    );
+    let before = fixture.server_readiness.current_revision();
+
+    fixture.withdraw_server_cluster_readiness();
+
+    assert!(!fixture.server_readiness.is_ready());
+    assert_eq!(
+        fixture
+            .server_readiness
+            .route_readiness(SOURCE_NODE)
+            .map(|route| route.state),
+        Some(PeerProbeState::Pending),
+        "withdrawal kept stale reachability evidence"
+    );
+    let snapshot = fixture.server_readiness.snapshot();
+    assert_eq!(snapshot.reachable_routes, 0);
+    assert_eq!(snapshot.capacity_ready_routes, 0);
+    assert_eq!(snapshot.available_capacity, None);
+    assert_eq!(
+        snapshot.required_routes, 1,
+        "withdrawal dropped the verified route and pin set"
+    );
+    assert!(
+        snapshot.revision > before,
+        "withdrawal did not fence in-flight probe results"
     );
 
     fixture.shutdown().await;

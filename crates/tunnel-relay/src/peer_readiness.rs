@@ -413,6 +413,30 @@ impl PeerReadiness {
         Ok(revision)
     }
 
+    /// Withdraw every reachability and capacity observation while keeping the
+    /// currently installed verified route and pin set.
+    ///
+    /// This is the readiness withdrawal used when the relay's *own* cluster
+    /// prerequisites are lost: readiness becomes false and no stale probe can
+    /// keep it true, but the verified route set stays installed so the relay
+    /// can still answer an authenticated peer's bounded reachability probe.
+    /// Dropping the route set instead would make two relays wait on each
+    /// other: each side's probe admission would require the other to already
+    /// be ready, and neither readiness could ever converge.
+    ///
+    /// The revision is bumped so an in-flight probe result from before the
+    /// withdrawal cannot publish into the withdrawn state.
+    pub fn reset_route_probes(&self) {
+        let mut state = self.state.lock().expect("peer readiness mutex poisoned");
+        state.revision = state.revision.saturating_add(1);
+        state.available_capacity = None;
+        for route in state.routes.values_mut() {
+            route.state = PeerProbeState::Pending;
+            route.last_probe = None;
+            route.available_capacity = None;
+        }
+    }
+
     /// Record a bounded probe result for one required route.
     pub fn record_probe(
         &self,
