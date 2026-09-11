@@ -902,6 +902,47 @@ struct TerminalObservation {
     terminal_receipts: usize,
 }
 
+impl TerminalObservation {
+    /// The first terminal observation is retained: the terminal event count
+    /// never changes, and while the tombstone is still present it remains
+    /// terminal at the same relay-side final emitted sequence.  A reclaimed
+    /// stream (STREAM_FORGET after the connector's receipt) is absent with
+    /// its retained terminal event intact.
+    fn retains_first_terminal(&self, first: &Self) -> bool {
+        self.terminal_events == first.terminal_events
+            && first.stream_present
+            && first.terminal
+            && (!self.stream_present
+                || (self.terminal
+                    && self.last_emitted_relay_to_connector
+                        == first.last_emitted_relay_to_connector))
+    }
+
+    /// Connector-side progress since `previous` must be monotonic while the
+    /// tombstone is present, the ACK cursor may never pass the relay's final
+    /// sequence, at most one independent terminal receipt may be recorded,
+    /// and a reclaimed stream never reappears.
+    fn advances_bounded(&self, previous: &Self) -> bool {
+        if !previous.stream_present {
+            return !self.stream_present && self.terminal_receipts == previous.terminal_receipts;
+        }
+        if !self.stream_present {
+            return self.terminal_receipts >= previous.terminal_receipts
+                && self.terminal_receipts <= 1;
+        }
+        self.peer_acked_relay_to_connector >= previous.peer_acked_relay_to_connector
+            && self.peer_acked_relay_to_connector <= self.last_emitted_relay_to_connector
+            && self.recv_contiguous_connector_to_relay
+                >= previous.recv_contiguous_connector_to_relay
+            && self.delivered_contiguous_connector_to_relay
+                >= previous.delivered_contiguous_connector_to_relay
+            && self.delivered_contiguous_connector_to_relay
+                <= self.recv_contiguous_connector_to_relay
+            && self.terminal_receipts >= previous.terminal_receipts
+            && self.terminal_receipts <= 1
+    }
+}
+
 /// Snapshot of the owner session's bounded queue accounting.
 #[derive(Clone, Copy, Debug)]
 struct QueueObservation {
@@ -1255,28 +1296,66 @@ async fn run_saturation(
     // A real cancellation, now that the carrier is writable: close one stream
     // and require the owner to retire exactly that stream.
     let live_before_cancel = owner_live_stream_ids(owner_relay, device_id).await?;
-    let cancelled_stream_id = *live_before_cancel.first().ok_or_else(|| {
-        HarnessError::Process("queue saturation had no live stream to cancel".into())
-    })?;
+    if live_before_cancel.is_empty() {
+        return Err(HarnessError::Process(
+            "queue saturation had no live stream to cancel".into(),
+        ));
+    }
     if let Some(mut stream) = surviving.pop() {
         let _ = timeout(Duration::from_secs(5), stream.close()).await;
     }
     let cancellation_accepted_after_resume =
         wait_for_stream_retirement(owner_relay, device_id, live_before_cancel.len()).await?;
+    // The public stream carries no owner stream id, so the cancelled stream is
+    // the exact one that left the live set: the terminal observation below
+    // must sample that stream, not whichever live stream sorts first.
+    let live_after_cancel = owner_live_stream_ids(owner_relay, device_id).await?;
+    let retired: Vec<u64> = live_before_cancel
+        .iter()
+        .copied()
+        .filter(|stream_id| !live_after_cancel.contains(stream_id))
+        .collect();
+    let cancelled_stream_id = match retired.as_slice() {
+        [stream_id] => *stream_id,
+        _ => {
+            return Err(HarnessError::Process(format!(
+                "queue saturation cancellation retired {} streams, expected exactly one",
+                retired.len()
+            )));
+        }
+    };
 
-    // An immutable first-terminal observation for the cancelled stream.
+    // An immutable first-terminal observation for the cancelled stream: the
+    // retained terminal event count may not change once observed, and while
+    // the tombstone is present it stays terminal at the relay's final
+    // emitted sequence.  The connector may still deliver the ACK for the
+    // relay's FIN, the reply to a record it already held when the owner
+    // cancelled, and its own FIN receipt, after which STREAM_FORGET reclaims
+    // the tombstone: connector-side cursors and the receipt are therefore
+    // required to be monotonic and bounded rather than frozen, and the
+    // stream may leave the live set exactly once and never return.
     let first_terminal =
         read_terminal_observation(owner_relay, device_id, cancelled_stream_id).await?;
     let mut terminal_observations = 0usize;
     let mut first_terminal_observation_immutable = true;
+    let mut previous = first_terminal.clone();
     for _ in 0..TERMINAL_IMMUTABILITY_SAMPLES {
         sleep(TERMINAL_SAMPLE_INTERVAL).await;
         let again = read_terminal_observation(owner_relay, device_id, cancelled_stream_id).await?;
         terminal_observations += 1;
-        if again != first_terminal {
+        if !again.retains_first_terminal(&first_terminal) || !again.advances_bounded(&previous) {
+            tracing::warn!(
+                stream_id = cancelled_stream_id,
+                first = ?first_terminal,
+                previous = ?previous,
+                again = ?again,
+                sample = terminal_observations,
+                "queue saturation terminal observation changed"
+            );
             first_terminal_observation_immutable = false;
             break;
         }
+        previous = again;
     }
 
     // The freed slot at the per-device cap must be usable again through the
@@ -2024,6 +2103,7 @@ async fn connect_client(config: tunnel_client::ConnectConfig) -> Result<Connecti
 
 #[cfg(test)]
 mod tests {
+    use super::TerminalObservation;
     use super::{
         DRAIN_OBSERVATION_BOUND, EXPECTED_CONTROL_RESERVED_BYTES, EXPECTED_DATA_BYTES_LIMIT,
         EXPECTED_MAX_STREAMS_PER_DEVICE, EXPECTED_QUEUE_BYTES_LIMIT, EXPECTED_QUEUE_MESSAGES,
@@ -2452,5 +2532,123 @@ mod tests {
                 "queue saturation",
             );
         }
+    }
+
+    fn terminal_sample(
+        stream_present: bool,
+        peer_acked: u64,
+        recv: u64,
+        delivered: u64,
+        receipts: usize,
+    ) -> TerminalObservation {
+        TerminalObservation {
+            stream_present,
+            terminal: stream_present,
+            last_emitted_relay_to_connector: if stream_present { 3 } else { 0 },
+            peer_acked_relay_to_connector: peer_acked,
+            recv_contiguous_connector_to_relay: recv,
+            delivered_contiguous_connector_to_relay: delivered,
+            terminal_events: 1,
+            terminal_receipts: receipts,
+        }
+    }
+
+    #[test]
+    fn terminal_observation_accepts_late_connector_progress_and_one_reclamation() {
+        let first = terminal_sample(true, 1, 1, 1, 0);
+        let acked = terminal_sample(true, 2, 2, 2, 0);
+        let receipted = terminal_sample(true, 3, 2, 2, 1);
+        let reclaimed = terminal_sample(false, 0, 0, 0, 1);
+        for (label, sample, previous) in [
+            ("ack and reply", &acked, &first),
+            ("connector receipt", &receipted, &acked),
+            ("reclaimed tombstone", &reclaimed, &receipted),
+            ("stays reclaimed", &reclaimed, &reclaimed),
+        ] {
+            assert!(
+                sample.retains_first_terminal(&first),
+                "{label}: first terminal must be retained"
+            );
+            assert!(
+                sample.advances_bounded(previous),
+                "{label}: progress must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_observation_rejects_every_mutation_of_the_first_terminal() {
+        let first = terminal_sample(true, 1, 1, 1, 0);
+        let mutations: &[(&str, TerminalObservation)] = &[
+            ("terminal event count changed", {
+                let mut sample = first.clone();
+                sample.terminal_events = 2;
+                sample
+            }),
+            ("terminal flag dropped while present", {
+                let mut sample = first.clone();
+                sample.terminal = false;
+                sample
+            }),
+            ("relay final sequence moved", {
+                let mut sample = first.clone();
+                sample.last_emitted_relay_to_connector = 4;
+                sample
+            }),
+        ];
+        for (label, sample) in mutations {
+            assert!(
+                !sample.retains_first_terminal(&first),
+                "{label}: must not count as a retained first terminal"
+            );
+        }
+        let regressions: &[(&str, TerminalObservation, TerminalObservation)] = &[
+            (
+                "ack cursor regressed",
+                terminal_sample(true, 1, 2, 2, 0),
+                terminal_sample(true, 2, 2, 2, 0),
+            ),
+            (
+                "ack cursor beyond the relay final sequence",
+                terminal_sample(true, 4, 2, 2, 0),
+                first.clone(),
+            ),
+            (
+                "delivered ahead of received",
+                terminal_sample(true, 2, 1, 2, 0),
+                first.clone(),
+            ),
+            (
+                "second terminal receipt",
+                terminal_sample(true, 3, 2, 2, 2),
+                terminal_sample(true, 3, 2, 2, 1),
+            ),
+            (
+                "receipt withdrawn",
+                terminal_sample(true, 3, 2, 2, 0),
+                terminal_sample(true, 3, 2, 2, 1),
+            ),
+            (
+                "reclaimed stream reappeared",
+                terminal_sample(true, 3, 2, 2, 1),
+                terminal_sample(false, 0, 0, 0, 1),
+            ),
+            (
+                "receipt changed after reclamation",
+                terminal_sample(false, 0, 0, 0, 0),
+                terminal_sample(false, 0, 0, 0, 1),
+            ),
+        ];
+        for (label, sample, previous) in regressions {
+            assert!(
+                !sample.advances_bounded(previous),
+                "{label}: must be rejected as unbounded or non-monotonic progress"
+            );
+        }
+        assert!(
+            !terminal_sample(false, 0, 0, 0, 0)
+                .retains_first_terminal(&terminal_sample(false, 0, 0, 0, 0)),
+            "a first sample that never saw the tombstone cannot anchor immutability"
+        );
     }
 }

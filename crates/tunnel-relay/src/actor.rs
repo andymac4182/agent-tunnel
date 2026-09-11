@@ -1349,6 +1349,15 @@ struct M2Stream {
     sequence: StreamState,
     response_bytes: Vec<u8>,
     response_records: VecDeque<oneshot::Sender<Result<Vec<u8>, EchoOutcome>>>,
+    /// Records already dispatched to the connector whose owner-side waiters
+    /// were failed by an owner-initiated close or authorization revocation.
+    /// The connector may still answer each of them; exactly this many late
+    /// response records are discarded on the retained tombstone instead of
+    /// being treated as unsolicited (`INVALID_SEQUENCE`).  Any further record
+    /// is still a protocol failure.
+    orphaned_response_records: usize,
+    /// Late response records discarded through the orphan allowance.
+    late_response_records: u64,
     send_bytes: usize,
     receive_bytes: usize,
     authorized_until: Option<Instant>,
@@ -4325,6 +4334,8 @@ impl RelayActor {
                 sequence,
                 response_bytes: Vec::new(),
                 response_records: VecDeque::new(),
+                orphaned_response_records: 0,
+                late_response_records: 0,
                 send_bytes: 0,
                 receive_bytes: 0,
                 authorized_until: None,
@@ -4420,13 +4431,22 @@ impl RelayActor {
             stream.budget_bytes = 0;
         }
         stream.pending_record_bytes = 0;
-        stream.response_bytes.clear();
+        // Partially received response bytes are retained, not cleared: the
+        // connector may still complete the record it was answering, and
+        // clearing mid-record would misalign every later length prefix on
+        // this stream.  The bytes leave with the tombstone at STREAM_FORGET
+        // or session end, where their budget charge is released.
         for (_, waiter) in stream.pending_records.drain(..) {
             let _ = waiter.send(Err(EchoOutcome::Failure {
                 code: "REVERSE_CHANNEL_INTERRUPTED",
                 execution: "unknown",
             }));
         }
+        // Every failed response waiter corresponds to one record the
+        // connector already holds and may still answer after this close.
+        stream.orphaned_response_records = stream
+            .orphaned_response_records
+            .saturating_add(stream.response_records.len());
         for waiter in stream.response_records.drain(..) {
             let _ = waiter.send(Err(EchoOutcome::Failure {
                 code: "REVERSE_CHANNEL_INTERRUPTED",
@@ -10094,20 +10114,20 @@ impl RelayActor {
             stream.terminal_fin_failure = true;
             let pending_bytes = stream.pending_record_bytes;
             stream.pending_record_bytes = 0;
-            let response_bytes = stream.response_bytes.len();
-            stream.response_bytes.clear();
-            session
-                .queue_budget
-                .release(pending_bytes.saturating_add(response_bytes));
-            stream.budget_bytes = stream
-                .budget_bytes
-                .saturating_sub(pending_bytes.saturating_add(response_bytes));
+            // Partial response bytes and their charge stay with the
+            // tombstone so late records from the connector remain framed;
+            // see `release_echo_stream_state`.
+            session.queue_budget.release(pending_bytes);
+            stream.budget_bytes = stream.budget_bytes.saturating_sub(pending_bytes);
             for (_, waiter) in std::mem::take(&mut stream.pending_records) {
                 let _ = waiter.send(Err(EchoOutcome::Failure {
                     code: "AUTHORIZATION_REVOKED",
                     execution: "not_dispatched",
                 }));
             }
+            stream.orphaned_response_records = stream
+                .orphaned_response_records
+                .saturating_add(stream.response_records.len());
             for waiter in std::mem::take(&mut stream.response_records) {
                 let _ = waiter.send(Err(EchoOutcome::Failure {
                     code: "AUTHORIZATION_REVOKED",
@@ -10668,9 +10688,33 @@ impl RelayActor {
                         break;
                     }
                     let record: Vec<u8> = stream.response_bytes.drain(..total).collect();
-                    let Some(waiter) = stream.response_records.pop_front() else {
-                        invalid = true;
-                        break;
+                    let waiter = match stream.response_records.pop_front() {
+                        Some(waiter) => Some(waiter),
+                        None if stream.orphaned_response_records > 0 => {
+                            // The owner side already failed this record's
+                            // waiter (close or revocation) after the record
+                            // had been dispatched.  The connector's answer
+                            // is late, not unsolicited: consume the allowance
+                            // and discard the record without fencing the
+                            // session.  The stream's cursors, ACK and credit
+                            // advance exactly as for a delivered record.
+                            stream.orphaned_response_records -= 1;
+                            stream.late_response_records =
+                                stream.late_response_records.saturating_add(1);
+                            tracing::debug!(
+                                device_id = %key.device_id,
+                                session_id = %key.session_id,
+                                epoch = key.epoch,
+                                stream_id = frame.stream_id,
+                                record_bytes = total,
+                                stage = "m2_late_response_discarded",
+                            );
+                            None
+                        }
+                        None => {
+                            invalid = true;
+                            break;
+                        }
                     };
                     release_m2_bytes(&queue_budget, stream, total);
                     stream.receive_bytes = stream.receive_bytes.saturating_add(declared);
@@ -10681,7 +10725,9 @@ impl RelayActor {
                             break;
                         }
                     };
-                    let _ = waiter.send(Ok(record));
+                    if let Some(waiter) = waiter {
+                        let _ = waiter.send(Ok(record));
+                    }
                 }
             }
             if !invalid {
@@ -13130,6 +13176,8 @@ mod stream_identity_tests {
                     sequence,
                     response_bytes: Vec::new(),
                     response_records: VecDeque::new(),
+                    orphaned_response_records: 0,
+                    late_response_records: 0,
                     send_bytes: 0,
                     receive_bytes: 0,
                     authorized_until: None,
@@ -13283,6 +13331,8 @@ mod stream_identity_tests {
                     sequence,
                     response_bytes: Vec::new(),
                     response_records: VecDeque::new(),
+                    orphaned_response_records: 0,
+                    late_response_records: 0,
                     send_bytes: 0,
                     receive_bytes: 0,
                     authorized_until: Some(

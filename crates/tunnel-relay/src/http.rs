@@ -3096,9 +3096,15 @@ async fn handle_peer_consumer_stream(
                         // write is outstanding.  A record or request end
                         // read ahead of the write is retained in the single
                         // lookahead slot and replayed after the response; a
-                        // receive failure (peer reset, idle deadline, or
-                        // membership cancellation) ends the wait now instead
-                        // of at the consumer's absolute deadline.
+                        // receive failure (peer reset or membership
+                        // cancellation) ends the wait now instead of at the
+                        // consumer's absolute deadline.  The transport idle
+                        // timeout does not apply here: the ingress is
+                        // legitimately silent while it waits for this parked
+                        // response, so the read is bounded by the consumer's
+                        // absolute deadline, the same instant `expires`
+                        // observes.
+                        let receive_deadline = expires.deadline();
                         let waited = loop {
                             let waited = tokio::select! {
                                 _ = &mut admission_cancelled => {
@@ -3118,7 +3124,7 @@ async fn handle_peer_consumer_stream(
                                         if lookahead.is_some() {
                                             std::future::pending::<()>().await;
                                         }
-                                        recv.recv_message().await
+                                        recv.recv_message_until(receive_deadline).await
                                     },
                                 ) => waited,
                             };
@@ -3181,6 +3187,7 @@ async fn handle_peer_consumer_stream(
                                     h3_code,
                                 );
                                 tracing::debug!(
+                                    error = ?error,
                                     body_len,
                                     phase = "consumer_actor_write_receive_failed",
                                     "peer receive direction failed while a record was outstanding"

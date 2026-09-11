@@ -254,6 +254,8 @@ impl FreezeFixture {
                 sequence,
                 response_bytes: Vec::new(),
                 response_records: VecDeque::new(),
+                orphaned_response_records: 0,
+                late_response_records: 0,
                 send_bytes: 0,
                 receive_bytes: 0,
                 authorized_until: Some(Instant::now() + StdDuration::from_secs(60)),

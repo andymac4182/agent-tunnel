@@ -1723,6 +1723,172 @@ async fn peer_consumer_outstanding_write_is_bounded_by_consumer_expiry() {
 }
 
 #[tokio::test]
+async fn peer_consumer_outstanding_write_outlives_the_receive_idle_timeout() {
+    // Regression for the queue-saturation gate: a parked actor write must not
+    // be ended by the transport's two-second receive idle timeout.  The
+    // ingress peer is legitimately silent while it waits for this response,
+    // so the serviced receive direction (EC-045) is bounded by the consumer's
+    // absolute deadline only.  With a five-second consumer deadline the
+    // stream must still be live and unfaulted after the idle window has
+    // passed, then end at the consumer deadline with no owner receive
+    // outcome recorded.
+    let fixture = H3PeerFixture::new().await;
+    let target = register_control(
+        &fixture,
+        DEVICE_SPKI,
+        device_id(),
+        "staged-parked-past-idle-target",
+    )
+    .await;
+    let target_session_id = target.session_id.clone();
+    let target_epoch = target.epoch;
+    let target_ticket = target.ticket.clone();
+    let mut target_rx = target.rx;
+    let target_device = fixture
+        .catalog
+        .resolve_device(DEVICE_SPKI, Utc::now())
+        .await
+        .expect("resolve outstanding-write target device")
+        .expect("outstanding-write target device identity");
+    let target_data = fixture
+        .handle
+        .attach_forwarded_data(target_device, DEVICE_SPKI.to_owned(), target_ticket)
+        .await
+        .expect("attach outstanding-write target carrier");
+    let mut target_data_rx = target_data.rx;
+
+    let sibling = register_control(
+        &fixture,
+        SIBLING_SPKI,
+        sibling_device_id(),
+        "staged-parked-past-idle-sibling",
+    )
+    .await;
+    let sibling_session_id = sibling.session_id.clone();
+    let sibling_epoch = sibling.epoch;
+    let _sibling_rx = sibling.rx;
+
+    let owner = current_target_owner(&fixture).await;
+    let short_lived_token = fixture.mint_consumer_token(5);
+    let mut stream = open_raw(&fixture, InternalRoute::ConsumerStreams).await;
+    admit_consumer(
+        &mut stream,
+        &owner.token,
+        &short_lived_token,
+        "staged-parked-past-idle-request",
+        "staged-parked-past-idle-stream",
+    )
+    .await;
+    // Admit the OPEN exactly as a real connector would.  The parked record
+    // below is waiting for the device's authorization confirmation, not for
+    // admission; an unadmitted OPEN would have its close deferred until the
+    // owner proves OPENED or REJECTED, so the bound under test would not be
+    // observable as this stream's terminal state.
+    admit_queued_open(&fixture, &mut target_rx, &target_session_id, target_epoch).await;
+    let admitted = wait_snapshot(&fixture.handle, |snapshot| {
+        find_session(snapshot, device_id()).is_some_and(|session| {
+            session.session_id == target_session_id
+                && session.epoch == target_epoch
+                && session.streams.len() == 1
+        }) && find_session(snapshot, sibling_device_id()).is_some()
+    })
+    .await;
+    let target_stream_before = find_session(&admitted, device_id())
+        .expect("outstanding-write target session after admission")
+        .streams
+        .first()
+        .expect("outstanding-write target stream after admission")
+        .clone();
+    assert!(!target_stream_before.terminal);
+    let sibling_before = find_session(&admitted, sibling_device_id())
+        .expect("outstanding-write sibling after admission")
+        .clone();
+    drain_queues(&mut target_rx, &mut target_data_rx).await;
+
+    // One complete length-prefixed application record.  Without a device
+    // authorization confirmation the actor cannot dispatch it, so the owner
+    // handler's write stays outstanding.
+    let body = b"outstanding-write";
+    let mut record = (body.len() as u32).to_be_bytes().to_vec();
+    record.extend_from_slice(body);
+    stream
+        .send_chunk(encode_peer_record(PeerRecordKind::ConsumerChunk, &record))
+        .await
+        .expect("send parked consumer record");
+
+    // Keep the client stream open: only the consumer's one-second absolute
+    // deadline may end the outstanding write.  A stranded handler would keep
+    // this stream live far beyond the bound below.
+    let owner_receive_before = fixture
+        .handle
+        .snapshot()
+        .await
+        .expect("outstanding-write baseline snapshot")
+        .peer_consumer_diagnostics
+        .owner_receive_count;
+    let started = tokio::time::Instant::now();
+    // Well past the two-second receive idle timeout, the parked stream is
+    // still live and no receive outcome has been recorded against it.
+    tokio::time::sleep(Duration::from_millis(3200)).await;
+    let parked_snapshot = fixture
+        .handle
+        .snapshot()
+        .await
+        .expect("parked-past-idle snapshot");
+    let parked_stream = find_session(&parked_snapshot, device_id())
+        .expect("parked-past-idle target session after the idle window")
+        .streams
+        .iter()
+        .find(|stream| stream.stream_id == target_stream_before.stream_id)
+        .cloned()
+        .expect("parked-past-idle target stream after the idle window");
+    assert!(
+        !parked_stream.terminal,
+        "the receive idle timeout must not end a parked consumer write"
+    );
+    assert_eq!(
+        parked_snapshot
+            .peer_consumer_diagnostics
+            .owner_receive_count,
+        owner_receive_before,
+        "no owner receive outcome may be recorded while the peer waits on the parked write"
+    );
+    let terminal_snapshot =
+        wait_snapshot_for(&fixture.handle, Duration::from_secs(8), &mut |snapshot| {
+            find_session(snapshot, device_id()).is_some_and(|session| {
+                session.session_id == target_session_id
+                    && session.epoch == target_epoch
+                    && session.streams.iter().any(|stream| {
+                        stream.stream_id == target_stream_before.stream_id
+                            && stream.operation_id == target_stream_before.operation_id
+                            && stream.terminal
+                    })
+            }) && find_session(snapshot, sibling_device_id()).is_some_and(|session| {
+                session.session_id == sibling_before.session_id
+                    && session.epoch == sibling_before.epoch
+            })
+        })
+        .await;
+    assert!(
+        started.elapsed() >= Duration::from_millis(4500),
+        "the parked write must end at the consumer deadline, not earlier"
+    );
+    assert_eq!(
+        terminal_snapshot
+            .peer_consumer_diagnostics
+            .owner_receive_count,
+        owner_receive_before,
+        "the consumer deadline, not a receive failure, must end the parked write"
+    );
+    assert_sibling_preserved(&terminal_snapshot, &sibling_session_id, sibling_epoch);
+    drain_queues(&mut target_rx, &mut target_data_rx).await;
+
+    stream.cancel();
+    drop(stream);
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
 async fn peer_consumer_transport_shutdown_closes_exact_stream_and_preserves_sibling() {
     // Explicit PeerServer shutdown cancels the active H3 request task.  Keep
     // the client stream open so this exercises transport cancellation/drop,

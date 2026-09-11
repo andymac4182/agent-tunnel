@@ -132,6 +132,8 @@ impl LateFixture {
                         .expect("fixture stream sequence"),
                     response_bytes: Vec::new(),
                     response_records: VecDeque::new(),
+                    orphaned_response_records: 0,
+                    late_response_records: 0,
                     send_bytes: 0,
                     receive_bytes: 0,
                     authorized_until: Some(Instant::now() + StdDuration::from_secs(60)),
@@ -1171,4 +1173,148 @@ async fn reciprocal_reset_uses_the_next_sequence_after_zero_one_and_many_records
         assert!(fixture.session_alive());
         assert!(fixture.has_stream(STREAM_B));
     }
+}
+
+#[tokio::test]
+async fn late_response_for_an_owner_closed_stream_is_discarded_without_fencing_the_session() {
+    // Regression from the queue-saturation gate after EC-045: the owner side
+    // closes a stream (the ingress reset the peer request half) while a
+    // dispatched record's waiter is still outstanding.  The connector already
+    // holds that record and answers it after the close.  That answer is late,
+    // not unsolicited: it must be discarded on the tombstone with the cursors
+    // and ACK advancing normally, the session must stay alive and the sibling
+    // must keep serving.  A second, genuinely unsolicited record on the same
+    // closed stream is still a protocol failure.
+    let mut fixture = LateFixture::new("orphaned-response");
+    let mut a1 = fixture.write(STREAM_A, b"a1");
+    let mut b1 = fixture.write(STREAM_B, b"b1");
+    assert_eq!(
+        sequenced(&fixture.drain_frames()),
+        vec![
+            (STREAM_A, FrameKind::Data, 1),
+            (STREAM_B, FrameKind::Data, 1)
+        ]
+    );
+    assert!(fixture.close(STREAM_A));
+    assert!(
+        matches!(
+            resolved(&mut a1),
+            Some(Err(EchoOutcome::Failure {
+                code: "REVERSE_CHANNEL_INTERRUPTED",
+                execution: "unknown",
+            }))
+        ),
+        "the outstanding waiter is failed with the typed unknown outcome"
+    );
+    assert_eq!(fixture.stream(STREAM_A).orphaned_response_records, 1);
+    assert_eq!(
+        sequenced(&fixture.drain_frames()),
+        vec![(STREAM_A, FrameKind::Fin, 2)],
+        "the owner close takes the next relay sequence"
+    );
+
+    // The connector answers the record it received before the close.
+    fixture
+        .inbound(Frame::data(
+            EPOCH,
+            GENERATION,
+            STREAM_A,
+            1,
+            2,
+            record(b"resp-a1"),
+        ))
+        .await;
+    assert!(
+        fixture.session_alive(),
+        "a late answer to an owner-closed stream must not fence the session"
+    );
+    assert_eq!(fixture.close_reason(), None);
+    assert_eq!(fixture.recv_contiguous(STREAM_A), 1);
+    assert_eq!(acks(&fixture.drain_frames()), vec![(STREAM_A, 1)]);
+    let closed = fixture.stream(STREAM_A);
+    assert_eq!(closed.orphaned_response_records, 0);
+    assert_eq!(closed.late_response_records, 1);
+    assert!(closed.response_bytes.is_empty());
+    assert!(closed.terminal);
+
+    // The sibling is untouched and still resolves its own record.
+    fixture
+        .inbound(Frame::data(
+            EPOCH,
+            GENERATION,
+            STREAM_B,
+            1,
+            1,
+            record(b"resp-b1"),
+        ))
+        .await;
+    assert_eq!(resolved_ok(&mut b1), Some(record(b"resp-b1")));
+    assert!(fixture.session_alive());
+
+    // Beyond the orphan allowance a record on the closed stream is
+    // unsolicited and fences the session exactly as before.
+    fixture
+        .inbound(Frame::data(
+            EPOCH,
+            GENERATION,
+            STREAM_A,
+            2,
+            2,
+            record(b"unsolicited"),
+        ))
+        .await;
+    assert!(!fixture.session_alive());
+    assert_eq!(fixture.close_reason(), Some("INVALID_SEQUENCE"));
+}
+
+#[tokio::test]
+async fn partial_late_response_keeps_its_framing_across_the_owner_close() {
+    // The close must not clear a half-received response record: the
+    // remainder arrives after the close and completes the same record, so
+    // the length prefix of any later record stays aligned.
+    let mut fixture = LateFixture::new("orphaned-partial");
+    let mut a1 = fixture.write(STREAM_A, b"a1");
+    let _ = fixture.drain_frames();
+    let full = record(b"resp-a1-partial");
+    let (head, tail) = full.split_at(6);
+    fixture
+        .inbound(Frame::data(
+            EPOCH,
+            GENERATION,
+            STREAM_A,
+            1,
+            1,
+            head.to_vec(),
+        ))
+        .await;
+    let _ = fixture.drain_frames();
+    assert!(resolved(&mut a1).is_none());
+    assert_eq!(fixture.stream(STREAM_A).response_bytes, head);
+
+    assert!(fixture.close(STREAM_A));
+    assert!(matches!(resolved(&mut a1), Some(Err(_))));
+    assert_eq!(
+        fixture.stream(STREAM_A).response_bytes,
+        head,
+        "partial response bytes survive the close"
+    );
+    let _ = fixture.drain_frames();
+
+    fixture
+        .inbound(Frame::data(
+            EPOCH,
+            GENERATION,
+            STREAM_A,
+            2,
+            2,
+            tail.to_vec(),
+        ))
+        .await;
+    assert!(fixture.session_alive());
+    assert_eq!(fixture.close_reason(), None);
+    let closed = fixture.stream(STREAM_A);
+    assert!(closed.response_bytes.is_empty());
+    assert_eq!(closed.late_response_records, 1);
+    assert_eq!(closed.orphaned_response_records, 0);
+    assert_eq!(fixture.recv_contiguous(STREAM_A), 2);
 }

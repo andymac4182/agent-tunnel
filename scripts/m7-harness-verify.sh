@@ -164,6 +164,12 @@ gate "M7 late DATA/FIN receipt after selected peer fault" \
   cargo run --locked -p tunnel-test-harness -- verify-m7-side-effect-late
 gate "M7 public abandoned upgrade reclamation" \
   cargo run --locked -p tunnel-test-harness -- verify-m7-public-abandoned-upgrade
+gate "M7 EC-041 device data ticket race across two ingress relays" \
+  cargo run --locked -p tunnel-test-harness -- verify-m7-ec041-device-attachment
+gate "M7 EC-023 owner death during control and data admission" \
+  cargo run --locked -p tunnel-test-harness -- verify-m7-ec023-owner-death
+gate "M7 EC-025 cross-relay handover under peer grace and owner readiness" \
+  cargo run --locked -p tunnel-test-harness -- verify-m7-ec025-handover
 gate "M7 C11 payload-free diagnostics capture and mutation scan" \
   cargo run --locked -p tunnel-test-harness -- verify-m7-c11-diagnostics
 gate "M7 OG-02 correlation completeness across fault gates" \

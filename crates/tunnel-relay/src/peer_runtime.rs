@@ -2197,8 +2197,29 @@ impl InboundPeerRecv {
         &self.request
     }
 
-    /// Receive one complete peer record.
+    /// Receive one complete peer record under the transport idle timeout.
     pub async fn recv_message(&mut self) -> Result<Option<PeerRecord>, PeerRuntimeError> {
+        self.recv_message_with(None).await
+    }
+
+    /// Receive one complete peer record under the caller's absolute deadline
+    /// instead of the transport idle timeout.
+    ///
+    /// Used while this side's response is parked: the peer is legitimately
+    /// silent until it is answered, so only resets, cancellation, request end
+    /// and malformed records end the read early, and the caller's own bound
+    /// (the consumer's absolute authorization deadline) applies otherwise.
+    pub async fn recv_message_until(
+        &mut self,
+        deadline: tokio::time::Instant,
+    ) -> Result<Option<PeerRecord>, PeerRuntimeError> {
+        self.recv_message_with(Some(deadline)).await
+    }
+
+    async fn recv_message_with(
+        &mut self,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<Option<PeerRecord>, PeerRuntimeError> {
         if self
             .admission_cancellation
             .as_ref()
@@ -2224,7 +2245,8 @@ impl InboundPeerRecv {
                 return Ok(Some(record));
             }
             let Some(chunk) =
-                recv_server_chunk(&mut self.recv, self.admission_context.as_ref()).await?
+                recv_server_chunk(&mut self.recv, self.admission_context.as_ref(), deadline)
+                    .await?
             else {
                 self.decoder.finish()?;
                 return Ok(None);
@@ -2515,12 +2537,22 @@ async fn recv_client_chunk(
     }
 }
 
+/// Receive one request body chunk.  `deadline` replaces the transport idle
+/// timeout when the caller's own absolute bound applies (a parked response).
 async fn recv_server_chunk(
     recv: &mut PeerServerRecv,
     admission_cancellation: Option<&PeerAdmissionCancellation>,
+    deadline: Option<tokio::time::Instant>,
 ) -> Result<Option<tunnel_transport::PeerBodyChunk>, PeerRuntimeError> {
+    let receive = async {
+        match deadline {
+            Some(deadline) => recv.recv_chunk_until(deadline).await,
+            None => recv.recv_chunk().await,
+        }
+    };
     if let Some(admission_cancellation) = admission_cancellation {
         if admission_cancellation.is_cancelled() {
+            drop(receive);
             recv.cancel();
             return Err(admission_cancellation_error(Some(admission_cancellation)));
         }
@@ -2529,7 +2561,7 @@ async fn recv_server_chunk(
             _ = admission_cancellation.cancelled() => {
                 Err(admission_cancellation_error(Some(admission_cancellation)))
             },
-            result = recv.recv_chunk() => {
+            result = receive => {
                 attribute_admission_failure(result.map_err(Into::into), admission_cancellation)
             }
         };
@@ -2541,7 +2573,7 @@ async fn recv_server_chunk(
         }
         result
     } else {
-        recv.recv_chunk().await.map_err(Into::into)
+        receive.await.map_err(Into::into)
     }
 }
 

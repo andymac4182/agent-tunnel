@@ -86,12 +86,14 @@ const ROWS: [Og02Row; 7] = [
             required_inner_process_counts: &[("m7-production-cli", 1)],
             required_snapshot_roles: PRODUCTION_SNAPSHOT_ROLES,
             required_safe_fields: PRODUCTION_SAFE_FIELDS_MINIMUM,
-            // A planned GOAWAY lands on the ingress relay either while it checks
-            // out a stream permit or while it dispatches the HTTP/3 request;
-            // both stages are legitimate and the cause is exact.
+            // A planned GOAWAY reaches the ingress relay asynchronously with
+            // respect to its own open pipeline, so captured runs have seen it
+            // at stream permit checkout, HTTP/3 dispatch and the response
+            // head; every ingress open stage is a legitimate landing point and
+            // the cause is exact.
             required_peer_faults: &[(
                 "ingress",
-                "stream_permit_checkout|h3_dispatch",
+                "pool_connect|stream_permit_checkout|sender_lock|h3_dispatch|envelope_send|head",
                 "transport_goaway",
             )],
         },
