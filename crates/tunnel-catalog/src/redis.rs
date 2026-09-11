@@ -715,15 +715,36 @@ impl RedisCatalog {
         keys: &[String],
         args: &[String],
     ) -> Result<T, CatalogError> {
-        let mut command = redis::cmd("EVAL");
-        command.arg(script).arg(keys.len() as i64);
-        for key in keys {
-            command.arg(key);
-        }
-        for arg in args {
-            command.arg(arg);
-        }
-        lane.query(&command).await
+        lane.query(&eval_command(script, keys, args)).await
+    }
+
+    /// Run one owner-affecting write script (`claim_owner`, `release_owner`)
+    /// on the catalog lane.  A reply lost after dispatch is the typed
+    /// [`CatalogError::WriteOutcomeUnknown`], never a replay.
+    async fn eval_owner_write<T: FromRedisValue>(
+        &self,
+        script: &str,
+        keys: &[String],
+        args: &[String],
+    ) -> Result<T, CatalogError> {
+        self.connection
+            .query_owner_write(&eval_command(script, keys, args))
+            .await
+    }
+
+    /// Run the owner renewal script on the next maintenance lane with the
+    /// same lost-reply contract as [`Self::eval_owner_write`].
+    async fn eval_maintenance_owner_write<T: FromRedisValue>(
+        &self,
+        script: &str,
+        keys: &[String],
+        args: &[String],
+    ) -> Result<T, CatalogError> {
+        let lane = self.maintenance_next.fetch_add(1, Ordering::Relaxed)
+            % self.maintenance_connections.len();
+        self.maintenance_connections[lane]
+            .query_owner_write(&eval_command(script, keys, args))
+            .await
     }
 
     async fn eval_membership_publish(
@@ -1571,7 +1592,7 @@ impl Catalog for RedisCatalog {
         }
         let lease_us = datetime_micros(request.lease_expires_at)?;
         let reply: Vec<String> = self
-            .eval(
+            .eval_owner_write(
                 &format!("{LUA_DECIMAL_HELPERS}{SCRIPT_CLAIM_OWNER_BODY}"),
                 &[
                     self.owner_key(incarnation, request.tenant_id, request.device_id),
@@ -1634,7 +1655,7 @@ impl Catalog for RedisCatalog {
             return Err(CatalogError::InvalidOwner);
         }
         let reply: Vec<String> = self
-            .eval_maintenance(
+            .eval_maintenance_owner_write(
                 SCRIPT_RENEW_OWNER,
                 &[
                     self.owner_key(incarnation, token.tenant_id, token.device_id),
@@ -1674,7 +1695,7 @@ impl Catalog for RedisCatalog {
         validate_identifier(&token.boot_id, MAX_IDENTIFIER_BYTES)?;
         validate_identifier(&token.session_id, MAX_IDENTIFIER_BYTES)?;
         let reply: Vec<String> = self
-            .eval(
+            .eval_owner_write(
                 SCRIPT_RELEASE_OWNER,
                 &[
                     self.owner_key(incarnation, token.tenant_id, token.device_id),
@@ -2013,6 +2034,18 @@ fn is_fixture_namespace(namespace: &str) -> bool {
     namespace.starts_with("test-")
         || namespace.starts_with("fixture-")
         || namespace.contains("-fixture-")
+}
+
+fn eval_command(script: &str, keys: &[String], args: &[String]) -> redis::Cmd {
+    let mut command = redis::cmd("EVAL");
+    command.arg(script).arg(keys.len() as i64);
+    for key in keys {
+        command.arg(key);
+    }
+    for arg in args {
+        command.arg(arg);
+    }
+    command
 }
 
 fn redis_timeout() -> redis::RedisError {

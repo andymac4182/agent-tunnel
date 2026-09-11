@@ -493,6 +493,7 @@ fn fixture_values() -> (CatalogFixture, Uuid, Uuid, Uuid, Uuid, Uuid, Uuid) {
 fn catalog_error_category(error: &CatalogError) -> &'static str {
     match error {
         CatalogError::Database(_) => "database",
+        CatalogError::WriteOutcomeUnknown(_) => "write_outcome_unknown",
         CatalogError::InvalidInput(_) => "invalid_input",
         CatalogError::NotFound => "not_found",
         CatalogError::Unauthorized => "unauthorized",

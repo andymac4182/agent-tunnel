@@ -143,6 +143,10 @@ pub struct RelaySessionSnapshot {
     pub session_id: String,
     pub epoch: u64,
     pub profile: &'static str,
+    /// Payload-free cause (`reply_timeout`, `connection_lost` or `unknown`)
+    /// while the session's last owner-lease renewal has an unknown outcome
+    /// and the session is unready pending an authoritative owner read.
+    pub owner_write_unknown: Option<&'static str>,
     pub phase: String,
     pub active_generation: u64,
     pub active_connection_id: String,
@@ -415,6 +419,7 @@ pub(crate) fn terminal_close_reason(reason: &str) -> &'static str {
         "OWNER_FENCE_DEADLINE",
         "OWNER_FENCE_MISSING",
         "STREAM_CLOSED",
+        "CANCEL_UNDELIVERABLE",
     ];
     ALLOWED
         .iter()

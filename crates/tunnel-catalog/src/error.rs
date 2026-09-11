@@ -67,12 +67,40 @@ impl From<CatalogConnectionError> for CatalogError {
     }
 }
 
+/// Why an owner-affecting write has no known outcome.  Both causes occur
+/// only after the command was dispatched to the authority: the script may
+/// have committed before its reply was lost, so the caller must neither
+/// assume failure nor replay the write.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UnknownWriteCause {
+    /// The authority did not answer within the bounded operation deadline.
+    ReplyTimeout,
+    /// The connection was severed after dispatch, before a reply arrived.
+    ConnectionLost,
+}
+
+impl UnknownWriteCause {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::ReplyTimeout => "reply_timeout",
+            Self::ConnectionLost => "connection_lost",
+        }
+    }
+}
+
 /// Errors returned by the durable catalog. User-facing handlers should map
 /// these to bounded public codes; backend details are never included in a
 /// response containing a bearer credential.
 #[derive(Debug)]
 pub enum CatalogError {
     Database(redis::RedisError),
+    /// An owner-affecting write (`claim_owner`, `renew_owner`,
+    /// `release_owner`) was dispatched but its reply was lost.  The write may
+    /// have committed.  Callers keep the affected session unready until a
+    /// fresh authoritative read confirms the owner state and never retry the
+    /// write automatically.  A failure *before* dispatch keeps its definite
+    /// shape (`Database`, `Conflict`, ...).
+    WriteOutcomeUnknown(UnknownWriteCause),
     InvalidInput(&'static str),
     NotFound,
     Unauthorized,
@@ -88,6 +116,11 @@ impl fmt::Display for CatalogError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Database(_) => formatter.write_str("catalog database failure"),
+            Self::WriteOutcomeUnknown(cause) => write!(
+                formatter,
+                "catalog write outcome unknown after dispatch ({})",
+                cause.as_str()
+            ),
             Self::InvalidInput(message) => write!(formatter, "invalid catalog input: {message}"),
             Self::NotFound => formatter.write_str("catalog record not found"),
             Self::Unauthorized => formatter.write_str("catalog authorization denied"),

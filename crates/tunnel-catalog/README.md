@@ -81,6 +81,20 @@ re-verifies the primary; neither replays the failed command. The relay bounds
 how many sessions it maintains per tick (see `docs/cluster.md`), so the lane
 count is a transport choice rather than a concurrency limit.
 
+Owner-affecting writes (`claim_owner`, `renew_owner`, `release_owner`) refine
+that contract. Once such a command has been dispatched on its lane, a lost
+reply no longer proves the script did not run: Redis may have committed the
+owner mutation before the reply deadline passed or the connection was
+severed. Those two failures are returned as the typed
+`CatalogError::WriteOutcomeUnknown(UnknownWriteCause)` with a payload-free
+cause (`reply_timeout` or `connection_lost`) instead of a generic `Database`
+error, so the relay can distinguish "may have committed" from "failed", keep
+the affected session unready until a fresh `current_owner` read confirms the
+exact token, and never retry the write automatically. A failure before
+dispatch (lane admission or reconnect) and an actual authority reply keep
+their definite shapes. `tests/redis_authority_lost_reply.rs` proves this
+through a severing loopback proxy for both a claim and a renewal.
+
 Owner lease comparisons and recovery quiescence checks use Redis server
 `TIME`; a caller-side clock skew can fail an operation closed. Authorization
 and credential expiry checks use the wall-clock instant supplied by the relay,

@@ -21,7 +21,8 @@ use tokio_util::sync::CancellationToken;
 use tunnel_catalog::{
     AttachmentTicket, AttachmentTicketBinding, AttachmentTicketConsumeRequest,
     AttachmentTicketIssueRequest, AuthenticatedConsumer, CatalogError, ConsumedAttachmentTicket,
-    DeviceIdentity, GrantSnapshot, OwnerClaimRequest, OwnerToken, SharedCatalog,
+    DeviceIdentity, GrantSnapshot, OwnerClaim, OwnerClaimRequest, OwnerToken, SharedCatalog,
+    UnknownWriteCause,
 };
 use tunnel_protocol::control_journal::{
     ControlJournal, JournalError, Observation as JournalObservation,
@@ -92,6 +93,10 @@ const OWNER_FORGET_FAILURE_TIMEOUT: Duration = Duration::from_secs(5);
 // below, making this an explicit total-entry bound of at most 2 * N.
 const RETAINED_ECHO_STREAM_FACTOR: usize = 2;
 const AUTHORITY_UNAVAILABLE: &str = "AUTHORITY_UNAVAILABLE";
+/// Typed session close reason when a CANCEL for a pending operation cannot
+/// enter the bounded control queue.  docs/protocol.md: failure to deliver a
+/// cancellation fences the session (EC-038).
+const CANCEL_UNDELIVERABLE: &str = "CANCEL_UNDELIVERABLE";
 /// Typed session close reason when the pure rotation machine has claimed its
 /// bounded connection-ID history.  Identifiers are never reused within a
 /// session, so the connector must establish a fresh session/epoch.
@@ -114,6 +119,8 @@ const MAX_MAINTENANCE_AUTHORITY_IN_FLIGHT: usize = 64;
 enum MaintenanceAuthorityOperation {
     RenewOwner,
     ResolveDevice,
+    /// The authoritative owner read that reconciles a lost-reply renewal.
+    CurrentOwner,
 }
 
 impl MaintenanceAuthorityOperation {
@@ -121,6 +128,7 @@ impl MaintenanceAuthorityOperation {
         match self {
             Self::RenewOwner => "renew_owner",
             Self::ResolveDevice => "resolve_device",
+            Self::CurrentOwner => "current_owner",
         }
     }
 }
@@ -137,6 +145,10 @@ enum MaintenanceAuthorityCategory {
     NotFound,
     InvalidInput,
     RevisionOverflow,
+    /// An owner-affecting write was dispatched but its reply was lost
+    /// (`CatalogError::WriteOutcomeUnknown`).  The write may have committed;
+    /// the session stays unready until a fresh owner read reconciles it.
+    OutcomeUnknown,
 }
 
 impl MaintenanceAuthorityCategory {
@@ -152,6 +164,7 @@ impl MaintenanceAuthorityCategory {
             Self::NotFound => "not_found",
             Self::InvalidInput => "invalid_input",
             Self::RevisionOverflow => "revision_overflow",
+            Self::OutcomeUnknown => "outcome_unknown",
         }
     }
 }
@@ -165,6 +178,26 @@ struct MaintenanceCandidate {
     spki_fingerprint: String,
     owner: OwnerToken,
     last_lease_renewal: Instant,
+    /// The session's last renewal has an unknown outcome: this round reads
+    /// the authoritative owner instead of renewing again.
+    owner_write_unknown: bool,
+}
+
+/// A lease renewal for one session was dispatched but its reply was lost.
+/// While set, the session is unready for dispatch and stream admission, its
+/// `last_lease_renewal` keeps the pre-write value so the local lease clock
+/// never assumes the write committed, and the renewal is never replayed:
+/// only a fresh authoritative owner read clears it (docs/cluster.md, EC-020).
+#[derive(Clone, Copy, Debug)]
+struct UnknownOwnerWrite {
+    since: Instant,
+    cause: Option<UnknownWriteCause>,
+}
+
+impl UnknownOwnerWrite {
+    fn cause_str(self) -> &'static str {
+        self.cause.map_or("unknown", |cause| cause.as_str())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -172,6 +205,8 @@ struct MaintenanceAuthorityFailure {
     operation: MaintenanceAuthorityOperation,
     category: MaintenanceAuthorityCategory,
     elapsed_ms: u64,
+    /// Present only for `OutcomeUnknown`: the payload-free lost-reply cause.
+    unknown_cause: Option<UnknownWriteCause>,
 }
 
 impl MaintenanceAuthorityFailure {
@@ -184,6 +219,10 @@ impl MaintenanceAuthorityFailure {
             operation,
             category: maintenance_authority_category(error),
             elapsed_ms: elapsed.as_millis().min(u128::from(u64::MAX)) as u64,
+            unknown_cause: match error {
+                CatalogError::WriteOutcomeUnknown(cause) => Some(*cause),
+                _ => None,
+            },
         }
     }
 }
@@ -208,6 +247,7 @@ fn maintenance_authority_category(error: &CatalogError) -> MaintenanceAuthorityC
                 MaintenanceAuthorityCategory::RedisBackend
             }
         }
+        CatalogError::WriteOutcomeUnknown(_) => MaintenanceAuthorityCategory::OutcomeUnknown,
         CatalogError::Serialization(_) => MaintenanceAuthorityCategory::Serialization,
         CatalogError::Conflict(_)
         | CatalogError::OwnerBusy
@@ -1569,6 +1609,9 @@ struct DeviceSession {
     queue_budget: QueueBudget,
     last_lease_renewal: Instant,
     maintenance_in_flight: bool,
+    /// Set while the last lease renewal has an unknown outcome; see
+    /// [`UnknownOwnerWrite`].
+    owner_write_unknown: Option<UnknownOwnerWrite>,
     closed: bool,
 }
 
@@ -1652,6 +1695,12 @@ enum Command {
         key: SessionKey,
         renewed: Option<Result<bool, MaintenanceAuthorityFailure>>,
         identity: Result<Option<DeviceIdentity>, MaintenanceAuthorityFailure>,
+    },
+    /// The authoritative owner read issued for a session whose renewal has
+    /// an unknown outcome.
+    OwnerWriteReconciled {
+        key: SessionKey,
+        read: Result<Option<OwnerClaim>, MaintenanceAuthorityFailure>,
     },
     OpenEchoStream {
         consumer: AuthenticatedConsumer,
@@ -2608,6 +2657,9 @@ impl RelayActor {
             } => {
                 self.finish_maintenance(key, renewed, identity).await;
             }
+            Command::OwnerWriteReconciled { key, read } => {
+                self.finish_owner_write_reconciliation(key, read).await;
+            }
             Command::OpenEchoStream {
                 consumer,
                 device_id,
@@ -3402,6 +3454,7 @@ impl RelayActor {
                 queue_budget: queue_budget.clone(),
                 last_lease_renewal: Instant::now(),
                 maintenance_in_flight: false,
+                owner_write_unknown: None,
                 closed: false,
             },
         );
@@ -3947,6 +4000,16 @@ impl RelayActor {
             });
             return;
         }
+        if session.owner_write_unknown.is_some() {
+            // The last lease renewal may or may not have committed.  Until
+            // the authority is re-read the owner is unready: nothing new is
+            // dispatched under a lease this relay cannot vouch for.
+            let _ = response.send(EchoOutcome::Failure {
+                code: "OWNER_AUTHORITY_UNKNOWN",
+                execution: "not_dispatched",
+            });
+            return;
+        }
         if Self::rotation_frozen(session) {
             // The finite echo also enters `session.pending`, which is part of
             // the immutable QUIESCE roster.  Pause its admission during a
@@ -4119,7 +4182,10 @@ impl RelayActor {
             let _ = response.send(Err(RelayError::Forbidden));
             return;
         }
-        if session.active_carrier.is_none() || (session.cluster_profile && !session.owner_fenced) {
+        if session.active_carrier.is_none()
+            || (session.cluster_profile && !session.owner_fenced)
+            || session.owner_write_unknown.is_some()
+        {
             let _ = response.send(Err(RelayError::OwnerNotReady));
             return;
         }
@@ -9129,7 +9195,8 @@ impl RelayActor {
                 if cancel.session_id != key.session_id || cancel.epoch != key.epoch {
                     return;
                 }
-                self.cancel(&key, cancel.stream_id, cancel.operation_id);
+                self.cancel(&key, cancel.stream_id, cancel.operation_id)
+                    .await;
             }
             ControlMessage::RotateRequest(request) => {
                 if request.session_id == key.session_id {
@@ -10831,27 +10898,53 @@ impl RelayActor {
         }
     }
 
-    fn cancel(&mut self, key: &SessionKey, stream_id: u64, operation_id: String) {
-        if let Some(session) = self.session_mut(key)
-            && session
-                .pending
-                .get(&stream_id)
-                .is_some_and(|pending| pending.operation_id == operation_id)
-            && let Some(pending) = session.pending.remove(&stream_id)
+    /// Cancel one pending operation.  The consumer always receives the
+    /// unknown `CANCELLED` outcome: cancellation is best effort and cannot
+    /// prove what the device already executed.  The device must still learn
+    /// of the cancellation, and docs/protocol.md reserves control capacity
+    /// for exactly that; when the CANCEL nevertheless cannot enter the bounded
+    /// control queue (slot bound reached or writer gone), the session is
+    /// fenced with the typed `CANCEL_UNDELIVERABLE` close instead of silently
+    /// leaving the device running an operation the consumer believes is
+    /// cancelled (EC-038).
+    async fn cancel(&mut self, key: &SessionKey, stream_id: u64, operation_id: String) {
+        let Some(session) = self.session_mut(key) else {
+            return;
+        };
+        if session
+            .pending
+            .get(&stream_id)
+            .is_none_or(|pending| pending.operation_id != operation_id)
         {
-            release_pending_budget(session, &pending);
-            let _ = pending.response.send(EchoOutcome::Failure {
-                code: "CANCELLED",
-                execution: "unknown",
-            });
-            if let Ok(message) = wire::encode_control_message(&wire::cancel(
-                &key.session_id,
-                key.epoch,
+            return;
+        }
+        let Some(pending) = session.pending.remove(&stream_id) else {
+            return;
+        };
+        release_pending_budget(session, &pending);
+        let _ = pending.response.send(EchoOutcome::Failure {
+            code: "CANCELLED",
+            execution: "unknown",
+        });
+        let delivered = wire::encode_control_message(&wire::cancel(
+            &key.session_id,
+            key.epoch,
+            stream_id,
+            &operation_id,
+        ))
+        .is_ok_and(|message| {
+            queue_control(&session.control_tx, &session.queue_budget, message).is_ok()
+        });
+        if !delivered {
+            tracing::warn!(
+                device_id = %key.device_id,
+                session_id = %key.session_id,
+                epoch = key.epoch,
                 stream_id,
-                &operation_id,
-            )) {
-                let _ = queue_control(&session.control_tx, &session.queue_budget, message);
-            }
+                phase = "cancel_undeliverable",
+                "CANCEL could not enter the control queue; fencing the session"
+            );
+            self.close_session(key, CANCEL_UNDELIVERABLE).await;
         }
     }
 
@@ -10984,12 +11077,25 @@ impl RelayActor {
             for stream_id in expired {
                 self.fail_pending(&key, stream_id, "REVERSE_CHANNEL_INTERRUPTED", "unknown");
             }
+            // An unknown renewal outcome never extends the local lease
+            // clock.  If the authority could not be re-read before the last
+            // confirmed lease ran out, the owner may already be fenced:
+            // close explicitly instead of dispatching under it.
+            let unknown_lease_expired = self.session_for(&key).is_some_and(|session| {
+                session.owner_write_unknown.is_some()
+                    && session.last_lease_renewal.elapsed() >= self.options.owner_lease
+            });
+            if unknown_lease_expired {
+                self.close_session(&key, AUTHORITY_UNAVAILABLE).await;
+                continue;
+            }
             let Some(candidate) = self.session_for(&key).and_then(|session| {
                 (!session.maintenance_in_flight).then(|| MaintenanceCandidate {
                     key: key.clone(),
                     spki_fingerprint: session.identity.spki_fingerprint.clone(),
                     owner: session.owner.clone(),
                     last_lease_renewal: session.last_lease_renewal,
+                    owner_write_unknown: session.owner_write_unknown.is_some(),
                 })
             }) else {
                 continue;
@@ -11025,8 +11131,11 @@ impl RelayActor {
             return;
         }
         let owner_lease = self.options.owner_lease;
+        // A reconciling owner read is as urgent as a due renewal: the
+        // session is unready until it completes.
         let renewal_due = |candidate: &MaintenanceCandidate| {
-            candidate.last_lease_renewal.elapsed() >= owner_lease / 3
+            candidate.owner_write_unknown
+                || candidate.last_lease_renewal.elapsed() >= owner_lease / 3
         };
         candidates.sort_by_key(|candidate| candidate.key.scope());
         let (mut renewals, rechecks): (Vec<_>, Vec<_>) =
@@ -11062,6 +11171,31 @@ impl RelayActor {
             let command_tx = self.command_tx.clone();
             let cancel = self.options.shutdown.clone();
             self.spawn_background(async move {
+                if candidate.owner_write_unknown {
+                    // Never replay the renewal whose reply was lost; read
+                    // the exact owner back from the authority instead.
+                    let started = Instant::now();
+                    let read = catalog
+                        .current_owner(candidate.key.tenant_id, candidate.key.device_id, Utc::now())
+                        .await
+                        .map_err(|error| {
+                            MaintenanceAuthorityFailure::from_catalog(
+                                MaintenanceAuthorityOperation::CurrentOwner,
+                                &error,
+                                started.elapsed(),
+                            )
+                        });
+                    send_background_command(
+                        &cancel,
+                        &command_tx,
+                        Command::OwnerWriteReconciled {
+                            key: candidate.key,
+                            read,
+                        },
+                    )
+                    .await;
+                    return;
+                }
                 let renewed = if renew {
                     let lease_expires_at = Utc::now()
                         + ChronoDuration::from_std(owner_lease)
@@ -11107,6 +11241,93 @@ impl RelayActor {
         }
     }
 
+    /// Resolve an unknown renewal outcome from the authoritative owner read.
+    ///
+    /// The exact token with lease lifetime remaining confirms the owner: the
+    /// local lease clock is re-anchored on the authority's remaining lifetime
+    /// (whichever lease the lost write left behind) and the session becomes
+    /// ready again.  A different or absent owner fences the session.  A
+    /// failed read keeps the session unready; the tick re-reads until the
+    /// last confirmed lease runs out, then closes.  The renewal itself is
+    /// never replayed.
+    async fn finish_owner_write_reconciliation(
+        &mut self,
+        key: SessionKey,
+        read: Result<Option<OwnerClaim>, MaintenanceAuthorityFailure>,
+    ) {
+        let owner_lease = self.options.owner_lease;
+        let mut close_reason = None;
+        let mut authority_failure = None;
+        if let Some(session) = self.sessions.get_mut(&key.scope()) {
+            if session.key != key {
+                return;
+            }
+            session.maintenance_in_flight = false;
+            let Some(unknown) = session.owner_write_unknown else {
+                return;
+            };
+            match read {
+                Ok(Some(claim)) if claim.token == session.owner => {
+                    let remaining = (claim.lease_expires_at - Utc::now())
+                        .to_std()
+                        .unwrap_or_default();
+                    if remaining.is_zero() {
+                        close_reason = Some("OWNER_FENCED");
+                    } else {
+                        let consumed = owner_lease.saturating_sub(remaining);
+                        session.last_lease_renewal = Instant::now()
+                            .checked_sub(consumed)
+                            .unwrap_or_else(Instant::now);
+                        session.owner_write_unknown = None;
+                        tracing::info!(
+                            device_id = %key.device_id,
+                            session_id = %key.session_id,
+                            epoch = key.epoch,
+                            phase = "owner_write_reconciled",
+                            unknown_cause = unknown.cause_str(),
+                            unknown_for_ms = u64::try_from(unknown.since.elapsed().as_millis())
+                                .unwrap_or(u64::MAX),
+                            lease_remaining_ms = u64::try_from(remaining.as_millis())
+                                .unwrap_or(u64::MAX),
+                        );
+                    }
+                }
+                Ok(_) => close_reason = Some("OWNER_FENCED"),
+                Err(error) => {
+                    authority_failure = Some(error);
+                    if session.last_lease_renewal.elapsed() >= owner_lease {
+                        close_reason = Some(AUTHORITY_UNAVAILABLE);
+                    }
+                }
+            }
+        }
+        if let Some(reason) = close_reason {
+            tracing::warn!(
+                device_id = %key.device_id,
+                session_id = %key.session_id,
+                epoch = key.epoch,
+                reason = %reason,
+                phase = "owner_write_reconciliation_failed",
+                authority_operation = authority_failure
+                    .map_or("none", |failure| failure.operation.as_str()),
+                authority_category = authority_failure
+                    .map_or("none", |failure| failure.category.as_str()),
+                authority_elapsed_ms = authority_failure.map_or(0, |failure| failure.elapsed_ms),
+            );
+            self.close_session(&key, reason).await;
+        } else if let Some(failure) = authority_failure {
+            tracing::warn!(
+                device_id = %key.device_id,
+                session_id = %key.session_id,
+                epoch = key.epoch,
+                phase = "owner_write_reconciliation_retry",
+                authority_operation = failure.operation.as_str(),
+                authority_category = failure.category.as_str(),
+                authority_elapsed_ms = failure.elapsed_ms,
+            );
+        }
+    }
+
     fn expire_unclaimed_echo_streams(&mut self, key: &SessionKey, now: Instant) {
         let expired_admissions = self
             .session_for(key)
@@ -11145,6 +11366,32 @@ impl RelayActor {
                 match renewed {
                     Ok(true) => session.last_lease_renewal = Instant::now(),
                     Ok(false) => close_reason = Some("OWNER_FENCED"),
+                    Err(error)
+                        if error.category == MaintenanceAuthorityCategory::OutcomeUnknown =>
+                    {
+                        // The renewal was dispatched and its reply lost.  It
+                        // may have committed, so this is neither a failed
+                        // authority nor a fenced owner: keep the session
+                        // unready and let the next maintenance round read
+                        // the owner back.  `last_lease_renewal` is left at
+                        // its pre-write value.
+                        if session.owner_write_unknown.is_none() {
+                            session.owner_write_unknown = Some(UnknownOwnerWrite {
+                                since: Instant::now(),
+                                cause: error.unknown_cause,
+                            });
+                        }
+                        tracing::warn!(
+                            device_id = %key.device_id,
+                            session_id = %key.session_id,
+                            epoch = key.epoch,
+                            phase = "owner_write_unknown",
+                            authority_operation = error.operation.as_str(),
+                            authority_category = error.category.as_str(),
+                            unknown_cause = error.unknown_cause.map_or("unknown", |cause| cause.as_str()),
+                            authority_elapsed_ms = error.elapsed_ms,
+                        );
+                    }
                     Err(error) => {
                         authority_failure = Some(error);
                         close_reason = Some(AUTHORITY_UNAVAILABLE);
@@ -11791,6 +12038,9 @@ impl RelayActor {
                 session_id: session.key.session_id.clone(),
                 epoch: session.key.epoch,
                 profile: session.profile.as_str(),
+                owner_write_unknown: session
+                    .owner_write_unknown
+                    .map(UnknownOwnerWrite::cause_str),
                 phase,
                 active_generation,
                 active_connection_id,
@@ -13282,6 +13532,7 @@ mod stream_identity_tests {
             queue_budget: queue_budget.clone(),
             last_lease_renewal: std::time::Instant::now(),
             maintenance_in_flight: false,
+            owner_write_unknown: None,
             closed: false,
         };
         let (command_tx, command_rx) = mpsc::channel(4);
@@ -15147,6 +15398,7 @@ mod stream_identity_tests {
                     queue_budget: queue_budget.clone(),
                     last_lease_renewal: std::time::Instant::now(),
                     maintenance_in_flight: false,
+                    owner_write_unknown: None,
                     closed: false,
                 },
                 control_rx,
@@ -16828,6 +17080,7 @@ mod stream_identity_tests {
                     operation: MaintenanceAuthorityOperation::RenewOwner,
                     category: MaintenanceAuthorityCategory::Timeout,
                     elapsed_ms: 2_000,
+                    unknown_cause: None,
                 })),
                 Ok(Some(identity.clone())),
                 AUTHORITY_UNAVAILABLE,
@@ -16837,6 +17090,7 @@ mod stream_identity_tests {
                     operation: MaintenanceAuthorityOperation::RenewOwner,
                     category: MaintenanceAuthorityCategory::RedisIo,
                     elapsed_ms: 2_001,
+                    unknown_cause: None,
                 })),
                 Ok(None),
                 "AUTHORIZATION_REVOKED",
@@ -16849,6 +17103,7 @@ mod stream_identity_tests {
                     operation: MaintenanceAuthorityOperation::ResolveDevice,
                     category: MaintenanceAuthorityCategory::WrongType,
                     elapsed_ms: 17,
+                    unknown_cause: None,
                 }),
                 AUTHORITY_UNAVAILABLE,
             ),
@@ -16879,6 +17134,7 @@ mod stream_identity_tests {
                 operation: MaintenanceAuthorityOperation::ResolveDevice,
                 category: MaintenanceAuthorityCategory::Serialization,
                 elapsed_ms: 23,
+                unknown_cause: None,
             }
         );
         assert_eq!(serialization_failure.operation.as_str(), "resolve_device");
@@ -16943,6 +17199,7 @@ mod stream_identity_tests {
             queue_budget,
             last_lease_renewal: std::time::Instant::now(),
             maintenance_in_flight: false,
+            owner_write_unknown: None,
             closed: false,
         }
     }
@@ -18806,6 +19063,14 @@ mod rotation_freeze_tests;
 #[cfg(test)]
 #[path = "actor_late_frame_tests.rs"]
 mod late_frame_tests;
+
+#[cfg(test)]
+#[path = "actor_cancel_tests.rs"]
+mod cancel_tests;
+
+#[cfg(test)]
+#[path = "actor_owner_write_tests.rs"]
+mod owner_write_tests;
 
 #[cfg(test)]
 mod cleanup_tests {

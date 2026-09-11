@@ -1,11 +1,13 @@
-//! EC-014 lost-reply evidence for one committed Redis owner mutation.
+//! EC-014 / EC-020 lost-reply evidence for committed Redis owner mutations.
 //!
 //! A bounded RESP-aware loopback proxy forwards the selected `EVAL` to Redis,
 //! reads the committed response, and drops it before it reaches the catalog
 //! client.  A fresh direct observer then checks the durable owner epoch and
 //! generation.  The selected command count proves this path did not retry or
-//! replay through a generic pool.  This remains an unknown-outcome test: it
-//! does not add or imply a typed lost-write API.
+//! replay through a generic pool.  The catalog reports the lost reply as the
+//! typed `CatalogError::WriteOutcomeUnknown` (M7-C63): the caller learns the
+//! write *may* have committed, and only the next authoritative owner read
+//! reconciles it.
 
 use std::{
     collections::BTreeSet,
@@ -29,9 +31,9 @@ use tokio::{
     time::timeout,
 };
 use tunnel_catalog::{
-    Catalog, CatalogFixture, CredentialRecord, FixtureDevice, GrantSpec, MembershipRecord,
-    MembershipRole, OwnerClaimRequest, PermissionSet, PrincipalIdentity, RedisCatalog, ServiceSpec,
-    TenantRecord, UserRecord,
+    Catalog, CatalogError, CatalogFixture, CredentialRecord, FixtureDevice, GrantSpec,
+    MembershipRecord, MembershipRole, OwnerClaimRequest, PermissionSet, PrincipalIdentity,
+    RedisCatalog, ServiceSpec, TenantRecord, UnknownWriteCause, UserRecord,
 };
 use uuid::Uuid;
 
@@ -524,15 +526,7 @@ async fn run_scenario(catalog: RedisCatalog, upstream_url: String, namespace: St
     };
     let outcome = timeout(StdDuration::from_secs(5), proxied.claim_owner(&request)).await;
     control.wait_selected_mutation().await;
-    match outcome {
-        Ok(Ok(_)) => panic!("lost reply was incorrectly reported as a successful owner claim"),
-        Ok(Err(tunnel_catalog::CatalogError::Database(_))) => {}
-        Ok(Err(error)) => panic!("unexpected typed lost-reply outcome: {error}"),
-        Err(_) => {
-            // The catalog has no typed unknown-write result. Its bounded
-            // timeout is accepted here and resolved below from Redis state.
-        }
-    }
+    assert_typed_unknown(outcome, "owner claim");
     // Keep the failed catalog handle and proxy listener alive briefly. If the
     // Redis driver had a background retry/reconnect path, a second selected
     // EVAL would be counted here rather than being hidden by immediate drop.
@@ -570,6 +564,21 @@ async fn run_scenario(catalog: RedisCatalog, upstream_url: String, namespace: St
         .expect("read committed owner hash epoch");
     assert_eq!(owner_node.as_deref(), Some("lost-reply-node"));
     assert_eq!(owner_epoch.as_deref(), Some(epoch_after.as_str()));
+    // The typed unknown outcome is reconciled only by a fresh authoritative
+    // read: the committed claim is visible with the exact requested token.
+    let reconciled = catalog
+        .current_owner(tenant_id, device_id, Utc::now())
+        .await
+        .expect("authoritative owner read after the lost reply")
+        .expect("the lost-reply claim committed and is readable");
+    assert_eq!(reconciled.token.node_id, request.node_id);
+    assert_eq!(reconciled.token.boot_id, request.boot_id);
+    assert_eq!(reconciled.token.session_id, request.session_id);
+    assert_eq!(
+        reconciled.token.epoch.to_string(),
+        epoch_after,
+        "the read returns the epoch the lost-reply write committed"
+    );
     assert_eq!(
         epoch_after.parse::<u64>().expect("parse committed epoch"),
         epoch_before.parse::<u64>().expect("parse baseline epoch") + 1
@@ -583,6 +592,160 @@ async fn run_scenario(catalog: RedisCatalog, upstream_url: String, namespace: St
             .expect("parse baseline generation")
             + 1
     );
+}
+
+/// A lost reply after dispatch is the typed unknown outcome, never a generic
+/// database error, a timeout, or a success.
+fn assert_typed_unknown<T>(
+    outcome: Result<Result<T, CatalogError>, tokio::time::error::Elapsed>,
+    what: &str,
+) {
+    match outcome {
+        Ok(Ok(_)) => panic!("lost reply was incorrectly reported as a successful {what}"),
+        Ok(Err(CatalogError::WriteOutcomeUnknown(cause))) => {
+            assert!(
+                matches!(
+                    cause,
+                    UnknownWriteCause::ConnectionLost | UnknownWriteCause::ReplyTimeout
+                ),
+                "unexpected unknown-write cause {cause:?}"
+            );
+        }
+        Ok(Err(error)) => {
+            panic!("lost {what} reply must be the typed unknown outcome, got: {error}")
+        }
+        Err(_) => panic!("the catalog must report the lost {what} reply within its own bound"),
+    }
+}
+
+/// EC-020: a committed owner *renewal* whose reply is lost is the typed
+/// unknown outcome; the catalog never replays it, and the next authoritative
+/// read shows the lease the lost write actually committed.
+async fn run_renew_scenario(catalog: RedisCatalog, upstream_url: String, namespace: String) {
+    catalog
+        .activate_deployment_incarnation()
+        .await
+        .expect("activate EC-020 lost-reply incarnation");
+    let (fixture, tenant_id, _user_id, device_id, _service_id) = fixture_values();
+    catalog
+        .seed_fixture(&fixture)
+        .await
+        .expect("seed EC-020 lost-reply fixture");
+    let claim = catalog
+        .claim_owner(&OwnerClaimRequest {
+            deployment_incarnation: INCARNATION.into(),
+            tenant_id,
+            device_id,
+            node_id: "lost-renew-node".into(),
+            boot_id: "lost-renew-boot".into(),
+            session_id: "lost-renew-session".into(),
+            lease_expires_at: Utc::now() + Duration::seconds(5),
+        })
+        .await
+        .expect("direct owner claim before the lost renewal");
+
+    let proxy = LoopbackProxy::start(&upstream_url).await;
+    let control = proxy.control.clone();
+    let proxied = RedisCatalog::connect_for_recovery(&proxy.url, &namespace, INCARNATION)
+        .await
+        .expect("connect proxied catalog");
+    control.arm_selected_mutation();
+    let renewed_lease = Utc::now() + Duration::seconds(25);
+    let outcome = timeout(
+        StdDuration::from_secs(5),
+        proxied.renew_owner(&claim.token, renewed_lease),
+    )
+    .await;
+    control.wait_selected_mutation().await;
+    assert_typed_unknown(outcome, "owner renewal");
+    timeout(
+        StdDuration::from_secs(1),
+        tokio::time::sleep(StdDuration::from_millis(250)),
+    )
+    .await
+    .expect("bounded post-error retry observation");
+    assert_eq!(control.selected_count(), 1, "no post-error renewal replay");
+    drop(proxied);
+    proxy.shutdown().await;
+    assert_eq!(
+        control.selected_count(),
+        1,
+        "selected renewal EVAL must run once"
+    );
+
+    let reconciled = catalog
+        .current_owner(tenant_id, device_id, Utc::now())
+        .await
+        .expect("authoritative owner read after the lost renewal reply")
+        .expect("the owner survives the lost renewal reply");
+    assert_eq!(
+        reconciled.token, claim.token,
+        "the exact owner token is unchanged by the lost reply"
+    );
+    assert!(
+        reconciled.lease_expires_at > claim.lease_expires_at,
+        "the lost-reply renewal committed: {} is not after {}",
+        reconciled.lease_expires_at,
+        claim.lease_expires_at
+    );
+    assert_eq!(
+        reconciled.lease_expires_at.timestamp_micros(),
+        renewed_lease.timestamp_micros(),
+        "the read returns exactly the lease the lost write committed"
+    );
+    assert!(
+        catalog
+            .release_owner(&claim.token)
+            .await
+            .expect("release the reconciled owner"),
+        "the reconciled token remains releasable"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires TUNNEL_CATALOG_REDIS_URL Redis primary fixture"]
+async fn m7_ec020_committed_owner_renew_withheld_reply_is_typed_unknown_and_reconciles() {
+    let upstream_url = std::env::var("TUNNEL_CATALOG_REDIS_URL")
+        .expect("EC-020 lost-reply test requires TUNNEL_CATALOG_REDIS_URL");
+    let namespace = format!("test-ec020-lost-renew-{}", Uuid::new_v4());
+    let cleanup_catalog =
+        RedisCatalog::connect_for_recovery(&upstream_url, &namespace, INCARNATION)
+            .await
+            .expect("connect cleanup catalog");
+    let scenario_catalog = cleanup_catalog.clone();
+    let scenario_upstream = upstream_url.clone();
+    let scenario_namespace = namespace.clone();
+    let mut scenario = tokio::spawn(async move {
+        run_renew_scenario(scenario_catalog, scenario_upstream, scenario_namespace).await;
+    });
+    let primary = match timeout(StdDuration::from_secs(30), &mut scenario).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(join_error)) if join_error.is_panic() => {
+            Err(format!("scenario panicked: {join_error}"))
+        }
+        Ok(Err(join_error)) => Err(format!("scenario did not complete: {join_error}")),
+        Err(_) => {
+            scenario.abort();
+            let _ = scenario.await;
+            Err("scenario deadline exceeded after 30 seconds".into())
+        }
+    };
+    let cleanup = match timeout(
+        StdDuration::from_secs(5),
+        cleanup_catalog.cleanup_fixture_namespace(),
+    )
+    .await
+    {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(format!("cleanup failed: {error}")),
+        Err(_) => Err("cleanup deadline exceeded after 5 seconds".into()),
+    };
+    match (primary, cleanup) {
+        (Ok(()), Ok(())) => {}
+        (primary, cleanup) => {
+            panic!("EC-020 lost-renewal scenario failed: primary={primary:?}; cleanup={cleanup:?}")
+        }
+    }
 }
 
 #[tokio::test]

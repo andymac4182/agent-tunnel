@@ -36,7 +36,7 @@ use redis::{FromRedisValue, RedisError, aio::MultiplexedConnection};
 use tokio::sync::Mutex;
 
 use super::{REDIS_OPERATION_TIMEOUT, open_verified_connection, redis_timeout};
-use crate::{CatalogConnectionError, CatalogError};
+use crate::{CatalogConnectionError, CatalogError, UnknownWriteCause};
 
 /// The closed conflict label returned when a reconnect reaches a primary
 /// whose `run_id` differs from the verified startup identity.
@@ -94,8 +94,32 @@ impl AuthorityLane {
         &self,
         command: &redis::Cmd,
     ) -> Result<T, CatalogError> {
-        self.execute(async |connection| command.query_async::<T>(connection).await)
-            .await
+        self.execute(
+            async |connection| command.query_async::<T>(connection).await,
+            DispatchedFailure::Definite,
+        )
+        .await
+    }
+
+    /// Run one owner-affecting write on this lane.
+    ///
+    /// Once the command has been dispatched, a lost reply no longer proves
+    /// the write failed: the script may have committed on the authority
+    /// before the reply deadline passed or the connection was severed.  Those
+    /// two failures are reported as the typed
+    /// [`CatalogError::WriteOutcomeUnknown`] so the caller can stay unready
+    /// until it re-reads the authority; a failure before dispatch (lane
+    /// admission) and an actual authority reply keep their definite shapes.
+    /// The write itself is never replayed.
+    pub(super) async fn query_owner_write<T: FromRedisValue>(
+        &self,
+        command: &redis::Cmd,
+    ) -> Result<T, CatalogError> {
+        self.execute(
+            async |connection| command.query_async::<T>(connection).await,
+            DispatchedFailure::Unknown,
+        )
+        .await
     }
 
     /// Run one bounded pipeline on this lane with the same failure contract
@@ -104,29 +128,36 @@ impl AuthorityLane {
         &self,
         pipeline: &redis::Pipeline,
     ) -> Result<T, CatalogError> {
-        self.execute(async |connection| pipeline.query_async::<T>(connection).await)
-            .await
+        self.execute(
+            async |connection| pipeline.query_async::<T>(connection).await,
+            DispatchedFailure::Definite,
+        )
+        .await
     }
 
     async fn execute<T>(
         &self,
         operation: impl AsyncFnOnce(&mut MultiplexedConnection) -> Result<T, RedisError>,
+        dispatched: DispatchedFailure,
     ) -> Result<T, CatalogError> {
         let (mut connection, connection_generation) = self.admit().await?;
         // The lane lock is no longer held: this deadline covers only the
-        // authority's handling of the caller's own command.
+        // authority's handling of the caller's own command.  From here on the
+        // command may have reached the authority, so `dispatched` decides
+        // how a lost reply is reported.
         match tokio::time::timeout(REDIS_OPERATION_TIMEOUT, operation(&mut connection)).await {
             Ok(Ok(value)) => Ok(value),
             Ok(Err(error)) => {
-                if lane_lost(&error) {
+                let lost = lane_lost(&error);
+                if lost {
                     // Release the dead connection and tell sibling lanes to
                     // probe theirs.  This command stays failed and is never
                     // replayed.
                     self.release_lost(connection_generation).await;
                 }
-                Err(CatalogError::Database(error))
+                Err(dispatched.classify(error, lost))
             }
-            Err(_) => Err(CatalogError::Database(redis_timeout())),
+            Err(_) => Err(dispatched.timeout()),
         }
     }
 
@@ -198,6 +229,39 @@ impl AuthorityLane {
             return Err(CatalogError::Conflict(RUN_ID_CONFLICT));
         }
         Ok(connection)
+    }
+}
+
+/// How a failure observed after the command was handed to the connection is
+/// reported.  Reads and non-owner writes keep the definite `Database` shape;
+/// owner-affecting writes report a lost reply as the typed unknown outcome.
+#[derive(Clone, Copy)]
+enum DispatchedFailure {
+    Definite,
+    Unknown,
+}
+
+impl DispatchedFailure {
+    fn classify(self, error: RedisError, lost: bool) -> CatalogError {
+        match self {
+            Self::Definite => CatalogError::Database(error),
+            Self::Unknown if lost => {
+                CatalogError::WriteOutcomeUnknown(UnknownWriteCause::ConnectionLost)
+            }
+            Self::Unknown if error.is_timeout() => {
+                CatalogError::WriteOutcomeUnknown(UnknownWriteCause::ReplyTimeout)
+            }
+            // An actual authority reply (server error, parse failure) is a
+            // definite outcome even for an owner write.
+            Self::Unknown => CatalogError::Database(error),
+        }
+    }
+
+    fn timeout(self) -> CatalogError {
+        match self {
+            Self::Definite => CatalogError::Database(redis_timeout()),
+            Self::Unknown => CatalogError::WriteOutcomeUnknown(UnknownWriteCause::ReplyTimeout),
+        }
     }
 }
 
