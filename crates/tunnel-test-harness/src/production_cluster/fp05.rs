@@ -174,14 +174,21 @@ pub fn validate_fp05_evidence(evidence: &Fp05Evidence) -> Result<()> {
     }
     if evidence.append_entries != 1
         || evidence.raw_data_frames != 1
-        || evidence.raw_fin_frames != 1
-        || evidence.raw_frame_observations != 2
+        // The terminal FIN toward the device is emitted only while the owner
+        // relay tears the held stream down at kill time (the consumer response
+        // is held, so no FIN precedes the shutdown). Delivering it races the
+        // device-listener teardown, so it is best-effort under an owner kill:
+        // accept zero or one. The device's required terminal signal for owner
+        // loss is `owner_loss_close_observed`, enforced above; DATA==1 and the
+        // single committed effect are the FP-05 contract and stay exact.
+        || evidence.raw_fin_frames > 1
+        || evidence.raw_frame_observations != evidence.raw_data_frames + evidence.raw_fin_frames
         || evidence.backend_effect_invocations != 1
         || evidence.duplicate_request_observations != 0
         || evidence.post_failure_effect_invocations != 0
     {
         return Err(HarnessError::Process(format!(
-            "FP-05 append/effect evidence was append={}, DATA={}, FIN={}, raw={}, effects={}, duplicates={}, post_failure_effects={}; expected 1,1,1,2,1,0,0",
+            "FP-05 append/effect evidence was append={}, DATA={}, FIN={}, raw={}, effects={}, duplicates={}, post_failure_effects={}; expected append=1, DATA=1, FIN in 0..=1, raw=DATA+FIN, effects=1, duplicates=0, post_failure_effects=0",
             evidence.append_entries,
             evidence.raw_data_frames,
             evidence.raw_fin_frames,
@@ -342,6 +349,31 @@ mod c17_validator_tests {
             mutate(&mut evidence);
             assert_rejected(validate_fp05_evidence(&evidence), "FP-05");
         }
+    }
+
+    #[test]
+    fn fp05_validator_accepts_best_effort_terminal_fin_under_owner_loss() {
+        // The terminal FIN toward the device is emitted only during the owner
+        // relay teardown and races the device-listener shutdown, so under an
+        // owner kill the device may see the DATA record and its owner-loss
+        // close without the FIN. That best-effort case is valid; DATA, the
+        // committed effect and the owner-loss close stay required.
+        let mut no_fin = valid_evidence();
+        no_fin.raw_fin_frames = 0;
+        no_fin.raw_frame_observations = no_fin.raw_data_frames;
+        validate_fp05_evidence(&no_fin)
+            .expect("a best-effort missing terminal FIN under owner loss is valid");
+
+        // Two terminal frames toward one device are never valid.
+        let mut double_fin = valid_evidence();
+        double_fin.raw_fin_frames = 2;
+        double_fin.raw_frame_observations = double_fin.raw_data_frames + 2;
+        assert_rejected(validate_fp05_evidence(&double_fin), "FP-05");
+
+        // The observation total must still reconcile with DATA + FIN.
+        let mut inconsistent = valid_evidence();
+        inconsistent.raw_frame_observations = 3;
+        assert_rejected(validate_fp05_evidence(&inconsistent), "FP-05");
     }
 
     #[test]
