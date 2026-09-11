@@ -997,6 +997,46 @@ async fn main() -> ExitCode {
                 )),
             }
         }
+        [command] if command == "verify-m7-owner-lease-expiry" => {
+            match tokio::time::timeout(
+                Duration::from_secs(240),
+                tunnel_test_harness::production_cluster::verify_owner_lease_expiry(),
+            )
+            .await
+            {
+                Ok(result) => result.and_then(|evidence| {
+                    require_m7_owner_lease_expiry_evidence(&evidence)?;
+                    println!(
+                        "M7 owner lease expiry passed: relays={} seeded_epoch={} original_epoch={} generation_preserved={} baseline_echo={} paused_connections={} present_after_barrier={} expired_while_partitioned={} absent_after_lease_deadline={} lease_expiry_ms={} lease_deadline_margin_ms={} dispatch_unchanged={} stale_release_refused_after_expiry={} successor_scope={} successor_epoch={} successor_fresh_session={} stale_release_refused_after_successor={} successor_token_unchanged={} successor_echo={} peak_sockets={} elapsed_ms={}",
+                        evidence.relay_count,
+                        evidence.seeded_epoch,
+                        evidence.original_epoch,
+                        evidence.catalog_generation_preserved,
+                        evidence.baseline_echo,
+                        evidence.paused_redis_connections,
+                        evidence.owner_present_after_barrier,
+                        evidence.owner_expired_while_partitioned,
+                        evidence.owner_absent_after_lease_deadline,
+                        evidence.lease_expiry_elapsed_ms,
+                        evidence.lease_deadline_margin_ms,
+                        evidence.expired_owner_dispatch_unchanged,
+                        evidence.stale_release_refused_after_expiry,
+                        evidence.successor_scope_matched,
+                        evidence.successor_epoch,
+                        evidence.successor_fresh_session,
+                        evidence.stale_release_refused_after_successor,
+                        evidence.successor_token_unchanged,
+                        evidence.successor_echo,
+                        evidence.fanout_peak_open,
+                        evidence.elapsed_ms,
+                    );
+                    Ok(())
+                }),
+                Err(_) => Err(HarnessError::Timeout(
+                    "M7 owner-lease expiry acceptance exceeded 240 seconds".to_owned(),
+                )),
+            }
+        }
         [command] if command == "verify-m7-peer-readiness" => {
             match tokio::time::timeout(
                 Duration::from_secs(180),
@@ -1399,6 +1439,72 @@ fn require_m7_redis_tls_evidence(
             (
                 "wrong_client_identity_rejected",
                 evidence.wrong_client_identity_rejected,
+            ),
+        ],
+    )
+}
+
+/// Require the full owner-lease expiry contract at the CLI boundary.
+///
+/// The module validator already checks every bound; re-stating the flags and
+/// epochs here means a validator regression cannot silently pass the command.
+fn require_m7_owner_lease_expiry_evidence(
+    evidence: &tunnel_test_harness::production_cluster::OwnerLeaseExpiryEvidence,
+) -> Result<(), HarnessError> {
+    tunnel_test_harness::production_cluster::validate_owner_lease_expiry_evidence(evidence)
+        .map_err(|error| HarnessError::Process(error.to_string()))?;
+    require_m7_acceptance_flags(
+        "M7 owner lease expiry",
+        &[
+            ("relay_count_is_three", evidence.relay_count == 3),
+            (
+                "catalog_generation_preserved",
+                evidence.catalog_generation_preserved,
+            ),
+            ("baseline_echo", evidence.baseline_echo),
+            (
+                "owner_present_after_barrier",
+                evidence.owner_present_after_barrier,
+            ),
+            (
+                "owner_expired_while_partitioned",
+                evidence.owner_expired_while_partitioned,
+            ),
+            (
+                "owner_absent_after_lease_deadline",
+                evidence.owner_absent_after_lease_deadline,
+            ),
+            (
+                "expired_owner_dispatch_unchanged",
+                evidence.expired_owner_dispatch_unchanged,
+            ),
+            (
+                "stale_release_refused_after_expiry",
+                evidence.stale_release_refused_after_expiry,
+            ),
+            ("successor_scope_matched", evidence.successor_scope_matched),
+            ("successor_fresh_session", evidence.successor_fresh_session),
+            (
+                "stale_release_refused_after_successor",
+                evidence.stale_release_refused_after_successor,
+            ),
+            (
+                "successor_token_unchanged",
+                evidence.successor_token_unchanged,
+            ),
+            ("successor_echo", evidence.successor_echo),
+            (
+                "paused_redis_connections_nonzero",
+                evidence.paused_redis_connections > 0,
+            ),
+            (
+                "retained_epoch_advanced",
+                evidence.successor_epoch > evidence.original_epoch
+                    && evidence.original_epoch > evidence.seeded_epoch,
+            ),
+            (
+                "fanout_peak_open_within_bound",
+                evidence.fanout_peak_open <= 3,
             ),
         ],
     )

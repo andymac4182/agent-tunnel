@@ -135,6 +135,11 @@ mod ownership;
 pub use ownership::{
     OwnershipEvidence, validate_ownership_evidence, verify as verify_owner_contention,
 };
+mod owner_lease_expiry;
+pub use owner_lease_expiry::{
+    OwnerLeaseExpiryEvidence, validate_owner_lease_expiry_evidence,
+    verify as verify_owner_lease_expiry,
+};
 mod c10;
 pub use c10::{
     C10ActualPathEvidence, validate_c10_actual_path_evidence, verify as verify_c10_actual_path,

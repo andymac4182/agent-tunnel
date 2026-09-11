@@ -27,7 +27,7 @@ const DUPLICATE_SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
 const SUCCESSOR_TIMEOUT: Duration = Duration::from_secs(20);
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const PROCESS_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
-const HIGH_EPOCH_BASE: u64 = 1_u64 << 53;
+pub(super) const HIGH_EPOCH_BASE: u64 = 1_u64 << 53;
 const HIGH_EPOCH_REDIS_TIMEOUT: Duration = Duration::from_secs(2);
 
 const SEED_HIGH_EPOCH_SCRIPT: &str = r#"
@@ -689,9 +689,9 @@ async fn run(
 }
 
 #[derive(Clone, Debug)]
-struct HighEpochSetup {
-    seeded_epoch: u64,
-    catalog_generation_preserved: bool,
+pub(super) struct HighEpochSetup {
+    pub(super) seeded_epoch: u64,
+    pub(super) catalog_generation_preserved: bool,
 }
 
 /// Seed only the durable owner epoch for this run's fresh fixture namespace.
@@ -704,7 +704,7 @@ struct HighEpochSetup {
 /// writes a decimal value above the JavaScript-safe integer boundary, and
 /// leaves catalog generation untouched.  Actual ownership still comes from
 /// the real CLI claim path immediately afterwards.
-async fn seed_high_owner_epoch(
+pub(super) async fn seed_high_owner_epoch(
     cluster: &ProductionCluster,
     harness: &RunningHarness,
     tenant_id: Uuid,
