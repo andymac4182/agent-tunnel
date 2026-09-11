@@ -323,6 +323,45 @@ impl FreezeFixture {
             .phase()
     }
 
+    fn rotation_status(&self) -> tunnel_protocol::rotation::RotationStatus {
+        self.session()
+            .rotation
+            .as_ref()
+            .expect("fixture rotation")
+            .state
+            .status()
+    }
+
+    /// The attempt's absolute overlap deadline.  Deterministic regressions pass
+    /// it straight to the relay deadline poll instead of waiting for it.
+    fn overlap_deadline_ms(&self) -> u64 {
+        self.rotation_status()
+            .deadline_ms
+            .expect("live attempt has an absolute overlap deadline")
+    }
+
+    /// Every retained cursor and credit of the fixture stream, in both
+    /// directions.  Recovery must preserve these exactly.
+    fn retained_cursors(&self) -> Vec<[u64; 8]> {
+        [Direction::RelayToConnector, Direction::ConnectorToRelay]
+            .into_iter()
+            .map(|direction| {
+                let stream = self.stream();
+                let state = stream.sequence.direction(direction);
+                [
+                    state.last_emitted(),
+                    state.peer_acked(),
+                    state.recv_contiguous(),
+                    state.delivered_contiguous(),
+                    state.sent_bytes(),
+                    state.received_bytes(),
+                    state.send_credit(),
+                    state.receive_credit(),
+                ]
+            })
+            .collect()
+    }
+
     fn relay_last_emitted(&self) -> u64 {
         self.stream()
             .sequence
@@ -520,8 +559,9 @@ impl FreezeFixture {
         self.retire_message_id = retire.message_id;
     }
 
-    /// Both endpoints close the old transport and the attempt completes.
-    async fn retire_old_carrier(&mut self) {
+    /// The connector attests its own old-transport closure.  The attempt stays
+    /// `Retiring` until the relay's physical close event arrives as well.
+    async fn connector_retired(&mut self) {
         self.actor
             .handle_rotate_retired(
                 &self.key,
@@ -534,6 +574,11 @@ impl FreezeFixture {
                 },
             )
             .await;
+    }
+
+    /// Both endpoints close the old transport and the attempt completes.
+    async fn retire_old_carrier(&mut self) {
+        self.connector_retired().await;
         self.actor.disconnect_data(self.old_carrier.clone()).await;
         assert_eq!(self.phase(), RotationPhase::Active);
         assert!(
@@ -1093,4 +1138,305 @@ async fn recovering_session_defers_consumer_fin_without_failure_deadline() {
     );
     assert!(fixture.session().terminal_fin_failure_deadline.is_none());
     assert_eq!(fixture.relay_last_emitted(), 1);
+}
+
+/// protocol.md, "Abort, deadline and loss during handover": "Old transport
+/// fails before drain completes: do not declare a successful drain or discard
+/// an unacknowledged prefix. Close failed/candidate transports as needed to
+/// preserve the socket bound and enter retained-state recovery with a fresh
+/// greater generation. The original overlap deadline still retires the
+/// abandoned attempt."  The state diagram's `Draining --> Recovering: old
+/// transport lost` edge is the same contract.  Here the old carrier disappears
+/// while the attempt is `Draining` with an unacknowledged relay prefix and an
+/// unreachable connector fence, so no drain proof is possible.
+#[tokio::test]
+async fn old_carrier_loss_while_draining_enters_retained_recovery() {
+    let mut fixture = FreezeFixture::new("draining-old-loss", false);
+    let _active = fixture.write(b"active-record");
+    assert_eq!(
+        sequenced(&drain_data(&mut fixture.old_rx)),
+        vec![(FrameKind::Data, 1, fixture.attempt.old_generation)],
+        "one unacknowledged relay record is outstanding on the old carrier"
+    );
+    fixture.quiesce();
+    assert!(fixture.complete_barrier().is_empty());
+    // The connector's fence advertises a sequence the relay has not received,
+    // so the relay owes a receive cursor it can never reach on this carrier.
+    fixture.connector_frozen(2).await;
+    assert_eq!(fixture.phase(), RotationPhase::Draining);
+    let retained_before = fixture.retained_cursors();
+    let abandoned_candidate_generation = fixture.attempt.new_generation;
+    let overlap_deadline_ms = fixture.overlap_deadline_ms();
+    let _ = fixture.drain_control();
+
+    fixture
+        .actor
+        .disconnect_data(fixture.old_carrier.clone())
+        .await;
+
+    assert!(
+        fixture.actor.sessions.contains_key(&fixture.key.scope()),
+        "losing the old carrier while draining must not close the session"
+    );
+    assert_eq!(fixture.phase(), RotationPhase::Recovering);
+    assert!(fixture.session().data_tx.is_none());
+    assert!(fixture.session().active_carrier.is_none());
+    let rotation = fixture
+        .session()
+        .rotation
+        .as_ref()
+        .expect("rotation state retained");
+    assert!(rotation.recovery.is_some(), "a recovery episode is owned");
+    assert!(
+        rotation.candidate.is_none(),
+        "the abandoned candidate transport is released"
+    );
+    let status = fixture.rotation_status();
+    assert_eq!(
+        status.recovery_reason,
+        Some(tunnel_protocol::rotation::RecoveryReason::OldTransportLost)
+    );
+    // Neither abandoned carrier can be promoted: the episode anchors on the
+    // retained old generation and allocates a fresh greater one.
+    assert_eq!(status.active_generation, fixture.attempt.old_generation);
+    assert_eq!(
+        status.active_connection_id,
+        fixture.attempt.old_connection_id
+    );
+    let recovery_attempt = status.attempt.clone().expect("recovery attempt identity");
+    assert_eq!(
+        recovery_attempt.old_generation,
+        fixture.attempt.old_generation
+    );
+    assert!(
+        recovery_attempt.new_generation > abandoned_candidate_generation,
+        "recovery must use a fresh greater generation, got {} after candidate {}",
+        recovery_attempt.new_generation,
+        abandoned_candidate_generation
+    );
+    assert!(
+        status.socket_count <= 3,
+        "recovery exceeded the one-control/two-data bound: {}",
+        status.socket_count
+    );
+    assert_eq!(
+        fixture.retained_cursors(),
+        retained_before,
+        "recovery preserves every retained cursor and credit"
+    );
+
+    // Both abandoned data transports are released immediately, which retires
+    // the abandoned attempt well inside its original overlap deadline.
+    assert!(
+        has_close(&drain_data(&mut fixture.candidate_rx)),
+        "the candidate transport is closed to preserve the socket bound"
+    );
+    assert!(
+        super::monotonic_millis() < overlap_deadline_ms,
+        "the abandoned attempt is retired before its original overlap deadline"
+    );
+    let control = fixture.drain_control();
+    assert!(
+        control
+            .iter()
+            .any(|message| matches!(message, ControlMessage::RecoveryBegin(_))),
+        "the coordinator begins the retained-state episode"
+    );
+    let closed = control
+        .iter()
+        .find_map(|message| match message {
+            ControlMessage::RecoveryClosed(closed) => Some(closed),
+            _ => None,
+        })
+        .expect("the coordinator attests its closure delta");
+    let mut expected_closed = vec![
+        fixture.attempt.old_connection_id.clone(),
+        fixture.attempt.new_connection_id.clone(),
+    ];
+    expected_closed.sort();
+    assert_eq!(
+        closed.closed_connection_ids, expected_closed,
+        "both abandoned carriers are named in the closure delta"
+    );
+
+    // The writer stays frozen and nothing is resumed on either abandoned
+    // carrier while the episode runs.
+    let mut held = fixture.write(b"recovering-record");
+    assert_held(&mut held, "recovering after old-carrier loss");
+    assert_eq!(fixture.relay_last_emitted(), 1);
+    assert!(sequenced(&drain_data(&mut fixture.old_rx)).is_empty());
+    assert!(sequenced(&drain_data(&mut fixture.candidate_rx)).is_empty());
+}
+
+/// The same contract at the commit-uncertain boundary.  protocol.md: "Commit
+/// uncertain: a connector timeout is not permission to resume old writes. If
+/// COMMIT may be in flight or the control connection is unavailable, remain
+/// quiesced and enter recovery", with the state diagram's
+/// `Committing --> Recovering: failure or uncertain commit`.  COMMIT has been
+/// queued but no COMMITTED has been accepted, so the episode may promote
+/// neither the candidate generation nor the old one.
+#[tokio::test]
+async fn old_carrier_loss_while_committing_enters_recovery_without_promoting_either_carrier() {
+    let mut fixture = FreezeFixture::new("committing-old-loss", false);
+    let _active = fixture.write(b"active-record");
+    assert_eq!(sequenced(&drain_data(&mut fixture.old_rx)).len(), 1);
+    fixture.quiesce();
+    assert!(fixture.complete_barrier().is_empty());
+    fixture.connector_frozen(0).await;
+    fixture.connector_drained().await;
+    assert_eq!(fixture.phase(), RotationPhase::Committing);
+    let retained_before = fixture.retained_cursors();
+    let candidate_generation = fixture.attempt.new_generation;
+    let _ = fixture.drain_control();
+
+    fixture
+        .actor
+        .disconnect_data(fixture.old_carrier.clone())
+        .await;
+
+    assert!(
+        fixture.actor.sessions.contains_key(&fixture.key.scope()),
+        "an uncertain commit must enter recovery rather than close the session"
+    );
+    let status = fixture.rotation_status();
+    assert_eq!(status.phase, RotationPhase::Recovering);
+    assert_eq!(
+        status.recovery_reason,
+        Some(tunnel_protocol::rotation::RecoveryReason::OldTransportLost)
+    );
+    // No commit was accepted, so the episode anchors on the retained old
+    // generation; the candidate generation is never promoted in its place.
+    assert_eq!(status.active_generation, fixture.attempt.old_generation);
+    assert_eq!(
+        status.active_connection_id,
+        fixture.attempt.old_connection_id
+    );
+    assert_eq!(fixture.session().generation, fixture.attempt.old_generation);
+    assert!(
+        fixture.session().data_tx.is_none(),
+        "neither abandoned carrier remains writable"
+    );
+    let recovery_attempt = status.attempt.clone().expect("recovery attempt identity");
+    assert!(
+        recovery_attempt.new_generation > candidate_generation,
+        "recovery allocates a fresh greater generation, got {} after candidate {}",
+        recovery_attempt.new_generation,
+        candidate_generation
+    );
+    assert!(status.socket_count <= 3);
+    assert_eq!(fixture.retained_cursors(), retained_before);
+    assert!(
+        fixture
+            .session()
+            .rotation
+            .as_ref()
+            .is_some_and(|rotation| rotation.candidate.is_none()),
+        "the uncommitted candidate transport is released"
+    );
+    assert!(has_close(&drain_data(&mut fixture.candidate_rx)));
+
+    // The writer stays frozen until the episode reaches READY; neither
+    // abandoned carrier receives a sequenced frame.
+    let mut held = fixture.write(b"committing-loss-record");
+    assert_held(&mut held, "recovering after an uncertain commit");
+    assert_eq!(fixture.relay_last_emitted(), 1);
+    assert!(sequenced(&drain_data(&mut fixture.old_rx)).is_empty());
+    assert!(sequenced(&drain_data(&mut fixture.candidate_rx)).is_empty());
+}
+
+/// protocol.md, "Abort, deadline and loss during handover": "Absolute overlap
+/// deadline: after commit, forcibly close any old transport still lingering",
+/// and the retire step: "`ROTATE_COMPLETE` ends the attempt after retirement
+/// evidence; deadline-forced closure is recorded distinctly."  The committed
+/// candidate is already serving the retained streams, and the state diagram has
+/// no `Retiring --> Recovering` edge, so the deadline must not tear the session
+/// down.
+#[tokio::test]
+async fn overlap_deadline_while_retiring_forces_retirement_and_keeps_serving() {
+    let mut fixture = FreezeFixture::new("retiring-deadline", false);
+    let _active = fixture.write(b"active-record");
+    assert_eq!(sequenced(&drain_data(&mut fixture.old_rx)).len(), 1);
+    fixture.quiesce();
+    assert!(fixture.complete_barrier().is_empty());
+    fixture.connector_frozen(0).await;
+    fixture.connector_drained().await;
+    fixture.connector_committed().await;
+    assert_eq!(fixture.phase(), RotationPhase::Retiring);
+    // The connector attests its own old-transport closure; the relay's own
+    // physical close event never arrives, so the old transport lingers.
+    fixture.connector_retired().await;
+    assert_eq!(fixture.phase(), RotationPhase::Retiring);
+    let new_generation = fixture.attempt.new_generation;
+    let overlap_deadline_ms = fixture.overlap_deadline_ms();
+    let retained_before = fixture.retained_cursors();
+    let _ = fixture.drain_control();
+
+    assert!(
+        !fixture
+            .actor
+            .poll_rotation_deadline_at(&fixture.key, overlap_deadline_ms),
+        "the overlap deadline must not tear down a committed handover"
+    );
+
+    assert!(
+        fixture.actor.sessions.contains_key(&fixture.key.scope()),
+        "the session keeps serving its retained streams on the new generation"
+    );
+    let status = fixture.rotation_status();
+    assert_eq!(status.phase, RotationPhase::Active);
+    assert_eq!(
+        status.active_generation, new_generation,
+        "the attempt completes on the committed candidate"
+    );
+    assert_eq!(
+        status.active_connection_id,
+        fixture.attempt.new_connection_id
+    );
+    assert!(
+        status.deadline_forced_retirement,
+        "the forced closure is recorded distinctly"
+    );
+    assert_eq!(
+        status.socket_count, 2,
+        "one control plus the committed data socket remain"
+    );
+    assert_eq!(fixture.retained_cursors(), retained_before);
+    let forced = fixture
+        .drain_control()
+        .into_iter()
+        .find_map(|message| match message {
+            ControlMessage::RotateComplete(complete) => Some(complete),
+            _ => None,
+        })
+        .expect("the forced retirement still ends the attempt with ROTATE_COMPLETE");
+    assert!(forced.forced, "ROTATE_COMPLETE records the forced closure");
+    assert_eq!(
+        forced.reason.as_deref(),
+        Some("overlap deadline forced retirement")
+    );
+    assert_eq!(forced.attempt.new_generation, new_generation);
+    let event = fixture
+        .actor
+        .rotation_deadline_events
+        .iter()
+        .find(|event| event.session_id == fixture.key.session_id)
+        .expect("a payload-free forced-retirement record is latched");
+    assert_eq!(event.reason, "forced_retirement");
+    assert_eq!(event.deadline_ms, overlap_deadline_ms);
+    assert!(event.fired_at_ms >= overlap_deadline_ms);
+
+    // The retained stream keeps serving on the committed candidate, and the
+    // old carrier never receives another sequenced frame.
+    let mut served = fixture.write(b"post-retirement-record");
+    assert_held(&mut served, "served after forced retirement");
+    assert_eq!(
+        sequenced(&drain_data(&mut fixture.candidate_rx)),
+        vec![(FrameKind::Data, 2, new_generation)],
+        "retained streams continue their sequence space on the new generation"
+    );
+    let old = drain_data(&mut fixture.old_rx);
+    assert!(
+        sequenced(&old).is_empty(),
+        "no path resumes writes on the old carrier after a commit"
+    );
 }

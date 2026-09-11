@@ -1101,27 +1101,31 @@ impl RotationState {
         self.deadline_forced_retirement |= now_ms >= overlap_deadline_ms;
         if complete {
             self.allocated_connections.remove(&old_connection_id);
-            if now_ms >= overlap_deadline_ms {
-                // The close evidence is accepted as a forced retirement, but
-                // the strict overlap budget cannot be retroactively converted
-                // into a successful handover.  Recovery must establish a
-                // fresh generation before payload admission resumes.
-                self.enter_recovery_in_place(RecoveryReason::Deadline);
-            } else {
-                let (new_generation, new_connection_id) = {
-                    let attempt = self.attempt.as_ref().expect("phase checked above");
-                    (
-                        attempt.identity.new_generation,
-                        attempt.identity.new_connection_id.clone(),
-                    )
-                };
-                self.active_generation = new_generation;
-                self.active_connection_id = new_connection_id;
-                self.attempt = None;
-                self.phase = RotationPhase::Active;
-                self.recovery_episode_deadline = None;
-                self.recovery_attempts = 0;
-            }
+            // Closure evidence at or after the absolute overlap deadline is a
+            // deadline-forced retirement, not a demotion: protocol.md retires
+            // the lingering old transport after commit ("Absolute overlap
+            // deadline: after commit, forcibly close any old transport still
+            // lingering") and ends the attempt on the committed candidate
+            // ("`ROTATE_COMPLETE` ends the attempt after retirement evidence;
+            // deadline-forced closure is recorded distinctly").  The state
+            // diagram has no `Retiring --> Recovering` edge, and payload
+            // admission already resumed on the new generation at COMMIT, so a
+            // fresh generation would protect nothing here.  The forced flag
+            // above keeps the distinction visible in diagnostics; the strict
+            // recover-or-fail rule still governs every pre-commit phase.
+            let (new_generation, new_connection_id) = {
+                let attempt = self.attempt.as_ref().expect("phase checked above");
+                (
+                    attempt.identity.new_generation,
+                    attempt.identity.new_connection_id.clone(),
+                )
+            };
+            self.active_generation = new_generation;
+            self.active_connection_id = new_connection_id;
+            self.attempt = None;
+            self.phase = RotationPhase::Active;
+            self.recovery_episode_deadline = None;
+            self.recovery_attempts = 0;
         }
         Ok(())
     }
@@ -1313,10 +1317,14 @@ impl RotationState {
         )?;
         validate_roster(&roster, self.config.max_roster_entries)?;
         validate_identifier("snapshot_id", &roster.snapshot_id)?;
-        if let Some(previous_roster) = self
-            .attempt
-            .as_ref()
-            .and_then(|attempt| attempt.roster.as_ref())
+        // A recovery retry must keep its episode's immutable roster.  The
+        // roster a *scheduled* attempt fixed at QUIESCE is a different object
+        // with its own snapshot identity: a handover abandoned by old-carrier
+        // loss starts a fresh episode, so its QUIESCE snapshot must not be
+        // mistaken for an episode roster this attempt has to match.
+        if let Some(attempt) = self.attempt.as_ref()
+            && attempt.is_recovery_attempt
+            && let Some(previous_roster) = attempt.roster.as_ref()
             && previous_roster != &roster
         {
             return Err(RotationError::RecoveryRosterMismatch);
@@ -1604,6 +1612,17 @@ impl RotationState {
             if self.phase == RotationPhase::Preparing && now_ms >= handshake_deadline_ms {
                 self.phase = RotationPhase::Aborting;
             }
+            return self.phase;
+        }
+        if self.phase == RotationPhase::Retiring {
+            // After commit the candidate is already activated and serving the
+            // retained streams.  protocol.md forces closure of the lingering
+            // old transport instead of demoting a committed handover, and its
+            // recover-or-fail rule at this deadline is scoped to "an unfinished
+            // abort or drain".  Record the forced retirement and leave the
+            // phase so the runtime can release the old carrier; the budget is
+            // not extended and the old generation is never promoted again.
+            self.deadline_forced_retirement = true;
             return self.phase;
         }
         self.enter_recovery_in_place(RecoveryReason::Deadline);
@@ -2665,33 +2684,64 @@ mod tests {
         assert_ne!(retiring.active_generation(), 4);
     }
 
+    /// protocol.md, "Abort, deadline and loss during handover": "Absolute
+    /// overlap deadline: after commit, forcibly close any old transport still
+    /// lingering", with the retire step's "`ROTATE_COMPLETE` ends the attempt
+    /// after retirement evidence; deadline-forced closure is recorded
+    /// distinctly."  The recover-or-fail half of that bullet is scoped to "an
+    /// unfinished abort or drain", and the state diagram has no
+    /// `Retiring --> Recovering` edge, so a committed candidate is not demoted
+    /// by the deadline.  The pre-commit phases keep the strict rule: see
+    /// `overlap_deadline_is_strict_and_socket_bound_is_bounded` and
+    /// `commit_decision_cannot_roll_back_on_uncertain_timeout`.
     #[test]
-    fn old_close_at_the_exact_overlap_deadline_cannot_activate_candidate() {
+    fn old_close_at_the_exact_overlap_deadline_forces_retirement_of_the_old_transport() {
         let mut machine = state();
         let identity = attempt(4);
         commit_to_retiring(&mut machine, &identity);
+        // The deadline itself neither demotes the committed handover nor
+        // extends the budget; it records the forced retirement.
+        assert_eq!(machine.tick(30), RotationPhase::Retiring);
+        assert!(machine.status().deadline_forced_retirement);
         machine
             .old_socket_closed(
                 &identity,
                 RotationSide::Owner,
                 ClosureEvidence::closed("data-old"),
-                29,
+                30,
             )
-            .expect("first old close");
+            .expect("forced owner close");
+        assert_eq!(
+            machine.phase(),
+            RotationPhase::Retiring,
+            "one endpoint's forced closure is not retirement evidence on its own"
+        );
+        assert_eq!(machine.active_generation(), 3);
         machine
             .old_socket_closed(
                 &identity,
                 RotationSide::Connector,
                 ClosureEvidence::closed("data-old"),
-                30,
+                31,
             )
-            .expect("forced old close");
-        assert_eq!(machine.phase(), RotationPhase::Recovering);
-        assert_ne!(machine.active_generation(), 4);
-        machine
-            .close_for_recovery("data-4", ClosureEvidence::closed("data-4"), 31)
-            .expect("candidate close");
-        assert_eq!(machine.socket_count(), CONTROL_SOCKETS);
+            .expect("forced connector close");
+        // The attempt completes on the committed candidate with the forced
+        // closure still visible in diagnostics.
+        assert_eq!(machine.phase(), RotationPhase::Active);
+        assert_eq!(machine.active_generation(), 4);
+        assert_eq!(machine.active_connection_id(), "data-4");
+        assert!(machine.status().deadline_forced_retirement);
+        assert_eq!(machine.socket_count(), CONTROL_SOCKETS + 1);
+        // The old carrier is never promoted again: its identifier stays fenced
+        // in the immutable connection history.
+        let mut reuses_old_carrier = attempt(5);
+        reuses_old_carrier.old_generation = 4;
+        reuses_old_carrier.old_connection_id = "data-4".to_owned();
+        reuses_old_carrier.new_connection_id = "data-old".to_owned();
+        assert!(matches!(
+            machine.prepare(reuses_old_carrier, 32),
+            Err(RotationError::ConnectionReuse)
+        ));
     }
 
     #[test]

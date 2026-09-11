@@ -5614,11 +5614,7 @@ impl RelayActor {
             // A PREPARING attempt can be coalesced into recovery after the
             // old carrier disappears: if PREPARE was already queued, its
             // candidate identity is carried in the closure roster below so
-            // the connector cannot leave a phantom candidate behind. Any
-            // later pre-commit phase has a bilateral abort/closure protocol
-            // in flight; it remains fail-closed until that protocol
-            // completes rather than allowing RECOVERY_BEGIN to overtake
-            // ROTATE_ABORT.
+            // the connector cannot leave a phantom candidate behind.
             let pending_rotation_attempt = if rotation.state.phase() == RotationPhase::Preparing
                 && rotation.candidate.is_none()
             {
@@ -5628,15 +5624,38 @@ impl RelayActor {
             };
             let canceled_prepare_was_queued =
                 pending_rotation_attempt.is_some() && !rotation.prepare_message_id.is_empty();
-            let canceled_candidate_connection_id = canceled_prepare_was_queued.then(|| {
-                pending_rotation_attempt
-                    .as_ref()
-                    .expect("queued prepare has pending attempt")
-                    .new_connection_id
-                    .clone()
-            });
+            // protocol.md, "Abort, deadline and loss during handover": "Old
+            // transport fails before drain completes: do not declare a
+            // successful drain or discard an unacknowledged prefix. Close
+            // failed/candidate transports as needed to preserve the socket
+            // bound and enter retained-state recovery with a fresh greater
+            // generation. The original overlap deadline still retires the
+            // abandoned attempt."  The attached candidate of an uncommitted
+            // attempt is therefore released here rather than failing the
+            // session closed, which also retires the abandoned attempt
+            // immediately, well inside its original overlap deadline.  The
+            // commit-uncertain rule is unchanged: COMMITTING has not accepted a
+            // commit, so the episode anchors on the retained old generation and
+            // allocates a fresh greater one instead of resuming either carrier.
+            // ABORTING keeps its bilateral closure protocol and stays
+            // fail-closed rather than letting RECOVERY_BEGIN overtake an
+            // in-flight ROTATE_ABORT.
+            let abandoned_rotation_attempt = if matches!(
+                rotation.state.phase(),
+                RotationPhase::Quiescing | RotationPhase::Draining | RotationPhase::Committing
+            ) {
+                rotation.attempt.clone()
+            } else {
+                None
+            };
+            let released_attempt = pending_rotation_attempt
+                .as_ref()
+                .or(abandoned_rotation_attempt.as_ref());
+            let canceled_candidate_connection_id = released_attempt
+                .filter(|_| canceled_prepare_was_queued || abandoned_rotation_attempt.is_some())
+                .map(|attempt| attempt.new_connection_id.clone());
             let active_rotation = rotation.state.phase() == RotationPhase::Active;
-            if !active_rotation && pending_rotation_attempt.is_none() {
+            if !active_rotation && released_attempt.is_none() {
                 return false;
             }
             if rotation.state.active_connection_id() != old_connection_id {
@@ -5653,9 +5672,8 @@ impl RelayActor {
             else {
                 return false;
             };
-            let old_generation = pending_rotation_attempt
-                .as_ref()
-                .map_or(session.generation, |attempt| attempt.old_generation);
+            let old_generation =
+                released_attempt.map_or(session.generation, |attempt| attempt.old_generation);
             let attempt = RotationAttemptIdentity::new(
                 session.key.session_id.clone(),
                 session.key.epoch,
@@ -5671,7 +5689,16 @@ impl RelayActor {
             else {
                 return false;
             };
-            let transport_attempt = pending_rotation_attempt.as_ref().unwrap_or(&attempt);
+            let transport_attempt = released_attempt.unwrap_or(&attempt);
+            // Release the abandoned attempt's candidate transport before the
+            // episode starts so the session is back inside the documented
+            // one-control/one-candidate shape.  A failure below closes the
+            // session, which releases the carrier anyway.
+            if abandoned_rotation_attempt.is_some()
+                && let Some(candidate) = rotation.candidate.take()
+            {
+                let _ = candidate.tx.try_send(DataOutbound::Close);
+            }
             if rotation
                 .state
                 .transport_lost(transport_attempt, now_ms, RecoveryReason::OldTransportLost)
@@ -5684,12 +5711,12 @@ impl RelayActor {
                         now_ms,
                     )
                     .is_err()
-                || pending_rotation_attempt.as_ref().is_some_and(|pending| {
+                || released_attempt.is_some_and(|released| {
                     rotation
                         .state
                         .close_for_recovery(
-                            &pending.new_connection_id,
-                            ClosureEvidence::closed(pending.new_connection_id.clone()),
+                            &released.new_connection_id,
+                            ClosureEvidence::closed(released.new_connection_id.clone()),
                             now_ms,
                         )
                         .is_err()
@@ -5801,7 +5828,7 @@ impl RelayActor {
                 session.queue_budget.clone(),
                 begin,
                 closed,
-                pending_rotation_attempt,
+                pending_rotation_attempt.or(abandoned_rotation_attempt),
             ))
         };
         let Some((control_tx, budget, begin, closed, canceled_attempt)) = prepared else {
@@ -7074,8 +7101,17 @@ impl RelayActor {
             );
             let encoded = wire::encode_control_message(&message)
                 .map_err(|_| tunnel_protocol::rotation::RotationError::Closed)?;
-            Self::complete_rotation_reply(rotation, &message, &encoded)
-                .map_err(|_| tunnel_protocol::rotation::RotationError::Closed)?;
+            match Self::complete_rotation_reply(rotation, &message, &encoded) {
+                Ok(()) => {}
+                // A deadline-forced retirement completes after this attempt's
+                // immutable journal window has closed.  The forced COMPLETE is
+                // the owner's terminal record for an attempt that is tombstoned
+                // immediately below, so an expired retention window must not
+                // strand the already-committed candidate.  Every other journal
+                // failure stays fail-closed.
+                Err(JournalError::Expired) if forced => {}
+                Err(_) => return Err(tunnel_protocol::rotation::RotationError::Closed),
+            }
             queue_control(&session.control_tx, &session.queue_budget, encoded)
                 .map_err(|_| tunnel_protocol::rotation::RotationError::Closed)?;
             rotation.last_message_id = message.message_id().to_owned();
@@ -7340,18 +7376,41 @@ impl RelayActor {
     /// no disconnect event will ever arrive to drive the owner decision.  The
     /// coordinator therefore polls the pure state clock on every maintenance
     /// tick and emits one unsolicited ABORT as soon as the handshake budget
-    /// expires.  Once the absolute overlap budget expires, fail closed rather
-    /// than leaving an old or candidate carrier allocated indefinitely.
+    /// expires.  Once the absolute overlap budget expires, a pre-commit attempt
+    /// fails closed rather than leaving an old or candidate carrier allocated
+    /// indefinitely; after commit the lingering old transport is force-retired
+    /// instead, because the candidate is already serving the retained streams.
     fn poll_rotation_deadline(&mut self, key: &SessionKey) -> bool {
-        let now_ms = monotonic_millis();
+        self.poll_rotation_deadline_at(key, monotonic_millis())
+    }
+
+    /// Explicit-clock body of [`Self::poll_rotation_deadline`].  Deterministic
+    /// regressions drive the absolute deadline directly instead of waiting on
+    /// the process monotonic clock; the production caller above always passes
+    /// the real sample.
+    fn poll_rotation_deadline_at(&mut self, key: &SessionKey, now_ms: u64) -> bool {
         let mut send_abort = false;
         let mut expired = false;
+        let mut force_retirement = false;
         let mut deadline_event = None;
         let result = self.with_rotation_mut(key, |_session, rotation| {
             let Some(deadline_ms) = rotation.state.status().deadline_ms else {
                 return Ok::<(), tunnel_protocol::rotation::RotationError>(());
             };
             if now_ms >= deadline_ms {
+                // protocol.md, "Abort, deadline and loss during handover":
+                // "Absolute overlap deadline: after commit, forcibly close any
+                // old transport still lingering."  The recover-or-fail rule in
+                // the same bullet is scoped to "an unfinished abort or drain",
+                // and the state diagram has no `Retiring --> Recovering` edge,
+                // so a committed candidate that is already serving the retained
+                // streams is not demoted here.  The lingering old transport is
+                // force-retired instead and the forced closure is recorded
+                // distinctly; no budget is extended.
+                if rotation.state.phase() == RotationPhase::Retiring {
+                    force_retirement = true;
+                    return Ok::<(), tunnel_protocol::rotation::RotationError>(());
+                }
                 deadline_event = Self::rotation_deadline_event(key, rotation, now_ms);
                 expired = true;
                 return Ok::<(), tunnel_protocol::rotation::RotationError>(());
@@ -7368,6 +7427,10 @@ impl RelayActor {
         if result.is_err() {
             return false;
         }
+        if force_retirement {
+            self.force_rotation_retirement(key, now_ms);
+            return false;
+        }
         if let Some(event) = deadline_event {
             self.retain_rotation_deadline_event(event);
         }
@@ -7375,6 +7438,62 @@ impl RelayActor {
             self.emit_rotation_abort(key, "candidate handshake timeout");
         }
         expired
+    }
+
+    /// Force-retire the old transport of a committed handover whose absolute
+    /// overlap deadline has expired.
+    ///
+    /// protocol.md retires the old carrier here rather than demoting the
+    /// session: "after commit, forcibly close any old transport still
+    /// lingering" and "`ROTATE_COMPLETE` ends the attempt after retirement
+    /// evidence; deadline-forced closure is recorded distinctly."  The relay
+    /// released its own old carrier at COMMITTED, so the forced step is to stop
+    /// waiting on that close handshake and record the owner-side closure.  The
+    /// connector's attestation is never fabricated: with its `ROTATE_RETIRED`
+    /// already present the attempt completes on the committed candidate, and
+    /// without it the session keeps serving the retained streams on the new
+    /// generation with the forced closure visible in diagnostics.  Nothing here
+    /// extends a budget and no path returns to the old generation.
+    fn force_rotation_retirement(&mut self, key: &SessionKey, now_ms: u64) {
+        let mut deadline_event = None;
+        let _ = self.with_rotation_mut(key, |_session, rotation| {
+            if rotation.state.phase() != RotationPhase::Retiring {
+                return Ok::<(), tunnel_protocol::rotation::RotationError>(());
+            }
+            let Some(attempt) = rotation.attempt.clone() else {
+                return Ok::<(), tunnel_protocol::rotation::RotationError>(());
+            };
+            // Latch the forced flag even when the closure record below is
+            // already present, so diagnostics distinguish this attempt from a
+            // handover that retired inside its budget.
+            let _ = rotation.state.tick(now_ms);
+            deadline_event = Self::rotation_deadline_event(key, rotation, now_ms).map(|event| {
+                RotationDeadlineEvent {
+                    reason: "forced_retirement",
+                    ..event
+                }
+            });
+            let status_before_close = rotation.state.status();
+            Self::latch_rotation_lifecycle(rotation, &status_before_close);
+            if !status_before_close.old_socket_closed[rotation_side_index(RotationSide::Owner)] {
+                rotation.state.old_socket_closed(
+                    &attempt,
+                    RotationSide::Owner,
+                    ClosureEvidence::closed(attempt.old_connection_id.clone()),
+                    now_ms,
+                )?;
+                let status_after_close = rotation.state.status();
+                Self::latch_rotation_lifecycle(rotation, &status_after_close);
+            }
+            Ok::<(), tunnel_protocol::rotation::RotationError>(())
+        });
+        if let Some(event) = deadline_event {
+            self.retain_rotation_deadline_event(event);
+        }
+        // A no-op unless the connector's RETIRED was already journaled: the
+        // forced owner closure alone leaves the attempt open while the session
+        // keeps serving on the committed candidate.
+        self.finish_rotation_if_ready(key);
     }
 
     /// Queue the coordinator's physical-failure decision exactly once.  The
@@ -11446,6 +11565,15 @@ fn direction_index(direction: Direction) -> usize {
     match direction {
         Direction::RelayToConnector => 0,
         Direction::ConnectorToRelay => 1,
+    }
+}
+
+/// Index of one endpoint in the pure machine's per-side closure arrays.  It
+/// mirrors the ordering of `RotationStatus::old_socket_closed`.
+fn rotation_side_index(side: RotationSide) -> usize {
+    match side {
+        RotationSide::Owner => 0,
+        RotationSide::Connector => 1,
     }
 }
 
