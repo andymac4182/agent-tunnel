@@ -26,7 +26,7 @@ const DUPLICATE_TERMINAL_TIMEOUT: Duration = Duration::from_secs(12);
 const DUPLICATE_SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
 const SUCCESSOR_TIMEOUT: Duration = Duration::from_secs(20);
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
-const PROCESS_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+pub(super) const PROCESS_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 pub(super) const HIGH_EPOCH_BASE: u64 = 1_u64 << 53;
 const HIGH_EPOCH_REDIS_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -829,7 +829,7 @@ pub(super) async fn seed_high_owner_epoch(
     })
 }
 
-async fn spawn_cli(name: &str, profile: &DeviceProfile) -> Result<ManagedProcess> {
+pub(super) async fn spawn_cli(name: &str, profile: &DeviceProfile) -> Result<ManagedProcess> {
     let binary = super::client_binary_path()?;
     ManagedProcess::spawn(
         name,
@@ -842,7 +842,7 @@ async fn spawn_cli(name: &str, profile: &DeviceProfile) -> Result<ManagedProcess
     .await
 }
 
-async fn wait_for_process_exit(
+pub(super) async fn wait_for_process_exit(
     process: &mut ManagedProcess,
     budget: Duration,
 ) -> Result<std::process::ExitStatus> {
@@ -860,7 +860,7 @@ async fn wait_for_process_exit(
     }
 }
 
-async fn wait_for_terminal_diagnostic(process: &ManagedProcess) -> bool {
+pub(super) async fn wait_for_terminal_diagnostic(process: &ManagedProcess) -> bool {
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
         let output_bytes = process.stdout();
@@ -875,7 +875,7 @@ async fn wait_for_terminal_diagnostic(process: &ManagedProcess) -> bool {
     }
 }
 
-fn is_owner_busy_diagnostic(line: &str) -> bool {
+pub(super) fn is_owner_busy_diagnostic(line: &str) -> bool {
     if line.len() > 8 * 1024 {
         return false;
     }
@@ -910,7 +910,7 @@ async fn shutdown_process(slot: &mut Option<ManagedProcess>, label: &str) -> Res
     Ok(())
 }
 
-async fn wait_for_consumer_stream(
+pub(super) async fn wait_for_consumer_stream(
     consumer_addr: SocketAddr,
     server_ca_der: &[u8],
     token: &str,
@@ -929,7 +929,7 @@ async fn wait_for_consumer_stream(
     }
 }
 
-async fn wait_for_owner(
+pub(super) async fn wait_for_owner(
     cluster: &ProductionCluster,
     tenant_id: Uuid,
     device_id: Uuid,
@@ -958,7 +958,7 @@ async fn wait_for_owner(
     }
 }
 
-async fn owner_stayed_same(
+pub(super) async fn owner_stayed_same(
     cluster: &ProductionCluster,
     tenant_id: Uuid,
     device_id: Uuid,
@@ -993,6 +993,19 @@ async fn control_conflict_counts(cluster: &ProductionCluster) -> Result<BTreeMap
         );
     }
     Ok(counts)
+}
+
+/// Sum the redacted control-registration conflict counters across the three
+/// relays.  Forwarded control can be rejected on either ingress relay or on
+/// the existing owner's relay, so the cluster-wide total is the authoritative
+/// figure; a reconnect storm shows up as a total above one.
+pub(super) async fn control_conflict_count_total(cluster: &ProductionCluster) -> Result<u64> {
+    let mut total = 0u64;
+    for relay in &cluster.relays {
+        let snapshot = relay.snapshot().await?;
+        total = total.saturating_add(snapshot.control_registration_conflicts);
+    }
+    Ok(total)
 }
 
 async fn wait_for_control_conflict_delta(
@@ -1034,7 +1047,7 @@ async fn wait_for_control_conflict_delta(
     }
 }
 
-fn device_addr(cluster: &ProductionCluster, node_id: &str) -> Result<SocketAddr> {
+pub(super) fn device_addr(cluster: &ProductionCluster, node_id: &str) -> Result<SocketAddr> {
     cluster
         .relay(node_id)?
         .running
@@ -1043,7 +1056,7 @@ fn device_addr(cluster: &ProductionCluster, node_id: &str) -> Result<SocketAddr>
         .ok_or_else(|| HarnessError::Process(format!("production relay {node_id} is not running")))
 }
 
-fn consumer_addr_other_than(
+pub(super) fn consumer_addr_other_than(
     cluster: &ProductionCluster,
     excluded_node: &str,
 ) -> Result<SocketAddr> {

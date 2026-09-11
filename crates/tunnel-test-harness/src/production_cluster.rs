@@ -140,6 +140,11 @@ pub use owner_lease_expiry::{
     OwnerLeaseExpiryEvidence, validate_owner_lease_expiry_evidence,
     verify as verify_owner_lease_expiry,
 };
+mod tenant_race;
+pub use tenant_race::{
+    ConcurrentTenantIsolationEvidence, OwnerRaceEvidence,
+    validate_concurrent_tenant_isolation_evidence, validate_owner_race_evidence,
+};
 mod c10;
 pub use c10::{
     C10ActualPathEvidence, validate_c10_actual_path_evidence, verify as verify_c10_actual_path,
@@ -190,7 +195,10 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 /// for this long is cancelled by the transport, so the fixture keeps it short
 /// and names it so gates can assert the bound rather than rediscover it.
 pub(crate) const PRODUCTION_PEER_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
-const SCENARIO_TIMEOUT: Duration = Duration::from_secs(120);
+// The production gate now also runs the duplicate exact-scope owner race with
+// three real CLI processes while the same-identifier tenant stays online, so
+// the bounded scenario budget covers both phases.
+const SCENARIO_TIMEOUT: Duration = Duration::from_secs(240);
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
 const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
 const REDIS_PARTITION_OPERATION_TIMEOUT: Duration = Duration::from_secs(10);
@@ -243,8 +251,18 @@ pub struct ProductionClusterEvidence {
     /// Whether expired OIDC and an unauthorized grant were rejected at ingress.
     pub authorization_negatives_rejected: bool,
     /// Whether both tenants used the same device/service UUIDs concurrently,
-    /// with distinct device certificates and response canaries.
+    /// with distinct device certificates and response canaries.  This flag is
+    /// now derived from [`Self::tenant_isolation`] rather than asserted on its
+    /// own, so an offline tenant-B device or a `503` accepted in place of a
+    /// routed canary cannot satisfy it.
     pub same_uuid_tenant_isolation_verified: bool,
+    /// Structured evidence that both same-identifier tenant sessions were
+    /// simultaneously online with exact, distinct canaries, separated owners
+    /// and the full rotation bound each.
+    pub tenant_isolation: ConcurrentTenantIsolationEvidence,
+    /// Structured evidence from the duplicate exact-scope owner race that ran
+    /// while the other tenant's same-identifier session stayed online.
+    pub owner_race: OwnerRaceEvidence,
     /// Whether a competing owner and stale release were fenced by Redis.
     pub stale_owner_rejected: bool,
     /// Whether removing the dynamic signed-peer pin set blocked H3 routing.
@@ -1088,6 +1106,16 @@ fn validate_production_evidence(evidence: &ProductionClusterEvidence) -> Result<
             evidence.elapsed_seconds
         )));
     }
+    // The structured same-identifier isolation and duplicate-owner race
+    // contracts are mandatory parts of this gate, not optional extras.
+    validate_concurrent_tenant_isolation_evidence(&evidence.tenant_isolation, ROTATION_COUNT)?;
+    validate_owner_race_evidence(&evidence.owner_race)?;
+    // The legacy summary flag must agree with the structured evidence.
+    if !evidence.same_uuid_tenant_isolation_verified {
+        return Err(HarnessError::Process(
+            "production M7 same_uuid_tenant_isolation_verified disagrees with its structured evidence".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -1139,6 +1167,17 @@ pub fn validate_redis_partition_evidence(evidence: &RedisPartitionEvidence) -> R
         ));
     }
     Ok(())
+}
+
+/// Identifiers and exact canaries for the cross-tenant leak probe.  The device
+/// and service UUIDs are deliberately one shared pair.
+struct CrossTenantProbe<'a> {
+    device_id: Uuid,
+    service_id: Uuid,
+    tenant_a_token: &'a str,
+    tenant_b_token: &'a str,
+    tenant_a_canary: &'a [u8],
+    tenant_b_canary: &'a [u8],
 }
 
 struct KeyRevocationProbe<'a> {
@@ -2022,6 +2061,21 @@ impl ProductionCluster {
             HarnessError::InvalidInput(format!("production client config: {error}"))
         })?;
 
+        // Seed only tenant A's durable owner epoch above the JavaScript-safe
+        // integer boundary, before any owner exists, so every later claim in
+        // this run — including the duplicate exact-scope race below — proves
+        // the epoch is retained as a full 64-bit value.  The guarded Lua
+        // operation refuses anything but this run's fresh fixture namespace
+        // with a zero epoch and no owner, and leaves catalog generation
+        // metadata untouched.
+        let high_epoch_setup =
+            ownership::seed_high_owner_epoch(self, harness, device.tenant_id, device.id).await?;
+        if !high_epoch_setup.catalog_generation_preserved {
+            return Err(HarnessError::Process(
+                "production M7 high-epoch seed mutated catalog generation metadata".into(),
+            ));
+        }
+
         let started = Instant::now();
         let mut client = timeout(
             STARTUP_TIMEOUT,
@@ -2098,6 +2152,148 @@ impl ProductionCluster {
             .map_err(|error| HarnessError::Http(format!("maximum routed canary: {error}")))?;
         ordered_records += 1;
 
+        // Bring the tenant-B device online BEFORE tenant A's rotation loop so
+        // both same-identifier sessions are genuinely live at the same time,
+        // and so each tenant completes the full real rotation bound while the
+        // other is connected.  The fixture deliberately gives both devices the
+        // same device UUID and service UUID; only their enrolled certificates,
+        // tenant scopes and canaries differ.  Tenant B's dedicated fanout
+        // routes control to relay-b and active data to relay-c, so this also
+        // exercises a second owner and a second H3 hop.
+        let device_b = harness.topology.devices_b.first().ok_or_else(|| {
+            HarnessError::InvalidInput("tenant B has no production device".into())
+        })?;
+        let service_b_id = *harness
+            .topology
+            .service_ids
+            .get(&device_b.id)
+            .ok_or_else(|| {
+                HarnessError::InvalidInput("tenant B device has no echo service".into())
+            })?;
+        let shared_device_identifier = device_b.id == device.id;
+        let shared_service_identifier = service_b_id == service_id;
+        if !shared_device_identifier || !shared_service_identifier {
+            return Err(HarnessError::InvalidInput(
+                "tenant-isolation fixture did not reuse device/service UUIDs".into(),
+            ));
+        }
+        let distinct_tenant_scopes = device_b.tenant_id != device.tenant_id;
+        // Distinct enrolled credentials: the same device UUID in two tenants
+        // must still be two different certificates and two different keys.
+        let distinct_device_credentials = device_b.certificate.certificate_pem
+            != device.certificate.certificate_pem
+            && device_b.certificate.private_key_pem != device.certificate.private_key_pem;
+        let tenant_b_canary = format!("m7-production:tenant-b:{}", device_b.id);
+        let distinct_canaries = tenant_b_canary != canary;
+        let profile_b_directory = tempdir().map_err(HarnessError::Io)?;
+        let mut profile_b = write_device_profile(
+            profile_b_directory.path(),
+            device_b.id,
+            service_b_id,
+            &tenant_b_canary,
+            self.tenant_b_fanout.local_addr(),
+            &device_b.certificate.certificate_pem,
+            &device_b.certificate.private_key_pem,
+            &harness.pki.server_ca.certificate_pem,
+        )?;
+        profile_b.config.rotation = ROTATION;
+        profile_b.config.validate().map_err(|error| {
+            HarnessError::InvalidInput(format!("tenant-B client config: {error}"))
+        })?;
+        let mut client_b = timeout(
+            STARTUP_TIMEOUT,
+            tunnel_client::connect(ConnectOptions {
+                config: profile_b.config.clone(),
+                cancellation: CancellationToken::new(),
+                profile: TransportProfile::M2,
+            }),
+        )
+        .await
+        .map_err(|_| HarnessError::Timeout("tenant-B connector startup timed out".into()))?
+        .map_err(|error| HarnessError::Process(format!("tenant-B connector failed: {error}")))?;
+        let session_b = timeout(STARTUP_TIMEOUT, client_b.wait_ready())
+            .await
+            .map_err(|_| HarnessError::Timeout("tenant-B connector readiness timed out".into()))?
+            .map_err(|error| {
+                HarnessError::Process(format!("tenant-B connector not ready: {error}"))
+            })?;
+        if session_b.generation == 0 {
+            let _ = client_b.stop().await;
+            return Err(HarnessError::Process(
+                "tenant-B connector reported an invalid initial generation".into(),
+            ));
+        }
+        let owner_b = self
+            .catalog
+            .current_owner(device_b.tenant_id, device_b.id, Utc::now())
+            .await
+            .map_err(|error| HarnessError::Redis(format!("reading tenant-B owner: {error}")))?
+            .ok_or_else(|| {
+                HarnessError::Process("tenant-B device did not claim an owner".into())
+            })?;
+        if owner_b.token.node_id != "relay-b" || owner_b.token.tenant_id != device_b.tenant_id {
+            let _ = client_b.stop().await;
+            return Err(HarnessError::Process(format!(
+                "tenant-B owner landed on {} instead of relay-b",
+                owner_b.token.node_id
+            )));
+        }
+        // Owner and node separation per tenant: two live complete owner tokens
+        // for one device identifier, on different relay nodes, in different
+        // tenant scopes, with different session identities.
+        let distinct_owner_nodes = owner_b.token.node_id != owner.token.node_id;
+        let distinct_owner_sessions = owner_b.token.session_id != owner.token.session_id
+            && owner_b.token.tenant_id != owner.token.tenant_id;
+        let mut concurrent_owner_samples = self
+            .sample_concurrent_owners(device, device_b, &owner, &owner_b)
+            .await?;
+        let mut tenant_a_exact_canaries = 0usize;
+        let mut tenant_b_exact_canaries = 0usize;
+        let token_b = harness.oidc.issue_with(
+            &harness.topology.consumers_b[0].name,
+            OidcTokenOptions {
+                expires_in: Duration::from_secs(90),
+                ..OidcTokenOptions::default()
+            },
+        )?;
+        let mut stream_b_tenant_b = open_consumer_stream(
+            relay_c_consumer_addr,
+            &harness.pki.server_ca.certificate_der,
+            &token_b,
+            device_b.id,
+            service_b_id,
+        )
+        .await
+        .map_err(connect_failure_to_harness)?;
+        stream_b_tenant_b
+            .round_trip(b"production-record-tenant-b", tenant_b_canary.as_bytes())
+            .await?;
+        ordered_records += 1;
+        tenant_b_exact_canaries += 1;
+        // Tenant A's live stream must still return the tenant-A canary while
+        // tenant B holds the identical device and service identifiers.
+        stream_b
+            .round_trip(b"production-record-tenant-a-with-b", canary.as_bytes())
+            .await?;
+        ordered_records += 1;
+        tenant_a_exact_canaries += 1;
+        // Neither route may emit the other tenant's canary.  Each probe uses
+        // its own throwaway stream so the live streams stay untouched.
+        let cross_tenant_canary_absent = self
+            .cross_tenant_canary_absent(
+                harness,
+                relay_b_consumer_addr,
+                relay_c_consumer_addr,
+                CrossTenantProbe {
+                    device_id: device.id,
+                    service_id,
+                    tenant_a_token: &token,
+                    tenant_b_token: &token_b,
+                    tenant_a_canary: canary.as_bytes(),
+                    tenant_b_canary: tenant_b_canary.as_bytes(),
+                },
+            )
+            .await?;
         let initial_status = client.status_snapshot();
         let original_control_local_addr = initial_status.control_local_addr.ok_or_else(|| {
             HarnessError::Process(
@@ -2129,6 +2325,22 @@ impl ProductionCluster {
             let payload = format!("production-record-{rotation}").into_bytes();
             stream_b.round_trip(&payload, canary.as_bytes()).await?;
             ordered_records += 1;
+            tenant_a_exact_canaries += 1;
+            // Exercise tenant B's stream on every tenant-A rotation.  This
+            // keeps both tenants' canaries exact while both sessions are live
+            // across the whole real rotation schedule, and keeps the pooled
+            // consumer stream inside `PRODUCTION_PEER_IDLE_TIMEOUT` rather
+            // than letting the transport cancel it between assertions.
+            let payload_b = format!("production-record-tenant-b-{rotation}").into_bytes();
+            stream_b_tenant_b
+                .round_trip(&payload_b, tenant_b_canary.as_bytes())
+                .await?;
+            ordered_records += 1;
+            tenant_b_exact_canaries += 1;
+            concurrent_owner_samples = concurrent_owner_samples.saturating_add(
+                self.sample_concurrent_owners(device, device_b, &owner, &owner_b)
+                    .await?,
+            );
             let owner_snapshot = self.relay("relay-a")?.snapshot().await?;
             assert_committed_rotation(
                 &owner_snapshot,
@@ -2165,117 +2377,54 @@ impl ProductionCluster {
         ordered_records += 1;
         stream_c.close().await?;
 
-        // Keep a tenant-B device live while tenant-A remains connected.  The
-        // fixture deliberately gives both devices the same UUID and service
-        // UUID, but their certificates and canaries remain distinct.  Its
-        // dedicated fanout routes control to relay-b and active data to
-        // relay-c, so this also exercises a second owner and a second H3 hop
-        // without consuming tenant-A's deterministic rotation schedule.
-        let device_b = harness.topology.devices_b.first().ok_or_else(|| {
-            HarnessError::InvalidInput("tenant B has no production device".into())
-        })?;
-        let service_b_id = *harness
-            .topology
-            .service_ids
-            .get(&device_b.id)
-            .ok_or_else(|| {
-                HarnessError::InvalidInput("tenant B device has no echo service".into())
-            })?;
-        if service_b_id != service_id || device_b.id != device.id {
-            return Err(HarnessError::InvalidInput(
-                "tenant-isolation fixture did not reuse device/service UUIDs".into(),
-            ));
-        }
-        let tenant_b_canary = format!("m7-production:tenant-b:{}", device_b.id);
-        let profile_b_directory = tempdir().map_err(HarnessError::Io)?;
-        let mut profile_b = write_device_profile(
-            profile_b_directory.path(),
-            device_b.id,
-            service_b_id,
-            &tenant_b_canary,
-            self.tenant_b_fanout.local_addr(),
-            &device_b.certificate.certificate_pem,
-            &device_b.certificate.private_key_pem,
-            &harness.pki.server_ca.certificate_pem,
-        )?;
-        profile_b.config.rotation = ROTATION;
-        profile_b.config.validate().map_err(|error| {
-            HarnessError::InvalidInput(format!("tenant-B client config: {error}"))
-        })?;
-        let mut client_b = timeout(
-            STARTUP_TIMEOUT,
-            tunnel_client::connect(ConnectOptions {
-                config: profile_b.config.clone(),
-                cancellation: CancellationToken::new(),
-                profile: TransportProfile::M2,
-            }),
-        )
-        .await
-        .map_err(|_| HarnessError::Timeout("tenant-B connector startup timed out".into()))?
-        .map_err(|error| HarnessError::Process(format!("tenant-B connector failed: {error}")))?;
-        let session_b = timeout(STARTUP_TIMEOUT, client_b.wait_ready())
-            .await
-            .map_err(|_| HarnessError::Timeout("tenant-B connector readiness timed out".into()))?
-            .map_err(|error| {
-                HarnessError::Process(format!("tenant-B connector not ready: {error}"))
-            })?;
-        let owner_b = self
-            .catalog
-            .current_owner(device_b.tenant_id, device_b.id, Utc::now())
-            .await
-            .map_err(|error| HarnessError::Redis(format!("reading tenant-B owner: {error}")))?
-            .ok_or_else(|| {
-                HarnessError::Process("tenant-B device did not claim an owner".into())
-            })?;
-        if owner_b.token.node_id != "relay-b" || owner_b.token.tenant_id != device_b.tenant_id {
-            let _ = client_b.stop().await;
-            return Err(HarnessError::Process(format!(
-                "tenant-B owner landed on {} instead of relay-b",
-                owner_b.token.node_id
-            )));
-        }
-        if session_b.generation == 0 {
-            let _ = client_b.stop().await;
-            return Err(HarnessError::Process(
-                "tenant-B connector reported an invalid initial generation".into(),
-            ));
-        }
-        let token_b = harness.oidc.issue_with(
-            &harness.topology.consumers_b[0].name,
-            OidcTokenOptions {
-                expires_in: Duration::from_secs(90),
-                ..OidcTokenOptions::default()
-            },
-        )?;
-        let mut stream_b_tenant_b = open_consumer_stream(
-            relay_c_consumer_addr,
-            &harness.pki.server_ca.certificate_der,
-            &token_b,
-            device_b.id,
-            service_b_id,
-        )
-        .await
-        .map_err(connect_failure_to_harness)?;
+        // Tenant B stayed online for tenant A's whole rotation schedule, so it
+        // must have completed the same real rotation bound on its own owner
+        // relay.  This is the "three rotations per tenant" assertion: a tenant
+        // that merely connected and echoed once cannot satisfy it.
+        let tenant_b_rotations = self
+            .wait_for_tenant_rotations(&mut client_b, &owner_b.token.node_id, ROTATION_COUNT)
+            .await?;
+        // Both tenants exchange their exact canaries again after both have
+        // rotated, and both owners are sampled live once more.
         stream_b_tenant_b
-            .round_trip(b"production-record-tenant-b", tenant_b_canary.as_bytes())
+            .round_trip(
+                b"production-record-tenant-b-rotated",
+                tenant_b_canary.as_bytes(),
+            )
             .await?;
         ordered_records += 1;
-        // The original tenant-A stream remains live and must still return the
-        // tenant-A canary after tenant B's same-UUID exchange succeeds.
+        tenant_b_exact_canaries += 1;
         stream_b
             .round_trip(b"production-record-tenant-a-after-b", canary.as_bytes())
             .await?;
         ordered_records += 1;
+        tenant_a_exact_canaries += 1;
+        concurrent_owner_samples = concurrent_owner_samples.saturating_add(
+            self.sample_concurrent_owners(device, device_b, &owner, &owner_b)
+                .await?,
+        );
+        // Retire tenant B's pooled consumer stream here.  Tenant B's device
+        // session stays online through the later negative, revocation and race
+        // phases, but an application stream held idle across them would be
+        // cancelled by the peer idle timeout; the later phases open fresh
+        // tenant-B streams where they need one.
         stream_b_tenant_b.close().await?;
-        let tenant_b_status = client_b.status_snapshot();
-        timeout(STARTUP_TIMEOUT, client_b.stop())
-            .await
-            .map_err(|_| HarnessError::Timeout("tenant-B connector shutdown timed out".into()))?
-            .map_err(|error| {
-                HarnessError::Process(format!("tenant-B connector shutdown: {error}"))
-            })?;
-        self.wait_for_no_owner(device_b.tenant_id, device_b.id)
-            .await?;
+        let tenant_isolation = ConcurrentTenantIsolationEvidence {
+            shared_device_identifier,
+            shared_service_identifier,
+            distinct_tenant_scopes,
+            distinct_device_credentials,
+            concurrent_owner_samples,
+            distinct_owner_nodes,
+            distinct_owner_sessions,
+            tenant_a_exact_canaries,
+            tenant_b_exact_canaries,
+            distinct_canaries,
+            cross_tenant_canary_absent,
+            tenant_a_rotations: client.status_snapshot().rotations_completed,
+            tenant_b_rotations,
+        };
+        validate_concurrent_tenant_isolation_evidence(&tenant_isolation, ROTATION_COUNT)?;
         let same_uuid_tenant_isolation_verified = true;
 
         let authorization_negatives_rejected =
@@ -2304,6 +2453,63 @@ impl ProductionCluster {
             })?;
         self.wait_for_no_owner(device.tenant_id, device.id).await?;
         wait_for_fanout_drained(&self.device_fanout, "library device").await?;
+
+        // Tenant A's scope is now free, while tenant B's session at the
+        // identical device and service UUIDs is still online with its
+        // unchanged owner.  Race two real CLI processes for tenant A's exact
+        // owner scope here, so the duplicate-owner property and the
+        // same-identifier isolation property are shown to hold together: a
+        // scope key that lost its tenant qualifier would evict the surviving
+        // tenant instead of leaving it untouched.  The contenders connect to
+        // relay device listeners directly rather than through tenant A's
+        // fanout, so the fanout socket accounting below is unchanged.
+        let race_sibling = harness.topology.devices_a.get(1).ok_or_else(|| {
+            HarnessError::InvalidInput("tenant A has no sibling race device".into())
+        })?;
+        let race_sibling_service = *harness
+            .topology
+            .service_ids
+            .get(&race_sibling.id)
+            .ok_or_else(|| {
+                HarnessError::InvalidInput("tenant A sibling has no echo service".into())
+            })?;
+        let race_sibling_canary = format!("m7-production-race-sibling:{}", race_sibling.id);
+        let owner_race = tenant_race::race_exact_owner_scope(
+            self,
+            harness,
+            tenant_race::OwnerRaceInputs {
+                contested: device,
+                contested_service: service_id,
+                contested_canary: &canary,
+                sibling: race_sibling,
+                sibling_service: race_sibling_service,
+                sibling_canary: &race_sibling_canary,
+                same_identifier_owner: &owner_b,
+                same_identifier_service: service_b_id,
+                same_identifier_canary: &tenant_b_canary,
+                same_identifier_token: &token_b,
+                token: &token,
+            },
+        )
+        .await?;
+        validate_owner_race_evidence(&owner_race)?;
+
+        // Tenant B's device session stayed online for the whole race; its
+        // post-race canary is asserted inside the race itself through a fresh
+        // public route, because a pooled consumer stream left idle for the
+        // race's duration would be cancelled by the peer idle timeout rather
+        // than proving anything about isolation.  Retire tenant B only now:
+        // the owner-death phase below shuts a relay down.
+        let tenant_b_status = client_b.status_snapshot();
+        timeout(STARTUP_TIMEOUT, client_b.stop())
+            .await
+            .map_err(|_| HarnessError::Timeout("tenant-B connector shutdown timed out".into()))?
+            .map_err(|error| {
+                HarnessError::Process(format!("tenant-B connector shutdown: {error}"))
+            })?;
+        self.wait_for_no_owner(device_b.tenant_id, device_b.id)
+            .await?;
+
         let (cli_process, mut cli_stream) = start_cli_smoke(
             harness,
             self.device_fanout.local_addr(),
@@ -2432,6 +2638,8 @@ impl ProductionCluster {
             ordered_records,
             authorization_negatives_rejected,
             same_uuid_tenant_isolation_verified,
+            tenant_isolation,
+            owner_race,
             stale_owner_rejected,
             key_revocation_rejected,
             owner_death_interrupted,
@@ -3239,6 +3447,130 @@ impl ProductionCluster {
                 )));
             }
             sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Read both same-identifier tenants' owners at one instant and count the
+    /// sample only when both are simultaneously live, scope-correct and
+    /// unchanged.  An offline tenant-B device cannot produce a sample.
+    async fn sample_concurrent_owners(
+        &self,
+        device_a: &crate::fixture::DeviceFixture,
+        device_b: &crate::fixture::DeviceFixture,
+        expected_a: &tunnel_catalog::OwnerClaim,
+        expected_b: &tunnel_catalog::OwnerClaim,
+    ) -> Result<usize> {
+        let now = Utc::now();
+        let live_a = self
+            .catalog
+            .current_owner(device_a.tenant_id, device_a.id, now)
+            .await
+            .map_err(|error| {
+                HarnessError::Redis(format!("sampling tenant-A concurrent owner: {error}"))
+            })?;
+        let live_b = self
+            .catalog
+            .current_owner(device_b.tenant_id, device_b.id, now)
+            .await
+            .map_err(|error| {
+                HarnessError::Redis(format!("sampling tenant-B concurrent owner: {error}"))
+            })?;
+        let (Some(live_a), Some(live_b)) = (live_a, live_b) else {
+            return Err(HarnessError::Process(
+                "same-identifier tenants were not both live at one owner sample".into(),
+            ));
+        };
+        if live_a.token != expected_a.token || live_b.token != expected_b.token {
+            return Err(HarnessError::Process(
+                "a same-identifier tenant's complete owner token changed while both were live"
+                    .into(),
+            ));
+        }
+        if live_a.token.tenant_id == live_b.token.tenant_id
+            || live_a.token.device_id != live_b.token.device_id
+        {
+            return Err(HarnessError::Process(
+                "concurrent owner sample did not hold one device identifier in two tenant scopes"
+                    .into(),
+            ));
+        }
+        Ok(1)
+    }
+
+    /// Require that neither same-identifier tenant's route ever returns the
+    /// other tenant's canary.  Each direction uses a throwaway stream so the
+    /// live application streams are not disturbed.
+    async fn cross_tenant_canary_absent(
+        &self,
+        harness: &RunningHarness,
+        tenant_a_ingress: SocketAddr,
+        tenant_b_ingress: SocketAddr,
+        probe: CrossTenantProbe<'_>,
+    ) -> Result<bool> {
+        let mut tenant_a_stream = open_consumer_stream(
+            tenant_a_ingress,
+            &harness.pki.server_ca.certificate_der,
+            probe.tenant_a_token,
+            probe.device_id,
+            probe.service_id,
+        )
+        .await
+        .map_err(connect_failure_to_harness)?;
+        // Expecting the OTHER tenant's canary on this route must fail.
+        let tenant_a_leaked = tenant_a_stream
+            .round_trip(b"production-cross-tenant-a", probe.tenant_b_canary)
+            .await
+            .is_ok();
+        let _ = tenant_a_stream.close().await;
+        let mut tenant_b_stream = open_consumer_stream(
+            tenant_b_ingress,
+            &harness.pki.server_ca.certificate_der,
+            probe.tenant_b_token,
+            probe.device_id,
+            probe.service_id,
+        )
+        .await
+        .map_err(connect_failure_to_harness)?;
+        let tenant_b_leaked = tenant_b_stream
+            .round_trip(b"production-cross-tenant-b", probe.tenant_a_canary)
+            .await
+            .is_ok();
+        let _ = tenant_b_stream.close().await;
+        Ok(!tenant_a_leaked && !tenant_b_leaked)
+    }
+
+    /// Wait until one tenant's connector and its own owner relay both report at
+    /// least `required` committed scheduled replacement generations, with no
+    /// candidate generation left open and the bounded socket count respected.
+    async fn wait_for_tenant_rotations(
+        &self,
+        client: &mut ConnectionHandle,
+        owner_node: &str,
+        required: u64,
+    ) -> Result<u64> {
+        let deadline = Instant::now() + Duration::from_secs(45);
+        loop {
+            let status = client.status_snapshot();
+            if status.rotations_completed >= required {
+                let snapshot = self.relay(owner_node)?.snapshot().await?;
+                let session = snapshot.sessions.into_iter().find(|session| {
+                    session.session_id == status.session_id.as_deref().unwrap_or_default()
+                });
+                if let Some(session) = session
+                    && session.rotations_completed >= required
+                    && session.candidate_generation.is_none()
+                    && session.sockets <= 2
+                {
+                    return Ok(session.rotations_completed);
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(HarnessError::Timeout(format!(
+                    "tenant session on {owner_node} reported {} of {required} committed rotations before its deadline",
+                    status.rotations_completed
+                )));
+            }
+            sleep(Duration::from_millis(50)).await;
         }
     }
 
@@ -5471,7 +5803,8 @@ fn connect_failure_to_harness(error: StreamConnectFailure) -> HarnessError {
 #[cfg(test)]
 mod tests {
     use super::{
-        ProcessPauseProbeOutcome, ProductionClusterEvidence, RedisPartitionEvidence,
+        ConcurrentTenantIsolationEvidence, OwnerRaceEvidence, ProcessPauseProbeOutcome,
+        ProductionClusterEvidence, ROTATION_COUNT, RedisPartitionEvidence,
         is_explicit_no_owner_response, is_partition_admission_response, is_peer_recovery_response,
         redacted_admission_failure, validate_production_evidence,
         validate_redis_partition_evidence,
@@ -5494,11 +5827,133 @@ mod tests {
             ordered_records: 4,
             authorization_negatives_rejected: true,
             same_uuid_tenant_isolation_verified: true,
+            tenant_isolation: valid_tenant_isolation(),
+            owner_race: valid_owner_race(),
             stale_owner_rejected: true,
             key_revocation_rejected: true,
             owner_death_interrupted: true,
             elapsed_seconds: 9,
         }
+    }
+
+    fn valid_tenant_isolation() -> ConcurrentTenantIsolationEvidence {
+        ConcurrentTenantIsolationEvidence {
+            shared_device_identifier: true,
+            shared_service_identifier: true,
+            distinct_tenant_scopes: true,
+            distinct_device_credentials: true,
+            concurrent_owner_samples: 2,
+            distinct_owner_nodes: true,
+            distinct_owner_sessions: true,
+            tenant_a_exact_canaries: 3,
+            tenant_b_exact_canaries: 3,
+            distinct_canaries: true,
+            cross_tenant_canary_absent: true,
+            tenant_a_rotations: ROTATION_COUNT,
+            tenant_b_rotations: ROTATION_COUNT,
+        }
+    }
+
+    fn valid_owner_race() -> OwnerRaceEvidence {
+        OwnerRaceEvidence {
+            concurrent_launches: true,
+            one_atomic_winner: true,
+            control_conflict_delta: 1,
+            control_conflict_delta_after_settle: 1,
+            loser_terminal_owner_busy: true,
+            loser_exit_non_success: true,
+            winner_token_unchanged: true,
+            winner_canary_preserved: true,
+            tenant_sibling_preserved: true,
+            same_identifier_tenant_owner_unchanged: true,
+            same_identifier_tenant_canary_preserved: true,
+            winner_epoch: (1_u64 << 53) + 1,
+            successor_epoch: (1_u64 << 53) + 2,
+            successor_higher_epoch: true,
+            epochs_above_js_safe_bound: true,
+            stale_cleanup_rejected: true,
+            successor_canary: true,
+            elapsed_ms: 1,
+        }
+    }
+
+    #[test]
+    fn valid_production_evidence_is_accepted() {
+        validate_production_evidence(&valid_evidence())
+            .expect("baseline production evidence must pass the extended validator");
+    }
+
+    /// The extended gate must refuse a run whose same-identifier isolation or
+    /// duplicate-owner race evidence is weakened, even when every pre-existing
+    /// production flag still passes.  An offline tenant-B device shows up as a
+    /// missing concurrent owner sample, and an accepted `503` in place of a
+    /// routed canary as a missing exact canary.
+    #[test]
+    fn production_evidence_rejects_weakened_isolation_and_race_subgates() {
+        // Each label is the evidence field the bounded diagnostic must name, so
+        // the mutation proves the rejection came from that exact assertion.
+        // The trailing comment records the production failure each one stands
+        // for.
+        type Mutate = (&'static str, fn(&mut ProductionClusterEvidence));
+        let mutations: [Mutate; 10] = [
+            // An offline tenant-B device.
+            ("concurrent_owner_samples", |e| {
+                e.tenant_isolation.concurrent_owner_samples = 1
+            }),
+            // A 503 accepted in place of tenant A's routed canary.
+            ("tenant_a_exact_canaries", |e| {
+                e.tenant_isolation.tenant_a_exact_canaries = 1
+            }),
+            // A 503 accepted in place of tenant B's routed canary.
+            ("tenant_b_exact_canaries", |e| {
+                e.tenant_isolation.tenant_b_exact_canaries = 1
+            }),
+            // Tenant B connected but never completed the rotation bound.
+            ("tenant_b_rotations", |e| {
+                e.tenant_isolation.tenant_b_rotations = ROTATION_COUNT - 1
+            }),
+            // One tenant's route emitted the other tenant's canary.
+            ("cross_tenant_canary_absent", |e| {
+                e.tenant_isolation.cross_tenant_canary_absent = false
+            }),
+            // Both owners landed on one relay, so node separation is unproven.
+            ("distinct_owner_nodes", |e| {
+                e.tenant_isolation.distinct_owner_nodes = false
+            }),
+            // A generic transport failure instead of the terminal OWNER_BUSY.
+            ("loser_terminal_owner_busy", |e| {
+                e.owner_race.loser_terminal_owner_busy = false
+            }),
+            // A reconnect storm after the loser terminated.
+            ("control_conflict_delta_after_settle", |e| {
+                e.owner_race.control_conflict_delta_after_settle = 2
+            }),
+            // The race evicted the same-identifier tenant's owner.
+            ("same_identifier_tenant_owner_unchanged", |e| {
+                e.owner_race.same_identifier_tenant_owner_unchanged = false
+            }),
+            // A stale predecessor cleanup was accepted.
+            ("stale_cleanup_rejected", |e| {
+                e.owner_race.stale_cleanup_rejected = false
+            }),
+        ];
+        for (name, mutate) in mutations {
+            let mut evidence = valid_evidence();
+            mutate(&mut evidence);
+            assert_rejected(validate_production_evidence(&evidence), name);
+        }
+    }
+
+    /// The legacy summary flag can no longer be the only isolation assertion:
+    /// it must agree with the structured evidence.
+    #[test]
+    fn production_evidence_rejects_summary_flag_disagreeing_with_structure() {
+        let mut evidence = valid_evidence();
+        evidence.same_uuid_tenant_isolation_verified = false;
+        assert_rejected(
+            validate_production_evidence(&evidence),
+            "same_uuid_tenant_isolation_verified",
+        );
     }
 
     #[test]

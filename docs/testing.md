@@ -51,7 +51,56 @@ cargo run -p tunnel-test-harness --locked -- verify-m7-remote-body-limits
 
 The transport command exercises real mTLS/H3 fault cases. The cluster command
 uses a synthetic owner callback. The production command uses real relay actors,
-CLI/device WebSockets and public consumers across three relays. The Redis
+CLI/device WebSockets and public consumers across three relays.
+
+### Concurrent same-identifier tenants and the duplicate-owner race
+
+`verify-m7-production` keeps both tenants' device sessions online at the
+identical device and service UUIDs for the whole run, and prints two extra
+payload-free evidence lines beside its summary line. Neither line records a
+payload, credential or canary byte; every field is a count, a boolean or an
+epoch number.
+
+`M7 production concurrent tenant isolation` reports that both tenants enrolled
+the same device and service UUID with distinct tenant scopes, certificates and
+keys; how many instants both tenants were sampled holding a live complete owner
+token at once (`concurrent_owner_samples`); that those owners sat on different
+relay nodes with different session identities; how many exact canary matches
+each tenant made while the other was online; that the canaries differ; that
+neither route ever emitted the other tenant's canary
+(`cross_tenant_canary_absent`, asserted by expecting the wrong canary on a
+throwaway stream in each direction and requiring that exchange to fail); and
+the committed scheduled replacement generations each tenant reached. An offline
+tenant-B device shows up as a missing concurrent owner sample, and a `503`
+accepted in place of a routed canary as a missing exact canary; the validator
+rejects both, so neither can satisfy the gate.
+
+`M7 production duplicate owner race` reports the race of two real CLI processes
+for one tenant's exact owner scope, run while the other tenant's
+same-identifier session is still online. It records that both children were
+spawned before any owner observation; that exactly one atomic winner took the
+scope; the cluster-wide relay control-registration conflict delta, which must be
+exactly one and must still be exactly one after a further settle window (a
+reconnect storm raises it); that the loser emitted the exact non-retryable
+`OWNER_BUSY` terminal diagnostic and exited non-success; that the winner's token
+and canary, the tenant's independent sibling, and the same-identifier tenant's
+owner and canary all survived; the winner and successor epochs, which stay above
+the JavaScript-safe integer bound because the run seeds tenant A's durable epoch
+there before any owner exists; and that a compare-release with the superseded
+token was refused without disturbing the successor or the other tenant.
+
+Composing the two properties in one run is the point: a scope key that lost its
+tenant qualifier would evict the surviving same-identifier tenant during the
+race rather than leave it untouched.
+
+Two timing notes for anyone extending this gate. A pooled consumer stream is
+cancelled after the fixture's 10-second peer HTTP/3 idle timeout, so an
+application stream cannot be held idle across the race phase; tenant B's
+stream is exercised on every tenant-A rotation and retired before the later
+phases, which open fresh streams where they need one. The loser's structured
+terminal diagnostic is drained with a longer budget than the component
+owner-contention gate uses, because this gate reaches the race phase on a busy
+machine; the assertion itself is unchanged. The Redis
 partition command is being implemented under M7-I05/I17 and is not yet verified;
 it must block both existing and newly accepted Redis connections, reject new
 admission and expired-authority dispatch, then prove fresh authorized recovery.

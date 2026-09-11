@@ -129,7 +129,7 @@ async fn main() -> ExitCode {
         }
         [command] if command == "verify-m7-production" => {
             match tokio::time::timeout(
-                Duration::from_secs(180),
+                Duration::from_secs(300),
                 tunnel_test_harness::production_cluster::verify(),
             )
             .await
@@ -149,9 +149,48 @@ async fn main() -> ExitCode {
                         evidence.key_revocation_rejected,
                         evidence.owner_death_interrupted,
                     );
+                    let isolation = &evidence.tenant_isolation;
+                    println!(
+                        "M7 production concurrent tenant isolation: shared_device={} shared_service={} distinct_tenants={} distinct_credentials={} concurrent_owner_samples={} distinct_owner_nodes={} distinct_owner_sessions={} tenant_a_exact_canaries={} tenant_b_exact_canaries={} distinct_canaries={} cross_tenant_canary_absent={} tenant_a_rotations={} tenant_b_rotations={}",
+                        isolation.shared_device_identifier,
+                        isolation.shared_service_identifier,
+                        isolation.distinct_tenant_scopes,
+                        isolation.distinct_device_credentials,
+                        isolation.concurrent_owner_samples,
+                        isolation.distinct_owner_nodes,
+                        isolation.distinct_owner_sessions,
+                        isolation.tenant_a_exact_canaries,
+                        isolation.tenant_b_exact_canaries,
+                        isolation.distinct_canaries,
+                        isolation.cross_tenant_canary_absent,
+                        isolation.tenant_a_rotations,
+                        isolation.tenant_b_rotations,
+                    );
+                    let race = &evidence.owner_race;
+                    println!(
+                        "M7 production duplicate owner race: concurrent_launches={} one_atomic_winner={} control_conflict_delta={} control_conflict_delta_after_settle={} loser_owner_busy={} loser_non_success={} winner_token_unchanged={} winner_canary={} tenant_sibling_preserved={} same_identifier_owner_unchanged={} same_identifier_canary={} winner_epoch={} successor_epoch={} successor_higher_epoch={} epochs_above_js_safe_bound={} stale_cleanup_rejected={} successor_canary={} elapsed_ms={}",
+                        race.concurrent_launches,
+                        race.one_atomic_winner,
+                        race.control_conflict_delta,
+                        race.control_conflict_delta_after_settle,
+                        race.loser_terminal_owner_busy,
+                        race.loser_exit_non_success,
+                        race.winner_token_unchanged,
+                        race.winner_canary_preserved,
+                        race.tenant_sibling_preserved,
+                        race.same_identifier_tenant_owner_unchanged,
+                        race.same_identifier_tenant_canary_preserved,
+                        race.winner_epoch,
+                        race.successor_epoch,
+                        race.successor_higher_epoch,
+                        race.epochs_above_js_safe_bound,
+                        race.stale_cleanup_rejected,
+                        race.successor_canary,
+                        race.elapsed_ms,
+                    );
                 }),
                 Err(_) => Err(HarnessError::Process(
-                    "M7 production acceptance exceeded 180 seconds".to_owned(),
+                    "M7 production acceptance exceeded 300 seconds".to_owned(),
                 )),
             }
         }
