@@ -22,6 +22,8 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use crate::{HarnessError, Result};
 
 const MANIFEST_FILE: &str = "sentinels.bin";
+/// Marks a manifest record as retiring a previously recorded value.
+pub(crate) const RETIRED_SENTINEL_FLAG: u8 = 0x80;
 const MAX_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_RECORD_BYTES: usize = 256 * 1024;
 const MAX_SNAPSHOT_BYTES: usize = 1024 * 1024;
@@ -40,7 +42,28 @@ pub(crate) fn capture_dir() -> Option<PathBuf> {
 /// Record one exact value which the fixture really used. The category name is
 /// stable and never caller data; values are bounded and written with a binary
 /// length prefix so arbitrary token/payload bytes remain unambiguous.
+/// Retire a previously recorded sentinel.
+///
+/// A `private_endpoint` sentinel names a socket address, and once that socket
+/// closes the operating system is free to hand the same port to anything else
+/// in the same run, including a managed child's own ephemeral client socket.
+/// The scanner compares exact bytes, so a recycled port would be reported as a
+/// leak of an endpoint that no longer exists. Retiring the value when its
+/// socket closes removes that false positive without weakening the scan for
+/// any endpoint that is still live: a real disclosure happens while the
+/// endpoint is in use, and remains recorded and matched.
+///
+/// The manifest is append-only, so this writes a tombstone the reader applies
+/// in order.
+pub(crate) fn retire_sentinel(kind: &'static str, value: &[u8]) -> Result<()> {
+    record_manifest_entry(kind, value, true)
+}
+
 pub(crate) fn record_sentinel(kind: &'static str, value: &[u8]) -> Result<()> {
+    record_manifest_entry(kind, value, false)
+}
+
+fn record_manifest_entry(kind: &'static str, value: &[u8], retired: bool) -> Result<()> {
     let Some(directory) = capture_dir() else {
         return Ok(());
     };
@@ -65,6 +88,11 @@ pub(crate) fn record_sentinel(kind: &'static str, value: &[u8]) -> Result<()> {
         let mut recorded = recorded
             .lock()
             .map_err(|_| HarnessError::Process("C11 sentinel set was poisoned".into()))?;
+        let kind_code = if retired {
+            kind_code | RETIRED_SENTINEL_FLAG
+        } else {
+            kind_code
+        };
         let key = (directory.clone(), kind_code, value.to_vec());
         if recorded.contains(&key) {
             return Ok(());

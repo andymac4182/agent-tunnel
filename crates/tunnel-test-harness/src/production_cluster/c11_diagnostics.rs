@@ -806,7 +806,13 @@ fn read_sentinel_manifest(path: &std::path::Path) -> Result<Vec<Sentinel>> {
                 "C11 sentinel manifest record exceeded its bound".into(),
             ));
         }
-        let kind = match kind_code {
+        // The high bit marks a tombstone: the value's socket has closed, so the
+        // operating system may hand that port to anything else in this run and
+        // an exact-bytes match would no longer prove a disclosure. Records are
+        // applied in order, so a value can be recorded, retired, and recorded
+        // again for a later socket.
+        let retired = kind_code & crate::c11_capture::RETIRED_SENTINEL_FLAG != 0;
+        let kind = match kind_code & !crate::c11_capture::RETIRED_SENTINEL_FLAG {
             1 => SentinelKind::Credential,
             2 => SentinelKind::ApplicationPayload,
             3 => SentinelKind::FilesystemPath,
@@ -817,10 +823,18 @@ fn read_sentinel_manifest(path: &std::path::Path) -> Result<Vec<Sentinel>> {
                 ));
             }
         };
-        values.push(
-            Sentinel::new(kind, bytes[offset..end].to_vec())
-                .map_err(|_| HarnessError::Process("C11 sentinel manifest was invalid".into()))?,
-        );
+        let value = bytes[offset..end].to_vec();
+        if retired {
+            values.retain(|sentinel: &Sentinel| {
+                sentinel.kind() != kind || !sentinel.has_value(&value)
+            });
+        } else {
+            values.push(
+                Sentinel::new(kind, value).map_err(|_| {
+                    HarnessError::Process("C11 sentinel manifest was invalid".into())
+                })?,
+            );
+        }
         offset = end;
     }
     Ok(values)
@@ -970,4 +984,77 @@ fn now_millis() -> Result<i64> {
         .map_err(|_| HarnessError::Process("C11 diagnostics clock moved backwards".into()))?;
     i64::try_from(elapsed.as_millis())
         .map_err(|_| HarnessError::Process("C11 diagnostics timestamp overflow".into()))
+}
+
+#[cfg(test)]
+mod sentinel_manifest_tests {
+    use super::{SentinelKind, read_sentinel_manifest};
+    use crate::c11_capture::RETIRED_SENTINEL_FLAG;
+
+    fn record(kind_code: u8, value: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![kind_code];
+        bytes.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(value);
+        bytes
+    }
+
+    fn manifest(records: &[(u8, &[u8])]) -> Vec<u8> {
+        records
+            .iter()
+            .flat_map(|(kind, value)| record(*kind, value))
+            .collect()
+    }
+
+    #[test]
+    fn a_retired_endpoint_is_dropped_and_can_be_recorded_again() {
+        let path = tempfile::Builder::new()
+            .prefix("c11-sentinels")
+            .tempfile()
+            .expect("sentinel manifest fixture");
+        // Record a listener, retire it when its socket closes, then record a
+        // different one: only the live value may still be scanned for.
+        std::fs::write(
+            path.path(),
+            manifest(&[
+                (4, b"127.0.0.1:51190"),
+                (4 | RETIRED_SENTINEL_FLAG, b"127.0.0.1:51190"),
+                (4, b"127.0.0.1:51191"),
+            ]),
+        )
+        .expect("write sentinel manifest");
+        let sentinels = read_sentinel_manifest(path.path()).expect("read sentinel manifest");
+        assert_eq!(sentinels.len(), 1);
+        assert_eq!(sentinels[0].kind(), SentinelKind::PrivateEndpoint);
+        assert!(sentinels[0].has_value(b"127.0.0.1:51191"));
+
+        // The same port recorded again after retirement is live once more.
+        std::fs::write(
+            path.path(),
+            manifest(&[
+                (4, b"127.0.0.1:51190"),
+                (4 | RETIRED_SENTINEL_FLAG, b"127.0.0.1:51190"),
+                (4, b"127.0.0.1:51190"),
+            ]),
+        )
+        .expect("rewrite sentinel manifest");
+        let sentinels = read_sentinel_manifest(path.path()).expect("reread sentinel manifest");
+        assert_eq!(sentinels.len(), 1);
+        assert!(sentinels[0].has_value(b"127.0.0.1:51190"));
+
+        // Retirement is category-exact: a credential with the same bytes is
+        // untouched by an endpoint tombstone.
+        std::fs::write(
+            path.path(),
+            manifest(&[
+                (1, b"shared-bytes"),
+                (4, b"shared-bytes"),
+                (4 | RETIRED_SENTINEL_FLAG, b"shared-bytes"),
+            ]),
+        )
+        .expect("rewrite sentinel manifest again");
+        let sentinels =
+            read_sentinel_manifest(path.path()).expect("reread sentinel manifest again");
+        assert_eq!(sentinels.len(), 1);
+        assert_eq!(sentinels[0].kind(), SentinelKind::Credential);
+    }
 }

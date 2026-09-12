@@ -251,6 +251,14 @@ impl Sentinel {
     pub fn kind(&self) -> SentinelKind {
         self.kind
     }
+
+    /// Compare this sentinel's exact bytes, for applying a manifest tombstone.
+    ///
+    /// Deliberately a comparison rather than an accessor: the value must not
+    /// leave this type, so a failure or a log can never carry it.
+    pub fn has_value(&self, value: &[u8]) -> bool {
+        self.value == value
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]

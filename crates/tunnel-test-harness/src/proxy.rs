@@ -546,6 +546,7 @@ impl ProxyHandle {
 
     pub async fn shutdown(mut self) -> Result<()> {
         let _ = record_c11_proxy_snapshot(&self);
+        retire_c11_proxy_sentinels(&self);
         let _ = self.shutdown_tx.send(());
         if let Some(task) = self.accept_task.take() {
             task.await
@@ -563,6 +564,7 @@ impl ProxyHandle {
     /// cancelled.
     pub async fn shutdown_until(&mut self, deadline: tokio::time::Instant) -> Result<()> {
         let _ = record_c11_proxy_snapshot(self);
+        retire_c11_proxy_sentinels(self);
         let _ = self.shutdown_tx.send(());
         let Some(task) = self.accept_task.as_mut() else {
             return Ok(());
@@ -605,6 +607,22 @@ async fn await_command_response(response: oneshot::Receiver<Result<()>>) -> Resu
         .await
         .map_err(|_| HarnessError::Timeout("proxy command response timed out".to_owned()))?
         .map_err(|_| HarnessError::Proxy("proxy command response was dropped".to_owned()))?
+}
+
+/// Retire this proxy's endpoint sentinels once its listener is closed.
+///
+/// The listening port returns to the operating system here, which is free to
+/// hand it to anything else in the same run, including a managed child's own
+/// ephemeral client socket. The C11 scanner compares exact bytes, so leaving
+/// the value recorded turns that ordinary reuse into a reported leak of an
+/// endpoint that no longer exists. Only the local listener is retired: the
+/// target address belongs to something this proxy does not own and may still
+/// be live.
+fn retire_c11_proxy_sentinels(handle: &ProxyHandle) {
+    let _ = crate::c11_capture::retire_sentinel(
+        "private_endpoint",
+        handle.local_addr.to_string().as_bytes(),
+    );
 }
 
 impl Drop for ProxyHandle {
