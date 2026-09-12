@@ -58,6 +58,16 @@ pub const DEFAULT_PEER_HEADER_BYTES: usize = 16 * 1024;
 /// The default deadline for a QUIC/TLS handshake and HTTP/3 setup.
 pub const DEFAULT_PEER_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long a connection checkout waits for a permit that is about to be
+/// released before it reports typed capacity exhaustion.
+///
+/// Replacing an unusable pooled connection releases its permit when the last
+/// handle drops, which is ordinarily immediate; this grace covers that handoff
+/// without letting a caller sit on an exhausted pool. It is far below any
+/// probe or request budget, so exhaustion stays observable as capacity rather
+/// than surfacing as that caller's own timeout.
+const CAPACITY_RELEASE_GRACE: Duration = Duration::from_millis(250);
+
 /// The default absolute checkout/setup deadline for one request stream.
 pub const DEFAULT_PEER_STREAM_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
@@ -2260,13 +2270,36 @@ impl PeerClient {
                 previous.shutdown_until(deadline).await?;
             }
 
-            let connection_permit = with_checkout_deadline(
-                &self.cancel,
-                deadline,
-                self.connections.clone().acquire_owned(),
-            )
-            .await?
-            .map_err(|_| PeerTransportError::Capacity)?;
+            // Connection-pool exhaustion is a typed capacity condition and must
+            // be reported as one, promptly.  Waiting on the semaphore under the
+            // handshake deadline reported `Timeout` instead: it is
+            // `with_checkout_deadline` that maps deadline expiry to `Timeout`,
+            // and the `?` propagated that before the `map_err` intended to
+            // produce `Capacity`, which only ever saw the semaphore's own closed
+            // error.  So a caller learned nothing about capacity, and learned it
+            // only after the whole handshake budget: the readiness probe
+            // recorded the route `Unreachable` rather than `CapacityExhausted`,
+            // collapsing the distinction that model is built on.
+            //
+            // A permit can also be moments from release: the branch above
+            // removes and shuts down an unusable pooled connection for this
+            // destination, and its permit lands when the last handle to it
+            // drops.  Refusing instantly turns that ordinary replacement into a
+            // spurious capacity error (measured: the peer-capacity gate went
+            // from roughly one failure in six to five in fourteen).  So take a
+            // free permit immediately, otherwise wait a short bounded grace
+            // that stays well inside a probe's budget, and report exhaustion as
+            // typed capacity either way.
+            let connection_permit = match self.connections.clone().try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    let grace = deadline.min(Instant::now() + CAPACITY_RELEASE_GRACE);
+                    match timeout_at(grace, self.connections.clone().acquire_owned()).await {
+                        Ok(Ok(permit)) => permit,
+                        Ok(Err(_)) | Err(_) => return Err(PeerTransportError::Capacity),
+                    }
+                }
+            };
             let connecting = self
                 .endpoint
                 .connect(destination.address, &destination.server_name)

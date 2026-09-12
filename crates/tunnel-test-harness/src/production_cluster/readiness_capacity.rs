@@ -45,7 +45,15 @@ const INGRESS_NODE: &str = "relay-b";
 const CAPACITY_LOSS_TIMEOUT: Duration = Duration::from_secs(12);
 const CAPACITY_RECOVERY_TIMEOUT: Duration = Duration::from_secs(20);
 const CAPACITY_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(8);
-const CAPACITY_COMPARISON_WINDOW: Duration = Duration::from_secs(5);
+/// Bound for the typed-capacity probe.
+///
+/// This must exceed the relay's own `PEER_PROBE_TIMEOUT` (5 s), which bounds a
+/// single route probe inside `refresh_required_routes`. At five seconds the two
+/// deadlines expired together, so which one fired was a scheduling race and the
+/// gate failed intermittently on an idle machine while asserting nothing about
+/// the product. The assertion itself is unchanged: the refresh must still
+/// return typed capacity, never a generic timeout.
+const CAPACITY_COMPARISON_WINDOW: Duration = Duration::from_secs(15);
 const CAPACITY_DIAGNOSTIC_TIMEOUT: Duration = Duration::from_millis(500);
 // The configured peer QUIC connection idle timeout is longer than this
 // fixture's bounded phases. The actor and H3 receive paths have their own idle

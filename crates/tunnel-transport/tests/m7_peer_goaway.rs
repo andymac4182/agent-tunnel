@@ -1550,3 +1550,115 @@ async fn peer_client_shutdown_joins_cleanly_when_the_remote_peer_is_already_gone
         .map_err(|error| format!("second client shutdown failed: {error}"))?;
     Ok(())
 }
+
+/// Connection-pool exhaustion must be reported as typed capacity, promptly.
+///
+/// `PeerClient::connect` waited on the connection semaphore under the
+/// handshake deadline, and `with_checkout_deadline` maps deadline expiry to
+/// `Timeout`, which the `?` propagated before the `map_err` that was meant to
+/// produce `Capacity` (that `map_err` only ever saw the semaphore's own closed
+/// error). So an exhausted pool reported a generic timeout after the full
+/// handshake budget. Peer readiness therefore recorded the route `Unreachable`
+/// rather than `CapacityExhausted`, collapsing the distinction its model is
+/// built on, and `verify-m7-peer-capacity` failed roughly one run in six on an
+/// idle machine: every probe failure measured 5001 ms, its whole budget, and
+/// raced the gate's own equal-length window.
+#[tokio::test]
+async fn exhausted_connection_pool_is_typed_capacity_not_a_timeout() -> TestResult {
+    let pki = FixturePki::new();
+    let client_leaf = pki.issue_peer("capacity-client");
+    let first_leaf = pki.issue_peer("capacity-first");
+    let second_leaf = pki.issue_peer("capacity-second");
+    let first = ServerFixture::start(&pki, &first_leaf, false);
+    let second = ServerFixture::start(&pki, &second_leaf, false);
+
+    let mut client_endpoint = quinn::Endpoint::client(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .expect("capacity client endpoint");
+    let client_config = load_peer_client_config_from_pem(
+        pki.chain(&client_leaf).as_bytes(),
+        client_leaf.private_key_pem.as_bytes(),
+        pki.ca_pem.as_bytes(),
+    )
+    .expect("capacity client TLS config");
+    client_endpoint.set_default_client_config(client_config);
+    let pins = ApprovedPeerPins::new([
+        spki_sha256_from_der(&first_leaf.der).expect("capacity first pin"),
+        spki_sha256_from_der(&second_leaf.der).expect("capacity second pin"),
+    ])
+    .expect("capacity client pins");
+
+    // One connection slot, two destinations, and a long handshake budget so a
+    // wait would be unmistakable against the assertion below.
+    let capacity_limits = PeerTransportLimits {
+        max_connections: 1,
+        handshake_timeout: Duration::from_secs(10),
+        stream_timeout: CASE_TIMEOUT,
+        idle_timeout: CASE_TIMEOUT,
+        drain_timeout: Duration::from_secs(1),
+        ..PeerTransportLimits::default()
+    };
+    let client =
+        PeerClient::new(client_endpoint, pins, capacity_limits).expect("capacity peer client");
+
+    // The only slot is taken by a live, authenticated connection.
+    let held = client
+        .connect(first.destination.clone())
+        .await
+        .map_err(|error| format!("first connect failed: {error}"))?;
+    if held.peer_identity().role_id() != "capacity-first" {
+        return Err("capacity first peer identity was not authenticated".into());
+    }
+
+    let started = tokio::time::Instant::now();
+    let refused = client.connect(second.destination.clone()).await;
+    let elapsed = started.elapsed();
+    match refused {
+        Err(PeerTransportError::Capacity) => {}
+        Err(other) => {
+            return Err(
+                format!("exhausted pool reported {other} instead of typed capacity").into(),
+            );
+        }
+        Ok(_) => return Err("exhausted pool admitted a second connection".into()),
+    }
+    // Promptly: a caller carrying its own deadline (the readiness probe has
+    // five seconds) must learn this well inside it, not at the handshake
+    // budget.
+    if elapsed >= Duration::from_secs(1) {
+        return Err(format!(
+            "typed capacity took {} ms, which a bounded probe cannot observe",
+            elapsed.as_millis()
+        )
+        .into());
+    }
+
+    // Releasing the slot makes the destination usable again, so the refusal is
+    // capacity and not a permanent rejection. The pooled connection holds the
+    // permit until it is closed, so dropping the handle alone is not enough.
+    drop(held);
+    client
+        .close_peer(&first.destination)
+        .await
+        .map_err(|error| format!("closing a healthy pooled peer failed: {error}"))?;
+    let recovered = client
+        .connect(second.destination.clone())
+        .await
+        .map_err(|error| format!("recovered connect failed: {error}"))?;
+    if recovered.peer_identity().role_id() != "capacity-second" {
+        return Err("recovered connection reached the wrong peer".into());
+    }
+
+    client
+        .shutdown()
+        .await
+        .map_err(|error| format!("capacity client shutdown failed: {error}"))?;
+    // This client deliberately closed its connection to the first server, and
+    // that fixture's serve loop reports a client-initiated close as an error.
+    // The close itself is asserted above; the fixture's view of it is not this
+    // test's subject.
+    let _ = first.shutdown().await;
+    // Same for the second server: `client.shutdown()` above closed this
+    // connection from the client side.
+    let _ = second.shutdown().await;
+    Ok(())
+}
