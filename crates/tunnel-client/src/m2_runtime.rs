@@ -599,6 +599,14 @@ enum CarrierCommand {
     Close(oneshot::Sender<()>),
 }
 
+/// What one deadline-forced closure of the old carrier released: the closed
+/// connection identifier, and the owner `ROTATE_RETIRE` that was still
+/// deferred when the deadline arrived, if any.
+struct ForcedRetirement {
+    old_connection_id: String,
+    deferred_retire: Option<RotateRetire>,
+}
+
 struct QueuedCarrierFrame {
     bytes: Vec<u8>,
     bytes_len: usize,
@@ -2063,6 +2071,17 @@ impl M2Actor {
                     scope: "retained recovery",
                     detail: self.retained_recovery_detail("recovery episode deadline expired"),
                 });
+            }
+            RotationPhase::Retiring
+                if self.retiring.is_some() && self.rotation.status().deadline_forced_retirement =>
+            {
+                // protocol.md, absolute overlap deadline: "after commit,
+                // forcibly close any old transport still lingering".  The
+                // machine records the forced retirement without leaving
+                // `Retiring`; the connector releases its own half here rather
+                // than waiting for the owner's forced COMPLETE.  The carrier
+                // guard makes this arm fire exactly once per attempt.
+                self.force_retire_at_overlap_deadline().await?;
             }
             RotationPhase::Closed => {
                 return Err(ClientError::Transport {
@@ -6826,6 +6845,83 @@ impl M2Actor {
         Ok(())
     }
 
+    /// Force-close the lingering old carrier and submit this connector's own
+    /// retirement evidence for `attempt`.
+    ///
+    /// This is the connector half of the absolute overlap deadline: unlike
+    /// [`Self::handle_rotate_retire`] it never waits for pending carrier
+    /// controls or forget barriers, because protocol.md is explicit that "no
+    /// slow stream, retransmission, close handshake or duplicate message
+    /// extends the budget".  It is a no-op when the carrier is already gone,
+    /// so the deadline timer and a forced COMPLETE can both call it.
+    async fn force_close_retiring_carrier(
+        &mut self,
+        attempt: &RotationAttemptIdentity,
+    ) -> Result<Option<ForcedRetirement>, ClientError> {
+        let Some(old) = self.retiring.take() else {
+            return Ok(None);
+        };
+        // A deferred RETIRE can no longer be answered on the ordinary path;
+        // the forced closure replaces it.
+        let deferred_retire = self.pending_retire.take();
+        let old_connection_id = old.key.connection_id.clone();
+        let evidence = close_carrier(old).await;
+        if !evidence.is_complete() {
+            return Err(ClientError::Transport {
+                scope: "forced retired data carrier",
+                detail: "forced old data carrier closure was not confirmed".to_owned(),
+            });
+        }
+        self.rotation
+            .retired(attempt, RotationSide::Connector, evidence, self.now_ms())
+            .map_err(|error| {
+                ClientError::Protocol(format!("forced retirement evidence rejected: {error}"))
+            })?;
+        Ok(Some(ForcedRetirement {
+            old_connection_id,
+            deferred_retire,
+        }))
+    }
+
+    /// Whether the control writer half is still attached.  A forced closure at
+    /// the deadline must still release the carrier when it is not, so the
+    /// attestation is best effort while the closure is not.
+    fn control_socket_is_live(&self) -> bool {
+        !self.control_queue.sender.is_closed() && !self.cancellation.is_cancelled()
+    }
+
+    /// The connector's own arm of the absolute overlap deadline.  The pure
+    /// rotation machine latches `deadline_forced_retirement` in `Retiring` and
+    /// leaves the phase alone so this runtime can release the old carrier.
+    /// The closure and its evidence are unconditional; the `ROTATE_RETIRED`
+    /// attestation is sent only when there is a live control socket and an
+    /// owner `ROTATE_RETIRE` to correlate to, because the wire requires a
+    /// bound reply target on that message.
+    async fn force_retire_at_overlap_deadline(&mut self) -> Result<(), ClientError> {
+        let Some(attempt) = self.rotation.status().attempt else {
+            return Ok(());
+        };
+        let Some(forced) = self.force_close_retiring_carrier(&attempt).await? else {
+            return Ok(());
+        };
+        if let Some(retire) = forced.deferred_retire
+            && self.control_socket_is_live()
+        {
+            let response = ControlMessage::RotateRetired(RotateRetired {
+                message_id: message_id(),
+                reply_to: retire.message_id.clone(),
+                attempt: retire.attempt,
+                snapshot_id: retire.snapshot_id,
+                closed_connection_id: forced.old_connection_id,
+            });
+            self.local_retired_message_id = Some(response.message_id().to_owned());
+            self.peer_retire_message_id = Some(retire.message_id.clone());
+            self.send_rotation_reply(&retire.message_id, response)?;
+        }
+        self.publish_status();
+        Ok(())
+    }
+
     async fn retry_pending_retire(&mut self) -> Result<(), ClientError> {
         let Some(retire) = self.pending_retire.take() else {
             return Ok(());
@@ -6869,10 +6965,38 @@ impl M2Actor {
                 "ROTATE_COMPLETE identity mismatch".to_owned(),
             ));
         }
-        if self.local_retired_message_id.as_deref() != Some(complete.reply_to.as_str()) {
+        // protocol.md, reply-target table: "Owner COMPLETE | Connector
+        // RETIRED; empty only for a forced completion whose connector RETIRED
+        // never arrived".  The strict equality below is this endpoint's
+        // anti-spoofing guard, so it is relaxed only for the forced shape the
+        // wire permits, and only to the empty target or to the very message
+        // this connector sent if its RETIRED crossed the owner's grace.  A
+        // forced COMPLETE naming any other target is still refused.  The
+        // attempt identity and snapshot checks above run first either way, so
+        // a forced COMPLETE must still name the exact in-flight attempt
+        // (session, epoch, owner, rotation, both generations and both
+        // connection identifiers) and this connector's own fence snapshot.
+        if complete.forced {
+            if !complete.reply_to.is_empty()
+                && self.local_retired_message_id.as_deref() != Some(complete.reply_to.as_str())
+            {
+                return Err(ClientError::Protocol(
+                    "ROTATE_COMPLETE forced reply correlation mismatch".to_owned(),
+                ));
+            }
+        } else if self.local_retired_message_id.as_deref() != Some(complete.reply_to.as_str()) {
             return Err(ClientError::Protocol(
                 "ROTATE_COMPLETE reply correlation mismatch".to_owned(),
             ));
+        }
+        // protocol.md, Retire: "after a forced completion the owner's old
+        // transport resources are already released, and a connector that still
+        // holds its half is required by its own deadline to force-close it
+        // before the next attempt".  Release it here so the attempt reaches
+        // Active from this connector's own closure evidence rather than from
+        // the owner's message alone.
+        if complete.forced && self.rotation.phase() == RotationPhase::Retiring {
+            self.force_close_retiring_carrier(&complete.attempt).await?;
         }
         if self.rotation.phase() == RotationPhase::Retiring {
             self.rotation
@@ -13747,5 +13871,345 @@ mod tests {
             "CANCEL must be handled while one OPEN waits for a bounded control pair; result={proof:?}"
         );
         Ok(())
+    }
+
+    /// Drive one connector actor to `Retiring` with its old carrier still
+    /// owned, exactly as `ROTATE_COMMIT` leaves it.  The returned flag is set
+    /// by the old carrier's own task when it observes the close command, so a
+    /// forced closure is proven on the carrier channel rather than inferred.
+    async fn retiring_connector_actor() -> (
+        M2Actor,
+        RotationAttemptIdentity,
+        CarrierKey,
+        Arc<AtomicBool>,
+        tokio::task::JoinHandle<()>,
+        mpsc::Receiver<CarrierCommand>,
+        mpsc::Receiver<crate::QueuedMessage>,
+    ) {
+        let (mut actor, old_key, old_receiver, control_receiver) =
+            test_actor_with_carrier(M2_CARRIER_QUEUE_FRAMES);
+        actor.streams.insert(1, test_stream());
+
+        let old_closed = Arc::new(AtomicBool::new(false));
+        let observer = old_closed.clone();
+        let old_carrier_task = tokio::spawn(async move {
+            let mut receiver = old_receiver;
+            while let Some(command) = receiver.recv().await {
+                if let CarrierCommand::Close(reply) = command {
+                    observer.store(true, Ordering::SeqCst);
+                    let _ = reply.send(());
+                    break;
+                }
+            }
+        });
+
+        let candidate_key = CarrierKey::new(2, "candidate");
+        let (candidate_tx, candidate_receiver) = mpsc::channel(M2_CARRIER_QUEUE_FRAMES);
+        actor.candidate = Some(Carrier {
+            key: candidate_key.clone(),
+            local_addr: None,
+            tx: candidate_tx,
+            pending_controls: BTreeMap::new(),
+            reader_cancel: CancellationToken::new(),
+            reader: None,
+            writer: None,
+        });
+
+        let attempt = RotationAttemptIdentity::new(
+            "session",
+            1,
+            "owner",
+            "rotation",
+            old_key.generation,
+            candidate_key.generation,
+            old_key.connection_id.clone(),
+            candidate_key.connection_id.clone(),
+        );
+        let now = actor.now_ms();
+        actor
+            .rotation
+            .prepare(attempt.clone(), now)
+            .expect("rotation prepares");
+        actor
+            .rotation
+            .candidate_ready(&attempt, now)
+            .expect("candidate is ready");
+        actor
+            .rotation
+            .quiesce(
+                &attempt,
+                tunnel_protocol::rotation_control::StreamRoster::new("snapshot", vec![1]),
+                now,
+            )
+            .expect("rotation quiesces");
+        let local_fence = FenceSnapshot::new(
+            "snapshot",
+            vec![tunnel_protocol::rotation_control::StreamFence::new(
+                1,
+                Direction::ConnectorToRelay,
+                0,
+            )],
+        );
+        let peer_fence = FenceSnapshot::new(
+            "snapshot",
+            vec![tunnel_protocol::rotation_control::StreamFence::new(
+                1,
+                Direction::RelayToConnector,
+                0,
+            )],
+        );
+        actor
+            .rotation
+            .frozen(
+                &attempt,
+                local_fence.clone(),
+                Direction::ConnectorToRelay,
+                now,
+            )
+            .expect("local fence is accepted");
+        actor
+            .rotation
+            .frozen(
+                &attempt,
+                peer_fence.clone(),
+                Direction::RelayToConnector,
+                now,
+            )
+            .expect("peer fence is accepted");
+        actor
+            .rotation
+            .drained(
+                &attempt,
+                tunnel_protocol::rotation_control::DrainProof::new(
+                    "snapshot",
+                    peer_fence.digest().expect("peer fence digest"),
+                    Direction::RelayToConnector,
+                    vec![tunnel_protocol::rotation_control::StreamAck::new(1, 0)],
+                ),
+                now,
+            )
+            .expect("peer drain proof is accepted");
+        actor
+            .rotation
+            .drained(
+                &attempt,
+                tunnel_protocol::rotation_control::DrainProof::new(
+                    "snapshot",
+                    local_fence.digest().expect("local fence digest"),
+                    Direction::ConnectorToRelay,
+                    vec![tunnel_protocol::rotation_control::StreamAck::new(1, 0)],
+                ),
+                now,
+            )
+            .expect("local drain proof is accepted");
+        actor.local_fence = Some(local_fence.clone());
+        actor.local_drained_message_id = Some("drained".to_owned());
+
+        let commit = RotateCommit {
+            message_id: "commit".to_owned(),
+            reply_to: "drained".to_owned(),
+            attempt: attempt.clone(),
+            snapshot_id: "snapshot".to_owned(),
+            drain_proofs: vec![
+                tunnel_protocol::rotation_control::DrainProofRef {
+                    snapshot_id: "snapshot".to_owned(),
+                    fence_digest: local_fence.digest().expect("local fence digest"),
+                    direction: Direction::ConnectorToRelay,
+                },
+                tunnel_protocol::rotation_control::DrainProofRef {
+                    snapshot_id: "snapshot".to_owned(),
+                    fence_digest: peer_fence.digest().expect("peer fence digest"),
+                    direction: Direction::RelayToConnector,
+                },
+            ],
+        };
+        let scope = actor
+            .rotation_journal_scope(&ControlMessage::RotateCommit(commit.clone()))
+            .expect("commit belongs to the active rotation");
+        actor
+            .observe_rotation_message(&ControlMessage::RotateCommit(commit.clone()), scope)
+            .expect("commit is journaled");
+        actor
+            .handle_rotate_commit(commit)
+            .await
+            .expect("candidate is committed");
+        assert_eq!(actor.rotation.phase(), RotationPhase::Retiring);
+        assert_eq!(actor.active.key, candidate_key);
+        assert_eq!(
+            actor
+                .retiring
+                .as_ref()
+                .expect("old carrier is still owned after commit")
+                .key,
+            old_key
+        );
+        // The stall this row is about: the connector never answered
+        // `ROTATE_RETIRE`, so it holds no local retired message identifier to
+        // correlate a completion against.
+        assert!(actor.local_retired_message_id.is_none());
+        (
+            actor,
+            attempt,
+            candidate_key,
+            old_closed,
+            old_carrier_task,
+            candidate_receiver,
+            control_receiver,
+        )
+    }
+
+    /// Move the actor clock past the absolute overlap deadline and the owner's
+    /// one bounded post-deadline grace without sleeping.  `now_ms` is measured
+    /// from `rotation_started`, so moving that start into the past advances the
+    /// clock monotonically.
+    fn cross_overlap_deadline_and_grace(actor: &mut M2Actor) {
+        let elapsed = tunnel_protocol::rotation::DEFAULT_OVERLAP_TIMEOUT_MS
+            + tunnel_protocol::rotation::DEFAULT_HANDSHAKE_TIMEOUT_MS
+            + 1_000;
+        actor.rotation_started = Instant::now() - Duration::from_millis(elapsed);
+    }
+
+    /// protocol.md, reply-target table: "Owner COMPLETE | Connector RETIRED;
+    /// empty only for a forced completion whose connector RETIRED never
+    /// arrived".  A connector that stalled through the overlap deadline must
+    /// absorb that completion and release its own half of the old transport
+    /// instead of failing the session on reply correlation.
+    #[tokio::test]
+    async fn forced_complete_with_no_reply_target_is_absorbed_and_force_closes_the_old_carrier() {
+        let (
+            mut actor,
+            attempt,
+            candidate_key,
+            old_closed,
+            old_carrier_task,
+            _candidate_receiver,
+            _control_receiver,
+        ) = retiring_connector_actor().await;
+        cross_overlap_deadline_and_grace(&mut actor);
+
+        let complete = RotateComplete {
+            message_id: "complete".to_owned(),
+            reply_to: String::new(),
+            attempt: attempt.clone(),
+            snapshot_id: "snapshot".to_owned(),
+            forced: true,
+            reason: Some("connector_retirement_missing".to_owned()),
+        };
+        actor
+            .handle_rotate_complete(complete)
+            .await
+            .expect("a forced ROTATE_COMPLETE with an empty reply target is absorbed");
+
+        assert!(
+            old_closed.load(Ordering::SeqCst),
+            "the connector must force-close its own half of the old transport"
+        );
+        assert!(actor.retiring.is_none());
+        assert_eq!(actor.rotation.phase(), RotationPhase::Active);
+        assert_eq!(actor.active.key, candidate_key);
+        assert_eq!(actor.rotations_completed, 1);
+        assert!(
+            actor.rotation.status().deadline_forced_retirement,
+            "the forced retirement stays visible in diagnostics"
+        );
+        assert!(actor.accepting);
+        assert!(!actor.writes_frozen);
+        old_carrier_task
+            .await
+            .expect("old carrier task joins after the forced closure");
+    }
+
+    /// The same wire message with a reply target that is neither empty nor this
+    /// connector's own `ROTATE_RETIRED` is still refused: relaxing correlation
+    /// for the forced shape must not become a way to address one connector's
+    /// attempt with another's reply header.
+    #[tokio::test]
+    async fn forced_complete_with_a_foreign_reply_target_is_refused() {
+        let (
+            mut actor,
+            attempt,
+            _candidate_key,
+            old_closed,
+            old_carrier_task,
+            _candidate_receiver,
+            _control_receiver,
+        ) = retiring_connector_actor().await;
+        cross_overlap_deadline_and_grace(&mut actor);
+
+        let complete = RotateComplete {
+            message_id: "complete".to_owned(),
+            reply_to: "someone-elses-retired".to_owned(),
+            attempt,
+            snapshot_id: "snapshot".to_owned(),
+            forced: true,
+            reason: Some("connector_retirement_missing".to_owned()),
+        };
+        let error = actor
+            .handle_rotate_complete(complete)
+            .await
+            .expect_err("a forced COMPLETE naming a foreign reply target is refused");
+        assert!(
+            matches!(&error, ClientError::Protocol(detail)
+                if detail == "ROTATE_COMPLETE forced reply correlation mismatch"),
+            "unexpected error: {error:?}"
+        );
+        assert!(
+            !old_closed.load(Ordering::SeqCst),
+            "a refused completion must not release the old transport"
+        );
+        assert!(actor.retiring.is_some());
+        assert_eq!(actor.rotation.phase(), RotationPhase::Retiring);
+        drop(actor);
+        old_carrier_task
+            .await
+            .expect("old carrier task joins after the actor is dropped");
+    }
+
+    /// protocol.md, absolute overlap deadline: "after commit, forcibly close
+    /// any old transport still lingering", and Retire: "a connector that still
+    /// holds its half is required by its own deadline to force-close it before
+    /// the next attempt".  The deadline alone must do this, with no
+    /// `ROTATE_COMPLETE` from the owner at all.
+    #[tokio::test]
+    async fn overlap_deadline_alone_force_closes_the_connector_old_carrier() {
+        let (
+            mut actor,
+            _attempt,
+            candidate_key,
+            old_closed,
+            old_carrier_task,
+            _candidate_receiver,
+            _control_receiver,
+        ) = retiring_connector_actor().await;
+        cross_overlap_deadline_and_grace(&mut actor);
+
+        actor
+            .handle_rotation_deadline()
+            .await
+            .expect("the overlap deadline retires the old carrier in place");
+
+        assert!(
+            old_closed.load(Ordering::SeqCst),
+            "the connector must force-close its own old carrier at its own deadline"
+        );
+        assert!(actor.retiring.is_none());
+        assert!(
+            actor.rotation.status().deadline_forced_retirement,
+            "the machine latches the forced retirement at the deadline"
+        );
+        // The connector's own closure is only one side's evidence: the attempt
+        // still waits for the owner's completion, and the candidate is already
+        // the active carrier.
+        assert_eq!(actor.rotation.phase(), RotationPhase::Retiring);
+        assert_eq!(actor.active.key, candidate_key);
+        // The arm is idempotent: a second deadline tick releases nothing more.
+        actor
+            .handle_rotation_deadline()
+            .await
+            .expect("a repeated deadline tick is a no-op");
+        assert!(actor.retiring.is_none());
+        old_carrier_task
+            .await
+            .expect("old carrier task joins after the forced closure");
     }
 }
