@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -6,7 +7,10 @@ use std::{
     time::Duration,
 };
 
-use super::{Relay, RelayError, RelayHandle, RelayOptions, RunningRelay, spawn_transport_listener};
+use super::{
+    Command, ControlOutbound, DataOutbound, Relay, RelayError, RelayHandle, RelayOptions,
+    RunningRelay, spawn_transport_listener,
+};
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use rcgen::{CertificateParams, KeyPair};
@@ -22,9 +26,10 @@ use tunnel_catalog::{
     AuthenticatedConsumer, Catalog, CatalogError, CatalogFixture, ConsumedAttachmentTicket,
     CredentialRecord, DeviceIdentity, DeviceListFilter, DeviceSummary, FixtureDevice,
     GrantSnapshot, GrantSpec, MembershipRecord, MembershipRole, MemoryCatalog, OidcConfig,
-    OidcVerifier, OwnerClaim, OwnerClaimRequest, OwnerToken, SignedMembershipRecord, TenantRecord,
-    UserRecord,
+    OidcVerifier, OwnerClaim, OwnerClaimRequest, OwnerToken, PermissionSet, SignedMembershipRecord,
+    TenantRecord, UserRecord,
 };
+use tunnel_protocol::{ControlMessage, Opened, frame::FrameKind};
 use tunnel_transport::load_server_config_from_pem;
 use uuid::Uuid;
 
@@ -722,5 +727,180 @@ async fn background_registration_panic_is_reported_by_shutdown() {
             .expect("read lifecycle owner after panic")
             .is_none(),
         "a registration panic must not leave an owner claim behind"
+    );
+}
+
+/// M7-C71 regression.
+///
+/// A consumer close that races relay shutdown must still reach the device
+/// carrier as a FIN, and it must reach it *before* the carrier `Close` that
+/// tears the session down.  Both halves of the recorded design are on this
+/// path: the `CloseEchoStream` command is deliberately queued behind the
+/// `Shutdown` command, so it can only be observed by the shutdown drain, and
+/// the drain must complete it rather than discard it.
+///
+/// The device carrier receiver is held and never polled, which is the unit
+/// stand-in for a device socket whose writer has not yet drained.  This
+/// proves the FIN reaches the writer's queue ahead of the close; it does
+/// **not** prove the peer read it, which no unit test can show.
+#[tokio::test]
+async fn shutdown_drain_flushes_a_racing_stream_fin_before_the_device_close() {
+    let (catalog, tenant_id, device_id, identity) = prepared_lifecycle_catalog().await;
+    let user_id = Uuid::from_u128(111);
+    let service_id = Uuid::from_u128(151);
+    let cancel = CancellationToken::new();
+    let handle = test_handle_with_catalog(
+        cancel.clone(),
+        Arc::new(catalog.clone()),
+        Duration::from_secs(30),
+    );
+
+    let mut hello = lifecycle_hello(device_id);
+    // The ordered-stream profile is what admits an echo stream at all.
+    hello
+        .features
+        .push(crate::wire::ORDERED_ROTATION_FEATURE.to_owned());
+    let mut control = handle
+        .register_forwarded_control(identity.clone(), LIFECYCLE_SPKI.to_owned(), hello)
+        .await
+        .expect("register lifecycle device");
+    let key = control.key.clone();
+    let ticket =
+        match serde_json::from_str::<ControlMessage>(&control.welcome).expect("WELCOME decodes") {
+            ControlMessage::Welcome(welcome) => welcome.attachment_ticket,
+            other => panic!("registration returned {other:?} instead of a WELCOME"),
+        };
+
+    // Registration advanced the owner epoch, so the carrier must attach with
+    // the identity as the catalog holds it now.
+    let attached_identity = catalog.identity(Utc::now()).await;
+    let data = handle
+        .attach_forwarded_data(attached_identity, LIFECYCLE_SPKI.to_owned(), ticket)
+        .await
+        .expect("attach lifecycle device carrier");
+    // Deliberately never polled: the queued frames stay observable in order.
+    let mut carrier_rx = data.rx;
+
+    let now = Utc::now();
+    let consumer = AuthenticatedConsumer {
+        tenant_id,
+        principal_id: user_id,
+    };
+    let grant = GrantSnapshot {
+        tenant_id,
+        principal_id: user_id,
+        device_id,
+        service_id,
+        revision: 1,
+        permissions: PermissionSet {
+            operations: BTreeSet::from([crate::ECHO_OPERATION.to_owned()]),
+        },
+        constraints: serde_json::json!({}),
+        valid_until: now + ChronoDuration::minutes(5),
+        read_started_at: now,
+    };
+    let registration = handle
+        .open_echo_stream(
+            consumer,
+            device_id,
+            service_id,
+            grant,
+            now + ChronoDuration::minutes(5),
+        )
+        .await
+        .expect("open lifecycle echo stream");
+    registration.claim_admission();
+    let stream_id = registration.stream_id;
+    let operation_id = registration.operation_id.clone();
+
+    // Admit the stream: an OPEN the connector has not acknowledged defers its
+    // terminal instead of emitting a FIN, so the race under test needs a real
+    // admitted stream.
+    let open_message_id = loop {
+        let Some(ControlOutbound::Text(mut text)) =
+            timeout(Duration::from_secs(2), control.rx.recv())
+                .await
+                .expect("stream OPEN was queued")
+        else {
+            panic!("control carrier closed before the stream OPEN");
+        };
+        let message: ControlMessage =
+            serde_json::from_slice(text.as_bytes()).expect("control message decodes");
+        text.release();
+        if matches!(message, ControlMessage::Open(_)) {
+            break message.message_id().to_owned();
+        }
+    };
+    handle
+        .inbound_control(
+            key.clone(),
+            ControlMessage::Opened(Opened::new(
+                "lifecycle-opened",
+                open_message_id,
+                key.session_id.clone(),
+                key.epoch,
+                stream_id,
+                operation_id.clone(),
+                crate::wire::M2_INITIAL_WINDOW_BYTES as u64,
+                crate::wire::M2_INITIAL_WINDOW_BYTES as u64,
+            )),
+        )
+        .await
+        .expect("admit the lifecycle stream");
+
+    // Reserve both queue slots first, then push Shutdown and the close
+    // back-to-back with no await between them.  That makes the ordering
+    // exact: the actor leaves its command loop on the Shutdown and can only
+    // ever see the close from the shutdown drain.
+    let shutdown_permit = handle.tx.reserve().await.expect("reserve shutdown slot");
+    let close_permit = handle.tx.reserve().await.expect("reserve close slot");
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let (close_tx, close_rx) = tokio::sync::oneshot::channel();
+    shutdown_permit.send(Command::Shutdown(shutdown_tx));
+    close_permit.send(Command::CloseEchoStream {
+        key: key.clone(),
+        stream_id,
+        operation_id,
+        cause: None,
+        response: close_tx,
+    });
+
+    let shutdown = timeout(Duration::from_secs(5), handle.shutdown())
+        .await
+        .expect("relay shutdown is bounded");
+    assert!(matches!(shutdown, Ok(()) | Err(RelayError::Shutdown)));
+    assert!(
+        shutdown_rx.await.is_ok(),
+        "the queued shutdown command is answered"
+    );
+
+    let mut drained = Vec::new();
+    while let Ok(item) = carrier_rx.try_recv() {
+        match item {
+            DataOutbound::Binary(mut bytes) => {
+                let frame = tunnel_protocol::frame::decode(bytes.as_slice())
+                    .expect("device carrier frame decodes");
+                bytes.release();
+                drained.push(format!("{:?}", frame.kind));
+            }
+            DataOutbound::Barrier(done) => {
+                let _ = done.send(());
+                drained.push("Barrier".to_owned());
+            }
+            DataOutbound::Close => drained.push("Close".to_owned()),
+        }
+    }
+    let fin = drained
+        .iter()
+        .position(|entry| entry == &format!("{:?}", FrameKind::Fin));
+    let close = drained.iter().position(|entry| entry == "Close");
+    assert!(
+        matches!((fin, close), (Some(fin), Some(close)) if fin < close),
+        "the device carrier must observe the stream FIN before the carrier close, drained {drained:?}"
+    );
+    assert_eq!(
+        close_rx.await,
+        Ok(true),
+        "the racing close is answered by the shutdown drain"
     );
 }

@@ -11898,6 +11898,45 @@ impl RelayActor {
         self.enqueue_cleanup(owner).await;
     }
 
+    /// Complete the narrow set of commands whose entire effect is one
+    /// *synchronous* terminal transition over state this actor still owns,
+    /// while the shutdown drain empties the command queue.
+    ///
+    /// This is a deliberately closed allowlist, not a reopening of the actor
+    /// during teardown.  Every arm must be synchronous, must not await, must
+    /// not spawn a background task, must not issue a catalog call, and must
+    /// not admit new work: `CloseEchoStream` is the terminal transition that
+    /// queues a stream's FIN toward the device before `close_session` queues
+    /// the carrier `Close`, and `Shutdown` is answered because the actor is
+    /// already shutting down, so its waiter has no reason to observe a
+    /// dropped response channel.  Anything else is dropped here exactly as
+    /// the previous unconditional drain dropped it: a queued registration or
+    /// attach command still loses its response sender (the caller observes
+    /// `RelayError::Shutdown`) and still routes its owner-claim guard through
+    /// cleanup.
+    fn apply_terminal_command_during_drain(&mut self, command: Command) {
+        match command {
+            Command::CloseEchoStream {
+                key,
+                stream_id,
+                operation_id,
+                cause,
+                response,
+            } => {
+                let _ = response.send(self.close_echo_stream_with_cause(
+                    &key,
+                    stream_id,
+                    &operation_id,
+                    cause,
+                ));
+            }
+            Command::Shutdown(response) => {
+                let _ = response.send(());
+            }
+            _ => {}
+        }
+    }
+
     async fn close_all(&mut self) {
         let deadline = tokio::time::Instant::now() + CLEANUP_SHUTDOWN_TIMEOUT;
         // Stop every background result sender before the actor stops draining
@@ -11905,7 +11944,13 @@ impl RelayActor {
         // owner-claim guard, which routes the exact token through cleanup.
         self.options.shutdown.cancel();
         self.rx.close();
-        while self.rx.recv().await.is_some() {}
+        // The drain used to discard every queued command, so a consumer close
+        // that raced relay shutdown never produced its device-facing FIN at
+        // all.  Terminal-shaped commands are completed here instead; every
+        // other command is still dropped exactly as before.
+        while let Some(command) = self.rx.recv().await {
+            self.apply_terminal_command_during_drain(command);
+        }
         let keys: Vec<_> = self
             .sessions
             .values()
@@ -12737,13 +12782,29 @@ impl RunningRelay {
             peer_runtime.set_peer_listener_state(PeerListenerState::Draining);
         }
         let deadline = tokio::time::Instant::now() + RUNNING_RELAY_SHUTDOWN_TIMEOUT;
-        self.cancel.cancel();
         let mut first_error = None;
 
-        // Cancellation can win the actor's select before the explicit
-        // shutdown command is received.  In that expected race, Shutdown is
-        // not a listener failure; the actor still runs its close_all path.
-        match tokio::time::timeout_at(deadline, self.handle.shutdown()).await {
+        // Ask the actor to shut down *before* cancelling the shared token.
+        // Cancelling first tears the device listener down while a session's
+        // terminal FIN may still be queued on its carrier, so the frame is
+        // handed to a socket task that is already draining.  Requesting the
+        // actor shutdown first lets `close_all` reach the terminal drain and
+        // `close_session` while the listener is still serving.
+        //
+        // This is bounded on purpose: the request is awaited only until the
+        // existing shutdown deadline, and the cancel below runs on every
+        // path -- clean reply, typed error, or expired deadline -- so an
+        // actor that never answers cannot hang shutdown.  The actor task
+        // also cancels the same token itself when `run` returns, and `Drop`
+        // remains the emergency cancellation path.
+        let actor_shutdown = tokio::time::timeout_at(deadline, self.handle.shutdown()).await;
+        self.cancel.cancel();
+
+        // Cancellation can still win the actor's select before the explicit
+        // shutdown command is received (an earlier listener failure, a panic
+        // boundary, or `Drop`).  In that expected race, Shutdown is not a
+        // listener failure; the actor still runs its close_all path.
+        match actor_shutdown {
             Ok(Ok(())) | Ok(Err(RelayError::Shutdown)) => {}
             Ok(Err(error)) => record_first_error(&mut first_error, error),
             Err(_) => {
