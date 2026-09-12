@@ -1,5 +1,45 @@
 # Active continuation checkpoint
 
+## Checkpoint: worker wave integrated, five relay defects fixed, one gate clause open — 2026-09-12T11:30:00+10:00
+
+M7 remains open but the branch is close to merge. `andymac4182/c/m7-cluster-foundations`
+is pushed with draft PR #12 against main; its head at this checkpoint is 50ecfb2. PR #10
+(M1) is merged into main as 3c14b71, and PR #11 (M2) is superseded by this branch rather
+than merged on its own.
+
+Every parallel worker's result is integrated: bounded peer stage and cause tuples with the
+OG-02 correlation bundle, the duplex receive fix, the FP-05 best-effort FIN correction, the
+C67 rotation deadline path, the EC-041/EC-023/EC-025 device gates, and the chaos gate with
+the parity build receipt and the evidence guard.
+
+Five relay or transport defects were found and fixed during integration, each with its own
+task row: a parked owner peer receive bounded by the transport idle timeout instead of the
+consumer deadline (C68), a late connector reply fencing a whole device session after an
+owner close (C69), a connector terminal leaving an unreclaimable tombstone (fixed in the
+same pass), the rotation deadline cause not latched when a candidate closed just after the
+overlap budget (C67), and a post-GOAWAY drain treating a peer's graceful QUIC application
+code 0 close as a protocol failure (C77). The last one is why the I08 GOAWAY gate failed
+cluster cleanup in two consecutive full surveys while its scenario passed.
+
+Evidence at the final source: formatting, strict all-target Clippy and the workspace suite
+pass; the gate survey, the M1 acceptance and the M2 default plan with three actual
+300-second rotations pass. The gate suite is now 73 gates. Four test binaries were found to
+be `#[ignore]`d and never registered, so they ran in neither the survey nor the workspace
+suite; all four are registered and pass, including the dynamic certificate replacement gate
+that had not run since before four commits touched the code it covers.
+
+The 98-row matrix stands at 85 verified. Three independent adversarial audits drove that
+number: rows were reverted or held whenever a clause was unproven, and each of the 13 open
+rows now records the exact missing clause. Seven task rows carried evidence that was stale
+at the tip, claiming gaps that later gates had closed, and those are corrected.
+
+Open before merge: the final chain at 7c28ce6 is the gating run. After it, update M7-I12
+with its numbers, then merge PR #12 with a merge commit and close PR #11 as superseded.
+Remaining planned work is recorded as M7-C50, C52, C54, C66, C70, C71, C72, C76 and the
+open integration rows; none is a known product defect, each is a missing proof at a
+declared scope.
+
+
 ## Session continuation: reviews merged, four repairs integrated, six workers resumed — 2026-09-11T18:53:06+10:00
 
 M7 remains open. Branch `andymac4182/c/m7-cluster-foundations` is pushed (draft PR #12 against main); its head at this checkpoint is fc38699. PR #10 (M1) was merged into main as 3c14b71 after an independent review found no blockers; its five should-fix items are tracker rows M7-C31..C35. PR #11 (M2) is retargeted to main but deliberately not merged standalone: the review found the relay never freezes its old writer at the rotation fence and never reclaimed terminal streams, and read-only verification against d21b116 confirmed the writer freeze (M7-C36), OPEN-during-quiesce (C37), local PREPARE queue failure (C38), the 256-entry connection-history cap (C39), unbounded handler writes (C40) and the Draining/Retiring recovery mismatch (C41) still open, while STREAM_FORGET reclamation, DRAINED reply pinning and abort-reason derivation are fixed with tests. M2 lands through PR #12.
