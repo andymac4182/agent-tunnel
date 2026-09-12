@@ -189,6 +189,121 @@ struct ServerSignals {
     cancel: CancellationToken,
 }
 
+/// A peer server that answers one request, sends GOAWAY, and then shuts down
+/// the way the transport and the relay do: QUIC application code 0 on the
+/// connection and the endpoint, rather than the `H3_NO_ERROR` code the other
+/// fixtures use.
+struct CodeZeroServerFixture {
+    destination: PeerDestination,
+    close_now: Arc<Notify>,
+    task: JoinHandle<TestResult>,
+}
+
+impl CodeZeroServerFixture {
+    fn start(pki: &FixturePki, server_leaf: &Leaf) -> Self {
+        let server_config = load_peer_server_config_from_pem(
+            pki.chain(server_leaf).as_bytes(),
+            server_leaf.private_key_pem.as_bytes(),
+            pki.ca_pem.as_bytes(),
+        )
+        .expect("code-zero server TLS config");
+        let endpoint =
+            quinn::Endpoint::server(server_config, SocketAddr::from(([127, 0, 0, 1], 0)))
+                .expect("code-zero server endpoint");
+        let address = endpoint.local_addr().expect("code-zero server address");
+        let close_now = Arc::new(Notify::new());
+        let task = tokio::spawn(serve_one_then_close_with_code_zero(
+            endpoint,
+            close_now.clone(),
+        ));
+        Self {
+            destination: PeerDestination::new(address, SERVER_NAME),
+            close_now,
+            task,
+        }
+    }
+
+    fn send_goaway_then_close_with_code_zero(&self) -> TestResult {
+        self.close_now.notify_one();
+        Ok(())
+    }
+
+    async fn join(mut self) -> TestResult {
+        match timeout(CASE_TIMEOUT, &mut self.task).await {
+            Ok(joined) => {
+                joined??;
+                Ok(())
+            }
+            Err(_) => {
+                self.task.abort();
+                Err("code-zero server exceeded its join deadline".into())
+            }
+        }
+    }
+}
+
+impl Drop for CodeZeroServerFixture {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn serve_one_then_close_with_code_zero(
+    endpoint: quinn::Endpoint,
+    close_now: Arc<Notify>,
+) -> TestResult {
+    let incoming = timeout(CASE_TIMEOUT, endpoint.accept())
+        .await?
+        .ok_or("code-zero server had no incoming connection")?;
+    let connection = timeout(CASE_TIMEOUT, incoming).await??;
+    let quic = h3_quinn::Connection::new(connection.clone());
+    let mut h3_connection =
+        timeout(CASE_TIMEOUT, h3::server::builder().build::<_, Bytes>(quic)).await??;
+    let resolver = timeout(CASE_TIMEOUT, h3_connection.accept())
+        .await??
+        .ok_or("code-zero server ended before the first request")?;
+    let (request, mut stream) = resolver.resolve_request().await?;
+    if request.uri().path() != GOAWAY_PATH {
+        return Err(format!(
+            "unexpected code-zero fixture path: {}",
+            request.uri().path()
+        )
+        .into());
+    }
+    while stream.recv_data().await?.is_some() {}
+    stream
+        .send_response(Response::builder().status(StatusCode::OK).body(())?)
+        .await?;
+    stream.send_data(Bytes::from_static(RESPONSE_A)).await?;
+    stream.finish().await?;
+
+    // Keep driving H3 until the test asks for the shutdown, so the client has
+    // consumed its response before GOAWAY.
+    loop {
+        tokio::select! {
+            _ = close_now.notified() => break,
+            result = timeout(GOAWAY_DRAIN_QUIET, h3_connection.accept()) => match result {
+                Ok(Ok(Some(resolver))) => {
+                    let (_, mut rejected) =
+                        timeout(CASE_TIMEOUT, resolver.resolve_request()).await??;
+                    rejected.stop_stream(h3::error::Code::H3_REQUEST_REJECTED);
+                }
+                Ok(Ok(None)) => break,
+                Ok(Err(error)) => return Err(error.into()),
+                Err(_) => {}
+            },
+        }
+    }
+
+    // GOAWAY first, so the client driver enters its planned drain, then the
+    // graceful close every relay shutdown path performs: application code 0.
+    timeout(CASE_TIMEOUT, h3_connection.shutdown(0)).await??;
+    connection.close(quinn::VarInt::from_u32(0), b"code-zero cleanup");
+    endpoint.close(quinn::VarInt::from_u32(0), b"code-zero server shutdown");
+    timeout(CASE_TIMEOUT, endpoint.wait_idle()).await?;
+    Ok(())
+}
+
 async fn serve_one(endpoint: quinn::Endpoint, signals: ServerSignals, goaway: bool) -> TestResult {
     let ServerSignals {
         accepted,
@@ -1282,4 +1397,156 @@ async fn peer_client_keeps_request_cancelled_reset_as_generic_h3() -> TestResult
         }
         Ok(_) => Err("cancelled request unexpectedly received a response".into()),
     }
+}
+
+/// Characterization of the post-GOAWAY drain against a peer that shuts down
+/// the way production does: QUIC application code 0.
+///
+/// Honest scope: this case passes both before and after the classifier fix,
+/// because with no stream lease outstanding the driver can finish its drain
+/// without reaching `planned_idle_result`. It is kept because it pins the
+/// invariant with a production-shaped close, and because the other fixtures
+/// deliberately avoid that close. The evidence for the fix itself is the code
+/// path plus repeated runs of the I08 GOAWAY gate, recorded in docs/tasks.md.
+///
+/// Every graceful close in the transport and the relay closes its QUIC
+/// connection and endpoint with application code 0. `is_h3_no_error` accepts
+/// only `H3_NO_ERROR` (0x100), so the post-GOAWAY drain classified that clean
+/// shutdown as a protocol failure. A cluster stops its relays in sequence, so
+/// the later relay's client pool was still draining a connection to the one
+/// already stopped and its shutdown reported `stopping relay <node>: peer
+/// transport failed`, failing the I08 GOAWAY gate's cluster cleanup in two
+/// consecutive surveys on whichever relay stopped later. Note the existing
+/// `ServerFixture` deliberately closes with `H3_NO_ERROR` to avoid this, so
+/// this case needs a fixture that closes the way production does.
+#[tokio::test]
+async fn peer_client_drain_completes_when_the_peer_closes_with_application_code_zero() -> TestResult
+{
+    let pki = FixturePki::new();
+    let client_leaf = pki.issue_peer("code-zero-client");
+    let server_leaf = pki.issue_peer("code-zero-server");
+    let server = CodeZeroServerFixture::start(&pki, &server_leaf);
+
+    let mut client_endpoint = quinn::Endpoint::client(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .expect("code-zero client endpoint");
+    let client_config = load_peer_client_config_from_pem(
+        pki.chain(&client_leaf).as_bytes(),
+        client_leaf.private_key_pem.as_bytes(),
+        pki.ca_pem.as_bytes(),
+    )
+    .expect("code-zero client TLS config");
+    client_endpoint.set_default_client_config(client_config);
+    let pins = ApprovedPeerPins::new([
+        spki_sha256_from_der(&server_leaf.der).expect("code-zero server pin")
+    ])
+    .expect("code-zero client pins");
+    let client = PeerClient::new(client_endpoint, pins, limits()).expect("code-zero client");
+
+    // One real authenticated exchange, so the pooled connection is live and
+    // its driver is running rather than idle from birth.
+    let connection = client.connect(server.destination.clone()).await?;
+    let mut admitted = connection.open(request()).await?;
+    admitted.finish().await?;
+    let response = admitted.recv_response().await?;
+    if response.status() != StatusCode::OK {
+        return Err("code-zero exchange was not successful".into());
+    }
+    if body_bytes(admitted.recv_chunk().await?)?.as_slice() != RESPONSE_A {
+        return Err("code-zero response body changed".into());
+    }
+    drop(admitted);
+
+    // The peer sends GOAWAY, putting this client's driver into its planned
+    // drain, and then shuts down the way the relay does: QUIC application
+    // code 0 on the connection and the endpoint.
+    server.send_goaway_then_close_with_code_zero()?;
+
+    // The drain must complete: this client's own shutdown joins cleanly and
+    // stays inside its drain deadline.
+    let started = tokio::time::Instant::now();
+    client.shutdown().await.map_err(|error| {
+        format!("drain after a peer close with application code 0 failed: {error}")
+    })?;
+    if started.elapsed() >= CASE_TIMEOUT {
+        return Err("client shutdown did not complete within its drain deadline".into());
+    }
+    server.join().await?;
+    Ok(())
+}
+
+/// Characterization: a pooled connection whose remote peer has already stopped
+/// must not make this client's own shutdown report a failure.
+///
+/// Honest scope: this also passes before the classifier fix, because a clean
+/// remote close leaves the driver's result successful on that path. It pins the
+/// multi-node teardown invariant that a cluster relies on when it stops relays
+/// in sequence.
+///
+/// A cluster stops its relays in sequence, so by the time a later relay shuts
+/// down its peer client pool, it still holds connections to relays that are
+/// already gone. Those connections end with the remote's close code, and
+/// `PeerClient::shutdown` previously propagated that terminal state as a
+/// shutdown error. The relay surfaced it as `stopping relay <node>: peer
+/// transport failed`, which failed the I08 GOAWAY gate's cluster cleanup in
+/// two consecutive surveys on whichever relay happened to be stopped later.
+/// Shutdown reports the drain exceeding its deadline, not the terminal state
+/// of a connection it closed itself.
+#[tokio::test]
+async fn peer_client_shutdown_joins_cleanly_when_the_remote_peer_is_already_gone() -> TestResult {
+    let pki = FixturePki::new();
+    let client_leaf = pki.issue_peer("gone-peer-client");
+    let server_leaf = pki.issue_peer("gone-peer-server");
+    let server = ServerFixture::start(&pki, &server_leaf, false);
+
+    let mut client_endpoint = quinn::Endpoint::client(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .expect("gone-peer client endpoint");
+    let client_config = load_peer_client_config_from_pem(
+        pki.chain(&client_leaf).as_bytes(),
+        client_leaf.private_key_pem.as_bytes(),
+        pki.ca_pem.as_bytes(),
+    )
+    .expect("gone-peer client TLS config");
+    client_endpoint.set_default_client_config(client_config);
+    let pins = ApprovedPeerPins::new([
+        spki_sha256_from_der(&server_leaf.der).expect("gone-peer server pin")
+    ])
+    .expect("gone-peer client pins");
+    let client = PeerClient::new(client_endpoint, pins, limits()).expect("gone-peer client");
+
+    // One real authenticated exchange, so the pooled connection is live and
+    // its driver is running rather than idle from birth.
+    let connection = client.connect(server.destination.clone()).await?;
+    let mut admitted = connection.open(request()).await?;
+    admitted.finish().await?;
+    let response = admitted.recv_response().await?;
+    if response.status() != StatusCode::OK {
+        return Err("gone-peer exchange was not successful".into());
+    }
+    if body_bytes(admitted.recv_chunk().await?)?.as_slice() != RESPONSE_B {
+        return Err("gone-peer response body changed".into());
+    }
+    drop(admitted);
+
+    // The remote stops first, exactly as an earlier relay in a cluster
+    // teardown does. The pooled connection is now terminal through no fault
+    // of this client.
+    server.shutdown().await?;
+
+    // The client still holds that pooled connection. Its own shutdown must
+    // join cleanly and stay within the drain deadline.
+    let started = tokio::time::Instant::now();
+    client
+        .shutdown()
+        .await
+        .map_err(|error| format!("shutting down a client whose peer is gone failed: {error}"))?;
+    if started.elapsed() >= CASE_TIMEOUT {
+        return Err("client shutdown did not complete within its drain deadline".into());
+    }
+
+    // Shutdown is idempotent and still clean with the pool already drained.
+    client
+        .shutdown()
+        .await
+        .map_err(|error| format!("second client shutdown failed: {error}"))?;
+    Ok(())
 }

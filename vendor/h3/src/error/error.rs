@@ -36,6 +36,23 @@ pub enum ConnectionError {
 }
 
 impl ConnectionError {
+    /// Returns whether the peer closed the connection with QUIC application
+    /// code 0 and no HTTP/3 error.
+    ///
+    /// Local patch (Agent Tunnel): `is_h3_no_error` accepts only the HTTP/3
+    /// `H3_NO_ERROR` code (0x100), but endpoints commonly perform a graceful
+    /// shutdown by closing the QUIC connection with application code 0, which
+    /// carries no HTTP/3 error at all.  A driver draining after GOAWAY needs to
+    /// distinguish that clean remote shutdown from a real protocol failure,
+    /// which always arrives with a defined 0x1xx code.  The `Remote` variant is
+    /// otherwise reachable only behind the third-party-backend feature.
+    pub fn is_remote_no_error_application_close(&self) -> bool {
+        matches!(
+            self,
+            ConnectionError::Remote(ConnectionErrorIncoming::ApplicationClose { error_code: 0 })
+        )
+    }
+
     /// Returns if the error is H3_NO_ERROR local or remote
     pub fn is_h3_no_error(&self) -> bool {
         match self {
@@ -194,3 +211,4 @@ impl std::fmt::Display for StreamError {
 }
 
 impl std::error::Error for StreamError {}
+

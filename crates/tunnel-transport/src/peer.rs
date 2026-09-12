@@ -748,7 +748,9 @@ type ServerRecvStream = h3::server::RequestStream<h3_quinn::RecvStream, Bytes>;
 fn planned_idle_result(
     connection_result: h3::error::ConnectionError,
 ) -> Result<(), PeerTransportError> {
-    if connection_result.is_h3_no_error() {
+    if connection_result.is_h3_no_error()
+        || connection_result.is_remote_no_error_application_close()
+    {
         Ok(())
     } else {
         Err(PeerTransportError::H3(connection_result.to_string()))
