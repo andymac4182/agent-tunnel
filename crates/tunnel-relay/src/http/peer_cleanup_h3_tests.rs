@@ -7,6 +7,7 @@
 use super::*;
 
 use crate::peer_fault_diagnostics::{PeerFaultContext, PeerFaultObserver, PeerFaultRole};
+use crate::routing::OwnerScope;
 use crate::{
     peer_consumer_transport_diagnostics::{
         PeerConsumerDiagnosticH3Code, PeerConsumerDiagnosticRole,
@@ -15,8 +16,11 @@ use crate::{
     runtime::{RelaySessionSnapshot, RelaySnapshot, RelayStreamSnapshot},
 };
 use chrono::Duration as ChronoDuration;
+use http::StatusCode;
 use tokio::task::JoinHandle;
-use tunnel_catalog::{Catalog, DeviceIdentity, MemoryCatalog, OwnerClaim, OwnerToken};
+use tunnel_catalog::{
+    Catalog, DeviceIdentity, MemoryCatalog, OwnerClaim, OwnerClaimRequest, OwnerToken,
+};
 use tunnel_cluster::envelope::{
     ConsumerStreamsRequest, Destination, DeviceAuthenticationContext, DeviceControlRequest,
     DeviceDataRequest, ForwardedConsumerBearer, IngressRequestBinding, InternalRequest,
@@ -146,6 +150,21 @@ impl H3PeerFixture {
                 runtime,
                 handle,
                 device,
+                returned_errors,
+            },
+        )
+        .await
+    }
+
+    /// Build a server whose H3 callback answers the ingress request head and
+    /// then deliberately withholds the response record past the transport's
+    /// receive idle window.  Everything before the hold is the production
+    /// admission path (`PeerRuntime::accept_inbound`); only the response
+    /// timing is staged, which is what the ingress read bound is about.
+    async fn new_holding_owner() -> Self {
+        Self::new_with(
+            |runtime, _handle, _catalog, _oidc, _device, returned_errors| HoldingOwnerHandler {
+                runtime,
                 returned_errors,
             },
         )
@@ -350,6 +369,65 @@ impl PeerRequestHandler for DirectControlHandler {
                 super::super::handle_peer_device_control(inbound, handle, device, &fault)
                     .await
                     .map_err(|error| PeerTransportError::H3(error.to_string()))
+            }
+            .await;
+            if result.is_err() {
+                returned_errors.fetch_add(1, Ordering::AcqRel);
+            }
+            result
+        })
+    }
+}
+
+/// Longer than the fixture's two-second transport receive idle timeout, so a
+/// response read still bounded by that window cannot observe the record.
+const INGRESS_OWNER_HOLD: Duration = Duration::from_millis(3_200);
+/// The fixture's transport receive idle timeout (`test_limits`).
+const INGRESS_IDLE_WINDOW: Duration = Duration::from_secs(2);
+/// Stands in for the consumer's absolute authorization deadline.  It is well
+/// past the hold above, so the record must arrive before it.
+const INGRESS_CONSUMER_LIFETIME: Duration = Duration::from_secs(7);
+/// Scheduling slack around the deadline the silent owner must be ended by.
+const INGRESS_DEADLINE_SLACK: Duration = Duration::from_millis(2_500);
+const INGRESS_HELD_BODY: &[u8] = b"ingress-parked-response";
+
+/// Owner stub for the ingress-role bound: it accepts a real forwarded
+/// consumer request, answers the head immediately, withholds the single
+/// response record for [`INGRESS_OWNER_HOLD`], and then stays silent so only
+/// the ingress's own absolute deadline can end the exchange.
+struct HoldingOwnerHandler {
+    runtime: Arc<PeerRuntime>,
+    returned_errors: Arc<AtomicUsize>,
+}
+
+impl PeerRequestHandler for HoldingOwnerHandler {
+    fn handle(
+        &self,
+        identity: TlsIdentity,
+        request: Request<()>,
+        stream: PeerServerStream,
+    ) -> PeerHandlerFuture {
+        let runtime = Arc::clone(&self.runtime);
+        let returned_errors = Arc::clone(&self.returned_errors);
+        Box::pin(async move {
+            let result = async {
+                let inbound = runtime
+                    .accept_inbound(identity, request, stream)
+                    .await
+                    .map_err(|error| PeerTransportError::H3(error.to_string()))?;
+                let (mut send, _recv) = inbound.split();
+                send.respond(StatusCode::OK)
+                    .await
+                    .map_err(|error| PeerTransportError::H3(error.to_string()))?;
+                tokio::time::sleep(INGRESS_OWNER_HOLD).await;
+                send.send_message(PeerRecordKind::ConsumerChunk, INGRESS_HELD_BODY)
+                    .await
+                    .map_err(|error| PeerTransportError::H3(error.to_string()))?;
+                // Deliberately never finish: the exchange must be ended by
+                // the ingress deadline, not by the owner closing.  The
+                // fixture's server shutdown cancels this task.
+                std::future::pending::<()>().await;
+                Ok::<_, PeerTransportError>(())
             }
             .await;
             if result.is_err() {
@@ -1890,6 +1968,132 @@ async fn peer_consumer_outstanding_write_outlives_the_receive_idle_timeout() {
 
     stream.cancel();
     drop(stream);
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn peer_ingress_response_read_outlives_the_receive_idle_timeout() {
+    // M7-C70 regression, the ingress mirror of
+    // `peer_consumer_outstanding_write_outlives_the_receive_idle_timeout`.
+    // A saturated-but-healthy owner is legitimately silent while it queues
+    // the consumer's response, so the ingress's read of that response must be
+    // bounded by the consumer's absolute authorization deadline rather than
+    // by the peer transport's two-second receive idle window.  The stub owner
+    // holds its record past that window: the record must still arrive, the
+    // read must then end at the consumer deadline rather than one idle window
+    // after the record, and nothing may be cancelled in between.
+    let fixture = H3PeerFixture::new_holding_owner().await;
+    let owner = fixture
+        .catalog
+        .claim_owner(&OwnerClaimRequest {
+            deployment_incarnation: DEPLOYMENT_INCARNATION.to_owned(),
+            tenant_id: tenant_id(),
+            device_id: device_id(),
+            node_id: DESTINATION_NODE.to_owned(),
+            boot_id: DESTINATION_BOOT.to_owned(),
+            session_id: "ingress-parked-response-owner".to_owned(),
+            lease_expires_at: Utc::now() + ChronoDuration::minutes(5),
+        })
+        .await
+        .expect("claim the staged remote owner");
+    let route = fixture
+        .runtime
+        .resolve(OwnerScope::new(tenant_id(), device_id()), Utc::now())
+        .await
+        .expect("resolve the staged remote owner route");
+    assert!(
+        !route.is_local(),
+        "the staged owner must route remotely so the ingress client path runs"
+    );
+    assert_eq!(route.owner_token(), &owner.token);
+
+    let envelope = consumer_envelope(
+        "ingress-parked-response-request",
+        "ingress-parked-response-stream",
+        route.owner_token(),
+        &fixture.consumer_token,
+    );
+    let exchange = fixture
+        .runtime
+        .open(&route, envelope)
+        .await
+        .expect("open the staged ingress exchange");
+    let (mut send, mut recv) = exchange.split();
+    recv.accept_response()
+        .await
+        .expect("staged owner response head");
+
+    let before = fixture
+        .handle
+        .snapshot()
+        .await
+        .expect("ingress parked-response baseline snapshot")
+        .peer_consumer_diagnostics
+        .ingress_receive_count;
+    let stub_errors_before = fixture.returned_errors.load(Ordering::Acquire);
+    let started = tokio::time::Instant::now();
+    let consumer_deadline = started + INGRESS_CONSUMER_LIFETIME;
+
+    // The owner holds well past the idle window.  Bounded by the idle
+    // timeout this read fails with a transport timeout and resets the owner
+    // with H3_REQUEST_CANCELLED; bounded by the consumer deadline it waits.
+    let record = recv
+        .recv_message_until(consumer_deadline)
+        .await
+        .expect("the held owner record must outlive the receive idle timeout")
+        .expect("the staged owner sends one record before it goes silent");
+    let held_for = started.elapsed();
+    assert_eq!(record.kind(), PeerRecordKind::ConsumerChunk);
+    assert_eq!(record.body(), INGRESS_HELD_BODY);
+    assert!(
+        held_for >= INGRESS_IDLE_WINDOW,
+        "the record must have been withheld past the idle window, waited {held_for:?}"
+    );
+    assert_eq!(
+        fixture.returned_errors.load(Ordering::Acquire),
+        stub_errors_before,
+        "the ingress must not have reset the parked owner while it waited"
+    );
+    assert_eq!(
+        fixture
+            .handle
+            .snapshot()
+            .await
+            .expect("ingress parked-response snapshot after the record")
+            .peer_consumer_diagnostics
+            .ingress_receive_count,
+        before,
+        "no ingress receive cancellation diagnostic may be recorded while the owner is parked"
+    );
+
+    // The owner is now silent for good.  The read is ended by the consumer's
+    // absolute deadline, not one idle window after the record above.
+    let error = match recv.recv_message_until(consumer_deadline).await {
+        Ok(_) => panic!("the silent owner must end the read at the consumer deadline"),
+        Err(error) => error,
+    };
+    let total = started.elapsed();
+    assert!(
+        matches!(
+            error,
+            PeerRuntimeError::Transport(PeerTransportError::Timeout)
+        ),
+        "the deadline must surface as a transport timeout, got {error:?}"
+    );
+    assert!(
+        total >= INGRESS_CONSUMER_LIFETIME.saturating_sub(INGRESS_DEADLINE_SLACK)
+            && total >= held_for + INGRESS_IDLE_WINDOW,
+        "the read must not end before the consumer deadline, ended after {total:?}"
+    );
+    assert!(
+        total < INGRESS_CONSUMER_LIFETIME + INGRESS_DEADLINE_SLACK,
+        "the read must still end at the consumer deadline, ended after {total:?}"
+    );
+
+    recv.cancel();
+    send.cancel();
+    drop(recv);
+    drop(send);
     fixture.shutdown().await;
 }
 

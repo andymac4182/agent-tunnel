@@ -1727,6 +1727,15 @@ async fn handle_remote_consumer_stream(
     // existing transport idle deadline and this exchange's absolute expiry
     // bound how long Ping/Close can wait without consuming another Binary
     // frame into an unaccounted queue.
+    // The owner response read is bounded by the consumer's absolute
+    // deadline, not by the peer transport idle timeout.  A saturated but
+    // healthy owner is legitimately silent while it queues this response, so
+    // an idle-window fault here fails the consumer's request with
+    // `H3_REQUEST_CANCELLED` while its own authorization deadline is still
+    // far away (the ingress mirror of the owner-side bound).  Owner reset,
+    // GOAWAY, response end and membership loss still end the read promptly,
+    // and the QUIC connection idle timeout remains armed underneath for a
+    // peer that has actually gone away.
     let mut pending_forward = None;
     loop {
         let event = if pending_forward.is_some() {
@@ -1735,7 +1744,7 @@ async fn handle_remote_consumer_stream(
                     biased;
                     _ = &mut expires => RemoteConsumerEvent::Expired,
                     forward_done = &mut forwarder => RemoteConsumerEvent::ForwardDone(forward_done),
-                    remote = recv.recv_message() => RemoteConsumerEvent::Remote(remote),
+                    remote = recv.recv_message_until(consumer_deadline) => RemoteConsumerEvent::Remote(remote),
                     slot = forward_tx.reserve() => {
                         match slot {
                             Ok(slot) => {
@@ -1760,7 +1769,7 @@ async fn handle_remote_consumer_stream(
                             Err(_) => RemoteConsumerEvent::ForwardClosed,
                         }
                     }
-                    remote = recv.recv_message() => RemoteConsumerEvent::Remote(remote),
+                    remote = recv.recv_message_until(consumer_deadline) => RemoteConsumerEvent::Remote(remote),
                 }
             }
         } else if prefer_remote {
@@ -1768,7 +1777,7 @@ async fn handle_remote_consumer_stream(
                 biased;
                 _ = &mut expires => RemoteConsumerEvent::Expired,
                 forward_done = &mut forwarder => RemoteConsumerEvent::ForwardDone(forward_done),
-                remote = recv.recv_message() => RemoteConsumerEvent::Remote(remote),
+                remote = recv.recv_message_until(consumer_deadline) => RemoteConsumerEvent::Remote(remote),
                 inbound = socket.next() => RemoteConsumerEvent::Inbound(inbound),
             }
         } else {
@@ -1777,7 +1786,7 @@ async fn handle_remote_consumer_stream(
                 _ = &mut expires => RemoteConsumerEvent::Expired,
                 forward_done = &mut forwarder => RemoteConsumerEvent::ForwardDone(forward_done),
                 inbound = socket.next() => RemoteConsumerEvent::Inbound(inbound),
-                remote = recv.recv_message() => RemoteConsumerEvent::Remote(remote),
+                remote = recv.recv_message_until(consumer_deadline) => RemoteConsumerEvent::Remote(remote),
             }
         };
         prefer_remote = !prefer_remote;

@@ -1544,6 +1544,25 @@ impl PeerClientRecv {
         self._connection.observe_stream_result(result)
     }
 
+    /// Receive one bounded response body chunk under an absolute deadline
+    /// supplied by the caller's operation instead of the idle timeout.
+    ///
+    /// The mirror of [`PeerServerRecv::recv_chunk_until`] on the ingress
+    /// side.  A saturated-but-healthy owner is legitimately silent while it
+    /// queues this response, so it is not idle-faulted; the caller's own
+    /// bound (the consumer's absolute authorization deadline) applies.
+    /// Resets, response end and malformed chunks are still surfaced
+    /// immediately, and the QUIC connection idle timeout remains the
+    /// transport-level liveness check for a peer that has actually gone
+    /// away.
+    pub async fn recv_chunk_until(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<Option<PeerBodyChunk>, PeerTransportError> {
+        let result = recv_client_chunk_until(&mut self.inner, &self.budget, deadline).await;
+        self._connection.observe_stream_result(result)
+    }
+
     /// Ask the peer to stop sending the response body.
     pub fn cancel(&mut self) {
         self.inner
@@ -1634,7 +1653,19 @@ async fn recv_client_chunk<S>(
 where
     S: h3::quic::RecvStream,
 {
-    let chunk = match timeout(idle_timeout, stream.recv_data()).await {
+    recv_client_chunk_until(stream, budget, Instant::now() + idle_timeout).await
+}
+
+/// Read one bounded response body chunk against an absolute deadline.
+async fn recv_client_chunk_until<S>(
+    stream: &mut h3::client::RequestStream<S, Bytes>,
+    budget: &BodyBudget,
+    deadline: Instant,
+) -> Result<Option<PeerBodyChunk>, PeerTransportError>
+where
+    S: h3::quic::RecvStream,
+{
+    let chunk = match timeout_at(deadline, stream.recv_data()).await {
         Ok(result) => result.map_err(classify_client_stream_error)?,
         Err(_) => {
             stream.stop_sending(h3::error::Code::H3_REQUEST_CANCELLED);
