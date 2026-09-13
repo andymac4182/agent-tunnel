@@ -1,6 +1,8 @@
 # Build roadmap
 
-Status: M1 local verification is complete; later cluster work remains.
+The [task tracker](tasks.md) records task status, ownership, discovered defects, and acceptance evidence within each milestone.
+
+Status: M1 is merged to main and M2 is locally verified and contained in the M7 branch. M7 is in progress: its component, configured-process and real three-relay checks now cover admission, rotation, recovery, saturation, peer trust, chaos classification and tenant isolation, and the 98-row edge-case matrix stands at 85 rows verified locally, with each of the remaining 13 recording the exact clause that is still unproven. The full local gate suite, the M1 acceptance and the M2 default plan with three actual 300-second rotations pass against the branch source. The production integration gate is not yet satisfied; see [the task tracker](tasks.md) for the open rows and [the matrix](m7-edge-cases.md) for the remaining row scopes.
 On 2026-09-09 macOS arm64 with pinned Rust 1.95.0 and Redis 8.4, formatting,
 strict locked Clippy, 62 workspace tests, five explicitly executed real Redis integration tests, the AOF restart
 check, and the full real HTTPS/WSS CLI acceptance passed for five
@@ -25,7 +27,7 @@ GitHub tracking: [v0.1 Private alpha](https://github.com/andymac4182/agent-tunne
 | CLI operations and diagnostics | [#9](https://github.com/andymac4182/agent-tunnel/issues/9) |
 
 Hosted verification: [M1 CI checks](https://github.com/andymac4182/agent-tunnel/pull/10/checks).
-
+Hosted CI status: since 2026-09-11 GitHub Actions jobs on this repository fail before starting because of an account payment/spending-limit block, so M2 and M7 evidence is local-only until that is restored.
 ## M0 — Repository and executable configuration
 
 Delivered or under active implementation: private MIT-licensed repo, Rust workspace, strict legacy configuration validation, the M1 `RuntimeConfig` client CLI, local CSR/import commands for externally issued device credentials, Axum consumer/device listeners, configured Redis authority and JWT/JWKS authorization, pinned TLS/WSS/H3 transport helpers, and a reusable real-resource harness. Local evidence covers the locked checks, 62 workspace tests, five explicitly executed real Redis integration tests, AOF same-dataset restart, and full real M1 acceptance; CI results are linked in this document. Redis is the authority catalog for every tenant, user, membership, device, service, grant, and credential record formerly assigned to PostgreSQL. Relay sockets, queues, in-flight operations, and other process-local session state remain ephemeral. In the narrow M1 Redis profile, the durable device hash also stores lease fields and expiry without a Redis TTL; logical lease validation and complete `deployment_incarnation` plus `run_id` guards make stale owner fields non-authoritative. Separate TTL namespaces remain an M7 design. `redis_url`, `redis_namespace`, and `deployment_incarnation` remain deployment inputs whose persistence, restore, and fail-closed behavior require explicit evidence. Legacy configuration retains the documented 300-second/10-second/30-second rotation defaults for the future M2 profile; M1 itself does not rotate or replay.
@@ -52,6 +54,12 @@ Public consumers cannot forge internal verified identity headers. M7 multi-relay
 
 ## M2 — Independent ordering and drain before handover
 
+Locally verified on 2026-09-10: 151 workspace tests, strict locked checks,
+five Redis tests, AOF restart and full M1 regression pass. The real-socket
+M2 suite passes three accelerated rotations, targeted recovery/abort/control
+loss/cancellation/revocation faults, and three actual 300-second rotations in
+903.05 seconds. See [M2 evidence](m2-verification.md). Hosted M2 CI is pending.
+
 Implement [protocol.md](protocol.md) as a pure state machine before real socket I/O. Each logical stream has independent sequence spaces per direction, tied to a unique session/stream identity and preserved through scheduled rotation. Physical connection IDs, generations and owner epochs fence carriers without resetting logical counters. Bound credits, queued bytes, replay, tombstones, roster snapshots and recovery time.
 
 Scheduled handover is **prepare → quiesce → drain → commit → retire**. Freeze old writers at immutable per-stream fences, pause new stream admission, wait for contiguous acknowledgements in both directions, then activate the candidate and retire the old socket within the original overlap budget. A delivery drain does not wait for a long-running agent task to complete. Cancellation remains responsive; no next replacement begins while the old transport remains allocated.
@@ -62,7 +70,12 @@ M1/M2 gate remotely usable service adapters. Adapter/codec research can run in p
 
 ## M7 — Cluster foundations and three-node integration
 
-This is required for alpha, despite its retained issue number. Implement [cluster.md](cluster.md): direct owner routing over bounded bidirectional HTTP/3 streams, mandatory peer mTLS, externally signed Redis membership/public keys, approved trust anchors, Redis-backed authorization authority, owner leases and connector-enforced fencing. Use separate device and peer roles. Redis mutation alone cannot enroll a server.
+This is required for alpha, despite its retained issue number. The implemented
+slice provides [cluster.md](cluster.md)'s direct owner routing over bounded
+bidirectional HTTP/3 streams, mandatory peer mTLS, externally signed Redis
+membership/public keys, approved trust anchors, Redis-backed authorization
+authority, owner leases, and connector-enforced fencing. Use separate device
+and peer roles. Redis mutation alone cannot enroll a server.
 
 The supported first coordination profile is one authoritative Redis primary with
 no automatic promotion. The local AOF check proves same-dataset restart
@@ -78,7 +91,32 @@ Membership expiry, authorization expiry, owner lease expiry and certificate
 expiry are distinct deadlines. Coordination high availability is a separate
 future gate, and M1 does not claim safe restoration of arbitrary backups.
 
-Gate: three real relays, two users, three or more devices, control/data/replacement/consumer ingress deliberately placed on different nodes. Test direct routing, peer key rotation/revocation, expired/forged/replayed membership, lost notifications, stale snapshots, owner death, UDP/Redis partitions and process pauses. Prove fencing, memory bounds, useful traces and no cross-tenant delivery. Repeat full stream drains through peer forwarding. Lost owner state creates fresh sessions, not invisible recovery of agent memory.
+The synthetic local harness uses three real mTLS QUIC relays and isolated
+Redis to exercise routing contracts, membership verification, owner contention,
+stale release and pin revocation. Its synthetic owner callback does not prove
+production device sockets, authorization and rotation together. The production
+three-relay harness and expanded transport faults must pass before those gates
+can close. Redis recovery/rollback, UDP partitions and process pauses also
+require acceptance evidence; no automatic promotion is claimed.
+
+### Mandatory M7 edge-case acceptance expansion
+
+M7 must cover every applicable case and analogous failure in the Kaizen
+`tunnel-edge-cases.md` inventory supplied on 2026-09-10. Track each source case
+in [the M7 edge-case matrix](m7-edge-cases.md), with an Agent Tunnel invariant,
+concrete regression or fault-injection test, and revision-specific evidence.
+An existing unit test is not evidence for a cross-relay lifecycle requirement.
+Uncovered cases remain open M7 gates; adaptations and non-applicability require
+an explicit reason. Include the inventory's incidents and outstanding staging
+proof, not only its numbered tables.
+
+Preserve Agent Tunnel's own contract: scheduled data-carrier rotation retains
+logical streams, ambiguous side effects are never retried, and missing owner
+or authorization state never redirects work to an unrelated backend. Exercise
+ownership races, tenant isolation, readiness, Redis/peer loss, key changes,
+backpressure, physical write stalls, cancellation, terminal cleanup, protocol
+compatibility, partial responses, and shutdown using bounded synthetic loads.
+Release/source parity and state-preserving rollback remain required evidence.
 
 ## M3 — MCP service adapter
 

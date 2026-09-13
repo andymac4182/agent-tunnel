@@ -11,6 +11,18 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::owner_fencing::{MAX_OWNER_FENCING_MESSAGE_BYTES, OwnerFence, OwnerFenced};
+use crate::rotation_control::{
+    RecoveryBegin, RecoveryClosed, Resume, Resumed, RotateAbort, RotateAborted, RotateCommit,
+    RotateCommitted, RotateComplete, RotateDrained, RotateFrozen, RotatePrepare, RotateQuiesce,
+    RotateRequest, RotateRetire, RotateRetired, StreamForget, validate_recovery_begin,
+    validate_recovery_closed, validate_resume, validate_resumed, validate_rotate_abort,
+    validate_rotate_aborted, validate_rotate_commit, validate_rotate_committed,
+    validate_rotate_complete, validate_rotate_drained, validate_rotate_frozen,
+    validate_rotate_prepare, validate_rotate_quiesce, validate_rotate_request,
+    validate_rotate_retire, validate_rotate_retired, validate_stream_forget,
+};
+
 /// Maximum encoded control message size, inclusive.
 pub const MAX_CONTROL_MESSAGE_BYTES: usize = 32 * 1024;
 /// Authorization challenge/confirmation messages have a tighter independent
@@ -30,6 +42,27 @@ pub const MAX_METADATA_VALUE_BYTES: usize = 4096;
 pub const MAX_REASON_BYTES: usize = 1024;
 /// Maximum opaque credential/ticket length.
 pub const MAX_CREDENTIAL_BYTES: usize = 4096;
+/// Maximum advertised rotation interval, matching the core configuration's
+/// 86,400-second ceiling after conversion to milliseconds.
+pub const MAX_ROTATION_INTERVAL_MS: u64 = 86_400_000;
+/// Maximum candidate handshake timeout, matching the core 300-second ceiling.
+pub const MAX_ROTATION_HANDSHAKE_TIMEOUT_MS: u64 = 300_000;
+/// Maximum overlap timeout, matching the core 3,600-second ceiling.
+pub const MAX_ROTATION_OVERLAP_TIMEOUT_MS: u64 = 3_600_000;
+/// Temporary hard ceiling for negotiated recovery retention.
+pub const MAX_ROTATION_RECOVERY_TIMEOUT_MS: u64 = 30_000;
+/// Default rotation interval from the shared core policy, in milliseconds.
+pub const DEFAULT_ROTATION_INTERVAL_MS: u64 = 300_000;
+/// Default candidate handshake timeout from the shared core policy.
+pub const DEFAULT_ROTATION_HANDSHAKE_TIMEOUT_MS: u64 = 10_000;
+/// Default overlap timeout from the shared core policy.
+pub const DEFAULT_ROTATION_OVERLAP_TIMEOUT_MS: u64 = 30_000;
+/// WebSocket close status used when an authenticated device cannot acquire
+/// the single active owner slot for its exact tenant/device scope.
+pub const CONTROL_OWNER_BUSY_CLOSE_CODE: u16 = 1008;
+/// Bounded close reason for the owner-conflict admission result.  The reason
+/// is deliberately fixed so backend/catalog details never cross the socket.
+pub const CONTROL_OWNER_BUSY_CLOSE_REASON: &str = "OWNER_BUSY";
 
 /// Serde helper for u64 values represented as decimal JSON strings.
 pub mod decimal_u64 {
@@ -109,6 +142,64 @@ impl ServiceAdvertisement {
     }
 }
 
+/// Connector-requested rotation timing, expressed in milliseconds on the
+/// wire.  The relay clamps these values componentwise to its own policy before
+/// returning the negotiated WELCOME fields.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RotationPolicy {
+    #[serde(with = "decimal_u64")]
+    pub interval_ms: u64,
+    #[serde(with = "decimal_u64")]
+    pub handshake_timeout_ms: u64,
+    #[serde(with = "decimal_u64")]
+    pub overlap_timeout_ms: u64,
+}
+
+impl Default for RotationPolicy {
+    fn default() -> Self {
+        Self::new(
+            DEFAULT_ROTATION_INTERVAL_MS,
+            DEFAULT_ROTATION_HANDSHAKE_TIMEOUT_MS,
+            DEFAULT_ROTATION_OVERLAP_TIMEOUT_MS,
+        )
+    }
+}
+
+impl RotationPolicy {
+    #[must_use]
+    pub const fn new(interval_ms: u64, handshake_timeout_ms: u64, overlap_timeout_ms: u64) -> Self {
+        Self {
+            interval_ms,
+            handshake_timeout_ms,
+            overlap_timeout_ms,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), ControlError> {
+        validate_rotation_value(
+            "rotation_policy.interval_ms",
+            self.interval_ms,
+            MAX_ROTATION_INTERVAL_MS,
+        )?;
+        validate_rotation_value(
+            "rotation_policy.handshake_timeout_ms",
+            self.handshake_timeout_ms,
+            MAX_ROTATION_HANDSHAKE_TIMEOUT_MS,
+        )?;
+        validate_rotation_value(
+            "rotation_policy.overlap_timeout_ms",
+            self.overlap_timeout_ms,
+            MAX_ROTATION_OVERLAP_TIMEOUT_MS,
+        )?;
+        validate_rotation_order(
+            self.handshake_timeout_ms,
+            self.overlap_timeout_ms,
+            self.interval_ms,
+        )
+    }
+}
+
 /// HELLO advertises the connector and its generic service identifiers.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -121,6 +212,8 @@ pub struct Hello {
     pub features: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub services: Vec<ServiceAdvertisement>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotation_policy: Option<RotationPolicy>,
 }
 
 impl Hello {
@@ -174,6 +267,28 @@ pub struct Welcome {
         with = "optional_decimal_u64"
     )]
     pub rotation_interval_ms: Option<u64>,
+    /// Owner identity negotiated for M2 rotation.  It is optional so M1
+    /// WELCOME frames remain byte-for-byte compatible with the old profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_id: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "optional_decimal_u64"
+    )]
+    pub rotation_handshake_timeout_ms: Option<u64>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "optional_decimal_u64"
+    )]
+    pub rotation_overlap_timeout_ms: Option<u64>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "optional_decimal_u64"
+    )]
+    pub rotation_recovery_timeout_ms: Option<u64>,
 }
 
 impl fmt::Debug for Welcome {
@@ -199,6 +314,19 @@ impl fmt::Debug for Welcome {
             .field("heartbeat_interval_ms", &self.heartbeat_interval_ms)
             .field("heartbeat_timeout_ms", &self.heartbeat_timeout_ms)
             .field("rotation_interval_ms", &self.rotation_interval_ms)
+            .field("owner_id", &self.owner_id)
+            .field(
+                "rotation_handshake_timeout_ms",
+                &self.rotation_handshake_timeout_ms,
+            )
+            .field(
+                "rotation_overlap_timeout_ms",
+                &self.rotation_overlap_timeout_ms,
+            )
+            .field(
+                "rotation_recovery_timeout_ms",
+                &self.rotation_recovery_timeout_ms,
+            )
             .finish()
     }
 }
@@ -234,6 +362,10 @@ impl Welcome {
             heartbeat_interval_ms: 20_000,
             heartbeat_timeout_ms: 60_000,
             rotation_interval_ms: None,
+            owner_id: None,
+            rotation_handshake_timeout_ms: None,
+            rotation_overlap_timeout_ms: None,
+            rotation_recovery_timeout_ms: None,
         }
     }
 
@@ -298,6 +430,36 @@ impl DataReady {
             generation,
             connection_id: connection_id.into(),
         }
+    }
+
+    /// Validate DATA_READY against the authenticated attachment context.
+    /// This takes the exact expected values rather than a whole WELCOME so a
+    /// replacement data socket can be checked against its candidate ticket
+    /// and generation without reusing stale bootstrap state.
+    pub fn validate_context(
+        &self,
+        session_id: &str,
+        epoch: u64,
+        generation: u64,
+        connection_id: &str,
+    ) -> Result<(), ControlError> {
+        for (field, actual, expected) in [
+            ("session_id", self.session_id.as_str(), session_id),
+            ("connection_id", self.connection_id.as_str(), connection_id),
+        ] {
+            if actual != expected {
+                return Err(ControlError::ContextMismatch { field });
+            }
+        }
+        if self.epoch != epoch {
+            return Err(ControlError::ContextMismatch { field: "epoch" });
+        }
+        if self.generation != generation {
+            return Err(ControlError::ContextMismatch {
+                field: "generation",
+            });
+        }
+        Ok(())
     }
 }
 
@@ -718,6 +880,25 @@ pub enum ControlMessage {
     AuthorizationChallenge(AuthorizationChallenge),
     AuthorizationConfirmed(AuthorizationConfirmed),
     AuthorizationInvalidated(AuthorizationInvalidated),
+    OwnerFence(OwnerFence),
+    OwnerFenced(OwnerFenced),
+    RotateRequest(RotateRequest),
+    RotatePrepare(RotatePrepare),
+    RotateQuiesce(RotateQuiesce),
+    RotateFrozen(RotateFrozen),
+    RotateDrained(RotateDrained),
+    RotateCommit(RotateCommit),
+    RotateCommitted(RotateCommitted),
+    RotateRetire(RotateRetire),
+    RotateRetired(RotateRetired),
+    RotateComplete(RotateComplete),
+    RotateAbort(RotateAbort),
+    RotateAborted(RotateAborted),
+    StreamForget(StreamForget),
+    Resume(Resume),
+    Resumed(Resumed),
+    RecoveryBegin(RecoveryBegin),
+    RecoveryClosed(RecoveryClosed),
 }
 
 /// Short aliases for callers that use `Control`/`Message` vocabulary.
@@ -742,7 +923,75 @@ impl ControlMessage {
             Self::AuthorizationChallenge(message) => &message.message_id,
             Self::AuthorizationConfirmed(message) => &message.message_id,
             Self::AuthorizationInvalidated(message) => &message.message_id,
+            Self::OwnerFence(message) => &message.message_id,
+            Self::OwnerFenced(message) => &message.message_id,
+            Self::RotateRequest(message) => &message.message_id,
+            Self::RotatePrepare(message) => &message.message_id,
+            Self::RotateQuiesce(message) => &message.message_id,
+            Self::RotateFrozen(message) => &message.message_id,
+            Self::RotateDrained(message) => &message.message_id,
+            Self::RotateCommit(message) => &message.message_id,
+            Self::RotateCommitted(message) => &message.message_id,
+            Self::RotateRetire(message) => &message.message_id,
+            Self::RotateRetired(message) => &message.message_id,
+            Self::RotateComplete(message) => &message.message_id,
+            Self::RotateAbort(message) => &message.message_id,
+            Self::RotateAborted(message) => &message.message_id,
+            Self::StreamForget(message) => &message.message_id,
+            Self::Resume(message) => &message.message_id,
+            Self::Resumed(message) => &message.message_id,
+            Self::RecoveryBegin(message) => &message.message_id,
+            Self::RecoveryClosed(message) => &message.message_id,
         }
+    }
+
+    /// The stable idempotency key for this message.  Runtime journals retain
+    /// the first response under this key and reject a reused key whose
+    /// encoded contents differ; the wire codec only validates its shape.
+    #[must_use]
+    pub fn idempotency_key(&self) -> &str {
+        self.message_id()
+    }
+
+    /// Return the request ID referenced by a reply, when the message carries
+    /// one.  Empty reply IDs are omitted by request serialization.
+    #[must_use]
+    pub fn reply_to(&self) -> Option<&str> {
+        let value = match self {
+            Self::Welcome(message) => &message.reply_to,
+            Self::DataReady(message) => &message.reply_to,
+            Self::Opened(message) => &message.reply_to,
+            Self::Rejected(message) => &message.reply_to,
+            Self::Pong(message) => &message.reply_to,
+            Self::AuthorizationConfirmed(message) => &message.reply_to,
+            Self::OwnerFenced(message) => &message.reply_to,
+            Self::RotateRequest(message) => &message.reply_to,
+            Self::RotatePrepare(message) => &message.reply_to,
+            Self::RotateQuiesce(message) => &message.reply_to,
+            Self::RotateFrozen(message) => &message.reply_to,
+            Self::RotateDrained(message) => &message.reply_to,
+            Self::RotateCommit(message) => &message.reply_to,
+            Self::RotateCommitted(message) => &message.reply_to,
+            Self::RotateRetire(message) => &message.reply_to,
+            Self::RotateRetired(message) => &message.reply_to,
+            Self::RotateComplete(message) => &message.reply_to,
+            Self::RotateAbort(message) => &message.reply_to,
+            Self::RotateAborted(message) => &message.reply_to,
+            Self::StreamForget(message) => &message.reply_to,
+            Self::Resume(message) => &message.reply_to,
+            Self::Resumed(message) => &message.reply_to,
+            Self::RecoveryBegin(message) => &message.reply_to,
+            Self::RecoveryClosed(message) => &message.reply_to,
+            Self::Hello(_)
+            | Self::Open(_)
+            | Self::Ping(_)
+            | Self::Cancel(_)
+            | Self::GoAway(_)
+            | Self::AuthorizationChallenge(_)
+            | Self::AuthorizationInvalidated(_)
+            | Self::OwnerFence(_) => return None,
+        };
+        (!value.is_empty()).then_some(value)
     }
 
     /// Return the canonical registry name.
@@ -762,6 +1011,25 @@ impl ControlMessage {
             Self::AuthorizationChallenge(_) => "AUTHORIZATION_CHALLENGE",
             Self::AuthorizationConfirmed(_) => "AUTHORIZATION_CONFIRMED",
             Self::AuthorizationInvalidated(_) => "AUTHORIZATION_INVALIDATED",
+            Self::OwnerFence(_) => "OWNER_FENCE",
+            Self::OwnerFenced(_) => "OWNER_FENCED",
+            Self::RotateRequest(_) => "ROTATE_REQUEST",
+            Self::RotatePrepare(_) => "ROTATE_PREPARE",
+            Self::RotateQuiesce(_) => "ROTATE_QUIESCE",
+            Self::RotateFrozen(_) => "ROTATE_FROZEN",
+            Self::RotateDrained(_) => "ROTATE_DRAINED",
+            Self::RotateCommit(_) => "ROTATE_COMMIT",
+            Self::RotateCommitted(_) => "ROTATE_COMMITTED",
+            Self::RotateRetire(_) => "ROTATE_RETIRE",
+            Self::RotateRetired(_) => "ROTATE_RETIRED",
+            Self::RotateComplete(_) => "ROTATE_COMPLETE",
+            Self::RotateAbort(_) => "ROTATE_ABORT",
+            Self::RotateAborted(_) => "ROTATE_ABORTED",
+            Self::StreamForget(_) => "STREAM_FORGET",
+            Self::Resume(_) => "RESUME",
+            Self::Resumed(_) => "RESUMED",
+            Self::RecoveryBegin(_) => "RECOVERY_BEGIN",
+            Self::RecoveryClosed(_) => "RECOVERY_CLOSED",
         }
     }
 
@@ -772,6 +1040,7 @@ impl ControlMessage {
             Self::AuthorizationChallenge(_)
             | Self::AuthorizationConfirmed(_)
             | Self::AuthorizationInvalidated(_) => MAX_AUTHORIZATION_MESSAGE_BYTES,
+            Self::OwnerFence(_) | Self::OwnerFenced(_) => MAX_OWNER_FENCING_MESSAGE_BYTES,
             _ => MAX_CONTROL_MESSAGE_BYTES,
         }
     }
@@ -794,6 +1063,9 @@ impl ControlMessage {
                     validate_id("service_type", &service.service_type)?;
                     validate_id("service_version", &service.version)?;
                     validate_identifiers("capability", &service.capabilities)?;
+                }
+                if let Some(rotation_policy) = &message.rotation_policy {
+                    rotation_policy.validate()?;
                 }
             }
             Self::Welcome(message) => {
@@ -819,11 +1091,17 @@ impl ControlMessage {
                         actual: message.max_control_message as usize,
                     });
                 }
+                if let Some(owner_id) = &message.owner_id {
+                    validate_id("owner_id", owner_id)?;
+                }
+                validate_optional_welcome_rotation_policy(message)?;
             }
             Self::DataReady(message) => {
                 validate_id("reply_to", &message.reply_to)?;
                 validate_id("session_id", &message.session_id)?;
                 validate_id("connection_id", &message.connection_id)?;
+                validate_nonzero_counter("epoch", message.epoch)?;
+                validate_nonzero_counter("generation", message.generation)?;
             }
             Self::Open(message) => {
                 validate_id("session_id", &message.session_id)?;
@@ -891,6 +1169,25 @@ impl ControlMessage {
                 validate_id("challenge_id", &message.challenge_id)?;
                 validate_reason("reason", &message.reason)?;
             }
+            Self::OwnerFence(message) => message.validate()?,
+            Self::OwnerFenced(message) => message.validate()?,
+            Self::RotateRequest(message) => validate_rotate_request(message)?,
+            Self::RotatePrepare(message) => validate_rotate_prepare(message)?,
+            Self::RotateQuiesce(message) => validate_rotate_quiesce(message)?,
+            Self::RotateFrozen(message) => validate_rotate_frozen(message)?,
+            Self::RotateDrained(message) => validate_rotate_drained(message)?,
+            Self::RotateCommit(message) => validate_rotate_commit(message)?,
+            Self::RotateCommitted(message) => validate_rotate_committed(message)?,
+            Self::RotateRetire(message) => validate_rotate_retire(message)?,
+            Self::RotateRetired(message) => validate_rotate_retired(message)?,
+            Self::RotateComplete(message) => validate_rotate_complete(message)?,
+            Self::RotateAbort(message) => validate_rotate_abort(message)?,
+            Self::RotateAborted(message) => validate_rotate_aborted(message)?,
+            Self::StreamForget(message) => validate_stream_forget(message)?,
+            Self::Resume(message) => validate_resume(message)?,
+            Self::Resumed(message) => validate_resumed(message)?,
+            Self::RecoveryBegin(message) => validate_recovery_begin(message)?,
+            Self::RecoveryClosed(message) => validate_recovery_closed(message)?,
         }
         Ok(())
     }
@@ -969,6 +1266,93 @@ fn validate_id(field: &'static str, value: &str) -> Result<(), ControlError> {
 fn validate_nonzero_counter(field: &'static str, value: u64) -> Result<(), ControlError> {
     if value == 0 {
         return Err(ControlError::ZeroCounter { field });
+    }
+    Ok(())
+}
+
+fn validate_rotation_value(
+    field: &'static str,
+    value: u64,
+    maximum: u64,
+) -> Result<(), ControlError> {
+    validate_nonzero_counter(field, value)?;
+    if value > maximum {
+        return Err(ControlError::InvalidRotationPolicy {
+            field,
+            reason: "value exceeds the negotiated hard bound",
+        });
+    }
+    Ok(())
+}
+
+fn validate_rotation_order(
+    handshake_timeout_ms: u64,
+    overlap_timeout_ms: u64,
+    interval_ms: u64,
+) -> Result<(), ControlError> {
+    if handshake_timeout_ms >= overlap_timeout_ms {
+        return Err(ControlError::InvalidRotationPolicy {
+            field: "handshake_timeout_ms",
+            reason: "must be less than overlap_timeout_ms",
+        });
+    }
+    if overlap_timeout_ms >= interval_ms {
+        return Err(ControlError::InvalidRotationPolicy {
+            field: "overlap_timeout_ms",
+            reason: "must be less than interval_ms",
+        });
+    }
+    Ok(())
+}
+
+fn validate_optional_welcome_rotation_policy(message: &Welcome) -> Result<(), ControlError> {
+    if let Some(interval_ms) = message.rotation_interval_ms {
+        validate_rotation_value(
+            "rotation_interval_ms",
+            interval_ms,
+            MAX_ROTATION_INTERVAL_MS,
+        )?;
+    }
+    if let Some(handshake_timeout_ms) = message.rotation_handshake_timeout_ms {
+        validate_rotation_value(
+            "rotation_handshake_timeout_ms",
+            handshake_timeout_ms,
+            MAX_ROTATION_HANDSHAKE_TIMEOUT_MS,
+        )?;
+    }
+    if let Some(overlap_timeout_ms) = message.rotation_overlap_timeout_ms {
+        validate_rotation_value(
+            "rotation_overlap_timeout_ms",
+            overlap_timeout_ms,
+            MAX_ROTATION_OVERLAP_TIMEOUT_MS,
+        )?;
+    }
+    if let Some(recovery_timeout_ms) = message.rotation_recovery_timeout_ms {
+        validate_rotation_value(
+            "rotation_recovery_timeout_ms",
+            recovery_timeout_ms,
+            MAX_ROTATION_RECOVERY_TIMEOUT_MS,
+        )?;
+    }
+    if let (Some(handshake_timeout_ms), Some(overlap_timeout_ms)) = (
+        message.rotation_handshake_timeout_ms,
+        message.rotation_overlap_timeout_ms,
+    ) && handshake_timeout_ms >= overlap_timeout_ms
+    {
+        return Err(ControlError::InvalidRotationPolicy {
+            field: "rotation_handshake_timeout_ms",
+            reason: "must be less than rotation_overlap_timeout_ms",
+        });
+    }
+    if let (Some(overlap_timeout_ms), Some(interval_ms)) = (
+        message.rotation_overlap_timeout_ms,
+        message.rotation_interval_ms,
+    ) && overlap_timeout_ms >= interval_ms
+    {
+        return Err(ControlError::InvalidRotationPolicy {
+            field: "rotation_overlap_timeout_ms",
+            reason: "must be less than rotation_interval_ms",
+        });
     }
     Ok(())
 }
@@ -1071,6 +1455,62 @@ pub enum ControlError {
         field: &'static str,
     },
     InvalidAuthorizationLifetime(u64),
+    InvalidOwnerFenceLifetime(u64),
+    InvalidRotationPolicy {
+        field: &'static str,
+        reason: &'static str,
+    },
+    ContextMismatch {
+        field: &'static str,
+    },
+    GenerationNotAdvanced {
+        old: u64,
+        new: u64,
+    },
+    MixedFenceDirections,
+    UnorderedEntries {
+        field: &'static str,
+    },
+    MismatchedSnapshot,
+    InvalidProofCount {
+        expected: usize,
+        actual: usize,
+    },
+    InvalidDirectionCount {
+        field: &'static str,
+    },
+    WrongConnection {
+        field: &'static str,
+    },
+    SameConnection {
+        field: &'static str,
+    },
+    InvalidReplayRange {
+        from: u64,
+        through: u64,
+    },
+    CursorBeyondFence {
+        field: &'static str,
+    },
+    MismatchedStream,
+    CreditExceeded {
+        field: &'static str,
+    },
+    TerminalWithoutSequence {
+        field: &'static str,
+    },
+    TerminalSequenceMismatch {
+        field: &'static str,
+    },
+    InvalidDigest {
+        field: &'static str,
+    },
+    MismatchedRecoveryContext {
+        field: &'static str,
+    },
+    InvalidRecoveryStage {
+        field: &'static str,
+    },
 }
 
 impl fmt::Debug for ControlError {
@@ -1134,6 +1574,81 @@ impl fmt::Debug for ControlError {
                 .debug_tuple("InvalidAuthorizationLifetime")
                 .field(value)
                 .finish(),
+            Self::InvalidOwnerFenceLifetime(value) => formatter
+                .debug_tuple("InvalidOwnerFenceLifetime")
+                .field(value)
+                .finish(),
+            Self::InvalidRotationPolicy { field, reason } => formatter
+                .debug_struct("InvalidRotationPolicy")
+                .field("field", field)
+                .field("reason", reason)
+                .finish(),
+            Self::ContextMismatch { field } => formatter
+                .debug_struct("ContextMismatch")
+                .field("field", field)
+                .finish(),
+            Self::GenerationNotAdvanced { old, new } => formatter
+                .debug_struct("GenerationNotAdvanced")
+                .field("old", old)
+                .field("new", new)
+                .finish(),
+            Self::MixedFenceDirections => formatter.write_str("ControlError::MixedFenceDirections"),
+            Self::UnorderedEntries { field } => formatter
+                .debug_struct("UnorderedEntries")
+                .field("field", field)
+                .finish(),
+            Self::MismatchedSnapshot => formatter.write_str("ControlError::MismatchedSnapshot"),
+            Self::InvalidProofCount { expected, actual } => formatter
+                .debug_struct("InvalidProofCount")
+                .field("expected", expected)
+                .field("actual", actual)
+                .finish(),
+            Self::InvalidDirectionCount { field } => formatter
+                .debug_struct("InvalidDirectionCount")
+                .field("field", field)
+                .finish(),
+            Self::WrongConnection { field } => formatter
+                .debug_struct("WrongConnection")
+                .field("field", field)
+                .finish(),
+            Self::SameConnection { field } => formatter
+                .debug_struct("SameConnection")
+                .field("field", field)
+                .finish(),
+            Self::InvalidReplayRange { from, through } => formatter
+                .debug_struct("InvalidReplayRange")
+                .field("from", from)
+                .field("through", through)
+                .finish(),
+            Self::CursorBeyondFence { field } => formatter
+                .debug_struct("CursorBeyondFence")
+                .field("field", field)
+                .finish(),
+            Self::MismatchedStream => formatter.write_str("ControlError::MismatchedStream"),
+            Self::CreditExceeded { field } => formatter
+                .debug_struct("CreditExceeded")
+                .field("field", field)
+                .finish(),
+            Self::TerminalWithoutSequence { field } => formatter
+                .debug_struct("TerminalWithoutSequence")
+                .field("field", field)
+                .finish(),
+            Self::TerminalSequenceMismatch { field } => formatter
+                .debug_struct("TerminalSequenceMismatch")
+                .field("field", field)
+                .finish(),
+            Self::InvalidDigest { field } => formatter
+                .debug_struct("InvalidDigest")
+                .field("field", field)
+                .finish(),
+            Self::MismatchedRecoveryContext { field } => formatter
+                .debug_struct("MismatchedRecoveryContext")
+                .field("field", field)
+                .finish(),
+            Self::InvalidRecoveryStage { field } => formatter
+                .debug_struct("InvalidRecoveryStage")
+                .field("field", field)
+                .finish(),
         }
     }
 }
@@ -1173,6 +1688,72 @@ impl fmt::Display for ControlError {
                 f,
                 "authorization remaining_ms must be between 1 and 5000, got {value}"
             ),
+            Self::InvalidOwnerFenceLifetime(value) => write!(
+                f,
+                "owner fence handshake remaining_ms must be between 1 and 20000, got {value}"
+            ),
+            Self::InvalidRotationPolicy { field, reason } => {
+                write!(f, "invalid rotation policy {field}: {reason}")
+            }
+            Self::ContextMismatch { field } => {
+                write!(f, "DATA_READY context does not match {field}")
+            }
+            Self::GenerationNotAdvanced { old, new } => {
+                write!(
+                    f,
+                    "rotation new generation {new} must be greater than old {old}"
+                )
+            }
+            Self::MixedFenceDirections => {
+                f.write_str("a fence/proof contains mixed sequence directions")
+            }
+            Self::UnorderedEntries { field } => {
+                write!(f, "{field} entries must be strictly ordered by stream ID")
+            }
+            Self::MismatchedSnapshot => f.write_str("rotation values refer to different snapshots"),
+            Self::InvalidProofCount { expected, actual } => {
+                write!(f, "rotation requires {expected} drain proofs, got {actual}")
+            }
+            Self::InvalidDirectionCount { field } => {
+                write!(f, "{field} must contain exactly one entry per direction")
+            }
+            Self::WrongConnection { field } => {
+                write!(f, "{field} does not identify the old rotation connection")
+            }
+            Self::SameConnection { field } => {
+                write!(f, "{field} must identify distinct connections")
+            }
+            Self::InvalidReplayRange { from, through } => {
+                write!(
+                    f,
+                    "replay range starts at {from} after it ends at {through}"
+                )
+            }
+            Self::CursorBeyondFence { field } => {
+                write!(
+                    f,
+                    "resume {field} cursor exceeds its emitted/received fence"
+                )
+            }
+            Self::MismatchedStream => f.write_str("resume direction refers to a different stream"),
+            Self::CreditExceeded { field } => {
+                write!(f, "resume {field} exceeds its absolute credit limit")
+            }
+            Self::TerminalWithoutSequence { field } => {
+                write!(f, "resume {field} requires a nonzero sequence cursor")
+            }
+            Self::TerminalSequenceMismatch { field } => {
+                write!(f, "{field} does not match its terminal cursor")
+            }
+            Self::InvalidDigest { field } => {
+                write!(f, "{field} must be a lowercase SHA-256 digest")
+            }
+            Self::MismatchedRecoveryContext { field } => {
+                write!(f, "recovery records do not match on {field}")
+            }
+            Self::InvalidRecoveryStage { field } => {
+                write!(f, "recovery stage forbids {field}")
+            }
         }
     }
 }
@@ -1202,6 +1783,72 @@ mod tests {
         assert!(json.contains("\"epoch\":\"7\""));
         assert!(json.contains("\"nonce\":\"18446744073709551615\""));
         assert_eq!(decode_control(&encoded).expect("round trip"), ping());
+    }
+
+    #[test]
+    fn welcome_negotiates_optional_rotation_owner_and_deadlines() {
+        let mut welcome =
+            Welcome::new_m1("welcome", "hello", "session", 7, 3, "connection", "ticket");
+        welcome.owner_id = Some("owner-token-context".to_owned());
+        welcome.rotation_interval_ms = Some(300_000);
+        welcome.rotation_handshake_timeout_ms = Some(10_000);
+        welcome.rotation_overlap_timeout_ms = Some(30_000);
+        welcome.rotation_recovery_timeout_ms = Some(30_000);
+
+        let encoded = encode_control(&ControlMessage::Welcome(welcome.clone()))
+            .expect("valid negotiated welcome");
+        let json = String::from_utf8(encoded.clone()).expect("JSON UTF-8");
+        assert!(json.contains("\"rotation_handshake_timeout_ms\":\"10000\""));
+        assert!(json.contains("\"rotation_overlap_timeout_ms\":\"30000\""));
+        assert_eq!(
+            decode_control(&encoded).expect("round trip"),
+            ControlMessage::Welcome(welcome.clone())
+        );
+
+        let mut invalid = welcome;
+        invalid.rotation_recovery_timeout_ms = Some(MAX_ROTATION_RECOVERY_TIMEOUT_MS + 1);
+        assert!(matches!(
+            encode_control(&ControlMessage::Welcome(invalid)),
+            Err(ControlError::InvalidRotationPolicy {
+                field: "rotation_recovery_timeout_ms",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn hello_rotation_policy_is_decimal_and_ordered() {
+        let mut hello = Hello::new("hello", "connector", 1, 1);
+        hello.rotation_policy = Some(RotationPolicy::default());
+        let encoded =
+            encode_control(&ControlMessage::Hello(hello.clone())).expect("valid rotation policy");
+        let json = String::from_utf8(encoded.clone()).expect("JSON UTF-8");
+        assert!(json.contains("\"interval_ms\":\"300000\""));
+        assert_eq!(
+            decode_control(&encoded).expect("round trip"),
+            ControlMessage::Hello(hello.clone())
+        );
+
+        let mut invalid = hello;
+        invalid.rotation_policy = Some(RotationPolicy::new(30_000, 30_000, 10_000));
+        assert!(matches!(
+            encode_control(&ControlMessage::Hello(invalid)),
+            Err(ControlError::InvalidRotationPolicy { .. })
+        ));
+    }
+
+    #[test]
+    fn data_ready_context_helper_checks_candidate_binding() {
+        let ready = DataReady::new("ready", "prepare", "session", 7, 4, "candidate");
+        ready
+            .validate_context("session", 7, 4, "candidate")
+            .expect("matching context");
+        assert!(matches!(
+            ready.validate_context("session", 7, 3, "candidate"),
+            Err(ControlError::ContextMismatch {
+                field: "generation"
+            })
+        ));
     }
 
     #[test]

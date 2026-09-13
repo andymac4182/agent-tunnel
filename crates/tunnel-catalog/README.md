@@ -33,6 +33,12 @@ store. Construct it with:
 let catalog = RedisCatalog::connect(redis_url, namespace).await?;
 ```
 
+The low-level constructor intentionally remains transport-agnostic for the
+disposable local test harness, which may use a loopback `redis://` URL. The
+production `tunnel-relay serve` configuration validates the boundary before
+connecting and requires `rediss://`; plaintext Redis is not a supported relay
+deployment profile.
+
 For a normal owner-enabled process, use
 `RedisCatalog::connect_with_deployment_incarnation(redis_url, namespace, incarnation)`.
 That constructor accepts only an already initialized active incarnation and
@@ -48,8 +54,46 @@ does not infer safe rollback state from a backup.
 The crate deliberately uses redis-rs `MultiplexedConnection`, without the
 reconnecting `ConnectionManager`. Every connection acquisition and command is
 bounded by two seconds. Redis errors are returned to the caller so relay
-authorization and ownership fail closed during an authority outage. Redis
-pub/sub is not part of the authority path.
+authorization and ownership fail closed during an authority outage, and no
+command is ever replayed. A lane whose connection was lost reconnects only for
+a later command, after repeating the startup PING/INFO identity check; a
+primary whose `run_id` differs from the verified startup identity is refused
+with a typed conflict, so a Redis restart, restore or promotion remains an
+operator recovery event rather than a silent resume. Redis pub/sub is not part
+of the authority path.
+
+The catalog opens seven physical lanes to the primary: one catalog lane for
+owner claim/release, tickets, membership and fixture pipelines; four
+authorization lanes for `authorize`; and two maintenance lanes for the
+relay's per-session `resolve_device` re-checks and `renew_owner` renewals.
+A lane never serializes its callers. Its lock is held only across the
+bounded probe or reconnect that verifies the physical connection; each
+caller then runs its own command on that multiplexed connection, so
+concurrent commands pipeline on one socket and the two-second deadline
+(enforced both by redis-rs' per-command response timeout and by the catalog)
+measures the authority's reply, never the time spent behind other callers.
+A queueing delay therefore cannot surface as an authority timeout. A reply
+that is genuinely later than two seconds fails that command closed with an
+I/O `TimedOut` error (`RedisError::is_timeout()`), which the relay reports as
+`timeout`; a severed connection fails with a connection-dropped I/O error,
+reported as `redis_io`. Both release the lane so its next command
+re-verifies the primary; neither replays the failed command. The relay bounds
+how many sessions it maintains per tick (see `docs/cluster.md`), so the lane
+count is a transport choice rather than a concurrency limit.
+
+Owner-affecting writes (`claim_owner`, `renew_owner`, `release_owner`) refine
+that contract. Once such a command has been dispatched on its lane, a lost
+reply no longer proves the script did not run: Redis may have committed the
+owner mutation before the reply deadline passed or the connection was
+severed. Those two failures are returned as the typed
+`CatalogError::WriteOutcomeUnknown(UnknownWriteCause)` with a payload-free
+cause (`reply_timeout` or `connection_lost`) instead of a generic `Database`
+error, so the relay can distinguish "may have committed" from "failed", keep
+the affected session unready until a fresh `current_owner` read confirms the
+exact token, and never retry the write automatically. A failure before
+dispatch (lane admission or reconnect) and an actual authority reply keep
+their definite shapes. `tests/redis_authority_lost_reply.rs` proves this
+through a severing loopback proxy for both a claim and a renewal.
 
 Owner lease comparisons and recovery quiescence checks use Redis server
 `TIME`; a caller-side clock skew can fail an operation closed. Authorization
@@ -79,6 +123,11 @@ expiry, not-before, subject, and configured scopes, and then asks the catalog
 to map `(issuer, subject, tenant)` to an active membership. JWT tenant claims
 are ignored. `authenticate_for_scope` is the route helper for an explicit
 scope such as `echo:invoke`; the resulting service grant remains required.
+Approved RSA keys must be 2048–4096-bit public keys (PEM or JWK `n`/`e`) and
+approved Ed25519 keys are the raw 32-byte public key; key material that does
+not match its approved algorithm family, or an RSA key outside that range, is
+rejected when the verifier is configured rather than failing every token at
+request time. Signature verification uses jsonwebtoken's RustCrypto backend.
 
 `MemoryCatalog` is available for pure unit tests and fixture wiring. Redis
 integration coverage is intentionally ignored by the default workspace suite

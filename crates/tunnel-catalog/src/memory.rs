@@ -1,7 +1,11 @@
+use crate::types::valid_principal_identity;
 use crate::{
-    AuthenticatedConsumer, Catalog, CatalogError, CatalogFixture, CredentialRecord, DeviceIdentity,
-    DeviceListFilter, DeviceSummary, FixtureDevice, GrantSnapshot, GrantSpec, MembershipRecord,
-    OwnerClaim, OwnerClaimRequest, OwnerToken, PrincipalIdentity, ServiceRecord, ServiceSpec,
+    AttachmentTicket, AttachmentTicketConsumeRequest, AttachmentTicketIssueRequest,
+    AuthenticatedConsumer, Catalog, CatalogError, CatalogFixture, ConsumedAttachmentTicket,
+    CredentialRecord, DeviceIdentity, DeviceListFilter, DeviceSummary, FixtureDevice,
+    GrantSnapshot, GrantSpec, MAX_SIGNED_MEMBERSHIP_RECORDS, MembershipRecord, OwnerClaim,
+    OwnerClaimRequest, OwnerToken, PrincipalIdentity, ServiceRecord, ServiceSpec,
+    SignedMembershipRecord, cluster,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
@@ -27,6 +31,8 @@ struct State {
     grants: HashMap<(Uuid, Uuid, Uuid, Uuid), MemoryGrant>,
     owners: HashMap<(Uuid, Uuid), OwnerClaim>,
     owner_epochs: HashMap<(Uuid, Uuid), u64>,
+    attachment_tickets: HashMap<String, MemoryAttachmentTicket>,
+    signed_memberships: Vec<SignedMembershipRecord>,
 }
 
 #[derive(Clone)]
@@ -35,9 +41,29 @@ struct MemoryGrant {
     revision: u64,
 }
 
+#[derive(Clone)]
+struct MemoryAttachmentTicket {
+    binding: crate::AttachmentTicketBinding,
+    expires_at: DateTime<Utc>,
+}
+
 impl MemoryCatalog {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Replace the in-process membership directory used by runtime tests and
+    /// embedding callers.  Signature verification remains outside the catalog
+    /// boundary, just as it is for Redis.
+    pub async fn set_signed_memberships(
+        &self,
+        records: Vec<SignedMembershipRecord>,
+    ) -> Result<(), CatalogError> {
+        if records.len() > MAX_SIGNED_MEMBERSHIP_RECORDS {
+            return Err(CatalogError::InvalidInput("signed membership count"));
+        }
+        self.state.lock().await.signed_memberships = records;
+        Ok(())
     }
 
     pub async fn snapshot_fixture(&self) -> CatalogFixture {
@@ -75,8 +101,7 @@ impl MemoryCatalog {
         }
         for identity in &fixture.identities {
             if !state.users.contains_key(&identity.user_id)
-                || identity.issuer.trim().is_empty()
-                || identity.subject.trim().is_empty()
+                || !valid_principal_identity(&identity.issuer, &identity.subject)
             {
                 return Err(CatalogError::InvalidInput(
                     "identity user, issuer, or subject",
@@ -264,6 +289,9 @@ impl Catalog for MemoryCatalog {
         subject: &str,
         tenant_id: Option<Uuid>,
     ) -> Result<Option<AuthenticatedConsumer>, CatalogError> {
+        if !valid_principal_identity(issuer, subject) {
+            return Ok(None);
+        }
         let state = self.state.lock().await;
         let Some(identity) = state
             .identities
@@ -533,6 +561,9 @@ impl Catalog for MemoryCatalog {
             state.device_versions.insert(key, next_version);
             state.owner_epochs.insert(key, next_epoch);
             state.owners.remove(&key);
+            state.attachment_tickets.retain(|_, ticket| {
+                ticket.binding.tenant_id != tenant_id || ticket.binding.device_id != device_id
+            });
             for credential in state.credentials.values_mut().filter(|credential| {
                 credential.tenant_id == tenant_id && credential.device_id == device_id
             }) {
@@ -716,6 +747,94 @@ impl Catalog for MemoryCatalog {
             Ok(state.owners.get(&key).cloned())
         })
         .await
+    }
+
+    async fn issue_attachment_ticket(
+        &self,
+        request: &AttachmentTicketIssueRequest,
+    ) -> Result<AttachmentTicket, CatalogError> {
+        let now = Utc::now();
+        cluster::validate_ticket_issue(request, &request.owner.deployment_incarnation, now)?;
+        let key = (request.tenant_id, request.device_id);
+        self.with_state(|state| {
+            let Some(current) = state.owners.get(&key) else {
+                return Err(CatalogError::InvalidOwner);
+            };
+            if current.token != request.owner || current.lease_expires_at <= now {
+                return Err(CatalogError::InvalidOwner);
+            }
+            state
+                .attachment_tickets
+                .retain(|_, ticket| ticket.expires_at > now);
+            let outstanding = state
+                .attachment_tickets
+                .values()
+                .filter(|ticket| {
+                    ticket.binding.tenant_id == request.tenant_id
+                        && ticket.binding.device_id == request.device_id
+                })
+                .count();
+            if outstanding >= crate::MAX_ATTACHMENT_TICKETS_PER_DEVICE {
+                return Err(CatalogError::Conflict("attachment ticket bound"));
+            }
+            let ticket = cluster::generate_ticket();
+            let digest = cluster::ticket_digest(&ticket);
+            state.attachment_tickets.insert(
+                digest.clone(),
+                MemoryAttachmentTicket {
+                    binding: request.binding(),
+                    expires_at: request.expires_at,
+                },
+            );
+            Ok(AttachmentTicket {
+                ticket,
+                locator: crate::AttachmentTicketLocator {
+                    tenant_id: request.tenant_id,
+                    device_id: request.device_id,
+                    digest,
+                },
+                expires_at: request.expires_at,
+            })
+        })
+        .await
+    }
+
+    async fn consume_attachment_ticket(
+        &self,
+        request: &AttachmentTicketConsumeRequest,
+    ) -> Result<ConsumedAttachmentTicket, CatalogError> {
+        let binding = request.binding();
+        cluster::validate_ticket_consume(
+            &binding,
+            &request.owner.deployment_incarnation,
+            &request.ticket,
+        )?;
+        let digest = cluster::ticket_digest(&request.ticket);
+        self.with_state(|state| {
+            let Some(ticket) = state.attachment_tickets.get(&digest) else {
+                return Err(CatalogError::Unauthorized);
+            };
+            if ticket.expires_at <= Utc::now() || ticket.binding != binding {
+                return Err(CatalogError::Unauthorized);
+            }
+            let ticket = state
+                .attachment_tickets
+                .remove(&digest)
+                .expect("ticket checked above");
+            Ok(ConsumedAttachmentTicket {
+                binding: ticket.binding,
+                expires_at: ticket.expires_at,
+            })
+        })
+        .await
+    }
+
+    async fn read_signed_membership(&self) -> Result<Option<SignedMembershipRecord>, CatalogError> {
+        Ok(self.state.lock().await.signed_memberships.first().cloned())
+    }
+
+    async fn read_signed_memberships(&self) -> Result<Vec<SignedMembershipRecord>, CatalogError> {
+        Ok(self.state.lock().await.signed_memberships.clone())
     }
 }
 

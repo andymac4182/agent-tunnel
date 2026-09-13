@@ -94,7 +94,71 @@ Control messages use bounded UTF-8 JSON WebSocket messages for initial inspectab
 
 Control-plane state changes are idempotent for an identical `message_id` within a bounded retention period. A reused identifier with different contents is a protocol error. The relay is the only rotation coordinator: the connector may request rotation, but cannot independently commit a competing generation.
 
-Every rotation message also identifies `rotation_id`, owner, epoch, old/new generation and old/new connection ID. Acknowledgements apply only to that exact attempt and phase. Encode 64-bit control counters as decimal strings so consumers cannot lose precision through JSON numbers. Bounded tombstones reject stale messages after an attempt finishes; expired context requires explicit recovery, never inference from a reused ID.
+An identical pending `OPEN` coalesces with the original request and retains its
+original operation and authorization deadlines. After admission, an identical
+retry replays only the exact retained `OPENED`; a refused request replays its
+retained `REJECTED`. The first admission queues `OPENED` and its independent
+authorization challenge atomically. Retrying `OPEN` never issues or replays an
+authorization challenge and never refreshes a grant. A new message ID cannot
+replace an existing stream or reuse a forgotten stream ID.
+
+The connector's OPEN journal is separate from the data replay budget. Its
+canonical requests and retained wire replies have explicit byte charges, at
+most the smaller of the configured queue budget and 4 MiB; its total active
+entries and tombstones are limited to 128. Uncompacted journal entries also obey the retained stream-table limit of
+twice the negotiated active stream limit, capped at128. Nonterminal streams
+separately obey the negotiated active limit. Retained terminal streams cannot
+consume a free active slot, and each journal entry reserves its future tombstone slot.
+Authenticated, operation-matched `STREAM_FORGET` releases retained reply bytes
+after the carrier barriers, including for refused requests with no stream.
+Canonical tombstones remain bounded for the session lifetime. The journal
+never evicts a known ID to admit a new one; exhaustion requires an explicit
+resource-exhausted/fresh-session outcome. A permanent retention failure must
+not wait indefinitely as if it were temporary writer backpressure.
+
+Decoded pending OPEN requests use a separate bounded pool. Each retained
+request reserves its parsed strings, metadata tree, authorization clones and
+conservative allocation overhead; dropping the pending request releases that
+reservation exactly once. Duplicate requests reuse the existing reservation
+and deadlines. The pool is capped by the configured queue budget and the
+negotiated stream count times a hard per-request estimate. This cap, the
+journal cap and the data replay/output cap are separate; the configured queue
+value is not a single combined process-memory limit.
+
+Every attempt-bearing rotation phase identifies `rotation_id`, owner, epoch, old/new generation and old/new connection ID. `ROTATE_REQUEST` carries only the currently active session, owner, generation and connection; the owner allocates the candidate attempt identity in `ROTATE_PREPARE`. Acknowledgements apply only to that exact attempt and phase. Encode 64-bit control counters as decimal strings so consumers cannot lose precision through JSON numbers. Bounded tombstones reject stale messages after an attempt finishes; expired context requires explicit recovery, never inference from a reused ID.
+
+For a fresh normal-phase message, `reply_to` must bind the preceding message
+below before state changes. Identical message-ID retries use the retained
+journal, including after completion; a fresh ID cannot replace an already
+accepted phase message. Retain completed attempt context through its original
+deadline even when a later attempt begins.
+
+| Message | Required `reply_to` |
+| --- | --- |
+| Owner QUIESCE | Owner PREPARE |
+| Connector FROZEN | Owner QUIESCE |
+| Owner FROZEN | Connector FROZEN |
+| Connector DRAINED | Owner FROZEN |
+| Owner DRAINED | Connector FROZEN |
+| Owner COMMIT | Connector DRAINED |
+| Connector COMMITTED | Owner COMMIT |
+| Owner RETIRE | Connector COMMITTED |
+| Connector RETIRED | Owner RETIRE |
+| Owner COMPLETE | Connector RETIRED; empty only for a forced completion whose connector RETIRED never arrived (see Retire) |
+| Owner ABORT | Empty: unsolicited coordinator decision |
+| Connector ABORTED | Owner ABORT |
+| Final owner ABORTED | Connector ABORTED |
+
+The owner can measure its local writer fence first, but queues its FROZEN
+message only after the connector's FROZEN identity is known. Neither endpoint
+waits for peer fences before flushing its own old writer.
+One request can produce multiple phase replies over time: the owner's FROZEN
+and DRAINED both bind the connector's FROZEN. Its bounded response journal
+therefore retains an ordered reply prefix and appends each new reply by its
+own message ID. An identical append is idempotent; the same reply ID with
+different bytes is a conflict. A request retry replays the retained prefix
+without repeating state transitions. Appending never extends the deadline
+or evicts an earlier unexpired reply.
 
 ## Proposed binary data framing
 
@@ -190,7 +254,7 @@ stateDiagram-v2
 3. **Freeze each writer.** Each endpoint stops accepting additional old-generation DATA/FIN/RESET into its writer. It finishes already queued old frames and flushes that writer before reporting `ROTATE_FROZEN`; no sequenced frame can be emitted on old after this local barrier unless the coordinator explicitly aborts the attempt. New adapter output, including a later FIN/RESET, stays bounded and applies backpressure until activation or abort. For each roster entry, FROZEN records the local direction's `last_emitted` fence, zero if none, including any emitted FIN/RESET. Both immutable fence sets reference the same snapshot and rotation attempt.
 4. **Drain both directions.** Receivers continue accepting old frames through the advertised peer fences. ACKs, credit updates, heartbeats and cancellation remain responsive; they do not extend deadlines. A control FROZEN marker can arrive before old data, so it is not a drain proof. Each receiver sends `ROTATE_DRAINED` only when its contiguous receive cursor reaches every peer fence. DRAINED carries the snapshot/peer-fence reference and corresponding cumulative ACK cursors. The sender validates these against its emitted state. The owner requires both DRAINED proofs and acknowledgement of every sequence through both fence sets. There can be no gap below a fence. Neither endpoint sends sequenced frames on the candidate during drain.
 5. **Commit.** The owner records the decision for this attempt in its live session state, enables candidate reception and sends `ROTATE_COMMIT` referencing both drain proofs. The connector validates the phase and proofs, activates candidate reception, sends `ROTATE_COMMITTED`, then resumes its writer on `n`. The relay resumes its writer only after that acknowledgement. New sequences follow the old fences without resetting counters; FIN already emitted remains terminal. A scheduled successful drain requires **no replay** of the drained prefix.
-6. **Retire.** The owner sends `ROTATE_RETIRE`. Both sides close the old WebSocket and send `ROTATE_RETIRED` identifying its connection ID only when their old transport is closed. WebSocket Close/Close acknowledgement maps to transport retirement, never to stream FIN or operation completion. `ROTATE_COMPLETE` ends the attempt after retirement evidence; deadline-forced closure is recorded distinctly. Long-lived streams, fids, HTTP responses and operations continue on `n` without reopening their adapters. No next candidate is admitted while old transport resources remain.
+6. **Retire.** The owner sends `ROTATE_RETIRE`. Both sides close the old WebSocket and send `ROTATE_RETIRED` identifying its connection ID only when their old transport is closed. WebSocket Close/Close acknowledgement maps to transport retirement, never to stream FIN or operation completion. `ROTATE_COMPLETE` ends the attempt after retirement evidence; deadline-forced closure is recorded distinctly. Retirement evidence is the connector's own `ROTATE_RETIRED`, which the owner never fabricates, or, only after the absolute overlap deadline has force-closed the old transport, the owner's forced closure itself. The owner waits at most one further handshake budget after that deadline for the connector's attestation; if it has still not arrived, the attempt completes on the forced closure alone with `ROTATE_COMPLETE` marked `forced`, an empty `reply_to`, a distinct missing-retirement reason and a distinct diagnostic record, and any later `ROTATE_RETIRED` for that attempt is stale and ignored. That grace bounds only the wait for a control message, never the old transport's lifetime, and it does not extend any budget. Long-lived streams, fids, HTTP responses and operations continue on `n` without reopening their adapters. No next candidate is admitted while old transport resources remain; after a forced completion the owner's old transport resources are already released, and a connector that still holds its half is required by its own deadline to force-close it before the next attempt.
 
 All stream entries, including cancelled/reset tombstones, stay in the drain roster until that attempt completes. Cancellation can stop adapter delivery while the transport still receives and accounts for old bytes in order. A stream's FIN or cancellation must not remove an unacknowledged prefix from the snapshot. Final-state reclamation requires both directions' outstanding frames to be accounted for and no drain/replay reference; admission stops when the negotiated tracked-entry cap is full. Roster and fence messages must fit both the entry cap and the control-message byte cap. There is no unbounded snapshot pagination.
 
@@ -198,17 +262,94 @@ All stream entries, including cancelled/reset tombstones, stay in the drain rost
 
 ### Abort, deadline and loss during handover
 
-- **Known uncommitted attempt, old healthy:** only the owner chooses `ROTATE_ABORT`. Close the candidate and retain all stream counters/credits. The owner enables old reception before issuing ABORT; the connector enables old reception, fully releases its candidate transport resources, replies `ROTATE_ABORTED`, then resumes old writes. The owner leaves Aborting and resumes old writes only after that acknowledgement and its own candidate closure. No fresh attachment begins earlier. This explicitly releases the attempt's freeze; bytes already emitted stay in the same sequence space. A later attempt uses a fresh generation/snapshot and newly measured fences. An abort never rewinds cursors or reuses identities, and must complete before the original deadline.
+- **Known uncommitted attempt, old healthy:** only the owner chooses `ROTATE_ABORT`. Close the candidate and retain all stream counters/credits. The owner enables old reception before issuing ABORT; ABORT records a decision, not candidate-closure evidence. The connector enables old reception, fully releases its candidate transport resources, replies `ROTATE_ABORTED`, and keeps old writes frozen. After that acknowledgement and its own confirmed candidate closure, the owner sends a final `ROTATE_ABORTED` whose `reply_to` is the connector acknowledgement ID. The owner queues and journals this final confirmation before resuming old writes; the connector resumes old writes only after validating it. Both acknowledgements identify the exact abandoned candidate. Duplicate requests replay their cached response without repeating closure or changing the original deadline. No fresh attachment begins earlier. This explicitly releases the attempt's freeze; bytes already emitted stay in the same sequence space. A later attempt uses a fresh generation/snapshot and newly measured fences. An abort never rewinds cursors or reuses identities, and must complete before the original deadline. If the old transport is lost while the abort is in flight, the abort decision becomes uncertain: the final owner `ROTATE_ABORTED` is never sent (it would resume writes on a carrier that is gone), the candidate is closed, both abandoned connection identifiers enter the recovery closure delta, and the owner enters retained-state recovery with a fresh greater generation exactly as for old-transport loss before drain. A `ROTATE_ABORTED` that arrives after the episode began names an attempt the session no longer owns and is ignored.
 - **Commit uncertain:** a connector timeout is not permission to resume old writes. If COMMIT may be in flight or the control connection is unavailable, remain quiesced and enter recovery. The owner's serialized decision prevents both ABORT and COMMIT for one attempt. A stale message cannot change that decision; an accepted commit is never rolled back to `g`.
 - **Old transport fails before drain completes:** do not declare a successful drain or discard an unacknowledged prefix. Close failed/candidate transports as needed to preserve the socket bound and enter retained-state recovery with a fresh greater generation. The original overlap deadline still retires the abandoned attempt.
 - **Committed replacement fails:** retire the old transport within the deadline; never promote it again. Recover with a fresh greater generation and retained stream cursors, or fail explicitly.
 - **Absolute overlap deadline:** after commit, forcibly close any old transport still lingering. An unfinished abort or drain cannot resume old at timeout: force-close both attempt data transports and enter retained-state recovery with a fresh greater generation, or fail. No slow stream, retransmission, close handshake or duplicate message extends the budget. A candidate attachment failure before this deadline may still complete a safe coordinated abort.
 
-Retained-state recovery exchanges each stream/direction's last emitted sequence, cumulative receive/ACK state, terminal state and credit counters before enabling payload admission. Receiver progress must not be lower than any ACK the sender has already observed; missing receipt/deduplication state prevents safe resume. Replay **only** the missing range above the reconciled contiguous receive cursor through the sender's last emitted sequence, from retained bounded buffers, using original stream IDs/sequences and the new carrier epoch/generation. Duplicate arrivals never dispatch an adapter record again and replay consumes no new logical credit. Missing retained bytes, conflicting terminal state or exhausted recovery deadlines fail affected streams, with `outcome_unknown` where side effects may have occurred.
+Retained-state recovery exchanges two fixed `RESUME` messages, one for each logical direction, before enabling payload admission. Each message carries at most 128 stream entries with decimal `stream_id`, `last_emitted`, `peer_acked`, `recv_contiguous`, `delivered_contiguous`, `sent_bytes`, `received_bytes`, `send_credit`, `receive_credit`, and compact FIN/RESET terminal evidence. Terminal sequence numbers are derived from `last_emitted` and `recv_contiguous`; a terminal without its corresponding nonzero cursor is invalid. The retained replay floor is derived as `peer_acked + 1` exactly when `last_emitted > peer_acked`, and is absent after all emitted sequences are acknowledged, so a missing retained prefix cannot be hidden by an omitted counter. Receiver progress must not be lower than any ACK the sender has already observed; missing receipt/deduplication state prevents safe resume. Replay **only** the missing range above the reconciled contiguous receive cursor through the sender's last emitted sequence, from retained bounded buffers, using original stream IDs/sequences and the new carrier epoch/generation. Duplicate arrivals never dispatch an adapter record again and replay consumes no new logical credit. Missing retained bytes, conflicting terminal state or exhausted recovery deadlines fail affected streams, with `outcome_unknown` where side effects may have occurred. Both direction messages and every roster entry remain within the 32 KiB control bound; recovery does not use unbounded snapshot pagination.
 
-Repeated failures use bounded exponential backoff with jitter and expose a degraded state. They cannot accumulate sockets, payloads or tickets, or silently reset the last successful rotation timestamp. Recovery is a distinct protocol path; it is not a shortcut around the scheduled drain gate.
+#### Recovery control handshake
+
+The surviving authenticated control socket carries recovery. Control loss ends
+the session in M2. Only the relay coordinates recovery; a connector reports
+data loss with a current-context ROTATE_REQUEST whose reason is `data_loss`.
+
+1. The relay sends RECOVERY_BEGIN with a fresh attempt, a fixed `episode_id`,
+   attempt number 1..3, exact stream roster and remaining budget. One absolute
+   30-second episode deadline includes resource closure, attachment, replay and
+   readiness. Each endpoint retains its own monotonic deadline; subsequent
+   messages can shorten but never restart or extend it.
+   A queued RESUME carries the sender's earlier remaining-duration sample.
+   Validate that sample as nonzero and within the protocol bound; it does not
+   replace the receiver's established absolute episode or candidate deadline.
+   ROTATE_PREPARE establishes the candidate deadline, capped by the retained
+   episode. An expired candidate rejects RESUME before journal updates or replay,
+   even when control input arrives before the maintenance timer runs.
+2. Both endpoints freeze admission and application writes and close every
+   abandoned data carrier. RECOVERY_CLOSED is sent only after local reader,
+   writer and dial tasks have released those resources. Its sorted connection
+   list is checked against the prior allocated set. A canonical role-specific
+   digest binds the attempt, episode, attempt number and closed IDs. Both sides
+   retain both closure records; their fixed-order combined digest binds the
+   next attachment. An empty list is valid only when the recorded set is empty.
+   The list is a per-attempt closure delta: on attempt 1 it contains the
+   currently allocated abandoned carriers; on a retry it contains only the
+   newly released candidate since the preceding authenticated closure pair.
+   Connection IDs from earlier pairs remain authenticated in the immutable
+   recovery fence/history and cannot be reattached, but they are not repeated
+   on the next wire list. This keeps each closure message within the physical
+   bound while making every retry's failed candidate explicit.
+3. Only after both closure records agree does the relay issue ROTATE_PREPARE
+   with attachment purpose `RECOVERY`, episode/attempt number and the combined
+   closure digest. The one-use ticket record binds that purpose and complete
+   attempt as well as the existing session, owner and device mTLS identity.
+   `ROTATION_CANDIDATE` is the distinct scheduled purpose. DATA_READY identifies
+   the exact prepare message and candidate context; it is not permission for
+   new application traffic.
+4. The relay sends two RESUME messages with stage `SNAPSHOT`, one per logical
+   direction. The connector returns matching RESUMED messages after validating
+   the complete pair and exact roster. Both endpoints retain the initial
+   emitted fences and derive replay from their sequence state. The candidate
+   admits only those retained replay ranges and housekeeping while this round
+   runs. Replay never allocates a new operation or new logical credit.
+   Initial snapshots establish immutable obligations: each local receive
+   cursor must cover the peer's emitted fence, and each local emitted fence
+   must be acknowledged. Track progress against those fences; do not compare
+   an advanced acknowledgement cursor against a stale initial snapshot as if
+   it were a new peer assertion. ACKs, window updates and in-range replay must
+   remain processable before activation. Final reconciliation uses the fresh
+   READY pair and verifies its terminal, credit and cursor evidence.
+5. After its replay and received prefixes are accounted for, the relay sends
+   both RESUME messages with stage `READY`. This is the coordinator's decision
+   to accept normal candidate reception; it enables reception before sending
+   them so data cannot race ahead of control acknowledgements. The connector
+   waits for the complete pair and its own reconciled state, enables reception,
+   and queues both RESUMED `READY` responses before resuming its writer. The
+   relay resumes its writer only after both responses. READY carries no replay;
+   emitted fences and sender terminal state cannot change from SNAPSHOT.
+   Receiver terminal state may advance only consistently with replayed peer
+   terminal frames. Message IDs, reply IDs, direction, stage and roster all
+   remain bound to the same attempt. Uncertain readiness never permits a return
+   to an abandoned generation.
+
+A failed candidate is fully released before the next attempt. The first
+attempt is eligible immediately after the closure and attachment barriers. If
+it fails, the relay's owned recovery timer waits 100 ms before attempt 2 and
+200 ms before attempt 3; those delays are measured from the completed preceding
+attempt and cannot extend the immutable episode deadline. M2 permits at most
+three physical attempts. Each attempt has fresh generation, connection and
+attempt IDs, a new ticket and a new closure binding. The closure list on each
+retry remains the per-attempt delta described above; prior authenticated IDs
+stay fenced in the retained episode state. Exhaustion fails affected operations
+explicitly, including unknown outcomes when necessary. Recovery cannot
+accumulate sockets or silently reset the last successful rotation timestamp;
+it is not a shortcut around the scheduled drain gate.
 
 Rotation limits socket lifetime; it is not a substitute for authorization expiry or application credential rotation. Revoking a user grant, connector credential or capability takes effect independently of the five-minute timer.
+
+A session retains every physical connection identifier it has claimed, including aborted and recovery candidates, in a bounded immutable history of 256 entries; identifiers are never evicted or reused because delayed closure evidence references them. The claim that would exceed that bound, whether for a scheduled candidate or a recovery attempt, is an explicit resource-exhausted outcome: the owner closes the session with the typed reason `CONNECTION_HISTORY_EXHAUSTED`, surfaces the used-history counter and terminal reason in its payload-free diagnostics, and the connector establishes a fresh session rather than continuing on a carrier that can no longer rotate.
 
 ## Delivery guarantees and side effects
 
@@ -231,8 +372,12 @@ Read-only calls may be retried according to adapter policy. Non-idempotent calls
 | Lease or resume retention expires | Close data sockets, release bounded transport resources and expose terminal or unknown operation status as available. A later connection creates a fresh session. |
 | Connector process restarts | A fresh session is required in v0. Surface unknown outcomes for in-flight side-effecting operations; do not pretend in-memory sequence state survived. |
 | Session-owner relay process restarts or loses its fenced lease | Its sessions end; a new owner requires a fresh session. Other owners continue subject to cluster routing/lease health. No cross-owner transport replay is promised. |
+| Selected owner is lost before or after admission | The relay never reselects an owner for the request, on any method, admitted or not: the request ends with one typed outcome (`not_dispatched`, `dispatched` or `unknown`) and no second dispatch. A GET, HEAD or OPTIONS shaped request at the POST-only echo route is a typed `405 METHOD_NOT_ALLOWED` / `not_dispatched` before authentication or owner selection. The only bridge across the owner change is a consumer-driven retry of a `not_dispatched` request, which performs a fresh authoritative owner lookup; see [cluster.md](cluster.md). |
+| Service label matches more than one active service | Every path that resolves a service (public echo, public stream upgrade, owner-side peer ingress) uses one shared resolver and fails closed with the typed `409 SERVICE_AMBIGUOUS` / `not_dispatched` outcome before owner selection and before any body read. The relay never selects the first match; a consumer addresses one candidate by identifier instead. |
 | Duplicate/stale socket attaches | Reject before binding or allocating stream buffers. |
 | Malformed/oversized data | Reject before payload allocation where possible; reset the scoped stream or close the connection for framing/authentication violations. |
+
+The recovery handshake above is in-session data-carrier recovery only: it requires the authenticated control socket, the same owner and connector actors, and retained logical stream state. It replaces failed data carriers inside that session/epoch; it does not reconnect the control socket, acquire a new owner, or recreate a session. Whole-session control reconnect, process restart, owner change, and recovery after retention expiry remain separate fresh-session lifecycle work and are not implemented by this retry path. A side-effecting operation that crosses one of those boundaries keeps its known/unknown result rules and is not automatically replayed.
 
 Control recovery must preserve the total socket bound: close the old control transport before establishing its replacement; close any rotation candidate before establishing replacement data sockets. A valid new epoch invalidates old-generation tickets and sockets. Whether to retain an existing operation result is separate from whether its old transport remains authorized.
 
@@ -240,7 +385,9 @@ Heartbeats and timeouts are independent of rotation. Proposed defaults are a con
 
 ## Flow control and fairness
 
-WebSocket transport backpressure alone is insufficient when many logical streams share one connection. Enforce both per-stream receive credit and a session-wide outstanding byte cap. Charge queued frames, quiesced new writes, reorder buffers and replay buffers to the same bounded memory budget. Candidate sockets do not receive a second full budget. Pausing data admission during drain must not pause reserved bounded capacity for ACKs, cancellation and rotation control.
+WebSocket transport backpressure alone is insufficient when many logical streams share one connection. Enforce both per-stream receive credit and a session-wide outstanding byte cap. Charge queued frames, quiesced new writes, reorder buffers and replay buffers to the same bounded memory budget. Candidate sockets do not receive a second full budget. Pausing data admission during drain must not pause reserved bounded capacity for ACKs, cancellation and rotation control. Reserved capacity makes a refused cancellation exceptional, not impossible: if a `CANCEL` for a pending operation still cannot enter the bounded control queue (slot bound reached or control writer gone), the relay fences the session with the typed `CANCEL_UNDELIVERABLE` close instead of discarding the refusal, because a device that never learns of the cancellation would keep executing an operation the consumer already treats as cancelled. The consumer's result stays `CANCELLED` with unknown execution either way; a delivered `CANCEL` leaves the session live and is sent exactly once per pending operation.
+
+"Reserved bounded capacity" above has two separate dimensions, and the distinction was ambiguous until it was measured. Message **slots** are reserved structurally: control and data use separate bounded channels of `max_queue_messages` each, so data frames can never consume a control slot. Reserved **bytes** are carved out of the same `max_queue_bytes` session budget rather than held in a second budget: the relay reserves `4 * 32 KiB = 131,072` bytes (four control messages at the 32 KiB control bound, enough for a rotation's back-to-back pair plus a cancellation and a revocation close) for control-lane charges, and refuses every data-lane charge (pending request bodies, retained replay chunks, encoded data frames and reassembled response payloads) once the total charge would exceed `max_queue_bytes - 131,072`. Control-lane charges are refused only at the full `max_queue_bytes`, so the total bound stays a single explicit number, data admission can never consume the reserved control bytes, and a control message always has at least the reservation available while data is saturated. Data refusals keep their existing typed shape. The configured minimum `max_queue_bytes` of 256 KiB is exactly twice the reservation. Before this reservation the state was reachable by arithmetic: with `max_queue_messages = 2 * max_streams_per_device` and one in-flight record per public consumer stream, `max_streams_per_device` concurrent records of 32,732 bytes each charged exactly `max_queue_bytes`, leaving zero control bytes; the same workload now admits 62 records against the `4,063,232`-byte data limit and every control class still enqueues. Session diagnostics expose `control_reserved_bytes`, `data_bytes_limit` and `data_bytes_high_water` (the highest total charge at which a data reservation was admitted) so a gate can prove that `max_queue_bytes - data_bytes_high_water` never fell below the reservation at the data-byte peak. See `verify-m7-queue-saturation` in [testing.md](testing.md).
 
 Proposed starting limits, to validate through load testing:
 

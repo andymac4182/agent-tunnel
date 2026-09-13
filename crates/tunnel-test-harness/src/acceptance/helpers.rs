@@ -23,6 +23,7 @@ use tokio::{
 };
 use tokio_rustls::TlsConnector;
 use tunnel_client::{ConnectConfig, CredentialConfig, LimitsConfig, LocalExport, LocalExportKind};
+use tunnel_core::RotationConfig;
 use uuid::Uuid;
 
 // Echo responses include a device canary and a small JSON error envelope.  A
@@ -153,6 +154,11 @@ pub(crate) fn write_device_profile(
     std::fs::write(&key_path, private_key_pem).map_err(HarnessError::Io)?;
     std::fs::write(&server_ca_path, server_ca_pem).map_err(HarnessError::Io)?;
 
+    for path in [&certificate_path, &key_path, &server_ca_path, &config_path] {
+        let path = path.to_string_lossy();
+        crate::c11_capture::record_sentinel("filesystem_path", path.as_bytes())?;
+    }
+
     let config = ConnectConfig {
         device_id: device_id.to_string(),
         relay_url: format!("wss://localhost:{}/v1/tunnel/control", relay_addr.port()),
@@ -171,6 +177,7 @@ pub(crate) fn write_device_profile(
         .into_iter()
         .collect(),
         limits: LimitsConfig::default(),
+        rotation: RotationConfig::default(),
     };
     config.validate().map_err(|error| {
         HarnessError::InvalidInput(format!("generated client config is invalid: {error}"))

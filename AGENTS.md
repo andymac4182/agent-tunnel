@@ -1,7 +1,9 @@
 # Repository guidance
 
-- M1 provides authenticated echo tunneling and a reusable real-socket harness, verified locally against Redis. Remote service adapters, rotation/replay and multi-relay routing remain planned. Re-run the complete acceptance command when networking or authorization changes; keep status claims precise.
+- M1 authenticated echo and M2 ordered rotation/retained replay are locally verified against Redis, including real-socket faults and three actual 300-second rotations. M7 multi-relay routing is in progress; remote service adapters remain planned. Re-run the complete acceptance commands when networking or authorization changes; keep status claims precise and distinguish local evidence from hosted CI.
 - Read README.md, docs/roadmap.md, and the relevant design document before implementing a milestone.
+- Maintain docs/tasks.md as the task-level milestone tracker. Record newly discovered defects, implementation work, and missing tests when found; update status, current owner, remaining work, and verification evidence as work progresses. Link M7 edge-case task coverage to docs/m7-edge-cases.md. Do not mark implementation or a milestone verified from narrower tests, and record required reruns after relevant changes.
+- Record `Completed at` in docs/tasks.md and docs/m7-edge-cases.md when the full row scope is verified, using ISO 8601 timestamps with seconds and an explicit timezone offset. Append first completions, reopenings, re-verifications, and new scope to each document's Completion history; preserve historical dates without inventing missing times. Follow each document's completion timing rules.
 - Rust 1.95.0 is pinned in rust-toolchain.toml. Use Cargo.lock and `--locked` for validation.
 - Required Rust checks: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, and `cargo test --workspace --locked`.
 - Keep client/relay core and privileged adapters in Rust. A shared TypeScript client and thin native adapters are planned for Files SDK, Mastra, AI SDK Files and just-bash.

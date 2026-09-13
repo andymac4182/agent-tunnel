@@ -1,15 +1,34 @@
+use crate::cluster;
+use crate::error::{CatalogConnectionError, CatalogConnectionStage};
 use crate::memory::valid_fingerprint;
+use crate::types::valid_principal_identity;
 use crate::{
-    AuthenticatedConsumer, Catalog, CatalogError, CatalogFixture, CredentialRecord, DeviceIdentity,
-    DeviceListFilter, DeviceSummary, GrantSnapshot, GrantSpec, OwnerClaim, OwnerClaimRequest,
-    OwnerToken, ServiceRecord,
+    AttachmentTicket, AttachmentTicketConsumeRequest, AttachmentTicketIssueRequest,
+    AuthenticatedConsumer, Catalog, CatalogError, CatalogFixture, ConsumedAttachmentTicket,
+    CredentialRecord, DeviceIdentity, DeviceListFilter, DeviceSummary, GrantSnapshot, GrantSpec,
+    MAX_SIGNED_MEMBERSHIP_RECORDS, OwnerClaim, OwnerClaimRequest, OwnerToken, ServiceRecord,
+    SignedMembershipRecord,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use redis::{FromRedisValue, aio::MultiplexedConnection};
-use std::{collections::HashSet, sync::Arc, time::Duration};
-use tokio::sync::Mutex;
+use redis::{FromRedisValue, IntoConnectionInfo, aio::MultiplexedConnection};
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::HashSet,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 use uuid::Uuid;
+
+mod lane;
+mod recovery;
+mod recovery_scanner;
+mod recovery_schema;
+use lane::{AuthorityLane, LaneGroup};
+pub use recovery::DurableCatalogObservation;
 
 const MAX_SAFE_REDIS_TIME: i64 = 9_000_000_000_000_000;
 const MAX_FIXTURE_RECORDS: usize = 4_096;
@@ -17,21 +36,275 @@ const MAX_CLEANUP_KEYS: usize = 100_000;
 const MAX_SEED_SCAN_KEYS: usize = 100_000;
 const DEFAULT_MAX_LIST_ITEMS: usize = 1_024;
 const MAX_IDENTIFIER_BYTES: usize = 128;
+/// Maximum accepted length of the authoritative Redis key namespace.
+pub const MAX_REDIS_NAMESPACE_BYTES: usize = 96;
 const REDIS_OPERATION_TIMEOUT: Duration = Duration::from_secs(2);
+const AUTHORIZATION_CONNECTIONS: usize = 4;
+/// Physical lanes reserved for the relay's per-session maintenance reads
+/// (`resolve_device`) and owner renewals (`renew_owner`).  Two lanes keep
+/// that steady per-tick traffic off the catalog lane's atomic pipelines and
+/// off the authorization lanes; the relay bounds how many sessions it
+/// maintains per tick, so the lane count is a transport choice, not a
+/// concurrency limit.
+const MAINTENANCE_CONNECTIONS: usize = 2;
+/// How far a caller's clock may run *ahead* of the authority before a
+/// timestamped read is refused. This is the genuine clock-skew direction: the
+/// scripts evaluate validity at `math.max(caller_at, now)`, so a caller ahead of
+/// the authority would otherwise extend a validity window past its real expiry.
 const MAX_AUTHORITY_CLOCK_SKEW_US: i64 = 1_000_000;
+/// How far a caller's timestamp may lag the authority's clock before a
+/// timestamped read is refused.
+///
+/// A script only ever sees the timestamp the caller sampled before dispatching
+/// its command, so it cannot separate a slow caller clock from time the command
+/// spent in flight. Bounding this direction below the authority deadline
+/// therefore creates a latency band in which a reply the transport accepted is
+/// deterministically refused, and refused as a `Conflict` rather than a timeout
+/// -- the relay's maintenance tick escalates that into `AUTHORITY_UNAVAILABLE`
+/// and closes a healthy session whose lease is still being renewed. The budget
+/// is the authority deadline so that the deadline stays the single boundary
+/// docs/cluster.md documents; a command in flight longer than that fails as a
+/// `timeout` before any script runs. Lag needs no tighter bound to stay fail
+/// closed: validity is evaluated at `math.max(caller_at, now)` and the returned
+/// windows are translated back into the caller's frame, so a lagging caller
+/// timestamp can only shorten a window, never extend one.
+const MAX_AUTHORITY_CALLER_LAG_US: i64 = REDIS_OPERATION_TIMEOUT.as_micros() as i64;
+const MAX_TICKET_INDEX_ITEMS: usize = crate::MAX_ATTACHMENT_TICKETS_PER_DEVICE;
+const MAX_REDIS_TLS_PEM_BYTES: usize = 1024 * 1024;
 
 /// The authoritative M1 catalog. Redis is the only durable state authority;
-/// this type deliberately uses a plain multiplexed connection and does not
+/// this type deliberately uses plain multiplexed connections and does not
 /// enable redis-rs' reconnecting `ConnectionManager`. A connection error is
-/// therefore surfaced to callers and authorization/ownership fail closed.
+/// surfaced to the caller that observed it and authorization/ownership fail
+/// closed; no command is ever replayed. Each lane re-establishes a lost
+/// connection only for a later command, and only to a primary whose `run_id`
+/// still matches the identity verified at startup (see `lane.rs`), so a Redis
+/// restart, restore or promotion remains a fail-closed recovery event.
 #[derive(Clone)]
 pub struct RedisCatalog {
-    connection: Arc<Mutex<MultiplexedConnection>>,
+    client: redis::Client,
+    connection: Arc<AuthorityLane>,
+    /// Authorization snapshots use a bounded set of separate physical
+    /// connections so a delayed atomic authorization EVAL cannot
+    /// head-of-line block owner, recovery, or fixture transactions on the
+    /// catalog connection (or every other authorization read). The Lua
+    /// operation itself remains atomic on Redis; only its transport lanes are
+    /// isolated.
+    authorization_connections: Arc<Vec<AuthorityLane>>,
+    authorization_next: Arc<AtomicUsize>,
+    /// Maintenance identity reads and owner renewals use their own bounded
+    /// lanes for the same reason: the relay's tick must never wait behind a
+    /// seed, cleanup, membership publish, or authorization pipeline, and an
+    /// authority deadline observed there must mean the authority stalled.
+    maintenance_connections: Arc<Vec<AuthorityLane>>,
+    maintenance_next: Arc<AtomicUsize>,
     namespace: String,
     prefix: String,
     redis_run_id: String,
     deployment_incarnation: Option<String>,
     max_list_items: usize,
+}
+
+/// Explicit TLS material for a Redis authority connection.
+///
+/// The relay's low-level catalog API normally uses the system/webpki trust
+/// roots for `rediss://`.  Tests and deployments with a private Redis CA can
+/// pass a bounded PEM trust bundle here.  Client certificate and key material
+/// must be supplied together; private bytes are never included in `Debug`.
+#[derive(Clone, Default)]
+pub struct RedisTlsOptions {
+    pub root_cert_pem: Option<Vec<u8>>,
+    pub client_cert_pem: Option<Vec<u8>>,
+    pub client_key_pem: Option<Vec<u8>>,
+}
+
+impl std::fmt::Debug for RedisTlsOptions {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RedisTlsOptions")
+            .field("has_root_cert", &self.root_cert_pem.is_some())
+            .field("has_client_identity", &self.client_cert_pem.is_some())
+            .finish()
+    }
+}
+
+impl RedisTlsOptions {
+    pub fn with_root_cert_pem(root_cert_pem: impl Into<Vec<u8>>) -> Self {
+        Self {
+            root_cert_pem: Some(root_cert_pem.into()),
+            ..Self::default()
+        }
+    }
+
+    pub fn with_client_identity_pem(
+        mut self,
+        client_cert_pem: impl Into<Vec<u8>>,
+        client_key_pem: impl Into<Vec<u8>>,
+    ) -> Self {
+        self.client_cert_pem = Some(client_cert_pem.into());
+        self.client_key_pem = Some(client_key_pem.into());
+        self
+    }
+
+    fn into_redis_certificates(self) -> Result<redis::TlsCertificates, CatalogError> {
+        if self
+            .root_cert_pem
+            .as_ref()
+            .is_some_and(|pem| pem.is_empty() || pem.len() > MAX_REDIS_TLS_PEM_BYTES)
+        {
+            return Err(CatalogError::InvalidInput(
+                "Redis TLS root certificate PEM must be 1..=1048576 bytes",
+            ));
+        }
+        if self
+            .client_cert_pem
+            .as_ref()
+            .is_some_and(|pem| pem.is_empty() || pem.len() > MAX_REDIS_TLS_PEM_BYTES)
+        {
+            return Err(CatalogError::InvalidInput(
+                "Redis TLS client certificate PEM must be 1..=1048576 bytes",
+            ));
+        }
+        if self
+            .client_key_pem
+            .as_ref()
+            .is_some_and(|pem| pem.is_empty() || pem.len() > MAX_REDIS_TLS_PEM_BYTES)
+        {
+            return Err(CatalogError::InvalidInput(
+                "Redis TLS client key PEM must be 1..=1048576 bytes",
+            ));
+        }
+        let client_tls = match (self.client_cert_pem, self.client_key_pem) {
+            (Some(client_cert), Some(client_key)) => Some(redis::ClientTlsConfig {
+                client_cert,
+                client_key,
+            }),
+            (None, None) => None,
+            _ => {
+                return Err(CatalogError::InvalidInput(
+                    "Redis TLS client certificate and key must be supplied together",
+                ));
+            }
+        };
+        Ok(redis::TlsCertificates {
+            client_tls,
+            root_cert: self.root_cert_pem,
+        })
+    }
+}
+
+/// Redis stores one envelope per node in the directory hash.  The version is
+/// encoded as a decimal string so Lua comparisons remain exact for the full
+/// `u64` range; signed membership bytes remain opaque and are base64-encoded
+/// by serde inside this envelope.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct DirectoryMembershipValue {
+    version: String,
+    bytes: Vec<u8>,
+}
+
+#[derive(Deserialize)]
+struct MembershipNodeId {
+    node_id: String,
+}
+
+/// A separately constructed publisher handle for the operator-only signed
+/// membership namespace.  Relay/catalog handles expose reads only; deployments
+/// should give this connection a Redis ACL limited to `membership:operator:*`.
+#[derive(Clone)]
+pub struct RedisMembershipPublisher {
+    catalog: RedisCatalog,
+}
+
+impl std::fmt::Debug for RedisMembershipPublisher {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RedisMembershipPublisher")
+            .field("namespace", &self.catalog.namespace)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RedisMembershipPublisher {
+    /// Connect with the operator's separately authenticated Redis URL.  ACL
+    /// enforcement is intentionally delegated to Redis deployment policy; the
+    /// catalog code never treats signed bytes as trust anchors.
+    pub async fn connect(redis_url: &str, namespace: &str) -> Result<Self, CatalogError> {
+        Ok(Self {
+            catalog: RedisCatalog::connect(redis_url, namespace).await?,
+        })
+    }
+
+    pub async fn publish_signed_membership(
+        &self,
+        record: &SignedMembershipRecord,
+    ) -> Result<(), CatalogError> {
+        cluster::validate_membership_bytes(&record.bytes)?;
+        if record.version == 0 {
+            return Err(CatalogError::InvalidInput("signed membership version"));
+        }
+        // SignedMembershipRecord is intentionally opaque at the catalog
+        // boundary.  We inspect only the bounded node_id field to select a
+        // directory slot; the cluster verifier still authenticates every
+        // signed field before admission.  Keep the legacy path for old
+        // publisher fixtures that contain arbitrary opaque bytes.
+        if let Ok(node_id) = membership_node_id(&record.bytes) {
+            return self
+                .publish_signed_membership_for_node(&node_id, record)
+                .await;
+        }
+        let version = record.version.to_string();
+        let reply: Vec<String> = self
+            .catalog
+            .eval_membership_publish(&version, &record.bytes)
+            .await?;
+        match reply.first().map(String::as_str) {
+            Some("ok") => Ok(()),
+            Some("stale") => Err(CatalogError::Conflict("signed membership version")),
+            Some("conflict") => Err(CatalogError::Conflict("signed membership contents")),
+            _ => Err(CatalogError::Serialization(
+                "invalid Redis membership publish reply".into(),
+            )),
+        }
+    }
+
+    /// Publish one independently signed relay record into the bounded
+    /// operator directory.  The node id is an index only; it does not grant
+    /// trust and is checked again against the signed bytes by the reader and
+    /// cluster verifier.
+    pub async fn publish_signed_membership_for_node(
+        &self,
+        node_id: &str,
+        record: &SignedMembershipRecord,
+    ) -> Result<(), CatalogError> {
+        cluster::validate_membership_bytes(&record.bytes)?;
+        cluster::validate_identifier(node_id, 128)?;
+        if record.version == 0 {
+            return Err(CatalogError::InvalidInput("signed membership version"));
+        }
+        let encoded_node_id = membership_node_id(&record.bytes)?;
+        if encoded_node_id != node_id {
+            return Err(CatalogError::InvalidInput("signed membership node id"));
+        }
+        let envelope = DirectoryMembershipValue {
+            version: record.version.to_string(),
+            bytes: record.bytes.clone(),
+        };
+        let envelope = serde_json::to_vec(&envelope)?;
+        let reply = self
+            .catalog
+            .eval_membership_publish_directory(node_id, &record.version.to_string(), &envelope)
+            .await?;
+        match reply.first().map(String::as_str) {
+            Some("ok") => Ok(()),
+            Some("stale") => Err(CatalogError::Conflict("signed membership version")),
+            Some("conflict") => Err(CatalogError::Conflict("signed membership contents")),
+            Some("bound") => Err(CatalogError::Conflict("signed membership directory bound")),
+            _ => Err(CatalogError::Serialization(
+                "invalid Redis membership publish reply".into(),
+            )),
+        }
+    }
 }
 
 impl std::fmt::Debug for RedisCatalog {
@@ -53,34 +326,106 @@ impl RedisCatalog {
     /// `namespace` is durable identity state and must not be changed when a
     /// deployment incarnation changes after an uncertain Redis restore.
     pub async fn connect(redis_url: &str, namespace: &str) -> Result<Self, CatalogError> {
-        validate_namespace(namespace)?;
+        Self::connect_inner(redis_url, namespace, None)
+            .await
+            .map_err(CatalogConnectionError::into_catalog_error)
+    }
+
+    /// Connect to Redis over verified TLS with an explicit trust bundle and,
+    /// optionally, a client certificate/key pair. The URL must use the
+    /// `rediss://` scheme; the TLS handshake and the first PING/INFO exchange
+    /// complete before this returns.
+    pub async fn connect_with_tls(
+        redis_url: &str,
+        namespace: &str,
+        tls: RedisTlsOptions,
+    ) -> Result<Self, CatalogError> {
+        Self::connect_inner(redis_url, namespace, Some(tls))
+            .await
+            .map_err(CatalogConnectionError::into_catalog_error)
+    }
+
+    async fn connect_inner(
+        redis_url: &str,
+        namespace: &str,
+        tls: Option<RedisTlsOptions>,
+    ) -> Result<Self, CatalogConnectionError> {
+        validate_redis_namespace(namespace).map_err(|error| {
+            catalog_connection_error(CatalogConnectionStage::AuthorityProfile, error)
+        })?;
         if redis_url.trim().is_empty() {
-            return Err(CatalogError::InvalidInput("redis URL"));
+            return Err(catalog_connection_error(
+                CatalogConnectionStage::ConnectionEstablishment,
+                CatalogError::InvalidInput("redis URL"),
+            ));
         }
-        let client = redis::Client::open(redis_url)?;
-        let mut connection = tokio::time::timeout(
-            REDIS_OPERATION_TIMEOUT,
-            client.get_multiplexed_async_connection(),
-        )
-        .await
-        .map_err(|_| redis_timeout())??;
-        tokio::time::timeout(
-            REDIS_OPERATION_TIMEOUT,
-            redis::cmd("PING").query_async::<String>(&mut connection),
-        )
-        .await
-        .map_err(|_| redis_timeout())??;
-        let info: String = tokio::time::timeout(
-            REDIS_OPERATION_TIMEOUT,
-            redis::cmd("INFO")
-                .arg("server")
-                .query_async(&mut connection),
-        )
-        .await
-        .map_err(|_| redis_timeout())??;
-        let redis_run_id = parse_redis_run_id(&info)?;
+        let client = match tls {
+            Some(tls) => {
+                let connection_info = redis_url.into_connection_info().map_err(|error| {
+                    catalog_connection_error(CatalogConnectionStage::ConnectionEstablishment, error)
+                })?;
+                if !matches!(
+                    connection_info.addr(),
+                    redis::ConnectionAddr::TcpTls {
+                        insecure: false,
+                        ..
+                    }
+                ) {
+                    return Err(catalog_connection_error(
+                        CatalogConnectionStage::TlsSetup,
+                        CatalogError::InvalidInput(
+                            "Redis TLS connection requires a verified rediss:// URL",
+                        ),
+                    ));
+                }
+                let certificates = tls.into_redis_certificates().map_err(|error| {
+                    catalog_connection_error(CatalogConnectionStage::TlsSetup, error)
+                })?;
+                redis::Client::build_with_tls(connection_info, certificates).map_err(|error| {
+                    catalog_connection_error(CatalogConnectionStage::ConnectionEstablishment, error)
+                })?
+            }
+            None => redis::Client::open(redis_url).map_err(|error| {
+                catalog_connection_error(CatalogConnectionStage::ConnectionEstablishment, error)
+            })?,
+        };
+        let (connection, redis_run_id) = open_verified_connection(&client).await?;
+        let lane_group = Arc::new(LaneGroup::default());
+        let open_lanes =
+            async |count: usize| -> Result<Vec<AuthorityLane>, CatalogConnectionError> {
+                let mut lanes = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let (lane_connection, lane_run_id) = open_verified_connection(&client).await?;
+                    if lane_run_id != redis_run_id {
+                        return Err(catalog_connection_error(
+                            CatalogConnectionStage::PrimaryIdentity,
+                            CatalogError::Conflict(lane::RUN_ID_CONFLICT),
+                        ));
+                    }
+                    lanes.push(AuthorityLane::new(
+                        client.clone(),
+                        lane_connection,
+                        redis_run_id.clone(),
+                        Arc::clone(&lane_group),
+                    ));
+                }
+                Ok(lanes)
+            };
+        let authorization_connections = open_lanes(AUTHORIZATION_CONNECTIONS).await?;
+        let maintenance_connections = open_lanes(MAINTENANCE_CONNECTIONS).await?;
+        let connection = Arc::new(AuthorityLane::new(
+            client.clone(),
+            connection,
+            redis_run_id.clone(),
+            lane_group,
+        ));
         Ok(Self {
-            connection: Arc::new(Mutex::new(connection)),
+            client,
+            connection,
+            authorization_connections: Arc::new(authorization_connections),
+            authorization_next: Arc::new(AtomicUsize::new(0)),
+            maintenance_connections: Arc::new(maintenance_connections),
+            maintenance_next: Arc::new(AtomicUsize::new(0)),
             namespace: namespace.to_owned(),
             prefix: format!("tunnel-catalog:{namespace}:"),
             redis_run_id,
@@ -97,9 +442,71 @@ impl RedisCatalog {
         namespace: &str,
         deployment_incarnation: &str,
     ) -> Result<Self, CatalogError> {
-        let mut catalog = Self::connect(redis_url, namespace).await?;
-        catalog.configure_deployment_incarnation(deployment_incarnation)?;
-        catalog.ensure_active_incarnation().await?;
+        Self::connect_with_deployment_incarnation_staged(
+            redis_url,
+            namespace,
+            deployment_incarnation,
+        )
+        .await
+        .map_err(CatalogConnectionError::into_catalog_error)
+    }
+
+    /// Staged startup connection used by the relay's bounded diagnostics.
+    /// Existing callers should use [`Self::connect_with_deployment_incarnation`]
+    /// when they only need the catalog error classification.
+    pub async fn connect_with_deployment_incarnation_staged(
+        redis_url: &str,
+        namespace: &str,
+        deployment_incarnation: &str,
+    ) -> Result<Self, CatalogConnectionError> {
+        let mut catalog = Self::connect_inner(redis_url, namespace, None).await?;
+        catalog
+            .configure_deployment_incarnation(deployment_incarnation)
+            .map_err(|error| {
+                catalog_connection_error(CatalogConnectionStage::AuthorityProfile, error)
+            })?;
+        catalog.ensure_active_incarnation().await.map_err(|error| {
+            catalog_connection_error(CatalogConnectionStage::AuthorityIdentity, error)
+        })?;
+        Ok(catalog)
+    }
+
+    /// TLS-configured variant of [`Self::connect_with_deployment_incarnation`].
+    pub async fn connect_with_tls_and_deployment_incarnation(
+        redis_url: &str,
+        namespace: &str,
+        deployment_incarnation: &str,
+        tls: RedisTlsOptions,
+    ) -> Result<Self, CatalogError> {
+        Self::connect_with_tls_and_deployment_incarnation_staged(
+            redis_url,
+            namespace,
+            deployment_incarnation,
+            tls,
+        )
+        .await
+        .map_err(CatalogConnectionError::into_catalog_error)
+    }
+
+    /// TLS-configured staged startup connection used by the relay's bounded
+    /// diagnostics. Existing callers should use
+    /// [`Self::connect_with_tls_and_deployment_incarnation`] when they only
+    /// need the catalog error classification.
+    pub async fn connect_with_tls_and_deployment_incarnation_staged(
+        redis_url: &str,
+        namespace: &str,
+        deployment_incarnation: &str,
+        tls: RedisTlsOptions,
+    ) -> Result<Self, CatalogConnectionError> {
+        let mut catalog = Self::connect_inner(redis_url, namespace, Some(tls)).await?;
+        catalog
+            .configure_deployment_incarnation(deployment_incarnation)
+            .map_err(|error| {
+                catalog_connection_error(CatalogConnectionStage::AuthorityProfile, error)
+            })?;
+        catalog.ensure_active_incarnation().await.map_err(|error| {
+            catalog_connection_error(CatalogConnectionStage::AuthorityIdentity, error)
+        })?;
         Ok(catalog)
     }
 
@@ -112,6 +519,18 @@ impl RedisCatalog {
         deployment_incarnation: &str,
     ) -> Result<Self, CatalogError> {
         let mut catalog = Self::connect(redis_url, namespace).await?;
+        catalog.configure_deployment_incarnation(deployment_incarnation)?;
+        Ok(catalog)
+    }
+
+    /// TLS-configured variant of [`Self::connect_for_recovery`].
+    pub async fn connect_for_recovery_with_tls(
+        redis_url: &str,
+        namespace: &str,
+        deployment_incarnation: &str,
+        tls: RedisTlsOptions,
+    ) -> Result<Self, CatalogError> {
+        let mut catalog = Self::connect_with_tls(redis_url, namespace, tls).await?;
         catalog.configure_deployment_incarnation(deployment_incarnation)?;
         Ok(catalog)
     }
@@ -137,11 +556,14 @@ impl RedisCatalog {
         Ok(())
     }
 
-    /// Set the configured incarnation as the active owner-fencing
-    /// incarnation. This is an explicit recovery operation. It is idempotent
-    /// for the same incarnation and Redis run, or installs a different
-    /// incarnation when no live owner exists. A Redis run change requires a
-    /// different incarnation and never promotes automatically.
+    /// Compatibility bootstrap/fixture path for setting the configured
+    /// incarnation as active. Production recovery must use
+    /// `activate_deployment_incarnation_with_approval`, which verifies an
+    /// external approval and a fresh durable-catalog observation first. This
+    /// method is idempotent for the same incarnation and Redis run, or
+    /// installs a different incarnation when no live owner exists. A Redis
+    /// run change requires a different incarnation and never promotes
+    /// automatically.
     pub async fn activate_deployment_incarnation(&self) -> Result<(), CatalogError> {
         let incarnation = self.configured_incarnation()?;
         let reply: Vec<String> = self
@@ -162,6 +584,7 @@ impl RedisCatalog {
         match reply.first().map(String::as_str) {
             Some("ok") => Ok(()),
             Some("busy") => Err(CatalogError::OwnerBusy),
+            Some("bound") => Err(CatalogError::Conflict("owner lease scan bound")),
             Some("mismatch") => Err(CatalogError::Conflict("active deployment incarnation")),
             _ => Err(CatalogError::Serialization(
                 "invalid Redis incarnation reply".into(),
@@ -214,12 +637,7 @@ impl RedisCatalog {
                     .arg(format!("{}*", self.prefix))
                     .arg("COUNT")
                     .arg(256_i64);
-                tokio::time::timeout(REDIS_OPERATION_TIMEOUT, async {
-                    let mut connection = self.connection.lock().await;
-                    command.query_async(&mut *connection).await
-                })
-                .await
-                .map_err(|_| redis_timeout())??
+                self.connection.query(&command).await?
             };
             batch.retain(|key| key != &guard_key);
             keys.append(&mut batch);
@@ -237,21 +655,11 @@ impl RedisCatalog {
             for key in keys {
                 pipeline.cmd("DEL").arg(key).ignore();
             }
-            tokio::time::timeout(REDIS_OPERATION_TIMEOUT, async {
-                let mut connection = self.connection.lock().await;
-                pipeline.query_async::<()>(&mut *connection).await
-            })
-            .await
-            .map_err(|_| redis_timeout())??;
+            self.connection.query_pipeline::<()>(&pipeline).await?;
         }
         let mut delete_guard = redis::cmd("DEL");
         delete_guard.arg(&guard_key);
-        tokio::time::timeout(REDIS_OPERATION_TIMEOUT, async {
-            let mut connection = self.connection.lock().await;
-            delete_guard.query_async::<()>(&mut *connection).await
-        })
-        .await
-        .map_err(|_| redis_timeout())??;
+        self.connection.query::<()>(&delete_guard).await?;
         Ok(())
     }
 
@@ -283,31 +691,184 @@ impl RedisCatalog {
         keys: &[String],
         args: &[String],
     ) -> Result<T, CatalogError> {
+        self.eval_on(&self.connection, script, keys, args).await
+    }
+
+    /// Run one maintenance script (`resolve_device`, `renew_owner`) on the
+    /// next maintenance lane, round-robin.
+    async fn eval_maintenance<T: FromRedisValue>(
+        &self,
+        script: &str,
+        keys: &[String],
+        args: &[String],
+    ) -> Result<T, CatalogError> {
+        let lane = self.maintenance_next.fetch_add(1, Ordering::Relaxed)
+            % self.maintenance_connections.len();
+        self.eval_on(&self.maintenance_connections[lane], script, keys, args)
+            .await
+    }
+
+    async fn eval_on<T: FromRedisValue>(
+        &self,
+        lane: &AuthorityLane,
+        script: &str,
+        keys: &[String],
+        args: &[String],
+    ) -> Result<T, CatalogError> {
+        lane.query(&eval_command(script, keys, args)).await
+    }
+
+    /// Run one owner-affecting write script (`claim_owner`, `release_owner`)
+    /// on the catalog lane.  A reply lost after dispatch is the typed
+    /// [`CatalogError::WriteOutcomeUnknown`], never a replay.
+    async fn eval_owner_write<T: FromRedisValue>(
+        &self,
+        script: &str,
+        keys: &[String],
+        args: &[String],
+    ) -> Result<T, CatalogError> {
+        self.connection
+            .query_owner_write(&eval_command(script, keys, args))
+            .await
+    }
+
+    /// Run the owner renewal script on the next maintenance lane with the
+    /// same lost-reply contract as [`Self::eval_owner_write`].
+    async fn eval_maintenance_owner_write<T: FromRedisValue>(
+        &self,
+        script: &str,
+        keys: &[String],
+        args: &[String],
+    ) -> Result<T, CatalogError> {
+        let lane = self.maintenance_next.fetch_add(1, Ordering::Relaxed)
+            % self.maintenance_connections.len();
+        self.maintenance_connections[lane]
+            .query_owner_write(&eval_command(script, keys, args))
+            .await
+    }
+
+    async fn eval_membership_publish(
+        &self,
+        version: &str,
+        bytes: &[u8],
+    ) -> Result<Vec<String>, CatalogError> {
         let mut command = redis::cmd("EVAL");
-        command.arg(script).arg(keys.len() as i64);
-        for key in keys {
-            command.arg(key);
+        command
+            .arg(format!("{LUA_DECIMAL_HELPERS}{SCRIPT_PUBLISH_MEMBERSHIP}"))
+            .arg(1_i64)
+            .arg(self.signed_membership_key())
+            .arg(version)
+            .arg(bytes)
+            .arg(cluster::MEMBERSHIP_TTL_SECONDS.to_string());
+        self.connection.query(&command).await
+    }
+
+    async fn eval_membership_publish_directory(
+        &self,
+        node_id: &str,
+        version: &str,
+        envelope: &[u8],
+    ) -> Result<Vec<String>, CatalogError> {
+        let mut command = redis::cmd("EVAL");
+        command
+            .arg(format!(
+                "{LUA_DECIMAL_HELPERS}{SCRIPT_PUBLISH_MEMBERSHIP_DIRECTORY}"
+            ))
+            .arg(1_i64)
+            .arg(self.signed_membership_directory_key())
+            .arg(node_id)
+            .arg(version)
+            .arg(envelope)
+            .arg(MAX_SIGNED_MEMBERSHIP_RECORDS.to_string())
+            .arg(cluster::MEMBERSHIP_TTL_SECONDS.to_string());
+        self.connection.query(&command).await
+    }
+
+    async fn read_signed_membership_directory(
+        &self,
+    ) -> Result<Vec<SignedMembershipRecord>, CatalogError> {
+        // The Lua side checks HLEN before HGETALL.  This keeps a malformed or
+        // unauthorized directory from turning a catalog read into an
+        // unbounded client allocation.
+        let reply: Vec<String> = self
+            .eval(
+                &format!("{LUA_DECIMAL_HELPERS}{SCRIPT_READ_MEMBERSHIP_DIRECTORY}"),
+                &[self.signed_membership_directory_key()],
+                &[MAX_SIGNED_MEMBERSHIP_RECORDS.to_string()],
+            )
+            .await?;
+        match reply.first().map(String::as_str) {
+            Some("ok") => {}
+            Some("too_many") => {
+                return Err(CatalogError::InvalidInput("signed membership count"));
+            }
+            _ => {
+                return Err(CatalogError::Serialization(
+                    "invalid Redis membership directory reply".into(),
+                ));
+            }
         }
-        for arg in args {
-            command.arg(arg);
+        let payload = &reply[1..];
+        if !payload.len().is_multiple_of(2) || payload.len() / 2 > MAX_SIGNED_MEMBERSHIP_RECORDS {
+            return Err(CatalogError::Serialization(
+                "invalid Redis membership directory shape".into(),
+            ));
         }
-        let result = tokio::time::timeout(REDIS_OPERATION_TIMEOUT, async {
-            let mut connection = self.connection.lock().await;
-            command.query_async(&mut *connection).await
-        })
-        .await
-        .map_err(|_| redis_timeout())??;
-        Ok(result)
+        let mut records = Vec::with_capacity(payload.len() / 2);
+        for pair in payload.chunks_exact(2) {
+            let node_id = &pair[0];
+            cluster::validate_identifier(node_id, 128)?;
+            let envelope: DirectoryMembershipValue = serde_json::from_str(&pair[1])?;
+            let version = parse_u64_decimal(&envelope.version)?;
+            if version == 0 {
+                return Err(CatalogError::Serialization(
+                    "invalid Redis membership version".into(),
+                ));
+            }
+            cluster::validate_membership_bytes(&envelope.bytes)?;
+            if membership_node_id(&envelope.bytes)? != node_id.as_str() {
+                return Err(CatalogError::Serialization(
+                    "Redis membership node index mismatch".into(),
+                ));
+            }
+            records.push(SignedMembershipRecord {
+                version,
+                bytes: envelope.bytes,
+            });
+        }
+        Ok(records)
+    }
+
+    async fn read_legacy_signed_membership(
+        &self,
+    ) -> Result<Option<SignedMembershipRecord>, CatalogError> {
+        let key = self.signed_membership_key();
+        let mut pipeline = redis::pipe();
+        pipeline.atomic();
+        pipeline.cmd("HGET").arg(&key).arg("version");
+        pipeline.cmd("HGET").arg(&key).arg("bytes");
+        let reply: (Option<String>, Option<Vec<u8>>) =
+            self.connection.query_pipeline(&pipeline).await?;
+        match reply {
+            (None, None) => Ok(None),
+            (Some(version), Some(bytes)) => {
+                cluster::validate_membership_bytes(&bytes)?;
+                let version = parse_u64_decimal(&version)?;
+                if version == 0 {
+                    return Err(CatalogError::Serialization(
+                        "invalid Redis membership version".into(),
+                    ));
+                }
+                Ok(Some(SignedMembershipRecord { version, bytes }))
+            }
+            _ => Err(CatalogError::Serialization(
+                "partial Redis membership record".into(),
+            )),
+        }
     }
 
     async fn execute_seed_pipeline(&self, pipeline: redis::Pipeline) -> Result<(), CatalogError> {
-        tokio::time::timeout(REDIS_OPERATION_TIMEOUT, async {
-            let mut connection = self.connection.lock().await;
-            pipeline.query_async::<()>(&mut *connection).await
-        })
-        .await
-        .map_err(|_| redis_timeout())??;
-        Ok(())
+        self.connection.query_pipeline::<()>(&pipeline).await
     }
 
     fn tenant_key(&self, tenant: Uuid) -> String {
@@ -333,6 +894,51 @@ impl RedisCatalog {
 
     fn device_key(&self, tenant: Uuid, device: Uuid) -> String {
         format!("{}device:{tenant}:{device}", self.prefix)
+    }
+
+    /// Ephemeral owner leases are incarnation-scoped and carry a Redis TTL.
+    /// The key is deliberately separate from the durable device hash.
+    fn owner_key(&self, incarnation: &str, tenant: Uuid, device: Uuid) -> String {
+        format!(
+            "{}coord:owner:{}:{}:{}",
+            self.prefix,
+            key_component(incarnation),
+            tenant,
+            device
+        )
+    }
+
+    /// Epoch counters are durable coordination fences.  They have no TTL and
+    /// are intentionally independent of deployment incarnation.
+    fn owner_epoch_key(&self, tenant: Uuid, device: Uuid) -> String {
+        format!("{}coord:epoch:{tenant}:{device}", self.prefix)
+    }
+
+    fn attachment_ticket_key(
+        &self,
+        incarnation: &str,
+        tenant: Uuid,
+        device: Uuid,
+        digest: &str,
+    ) -> String {
+        format!(
+            "{}coord:ticket:{}:{}:{}:{}",
+            self.prefix,
+            key_component(incarnation),
+            tenant,
+            device,
+            digest
+        )
+    }
+
+    fn attachment_ticket_index_key(&self, incarnation: &str, tenant: Uuid, device: Uuid) -> String {
+        format!(
+            "{}coord:tickets:{}:{}:{}",
+            self.prefix,
+            key_component(incarnation),
+            tenant,
+            device
+        )
     }
 
     fn credential_key(&self, tenant: Uuid, device: Uuid, credential: Uuid) -> String {
@@ -394,8 +1000,23 @@ impl RedisCatalog {
         format!("{}meta:redis_run_id", self.prefix)
     }
 
+    /// Durable catalog mutation generation used only as a live concurrency
+    /// fence while recovery observes the namespace.  It is deliberately not
+    /// an external checkpoint or rollback authority.
+    fn catalog_generation_key(&self) -> String {
+        format!("{}meta:catalog_generation", self.prefix)
+    }
+
     fn fixture_seed_guard_key(&self) -> String {
         format!("{}meta:fixture_seeded", self.prefix)
+    }
+
+    fn signed_membership_key(&self) -> String {
+        format!("{}membership:operator:current", self.prefix)
+    }
+
+    fn signed_membership_directory_key(&self) -> String {
+        format!("{}membership:operator:directory", self.prefix)
     }
 
     fn fingerprint_index(&self, fingerprint: &str) -> String {
@@ -412,7 +1033,7 @@ impl RedisCatalog {
             .map_or_else(String::new, |value| value.to_string());
         let reply: Vec<String> = self
             .eval(
-                SCRIPT_SEED_CREDENTIAL,
+                &format!("{LUA_DECIMAL_HELPERS}{SCRIPT_SEED_CREDENTIAL}"),
                 &[
                     self.credential_key(
                         credential.tenant_id,
@@ -421,6 +1042,7 @@ impl RedisCatalog {
                     ),
                     self.fingerprint_index(&credential.spki_fingerprint),
                     self.credentials_index(credential.tenant_id, credential.device_id),
+                    self.catalog_generation_key(),
                 ],
                 &[
                     credential.tenant_id.to_string(),
@@ -458,7 +1080,7 @@ impl Catalog for RedisCatalog {
         }
         let at = datetime_micros(at)?;
         let reply: Vec<String> = self
-            .eval(
+            .eval_maintenance(
                 SCRIPT_RESOLVE_DEVICE,
                 &[self.fingerprint_index(spki_fingerprint)],
                 &[
@@ -466,6 +1088,7 @@ impl Catalog for RedisCatalog {
                     at.to_string(),
                     self.prefix.clone(),
                     MAX_AUTHORITY_CLOCK_SKEW_US.to_string(),
+                    MAX_AUTHORITY_CALLER_LAG_US.to_string(),
                 ],
             )
             .await?;
@@ -485,7 +1108,7 @@ impl Catalog for RedisCatalog {
         subject: &str,
         tenant_id: Option<Uuid>,
     ) -> Result<Option<AuthenticatedConsumer>, CatalogError> {
-        if issuer.trim().is_empty() || subject.trim().is_empty() {
+        if !valid_principal_identity(issuer, subject) {
             return Ok(None);
         }
         let reply: Vec<String> = self
@@ -526,8 +1149,11 @@ impl Catalog for RedisCatalog {
         }
         let read_started_us = datetime_micros(read_started_at)?;
         let at_us = datetime_micros(at)?;
+        let lane = self.authorization_next.fetch_add(1, Ordering::Relaxed)
+            % self.authorization_connections.len();
         let reply: Vec<String> = self
-            .eval(
+            .eval_on(
+                &self.authorization_connections[lane],
                 SCRIPT_AUTHORIZE,
                 &[
                     self.grant_key(
@@ -545,6 +1171,7 @@ impl Catalog for RedisCatalog {
                     at_us.to_string(),
                     read_started_us.to_string(),
                     MAX_AUTHORITY_CLOCK_SKEW_US.to_string(),
+                    MAX_AUTHORITY_CALLER_LAG_US.to_string(),
                 ],
             )
             .await?;
@@ -597,6 +1224,7 @@ impl Catalog for RedisCatalog {
                     self.max_list_items.to_string(),
                     (self.max_list_items.saturating_mul(32)).to_string(),
                     MAX_AUTHORITY_CLOCK_SKEW_US.to_string(),
+                    MAX_AUTHORITY_CALLER_LAG_US.to_string(),
                 ],
             )
             .await?;
@@ -636,6 +1264,7 @@ impl Catalog for RedisCatalog {
                     self.device_key(spec.tenant_id, spec.device_id),
                     self.service_key(spec.tenant_id, spec.device_id, spec.service_id),
                     self.grants_device_index(spec.tenant_id, spec.device_id),
+                    self.catalog_generation_key(),
                 ],
                 &[
                     at_us.to_string(),
@@ -686,7 +1315,10 @@ impl Catalog for RedisCatalog {
         let reply: Vec<String> = self
             .eval(
                 &format!("{LUA_DECIMAL_HELPERS}{SCRIPT_REVOKE_GRANT_BODY}"),
-                &[self.grant_key(tenant_id, principal_id, device_id, service_id)],
+                &[
+                    self.grant_key(tenant_id, principal_id, device_id, service_id),
+                    self.catalog_generation_key(),
+                ],
                 &[at_us.to_string()],
             )
             .await?;
@@ -714,6 +1346,9 @@ impl Catalog for RedisCatalog {
                     self.device_key(tenant_id, device_id),
                     self.credentials_index(tenant_id, device_id),
                     self.grants_device_index(tenant_id, device_id),
+                    self.owner_key(self.configured_incarnation()?, tenant_id, device_id),
+                    self.owner_epoch_key(tenant_id, device_id),
+                    self.catalog_generation_key(),
                 ],
                 &[
                     self.prefix.clone(),
@@ -747,6 +1382,7 @@ impl Catalog for RedisCatalog {
                 &[
                     self.device_key(tenant_id, device_id),
                     self.credential_key(tenant_id, device_id, credential_id),
+                    self.catalog_generation_key(),
                 ],
                 &[at_us.to_string()],
             )
@@ -888,10 +1524,10 @@ impl Catalog for RedisCatalog {
                 .arg("device_version")
                 .arg("1");
             pipeline
-                .cmd("HSETNX")
-                .arg(self.device_key(device.tenant_id, device.device_id))
-                .arg("owner_epoch")
-                .arg("0");
+                .cmd("SETNX")
+                .arg(self.owner_epoch_key(device.tenant_id, device.device_id))
+                .arg("0")
+                .ignore();
             pipeline
                 .cmd("SADD")
                 .arg(self.devices_index(device.tenant_id))
@@ -922,6 +1558,14 @@ impl Catalog for RedisCatalog {
                 .arg(self.services_index(service.tenant_id, service.device_id))
                 .arg(service.service_id.to_string());
         }
+        pipeline
+            .cmd("EVAL")
+            .arg(format!(
+                "{LUA_DECIMAL_HELPERS}{SCRIPT_INCREMENT_CATALOG_GENERATION}"
+            ))
+            .arg(1_i64)
+            .arg(self.catalog_generation_key())
+            .ignore();
         self.execute_seed_pipeline(pipeline).await?;
         for credential in &fixture.credentials {
             self.seed_credential(credential).await?;
@@ -948,12 +1592,15 @@ impl Catalog for RedisCatalog {
         }
         let lease_us = datetime_micros(request.lease_expires_at)?;
         let reply: Vec<String> = self
-            .eval(
+            .eval_owner_write(
                 &format!("{LUA_DECIMAL_HELPERS}{SCRIPT_CLAIM_OWNER_BODY}"),
                 &[
+                    self.owner_key(incarnation, request.tenant_id, request.device_id),
+                    self.owner_epoch_key(request.tenant_id, request.device_id),
                     self.device_key(request.tenant_id, request.device_id),
                     self.active_incarnation_key(),
                     self.redis_run_id_key(),
+                    self.catalog_generation_key(),
                 ],
                 &[
                     incarnation.to_owned(),
@@ -970,6 +1617,7 @@ impl Catalog for RedisCatalog {
             Some("busy") => Err(CatalogError::OwnerBusy),
             Some("incarnation") => Err(CatalogError::Conflict("active deployment incarnation")),
             Some("authority") => Err(CatalogError::Conflict("Redis authority run")),
+            Some("missing_epoch") => Err(CatalogError::Conflict("missing owner epoch")),
             Some("overflow") => Err(CatalogError::RevisionOverflow),
             Some("ok") if reply.len() == 3 => Ok(OwnerClaim {
                 token: OwnerToken {
@@ -1007,9 +1655,10 @@ impl Catalog for RedisCatalog {
             return Err(CatalogError::InvalidOwner);
         }
         let reply: Vec<String> = self
-            .eval(
+            .eval_maintenance_owner_write(
                 SCRIPT_RENEW_OWNER,
                 &[
+                    self.owner_key(incarnation, token.tenant_id, token.device_id),
                     self.device_key(token.tenant_id, token.device_id),
                     self.active_incarnation_key(),
                     self.redis_run_id_key(),
@@ -1046,10 +1695,10 @@ impl Catalog for RedisCatalog {
         validate_identifier(&token.boot_id, MAX_IDENTIFIER_BYTES)?;
         validate_identifier(&token.session_id, MAX_IDENTIFIER_BYTES)?;
         let reply: Vec<String> = self
-            .eval(
+            .eval_owner_write(
                 SCRIPT_RELEASE_OWNER,
                 &[
-                    self.device_key(token.tenant_id, token.device_id),
+                    self.owner_key(incarnation, token.tenant_id, token.device_id),
                     self.active_incarnation_key(),
                     self.redis_run_id_key(),
                 ],
@@ -1084,6 +1733,7 @@ impl Catalog for RedisCatalog {
             .eval(
                 SCRIPT_CURRENT_OWNER,
                 &[
+                    self.owner_key(incarnation, tenant_id, device_id),
                     self.device_key(tenant_id, device_id),
                     self.active_incarnation_key(),
                     self.redis_run_id_key(),
@@ -1111,10 +1761,201 @@ impl Catalog for RedisCatalog {
             )),
         }
     }
+
+    async fn issue_attachment_ticket(
+        &self,
+        request: &AttachmentTicketIssueRequest,
+    ) -> Result<AttachmentTicket, CatalogError> {
+        let incarnation = self.configured_incarnation()?;
+        if incarnation != request.owner.deployment_incarnation {
+            return Err(CatalogError::InvalidOwner);
+        }
+        let now = Utc::now();
+        cluster::validate_ticket_issue(request, incarnation, now)?;
+        let ticket = cluster::generate_ticket();
+        let digest = cluster::ticket_digest(&ticket);
+        let expiry_us = datetime_micros(request.expires_at)?;
+        let reply: Vec<String> = self
+            .eval(
+                SCRIPT_ISSUE_ATTACHMENT_TICKET,
+                &[
+                    self.owner_key(incarnation, request.tenant_id, request.device_id),
+                    self.attachment_ticket_key(
+                        incarnation,
+                        request.tenant_id,
+                        request.device_id,
+                        &digest,
+                    ),
+                    self.attachment_ticket_index_key(
+                        incarnation,
+                        request.tenant_id,
+                        request.device_id,
+                    ),
+                    self.device_key(request.tenant_id, request.device_id),
+                    self.fingerprint_index(&request.spki_fingerprint),
+                    self.active_incarnation_key(),
+                    self.redis_run_id_key(),
+                ],
+                &[
+                    incarnation.to_owned(),
+                    self.redis_run_id.clone(),
+                    request.owner.epoch.to_string(),
+                    request.owner.node_id.clone(),
+                    request.owner.boot_id.clone(),
+                    request.owner.session_id.clone(),
+                    request.spki_fingerprint.clone(),
+                    request.generation.to_string(),
+                    request.connection_id.clone(),
+                    request.purpose.clone(),
+                    request.binding_digest.clone(),
+                    request.tenant_id.to_string(),
+                    request.device_id.to_string(),
+                    expiry_us.to_string(),
+                    digest.clone(),
+                    MAX_TICKET_INDEX_ITEMS.to_string(),
+                ],
+            )
+            .await?;
+        match reply.first().map(String::as_str) {
+            Some("ok") => Ok(AttachmentTicket {
+                ticket,
+                locator: crate::AttachmentTicketLocator {
+                    tenant_id: request.tenant_id,
+                    device_id: request.device_id,
+                    digest,
+                },
+                expires_at: request.expires_at,
+            }),
+            Some("busy") => Err(CatalogError::InvalidOwner),
+            Some("bound") => Err(CatalogError::Conflict("attachment ticket bound")),
+            Some("collision") => Err(CatalogError::Conflict("attachment ticket collision")),
+            Some("incarnation") => Err(CatalogError::Conflict("active deployment incarnation")),
+            Some("authority") => Err(CatalogError::Conflict("Redis authority run")),
+            Some("stale") => Err(CatalogError::StaleOwner),
+            _ => Err(CatalogError::Serialization(
+                "invalid Redis attachment ticket issue reply".into(),
+            )),
+        }
+    }
+
+    async fn consume_attachment_ticket(
+        &self,
+        request: &AttachmentTicketConsumeRequest,
+    ) -> Result<ConsumedAttachmentTicket, CatalogError> {
+        let incarnation = self.configured_incarnation()?;
+        if incarnation != request.owner.deployment_incarnation {
+            return Err(CatalogError::InvalidOwner);
+        }
+        let binding = request.binding();
+        cluster::validate_ticket_consume(&binding, incarnation, &request.ticket)?;
+        let digest = cluster::ticket_digest(&request.ticket);
+        let reply: Vec<String> = self
+            .eval(
+                SCRIPT_CONSUME_ATTACHMENT_TICKET,
+                &[
+                    self.attachment_ticket_key(
+                        incarnation,
+                        request.tenant_id,
+                        request.device_id,
+                        &digest,
+                    ),
+                    self.attachment_ticket_index_key(
+                        incarnation,
+                        request.tenant_id,
+                        request.device_id,
+                    ),
+                    self.owner_key(incarnation, request.tenant_id, request.device_id),
+                    self.device_key(request.tenant_id, request.device_id),
+                    self.fingerprint_index(&request.spki_fingerprint),
+                    self.active_incarnation_key(),
+                    self.redis_run_id_key(),
+                ],
+                &[
+                    incarnation.to_owned(),
+                    self.redis_run_id.clone(),
+                    request.owner.epoch.to_string(),
+                    request.owner.node_id.clone(),
+                    request.owner.boot_id.clone(),
+                    request.owner.session_id.clone(),
+                    request.spki_fingerprint.clone(),
+                    request.generation.to_string(),
+                    request.connection_id.clone(),
+                    request.purpose.clone(),
+                    request.binding_digest.clone(),
+                    request.tenant_id.to_string(),
+                    request.device_id.to_string(),
+                    digest,
+                ],
+            )
+            .await?;
+        match reply.first().map(String::as_str) {
+            Some("ok") if reply.len() == 14 => Ok(ConsumedAttachmentTicket {
+                binding: crate::AttachmentTicketBinding {
+                    tenant_id: parse_uuid(&reply[1])?,
+                    device_id: parse_uuid(&reply[2])?,
+                    spki_fingerprint: reply[3].clone(),
+                    owner: OwnerToken {
+                        deployment_incarnation: reply[4].clone(),
+                        tenant_id: parse_uuid(&reply[1])?,
+                        device_id: parse_uuid(&reply[2])?,
+                        node_id: reply[5].clone(),
+                        boot_id: reply[6].clone(),
+                        session_id: reply[7].clone(),
+                        epoch: parse_u64_decimal(&reply[8])?,
+                    },
+                    generation: parse_u64_decimal(&reply[9])?,
+                    connection_id: reply[10].clone(),
+                    purpose: reply[11].clone(),
+                    binding_digest: reply[12].clone(),
+                },
+                expires_at: parse_datetime_micros(&reply[13])?,
+            }),
+            Some("missing") | Some("spent") | Some("expired") | Some("mismatch")
+            | Some("stale") | Some("incarnation") | Some("authority") => {
+                Err(CatalogError::Unauthorized)
+            }
+            _ => Err(CatalogError::Serialization(
+                "invalid Redis attachment ticket consume reply".into(),
+            )),
+        }
+    }
+
+    async fn read_signed_membership(&self) -> Result<Option<SignedMembershipRecord>, CatalogError> {
+        if let Some(record) = self
+            .read_signed_membership_directory()
+            .await?
+            .into_iter()
+            .next()
+        {
+            return Ok(Some(record));
+        }
+        self.read_legacy_signed_membership().await
+    }
+
+    async fn read_signed_memberships(&self) -> Result<Vec<SignedMembershipRecord>, CatalogError> {
+        let records = self.read_signed_membership_directory().await?;
+        if !records.is_empty() {
+            return Ok(records);
+        }
+        Ok(self
+            .read_legacy_signed_membership()
+            .await?
+            .into_iter()
+            .collect())
+    }
 }
 
-fn validate_namespace(namespace: &str) -> Result<(), CatalogError> {
-    if namespace.is_empty() || namespace.len() > 96 {
+/// The authoritative Redis namespace rule, applied without opening a
+/// connection.
+///
+/// `connect_inner` enforces exactly this before any socket is created, so a
+/// configuration validator can refuse an unusable namespace at parse time
+/// instead of discovering it after listeners are bound. Every key the catalog
+/// writes is prefixed with this value, so the charset stays restricted to
+/// characters that cannot introduce a second key separator or a glob
+/// metacharacter into a scan pattern.
+pub fn validate_redis_namespace(namespace: &str) -> Result<(), CatalogError> {
+    if namespace.is_empty() || namespace.len() > MAX_REDIS_NAMESPACE_BYTES {
         return Err(CatalogError::InvalidInput("Redis namespace"));
     }
     if !namespace
@@ -1126,10 +1967,85 @@ fn validate_namespace(namespace: &str) -> Result<(), CatalogError> {
     Ok(())
 }
 
+/// Open one lane connection and verify the primary's identity.
+///
+/// redis-rs applies its own per-command response deadline inside the
+/// multiplexed connection, measured from the moment the command is written
+/// until its reply arrives.  It is set to the documented two-second
+/// authority bound here (the library default is 500 ms) so that deadline,
+/// like the catalog's outer one, bounds the authority's reply and nothing
+/// else; a reply slower than that is reported as a timeout distinct from a
+/// severed connection.
+async fn open_verified_connection(
+    client: &redis::Client,
+) -> Result<(MultiplexedConnection, String), CatalogConnectionError> {
+    let config =
+        redis::AsyncConnectionConfig::new().set_response_timeout(Some(REDIS_OPERATION_TIMEOUT));
+    let connection = tokio::time::timeout(
+        REDIS_OPERATION_TIMEOUT,
+        client.get_multiplexed_async_connection_with_config(&config),
+    )
+    .await
+    .map_err(|_| {
+        catalog_connection_error(
+            CatalogConnectionStage::ConnectionEstablishment,
+            redis_timeout(),
+        )
+    })?
+    .map_err(|error| {
+        catalog_connection_error(CatalogConnectionStage::ConnectionEstablishment, error)
+    })?;
+    verify_connection_identity(connection).await
+}
+
+/// Complete the same bounded PING/INFO exchange used by configured catalog
+/// startup.  Keeping this separate gives the in-process transport regression a
+/// real redis-rs `MultiplexedConnection` seam, so it can distinguish an
+/// injected AsyncWrite error from a peer/read-side close without inferring direction from
+/// the remote socket's last observed command.
+async fn verify_connection_identity(
+    mut connection: MultiplexedConnection,
+) -> Result<(MultiplexedConnection, String), CatalogConnectionError> {
+    tokio::time::timeout(
+        REDIS_OPERATION_TIMEOUT,
+        redis::cmd("PING").query_async::<String>(&mut connection),
+    )
+    .await
+    .map_err(|_| catalog_connection_error(CatalogConnectionStage::Ping, redis_timeout()))?
+    .map_err(|error| catalog_connection_error(CatalogConnectionStage::Ping, error))?;
+    let info: String = tokio::time::timeout(
+        REDIS_OPERATION_TIMEOUT,
+        redis::cmd("INFO")
+            .arg("server")
+            .query_async(&mut connection),
+    )
+    .await
+    .map_err(|_| {
+        catalog_connection_error(CatalogConnectionStage::PrimaryIdentity, redis_timeout())
+    })?
+    .map_err(|error| catalog_connection_error(CatalogConnectionStage::PrimaryIdentity, error))?;
+    let redis_run_id = parse_redis_run_id(&info).map_err(|error| {
+        catalog_connection_error(CatalogConnectionStage::PrimaryIdentity, error)
+    })?;
+    Ok((connection, redis_run_id))
+}
+
 fn is_fixture_namespace(namespace: &str) -> bool {
     namespace.starts_with("test-")
         || namespace.starts_with("fixture-")
         || namespace.contains("-fixture-")
+}
+
+fn eval_command(script: &str, keys: &[String], args: &[String]) -> redis::Cmd {
+    let mut command = redis::cmd("EVAL");
+    command.arg(script).arg(keys.len() as i64);
+    for key in keys {
+        command.arg(key);
+    }
+    for arg in args {
+        command.arg(arg);
+    }
+    command
 }
 
 fn redis_timeout() -> redis::RedisError {
@@ -1137,6 +2053,13 @@ fn redis_timeout() -> redis::RedisError {
         std::io::ErrorKind::TimedOut,
         "Redis catalog operation timed out",
     ))
+}
+
+fn catalog_connection_error(
+    stage: CatalogConnectionStage,
+    error: impl Into<CatalogError>,
+) -> CatalogConnectionError {
+    CatalogConnectionError::new(stage, error.into())
 }
 
 fn parse_redis_run_id(info: &str) -> Result<String, CatalogError> {
@@ -1199,6 +2122,15 @@ fn parse_u64_decimal(value: &str) -> Result<u64, CatalogError> {
     value
         .parse::<u64>()
         .map_err(|_| CatalogError::Serialization("invalid Redis revision".into()))
+}
+
+/// Extract only the bounded index field needed to select a directory slot.
+/// This does not validate a signature or any other membership field; that
+/// remains the cluster trust layer's responsibility.
+fn membership_node_id(bytes: &[u8]) -> Result<String, CatalogError> {
+    let envelope: MembershipNodeId = serde_json::from_slice(bytes)?;
+    cluster::validate_identifier(&envelope.node_id, 128)?;
+    Ok(envelope.node_id)
 }
 
 fn optional_datetime(value: &str) -> Result<Option<DateTime<Utc>>, CatalogError> {
@@ -1340,10 +2272,7 @@ fn validate_fixture(fixture: &CatalogFixture) -> Result<(), CatalogError> {
     }
     for identity in &fixture.identities {
         if !users.contains(&identity.user_id)
-            || identity.issuer.trim().is_empty()
-            || identity.subject.trim().is_empty()
-            || identity.issuer.len() > 2048
-            || identity.subject.len() > 1024
+            || !valid_principal_identity(&identity.issuer, &identity.subject)
         {
             return Err(CatalogError::InvalidInput("identity fixture"));
         }
@@ -1444,19 +2373,19 @@ local current = redis.call('GET', KEYS[1])
 local current_run = redis.call('GET', KEYS[3])
 if current and current == ARGV[2] and current_run == ARGV[3] then return {'ok'} end
 if current and current == ARGV[2] and current_run ~= ARGV[3] then return {'mismatch'} end
-local tenants = redis.call('SMEMBERS', KEYS[2])
-local clock = redis.call('TIME')
-local now = tonumber(clock[1]) * 1000000 + tonumber(clock[2])
-for _, tenant in ipairs(tenants) do
-  local devices = redis.call('SMEMBERS', ARGV[1] .. 'idx:devices:' .. tenant)
-  for _, device in ipairs(devices) do
-    local key = ARGV[1] .. 'device:' .. tenant .. ':' .. device
-    local expiry = redis.call('HGET', key, 'owner_expires_at_us')
-    if expiry and expiry ~= '' and tonumber(expiry) > now then
-      return {'busy'}
-    end
+-- Owner leases are ephemeral keys.  Do not consult durable device hashes:
+-- doing so would make old M1 owner fields a second authority.
+local cursor = '0'
+local examined = 0
+repeat
+  local result = redis.call('SCAN', cursor, 'MATCH', ARGV[1] .. 'coord:owner:*', 'COUNT', 256)
+  cursor = result[1]
+  for _, key in ipairs(result[2]) do
+    examined = examined + 1
+    if examined > 100000 then return {'bound'} end
+    if redis.call('EXISTS', key) == 1 then return {'busy'} end
   end
-end
+until cursor == '0'
 redis.call('SET', KEYS[1], ARGV[2])
 redis.call('SET', KEYS[3], ARGV[3])
 return {'ok'}
@@ -1476,7 +2405,8 @@ local device_key = ARGV[3] .. 'device:' .. tenant_id .. ':' .. device_id
 local caller_at = tonumber(ARGV[2])
 local clock = redis.call('TIME')
 local now = tonumber(clock[1]) * 1000000 + tonumber(clock[2])
-if not caller_at or math.abs(now - caller_at) > tonumber(ARGV[4]) then return {'clock_skew'} end
+if not caller_at or caller_at - now > tonumber(ARGV[4])
+   or now - caller_at > tonumber(ARGV[5]) then return {'clock_skew'} end
 local at = math.max(caller_at, now)
 local translation = math.max(0, now - caller_at)
 local active = h(credential_key, 'active')
@@ -1489,7 +2419,8 @@ return {
   'ok', tenant_id, device_id, h(device_key, 'owner_user_id'), credential_id,
   h(credential_key, 'spki_fingerprint'), string.format('%.0f', not_before - translation),
   string.format('%.0f', expires - translation), h(credential_key, 'revoked_at_us'),
-  device_active, active, h(device_key, 'device_version'), h(device_key, 'owner_epoch'),
+  device_active, active, h(device_key, 'device_version'),
+  redis.call('GET', ARGV[3] .. 'coord:epoch:' .. tenant_id .. ':' .. device_id) or h(device_key, 'owner_epoch'),
   h(device_key, 'last_seen_at_us')
 }
 "#;
@@ -1531,7 +2462,8 @@ local at = tonumber(ARGV[1])
 local start = tonumber(ARGV[2])
 local clock = redis.call('TIME')
 local now = tonumber(clock[1]) * 1000000 + tonumber(clock[2])
-if not at or math.abs(now - at) > tonumber(ARGV[3]) then return {'clock_skew'} end
+if not at or at - now > tonumber(ARGV[3])
+   or now - at > tonumber(ARGV[4]) then return {'clock_skew'} end
 local effective_at = math.max(at, now)
 local expiry_string = h(KEYS[1], 'expires_at_us')
 local expiry
@@ -1564,7 +2496,8 @@ local include_inactive = ARGV[6] == '1'
 local caller_at = tonumber(ARGV[7])
 local clock = redis.call('TIME')
 local now = tonumber(clock[1]) * 1000000 + tonumber(clock[2])
-if not caller_at or math.abs(now - caller_at) > tonumber(ARGV[10]) then return {'clock_skew'} end
+if not caller_at or caller_at - now > tonumber(ARGV[10])
+   or now - caller_at > tonumber(ARGV[11]) then return {'clock_skew'} end
 local at = math.max(caller_at, now)
 local max_devices = tonumber(ARGV[8])
 local max_services = tonumber(ARGV[9])
@@ -1649,6 +2582,13 @@ local function decimal_increment(value)
 end
 "#;
 
+const SCRIPT_INCREMENT_CATALOG_GENERATION: &str = r#"
+local next_generation = decimal_increment(redis.call('GET', KEYS[1]))
+if not next_generation then return redis.error_reply('catalog generation overflow') end
+redis.call('SET', KEYS[1], next_generation)
+return next_generation
+"#;
+
 const SCRIPT_UPSERT_GRANT_BODY: &str = r#"
 local function h(key, field)
   return redis.call('HGET', key, field) or ''
@@ -1663,8 +2603,11 @@ if old ~= '' then
   revision = decimal_increment(old)
   if not revision then return {'overflow'} end
 end
+local next_generation = decimal_increment(redis.call('GET', KEYS[7]))
+if not next_generation then return {'overflow'} end
 redis.call('HSET', KEYS[1], 'tenant_id', h(KEYS[3], 'tenant_id'), 'principal_id', h(KEYS[2], 'user_id'), 'device_id', h(KEYS[4], 'device_id'), 'service_id', h(KEYS[5], 'service_id'), 'revision', revision, 'permissions', ARGV[2], 'constraints', ARGV[3], 'expires_at_us', ARGV[4], 'active', ARGV[5], 'revoked_at_us', '')
 redis.call('SADD', KEYS[6], KEYS[1])
+redis.call('SET', KEYS[7], next_generation)
 return {'ok', revision}
 "#;
 
@@ -1673,7 +2616,10 @@ local revision = redis.call('HGET', KEYS[1], 'revision')
 if not revision then return {'none'} end
 local next_revision = decimal_increment(revision)
 if not next_revision then return {'overflow'} end
+local next_generation = decimal_increment(redis.call('GET', KEYS[2]))
+if not next_generation then return {'overflow'} end
 redis.call('HSET', KEYS[1], 'revision', next_revision, 'active', '0', 'revoked_at_us', ARGV[1])
+redis.call('SET', KEYS[2], next_generation)
 return {'ok', next_revision}
 "#;
 
@@ -1683,8 +2629,9 @@ local function h(key, field)
 end
 if h(KEYS[1], 'device_id') == '' then return {'none'} end
 local device_version = decimal_increment(h(KEYS[1], 'device_version'))
-local owner_epoch = decimal_increment(h(KEYS[1], 'owner_epoch'))
-if not device_version or not owner_epoch then return {'overflow'} end
+local owner_epoch = decimal_increment(redis.call('GET', KEYS[5]) or h(KEYS[1], 'owner_epoch'))
+local next_generation = decimal_increment(redis.call('GET', KEYS[6]))
+if not device_version or not owner_epoch or not next_generation then return {'overflow'} end
 local grants = redis.call('SMEMBERS', KEYS[3])
 local next_revisions = {}
 for _, grant_key in ipairs(grants) do
@@ -1692,7 +2639,10 @@ for _, grant_key in ipairs(grants) do
   if not next_revision then return {'overflow'} end
   next_revisions[grant_key] = next_revision
 end
-redis.call('HSET', KEYS[1], 'active', '0', 'device_version', device_version, 'owner_epoch', owner_epoch, 'owner_deployment_incarnation', '', 'owner_node_id', '', 'owner_boot_id', '', 'owner_session_id', '', 'owner_expires_at_us', '')
+redis.call('HSET', KEYS[1], 'active', '0', 'device_version', device_version)
+redis.call('SET', KEYS[5], owner_epoch)
+redis.call('SET', KEYS[6], next_generation)
+redis.call('DEL', KEYS[4])
 for _, credential_id in ipairs(redis.call('SMEMBERS', KEYS[2])) do
   local credential_key = ARGV[1] .. 'credential:' .. ARGV[2] .. ':' .. ARGV[3] .. ':' .. credential_id
   redis.call('HSET', credential_key, 'active', '0', 'revoked_at_us', ARGV[4])
@@ -1709,8 +2659,11 @@ if active ~= '1' then return {'none'} end
 local revision = redis.call('HGET', KEYS[1], 'device_version') or '0'
 local next_revision = decimal_increment(revision)
 if not next_revision then return {'overflow'} end
+local next_generation = decimal_increment(redis.call('GET', KEYS[3]))
+if not next_generation then return {'overflow'} end
 redis.call('HSET', KEYS[2], 'active', '0', 'revoked_at_us', ARGV[1])
 redis.call('HSET', KEYS[1], 'device_version', next_revision)
+redis.call('SET', KEYS[3], next_generation)
 return {'ok', next_revision}
 "#;
 
@@ -1718,28 +2671,39 @@ const SCRIPT_CLAIM_OWNER_BODY: &str = r#"
 local function h(key, field)
   return redis.call('HGET', key, field) or ''
 end
-if redis.call('GET', KEYS[2]) ~= ARGV[1] then return {'incarnation'} end
-if redis.call('GET', KEYS[3]) ~= ARGV[2] then return {'authority'} end
-if h(KEYS[1], 'device_id') == '' or h(KEYS[1], 'active') ~= '1' then return {'none'} end
+if redis.call('GET', KEYS[4]) ~= ARGV[1] then return {'incarnation'} end
+if redis.call('GET', KEYS[5]) ~= ARGV[2] then return {'authority'} end
+if h(KEYS[3], 'device_id') == '' or h(KEYS[3], 'active') ~= '1' then return {'none'} end
 local clock = redis.call('TIME')
 local now = tonumber(clock[1]) * 1000000 + tonumber(clock[2])
 local lease = tonumber(ARGV[6])
 if not lease or lease <= now then return {'stale'} end
-local expiry = tonumber(h(KEYS[1], 'owner_expires_at_us'))
+local expiry = tonumber(h(KEYS[1], 'lease_expires_at_us'))
 if expiry and expiry > now then
-  if h(KEYS[1], 'owner_deployment_incarnation') == ARGV[1]
-     and h(KEYS[1], 'owner_node_id') == ARGV[3]
-     and h(KEYS[1], 'owner_boot_id') == ARGV[4]
-     and h(KEYS[1], 'owner_session_id') == ARGV[5] then
+  if h(KEYS[1], 'deployment_incarnation') == ARGV[1]
+     and h(KEYS[1], 'node_id') == ARGV[3]
+     and h(KEYS[1], 'boot_id') == ARGV[4]
+     and h(KEYS[1], 'session_id') == ARGV[5] then
     local selected = math.max(expiry, lease)
-    redis.call('HSET', KEYS[1], 'owner_expires_at_us', string.format('%.0f', selected))
+    redis.call('HSET', KEYS[1], 'lease_expires_at_us', string.format('%.0f', selected))
+    redis.call('PEXPIREAT', KEYS[1], math.floor(selected / 1000))
     return {'ok', h(KEYS[1], 'owner_epoch'), string.format('%.0f', selected)}
   end
   return {'busy'}
 end
-local epoch = decimal_increment(h(KEYS[1], 'owner_epoch'))
-if not epoch then return {'overflow'} end
-redis.call('HSET', KEYS[1], 'owner_epoch', epoch, 'owner_deployment_incarnation', ARGV[1], 'owner_node_id', ARGV[3], 'owner_boot_id', ARGV[4], 'owner_session_id', ARGV[5], 'owner_expires_at_us', ARGV[6])
+local epoch = redis.call('GET', KEYS[2])
+if not epoch then epoch = h(KEYS[3], 'owner_epoch') end
+if not epoch or epoch == '' then return {'missing_epoch'} end
+epoch = decimal_increment(epoch)
+local next_generation = decimal_increment(redis.call('GET', KEYS[6]))
+if not epoch or not next_generation then return {'overflow'} end
+redis.call('SET', KEYS[2], epoch)
+redis.call('HSET', KEYS[1],
+  'tenant_id', h(KEYS[3], 'tenant_id'), 'device_id', h(KEYS[3], 'device_id'),
+  'deployment_incarnation', ARGV[1], 'node_id', ARGV[3], 'boot_id', ARGV[4],
+  'session_id', ARGV[5], 'owner_epoch', epoch, 'lease_expires_at_us', ARGV[6])
+redis.call('PEXPIREAT', KEYS[1], math.floor(lease / 1000))
+redis.call('SET', KEYS[6], next_generation)
 return {'ok', epoch, ARGV[6]}
 "#;
 
@@ -1747,20 +2711,21 @@ const SCRIPT_RENEW_OWNER: &str = r#"
 local function h(key, field)
   return redis.call('HGET', key, field) or ''
 end
-if redis.call('GET', KEYS[2]) ~= ARGV[1] then return {'incarnation'} end
-if redis.call('GET', KEYS[3]) ~= ARGV[2] then return {'authority'} end
-if h(KEYS[1], 'active') ~= '1' then return {'stale'} end
+if redis.call('GET', KEYS[3]) ~= ARGV[1] then return {'incarnation'} end
+if redis.call('GET', KEYS[4]) ~= ARGV[2] then return {'authority'} end
+if h(KEYS[2], 'active') ~= '1' then return {'stale'} end
 local clock = redis.call('TIME')
 local now = tonumber(clock[1]) * 1000000 + tonumber(clock[2])
 local lease = tonumber(ARGV[7])
-local current_expiry = tonumber(h(KEYS[1], 'owner_expires_at_us'))
+local current_expiry = tonumber(h(KEYS[1], 'lease_expires_at_us'))
 if not lease or not current_expiry or lease <= now or current_expiry <= now then return {'stale'} end
 if h(KEYS[1], 'owner_epoch') ~= ARGV[3]
-   or h(KEYS[1], 'owner_deployment_incarnation') ~= ARGV[1]
-   or h(KEYS[1], 'owner_node_id') ~= ARGV[4]
-   or h(KEYS[1], 'owner_boot_id') ~= ARGV[5]
-   or h(KEYS[1], 'owner_session_id') ~= ARGV[6] then return {'stale'} end
-redis.call('HSET', KEYS[1], 'owner_expires_at_us', ARGV[7])
+   or h(KEYS[1], 'deployment_incarnation') ~= ARGV[1]
+   or h(KEYS[1], 'node_id') ~= ARGV[4]
+   or h(KEYS[1], 'boot_id') ~= ARGV[5]
+   or h(KEYS[1], 'session_id') ~= ARGV[6] then return {'stale'} end
+redis.call('HSET', KEYS[1], 'lease_expires_at_us', ARGV[7])
+redis.call('PEXPIREAT', KEYS[1], math.floor(tonumber(ARGV[7]) / 1000))
 return {'ok'}
 "#;
 
@@ -1771,11 +2736,11 @@ end
 if redis.call('GET', KEYS[2]) ~= ARGV[1] then return {'incarnation'} end
 if redis.call('GET', KEYS[3]) ~= ARGV[2] then return {'authority'} end
 if h(KEYS[1], 'owner_epoch') ~= ARGV[3]
-   or h(KEYS[1], 'owner_deployment_incarnation') ~= ARGV[1]
-   or h(KEYS[1], 'owner_node_id') ~= ARGV[4]
-   or h(KEYS[1], 'owner_boot_id') ~= ARGV[5]
-   or h(KEYS[1], 'owner_session_id') ~= ARGV[6] then return {'stale'} end
-redis.call('HSET', KEYS[1], 'owner_deployment_incarnation', '', 'owner_node_id', '', 'owner_boot_id', '', 'owner_session_id', '', 'owner_expires_at_us', '')
+   or h(KEYS[1], 'deployment_incarnation') ~= ARGV[1]
+   or h(KEYS[1], 'node_id') ~= ARGV[4]
+   or h(KEYS[1], 'boot_id') ~= ARGV[5]
+   or h(KEYS[1], 'session_id') ~= ARGV[6] then return {'stale'} end
+redis.call('DEL', KEYS[1])
 return {'ok'}
 "#;
 
@@ -1783,27 +2748,270 @@ const SCRIPT_CURRENT_OWNER: &str = r#"
 local function h(key, field)
   return redis.call('HGET', key, field) or ''
 end
-if redis.call('GET', KEYS[2]) ~= ARGV[1] then return {'incarnation'} end
-if redis.call('GET', KEYS[3]) ~= ARGV[2] then return {'authority'} end
-if h(KEYS[1], 'active') ~= '1' then return {'none'} end
+if redis.call('GET', KEYS[3]) ~= ARGV[1] then return {'incarnation'} end
+if redis.call('GET', KEYS[4]) ~= ARGV[2] then return {'authority'} end
+if h(KEYS[2], 'active') ~= '1' then return {'none'} end
 local clock = redis.call('TIME')
 local now = tonumber(clock[1]) * 1000000 + tonumber(clock[2])
-local expiry = tonumber(h(KEYS[1], 'owner_expires_at_us'))
+local expiry = tonumber(h(KEYS[1], 'lease_expires_at_us'))
 if not expiry or expiry <= now then return {'none'} end
-return {'ok', h(KEYS[1], 'owner_node_id'), h(KEYS[1], 'owner_boot_id'), h(KEYS[1], 'owner_session_id'), h(KEYS[1], 'owner_epoch'), h(KEYS[1], 'owner_expires_at_us')}
+return {'ok', h(KEYS[1], 'node_id'), h(KEYS[1], 'boot_id'), h(KEYS[1], 'session_id'), h(KEYS[1], 'owner_epoch'), h(KEYS[1], 'lease_expires_at_us')}
+"#;
+
+const SCRIPT_ISSUE_ATTACHMENT_TICKET: &str = r#"
+local function h(key, field)
+  return redis.call('HGET', key, field) or ''
+end
+if redis.call('GET', KEYS[6]) ~= ARGV[1] then return {'incarnation'} end
+if redis.call('GET', KEYS[7]) ~= ARGV[2] then return {'authority'} end
+if h(KEYS[4], 'active') ~= '1' then return {'stale'} end
+local clock = redis.call('TIME')
+local now_us = tonumber(clock[1]) * 1000000 + tonumber(clock[2])
+local expiry = tonumber(ARGV[14])
+local lease = tonumber(h(KEYS[1], 'lease_expires_at_us'))
+if not expiry or expiry <= now_us or not lease or lease <= now_us then return {'stale'} end
+local credential_key = redis.call('GET', KEYS[5])
+if not credential_key or h(credential_key, 'active') ~= '1'
+   or h(credential_key, 'tenant_id') ~= ARGV[12]
+   or h(credential_key, 'device_id') ~= ARGV[13]
+   or h(credential_key, 'revoked_at_us') ~= '' then return {'stale'} end
+local not_before = tonumber(h(credential_key, 'not_before_us'))
+local credential_expiry = tonumber(h(credential_key, 'expires_at_us'))
+if not not_before or not credential_expiry or not_before > now_us or credential_expiry <= now_us then return {'stale'} end
+if h(KEYS[1], 'owner_epoch') ~= ARGV[3]
+   or h(KEYS[1], 'deployment_incarnation') ~= ARGV[1]
+   or h(KEYS[1], 'node_id') ~= ARGV[4]
+   or h(KEYS[1], 'boot_id') ~= ARGV[5]
+   or h(KEYS[1], 'session_id') ~= ARGV[6] then return {'stale'} end
+if redis.call('EXISTS', KEYS[2]) == 1 then return {'collision'} end
+local now_ms = math.floor(now_us / 1000)
+redis.call('ZREMRANGEBYSCORE', KEYS[3], '-inf', now_ms)
+if redis.call('ZCARD', KEYS[3]) >= tonumber(ARGV[16]) then return {'bound'} end
+redis.call('HSET', KEYS[2],
+  'tenant_id', ARGV[12], 'device_id', ARGV[13], 'spki_fingerprint', ARGV[7],
+  'deployment_incarnation', ARGV[1], 'node_id', ARGV[4], 'boot_id', ARGV[5],
+  'session_id', ARGV[6], 'owner_epoch', ARGV[3], 'generation', ARGV[8],
+  'connection_id', ARGV[9], 'purpose', ARGV[10], 'binding_digest', ARGV[11],
+  'expires_at_us', ARGV[14], 'spent', '0')
+redis.call('PEXPIREAT', KEYS[2], math.floor(expiry / 1000))
+redis.call('ZADD', KEYS[3], math.floor(expiry / 1000), ARGV[15])
+redis.call('PEXPIREAT', KEYS[3], math.floor(expiry / 1000))
+return {'ok'}
+"#;
+
+const SCRIPT_CONSUME_ATTACHMENT_TICKET: &str = r#"
+local function h(key, field)
+  return redis.call('HGET', key, field) or ''
+end
+if redis.call('GET', KEYS[6]) ~= ARGV[1] then return {'incarnation'} end
+if redis.call('GET', KEYS[7]) ~= ARGV[2] then return {'authority'} end
+if redis.call('EXISTS', KEYS[1]) == 0 then return {'missing'} end
+if h(KEYS[1], 'spent') == '1' then return {'spent'} end
+local clock = redis.call('TIME')
+local now_us = tonumber(clock[1]) * 1000000 + tonumber(clock[2])
+local expiry = tonumber(h(KEYS[1], 'expires_at_us'))
+if not expiry or expiry <= now_us then return {'expired'} end
+if h(KEYS[4], 'active') ~= '1' then return {'stale'} end
+local lease = tonumber(h(KEYS[3], 'lease_expires_at_us'))
+if not lease or lease <= now_us then return {'stale'} end
+local credential_key = redis.call('GET', KEYS[5])
+if not credential_key or h(credential_key, 'active') ~= '1'
+   or h(credential_key, 'tenant_id') ~= ARGV[12]
+   or h(credential_key, 'device_id') ~= ARGV[13]
+   or h(credential_key, 'revoked_at_us') ~= '' then return {'stale'} end
+local not_before = tonumber(h(credential_key, 'not_before_us'))
+local credential_expiry = tonumber(h(credential_key, 'expires_at_us'))
+if not not_before or not credential_expiry or not_before > now_us or credential_expiry <= now_us then return {'stale'} end
+if h(KEYS[3], 'owner_epoch') ~= ARGV[3]
+   or h(KEYS[3], 'deployment_incarnation') ~= ARGV[1]
+   or h(KEYS[3], 'node_id') ~= ARGV[4]
+   or h(KEYS[3], 'boot_id') ~= ARGV[5]
+   or h(KEYS[3], 'session_id') ~= ARGV[6] then return {'stale'} end
+if h(KEYS[1], 'tenant_id') ~= ARGV[12]
+   or h(KEYS[1], 'device_id') ~= ARGV[13]
+   or h(KEYS[1], 'spki_fingerprint') ~= ARGV[7]
+   or h(KEYS[1], 'deployment_incarnation') ~= ARGV[1]
+   or h(KEYS[1], 'node_id') ~= ARGV[4]
+   or h(KEYS[1], 'boot_id') ~= ARGV[5]
+   or h(KEYS[1], 'session_id') ~= ARGV[6]
+   or h(KEYS[1], 'owner_epoch') ~= ARGV[3]
+   or h(KEYS[1], 'generation') ~= ARGV[8]
+   or h(KEYS[1], 'connection_id') ~= ARGV[9]
+   or h(KEYS[1], 'purpose') ~= ARGV[10]
+   or h(KEYS[1], 'binding_digest') ~= ARGV[11] then return {'mismatch'} end
+redis.call('HSET', KEYS[1], 'spent', '1')
+redis.call('PEXPIREAT', KEYS[1], math.floor(expiry / 1000))
+redis.call('ZREM', KEYS[2], ARGV[14])
+return {
+  'ok', h(KEYS[1], 'tenant_id'), h(KEYS[1], 'device_id'), h(KEYS[1], 'spki_fingerprint'),
+  h(KEYS[1], 'deployment_incarnation'), h(KEYS[1], 'node_id'), h(KEYS[1], 'boot_id'),
+  h(KEYS[1], 'session_id'), h(KEYS[1], 'owner_epoch'), h(KEYS[1], 'generation'),
+  h(KEYS[1], 'connection_id'), h(KEYS[1], 'purpose'), h(KEYS[1], 'binding_digest'),
+  h(KEYS[1], 'expires_at_us')
+}
+"#;
+
+const SCRIPT_PUBLISH_MEMBERSHIP: &str = r#"
+local current = redis.call('HGET', KEYS[1], 'version')
+if current then
+  local ordering = decimal_compare(current, ARGV[1])
+  if not ordering then return {'invalid'} end
+  if ordering > 0 then return {'stale'} end
+  if ordering == 0 then
+    local existing = redis.call('HGET', KEYS[1], 'bytes')
+    if existing == ARGV[2] then
+      redis.call('EXPIRE', KEYS[1], tonumber(ARGV[3]))
+      return {'ok'}
+    end
+    return {'conflict'}
+  end
+end
+redis.call('HSET', KEYS[1], 'version', ARGV[1], 'bytes', ARGV[2])
+redis.call('EXPIRE', KEYS[1], tonumber(ARGV[3]))
+return {'ok'}
+"#;
+
+const SCRIPT_PUBLISH_MEMBERSHIP_DIRECTORY: &str = r#"
+local current = redis.call('HGET', KEYS[1], ARGV[1])
+if current then
+  local ok, decoded = pcall(cjson.decode, current)
+  if not ok or type(decoded) ~= 'table' or not decoded.version then return {'invalid'} end
+  local ordering = decimal_compare(tostring(decoded.version), ARGV[2])
+  if not ordering then return {'invalid'} end
+  if ordering > 0 then return {'stale'} end
+  if ordering == 0 then
+    if current == ARGV[3] then
+      redis.call('EXPIRE', KEYS[1], tonumber(ARGV[5]))
+      return {'ok'}
+    end
+    return {'conflict'}
+  end
+else
+  local max_records = tonumber(ARGV[4])
+  if not max_records or redis.call('HLEN', KEYS[1]) >= max_records then return {'bound'} end
+end
+redis.call('HSET', KEYS[1], ARGV[1], ARGV[3])
+redis.call('EXPIRE', KEYS[1], tonumber(ARGV[5]))
+return {'ok'}
+"#;
+
+const SCRIPT_READ_MEMBERSHIP_DIRECTORY: &str = r#"
+local max_records = tonumber(ARGV[1])
+local count = redis.call('HLEN', KEYS[1])
+if not max_records or count > max_records then return {'too_many'} end
+local entries = redis.call('HGETALL', KEYS[1])
+local result = {'ok'}
+for _, value in ipairs(entries) do result[#result + 1] = value end
+return result
 "#;
 
 const SCRIPT_SEED_CREDENTIAL: &str = r#"
 local existing = redis.call('GET', KEYS[2])
 if existing and existing ~= KEYS[1] then return {'conflict'} end
+local next_generation = decimal_increment(redis.call('GET', KEYS[4]))
+if not next_generation then return {'overflow'} end
 redis.call('HSET', KEYS[1], 'tenant_id', ARGV[1], 'device_id', ARGV[2], 'credential_id', ARGV[3], 'spki_fingerprint', ARGV[4], 'serial', ARGV[5], 'not_before_us', ARGV[6], 'expires_at_us', ARGV[7], 'revoked_at_us', ARGV[8], 'active', ARGV[9])
 redis.call('SET', KEYS[2], KEYS[1])
 redis.call('SADD', KEYS[3], ARGV[3])
+redis.call('SET', KEYS[4], next_generation)
 return {'ok'}
 "#;
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        io,
+        pin::Pin,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        task::{Context, Poll},
+        time::Duration,
+    };
+
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+
+    /// `examples/m1-relay.toml` shipped `agent-tunnel/m1`, which this rule
+    /// refuses: the documented `serve --config` therefore failed at startup.
+    /// The rule is the authority for every relay key prefix, so pin both the
+    /// accepted charset and the exact characters that broke the example.
+    #[test]
+    fn redis_namespace_rule_accepts_only_bounded_unambiguous_key_prefixes() {
+        for accepted in [
+            "agent-tunnel-m1",
+            "agent_tunnel.m1",
+            "AgentTunnel0",
+            "a",
+            "-",
+            ".",
+            "_",
+            &"n".repeat(super::MAX_REDIS_NAMESPACE_BYTES),
+        ] {
+            super::validate_redis_namespace(accepted)
+                .unwrap_or_else(|error| panic!("{accepted:?} must be accepted: {error}"));
+        }
+
+        for rejected in [
+            // The exact namespace the checked-in example shipped.
+            "agent-tunnel/m1",
+            "",
+            &"n".repeat(super::MAX_REDIS_NAMESPACE_BYTES + 1),
+            // A second key separator would let a namespace address another
+            // namespace's keys.
+            "agent:tunnel",
+            // Glob metacharacters would change which keys a scan pattern
+            // matches.
+            "agent*tunnel",
+            "agent?tunnel",
+            "agent[tunnel]",
+            // Whitespace, control bytes and non-ASCII are never key-safe.
+            " agent-tunnel",
+            "agent-tunnel ",
+            "agent\ttunnel",
+            "agent\ntunnel",
+            "agent\0tunnel",
+            "agent-tünnel",
+            "agent+tunnel",
+            "agent{tunnel}",
+        ] {
+            assert!(
+                super::validate_redis_namespace(rejected).is_err(),
+                "{rejected:?} must be rejected"
+            );
+        }
+    }
+
+    /// The namespace is refused before the catalog opens a socket, so a
+    /// configuration validator mirroring the rule loses no fidelity.
+    #[tokio::test]
+    async fn redis_namespace_is_rejected_before_any_connection_attempt() {
+        // Port 1 on loopback: a connection attempt fails with a distinct
+        // database error, so the namespace error cannot come from the network.
+        let namespace_error =
+            super::RedisCatalog::connect("redis://127.0.0.1:1/0", "bad/namespace")
+                .await
+                .expect_err("an invalid namespace must be refused");
+        assert!(
+            matches!(
+                namespace_error,
+                crate::CatalogError::InvalidInput("Redis namespace")
+            ),
+            "expected the namespace rule, observed {namespace_error:?}"
+        );
+        let connection_error =
+            super::RedisCatalog::connect("redis://127.0.0.1:1/0", "good-namespace")
+                .await
+                .expect_err("an unreachable authority must fail");
+        assert!(
+            !matches!(
+                connection_error,
+                crate::CatalogError::InvalidInput("Redis namespace")
+            ),
+            "a valid namespace must reach the connection attempt"
+        );
+    }
+
     #[test]
     fn malformed_list_counts_are_rejected_before_allocation() {
         let huge = usize::MAX.to_string();
@@ -1824,7 +3032,9 @@ mod tests {
         assert!(super::parse_device_summaries(&reply).is_err());
     }
 
-    use super::{is_fixture_namespace, key_component};
+    use super::{
+        CatalogConnectionStage, RedisCatalog, RedisTlsOptions, is_fixture_namespace, key_component,
+    };
     use uuid::Uuid;
 
     #[test]
@@ -1854,5 +3064,365 @@ mod tests {
         assert!(is_fixture_namespace("fixture-123"));
         assert!(!is_fixture_namespace("production-123"));
         assert!(!is_fixture_namespace("test123"));
+    }
+
+    #[tokio::test]
+    async fn tls_connection_rejects_insecure_profile_and_unbounded_material() {
+        let insecure = RedisCatalog::connect_with_tls(
+            "rediss://localhost:1/#insecure",
+            "test-tls-validation",
+            RedisTlsOptions::default(),
+        )
+        .await
+        .expect_err("insecure Redis TLS profile must be rejected before dialing");
+        assert!(matches!(
+            insecure,
+            super::CatalogError::InvalidInput(
+                "Redis TLS connection requires a verified rediss:// URL"
+            )
+        ));
+
+        let empty = RedisCatalog::connect_with_tls(
+            "rediss://localhost:1/0",
+            "test-tls-validation",
+            RedisTlsOptions::with_root_cert_pem(Vec::new()),
+        )
+        .await
+        .expect_err("empty Redis TLS material must be rejected before dialing");
+        assert!(matches!(
+            empty,
+            super::CatalogError::InvalidInput(
+                "Redis TLS root certificate PEM must be 1..=1048576 bytes"
+            )
+        ));
+
+        let oversized = RedisCatalog::connect_with_tls(
+            "rediss://localhost:1/0",
+            "test-tls-validation",
+            RedisTlsOptions::with_root_cert_pem(vec![b'x'; super::MAX_REDIS_TLS_PEM_BYTES + 1]),
+        )
+        .await
+        .expect_err("oversized Redis TLS material must be rejected before dialing");
+        assert!(matches!(
+            oversized,
+            super::CatalogError::InvalidInput(
+                "Redis TLS root certificate PEM must be 1..=1048576 bytes"
+            )
+        ));
+    }
+
+    #[tokio::test]
+    async fn staged_tls_connection_reports_tls_setup_without_changing_error() {
+        let error = RedisCatalog::connect_with_tls_and_deployment_incarnation_staged(
+            "rediss://localhost:1/0",
+            "test-tls-validation",
+            "test-incarnation",
+            RedisTlsOptions::with_root_cert_pem(Vec::new()),
+        )
+        .await
+        .expect_err("empty Redis TLS material must be rejected before dialing");
+        assert_eq!(error.stage(), CatalogConnectionStage::TlsSetup);
+        assert!(matches!(
+            error.into_catalog_error(),
+            super::CatalogError::InvalidInput(
+                "Redis TLS root certificate PEM must be 1..=1048576 bytes"
+            )
+        ));
+    }
+
+    #[tokio::test]
+    async fn staged_connection_reports_authority_profile_before_dialing() {
+        let error = RedisCatalog::connect_with_deployment_incarnation_staged(
+            "redis://localhost:1/0",
+            "invalid namespace",
+            "test-incarnation",
+        )
+        .await
+        .expect_err("invalid Redis namespace must be rejected before dialing");
+        assert_eq!(error.stage(), CatalogConnectionStage::AuthorityProfile);
+        assert!(matches!(
+            error.into_catalog_error(),
+            super::CatalogError::InvalidInput("Redis namespace")
+        ));
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum TransportFault {
+        InfoWrite,
+        InfoRead,
+    }
+
+    #[derive(Default)]
+    struct TransportObservation {
+        writes_completed: AtomicUsize,
+        write_bytes: AtomicUsize,
+        write_errors: AtomicUsize,
+        read_bytes: AtomicUsize,
+        read_eof: AtomicUsize,
+        read_errors: AtomicUsize,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct ObservationSnapshot {
+        writes_completed: usize,
+        write_bytes: usize,
+        write_errors: usize,
+        read_bytes: usize,
+        read_eof: usize,
+        read_errors: usize,
+    }
+
+    impl TransportObservation {
+        fn snapshot(&self) -> ObservationSnapshot {
+            ObservationSnapshot {
+                writes_completed: self.writes_completed.load(Ordering::Acquire),
+                write_bytes: self.write_bytes.load(Ordering::Acquire),
+                write_errors: self.write_errors.load(Ordering::Acquire),
+                read_bytes: self.read_bytes.load(Ordering::Acquire),
+                read_eof: self.read_eof.load(Ordering::Acquire),
+                read_errors: self.read_errors.load(Ordering::Acquire),
+            }
+        }
+    }
+
+    struct ObservedStream {
+        inner: tokio::io::DuplexStream,
+        observation: Arc<TransportObservation>,
+        fault: TransportFault,
+    }
+
+    impl AsyncRead for ObservedStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buffer: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let before = buffer.filled().len();
+            match Pin::new(&mut self.inner).poll_read(cx, buffer) {
+                Poll::Ready(Ok(())) => {
+                    let bytes = buffer.filled().len().saturating_sub(before);
+                    if bytes == 0 {
+                        self.observation.read_eof.fetch_add(1, Ordering::Release);
+                    } else {
+                        self.observation
+                            .read_bytes
+                            .fetch_add(bytes, Ordering::Release);
+                    }
+                    Poll::Ready(Ok(()))
+                }
+                Poll::Ready(Err(error)) => {
+                    self.observation.read_errors.fetch_add(1, Ordering::Release);
+                    Poll::Ready(Err(error))
+                }
+                Poll::Pending => Poll::Pending,
+            }
+        }
+    }
+
+    impl AsyncWrite for ObservedStream {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if matches!(self.fault, TransportFault::InfoWrite)
+                && bytes
+                    .windows(b"$4\r\nINFO\r\n".len())
+                    .any(|window| window == b"$4\r\nINFO\r\n")
+            {
+                self.observation
+                    .write_errors
+                    .fetch_add(1, Ordering::Release);
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "injected INFO write failure",
+                )));
+            }
+            match Pin::new(&mut self.inner).poll_write(cx, bytes) {
+                Poll::Ready(Ok(written)) => {
+                    self.observation
+                        .writes_completed
+                        .fetch_add(1, Ordering::Release);
+                    self.observation
+                        .write_bytes
+                        .fetch_add(written, Ordering::Release);
+                    Poll::Ready(Ok(written))
+                }
+                Poll::Ready(Err(error)) => {
+                    self.observation
+                        .write_errors
+                        .fetch_add(1, Ordering::Release);
+                    Poll::Ready(Err(error))
+                }
+                Poll::Pending => Poll::Pending,
+            }
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            match Pin::new(&mut self.inner).poll_flush(cx) {
+                Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
+                Poll::Ready(Err(error)) => {
+                    self.observation
+                        .write_errors
+                        .fetch_add(1, Ordering::Release);
+                    Poll::Ready(Err(error))
+                }
+                Poll::Pending => Poll::Pending,
+            }
+        }
+
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    async fn serve_observed_redis(
+        mut stream: tokio::io::DuplexStream,
+        fault: TransportFault,
+    ) -> io::Result<()> {
+        let mut pending = Vec::new();
+        let mut setup_responses = 0;
+        let mut ping_replied = false;
+        let mut buffer = [0_u8; 1024];
+        loop {
+            let read = stream.read(&mut buffer).await?;
+            if read == 0 {
+                return Ok(());
+            }
+            pending.extend_from_slice(&buffer[..read]);
+            if pending.len() > 16 * 1024 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "bounded Redis observer request buffer exceeded",
+                ));
+            }
+            while setup_responses < 2
+                && pending
+                    .windows(b"CLIENT".len())
+                    .any(|window| window == b"CLIENT")
+            {
+                stream.write_all(b"+OK\r\n").await?;
+                setup_responses += 1;
+            }
+            if !ping_replied
+                && pending
+                    .windows(b"$4\r\nPING\r\n".len())
+                    .any(|window| window == b"$4\r\nPING\r\n")
+            {
+                stream.write_all(b"+PONG\r\n").await?;
+                ping_replied = true;
+            }
+            if ping_replied
+                && pending
+                    .windows(b"$4\r\nINFO\r\n".len())
+                    .any(|window| window == b"$4\r\nINFO\r\n")
+            {
+                if matches!(fault, TransportFault::InfoRead) {
+                    return Ok(());
+                }
+                let body = b"# Server\r\nrun_id: transport-observer\r\n\r\n";
+                let header = format!("${}\r\n", body.len());
+                stream.write_all(header.as_bytes()).await?;
+                stream.write_all(body).await?;
+                stream.write_all(b"\r\n").await?;
+                return Ok(());
+            }
+        }
+    }
+
+    async fn run_observed_transport(
+        fault: TransportFault,
+    ) -> (super::CatalogConnectionError, ObservationSnapshot) {
+        const OBSERVER_DEADLINE: Duration = Duration::from_secs(3);
+        const HANDLE_CLEANUP_DEADLINE: Duration = Duration::from_secs(1);
+
+        let (client_stream, server_stream) = tokio::io::duplex(16 * 1024);
+        let observation = Arc::new(TransportObservation::default());
+        let server = tokio::spawn(serve_observed_redis(server_stream, fault));
+        let observed_stream = ObservedStream {
+            inner: client_stream,
+            observation: Arc::clone(&observation),
+            fault,
+        };
+        let connection_info = redis::RedisConnectionInfo::default().set_skip_set_lib_name();
+        let constructed = tokio::time::timeout(
+            OBSERVER_DEADLINE,
+            redis::aio::MultiplexedConnection::new(&connection_info, observed_stream),
+        )
+        .await;
+        let (connection, driver) = match constructed {
+            Ok(Ok(connection)) => connection,
+            Ok(Err(error)) => {
+                let server_result = join_observed_server(server, HANDLE_CLEANUP_DEADLINE).await;
+                assert!(server_result.is_ok());
+                panic!("construct observed Redis connection: {error}");
+            }
+            Err(_) => {
+                let server_result = join_observed_server(server, HANDLE_CLEANUP_DEADLINE).await;
+                assert!(server_result.is_ok());
+                panic!("construct observed Redis connection timed out");
+            }
+        };
+        // Drive the borrowed Redis future in this scope. redis-rs 1.7 captures
+        // connection_info in its returned future, so spawning it would require
+        // leaking that configuration. The bounded join owns both futures and
+        // drops them together on timeout.
+        let probe = tokio::time::timeout(OBSERVER_DEADLINE, async {
+            let (result, ()) = tokio::join!(super::verify_connection_identity(connection), driver);
+            result
+        })
+        .await;
+        let server_result = join_observed_server(server, HANDLE_CLEANUP_DEADLINE).await;
+        assert!(server_result.is_ok());
+        let error = match probe {
+            Ok(Err(error)) => error,
+            Ok(Ok((_connection, _redis_run_id))) => {
+                panic!("injected transport fault unexpectedly passed PING/INFO verification")
+            }
+            Err(_) => panic!("observed Redis transport probe timed out"),
+        };
+        (error, observation.snapshot())
+    }
+
+    async fn join_observed_server(
+        mut handle: tokio::task::JoinHandle<io::Result<()>>,
+        cleanup_deadline: Duration,
+    ) -> io::Result<()> {
+        match tokio::time::timeout(cleanup_deadline, &mut handle).await {
+            Ok(joined) => joined.expect("observed Redis server task must join"),
+            Err(_) => {
+                handle.abort();
+                match handle.await {
+                    Ok(result) => result,
+                    Err(error) => {
+                        assert!(
+                            error.is_cancelled(),
+                            "observed Redis server task failed while joining: {error}"
+                        );
+                        Ok(())
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn transport_observer_distinguishes_info_write_error_from_peer_read_close() {
+        let (write_error, write_observation) =
+            run_observed_transport(TransportFault::InfoWrite).await;
+        assert_eq!(write_error.stage(), CatalogConnectionStage::PrimaryIdentity);
+        assert!(write_observation.writes_completed >= 1);
+        assert!(write_observation.write_bytes > 0);
+        assert!(write_observation.read_bytes > 0);
+        assert!(write_observation.write_errors >= 1);
+        assert_eq!(write_observation.read_errors, 0);
+
+        let (read_error, read_observation) = run_observed_transport(TransportFault::InfoRead).await;
+        assert_eq!(read_error.stage(), CatalogConnectionStage::PrimaryIdentity);
+        assert!(read_observation.writes_completed >= 2);
+        assert!(read_observation.write_bytes > 0);
+        assert!(read_observation.read_bytes > 0);
+        assert_eq!(read_observation.write_errors, 0);
+        assert!(read_observation.read_eof >= 1 || read_observation.read_errors >= 1);
     }
 }

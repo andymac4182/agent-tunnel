@@ -3,9 +3,9 @@
 //! `tunnel_core::ClientConfig` is retained for the bootstrap `check-config`
 //! compatibility command.  A live connector uses [`RuntimeConfig`] instead:
 //! it contains the endpoint and credential references that are required to
-//! establish both mutually authenticated WebSockets.  No rotation setting is
-//! accepted here; scheduled data rotation is an M2 feature and must not be
-//! advertised by an M1 client.
+//! establish both mutually authenticated WebSockets.  The validated rotation
+//! policy is carried for the pending M2 runtime integration; this module does
+//! not itself schedule or perform data-socket handover.
 
 use serde::{Deserialize, Serialize};
 use std::{
@@ -14,6 +14,7 @@ use std::{
     fmt, fs,
     path::{Path, PathBuf},
 };
+use tunnel_core::{ConfigError as CoreConfigError, RotationConfig};
 use url::Url;
 
 const MAX_DEVICE_ID_LEN: usize = 128;
@@ -38,6 +39,9 @@ pub struct RuntimeConfig {
     pub exports: BTreeMap<String, ExportConfig>,
     /// Hard local resource limits.
     pub limits: LimitsConfig,
+    /// Validated M2 data-socket rotation policy.  The connector runtime does
+    /// not consume this policy until rotation is integrated.
+    pub rotation: RotationConfig,
 }
 
 impl<'de> Deserialize<'de> for RuntimeConfig {
@@ -108,6 +112,9 @@ impl RuntimeConfig {
 
         self.credentials.validate()?;
         self.limits.validate()?;
+        self.rotation
+            .validate()
+            .map_err(RuntimeConfigError::Rotation)?;
         if self.exports.is_empty() {
             return Err(RuntimeConfigError::Invalid(
                 "at least one local export must be configured",
@@ -161,6 +168,7 @@ impl Default for RuntimeConfig {
             credentials: CredentialConfig::default(),
             exports,
             limits: LimitsConfig::default(),
+            rotation: RotationConfig::default(),
         }
     }
 }
@@ -330,6 +338,8 @@ struct RawRuntimeConfig {
     exports: Option<BTreeMap<String, ExportConfig>>,
     #[serde(default)]
     limits: LimitsConfig,
+    #[serde(default)]
+    rotation: RotationConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -393,6 +403,7 @@ impl TryFrom<RawRuntimeConfig> for RuntimeConfig {
             credentials,
             exports,
             limits: raw.limits,
+            rotation: raw.rotation,
         })
     }
 }
@@ -402,6 +413,7 @@ impl TryFrom<RawRuntimeConfig> for RuntimeConfig {
 pub enum RuntimeConfigError {
     Io(std::io::Error),
     Parse(toml::de::Error),
+    Rotation(CoreConfigError),
     Invalid(&'static str),
 }
 
@@ -410,6 +422,7 @@ impl fmt::Display for RuntimeConfigError {
         match self {
             Self::Io(error) => write!(formatter, "could not read runtime configuration: {error}"),
             Self::Parse(error) => write!(formatter, "invalid TOML configuration: {error}"),
+            Self::Rotation(error) => write!(formatter, "invalid rotation policy: {error}"),
             Self::Invalid(message) => formatter.write_str(message),
         }
     }
@@ -420,6 +433,7 @@ impl Error for RuntimeConfigError {
         match self {
             Self::Io(error) => Some(error),
             Self::Parse(error) => Some(error),
+            Self::Rotation(error) => Some(error),
             Self::Invalid(_) => None,
         }
     }
@@ -499,8 +513,54 @@ ca = "ca.pem"
     }
 
     #[test]
-    fn runtime_config_does_not_accept_rotation_settings() {
-        assert!(RuntimeConfig::parse(&format!("{}\nrotation_seconds = 10", valid_toml())).is_err());
+    fn m1_configuration_uses_default_rotation_policy() {
+        let config = RuntimeConfig::parse(valid_toml()).expect("valid runtime configuration");
+        assert_eq!(config.rotation, RotationConfig::default());
+    }
+
+    #[test]
+    fn accepts_partial_rotation_overrides() {
+        let input = format!(
+            "{}\n[rotation]\ninterval_seconds = 600\noverlap_seconds = 45",
+            valid_toml()
+        );
+        let config = RuntimeConfig::parse(&input).expect("valid rotation override");
+        assert_eq!(config.rotation.interval_seconds, 600);
+        assert_eq!(config.rotation.handshake_timeout_seconds, 10);
+        assert_eq!(config.rotation.overlap_seconds, 45);
+    }
+
+    #[test]
+    fn rejects_invalid_rotation_timing() {
+        for timing in [
+            "interval_seconds = 0",
+            "interval_seconds = 86401",
+            "handshake_timeout_seconds = 0",
+            "handshake_timeout_seconds = 301",
+            "overlap_seconds = 0",
+            "overlap_seconds = 3601",
+            "handshake_timeout_seconds = 30",
+            "interval_seconds = 30",
+        ] {
+            let input = format!("{}\n[rotation]\n{timing}", valid_toml());
+            assert!(RuntimeConfig::parse(&input).is_err(), "accepted {timing}");
+        }
+        let input = format!("{}\n[rotation]\ninterval_seconds = 0", valid_toml());
+        let error = RuntimeConfig::parse(&input).expect_err("invalid rotation interval");
+        assert!(error.to_string().contains("rotation.interval_seconds"));
+    }
+
+    #[test]
+    fn rejects_unknown_rotation_keys() {
+        for input in [
+            format!("{}\nrotation_seconds = 10", valid_toml()),
+            format!("{}\n[rotation]\ninterval_second = 300", valid_toml()),
+        ] {
+            assert!(
+                RuntimeConfig::parse(&input).is_err(),
+                "accepted unknown key"
+            );
+        }
     }
 
     #[test]

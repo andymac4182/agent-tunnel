@@ -5,24 +5,36 @@
 //! buffers, or adapter state. Every record is tenant-qualified in the
 //! authoritative Redis namespace.
 
+mod cluster;
 mod error;
 mod memory;
 mod oidc;
+pub mod recovery;
 mod redis;
 mod types;
 
-pub use error::CatalogError;
+pub use error::{CatalogConnectionError, CatalogConnectionStage, CatalogError, UnknownWriteCause};
 pub use memory::MemoryCatalog;
 pub use oidc::{
     ApprovedJwk, OidcConfig, OidcError, OidcVerifier, ValidatedAccessToken, ValidatedClaims,
 };
-pub use redis::RedisCatalog;
+pub use recovery::{
+    RecoveryApproval, RecoveryApprovalIssuer, RecoveryApprovalVerifier, RecoveryError,
+    RecoveryPolicy, SignedRecoveryApproval, TrustedRecoveryKey, VerifiedRecoveryApproval,
+};
+pub use redis::{
+    DurableCatalogObservation, MAX_REDIS_NAMESPACE_BYTES, RedisCatalog, RedisMembershipPublisher,
+    RedisTlsOptions, validate_redis_namespace,
+};
 pub use types::{
-    AuthenticatedConsumer, CatalogFixture, CredentialId, CredentialRecord, DeviceId,
-    DeviceIdentity, DeviceListFilter, DeviceSummary, FixtureDevice, GrantConstraints,
-    GrantRevision, GrantSnapshot, GrantSpec, MembershipRecord, MembershipRole, OwnerClaim,
-    OwnerClaimRequest, OwnerToken, PermissionSet, PrincipalIdentity, ServiceId, ServiceRecord,
-    ServiceSpec, TenantId, TenantRecord, UserId, UserRecord,
+    AttachmentPurpose, AttachmentTicket, AttachmentTicketBinding, AttachmentTicketConsumeRequest,
+    AttachmentTicketIssueRequest, AttachmentTicketLocator, AuthenticatedConsumer, CatalogFixture,
+    ConsumedAttachmentTicket, CredentialId, CredentialRecord, DeviceId, DeviceIdentity,
+    DeviceListFilter, DeviceSummary, FixtureDevice, GrantConstraints, GrantRevision, GrantSnapshot,
+    GrantSpec, MAX_ATTACHMENT_TICKETS_PER_DEVICE, MAX_SIGNED_MEMBERSHIP_BYTES,
+    MAX_SIGNED_MEMBERSHIP_RECORDS, MembershipRecord, MembershipRole, OwnerClaim, OwnerClaimRequest,
+    OwnerToken, PermissionSet, PrincipalIdentity, ServiceId, ServiceRecord, ServiceSpec,
+    SignedMembershipRecord, TenantId, TenantRecord, UserId, UserRecord,
 };
 
 use async_trait::async_trait;
@@ -173,6 +185,31 @@ pub trait Catalog: Send + Sync {
         device_id: Uuid,
         at: DateTime<Utc>,
     ) -> Result<Option<OwnerClaim>, CatalogError>;
+
+    /// Issue a short-lived, one-use data attachment ticket bound to the
+    /// complete owner token and authenticated device key.
+    async fn issue_attachment_ticket(
+        &self,
+        request: &AttachmentTicketIssueRequest,
+    ) -> Result<AttachmentTicket, CatalogError>;
+
+    /// Atomically consume one attachment ticket.  Any uncertain Redis result
+    /// is surfaced as a database error and callers must fail closed.
+    async fn consume_attachment_ticket(
+        &self,
+        request: &AttachmentTicketConsumeRequest,
+    ) -> Result<ConsumedAttachmentTicket, CatalogError>;
+
+    /// Read the latest opaque signed membership bytes.  Verification is owned
+    /// by the cluster trust layer and is intentionally absent from this trait.
+    async fn read_signed_membership(&self) -> Result<Option<SignedMembershipRecord>, CatalogError>;
+
+    /// Read the bounded opaque signed membership directory.  Each returned
+    /// value is one independently signed relay record; the catalog never
+    /// verifies or promotes these bytes to trust anchors.
+    async fn read_signed_memberships(&self) -> Result<Vec<SignedMembershipRecord>, CatalogError> {
+        Ok(self.read_signed_membership().await?.into_iter().collect())
+    }
 }
 
 /// The object type used by relay state owners.
@@ -534,5 +571,38 @@ mod tests {
             .await
             .unwrap();
         assert!(replacement.token.epoch > claim.token.epoch);
+    }
+
+    #[tokio::test]
+    async fn memory_catalog_reads_all_signed_membership_records() {
+        let catalog = MemoryCatalog::new();
+        let records = (0..3)
+            .map(|index| SignedMembershipRecord {
+                version: index + 1,
+                bytes: format!(r#"{{"node_id":"relay-{index}"}}"#).into_bytes(),
+            })
+            .collect::<Vec<_>>();
+        catalog
+            .set_signed_memberships(records.clone())
+            .await
+            .expect("bounded membership directory");
+        assert_eq!(catalog.read_signed_memberships().await.unwrap(), records);
+        assert_eq!(
+            catalog.read_signed_membership().await.unwrap(),
+            records.first().cloned()
+        );
+        assert!(matches!(
+            catalog
+                .set_signed_memberships(
+                    (0..=MAX_SIGNED_MEMBERSHIP_RECORDS)
+                        .map(|index| SignedMembershipRecord {
+                            version: index as u64 + 1,
+                            bytes: vec![1],
+                        })
+                        .collect(),
+                )
+                .await,
+            Err(CatalogError::InvalidInput("signed membership count"))
+        ));
     }
 }

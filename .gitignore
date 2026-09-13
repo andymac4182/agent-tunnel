@@ -5,3 +5,5 @@
 !.env.example
 *.pem
 *.key
+/work/
+/.claude/worktrees/

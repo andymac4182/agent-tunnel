@@ -8,17 +8,33 @@
 
 #![deny(missing_docs)]
 
+mod peer;
 mod peer_probe;
 mod server;
 mod tls;
 
+pub use peer::{
+    DEFAULT_PEER_BODY_CHUNK_BYTES, DEFAULT_PEER_CONNECTION_BODY_BYTES, DEFAULT_PEER_CONNECTIONS,
+    DEFAULT_PEER_DESTINATIONS, DEFAULT_PEER_HANDSHAKE_TIMEOUT, DEFAULT_PEER_HEADER_BYTES,
+    DEFAULT_PEER_STREAM_BODY_BYTES, DEFAULT_PEER_STREAM_TIMEOUT,
+    DEFAULT_PEER_STREAMS_PER_CONNECTION, MAX_DYNAMIC_PEER_PINS, PeerBodyChunk, PeerClient,
+    PeerClientRecv, PeerClientSend, PeerClientStream, PeerConnectionHandle, PeerDestination,
+    PeerHandlerFuture, PeerOpenProgress, PeerPinSnapshot, PeerPolicyRejected,
+    PeerPoolConnectionStats, PeerPoolStats, PeerRequestHandler, PeerRequestPolicy, PeerServer,
+    PeerServerConnectionStats, PeerServerDiagnostics, PeerServerRecv, PeerServerSend,
+    PeerServerStats, PeerServerStream, PeerTransportError, PeerTransportLimits,
+    PeerTransportOpenStage, SharedPeerPins, serve_peer,
+};
 pub use peer_probe::{
     ApprovedPeerPins, PeerProbeError, PeerProbeLimits, PeerProbeResponse, peer_probe,
     serve_peer_probe,
 };
 pub use server::{
-    DEFAULT_HANDSHAKE_TIMEOUT, DEFAULT_MAX_CONCURRENT_HANDSHAKES, DEFAULT_MAX_HTTP1_HEADERS,
-    DEFAULT_MAX_HTTP2_HEADER_LIST_BYTES, DEFAULT_MAX_HTTP2_STREAMS, TransportError, serve,
+    AcceptedSocketDiagnostics, AcceptedSocketOptions, DEFAULT_HANDSHAKE_TIMEOUT,
+    DEFAULT_HTTP1_HEADER_READ_TIMEOUT, DEFAULT_MAX_CONCURRENT_HANDSHAKES,
+    DEFAULT_MAX_HTTP1_HEADERS, DEFAULT_MAX_HTTP2_HEADER_LIST_BYTES, DEFAULT_MAX_HTTP2_STREAMS,
+    DEFAULT_PRE_REQUEST_TIMEOUT, ListenerTimeouts, TransportError, serve,
+    serve_with_listener_options, serve_with_socket_options,
 };
 pub use tls::{
     CertificateRole, ClientTlsConfigError, SanName, SpkiSha256, TlsConfigError, TlsIdentity,

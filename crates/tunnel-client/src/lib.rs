@@ -1,16 +1,17 @@
-//! M1 connector library.
+//! Connector library with explicit M1 and M2 transport profiles.
 //!
-//! A connector establishes exactly one mutually authenticated control WSS and
-//! one mutually authenticated data WSS for a session. M1 deliberately has no
-//! scheduled data rotation, resume/replay, or reconnect loop: any transport
-//! failure closes the pair and the caller must start a fresh session. This
-//! keeps application side effects from being replayed while the retained
-//! stream state needed by M2 is still being designed.
+//! Both profiles establish one mutually authenticated control WSS and one
+//! mutually authenticated data WSS for a session. M1 is the baseline profile:
+//! transport loss closes the pair and requires a fresh session. M2 adds
+//! ordered data-carrier rotation and bounded retained replay, while preserving
+//! logical stream identity across physical connections. Neither profile
+//! resubmits application operations after an ambiguous transport outcome.
 
 #![forbid(unsafe_code)]
 
 mod config;
 pub mod credentials;
+mod m2_runtime;
 
 use config::{ExportConfig, ExportKind, RuntimeConfig};
 use credentials::{CredentialError, load_client_config};
@@ -19,6 +20,7 @@ use std::{
     collections::{BTreeMap, VecDeque},
     error::Error,
     fmt,
+    net::SocketAddr,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -31,14 +33,20 @@ use tokio::{
 };
 use tokio_tungstenite::{
     Connector, MaybeTlsStream, WebSocketStream, connect_async_tls_with_config,
-    tungstenite::{Message, client::IntoClientRequest, http::HeaderValue},
+    tungstenite::{
+        Message,
+        client::IntoClientRequest,
+        http::HeaderValue,
+        protocol::frame::{CloseFrame, coding::CloseCode},
+    },
 };
 use tokio_util::sync::CancellationToken;
 use tunnel_protocol::{
-    AuthorizationChallenge, AuthorizationConfirmed, AuthorizationInvalidated, Cancel,
-    ControlMessage, DataReady, Frame, FrameKind, Hello, MAX_CONTROL_MESSAGE_BYTES, MAX_FRAME_LEN,
-    MAX_PAYLOAD_LEN, Open, Opened, Ping, Pong, Rejected, ServiceAdvertisement, Welcome,
-    decode_control, encode_control,
+    AuthorizationChallenge, AuthorizationConfirmed, AuthorizationInvalidated,
+    CONTROL_OWNER_BUSY_CLOSE_CODE, CONTROL_OWNER_BUSY_CLOSE_REASON, Cancel, ControlMessage,
+    DataReady, Frame, FrameKind, Hello, MAX_CONTROL_MESSAGE_BYTES, MAX_FRAME_LEN, MAX_PAYLOAD_LEN,
+    Open, Opened, Ping, Pong, Rejected, ServiceAdvertisement, Welcome, decode_control,
+    encode_control,
 };
 use url::Url;
 use uuid::Uuid;
@@ -55,6 +63,19 @@ pub use tokio_util::sync::CancellationToken as ConnectCancellation;
 pub const M1_TRANSPORT_FAILURE_POLICY: &str =
     "close control and data and require a fresh session; no retained replay or automatic reconnect";
 
+/// The connector transport profile.  M1 is retained for the deterministic
+/// baseline harness; the foreground CLI and library constructor default to
+/// M2 so new sessions negotiate ordered rotation when the relay supports it.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TransportProfile {
+    /// One control and one data socket; any transport failure ends the epoch.
+    M1,
+    /// Ordered stream state with scheduled data-carrier rotation and bounded
+    /// retained recovery.
+    #[default]
+    M2,
+}
+
 const PROTOCOL_MAJOR: u16 = 1;
 const PROTOCOL_MINOR: u16 = 0;
 const DATA_CLOSE_AUTH_EXPIRED: u16 = 4_001;
@@ -67,10 +88,31 @@ const DATA_QUEUE_BYTES: usize = 8 * 1024 * 1024;
 const CONTROL_SUBPROTOCOL: &str = "agent-tunnel.control.v1";
 const DATA_SUBPROTOCOL: &str = "agent-tunnel.data.v1";
 
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use std::sync::atomic::AtomicBool;
+    use tokio::sync::Notify;
+
+    pub(crate) struct ControlWriterGate {
+        pub(crate) block_once: AtomicBool,
+        pub(crate) entered: Notify,
+        pub(crate) release: Notify,
+    }
+}
+
+#[cfg(test)]
+pub(crate) type WriterTestGate = std::sync::Arc<test_hooks::ControlWriterGate>;
+#[cfg(not(test))]
+pub(crate) type WriterTestGate = ();
+
 type ClientWebSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 type ClientStream = futures_util::stream::SplitStream<ClientWebSocket>;
 type ClientSink = futures_util::stream::SplitSink<ClientWebSocket, Message>;
 type SupervisorJoin = JoinHandle<Result<(), ClientError>>;
+
+fn socket_local_addr(socket: &ClientWebSocket) -> Option<SocketAddr> {
+    socket.get_ref().get_ref().local_addr().ok()
+}
 
 struct ConnectionLifecycle {
     cancellation: CancellationToken,
@@ -85,6 +127,9 @@ pub struct ConnectOptions {
     /// Cancellation owned by the caller. Cancelling before or during
     /// admission closes both sockets and joins all connector tasks.
     pub cancellation: CancellationToken,
+    /// Explicit transport profile.  `M2` is the default for callers using
+    /// [`ConnectOptions::new`]; M1 callers must opt into the baseline policy.
+    pub profile: TransportProfile,
 }
 
 impl ConnectOptions {
@@ -93,6 +138,102 @@ impl ConnectOptions {
         Self {
             config,
             cancellation: CancellationToken::new(),
+            profile: TransportProfile::M2,
+        }
+    }
+}
+
+/// A bounded, payload-free status snapshot owned by the connector actor.
+/// Identifiers are useful for diagnosing a handover; credentials and frame
+/// bodies are deliberately absent.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConnectionStatus {
+    pub phase: String,
+    pub session_id: Option<String>,
+    pub epoch: Option<u64>,
+    pub active_generation: Option<u64>,
+    pub active_connection_id: Option<String>,
+    pub candidate_generation: Option<u64>,
+    pub candidate_connection_id: Option<String>,
+    pub rotation_id: Option<String>,
+    pub streams: usize,
+    pub emitted_sequences: u64,
+    pub received_sequences: u64,
+    pub drain_fences: usize,
+    pub drain_acks: usize,
+    pub replay_frames: usize,
+    pub replay_bytes: usize,
+    pub queue_frames: usize,
+    pub queue_bytes: usize,
+    pub rotations_completed: u64,
+    /// Current retained-recovery attempt number, or the last completed
+    /// attempt carried with a verified successor reset.  This is bounded by
+    /// the protocol's maximum recovery attempts and never contains payloads.
+    pub recovery_attempt: Option<u64>,
+    /// Monotonic actor-clock start of the current or most recently completed
+    /// retained-recovery attempt, copied from the rotation state machine's
+    /// authenticated attempt.
+    pub recovery_attempt_started_at_ms: Option<u64>,
+    /// Monotonic actor-clock deadline of the current or most recently
+    /// completed retained-recovery attempt. It is the current attempt's
+    /// overlap deadline and is never later than the immutable episode cap.
+    pub recovery_attempt_deadline_ms: Option<u64>,
+    /// Immutable actor-clock deadline shared by every attempt in the current
+    /// or most recently completed recovery episode. This is distinct from
+    /// the per-attempt overlap deadline above.
+    pub recovery_episode_deadline_ms: Option<u64>,
+    /// The sorted physical carrier IDs released by the current recovery
+    /// attempt. The list is bounded by the protocol closure-record limit and
+    /// contains identity metadata only; prior authenticated IDs remain local
+    /// fences rather than being repeated on later retry records.
+    pub recovery_closed_connection_ids: Vec<String>,
+    /// Closed reason for the last successful retained-recovery reset.
+    pub recovery_reset_reason: Option<&'static str>,
+    /// Exact old/new carrier identities for the active recovery attempt or
+    /// the last verified fenced successor.
+    pub recovery_old_generation: Option<u64>,
+    pub recovery_old_connection_id: Option<String>,
+    pub recovery_successor_generation: Option<u64>,
+    pub recovery_successor_connection_id: Option<String>,
+    pub control_local_addr: Option<SocketAddr>,
+    pub active_local_addr: Option<SocketAddr>,
+    pub candidate_local_addr: Option<SocketAddr>,
+}
+
+impl Default for ConnectionStatus {
+    fn default() -> Self {
+        Self {
+            phase: "connecting".to_owned(),
+            session_id: None,
+            epoch: None,
+            active_generation: None,
+            active_connection_id: None,
+            candidate_generation: None,
+            candidate_connection_id: None,
+            rotation_id: None,
+            streams: 0,
+            emitted_sequences: 0,
+            received_sequences: 0,
+            drain_fences: 0,
+            drain_acks: 0,
+            replay_frames: 0,
+            replay_bytes: 0,
+            queue_frames: 0,
+            queue_bytes: 0,
+            rotations_completed: 0,
+            recovery_attempt: None,
+            recovery_attempt_started_at_ms: None,
+            recovery_attempt_deadline_ms: None,
+            recovery_episode_deadline_ms: None,
+            recovery_closed_connection_ids: Vec::new(),
+            recovery_reset_reason: None,
+            recovery_old_generation: None,
+            recovery_old_connection_id: None,
+            recovery_successor_generation: None,
+            recovery_successor_connection_id: None,
+            control_local_addr: None,
+            active_local_addr: None,
+            candidate_local_addr: None,
         }
     }
 }
@@ -127,6 +268,7 @@ impl Readiness {
 #[derive(Clone)]
 pub struct ConnectionHandle {
     readiness: watch::Receiver<Readiness>,
+    status: watch::Receiver<ConnectionStatus>,
     lifecycle: Arc<ConnectionLifecycle>,
 }
 
@@ -135,6 +277,7 @@ impl fmt::Debug for ConnectionHandle {
         formatter
             .debug_struct("ConnectionHandle")
             .field("readiness", &*self.readiness.borrow())
+            .field("status", &*self.status.borrow())
             .finish_non_exhaustive()
     }
 }
@@ -144,6 +287,18 @@ impl ConnectionHandle {
     #[must_use]
     pub fn readiness(&self) -> watch::Receiver<Readiness> {
         self.readiness.clone()
+    }
+
+    /// Subscribe to the actor-owned bounded status snapshot.
+    #[must_use]
+    pub fn status(&self) -> watch::Receiver<ConnectionStatus> {
+        self.status.clone()
+    }
+
+    /// Return the most recent redacted status snapshot.
+    #[must_use]
+    pub fn status_snapshot(&self) -> ConnectionStatus {
+        self.status.borrow().clone()
     }
 
     /// Wait for Ready or a terminal closed state.
@@ -171,14 +326,23 @@ impl ConnectionHandle {
     /// Stop both sockets and join the supervisor and writer tasks.
     pub async fn stop(&self) -> Result<(), ClientError> {
         self.lifecycle.cancellation.cancel();
-        let join = self.lifecycle.join.lock().await.take();
-        match join {
-            Some(join) => join
-                .await
-                .map_err(|_| ClientError::SupervisorPanicked)?
-                .map(|_| ()),
+        // Keep the lifecycle mutex held until the one supervisor join has
+        // completed. A second concurrent stop therefore waits for the first
+        // caller instead of observing `None` and returning early.
+        let mut lifecycle_join = self.lifecycle.join.lock().await;
+        let result = match lifecycle_join.as_mut() {
+            // Await through the option while holding the mutex. The handle is
+            // only removed after completion, so cancellation of this stop
+            // future leaves it available for a later caller to join.
+            Some(join) => match join.await {
+                Ok(result) => result.map(|_| ()),
+                Err(_) => Err(ClientError::SupervisorPanicked),
+            },
             None => Ok(()),
-        }
+        };
+        let _ = lifecycle_join.take();
+        drop(lifecycle_join);
+        result
     }
 
     /// Alias used by callers that model supervisor lifecycle as shutdown.
@@ -198,6 +362,9 @@ impl Drop for ConnectionHandle {
 /// Connect the control/data pair, perform HELLO/WELCOME and DATA_READY, then
 /// return a handle for the running session actor.
 pub async fn connect(options: ConnectOptions) -> Result<ConnectionHandle, ClientError> {
+    if options.profile == TransportProfile::M2 {
+        return m2_runtime::connect_m2(options).await;
+    }
     options.config.validate()?;
     if options.cancellation.is_cancelled() {
         return Err(ClientError::Cancelled);
@@ -206,6 +373,7 @@ pub async fn connect(options: ConnectOptions) -> Result<ConnectionHandle, Client
     let control_url = Url::parse(&options.config.relay_url)
         .map_err(|_| ClientError::Invalid("relay_url is not a valid URL"))?;
     let (readiness_tx, readiness_rx) = watch::channel(Readiness::Connecting);
+    let (_, status_rx) = watch::channel(ConnectionStatus::default());
 
     let mut control = open_socket(
         &control_url,
@@ -230,6 +398,7 @@ pub async fn connect(options: ConnectOptions) -> Result<ConnectionHandle, Client
             "echo".to_owned(),
         ],
         services: configured_services(&options.config),
+        rotation_policy: None,
     });
     tokio::select! {
         _ = options.cancellation.cancelled() => return Err(ClientError::Cancelled),
@@ -300,6 +469,7 @@ pub async fn connect(options: ConnectOptions) -> Result<ConnectionHandle, Client
     });
     Ok(ConnectionHandle {
         readiness: readiness_rx,
+        status: status_rx,
         lifecycle,
     })
 }
@@ -450,6 +620,15 @@ async fn receive_welcome(
                     }
                 })?;
             }
+            Some(Ok(Message::Close(Some(frame)))) => {
+                if let Some(error) = classify_initial_control_close(&frame) {
+                    return Err(error);
+                }
+                return Err(ClientError::Transport {
+                    scope: "control handshake",
+                    detail: "relay closed the control socket".to_owned(),
+                });
+            }
             Some(Ok(Message::Close(_))) | None => {
                 return Err(ClientError::Transport {
                     scope: "control handshake",
@@ -470,6 +649,12 @@ async fn receive_welcome(
             }
         }
     }
+}
+
+fn classify_initial_control_close(frame: &CloseFrame) -> Option<ClientError> {
+    (frame.code == CloseCode::from(CONTROL_OWNER_BUSY_CLOSE_CODE)
+        && &*frame.reason == CONTROL_OWNER_BUSY_CLOSE_REASON)
+        .then_some(ClientError::OwnerBusy)
 }
 
 async fn receive_data_ready(
@@ -578,6 +763,10 @@ struct QueueBudget {
 }
 
 impl QueueBudget {
+    fn current(&self) -> usize {
+        self.bytes.load(Ordering::Acquire)
+    }
+
     fn reserve(self: &Arc<Self>, bytes: usize) -> Result<(), ClientError> {
         if bytes > self.maximum {
             return Err(ClientError::QueueLimit);
@@ -673,6 +862,93 @@ impl OutboundQueue {
             }
         }
     }
+
+    #[cfg(test)]
+    fn try_send(&self, message: Message) -> Result<(), ClientError> {
+        self.try_send_with_deadline(message, None)
+    }
+
+    /// Enqueue without waiting for capacity, while retaining the writer-side
+    /// deadline used by authorization-bearing control messages. M1 continues
+    /// to use [`Self::send`] and its cancellation/deadline-aware backpressure;
+    /// M2 actors use this bounded path so a full writer queue cannot stall the
+    /// actor.
+    fn try_send_with_deadline(
+        &self,
+        message: Message,
+        deadline: Option<DualDeadline>,
+    ) -> Result<(), ClientError> {
+        let bytes = message_size(&message);
+        self.budget.reserve(bytes)?;
+        let item = QueuedMessage {
+            message,
+            bytes,
+            budget: self.budget.clone(),
+            deadline,
+        };
+        self.sender.try_send(item).map_err(|error| match error {
+            mpsc::error::TrySendError::Full(_) => ClientError::QueueLimit,
+            mpsc::error::TrySendError::Closed(_) => ClientError::Transport {
+                scope: "writer",
+                detail: "writer stopped".to_owned(),
+            },
+        })
+    }
+
+    /// Reserve and enqueue the two control responses for one OPEN as one
+    /// bounded admission.  The actor must not publish stream state after only
+    /// the OPENED response has entered the queue: a full queue at the
+    /// authorization challenge would otherwise make the whole session fail
+    /// while leaving a half-admitted stream behind.
+    fn try_send_pair(
+        &self,
+        first: Message,
+        first_deadline: Option<DualDeadline>,
+        second: Message,
+        second_deadline: Option<DualDeadline>,
+    ) -> Result<(), ClientError> {
+        let first_bytes = message_size(&first);
+        let second_bytes = message_size(&second);
+        let total_bytes = first_bytes
+            .checked_add(second_bytes)
+            .ok_or(ClientError::QueueLimit)?;
+        self.budget.reserve(total_bytes)?;
+        let mut permits = match self.sender.try_reserve_many(2) {
+            Ok(permits) => permits,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.budget.release(total_bytes);
+                return Err(ClientError::QueueLimit);
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.budget.release(total_bytes);
+                return Err(ClientError::Transport {
+                    scope: "writer",
+                    detail: "writer stopped".to_owned(),
+                });
+            }
+        };
+        let first_permit = permits.next().ok_or_else(|| {
+            self.budget.release(total_bytes);
+            ClientError::QueueLimit
+        })?;
+        let second_permit = permits.next().ok_or_else(|| {
+            self.budget.release(total_bytes);
+            ClientError::QueueLimit
+        })?;
+        first_permit.send(QueuedMessage {
+            message: first,
+            bytes: first_bytes,
+            budget: self.budget.clone(),
+            deadline: first_deadline,
+        });
+        second_permit.send(QueuedMessage {
+            message: second,
+            bytes: second_bytes,
+            budget: self.budget.clone(),
+            deadline: second_deadline,
+        });
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -690,6 +966,7 @@ async fn writer_loop(
     mut receiver: mpsc::Receiver<QueuedMessage>,
     failure: mpsc::Sender<WriterFailure>,
     cancellation: CancellationToken,
+    _test_gate: Option<WriterTestGate>,
 ) -> Result<(), ClientError> {
     loop {
         tokio::select! {
@@ -703,6 +980,25 @@ async fn writer_loop(
                     close_writer_sink(sink).await;
                     return Ok(());
                 };
+                #[cfg(test)]
+                if matches!(kind, WriterKind::Control)
+                    && let Some(gate) = _test_gate.as_ref()
+                    && gate
+                        .block_once
+                        .swap(false, std::sync::atomic::Ordering::AcqRel)
+                {
+                    gate.entered.notify_one();
+                    let cancelled = tokio::select! {
+                        biased;
+                        _ = gate.release.notified() => false,
+                        _ = cancellation.cancelled() => true,
+                    };
+                    if cancelled {
+                        // Dropping this test-held sink is immediate and keeps
+                        // cancellation from waiting on a close handshake.
+                        return Ok(());
+                    }
+                }
                 if item.deadline.is_some_and(DualDeadline::expired) {
                     let _ = failure.send(WriterFailure(kind)).await;
                     return Err(ClientError::AuthorizationExpired);
@@ -795,6 +1091,10 @@ impl DualDeadline {
     fn expired(self) -> bool {
         self.expired_at(Instant::now(), SystemTime::now())
     }
+
+    fn remaining(self, monotonic_now: Instant) -> Duration {
+        self.monotonic.saturating_duration_since(monotonic_now)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -806,6 +1106,10 @@ struct AuthContext {
     deadline: DualDeadline,
     operation_deadline: DualDeadline,
     confirmed: bool,
+    /// A fresh challenge is awaiting confirmation.  M2 sets this again for
+    /// each long-lived stream authorization refresh; the operation deadline
+    /// remains independent and is never extended by a confirmation.
+    refresh_in_flight: bool,
     invalidated: bool,
 }
 
@@ -866,6 +1170,7 @@ async fn run_session(
         control_receiver,
         writer_failure_tx.clone(),
         cancellation.clone(),
+        None,
     ));
     let data_writer = tokio::spawn(writer_loop(
         WriterKind::Data,
@@ -873,6 +1178,7 @@ async fn run_session(
         data_receiver,
         writer_failure_tx,
         cancellation.clone(),
+        None,
     ));
     let mut actor = SessionActor {
         config,
@@ -1024,6 +1330,27 @@ impl SessionActor {
             | ControlMessage::Hello(_)
             | ControlMessage::Pong(_)
             | ControlMessage::AuthorizationChallenge(_) => Ok(()),
+            ControlMessage::RotateRequest(_)
+            | ControlMessage::RotatePrepare(_)
+            | ControlMessage::RotateQuiesce(_)
+            | ControlMessage::RotateFrozen(_)
+            | ControlMessage::RotateDrained(_)
+            | ControlMessage::RotateCommit(_)
+            | ControlMessage::RotateCommitted(_)
+            | ControlMessage::RotateRetire(_)
+            | ControlMessage::RotateRetired(_)
+            | ControlMessage::RotateComplete(_)
+            | ControlMessage::RotateAbort(_)
+            | ControlMessage::RotateAborted(_)
+            | ControlMessage::StreamForget(_)
+            | ControlMessage::Resume(_)
+            | ControlMessage::RecoveryBegin(_)
+            | ControlMessage::RecoveryClosed(_)
+            | ControlMessage::OwnerFence(_)
+            | ControlMessage::OwnerFenced(_)
+            | ControlMessage::Resumed(_) => Err(ClientError::Protocol(
+                "M2 control message received while using the explicit M1 profile".to_owned(),
+            )),
         }
     }
 
@@ -1126,6 +1453,7 @@ impl SessionActor {
                 deadline,
                 operation_deadline,
                 confirmed: false,
+                refresh_in_flight: true,
                 invalidated: false,
             },
             inbound_sequence: 0,
@@ -1690,6 +2018,77 @@ fn sanitize_error(error: &str) -> String {
     "transport failure".to_owned()
 }
 
+fn safe_rotation_detail(detail: &str) -> String {
+    // Only expose a closed set of state diagnostics.  Rotation details are
+    // otherwise intentionally opaque because transport errors can originate
+    // below the protocol boundary.
+    let (base, metadata) = detail
+        .split_once("; recovery_trigger=")
+        .map_or((detail, None), |(base, metadata)| (base, Some(metadata)));
+    let safe_base = match base {
+        "candidate abort owner decision not received before overlap deadline" => {
+            "owner abort decision deadline expired".to_owned()
+        }
+        "rotation deadline requires retained recovery" => "retained recovery required".to_owned(),
+        "rotation state closed" => "rotation reached terminal state".to_owned(),
+        "recovery episode deadline expired" => "recovery episode deadline expired".to_owned(),
+        "recovery candidate phase deadline expired" => {
+            "recovery candidate phase deadline expired".to_owned()
+        }
+        "control socket closed during retained recovery" => {
+            "control socket closed during retained recovery".to_owned()
+        }
+        _ => "bounded rotation state failure".to_owned(),
+    };
+    let Some(metadata) = metadata else {
+        return safe_base;
+    };
+    let Some((trigger, metadata)) = metadata.split_once("; recovery_role=") else {
+        return safe_base;
+    };
+    let Some((role, generation)) = metadata.split_once("; recovery_generation=") else {
+        return safe_base;
+    };
+    // An optional bounded attempt number follows the generation when the
+    // episode itself was ended by the coordinator.
+    let (generation, attempt) = generation
+        .split_once("; recovery_attempt=")
+        .map_or((generation, None), |(generation, attempt)| {
+            (generation, Some(attempt))
+        });
+    let attempt = match attempt {
+        None => None,
+        Some(attempt) => match attempt.parse::<u64>() {
+            Ok(attempt) if (1..=3).contains(&attempt) => Some(attempt),
+            _ => return safe_base,
+        },
+    };
+    let trigger = match trigger {
+        "data_writer_failed" | "data_reader_closed" | "data_writer_closed" => trigger,
+        _ => return safe_base,
+    };
+    let role = match role {
+        "active"
+        | "candidate"
+        | "retiring"
+        | "pending_candidate"
+        | "pending_candidate_close"
+        | "recovery_closed"
+        | "unknown" => role,
+        _ => return safe_base,
+    };
+    let Ok(generation) = generation.parse::<u64>() else {
+        return safe_base;
+    };
+    let mut message = format!(
+        "{safe_base}; recovery_trigger={trigger}; recovery_role={role}; recovery_generation={generation}"
+    );
+    if let Some(attempt) = attempt {
+        message.push_str(&format!("; recovery_attempt={attempt}"));
+    }
+    message
+}
+
 /// Errors returned by the connector API. Display text is safe for CLI JSON;
 /// it does not include credentials, payloads, or endpoint query strings.
 #[derive(Debug)]
@@ -1698,10 +2097,22 @@ pub enum ClientError {
     Credential(CredentialError),
     Invalid(&'static str),
     Protocol(String),
-    Transport { scope: &'static str, detail: String },
+    Transport {
+        scope: &'static str,
+        detail: String,
+    },
+    /// The authenticated relay rejected this session because the exact
+    /// tenant/device owner slot is already held.  Callers must stop the
+    /// existing owner before starting another session; this is terminal and
+    /// never eligible for an automatic reconnect or takeover.
+    OwnerBusy,
     HandshakeTimeout,
     AuthorizationExpired,
     QueueLimit,
+    /// The authenticated session cannot retain another OPEN response. This
+    /// is terminal for the current session; callers must establish a fresh
+    /// session instead of retrying the same request indefinitely.
+    OpenRetentionFull,
     Cancelled,
     SupervisorPanicked,
 }
@@ -1715,9 +2126,10 @@ impl ClientError {
             Self::Invalid(_) => "INVALID_INVOCATION",
             Self::Protocol(_) => "PROTOCOL_ERROR",
             Self::Transport { .. } => "TRANSPORT_ERROR",
+            Self::OwnerBusy => "OWNER_BUSY",
             Self::HandshakeTimeout => "DEADLINE_EXCEEDED",
             Self::AuthorizationExpired => "AUTHORIZATION_STALE",
-            Self::QueueLimit => "RESOURCE_EXHAUSTED",
+            Self::QueueLimit | Self::OpenRetentionFull => "RESOURCE_EXHAUSTED",
             Self::Cancelled => "CANCELLED",
             Self::SupervisorPanicked => "SUPERVISOR_FAILED",
         }
@@ -1734,10 +2146,22 @@ impl ClientError {
             Self::Credential(error) => error.to_string(),
             Self::Invalid(message) => (*message).to_owned(),
             Self::Protocol(message) => message.clone(),
+            Self::Transport { scope, detail }
+                if *scope == "data rotation" || *scope == "retained recovery" =>
+            {
+                format!("{scope} failed: {}", safe_rotation_detail(detail))
+            }
             Self::Transport { scope, .. } => format!("{scope} failed"),
+            Self::OwnerBusy => {
+                "device already has an active owner; stop it before starting another session"
+                    .to_owned()
+            }
             Self::HandshakeTimeout => "TLS/WebSocket handshake deadline exceeded".to_owned(),
             Self::AuthorizationExpired => "authorization confirmation deadline expired".to_owned(),
             Self::QueueLimit => "bounded connector queue limit reached".to_owned(),
+            Self::OpenRetentionFull => {
+                "OPEN idempotency retention is full; start a fresh session".to_owned()
+            }
             Self::Cancelled => "connector cancelled".to_owned(),
             Self::SupervisorPanicked => "connector supervisor failed".to_owned(),
         }
@@ -1801,6 +2225,132 @@ mod tests {
         budget.release(4);
     }
 
+    #[tokio::test]
+    async fn try_send_with_deadline_is_bounded_and_preserves_deadline() {
+        let cancellation = CancellationToken::new();
+        let (queue, mut receiver) = OutboundQueue::new(1, 64, cancellation);
+        let deadline = DualDeadline::new(Instant::now(), SystemTime::now(), Duration::from_secs(1))
+            .expect("valid deadline");
+
+        queue
+            .try_send_with_deadline(Message::Text("first".to_owned().into()), Some(deadline))
+            .expect("first bounded enqueue");
+        assert!(matches!(
+            queue.try_send(Message::Text("second".to_owned().into())),
+            Err(ClientError::QueueLimit)
+        ));
+
+        let queued = receiver.recv().await.expect("queued message");
+        assert!(queued.deadline.is_some());
+        drop(queued);
+        queue
+            .try_send(Message::Text("second".to_owned().into()))
+            .expect("budget released after dequeue");
+    }
+
+    #[tokio::test]
+    async fn concurrent_stop_waits_for_existing_supervisor_join() {
+        let cancellation = CancellationToken::new();
+        let (readiness_tx, readiness_rx) = watch::channel(Readiness::Connecting);
+        let (status_tx, status_rx) = watch::channel(ConnectionStatus::default());
+        drop(readiness_tx);
+        drop(status_tx);
+
+        let release = Arc::new(tokio::sync::Notify::new());
+        let supervisor_release = release.clone();
+        let join = tokio::spawn(async move {
+            supervisor_release.notified().await;
+            Ok(())
+        });
+        let lifecycle = Arc::new(ConnectionLifecycle {
+            cancellation,
+            join: Mutex::new(Some(join)),
+        });
+        let handle = ConnectionHandle {
+            readiness: readiness_rx,
+            status: status_rx,
+            lifecycle: lifecycle.clone(),
+        };
+
+        let first_handle = handle.clone();
+        let first = tokio::spawn(async move { first_handle.stop().await });
+        let mut first_holds_join_lock = false;
+        for _ in 0..1_000 {
+            if lifecycle.join.try_lock().is_err() {
+                first_holds_join_lock = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(first_holds_join_lock, "first stop did not begin joining");
+
+        let second_handle = handle.clone();
+        let mut second = tokio::spawn(async move { second_handle.stop().await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut second)
+                .await
+                .is_err(),
+            "concurrent stop returned before the supervisor completed"
+        );
+
+        release.notify_one();
+        assert!(first.await.expect("first stop task").is_ok());
+        assert!(second.await.expect("second stop task").is_ok());
+    }
+
+    #[tokio::test]
+    async fn cancelled_stop_keeps_supervisor_join_for_next_caller() {
+        let cancellation = CancellationToken::new();
+        let (readiness_tx, readiness_rx) = watch::channel(Readiness::Connecting);
+        let (status_tx, status_rx) = watch::channel(ConnectionStatus::default());
+        drop(readiness_tx);
+        drop(status_tx);
+
+        let release = Arc::new(tokio::sync::Notify::new());
+        let supervisor_release = release.clone();
+        let join = tokio::spawn(async move {
+            supervisor_release.notified().await;
+            Ok(())
+        });
+        let lifecycle = Arc::new(ConnectionLifecycle {
+            cancellation,
+            join: Mutex::new(Some(join)),
+        });
+        let handle = ConnectionHandle {
+            readiness: readiness_rx,
+            status: status_rx,
+            lifecycle: lifecycle.clone(),
+        };
+
+        let first_handle = handle.clone();
+        let first = tokio::spawn(async move { first_handle.stop().await });
+        let mut first_holds_join_lock = false;
+        for _ in 0..1_000 {
+            if lifecycle.join.try_lock().is_err() {
+                first_holds_join_lock = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(first_holds_join_lock, "first stop did not begin joining");
+
+        first.abort();
+        let first_error = first.await.expect_err("first stop should be cancelled");
+        assert!(first_error.is_cancelled());
+
+        let second_handle = handle.clone();
+        let mut second = tokio::spawn(async move { second_handle.stop().await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut second)
+                .await
+                .is_err(),
+            "replacement stop returned before the supervisor completed"
+        );
+
+        release.notify_one();
+        assert!(second.await.expect("replacement stop task").is_ok());
+    }
+
     #[test]
     fn authorization_replay_cannot_extend_first_short_deadline() {
         let started = Instant::now();
@@ -1847,6 +2397,43 @@ mod tests {
         assert_eq!(reserve_outbound_sequences(4, 2), Some((5, 6)));
         assert_eq!(reserve_outbound_sequences(u64::MAX, 1), None);
         assert_eq!(reserve_outbound_sequences(9, 0), Some((9, 9)));
+    }
+
+    #[test]
+    fn owner_busy_is_typed_actionable_and_non_retryable() {
+        let error = ClientError::OwnerBusy;
+        assert_eq!(error.code(), "OWNER_BUSY");
+        assert!(!error.retryable());
+        assert_eq!(
+            error.to_string(),
+            "device already has an active owner; stop it before starting another session"
+        );
+        assert!(!error.to_string().contains("token"));
+        assert!(!error.to_string().contains("redis"));
+    }
+
+    #[test]
+    fn only_the_authenticated_owner_busy_close_is_classified() {
+        let owner_busy = CloseFrame {
+            code: CloseCode::from(CONTROL_OWNER_BUSY_CLOSE_CODE),
+            reason: CONTROL_OWNER_BUSY_CLOSE_REASON.into(),
+        };
+        assert!(matches!(
+            classify_initial_control_close(&owner_busy),
+            Some(ClientError::OwnerBusy)
+        ));
+
+        let wrong_reason = CloseFrame {
+            code: owner_busy.code,
+            reason: "backend owner still live".into(),
+        };
+        assert!(classify_initial_control_close(&wrong_reason).is_none());
+
+        let wrong_code = CloseFrame {
+            code: CloseCode::Error,
+            reason: CONTROL_OWNER_BUSY_CLOSE_REASON.into(),
+        };
+        assert!(classify_initial_control_close(&wrong_code).is_none());
     }
 
     #[test]

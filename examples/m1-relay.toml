@@ -11,8 +11,15 @@ device_bind = "127.0.0.1:9443"
 oidc_issuer = "https://issuer.example.test/"
 oidc_audience = ["agent-tunnel"]
 oidc_jwks_path = "examples/credentials/oidc-jwks.json"
-redis_url = "redis://127.0.0.1:6379/0"
-redis_namespace = "agent-tunnel/m1"
+# Production relay startup requires Redis TLS. The disposable local harness
+# accepts TEST_REDIS_URL=redis://... through its low-level test-only path.
+redis_url = "rediss://redis.example.internal:6379/0"
+# The Redis authority prefixes every key with this namespace, so it accepts
+# 1..=96 ASCII letters, digits, '.', '_' or '-' only. A '/' or ':' is refused.
+# Validate an edit with:
+#   cargo run --locked -p tunnel-relay -- \
+#     check-serve-config --config examples/m1-relay.toml
+redis_namespace = "agent-tunnel-m1"
 
 device_tls_cert_chain = "examples/credentials/relay-device-cert-chain.pem"
 device_tls_private_key = "examples/credentials/relay-device-key.pem"
@@ -29,3 +36,10 @@ boot_id = "replace-with-a-unique-boot-id"
 deployment_incarnation = "m1-local"
 max_devices_per_user = 16
 max_queue_bytes = 4194304
+
+# M2 rotation policy. Values are validated now; scheduled data-socket
+# handover remains pending runtime integration.
+[rotation]
+interval_seconds = 300
+handshake_timeout_seconds = 10
+overlap_seconds = 30

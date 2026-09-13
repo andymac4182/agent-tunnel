@@ -1,6 +1,6 @@
 use crate::database::{RedisLease, RedisLeaseOptions};
 use crate::error::{HarnessError, Result};
-use crate::fixture::FixtureTopology;
+use crate::fixture::{FixtureTopology, SharedFixtureIdentity};
 use crate::oidc::OidcFixture;
 use crate::pki::FixturePki;
 use crate::proxy::{ProxyConfig, ProxyHandle, TcpProxy};
@@ -11,22 +11,39 @@ use rustls::{
     ClientConfig, RootCertStore,
     pki_types::{CertificateDer, ServerName},
 };
-use std::net::SocketAddr;
 use std::sync::Arc;
+use std::{net::SocketAddr, time::Duration};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsConnector;
 use tunnel_catalog::{ApprovedJwk, Catalog, OidcConfig, OidcVerifier, RedisCatalog};
-use tunnel_relay::{Relay, RelayLimits, RelayOptions, RunningRelay};
+use tunnel_core::RotationConfig;
+use tunnel_relay::{Relay, RelayLimits, RelayOptions, RelaySnapshot, RunningRelay};
 
 const FIXTURE_DEPLOYMENT_INCARNATION: &str = "m1-local";
 
-/// Inputs for one isolated M1 run.
+/// Inputs for one isolated real-socket harness run.
 #[derive(Clone, Debug)]
 pub struct HarnessOptions {
     pub redis_url: Option<String>,
     pub namespace_prefix: Option<String>,
     pub proxy_target: Option<SocketAddr>,
     pub proxy_config: ProxyConfig,
+    /// Effective data-carrier rotation policy used by the production relay.
+    /// M1 callers can keep the defaults; M2 acceptance overrides this with an
+    /// accelerated policy while preserving the same real runtime path.
+    pub rotation: RotationConfig,
+    /// Build the production fixture with one device UUID reused by both
+    /// tenant scopes.  This is reserved for tenant-isolation acceptance and
+    /// remains disabled for the ordinary M1/M2 topology.
+    pub shared_device_uuid: bool,
+    /// Explicit colliding device/service identity for an M7 tenant-isolation
+    /// run. This takes precedence over `shared_device_uuid` when set.
+    pub shared_fixture_identity: Option<SharedFixtureIdentity>,
+    /// Seed a second active `echo` service on the first tenant-A device so a
+    /// service-type label has more than one live target.  This is reserved for
+    /// the fail-closed admission matrix and stays disabled everywhere else, so
+    /// no existing gate's service or grant counts change.
+    pub ambiguous_echo_service: bool,
 }
 
 impl Default for HarnessOptions {
@@ -36,6 +53,10 @@ impl Default for HarnessOptions {
             namespace_prefix: Some("m1-fixture".to_owned()),
             proxy_target: None,
             proxy_config: ProxyConfig::default(),
+            rotation: RotationConfig::default(),
+            shared_device_uuid: false,
+            shared_fixture_identity: None,
+            ambiguous_echo_service: false,
         }
     }
 }
@@ -80,6 +101,32 @@ impl HarnessOptions {
         self.proxy_config = value;
         self
     }
+
+    pub fn rotation(mut self, value: RotationConfig) -> Self {
+        self.rotation = value;
+        self
+    }
+
+    pub fn shared_device_uuid(mut self, value: bool) -> Self {
+        self.shared_device_uuid = value;
+        self
+    }
+
+    /// Opt into the duplicate active `echo` service used by the fail-closed
+    /// admission matrix's ambiguous-target scenario.
+    pub fn ambiguous_echo_service(mut self, value: bool) -> Self {
+        self.ambiguous_echo_service = value;
+        self
+    }
+
+    /// Opt into a fixture where both tenant records use the supplied device
+    /// and service UUIDs. The topology is seeded once through the production
+    /// catalog, preserving tenant-qualified authority keys.
+    pub fn shared_fixture_identity(mut self, value: SharedFixtureIdentity) -> Self {
+        self.shared_fixture_identity = Some(value);
+        self.shared_device_uuid = false;
+        self
+    }
 }
 
 /// Entry point kept deliberately tiny so integration tests can share setup.
@@ -106,7 +153,13 @@ impl Harness {
                 return Err(with_redis_cleanup(error, redis.close().await));
             }
         };
-        let topology = match FixtureTopology::new(&pki) {
+        let topology = match match options.shared_fixture_identity {
+            Some(shared) => FixtureTopology::new_with_shared_device_and_service_uuid(&pki, shared),
+            None if options.shared_device_uuid => {
+                FixtureTopology::new_with_shared_device_uuid(&pki, uuid::Uuid::new_v4())
+            }
+            None => FixtureTopology::new(&pki),
+        } {
             Ok(topology) => topology,
             Err(error) => {
                 return Err(with_redis_cleanup(error, redis.close().await));
@@ -126,6 +179,11 @@ impl Harness {
         // relay will receive.  This is intentionally a one-time seed; callers
         // obtain clones through RunningHarness::production_catalog.
         let redis_url = redis.redis_url().to_owned();
+        if let Err(error) =
+            crate::c11_capture::record_sentinel("private_endpoint", redis_url.as_bytes())
+        {
+            return Err(with_redis_cleanup(error, redis.close().await));
+        }
         let namespace = redis.namespace().to_owned();
         let catalog = match RedisCatalog::connect_for_recovery(
             &redis_url,
@@ -156,6 +214,26 @@ impl Harness {
                 Ok(devices) => devices,
                 Err(error) => return Err(with_redis_cleanup(error, redis.close().await)),
             };
+        let ambiguous_echo_service = if options.ambiguous_echo_service {
+            // Deliberately the last tenant-A device: the first one can share
+            // its device and service UUID with tenant B, and an ambiguous
+            // label must be scoped to exactly one tenant's service list.
+            let device_id = match topology.devices_a.last() {
+                Some(device) => device.id,
+                None => {
+                    let error = HarnessError::InvalidInput(
+                        "ambiguous echo service requires a tenant-A device".to_owned(),
+                    );
+                    return Err(with_redis_cleanup(error, redis.close().await));
+                }
+            };
+            match topology.push_ambiguous_echo_service(&mut fixture, device_id) {
+                Ok(service_id) => Some(service_id),
+                Err(error) => return Err(with_redis_cleanup(error, redis.close().await)),
+            }
+        } else {
+            None
+        };
         if let Err(error) = catalog.seed_fixture(&fixture).await {
             let error = HarnessError::Redis(format!("seeding production Redis catalog: {error}"));
             // A seed is one-shot. Discard a failed fixture, including partial
@@ -172,9 +250,11 @@ impl Harness {
             oidc,
             topology,
             admission_devices,
+            ambiguous_echo_service,
             proxy,
             production_catalog: Some(catalog),
             production_relay: None,
+            rotation: options.rotation,
         })
     }
 }
@@ -189,9 +269,13 @@ pub struct RunningHarness {
     pub oidc: OidcFixture,
     pub topology: FixtureTopology,
     pub(crate) admission_devices: Vec<crate::admission::AdmissionDevice>,
+    /// The duplicate active `echo` service seeded for the fail-closed
+    /// admission matrix, present only when that option was requested.
+    pub ambiguous_echo_service: Option<uuid::Uuid>,
     pub proxy: Option<ProxyHandle>,
     production_catalog: Option<RedisCatalog>,
     production_relay: Option<RunningRelay>,
+    rotation: RotationConfig,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -213,6 +297,10 @@ impl std::fmt::Debug for RunningHarness {
 }
 
 impl RunningHarness {
+    pub(crate) fn rotation_config(&self) -> RotationConfig {
+        self.rotation.clone()
+    }
+
     /// Return the already seeded production Redis catalog.  The relay and
     /// acceptance callers share this cloneable connection-backed instance;
     /// this accessor never reconnects, reseeds, or substitutes a memory
@@ -270,6 +358,7 @@ impl RunningHarness {
         let mut options = RelayOptions::new(oidc);
         options.limits = limits;
         options.deployment_incarnation = FIXTURE_DEPLOYMENT_INCARNATION.to_owned();
+        options.rotation = self.rotation.clone();
         let shared_catalog: tunnel_catalog::SharedCatalog = Arc::new(catalog.clone());
         let relay = Relay::start(
             options,
@@ -291,6 +380,20 @@ impl RunningHarness {
         self.production_relay
             .as_ref()
             .map(|relay| (relay.consumer_addr, relay.device_addr))
+    }
+
+    /// Return the relay's bounded, payload-free runtime snapshot for
+    /// acceptance evidence.  This remains an in-process diagnostic call; all
+    /// exercised service traffic still crosses the public TLS/WebSocket
+    /// listeners.
+    pub async fn production_snapshot(&self) -> Result<RelaySnapshot> {
+        let relay = self.production_relay.as_ref().ok_or_else(|| {
+            HarnessError::InvalidInput("production relay is not running".to_owned())
+        })?;
+        relay
+            .snapshot()
+            .await
+            .map_err(|error| HarnessError::Process(format!("reading relay snapshot: {error}")))
     }
 
     /// Exercise the public HTTPS listener through a real TLS connection and
@@ -452,6 +555,77 @@ impl RunningHarness {
             return Err(error);
         }
         Ok(())
+    }
+
+    /// Shut down with a caller-owned absolute deadline while retaining every
+    /// task-bearing handle until its cancellation-safe join path completes.
+    /// Relay and Redis lease shutdowns already own their internal bounds; the
+    /// proxy uses an abort-and-join fallback when the shared deadline expires.
+    pub async fn shutdown_until(mut self, deadline: tokio::time::Instant) -> Result<()> {
+        let mut errors = Vec::new();
+        if let Some(relay) = self.production_relay.take()
+            && let Err(error) = relay.shutdown().await
+        {
+            errors.push(format!("stopping production relay: {error}"));
+        }
+        if let Some(catalog) = self.production_catalog.take() {
+            match tokio::time::timeout_at(deadline, catalog.cleanup_fixture_namespace()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    errors.push(format!("cleaning production Redis catalog: {error}"));
+                }
+                Err(_) => {
+                    errors.push(
+                        "cleaning production Redis catalog exceeded its shared deadline".to_owned(),
+                    );
+                }
+            }
+        }
+        if let Some(mut proxy) = self.proxy.take()
+            && let Err(error) = shutdown_proxy_until(&mut proxy, deadline).await
+        {
+            errors.push(format!("proxy cleanup: {error}"));
+        }
+        if let Err(error) = self.redis.close().await {
+            errors.push(format!("Redis lease cleanup: {error}"));
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(HarnessError::Process(errors.join("; ")))
+        }
+    }
+}
+
+const PROXY_FORCED_JOIN_GRACE: Duration = Duration::from_secs(2);
+
+async fn shutdown_proxy_until(
+    proxy: &mut ProxyHandle,
+    graceful_deadline: tokio::time::Instant,
+) -> Result<()> {
+    let graceful = proxy.shutdown_until(graceful_deadline).await;
+    let Err(graceful_error) = graceful else {
+        return Ok(());
+    };
+    // Keep ownership after the helper's bounded abort/join path and perform
+    // bounded retries on that same handle. Never call the unbounded
+    // consuming `ProxyHandle::shutdown` from this deadline-aware path.
+    let forced_deadline = tokio::time::Instant::now() + PROXY_FORCED_JOIN_GRACE;
+    match proxy.shutdown_until(forced_deadline).await {
+        Ok(()) => Err(HarnessError::Process(format!(
+            "harness proxy exceeded its graceful shutdown deadline: {graceful_error}; bounded forced join completed"
+        ))),
+        Err(forced_error) => {
+            let final_deadline = tokio::time::Instant::now() + PROXY_FORCED_JOIN_GRACE;
+            match proxy.shutdown_until(final_deadline).await {
+                Ok(()) => Err(HarnessError::Process(format!(
+                    "harness proxy graceful shutdown failed: {graceful_error}; bounded forced join failed: {forced_error}; final bounded join completed"
+                ))),
+                Err(final_error) => Err(HarnessError::Process(format!(
+                    "harness proxy graceful shutdown failed: {graceful_error}; bounded forced join failed: {forced_error}; final bounded join failed: {final_error}"
+                ))),
+            }
+        }
     }
 }
 

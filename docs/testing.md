@@ -1,6 +1,6 @@
 # Verification plan
 
-This document defines acceptance gates across the project. M1's locked Rust checks, Redis catalog regressions, same-dataset AOF restart and real HTTPS/WSS/CLI/private-H3 harness have local evidence in [m1-harness.md](m1-harness.md). Rotation, clustered routing, remote adapters, backup rollback verification and performance/soak checks below remain future gates; they are not implied by the M1 result.
+This document defines acceptance gates across the project. M1's locked Rust checks, Redis catalog regressions, same-dataset AOF restart and real HTTPS/WSS/CLI/private-H3 harness have local evidence in [m1-harness.md](m1-harness.md). M2 rotation/replay has separate local evidence in [m2-verification.md](m2-verification.md). M7 cluster implementation and verification are in progress; remote adapters, backup rollback verification and performance/soak gates remain open. See [tasks.md](tasks.md) for current task status.
 
 Read [the protocol plan](protocol.md) for authoritative connection and rotation rules, [runtime.md](runtime.md) for mTLS/CLI behavior, [cluster.md](cluster.md) for peer trust and ownership, [the filesystem API](filesystem-api.md) and [adapters](filesystem-adapters.md) for filesystem contracts, and [acp.md](acp.md) for agent HTTP transport. [The integrations plan](integrations.md) also covers computer use. Every implementation milestone must update this document to identify which checks actually run and link to their test code or CI job.
 
@@ -12,9 +12,15 @@ Run these commands from the repository root:
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --all-targets --locked
+cargo run --locked -p tunnel-client -- config check --config examples/m1-client.toml
 cargo run --locked -p tunnel-client -- check-config examples/client.toml
 cargo run --locked -p tunnel-relay -- check-config examples/relay.toml
+cargo run --locked -p tunnel-relay -- check-serve-config --config examples/m1-relay.toml
 ```
+
+Each checked-in example must be validated by the parser that actually loads it, not by a parser that merely accepts a similar shape. `examples/m1-relay.toml` is the relay's serving document, so only `check-serve-config --config PATH` — which constructs the same `ServeConfig` as `serve --config PATH` — is evidence for it; the relay's legacy `check-config [PATH]` parses `tunnel_core::RelayConfig` and cannot represent a serving document at all. CI expands `examples/*-relay.toml` and dry-runs every match, and `crates/tunnel-relay/tests/example_configs.rs` plus `crates/tunnel-client/tests/example_configs.rs` walk the examples directory and fail on any file not classified with its parser, so a newly added example cannot escape coverage. Keep a serving example's filename matching that glob.
+
+All four validation commands are read-only: they open no socket, contact no Redis authority, and read no credential, key or JWKS material. `check-serve-config` exits 0 when the configuration is valid and 1 with a redacted field-level reason on stderr when it is not; validating the referenced credential material stays in `serve`'s own startup.
 
 The initial CI runs formatting, linting, and Rust tests on Linux, macOS, and Windows. The executable scaffolds check configuration; a successful exit is evidence of configuration validation only. Record the exact commit and runner when reporting a check as passed. The initial CI does not establish network connectivity, tenant isolation, upstream compatibility, or release readiness.
 
@@ -24,7 +30,363 @@ Configuration tests must preserve these defaults and reject invalid values:
 - `handshake_timeout_seconds` defaults to 10 and accepts 1–300 seconds. `overlap_seconds` defaults to 30 and accepts 1–3,600 seconds. Overlap begins when the candidate connection attempt starts, including its handshake.
 - The cross-field rule is `handshake_timeout_seconds < overlap_seconds < interval_seconds`. An individually valid value can still violate this rule.
 - Client `device_id` accepts 1–128 ASCII characters from `[A-Za-z0-9._-]`. Relay limits default to 1,024 total connected clients and 16 per user, with per-user capacity no greater than total capacity.
+- Listener `handshake_timeout` defaults to 10 seconds, `pre_request_timeout` to 15 seconds and `http1_header_read_timeout` to 10 seconds. Each accepts 100 ms–300 seconds inclusive, and the cross-field rule is `http1_header_read_timeout <= pre_request_timeout`. A zero value is rejected rather than treated as "disabled", and an invalid value must return a typed error and release the listener instead of accepting connections with an unbounded permit. See the [bounded listener connection permits](runtime.md#bounded-listener-connection-permits) contract.
 - Empty/default and partial configuration, unknown or duplicate keys, incorrect types, negative/overflowing values, valid boundaries, and the checked-in examples must be covered. Add boundary and cross-field cases whenever an invariant changes.
+
+## Repeatable M7 harness commands
+
+Build the workspace binaries with `cargo build --workspace --locked` before
+running the process-based fixtures. Use a dedicated Redis primary and set
+`TEST_REDIS_URL` to its URL; the harness creates isolated namespaces and uses
+synthetic payloads and ephemeral certificates.
+
+```sh
+cargo run -p tunnel-test-harness --locked -- verify-m7-transport
+cargo run -p tunnel-test-harness --locked -- verify-m7-cluster
+cargo run -p tunnel-test-harness --locked -- verify-m7-production
+cargo run -p tunnel-test-harness --locked -- verify-m7-redis-partition
+cargo run -p tunnel-test-harness --locked -- verify-m7-queue-saturation
+cargo run -p tunnel-test-harness --locked -- verify-m7-remote-body-limits
+```
+
+The transport command exercises real mTLS/H3 fault cases. The cluster command
+uses a synthetic owner callback. The production command uses real relay actors,
+CLI/device WebSockets and public consumers across three relays.
+
+### Bounded multi-fault chaos classification (`verify-m7-chaos`)
+
+```sh
+cargo run -p tunnel-test-harness --locked -- verify-m7-chaos
+```
+
+The chaos gate (OG-08) fronts Redis with an opaque TCP proxy, starts one real
+three-relay production cluster, and runs a fixed seven-round schedule that
+repeats owner kill, CLI process pause and peer UDP loss and exercises a full
+Redis pause once, each built from an existing fault injector: Redis pause
+(`ProxyHandle::pause_all`), non-owner peer UDP loss (`set_peer_path_drop`), CLI
+process pause (`SIGSTOP`/`SIGCONT` via `ProcessPauseGuard`) and owner kill
+(`SIGKILL` of the owning `tunnel-client`). A full Redis pause expires the
+in-process fixture's signed membership lease, which does not re-arm for a second
+full outage on the same long-lived cluster (a fixture limitation, not a protocol
+one), so Redis pause is scheduled once while the other three faults repeat.
+Every observed close or interruption is mapped into the closed vocabulary the
+diagnostics already use — `bounded_close`, `admission_unavailable`,
+`peer_unavailable`, `owner_released`, `outcome_unknown`, `unclassified`.
+Unknown outcomes (a timed-out or unsendable probe) are preserved as
+`outcome_unknown`, not discarded; an observation that matches no bucket (for
+example an echo from a killed or paused owner, or an unexpected HTTP status) is
+recorded as `unclassified`. Each round recycles the owner session, so
+device-fanout reconnect sockets are counted per round. `validate_chaos_evidence`
+blocks release when any interruption is unclassified, when the peak per-round
+reconnect rate exceeds the documented threshold of 12.000 sockets/second
+(`reconnect_rate_threshold_milli = 12000`), when the concurrent device-fanout
+socket peak exceeds four, when a fault type was never exercised, or when a
+per-round or final recovery echo did not succeed. The gate runs as part of
+`scripts/m7-harness-verify.sh`. Its structured validator and its table-driven
+M7-C17 mutation case live in `crates/tunnel-test-harness/src/production_cluster/chaos.rs`.
+
+### Evidence-promotion guard (`scripts/m7-evidence-guard.py`)
+
+```sh
+python3 scripts/m7-evidence-guard.py --verbose
+```
+
+A read-only IN-11 guard over `docs/m7-edge-cases.md` and `docs/tasks.md`. For
+every row whose status column says verified it fails when the row cites a
+`verify-*` harness gate that is neither a `tunnel-test-harness` command nor
+referenced by `scripts/m7-harness-verify.sh`, or a commit hash that git
+resolves to a real commit which is not an ancestor of `HEAD`. Hex tokens git
+cannot resolve to a commit (digests, blob ids, squashed short hashes) and
+gate fragments embedded in a longer path or log filename are ignored, so only
+real citations are checked. The guard never writes to the docs.
+
+### Concurrent same-identifier tenants and the duplicate-owner race
+
+`verify-m7-production` keeps both tenants' device sessions online at the
+identical device and service UUIDs for the whole run, and prints two extra
+payload-free evidence lines beside its summary line. Neither line records a
+payload, credential or canary byte; every field is a count, a boolean or an
+epoch number.
+
+`M7 production concurrent tenant isolation` reports that both tenants enrolled
+the same device and service UUID with distinct tenant scopes, certificates and
+keys; how many instants both tenants were sampled holding a live complete owner
+token at once (`concurrent_owner_samples`); that those owners sat on different
+relay nodes with different session identities; how many exact canary matches
+each tenant made while the other was online; that the canaries differ; that
+neither route ever emitted the other tenant's canary
+(`cross_tenant_canary_absent`, asserted by expecting the wrong canary on a
+throwaway stream in each direction and requiring that exchange to fail); and
+the committed scheduled replacement generations each tenant reached. An offline
+tenant-B device shows up as a missing concurrent owner sample, and a `503`
+accepted in place of a routed canary as a missing exact canary; the validator
+rejects both, so neither can satisfy the gate.
+
+`M7 production duplicate owner race` reports the race of two real CLI processes
+for one tenant's exact owner scope, run while the other tenant's
+same-identifier session is still online. It records that both children were
+spawned before any owner observation; that exactly one atomic winner took the
+scope; the cluster-wide relay control-registration conflict delta, which must be
+exactly one and must still be exactly one after a further settle window (a
+reconnect storm raises it); that the loser emitted the exact non-retryable
+`OWNER_BUSY` terminal diagnostic and exited non-success; that the winner's token
+and canary, the tenant's independent sibling, and the same-identifier tenant's
+owner and canary all survived; the winner and successor epochs, which stay above
+the JavaScript-safe integer bound because the run seeds tenant A's durable epoch
+there before any owner exists; and that a compare-release with the superseded
+token was refused without disturbing the successor or the other tenant.
+
+Composing the two properties in one run is the point: a scope key that lost its
+tenant qualifier would evict the surviving same-identifier tenant during the
+race rather than leave it untouched.
+
+Two timing notes for anyone extending this gate. A pooled consumer stream is
+cancelled after the fixture's 10-second peer HTTP/3 idle timeout, so an
+application stream cannot be held idle across the race phase; tenant B's
+stream is exercised on every tenant-A rotation and retired before the later
+phases, which open fresh streams where they need one. The loser's structured
+terminal diagnostic is drained with a longer budget than the component
+owner-contention gate uses, because this gate reaches the race phase on a busy
+machine; the assertion itself is unchanged. The Redis
+partition command is being implemented under M7-I05/I17 and is not yet verified;
+it must block both existing and newly accepted Redis connections, reject new
+admission and expired-authority dispatch, then prove fresh authorized recovery.
+The queue-saturation command drives the configured bounded data message queue to
+its reachable physical bound behind a blackholed carrier; see
+"Physical versus logical queue occupancy" below for what it does and does not
+prove.
+The remote-body-limits command drives the public echo stream through a
+non-owner ingress and checks the maximum, zero, limit-plus-one (whole and split
+prefix), truncated and coalesced record boundaries against owner-only peer
+chunk reads and dispatch counters, so the forwarded and owner-local ingress
+paths cannot drift on the bounded body-limit decision. Its final stage pins
+the forwarded route's idle bound: a stream that completed a maximum record and
+then carries no traffic is closed by the relay only after the fixture's
+10-second peer HTTP/3 idle timeout. A remote exchange that idles or stalls
+past that bound therefore fails to complete by design, which the owner-local
+route does not enforce.
+A command passing cannot close unrelated rows in [m7-edge-cases.md](m7-edge-cases.md).
+Record the tested revision and outcomes in [m7-verification.md](m7-verification.md).
+
+### Real owner-lease expiry, epoch retention and stale-release fencing
+
+```sh
+cargo run -p tunnel-test-harness --locked -- verify-m7-owner-lease-expiry
+```
+
+The owner-contention command only ever observes a *graceful* owner
+disappearance: the CLI exits, the relay releases its lease and a successor
+claims the retained epoch. That path never exercises the durable lease
+deadline. This command does.
+
+Every relay reaches Redis through an opaque TCP proxy. Once a real CLI owner
+session is serving and has echoed, the proxy pauses both directions of every
+Redis socket, including sockets accepted after the barrier. The relay can then
+neither renew nor release the lease and logs its documented "lease expiry
+remains the fencing fallback" path, so the owner hash can only disappear
+through the `PEXPIREAT` deadline written by the claim script. A second catalog
+handle, connected directly to the upstream Redis rather than through the proxy,
+is the only authority reader that still works during the barrier; it watches
+that disappearance and then attempts the predecessor's exact
+compare-and-release.
+
+The gate asserts, payload-free:
+
+- the predecessor's exact owner token was still present after the barrier, so
+  the later absence is an expiry rather than a pre-existing condition;
+- the disappearance was observed at or after the lease deadline carried in the
+  predecessor's own claim, with the measured margin recorded, and no earlier
+  than one missed renewal tick (the relay renews at a third of the lease);
+- at least one Redis socket was still paused when the absence was observed, so
+  no relay release or delete could have removed the hash;
+- the relay's monotonic lifetime application-dispatch counter did not advance
+  across the expiry. The per-device counter legitimately drops to zero once the
+  expired session is unregistered, so equality would be the wrong contract
+  there and only "did not advance" is required of it;
+- the predecessor's exact compare-and-release is refused both immediately after
+  expiry and again once a successor holds the lease, leaving the successor's
+  complete token unchanged;
+- the retained epoch, seeded above 2^53 before any claim, is honoured: the
+  predecessor claims above the seed and the successor strictly above the
+  predecessor. The epoch key carries no TTL, so a reset to one would fail here.
+
+This is relay no-forward and authority evidence. It is not a claim about device
+side effects, and it does not establish any HA or automatic-failover behaviour:
+the successor is a fresh CLI process started after the predecessor is joined.
+
+### Configured recovery with an unfenced writer
+
+```sh
+cargo test -p tunnel-test-harness --locked --test m7_recovery_process -- \
+  --ignored --test-threads=1
+```
+
+This process-bound gate crosses the executable and socket boundaries: a
+configured relay serves an authenticated device, the operator recovery CLI
+consumes a signed approval after the measured lifetime-plus-skew quiescence
+wait, and a fresh candidate-incarnation relay serves a new device session. A
+separate device is revoked before the approval and stays unauthorized
+afterwards.
+
+Because an operator's fencing declaration is a claim rather than a proof, the
+gate also keeps one writer deliberately unfenced:
+
+- after the operator observes the durable catalog digest, that writer revokes a
+  third device through its still-open handle on the old incarnation. The next
+  observation must report a different digest, and an approval bound to the
+  earlier digest must be refused with the bounded
+  `recovery approval does not match the live catalog observation` diagnostic —
+  the sole `Display` text for `CatalogDigestMismatch`, so no other refusal can
+  satisfy it. The refusal precedes approval-version persistence, so the
+  corrected approval reuses that version and changes only the bound digest;
+- after the corrected approval activates the candidate incarnation, the same
+  still-connected writer attempts an ownership claim. Redis itself must refuse
+  it with the typed `active deployment incarnation` conflict. This is stronger
+  than the existing fresh-connect refusal, which a process holding an open
+  connection would never reach.
+
+The gate returns payload-free evidence and a strict validator re-checks every
+flag plus the measured quiescence floor, so neither half can silently regress
+to a declaration. Operator fencing remains a prerequisite: nothing here
+discovers external writers automatically.
+
+### Fail-closed admission with a request-body sentinel
+
+```sh
+cargo run -p tunnel-test-harness --locked -- verify-m7-i04-fail-closed
+```
+
+`verify-m7-i04-fail-closed` extends the three-relay admission family with the
+negative membership, body-consumption and fallback scopes. Its instrument is a
+*request-body sentinel*: an `http_body::Body` that declares a `content-length`
+and then delivers a controlled number of bytes. Reading the sentinel's own poll
+count is not enough, because the client transport polls a body regardless of
+whether the relay reads it; the evidence is the pair
+`declared_body_bytes > 0, delivered_body_bytes = 0` together with an exact typed
+response that arrives inside a bound far below the relay's ten-second body
+deadline.
+
+That inference is only sound with a control, so the gate always runs one first:
+the same withheld sentinel against a fully valid target must reach
+`408 BODY_TIMEOUT/not_dispatched` after roughly ten seconds. A passing control
+proves the body read really is on this route, which is what makes every
+zero-delivery rejection falsifiable. Treat a fast control as a gate failure, not
+as a faster machine.
+
+The same run records two further non-vacuity controls. A service-type label
+against a device with exactly one active service must still return the exact
+owner canary, otherwise the ambiguous-label rejection proves only that the label
+path is broken. And a successful remote echo through the non-owner ingress must
+precede the caller-named-peer-address check, otherwise zero honeypot datagrams
+only prove that no peer hop happened at all.
+
+Named scenarios and the rows they inform: absent, unknown-service, inactive,
+ambiguous-label and cross-device-destination targets, with the same duplicate
+label rejected identically through the stream upgrade and both candidates still
+visible in the service listing (`EC-003`, M7-C47); a UDP and TCP
+honeypot that consumer headers name but no relay may reach (`EC-017`);
+cross-scope rejection before any body read or peer forward, with the owner-side
+`lifetime_consumer_chunk_reads` counter at zero (`EC-049`); a zero-byte body that
+stays live and is distinct from a failed body stream (`EC-031`); consumed,
+body-free and failed-body requests during a real owner process loss, each with a
+proven `not_dispatched` outcome and zero cluster-wide dispatch (`FP-04`,
+`IN-03`); a SIGKILLed owner connector with at most one committed effect and a
+mandatory fresh owner identity (`EC-023`, `EC-048`); and the explicit advertised
+route set with every excluded path typed, recorded as the route boundary for the
+excluded browser surface (`EC-009`).
+
+Two limits are deliberate. The relay performs **no** automatic reselection on
+any method; the former unreachable admission retry budget was removed rather
+than wired to a route, and [cluster.md](cluster.md) records that decision. The
+gate proves zero reselection (including typed `405 METHOD_NOT_ALLOWED` /
+`not_dispatched` for GET, HEAD and OPTIONS shapes at the lost owner's echo
+route with zero dispatch) plus one bounded *consumer-driven* safe retry after
+the successor owner is committed. The gate also uses the policy
+rotation interval rather than the accelerated M2 one, because a three-second
+replacement carrier injects unrelated owner-readiness windows into admission
+outcomes; owner readiness is instead established by a bounded precondition
+helper before each must-succeed probe, never inside a measured window.
+
+### Process bootstrap and capacity fault matrix
+
+```sh
+cargo test -p tunnel-test-harness --test m7_deployment_failures --locked \
+  -- --ignored --test-threads=1
+```
+
+This process matrix drives the built relay executable through every FP-10
+bootstrap prerequisite: local peer identity, signed membership, signed
+checkpoint authority, Redis authority, peer reachability, and capacity. Each
+case must expose `/livez` as live while `/readyz` stays `503 unready`, emit a
+bounded typed credential-free diagnostic, and release all three listener ports.
+The capacity cases fail during configuration validation, so the executable
+never reaches a listener and the matrix requires `initialize` itself to fail
+with the exact named bound.
+
+The `unreachable-peer` case is the one fault whose documented outcome is not a
+bounded exit. Signed membership names a second relay whose advertised peer
+endpoint has no listener, and the relay must stay alive, live and unready while
+emitting its typed probe-failure diagnostic. The case then binds a real peer
+listener at that exact advertised address, presenting the second relay's own
+signed peer certificate and answering the reserved authenticated health route,
+and requires the same process (same pid, no restart) to converge to ready
+before releasing its ports. Requiring an exit instead would deadlock two relays
+booting together, so the matrix asserts convergence rather than failure there.
+Loss of an authority *after* a ready start is
+`m7_deployment_runtime_faults.rs`.
+
+### Dynamic configured peer-SPKI replacement
+
+```sh
+cargo test -p tunnel-test-harness --test m7_deployment_spki_replacement --locked \
+  -- --ignored --test-threads=1
+```
+
+Two configured relay executables run over separate `rediss://` forwarders and a
+live signed checkpoint authority. Relay A is **never restarted** and is the
+subject: the signed relay-B record walks old -> old+new -> new while a harness
+peer client presents the retired, the replacement and an unapproved certificate
+to A's private listener, and an impostor QUIC server presents the retired
+certificate at relay B's endpoint after the overlap ends. The gate requires, in
+order: the replacement SPKI is refused before any record approves it; both keys
+are accepted during the overlap while the established device session keeps its
+original generation and a public canary still returns the exact canary plus
+payload bytes; A's readiness stays ready for every sample across the overlap;
+the retired SPKI is refused once the replacement-only record is adopted, with
+A's readiness reflecting that pin transition while relay B is still running; the
+relay whose own key was retired surrenders its owner claim and closes its device
+session; a public request across the retired route returns
+`503 CLUSTER_UNREADY` / `not_dispatched` and the impostor receives a connection
+from A but never a request stream; an untrusted signer naming a rogue SPKI
+leaves A unready with both the rogue and the replacement certificate refused;
+and a trusted record restores the replacement-only key set. Every transition
+asserts payload-free, credential-free process diagnostics, and cleanup joins
+both relay processes, the impostor, the checkpoint authority, both Redis
+forwarders and the catalog namespace. The deterministic statement of the same
+replacement rule is `tunnel-cluster`'s
+`membership::tests::peer_key_replacement_walks_old_then_overlap_then_new`.
+
+Two boundaries are deliberate and not claimed by this gate. The typed public
+outcome across the retired route is the readiness boundary rather than
+`PEER_UNTRUSTED`, because the relay withdraws that route from readiness before a
+consumer request reaches peer resolution; the pin failure itself is observed on
+the authenticated probe path, where A dials the retired certificate, refuses it
+and opens no stream. And the **replacement process's own public admission is not
+exercised**. The non-convergence originally recorded here — a relay booting
+beside a peer flapping between ready and unready never reaching `/readyz` ready
+within 20 s (0 of 123 samples) — was a product defect and has been fixed: probe
+admission required the *receiving* relay's readiness-derived route set, which
+was cleared whenever that relay's membership readiness dropped, so a peer which
+was reachable but momentarily unready refused the probe and the prober observed
+`H3_FRAME_UNEXPECTED` ("Stream finished without receiving response headers").
+Reachability is now measured independently of the responder's own readiness; see
+the readiness paragraph in [cluster.md](cluster.md) and the deterministic
+regressions `real_h3_probe_converges_while_peer_cluster_readiness_is_withdrawn`
+and `real_h3_probe_converges_across_a_peer_readiness_flap`. The replacement boot
+is still asserted only through relay A: A's readiness recovers on the
+replacement route and A accepts the replacement certificate on the private path.
+A device session and consumer request served *by* a replaced process remain
+uncovered; see the M7-C06 tracker row.
 
 ## Deterministic transport and state-machine tests
 
@@ -116,8 +478,67 @@ Use three real relay processes, one supported authoritative Redis primary with s
 | Shared authorization | Redis-native tenant/device key scoping, durable catalog revisions, concurrent grant/revocation updates, bounded atomic scripts/functions, least-privilege publisher versus relay identities, and rolling schema/version changes. Durable-catalog read/write failure stops new admission immediately; snapshot lifetime starts at catalog-read initiation and never exceeds five seconds or renews through cache hits. Inject catalog-operation failures independently from ephemeral lease/coordination failures even though both use the same authoritative Redis. |
 | Ownership and tickets | Exercise atomic acquire/increment/renew/compare-release/one-use consumption under races, lost replies and stale node/boot/session tokens. Validate the complete owner token, exact credential/ticket binding, connector fencing ACK before readiness, and rejection before buffer allocation. Old cleanup cannot delete the successor; unknown acquisition/renewal cannot assume authority. |
 | Lease deadlines | Test 30-second TTL, 10-second renewal, five-second owner margin, two-second registry RPC deadline and challenge-send-based device permission of at most 20 seconds. Delay replies, suspend/resume processes and race dispatch after await; authority is checked immediately before each dispatch and cannot be extended from reply receipt or heartbeat traffic. |
-| Forwarded admission | Reject forged source identity, destination owner, tenant/grant, internal headers, credential context and hop budget. The owner independently verifies consumer grants and ticket/device context. Retry route admission once only with proven `NOT_DISPATCHED`; lost/partial acknowledgments preserve uncertainty and never repeat effects. |
+| Forwarded admission | Reject forged source identity, destination owner, tenant/grant, internal headers, credential context and hop budget. The owner independently verifies consumer grants and ticket/device context. The relay performs no automatic route-admission retry; prove zero reselection on every method and that only a consumer-driven retry of a proven `NOT_DISPATCHED` request bridges an owner change. Lost/partial acknowledgments preserve uncertainty and never repeat effects. |
 | Coordination failure | Partition Redis, kill/restart/restore the primary, simulate missing/rolled-back epochs, unknown authority, two primaries and exhausted counters. Test AOF/fsync and verified backup restore as durability behavior only; neither backup success nor replica acknowledgment authorizes promotion. The initial profile rejects automatic promotion: stop admission, fence/close sessions, remain unready, verify the durable catalog/signed directory, and require operator quiescence plus a fresh externally authorized incarnation/checkpoint. Unfenced old writers or incomplete/ambiguous restores block recovery. |
+
+### Continuation verification checkpoint (2026-09-10T08:24:36+10:00)
+
+The maximum encoded-record fix is now linked: peer sends fragment transport
+chunks while preserving one complete record and its whole reservation. Current
+scoped results are recorded in [m7-verification.md](m7-verification.md): cluster
+47, protocol/core 85/8, relay/transport libraries 106/18, Redis catalog/cluster
+5/9, Redis recovery/races 10/2, live boot replacement 1, privileged RPC 7, and
+operator recovery workflow 3 tests pass. Rebuilt transport fault acceptance
+passes all flags; two full production acceptance runs and the process-pause
+fixture pass on that build. The first production revocation-recovery timeout
+remains unexplained, so I22 stays open. Pressure I23, readiness C20, the final
+workspace/Clippy/format gate, M1/M2 reruns and row-by-row matrix closure remain
+open. These counts do not imply current hosted CI or full milestone acceptance.
+
+The reusable M7 script includes both newly linked boot-replacement and operator
+recovery targets. Later readiness/runtime edits require affected acceptance
+reruns. The following older checkpoint remains as chronological evidence and
+must not be read as overriding this scoped update or [tasks.md](tasks.md).
+
+### Current M7 evidence boundaries (2026-09-10)
+
+The focused transport command is evidence for the HTTP/3 component path. The fixed `verify-m7-transport` runtime passes M7-C03's stated narrow gates in `/tmp/agent-tunnel-m7-runtime-verify-m7-transport-fixed.log`: duplex, role/pin, oversize, truncation, idle, cancellation, revocation, sibling, budget, UDP partition, no TCP fallback, 0-RTT disabled, joined shutdown, mutation positive control, and stable admissions. The root cause was test-only `ClientSessionMemoryCache(4)` ticket eviction; bounded size 16 preserves reuse. This closes the narrow transport component scope. The earlier `mutation_positive=false` run remains chronological; broader relay/production fallback evidence remains open.
+
+M7-C06's earlier health-route gap has an implementation in place: redacted `livez`/`readyz` routes and a readiness dispatch gate are now present. The focused log `/tmp/agent-tunnel-m7-validation-m7_health_endpoints.log` records one passing `livez_stays_observable_while_readiness_and_dispatch_fail_closed` test, which closes only the local endpoint/dispatch-gate slice. Test live configured `rediss` authority and both public liveness/readiness endpoints while Redis or membership authority is unavailable; synthetic readiness fixtures and Redis-directory tests do not establish startup checkpoint refresh, full dependency-loss behavior, or fail-closed admission in that process-level condition.
+
+M7-C07 requires direct returned-error cleanup from each relevant control, data, and peer handler. Receiver-drop, queue-budget, stale-successor, and cancellation regressions cover bounded cleanup components, but they do not close every handler path that returns an error after admission. The latest focused cleanup checkpoint passes 1/1 with a real H3 `PeerClientStream`: a valid envelope receives 200/OPEN, a declared one-byte consumer prefix with no payload is followed by FIN, `RecordingHandler` increments its error count before revocation, and the raw stream is terminal while the original stream queue remains charged. This closes the direct consumer returned-error cleanup and sibling-isolation subset. The staged control-cleanup fixture's two-catalog setup was rejected in review and is being corrected to one authority or explicitly scoped direct post-admission handler testing. The remaining control/data returned-error cases are staged by `peer_deadlines` after successful control registration and data admission, using malformed peer framing before actor cleanup; no new control/data result is claimed and broad all-exit coverage remains open. The earlier 86/87 and 0/1 failures remain chronological evidence in [m7-verification.md](m7-verification.md). See [tasks.md](tasks.md).
+
+M7-C16's Redis TLS API and real peer mTLS forwarder fixture passed build 40800 with all four flags true: authenticated catalog connection, wrong-CA rejection, wrong-server-name rejection, and wrong-client-identity rejection. This closes the narrow TLS fixture scope; full relay `rediss` deployment and health integration remain open. M7-C17's false-flag handling fix in `main` requires fresh production, transport, and partition command runs; earlier passing output remains dated baseline evidence.
+
+M7-C18 must bind each inbound and outbound peer flow to the actual authenticated certificate during signed key overlap. A first signed-valid SPKI is insufficient: an overlap certificate can be globally approved while failing equality against that first key. The focused log `/tmp/agent-tunnel-m7-validation-m7_live_membership.log` now records one test passed in 0.07 seconds, covering real H3 old/new positives, an unknown same-node certificate rejection, and no-hint signed removal/expiry. This closes the narrow certificate-binding slice; broader propagation remains M7-I06.
+
+M7-C19 is in handover. The generic encoded-record boundary is explicit: a valid `CompleteDeviceData` body of 65,600 bytes encodes to 65,608 bytes, above the 65,536-byte H3 chunk maximum. `peer_fault_harness` is frozen after changing only `crates/tunnel-transport/src/peer.rs`, where unvalidated `send_chunked(&[u8])` methods/helper sequentially split by the actual `BodyBudget.max_chunk_bytes`. Wire the two send helpers in `peer_runtime.rs`, remove the unused `Bytes` import, add focused tests, and run transport/maximum-size production validation. Consumer workaround bodies remain 65,528 bytes. Preserve the advertised limit and required auth/isolation behavior; runtime verification is pending and no pass is claimed. Dedicated security auditing is deferred to Daybreak when requested.
+
+The fresh local suite checkpoint records relay library 88 passed/0 failed,
+health endpoints 1/0, persistence 4/0, readiness 9/0, harness library 27
+passed with 1 ignored, harness main 6/0, live membership 1/0, and privileged
+RPC 4/0 in `/tmp/agent-tunnel-m7-validation-tests.log`. The standalone binary
+build passed in `/tmp/agent-tunnel-m7-validation-build.log`; this is local
+library/harness/build evidence and does not establish production three-relay
+acceptance or hosted CI.
+
+The task-owned fixture permission correction now gets the latest
+`verify-m7-production` run past the strict membership-state parent check, but
+the run fails later with `production echo closed before response`
+(`/tmp/agent-tunnel-m7-runtime-production-current.log`). Static phase diagnosis
+is active and has not identified whether the initial or maximum-size canary
+failed. No C19, canary-isolation, or complete production acceptance assertion
+is counted. `real_cluster_harness` repairs only its task-owned fixture
+directory while production private-path checks remain strict. Affected current
+production rows stay implemented-awaiting-verification under C06/I12/I20 until
+the focused diagnosis and required reruns pass; earlier startup and production
+passes remain dated history.
+
+The real signed key-rotation and expiry socket slice now has one narrow pass recorded above; M7-I06 remains active for propagation, expiry bounds, and deployment diagnostics. The M7-I07 production-pressure implementation is present and compiles, but no runtime pressure result is recorded; compile session 21471's fixture issues remain chronological evidence in [m7-verification.md](m7-verification.md). A read-only `verify_scope` audit is checking applicability, evidence scope, and circular adapter dependencies before the 98-row matrix is edited. The I20 verifier fix and production `new_with_store` wiring are implemented; the corrected persistence fixture must still prove save-before-publish behavior in a runtime rerun.
+
+The corrected catalog session 32255 passed 23 unit tests, including six approval and six full-schema tests, plus five `redis_catalog` and nine `redis_cluster` tests, with current-generation mutation regressions. The exclusive-validator recovery checkpoint then passed `redis_recovery_races` 2/2 (`/tmp/agent-tunnel-m7-validation-redis-recovery-races.log`) and `redis_recovery` 10/10 (`/tmp/agent-tunnel-m7-validation-redis-recovery.log`), including oversized-key, cumulative-key-byte, and dedicated-connection cases. These are bounded I19/I21 subsets; operator CLI recovery and post-EXEC ambiguity remain open. The staged operator module now has redacted `Debug`, supervised blocking phases, and staged Redis workflow tests. `recovery.rs.disabled` contains three ignored recovery test cases, but they are not linked into Cargo and have not run; `wiring.md` likewise has no integration evidence. The canonical recovery snapshot must include orphan, direct-lookup, and epoch keys and bind one catalog generation atomically. Avoid `WATCH` phantoms and pre-bound `HGETALL`/`SMEMBERS` allocation, reject a same-incarnation live-owner bypass, and retain bounded raw `SCAN` handling. The hardened I20 store uses standard OS sidecar locking, safe no-follow FD validation, and a private parent; its verifier fix and production `new_with_store` wiring are implemented. The local persistence/restart log `/tmp/agent-tunnel-m7-validation-m7_membership_persistence.log` records 4/4 passed, closing that local scope alongside prior `membership_version_state` unit coverage; full server-process deployment and configured health/readiness integration remain C06. The owned synthetic process-pause command passed with three relays and fresh-owner recovery; it does not exercise a desktop or close the broader lifecycle gate. The privileged RPC baseline is 4 passed/0 failed in the fresh suite; the expanded target passed 6/6 in `/tmp/agent-tunnel-m7-validation-m7_privileged_rpc-final.log`, including shared-pool same-ID isolation and deadline/retained-worker cleanup. Its source now has seven tests, with the corrected deadline assertion and a separate active-worker shutdown case awaiting validation; no fixed sleeps remain. A separate active synthetic state-admission slice covers EC065/EC066 without claiming production adapters, Redis, SQLite, or later adapter semantics. See [m7-verification.md](m7-verification.md).
+
+The `real_cluster_harness` EC011 public `/livez` 200, `/readyz` 503 during an actual Redis partition, then `/readyz` 200 after restore assertions and mandatory-flag mapping are implemented; Cargo/runtime verification remains pending. An active `verify_scope` synthetic RPC slice targets EC065/EC066 terminal/commit/success-ACK counts and frozen, fenced, pending, poisoned, stopped, and uncertain manager-state admission. That slice has no runtime result yet. `scripts/m7-harness-verify.sh` and the M7 CI job have passed only local script-syntax and workflow-YAML checks; no hosted CI result is claimed. Keep the M7 gate and 98-row matrix open until these scoped checks and the remaining lifecycle/adapter evidence are rerun.
 
 Verify independent device `AUTHORIZATION_CHALLENGE`/`AUTHORIZATION_CONFIRMED` for every frozen stream context: grant scope/digest/revision and owner binding, latest one-use nonce, and deadline anchored at device challenge creation before queueing. The owner supplies only remaining lifetime from the original Redis catalog read-start deadline; cached reads cannot renew it. Test the five-second authorization ceiling while ownership permission remains valid for 20 seconds, two-second refresh/timeout, delayed/duplicate/reordered confirmations, snapshot predating the challenge, and clock suspension. Buffered decoded 9P requests and later privileged steps must recheck after every await and expire without dispatch; reset stale streams, discard undispatched work, and preserve already-started outcomes. Late confirmation cannot revive a closed context, and changed grants require fresh OPEN. Exercise the 64-context, one-outstanding-nonce, 2 KiB single-context message and bounded renewal-queue limits during saturated rotation/cancellation traffic.
 
@@ -137,9 +558,66 @@ Test deduplication identifiers within their declared scope, duplicate terminal r
 
 Use generated binary files and synthetic screenshots, including empty data, invalid text bytes, and payloads above every configured threshold. Transfer small interactive responses concurrently with large file reads, file writes, and screenshot streams. Slow or stop an individual reader and verify that its queues are bounded and other users and devices continue to make progress.
 
+Listener connection permits need real-socket evidence, not a counter assertion. Fill every one of the 64 permits with connections that complete an actual TLS 1.3 handshake and then send no application byte, and prove that a further connection is refused while they are held, that each silent connection is closed within the configured pre-request bound, that the permit count returns to full, and that a further connection is then served. Separately prove the bound cannot kill an established connection: an in-flight request lasting several times the bound must still complete, and a keep-alive connection that already dispatched a request must still serve a second request after the bound elapsed. `crates/tunnel-transport/tests/m7_listener_permits.rs` holds these regressions.
+
 Assert maximum frame size, maximum operation size, per-stream and per-connection queue limits, in-flight operation limits, and per-user/device quotas. Test admission at the limit and one unit over it, cancellation of a blocked writer, disk-full errors, exhausted file handles, and memory-pressure behavior. Verify that heartbeat, cancellation, revocation, and rotation control messages remain responsive while the data path is saturated.
 
+An in-flight operation limit that is only relay-global is not a tenant-isolation test. A capacity regression must prove that one tenant saturating its own allowance still leaves another tenant's public request admitted, that the relay-global bound independently refuses a tenant whose own scope is empty, and that every permit returns exactly once when a request is abandoned or an upgrade is cancelled. `crates/tunnel-relay/src/http/tenant_admission_tests.rs` runs two fully independent tenants through the real consumer route on a loopback listener for those invariants; a double release is detected by the released capacity readmitting more streams than the bound allows, not by inspecting a counter alone.
+
 Measure peak resident memory, queue high-water marks, end-to-end latency, fairness, and bytes transferred. A successful checksum proves content integrity; a successful return code alone does not. Use a streaming generator and sink so the harness does not conceal relay buffering by preloading entire files into memory.
+
+### Physical versus logical queue occupancy
+
+A session's logical admission count (`queue_messages`, which is pending
+operations plus streams) is not occupancy and must never be reported as
+saturation evidence. The relay publishes the physical counters a gate needs:
+`data_queue_depth`/`data_queue_capacity` and
+`control_queue_depth`/`control_queue_capacity` are live item counts taken from
+the bounded channels themselves, `*_depth_high_water` and
+`queue_bytes_high_water` are saturating latches that a bounded observation
+window cannot miss, `queue_bytes_limit` exposes the configured budget beside its
+use, and `control_queue_refusals`/`data_queue_refusals` plus
+`control_queue_enqueued`/`data_queue_enqueued` separate "never refused" from
+"actually still flowing". All are payload-free.
+
+`verify-m7-queue-saturation` is the configured-bound gate built on them. It runs
+through a non-owner ingress, admits the full `max_streams_per_device` cap and
+proves the next admission is refused, blackholes the exact correlated data
+carrier, and then requires physical residency, retained reserved control and
+data capacity with a byte headroom floor, an advancing accepted-control-enqueue
+count during the blackhole, a real cancellation with an immutable first-terminal
+observation, bounded physical drain, and three same-owner rotations beginning
+with the one that replaces exactly the paused carrier. Across those rotations it
+requires generations to advance by one and never rewind, the socket bound to
+hold, and each attempt to keep one absolute deadline: the same start and the same
+deadline across at least two observations of that attempt, and within the
+configured overlap of that attempt's own start.
+
+Two limits are deliberately **not** in this gate, with reasons recorded so the
+omission is not mistaken for coverage. Public body and length-prefix limits stay
+with M7-C24 and EC-007: while building this gate, a record whose length prefix
+declares one byte above `max_body_bytes` was observed not to fail closed on the
+**remote** consumer ingress. `handle_consumer_stream` breaks the connection on
+`declared > MAX_BODY_BYTES`, but the peer path in `handle_remote_consumer_stream`
+treats the same condition as an incomplete record and waits for more bytes, so an
+over-limit prefix stalls instead of being refused. A maximum-size body on that
+route also failed to complete in this fixture while the established production
+gate's maximum-body probe passes, so the difference needs its own diagnosis
+rather than an assertion bolted onto a saturation gate. Late, reordered and
+duplicate frames, GOAWAY, and active privileged-adapter traffic across rotations
+remain with their own tasks; echo rotation here is supporting evidence only.
+
+Two bounds make the nominal 128-entry data channel unreachable from the public
+echo route, and the gate asserts that rather than hiding it. The consumer
+ingress admits one in-flight record per stream, and
+`max_queue_messages = 2 * max_streams_per_device`, so residency is capped at 64
+entries for every admissible body size; a maximum 64 KiB record additionally
+spans two frames charging 131,208 bytes, so only 31 such records fit the 4 MiB
+budget (62 entries). Separately, the frames the kernel socket buffers absorb
+before the writer blocks are no longer charged, so the gate derives the absorbed
+count from the relay's own accepted-enqueue counter rather than assuming a
+buffer size. A workload that cannot fill the channel must say so with numbers;
+it must not be relabelled as success against a logical count.
 
 ## Filesystem API and framework interoperability
 
@@ -288,3 +766,5 @@ Report expected errors caused by fault injection separately from unexplained fai
 Keep fast unit/config/codec tests in every pull request. Add protocol and adapter suites to required pull-request jobs as their implementations land. Schedule longer property, fuzz, real-interval rotation, soak, and VM runs separately, and make their relevant results release requirements. A skipped VM or upstream contract job must remain visible as unverified coverage.
 
 For release artifacts, build for every advertised OS/architecture, record checksums and provenance, then download and unpack those artifacts into clean temporary environments. Execute their help/version/config checks and launch the packaged relay and device for a real consumer-to-device operation and a rotation. Verify that expected configuration examples, notices, and required runtime assets are present and that no workspace-only dependency is masking a missing file. macOS/Linux/Windows CI success is not by itself evidence for every architecture on those systems.
+
+For the local macOS-arm64 CLI scope of IN-10/OG-05, `scripts/m7-local-source-parity-build.sh` builds the workspace binaries from an immutable copy of the current `HEAD` source inputs (crates, vendor, examples, root Cargo metadata) and emits an immutable `source-parity-receipt.txt` tying the copied source digest to each binary's sha256. `scripts/m7-local-artifact-verify.sh --build-receipt <receipt>` then cross-checks that receipt — the recorded base `HEAD`, tracked-diff digest and worktree-status digest must equal the current checkout's, and every supplied binary's sha256 must equal the receipt's digest — and only then records `binary_provenance=verified` and source-to-binary provenance as verified; any mismatch is fatal, so provenance is never falsely claimed. Without `--build-receipt` the verifier still records provenance as unverified. Both scripts are single-host, local macOS-arm64, this-source-only observers; they make no release, other-OS/architecture, hosted-CI or full-M7-row claim, and neither builds nor mutates the original checkout. Drive the source-matched CLI into an acceptance gate by exporting `TUNNEL_CLIENT_BIN=<bundle>/bin/tunnel-client` (the verifier writes a `tunnel-client-env.sh` for this) so `verify-m7-production` and `verify-m7-chaos`/`verify-m7-i08-recovery-attempts` record heartbeat, liveness, bounded shutdown and no-reconnect-storm evidence against the exact receipt-matched binary.

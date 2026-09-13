@@ -1,6 +1,6 @@
 //! Strict TOML parsing and bounded configuration values.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{error::Error, fmt};
 
 /// Rotation policy. All durations are whole seconds.
@@ -9,7 +9,7 @@ use std::{error::Error, fmt};
 /// including its handshake. An abort before commit closes the replacement;
 /// after commit the old socket must close within this budget. It is not an
 /// additional drain period after the handshake.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RotationConfig {
     /// Target age of a data socket before replacement; 1..=86,400 seconds.

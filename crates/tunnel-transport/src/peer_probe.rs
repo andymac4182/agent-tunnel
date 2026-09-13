@@ -417,7 +417,9 @@ where
     Ok(Bytes::from(body))
 }
 
-fn verified_peer_identity(connection: &quinn::Connection) -> Result<TlsIdentity, PeerProbeError> {
+pub(crate) fn verified_peer_identity(
+    connection: &quinn::Connection,
+) -> Result<TlsIdentity, PeerProbeError> {
     let identity = connection
         .peer_identity()
         .ok_or(PeerProbeError::MissingPeerCertificate)?;
@@ -427,7 +429,7 @@ fn verified_peer_identity(connection: &quinn::Connection) -> Result<TlsIdentity,
     parse_leaf_identity(&certificates).map_err(PeerProbeError::Identity)
 }
 
-fn verify_peer(
+pub(crate) fn verify_peer(
     identity: &TlsIdentity,
     approved_pins: &ApprovedPeerPins,
 ) -> Result<(), PeerProbeError> {

@@ -429,15 +429,24 @@ async fn redis_authority_clock_bounds_expiry_checks() {
     };
     let device = fixture.devices[0].device_id;
     let service = fixture.services[0].service_id;
-    let too_old = Utc::now() - Duration::seconds(2);
-    assert!(matches!(
-        catalog
-            .resolve_device(&fixture.credentials[0].spki_fingerprint, too_old)
-            .await,
-        Err(tunnel_catalog::CatalogError::Conflict(
-            "authority clock skew"
-        ))
-    ));
+    // A caller clock behind the authority is tolerated up to the Redis
+    // operation timeout (a slow reply must not be refused as skew), so the
+    // refusal boundary is that lag bound, not the one-second ahead bound.
+    // Thirty seconds is far beyond both and is immune to the sub-second
+    // drift between the host clock and the containerised authority.
+    let too_old = Utc::now() - Duration::seconds(30);
+    let skewed = catalog
+        .resolve_device(&fixture.credentials[0].spki_fingerprint, too_old)
+        .await;
+    assert!(
+        matches!(
+            skewed,
+            Err(tunnel_catalog::CatalogError::Conflict(
+                "authority clock skew"
+            ))
+        ),
+        "a caller clock far behind the authority must be refused as clock skew, observed {skewed:?}"
+    );
     assert!(matches!(
         catalog
             .authorize(&principal, device, service, too_old, too_old)
@@ -544,4 +553,89 @@ async fn redis_authority_clock_bounds_expiry_checks() {
         .cleanup_fixture_namespace()
         .await
         .expect("cleanup clock fixture namespace");
+}
+
+/// A caller timestamp that lags the authority by more than the clock-skew
+/// budget but still arrives inside the 2 second authority deadline must be
+/// honoured, not rejected as clock skew.
+///
+/// The script cannot separate "the caller's clock is wrong" from "this command
+/// spent time in flight": it only ever sees the timestamp the caller sampled
+/// before dispatching. docs/cluster.md records the 2 second authority deadline
+/// as the single boundary for a maintenance read, with a later reply reported
+/// as the `timeout` category. A symmetric skew bound tighter than that deadline
+/// creates a second, undocumented boundary in which a reply the transport
+/// accepted is deterministically refused, and refused as a `conflict` rather
+/// than a timeout. Lagging callers are already fail-closed without the
+/// rejection: every script evaluates validity at `math.max(caller_at, now)` and
+/// translates the returned windows back into the caller's frame, so a stale
+/// caller timestamp can only shorten a validity window, never extend one.
+#[tokio::test]
+#[ignore = "requires TUNNEL_CATALOG_REDIS_URL Redis primary fixture"]
+async fn redis_authority_accepts_caller_lag_inside_the_authority_deadline() {
+    let url = std::env::var("TUNNEL_CATALOG_REDIS_URL")
+        .expect("M1 Redis harness must set TUNNEL_CATALOG_REDIS_URL");
+    let namespace = format!("test-lag-{}", Uuid::new_v4());
+    let catalog = RedisCatalog::connect_for_recovery(&url, &namespace, "fixture-incarnation")
+        .await
+        .expect("connect Redis catalog");
+    catalog
+        .activate_deployment_incarnation()
+        .await
+        .expect("activate explicit fixture incarnation");
+    let fixture = fixture();
+    catalog.seed_fixture(&fixture).await.expect("seed fixture");
+    let principal = AuthenticatedConsumer {
+        tenant_id: fixture.tenants[0].tenant_id,
+        principal_id: fixture.users[0].user_id,
+    };
+    let device = fixture.devices[0].device_id;
+    let service = fixture.services[0].service_id;
+
+    // 1.5s is the band the relay's maintenance tick actually observed: past the
+    // 1 second skew budget, inside the 2 second authority deadline.
+    let lagging = Utc::now() - Duration::milliseconds(1_500);
+
+    let identity = catalog
+        .resolve_device(&fixture.credentials[0].spki_fingerprint, lagging)
+        .await
+        .expect("a reply inside the authority deadline must not be a clock-skew conflict")
+        .expect("the seeded credential remains live");
+    assert_eq!(identity.device_id, device);
+    assert!(identity.device_active);
+    assert!(identity.credential_active);
+    // The window is translated into the lagging caller's frame, so it may only
+    // shorten. It must never be reported as still valid past the real expiry.
+    assert!(identity.expires_at <= fixture.credentials[0].expires_at);
+
+    let grant = catalog
+        .authorize(&principal, device, service, lagging, lagging)
+        .await
+        .expect("a reply inside the authority deadline must not be a clock-skew conflict")
+        .expect("the seeded grant remains live");
+    assert_eq!(grant.device_id, device);
+    assert!(grant.valid_until > lagging);
+
+    let devices = catalog
+        .list_devices_filtered(&principal, &DeviceListFilter::default(), lagging)
+        .await
+        .expect("a reply inside the authority deadline must not be a clock-skew conflict");
+    assert!(devices.iter().any(|summary| summary.device_id == device));
+
+    // A caller whose clock runs ahead of the authority is genuine skew and
+    // stays refused: `math.max` would otherwise extend a validity window.
+    let ahead = Utc::now() + Duration::milliseconds(1_500);
+    assert!(matches!(
+        catalog
+            .resolve_device(&fixture.credentials[0].spki_fingerprint, ahead)
+            .await,
+        Err(tunnel_catalog::CatalogError::Conflict(
+            "authority clock skew"
+        ))
+    ));
+
+    catalog
+        .cleanup_fixture_namespace()
+        .await
+        .expect("cleanup lag fixture namespace");
 }

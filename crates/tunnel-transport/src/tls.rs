@@ -128,6 +128,8 @@ impl SanName {
 pub struct TlsIdentity {
     role: CertificateRole,
     spki_sha256: SpkiSha256,
+    certificate_serial: String,
+    certificate_not_before: i64,
     certificate_expires_at: i64,
     subject: String,
     subject_alt_names: Vec<SanName>,
@@ -144,6 +146,27 @@ impl TlsIdentity {
     #[must_use]
     pub const fn spki_sha256(&self) -> SpkiSha256 {
         self.spki_sha256
+    }
+
+    /// Return the leaf certificate serial as lower-case, colon-separated
+    /// hexadecimal bytes in the same representation used by x509-parser.
+    ///
+    /// This is observed certificate metadata.  It is not an authorization
+    /// decision and must still be compared with the authoritative credential
+    /// record by the caller.
+    #[must_use]
+    pub fn certificate_serial(&self) -> &str {
+        &self.certificate_serial
+    }
+
+    /// Return the leaf certificate's `notBefore` value as Unix seconds.
+    ///
+    /// This is observed certificate metadata.  It is not an authorization
+    /// decision and must still be checked against the authoritative
+    /// credential validity window by the caller.
+    #[must_use]
+    pub const fn certificate_not_before(&self) -> i64 {
+        self.certificate_not_before
     }
 
     /// Return the leaf certificate's `notAfter` value as Unix seconds.
@@ -256,6 +279,8 @@ pub(crate) fn parse_leaf_identity(
     Ok(TlsIdentity {
         role,
         spki_sha256,
+        certificate_serial: certificate.raw_serial_as_string(),
+        certificate_not_before: certificate.validity().not_before.timestamp(),
         certificate_expires_at: certificate.validity().not_after.timestamp(),
         subject,
         subject_alt_names,
@@ -571,5 +596,24 @@ mod tests {
             pin.to_hex(),
             "abababababababababababababababababababababababababababababababab"
         );
+    }
+
+    #[test]
+    fn identity_exposes_observed_certificate_validity_and_serial() {
+        let identity = TlsIdentity {
+            role: CertificateRole::Peer {
+                id: "relay-01".into(),
+            },
+            spki_sha256: SpkiSha256::from_bytes([0x42; 32]),
+            certificate_serial: "01:02:ff".into(),
+            certificate_not_before: 1_700_000_000,
+            certificate_expires_at: 1_700_100_000,
+            subject: "CN=relay-01".into(),
+            subject_alt_names: vec![SanName::Uri("urn:agent-tunnel:peer:relay-01".into())],
+        };
+
+        assert_eq!(identity.certificate_serial(), "01:02:ff");
+        assert_eq!(identity.certificate_not_before(), 1_700_000_000);
+        assert_eq!(identity.certificate_expires_at(), 1_700_100_000);
     }
 }

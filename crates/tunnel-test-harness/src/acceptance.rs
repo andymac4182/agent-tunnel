@@ -5,7 +5,7 @@
 //! relay actor all remain production implementations; this file only creates
 //! synthetic inputs and records bounded evidence.
 
-mod helpers;
+pub(crate) mod helpers;
 
 use crate::{Direction, FaultAction, FaultScript, ProxyConfig, ProxyHandle, TcpProxy};
 use crate::{Harness, HarnessError, HarnessOptions, OidcTokenOptions, Result, RunningHarness};
@@ -21,13 +21,22 @@ use std::{
 };
 use tokio::time::{sleep, timeout};
 use tunnel_catalog::{Catalog, DeviceSummary};
-use tunnel_client::{ConnectOptions, ConnectionHandle};
+use tunnel_client::{ConnectConfig, ConnectOptions, ConnectionHandle, TransportProfile};
 use tunnel_relay::RelayLimits;
 use uuid::Uuid;
 
 const SUITE_TIMEOUT: Duration = Duration::from_secs(150);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const REVOCATION_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Keep the legacy M1 acceptance on its explicit finite profile now that new
+/// library callers default to M2.  The fixtures still prove the original M1
+/// contract and must not accidentally start a rotation runtime.
+fn m1_options(config: ConnectConfig) -> ConnectOptions {
+    let mut options = ConnectOptions::new(config);
+    options.profile = TransportProfile::M1;
+    options
+}
 
 /// Run the M1 acceptance gate against the harness's real durable catalog,
 /// real relay TLS listeners, and five real connector sessions.
@@ -246,7 +255,7 @@ async fn connect_all(
     clients: &mut Vec<ConnectionHandle>,
 ) -> Result<()> {
     for profile in profiles {
-        let mut handle = tunnel_client::connect(ConnectOptions::new(profile.config.clone()))
+        let mut handle = tunnel_client::connect(m1_options(profile.config.clone()))
             .await
             .map_err(|error| {
                 HarnessError::Process(format!("device connector failed to connect: {error}"))
@@ -984,7 +993,7 @@ async fn verify_proxy_drop_and_fresh_session(
     // establish a fresh epoch after the proxy-induced pair failure.
     profiles[0].config.relay_url =
         format!("wss://localhost:{}/v1/tunnel/control", device_addr.port());
-    let mut fresh = tunnel_client::connect(ConnectOptions::new(profiles[0].config.clone()))
+    let mut fresh = tunnel_client::connect(m1_options(profiles[0].config.clone()))
         .await
         .map_err(|error| {
             HarnessError::Process(format!("fresh post-proxy connector failed: {error}"))
@@ -1059,7 +1068,7 @@ async fn verify_disconnect_and_fresh_session(
         sleep(Duration::from_millis(100)).await;
     }
 
-    let mut fresh = tunnel_client::connect(ConnectOptions::new(profiles[index].config.clone()))
+    let mut fresh = tunnel_client::connect(m1_options(profiles[index].config.clone()))
         .await
         .map_err(|error| {
             HarnessError::Process(format!("fresh connector failed to connect: {error}"))
@@ -1175,7 +1184,7 @@ async fn verify_cli_smoke(
     let mut fresh = None;
     let retry_started = Instant::now();
     while retry_started.elapsed() < Duration::from_secs(10) {
-        match tunnel_client::connect(ConnectOptions::new(profile.config.clone())).await {
+        match tunnel_client::connect(m1_options(profile.config.clone())).await {
             Ok(mut candidate) => match timeout(REQUEST_TIMEOUT, candidate.wait_ready()).await {
                 Ok(Ok(_)) => {
                     fresh = Some(candidate);
@@ -1341,5 +1350,59 @@ fn assert_named(condition: bool, name: &str) -> Result<()> {
         Err(HarnessError::Http(format!(
             "acceptance assertion failed: {name}"
         )))
+    }
+}
+
+#[cfg(test)]
+mod c17_validator_tests {
+    use super::{HttpResponse, assert_echo, assert_named, assert_status};
+    use crate::acceptance_test_support::assert_rejected;
+
+    fn echo_response(canary: &str, body: &[u8]) -> HttpResponse {
+        let mut bytes = canary.as_bytes().to_vec();
+        bytes.extend_from_slice(body);
+        HttpResponse {
+            status: hyper::StatusCode::OK,
+            body: bytes,
+        }
+    }
+
+    #[test]
+    fn m1_named_assertions_accept_matching_observations() {
+        assert_named(true, "gate").expect("true condition passes");
+        let response = echo_response("canary-", b"fixture-secret-token");
+        assert_status(&response, hyper::StatusCode::OK, "status").expect("matching status passes");
+        assert_echo(&response, "canary-", b"fixture-secret-token", "echo")
+            .expect("matching echo passes");
+    }
+
+    #[test]
+    fn m1_named_assertions_reach_the_shared_exit_path_without_echoing_bodies() {
+        assert_rejected(assert_named(false, "named-gate"), "named-gate");
+        let response = echo_response("canary-", b"fixture-secret-token");
+        assert_rejected(
+            assert_status(&response, hyper::StatusCode::FORBIDDEN, "status-gate"),
+            "status-gate: expected 403",
+        );
+        assert_rejected(
+            assert_echo(
+                &response,
+                "other-canary-",
+                b"fixture-secret-token",
+                "echo-gate",
+            ),
+            "echo-gate",
+        );
+        let mut wrong_status = echo_response("canary-", b"fixture-secret-token");
+        wrong_status.status = hyper::StatusCode::SERVICE_UNAVAILABLE;
+        assert_rejected(
+            assert_echo(
+                &wrong_status,
+                "canary-",
+                b"fixture-secret-token",
+                "echo-status-gate",
+            ),
+            "echo-status-gate",
+        );
     }
 }
