@@ -41,7 +41,15 @@ mkdir -p "$C11_CHILD_FAILURE_DIR"
 : > "$out/summary.tsv"
 
 # Gates whose assertions are bounded by real deadlines; these run alone.
-SERIAL='credential-expiry|recovery-attempts|goaway|peer-capacity|timing-boundaries|queue-saturation|og02|c11-diagnostics|chaos'
+#
+# The tunnel-catalog Redis integration tests are here for a measured reason.
+# They assert against the catalog's own two-second Redis operation bound, which
+# is a product constant, so running them beside the parallel lane measures how
+# busy the machine is rather than the property under test.  Under six competing
+# CPU hogs they fail four times out of four with `Database(timed out)` during
+# fixture setup, and they pass every standalone run.  The product bound is not
+# the thing to relax, so the schedule is.
+SERIAL='credential-expiry|recovery-attempts|goaway|peer-capacity|timing-boundaries|queue-saturation|og02|c11-diagnostics|chaos|tunnel-catalog'
 
 python3 - "$REPO/scripts/m7-harness-verify.sh" <<'PY' > "$out/gates.list"
 import re, sys
