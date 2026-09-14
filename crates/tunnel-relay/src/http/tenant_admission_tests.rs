@@ -782,3 +782,137 @@ fn scoped_admission_clamps_a_per_owner_bound_above_the_global_bound() {
     assert_eq!(ScopedAdmission::new(2, 64).permits(), 2);
     assert_eq!(ScopedAdmission::new(0, 64).permits(), 1);
 }
+
+/// RFC 6455 close opcode.
+const CLOSE_OPCODE: u8 = 0x8;
+
+/// Encode one client close frame.  Clients must mask, so this is the exact
+/// wire shape a browser sends when it closes a stream normally.
+fn client_close_frame(code: u16) -> Vec<u8> {
+    let mask = [0x37_u8, 0xfa, 0x21, 0x3d];
+    let payload = code.to_be_bytes();
+    let mut frame = vec![0x80 | CLOSE_OPCODE, 0x80 | payload.len() as u8];
+    frame.extend_from_slice(&mask);
+    for (index, byte) in payload.iter().enumerate() {
+        frame.push(byte ^ mask[index % mask.len()]);
+    }
+    frame
+}
+
+/// Read one server frame off the upgraded socket, or `None` at end of stream.
+/// Server frames are never masked and control payloads never reach the
+/// extended-length forms, so both are asserted rather than parsed.
+async fn read_server_frame(socket: &mut TcpStream) -> Option<(u8, Vec<u8>)> {
+    let mut header = [0_u8; 2];
+    if socket.read_exact(&mut header).await.is_err() {
+        return None;
+    }
+    assert_eq!(header[1] & 0x80, 0, "a server frame must not be masked");
+    let length = usize::from(header[1] & 0x7f);
+    assert!(
+        length < 126,
+        "a control frame payload stays inside its 125-byte bound, saw {length}"
+    );
+    let mut payload = vec![0_u8; length];
+    if length > 0 {
+        socket
+            .read_exact(&mut payload)
+            .await
+            .expect("read server frame payload");
+    }
+    Some((header[0] & 0x0f, payload))
+}
+
+/// EC-043 (section 5 row 3: the browser sends a normal close first) against
+/// the consumer WebSocket path that exists today.  Three of the row's four
+/// required properties are observable here and are asserted on the real
+/// socket: the relay answers a normal consumer close with exactly one
+/// flushed close frame, that reciprocal close lands on a bound far shorter
+/// than the stream's own authorization horizon, and the stream's admission
+/// permits -- relay-global and per-owner -- come back afterwards.
+///
+/// The row's fourth property, split-direction close state, is deliberately
+/// not asserted: the present path tears both directions down together, and a
+/// half-closed consumer direction only becomes meaningful inside the future
+/// consumer WebSocket adapter.
+#[tokio::test]
+async fn a_normal_consumer_close_is_answered_once_within_a_bound_and_frees_its_permits() {
+    // SPKI fingerprints are 64 lowercase hex characters; this stage's catalog
+    // is its own, so reusing hex digits across stages cannot collide.
+    let tenants = [Tenant::new("a", 7, '0'), Tenant::new("b", 8, '1')];
+    // One permit per owner scope: a permit leaked across a normal close would
+    // refuse the readmission asserted at the end of this test.
+    let stage = Stage::start("ec043-normal-close", &tenants, 4, 1, None).await;
+
+    let mut accepted = stage.attempt(&tenants, 0).await;
+    assert_eq!(accepted.status, 101, "the consumer stream upgraded");
+    let mut socket = accepted.socket.take().expect("upgraded consumer socket");
+    assert_eq!(
+        stage.scoped.in_flight(tenants[0].scope()),
+        1,
+        "the live stream holds its per-owner permit"
+    );
+    assert_eq!(
+        stage.admission.available_permits(),
+        3,
+        "the live stream holds one relay-global permit"
+    );
+
+    // The browser closes first, normally.
+    socket
+        .write_all(&client_close_frame(1000))
+        .await
+        .expect("write the client's normal close frame");
+
+    let started = tokio::time::Instant::now();
+    let (opcode, payload) = timeout(POLL_BUDGET, read_server_frame(&mut socket))
+        .await
+        .expect("the relay answered the close inside its bound")
+        .expect("the relay answered with a close frame rather than a silent teardown");
+    let reciprocal_close = started.elapsed();
+    assert_eq!(
+        opcode, CLOSE_OPCODE,
+        "the relay's first reply to a normal close is a close frame"
+    );
+    // Either an empty payload or a well-formed status code; a one-byte
+    // payload is not a legal close body.
+    assert!(
+        payload.is_empty() || payload.len() >= 2,
+        "the reciprocal close carries a well-formed payload, saw {payload:?}"
+    );
+    // The grant and the consumer token in this fixture are ten minutes out,
+    // so the stream's own authorization deadline cannot be what bounded this
+    // reply.  The reciprocal close has a bound of its own.
+    assert!(
+        reciprocal_close < POLL_BUDGET,
+        "the reciprocal close took {reciprocal_close:?}, which is not a bound \
+         shorter than the ten-minute authorization horizon"
+    );
+
+    // Exactly one flushed close: any further frame would mean the path
+    // answered a single normal close more than once.
+    let trailing = timeout(POLL_BUDGET, read_server_frame(&mut socket))
+        .await
+        .expect("the relay finished the connection inside its bound");
+    assert!(
+        trailing.is_none(),
+        "the relay sent more than one frame after a normal close: {trailing:?}"
+    );
+
+    stage.wait_drained("normally closed consumer stream").await;
+    assert_eq!(
+        stage.scoped.in_flight(tenants[0].scope()),
+        0,
+        "a normal close must release the stream's per-owner permit"
+    );
+
+    // Released, not merely untracked: the scope readmits at its bound of one.
+    let mut reused = stage.attempt(&tenants, 0).await;
+    assert_eq!(
+        reused.status, 101,
+        "the permit released by the normal close is reusable"
+    );
+    drop(reused.socket.take());
+    stage.wait_drained("readmitted consumer stream").await;
+    stage.shutdown().await;
+}
