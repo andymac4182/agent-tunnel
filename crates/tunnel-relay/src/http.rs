@@ -2498,7 +2498,23 @@ async fn cluster_readiness_gate(
 async fn handle_control_ingress(socket: WebSocket, identity: TlsIdentity, state: HttpState) {
     match remote_device_route(&state, &identity, true).await {
         Ok(Some((peer, route))) => {
-            if let Err(error) = handle_remote_device_control(socket, identity, peer, route).await {
+            // The forwarded attach is answered on its own request stream, and
+            // a duplicate exact-scope owner is answered `409 CONFLICT`.  That
+            // is the same refusal the owner-local path closes with
+            // `OWNER_BUSY`, so the device must see the same typed, bounded,
+            // non-retryable close whichever relay it reached.  Dropping the
+            // status here left a remote duplicate claim reporting an untyped
+            // transport failure while a local one reported the exact terminal
+            // diagnostic, for the same condition.
+            let mut socket = socket;
+            let forwarded = handle_remote_device_control(&mut socket, identity, peer, route).await;
+            if let Err(error) = forwarded {
+                if matches!(
+                    error,
+                    PeerRuntimeError::RemoteStatus(status) if status == StatusCode::CONFLICT
+                ) {
+                    let _ = send_socket(&mut socket, owner_busy_close()).await;
+                }
                 tracing::debug!(?error, "remote device control forwarding stopped");
             }
         }
@@ -2565,7 +2581,7 @@ fn is_no_live_owner(error: &PeerRuntimeError) -> bool {
 }
 
 async fn handle_remote_device_control(
-    mut socket: WebSocket,
+    socket: &mut WebSocket,
     identity: TlsIdentity,
     peer: Arc<PeerRuntime>,
     route: OwnerRoute,
@@ -2603,7 +2619,7 @@ async fn handle_remote_device_control(
                         send.send_message(PeerRecordKind::CompleteControlText, text.as_bytes()).await?;
                     }
                     Message::Ping(payload) => {
-                        if !send_socket(&mut socket, Message::Pong(payload)).await { break; }
+                        if !send_socket(&mut *socket, Message::Pong(payload)).await { break; }
                     }
                     Message::Close(_) => break,
                     Message::Pong(_) => {}
@@ -2615,7 +2631,7 @@ async fn handle_remote_device_control(
                 match record.kind() {
                     PeerRecordKind::CompleteControlText => {
                         let text = record.as_text().map_err(PeerRuntimeError::Frame)?;
-                        if !send_socket(&mut socket, Message::Text(text.to_owned().into())).await { break; }
+                        if !send_socket(&mut *socket, Message::Text(text.to_owned().into())).await { break; }
                     }
                     PeerRecordKind::Close => break,
                     _ => break,
@@ -2625,7 +2641,7 @@ async fn handle_remote_device_control(
     }
     send.cancel();
     recv.cancel();
-    let _ = send_socket(&mut socket, Message::Close(None)).await;
+    let _ = send_socket(&mut *socket, Message::Close(None)).await;
     Ok(())
 }
 
