@@ -267,6 +267,18 @@ pub struct ChaosEvidence {
     pub unclassified_interruptions: usize,
     /// Preserved `OutcomeUnknown` rounds.  Retained, bounded, never a success.
     pub unknown_outcomes_preserved: usize,
+    /// Preserved unknowns that came from a peer-loss round.
+    ///
+    /// Recorded because the ceiling alone says only "not too many".  A
+    /// blackholed peer path is the one fault in this schedule whose outcome is
+    /// legitimately unknown: the relay forwards toward the owner and then
+    /// loses the path, so whether the request was dispatched genuinely cannot
+    /// be determined, and it says so with a typed `execution=unknown`.  Every
+    /// other fault in the schedule has a determinate answer, so an unknown
+    /// arising anywhere else is a gap in the vocabulary rather than an
+    /// honest ambiguity, and the validator rejects it even while the ceiling
+    /// would still accept the count.
+    pub peer_loss_unknown_outcomes: usize,
     pub class_bounded_close: usize,
     pub class_admission_unavailable: usize,
     pub class_peer_unavailable: usize,
@@ -398,7 +410,8 @@ impl ChaosEvidence {
             .join(",");
         format!(
             "relays={} rounds={} owner_kill={} cli_pause={} peer_loss={} redis_pause={} \
-classified={} unclassified={} unknown_preserved={} bounded_close={} admission_unavailable={} \
+classified={} unclassified={} unknown_preserved={} unknown_from_peer_loss={} \
+bounded_close={} admission_unavailable={} \
 peer_unavailable={} owner_released={} client_exit_class={} reconnect_sockets={} \
 max_reconnect_rate_milli={} reconnect_threshold_milli={} cli_reconnect_sockets={} \
 fixture_recycle_sockets={} max_recycle_sockets_round={} max_cli_reconnects_per_window={} \
@@ -415,6 +428,7 @@ cleanup_joined={} elapsed_ms={} vocabulary={}",
             self.classified_interruptions,
             self.unclassified_interruptions,
             self.unknown_outcomes_preserved,
+            self.peer_loss_unknown_outcomes,
             self.class_bounded_close,
             self.class_admission_unavailable,
             self.class_peer_unavailable,
@@ -500,6 +514,16 @@ pub fn validate_chaos_evidence(evidence: &ChaosEvidence) -> Result<()> {
     }
     if evidence.unknown_outcomes_preserved > MAX_UNKNOWN_OUTCOMES {
         return Err(reject("unknown_outcomes_within_bound"));
+    }
+    // Every preserved unknown must be attributable to a peer-loss round.  This
+    // is what the ceiling cannot say: a run sitting at the ceiling is fine when
+    // both unknowns are the two blackholed peer paths, and is a finding when
+    // one of them came from a fault whose outcome should have been determinate.
+    if evidence.peer_loss_unknown_outcomes != evidence.unknown_outcomes_preserved {
+        return Err(reject("unknown_outcomes_attributed_to_peer_loss"));
+    }
+    if evidence.peer_loss_unknown_outcomes > evidence.peer_loss_rounds {
+        return Err(reject("peer_loss_unknowns_within_peer_loss_rounds"));
     }
     if evidence.reconnect_rate_threshold_milli != RECONNECT_RATE_THRESHOLD_MILLI {
         return Err(reject("documented_reconnect_threshold"));
@@ -735,6 +759,7 @@ async fn run_chaos(
         classified_interruptions: 0,
         unclassified_interruptions: 0,
         unknown_outcomes_preserved: 0,
+        peer_loss_unknown_outcomes: 0,
         class_bounded_close: 0,
         class_admission_unavailable: 0,
         class_peer_unavailable: 0,
@@ -795,6 +820,9 @@ async fn run_chaos(
             );
         }
         tally_class(&mut evidence, class);
+        if class == InterruptionClass::OutcomeUnknown && fault == Fault::PeerLoss {
+            evidence.peer_loss_unknown_outcomes += 1;
+        }
         match fault {
             Fault::RedisPause => evidence.redis_pause_rounds += 1,
             Fault::PeerLoss => evidence.peer_loss_rounds += 1,
@@ -1492,6 +1520,7 @@ mod tests {
             classified_interruptions: 8,
             unclassified_interruptions: 0,
             unknown_outcomes_preserved: 0,
+            peer_loss_unknown_outcomes: 0,
             class_bounded_close: 2,
             class_admission_unavailable: 2,
             class_peer_unavailable: 2,
@@ -1544,6 +1573,7 @@ mod tests {
         with_unknown.classified_interruptions = 7;
         with_unknown.class_owner_released = 1;
         with_unknown.unknown_outcomes_preserved = 1;
+        with_unknown.peer_loss_unknown_outcomes = 1;
         assert!(validate_chaos_evidence(&with_unknown).is_ok());
     }
 
@@ -1610,6 +1640,34 @@ mod tests {
                 e.class_owner_released = 0;
                 e.class_admission_unavailable = 4;
             }),
+            // An unknown that did not come from a blackholed peer path is a
+            // gap in the vocabulary, even while the ceiling still accepts the
+            // count.
+            (
+                "unknown_from_another_fault",
+                "unknown_outcomes_attributed_to_peer_loss",
+                |e| {
+                    e.classified_interruptions -= 1;
+                    e.class_bounded_close -= 1;
+                    e.unknown_outcomes_preserved += 1;
+                },
+            ),
+            // More unknowns than there were peer-loss rounds to explain them.
+            (
+                "unknowns_exceed_peer_loss_rounds",
+                "peer_loss_unknowns_within_peer_loss_rounds",
+                |e| {
+                    // One peer-loss round, but two unknowns claimed for it:
+                    // the round tally and every earlier guard still agree, so
+                    // only this rule can catch the over-attribution.
+                    e.peer_loss_rounds = 1;
+                    e.cli_pause_rounds = 3;
+                    e.class_peer_unavailable = 0;
+                    e.classified_interruptions = 6;
+                    e.unknown_outcomes_preserved = 2;
+                    e.peer_loss_unknown_outcomes = 2;
+                },
+            ),
             // The Redis fault must be repeated, not exercised once.
             ("redis_single_round", "redis_pause_repeated", |e| {
                 e.redis_pause_rounds = 1;
@@ -1646,6 +1704,7 @@ mod tests {
             ("unknown_over_bound", "unknown_outcomes_within_bound", |e| {
                 let excess = MAX_UNKNOWN_OUTCOMES + 1;
                 e.unknown_outcomes_preserved = excess;
+                e.peer_loss_unknown_outcomes = excess;
                 e.classified_interruptions = CHAOS_ROUNDS - excess;
                 e.class_bounded_close = 0;
                 e.class_peer_unavailable = 0;
