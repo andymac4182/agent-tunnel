@@ -2038,12 +2038,28 @@ async fn run_stream_worker(
         .await
         {
             Ok(Ok(())) => records += 1,
-            Ok(Err(_)) | Err(_) => {
+            // Separated on purpose.  These are different outcomes and the
+            // single message they used to share made a survey failure
+            // unexplainable: a round trip that failed is the stream losing
+            // ordered progress, while a probe that ran out of time on a busy
+            // machine says only that the bound was not met.  The bound itself
+            // is unchanged.
+            Ok(Err(error)) => {
                 failure.cancel();
                 let _ = timeout(STREAM_CLOSE_TIMEOUT, stream.close()).await;
-                return Err(HarnessError::Process(
-                    "concurrent load stream lost ordered echo progress".into(),
-                ));
+                return Err(HarnessError::Process(format!(
+                    "concurrent load stream lost ordered echo progress at record {sequence} of \
+                     {WORKLOAD_RECORDS_PER_STREAM}: {error}"
+                )));
+            }
+            Err(_) => {
+                failure.cancel();
+                let _ = timeout(STREAM_CLOSE_TIMEOUT, stream.close()).await;
+                return Err(HarnessError::Timeout(format!(
+                    "concurrent load ordered echo exceeded its {}s probe bound at record \
+                     {sequence} of {WORKLOAD_RECORDS_PER_STREAM}",
+                    PROBE_TIMEOUT.as_secs()
+                )));
             }
         }
     }
