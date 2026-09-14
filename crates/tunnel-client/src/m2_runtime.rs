@@ -5298,6 +5298,16 @@ impl M2Actor {
             Vec::new()
         };
         let confirmed = stream.auth.confirmed;
+        // An invalidated authorization can never be confirmed, so nothing
+        // will ever drain this stream's buffered input: `dispatch_payload`
+        // and `dispatch_fin` refuse an invalidated stream, and a later
+        // confirmation is rejected for the same reason.  Buffering here would
+        // therefore retain permanent adapter input debt on a stream the
+        // connector has already reset, which the owner's STREAM_FORGET proof
+        // then rejects as undrained.  The frames are still marked delivered
+        // and acknowledged below, so the sequence evidence both sides compare
+        // is unchanged.
+        let invalidated = stream.auth.invalidated;
         let mut reset_ready = false;
         let mut reset_delivered = false;
         // Sequence byte credit is cumulative.  Once a DATA frame has been
@@ -5323,6 +5333,7 @@ impl M2Actor {
                         })?;
                 }
                 match ready_frame.kind {
+                    FrameKind::Data if invalidated => {}
                     FrameKind::Data => {
                         if stream.pending_bytes.saturating_add(payload.len())
                             > self.config.limits.max_queue_bytes
@@ -5332,6 +5343,7 @@ impl M2Actor {
                         stream.pending_bytes += payload.len();
                         stream.pending.push_back(BufferedInput::Data(payload));
                     }
+                    FrameKind::Fin if invalidated => {}
                     FrameKind::Fin => stream.pending.push_back(BufferedInput::Fin),
                     FrameKind::Reset => {
                         stream.input_reset = true;
@@ -9043,6 +9055,39 @@ mod tests {
         }
         assert_eq!(actor.active.tx.capacity(), 0);
         assert_eq!(actor.pending_pongs.len(), 1);
+
+        drop(actor);
+        while receiver.recv().await.is_some() {}
+    }
+
+    /// A relay FIN can arrive after the connector has already reset a stream
+    /// whose authorization was invalidated: the invalidation travels on the
+    /// control socket while the FIN travels on the data carrier.  That FIN
+    /// must not be retained as adapter input debt.  An invalidated stream can
+    /// never be confirmed, so nothing would ever drain it, and the owner's
+    /// STREAM_FORGET proof rejects a stream still holding undrained input,
+    /// which fails the whole session with a protocol error.
+    #[tokio::test]
+    async fn invalidated_stream_retains_no_undrainable_input_debt() {
+        let (mut actor, key, mut receiver, _control_receiver) =
+            test_actor_with_carrier(M2_CARRIER_QUEUE_FRAMES);
+        let mut stream = test_stream();
+        stream.sequence = StreamState::new(7, 1_024).expect("test stream sequence");
+        actor.streams.insert(7, stream);
+        actor
+            .expire_stream(7)
+            .await
+            .expect("an invalidated stream resets");
+        assert!(actor.streams[&7].auth.invalidated);
+        actor
+            .handle_frame(key.clone(), Frame::fin(1, 1, 7, 1, 0))
+            .await
+            .expect("a late relay FIN is accepted");
+        let stream = &actor.streams[&7];
+        assert!(
+            stream.pending.is_empty() && stream.pending_bytes == 0,
+            "an invalidated stream must not retain input nothing can drain"
+        );
 
         drop(actor);
         while receiver.recv().await.is_some() {}

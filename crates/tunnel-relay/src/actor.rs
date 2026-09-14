@@ -78,6 +78,14 @@ const AUTHORIZATION_LIFETIME: Duration = Duration::from_secs(5);
 /// narrower reasons mapped in `authorization_failure_code`, so it carries the
 /// existing `AUTHORIZATION_INVALIDATED` code rather than adding a new one.
 const CHALLENGE_MISMATCH_REASON: &str = "challenge mismatch";
+/// Reason returned for a device authorization request whose stream reached a
+/// terminal state while the request was outstanding.  The stream is already
+/// terminal here, so this answer changes no relay stream state; it exists so
+/// the connector learns the outcome of its own challenge immediately instead
+/// of holding the stream — and its admission slot — until its independent
+/// grant deadline expires.  It carries the existing `AUTHORIZATION_INVALIDATED`
+/// code like every other reason outside `authorization_failure_code`.
+const TERMINAL_STREAM_CHALLENGE_REASON: &str = "stream closed";
 const OWNER_LEASE_SAFETY_MARGIN: Duration = Duration::from_secs(5);
 const MAX_ECHO_RESPONSE_EXTRA_BYTES: usize = 256;
 const INITIAL_ATTACHMENT_PURPOSE: &str = "initial";
@@ -9707,6 +9715,11 @@ impl RelayActor {
         enum MismatchedChallenge {
             Pending,
             Stream,
+            /// The challenge names a stream that is already terminal.  It can
+            /// never be confirmed, and the connector is still holding the
+            /// stream while it waits for an answer, so it is refused with the
+            /// exact typed invalidation instead of being dropped.
+            TerminalStream,
         }
         let mut mismatched = None;
         let Some(session) = self.session_mut(&key) else {
@@ -9735,15 +9748,18 @@ impl RelayActor {
                 ))
             }
         } else if let Some(stream) = session.streams.get_mut(&message.stream_id) {
-            if stream.authorization_in_flight || stream.terminal {
+            if stream.authorization_in_flight {
                 return;
             }
             let expected_digest =
                 wire::permission_digest(&stream.grant, &stream.service_id.to_string());
-            if challenge.permission_digest != expected_digest
+            let identity_mismatch = challenge.permission_digest != expected_digest
                 || challenge.grant_revision != stream.grant.revision
-                || challenge.service_id != stream.service_id.to_string()
-            {
+                || challenge.service_id != stream.service_id.to_string();
+            if stream.terminal {
+                mismatched = Some(MismatchedChallenge::TerminalStream);
+                None
+            } else if identity_mismatch {
                 mismatched = Some(MismatchedChallenge::Stream);
                 None
             } else {
@@ -9783,6 +9799,13 @@ impl RelayActor {
                 ),
                 Some(MismatchedChallenge::Stream) => {
                     self.invalidate_stream_challenge(&key, &challenge, CHALLENGE_MISMATCH_REASON);
+                }
+                Some(MismatchedChallenge::TerminalStream) => {
+                    self.answer_terminal_stream_challenge(
+                        &key,
+                        &challenge,
+                        TERMINAL_STREAM_CHALLENGE_REASON,
+                    );
                 }
                 None => {}
             }
@@ -10149,6 +10172,25 @@ impl RelayActor {
                 )
             })
         else {
+            // The stream reached its terminal state while this authorization
+            // was in flight to the catalog.  The connector is still holding
+            // the stream open waiting for the answer to this exact challenge,
+            // so answer it instead of dropping it; see
+            // `answer_terminal_stream_challenge`.
+            let stranded = self
+                .session_for(&key)
+                .and_then(|session| session.streams.get(&challenge.stream_id))
+                .is_some_and(|stream| {
+                    stream.terminal
+                        && stream.challenge_id.as_deref() == Some(challenge.challenge_id.as_str())
+                });
+            if stranded {
+                self.answer_terminal_stream_challenge(
+                    &key,
+                    &challenge,
+                    TERMINAL_STREAM_CHALLENGE_REASON,
+                );
+            }
             return;
         };
         if challenge_id.as_deref() != Some(challenge.challenge_id.as_str()) {
@@ -10292,6 +10334,47 @@ impl RelayActor {
             "device authorization unavailable" => "DEVICE_AUTHORIZATION_UNAVAILABLE",
             _ => "AUTHORIZATION_INVALIDATED",
         }
+    }
+
+    /// Answer one device authorization request whose stream has already
+    /// reached a terminal state.
+    ///
+    /// A stream can go terminal while its challenge is still outstanding: the
+    /// public consumer registration is dropped, the unclaimed admission lease
+    /// expires, or the stream closes normally, all of which can land between
+    /// the connector's `AUTHORIZATION_CHALLENGE` and the relay's catalog
+    /// answer.  The relay releases its own admission slot at that terminal
+    /// transition, but the connector keeps the stream — and the slot it
+    /// charges against its own `max_streams` — until it learns the outcome of
+    /// its challenge; a silently dropped challenge therefore leaves the two
+    /// sides disagreeing about capacity for the connector's whole grant
+    /// deadline, and a replacement OPEN admitted by the relay is refused with
+    /// `RESOURCE_EXHAUSTED` by the connector.
+    ///
+    /// The invalidation is the same typed outcome the connector reaches on
+    /// its own deadline, delivered immediately and correlated to the exact
+    /// challenge.  The stream is already terminal, so no relay stream state
+    /// changes here: in particular this must not use
+    /// `invalidate_stream_challenge`, which would record FIN debt and arm the
+    /// fail-closed terminal-FIN deadline for a stream whose FIN was queued
+    /// normally.
+    fn answer_terminal_stream_challenge(
+        &mut self,
+        key: &SessionKey,
+        challenge: &DeviceChallenge,
+        reason: &str,
+    ) {
+        let _ = self.send_control(
+            key,
+            wire::authorization_invalidated(
+                &key.session_id,
+                key.epoch,
+                challenge.stream_id,
+                &challenge.challenge_id,
+                challenge.grant_revision,
+                reason,
+            ),
+        );
     }
 
     fn invalidate_stream_challenge(
@@ -16649,6 +16732,167 @@ mod stream_identity_tests {
                 .is_some_and(|until| until <= projected_token_expiry),
             "dispatch gate must not outlive the consumer credential"
         );
+    }
+
+    /// A stream that goes terminal while its authorization is in flight must
+    /// still receive the answer to that exact challenge.  The relay releases
+    /// its admission slot at the terminal transition, but the connector holds
+    /// the stream — and the slot it charges against its own `max_streams` —
+    /// until the challenge it sent is answered.  Dropping the resolution
+    /// leaves the two sides disagreeing about capacity for the connector's
+    /// whole grant deadline, so a replacement OPEN the relay admits is
+    /// refused by the connector with `RESOURCE_EXHAUSTED`.
+    #[tokio::test]
+    async fn terminal_stream_challenge_resolution_is_answered_to_the_connector() {
+        let now = Utc::now();
+        let tenant_id = Uuid::from_u128(611);
+        let device_id = Uuid::from_u128(612);
+        let principal_id = Uuid::from_u128(613);
+        let service_id = Uuid::from_u128(614);
+        let identity = DeviceIdentity {
+            tenant_id,
+            device_id,
+            owner_user_id: principal_id,
+            credential_id: Uuid::from_u128(615),
+            spki_fingerprint: "terminal-challenge-spki".to_owned(),
+            credential_not_before: now - Duration::minutes(1),
+            expires_at: now + Duration::minutes(1),
+            credential_revoked_at: None,
+            device_active: true,
+            credential_active: true,
+            device_version: 1,
+            owner_epoch: 1,
+            last_seen_at: Some(now),
+        };
+        let consumer = AuthenticatedConsumer {
+            tenant_id,
+            principal_id,
+        };
+        let grant = GrantSnapshot {
+            tenant_id,
+            principal_id,
+            device_id,
+            service_id,
+            revision: 1,
+            permissions: PermissionSet {
+                operations: BTreeSet::from(["echo:invoke".to_owned()]),
+            },
+            constraints: serde_json::json!({}),
+            valid_until: now + Duration::minutes(1),
+            read_started_at: now,
+        };
+        let key = SessionKey {
+            tenant_id,
+            device_id,
+            session_id: "terminal-challenge".to_owned(),
+            epoch: 1,
+        };
+        let (mut actor, mut control) = admitted_control_actor(identity.clone(), key.clone());
+        let (data_tx, mut data_rx) = mpsc::channel(actor.options.limits.max_queue_messages);
+        let session = actor.sessions.get_mut(&key.scope()).expect("test session");
+        session.profile = super::RuntimeProfile::M2;
+        session.data_tx = Some(data_tx.clone());
+        session.active_carrier = Some(DataCarrier {
+            context: CarrierContext::new(
+                key.session_id.clone(),
+                key.epoch,
+                1,
+                "terminal-challenge-data".to_owned(),
+            ),
+            tx: data_tx,
+        });
+        let (open_tx, open_rx) = oneshot::channel();
+        actor.open_echo_stream(
+            consumer,
+            device_id,
+            service_id,
+            grant.clone(),
+            now + Duration::minutes(1),
+            open_tx,
+        );
+        let admitted = open_rx
+            .await
+            .expect("open response")
+            .expect("stream admitted");
+        drop(control.rx.try_recv().expect("OPEN queued"));
+        // The connector answered OPENED and raised its initial challenge, so
+        // the relay is waiting on the catalog for this exact challenge.
+        let challenge_id = "terminal-challenge-id";
+        let started_at_ms = super::monotonic_millis();
+        {
+            let stream = actor
+                .sessions
+                .get_mut(&key.scope())
+                .expect("test session")
+                .streams
+                .get_mut(&admitted.stream_id)
+                .expect("admitted stream");
+            stream.open_pending = false;
+            stream.authorization_in_flight = true;
+            stream.authorization_started_at_ms = Some(started_at_ms);
+            stream.authorization_deadline_ms = Some(started_at_ms + 2_000);
+            stream.challenge_id = Some(challenge_id.to_owned());
+        }
+        // The public consumer registration disappears while that catalog read
+        // is outstanding: the stream goes terminal and the relay releases its
+        // own admission slot.
+        assert!(actor.close_echo_stream(&key, admitted.stream_id, &admitted.operation_id));
+        assert!(actor.sessions[&key.scope()].streams[&admitted.stream_id].terminal);
+        assert!(data_rx.try_recv().is_ok(), "terminal FIN must be queued");
+        let owner_token = actor.sessions[&key.scope()].owner.clone();
+        actor.finish_stream_challenge(
+            key.clone(),
+            DeviceChallenge {
+                message_id: "terminal-challenge-auth".to_owned(),
+                stream_id: admitted.stream_id,
+                service_id: service_id.to_string(),
+                challenge_id: challenge_id.to_owned(),
+                nonce: "terminal-challenge-nonce".to_owned(),
+                permission_digest: super::wire::permission_digest(&grant, &service_id.to_string()),
+                grant_revision: grant.revision,
+                received_at: std::time::Instant::now(),
+                lifetime: std::time::Duration::from_secs(2),
+            },
+            Ok((
+                Some(grant.clone()),
+                Some(OwnerClaim {
+                    token: owner_token,
+                    lease_expires_at: now + Duration::minutes(1),
+                }),
+                Some(identity),
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(60)),
+            )),
+        );
+        let mut invalidated = None;
+        while let Ok(outbound) = control.rx.try_recv() {
+            if let ControlOutbound::Text(mut text) = outbound {
+                let message = super::wire::parse_control(text.as_bytes())
+                    .expect("queued control must decode");
+                text.release();
+                match message {
+                    ControlMessage::AuthorizationInvalidated(message) => {
+                        invalidated = Some(message);
+                    }
+                    ControlMessage::AuthorizationConfirmed(_) => {
+                        panic!("a terminal stream must never be confirmed");
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let invalidated =
+            invalidated.expect("a terminal stream's challenge must be answered, not dropped");
+        assert_eq!(invalidated.session_id, key.session_id);
+        assert_eq!(invalidated.epoch, key.epoch);
+        assert_eq!(invalidated.stream_id, admitted.stream_id);
+        assert_eq!(invalidated.challenge_id, challenge_id);
+        assert_eq!(invalidated.grant_revision, grant.revision);
+        // The answer reports the already-terminal stream; it must not invent
+        // FIN debt or arm the fail-closed terminal-FIN deadline for a stream
+        // whose FIN was queued normally above.
+        let session = &actor.sessions[&key.scope()];
+        assert!(!session.streams[&admitted.stream_id].terminal_fin_failure);
+        assert!(session.terminal_fin_failure_deadline.is_none());
     }
 
     #[tokio::test]
