@@ -815,3 +815,34 @@ Keep fast unit/config/codec tests in every pull request. Add protocol and adapte
 For release artifacts, build for every advertised OS/architecture, record checksums and provenance, then download and unpack those artifacts into clean temporary environments. Execute their help/version/config checks and launch the packaged relay and device for a real consumer-to-device operation and a rotation. Verify that expected configuration examples, notices, and required runtime assets are present and that no workspace-only dependency is masking a missing file. macOS/Linux/Windows CI success is not by itself evidence for every architecture on those systems.
 
 For the local macOS-arm64 CLI scope of IN-10/OG-05, `scripts/m7-local-source-parity-build.sh` builds the workspace binaries from an immutable copy of the current `HEAD` source inputs (crates, vendor, examples, root Cargo metadata) and emits an immutable `source-parity-receipt.txt` tying the copied source digest to each binary's sha256. `scripts/m7-local-artifact-verify.sh --build-receipt <receipt>` then cross-checks that receipt — the recorded base `HEAD`, tracked-diff digest and worktree-status digest must equal the current checkout's, and every supplied binary's sha256 must equal the receipt's digest — and only then records `binary_provenance=verified` and source-to-binary provenance as verified; any mismatch is fatal, so provenance is never falsely claimed. Without `--build-receipt` the verifier still records provenance as unverified. Both scripts are single-host, local macOS-arm64, this-source-only observers; they make no release, other-OS/architecture, hosted-CI or full-M7-row claim, and neither builds nor mutates the original checkout. Drive the source-matched CLI into an acceptance gate by exporting `TUNNEL_CLIENT_BIN=<bundle>/bin/tunnel-client` (the verifier writes a `tunnel-client-env.sh` for this) so `verify-m7-production` and `verify-m7-chaos`/`verify-m7-i08-recovery-attempts` record heartbeat, liveness, bounded shutdown and no-reconnect-storm evidence against the exact receipt-matched binary.
+
+## Survey stability, measured 2026-09-14
+
+The full gate survey is not a stable pass/fail signal on this machine, and the
+reason is worth stating plainly rather than discovering again.
+
+Five consecutive surveys returned 75/75, 72/75, 73/75, 74/75 and 69/75, and the
+failing gates were almost entirely different each time. Three findings came out
+of chasing them:
+
+* Some were real defects the survey deserves credit for: a peer transport
+  reporting a clean remote close as a failure, a refused forwarded device
+  attachment collapsing a shared peer connection, and a diagnostics scanner
+  that correctly refused a vocabulary it had not been taught.
+* Some were the survey's own doing: a 4 MB write timing out against a Redis
+  carrying the rest of the run, and a failing diagnostics child whose stderr
+  was discarded because the survey never set `C11_CHILD_FAILURE_DIR`.
+* Some were the machine. One failure was a CLI killed with signal 9, which is
+  memory pressure, not a product result. Disk reached 97% during this work.
+
+Reducing the parallel lane from three jobs to two did **not** stabilise it: that
+run still failed five gates, again a different five. So parallelism is not the
+single cause and the cap is not the fix.
+
+What follows from this: a single survey result is evidence about one run, not
+about the branch. A gate that fails once should be rerun standalone on an idle
+machine before it is called a defect, and a gate that passes once should not be
+recorded as verified on that basis alone. Where a gate has been measured
+repeatedly, the measured rate belongs in its row. The owner-local stream
+capacity gate, for instance, fails roughly half of its standalone runs and its
+earlier clean survey results were luck.
