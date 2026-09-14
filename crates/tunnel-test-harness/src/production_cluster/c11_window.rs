@@ -57,7 +57,7 @@ pub const PEER_FAULT_CAUSES: [&str; 25] = [
     "deadline",
 ];
 const PEER_FAULT_ROLES: [&str; 2] = ["ingress", "owner"];
-const PEER_FAULT_SNAPSHOT_KEYS: [&str; 7] = [
+const PEER_FAULT_SNAPSHOT_KEYS: [&str; 10] = [
     "fault_count",
     "ingress_count",
     "owner_count",
@@ -65,7 +65,41 @@ const PEER_FAULT_SNAPSHOT_KEYS: [&str; 7] = [
     "cause_counts",
     "last_by_stage",
     "recent",
+    "closure_stage_counts",
+    "closure_cause_counts",
+    "closures",
 ];
+/// Task closure lifecycle stages, kept as their own closed vocabulary.
+///
+/// These are lifecycle ends, not faults, and the relay keeps them in a
+/// separate ring so a routine close never reaches `fault_count` or the fault
+/// rings.  The scan holds them to the same standard as the fault labels: a
+/// closed set, bounded counts, and no payload-derived content.
+const TASK_CLOSURE_STAGES: [&str; 3] = ["control", "data", "consumer_stream"];
+const TASK_CLOSURE_CAUSES: [&str; 9] = [
+    "peer_closed",
+    "write_failed",
+    "protocol_error",
+    "record_too_large",
+    "unexpected_message",
+    "server_close",
+    "stream_closed",
+    "expired",
+    "stream_failed",
+];
+const TASK_CLOSURE_EVENT_KEYS: [&str; 9] = [
+    "sequence",
+    "observed_at_ms",
+    "stage",
+    "cause",
+    "tenant_id",
+    "device_id",
+    "session_id",
+    "epoch",
+    "stream_id",
+];
+/// Relay bound on the retained closure ring (`MAX_TASK_CLOSURES`).
+const MAX_TASK_CLOSURE_RECENT: usize = 32;
 const PEER_FAULT_EVENT_KEYS: [&str; 12] = [
     "sequence",
     "observed_at_ms",
@@ -994,6 +1028,44 @@ fn validate_peer_fault_table(
         last_sequence = sequence;
         tuples.insert(tuple);
     }
+    // Closure entries are validated to the same standard, and separately: a
+    // closure must never be counted as a fault, so these counters are checked
+    // against the closure ring rather than against `fault_count`.
+    let closure_stage_counts = json_count_map(
+        &object["closure_stage_counts"],
+        &TASK_CLOSURE_STAGES,
+        "closure_stage_counts",
+    )?;
+    let closure_cause_counts = json_count_map(
+        &object["closure_cause_counts"],
+        &TASK_CLOSURE_CAUSES,
+        "closure_cause_counts",
+    )?;
+    if closure_stage_counts != closure_cause_counts {
+        return Err(ScanFailure::InvalidPeerFault {
+            reason: "closure stage and cause counters disagree",
+        });
+    }
+    let closures = object["closures"]
+        .as_array()
+        .ok_or(ScanFailure::InvalidPeerFault {
+            reason: "closures was not an array",
+        })?;
+    if closures.len() > MAX_TASK_CLOSURE_RECENT || closures.len() as u64 > closure_stage_counts {
+        return Err(ScanFailure::InvalidPeerFault {
+            reason: "closure ring exceeds the relay bound",
+        });
+    }
+    let mut last_closure_sequence = 0_u64;
+    for closure in closures {
+        let sequence = validate_task_closure_event(closure)?;
+        if sequence <= last_closure_sequence {
+            return Err(ScanFailure::InvalidPeerFault {
+                reason: "closure ring is not strictly ordered",
+            });
+        }
+        last_closure_sequence = sequence;
+    }
     let last_by_stage =
         object["last_by_stage"]
             .as_object()
@@ -1047,6 +1119,45 @@ fn validate_peer_fault_event(
     }
     json_optional_token(&object["request_id"], "request_id")?;
     Ok((tuple, sequence))
+}
+
+/// Validate one task closure entry and return its diagnostic sequence.
+///
+/// A closure carries only bounded labels and owner-registration identifiers.
+/// Anything derived from a request body, header, ticket or endpoint would fail
+/// the exact-key check here, which is the point.
+fn validate_task_closure_event(event: &serde_json::Value) -> Result<u64, ScanFailure> {
+    let object = event.as_object().ok_or(ScanFailure::InvalidPeerFault {
+        reason: "closure was not an object",
+    })?;
+    require_exact_keys(object, &TASK_CLOSURE_EVENT_KEYS, "event")?;
+    let sequence = json_u64(&object["sequence"], "sequence")?;
+    if sequence == 0 {
+        return Err(ScanFailure::InvalidPeerFault {
+            reason: "event sequence was zero",
+        });
+    }
+    json_u64(&object["observed_at_ms"], "observed_at_ms")?;
+    let stage = json_label(&object["stage"], "stage")?;
+    if !TASK_CLOSURE_STAGES.contains(&stage) {
+        return Err(ScanFailure::InvalidPeerFault {
+            reason: "closure stage is outside the relay vocabulary",
+        });
+    }
+    let cause = json_label(&object["cause"], "cause")?;
+    if !TASK_CLOSURE_CAUSES.contains(&cause) {
+        return Err(ScanFailure::InvalidPeerFault {
+            reason: "closure cause is outside the relay vocabulary",
+        });
+    }
+    json_uuid(&object["tenant_id"], "tenant_id")?;
+    json_uuid(&object["device_id"], "device_id")?;
+    json_optional_token(&object["session_id"], "session_id")?;
+    json_u64(&object["epoch"], "epoch")?;
+    if !object["stream_id"].is_null() {
+        json_u64(&object["stream_id"], "stream_id")?;
+    }
+    Ok(sequence)
 }
 
 fn require_exact_keys(
