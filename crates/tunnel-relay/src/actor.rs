@@ -7161,6 +7161,30 @@ impl RelayActor {
             .flatten()
     }
 
+    /// A stream whose settled receive cursor is above the fence the connector
+    /// attests for it.
+    fn fence_violation_at_frozen(
+        &self,
+        key: &SessionKey,
+        snapshot: &tunnel_protocol::rotation_control::FenceSnapshot,
+        direction: Direction,
+    ) -> Option<BeyondFenceObservation> {
+        let session = self.session_for(key)?;
+        snapshot
+            .entries
+            .iter()
+            .filter(|entry| entry.direction == direction)
+            .find_map(|entry| {
+                let stream = session.streams.get(&entry.stream_id)?;
+                let observed = stream.sequence.direction(direction).recv_contiguous();
+                (observed > entry.last_emitted).then_some(BeyondFenceObservation {
+                    stream_id: entry.stream_id,
+                    attested_fence: entry.last_emitted,
+                    observed_recv_contiguous: observed,
+                })
+            })
+    }
+
     async fn handle_rotate_frozen(
         &mut self,
         key: &SessionKey,
@@ -7189,6 +7213,34 @@ impl RelayActor {
         // Empty rosters therefore remain unambiguous and every non-empty
         // entry is checked by the pure state machine against this direction.
         let direction = Direction::ConnectorToRelay;
+        // M7-C66: the connector's attested fence is the first moment the relay
+        // learns what the connector claims it emitted on the old carrier. The
+        // forward check in `inbound_data` (M7-C65) can only refuse frames that
+        // arrive after FROZEN is processed, so a frame beyond the fence that
+        // raced ahead of it was admitted and advanced the receive cursor. That
+        // makes the connector's own attestation inconsistent with the relay's
+        // state, and the drain proof built from it unprovable.
+        //
+        // The check is deliberately retroactive rather than a forward bound.
+        // Before FROZEN there is no fence to compare against, and a connector
+        // legitimately flushes frames queued before its own freeze, so any
+        // bound derived from the relay's cursor at quiesce would reject exactly
+        // the in-flight frames the drain exists to receive. Comparing the
+        // settled receive cursor against the fence once it arrives rejects only
+        // the frames the connector says it never sent.
+        if let Some(violation) = self.fence_violation_at_frozen(key, &frozen.snapshot, direction) {
+            tracing::warn!(
+                device_id = %key.device_id,
+                session_id = %key.session_id,
+                epoch = key.epoch,
+                stream_id = violation.stream_id,
+                attested_fence = violation.attested_fence,
+                observed_recv_contiguous = violation.observed_recv_contiguous,
+                stage = "connector_frozen_beyond_fence",
+            );
+            self.protocol_failure(key, "FENCE_VIOLATION").await;
+            return;
+        }
         let result = self.with_rotation_mut(key, |_session, rotation| {
             rotation.state.frozen(
                 &frozen.attempt,
@@ -12741,6 +12793,15 @@ pub struct RunningRelay {
     peer_planned_cancel: Option<CancellationToken>,
     pub consumer_addr: std::net::SocketAddr,
     pub device_addr: std::net::SocketAddr,
+}
+
+/// Payload-free record of a receive cursor that sits above the connector's
+/// attested fence for the same stream.
+#[derive(Clone, Copy, Debug)]
+struct BeyondFenceObservation {
+    stream_id: u64,
+    attested_fence: u64,
+    observed_recv_contiguous: u64,
 }
 
 impl RunningRelay {
