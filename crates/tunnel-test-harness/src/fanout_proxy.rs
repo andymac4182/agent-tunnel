@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::{JoinHandle, JoinSet};
@@ -27,6 +27,10 @@ const MAX_CONNECTIONS: usize = 1024;
 const MAX_DIAGNOSTICS_CAPACITY: usize = 4096;
 const MAX_READ_BUFFER_BYTES: usize = 1024 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Bounded ring of recent accept instants.  Large enough that a normal
+/// acceptance run never evicts, so a caller can compute an exact short-window
+/// accept rate; an overflow is reported rather than silently truncating.
+const ACCEPT_INSTANT_CAPACITY: usize = 4096;
 
 /// Configuration for [`FanoutProxy`].
 ///
@@ -180,6 +184,14 @@ pub struct FanoutProxyDiagnostics {
     pub open: Vec<FanoutConnection>,
     /// Bounded oldest-to-newest tail of closed accepted sockets.
     pub closed: Vec<FanoutConnection>,
+    /// Monotonic instants of recent accepts, oldest first, bounded by
+    /// `ACCEPT_INSTANT_CAPACITY`.  These allow a true short-window (e.g.
+    /// per-second) accept rate instead of an average over a whole phase.
+    pub recent_accepts: Vec<Instant>,
+    /// Accept instants evicted because the bounded ring overflowed.  Non-zero
+    /// means any short-window rate computed from `recent_accepts` is an
+    /// undercount, so a caller must treat it as a failed measurement.
+    pub dropped_accepts: u64,
 }
 
 impl FanoutProxyDiagnostics {
@@ -202,6 +214,8 @@ struct DiagnosticsState {
     open: BTreeMap<u64, FanoutConnection>,
     closed: VecDeque<FanoutConnection>,
     diagnostics_capacity: usize,
+    accept_instants: VecDeque<Instant>,
+    dropped_accepts: u64,
 }
 
 impl DiagnosticsState {
@@ -213,12 +227,19 @@ impl DiagnosticsState {
             open: BTreeMap::new(),
             closed: VecDeque::with_capacity(diagnostics_capacity),
             diagnostics_capacity,
+            accept_instants: VecDeque::new(),
+            dropped_accepts: 0,
         }
     }
 
     fn accepted(&mut self, target: SocketAddr) -> FanoutConnection {
         let index = self.accepted;
         self.accepted = self.accepted.saturating_add(1);
+        if self.accept_instants.len() == ACCEPT_INSTANT_CAPACITY {
+            self.accept_instants.pop_front();
+            self.dropped_accepts = self.dropped_accepts.saturating_add(1);
+        }
+        self.accept_instants.push_back(Instant::now());
         let route = FanoutConnection { index, target };
         self.open.insert(index, route);
         self.peak_open = self.peak_open.max(self.open.len());
@@ -245,6 +266,8 @@ impl DiagnosticsState {
             peak_open: self.peak_open,
             open: self.open.values().copied().collect(),
             closed,
+            recent_accepts: self.accept_instants.iter().copied().collect(),
+            dropped_accepts: self.dropped_accepts,
         }
     }
 }

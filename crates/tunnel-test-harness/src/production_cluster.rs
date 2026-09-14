@@ -4370,6 +4370,46 @@ impl ProductionCluster {
         }
     }
 
+    /// Observe, without forcing or failing, whether every relay's membership
+    /// runtime returns to `Ready` within `budget`.
+    ///
+    /// A full Redis outage drives each relay's membership runtime Unready: its
+    /// signed checkpoint cannot be refreshed against an unreachable catalog.
+    /// The runtime is not latched -- its supervisor keeps reconciling and
+    /// restores `Ready` once a strictly-newer signed checkpoint and a catalog
+    /// snapshot land in the same pass -- but whether it re-arms in a bounded
+    /// run depends on how much of the fixture's signed membership record
+    /// lifetime remains when the outage happens.  This returns the observation
+    /// so a caller can record it as evidence either way.
+    async fn observe_membership_readiness(&self, budget: Duration) -> bool {
+        let deadline = Instant::now() + budget;
+        loop {
+            if self
+                .relays
+                .iter()
+                .all(|relay| matches!(relay.membership.readiness(), MembershipReadiness::Ready))
+            {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Re-publish every relay's verified peer pins from its current membership
+    /// snapshot, retrying until each relay's runtime is Ready enough to supply
+    /// them.
+    ///
+    /// This fixture publishes peer pins from the membership *invalidation*
+    /// callback only, which is edge-triggered: a full Redis outage drives
+    /// membership Unready, that callback empties the pin set, and nothing
+    /// re-publishes it when the runtime later returns to `Ready`.  The gap is
+    /// in the fixture's wiring, not in the membership runtime (which does
+    /// re-arm on its own) and not in the protocol, so a caller that has
+    /// observed readiness return re-publishes explicitly -- exactly as the
+    /// key-revocation probe does after it deliberately revokes pins.
     async fn wait_for_peer_readiness(&self, budget: Duration) -> Result<()> {
         let deadline = Instant::now() + budget;
         loop {
@@ -5231,11 +5271,17 @@ async fn start_cli_smoke(
             }
         };
         if let Some(status) = status {
+            // Typed, not stringly: the CLI's exit code is its own closed
+            // diagnostic vocabulary, so a caller (the chaos gate) can classify
+            // this interruption instead of treating it as a harness failure.
+            let diagnostic_code = cli_diagnostic_code(&process.stdout(), &process.stderr());
             return Err(cleanup_cli_startup_failure(
                 process,
-                HarnessError::Process(format!(
-                    "tunnel-client CLI exited before production readiness: {status}"
-                )),
+                HarnessError::CliExitedBeforeReady {
+                    stage: "production",
+                    code: status.code(),
+                    diagnostic_code,
+                },
             )
             .await);
         }
@@ -5263,6 +5309,51 @@ async fn start_cli_smoke(
             }
         }
     }
+}
+
+/// Recognised `tunnel-client` diagnostic codes.  Only these are surfaced, so
+/// a CLI failure can never smuggle free text or payload into harness evidence.
+const CLI_DIAGNOSTIC_CODES: [&str; 12] = [
+    "INVALID_INVOCATION",
+    "CONFIG_ERROR",
+    "INVALID_CONFIG",
+    "CREDENTIAL_ERROR",
+    "CREDENTIAL_MISSING",
+    "CREDENTIAL_INVALID",
+    "CREDENTIAL_KEY_MISMATCH",
+    "CREDENTIAL_PERMISSIONS",
+    "CREDENTIAL_EXPIRED",
+    "CREDENTIAL_NOT_YET_VALID",
+    "TRANSPORT_ERROR",
+    "SUPERVISOR_ABSENT",
+];
+
+/// Extract the CLI's own typed diagnostic code from its `--json` output.
+///
+/// The CLI emits one JSON object per line with an optional `error.code`.  Only
+/// a code in [`CLI_DIAGNOSTIC_CODES`] is returned, as a `'static` constant, so
+/// the result is a closed vocabulary rather than captured process output.
+fn cli_diagnostic_code(stdout: &[u8], stderr: &[u8]) -> Option<&'static str> {
+    let mut found = None;
+    for stream in [stdout, stderr] {
+        for line in String::from_utf8_lossy(stream).lines() {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let Some(code) = value.get("error").and_then(|error| error.get("code")) else {
+                continue;
+            };
+            let Some(code) = code.as_str() else { continue };
+            if let Some(known) = CLI_DIAGNOSTIC_CODES
+                .iter()
+                .find(|candidate| **candidate == code)
+            {
+                // Keep the last emitted code: it is the terminal one.
+                found = Some(*known);
+            }
+        }
+    }
+    found
 }
 
 async fn cleanup_cli_startup_failure(

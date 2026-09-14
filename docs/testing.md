@@ -65,25 +65,72 @@ repeats owner kill, CLI process pause and peer UDP loss and exercises a full
 Redis pause once, each built from an existing fault injector: Redis pause
 (`ProxyHandle::pause_all`), non-owner peer UDP loss (`set_peer_path_drop`), CLI
 process pause (`SIGSTOP`/`SIGCONT` via `ProcessPauseGuard`) and owner kill
-(`SIGKILL` of the owning `tunnel-client`). A full Redis pause expires the
-in-process fixture's signed membership lease, which does not re-arm for a second
-full outage on the same long-lived cluster (a fixture limitation, not a protocol
-one), so Redis pause is scheduled once while the other three faults repeat.
+(`SIGKILL` of the owning `tunnel-client`). Redis pause is scheduled once, as
+the terminal round, while the other three faults repeat.
+
+The signed membership lease is **not** latched: the membership supervisor keeps
+reconciling and restores `Ready` from the current pass alone once a
+strictly-newer signed checkpoint and a catalog snapshot land together
+(`crates/tunnel-relay/src/membership_runtime.rs`). The round records whether
+that re-arm happened as `redis_membership_recovery=`, observed over a bounded
+budget and **never asserted**, because it is measurably position-dependent in
+this fixture:
+
+* with the Redis pause mid-schedule, every relay returns to `Ready` on its own
+  (observed at roughly 28 s after resume);
+* as the terminal round of a ~60-second run it does not re-arm at all
+  (0/3 relays Ready after 45 s of waiting).
+
+The fixture's signed membership record lifetime is itself 60 seconds with a
+20-second refresh (`membership_record_lifetime_seconds` /
+`membership_refresh_seconds` in `production_cluster.rs`), so by the last round
+there is no headroom left to absorb a full outage. Even in the mid-schedule
+position where membership does re-arm, the cluster cannot be *reused*: the
+record expires again shortly afterwards (`MembershipExpired`) and every fresh
+owner CLI then fails its device control WebSocket handshake with a typed
+`TRANSPORT_ERROR` on all three relays. Repeating the Redis fault with an
+observed *session* recovery therefore needs a fixture change to the membership
+record lifetime and its refresh across an outage -- not a schedule change -- so
+the round is left terminal rather than given a recovery it does not have.
 Every observed close or interruption is mapped into the closed vocabulary the
 diagnostics already use — `bounded_close`, `admission_unavailable`,
-`peer_unavailable`, `owner_released`, `outcome_unknown`, `unclassified`.
-Unknown outcomes (a timed-out or unsendable probe) are preserved as
-`outcome_unknown`, not discarded; an observation that matches no bucket (for
-example an echo from a killed or paused owner, or an unexpected HTTP status) is
-recorded as `unclassified`. Each round recycles the owner session, so
-device-fanout reconnect sockets are counted per round. `validate_chaos_evidence`
-blocks release when any interruption is unclassified, when the peak per-round
-reconnect rate exceeds the documented threshold of 12.000 sockets/second
-(`reconnect_rate_threshold_milli = 12000`), when the concurrent device-fanout
-socket peak exceeds four, when a fault type was never exercised, or when a
-per-round or final recovery echo did not succeed. The gate runs as part of
+`peer_unavailable`, `owner_released`, `outcome_unknown`,
+`client_exit_before_ready`, `unclassified`. Unknown outcomes (a timed-out or
+unsendable probe) are preserved as `outcome_unknown`, not discarded; an
+observation that matches no bucket (for example an echo from a killed or paused
+owner, or an unexpected HTTP status) is recorded as `unclassified`.
+
+A `tunnel-client` that exits before readiness on the establish path is
+classified rather than surfaced as an opaque harness error: the CLI's exit codes
+are their own closed vocabulary (`CliError::exit_code` in
+`crates/tunnel-client/src/main.rs` — 1 other, 2 invocation/config, 3 credential,
+4 transport or supervisor-absent, 5 deadline exceeded, 6 outcome unknown), and
+its typed `--json` diagnostic code is carried alongside. Such an exit is counted
+in `client_exit_before_ready`; the validator requires every one of them to have
+carried a typed exit code, so a signal death or an unexpected success exit
+blocks release.
+
+Reconnects are measured **at second scale and attributed to the client**. The
+fanout fixture records the exact instant of every accepted device-fanout socket,
+and each round brackets its own deliberate session recycle, so the enforced
+metric `max_cli_reconnects_per_window` is the largest number of
+*client-attributed* accepts inside any real one-second window, with the
+fixture's recycle sockets (roughly two per round) excluded and bounded
+separately by `max_recycle_sockets_round`. The previous whole-round average is
+retained only for continuity: a ten-reconnect burst inside a ten-second round
+averaged to one per second and passed a twelve-per-second threshold, which the
+windowed metric now catches.
+
+`validate_chaos_evidence` blocks release when any interruption is unclassified,
+when client-attributed reconnects in any one-second window exceed the documented
+ceiling of four, when a recycle exceeds six sockets, when accept instants were
+evicted (making the window an undercount), when the reconnect attribution totals
+disagree, when a pre-readiness CLI exit carried no typed exit code, when the
+concurrent
+device-fanout socket peak exceeds four, when a fault type was never exercised,
+or when a per-round or final recovery echo did not succeed. The gate runs as part of
 `scripts/m7-harness-verify.sh`. Its structured validator and its table-driven
-M7-C17 mutation case live in `crates/tunnel-test-harness/src/production_cluster/chaos.rs`.
+M7-C17 mutation cases live in `crates/tunnel-test-harness/src/production_cluster/chaos.rs`.
 
 ### Evidence-promotion guard (`scripts/m7-evidence-guard.py`)
 
