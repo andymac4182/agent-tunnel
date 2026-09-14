@@ -53,6 +53,37 @@ The transport command exercises real mTLS/H3 fault cases. The cluster command
 uses a synthetic owner callback. The production command uses real relay actors,
 CLI/device WebSockets and public consumers across three relays.
 
+`verify-m7-production` also records and asserts the IN-10/OG-05 heartbeat,
+liveness and shutdown evidence, printed as a
+`M7 production heartbeat/liveness/shutdown:` line and enforced by
+`validate_production_liveness_evidence`:
+
+- **Heartbeat.** The relay actor's owner-lease renewal is the only periodic
+  authority round trip the product actually performs end to end, so the gate
+  samples `Catalog::current_owner` for both tenant device scopes across the
+  whole run and counts each advance of `lease_expires_at` per owner token.
+  Every measured interval must fall inside `[owner_lease / 3, owner_lease]`,
+  both edges derived from the fixture's configured
+  `PRODUCTION_OWNER_LEASE`: the actor marks a lease due for renewal at
+  `last_lease_renewal.elapsed() >= owner_lease / 3`, and a renewal later than
+  the lease itself would have fenced the owner. The protocol `PING`/`PONG`
+  pair is deliberately *not* used as heartbeat evidence — both peers answer an
+  inbound `PING`, but nothing in the product emits one and the `WELCOME`
+  heartbeat interval/timeout fields are advertised without being driven, so
+  asserting on them would require adding a product heartbeat purely for the
+  test.
+- **Liveness vs readiness.** The gate probes one surviving relay's `/livez`
+  and `/readyz` before and after the owner relay is shut down and requires
+  both a ready and an unready observation, with the live envelope still served
+  at the moment readiness failed closed.
+- **Shutdown.** A dedicated real CLI epoch on its own device fanout (so the
+  shared fixture's ordered route schedule and socket accounting are unchanged)
+  is interrupted with `SIGINT`, and its join is *measured*. The measured
+  duration must land inside one complete configured rotation cycle
+  (`interval + handshake_timeout + overlap` from the fixture's `ROTATION`), the
+  process must exit through its own stop path rather than be force-killed, and
+  the stopped CLI must have released its Redis owner.
+
 ### Bounded multi-fault chaos classification (`verify-m7-chaos`)
 
 ```sh

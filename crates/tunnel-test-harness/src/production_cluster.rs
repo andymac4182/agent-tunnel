@@ -202,6 +202,13 @@ mod credential_expiry_rotation;
 pub use credential_expiry_rotation::{
     CredentialExpiryRotationEvidence, validate_credential_expiry_rotation_evidence,
 };
+mod liveness;
+use liveness::{
+    CLI_SHUTDOWN_JOIN_BOUND, HeartbeatScope, OwnerLeaseHeartbeat, heartbeat_maximum_interval,
+    heartbeat_minimum_interval, join_cli_after_interrupt, owner_lease_ms,
+};
+pub use liveness::{ProductionLivenessEvidence, validate_production_liveness_evidence};
+
 mod trust_expiry;
 pub use trust_expiry::{
     TrustExpiryEvidence, validate_trust_expiry_evidence, verify as verify_trust_expiry,
@@ -220,6 +227,13 @@ const ROTATION: RotationConfig = RotationConfig {
     overlap_seconds: 2,
 };
 const ROTATION_COUNT: u64 = 3;
+/// Owner lease every production-fixture relay is configured with.  It is the
+/// `RelayOptions` default spelled out here so the heartbeat bounds in
+/// [`liveness`] have a single named configuration source instead of a magic
+/// duration, and so changing the fixture's lease policy moves those bounds
+/// with it.  The relay renews a session's lease once a third of this has
+/// elapsed, which is where the observable heartbeat cadence comes from.
+pub(crate) const PRODUCTION_OWNER_LEASE: Duration = Duration::from_secs(30);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 /// Peer HTTP/3 idle timeout applied to every production-fixture relay.  A
 /// pooled consumer stream with no transport operation in either direction
@@ -325,6 +339,9 @@ pub struct ProductionClusterEvidence {
     pub key_revocation_rejected: bool,
     /// Whether owner shutdown produced an explicit no-owner interruption.
     pub owner_death_interrupted: bool,
+    /// IN-10/OG-05 heartbeat, liveness/readiness and bounded CLI shutdown
+    /// evidence recorded from the real CLI and relay during this run.
+    pub liveness: ProductionLivenessEvidence,
     /// Wall-clock seconds elapsed before the three replacement generations.
     pub elapsed_seconds: u64,
 }
@@ -1045,6 +1062,57 @@ fn validate_public_health_response(
     Ok(())
 }
 
+/// Bounded wait for readiness to fail closed after a peer route is lost.  It
+/// matches the C20 peer-readiness gate's own loss deadline; it is a timeout,
+/// not an asserted bound.
+const PEER_ROUTE_READINESS_TIMEOUT: Duration = Duration::from_secs(12);
+const HEALTH_SPLIT_POLL: Duration = Duration::from_millis(100);
+
+/// Counted `/livez` and `/readyz` observations from one production run.
+#[derive(Clone, Copy, Debug, Default)]
+struct HealthSplitObservation {
+    livez_probes: usize,
+    livez_live: usize,
+    readyz_probes: usize,
+    readyz_ready: usize,
+    readyz_unready: usize,
+    liveness_up_while_readiness_false: bool,
+}
+
+/// Probe one relay's public `/livez` and `/readyz` once and classify both
+/// answers into the fixed redacted envelopes.  Returns whether liveness
+/// answered live and whether readiness failed closed.
+async fn probe_health_pair(
+    consumer_addr: SocketAddr,
+    server_ca_der: &[u8],
+    observation: &mut HealthSplitObservation,
+) -> Result<(bool, bool)> {
+    let live = public_health_request(consumer_addr, server_ca_der, "/livez").await?;
+    observation.livez_probes += 1;
+    let live_ok = validate_public_health_response(&live, "/livez", 200, LIVEZ_BODY).is_ok();
+    if live_ok {
+        observation.livez_live += 1;
+    }
+    let ready = public_health_request(consumer_addr, server_ca_der, "/readyz").await?;
+    observation.readyz_probes += 1;
+    let ready_ok = validate_public_health_response(&ready, "/readyz", 200, READYZ_BODY).is_ok();
+    let unready_ok = validate_public_health_response(&ready, "/readyz", 503, UNREADYZ_BODY).is_ok();
+    match (ready_ok, unready_ok) {
+        (true, false) => observation.readyz_ready += 1,
+        (false, true) => observation.readyz_unready += 1,
+        _ => {
+            return Err(HarnessError::Http(format!(
+                "public /readyz returned neither the ready nor the unready envelope: status {}",
+                ready.status
+            )));
+        }
+    }
+    if live_ok && unready_ok {
+        observation.liveness_up_while_readiness_false = true;
+    }
+    Ok((live_ok, unready_ok))
+}
+
 async fn assert_public_health_ready(consumer_addr: SocketAddr, server_ca_der: &[u8]) -> Result<()> {
     let live = public_health_request(consumer_addr, server_ca_der, "/livez").await?;
     validate_public_health_response(&live, "/livez", 200, LIVEZ_BODY)?;
@@ -1166,6 +1234,9 @@ fn validate_production_evidence(evidence: &ProductionClusterEvidence) -> Result<
     // contracts are mandatory parts of this gate, not optional extras.
     validate_concurrent_tenant_isolation_evidence(&evidence.tenant_isolation, ROTATION_COUNT)?;
     validate_owner_race_evidence(&evidence.owner_race)?;
+    // IN-10/OG-05: heartbeat, liveness/readiness and the measured bounded
+    // shutdown join are mandatory parts of this gate too.
+    validate_production_liveness_evidence(&evidence.liveness)?;
     // The legacy summary flag must agree with the structured evidence.
     if !evidence.same_uuid_tenant_isolation_verified {
         return Err(HarnessError::Process(
@@ -1281,6 +1352,17 @@ struct MembershipResignInputs {
     /// Record version the next re-signing round issues.  Bootstrap published
     /// version 1, and the verifier replaces a record only with a newer one.
     next_record_version: u64,
+}
+
+/// Inputs for one bounded IN-10/OG-05 CLI shutdown-join measurement.
+#[derive(Clone, Copy)]
+struct CliShutdownJoinContext<'a> {
+    harness: &'a RunningHarness,
+    device: &'a crate::fixture::DeviceFixture,
+    service_id: Uuid,
+    canary: &'a str,
+    token: &'a str,
+    consumer_addr: SocketAddr,
 }
 
 struct ProductionRelay {
@@ -2374,6 +2456,20 @@ impl ProductionCluster {
                 HarnessError::InvalidInput("production device has no echo service".into())
             })?;
         let canary = format!("m7-production:{}", device.id);
+        // IN-10/OG-05: start counting the relay's owner-lease heartbeat for
+        // both tenant scopes before the first session claims an owner, so the
+        // renewals are observed as they happen rather than reconstructed.
+        let mut heartbeat_scopes = vec![HeartbeatScope {
+            tenant_id: device.tenant_id,
+            device_id: device.id,
+        }];
+        if let Some(tenant_b_device) = harness.topology.devices_b.first() {
+            heartbeat_scopes.push(HeartbeatScope {
+                tenant_id: tenant_b_device.tenant_id,
+                device_id: tenant_b_device.id,
+            });
+        }
+        let heartbeat = OwnerLeaseHeartbeat::start(self.catalog.clone(), heartbeat_scopes);
         let profile_directory = tempdir().map_err(HarnessError::Io)?;
         let mut profile = write_device_profile(
             profile_directory.path(),
@@ -2839,6 +2935,28 @@ impl ProductionCluster {
         self.wait_for_no_owner(device_b.tenant_id, device_b.id)
             .await?;
 
+        // IN-10/OG-05 bounded shutdown evidence.  A dedicated real CLI epoch
+        // is interrupted and *joined with a measured duration* against a
+        // bound taken from the fixture's rotation policy, and its Redis owner
+        // must be released by that stop.
+        //
+        // It is deliberately a separate epoch on its own device fanout.  The
+        // owner-death phase below still needs an owner that was abandoned
+        // rather than released, so this measurement must not consume it; and
+        // routing it through a private fanout keeps the shared fixture's
+        // ordered route schedule, socket counts and three-socket peak exactly
+        // as every other assertion in this gate already expects.
+        let (cli_shutdown, cli_shutdown_owner_released) = self
+            .measure_cli_shutdown_join(&CliShutdownJoinContext {
+                harness,
+                device,
+                service_id,
+                canary: &canary,
+                token: &token,
+                consumer_addr: relay_c_consumer_addr,
+            })
+            .await?;
+
         let (cli_process, mut cli_stream) = start_cli_smoke(
             harness,
             self.device_fanout.local_addr(),
@@ -2885,6 +3003,16 @@ impl ProductionCluster {
                 ..OidcTokenOptions::default()
             },
         )?;
+        // IN-10/OG-05 liveness/readiness split.  Record the surviving
+        // ingress answering both the live and the ready envelope first, so a
+        // relay that was wedged unready all along cannot satisfy the split.
+        let mut health = HealthSplitObservation::default();
+        probe_health_pair(
+            owner_death_relay_addr,
+            &harness.pki.server_ca.certificate_der,
+            &mut health,
+        )
+        .await?;
         self.shutdown_node(&cli_owner.token.node_id).await?;
         let owner_death_interrupted = match open_consumer_stream(
             owner_death_relay_addr,
@@ -2916,6 +3044,59 @@ impl ProductionCluster {
                 "owner shutdown did not produce a no-owner interruption".into(),
             ));
         }
+        // Losing a required signed peer route must fail this relay's
+        // readiness closed while its process-only liveness keeps answering:
+        // docs/cluster.md's rule that liveness may stay up while readiness
+        // goes false.
+        let readiness_deadline = Instant::now() + PEER_ROUTE_READINESS_TIMEOUT;
+        loop {
+            let (live_ok, unready_ok) = probe_health_pair(
+                owner_death_relay_addr,
+                &harness.pki.server_ca.certificate_der,
+                &mut health,
+            )
+            .await?;
+            if unready_ok {
+                if !live_ok {
+                    return Err(HarnessError::Process(
+                        "production /livez stopped answering when readiness failed closed".into(),
+                    ));
+                }
+                break;
+            }
+            if Instant::now() >= readiness_deadline {
+                return Err(HarnessError::Timeout(
+                    "production /readyz did not fail closed after the owner relay was shut down"
+                        .into(),
+                ));
+            }
+            sleep(HEALTH_SPLIT_POLL).await;
+        }
+
+        let heartbeat = heartbeat.join().await?;
+        let liveness = ProductionLivenessEvidence {
+            owner_lease_ms: owner_lease_ms(),
+            heartbeat_minimum_interval_ms: heartbeat_minimum_interval().as_millis() as u64,
+            heartbeat_maximum_interval_ms: heartbeat_maximum_interval().as_millis() as u64,
+            heartbeat_owner_tokens: heartbeat.owner_tokens,
+            heartbeat_round_trips: heartbeat.round_trips,
+            heartbeat_intervals: heartbeat.intervals_ms.len(),
+            longest_heartbeat_run_intervals: heartbeat.longest_run_intervals,
+            observed_minimum_interval_ms: heartbeat.minimum_interval_ms(),
+            observed_maximum_interval_ms: heartbeat.maximum_interval_ms(),
+            heartbeat_intervals_within_bounds: heartbeat.within_bounds(),
+            livez_probes: health.livez_probes,
+            livez_live: health.livez_live,
+            readyz_probes: health.readyz_probes,
+            readyz_ready: health.readyz_ready,
+            readyz_unready: health.readyz_unready,
+            liveness_up_while_readiness_false: health.liveness_up_while_readiness_false,
+            cli_shutdown_join_bound_ms: CLI_SHUTDOWN_JOIN_BOUND.as_millis() as u64,
+            cli_shutdown_join_ms: cli_shutdown.join_ms,
+            cli_shutdown_joined_within_bound: cli_shutdown.within_bound,
+            cli_shutdown_graceful_exit: cli_shutdown.graceful_exit,
+            cli_shutdown_owner_released,
+        };
 
         let final_status = client_status_after_stop(&client);
         let fanout = wait_for_fanout_drained(&self.device_fanout, "device").await?;
@@ -2972,8 +3153,102 @@ impl ProductionCluster {
             stale_owner_rejected,
             key_revocation_rejected,
             owner_death_interrupted,
+            liveness,
             elapsed_seconds: elapsed.as_secs(),
         })
+    }
+
+    /// Run one real CLI epoch on a private device fanout, interrupt it, and
+    /// measure the join plus the Redis owner release.
+    ///
+    /// The private fanout is the point: the shared fixture fanout carries an
+    /// ordered route schedule and bounded socket accounting that the rest of
+    /// this gate asserts on, so the shutdown epoch must not consume slots in
+    /// it.  The fanout is always joined before returning, on success or
+    /// failure.
+    async fn measure_cli_shutdown_join(
+        &mut self,
+        context: &CliShutdownJoinContext<'_>,
+    ) -> Result<(liveness::CliShutdownJoin, bool)> {
+        let targets = ["relay-a", "relay-b", "relay-c"]
+            .into_iter()
+            .map(|node_id| {
+                self.relays
+                    .iter()
+                    .find(|relay| relay.node_id == node_id)
+                    .and_then(|relay| relay.running.as_ref().map(|running| running.device_addr))
+                    .ok_or_else(|| {
+                        HarnessError::InvalidInput(format!(
+                            "shutdown-join fanout has no device listener for {node_id}"
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut fanout = FanoutProxy::bind(targets, FanoutProxyConfig::default()).await?;
+        let outcome = self.run_cli_shutdown_join(context, &fanout).await;
+        let cleanup = fanout
+            .shutdown_until(tokio::time::Instant::now() + CLEANUP_TIMEOUT)
+            .await;
+        match (outcome, cleanup) {
+            (Ok(outcome), Ok(())) => Ok(outcome),
+            (Ok(_), Err(cleanup)) => Err(HarnessError::Process(format!(
+                "shutdown-join fanout cleanup: {cleanup}"
+            ))),
+            (Err(error), Ok(())) => Err(error),
+            (Err(error), Err(cleanup)) => Err(HarnessError::Process(format!(
+                "{error}; shutdown-join fanout cleanup: {cleanup}"
+            ))),
+        }
+    }
+
+    async fn run_cli_shutdown_join(
+        &mut self,
+        context: &CliShutdownJoinContext<'_>,
+        fanout: &FanoutProxyHandle,
+    ) -> Result<(liveness::CliShutdownJoin, bool)> {
+        let CliShutdownJoinContext {
+            harness,
+            device,
+            service_id,
+            canary,
+            token,
+            consumer_addr,
+        } = *context;
+        let profile_directory = tempdir().map_err(HarnessError::Io)?;
+        let mut profile = write_device_profile(
+            profile_directory.path(),
+            device.id,
+            service_id,
+            canary,
+            fanout.local_addr(),
+            &device.certificate.certificate_pem,
+            &device.certificate.private_key_pem,
+            &harness.pki.server_ca.certificate_pem,
+        )?;
+        profile.config.rotation = ROTATION;
+        profile.config.validate().map_err(|error| {
+            HarnessError::InvalidInput(format!("shutdown-join client config: {error}"))
+        })?;
+        let (process, mut stream) = start_cli_smoke(
+            harness,
+            fanout.local_addr(),
+            consumer_addr,
+            &profile,
+            token,
+            device.id,
+            service_id,
+        )
+        .await?;
+        stream
+            .round_trip(b"production-record-cli-shutdown", canary.as_bytes())
+            .await?;
+        stream.close().await?;
+        let shutdown = join_cli_after_interrupt(process).await?;
+        let owner_released = self
+            .wait_for_no_owner(device.tenant_id, device.id)
+            .await
+            .is_ok();
+        Ok((shutdown, owner_released))
     }
 
     async fn run_process_pause(
@@ -5140,6 +5415,10 @@ async fn start_relay(
     options.boot_id = node.boot_id.clone();
     options.deployment_incarnation = fixture.deployment_incarnation.clone();
     options.rotation = harness.rotation_config();
+    // Same value as `RelayOptions::new`, stated explicitly: the IN-10/OG-05
+    // heartbeat bounds are derived from this configured lease, so the fixture
+    // must name it rather than inherit it silently.
+    options.owner_lease = PRODUCTION_OWNER_LEASE;
     if let Some(max_pending_operations) = max_pending_operations {
         options.limits.max_pending_operations = max_pending_operations;
     }
@@ -6423,9 +6702,9 @@ fn connect_failure_to_harness(error: StreamConnectFailure) -> HarnessError {
 mod tests {
     use super::{
         ConcurrentTenantIsolationEvidence, OwnerRaceEvidence, ProcessPauseProbeOutcome,
-        ProductionClusterEvidence, ROTATION_COUNT, RedisPartitionEvidence,
-        is_explicit_no_owner_response, is_partition_admission_response, is_peer_recovery_response,
-        redacted_admission_failure, validate_production_evidence,
+        ProductionClusterEvidence, ProductionLivenessEvidence, ROTATION_COUNT,
+        RedisPartitionEvidence, is_explicit_no_owner_response, is_partition_admission_response,
+        is_peer_recovery_response, redacted_admission_failure, validate_production_evidence,
         validate_redis_partition_evidence,
     };
     use crate::acceptance_test_support::{assert_failed, assert_rejected};
@@ -6451,7 +6730,36 @@ mod tests {
             stale_owner_rejected: true,
             key_revocation_rejected: true,
             owner_death_interrupted: true,
+            liveness: valid_liveness(),
             elapsed_seconds: 9,
+        }
+    }
+
+    fn valid_liveness() -> ProductionLivenessEvidence {
+        let lease = super::owner_lease_ms();
+        let minimum = super::heartbeat_minimum_interval().as_millis() as u64;
+        ProductionLivenessEvidence {
+            owner_lease_ms: lease,
+            heartbeat_minimum_interval_ms: minimum,
+            heartbeat_maximum_interval_ms: lease,
+            heartbeat_owner_tokens: 2,
+            heartbeat_round_trips: 3,
+            heartbeat_intervals: 3,
+            longest_heartbeat_run_intervals: 2,
+            observed_minimum_interval_ms: minimum + 10,
+            observed_maximum_interval_ms: minimum + 90,
+            heartbeat_intervals_within_bounds: true,
+            livez_probes: 3,
+            livez_live: 3,
+            readyz_probes: 3,
+            readyz_ready: 1,
+            readyz_unready: 2,
+            liveness_up_while_readiness_false: true,
+            cli_shutdown_join_bound_ms: super::CLI_SHUTDOWN_JOIN_BOUND.as_millis() as u64,
+            cli_shutdown_join_ms: 150,
+            cli_shutdown_joined_within_bound: true,
+            cli_shutdown_graceful_exit: true,
+            cli_shutdown_owner_released: true,
         }
     }
 
@@ -6560,6 +6868,55 @@ mod tests {
             let mut evidence = valid_evidence();
             mutate(&mut evidence);
             assert_rejected(validate_production_evidence(&evidence), name);
+        }
+    }
+
+    /// IN-10/OG-05: the production gate must fail when the heartbeat,
+    /// liveness/readiness or bounded-shutdown evidence is missing or
+    /// weakened, exactly like the isolation and race sub-gates.  Without
+    /// these the row's `records heartbeat/liveness and shutdown evidence`
+    /// clause is unasserted and the run only proves the gateway path.
+    #[test]
+    fn production_evidence_rejects_weakened_liveness_subgate() {
+        type Mutate = (&'static str, fn(&mut ProductionClusterEvidence));
+        let mutations: [Mutate; 7] = [
+            // The session stayed up but no heartbeat was ever counted.
+            ("counted owner-lease renewals", |e| {
+                e.liveness.heartbeat_round_trips = 0;
+                e.liveness.heartbeat_intervals = 0;
+                e.liveness.longest_heartbeat_run_intervals = 0;
+            }),
+            // A renewal landed outside the configured lease window.
+            ("escaped the configured window", |e| {
+                e.liveness.observed_maximum_interval_ms =
+                    e.liveness.heartbeat_maximum_interval_ms + 1;
+            }),
+            // The bound was invented instead of derived from the lease.
+            ("is not derived from owner_lease_ms", |e| {
+                e.liveness.heartbeat_minimum_interval_ms += 1;
+            }),
+            // Readiness never failed closed, so the two endpoints were never
+            // distinguished.
+            ("readyz_unready was zero", |e| {
+                e.liveness.readyz_probes = e.liveness.readyz_ready;
+                e.liveness.readyz_unready = 0;
+            }),
+            ("were never distinguished", |e| {
+                e.liveness.liveness_up_while_readiness_false = false;
+            }),
+            // The CLI ignored its interrupt and had to be force-killed.
+            ("force-killed rather than joined", |e| {
+                e.liveness.cli_shutdown_graceful_exit = false;
+            }),
+            // The measured join outran its bound.
+            ("exceeded its bound", |e| {
+                e.liveness.cli_shutdown_join_ms = e.liveness.cli_shutdown_join_bound_ms + 1;
+            }),
+        ];
+        for (expected, mutate) in mutations {
+            let mut evidence = valid_evidence();
+            mutate(&mut evidence);
+            assert_rejected(validate_production_evidence(&evidence), expected);
         }
     }
 

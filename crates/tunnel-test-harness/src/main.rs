@@ -188,6 +188,31 @@ async fn main() -> ExitCode {
                         race.successor_canary,
                         race.elapsed_ms,
                     );
+                    let liveness = &evidence.liveness;
+                    println!(
+                        "M7 production heartbeat/liveness/shutdown: owner_lease_ms={} heartbeat_window_ms=[{},{}] heartbeat_owner_tokens={} heartbeat_round_trips={} heartbeat_intervals={} longest_heartbeat_run={} observed_interval_ms=[{},{}] intervals_within_bounds={} livez={}/{} readyz_ready={} readyz_unready={}/{} live_while_unready={} cli_shutdown_join_ms={} cli_shutdown_bound_ms={} cli_shutdown_within_bound={} cli_shutdown_graceful_exit={} cli_shutdown_owner_released={}",
+                        liveness.owner_lease_ms,
+                        liveness.heartbeat_minimum_interval_ms,
+                        liveness.heartbeat_maximum_interval_ms,
+                        liveness.heartbeat_owner_tokens,
+                        liveness.heartbeat_round_trips,
+                        liveness.heartbeat_intervals,
+                        liveness.longest_heartbeat_run_intervals,
+                        liveness.observed_minimum_interval_ms,
+                        liveness.observed_maximum_interval_ms,
+                        liveness.heartbeat_intervals_within_bounds,
+                        liveness.livez_live,
+                        liveness.livez_probes,
+                        liveness.readyz_ready,
+                        liveness.readyz_unready,
+                        liveness.readyz_probes,
+                        liveness.liveness_up_while_readiness_false,
+                        liveness.cli_shutdown_join_ms,
+                        liveness.cli_shutdown_join_bound_ms,
+                        liveness.cli_shutdown_joined_within_bound,
+                        liveness.cli_shutdown_graceful_exit,
+                        liveness.cli_shutdown_owner_released,
+                    );
                 }),
                 Err(_) => Err(HarnessError::Process(
                     "M7 production acceptance exceeded 300 seconds".to_owned(),
