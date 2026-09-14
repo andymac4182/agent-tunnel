@@ -169,7 +169,8 @@ pub use owner_death_admission::{
 };
 mod handover_peer_grace;
 pub use handover_peer_grace::{
-    Ec025HandoverEvidence, validate_ec025_handover_evidence, verify as verify_ec025_handover,
+    Ec025HandoverEvidence, Ec025TrustCrossing, validate_ec025_handover_evidence,
+    verify as verify_ec025_handover,
 };
 mod public_abandoned_upgrade;
 pub use public_abandoned_upgrade::{

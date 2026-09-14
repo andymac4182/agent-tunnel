@@ -412,7 +412,7 @@ async fn main() -> ExitCode {
                 .and_then(|evidence| {
                     tunnel_test_harness::production_cluster::validate_ec025_handover_evidence(&evidence)?;
                     println!(
-                        "M7 EC-025 cross-relay handover passed: relays={} ingress_not_owner={} owner_unchanged={} baseline_exact_owner={} exact_owner_scope_observed={} barrier_completed_exact_owner={} peer_delay_typed_not_dispatched={} peer_delay_zero_dispatch={} rotation_observed={} across_rotation_no_foreign_dispatch={} across_rotation_completed_or_typed={} across_rotation_completed={} across_rotation_interrupted={} across_rotation_not_dispatched={} cleanup_joined={}",
+                        "M7 EC-025 cross-relay handover passed: relays={} ingress_not_owner={} owner_unchanged={} baseline_exact_owner={} exact_owner_scope_observed={} barrier_completed_exact_owner={} peer_delay_typed_not_dispatched={} peer_delay_zero_dispatch={} rotation_observed={} across_rotation_no_foreign_dispatch={} across_rotation_completed_or_typed={} across_rotation_completed={} across_rotation_interrupted={} across_rotation_not_dispatched={} trust_crossing_scope_observed={} trust_crossing_healthy_baseline={} trust_crossing_withdrawn_while_held={} trust_crossing_still_held={} trust_crossing_status={} trust_crossing_code={} trust_crossing_execution={} trust_crossing_delta_a={} trust_crossing_delta_b={} trust_crossing_delta_c={} trust_crossing_owner_delta={} trust_crossing_fault_role={} trust_crossing_fault_stage={} trust_crossing_fault_cause={} cleanup_joined={}",
                         evidence.relay_count,
                         evidence.ingress_is_not_owner,
                         evidence.owner_node_unchanged,
@@ -427,6 +427,24 @@ async fn main() -> ExitCode {
                         evidence.across_rotation_completed,
                         evidence.across_rotation_interrupted,
                         evidence.across_rotation_not_dispatched,
+                        evidence.trust_crossing.scope_observed,
+                        evidence.trust_crossing.healthy_baseline_completed,
+                        evidence.trust_crossing.withdrawn_while_held,
+                        evidence.trust_crossing.still_held_at_withdrawal,
+                        evidence.trust_crossing.refusal_status,
+                        evidence.trust_crossing.refusal_code.as_deref().unwrap_or("-"),
+                        evidence
+                            .trust_crossing
+                            .refusal_execution
+                            .as_deref()
+                            .unwrap_or("-"),
+                        evidence.trust_crossing.dispatch_delta[0],
+                        evidence.trust_crossing.dispatch_delta[1],
+                        evidence.trust_crossing.dispatch_delta[2],
+                        evidence.trust_crossing.owner_dispatch_delta,
+                        evidence.trust_crossing.fault_role.as_deref().unwrap_or("-"),
+                        evidence.trust_crossing.fault_stage.as_deref().unwrap_or("-"),
+                        evidence.trust_crossing.fault_cause.as_deref().unwrap_or("-"),
                         evidence.cleanup_joined,
                     );
                     Ok(())
