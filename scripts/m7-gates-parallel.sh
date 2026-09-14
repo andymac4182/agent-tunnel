@@ -33,6 +33,11 @@ export TUNNEL_CATALOG_REDIS_URL=${TUNNEL_CATALOG_REDIS_URL:-$TEST_REDIS_URL}
 export RUST_LOG=${RUST_LOG:-info}
 export C11_SOURCE_ID=${C11_SOURCE_ID:-git-$(git rev-parse --short=12 HEAD)}
 export C11_BUILD_ID=${C11_BUILD_ID:-local-$label}
+# Keep a failing C11 child's stderr.  Without this the gate reports only a byte
+# count and a marker list, and the evidence needed to diagnose it is discarded
+# at the moment it is produced.
+export C11_CHILD_FAILURE_DIR=${C11_CHILD_FAILURE_DIR:-$out/c11-child-failures}
+mkdir -p "$C11_CHILD_FAILURE_DIR"
 : > "$out/summary.tsv"
 
 # Gates whose assertions are bounded by real deadlines; these run alone.
