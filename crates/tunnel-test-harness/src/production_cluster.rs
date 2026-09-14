@@ -10,7 +10,10 @@
 //! to the live owner actor.
 
 use crate::acceptance::helpers::write_device_profile;
-use crate::cluster_fixture::TestMembershipAuthority;
+use crate::cluster_fixture::{
+    M7_MEMBERSHIP_LIFETIME, MembershipLifetimeOptions, MembershipNodeIdentity,
+    TestMembershipAuthority,
+};
 use crate::{
     ClusterFixture, Harness, HarnessError, HarnessOptions, ManagedProcess, OidcTokenOptions,
     ProcessSpec, ProxyConfig, ProxyHandle, Result, RunningHarness, TcpProxy,
@@ -30,7 +33,7 @@ use std::{
     path::{Path, PathBuf},
     pin::Pin,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -231,6 +234,31 @@ const CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
 const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
 const REDIS_PARTITION_OPERATION_TIMEOUT: Duration = Duration::from_secs(10);
 const REDIS_PARTITION_AUTHORIZATION_WAIT: Duration = Duration::from_secs(6);
+/// How often the fixture re-signs and republishes every relay's membership
+/// record once re-signing is started.
+///
+/// The records are signed at the fixture's normal lifetime and the relay's
+/// verifier caps a record at the product maximum of 60 seconds, so a scenario
+/// that runs longer than that cannot be given a longer record; it has to be
+/// given fresh ones.  Nothing in the fixture did that, so a record signed once
+/// at bootstrap became an absolute wall-clock deadline measured from cluster
+/// startup, and membership trust lapsed partway through any longer run.  That
+/// made post-fault recovery depend on *when* in the run the fault landed
+/// rather than on the behaviour under test.
+///
+/// The interval is a small fraction of the record lifetime so a single missed
+/// or slow publish cannot expire a record, and it matches how a real control
+/// plane re-issues membership well before expiry.
+const MEMBERSHIP_RESIGN_INTERVAL: Duration = Duration::from_secs(15);
+/// How many consecutive publish rounds may fail before the re-signer is
+/// treated as broken rather than as riding out a deliberate outage.
+///
+/// A scenario that pauses Redis on purpose makes the publish fail for as long
+/// as the pause lasts, so a re-signer that gave up on the first error would
+/// die in exactly the gate that needs it.  It retries instead.  The threshold
+/// spans a full record lifetime: past that, membership trust has genuinely
+/// lapsed and the run should say so rather than carry on with stale records.
+const MEMBERSHIP_RESIGN_MAX_CONSECUTIVE_FAILURES: u32 = 4;
 const REDIS_PARTITION_POLL: Duration = Duration::from_millis(25);
 const REDIS_RECOVERY_TIMEOUT: Duration = Duration::from_secs(15);
 const PUBLIC_HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -1229,6 +1257,30 @@ struct ProductionCluster {
     catalog: SharedCatalog,
     membership_records: usize,
     checkpoint_authority: Arc<FixtureCheckpointAuthority>,
+    /// Everything a background re-signer needs to keep issuing fresh
+    /// membership records, captured at startup while the harness is in scope.
+    membership_resign_inputs: MembershipResignInputs,
+    membership_resign_cancel: CancellationToken,
+    membership_resign: Option<JoinHandle<()>>,
+    /// First error the re-signer hit, if any.  A re-signer that died silently
+    /// would turn into flakiness in whatever gate relied on it, so the failure
+    /// is kept and surfaced instead of logged and forgotten.
+    membership_resign_error: Arc<Mutex<Option<String>>>,
+}
+
+/// Startup-captured inputs for the membership re-signer.
+#[derive(Clone)]
+struct MembershipResignInputs {
+    redis_url: String,
+    redis_namespace: String,
+    deployment_id: String,
+    deployment_incarnation: String,
+    /// Node identity and the peer endpoint its record advertises, in the same
+    /// order the bootstrap records were signed.
+    nodes: Vec<(MembershipNodeIdentity, SocketAddr)>,
+    /// Record version the next re-signing round issues.  Bootstrap published
+    /// version 1, and the verifier replaces a record only with a newer one.
+    next_record_version: u64,
 }
 
 struct ProductionRelay {
@@ -1916,6 +1968,9 @@ impl ProductionCluster {
             }
         };
         let membership_now = Utc::now();
+        // Captured while the node fixtures are in scope so a background
+        // re-signer can keep issuing fresh records without borrowing them.
+        let mut resign_nodes: Vec<(MembershipNodeIdentity, SocketAddr)> = Vec::new();
         for node in &fixture.nodes {
             let peer_endpoint = match peer_proxies
                 .get(&node.node_id)
@@ -1950,6 +2005,22 @@ impl ProductionCluster {
                     return Err(startup_cleanup_error(error, cleanup_errors));
                 }
             };
+            let peer_spki_sha256 = match node.peer_spki_fingerprint() {
+                Ok(digest) => digest,
+                Err(error) => {
+                    let cleanup_errors =
+                        shutdown_peer_proxies_until(&mut peer_proxies, startup_cleanup_deadline)
+                            .await;
+                    return Err(startup_cleanup_error(error, cleanup_errors));
+                }
+            };
+            resign_nodes.push((
+                MembershipNodeIdentity {
+                    node_id: node.node_id.clone(),
+                    peer_spki_sha256,
+                },
+                peer_endpoint,
+            ));
             fixture.memberships.insert(node.node_id.clone(), membership);
         }
         let trusted_publisher = match membership_authority.trusted_key() {
@@ -2206,6 +2277,14 @@ impl ProductionCluster {
                 }
             };
 
+        let resign_inputs = MembershipResignInputs {
+            redis_url: harness.redis.redis_url().to_owned(),
+            redis_namespace: harness.redis.namespace().to_owned(),
+            deployment_id: fixture.deployment_id.clone(),
+            deployment_incarnation: fixture.deployment_incarnation.clone(),
+            nodes: resign_nodes,
+            next_record_version: 2,
+        };
         let cluster = Self {
             fixture,
             _files: files,
@@ -2216,6 +2295,10 @@ impl ProductionCluster {
             catalog,
             membership_records: membership_records.len(),
             checkpoint_authority: authority,
+            membership_resign_inputs: resign_inputs,
+            membership_resign_cancel: CancellationToken::new(),
+            membership_resign: None,
+            membership_resign_error: Arc::new(Mutex::new(None)),
         };
         if let Err(error) = cluster.wait_for_peer_readiness(STARTUP_TIMEOUT).await {
             let cleanup_deadline = tokio::time::Instant::now() + CLEANUP_TIMEOUT;
@@ -4377,10 +4460,12 @@ impl ProductionCluster {
     /// signed checkpoint cannot be refreshed against an unreachable catalog.
     /// The runtime is not latched -- its supervisor keeps reconciling and
     /// restores `Ready` once a strictly-newer signed checkpoint and a catalog
-    /// snapshot land in the same pass -- but whether it re-arms in a bounded
-    /// run depends on how much of the fixture's signed membership record
-    /// lifetime remains when the outage happens.  This returns the observation
-    /// so a caller can record it as evidence either way.
+    /// snapshot land in the same pass.  With
+    /// membership re-signing started (see [`MEMBERSHIP_RESIGN_INTERVAL`]) the
+    /// re-arm no longer depends on when in the run the outage lands, so a
+    /// caller that started re-signing may assert this rather than merely
+    /// record it.  It still returns
+    /// the observation instead of failing, so the caller owns the diagnostic.
     async fn observe_membership_readiness(&self, budget: Duration) -> bool {
         let deadline = Instant::now() + budget;
         loop {
@@ -4410,6 +4495,64 @@ impl ProductionCluster {
     /// re-arm on its own) and not in the protocol, so a caller that has
     /// observed readiness return re-publishes explicitly -- exactly as the
     /// key-revocation probe does after it deliberately revokes pins.
+    /// Start re-signing and republishing every relay's membership record on a
+    /// fixed interval until shutdown.
+    ///
+    /// Opt-in, and started by the scenario that needs it rather than by every
+    /// cluster, because a background version bump would collide with any gate
+    /// that publishes its own record at a chosen version (the trust-expiry,
+    /// key-overlap and handover gates all do).  Those gates keep the original
+    /// behaviour of a record signed once at bootstrap.
+    ///
+    /// Each round issues a record at the fixture's normal lifetime with a
+    /// strictly newer version, which is what the relay's verifier requires to
+    /// replace one.  Nothing here widens what the relay will accept: the
+    /// record lifetime stays inside the product maximum, and the record still
+    /// names the same node and the same peer certificate digest.
+    async fn start_membership_resigning(&mut self) -> Result<()> {
+        if self.membership_resign.is_some() {
+            return Err(HarnessError::InvalidInput(
+                "membership re-signing is already running for this cluster".into(),
+            ));
+        }
+        let inputs = self.membership_resign_inputs.clone();
+        let publisher =
+            RedisMembershipPublisher::connect(&inputs.redis_url, &inputs.redis_namespace)
+                .await
+                .map_err(|error| {
+                    HarnessError::Redis(format!("connecting membership re-signer: {error}"))
+                })?;
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(membership_resign_loop(
+            Arc::clone(&self.checkpoint_authority),
+            inputs,
+            publisher,
+            MEMBERSHIP_RESIGN_INTERVAL,
+            Arc::clone(&self.membership_resign_error),
+            cancel.clone(),
+        ));
+        self.membership_resign_cancel = cancel;
+        self.membership_resign = Some(task);
+        Ok(())
+    }
+
+    /// The first error the membership re-signer hit, if it hit one.
+    fn membership_resign_failure(&self) -> Option<String> {
+        self.membership_resign_error
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+    }
+
+    fn republish_peer_pins(&self) -> Result<()> {
+        for relay in &self.relays {
+            publish_verified_pins(&relay.membership, &relay.pins)?;
+        }
+        Ok(())
+    }
+
+    /// Wait until every relay's peer runtime reports ready, or fail with the
+    /// count that got there before the budget expired.
     async fn wait_for_peer_readiness(&self, budget: Duration) -> Result<()> {
         let deadline = Instant::now() + budget;
         loop {
@@ -4577,6 +4720,21 @@ impl ProductionCluster {
 
     async fn shutdown_until(mut self, deadline: tokio::time::Instant) -> Result<()> {
         let mut errors = Vec::new();
+        self.membership_resign_cancel.cancel();
+        if let Some(mut task) = self.membership_resign.take() {
+            match timeout_at(deadline, &mut task).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => errors.push(format!("membership re-signer failed: {error}")),
+                Err(_) => {
+                    task.abort();
+                    let _ = task.await;
+                    errors.push("membership re-signer did not stop by its deadline".to_owned());
+                }
+            }
+        }
+        if let Some(failure) = self.membership_resign_failure() {
+            errors.push(format!("membership re-signer reported: {failure}"));
+        }
         if let Err(error) = capture_c11_cluster_diagnostics(&self, deadline).await {
             errors.push(format!("C11 cluster diagnostics: {error}"));
         }
@@ -5149,6 +5307,100 @@ fn required_peer_routes(
         .into_iter()
         .filter(|target| target.node_id() != local_node_id)
         .collect()
+}
+
+/// Re-sign and republish every relay's membership record on a fixed interval.
+///
+/// The relay's verifier caps a record's lifetime at the product maximum, so a
+/// scenario that outlives that cap cannot hold a longer record and has to be
+/// issued fresh ones, exactly as a real control plane issues them.  The first
+/// failure is kept in `failure` rather than only logged, so a re-signer that
+/// dies cannot quietly become flakiness in the gate that depends on it.
+async fn membership_resign_loop(
+    authority: Arc<FixtureCheckpointAuthority>,
+    inputs: MembershipResignInputs,
+    publisher: RedisMembershipPublisher,
+    interval: Duration,
+    failure: Arc<Mutex<Option<String>>>,
+    shutdown: CancellationToken,
+) {
+    let record_failure = |message: String| {
+        if let Ok(mut guard) = failure.lock()
+            && guard.is_none()
+        {
+            *guard = Some(message);
+        }
+    };
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // The first tick completes immediately; the bootstrap record was just
+    // published, so skip it and re-sign one interval later.
+    ticker.tick().await;
+    let mut record_version = inputs.next_record_version;
+    let mut consecutive_failures: u32 = 0;
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => break,
+            _ = ticker.tick() => {
+                let now = Utc::now();
+                let mut round_failed = false;
+                for (identity, peer_endpoint) in &inputs.nodes {
+                    let signed = match authority.issuer.sign_membership_identity(
+                        &inputs.deployment_id,
+                        &inputs.deployment_incarnation,
+                        identity,
+                        MembershipLifetimeOptions {
+                            record_version,
+                            peer_endpoint: *peer_endpoint,
+                            now,
+                            lifetime: M7_MEMBERSHIP_LIFETIME,
+                        },
+                    ) {
+                        Ok(signed) => signed,
+                        Err(error) => {
+                            record_failure(format!(
+                                "re-signing membership for {}: {error}",
+                                identity.node_id
+                            ));
+                            return;
+                        }
+                    };
+                    if let Err(error) = publisher
+                        .publish_signed_membership_for_node(
+                            &identity.node_id,
+                            &signed.catalog_record(),
+                        )
+                        .await
+                    {
+                        // A deliberate Redis outage makes this fail for as long
+                        // as it lasts.  Retry on the next tick rather than
+                        // dying inside the scenario that paused it.
+                        round_failed = true;
+                        tracing::debug!(
+                            node_id = %identity.node_id,
+                            ?error,
+                            stage = "membership_resign_publish",
+                            "membership republish failed; retrying on the next interval"
+                        );
+                        break;
+                    }
+                }
+                if round_failed {
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    if consecutive_failures > MEMBERSHIP_RESIGN_MAX_CONSECUTIVE_FAILURES {
+                        record_failure(format!(
+                            "membership republish failed {consecutive_failures} consecutive rounds, \
+                             which is longer than one record lifetime"
+                        ));
+                        return;
+                    }
+                    continue;
+                }
+                consecutive_failures = 0;
+                record_version = record_version.saturating_add(1);
+            }
+        }
+    }
 }
 
 async fn peer_refresh_loop(

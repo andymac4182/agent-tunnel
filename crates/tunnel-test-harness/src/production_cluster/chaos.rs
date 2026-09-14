@@ -63,42 +63,58 @@ use super::{
     wait_for_fanout_drained,
 };
 
-/// The fixed chaos schedule.  Owner kill, CLI process pause and peer UDP loss
-/// are each repeated; a full Redis pause is exercised once, as the terminal
-/// round.
+/// The fixed chaos schedule.  Every fault type is repeated, the full Redis
+/// pause included, and **no round is terminal**.
 ///
 /// Pausing *all* proxied Redis sockets drives each relay's membership runtime
 /// Unready, because its signed checkpoint cannot be refreshed against an
-/// unreachable catalog.  That state is **not** latched, and the gate proves
-/// it: the round waits for every relay's membership runtime to return to
-/// `Ready` on its own and records that observation
-/// (`redis_membership_recovery_observed`).
+/// unreachable catalog.  That state is **not** latched: the supervisor keeps
+/// reconciling on its interval and restores `Ready` from a single successful
+/// pass.  Each Redis round therefore waits for every relay's membership
+/// runtime to return to `Ready` on its own, asserts it, and then reuses the
+/// cluster -- recycling the owner session and echoing on it -- so post-pause
+/// recovery is observed at the *session* level rather than assumed.
 ///
-/// The cluster is nonetheless not *reused* after this round, and the round
-/// stays terminal.  Membership readiness returning is necessary but not
-/// sufficient: with this fixture's 60-second signed membership record lifetime
-/// and 20-second refresh (`membership_record_lifetime_seconds` /
-/// `membership_refresh_seconds` in `production_cluster.rs`), the time spent
-/// unready during a full outage leaves no headroom inside a bounded run, the
-/// record expires again shortly afterwards (`MembershipExpired`), and every
-/// fresh owner CLI then fails its device control WebSocket handshake with a
-/// typed `TRANSPORT_ERROR`.  Repeating the Redis fault with an observed
-/// *session* recovery therefore needs a fixture change (a membership record
-/// that survives the outage window), not a change to this schedule, so the
-/// round is left terminal rather than given a recovery it does not have.
-const CHAOS_SCHEDULE: [Fault; 7] = [
+/// Why that assertion is deterministic rather than positional.  The relay's
+/// trust deadline is
+/// `min(checkpoint_expiry, record.expires_at, peer_key.expires_at)`.  The
+/// checkpoint is minted fresh for every reconcile request, but this fixture
+/// signed each relay's membership record and peer key exactly **once**, at
+/// bootstrap, with `record_version = 1`, and never re-signed or republished
+/// them.  Their `expires_at` was therefore an absolute wall-clock deadline
+/// measured from cluster startup, not a sliding window: at the 60-second
+/// record lifetime, membership trust lapsed partway through this scenario no
+/// matter what the schedule did.  A Redis round placed early
+/// re-armed; the same round placed late could not, because there was no valid
+/// record left to re-arm *to*.  That, not any latch and not the relay's own
+/// `membership_record_lifetime_seconds` (which is pinned at the product
+/// maximum of 60 and is a separate quantity), is what made the observation
+/// position-dependent and unassertable.
+///
+/// A longer record is not available to buy: the relay's verifier caps a record
+/// at the product maximum of 60 seconds, and a fixture record signed past that
+/// cap is refused outright, so the cluster never reaches Ready at all.  The
+/// fixture therefore keeps *issuing* records instead, on the interval named by
+/// `MEMBERSHIP_RESIGN_INTERVAL`, which is what a real control plane does and
+/// which widens nothing the relay will accept.  Membership trust then cannot
+/// lapse mid-run and a Redis round re-arms from its own reconcile loop
+/// wherever it sits.  Both Redis rounds below are followed by further rounds,
+/// so cluster *reuse* after a full outage is proved by the rounds that come
+/// after them and not merely by the last one passing.
+const CHAOS_SCHEDULE: [Fault; 8] = [
     Fault::PeerLoss,
     Fault::CliPause,
-    Fault::OwnerKill,
-    Fault::PeerLoss,
-    Fault::CliPause,
-    Fault::OwnerKill,
     Fault::RedisPause,
+    Fault::OwnerKill,
+    Fault::PeerLoss,
+    Fault::CliPause,
+    Fault::RedisPause,
+    Fault::OwnerKill,
 ];
 const CHAOS_ROUNDS: usize = CHAOS_SCHEDULE.len();
 /// Whole-scenario wall-clock bound.  Cleanup joins are still owned by the
 /// scenario itself; this is the outer safety net.
-const CHAOS_SCENARIO_DEADLINE: Duration = Duration::from_secs(300);
+const CHAOS_SCENARIO_DEADLINE: Duration = Duration::from_secs(420);
 /// A slow rotation keeps a bounded chaos round from rotating its data carrier,
 /// so the only device-fanout reconnects are the deliberate per-round recycles.
 const CHAOS_ROTATION: RotationConfig = RotationConfig {
@@ -137,12 +153,23 @@ const MAX_CLI_RECONNECTS_PER_WINDOW: usize = 4;
 /// excluded population is bounded in its own right.
 const MAX_RECYCLE_SOCKETS_PER_ROUND: u64 = 6;
 /// Budget for observing whether every relay's membership runtime returns to
-/// `Ready` after a full Redis outage ends.  The supervisor reconciles on an
-/// interval bounded at five seconds and each pass is itself bounded, so this
-/// covers several reconcile attempts.  The observation is recorded as
-/// evidence, never asserted: see [`CHAOS_SCHEDULE`] for why it is measurably
-/// position-dependent in this fixture.
-const MEMBERSHIP_OBSERVE_BUDGET: Duration = Duration::from_secs(10);
+/// `Ready` after a full Redis outage ends.  The supervisor reconciles on the
+/// fixture's one-second interval and each pass is itself bounded, so this
+/// covers many reconcile attempts.
+///
+/// This is now **asserted**, not merely recorded: with membership trust no
+/// longer lapsing mid-run (see [`CHAOS_SCHEDULE`]) a re-arm needs one
+/// successful reconcile pass, which is a small multiple of the reconcile
+/// interval.  The budget is nonetheless generous, because the old 10-second
+/// budget was itself too short to see the ~28-second re-arm that the expired
+/// fixture record used to force, and a budget that cannot observe the recovery
+/// it asserts would be its own source of flakiness.
+const MEMBERSHIP_OBSERVE_BUDGET: Duration = Duration::from_secs(45);
+/// Minimum number of full Redis pause rounds.  The OG-08 clause asks for the
+/// Redis fault to be *repeated* with observed recovery, so a schedule that
+/// quietly fell back to a single terminal Redis round fails validation rather
+/// than passing with weaker evidence.
+const MIN_REDIS_PAUSE_ROUNDS: usize = 2;
 /// Preserved-unknown ceiling: a bounded chaos run may legitimately time a probe
 /// out once, but a run that is mostly ambiguous is not evidence.
 const MAX_UNKNOWN_OUTCOMES: usize = 2;
@@ -280,12 +307,15 @@ pub struct ChaosEvidence {
     /// Whether every relay's membership runtime returned to `Ready` on its own
     /// within the observation budget after the full Redis outage.
     ///
-    /// Recorded, not asserted.  The runtime is not latched, and in a
-    /// mid-schedule position it does re-arm; as the terminal round of a
-    /// ~60-second run it measurably does not, because the fixture's signed
-    /// membership record lifetime is itself 60 seconds.  See
+    /// Asserted, not merely recorded, and true only if *every* Redis round
+    /// re-armed.  Membership trust no longer lapses mid-run, so the re-arm no
+    /// longer depends on the round's position in the schedule.  See
     /// [`CHAOS_SCHEDULE`].
     pub redis_membership_recovery_observed: bool,
+    /// Number of Redis rounds that observed every relay return to `Ready`
+    /// within the budget.  Must equal `redis_pause_rounds`, so a schedule that
+    /// silently stopped repeating the Redis fault cannot pass.
+    pub redis_recovery_rounds: usize,
     /// Highest concurrent open device-fanout socket count observed.
     pub fanout_peak_open: usize,
     /// A fresh consumer echo succeeded after every single round.
@@ -374,7 +404,7 @@ max_reconnect_rate_milli={} reconnect_threshold_milli={} cli_reconnect_sockets={
 fixture_recycle_sockets={} max_recycle_sockets_round={} max_cli_reconnects_per_window={} \
 reconnect_window_ms={} max_cli_reconnects_allowed={} accept_instants_dropped={} \
 client_exit_before_ready={} client_exit_classified={} redis_membership_recovery={} \
-fanout_peak_open={} recovered_each_round={} final_recovery={} \
+redis_recovery_rounds={} fanout_peak_open={} recovered_each_round={} final_recovery={} \
 cleanup_joined={} elapsed_ms={} vocabulary={}",
             self.relay_count,
             self.rounds,
@@ -403,6 +433,7 @@ cleanup_joined={} elapsed_ms={} vocabulary={}",
             self.client_exit_before_ready,
             self.client_exit_classified,
             self.redis_membership_recovery_observed,
+            self.redis_recovery_rounds,
             self.fanout_peak_open,
             self.recovered_after_each_round,
             self.final_recovery_echo,
@@ -440,6 +471,18 @@ pub fn validate_chaos_evidence(evidence: &ChaosEvidence) -> Result<()> {
         || evidence.redis_pause_rounds == 0
     {
         return Err(reject("each_fault_type_exercised"));
+    }
+    // OG-08 requires the Redis fault to be *repeated* with recovery observed
+    // after it, not exercised once as a terminal round.
+    if evidence.redis_pause_rounds < MIN_REDIS_PAUSE_ROUNDS {
+        return Err(reject("redis_pause_repeated"));
+    }
+    // Every Redis round must have observed the re-arm, not just one of them.
+    if evidence.redis_recovery_rounds != evidence.redis_pause_rounds {
+        return Err(reject("redis_recovery_observed_each_round"));
+    }
+    if !evidence.redis_membership_recovery_observed {
+        return Err(reject("redis_membership_recovery_observed"));
     }
     if evidence.unclassified_interruptions != 0 {
         return Err(reject("no_unclassified_interruption"));
@@ -530,6 +573,8 @@ struct ChaosContext<'a> {
     /// Whether every relay's membership runtime returned to `Ready` on its own
     /// after the full Redis outage ended.
     redis_membership_recovery_observed: bool,
+    /// How many Redis rounds observed that re-arm.
+    redis_recovery_rounds: usize,
 }
 
 /// Bounded chaos gate entrypoint.
@@ -572,6 +617,15 @@ pub async fn verify() -> Result<ChaosEvidence> {
             return Err(error);
         }
     };
+    // This scenario runs longer than one membership record's maximum lifetime,
+    // so the fixture has to keep issuing fresh records; see [`CHAOS_SCHEDULE`]
+    // for what depended on that and why a longer record is not available.
+    if let Err(error) = cluster.start_membership_resigning().await {
+        let _ = cluster.shutdown().await;
+        let _ = harness.shutdown().await;
+        let _ = redis_proxy.shutdown().await;
+        return Err(error);
+    }
 
     let scenario = match timeout(
         CHAOS_SCENARIO_DEADLINE,
@@ -668,6 +722,7 @@ async fn run_chaos(
         client_exit_before_ready: 0,
         client_exit_classified: 0,
         redis_membership_recovery_observed: false,
+        redis_recovery_rounds: 0,
     };
 
     let mut evidence = ChaosEvidence {
@@ -698,6 +753,7 @@ async fn run_chaos(
         client_exit_before_ready: 0,
         client_exit_classified: 0,
         redis_membership_recovery_observed: false,
+        redis_recovery_rounds: 0,
         fanout_peak_open: 0,
         recovered_after_each_round: true,
         final_recovery_echo: false,
@@ -747,27 +803,20 @@ async fn run_chaos(
         }
         evidence.rounds += 1;
 
-        // Recovery policy per fault:
-        // * OwnerKill / CliPause / PeerLoss disturb the live session, so
-        //   recycle it and echo on the fresh one.  The recycle is the
-        //   fixture's own churn, so it is bracketed out of the
-        //   client-attributed reconnect metric.
-        // * RedisPause is terminal.  Its membership recovery *is* observed and
-        //   recorded inside `run_redis_pause`, but the cluster is not reused:
-        //   see the schedule comment for the measured reason.
-        match fault {
-            Fault::OwnerKill | Fault::CliPause | Fault::PeerLoss => {
-                let recycle_from = Instant::now();
-                session = recycle_session(&mut context, session).await?;
-                fixture_windows.push((recycle_from, Instant::now()));
-                record_recovery(
-                    &mut evidence,
-                    &mut recovered_each_round,
-                    soft_recovery_echo(&mut context, &mut session).await?,
-                );
-            }
-            Fault::RedisPause => {}
-        }
+        // Recovery policy is now uniform: every fault disturbs the live
+        // session, so every round recycles it and echoes on the fresh one.
+        // The recycle is the fixture's own churn, so it is bracketed out of
+        // the client-attributed reconnect metric.  RedisPause has already
+        // asserted its membership re-arm and re-published peer pins inside
+        // `run_redis_pause`, so the cluster is routable again here.
+        let recycle_from = Instant::now();
+        session = recycle_session(&mut context, session).await?;
+        fixture_windows.push((recycle_from, Instant::now()));
+        record_recovery(
+            &mut evidence,
+            &mut recovered_each_round,
+            soft_recovery_echo(&mut context, &mut session).await?,
+        );
 
         let accepted_after = context.cluster.device_fanout.diagnostics().accepted;
         let round_ms = u64::try_from(round_started.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -818,6 +867,7 @@ async fn run_chaos(
     evidence.client_exit_before_ready = context.client_exit_before_ready;
     evidence.client_exit_classified = context.client_exit_classified;
     evidence.redis_membership_recovery_observed = context.redis_membership_recovery_observed;
+    evidence.redis_recovery_rounds = context.redis_recovery_rounds;
 
     teardown_session(&mut context, session).await?;
     evidence.fanout_peak_open = context.cluster.device_fanout.diagnostics().peak_open;
@@ -1073,7 +1123,7 @@ async fn ensure_owner_released(context: &ChaosContext<'_>) -> Result<()> {
     }
 }
 
-/// RedisPause round (terminal): pause every proxied Redis socket, prove
+/// RedisPause round: pause every proxied Redis socket, prove
 /// admission fails closed with a typed authorization/cluster-unready response,
 /// then resume and **wait for every relay's membership runtime to return to
 /// `Ready`**.
@@ -1083,10 +1133,11 @@ async fn ensure_owner_released(context: &ChaosContext<'_>) -> Result<()> {
 /// is not latched: the supervisor keeps reconciling on its interval and
 /// restores `Ready` from the current pass alone once a strictly-newer signed
 /// checkpoint and a catalog snapshot land together.  Waiting for that here
-/// turns the re-arm into a recorded observation instead of an assumption.
+/// turns the re-arm into an asserted observation instead of an assumption.
 ///
-/// The cluster is still not reused after this round -- see the schedule
-/// comment for the measured reason -- so no session recovery is claimed.
+/// The cluster is then reused: the caller recycles the owner session and
+/// echoes on it, and further rounds follow, so recovery after a full Redis
+/// outage is proved at the session level and not only at the membership level.
 async fn run_redis_pause(context: &mut ChaosContext<'_>) -> Result<InterruptionClass> {
     let ingress = context.cluster.relay(OWNER_INGRESS_NODE)?.consumer_addr()?;
     context.redis_proxy.pause_all().await?;
@@ -1112,19 +1163,42 @@ async fn run_redis_pause(context: &mut ChaosContext<'_>) -> Result<InterruptionC
         (Err(error), _) => Err(error),
         (Ok(_), Err(error)) => Err(error),
         (Ok(class), Ok(())) => {
-            // Observed, never forced and never asserted: whether every relay's
-            // membership runtime re-arms to `Ready` by its own reconcile loop
-            // after the outage.  Recorded as evidence either way, because it
-            // is measurably position-dependent in this fixture.
-            context.redis_membership_recovery_observed = context
+            // Observed and never forced: whether every relay's membership
+            // runtime re-arms to `Ready` by its own reconcile loop after the
+            // outage.  This is now asserted, because membership trust no
+            // longer lapses mid-run and the re-arm is position-independent.
+            let recovered = context
                 .cluster
                 .observe_membership_readiness(MEMBERSHIP_OBSERVE_BUDGET)
                 .await;
             tracing::info!(
-                recovered = context.redis_membership_recovery_observed,
+                recovered,
                 stage = "chaos_redis_membership_recovery",
                 "observed whether membership re-armed after the full Redis outage"
             );
+            if !recovered {
+                return Err(HarnessError::Timeout(
+                    "chaos redis round: membership did not return to Ready after the outage".into(),
+                ));
+            }
+            // Every Redis round must re-arm, not just the first, so the
+            // evidence records the conjunction rather than the last round.
+            context.redis_membership_recovery_observed = true;
+            context.redis_recovery_rounds += 1;
+
+            // The fixture publishes peer pins from the membership
+            // *invalidation* callback only, which is edge-triggered: the
+            // outage emptied each relay's pin set and nothing re-publishes it
+            // when the runtime returns to `Ready`.  That gap is in the
+            // fixture's wiring, not the membership runtime and not the
+            // protocol, so re-publish explicitly before the cluster is reused
+            // -- exactly as the key-revocation probe does after it
+            // deliberately revokes pins.
+            context.cluster.republish_peer_pins()?;
+            context
+                .cluster
+                .wait_for_peer_readiness(PEER_RECOVERY_TIMEOUT)
+                .await?;
             Ok(class)
         }
     }
@@ -1405,21 +1479,21 @@ mod tests {
     }
 
     fn valid_evidence() -> ChaosEvidence {
-        // Schedule: peer-loss x2 -> peer_unavailable, redis-pause x1 ->
+        // Schedule: peer-loss x2 -> peer_unavailable, redis-pause x2 ->
         // admission_unavailable, cli-pause x2 -> bounded_close, owner-kill x2
-        // -> owner_released.  Seven classified rounds.
+        // -> owner_released.  Eight classified rounds.
         ChaosEvidence {
             relay_count: 3,
             rounds: CHAOS_ROUNDS,
             owner_kill_rounds: 2,
             cli_pause_rounds: 2,
             peer_loss_rounds: 2,
-            redis_pause_rounds: 1,
-            classified_interruptions: 7,
+            redis_pause_rounds: 2,
+            classified_interruptions: 8,
             unclassified_interruptions: 0,
             unknown_outcomes_preserved: 0,
             class_bounded_close: 2,
-            class_admission_unavailable: 1,
+            class_admission_unavailable: 2,
             class_peer_unavailable: 2,
             class_owner_released: 2,
             class_client_exit_before_ready: 0,
@@ -1435,7 +1509,8 @@ mod tests {
             accept_instants_dropped: 0,
             client_exit_before_ready: 0,
             client_exit_classified: 0,
-            redis_membership_recovery_observed: false,
+            redis_membership_recovery_observed: true,
+            redis_recovery_rounds: 2,
             fanout_peak_open: 3,
             recovered_after_each_round: true,
             final_recovery_echo: true,
@@ -1463,9 +1538,10 @@ mod tests {
     fn complete_chaos_evidence_passes() {
         assert!(validate_chaos_evidence(&valid_evidence()).is_ok());
         // One preserved unknown outcome (converted from one classified round) is
-        // still accepted: six classified plus one preserved unknown is seven.
+        // still accepted: seven classified plus one preserved unknown is eight,
+        // which is the round count of the current schedule.
         let mut with_unknown = valid_evidence();
-        with_unknown.classified_interruptions = 6;
+        with_unknown.classified_interruptions = 7;
         with_unknown.class_owner_released = 1;
         with_unknown.unknown_outcomes_preserved = 1;
         assert!(validate_chaos_evidence(&with_unknown).is_ok());
@@ -1530,10 +1606,29 @@ mod tests {
                 // Keep the round tally and class totals consistent while zeroing
                 // one fault type (move owner-kill's rounds into redis-pause).
                 e.owner_kill_rounds = 0;
-                e.redis_pause_rounds = 3;
+                e.redis_pause_rounds = 4;
                 e.class_owner_released = 0;
-                e.class_admission_unavailable = 3;
+                e.class_admission_unavailable = 4;
             }),
+            // The Redis fault must be repeated, not exercised once.
+            ("redis_single_round", "redis_pause_repeated", |e| {
+                e.redis_pause_rounds = 1;
+                e.cli_pause_rounds = 3;
+                e.class_admission_unavailable = 1;
+                e.class_bounded_close = 3;
+                e.redis_recovery_rounds = 1;
+            }),
+            // Recovery must be observed after every Redis round.
+            (
+                "redis_recovery_partial",
+                "redis_recovery_observed_each_round",
+                |e| e.redis_recovery_rounds = 1,
+            ),
+            (
+                "redis_recovery_absent",
+                "redis_membership_recovery_observed",
+                |e| e.redis_membership_recovery_observed = false,
+            ),
             ("cli_pause_missing", "each_fault_type_exercised", |e| {
                 e.cli_pause_rounds = 0;
                 e.peer_loss_rounds = 4;
