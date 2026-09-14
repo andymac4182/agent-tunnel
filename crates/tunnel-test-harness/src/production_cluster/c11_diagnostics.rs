@@ -190,9 +190,16 @@ const CASES: [MatrixCase; 8] = [
         outcome: RunOutcome::Success,
         required_sentinels: PRODUCTION_SENTINELS,
         // The production gate composes the concurrent same-identifier tenant
-        // race (four managed CLI roles) with its single production CLI.
+        // race (four managed CLI roles) with two production CLI roles: the
+        // scenario's own long-lived client, and a second one on its own
+        // private device fanout whose only purpose is the measured shutdown
+        // join.  The second cannot reuse the first, because the owner-death
+        // phase needs an owner that was abandoned rather than released, and it
+        // cannot share the fixture fanout, whose ordered route slots the rest
+        // of the gate asserts on.  The count stays exact so a third,
+        // unexplained CLI still fails this scan.
         required_inner_process_counts: &[
-            ("m7-production-cli", 1),
+            ("m7-production-cli", 2),
             ("m7-tenant-race-first", 1),
             ("m7-tenant-race-second", 1),
             ("m7-tenant-race-sibling", 1),
