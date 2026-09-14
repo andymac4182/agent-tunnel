@@ -55,8 +55,8 @@ use tunnel_relay::{
     ClusterConfig, ConsumerUpgradeBarrier, ListenerSocketOptions, MembershipReadiness,
     MembershipRuntime, MembershipRuntimeConfig, MembershipRuntimeHandle,
     MembershipVersionStateIdentity, MembershipVersionStateStore, PeerAdmissionBarrier,
-    PeerListenerConfig, PeerReadiness, PeerRouteTarget, PeerRuntime, RelayOptions, RelaySnapshot,
-    RunningRelay, ServeConfig,
+    PeerFaultEventSnapshot, PeerListenerConfig, PeerReadiness, PeerRouteTarget, PeerRuntime,
+    RelayOptions, RelaySnapshot, RunningRelay, ServeConfig,
     routing::{OwnerRouter, RelayIdentity},
 };
 use tunnel_transport::{
@@ -1268,6 +1268,164 @@ fn private_fixture_directory() -> Result<TempDir> {
     let path = files.path().to_string_lossy();
     crate::c11_capture::record_sentinel("filesystem_path", path.as_bytes())?;
     Ok(files)
+}
+
+/// One relay's latest bounded peer-fault tuple for a stage, joined with the
+/// node that recorded it and that stage's saturating count.
+#[derive(Clone, Debug)]
+pub(crate) struct RelayPeerFaultStage {
+    pub(crate) node_id: String,
+    pub(crate) stage: &'static str,
+    pub(crate) count: u64,
+    pub(crate) event: PeerFaultEventSnapshot,
+}
+
+/// The bounded correlation a gate requires of the tuple it induced.
+///
+/// Only identifiers the gate itself chose are named here: the relay mints the
+/// peer `request_id` internally, so it is required to be present rather than
+/// to equal a value the gate could not know.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PeerFaultCorrelation<'a> {
+    pub(crate) tenant_id: Uuid,
+    pub(crate) device_id: Uuid,
+    /// When set, the tuple must name this relay as the selected owner.
+    pub(crate) owner_node_id: Option<&'a str>,
+    /// When set, the tuple's owner epoch must equal this claim's epoch.
+    pub(crate) owner_epoch: Option<u64>,
+    /// When set, the tuple must carry this exact service identifier.
+    pub(crate) service_id: Option<Uuid>,
+    /// Require a bounded session identifier and a peer request identifier.
+    /// A fault raised before an owner token is selected carries neither.
+    pub(crate) require_request_identity: bool,
+}
+
+/// The summed `stage_counts` entry for one stage label across every relay.
+///
+/// A gate takes this before and after the fault it induces so it asserts the
+/// stage was *gained*, never that the cluster happens to carry one.
+pub(crate) fn peer_fault_stage_count(stages: &[RelayPeerFaultStage], stage: &str) -> u64 {
+    stages
+        .iter()
+        .filter(|candidate| candidate.stage == stage)
+        .map(|candidate| candidate.count)
+        .sum()
+}
+
+/// Render every observed stage tuple for a diagnostic message.
+pub(crate) fn format_peer_fault_stages(stages: &[RelayPeerFaultStage]) -> String {
+    if stages.is_empty() {
+        return "none".to_owned();
+    }
+    stages
+        .iter()
+        .map(|stage| {
+            format!(
+                "{}:{}/{}/{}x{}",
+                stage.node_id,
+                stage.event.role.as_str(),
+                stage.stage,
+                stage.event.cause.as_str(),
+                stage.count,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Require exactly one bounded `role/stage/cause` tuple with the correlation
+/// identifiers of the request the gate issued.
+///
+/// `stage_counts` must have *gained* the stage against the pre-fault reading
+/// in `before`, and `last_by_stage[stage]` must carry the gate's own scope.
+/// The failure text lists everything that was observed instead, so a gate that
+/// stops producing the fault reports what it produced rather than a bare
+/// absence.
+pub(crate) fn require_peer_fault_stage(
+    gate: &str,
+    before: &[RelayPeerFaultStage],
+    stages: &[RelayPeerFaultStage],
+    role: &str,
+    stage: &str,
+    cause: &str,
+    correlation: PeerFaultCorrelation<'_>,
+) -> Result<RelayPeerFaultStage> {
+    let baseline = peer_fault_stage_count(before, stage);
+    let gained = peer_fault_stage_count(stages, stage);
+    if gained <= baseline {
+        return Err(HarnessError::Process(format!(
+            "{gate} did not gain a {stage} stage_counts entry ({baseline} before, {gained} after); observed {}",
+            format_peer_fault_stages(stages)
+        )));
+    }
+    let observed = stages
+        .iter()
+        .find(|candidate| {
+            candidate.stage == stage
+                && candidate.event.role.as_str() == role
+                && candidate.event.cause.as_str() == cause
+        })
+        .ok_or_else(|| {
+            HarnessError::Process(format!(
+                "{gate} recorded no {role}/{stage}/{cause} peer fault; observed {}",
+                format_peer_fault_stages(stages)
+            ))
+        })?
+        .clone();
+    if observed.count == 0 {
+        return Err(HarnessError::Process(format!(
+            "{gate} {role}/{stage}/{cause} carried a zero stage_counts entry"
+        )));
+    }
+    let event = &observed.event;
+    if event.tenant_id != correlation.tenant_id || event.device_id != correlation.device_id {
+        return Err(HarnessError::Process(format!(
+            "{gate} {role}/{stage}/{cause} tuple was recorded for a different tenant/device scope"
+        )));
+    }
+    if let Some(expected) = correlation.owner_node_id
+        && event.owner_node_id.as_deref() != Some(expected)
+    {
+        return Err(HarnessError::Process(format!(
+            "{gate} {role}/{stage}/{cause} tuple named owner {:?}, expected {expected}",
+            event.owner_node_id
+        )));
+    }
+    if let Some(expected) = correlation.owner_epoch
+        && event.owner_epoch != Some(expected)
+    {
+        return Err(HarnessError::Process(format!(
+            "{gate} {role}/{stage}/{cause} tuple carried owner epoch {:?}, expected {expected}",
+            event.owner_epoch
+        )));
+    }
+    if let Some(expected) = correlation.service_id
+        && event.service_id != Some(expected)
+    {
+        return Err(HarnessError::Process(format!(
+            "{gate} {role}/{stage}/{cause} tuple carried service {:?}, expected {expected}",
+            event.service_id
+        )));
+    }
+    if correlation.require_request_identity {
+        if event.session_id.as_deref().unwrap_or_default().is_empty() {
+            return Err(HarnessError::Process(format!(
+                "{gate} {role}/{stage}/{cause} tuple carried no session identifier"
+            )));
+        }
+        if event.request_id.as_deref().unwrap_or_default().is_empty() {
+            return Err(HarnessError::Process(format!(
+                "{gate} {role}/{stage}/{cause} tuple carried no peer request identifier"
+            )));
+        }
+    }
+    // The accepted tuple is the row's evidence, so record it on the run's own
+    // transcript.  Every field here is a closed label or a relay node id.
+    eprintln!(
+        "peer fault stage accepted: {gate} {}/{role}/{stage}/{cause} stage_counts {baseline}->{gained}",
+        observed.node_id
+    );
+    Ok(observed)
 }
 
 impl ProductionRelay {
@@ -4235,6 +4393,32 @@ impl ProductionCluster {
             }
             sleep(Duration::from_millis(50)).await;
         }
+    }
+
+    /// Join every running relay's bounded `last_by_stage` peer-fault view with
+    /// the node that produced it and the stage's saturating count.
+    ///
+    /// This reads only the typed relay snapshot, so it carries no error text
+    /// and no endpoint: the tuple's own correlation identifiers are what a
+    /// gate asserts on.
+    async fn peer_fault_stages(&self) -> Result<Vec<RelayPeerFaultStage>> {
+        let mut stages = Vec::new();
+        for relay in &self.relays {
+            if relay.running.is_none() {
+                continue;
+            }
+            let snapshot = relay.snapshot().await?;
+            let diagnostics = snapshot.peer_fault_diagnostics;
+            for (stage, event) in diagnostics.last_by_stage {
+                stages.push(RelayPeerFaultStage {
+                    node_id: relay.node_id.clone(),
+                    stage,
+                    count: diagnostics.stage_counts.get(stage).copied().unwrap_or(0),
+                    event,
+                });
+            }
+        }
+        Ok(stages)
     }
 
     fn set_peer_path_drop(&self, node_id: &str, drop_packets: bool) -> Result<()> {

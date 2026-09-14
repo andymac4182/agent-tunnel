@@ -341,6 +341,7 @@ async fn run(
     // Kill the owner while the request is pinned at control admission, then let
     // the authoritative Redis owner disappear before releasing the barrier.
     let before = total_dispatch(cluster).await?;
+    let peer_faults_before_control = cluster.peer_fault_stages().await?;
     let control_owner_killed = kill_owner(resources, control_idx).await?;
     cluster
         .wait_for_owner_clear(
@@ -359,6 +360,34 @@ async fn run(
         classify_typed_rejection(outcome, false, "EC-023 control-admission").await?;
     let after = total_dispatch(cluster).await?;
     let control_dispatch_delta = after.saturating_sub(before);
+    // IN-05: the control seam is the one place this fixture reaches the owner
+    // relay's own admission decision -- the peer stream really opens and the
+    // owner refuses mid-admission because the Redis claim it is asked to serve
+    // is gone.  That refusal must surface as the bounded `owner` stage in the
+    // owner role, with the correlation of the request this phase issued.
+    let peer_faults_after_control = cluster.peer_fault_stages().await?;
+    let control_owner_stage_fault = super::require_peer_fault_stage(
+        "EC-023 control-admission",
+        &peer_faults_before_control,
+        &peer_faults_after_control,
+        "owner",
+        "owner",
+        "membership",
+        super::PeerFaultCorrelation {
+            tenant_id: control_device.tenant_id,
+            device_id: control_device.id,
+            owner_node_id: Some(owner1_node.as_str()),
+            owner_epoch: Some(owner1.token.epoch),
+            service_id: Some(control_device.service_id),
+            require_request_identity: true,
+        },
+    )?;
+    if control_owner_stage_fault.node_id != owner1_node {
+        return Err(HarnessError::Process(format!(
+            "EC-023 control-admission owner-stage fault was recorded by {} rather than the owner relay {owner1_node}",
+            control_owner_stage_fault.node_id
+        )));
+    }
     let control_no_stale_session = no_session_for(cluster, &owner1_node, control_device.id).await?;
     let control_owner_identity_required_fresh = owner_is_fresh_or_absent(
         cluster,
@@ -410,6 +439,7 @@ async fn run(
     let data_attach_barrier_hit = upgrade_barrier.hit_count() == 1;
 
     let before = total_dispatch(cluster).await?;
+    let peer_faults_before_data = cluster.peer_fault_stages().await?;
     let data_owner_killed = kill_owner(resources, data_idx).await?;
     cluster
         .wait_for_owner_clear(data_device.tenant_id, data_device.id, OWNER_CLEAR_TIMEOUT)
@@ -423,6 +453,34 @@ async fn run(
         classify_typed_rejection(outcome, true, "EC-023 data-attachment").await?;
     let after = total_dispatch(cluster).await?;
     let data_dispatch_delta = after.saturating_sub(before);
+    // IN-05: the data seam pins the held request exactly where the ingress
+    // re-reads the owner claim before the 101.  That re-read is the `lease`
+    // stage, and the killed owner makes it fail closed, so the ingress relay
+    // must carry an `ingress/lease/owner_not_ready` tuple naming the owner
+    // this phase selected.
+    let peer_faults_after_data = cluster.peer_fault_stages().await?;
+    let data_lease_stage_fault = super::require_peer_fault_stage(
+        "EC-023 data-attachment",
+        &peer_faults_before_data,
+        &peer_faults_after_data,
+        "ingress",
+        "lease",
+        "owner_not_ready",
+        super::PeerFaultCorrelation {
+            tenant_id: data_device.tenant_id,
+            device_id: data_device.id,
+            owner_node_id: Some(owner2_node.as_str()),
+            owner_epoch: Some(owner2.token.epoch),
+            service_id: Some(data_device.service_id),
+            require_request_identity: true,
+        },
+    )?;
+    if data_lease_stage_fault.node_id != data_ingress_node {
+        return Err(HarnessError::Process(format!(
+            "EC-023 data-attachment lease fault was recorded by {} rather than the held ingress {data_ingress_node}",
+            data_lease_stage_fault.node_id
+        )));
+    }
     let data_no_stale_session = no_session_for(cluster, &owner2_node, data_device.id).await?;
     let data_owner_identity_required_fresh = owner_is_fresh_or_absent(
         cluster,

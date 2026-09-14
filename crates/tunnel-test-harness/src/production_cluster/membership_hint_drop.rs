@@ -977,6 +977,7 @@ async fn run_inner(
         .snapshot()
         .await?
         .lifetime_application_dispatches;
+    let peer_faults_before_refusal = cluster.peer_fault_stages().await?;
     let (withdrawn_admission_outcome, withdrawn_admission_detail) = match open_consumer_stream(
         affected_ingress,
         &harness.pki.server_ca.certificate_der,
@@ -1009,6 +1010,35 @@ async fn run_inner(
     if !withdrawn_key_admission_refused {
         return Err(HarnessError::Process(format!(
             "hint-drop withdrawn key admission did not return the PEER_UNTRUSTED 503 not_dispatched refusal: {withdrawn_admission_detail}"
+        )));
+    }
+    // IN-05: the withdrawn key is refused inside the pooled peer connect, at
+    // the handshake boundary -- the mTLS peer still answers, but the SPKI it
+    // presents is no longer an approved membership key, so the binding recheck
+    // that follows the handshake fails while the observer is still at
+    // `pool_connect`.  This is the gate's own fault, so the tuple must carry
+    // the scope of the admission it just refused.
+    let peer_faults_after_refusal = cluster.peer_fault_stages().await?;
+    let withdrawn_pool_connect_fault = super::require_peer_fault_stage(
+        "hint-drop withdrawn-key admission",
+        &peer_faults_before_refusal,
+        &peer_faults_after_refusal,
+        "ingress",
+        "pool_connect",
+        "membership",
+        super::PeerFaultCorrelation {
+            tenant_id: device_a.tenant_id,
+            device_id: device_a.id,
+            owner_node_id: Some(TARGET_NODE),
+            owner_epoch: Some(owner_a.token.epoch),
+            service_id: Some(service_a),
+            require_request_identity: true,
+        },
+    )?;
+    if withdrawn_pool_connect_fault.node_id != AFFECTED_INGRESS {
+        return Err(HarnessError::Process(format!(
+            "hint-drop pool_connect fault was recorded by {} rather than the affected ingress {AFFECTED_INGRESS}",
+            withdrawn_pool_connect_fault.node_id
         )));
     }
     let dispatch_after_refusal = cluster
