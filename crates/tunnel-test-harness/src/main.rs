@@ -380,7 +380,7 @@ async fn main() -> ExitCode {
                 .and_then(|evidence| {
                     tunnel_test_harness::production_cluster::validate_ec041_device_attachment_evidence(&evidence)?;
                     println!(
-                        "M7 EC-041 device attachment race passed: relays={} predecessor_owner={} successor_owner={} full_owner_replaced={} predecessor_gen={} successor_gen={} stale_rejected={} stale_data_ready_absent={} stale_session_unchanged={} distinct_ingress={} winner_count={} loser_count={} data_ready_count={} winner_gen={} winner_carrier_installed={} loser_no_counter_reset={} reuse_rejected={} reuse_data_ready_absent={} cleanup_joined={}",
+                        "M7 EC-041 device attachment race passed: relays={} predecessor_owner={} successor_owner={} full_owner_replaced={} predecessor_gen={} successor_gen={} stale_rejected={} stale_data_ready_absent={} stale_session_unchanged={} distinct_ingress={} winner_count={} loser_count={} data_ready_count={} winner_gen={} winner_carrier_installed={} loser_no_counter_reset={} reuse_rejected={} reuse_data_ready_absent={} control_barrier_held={} control_barrier_hits={} control_owner_changed_while_held={} control_interloper_owner={} control_revalidated={} control_outcome={:?} control_single_owner={} control_no_stale_welcome={} winner_stream_count={} winner_cursors_advanced={} winner_cursors_unchanged={} loser_no_stream_row={} cleanup_joined={}",
                         evidence.relay_count,
                         evidence.predecessor_owner_complete,
                         evidence.successor_owner_complete,
@@ -399,6 +399,18 @@ async fn main() -> ExitCode {
                         evidence.loser_caused_no_counter_reset,
                         evidence.fresh_ticket_reuse_rejected,
                         evidence.fresh_ticket_reuse_data_ready_absent,
+                        evidence.control_attach_barrier_held,
+                        evidence.control_attach_barrier_hits,
+                        evidence.control_owner_changed_while_held,
+                        evidence.control_interloper_owner_node_matched,
+                        evidence.control_attach_revalidated,
+                        evidence.control_attach_outcome,
+                        evidence.control_single_owner_after_race,
+                        evidence.control_no_stale_owner_welcome,
+                        evidence.winner_stream_count,
+                        evidence.winner_stream_cursors_advanced,
+                        evidence.winner_stream_cursors_unchanged,
+                        evidence.loser_created_no_stream_row,
                         evidence.cleanup_joined,
                     );
                     Ok(())

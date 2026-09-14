@@ -40,8 +40,9 @@ pub use consumer_write_diagnostics::{
     ConsumerWriteTimeoutSnapshot,
 };
 pub use http::{
-    ConsumerUpgradeBarrier, PeerAdmissionBarrier, PeerAdmissionScope, consumer_router,
-    device_router, peer_ingress_handler, router, router_with_peer,
+    ConsumerUpgradeBarrier, ControlAttachBarrier, PeerAdmissionBarrier, PeerAdmissionScope,
+    consumer_router, device_router, device_router_with_peer_and_barrier, peer_ingress_handler,
+    router, router_with_peer,
 };
 pub use membership_runtime::{
     AdmissionDeadline, CheckpointAuthority, CheckpointAuthorityError, CheckpointRequest,

@@ -22,7 +22,10 @@ use tokio::{
 };
 use tokio_tungstenite::{
     Connector, MaybeTlsStream, WebSocketStream, connect_async_tls_with_config,
-    tungstenite::{Message, client::IntoClientRequest, http::HeaderValue},
+    tungstenite::{
+        Error as WsError, Message, client::IntoClientRequest, error::ProtocolError,
+        http::HeaderValue,
+    },
 };
 use tunnel_catalog::OwnerClaim;
 use tunnel_core::RotationConfig;
@@ -41,8 +44,16 @@ const PHASE_TIMEOUT: Duration = Duration::from_secs(15);
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(20);
 const QUIET_CONTROL_WINDOW: Duration = Duration::from_millis(300);
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
+const CONSUMER_SUBPROTOCOL: &str = "agent-tunnel.echo.v1";
+/// Bounded device canary the shared fixture connector prepends to its echo.
+const CURSOR_DEVICE_CANARY: &[u8] = b"ec041-cursor-canary:";
+/// Bounded consumer probe body for the cursor-immutability exchange.
+const CURSOR_PROBE_BODY: &[u8] = b"ec041-cursor-probe";
+/// Width of the consumer stream record's big-endian body-length prefix.
+const RECORD_LENGTH_BYTES: usize = 4;
 
 type DeviceSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+type ConsumerSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 /// Payload-free evidence for the device control/data ticket race.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -81,7 +92,64 @@ pub struct Ec041DeviceAttachmentEvidence {
     pub loser_caused_no_counter_reset: bool,
     pub fresh_ticket_reuse_rejected: bool,
     pub fresh_ticket_reuse_data_ready_absent: bool,
+
+    // ---- Control-attachment race (EC-041 clause one) ----
+    /// The fixture-only `ControlAttachBarrier` actually held one owner-local
+    /// device control socket between its `HELLO` and its `WELCOME`.  Without
+    /// this the control race is timing-based and proves nothing.
+    pub control_attach_barrier_held: bool,
+    /// Exactly one control attach was intercepted for the whole run, proving
+    /// the seam is invisible to every other control socket.
+    pub control_attach_barrier_hits: u64,
+    /// Device ownership genuinely changed hands while that control attach was
+    /// held: no owner at `HELLO`, a different live owner node at release.
+    pub control_owner_changed_while_held: bool,
+    /// The node that took ownership during the hold.
+    pub control_interloper_owner_node_matched: bool,
+    /// The held relay revalidated at attachment: its outcome is consistent
+    /// with the owner authoritative at release, never with the owner state it
+    /// observed at `HELLO`.
+    pub control_attach_revalidated: bool,
+    /// Closed, measured outcome of the raced control attach.
+    pub control_attach_outcome: ControlAttachOutcomeKind,
+    /// Exactly one live owner remained in the catalog after the race: the
+    /// race never produced split ownership.
+    pub control_single_owner_after_race: bool,
+    /// The raced control attach never produced a `WELCOME` binding an owner
+    /// token other than the one authoritative at release.
+    pub control_no_stale_owner_welcome: bool,
+
+    // ---- Per-stream cursor immutability (EC-041 clause two) ----
+    /// Number of stream rows on the winner's session when the cursors were
+    /// captured.  Zero would make the immutability assertion vacuous.
+    pub winner_stream_count: usize,
+    /// At least one captured cursor was non-zero, so the comparison is over
+    /// real sequence state rather than a freshly zeroed row.
+    pub winner_stream_cursors_advanced: bool,
+    /// Every captured per-stream cursor quadruple (emitted, acknowledged,
+    /// received, delivered) was identical after the losing attachment.
+    pub winner_stream_cursors_unchanged: bool,
+    /// The losing attachment created no stream row of its own.
+    pub loser_created_no_stream_row: bool,
+
     pub cleanup_joined: bool,
+}
+
+/// Closed, payload-free outcome vocabulary for the raced control attach.
+/// The value is measured, never assumed: both variants are legitimate
+/// revalidation outcomes and the gate asserts the invariants that must hold
+/// either way.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ControlAttachOutcomeKind {
+    /// The gate never reached the measurement point.
+    #[default]
+    Unknown,
+    /// The held relay refused the attach after revalidating and closed the
+    /// device control socket without a `WELCOME`.
+    RefusedAfterOwnerChange,
+    /// The held relay completed a fenced takeover and issued a `WELCOME`
+    /// binding the owner token authoritative at release.
+    FencedTakeover,
 }
 
 pub fn validate_ec041_device_attachment_evidence(
@@ -127,6 +195,44 @@ pub fn validate_ec041_device_attachment_evidence(
             evidence.fresh_ticket_reuse_data_ready_absent,
         ),
         ("joined cleanup", evidence.cleanup_joined),
+        // ---- Control-attachment race ----
+        (
+            "control attach barrier held",
+            evidence.control_attach_barrier_held,
+        ),
+        (
+            "owner changed while the control attach was held",
+            evidence.control_owner_changed_while_held,
+        ),
+        (
+            "interloper owner node",
+            evidence.control_interloper_owner_node_matched,
+        ),
+        (
+            "control attach revalidated at attachment",
+            evidence.control_attach_revalidated,
+        ),
+        (
+            "single owner after the control race",
+            evidence.control_single_owner_after_race,
+        ),
+        (
+            "no stale-owner WELCOME",
+            evidence.control_no_stale_owner_welcome,
+        ),
+        // ---- Per-stream cursor immutability ----
+        (
+            "winner stream cursors advanced",
+            evidence.winner_stream_cursors_advanced,
+        ),
+        (
+            "winner stream cursors unchanged",
+            evidence.winner_stream_cursors_unchanged,
+        ),
+        (
+            "loser created no stream row",
+            evidence.loser_created_no_stream_row,
+        ),
     ];
     if let Some((name, false)) = required.into_iter().find(|(_, passed)| !passed) {
         return Err(HarnessError::Process(format!(
@@ -161,6 +267,28 @@ pub fn validate_ec041_device_attachment_evidence(
             evidence.concurrent_data_ready_count
         )));
     }
+    // The fixture seam must have intercepted exactly one control attach for
+    // the whole run.  More than one would mean the barrier caught a socket
+    // the phase order did not intend; zero is already rejected above.
+    if evidence.control_attach_barrier_hits != 1 {
+        return Err(HarnessError::Process(format!(
+            "EC-041 control attach barrier did not hold exactly one attach: {}",
+            evidence.control_attach_barrier_hits
+        )));
+    }
+    if evidence.control_attach_outcome == ControlAttachOutcomeKind::Unknown {
+        return Err(HarnessError::Process(
+            "EC-041 control attach outcome was never measured".into(),
+        ));
+    }
+    // An all-zero cursor comparison would be vacuous, so the gate requires a
+    // real stream row carrying real sequence state before it asserts that the
+    // losing attachment left those cursors alone.
+    if evidence.winner_stream_count == 0 {
+        return Err(HarnessError::Process(
+            "EC-041 captured no winner stream row, so cursor immutability is vacuous".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -174,7 +302,20 @@ pub async fn verify() -> Result<Ec041DeviceAttachmentEvidence> {
     let mut harness = timeout(super::STARTUP_TIMEOUT, Harness::start(options))
         .await
         .map_err(|_| HarnessError::Timeout("EC-041 harness startup timed out".into()))??;
-    let mut cluster = match ProductionCluster::start(&mut harness).await {
+    // relay-b carries the one-shot control-attach seam.  Every other relay
+    // runs with no barrier at all, and relay-b's barrier is a pass-through
+    // once released, so the data-attachment arms below are unaffected.
+    let control_attach_barrier = Arc::new(tunnel_relay::ControlAttachBarrier::default());
+    let control_attach_barriers = std::collections::BTreeMap::from([(
+        "relay-b".to_owned(),
+        Arc::clone(&control_attach_barrier),
+    )]);
+    let mut cluster = match ProductionCluster::start_with_control_attach_barriers(
+        &mut harness,
+        control_attach_barriers,
+    )
+    .await
+    {
         Ok(cluster) => cluster,
         Err(primary) => {
             return match harness.shutdown().await {
@@ -189,7 +330,12 @@ pub async fn verify() -> Result<Ec041DeviceAttachmentEvidence> {
     let mut resources = AttachmentRaceResources::default();
     let scenario = timeout(
         SCENARIO_TIMEOUT,
-        run_race(&mut cluster, &harness, &mut resources),
+        run_race(
+            &mut cluster,
+            &harness,
+            &mut resources,
+            &control_attach_barrier,
+        ),
     )
     .await
     .map_err(|_| HarnessError::Timeout("EC-041 device attachment race timed out".into()))?;
@@ -225,10 +371,12 @@ pub async fn verify() -> Result<Ec041DeviceAttachmentEvidence> {
 /// The scenario returns its evidence before cleanup; keeping this helper
 /// separate makes it impossible for the validator to mistake cleanup state for
 /// a successful attachment assertion.
+#[allow(clippy::too_many_lines)]
 async fn run_race(
     cluster: &mut ProductionCluster,
     harness: &HarnessRuntime,
     resources: &mut AttachmentRaceResources,
+    control_attach_barrier: &Arc<tunnel_relay::ControlAttachBarrier>,
 ) -> Result<Ec041DeviceAttachmentEvidence> {
     let device = harness
         .topology
@@ -243,6 +391,22 @@ async fn run_race(
     let tls = device_tls(harness, device)?;
     let scenario_deadline = Instant::now() + SCENARIO_TIMEOUT;
 
+    // ---- PHASE A: the control-attachment race (EC-041 clause one) ----
+    // This runs first and tears itself down, so PHASE B below is the existing
+    // data-attachment race, unchanged, starting from its own no-owner
+    // baseline.  See `run_control_attach_race` for the explicit phase order
+    // the single-use barrier requires.
+    let control_race = run_control_attach_race(
+        cluster,
+        device,
+        service_id,
+        Arc::clone(&tls),
+        control_attach_barrier,
+        scenario_deadline,
+    )
+    .await?;
+
+    // ---- PHASE B: the data-attachment race (already-proven clauses) ----
     let old_device_addr = relay_device_addr(cluster, "relay-a")?;
     let old_barrier = ControlOnlyBarrier::open(
         old_device_addr,
@@ -479,6 +643,31 @@ async fn run_race(
     // same generation, same active connection, no rotation candidate, no reset.
     let loser_caused_no_counter_reset = before_reuse == after_reuse;
 
+    // ---- PHASE C: per-stream cursor immutability (EC-041 clause two) ----
+    // The arms above prove no counter reset at session-carrier level.  They
+    // say nothing about the winning stream's own sequence cursors, because no
+    // stream exists yet.  So drive one real stream over the winner's carrier
+    // until its cursors carry real sequence state, capture the per-stream
+    // quadruple (emitted, acknowledged, received, delivered), present the
+    // already-consumed ticket once more as a losing attachment, and require
+    // the quadruple to be identical and no new stream row to appear.
+    //
+    // The backend takes ownership of the successor control socket, so this
+    // phase runs strictly after every arm above that reads that socket.
+    let cursor_evidence = run_stream_cursor_immutability(
+        cluster,
+        harness,
+        resources,
+        device,
+        service_id,
+        Arc::clone(&tls),
+        &successor_owner,
+        &successor_welcome,
+        ingress_a,
+        scenario_deadline,
+    )
+    .await?;
+
     Ok(Ec041DeviceAttachmentEvidence {
         relay_count: cluster.relays.len(),
         predecessor_owner_complete,
@@ -500,6 +689,21 @@ async fn run_race(
         loser_caused_no_counter_reset,
         fresh_ticket_reuse_rejected,
         fresh_ticket_reuse_data_ready_absent,
+
+        control_attach_barrier_held: control_race.barrier_held,
+        control_attach_barrier_hits: control_race.barrier_hits,
+        control_owner_changed_while_held: control_race.owner_changed_while_held,
+        control_interloper_owner_node_matched: control_race.interloper_owner_node_matched,
+        control_attach_revalidated: control_race.revalidated,
+        control_attach_outcome: control_race.outcome,
+        control_single_owner_after_race: control_race.single_owner_after_race,
+        control_no_stale_owner_welcome: control_race.no_stale_owner_welcome,
+
+        winner_stream_count: cursor_evidence.stream_count,
+        winner_stream_cursors_advanced: cursor_evidence.cursors_advanced,
+        winner_stream_cursors_unchanged: cursor_evidence.cursors_unchanged,
+        loser_created_no_stream_row: cursor_evidence.loser_created_no_stream_row,
+
         cleanup_joined: false,
     })
 }
@@ -815,6 +1019,70 @@ impl ControlOnlyBarrier {
         }
     }
 
+    /// Read the raced control socket after the barrier is released and report
+    /// what the device actually observed.  Both a transport close and a
+    /// WELCOME are legitimate revalidation outcomes, so this helper measures
+    /// rather than asserting: the caller decides which invariants apply.
+    async fn observe_raced_attach(&mut self, deadline: Instant) -> Result<RacedControlOutcome> {
+        if self.paused {
+            self.proxy
+                .as_ref()
+                .expect("EC-041 proxy retained")
+                .resume(Direction::TargetToClient, self.connection_id)
+                .await?;
+            self.paused = false;
+        }
+        let control = self.control.as_mut().expect("EC-041 control retained");
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(HarnessError::Timeout(
+                    "EC-041 raced control attach produced no outcome".into(),
+                ));
+            }
+            let item = match timeout(remaining, control.next()).await {
+                Err(_) => {
+                    return Err(HarnessError::Timeout(
+                        "EC-041 raced control attach produced no outcome".into(),
+                    ));
+                }
+                Ok(None) | Ok(Some(Ok(Message::Close(_)))) | Ok(Some(Err(_))) => {
+                    return Ok(RacedControlOutcome::Closed);
+                }
+                Ok(Some(Ok(item))) => item,
+            };
+            match item {
+                Message::Text(text) => {
+                    let message = decode_control(text.as_bytes()).map_err(|error| {
+                        HarnessError::Http(format!("EC-041 raced control decode: {error}"))
+                    })?;
+                    if let ControlMessage::Welcome(welcome) = message {
+                        return Ok(RacedControlOutcome::Welcomed(Box::new(welcome)));
+                    }
+                }
+                Message::Binary(bytes) => {
+                    let message = decode_control(&bytes).map_err(|error| {
+                        HarnessError::Http(format!("EC-041 raced control decode: {error}"))
+                    })?;
+                    if let ControlMessage::Welcome(welcome) = message {
+                        return Ok(RacedControlOutcome::Welcomed(Box::new(welcome)));
+                    }
+                }
+                Message::Ping(payload) => {
+                    timeout(remaining, control.send(Message::Pong(payload)))
+                        .await
+                        .map_err(|_| {
+                            HarnessError::Timeout("EC-041 raced control PONG deadline".into())
+                        })?
+                        .map_err(|error| {
+                            HarnessError::Http(format!("EC-041 raced control PONG: {error}"))
+                        })?;
+                }
+                Message::Pong(_) | Message::Frame(_) | Message::Close(_) => {}
+            }
+        }
+    }
+
     async fn expect_no_data_ready(&mut self, deadline: Instant) -> Result<bool> {
         let quiet_deadline = Instant::now()
             .checked_add(QUIET_CONTROL_WINDOW)
@@ -880,6 +1148,27 @@ impl ControlOnlyBarrier {
         }
     }
 
+    /// Surrender the control socket to the shared fixture connector while the
+    /// barrier, and therefore its interception proxy, stays alive.
+    ///
+    /// The device control socket is carried by a TCP connection this proxy
+    /// owns: the client half terminates on the proxy listener and the proxy
+    /// holds the only connection to the relay's device ingress.  Shutting the
+    /// proxy down drops both halves of every live proxied connection, so
+    /// shutting it down here would close the control socket in the same
+    /// breath as handing it over.  The relay would observe `CONTROL_CLOSED`,
+    /// destroy the session, and every later step against that owner -- the
+    /// cursor phase's consumer stream included -- would find no live owner.
+    ///
+    /// So this only takes the socket, exactly like the pending-owner fixture's
+    /// `take_control`.  The caller keeps the barrier in its resource set, and
+    /// `close` shuts the proxy down after the connector has been joined.
+    fn take_control(&mut self) -> Result<DeviceSocket> {
+        self.control
+            .take()
+            .ok_or_else(|| HarnessError::Process("EC-041 control socket was lost".into()))
+    }
+
     async fn close(mut self, deadline: Instant) -> Result<()> {
         let mut first_error = None;
         if self.paused {
@@ -906,10 +1195,18 @@ impl ControlOnlyBarrier {
                 && let Err(error) = timeout(remaining, control.close(None))
                     .await
                     .map_err(|_| HarnessError::Timeout("EC-041 control close timed out".into()))
-                    .and_then(|result| {
-                        result.map_err(|error| {
-                            HarnessError::Http(format!("EC-041 control close: {error}"))
-                        })
+                    .and_then(|result| match result {
+                        Ok(()) => Ok(()),
+                        // This gate deliberately drives control sockets the
+                        // relay refuses, so cleanup routinely reaches a socket
+                        // the relay already closed.  Closing an
+                        // already-closed socket is this cleanup succeeding,
+                        // not the scenario failing; only a close that fails
+                        // for some other reason is reported.
+                        Err(error) if is_already_closed(&error) => Ok(()),
+                        Err(error) => {
+                            Err(HarnessError::Http(format!("EC-041 control close: {error}")))
+                        }
                     })
             {
                 first_error.get_or_insert(error);
@@ -932,6 +1229,617 @@ impl ControlOnlyBarrier {
         match first_error {
             Some(error) => Err(error),
             None => Ok(()),
+        }
+    }
+}
+
+/// Measured evidence from the control-attachment race.
+struct ControlRaceEvidence {
+    barrier_held: bool,
+    barrier_hits: u64,
+    owner_changed_while_held: bool,
+    interloper_owner_node_matched: bool,
+    revalidated: bool,
+    outcome: ControlAttachOutcomeKind,
+    single_owner_after_race: bool,
+    no_stale_owner_welcome: bool,
+}
+
+/// The measured outcome of the raced control attach, with whatever the device
+/// actually observed on its control socket.
+enum RacedControlOutcome {
+    /// The relay closed the control socket without ever issuing a WELCOME.
+    Closed,
+    /// The relay issued a WELCOME.
+    Welcomed(Box<Welcome>),
+}
+
+/// EC-041 clause one: an owner change strictly between the device's `HELLO`
+/// and its `WELCOME`.
+///
+/// PHASE ORDER, made explicit because the `ControlAttachBarrier` is
+/// single-use.  `arm` succeeds only from `IDLE`, so exactly one control
+/// attach in the whole gate run can be held.  Unlike the peer admission
+/// barrier, a released control-attach barrier never *refuses* a later
+/// attach: it is a pass-through, so every control socket opened after
+/// `release` behaves exactly as it would with no barrier at all.  That is
+/// what lets the existing data-attachment race below run unchanged.
+///
+///   A1  No owner exists yet, so relay-b's device ingress resolves the LOCAL
+///       path rather than forwarding the control socket to a remote owner.
+///   A2  Arm relay-b's barrier, then open a device control socket to relay-b
+///       and send `HELLO`.
+///   A3  relay-b holds inside `handle_control`, after the `HELLO` is parsed
+///       and before the registration that produces the `WELCOME`.
+///   A4  While it is held, an interloper device control socket on relay-c
+///       claims ownership and completes its own owner fencing.  Ownership has
+///       now changed strictly inside relay-b's HELLO -> WELCOME window.
+///   A5  Release.  relay-b must revalidate against the owner that exists at
+///       attachment time, never against the owner state it saw at `HELLO`.
+///   A6  Measure, then tear the phase down and return the device to no-owner
+///       so the existing data-attachment race starts from its own baseline.
+#[allow(clippy::too_many_lines)]
+async fn run_control_attach_race(
+    cluster: &mut ProductionCluster,
+    device: &crate::DeviceFixture,
+    service_id: Uuid,
+    tls: Arc<ClientConfig>,
+    barrier: &Arc<tunnel_relay::ControlAttachBarrier>,
+    deadline: Instant,
+) -> Result<ControlRaceEvidence> {
+    // A1: the race is only meaningful on the owner-local control path.
+    wait_for_no_owner(cluster, device.tenant_id, device.id, deadline).await?;
+
+    // A2: arm before the HELLO is written so the seam cannot be missed.
+    if !barrier.arm() {
+        return Err(HarnessError::Process(
+            "EC-041 control attach barrier was already armed".into(),
+        ));
+    }
+    let held_addr = relay_device_addr(cluster, "relay-b")?;
+    let mut held = ControlOnlyBarrier::open(
+        held_addr,
+        Arc::clone(&tls),
+        device.id,
+        service_id,
+        RotationConfig::default(),
+    )
+    .await?;
+
+    // A3: wait for the exact server-side point between HELLO and WELCOME.
+    // This is the whole point of the seam: without it the next step would be
+    // a sleep racing the registration.
+    let barrier_held = timeout(
+        deadline.saturating_duration_since(Instant::now()),
+        barrier.wait_reached(),
+    )
+    .await
+    .is_ok()
+        && barrier.hit_count() == 1;
+    if !barrier_held {
+        let _ = held.close(Instant::now() + CLEANUP_TIMEOUT).await;
+        barrier.release();
+        return Err(HarnessError::Timeout(
+            "EC-041 control attach barrier never held the device control socket".into(),
+        ));
+    }
+    // The held relay has not registered, so the catalog still has no owner.
+    let owner_absent_at_hello = cluster
+        .catalog
+        .current_owner(device.tenant_id, device.id, chrono::Utc::now())
+        .await
+        .map_err(|error| HarnessError::Redis(format!("EC-041 held owner read: {error}")))?
+        .is_none();
+
+    // A4: an interloper takes ownership on relay-c while relay-b is held.
+    let interloper_addr = relay_device_addr(cluster, "relay-c")?;
+    let mut interloper = match ControlOnlyBarrier::open(
+        interloper_addr,
+        Arc::clone(&tls),
+        device.id,
+        service_id,
+        RotationConfig::default(),
+    )
+    .await
+    {
+        Ok(socket) => socket,
+        Err(error) => {
+            let _ = held.close(Instant::now() + CLEANUP_TIMEOUT).await;
+            barrier.release();
+            return Err(error);
+        }
+    };
+    let interloper_result = async {
+        let owner =
+            wait_for_owner_on(cluster, device.tenant_id, device.id, "relay-c", deadline).await?;
+        interloper
+            .capture_control_only(&owner.token, deadline)
+            .await?;
+        Ok::<OwnerClaim, HarnessError>(owner)
+    }
+    .await;
+    let interloper_owner = match interloper_result {
+        Ok(owner) => owner,
+        Err(error) => {
+            let _ = interloper.close(Instant::now() + CLEANUP_TIMEOUT).await;
+            let _ = held.close(Instant::now() + CLEANUP_TIMEOUT).await;
+            barrier.release();
+            return Err(error);
+        }
+    };
+    let interloper_owner_node_matched = interloper_owner.token.node_id == "relay-c";
+    let owner_changed_while_held =
+        owner_absent_at_hello && interloper_owner_node_matched && barrier.is_held();
+
+    // A5: release the held attach into a world whose owner has changed.
+    barrier.release();
+
+    // A6: measure.  Both a refusal and a fenced takeover are legitimate
+    // revalidation outcomes; the gate reads what actually happens rather than
+    // fixing an expected code in advance.
+    let raced = held.observe_raced_attach(deadline).await;
+    let (outcome, raced_welcome) = match raced {
+        Ok(RacedControlOutcome::Closed) => {
+            (ControlAttachOutcomeKind::RefusedAfterOwnerChange, None)
+        }
+        Ok(RacedControlOutcome::Welcomed(welcome)) => {
+            (ControlAttachOutcomeKind::FencedTakeover, Some(welcome))
+        }
+        Err(error) => {
+            let _ = interloper.close(Instant::now() + CLEANUP_TIMEOUT).await;
+            let _ = held.close(Instant::now() + CLEANUP_TIMEOUT).await;
+            return Err(error);
+        }
+    };
+
+    // Whatever the outcome, exactly one owner must be live and the device must
+    // never hold a WELCOME binding an owner other than that one.
+    let settled_owner = cluster
+        .catalog
+        .current_owner(device.tenant_id, device.id, chrono::Utc::now())
+        .await
+        .map_err(|error| HarnessError::Redis(format!("EC-041 settled owner read: {error}")))?;
+    let single_owner_after_race = settled_owner.is_some();
+    let (revalidated, no_stale_owner_welcome) = match (&outcome, raced_welcome.as_ref()) {
+        // Refused: the relay declined to attach precisely because the owner it
+        // selected at HELLO no longer held the device at attachment time.  No
+        // WELCOME was issued, so no stale binding can exist.
+        (ControlAttachOutcomeKind::RefusedAfterOwnerChange, _) => (
+            settled_owner
+                .as_ref()
+                .is_some_and(|owner| owner.token.node_id == "relay-c"),
+            true,
+        ),
+        // Takeover: the WELCOME must bind the owner token authoritative after
+        // the race, never the interloper's replaced one.
+        (ControlAttachOutcomeKind::FencedTakeover, Some(welcome)) => {
+            let bound = settled_owner
+                .as_ref()
+                .is_some_and(|owner| welcome_matches_owner(welcome, &owner.token));
+            let replaced = settled_owner.as_ref().is_some_and(|owner| {
+                owner.token.session_id != interloper_owner.token.session_id
+                    || owner.token.epoch != interloper_owner.token.epoch
+            });
+            (bound && replaced, bound)
+        }
+        _ => (false, false),
+    };
+
+    let barrier_hits = barrier.hit_count();
+
+    // Tear the phase down and return the device to no-owner so the existing
+    // data-attachment race below starts from its own clean baseline.
+    let mut cleanup = None;
+    append_cleanup(
+        &mut cleanup,
+        "EC-041 raced control socket",
+        held.close(Instant::now() + CLEANUP_TIMEOUT).await,
+    );
+    append_cleanup(
+        &mut cleanup,
+        "EC-041 interloper control socket",
+        interloper.close(Instant::now() + CLEANUP_TIMEOUT).await,
+    );
+    if let Some(error) = cleanup {
+        return Err(error);
+    }
+    wait_for_no_owner(cluster, device.tenant_id, device.id, deadline).await?;
+
+    Ok(ControlRaceEvidence {
+        barrier_held,
+        barrier_hits,
+        owner_changed_while_held,
+        interloper_owner_node_matched,
+        revalidated,
+        outcome,
+        single_owner_after_race,
+        no_stale_owner_welcome,
+    })
+}
+
+/// Per-stream sequence cursors for one stream row, plus the stable logical
+/// operation identity that makes the row comparable across two samples.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct StreamCursors {
+    operation_id: String,
+    stream_id: u64,
+    last_emitted_relay_to_connector: u64,
+    peer_acked_relay_to_connector: u64,
+    recv_contiguous_connector_to_relay: u64,
+    delivered_contiguous_connector_to_relay: u64,
+}
+
+impl StreamCursors {
+    fn advanced(&self) -> bool {
+        self.last_emitted_relay_to_connector != 0
+            || self.peer_acked_relay_to_connector != 0
+            || self.recv_contiguous_connector_to_relay != 0
+            || self.delivered_contiguous_connector_to_relay != 0
+    }
+}
+
+struct CursorImmutabilityEvidence {
+    stream_count: usize,
+    cursors_advanced: bool,
+    cursors_unchanged: bool,
+    loser_created_no_stream_row: bool,
+}
+
+/// Capture every stream row on the successor owner's session, ordered by the
+/// stable logical operation identity so two samples compare element-wise.
+async fn stream_cursors(
+    cluster: &ProductionCluster,
+    node_id: &str,
+    device_id: Uuid,
+    owner: &tunnel_catalog::OwnerToken,
+) -> Result<Vec<StreamCursors>> {
+    let snapshot = cluster.relay(node_id)?.snapshot().await?;
+    let session = snapshot
+        .sessions
+        .iter()
+        .find(|session| {
+            session.device_id == device_id.to_string()
+                && session.session_id == owner.session_id
+                && session.epoch == owner.epoch
+        })
+        .ok_or_else(|| {
+            HarnessError::Process("EC-041 owner session disappeared during cursor capture".into())
+        })?;
+    let mut cursors = session
+        .streams
+        .iter()
+        .map(|stream| StreamCursors {
+            operation_id: stream.operation_id.clone(),
+            stream_id: stream.stream_id,
+            last_emitted_relay_to_connector: stream.last_emitted_relay_to_connector,
+            peer_acked_relay_to_connector: stream.peer_acked_relay_to_connector,
+            recv_contiguous_connector_to_relay: stream.recv_contiguous_connector_to_relay,
+            delivered_contiguous_connector_to_relay: stream.delivered_contiguous_connector_to_relay,
+        })
+        .collect::<Vec<_>>();
+    cursors.sort();
+    Ok(cursors)
+}
+
+/// EC-041 clause two.  Drive one real stream over the winning attachment's
+/// carrier until its own sequence cursors carry real state, then prove a
+/// losing attachment leaves that state byte for byte alone.
+#[allow(clippy::too_many_arguments)]
+async fn run_stream_cursor_immutability(
+    cluster: &mut ProductionCluster,
+    harness: &HarnessRuntime,
+    resources: &mut AttachmentRaceResources,
+    device: &crate::DeviceFixture,
+    service_id: Uuid,
+    tls: Arc<ClientConfig>,
+    owner: &OwnerClaim,
+    welcome: &Welcome,
+    loser_ingress: SocketAddr,
+    deadline: Instant,
+) -> Result<CursorImmutabilityEvidence> {
+    // Hand both successor sockets to the shared fixture connector.  Every arm
+    // that reads the successor control socket has already run.
+    //
+    // The barrier itself is deliberately left in `resources`: its interception
+    // proxy still carries this control connection, so it must outlive the
+    // connector and be shut down by `AttachmentRaceResources::cleanup`.
+    let control = resources
+        .successor
+        .as_mut()
+        .ok_or_else(|| HarnessError::Process("EC-041 successor control was lost".into()))?
+        .take_control()?;
+    let data = resources
+        .fresh_data
+        .take()
+        .ok_or_else(|| HarnessError::Process("EC-041 winning data carrier was lost".into()))?;
+    let mut backend = super::pending_owner::spawn_backend(
+        control,
+        data,
+        welcome.clone(),
+        service_id,
+        CURSOR_DEVICE_CANARY,
+    );
+
+    // A long-lived consumer stream keeps the row alive while it is sampled; a
+    // completed one-shot echo could be reaped between the two samples and turn
+    // the comparison vacuous.
+    let token = harness.oidc.issue_with(
+        &harness.topology.consumers_a[0].name,
+        crate::OidcTokenOptions {
+            expires_in: Duration::from_secs(120),
+            ..crate::OidcTokenOptions::default()
+        },
+    )?;
+    let consumer_addr = cluster.relay("relay-b")?.consumer_addr()?;
+    let mut consumer = open_consumer_stream(
+        consumer_addr,
+        &harness.pki.server_ca.certificate_der,
+        &format!("Bearer {token}"),
+        device.id,
+        service_id,
+        deadline,
+    )
+    .await?;
+
+    // Exchange one message so both directions carry real sequence state.
+    let exchanged = drive_consumer_exchange(&mut consumer, CURSOR_PROBE_BODY, deadline).await;
+
+    let capture = async {
+        exchanged?;
+        // Sample only once the relay has published a stream row whose cursors
+        // have actually moved.  Sampling immediately would race the actor and
+        // could capture a freshly zeroed row, which is the vacuity trap.
+        let before =
+            wait_for_advanced_stream_cursors(cluster, "relay-b", device.id, &owner.token, deadline)
+                .await?;
+
+        // The losing attachment: present the already-consumed winning ticket
+        // through a non-owner ingress once more.
+        let loser_socket = open_data_socket(
+            loser_ingress,
+            Arc::clone(&tls),
+            &welcome.attachment_ticket,
+            deadline,
+        )
+        .await?;
+        let refused = expect_data_rejection(loser_socket, deadline).await?;
+        if !refused {
+            return Err(HarnessError::Process(
+                "EC-041 cursor-phase losing attachment was not refused".into(),
+            ));
+        }
+        // Give the owner a bounded settling window so a late mutation caused
+        // by the refusal is observed rather than missed.
+        sleep(QUIET_CONTROL_WINDOW).await;
+        let after = stream_cursors(cluster, "relay-b", device.id, &owner.token).await?;
+        Ok::<_, HarnessError>((before, after))
+    }
+    .await;
+
+    // Release the fixture connector and the consumer stream regardless.
+    let mut cleanup = None;
+    if let Some(cancel) = backend.cancel.take() {
+        let _ = cancel.send(());
+    }
+    if let Some(task) = backend.task.take() {
+        match timeout(CLEANUP_TIMEOUT, task).await {
+            Ok(Ok(Ok(_))) => {}
+            Ok(Ok(Err(error))) => {
+                append_cleanup(&mut cleanup, "EC-041 cursor backend", Err(error));
+            }
+            Ok(Err(error)) => append_cleanup(
+                &mut cleanup,
+                "EC-041 cursor backend join",
+                Err(HarnessError::Process(error.to_string())),
+            ),
+            Err(_) => append_cleanup(
+                &mut cleanup,
+                "EC-041 cursor backend",
+                Err(HarnessError::Timeout("cursor backend did not stop".into())),
+            ),
+        }
+    }
+    let _ = timeout(CLEANUP_TIMEOUT, consumer.close(None)).await;
+
+    let (before, after) = capture?;
+    if let Some(error) = cleanup {
+        return Err(error);
+    }
+
+    let stream_count = before.len();
+    let cursors_advanced = !before.is_empty() && before.iter().all(StreamCursors::advanced);
+    let cursors_unchanged = before == after;
+    // The refused attachment must not have added a row of its own.
+    let before_ids = before
+        .iter()
+        .map(|cursor| cursor.operation_id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let loser_created_no_stream_row = after.len() == before.len()
+        && after
+            .iter()
+            .all(|cursor| before_ids.contains(&cursor.operation_id));
+
+    Ok(CursorImmutabilityEvidence {
+        stream_count,
+        cursors_advanced,
+        cursors_unchanged,
+        loser_created_no_stream_row,
+    })
+}
+
+/// Poll until the successor session publishes at least one stream row whose
+/// sequence cursors have moved off zero.
+async fn wait_for_advanced_stream_cursors(
+    cluster: &ProductionCluster,
+    node_id: &str,
+    device_id: Uuid,
+    owner: &tunnel_catalog::OwnerToken,
+    deadline: Instant,
+) -> Result<Vec<StreamCursors>> {
+    loop {
+        let cursors = stream_cursors(cluster, node_id, device_id, owner).await?;
+        if !cursors.is_empty() && cursors.iter().all(StreamCursors::advanced) {
+            return Ok(cursors);
+        }
+        if Instant::now() >= deadline {
+            return Err(HarnessError::Timeout(
+                "EC-041 winning stream cursors never advanced off zero".into(),
+            ));
+        }
+        sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// Open the public consumer echo stream against one relay's consumer listener.
+async fn open_consumer_stream(
+    consumer_addr: SocketAddr,
+    server_ca_der: &[u8],
+    authorization: &str,
+    device_id: Uuid,
+    service_id: Uuid,
+    deadline: Instant,
+) -> Result<ConsumerSocket> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(rustls::pki_types::CertificateDer::from(
+            server_ca_der.to_vec(),
+        ))
+        .map_err(|error| HarnessError::Http(format!("EC-041 consumer CA: {error}")))?;
+    let tls = ClientConfig::builder_with_provider(rustls::crypto::ring::default_provider().into())
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|error| HarnessError::Http(format!("EC-041 consumer TLS: {error}")))?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let url = format!(
+        "wss://localhost:{}/v1/devices/{device_id}/services/{service_id}/stream",
+        consumer_addr.port()
+    );
+    let mut request = url
+        .into_client_request()
+        .map_err(|error| HarnessError::Http(format!("EC-041 consumer request: {error}")))?;
+    request.headers_mut().insert(
+        "authorization",
+        HeaderValue::from_str(authorization)
+            .map_err(|error| HarnessError::Http(format!("EC-041 consumer auth: {error}")))?,
+    );
+    request.headers_mut().insert(
+        "sec-websocket-protocol",
+        HeaderValue::from_static(CONSUMER_SUBPROTOCOL),
+    );
+    let (socket, response) = timeout(
+        deadline.saturating_duration_since(Instant::now()),
+        connect_async_tls_with_config(request, None, true, Some(Connector::Rustls(Arc::new(tls)))),
+    )
+    .await
+    .map_err(|_| HarnessError::Timeout("EC-041 consumer stream handshake timed out".into()))?
+    .map_err(|error| HarnessError::Http(format!("EC-041 consumer stream handshake: {error}")))?;
+    if response
+        .headers()
+        .get("sec-websocket-protocol")
+        .and_then(|value| value.to_str().ok())
+        != Some(CONSUMER_SUBPROTOCOL)
+    {
+        return Err(HarnessError::Http(
+            "EC-041 consumer stream selected an unexpected subprotocol".into(),
+        ));
+    }
+    Ok(socket)
+}
+
+/// Send one message on the consumer stream and read the connector's echo back.
+/// Completing the round trip is what moves all four per-stream cursors off
+/// zero, so the immutability comparison below is over real sequence state.
+async fn drive_consumer_exchange(
+    consumer: &mut ConsumerSocket,
+    body: &[u8],
+    deadline: Instant,
+) -> Result<()> {
+    // The consumer stream carries length-prefixed records, not bare bodies:
+    // a four byte big-endian body length followed by that many bytes, in both
+    // directions.  Sending the body unframed makes the relay read its first
+    // four bytes as the declared length, which it rejects at
+    // `consumer_record_declared_limit` and then closes the stream.
+    let length = u32::try_from(body.len())
+        .map_err(|_| HarnessError::InvalidInput("EC-041 consumer probe is too large".into()))?;
+    let mut record = Vec::with_capacity(body.len() + RECORD_LENGTH_BYTES);
+    record.extend_from_slice(&length.to_be_bytes());
+    record.extend_from_slice(body);
+    timeout(
+        deadline.saturating_duration_since(Instant::now()),
+        consumer.send(Message::Binary(record.into())),
+    )
+    .await
+    .map_err(|_| HarnessError::Timeout("EC-041 consumer send timed out".into()))?
+    .map_err(|error| HarnessError::Http(format!("EC-041 consumer send: {error}")))?;
+    let expected = CURSOR_DEVICE_CANARY
+        .iter()
+        .copied()
+        .chain(body.iter().copied())
+        .collect::<Vec<_>>();
+    // The response record may arrive across several WebSocket frames, so
+    // reassemble it under an explicit bound before comparing.
+    let maximum_response = expected.len().saturating_add(RECORD_LENGTH_BYTES);
+    let mut response = Vec::with_capacity(maximum_response);
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(HarnessError::Timeout(
+                "EC-041 consumer stream produced no echo".into(),
+            ));
+        }
+        match timeout(remaining, consumer.next()).await {
+            Err(_) => {
+                return Err(HarnessError::Timeout(
+                    "EC-041 consumer stream produced no echo".into(),
+                ));
+            }
+            Ok(Some(Ok(Message::Binary(bytes)))) => {
+                if response.len().saturating_add(bytes.len()) > maximum_response {
+                    return Err(HarnessError::Process(
+                        "EC-041 consumer stream echo exceeded its bounded reassembly".into(),
+                    ));
+                }
+                response.extend_from_slice(&bytes);
+                if response.len() < RECORD_LENGTH_BYTES {
+                    continue;
+                }
+                let declared =
+                    u32::from_be_bytes([response[0], response[1], response[2], response[3]])
+                        as usize;
+                if declared != expected.len() {
+                    return Err(HarnessError::Process(
+                        "EC-041 consumer stream echo declared an unexpected record length".into(),
+                    ));
+                }
+                if response.len() < declared.saturating_add(RECORD_LENGTH_BYTES) {
+                    continue;
+                }
+                if &response[RECORD_LENGTH_BYTES..] == expected.as_slice() {
+                    return Ok(());
+                }
+                return Err(HarnessError::Process(
+                    "EC-041 consumer stream echo did not match the probe".into(),
+                ));
+            }
+            Ok(Some(Ok(Message::Ping(payload)))) => {
+                timeout(remaining, consumer.send(Message::Pong(payload)))
+                    .await
+                    .map_err(|_| HarnessError::Timeout("EC-041 consumer PONG deadline".into()))?
+                    .map_err(|error| {
+                        HarnessError::Http(format!("EC-041 consumer PONG: {error}"))
+                    })?;
+            }
+            Ok(Some(Ok(_))) => {}
+            Ok(Some(Err(error))) => {
+                return Err(HarnessError::Http(format!(
+                    "EC-041 consumer stream read: {error}"
+                )));
+            }
+            Ok(None) => {
+                return Err(HarnessError::Http(
+                    "EC-041 consumer stream closed before echoing".into(),
+                ));
+            }
         }
     }
 }
@@ -1280,6 +2188,20 @@ fn append_cleanup(slot: &mut Option<HarnessError>, label: &str, result: Result<(
     }
 }
 
+/// Whether a WebSocket error only says the socket was already closed.
+///
+/// Tungstenite reports a close on an already-closed socket three ways
+/// depending on how far the close handshake got.  All three mean the same
+/// thing for cleanup: there is nothing left to close.
+fn is_already_closed(error: &WsError) -> bool {
+    matches!(
+        error,
+        WsError::ConnectionClosed
+            | WsError::AlreadyClosed
+            | WsError::Protocol(ProtocolError::SendAfterClosing)
+    )
+}
+
 #[cfg(test)]
 mod c17_validator_tests {
     use super::*;
@@ -1307,6 +2229,18 @@ mod c17_validator_tests {
             loser_caused_no_counter_reset: true,
             fresh_ticket_reuse_rejected: true,
             fresh_ticket_reuse_data_ready_absent: true,
+            control_attach_barrier_held: true,
+            control_attach_barrier_hits: 1,
+            control_owner_changed_while_held: true,
+            control_interloper_owner_node_matched: true,
+            control_attach_revalidated: true,
+            control_attach_outcome: ControlAttachOutcomeKind::RefusedAfterOwnerChange,
+            control_single_owner_after_race: true,
+            control_no_stale_owner_welcome: true,
+            winner_stream_count: 1,
+            winner_stream_cursors_advanced: true,
+            winner_stream_cursors_unchanged: true,
+            loser_created_no_stream_row: true,
             cleanup_joined: true,
         }
     }
@@ -1319,7 +2253,7 @@ mod c17_validator_tests {
     #[test]
     fn every_ec041_required_flag_reaches_the_shared_exit_path() {
         type Disable = (&'static str, fn(&mut Ec041DeviceAttachmentEvidence));
-        let flags: [Disable; 14] = [
+        let flags: [Disable; 23] = [
             ("predecessor_owner_complete", |e| {
                 e.predecessor_owner_complete = false
             }),
@@ -1358,6 +2292,33 @@ mod c17_validator_tests {
                 e.fresh_ticket_reuse_data_ready_absent = false
             }),
             ("cleanup_joined", |e| e.cleanup_joined = false),
+            ("control_attach_barrier_held", |e| {
+                e.control_attach_barrier_held = false
+            }),
+            ("control_owner_changed_while_held", |e| {
+                e.control_owner_changed_while_held = false
+            }),
+            ("control_interloper_owner_node_matched", |e| {
+                e.control_interloper_owner_node_matched = false
+            }),
+            ("control_attach_revalidated", |e| {
+                e.control_attach_revalidated = false
+            }),
+            ("control_single_owner_after_race", |e| {
+                e.control_single_owner_after_race = false
+            }),
+            ("control_no_stale_owner_welcome", |e| {
+                e.control_no_stale_owner_welcome = false
+            }),
+            ("winner_stream_cursors_advanced", |e| {
+                e.winner_stream_cursors_advanced = false
+            }),
+            ("winner_stream_cursors_unchanged", |e| {
+                e.winner_stream_cursors_unchanged = false
+            }),
+            ("loser_created_no_stream_row", |e| {
+                e.loser_created_no_stream_row = false
+            }),
         ];
         for (_, disable) in flags {
             let mut evidence = valid_evidence();
@@ -1369,7 +2330,7 @@ mod c17_validator_tests {
     #[test]
     fn every_ec041_required_count_and_generation_reaches_the_shared_exit_path() {
         type Mutate = (&'static str, fn(&mut Ec041DeviceAttachmentEvidence));
-        let counts: [Mutate; 9] = [
+        let counts: [Mutate; 13] = [
             ("relay_count", |e| e.relay_count = 2),
             ("predecessor_generation", |e| e.predecessor_generation = 2),
             ("successor_generation", |e| e.successor_generation = 2),
@@ -1383,6 +2344,16 @@ mod c17_validator_tests {
             ("concurrent_data_ready_double", |e| {
                 e.concurrent_data_ready_count = 2
             }),
+            ("control_attach_barrier_hits_none", |e| {
+                e.control_attach_barrier_hits = 0
+            }),
+            ("control_attach_barrier_hits_double", |e| {
+                e.control_attach_barrier_hits = 2
+            }),
+            ("control_attach_outcome_unmeasured", |e| {
+                e.control_attach_outcome = ControlAttachOutcomeKind::Unknown
+            }),
+            ("winner_stream_count_zero", |e| e.winner_stream_count = 0),
         ];
         for (_, mutate) in counts {
             let mut evidence = valid_evidence();

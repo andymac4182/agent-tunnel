@@ -13158,6 +13158,9 @@ pub struct ListenerSocketOptions {
     pub consumer_upgrade_barrier: Option<Arc<crate::http::ConsumerUpgradeBarrier>>,
     /// Optional fixture-only hold immediately before remote H3 admission.
     pub consumer_peer_admission_barrier: Option<Arc<crate::http::PeerAdmissionBarrier>>,
+    /// Optional one-shot fixture gate on an owner-local device control socket,
+    /// after the device's HELLO and before the WELCOME-producing registration.
+    pub device_control_attach_barrier: Option<Arc<crate::http::ControlAttachBarrier>>,
 }
 
 impl Relay {
@@ -13347,11 +13350,12 @@ impl Relay {
             listener_options.consumer_upgrade_barrier.clone(),
             listener_options.consumer_peer_admission_barrier.clone(),
         );
-        let device_router = http::device_router_with_peer(
+        let device_router = http::device_router_with_peer_and_barrier(
             handle.clone(),
             Some(catalog.clone()),
             options.limits.clone(),
             peer_runtime.clone(),
+            listener_options.device_control_attach_barrier.clone(),
         );
         let consumer_cancel = cancel.child_token();
         let device_cancel = cancel.child_token();

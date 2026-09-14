@@ -55,8 +55,8 @@ use tunnel_client::{ConnectOptions, ConnectionHandle, ConnectionStatus, Transpor
 use tunnel_core::RotationConfig;
 use tunnel_relay::{
     CheckpointAuthority, CheckpointAuthorityError, CheckpointRequest, CheckpointResponse,
-    ClusterConfig, ConsumerUpgradeBarrier, ListenerSocketOptions, MembershipReadiness,
-    MembershipRuntime, MembershipRuntimeConfig, MembershipRuntimeHandle,
+    ClusterConfig, ConsumerUpgradeBarrier, ControlAttachBarrier, ListenerSocketOptions,
+    MembershipReadiness, MembershipRuntime, MembershipRuntimeConfig, MembershipRuntimeHandle,
     MembershipVersionStateIdentity, MembershipVersionStateStore, PeerAdmissionBarrier,
     PeerFaultEventSnapshot, PeerListenerConfig, PeerReadiness, PeerRouteTarget, PeerRuntime,
     RelayOptions, RelaySnapshot, RunningRelay, ServeConfig,
@@ -1788,6 +1788,7 @@ impl ProductionCluster {
             barriers,
             Some(max_pending_operations),
             None,
+            BTreeMap::new(),
         )
         .await
     }
@@ -1809,6 +1810,7 @@ impl ProductionCluster {
             BTreeMap::new(),
             None,
             Some((target_node_id, barrier)),
+            BTreeMap::new(),
         )
         .await
     }
@@ -1838,6 +1840,31 @@ impl ProductionCluster {
             upgrade_barriers,
             Some(max_pending_operations),
             Some((target_node_id, peer_admission_barrier)),
+            BTreeMap::new(),
+        )
+        .await
+    }
+
+    /// Start a three-relay cluster with one-shot device control-attach
+    /// barriers keyed by relay node ID.  Each barrier holds exactly one
+    /// owner-local device control socket between its `HELLO` and the
+    /// registration that produces its `WELCOME`.  An empty map preserves the
+    /// ordinary production harness path.  The barrier is single-use: once
+    /// released it is a pass-through for every later control attach, so a
+    /// caller must make its phase order explicit.
+    pub(super) async fn start_with_control_attach_barriers(
+        harness: &mut RunningHarness,
+        control_attach_barriers: BTreeMap<String, Arc<ControlAttachBarrier>>,
+    ) -> Result<Self> {
+        let catalog = Arc::new(harness.production_catalog()?.clone()) as SharedCatalog;
+        Self::start_with_catalog_send_buffer_and_barriers(
+            harness,
+            catalog,
+            None,
+            BTreeMap::new(),
+            None,
+            None,
+            control_attach_barriers,
         )
         .await
     }
@@ -1873,6 +1900,7 @@ impl ProductionCluster {
             BTreeMap::new(),
             None,
             None,
+            BTreeMap::new(),
         )
         .await
     }
@@ -1884,6 +1912,7 @@ impl ProductionCluster {
         upgrade_barriers: BTreeMap<String, Arc<ConsumerUpgradeBarrier>>,
         max_pending_operations: Option<usize>,
         peer_admission_barrier: Option<(&'static str, Arc<PeerAdmissionBarrier>)>,
+        control_attach_barriers: BTreeMap<String, Arc<ControlAttachBarrier>>,
     ) -> Result<Self> {
         let mut fixture =
             ClusterFixture::with_deployment(&harness.pki, DEPLOYMENT_ID, DEPLOYMENT_INCARCATION)?;
@@ -2125,6 +2154,7 @@ impl ProductionCluster {
                 (target_node_id == node.node_id.as_str()).then_some(bytes)
             });
             let upgrade_barrier = upgrade_barriers.get(&node.node_id).cloned();
+            let control_attach_barrier = control_attach_barriers.get(&node.node_id).cloned();
             let peer_admission_barrier =
                 peer_admission_barrier
                     .as_ref()
@@ -2146,6 +2176,7 @@ impl ProductionCluster {
                 send_buffer_bytes,
                 upgrade_barrier,
                 peer_admission_barrier,
+                control_attach_barrier,
                 max_pending_operations,
                 startup_cleanup_deadline,
             )
@@ -4858,6 +4889,7 @@ async fn start_relay(
     consumer_send_buffer_bytes: Option<u32>,
     consumer_upgrade_barrier: Option<Arc<ConsumerUpgradeBarrier>>,
     consumer_peer_admission_barrier: Option<Arc<PeerAdmissionBarrier>>,
+    device_control_attach_barrier: Option<Arc<ControlAttachBarrier>>,
     max_pending_operations: Option<usize>,
     startup_cleanup_deadline: tokio::time::Instant,
 ) -> Result<ProductionRelay> {
@@ -5170,6 +5202,7 @@ async fn start_relay(
                 },
                 consumer_upgrade_barrier,
                 consumer_peer_admission_barrier,
+                device_control_attach_barrier,
             },
         )
         .await

@@ -390,6 +390,7 @@ impl Stage {
             peer: None,
             consumer_upgrade_barrier: barrier.clone(),
             peer_admission_barrier: None,
+            control_attach_barrier: None,
         };
         let router = Router::new()
             .route(

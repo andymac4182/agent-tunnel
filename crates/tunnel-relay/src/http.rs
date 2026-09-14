@@ -193,6 +193,151 @@ impl ConsumerUpgradeBarrier {
     }
 }
 
+/// One-shot fixture seam immediately after the device's `HELLO` has been
+/// received and parsed on an owner-local device control socket, and
+/// immediately before the relay registers the control stream and produces the
+/// `WELCOME`.  It mirrors [`ConsumerUpgradeBarrier`] exactly: it is optional,
+/// is `None` on every ordinary relay path, and changes no product behaviour
+/// when absent.  The harness can arm it, observe the exact server-side point
+/// between `HELLO` and `WELCOME`, change device ownership while the handler is
+/// held, and release, without relying on a timing sleep.
+///
+/// Like [`ConsumerUpgradeBarrier`] and unlike [`PeerAdmissionBarrier`], a
+/// released barrier is a *pass-through*, never a refusal: a later control
+/// attach observes the failed `ARMED -> HELD` transition and proceeds
+/// immediately.  It is nonetheless single-use, because `arm` only succeeds
+/// from `IDLE`, so a fixture must make its phase order explicit and hold the
+/// one control attach it actually intends to race.
+#[derive(Clone, Debug)]
+pub struct ControlAttachBarrier {
+    state: Arc<ControlAttachBarrierState>,
+}
+
+#[derive(Debug)]
+struct ControlAttachBarrierState {
+    /// One-shot state machine: idle -> armed -> held -> released, identical to
+    /// the consumer upgrade barrier so a stale second arm cannot reset the
+    /// state of a request already held between HELLO and WELCOME.
+    phase: AtomicU8,
+    hits: AtomicU64,
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+impl Default for ControlAttachBarrier {
+    fn default() -> Self {
+        Self {
+            state: Arc::new(ControlAttachBarrierState {
+                phase: AtomicU8::new(BARRIER_IDLE),
+                hits: AtomicU64::new(0),
+                reached: tokio::sync::Notify::new(),
+                release: tokio::sync::Notify::new(),
+            }),
+        }
+    }
+}
+
+impl ControlAttachBarrier {
+    /// Arm exactly one device control-attach interception.  A second arm is
+    /// rejected so a stale notification cannot be mistaken for the selected
+    /// control socket.
+    pub fn arm(&self) -> bool {
+        self.state
+            .phase
+            .compare_exchange(
+                BARRIER_IDLE,
+                BARRIER_ARMED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// Wait until the selected handler reaches the post-HELLO, pre-WELCOME
+    /// boundary.
+    pub async fn wait_reached(&self) {
+        loop {
+            if self.state.hits.load(Ordering::Acquire) != 0 {
+                return;
+            }
+            if self.state.phase.load(Ordering::Acquire) == BARRIER_RELEASED {
+                return;
+            }
+            let notified = self.state.reached.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.state.hits.load(Ordering::Acquire) != 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Release the held control attach.  The release is sticky, so a
+    /// cancellation/reordering race cannot strand the handler.
+    pub fn release(&self) {
+        let mut phase = self.state.phase.load(Ordering::Acquire);
+        loop {
+            match phase {
+                BARRIER_ARMED | BARRIER_HELD => {
+                    match self.state.phase.compare_exchange(
+                        phase,
+                        BARRIER_RELEASED,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    ) {
+                        Ok(_) => {
+                            self.state.release.notify_waiters();
+                            return;
+                        }
+                        Err(next) => phase = next,
+                    }
+                }
+                BARRIER_IDLE | BARRIER_RELEASED => return,
+                _ => return,
+            }
+        }
+    }
+
+    pub fn hit_count(&self) -> u64 {
+        self.state.hits.load(Ordering::Acquire)
+    }
+
+    /// Report whether the one-shot fixture handler is still holding the
+    /// control attach between HELLO and WELCOME.
+    pub fn is_held(&self) -> bool {
+        self.state.phase.load(Ordering::Acquire) == BARRIER_HELD
+    }
+
+    async fn wait_before_control_attach(&self, budget: Duration) {
+        if self
+            .state
+            .phase
+            .compare_exchange(
+                BARRIER_ARMED,
+                BARRIER_HELD,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return;
+        }
+        self.state.hits.fetch_add(1, Ordering::AcqRel);
+        self.state.reached.notify_waiters();
+        let notified = self.state.release.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if self.state.phase.load(Ordering::Acquire) != BARRIER_RELEASED
+            && timeout(budget, notified.as_mut()).await.is_err()
+        {
+            // A bounded fallback prevents a fixture bug or shutdown race from
+            // holding a device control task forever.
+            self.release();
+        }
+    }
+}
+
 /// Exact identity selected by the authenticated public request before the
 /// remote H3 admission attempt. This is payload-free and includes the full
 /// owner fencing token, so a fixture cannot release a different request or
@@ -612,6 +757,11 @@ pub(crate) struct HttpState {
     /// Fixture-only one-shot gate after public readiness and exact owner-route
     /// resolution but before the remote H3 admission attempt.
     pub(crate) peer_admission_barrier: Option<Arc<PeerAdmissionBarrier>>,
+    /// Fixture-only one-shot gate on an owner-local device control socket,
+    /// after the device's HELLO is received and before the relay registers
+    /// the control stream and emits the WELCOME.  `None` on every ordinary
+    /// relay path, including every consumer route.
+    pub(crate) control_attach_barrier: Option<Arc<ControlAttachBarrier>>,
 }
 
 /// Build both public consumer and device WebSocket routes. Run this router
@@ -714,6 +864,7 @@ pub(crate) fn consumer_router_with_peer_and_barriers(
         peer,
         consumer_upgrade_barrier,
         peer_admission_barrier,
+        control_attach_barrier: None,
     };
     Router::new()
         .merge(health::router::<HttpState>(state.peer.clone()))
@@ -745,6 +896,20 @@ pub fn device_router_with_peer(
     limits: RelayLimits,
     peer: Option<Arc<PeerRuntime>>,
 ) -> Router {
+    device_router_with_peer_and_barrier(handle, catalog, limits, peer, None)
+}
+
+/// Build device routes with an optional fixture-only control-attach barrier.
+/// The barrier is deliberately separate from the ordinary device route so
+/// production callers keep the existing no-gate behaviour; passing `None`
+/// reproduces `device_router_with_peer` exactly.
+pub fn device_router_with_peer_and_barrier(
+    handle: RelayHandle,
+    catalog: Option<SharedCatalog>,
+    limits: RelayLimits,
+    peer: Option<Arc<PeerRuntime>>,
+    control_attach_barrier: Option<Arc<ControlAttachBarrier>>,
+) -> Router {
     let state = HttpState {
         handle,
         catalog,
@@ -761,6 +926,7 @@ pub fn device_router_with_peer(
         peer,
         consumer_upgrade_barrier: None,
         peer_admission_barrier: None,
+        control_attach_barrier,
     };
     Router::new()
         .route("/v1/tunnel/control", get(control))
@@ -2342,7 +2508,16 @@ async fn handle_control_ingress(socket: WebSocket, identity: TlsIdentity, state:
                 let _ = send_socket(&mut socket, Message::Close(None)).await;
                 return;
             }
-            handle_control(socket, identity, state.handle).await;
+            let control_attach_barrier = state.control_attach_barrier.clone();
+            let operation_timeout = state.limits.operation_timeout;
+            handle_control(
+                socket,
+                identity,
+                state.handle,
+                control_attach_barrier,
+                operation_timeout,
+            )
+            .await;
         }
         Err(error) => {
             tracing::debug!(?error, "device control owner lookup failed");
@@ -2791,10 +2966,31 @@ async fn handle_peer_device_control(
         tunnel_protocol::ControlMessage::Hello(hello) => hello,
         _ => return Err(PeerRuntimeError::UnexpectedRecord(first.kind())),
     };
-    let registration = handle
-        .register_forwarded_control(device, spki, hello)
-        .await
-        .map_err(|_| PeerRuntimeError::Closed)?;
+    // A refused registration -- a duplicate owner claim, an unauthorized
+    // device, or a HELLO this cluster will not admit -- is an ordinary outcome
+    // of this request, not a peer protocol violation.  It must be answered on
+    // this request stream and finished, for the same reason the forwarded data
+    // attachment below must be: returning here without responding finishes the
+    // HTTP/3 request stream with no response headers, which the ingress
+    // relay's h3 client raises as a CONNECTION-level `H3_FRAME_UNEXPECTED`,
+    // tearing down the whole peer connection to this owner along with every
+    // other forwarded device carrier multiplexed on it.
+    let registration = match handle.register_forwarded_control(device, spki, hello).await {
+        Ok(registration) => registration,
+        Err(error) => {
+            // A duplicate exact-scope owner keeps its own status, because the
+            // local control path treats that refusal as its own typed outcome
+            // rather than folding it in with an unauthorized device.  Neither
+            // status carries session, owner, or device detail.
+            let status = if matches!(error, RelayError::OwnerBusy) {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::FORBIDDEN
+            };
+            send.respond(status).await?;
+            return send.finish().await;
+        }
+    };
     let key = registration.key.clone();
     let welcome = registration.welcome;
     let mut outbound = registration.rx;
@@ -2868,10 +3064,28 @@ async fn handle_peer_device_data(
         .or_else(|| ticket_record.as_text().ok()?.strip_prefix("bearer "))
         .ok_or(PeerRuntimeError::Closed)?
         .to_owned();
-    let registration = handle
-        .attach_forwarded_data(device, spki, ticket)
-        .await
-        .map_err(|_| PeerRuntimeError::Closed)?;
+    // A refused attachment -- a spent, unknown, or wrong-session attachment
+    // ticket -- is an ordinary outcome of this request, not a peer protocol
+    // violation.  It must be answered on this request stream and finished.
+    //
+    // Returning here without responding leaves the HTTP/3 request stream
+    // finished with no response headers, which the ingress relay's h3 client
+    // raises as a CONNECTION-level `H3_FRAME_UNEXPECTED`.  That tears down the
+    // whole peer connection to this owner and with it every other forwarded
+    // device carrier multiplexed on it, including healthy installed ones; the
+    // owner then sees those carriers vanish and closes their sessions with
+    // `RECOVERY_START_FAILED`.  One refused attachment must never cost another
+    // device its session.
+    let registration = match handle.attach_forwarded_data(device, spki, ticket).await {
+        Ok(registration) => registration,
+        Err(_) => {
+            // Forbidden, not unavailable: the ticket was refused on its merits
+            // and retrying the same attachment cannot succeed.  The status
+            // carries no ticket, session, or owner detail.
+            send.respond(StatusCode::FORBIDDEN).await?;
+            return send.finish().await;
+        }
+    };
     let carrier = registration.carrier.clone();
     let mut outbound = registration.rx;
     let mut cleanup = handle.data_cleanup_guard(carrier.clone());
@@ -3392,7 +3606,13 @@ async fn handle_peer_consumer_stream(
     result
 }
 
-async fn handle_control(mut socket: WebSocket, identity: TlsIdentity, handle: RelayHandle) {
+async fn handle_control(
+    mut socket: WebSocket,
+    identity: TlsIdentity,
+    handle: RelayHandle,
+    control_attach_barrier: Option<Arc<ControlAttachBarrier>>,
+    operation_timeout: Duration,
+) {
     let first = match timeout(Duration::from_secs(10), socket.next()).await {
         Ok(Some(Ok(Message::Text(text)))) => text,
         _ => return,
@@ -3401,6 +3621,11 @@ async fn handle_control(mut socket: WebSocket, identity: TlsIdentity, handle: Re
         Ok(value) => value,
         Err(_) => return,
     };
+    // Fixture-only seam strictly between the device's HELLO and the
+    // registration that produces its WELCOME.  Absent on every ordinary path.
+    if let Some(barrier) = control_attach_barrier.as_ref() {
+        barrier.wait_before_control_attach(operation_timeout).await;
+    }
     let registration = match handle.register_control(identity, hello).await {
         Ok(value) => value,
         Err(error) => {
@@ -3931,10 +4156,10 @@ fn error_response(
 #[cfg(test)]
 mod tests {
     use super::{
-        ConsumerUpgradeBarrier, PeerAdmissionBarrier, PeerAdmissionBarrierError,
-        PeerAdmissionScope, forwarded_bearer_token, is_no_live_owner, method_not_allowed,
-        owner_busy_close, peer_consumer_diagnostic_outcome, peer_failure_response,
-        service_resolution_response, stream_limit_response,
+        ConsumerUpgradeBarrier, ControlAttachBarrier, PeerAdmissionBarrier,
+        PeerAdmissionBarrierError, PeerAdmissionScope, forwarded_bearer_token, is_no_live_owner,
+        method_not_allowed, owner_busy_close, peer_consumer_diagnostic_outcome,
+        peer_failure_response, service_resolution_response, stream_limit_response,
     };
     use crate::{
         peer_runtime::PeerRuntimeError,
@@ -3972,6 +4197,65 @@ mod tests {
         assert!(!barrier.is_held());
         waiter.await.expect("bounded barrier waiter");
         assert!(!barrier.arm());
+    }
+
+    #[tokio::test]
+    async fn control_attach_barrier_is_one_shot_and_bounded() {
+        let barrier = ControlAttachBarrier::default();
+        assert!(barrier.arm());
+        assert!(!barrier.arm());
+
+        let waiter = tokio::spawn({
+            let barrier = barrier.clone();
+            async move {
+                barrier
+                    .wait_before_control_attach(std::time::Duration::from_secs(1))
+                    .await;
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), barrier.wait_reached())
+            .await
+            .expect("control attach barrier should be reached");
+        assert_eq!(barrier.hit_count(), 1);
+        assert!(barrier.is_held());
+        assert!(!barrier.arm());
+        barrier.release();
+        assert!(!barrier.is_held());
+        waiter.await.expect("bounded control attach waiter");
+        assert!(!barrier.arm());
+    }
+
+    /// A released control-attach barrier is a pass-through, never a refusal:
+    /// a later control attach returns immediately and adds no hit.  This is
+    /// the property that makes the seam invisible to every control socket
+    /// other than the single one a fixture deliberately races.
+    #[tokio::test]
+    async fn released_control_attach_barrier_passes_later_attaches_through() {
+        let barrier = ControlAttachBarrier::default();
+        assert!(barrier.arm());
+        barrier.release();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            barrier.wait_before_control_attach(std::time::Duration::from_secs(30)),
+        )
+        .await
+        .expect("a released barrier must not hold a later control attach");
+        assert_eq!(barrier.hit_count(), 0);
+        assert!(!barrier.is_held());
+    }
+
+    /// An unarmed barrier holds nothing at all, so the seam cannot change
+    /// relay behaviour before a fixture arms it.
+    #[tokio::test]
+    async fn idle_control_attach_barrier_holds_nothing() {
+        let barrier = ControlAttachBarrier::default();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            barrier.wait_before_control_attach(std::time::Duration::from_secs(30)),
+        )
+        .await
+        .expect("an idle barrier must not hold a control attach");
+        assert_eq!(barrier.hit_count(), 0);
     }
 
     fn peer_admission_test_scope(seed: u128) -> PeerAdmissionScope {

@@ -1454,10 +1454,10 @@ async fn next_control(socket: &mut DeviceSocket, deadline: Instant) -> Result<Co
     }
 }
 
-struct BackendTask {
-    task: Option<JoinHandle<Result<bool>>>,
-    cancel: Option<oneshot::Sender<()>>,
-    response_attempted: Option<oneshot::Receiver<()>>,
+pub(super) struct BackendTask {
+    pub(super) task: Option<JoinHandle<Result<bool>>>,
+    pub(super) cancel: Option<oneshot::Sender<()>>,
+    pub(super) response_attempted: Option<oneshot::Receiver<()>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1616,7 +1616,7 @@ async fn process_authorized_backend_frame(
     }
 }
 
-fn spawn_backend(
+pub(super) fn spawn_backend(
     mut control: DeviceSocket,
     mut data: DeviceSocket,
     welcome: Welcome,
