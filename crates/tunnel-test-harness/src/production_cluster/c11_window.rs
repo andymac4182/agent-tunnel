@@ -1679,7 +1679,12 @@ mod c17_validator_tests {
                 .join(",")
         };
         format!(
-            "{{\"lifetime_application_dispatches\":1,\"peer_fault_diagnostics\":{{\"fault_count\":{},\"ingress_count\":{ingress},\"owner_count\":{owner},\"stage_counts\":{{{}}},\"cause_counts\":{{{}}},\"last_by_stage\":{{{}}},\"recent\":[{}]}},\"sessions\":[]}}",
+            // The closure rings are present and empty: these fixtures exercise
+            // the fault vocabulary, and an empty closure ring is the shape a
+            // relay reports when no task body has ended yet.  They are spelled
+            // out rather than omitted because the scan requires the table's
+            // keys to match the relay schema exactly.
+            "{{\"lifetime_application_dispatches\":1,\"peer_fault_diagnostics\":{{\"fault_count\":{},\"ingress_count\":{ingress},\"owner_count\":{owner},\"stage_counts\":{{{}}},\"cause_counts\":{{{}}},\"last_by_stage\":{{{}}},\"recent\":[{}],\"closure_stage_counts\":{{}},\"closure_cause_counts\":{{}},\"closures\":[]}},\"sessions\":[]}}",
             tuples.len(),
             map(&stage_counts),
             map(&cause_counts),

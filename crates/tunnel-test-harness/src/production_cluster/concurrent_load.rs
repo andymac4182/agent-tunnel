@@ -85,6 +85,17 @@ pub struct ConcurrentLoadEvidence {
     pub accepted_streams: usize,
     pub fill_capacity_rejections: usize,
     pub over_cap_capacity_rejections: usize,
+    /// Attempts refused with the owner's bounded pre-dispatch not-ready
+    /// status while it was quiescing admission for a scheduled rotation.
+    ///
+    /// Counted as its own class rather than folded into capacity or into
+    /// transport failures.  The gate configures a three-second rotation on the
+    /// device it loads, so a quiesce window recurring inside the load window
+    /// is ordinary, and the invariant that matters is that the classes stay
+    /// separately typed and that every attempt lands in exactly one of them.
+    pub owner_not_ready_rejections: usize,
+    /// Largest retry hint observed on those refusals, in milliseconds.
+    pub max_owner_not_ready_retry_after_ms: u64,
     pub reconnecting_failures: usize,
     pub transport_failures: usize,
     pub timeout_failures: usize,
@@ -146,18 +157,20 @@ pub fn validate_concurrent_load_evidence(evidence: &ConcurrentLoadEvidence) -> R
             evidence.accepted_streams
         )));
     }
-    if evidence.fill_capacity_rejections != 1
-        || evidence.accepted_streams + evidence.fill_capacity_rejections
-            != 1 + evidence.cap_fill_attempts
-    {
+    if evidence.fill_capacity_rejections != 1 {
         return Err(HarnessError::Process(
             "concurrent load did not observe exactly one typed capacity refusal while filling the configured cap".into(),
         ));
     }
-    if evidence.over_cap_capacity_rejections != evidence.over_cap_attempts {
+    // A refusal without a bounded retry hint would turn a momentary quiesce
+    // into an unbounded stall for the consumer.
+    if evidence.owner_not_ready_rejections > 0
+        && (evidence.max_owner_not_ready_retry_after_ms == 0
+            || evidence.max_owner_not_ready_retry_after_ms > MAX_OWNER_NOT_READY_RETRY_AFTER_MS)
+    {
         return Err(HarnessError::Process(format!(
-            "concurrent load did not receive typed capacity refusals for every over-cap attempt: {}/{}",
-            evidence.over_cap_capacity_rejections, evidence.over_cap_attempts
+            "concurrent load observed an owner-not-ready refusal whose retry hint was absent or unbounded: {}ms",
+            evidence.max_owner_not_ready_retry_after_ms
         )));
     }
     if evidence.reconnecting_failures != 0
@@ -168,6 +181,31 @@ pub fn validate_concurrent_load_evidence(evidence: &ConcurrentLoadEvidence) -> R
         return Err(HarnessError::Process(
             "concurrent load mixed capacity with reconnecting, transport, timeout, or unknown failures".into(),
         ));
+    }
+    // Every attempt must land in exactly one typed class.  This is the
+    // invariant the row is about: not that load produces capacity refusals
+    // only, but that capacity, bounded owner-not-ready, reconnecting,
+    // transport, timeout and unknown stay separately typed and separately
+    // counted, with nothing unaccounted for.
+    //
+    // With the accepted count pinned to the device cap above and the fill
+    // refusal pinned at one, this identity also forces every over-cap attempt
+    // to be refused as one class or the other, so no separate over-cap check
+    // is needed and none is written: an unreachable assertion would only look
+    // like coverage.
+    if evidence.accepted_streams
+        + evidence.fill_capacity_rejections
+        + evidence.over_cap_capacity_rejections
+        + evidence.owner_not_ready_rejections
+        != evidence.attempted_streams
+    {
+        return Err(HarnessError::Process(format!(
+            "concurrent load outcomes did not account for every attempt: accepted={} capacity={} owner_not_ready={} attempted={}",
+            evidence.accepted_streams,
+            evidence.fill_capacity_rejections + evidence.over_cap_capacity_rejections,
+            evidence.owner_not_ready_rejections,
+            evidence.attempted_streams
+        )));
     }
     if evidence.observed_stream_peak < evidence.accepted_streams {
         return Err(HarnessError::Process(format!(
@@ -234,8 +272,9 @@ pub fn validate_concurrent_load_evidence(evidence: &ConcurrentLoadEvidence) -> R
 #[cfg(test)]
 mod c17_validator_tests {
     use super::{
-        ConcurrentLoadEvidence, DEVICE_STREAM_CAP, SINGLE_STREAM_PRODUCERS, TOTAL_STREAM_ATTEMPTS,
-        WORKLOAD_RECORDS_PER_STREAM, validate_concurrent_load_evidence,
+        ConcurrentLoadEvidence, DEVICE_STREAM_CAP, MAX_OWNER_NOT_READY_RETRY_AFTER_MS,
+        SINGLE_STREAM_PRODUCERS, TOTAL_STREAM_ATTEMPTS, WORKLOAD_RECORDS_PER_STREAM,
+        validate_concurrent_load_evidence,
     };
     use crate::acceptance_test_support::assert_failed;
 
@@ -250,6 +289,8 @@ mod c17_validator_tests {
             accepted_streams: DEVICE_STREAM_CAP,
             fill_capacity_rejections: 1,
             over_cap_capacity_rejections: 63,
+            owner_not_ready_rejections: 0,
+            max_owner_not_ready_retry_after_ms: 0,
             reconnecting_failures: 0,
             transport_failures: 0,
             timeout_failures: 0,
@@ -365,8 +406,26 @@ mod c17_validator_tests {
             ),
             (
                 "over_cap_capacity_rejections",
-                "typed capacity refusals for every over-cap attempt",
+                "did not account for every attempt",
                 |e| e.over_cap_capacity_rejections = 0,
+            ),
+            (
+                "owner_not_ready_unbounded_retry",
+                "retry hint was absent or unbounded",
+                |e| {
+                    e.over_cap_capacity_rejections -= 1;
+                    e.owner_not_ready_rejections += 1;
+                    e.max_owner_not_ready_retry_after_ms = 0;
+                },
+            ),
+            (
+                "owner_not_ready_retry_beyond_bound",
+                "retry hint was absent or unbounded",
+                |e| {
+                    e.over_cap_capacity_rejections -= 1;
+                    e.owner_not_ready_rejections += 1;
+                    e.max_owner_not_ready_retry_after_ms = MAX_OWNER_NOT_READY_RETRY_AFTER_MS + 1;
+                },
             ),
             ("reconnecting_failures", MIXED, |e| {
                 e.reconnecting_failures = 1
@@ -1105,6 +1164,11 @@ async fn run_inner(
         accepted_streams,
         fill_capacity_rejections: fill.capacity_rejections,
         over_cap_capacity_rejections: over_cap.capacity_rejections,
+        owner_not_ready_rejections: fill.owner_not_ready_rejections
+            + over_cap.owner_not_ready_rejections,
+        max_owner_not_ready_retry_after_ms: fill
+            .max_owner_not_ready_retry_after_ms
+            .max(over_cap.max_owner_not_ready_retry_after_ms),
         reconnecting_failures: fill.reconnecting_failures + over_cap.reconnecting_failures,
         transport_failures: fill.transport_failures + over_cap.transport_failures,
         timeout_failures: fill.timeout_failures + over_cap.timeout_failures,
@@ -1130,8 +1194,27 @@ async fn run_inner(
 enum ProbeResult {
     Accepted(Box<ProbeStream>),
     Capacity,
+    /// A bounded pre-dispatch refusal from the owner while it is quiescing
+    /// admission for a scheduled rotation.
+    ///
+    /// This is a distinct outcome from capacity and must stay distinct.  The
+    /// owner is momentarily not admitting for a protocol-ordering reason, not
+    /// because a resource bound was reached, and reporting it as a stream
+    /// limit would tell a consumer its owner is full when it is not.  It
+    /// carries the retry the consumer should honour.
+    OwnerNotReady {
+        retry_after_ms: u64,
+    },
     Failure(ProbeFailure),
 }
+
+/// Upper bound this gate will accept on an owner-not-ready retry hint.
+///
+/// The value is not asserted exactly, because it is a policy the relay owns.
+/// What is asserted is that the hint exists and is bounded: an unbounded or
+/// absent retry turns a momentary quiesce into an unbounded stall, and that
+/// would be a real defect rather than an ordinary refusal.
+const MAX_OWNER_NOT_READY_RETRY_AFTER_MS: u64 = 5_000;
 
 struct ProbeStream {
     stream: ConsumerStream,
@@ -1155,6 +1238,8 @@ enum ProbeFailure {
 struct ProbeBatch {
     accepted: Vec<ProbeStream>,
     capacity_rejections: usize,
+    owner_not_ready_rejections: usize,
+    max_owner_not_ready_retry_after_ms: u64,
     reconnecting_failures: usize,
     transport_failures: usize,
     timeout_failures: usize,
@@ -1166,6 +1251,8 @@ impl ProbeBatch {
         Self {
             accepted: Vec::new(),
             capacity_rejections: 0,
+            owner_not_ready_rejections: 0,
+            max_owner_not_ready_retry_after_ms: 0,
             reconnecting_failures: 0,
             transport_failures: 0,
             timeout_failures: 0,
@@ -1173,13 +1260,33 @@ impl ProbeBatch {
         }
     }
 
-    fn append(&mut self, mut batch: Self) {
-        self.accepted.append(&mut batch.accepted);
-        self.capacity_rejections += batch.capacity_rejections;
-        self.reconnecting_failures += batch.reconnecting_failures;
-        self.transport_failures += batch.transport_failures;
-        self.timeout_failures += batch.timeout_failures;
-        self.unknown_failures += batch.unknown_failures;
+    /// Merge one wave's outcomes into the aggregate.
+    ///
+    /// Destructured rather than field-by-field on purpose: the over-cap batch
+    /// runs in waves and aggregates here, so a class this function forgets is
+    /// silently dropped from the evidence and the attempts it counted simply
+    /// vanish.  Destructuring makes a new field a compile error instead.
+    fn append(&mut self, batch: Self) {
+        let Self {
+            mut accepted,
+            capacity_rejections,
+            owner_not_ready_rejections,
+            max_owner_not_ready_retry_after_ms,
+            reconnecting_failures,
+            transport_failures,
+            timeout_failures,
+            unknown_failures,
+        } = batch;
+        self.accepted.append(&mut accepted);
+        self.capacity_rejections += capacity_rejections;
+        self.owner_not_ready_rejections += owner_not_ready_rejections;
+        self.max_owner_not_ready_retry_after_ms = self
+            .max_owner_not_ready_retry_after_ms
+            .max(max_owner_not_ready_retry_after_ms);
+        self.reconnecting_failures += reconnecting_failures;
+        self.transport_failures += transport_failures;
+        self.timeout_failures += timeout_failures;
+        self.unknown_failures += unknown_failures;
     }
 }
 
@@ -1266,6 +1373,8 @@ async fn run_probe_batch(
 
     let mut accepted = Vec::new();
     let mut capacity_rejections = 0;
+    let mut owner_not_ready_rejections = 0;
+    let mut max_owner_not_ready_retry_after_ms = 0_u64;
     let mut reconnecting_failures = 0;
     let mut transport_failures = 0;
     let mut transport_causes = Vec::new();
@@ -1276,6 +1385,11 @@ async fn run_probe_batch(
         match result {
             ProbeResult::Accepted(stream) => accepted.push(*stream),
             ProbeResult::Capacity => capacity_rejections += 1,
+            ProbeResult::OwnerNotReady { retry_after_ms } => {
+                owner_not_ready_rejections += 1;
+                max_owner_not_ready_retry_after_ms =
+                    max_owner_not_ready_retry_after_ms.max(retry_after_ms);
+            }
             ProbeResult::Failure(ProbeFailure::Reconnecting) => reconnecting_failures += 1,
             ProbeResult::Failure(ProbeFailure::Transport(cause)) => {
                 transport_failures += 1;
@@ -1325,6 +1439,8 @@ async fn run_probe_batch(
     Ok(ProbeBatch {
         accepted,
         capacity_rejections,
+        owner_not_ready_rejections,
+        max_owner_not_ready_retry_after_ms,
         reconnecting_failures,
         transport_failures,
         timeout_failures,
@@ -1457,8 +1573,40 @@ fn classify_status_failure(status: u16, body: Option<&[u8]>) -> ProbeResult {
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned)
         });
+    // Parsed alongside the code so the owner-not-ready class below can be
+    // recognised on its full typed shape rather than on its status alone.
+    let parsed = body
+        .filter(|body| body.len() <= MAX_ERROR_BODY_BYTES)
+        .and_then(|body| serde_json::from_slice::<serde_json::Value>(body).ok());
+    let execution = parsed
+        .as_ref()
+        .and_then(|value| value.get("execution"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let retryable = parsed
+        .as_ref()
+        .and_then(|value| value.get("retryable"))
+        .and_then(serde_json::Value::as_bool);
+    let retry_after_ms = parsed
+        .as_ref()
+        .and_then(|value| value.get("retry_after_ms"))
+        .and_then(serde_json::Value::as_u64);
     match (status, code.as_deref()) {
         (429, Some("RESOURCE_EXHAUSTED" | "STREAM_LIMIT")) => ProbeResult::Capacity,
+        // Recognised only on the complete shape: a bounded retry, an explicit
+        // `not_dispatched` execution and the retryable flag.  A 503 missing
+        // any of those is not this class and still fails the gate below.
+        (503, Some("PEER_UNAVAILABLE"))
+            if execution.as_deref() == Some("not_dispatched")
+                && retryable == Some(true)
+                && retry_after_ms.is_some_and(|value| {
+                    value > 0 && value <= MAX_OWNER_NOT_READY_RETRY_AFTER_MS
+                }) =>
+        {
+            ProbeResult::OwnerNotReady {
+                retry_after_ms: retry_after_ms.unwrap_or_default(),
+            }
+        }
         (_, Some("RECONNECTING")) => ProbeResult::Failure(ProbeFailure::Reconnecting),
         _ => ProbeResult::Failure(ProbeFailure::UnexpectedHttpStatus {
             status,

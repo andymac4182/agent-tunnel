@@ -3972,6 +3972,19 @@ fn peer_failure_response(error: PeerRuntimeError) -> Response {
             "PEER_UNAVAILABLE",
             "not_dispatched",
         ),
+        // Every site that raises transport capacity does so strictly before
+        // anything is written to the owner: acquiring a connection permit,
+        // acquiring a stream permit on an existing connection, and the dial
+        // pool's destination bound.  The request cannot have reached the
+        // owner, so this is `not_dispatched`, and reporting it as `unknown`
+        // denied a consumer a retry it is entitled to make for a safe request.
+        // It stays `PEER_UNAVAILABLE`: from the consumer's side this ingress
+        // could not reach the owner at all.
+        PeerRuntimeError::Transport(PeerTransportError::Capacity) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "PEER_UNAVAILABLE",
+            "not_dispatched",
+        ),
         PeerRuntimeError::OwnerNotReady { retry_after_ms } => {
             return retryable_peer_failure_response(retry_after_ms);
         }
@@ -4460,6 +4473,25 @@ mod tests {
         assert_eq!(capacity_body["code"], "STREAM_LIMIT");
         assert_eq!(capacity_body["execution"], "not_dispatched");
         assert_eq!(capacity_body["retryable"], true);
+
+        // Ingress-local transport capacity: every site that raises it does so
+        // before anything is written to the owner -- the connection permit,
+        // the per-connection stream permit, and the dial pool's destination
+        // bound -- so the request provably never reached the owner.  Reporting
+        // it as `unknown` claimed uncertainty the relay does not have and
+        // denied a consumer the retry a safe request is entitled to.
+        let transport_capacity = peer_failure_response(PeerRuntimeError::Transport(
+            tunnel_transport::PeerTransportError::Capacity,
+        ));
+        assert_eq!(transport_capacity.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let transport_capacity_body = axum::body::to_bytes(transport_capacity.into_body(), 1024)
+            .await
+            .expect("bounded transport capacity body");
+        let transport_capacity_body: serde_json::Value =
+            serde_json::from_slice(&transport_capacity_body)
+                .expect("transport capacity response JSON");
+        assert_eq!(transport_capacity_body["code"], "PEER_UNAVAILABLE");
+        assert_eq!(transport_capacity_body["execution"], "not_dispatched");
     }
 
     #[tokio::test]
