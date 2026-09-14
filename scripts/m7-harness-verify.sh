@@ -122,6 +122,8 @@ gate "M7 peer-key revocation during rotation acceptance" \
   cargo run --locked -p tunnel-test-harness -- verify-m7-key-rotation
 gate "M7 signed peer trust expiry after a missed invalidation hint" \
   cargo run --locked -p tunnel-test-harness -- verify-m7-trust-expiry
+gate "M7 membership convergence from the bounded refresh with the hint dropped" \
+  cargo run --locked -p tunnel-test-harness -- verify-m7-membership-hint-drop
 gate "M7 peer-route readiness loss and recovery acceptance" \
   cargo run --locked -p tunnel-test-harness -- verify-m7-peer-readiness
 gate "M7 occupied peer capacity and admitted-stream survival" \

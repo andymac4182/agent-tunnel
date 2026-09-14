@@ -201,6 +201,11 @@ mod trust_expiry;
 pub use trust_expiry::{
     TrustExpiryEvidence, validate_trust_expiry_evidence, verify as verify_trust_expiry,
 };
+mod membership_hint_drop;
+pub use membership_hint_drop::{
+    MembershipHintDropEvidence, WithdrawnAdmissionOutcome, validate_membership_hint_drop_evidence,
+    verify as verify_membership_hint_drop,
+};
 
 const DEPLOYMENT_ID: &str = "m7-production-harness";
 const DEPLOYMENT_INCARCATION: &str = "m1-local";
