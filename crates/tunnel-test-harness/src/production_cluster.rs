@@ -74,8 +74,9 @@ mod m7_i08_recovery_attempts;
 mod m7_i08_rotation_faults;
 mod pending_owner;
 pub use c11_diagnostics::{
-    C11MatrixReport, OG02_CORRELATION_FIELDS, Og02CorrelationReport, Og02RowReport,
-    PEER_FAULT_CAUSES, PEER_FAULT_STAGES, verify_c11_diagnostics, verify_og02_correlation,
+    C11MatrixReport, OG02_CORRELATION_FIELDS, Og02CorrelationReport, Og02RowReport, Og02Shortfall,
+    PEER_FAULT_CAUSES, PEER_FAULT_STAGES, og02_row_shortfall, verify_c11_diagnostics,
+    verify_og02_correlation,
 };
 pub use concurrent_load::{
     ConcurrentLoadEvidence, validate_concurrent_load_evidence, verify as verify_concurrent_load,

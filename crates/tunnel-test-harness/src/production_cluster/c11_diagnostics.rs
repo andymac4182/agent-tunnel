@@ -17,7 +17,8 @@ use c11_window::{
 };
 pub use c11_window::{C11MatrixReport, PEER_FAULT_CAUSES, PEER_FAULT_STAGES};
 pub use og02_correlation::{
-    OG02_CORRELATION_FIELDS, Og02CorrelationReport, Og02RowReport, verify_og02_correlation,
+    OG02_CORRELATION_FIELDS, Og02CorrelationReport, Og02RowReport, Og02Shortfall,
+    og02_row_shortfall, verify_og02_correlation,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
