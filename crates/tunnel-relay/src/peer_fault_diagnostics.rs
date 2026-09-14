@@ -266,6 +266,25 @@ pub struct PeerFaultEventSnapshot {
     pub request_id: Option<String>,
 }
 
+/// One payload-free position on the peer fault diagnostic clock.
+///
+/// A stamp carries a sequence number and a monotonic millisecond reading and
+/// nothing else: no request, route, body, status or peer identity.  It is
+/// drawn from the *same* counter and the same process origin that
+/// [`PeerFaultDiagnostics::record`] uses for a fault tuple, so a stamp and a
+/// tuple can be totally ordered against each other.  This is what makes the
+/// EC-061 ordering clause observable from outside: the relay stamps the
+/// unregister of the owner state a fault tuple refers to, and
+/// `fault.sequence < unregister.sequence` proves the tuple was recorded
+/// first rather than merely coexisting with it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct DiagnosticStamp {
+    /// Saturating process-local sequence number, shared with fault tuples.
+    pub sequence: u64,
+    /// Milliseconds from this relay process's monotonic diagnostic origin.
+    pub at_ms: u64,
+}
+
 /// Redacted peer fault tuples retained by the typed relay snapshot.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct PeerFaultDiagnosticSnapshot {
@@ -346,6 +365,29 @@ impl PeerFaultDiagnostics {
             state.recent.pop_front();
         }
         state.recent.push_back(event);
+    }
+
+    /// Draw the next position on this relay's diagnostic clock without
+    /// recording a fault.
+    ///
+    /// The sequence comes from the same mutex-protected counter as
+    /// [`Self::record`], so acquiring a stamp establishes a real happens-after
+    /// relationship with every tuple that already holds a lower sequence.  The
+    /// caller stamps the moment *before* it unregisters owner state, so a
+    /// tuple with a lower sequence is provably recorded first.  It retains
+    /// nothing and is not itself a fault: no counter, ring or per-stage latch
+    /// is touched.
+    #[must_use]
+    pub(crate) fn stamp(&self) -> DiagnosticStamp {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.sequence = state.sequence.saturating_add(1);
+        DiagnosticStamp {
+            sequence: state.sequence,
+            at_ms: diagnostic_now_ms(),
+        }
     }
 
     /// Return the bounded typed view used by the relay snapshot.
@@ -693,6 +735,52 @@ mod tests {
             snapshot.last_by_stage.get("head").map(|event| event.cause),
             Some(PeerFaultCause::TransportGoAway)
         );
+    }
+
+    #[test]
+    fn stamps_and_fault_tuples_share_one_sequence_and_one_clock() {
+        let diagnostics = PeerFaultDiagnostics::default();
+        let context = PeerFaultContext::unrouted(Uuid::from_u128(1), Uuid::from_u128(2), None);
+        diagnostics.record(
+            &context,
+            PeerFaultRole::Owner,
+            PeerOpenDiagnosticStage::Body,
+            PeerFaultCause::Closed,
+        );
+        let first = diagnostics.stamp();
+        diagnostics.record(
+            &context,
+            PeerFaultRole::Owner,
+            PeerOpenDiagnosticStage::Head,
+            PeerFaultCause::Closed,
+        );
+        let second = diagnostics.stamp();
+
+        let snapshot = diagnostics.snapshot();
+        let before = snapshot
+            .last_by_stage
+            .get("body")
+            .expect("first tuple retained");
+        let after = snapshot
+            .last_by_stage
+            .get("head")
+            .expect("second tuple retained");
+        // One counter, interleaved: a stamp is comparable with a tuple.
+        assert_eq!(
+            (
+                before.sequence,
+                first.sequence,
+                after.sequence,
+                second.sequence
+            ),
+            (1, 2, 3, 4)
+        );
+        assert!(before.observed_at_ms <= first.at_ms);
+        assert!(first.at_ms <= after.observed_at_ms);
+        assert!(after.observed_at_ms <= second.at_ms);
+        // A stamp is not a fault: only the two records are counted.
+        assert_eq!(snapshot.fault_count, 2);
+        assert_eq!(snapshot.recent.len(), 2);
     }
 
     #[test]

@@ -61,9 +61,10 @@ use crate::{
         PeerTransportDiagnosticOutcome, PeerTransportDiagnosticRole, PeerTransportDiagnostics,
     },
     runtime::{
-        self, CarrierContext, RelayRotationSnapshot, RelaySessionSnapshot, RelaySnapshot,
-        RelayStreamSnapshot, RotationDeadlineEvent, RuntimeProfile, SessionTerminalEvent,
-        StreamTerminalCause, StreamTerminalEvent, StreamTerminalReceiptEvent,
+        self, CarrierContext, OwnerUnregisterEvent, OwnerUnregisterKind, RelayRotationSnapshot,
+        RelaySessionSnapshot, RelaySnapshot, RelayStreamSnapshot, RotationDeadlineEvent,
+        RuntimeProfile, SessionTerminalEvent, StreamTerminalCause, StreamTerminalEvent,
+        StreamTerminalReceiptEvent,
     },
     wire::{self, WireError},
 };
@@ -84,6 +85,10 @@ const RUNNING_RELAY_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 const TERMINAL_CLEANUP_QUEUE_CAPACITY: usize = 64;
 const MAX_ROTATION_DEADLINE_EVENTS: usize = 8;
 const MAX_SESSION_TERMINAL_EVENTS: usize = 16;
+/// Bound on retained owner-unregister tombstones.  Each entry is four small
+/// identifiers plus two integers, so the ring is fixed-size regardless of how
+/// many devices, sessions or carriers churn through the relay.
+const MAX_OWNER_UNREGISTER_EVENTS: usize = 32;
 const MAX_STREAM_TERMINAL_EVENTS: usize = 32;
 const MAX_STREAM_TERMINAL_RECEIPT_EVENTS: usize = 32;
 const OWNER_FORGET_FAILURE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1833,6 +1838,7 @@ impl RelayHandle {
             control_registration_conflicts: 0,
             maintenance_cursor: None,
             rotation_deadline_events: VecDeque::new(),
+            owner_unregister_events: VecDeque::new(),
             session_terminal_events: VecDeque::new(),
             stream_terminal_events: VecDeque::new(),
             stream_terminal_receipt_events: VecDeque::new(),
@@ -2416,6 +2422,7 @@ struct RelayActor {
     /// Bounded relay-local latches captured immediately before fail-closed
     /// session removal. These are diagnostics-only and never keep a session
     /// alive or change the close decision.
+    owner_unregister_events: VecDeque<OwnerUnregisterEvent>,
     session_terminal_events: VecDeque<SessionTerminalEvent>,
     /// Bounded stream terminal latches captured at the actual first terminal
     /// transition. They survive STREAM_FORGET/session removal so a snapshot
@@ -7774,6 +7781,41 @@ impl RelayActor {
         })
     }
 
+    /// Stamp the diagnostic clock for an owner-state removal that is about to
+    /// happen, and build its bounded tombstone.
+    ///
+    /// EC-061 ordering: this MUST be called after every guard that decides the
+    /// removal will occur and immediately before the state is actually
+    /// removed.  Stamping earlier would tombstone a removal that never
+    /// happened; stamping later would weaken the proof, because a fault tuple
+    /// with a lower sequence could then have been recorded in the window
+    /// between the removal and the stamp.  The stamp itself performs no I/O
+    /// and takes no session lock, so it cannot change when the removal lands.
+    fn owner_unregister_event(
+        diagnostics: &PeerFaultDiagnostics,
+        tenant_id: Uuid,
+        key: &SessionKey,
+        kind: OwnerUnregisterKind,
+    ) -> OwnerUnregisterEvent {
+        let stamp = diagnostics.stamp();
+        OwnerUnregisterEvent {
+            sequence: stamp.sequence,
+            unregistered_at_ms: stamp.at_ms,
+            kind,
+            tenant_id: tenant_id.to_string(),
+            device_id: key.device_id.to_string(),
+            session_id: key.session_id.clone(),
+            epoch: key.epoch,
+        }
+    }
+
+    fn retain_owner_unregister_event(&mut self, event: OwnerUnregisterEvent) {
+        if self.owner_unregister_events.len() >= MAX_OWNER_UNREGISTER_EVENTS {
+            self.owner_unregister_events.pop_front();
+        }
+        self.owner_unregister_events.push_back(event);
+    }
+
     fn retain_session_terminal_event(&mut self, event: SessionTerminalEvent) {
         if self.session_terminal_events.len() >= MAX_SESSION_TERMINAL_EVENTS {
             self.session_terminal_events.pop_front();
@@ -11603,10 +11645,17 @@ impl RelayActor {
         let mut candidate_abort: Option<(RotationAttemptIdentity, String, u64)> = None;
         let mut candidate_failure = false;
         let mut candidate_lost_after_deadline = false;
+        // EC-061: stamps are allocated inside the session borrow, immediately
+        // before the carrier registrations are cleared, and retained once the
+        // borrow ends.  The retained order does not matter -- the sequence
+        // each stamp carries is what orders it against the fault tuples.
+        let fault_clock = self.peer_fault_diagnostics.clone();
+        let mut unregisters: Vec<OwnerUnregisterEvent> = Vec::new();
         if let Some(session) = self.sessions.get_mut(&key.scope()) {
             if session.key != key {
                 return;
             }
+            let tenant_id = session.identity.tenant_id;
             let active = session
                 .active_carrier
                 .as_ref()
@@ -11624,11 +11673,26 @@ impl RelayActor {
                 return;
             }
             if active {
+                // Stamped before the two registrations below are dropped.
+                unregisters.push(Self::owner_unregister_event(
+                    &fault_clock,
+                    tenant_id,
+                    &key,
+                    OwnerUnregisterKind::DataCarrier,
+                ));
                 session.data_tx = None;
                 session.active_carrier = None;
                 active_lost = true;
             }
             if candidate && let Some(rotation) = session.rotation.as_mut() {
+                // Every branch below clears `rotation.candidate`; stamp once,
+                // here, before any of them runs.
+                unregisters.push(Self::owner_unregister_event(
+                    &fault_clock,
+                    tenant_id,
+                    &key,
+                    OwnerUnregisterKind::RotationCandidate,
+                ));
                 if rotation.recovery.is_some() {
                     // Recovery retries carry the immutable episode roster and
                     // close evidence into a fresh attempt.  They never reuse
@@ -11750,6 +11814,9 @@ impl RelayActor {
                     });
                 }
             }
+        }
+        for event in unregisters {
+            self.retain_owner_unregister_event(event);
         }
         if candidate_lost_after_deadline {
             // Mirror the maintenance tick exactly: latch the typed deadline
@@ -11877,9 +11944,25 @@ impl RelayActor {
         if let Some(event) = terminal_event {
             self.retain_session_terminal_event(event);
         }
+        // EC-061 ordering: stamp the shared diagnostic clock after the
+        // identity guard above has decided this session will be removed and
+        // immediately before the removal itself.  Any peer fault tuple with a
+        // lower sequence is therefore provably recorded before this
+        // unregister rather than merely coexisting with it.
+        let unregister = self.sessions.get(&key.scope()).map(|session| {
+            Self::owner_unregister_event(
+                &self.peer_fault_diagnostics,
+                session.identity.tenant_id,
+                key,
+                OwnerUnregisterKind::Session,
+            )
+        });
         let Some(mut session) = self.sessions.remove(&key.scope()) else {
             return;
         };
+        if let Some(event) = unregister {
+            self.retain_owner_unregister_event(event);
+        }
         // A successor session must never inherit a retryable FORGET identity.
         self.owner_forgets.remove(key);
         if session.closed {
@@ -12341,6 +12424,7 @@ impl RelayActor {
             peer_consumer_diagnostics: self.peer_consumer_diagnostics.snapshot(),
             peer_fault_diagnostics: self.peer_fault_diagnostics.snapshot(),
             rotation_deadline_events: self.rotation_deadline_events.iter().cloned().collect(),
+            owner_unregister_events: self.owner_unregister_events.iter().cloned().collect(),
             session_terminal_events: self.session_terminal_events.iter().cloned().collect(),
             stream_terminal_events: self.stream_terminal_events.iter().cloned().collect(),
             stream_terminal_receipt_events: self
@@ -13197,10 +13281,11 @@ mod stream_identity_tests {
         AUTHORITY_UNAVAILABLE, CarrierKey, ChallengeAuthorizationResult, ControlOutbound,
         ControlRegistration, DataCarrier, DataOutbound, DataRegistration, DeviceChallenge,
         DeviceScope, DeviceSession, DispatchRequest, M2Stream, MAX_MAINTENANCE_AUTHORITY_IN_FLIGHT,
-        MAX_ROTATION_TOMBSTONES, MaintenanceAuthorityCategory, MaintenanceAuthorityFailure,
-        MaintenanceAuthorityOperation, QueueBudget, RecoveryRuntime, RelayActor, RelayError,
-        RelayHandle, RotationJournalDecision, RotationRuntime, SessionKey,
-        TerminalCleanupDispatcher, allocate_stream_id, maintenance_authority_category,
+        MAX_OWNER_UNREGISTER_EVENTS, MAX_ROTATION_TOMBSTONES, MaintenanceAuthorityCategory,
+        MaintenanceAuthorityFailure, MaintenanceAuthorityOperation, OwnerUnregisterKind,
+        PeerFaultCause, QueueBudget, RecoveryRuntime, RelayActor, RelayError, RelayHandle,
+        RotationJournalDecision, RotationRuntime, SessionKey, TerminalCleanupDispatcher,
+        allocate_stream_id, maintenance_authority_category,
     };
     use chrono::{Duration, Utc};
     use tokio::sync::{mpsc, oneshot};
@@ -13727,6 +13812,220 @@ mod stream_identity_tests {
         hello
     }
 
+    /// EC-061 correlation identity for a fault tuple raised against the owner
+    /// state the test is about to unregister.
+    fn ec061_fault_context(key: &SessionKey) -> crate::peer_fault_diagnostics::PeerFaultContext {
+        crate::peer_fault_diagnostics::PeerFaultContext {
+            tenant_id: key.tenant_id,
+            device_id: key.device_id,
+            session_id: Some(key.session_id.clone()),
+            owner_epoch: Some(key.epoch),
+            owner_node_id: Some("test-node".to_owned()),
+            service_id: None,
+            request_id: None,
+        }
+    }
+
+    fn ec061_identity(key: &SessionKey, now: chrono::DateTime<Utc>) -> DeviceIdentity {
+        DeviceIdentity {
+            tenant_id: key.tenant_id,
+            device_id: key.device_id,
+            owner_user_id: Uuid::from_u128(4),
+            credential_id: Uuid::from_u128(5),
+            spki_fingerprint: "test-spki".to_owned(),
+            credential_not_before: now - Duration::minutes(1),
+            expires_at: now + Duration::minutes(1),
+            credential_revoked_at: None,
+            device_active: true,
+            credential_active: true,
+            device_version: 1,
+            owner_epoch: 1,
+            last_seen_at: Some(now),
+        }
+    }
+
+    /// EC-061 ordering clause, data-carrier leg.  The relay records the peer
+    /// fault tuple and then unregisters the forwarded data carrier the tuple
+    /// refers to.  Both events draw from one diagnostic clock, so the ordering
+    /// is decidable instead of merely coexistent.
+    #[tokio::test]
+    async fn peer_fault_tuple_is_sequenced_before_the_data_carrier_it_refers_to_is_unregistered() {
+        let now = Utc::now();
+        let key = SessionKey {
+            tenant_id: Uuid::from_u128(1),
+            device_id: Uuid::from_u128(2),
+            session_id: "ec061-carrier".to_owned(),
+            epoch: 1,
+        };
+        let (mut actor, _registration) =
+            admitted_control_actor(ec061_identity(&key, now), key.clone());
+        let (data_tx, _data_rx) = mpsc::channel(actor.options.limits.max_queue_messages);
+        let carrier = CarrierKey {
+            session: key.clone(),
+            generation: 1,
+            connection_id: "ec061-carrier-data".to_owned(),
+        };
+        {
+            let session = actor.sessions.get_mut(&key.scope()).expect("test session");
+            session.data_tx = Some(data_tx.clone());
+            session.active_carrier = Some(DataCarrier {
+                context: carrier.context(),
+                tx: data_tx,
+            });
+        }
+
+        // This mirrors the owner-side peer data close path exactly: the
+        // record call precedes `disconnect_data` for the same carrier.
+        actor.peer_fault_diagnostics.record(
+            &ec061_fault_context(&key),
+            crate::peer_fault_diagnostics::PeerFaultRole::Owner,
+            crate::PeerOpenDiagnosticStage::Body,
+            PeerFaultCause::Closed,
+        );
+        actor.disconnect_data(carrier).await;
+
+        let session = actor.sessions.get(&key.scope()).expect("session retained");
+        assert!(
+            session.active_carrier.is_none() && session.data_tx.is_none(),
+            "the data carrier registration is actually gone"
+        );
+
+        let snapshot = actor.snapshot();
+        let unregister = snapshot
+            .owner_unregister_events
+            .iter()
+            .find(|event| {
+                event.kind == OwnerUnregisterKind::DataCarrier
+                    && event.session_id == key.session_id
+                    && event.device_id == key.device_id.to_string()
+                    && event.epoch == key.epoch
+            })
+            .expect("data carrier tombstone retained after the unregister");
+        let fault = snapshot
+            .peer_fault_diagnostics
+            .last_by_stage
+            .get("body")
+            .expect("fault tuple retained for the carrier");
+        assert_eq!(fault.session_id.as_deref(), Some(key.session_id.as_str()));
+        assert!(
+            fault.sequence < unregister.sequence,
+            "fault tuple {} must be sequenced before the unregister {} it refers to",
+            fault.sequence,
+            unregister.sequence,
+        );
+        assert!(
+            fault.observed_at_ms <= unregister.unregistered_at_ms,
+            "fault tuple timestamp {} must not follow the unregister timestamp {}",
+            fault.observed_at_ms,
+            unregister.unregistered_at_ms,
+        );
+    }
+
+    /// EC-061 ordering clause, session leg, with its own negative control: a
+    /// tuple recorded after the session is removed lands on the far side of
+    /// the same tombstone, so the assertion above is not vacuous.
+    #[tokio::test]
+    async fn session_unregister_separates_fault_tuples_recorded_before_and_after_it() {
+        let now = Utc::now();
+        let key = SessionKey {
+            tenant_id: Uuid::from_u128(1),
+            device_id: Uuid::from_u128(2),
+            session_id: "ec061-session".to_owned(),
+            epoch: 1,
+        };
+        let (mut actor, _registration) =
+            admitted_control_actor(ec061_identity(&key, now), key.clone());
+        let context = ec061_fault_context(&key);
+
+        actor.peer_fault_diagnostics.record(
+            &context,
+            crate::peer_fault_diagnostics::PeerFaultRole::Owner,
+            crate::PeerOpenDiagnosticStage::Body,
+            PeerFaultCause::Closed,
+        );
+        actor.close_session(&key, "CONTROL_CLOSED").await;
+        assert!(!actor.sessions.contains_key(&key.scope()));
+        // Negative control: the same tuple shape, recorded after the removal.
+        actor.peer_fault_diagnostics.record(
+            &context,
+            crate::peer_fault_diagnostics::PeerFaultRole::Owner,
+            crate::PeerOpenDiagnosticStage::Head,
+            PeerFaultCause::Closed,
+        );
+
+        let snapshot = actor.snapshot();
+        let unregister = snapshot
+            .owner_unregister_events
+            .iter()
+            .find(|event| {
+                event.kind == OwnerUnregisterKind::Session && event.session_id == key.session_id
+            })
+            .expect("session tombstone retained after removal");
+        let before = snapshot
+            .peer_fault_diagnostics
+            .last_by_stage
+            .get("body")
+            .expect("tuple recorded before the unregister");
+        let after = snapshot
+            .peer_fault_diagnostics
+            .last_by_stage
+            .get("head")
+            .expect("tuple recorded after the unregister");
+        assert!(
+            before.sequence < unregister.sequence,
+            "tuple {} recorded before the removal must precede the tombstone {}",
+            before.sequence,
+            unregister.sequence,
+        );
+        assert!(
+            after.sequence > unregister.sequence,
+            "tuple {} recorded after the removal must follow the tombstone {}; \
+             an assertion that cannot fail here proves nothing",
+            after.sequence,
+            unregister.sequence,
+        );
+        assert_eq!(unregister.tenant_id, key.tenant_id.to_string());
+        assert_eq!(unregister.epoch, key.epoch);
+    }
+
+    /// The tombstone ring is fixed-size: unbounded unregister churn cannot
+    /// grow the retained state.
+    #[test]
+    fn owner_unregister_tombstones_stay_bounded_under_churn() {
+        let now = Utc::now();
+        let key = SessionKey {
+            tenant_id: Uuid::from_u128(1),
+            device_id: Uuid::from_u128(2),
+            session_id: "ec061-churn".to_owned(),
+            epoch: 1,
+        };
+        let (mut actor, _registration) =
+            admitted_control_actor(ec061_identity(&key, now), key.clone());
+        let overflow = MAX_OWNER_UNREGISTER_EVENTS + 7;
+        for _ in 0..overflow {
+            let event = RelayActor::owner_unregister_event(
+                &actor.peer_fault_diagnostics,
+                key.tenant_id,
+                &key,
+                OwnerUnregisterKind::Session,
+            );
+            actor.retain_owner_unregister_event(event);
+        }
+        assert_eq!(
+            actor.owner_unregister_events.len(),
+            MAX_OWNER_UNREGISTER_EVENTS
+        );
+        // The ring keeps the newest window, and the sequence is monotonic.
+        let sequences: Vec<u64> = actor
+            .owner_unregister_events
+            .iter()
+            .map(|event| event.sequence)
+            .collect();
+        assert_eq!(sequences.first().copied(), Some(8));
+        assert_eq!(sequences.last().copied(), Some(overflow as u64));
+        assert!(sequences.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
     pub(super) fn admitted_control_actor(
         identity: DeviceIdentity,
         key: SessionKey,
@@ -13807,6 +14106,7 @@ mod stream_identity_tests {
             control_registration_conflicts: 0,
             maintenance_cursor: None,
             rotation_deadline_events: VecDeque::new(),
+            owner_unregister_events: VecDeque::new(),
             session_terminal_events: VecDeque::new(),
             stream_terminal_events: VecDeque::new(),
             stream_terminal_receipt_events: VecDeque::new(),

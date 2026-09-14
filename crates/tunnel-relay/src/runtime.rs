@@ -247,6 +247,65 @@ pub struct RotationDeadlineEvent {
     pub reason: &'static str,
 }
 
+/// Which piece of owner state a relay unregister removed.
+///
+/// The vocabulary is closed and structural.  It names the owner registration
+/// being dropped, never the request, route or peer that caused the drop.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OwnerUnregisterKind {
+    /// The session's active forwarded data carrier was released.
+    DataCarrier,
+    /// A rotation candidate carrier was released.
+    RotationCandidate,
+    /// The authenticated device session was removed from the owner map.
+    Session,
+}
+
+impl OwnerUnregisterKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DataCarrier => "data_carrier",
+            Self::RotationCandidate => "rotation_candidate",
+            Self::Session => "session",
+        }
+    }
+}
+
+/// A bounded, payload-free tombstone marking the instant owner state was
+/// unregistered.
+///
+/// EC-061 requires every closure to report its stage and cause *before* the
+/// owner state it refers to is unregistered.  The fault tuple and the
+/// unregister are microseconds apart, so co-existence in a snapshot proves
+/// nothing.  This tombstone marks the second of the two events on the same
+/// diagnostic clock the fault tuple uses, which makes the clause decidable
+/// from outside: a tuple whose `sequence` is below a matching tombstone's
+/// `sequence` was recorded strictly before that unregister.
+///
+/// The stamp is drawn immediately *before* the state is removed and after
+/// every guard that decides the removal will happen, so a lower fault
+/// sequence cannot have been produced after the removal.  It is attribution
+/// only: nothing about when a close or unregister happens depends on it, and
+/// the correlation fields are the same bounded identifiers the fault tuple
+/// already carries.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct OwnerUnregisterEvent {
+    /// Position on the shared peer-fault diagnostic clock, taken just before
+    /// the owner state was removed.
+    pub sequence: u64,
+    /// Milliseconds from the same monotonic diagnostic origin the fault
+    /// tuples use.
+    pub unregistered_at_ms: u64,
+    /// Which owner registration was dropped.
+    pub kind: OwnerUnregisterKind,
+    pub tenant_id: String,
+    pub device_id: String,
+    pub session_id: String,
+    pub epoch: u64,
+}
+
 /// A bounded, payload-free record of a session terminal path.
 ///
 /// This is captured before the actor removes the live session so diagnostics
@@ -458,12 +517,20 @@ pub struct RelaySnapshot {
     pub peer_consumer_diagnostics: PeerConsumerDiagnosticSnapshot,
     /// Bounded `(role, stage, cause)` tuples for every peer fault this relay
     /// observed as ingress or owner, with correlation identifiers only.  The
-    /// tuple is recorded before the owner state it refers to is removed.
+    /// tuple is recorded before the owner state it refers to is removed; the
+    /// `owner_unregister_events` below make that ordering checkable rather
+    /// than asserted, because both sides draw from one diagnostic clock.
     pub peer_fault_diagnostics: PeerFaultDiagnosticSnapshot,
     /// Bounded deadline events retained after the corresponding owner session
     /// is removed.  The list is diagnostics-only and does not alter deadline
     /// or cleanup behavior.
     pub rotation_deadline_events: Vec<RotationDeadlineEvent>,
+    /// Bounded tombstones stamped from the peer-fault diagnostic clock at the
+    /// instant owner state was unregistered.  They exist so the EC-061
+    /// ordering clause is decidable: a peer fault tuple whose `sequence` is
+    /// below a matching tombstone's `sequence` was recorded strictly before
+    /// that unregister.
+    pub owner_unregister_events: Vec<OwnerUnregisterEvent>,
     /// Bounded terminal close events captured immediately before session
     /// removal.  These are diagnostics-only and do not imply a deadline.
     pub session_terminal_events: Vec<SessionTerminalEvent>,

@@ -58,8 +58,8 @@ pub use peer_consumer_transport_diagnostics::{
     PeerConsumerDiagnosticSnapshot,
 };
 pub use peer_fault_diagnostics::{
-    MAX_RECENT_PEER_FAULTS, PeerFaultCause, PeerFaultContext, PeerFaultDiagnosticSnapshot,
-    PeerFaultEventSnapshot, PeerFaultObserver, PeerFaultRole,
+    DiagnosticStamp, MAX_RECENT_PEER_FAULTS, PeerFaultCause, PeerFaultContext,
+    PeerFaultDiagnosticSnapshot, PeerFaultEventSnapshot, PeerFaultObserver, PeerFaultRole,
 };
 pub use peer_runtime::peer_readiness::{
     PeerListenerState, PeerProbeState, PeerReadiness, PeerReadinessError, PeerReadinessSnapshot,
@@ -78,9 +78,9 @@ pub use recovery::{
     RecoveryOutcome, RecoveryWorkflowConfig, RecoveryWorkflowError,
 };
 pub use runtime::{
-    RelayCarrierSnapshot, RelayRotationSnapshot, RelaySessionSnapshot, RelaySnapshot,
-    RelayStreamSnapshot, RotationDeadlineEvent, StreamTerminalCause, StreamTerminalEvent,
-    StreamTerminalReceiptEvent,
+    OwnerUnregisterEvent, OwnerUnregisterKind, RelayCarrierSnapshot, RelayRotationSnapshot,
+    RelaySessionSnapshot, RelaySnapshot, RelayStreamSnapshot, RotationDeadlineEvent,
+    StreamTerminalCause, StreamTerminalEvent, StreamTerminalReceiptEvent,
 };
 pub use wire::{MAX_BODY_BYTES, MAX_CONTROL_BYTES};
 
