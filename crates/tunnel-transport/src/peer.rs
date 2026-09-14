@@ -2397,11 +2397,27 @@ impl PeerClient {
                                 return Ok(());
                             }
                             connection_result = &mut idle => {
+                                // The connection went idle before the stream
+                                // leases drained.  That is only a failure if
+                                // the close itself was one: a peer that
+                                // finished its own planned close first ends
+                                // the connection with no error, and the wait
+                                // below classifies exactly that case with
+                                // `planned_idle_result`.  Classifying it the
+                                // same way here is what keeps a benign close
+                                // from being reported as a transport failure
+                                // depending on which branch of this race wins.
+                                let result = planned_idle_result(connection_result);
                                 driver_connection.close(
                                     quinn::VarInt::from_u32(0),
-                                    b"peer HTTP/3 driver stopped during GOAWAY drain",
+                                    if result.is_ok() {
+                                        b"peer connection closed cleanly during GOAWAY drain"
+                                            as &[u8]
+                                    } else {
+                                        b"peer HTTP/3 driver stopped during GOAWAY drain" as &[u8]
+                                    },
                                 );
-                                return Err(PeerTransportError::H3(connection_result.to_string()));
+                                return result;
                             }
                             result = timeout_at(
                                 deadline,
