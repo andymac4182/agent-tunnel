@@ -2953,9 +2953,111 @@ fn stream_id_hint(stream: &ConsumerStream) -> Option<u64> {
 
 #[cfg(test)]
 mod c17_validator_tests {
-    use super::assert_expected_control_loss;
+    use super::{
+        ContinuousTrafficEvidence, assert_expected_control_loss,
+        require_m2_continuous_traffic_evidence,
+    };
     use crate::acceptance_test_support::assert_rejected;
     use tunnel_client::{ClientError, Readiness};
+
+    /// Complete continuous-traffic evidence: three rotations carrying 100
+    /// records, with every cursor agreeing and no replay, terminal connector
+    /// phase or stray response.
+    fn valid_continuous_traffic_evidence() -> ContinuousTrafficEvidence {
+        ContinuousTrafficEvidence {
+            rotations_required: 3,
+            rotations_observed: 3,
+            records_round_tripped: 100,
+            records_during_freeze: 2,
+            handover_phases_observed: ["quiescing".to_owned(), "draining".to_owned()]
+                .into_iter()
+                .collect(),
+            relay_emitted_delta: 100,
+            relay_received_delta: 100,
+            relay_last_emitted: 100,
+            relay_peer_acked: 100,
+            relay_recv_contiguous: 100,
+            relay_delivered_contiguous: 100,
+            client_emitted_sequences: 100,
+            client_received_sequences: 100,
+            total_replayed_frames: 0,
+            connector_terminal_phase_observed: false,
+            stray_response_observed: false,
+        }
+    }
+
+    #[test]
+    fn m2_continuous_traffic_validator_accepts_complete_evidence() {
+        require_m2_continuous_traffic_evidence(&valid_continuous_traffic_evidence())
+            .expect("complete continuous-traffic evidence is valid");
+    }
+
+    #[test]
+    fn every_m2_continuous_traffic_condition_names_itself_and_is_load_bearing() {
+        // One case per condition in the validator.  Each mutates exactly the
+        // state that condition covers, and the rejection must name that
+        // condition, so a guard that stopped being load-bearing shows up as a
+        // case that no longer fails.
+        type Mutate = fn(&mut ContinuousTrafficEvidence);
+        let cases: [(&str, Mutate); 11] = [
+            ("rotations_observed_at_least_required", |e| {
+                e.rotations_observed = e.rotations_required - 1
+            }),
+            ("records_round_tripped_nonzero", |e| {
+                // Zero records, with every cursor moved to match, so only the
+                // nonzero condition can catch it.
+                e.records_round_tripped = 0;
+                e.relay_emitted_delta = 0;
+                e.relay_received_delta = 0;
+                e.relay_last_emitted = 0;
+                e.relay_peer_acked = 0;
+                e.relay_recv_contiguous = 0;
+                e.relay_delivered_contiguous = 0;
+                e.client_emitted_sequences = 0;
+                e.client_received_sequences = 0;
+            }),
+            ("records_during_freeze_nonzero", |e| {
+                e.records_during_freeze = 0
+            }),
+            ("relay_emitted_contiguous", |e| e.relay_emitted_delta -= 1),
+            ("relay_received_contiguous", |e| e.relay_received_delta -= 1),
+            ("relay_peer_acked_reaches_last_emitted", |e| {
+                e.relay_peer_acked -= 1
+            }),
+            ("relay_delivered_reaches_received", |e| {
+                e.relay_delivered_contiguous -= 1
+            }),
+            ("client_relay_cursors_agree", |e| {
+                e.client_received_sequences -= 1
+            }),
+            ("no_replayed_frames", |e| e.total_replayed_frames = 1),
+            ("connector_never_terminal", |e| {
+                e.connector_terminal_phase_observed = true
+            }),
+            ("no_stray_response", |e| e.stray_response_observed = true),
+        ];
+        for (condition, mutate) in cases {
+            let mut evidence = valid_continuous_traffic_evidence();
+            mutate(&mut evidence);
+            // assert_rejected already requires the diagnostic to name the
+            // condition, which is the load-bearing part of this case.
+            assert_rejected(require_m2_continuous_traffic_evidence(&evidence), condition);
+        }
+    }
+
+    #[test]
+    fn a_rotation_requirement_of_zero_is_refused() {
+        // `rotations_required > 0` is part of the first condition and is not
+        // reachable by lowering the observed count, so it gets its own case:
+        // a plan that requires no rotation cannot satisfy this stage.
+        let mut evidence = valid_continuous_traffic_evidence();
+        evidence.rotations_required = 0;
+        evidence.rotations_observed = 0;
+        assert_rejected(
+            require_m2_continuous_traffic_evidence(&evidence),
+            "rotations_observed_at_least_required",
+        );
+    }
 
     fn control_read_loss() -> ClientError {
         ClientError::Transport {
