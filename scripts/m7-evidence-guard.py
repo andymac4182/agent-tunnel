@@ -53,6 +53,23 @@ GATE_RE = re.compile(r"(?<![A-Za-z0-9._/-])(verify-m[0-9][a-z0-9-]*)")
 # before it is treated as a commit citation.
 HASH_RE = re.compile(r"(?<![0-9a-fA-Fx])([0-9a-f]{7,40})(?![0-9a-fA-F])")
 
+# A hash written as an explicit commit citation: "integrated as 7f5be40",
+# "fixed as d864dac", "commit `0687abf`". These must resolve AND be ancestors.
+#
+# The broader HASH_RE cannot carry that requirement: these documents also quote
+# SPKI fingerprints, source digests and patch checksums, none of which are
+# commit objects, so demanding that every hex token resolve would fail on
+# evidence that is perfectly correct. Cue words are what distinguish a claim
+# about this repository's history from a quoted digest.
+#
+# Known limit: a bare parenthesised hash with no cue word, "(5a2018e)", is
+# still only checked when it resolves. Citations in this project are written
+# with a cue in practice, and widening the rule would reintroduce the false
+# positives above.
+COMMIT_CITATION_RE = re.compile(
+    r"\b(?:as|commit|commits)\s+`?([0-9a-f]{7,40})`?(?![0-9a-fA-F])", re.IGNORECASE
+)
+
 
 def die(message: str) -> "None":
     sys.stderr.write(f"m7-evidence-guard: {message}\n")
@@ -157,11 +174,25 @@ def scan(gates: "set[str]", verbose: bool) -> "list[str]":
                         f"{rel}:{lineno}: verified row cites unknown harness gate "
                         f"'{token}' (not a main.rs command nor in m7-harness-verify.sh)"
                     )
+            cited_as_commit = {
+                match.group(1).lower() for match in COMMIT_CITATION_RE.finditer(line)
+            }
             for match in HASH_RE.finditer(line):
                 token = match.group(1)
                 verdict = commit_ancestry(token)
                 if verdict is None:
-                    continue  # not a real commit object; not a history claim
+                    if token.lower() in cited_as_commit:
+                        # Written as a commit citation but git cannot resolve it.
+                        # This is how a promotion ends up resting on a worker's
+                        # own SHA after its worktree is removed, or on a branch
+                        # that was squashed away: the evidence reads as history
+                        # but no longer exists in it.
+                        hash_citations += 1
+                        findings.append(
+                            f"{rel}:{lineno}: verified row cites commit '{token}' "
+                            f"which git cannot resolve to any commit"
+                        )
+                    continue  # otherwise a digest or fingerprint, not a history claim
                 hash_citations += 1
                 if verdict is False:
                     findings.append(
