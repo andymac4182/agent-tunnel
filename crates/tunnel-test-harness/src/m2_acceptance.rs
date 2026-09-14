@@ -2804,6 +2804,40 @@ fn connect_failure_to_harness(error: ConnectFailure) -> HarnessError {
     }
 }
 
+/// Payload-free evidence from the settled M2 proxy, once every retired socket
+/// has closed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProxyRetirementEvidence {
+    /// Rotations the plan required, which sets the socket floor.
+    pub rotations: u64,
+    /// Sockets the proxy accepted over the whole run.
+    pub accepted: u64,
+    /// Highest concurrent socket count the proxy observed.
+    pub peak_active: u64,
+}
+
+/// Bounds on a settled M2 proxy: every rotation must have cost a socket, and
+/// the carrier replacement must never have held more than the control socket
+/// plus an old and a new data carrier at once.
+pub fn validate_proxy_retirement_evidence(evidence: &ProxyRetirementEvidence) -> Result<()> {
+    if evidence.accepted < 2 + evidence.rotations {
+        return Err(HarnessError::Process(format!(
+            "M2 proxy accepted {} sockets; expected control, initial data, and rotations",
+            evidence.accepted
+        )));
+    }
+    if evidence.peak_active > MAX_PROXY_PEAK_ACTIVE_SOCKETS {
+        return Err(HarnessError::Process(format!(
+            "M2 proxy peak active sockets exceeded three: {}",
+            evidence.peak_active
+        )));
+    }
+    Ok(())
+}
+
+/// Control socket plus one old and one new data carrier during a replacement.
+const MAX_PROXY_PEAK_ACTIVE_SOCKETS: u64 = 3;
+
 async fn verify_proxy_retirement(harness: &RunningHarness, rotations: u64) -> Result<()> {
     let Some(proxy) = harness.proxy.as_ref() else {
         return Err(HarnessError::InvalidInput(
@@ -2814,19 +2848,15 @@ async fn verify_proxy_retirement(harness: &RunningHarness, rotations: u64) -> Re
     loop {
         let stats = proxy.stats();
         if stats.active == 0 && stats.completed == stats.accepted {
-            if stats.accepted < 2 + rotations {
-                return Err(HarnessError::Process(format!(
-                    "M2 proxy accepted {} sockets; expected control, initial data, and rotations",
-                    stats.accepted
-                )));
-            }
-            if proxy.diagnostics().peak_active > 3 {
-                return Err(HarnessError::Process(format!(
-                    "M2 proxy peak active sockets exceeded three: {}",
-                    proxy.diagnostics().peak_active
-                )));
-            }
-            return Ok(());
+            // The settle condition above stays in the loop, because it is a
+            // transient state this has to wait for.  The bounds below are
+            // properties of the settled result, so they are checked by a pure
+            // validator that a mutation table can exercise.
+            return validate_proxy_retirement_evidence(&ProxyRetirementEvidence {
+                rotations,
+                accepted: stats.accepted,
+                peak_active: proxy.diagnostics().peak_active,
+            });
         }
         if Instant::now() >= deadline {
             return Err(HarnessError::Timeout(format!(
@@ -2954,8 +2984,8 @@ fn stream_id_hint(stream: &ConsumerStream) -> Option<u64> {
 #[cfg(test)]
 mod c17_validator_tests {
     use super::{
-        ContinuousTrafficEvidence, assert_expected_control_loss,
-        require_m2_continuous_traffic_evidence,
+        ContinuousTrafficEvidence, ProxyRetirementEvidence, assert_expected_control_loss,
+        require_m2_continuous_traffic_evidence, validate_proxy_retirement_evidence,
     };
     use crate::acceptance_test_support::assert_rejected;
     use tunnel_client::{ClientError, Readiness};
@@ -2963,6 +2993,16 @@ mod c17_validator_tests {
     /// Complete continuous-traffic evidence: three rotations carrying 100
     /// records, with every cursor agreeing and no replay, terminal connector
     /// phase or stray response.
+    /// A settled proxy from a three-rotation run: control, initial data and
+    /// one socket per rotation, never more than three at once.
+    fn valid_proxy_retirement_evidence() -> ProxyRetirementEvidence {
+        ProxyRetirementEvidence {
+            rotations: 3,
+            accepted: 5,
+            peak_active: 3,
+        }
+    }
+
     fn valid_continuous_traffic_evidence() -> ContinuousTrafficEvidence {
         ContinuousTrafficEvidence {
             rotations_required: 3,
@@ -3043,6 +3083,43 @@ mod c17_validator_tests {
             // condition, which is the load-bearing part of this case.
             assert_rejected(require_m2_continuous_traffic_evidence(&evidence), condition);
         }
+    }
+
+    #[test]
+    fn proxy_retirement_validator_accepts_a_settled_proxy() {
+        validate_proxy_retirement_evidence(&valid_proxy_retirement_evidence())
+            .expect("a settled proxy within both bounds is valid");
+    }
+
+    #[test]
+    fn every_proxy_retirement_bound_is_load_bearing() {
+        // One socket short of the floor: a rotation that cost no socket.
+        let mut short = valid_proxy_retirement_evidence();
+        short.accepted = 2 + short.rotations - 1;
+        assert_rejected(validate_proxy_retirement_evidence(&short), "accepted");
+
+        // One above the peak bound: a replacement that held a fourth socket.
+        let mut peaked = valid_proxy_retirement_evidence();
+        peaked.peak_active = 4;
+        assert_rejected(
+            validate_proxy_retirement_evidence(&peaked),
+            "peak active sockets exceeded three",
+        );
+
+        // The floor tracks the rotation count rather than a fixed number.
+        let mut more_rotations = valid_proxy_retirement_evidence();
+        more_rotations.rotations += 1;
+        assert_rejected(
+            validate_proxy_retirement_evidence(&more_rotations),
+            "accepted",
+        );
+
+        // Exactly at each bound is accepted, so neither is off by one.
+        let mut exact = valid_proxy_retirement_evidence();
+        exact.accepted = 2 + exact.rotations;
+        exact.peak_active = 3;
+        validate_proxy_retirement_evidence(&exact)
+            .expect("evidence exactly at both bounds is valid");
     }
 
     #[test]
