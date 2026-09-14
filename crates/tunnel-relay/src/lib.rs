@@ -58,8 +58,9 @@ pub use peer_consumer_transport_diagnostics::{
     PeerConsumerDiagnosticSnapshot,
 };
 pub use peer_fault_diagnostics::{
-    DiagnosticStamp, MAX_RECENT_PEER_FAULTS, PeerFaultCause, PeerFaultContext,
+    DiagnosticStamp, MAX_RECENT_PEER_FAULTS, MAX_TASK_CLOSURES, PeerFaultCause, PeerFaultContext,
     PeerFaultDiagnosticSnapshot, PeerFaultEventSnapshot, PeerFaultObserver, PeerFaultRole,
+    TaskClosureCause, TaskClosureEventSnapshot, TaskClosureScope, TaskClosureStage,
 };
 pub use peer_runtime::peer_readiness::{
     PeerListenerState, PeerProbeState, PeerReadiness, PeerReadinessError, PeerReadinessSnapshot,

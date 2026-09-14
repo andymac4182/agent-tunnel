@@ -260,6 +260,12 @@ pub enum OwnerUnregisterKind {
     RotationCandidate,
     /// The authenticated device session was removed from the owner map.
     Session,
+    /// One consumer stream's owner-side registration was released: its
+    /// closure token cancelled, its parked records drained and its terminal
+    /// flag latched.  The bounded tombstone entry survives in the retained
+    /// stream table until the connector's STREAM_FORGET proof removes it, so
+    /// this names the release of the live registration, not the map removal.
+    ConsumerStream,
 }
 
 impl OwnerUnregisterKind {
@@ -269,6 +275,7 @@ impl OwnerUnregisterKind {
             Self::DataCarrier => "data_carrier",
             Self::RotationCandidate => "rotation_candidate",
             Self::Session => "session",
+            Self::ConsumerStream => "consumer_stream",
         }
     }
 }

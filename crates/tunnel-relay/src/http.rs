@@ -424,7 +424,8 @@ use tunnel_cluster::{
 
 use crate::{
     actor::{
-        ConsumerStreamRegistration, EchoOutcome, RelayError, RelayHandle, TerminalCleanupGuard,
+        CarrierKey, ConsumerStreamRegistration, EchoOutcome, RelayError, RelayHandle, SessionKey,
+        TerminalCleanupGuard,
     },
     config::RelayLimits,
     consumer_framing::{ConsumerRecordAssembler, ConsumerRecordCursor, ConsumerRecordLimit},
@@ -437,7 +438,10 @@ use crate::{
         PeerConsumerDiagnosticContext, PeerConsumerDiagnosticH3Code, PeerConsumerDiagnosticRole,
         classify_h3_code,
     },
-    peer_fault_diagnostics::{PeerFaultCause, PeerFaultContext, PeerFaultObserver, PeerFaultRole},
+    peer_fault_diagnostics::{
+        PeerFaultCause, PeerFaultContext, PeerFaultObserver, PeerFaultRole, TaskClosureCause,
+        TaskClosureScope, TaskClosureStage,
+    },
     peer_runtime::{
         InboundPeerRequest, OWNER_NOT_READY_RETRY_AFTER_MS, PeerExchangeRecv, PeerExchangeSend,
         PeerIngressHandler, PeerOpenDiagnostic, PeerOpenDiagnosticStage, PeerRuntime,
@@ -1502,6 +1506,16 @@ async fn handle_consumer_stream(
     // other exit stays unclassified so the actor's own close site keeps
     // whatever it can prove.
     let mut terminal_cause: Option<StreamTerminalCause> = None;
+    // EC-061: the bounded closure cause for this adapter.  It is distinct
+    // from `terminal_cause` above, which is the stream's typed terminal
+    // classification carried to the actor's close site and can stay `None`;
+    // this one always names the structural reason the adapter loop stopped.
+    // It is observational: no exit decision below reads it.
+    // Deliberately uninitialised: every exit from the loop below assigns a
+    // cause before it breaks, and leaving this without a default makes the
+    // compiler prove that rather than a comment claim it.  A new exit path
+    // that forgets to name its cause fails to compile.
+    let closure_cause: TaskClosureCause;
     let expires_in = (consumer_expires_at - Utc::now())
         .to_std()
         .unwrap_or_default();
@@ -1510,16 +1524,20 @@ async fn handle_consumer_stream(
     'connection: loop {
         let message = tokio::select! {
             biased;
-            _ = registration.closed.cancelled() => break,
-            _ = &mut expires => break,
+            _ = registration.closed.cancelled() => { closure_cause = TaskClosureCause::StreamClosed; break; }
+            _ = &mut expires => { closure_cause = TaskClosureCause::Expired; break; }
             message = socket.next() => message,
         };
         let Some(message) = message else {
+            closure_cause = TaskClosureCause::PeerClosed;
             break;
         };
         let message = match message {
             Ok(message) => message,
-            Err(_) => break,
+            Err(_) => {
+                closure_cause = TaskClosureCause::PeerClosed;
+                break;
+            }
         };
         match message {
             Message::Binary(bytes) => {
@@ -1533,6 +1551,7 @@ async fn handle_consumer_stream(
                         ingress = "local",
                         "consumer record rejected"
                     );
+                    closure_cause = TaskClosureCause::ProtocolError;
                     break 'connection;
                 }
                 loop {
@@ -1546,6 +1565,7 @@ async fn handle_consumer_stream(
                                 ingress = "local",
                                 "consumer record rejected"
                             );
+                            closure_cause = TaskClosureCause::ProtocolError;
                             break 'connection;
                         }
                     };
@@ -1571,15 +1591,22 @@ async fn handle_consumer_stream(
                     .await
                     {
                         BoundedStreamWrite::Completed(result) => result,
-                        BoundedStreamWrite::StreamClosed | BoundedStreamWrite::Expired => {
+                        BoundedStreamWrite::StreamClosed => {
+                            closure_cause = TaskClosureCause::StreamClosed;
+                            break 'connection;
+                        }
+                        BoundedStreamWrite::Expired => {
+                            closure_cause = TaskClosureCause::Expired;
                             break 'connection;
                         }
                         BoundedStreamWrite::PeerEvent(never) => match never {},
                     };
                     let Ok(response) = result else {
+                        closure_cause = TaskClosureCause::StreamFailed;
                         break 'connection;
                     };
                     if response.len() < 4 {
+                        closure_cause = TaskClosureCause::StreamFailed;
                         break 'connection;
                     }
                     let response_len =
@@ -1588,6 +1615,7 @@ async fn handle_consumer_stream(
                     if response_len > MAX_BODY_BYTES.saturating_add(MAX_ECHO_CANARY_BYTES)
                         || response_len.saturating_add(4) != response.len()
                     {
+                        closure_cause = TaskClosureCause::StreamFailed;
                         break 'connection;
                     }
                     let outcome =
@@ -1609,12 +1637,14 @@ async fn handle_consumer_stream(
                         terminal_cause = outcome.terminal_cause();
                     }
                     if !outcome.is_sent() {
+                        closure_cause = TaskClosureCause::WriteFailed;
                         break 'connection;
                     }
                 }
             }
             Message::Ping(payload) => {
                 if !send_socket(&mut socket, Message::Pong(payload)).await {
+                    closure_cause = TaskClosureCause::WriteFailed;
                     break;
                 }
             }
@@ -1622,13 +1652,62 @@ async fn handle_consumer_stream(
                 // Tungstenite queues the peer's close reply while reading.
                 // Flush it before dropping the upgraded TLS connection.
                 let _ = timeout(Duration::from_secs(5), socket.flush()).await;
+                closure_cause = TaskClosureCause::PeerClosed;
                 break;
             }
             Message::Pong(_) => {}
-            Message::Text(_) => break,
+            Message::Text(_) => {
+                closure_cause = TaskClosureCause::UnexpectedMessage;
+                break;
+            }
         }
     }
     let _ = send_socket(&mut socket, Message::Close(None)).await;
+    finish_consumer_task(
+        &handle,
+        key,
+        stream_id,
+        operation_id,
+        terminal_cause,
+        closure_cause,
+        &mut cleanup,
+    )
+    .await;
+}
+
+/// EC-061: the single exit of the public consumer stream adapter.
+///
+/// The closure tuple is recorded before the close command is sent, so it is
+/// strictly below the `ConsumerStream` unregister tombstone the actor stamps
+/// at the first terminal transition inside `close_echo_stream_with_cause`,
+/// where this stream's owner-side registration is actually released.
+///
+/// `terminal_cause` and the closure cause are deliberately separate.  The
+/// first is the stream's typed terminal classification and is allowed to stay
+/// `None` so the actor's own close site keeps whatever it can prove; the
+/// second always names why this adapter stopped.  Neither is read by any exit
+/// decision, and recording performs no I/O and enters no mailbox.
+#[allow(clippy::too_many_arguments)]
+async fn finish_consumer_task(
+    handle: &RelayHandle,
+    key: SessionKey,
+    stream_id: u64,
+    operation_id: String,
+    terminal_cause: Option<StreamTerminalCause>,
+    closure_cause: TaskClosureCause,
+    cleanup: &mut TerminalCleanupGuard,
+) {
+    handle.record_task_closure(
+        &TaskClosureScope {
+            tenant_id: key.tenant_id,
+            device_id: key.device_id,
+            session_id: key.session_id.clone(),
+            epoch: key.epoch,
+            stream_id: Some(stream_id),
+        },
+        TaskClosureStage::ConsumerStream,
+        closure_cause,
+    );
     if matches!(
         timeout(
             Duration::from_secs(5),
@@ -3334,15 +3413,19 @@ async fn handle_control(mut socket: WebSocket, identity: TlsIdentity, handle: Re
     let key = registration.key.clone();
     let mut cleanup = handle.control_cleanup_guard(key.clone());
     if !send_socket(&mut socket, Message::Text(registration.welcome.into())).await {
-        if matches!(
-            timeout(Duration::from_secs(5), handle.disconnect_control(key)).await,
-            Ok(true)
-        ) {
-            cleanup.disarm();
-        }
+        finish_control_task(&handle, key, TaskClosureCause::WriteFailed, &mut cleanup).await;
         return;
     }
     let mut rx = registration.rx;
+    // EC-061: the closure cause for this task body.  Every exit from the loop
+    // below sets it before breaking, so the tuple names the structural reason
+    // the socket stopped rather than being reconstructed afterwards.  It is
+    // observational: no branch, timeout or wire emission depends on it.
+    // Deliberately uninitialised: every exit from the loop below assigns a
+    // cause before it breaks, and leaving this without a default makes the
+    // compiler prove that rather than a comment claim it.  A new exit path
+    // that forgets to name its cause fails to compile.
+    let closure_cause: TaskClosureCause;
     loop {
         tokio::select! {
             inbound = socket.next() => {
@@ -3350,11 +3433,16 @@ async fn handle_control(mut socket: WebSocket, identity: TlsIdentity, handle: Re
                     Some(Ok(Message::Text(text))) if text.len() <= MAX_CONTROL_BYTES => {
                         if let Ok(message) = wire::parse_control(text.as_bytes()) {
                             let _ = handle.inbound_control(key.clone(), message).await;
-                        } else { break; }
+                        } else { closure_cause = TaskClosureCause::ProtocolError; break; }
                     }
-                    Some(Ok(Message::Ping(payload))) => { if !send_socket(&mut socket, Message::Pong(payload)).await { break; } }
-                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
-                    _ => break,
+                    Some(Ok(Message::Ping(payload))) => { if !send_socket(&mut socket, Message::Pong(payload)).await { closure_cause = TaskClosureCause::WriteFailed; break; } }
+                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => { closure_cause = TaskClosureCause::PeerClosed; break; }
+                    // The guarded text arm above already took every in-window
+                    // control frame, so this arm is exactly the over-window
+                    // one.  It breaks as it always did; only the attribution
+                    // is new.
+                    Some(Ok(Message::Text(_))) => { closure_cause = TaskClosureCause::RecordTooLarge; break; }
+                    _ => { closure_cause = TaskClosureCause::UnexpectedMessage; break; }
                 }
             }
             outbound = rx.recv() => {
@@ -3363,9 +3451,9 @@ async fn handle_control(mut socket: WebSocket, identity: TlsIdentity, handle: Re
                         let (text, mut charge) = text.into_parts();
                         let sent = send_socket(&mut socket, Message::Text(text.into())).await;
                         charge.release();
-                        if !sent { break; }
+                        if !sent { closure_cause = TaskClosureCause::WriteFailed; break; }
                     }
-                    Some(crate::actor::ControlOutbound::Close) | None => { let _ = send_socket(&mut socket, Message::Close(None)).await; break; }
+                    Some(crate::actor::ControlOutbound::Close) | None => { let _ = send_socket(&mut socket, Message::Close(None)).await; closure_cause = TaskClosureCause::ServerClose; break; }
                 }
             }
         }
@@ -3374,6 +3462,35 @@ async fn handle_control(mut socket: WebSocket, identity: TlsIdentity, handle: Re
     // The actor may still hold a sender until it processes the disconnect.
     rx.close();
     while rx.try_recv().is_ok() {}
+    finish_control_task(&handle, key, closure_cause, &mut cleanup).await;
+}
+
+/// EC-061: the single exit of the owner-local control task.
+///
+/// The bounded closure tuple is recorded *before* the disconnect command is
+/// sent, so it is strictly below the `Session` unregister tombstone the actor
+/// stamps when `close_session` removes the session this key names.  Both
+/// statements live in one function precisely so the ordering is exercised by
+/// a regression instead of being asserted in prose.  Recording takes only the
+/// diagnostics mutex: it performs no I/O, enters no actor mailbox and takes
+/// no session lock, so it cannot change when the disconnect lands.
+async fn finish_control_task(
+    handle: &RelayHandle,
+    key: SessionKey,
+    cause: TaskClosureCause,
+    cleanup: &mut TerminalCleanupGuard,
+) {
+    handle.record_task_closure(
+        &TaskClosureScope {
+            tenant_id: key.tenant_id,
+            device_id: key.device_id,
+            session_id: key.session_id.clone(),
+            epoch: key.epoch,
+            stream_id: None,
+        },
+        TaskClosureStage::Control,
+        cause,
+    );
     if matches!(
         timeout(Duration::from_secs(5), handle.disconnect_control(key)).await,
         Ok(true)
@@ -3395,6 +3512,12 @@ async fn handle_data(
     let carrier = registration.carrier.clone();
     let mut cleanup = handle.data_cleanup_guard(carrier.clone());
     let mut rx = registration.rx;
+    // EC-061: see `handle_control`.  Every break below sets this first.
+    // Deliberately uninitialised: every exit from the loop below assigns a
+    // cause before it breaks, and leaving this without a default makes the
+    // compiler prove that rather than a comment claim it.  A new exit path
+    // that forgets to name its cause fails to compile.
+    let closure_cause: TaskClosureCause;
     loop {
         tokio::select! {
             inbound = socket.next() => {
@@ -3402,9 +3525,12 @@ async fn handle_data(
                     Some(Ok(Message::Binary(bytes))) if bytes.len() <= tunnel_protocol::frame::MAX_FRAME_LEN => {
                         let _ = handle.inbound_data(carrier.clone(), bytes.to_vec()).await;
                     }
-                    Some(Ok(Message::Ping(payload))) => { if !send_socket(&mut socket, Message::Pong(payload)).await { break; } }
-                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
-                    _ => break,
+                    Some(Ok(Message::Ping(payload))) => { if !send_socket(&mut socket, Message::Pong(payload)).await { closure_cause = TaskClosureCause::WriteFailed; break; } }
+                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => { closure_cause = TaskClosureCause::PeerClosed; break; }
+                    // The guarded binary arm above took every in-window data
+                    // frame, so this arm is exactly the over-window one.
+                    Some(Ok(Message::Binary(_))) => { closure_cause = TaskClosureCause::RecordTooLarge; break; }
+                    _ => { closure_cause = TaskClosureCause::UnexpectedMessage; break; }
                 }
             }
             outbound = rx.recv() => {
@@ -3413,18 +3539,43 @@ async fn handle_data(
                         let (bytes, mut charge) = bytes.into_parts();
                         let sent = send_socket(&mut socket, Message::Binary(bytes.into())).await;
                         charge.release();
-                        if !sent { break; }
+                        if !sent { closure_cause = TaskClosureCause::WriteFailed; break; }
                     }
                     Some(crate::actor::DataOutbound::Barrier(done)) => {
                         let _ = done.send(());
                     }
-                    Some(crate::actor::DataOutbound::Close) | None => { let _ = send_socket(&mut socket, Message::Close(None)).await; break; }
+                    Some(crate::actor::DataOutbound::Close) | None => { let _ = send_socket(&mut socket, Message::Close(None)).await; closure_cause = TaskClosureCause::ServerClose; break; }
                 }
             }
         }
     }
     rx.close();
     while rx.try_recv().is_ok() {}
+    finish_data_task(&handle, carrier, closure_cause, &mut cleanup).await;
+}
+
+/// EC-061: the single exit of the owner-local data carrier task.
+///
+/// The closure tuple is recorded before the disconnect command is sent, so it
+/// is strictly below the `DataCarrier` unregister tombstone the actor stamps
+/// in `disconnect_data_at` when it drops `data_tx` and `active_carrier`.
+async fn finish_data_task(
+    handle: &RelayHandle,
+    carrier: CarrierKey,
+    cause: TaskClosureCause,
+    cleanup: &mut TerminalCleanupGuard,
+) {
+    handle.record_task_closure(
+        &TaskClosureScope {
+            tenant_id: carrier.session.tenant_id,
+            device_id: carrier.session.device_id,
+            session_id: carrier.session.session_id.clone(),
+            epoch: carrier.session.epoch,
+            stream_id: None,
+        },
+        TaskClosureStage::Data,
+        cause,
+    );
     if matches!(
         timeout(Duration::from_secs(5), handle.disconnect_data(carrier)).await,
         Ok(true)
@@ -4280,6 +4431,9 @@ mod peer_cleanup_tests;
 
 #[cfg(test)]
 mod pending_open_abandon_tests;
+
+#[cfg(test)]
+mod task_closure_tests;
 
 #[cfg(test)]
 mod tenant_admission_tests;

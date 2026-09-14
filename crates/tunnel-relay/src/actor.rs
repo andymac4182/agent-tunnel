@@ -55,7 +55,10 @@ use crate::{
         PeerConsumerDiagnosticContext, PeerConsumerDiagnosticH3Code, PeerConsumerDiagnosticRole,
         PeerConsumerDiagnostics,
     },
-    peer_fault_diagnostics::{PeerFaultCause, PeerFaultDiagnostics, PeerFaultObserver},
+    peer_fault_diagnostics::{
+        DiagnosticStamp, PeerFaultCause, PeerFaultDiagnostics, PeerFaultObserver, TaskClosureCause,
+        TaskClosureScope, TaskClosureStage,
+    },
     peer_runtime::{PeerOpenDiagnosticStage, PeerRuntimeError, peer_readiness::PeerListenerState},
     peer_transport_diagnostics::{
         PeerTransportDiagnosticOutcome, PeerTransportDiagnosticRole, PeerTransportDiagnostics,
@@ -2235,6 +2238,24 @@ impl RelayHandle {
         cause: PeerFaultCause,
     ) {
         observer.record_tuple(&self.peer_fault_diagnostics, stage, cause);
+    }
+
+    /// Record one bounded `(stage, cause)` closure tuple for a relay task
+    /// body that has reached its ordinary lifecycle end.
+    ///
+    /// EC-061: callers invoke this *before* handing the close to the actor,
+    /// so the tuple is on the shared diagnostic clock strictly before the
+    /// owner unregister it refers to is stamped.  It does not enter the actor
+    /// mailbox, take a session lock or perform I/O, so it cannot change when
+    /// the task ends or what it emits on the wire; it is attribution only.
+    pub(crate) fn record_task_closure(
+        &self,
+        scope: &TaskClosureScope,
+        stage: TaskClosureStage,
+        cause: TaskClosureCause,
+    ) -> DiagnosticStamp {
+        self.peer_fault_diagnostics
+            .record_closure(scope, stage, cause)
     }
 
     /// Redacted diagnostics for an internal harness.  No route exposes this
@@ -5328,6 +5349,14 @@ impl RelayActor {
         // OPENED (a real FIN) or REJECTED (a no-stream FORGET).  The actor
         // tick fails the fenced session closed if neither arrives by the
         // admission deadline.  Repeated closes are idempotent here.
+        //
+        // EC-061: the diagnostic clock is cloned out before any session
+        // borrow so both release sites below can stamp inside their borrow.
+        // Stamping is attribution only; it takes no session lock.
+        let fault_clock = self.peer_fault_diagnostics.clone();
+        let tenant_id = key.tenant_id;
+        let mut pending_unregister: Option<OwnerUnregisterEvent> = None;
+        let mut released_pending_open = false;
         if let Some(session) = self.session_mut(key) {
             let queue_budget = session.queue_budget.clone();
             if let Some(stream) = session.streams.get_mut(&stream_id)
@@ -5340,9 +5369,27 @@ impl RelayActor {
                 if stream.deferred_terminal_cause.is_none() {
                     stream.deferred_terminal_cause = cause;
                 }
+                // EC-061 ordering: every guard that decides this release has
+                // already passed, and the release is the next statement.  A
+                // closure tuple with a lower sequence is therefore provably
+                // recorded before this registration was dropped.  Stamping
+                // after the release would be unsound: a tuple recorded in the
+                // window between them would still compare as ordered.
+                pending_unregister = Some(Self::owner_unregister_event(
+                    &fault_clock,
+                    tenant_id,
+                    key,
+                    OwnerUnregisterKind::ConsumerStream,
+                ));
                 Self::release_echo_stream_state(stream, &queue_budget, false);
-                return true;
+                released_pending_open = true;
             }
+        }
+        if let Some(event) = pending_unregister.take() {
+            self.retain_owner_unregister_event(event);
+        }
+        if released_pending_open {
+            return true;
         }
         // Set only by the terminal-frame refusal below, from state sampled at
         // the refusal itself.
@@ -5440,6 +5487,19 @@ impl RelayActor {
                 && stream.operation_id == operation_id
             {
                 transitioned = !stream.terminal;
+                if transitioned {
+                    // EC-061 ordering: the first terminal transition is the
+                    // one that actually releases this stream's owner-side
+                    // registration.  Stamp here, after the guard that decides
+                    // it and before any of the release runs; a repeat close
+                    // releases nothing new and must not tombstone again.
+                    pending_unregister = Some(Self::owner_unregister_event(
+                        &fault_clock,
+                        tenant_id,
+                        key,
+                        OwnerUnregisterKind::ConsumerStream,
+                    ));
+                }
                 stream.terminal = true;
                 credit_held = stream.credit_held && !stream.pending_records.is_empty();
                 if !fin_queued {
@@ -5447,6 +5507,9 @@ impl RelayActor {
                 }
                 Self::release_echo_stream_state(stream, &queue_budget, false);
             }
+        }
+        if let Some(event) = pending_unregister {
+            self.retain_owner_unregister_event(event);
         }
         // A caller that proved a cause at its own close site always wins: the
         // membership/route transition, the physical write deadline and the
