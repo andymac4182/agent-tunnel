@@ -1179,6 +1179,12 @@ impl QueueBudget {
         self.limit.saturating_sub(self.control_reserved)
     }
 
+    /// No data-lane headroom remains: any further data reservation, however
+    /// small, is refused.  Read-only; it charges and releases nothing.
+    fn data_exhausted(&self) -> bool {
+        self.used() >= self.data_limit()
+    }
+
     fn pressure(&self) -> &QueuePressure {
         &self.pressure
     }
@@ -1404,6 +1410,13 @@ struct M2Stream {
     /// pending.  It is applied to the deferred terminal transition once the
     /// connector admits the stream; a rejected OPEN never has a terminal.
     deferred_terminal_cause: Option<StreamTerminalCause>,
+    /// The head of the bounded relay-to-connector FIFO is parked because the
+    /// connector has not advertised enough cumulative send credit for the
+    /// complete record.  This is set only by the credit admission decision
+    /// and cleared only when that record is finally admitted, so a close can
+    /// attribute a delayed-credit terminal without inspecting queue depth.
+    /// It is payload-free and never changes when a record is emitted.
+    credit_held: bool,
     closed: CancellationToken,
     /// The public WebSocket upgrade owns this lease until Axum invokes its
     /// callback.  The actor tick expires an unclaimed lease so a client that
@@ -2132,16 +2145,9 @@ impl RelayHandle {
         })?
     }
 
-    pub(crate) async fn close_echo_stream(
-        &self,
-        key: SessionKey,
-        stream_id: u64,
-        operation_id: String,
-    ) -> bool {
-        self.close_echo_stream_with_cause(key, stream_id, operation_id, None)
-            .await
-    }
-
+    /// Close one consumer stream, carrying the typed first cause the calling
+    /// handler proved at its own exit. `None` leaves the classification to
+    /// the actor's close site, which owns the queue and credit facts.
     pub(crate) async fn close_echo_stream_with_cause(
         &self,
         key: SessionKey,
@@ -4361,6 +4367,7 @@ impl RelayActor {
                 open_pending: true,
                 registration_dropped: false,
                 deferred_terminal_cause: None,
+                credit_held: false,
                 closed: closed.clone(),
                 admission_lease: admission_lease.clone(),
                 admission_deadline,
@@ -5094,6 +5101,11 @@ impl RelayActor {
             .checked_add(record_len_u64)
             .is_some_and(|attempted| attempted <= send_direction.send_credit());
         if !record_fits_credit {
+            // Attribution only: the record is parked exactly as before, and
+            // this marker records *why* it is parked so a terminal reached
+            // while it is still parked can name delayed credit instead of a
+            // generic close.  It changes no admission or queue decision.
+            stream.credit_held = true;
             if stream.pending_records.len() >= max_pending_operations
                 || stream.pending_record_bytes.saturating_add(body.len()) > max_queue_bytes
                 || !reserve_m2_bytes(&queue_budget, stream, body.len())
@@ -5274,6 +5286,11 @@ impl RelayActor {
                 let queue_budget = session.queue_budget.clone();
                 let stream = session.streams.get_mut(&stream_id)?;
                 let pending = stream.pending_records.pop_front()?;
+                // The head record the credit decision parked is admitted now,
+                // so the delayed-credit marker no longer describes this
+                // stream.  `write_echo_stream_inner` re-arms it below if the
+                // next record is parked for credit again.
+                stream.credit_held = false;
                 stream.pending_record_bytes = stream.pending_record_bytes.saturating_sub(body_len);
                 release_m2_bytes(&queue_budget, stream, body_len);
                 Some(pending)
@@ -5327,6 +5344,9 @@ impl RelayActor {
                 return true;
             }
         }
+        // Set only by the terminal-frame refusal below, from state sampled at
+        // the refusal itself.
+        let mut queue_exhausted = false;
         let disposition = {
             let Some(session) = self.session_mut(key) else {
                 return true;
@@ -5367,6 +5387,21 @@ impl RelayActor {
             } else if Self::queue_stream_terminal_frame(session, stream_id, Terminal::Fin) {
                 TerminalDisposition::Emitted
             } else {
+                // Sampled at the refusal itself, not reconstructed later: a
+                // *live* carrier whose bounded writer slots or data-lane byte
+                // budget have no headroom is queue exhaustion.  A missing,
+                // closed or unencodable carrier is carrier loss, which this
+                // site deliberately leaves unclassified.
+                let carrier_live = session
+                    .data_tx
+                    .as_ref()
+                    .is_some_and(|data_tx| !data_tx.is_closed());
+                let slots_full = session
+                    .data_tx
+                    .as_ref()
+                    .is_some_and(|data_tx| data_tx.capacity() == 0);
+                let budget_full = session.queue_budget.data_exhausted();
+                queue_exhausted = carrier_live && (slots_full || budget_full);
                 TerminalDisposition::Failed
             }
         };
@@ -5395,6 +5430,10 @@ impl RelayActor {
         // connector's StreamForget proof removes a tombstone; no identity is
         // silently evicted while late frames remain possible.
         let mut transitioned = false;
+        // Sampled inside the same borrow that flips the terminal flag, before
+        // `release_echo_stream_state` drains the parked records, so the
+        // close-site facts are read from live state and not reconstructed.
+        let mut credit_held = false;
         if let Some(session) = self.session_mut(key) {
             let queue_budget = session.queue_budget.clone();
             if let Some(stream) = session.streams.get_mut(&stream_id)
@@ -5402,15 +5441,34 @@ impl RelayActor {
             {
                 transitioned = !stream.terminal;
                 stream.terminal = true;
+                credit_held = stream.credit_held && !stream.pending_records.is_empty();
                 if !fin_queued {
                     stream.terminal_fin_failure = true;
                 }
                 Self::release_echo_stream_state(stream, &queue_budget, false);
             }
         }
+        // A caller that proved a cause at its own close site always wins: the
+        // membership/route transition, the physical write deadline and the
+        // planned drain are established where they happen and are passed in.
+        // Only when no such proof exists does this site classify from the two
+        // facts it owns itself, in proximity order.  Anything else stays
+        // deliberately unclassified rather than guessing.
+        let close_site_cause = if queue_exhausted {
+            Some(StreamTerminalCause::QueueExhausted)
+        } else if credit_held {
+            Some(StreamTerminalCause::DelayedCredit)
+        } else {
+            None
+        };
         if transitioned
-            && let Some(event) =
-                self.stream_terminal_event(key, stream_id, operation_id, "STREAM_CLOSED", cause)
+            && let Some(event) = self.stream_terminal_event(
+                key,
+                stream_id,
+                operation_id,
+                "STREAM_CLOSED",
+                cause.or(close_site_cause),
+            )
         {
             self.retain_stream_terminal_event(event);
         }
@@ -11523,7 +11581,15 @@ impl RelayActor {
             })
             .unwrap_or_default();
         for (stream_id, operation_id) in expired_admissions {
-            let _ = self.close_echo_stream(key, stream_id, &operation_id);
+            // The filter above *is* the proof: an uncancelled admission lease
+            // whose absolute admission deadline has passed. Attribute the
+            // terminal to that lease instead of closing it generically.
+            let _ = self.close_echo_stream_with_cause(
+                key,
+                stream_id,
+                &operation_id,
+                Some(StreamTerminalCause::AdmissionLeaseExpired),
+            );
         }
     }
 
@@ -12058,11 +12124,16 @@ impl RelayActor {
                 cause,
                 response,
             } => {
+                // Reaching this arm *is* the proof of a planned drain: the
+                // command queue is already closed and only terminal-shaped
+                // commands are completed here. A cause the closing handler
+                // proved for itself stays exactly as it was; only an
+                // otherwise unclassified close is named a planned drain.
                 let _ = response.send(self.close_echo_stream_with_cause(
                     &key,
                     stream_id,
                     &operation_id,
-                    cause,
+                    cause.or(Some(StreamTerminalCause::PlannedDrain)),
                 ));
             }
             Command::Shutdown(response) => {
@@ -13417,6 +13488,7 @@ mod stream_identity_tests {
                     open_pending: false,
                     registration_dropped: false,
                     deferred_terminal_cause: None,
+                    credit_held: false,
                     closed: tokio_util::sync::CancellationToken::new(),
                     admission_lease: tokio_util::sync::CancellationToken::new(),
                     admission_deadline: std::time::Instant::now()
@@ -13574,6 +13646,7 @@ mod stream_identity_tests {
                     open_pending: false,
                     registration_dropped: false,
                     deferred_terminal_cause: None,
+                    credit_held: false,
                     closed: tokio_util::sync::CancellationToken::new(),
                     admission_lease: tokio_util::sync::CancellationToken::new(),
                     admission_deadline: std::time::Instant::now()

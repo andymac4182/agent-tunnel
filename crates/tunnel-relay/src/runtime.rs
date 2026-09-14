@@ -344,6 +344,33 @@ pub enum StreamTerminalCause {
     /// resolved from the admission edge itself, never from later absence of
     /// the stream or session.
     PeerMembershipExpired,
+    /// The relay could not hand this stream's own terminal frame to the
+    /// bounded carrier queue at the close site: the writer slots or the
+    /// session byte budget were exhausted.  It is read from the failed
+    /// enqueue itself, never inferred from a full queue observed elsewhere,
+    /// and always coincides with a retained terminal-FIN failure marker.
+    QueueExhausted,
+    /// The head of this stream's bounded relay-to-connector FIFO was still
+    /// held for the connector's cumulative send credit when the stream
+    /// reached its terminal transition.  It is read from the credit
+    /// admission decision that parked the record, never from queue depth.
+    DelayedCredit,
+    /// A physical public response write did not complete before the relay's
+    /// own bounded write deadline.  Only that deadline produces this cause:
+    /// a transport failure and the consumer's absolute authorization expiry
+    /// are different outcomes and stay unclassified here.
+    PhysicalWriteTimeout,
+    /// The stream's unclaimed admission lease reached its absolute admission
+    /// deadline before the public consumer claimed it, so the actor tick
+    /// expired the registration.  This is the stream's own admission lease,
+    /// not the owner's catalog lease, whose loss fences the whole session and
+    /// publishes no stream terminal latch.
+    AdmissionLeaseExpired,
+    /// The close was completed by the actor's planned shutdown drain, which
+    /// finishes already-queued terminal transitions after the command queue
+    /// is closed.  It is read from the drain path itself, never from a
+    /// session that merely happens to be shutting down.
+    PlannedDrain,
 }
 
 /// A bounded, payload-free latch for one logical consumer stream's terminal

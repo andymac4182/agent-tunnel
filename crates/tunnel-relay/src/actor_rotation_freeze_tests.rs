@@ -245,6 +245,7 @@ impl FreezeFixture {
                 // These fixtures build admitted streams; a deferred
                 // pre-admission terminal cause never applies to them.
                 deferred_terminal_cause: None,
+                credit_held: false,
                 open_message_id: OPEN_MESSAGE_ID.to_owned(),
                 operation_id: OPERATION_ID.to_owned(),
                 request_id: None,

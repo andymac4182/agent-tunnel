@@ -27,9 +27,11 @@ use uuid::Uuid;
 
 use super::stream_identity_tests::admitted_control_actor;
 use super::{
-    CarrierKey, ControlOutbound, DataCarrier, DataOutbound, EchoOutcome, M2Stream, RelayActor,
-    SessionKey, runtime, wire,
+    CarrierKey, Command, ControlOutbound, DataCarrier, DataOutbound, DeviceSession, EchoOutcome,
+    M2Stream, RelayActor, SessionKey, runtime, wire,
 };
+use crate::consumer_write_diagnostics::{ConsumerWriteOutcome, send_until};
+use crate::runtime::StreamTerminalCause;
 
 const STREAM_A: u64 = 7;
 const STREAM_B: u64 = 8;
@@ -122,6 +124,7 @@ impl LateFixture {
                 stream_id,
                 M2Stream {
                     deferred_terminal_cause: None,
+                    credit_held: false,
                     open_message_id: format!("late-open-{stream_id}"),
                     operation_id: operation_id(stream_id),
                     request_id: None,
@@ -250,6 +253,56 @@ impl LateFixture {
     fn close(&mut self, stream_id: u64) -> bool {
         self.actor
             .close_echo_stream(&self.key, stream_id, &operation_id(stream_id))
+    }
+
+    fn close_with_cause(
+        &mut self,
+        stream_id: u64,
+        cause: Option<runtime::StreamTerminalCause>,
+    ) -> bool {
+        self.actor.close_echo_stream_with_cause(
+            &self.key,
+            stream_id,
+            &operation_id(stream_id),
+            cause,
+        )
+    }
+
+    fn session_mut(&mut self) -> &mut DeviceSession {
+        self.actor
+            .sessions
+            .get_mut(&self.key.scope())
+            .expect("fixture session")
+    }
+
+    fn stream_mut(&mut self, stream_id: u64) -> &mut M2Stream {
+        self.session_mut()
+            .streams
+            .get_mut(&stream_id)
+            .expect("fixture stream")
+    }
+
+    /// Every retained first-terminal latch for one stream, in capture order.
+    fn terminal_events(&self, stream_id: u64) -> Vec<&runtime::StreamTerminalEvent> {
+        self.actor
+            .stream_terminal_events
+            .iter()
+            .filter(|event| event.stream_id == stream_id && event.session_id == self.key.session_id)
+            .collect()
+    }
+
+    /// The single retained latch for one stream: its reason and typed cause.
+    fn terminal_latch(
+        &self,
+        stream_id: u64,
+    ) -> (&'static str, Option<runtime::StreamTerminalCause>) {
+        let events = self.terminal_events(stream_id);
+        assert_eq!(
+            events.len(),
+            1,
+            "stream {stream_id} must retain exactly one first-terminal latch"
+        );
+        (events[0].reason, events[0].cause)
     }
 
     /// Deliver one decoded connector frame through the full validator entry
@@ -1379,4 +1432,463 @@ async fn connector_terminal_releases_a_partial_response_and_keeps_the_tombstone_
         .await;
     assert_eq!(resolved_ok(&mut b1), Some(record(b"resp-b1")));
     let _ = budget_before;
+}
+
+// ---------------------------------------------------------------------------
+// M7-I27: typed first causes for the stream terminal latch.
+//
+// `StreamTerminalCause` distinguishes the conditions a close can prove for
+// itself.  Each regression below produces exactly one condition and asserts
+// exactly the cause it proves, with the existing latch semantics unchanged:
+// one immutable, payload-free record per stream, captured at the first
+// terminal transition and therefore before STREAM_FORGET can reclaim it.
+// Nothing here changes when a stream closes, what is emitted, or the
+// `STREAM_CLOSED` reason string.
+// ---------------------------------------------------------------------------
+
+/// Fill the device carrier's bounded writer queue with barriers so the next
+/// terminal frame cannot be handed to a carrier that is still live.
+///
+/// Barriers carry no queue-budget charge, so this saturates the writer slots
+/// exactly, without also draining the byte budget and blurring the two facts.
+fn saturate_carrier_slots(fixture: &mut LateFixture) -> Vec<oneshot::Receiver<()>> {
+    let data_tx = fixture
+        .session_mut()
+        .data_tx
+        .clone()
+        .expect("fixture carrier sender");
+    let mut held = Vec::new();
+    loop {
+        let (done, waiter) = oneshot::channel();
+        if data_tx.try_send(DataOutbound::Barrier(done)).is_err() {
+            break;
+        }
+        held.push(waiter);
+    }
+    assert_eq!(
+        data_tx.capacity(),
+        0,
+        "the writer queue must have no free slot"
+    );
+    assert!(!data_tx.is_closed(), "the carrier itself stays live");
+    held
+}
+
+/// Smaller than the four-byte length prefix alone, so no complete record
+/// can ever fit this absolute window.
+const NARROW_SEND_WINDOW: u64 = 4;
+
+/// Give stream A a send window too small for any complete record, so the
+/// next write is parked on cumulative send credit and on nothing else.
+///
+/// Deliberately not "write until the initial window is exhausted": that
+/// route also charges the session queue budget, which is the *other* fact
+/// the close site reads.  Starting from a narrow window keeps the queue and
+/// budget far from full, so the cause under test is the only one available.
+fn park_first_write_on_credit(
+    fixture: &mut LateFixture,
+) -> oneshot::Receiver<Result<Vec<u8>, EchoOutcome>> {
+    fixture.stream_mut(STREAM_A).sequence =
+        StreamState::new(STREAM_A, NARROW_SEND_WINDOW).expect("narrow credit window");
+    let mut parked = fixture.write(STREAM_A, b"needs-credit");
+    assert!(
+        resolved(&mut parked).is_none(),
+        "the record is parked, not refused"
+    );
+    assert!(
+        fixture.stream(STREAM_A).credit_held,
+        "the credit decision is what parked it"
+    );
+    assert_eq!(fixture.stream(STREAM_A).pending_records.len(), 1);
+    assert!(
+        fixture.drain_frames().is_empty(),
+        "no DATA frame is emitted for a record that does not fit the credit"
+    );
+    assert_eq!(
+        fixture.relay_last_emitted(STREAM_A),
+        0,
+        "a parked record reserves no sequence"
+    );
+    parked
+}
+
+/// The same refused terminal on a carrier that is *gone* is carrier loss,
+/// not queue exhaustion, and stays unclassified.
+///
+/// This is the discriminating case for the liveness half of the close site's
+/// classification. It is built on the byte-budget arm deliberately: a sender
+/// whose receiver has been dropped reports its buffer as entirely free, so
+/// the writer-slot arm can never fire for a lost carrier, while an exhausted
+/// data budget looks identical whether the carrier is alive or gone. Without
+/// the liveness guard this close would be mislabelled a capacity problem.
+#[tokio::test]
+async fn terminal_refused_by_a_lost_carrier_is_not_queue_exhaustion() {
+    let mut fixture = LateFixture::new("cause-carrier-lost");
+    // Drop the connector's receiving end: the carrier is gone.
+    let (_unused_tx, unused_rx) = mpsc::channel(1);
+    drop(std::mem::replace(&mut fixture.data_rx, unused_rx));
+    // And leave the data lane with no byte headroom at all.
+    let session = fixture.session_mut();
+    while session.queue_budget.reserve_data(1) {}
+    let queue_budget = session.queue_budget.clone();
+    let data_tx = session
+        .data_tx
+        .clone()
+        .expect("carrier sender outlives the receiver");
+    assert!(data_tx.is_closed(), "the carrier is gone");
+    assert!(
+        queue_budget.data_exhausted(),
+        "and the data lane has no headroom, which alone would read as exhaustion"
+    );
+
+    assert!(fixture.close(STREAM_A));
+
+    assert_eq!(
+        fixture.terminal_latch(STREAM_A),
+        ("STREAM_CLOSED", None),
+        "a terminal refused by a lost carrier is carrier loss, not exhaustion"
+    );
+    assert!(
+        fixture.stream(STREAM_A).terminal_fin_failure,
+        "the terminal-FIN failure marker is unchanged by the classification"
+    );
+    assert!(fixture.session_alive());
+}
+
+/// A close whose own terminal frame is refused by a live but full carrier
+/// queue is queue exhaustion, and is latched as exactly that.
+#[tokio::test]
+async fn terminal_refused_by_a_full_live_carrier_latches_queue_exhaustion() {
+    let mut fixture = LateFixture::new("cause-queue-exhausted");
+    let _held = saturate_carrier_slots(&mut fixture);
+
+    assert!(fixture.close(STREAM_A));
+
+    assert_eq!(
+        fixture.terminal_latch(STREAM_A),
+        ("STREAM_CLOSED", Some(StreamTerminalCause::QueueExhausted)),
+        "a terminal the live carrier queue refused is queue exhaustion"
+    );
+    assert!(
+        fixture.stream(STREAM_A).terminal,
+        "the stream still reaches its terminal tombstone"
+    );
+    assert!(
+        fixture.stream(STREAM_A).terminal_fin_failure,
+        "and still carries the terminal-FIN failure marker"
+    );
+    assert_eq!(
+        fixture.relay_last_emitted(STREAM_A),
+        0,
+        "no phantom FIN consumed a sequence number"
+    );
+    assert!(
+        fixture.terminal_events(STREAM_B).is_empty(),
+        "the sibling stream is untouched"
+    );
+    assert!(fixture.session_alive());
+}
+
+/// A stream whose head record is still parked for cumulative send credit when
+/// it closes is latched as delayed credit, not as a generic close and not as
+/// queue exhaustion: its own FIN is queued normally.
+#[tokio::test]
+async fn terminal_while_the_head_record_waits_for_credit_latches_delayed_credit() {
+    let mut fixture = LateFixture::new("cause-delayed-credit");
+    let _parked = park_first_write_on_credit(&mut fixture);
+
+    assert!(fixture.close(STREAM_A));
+
+    assert_eq!(
+        fixture.terminal_latch(STREAM_A),
+        ("STREAM_CLOSED", Some(StreamTerminalCause::DelayedCredit)),
+        "a terminal reached while the head record waits on credit is delayed credit"
+    );
+    let frames = fixture.drain_frames();
+    assert_eq!(
+        sequenced(&frames),
+        vec![(STREAM_A, FrameKind::Fin, 1)],
+        "the FIN itself is queued normally: this is not queue exhaustion"
+    );
+    assert!(
+        !fixture.stream(STREAM_A).terminal_fin_failure,
+        "and carries no terminal-FIN failure marker"
+    );
+    assert!(fixture.session_alive());
+}
+
+/// Credit that arrives before the close clears the marker, so the same stream
+/// then closes unclassified. This is the negative half of the regression
+/// above: the marker tracks the credit decision, not queue depth.
+#[tokio::test]
+async fn credit_that_arrives_before_the_close_leaves_the_terminal_unclassified() {
+    let mut fixture = LateFixture::new("cause-credit-released");
+    let _parked = park_first_write_on_credit(&mut fixture);
+
+    fixture
+        .inbound(Frame::window_update(
+            EPOCH,
+            GENERATION,
+            STREAM_A,
+            wire::M2_INITIAL_WINDOW_BYTES as u64,
+        ))
+        .await;
+    assert!(
+        !fixture.stream(STREAM_A).credit_held,
+        "the admitted record clears the marker"
+    );
+    assert!(fixture.stream(STREAM_A).pending_records.is_empty());
+    fixture.drain_frames();
+
+    assert!(fixture.close(STREAM_A));
+
+    assert_eq!(
+        fixture.terminal_latch(STREAM_A),
+        ("STREAM_CLOSED", None),
+        "a close with nothing to prove stays unclassified"
+    );
+}
+
+/// A physical public response write that stalls past the relay's own bounded
+/// write deadline is a typed physical write timeout, and that cause is latched
+/// at the first terminal transition, before STREAM_FORGET removes the stream.
+///
+/// The stall is real: `send_until` is the relay's own deadline wrapper and it
+/// is driven here against a write that never completes, exactly as
+/// `physical_write_deadline_remains_a_timeout_before_expiry` does in
+/// `consumer_write_diagnostics`.  The deadline is shortened to milliseconds
+/// so the regression does not sleep; the production callsite passes the same
+/// wrapper its own five-second bound.
+#[tokio::test]
+async fn a_stalled_physical_write_latches_its_timeout_before_stream_forget() {
+    // 1. The physical write stalls past the relay's own deadline.
+    let outcome = send_until(
+        std::future::pending::<Result<(), ()>>(),
+        tokio::time::Instant::now() + StdDuration::from_millis(5),
+    )
+    .await;
+    assert_eq!(
+        outcome,
+        ConsumerWriteOutcome::TimedOut,
+        "the relay's own write deadline, not the consumer's authorization, ended the write"
+    );
+    assert!(outcome.is_timed_out());
+    assert!(!outcome.is_sent());
+
+    // 2. That outcome, and only that outcome, proves the typed cause the
+    //    public handler carries into its close.
+    let cause = outcome.terminal_cause();
+    assert_eq!(cause, Some(StreamTerminalCause::PhysicalWriteTimeout));
+
+    // 3. The close latches it at the first terminal transition.
+    let mut fixture = LateFixture::new("cause-physical-write-timeout");
+    assert!(fixture.close_with_cause(STREAM_A, cause));
+    assert_eq!(
+        fixture.terminal_latch(STREAM_A),
+        (
+            "STREAM_CLOSED",
+            Some(StreamTerminalCause::PhysicalWriteTimeout)
+        )
+    );
+    let frames = fixture.drain_frames();
+    assert_eq!(sequenced(&frames), vec![(STREAM_A, FrameKind::Fin, 1)]);
+
+    // A second close cannot overwrite or duplicate the latch.
+    assert!(fixture.close_with_cause(STREAM_A, Some(StreamTerminalCause::QueueExhausted)));
+    assert_eq!(
+        fixture.terminal_latch(STREAM_A),
+        (
+            "STREAM_CLOSED",
+            Some(StreamTerminalCause::PhysicalWriteTimeout)
+        ),
+        "the first terminal latch is immutable"
+    );
+
+    // 4. The connector's FIN completes the stream; the owner reclaims it with
+    //    exactly one STREAM_FORGET and joins every piece of its state.
+    fixture
+        .inbound(Frame::fin(EPOCH, GENERATION, STREAM_A, 1, 1))
+        .await;
+    let forgets = fixture
+        .drain_control()
+        .into_iter()
+        .filter(|message| matches!(message, ControlMessage::StreamForget(_)))
+        .count();
+    assert_eq!(forgets, 1, "exactly one owner FORGET reclaims the stream");
+    assert!(
+        !fixture.has_stream(STREAM_A),
+        "cleanup joined: no stream state survives the FORGET"
+    );
+    assert!(
+        fixture
+            .actor
+            .sessions
+            .get(&fixture.key.scope())
+            .is_some_and(|session| session.terminal_fin_failure_deadline.is_none()),
+        "cleanup joined: no terminal-FIN debt is left armed"
+    );
+
+    // 5. The latch outlives the state it describes, with the same cause.
+    assert_eq!(
+        fixture.terminal_latch(STREAM_A),
+        (
+            "STREAM_CLOSED",
+            Some(StreamTerminalCause::PhysicalWriteTimeout)
+        ),
+        "the typed cause was latched before STREAM_FORGET and survives it"
+    );
+    assert!(fixture.session_alive());
+}
+
+/// Only the relay's own write deadline proves a physical write timeout. An
+/// authorization expiry, a transport failure and a completed write prove
+/// nothing and must stay unclassified.
+#[test]
+fn only_the_write_deadline_proves_a_physical_write_timeout() {
+    assert_eq!(
+        ConsumerWriteOutcome::TimedOut.terminal_cause(),
+        Some(StreamTerminalCause::PhysicalWriteTimeout)
+    );
+    for outcome in [
+        ConsumerWriteOutcome::Sent,
+        ConsumerWriteOutcome::Expired,
+        ConsumerWriteOutcome::Failed,
+    ] {
+        assert_eq!(
+            outcome.terminal_cause(),
+            None,
+            "{outcome:?} is not the relay's own physical write deadline"
+        );
+    }
+}
+
+/// An unclaimed admission lease that reaches its absolute deadline is latched
+/// as lease expiry by the actor tick that expires it.
+#[tokio::test]
+async fn an_expired_unclaimed_admission_lease_latches_lease_expiry() {
+    let mut fixture = LateFixture::new("cause-admission-lease");
+    let now = Instant::now();
+    // Stream A's lease is unclaimed and already past its deadline; stream B
+    // claimed its lease, so the same tick must leave it alone.
+    fixture.stream_mut(STREAM_A).admission_deadline = now - StdDuration::from_secs(1);
+    fixture.stream_mut(STREAM_B).admission_lease.cancel();
+    fixture.stream_mut(STREAM_B).admission_deadline = now - StdDuration::from_secs(1);
+
+    let key = fixture.key.clone();
+    fixture.actor.expire_unclaimed_echo_streams(&key, now);
+
+    assert_eq!(
+        fixture.terminal_latch(STREAM_A),
+        (
+            "STREAM_CLOSED",
+            Some(StreamTerminalCause::AdmissionLeaseExpired)
+        ),
+        "the expired unclaimed lease is the cause of this terminal"
+    );
+    assert!(
+        fixture.terminal_events(STREAM_B).is_empty(),
+        "a claimed lease is not expired by the same tick"
+    );
+    assert!(!fixture.stream(STREAM_B).terminal);
+
+    // A repeated tick is idempotent: the latch stays single and immutable.
+    fixture.actor.expire_unclaimed_echo_streams(&key, now);
+    assert_eq!(
+        fixture.terminal_latch(STREAM_A),
+        (
+            "STREAM_CLOSED",
+            Some(StreamTerminalCause::AdmissionLeaseExpired)
+        )
+    );
+    assert!(fixture.session_alive());
+}
+
+/// The same expiry on a stream whose OPEN is still pending has no terminal
+/// transition yet, so the cause is held on the stream and applied to the
+/// deferred terminal once the connector admits it. The latch stays a
+/// first-transition record; nothing is published early.
+#[tokio::test]
+async fn an_expired_lease_on_a_pending_open_defers_its_cause_to_the_real_terminal() {
+    let mut fixture = LateFixture::new("cause-admission-lease-pending");
+    let now = Instant::now();
+    fixture.stream_mut(STREAM_A).open_pending = true;
+    fixture.stream_mut(STREAM_A).admission_deadline = now - StdDuration::from_secs(1);
+
+    let key = fixture.key.clone();
+    fixture.actor.expire_unclaimed_echo_streams(&key, now);
+
+    assert!(
+        fixture.terminal_events(STREAM_A).is_empty(),
+        "a pending OPEN has no terminal transition to latch yet"
+    );
+    assert!(
+        !fixture.stream(STREAM_A).terminal,
+        "and no terminal tombstone is invented for it"
+    );
+    assert_eq!(
+        fixture.stream(STREAM_A).deferred_terminal_cause,
+        Some(StreamTerminalCause::AdmissionLeaseExpired),
+        "the cause is held for the terminal the admitted OPEN will produce"
+    );
+    assert!(
+        fixture.stream(STREAM_A).registration_dropped,
+        "the registration is recorded as dropped, exactly as before"
+    );
+    assert!(fixture.session_alive());
+}
+
+/// A close completed by the shutdown drain is latched as a planned drain, and
+/// a cause the closing handler already proved is preserved through it.
+#[tokio::test]
+async fn a_close_completed_by_the_shutdown_drain_latches_planned_drain() {
+    let mut fixture = LateFixture::new("cause-planned-drain");
+    let key = fixture.key.clone();
+    let (response, mut receiver) = oneshot::channel();
+    fixture
+        .actor
+        .apply_terminal_command_during_drain(Command::CloseEchoStream {
+            key: key.clone(),
+            stream_id: STREAM_A,
+            operation_id: operation_id(STREAM_A),
+            cause: None,
+            response,
+        });
+    assert_eq!(
+        receiver.try_recv().ok(),
+        Some(true),
+        "the drain completes the close"
+    );
+    assert_eq!(
+        fixture.terminal_latch(STREAM_A),
+        ("STREAM_CLOSED", Some(StreamTerminalCause::PlannedDrain)),
+        "an otherwise unclassified close on the drain path is a planned drain"
+    );
+    let frames = fixture.drain_frames();
+    assert_eq!(
+        sequenced(&frames),
+        vec![(STREAM_A, FrameKind::Fin, 1)],
+        "the drain still queues the device-facing FIN"
+    );
+
+    // A handler that proved its own cause keeps it: the drain never overwrites
+    // a cause established at a real close site.
+    let (response, mut receiver) = oneshot::channel();
+    fixture
+        .actor
+        .apply_terminal_command_during_drain(Command::CloseEchoStream {
+            key,
+            stream_id: STREAM_B,
+            operation_id: operation_id(STREAM_B),
+            cause: Some(StreamTerminalCause::PeerMembershipExpired),
+            response,
+        });
+    assert_eq!(receiver.try_recv().ok(), Some(true));
+    assert_eq!(
+        fixture.terminal_latch(STREAM_B),
+        (
+            "STREAM_CLOSED",
+            Some(StreamTerminalCause::PeerMembershipExpired)
+        ),
+        "the drain preserves a cause the closing handler proved"
+    );
 }

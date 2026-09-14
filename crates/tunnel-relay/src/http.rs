@@ -1497,6 +1497,11 @@ async fn handle_consumer_stream(
     let stream_id = registration.stream_id;
     let operation_id = registration.operation_id.clone();
     let mut assembler = ConsumerRecordAssembler::new(STREAM_RECORD_LIMIT);
+    // The typed first cause this handler can prove for itself.  Only the
+    // relay's own physical response-write deadline is established here; every
+    // other exit stays unclassified so the actor's own close site keeps
+    // whatever it can prove.
+    let mut terminal_cause: Option<StreamTerminalCause> = None;
     let expires_in = (consumer_expires_at - Utc::now())
         .to_std()
         .unwrap_or_default();
@@ -1596,6 +1601,13 @@ async fn handle_consumer_stream(
                             ))
                             .await;
                     }
+                    // The stall itself is the proof, taken from the same
+                    // outcome the bounded diagnostic already counts. The
+                    // first such outcome wins; nothing about the loop's exit
+                    // decision below changes.
+                    if terminal_cause.is_none() {
+                        terminal_cause = outcome.terminal_cause();
+                    }
                     if !outcome.is_sent() {
                         break 'connection;
                     }
@@ -1620,7 +1632,7 @@ async fn handle_consumer_stream(
     if matches!(
         timeout(
             Duration::from_secs(5),
-            handle.close_echo_stream(key, stream_id, operation_id),
+            handle.close_echo_stream_with_cause(key, stream_id, operation_id, terminal_cause),
         )
         .await,
         Ok(true)
