@@ -102,6 +102,16 @@ const POLL: Duration = Duration::from_millis(20);
 const MAX_ROTATIONS_PER_CASE: u64 = 4;
 const OUTCOME_WAIT: Duration = Duration::from_secs(45);
 const MEMBERSHIP_RESIGN_SPACING: Duration = Duration::from_secs(15);
+
+/// The case-boundary re-sign spacing.  `M3_ROTATION_RESIGN_SPACING_MS`
+/// overrides it only to reproduce the back-to-back re-sign readiness defect
+/// recorded in docs/tasks.md; a run with an override is not gate evidence.
+fn resign_spacing() -> Duration {
+    std::env::var("M3_ROTATION_RESIGN_SPACING_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map_or(MEMBERSHIP_RESIGN_SPACING, Duration::from_millis)
+}
 const FROZEN_PHASES: [&str; 3] = ["quiescing", "draining", "committing"];
 const SSE_EVENTS: [&[&[u8]]; 3] = [
     &[
@@ -1852,7 +1862,7 @@ impl Gate<'_> {
     async fn fresh_membership(&mut self) -> Result<()> {
         // Re-sign no more often than the chaos gate's background interval;
         // every case is shorter than the remaining record lifetime.
-        if self.membership_signed_at.elapsed() < MEMBERSHIP_RESIGN_SPACING {
+        if self.membership_signed_at.elapsed() < resign_spacing() {
             return Ok(());
         }
         self.cluster.resign_membership_now().await?;
@@ -1879,8 +1889,26 @@ impl Gate<'_> {
                         )
                     })
                     .collect::<Vec<_>>();
+                // Measure, for the defect record, how long peer readiness
+                // stays down after the route check gave up.
+                let gave_up = Instant::now();
+                let recovered_after = loop {
+                    if self
+                        .cluster
+                        .relays
+                        .iter()
+                        .filter(|relay| relay.running.is_some())
+                        .all(|relay| relay.peer_runtime.is_ready())
+                    {
+                        break Some(gave_up.elapsed());
+                    }
+                    if gave_up.elapsed() >= Duration::from_secs(120) {
+                        break None;
+                    }
+                    sleep(Duration::from_millis(250)).await;
+                };
                 return Err(HarnessError::Process(format!(
-                    "{node}: {error}; readiness {readiness:?}"
+                    "{node}: {error}; readiness {readiness:?}; every relay peer-ready again {recovered_after:?} after the route check gave up"
                 )));
             }
         }
