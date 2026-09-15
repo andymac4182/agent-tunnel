@@ -5864,6 +5864,7 @@ async fn membership_resign_loop(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn peer_refresh_loop(
     membership: Arc<MembershipRuntime>,
     pins: SharedPeerPins,
