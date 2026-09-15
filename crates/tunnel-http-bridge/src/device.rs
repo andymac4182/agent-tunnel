@@ -19,6 +19,9 @@ use tunnel_http_forward::{
 use crate::body::{BodySender, ChannelBody};
 use crate::exchange::{Dir, Exchange};
 use crate::normalize;
+use crate::progress::{
+    self, BudgetClock, PauseSignal, ProgressKind, WaitMark, track_partial_record,
+};
 use crate::pump::{self, PumpError, next_frame};
 use crate::status::{ExchangeReport, Execution};
 use crate::stream::{Frame, FrameReceiver, FrameSender};
@@ -89,7 +92,34 @@ where
     B: Body<Data = Bytes> + Send + 'static,
     E: Send + 'static,
 {
-    let exchange = Exchange::new(to_owner, Execution::NotDispatched);
+    serve_paused(
+        profile,
+        config,
+        from_owner,
+        to_owner,
+        PauseSignal::never(),
+        handler,
+    )
+    .await
+}
+
+/// [`serve`] whose progress clocks stop while `pause` reports this
+/// connector's recorded rotation freeze.
+pub async fn serve_paused<H, F, B, E>(
+    profile: Arc<Profile>,
+    config: BridgeConfig,
+    from_owner: FrameReceiver,
+    to_owner: FrameSender,
+    pause: PauseSignal,
+    handler: H,
+) -> ExchangeReport
+where
+    H: FnOnce(Request<ChannelBody>) -> F + Send + 'static,
+    F: Future<Output = Result<Response<B>, E>> + Send + 'static,
+    B: Body<Data = Bytes> + Send + 'static,
+    E: Send + 'static,
+{
+    let exchange = Exchange::new(to_owner, Execution::NotDispatched, pause, config.progress());
     let started = Instant::now();
     let deadline_at = started + config.deadline();
     let discard_until = started + config.discard_bound();
@@ -138,14 +168,28 @@ async fn request_pump(
     let mut dispatch = Some(dispatch);
     let mut body: Option<BodySender> = None;
     let mut peer_terminated = false;
+    let pause = exchange.pause.clone();
+    let mut first_head = BudgetClock::new(ProgressKind::FirstHead, &exchange.budgets);
+    let mut record = BudgetClock::new(ProgressKind::Record, &exchange.budgets);
+    let mut fin = BudgetClock::new(ProgressKind::FinAfterEnd, &exchange.budgets);
+    let mut record_ordinal = None;
+    first_head.arm();
     'frames: loop {
         let listen_only = exchange.is_complete(Dir::Request);
+        let mark = WaitMark::now(&pause);
+        let clocks = [first_head, record, fin];
         let frame = tokio::select! {
             biased;
             () = exchange.stop.cancelled() => break,
             () = exchange.response_terminal.cancelled(), if listen_only => return,
             frame = from_owner.recv() => frame,
+            kind = progress::expired(clocks, mark, pause.clone()), if !listen_only => {
+                exchange.note_progress_expired(kind);
+                exchange.abort(HttpErrorCode::DeadlineExceeded);
+                break;
+            }
         };
+        progress::end_wait(&mut [&mut first_head, &mut record, &mut fin], mark, &pause);
         if matches!(frame, None | Some(Frame::Reset(_))) {
             peer_terminated = true;
         }
@@ -162,6 +206,7 @@ async fn request_pump(
             }
             Some(Frame::Fin) => match reader.fin() {
                 Ok(()) => {
+                    fin.disarm();
                     if let Some(sender) = body.take() {
                         sender.finish();
                     }
@@ -186,6 +231,7 @@ async fn request_pump(
                     match event {
                         RequestEvent::Head(head) => match build_request(&head, queue, cancel) {
                             Ok((request, sender)) => {
+                                first_head.disarm();
                                 body = Some(sender);
                                 if let Some(dispatch) = dispatch.take() {
                                     let _ = dispatch.send((head.method, request));
@@ -217,9 +263,10 @@ async fn request_pump(
                                 }
                             }
                         }
-                        RequestEvent::End => {}
+                        RequestEvent::End => fin.arm(),
                     }
                 }
+                track_partial_record(reader.partial_record(), &mut record, &mut record_ordinal);
             }
         }
     }
@@ -306,6 +353,10 @@ async fn response_pump<H, F, B, E>(
         Err(PumpError::Stopped) => {}
         Err(PumpError::Source(code) | PumpError::Sink(code)) => {
             exchange.abort(code);
+        }
+        Err(PumpError::Progress(kind)) => {
+            exchange.note_progress_expired(kind);
+            exchange.abort(HttpErrorCode::DeadlineExceeded);
         }
     }
 }

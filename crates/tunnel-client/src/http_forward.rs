@@ -102,6 +102,17 @@ pub struct DeviceHttpExchangeRecord {
     /// The handler's request body queue.
     pub request_body_high_water: usize,
     pub report: Option<ExchangeReport>,
+    /// The device record log: request record headers the connector actor
+    /// received in order (after sequence deduplication), BODY octets, and
+    /// whether the ordered request FIN arrived.  Payload-free.
+    pub request_heads: u32,
+    pub request_bodies: u64,
+    pub request_ends: u32,
+    pub request_body_bytes: u64,
+    pub request_fin_received: bool,
+    pub request_framing_invalid: bool,
+    /// The owner sent a control `CANCEL` for this stream.
+    pub cancel_received: bool,
 }
 
 /// Shared bounded device diagnostics.

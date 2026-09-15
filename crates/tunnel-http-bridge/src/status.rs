@@ -90,6 +90,9 @@ pub struct ExchangeReport {
     pub execution: Execution,
     /// The first failure recorded, if any.
     pub error: Option<HttpErrorCode>,
+    /// The transport progress budget whose expiry caused `error`
+    /// (`HTTP_DEADLINE_EXCEEDED`), if one did.
+    pub progress_expired: Option<crate::progress::ProgressKind>,
 }
 
 /// Response extension on a gateway-generated response.

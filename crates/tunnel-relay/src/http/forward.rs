@@ -23,9 +23,16 @@
 //!   reads continuously, so CREDIT and RESET are never stuck behind a slow
 //!   body.
 //! * The owner relays the peer hop and its actor stream through two
-//!   handoffs.  It assigns every tunnel sequence and applies credit, but it
-//!   does not re-parse `http-forward/1` records: the ingress and the device
-//!   both validate them against their profile.
+//!   handoffs.  It assigns every tunnel sequence and applies credit, and it
+//!   re-validates both record directions against its own copy of the export
+//!   profile before forwarding a chunk ([`owner_relay`]); the ingress and the
+//!   device validate independently.
+//! * Gate 4: a public request whose head fails normalization is refused
+//!   before any route, peer stream or tunnel stream is opened; the owner
+//!   relays its rotation freeze to the ingress over the hop (`PAUSE`), so
+//!   both bridge adapters' progress budgets pause for exactly that freeze;
+//!   and every HTTP hop to one peer shares a per-direction aggregate byte
+//!   bound ([`aggregate`]).
 //! * A RESET carries the protocol's registered reason code.  The device's
 //!   bounded `RESULT_STATUS` detail is correlated on the owner and carried to
 //!   the ingress in the peer RESET record, so the ingress gateway status and
@@ -41,9 +48,10 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tunnel_http_bridge::{
     BridgeConfig, CarrierClosed, CarrierEvent, CarrierReader, CarrierWriter, ExchangeReport,
-    Execution, HANDOFF_CAPACITY, OutboundEnd, Outcome, Profile, QueueStats, ResetDetail,
-    ResetNotifier, ResetSignal, SignaledReset, channel, detail_from_reason, detail_from_status,
-    forward, pump_inbound, pump_outbound, reset_reason_for, reset_signal_pair,
+    Execution, HANDOFF_CAPACITY, OutboundEnd, Outcome, PauseController, PauseSignal, Profile,
+    QueueStats, ResetDetail, ResetNotifier, ResetSignal, SignaledReset, channel,
+    detail_from_reason, detail_from_status, forward_paused, pump_inbound, pump_outbound,
+    rejection_response, reset_reason_for, reset_signal_pair,
 };
 use tunnel_http_forward::HttpErrorCode;
 use tunnel_protocol::{ResultDetail, reset_reason};
@@ -51,6 +59,15 @@ use tunnel_protocol::{ResultDetail, reset_reason};
 use super::*;
 use crate::actor::{HttpPeerReset, HttpRead, HttpStreamRegistration};
 use crate::http_forward_diagnostics::{HttpExchangeRecord, HttpForwardDiagnostics};
+
+mod aggregate;
+mod hold;
+mod owner_relay;
+
+pub use aggregate::HOP_AGGREGATE_BYTES;
+pub(crate) use aggregate::{HopAggregate, HopAggregates};
+pub use hold::{HOLD_CEILING, HttpRelayHold, HttpRelayHoldPoint};
+use owner_relay::{OwnerRequestWriter, OwnerResponseWriter, OwnerVerdict};
 
 /// The peer hop's per-direction window, in encoded record bytes: three
 /// maximum records, inside the 256 KiB per-stream peer budget.
@@ -71,13 +88,18 @@ const TAG_DATA: u8 = 1;
 const TAG_FIN: u8 = 2;
 const TAG_RESET: u8 = 3;
 const TAG_CREDIT: u8 = 4;
+const TAG_PAUSE: u8 = 5;
 
-/// The `http-forward/1` export a relay serves on its public HTTP routes: the
-/// selected profile's policies and the bridge limits.
+/// The `http-forward/1` export a relay serves on its public HTTP routes and
+/// validates on its owner relay: the selected profile's policies and the
+/// bridge limits.
 #[derive(Clone)]
 pub struct HttpForwardExport {
     pub profile: Arc<Profile>,
     pub config: BridgeConfig,
+    /// A fixture hold for the owner's peer relay (implementation gate 4).
+    /// Production exports carry none.
+    pub fixture_hold: Option<HttpRelayHold>,
 }
 
 impl core::fmt::Debug for HttpForwardExport {
@@ -232,11 +254,12 @@ impl CarrierReader for ActorReader {
 pub(crate) fn actor_carriers(
     handle: &RelayHandle,
     registration: HttpStreamRegistration,
-) -> (ActorWriter, ActorReader, JoinHandle<()>) {
+) -> (ActorWriter, ActorReader, JoinHandle<()>, PauseSignal) {
     let HttpStreamRegistration {
         base,
         mut peer_reset,
         result_status,
+        freeze,
     } = registration;
     let (notifier, signal) = reset_signal_pair();
     let closed = base.closed.clone();
@@ -276,6 +299,7 @@ pub(crate) fn actor_carriers(
             pending_reset: None,
         },
         task,
+        freeze,
     )
 }
 
@@ -287,7 +311,13 @@ enum HopRecord {
     Data(Bytes),
     Fin,
     Reset(ResetDetail),
-    Credit { bytes: u64, records: u64 },
+    Credit {
+        bytes: u64,
+        records: u64,
+    },
+    /// The sending relay's recorded rotation freeze started (`true`) or
+    /// ended.  It carries no credit and consumes no window.
+    Pause(bool),
 }
 
 const EXECUTIONS: [Execution; 3] = [
@@ -326,6 +356,7 @@ fn encode_hop(record: &HopRecord) -> Vec<u8> {
             body.extend_from_slice(&records.to_be_bytes());
             body
         }
+        HopRecord::Pause(paused) => vec![TAG_PAUSE, u8::from(*paused)],
     }
 }
 
@@ -351,6 +382,7 @@ fn decode_hop(body: &[u8]) -> Option<HopRecord> {
             let records = u64::from_be_bytes(rest[8..].try_into().ok()?);
             Some(HopRecord::Credit { bytes, records })
         }
+        TAG_PAUSE if rest.len() == 1 && rest[0] <= 1 => Some(HopRecord::Pause(rest[0] == 1)),
         _ => None,
     }
 }
@@ -468,6 +500,36 @@ struct HopShared {
     consumed_tx: watch::Sender<(u64, u64)>,
     peer_terminal: CancellationToken,
     stop: CancellationToken,
+    /// The bounds this stream shares with every HTTP hop to the same peer.
+    aggregate: Arc<HopAggregate>,
+    /// The peer relay's recorded rotation freeze, as it reported it.
+    peer_pause: PauseController,
+}
+
+impl Drop for HopShared {
+    /// Return whatever this stream still holds of the peer aggregate: bytes
+    /// sent but never reported consumed, and bytes received but never read.
+    fn drop(&mut self) {
+        let credit = self
+            .credit
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let in_flight = credit.sent_bytes.saturating_sub(credit.peer_consumed_bytes);
+        self.aggregate.release_send(in_flight);
+        let queue = self
+            .queue
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let queued: u64 = queue
+            .events
+            .iter()
+            .map(|event| match event {
+                CarrierEvent::Data(data) => hop_cost(data.len()),
+                _ => 0,
+            })
+            .sum();
+        self.aggregate.release_receive(queued);
+    }
 }
 
 impl HopShared {
@@ -488,6 +550,22 @@ impl HopShared {
         self.credit_changed.notify_waiters();
     }
 
+    /// Resolves once the hop can no longer carry writes.
+    async fn closed_or_stopped(&self) {
+        loop {
+            let notified = self.credit_changed.notified();
+            let mut notified = pin!(notified);
+            notified.as_mut().enable();
+            if self.credit().closed || self.stop.is_cancelled() {
+                return;
+            }
+            tokio::select! {
+                () = self.stop.cancelled() => return,
+                () = notified => {}
+            }
+        }
+    }
+
     fn push(&self, event: CarrierEvent) {
         {
             let mut queue = self.queue();
@@ -506,12 +584,46 @@ enum HopCommand {
     Record(Vec<u8>),
     Fin,
     Reset(ResetDetail),
+    Pause(bool),
 }
 
 /// The credited send side of a peer hop.
 pub(crate) struct PeerHopWriter {
     shared: Arc<HopShared>,
     commands: mpsc::Sender<HopCommand>,
+}
+
+/// Relays this relay's freeze state to the peer over one hop.
+pub(crate) struct HopPauser {
+    commands: mpsc::Sender<HopCommand>,
+}
+
+impl HopPauser {
+    /// Forward every change of `freeze` until the hop's writer is gone.
+    pub(crate) async fn relay(self, mut freeze: PauseSignal) {
+        let mut reported = false;
+        loop {
+            let paused = freeze.is_paused();
+            if paused != reported {
+                if self.commands.send(HopCommand::Pause(paused)).await.is_err() {
+                    return;
+                }
+                reported = paused;
+            }
+            tokio::select! {
+                () = freeze.changed() => {}
+                () = self.commands.closed() => return,
+            }
+        }
+    }
+}
+
+impl PeerHopWriter {
+    pub(crate) fn pauser(&self) -> HopPauser {
+        HopPauser {
+            commands: self.commands.clone(),
+        }
+    }
 }
 
 impl CarrierWriter for PeerHopWriter {
@@ -551,12 +663,24 @@ impl CarrierWriter for PeerHopWriter {
                     () = notified => {}
                 }
             }
-            // Reserve every slot before charging credit or sending, so a
-            // dropped write sends nothing and a chunk is never split.
+            // Reserve every slot before charging or sending, so a dropped
+            // write sends nothing and a chunk is never split.
             let permits = commands
                 .reserve_many(pieces.len())
                 .await
                 .map_err(|_| CarrierClosed)?;
+            // The per-peer aggregate is shared by every HTTP hop to this
+            // peer.  Only this writer adds to this stream's in-flight bytes,
+            // so the per-stream window cannot close again while it waits.
+            // The aggregate charge and the credit charge below happen with no
+            // await between them, so a dropped write leaks neither.
+            if !shared
+                .aggregate
+                .acquire_send(cost, shared.closed_or_stopped())
+                .await
+            {
+                return Err(CarrierClosed);
+            }
             {
                 let mut credit = shared.credit();
                 credit.sent_bytes = credit.sent_bytes.saturating_add(cost);
@@ -609,6 +733,7 @@ impl CarrierReader for PeerHopReader {
                     let mut queue = shared.queue();
                     let event = queue.events.pop_front();
                     if let Some(CarrierEvent::Data(data)) = &event {
+                        shared.aggregate.release_receive(hop_cost(data.len()));
                         queue.queued_bytes = queue.queued_bytes.saturating_sub(data.len());
                         queue.queued_records = queue.queued_records.saturating_sub(1);
                         queue.consumed_bytes =
@@ -644,6 +769,15 @@ impl PeerHop {
         self.shared.credit().in_flight_high_water
     }
 
+    /// The peer relay's recorded freeze as it reported it on this hop.
+    pub(crate) fn peer_pause_signal(&self) -> PauseSignal {
+        self.shared.peer_pause.signal()
+    }
+
+    fn aggregate_high_water(&self) -> (usize, usize) {
+        self.shared.aggregate.high_water()
+    }
+
     fn receive_queue_high_water(&self) -> usize {
         self.shared.queue().high_water
     }
@@ -669,6 +803,7 @@ pub(crate) fn spawn_peer_hop<S: PeerSendHalf, R: PeerRecvHalf>(
     mut send: S,
     mut recv: R,
     deadline: tokio::time::Instant,
+    aggregate: Arc<HopAggregate>,
 ) -> (PeerHopWriter, PeerHopReader, PeerHop) {
     let (consumed_tx, mut consumed_rx) = watch::channel((0u64, 0u64));
     let shared = Arc::new(HopShared {
@@ -679,6 +814,8 @@ pub(crate) fn spawn_peer_hop<S: PeerSendHalf, R: PeerRecvHalf>(
         consumed_tx,
         peer_terminal: CancellationToken::new(),
         stop: CancellationToken::new(),
+        aggregate,
+        peer_pause: PauseController::new(false),
     });
     let (notifier, signal): (ResetNotifier, ResetSignal) = reset_signal_pair();
     let (commands, mut command_rx) = mpsc::channel::<HopCommand>(4);
@@ -744,6 +881,9 @@ pub(crate) fn spawn_peer_hop<S: PeerSendHalf, R: PeerRecvHalf>(
                 Step::Command(Some(HopCommand::Reset(detail))) => {
                     reset_sent = true;
                     encode_hop(&HopRecord::Reset(detail))
+                }
+                Step::Command(Some(HopCommand::Pause(paused))) => {
+                    encode_hop(&HopRecord::Pause(paused))
                 }
             };
             let sent = tokio::select! {
@@ -814,6 +954,13 @@ pub(crate) fn spawn_peer_hop<S: PeerSendHalf, R: PeerRecvHalf>(
                         shared.push(CarrierEvent::Closed);
                         break;
                     }
+                    // The same peer's HTTP hops together may not exceed the
+                    // aggregate its own sender bound respects.
+                    if !shared.aggregate.charge_receive(hop_cost(data.len())) {
+                        tracing::debug!(phase = "http_forward_peer_hop_aggregate_violation");
+                        shared.push(CarrierEvent::Closed);
+                        break;
+                    }
                     shared.push(CarrierEvent::Data(data));
                 }
                 HopRecord::Fin => {
@@ -831,13 +978,19 @@ pub(crate) fn spawn_peer_hop<S: PeerSendHalf, R: PeerRecvHalf>(
                     break;
                 }
                 HopRecord::Credit { bytes, records } => {
-                    {
+                    let released = {
                         let mut credit = shared.credit();
+                        // Consumption can never exceed what was sent.
+                        let bytes = bytes.min(credit.sent_bytes);
+                        let released = bytes.saturating_sub(credit.peer_consumed_bytes);
                         credit.peer_consumed_bytes = credit.peer_consumed_bytes.max(bytes);
                         credit.peer_consumed_records = credit.peer_consumed_records.max(records);
-                    }
+                        released
+                    };
+                    shared.aggregate.release_send(released);
                     shared.credit_changed.notify_waiters();
                 }
+                HopRecord::Pause(paused) => shared.peer_pause.set(paused),
             }
         }
         shared.peer_terminal.cancel();
@@ -1013,6 +1166,17 @@ pub(crate) async fn http_forward_route(
     };
     parts.uri = uri;
     strip_public_credentials(&mut parts.headers);
+    // A head the bridge would refuse is refused here, before any owner
+    // route, peer stream or tunnel stream exists: a malformed or forbidden
+    // head must not amplify into peer→owner→device admission work.
+    if let Err(error) = tunnel_http_bridge::normalize::request_head(&parts, &export.profile.request)
+    {
+        state
+            .handle
+            .http_forward_diagnostics()
+            .record_ingress_rejection();
+        return rejection_response(error).map(axum::body::Body::new);
+    }
     let request = http::Request::from_parts(parts, body);
 
     // The exchange never outlives the consumer's verified token.
@@ -1091,15 +1255,22 @@ pub(crate) async fn http_forward_route(
             };
             fault.mark(PeerOpenDiagnosticStage::Body);
             let (_, send, recv) = admission.into_parts();
-            let (hop_writer, hop_reader, hop) = spawn_peer_hop(send, recv, exchange_deadline);
+            let aggregate = state
+                .handle
+                .http_hop_aggregates()
+                .for_peer(&route.owner_token().node_id);
+            let (hop_writer, hop_reader, hop) =
+                spawn_peer_hop(send, recv, exchange_deadline, aggregate);
+            let owner_freeze = hop.peer_pause_signal();
             let outbound = tokio::spawn(pump_outbound(to_device_rx, hop_writer));
             let inbound = tokio::spawn(pump_inbound(hop_reader, from_device_tx));
-            let (response, exchange) = forward(
+            let (response, exchange) = forward_paused(
                 request,
                 export.profile,
                 config,
                 to_device_tx,
                 from_device_rx,
+                owner_freeze,
             )
             .await;
             let body_stats = response.body().stats();
@@ -1152,15 +1323,16 @@ pub(crate) async fn http_forward_route(
                 state
                     .handle
                     .echo_cleanup_guard(key.clone(), stream_id, operation_id.clone(), None);
-            let (writer, reader, signal_task) = actor_carriers(&state.handle, registration);
+            let (writer, reader, signal_task, freeze) = actor_carriers(&state.handle, registration);
             let outbound = tokio::spawn(pump_outbound(to_device_rx, writer));
             let inbound = tokio::spawn(pump_inbound(reader, from_device_tx));
-            let (response, exchange) = forward(
+            let (response, exchange) = forward_paused(
                 request,
                 export.profile,
                 config,
                 to_device_tx,
                 from_device_rx,
+                freeze,
             )
             .await;
             let body_stats = response.body().stats();
@@ -1210,6 +1382,8 @@ async fn hop_finish_and_record(
 ) {
     let send_high_water = hop.send_in_flight_high_water();
     let receive_high_water = hop.receive_queue_high_water();
+    let (aggregate_send, aggregate_receive) = hop.aggregate_high_water();
+    diagnostics.note_hop_aggregate(aggregate_send, aggregate_receive);
     hop.finish(RELAY_TERMINAL_GRACE).await;
     record_exchange(
         &diagnostics,
@@ -1254,6 +1428,9 @@ fn record_exchange(
         response_outcome: outcome_label(report.response),
         error_code: report.error.map(HttpErrorCode::as_str),
         execution: report.execution.as_str(),
+        progress_expired: report
+            .progress_expired
+            .map(tunnel_http_bridge::ProgressKind::as_str),
     });
 }
 
@@ -1329,9 +1506,11 @@ async fn both_finished(mut up: watch::Receiver<bool>, mut down: watch::Receiver<
 
 /// Relay one forwarded HTTP exchange between the peer hop and the owner
 /// actor.  The owner admits the stream itself (after re-authenticating the
-/// forwarded token and re-authorizing the grant) and remains the only
-/// authority for its tunnel sequences.
-#[allow(clippy::too_many_arguments)]
+/// forwarded token and re-authorizing the grant), remains the only authority
+/// for its tunnel sequences, and re-validates both record directions against
+/// its own copy of the export profile.  An owner without an export profile
+/// cannot validate and refuses the stream before admitting it.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(crate) async fn handle_peer_http_stream(
     request: InboundPeerRequest,
     handle: RelayHandle,
@@ -1341,8 +1520,14 @@ pub(crate) async fn handle_peer_http_stream(
     grant: tunnel_catalog::GrantSnapshot,
     consumer_expires_at: chrono::DateTime<Utc>,
     fault: &PeerFaultObserver,
+    export: Option<HttpForwardExport>,
 ) -> Result<(), PeerRuntimeError> {
+    let Some(export) = export else {
+        tracing::debug!(phase = "http_forward_owner_without_profile");
+        return Err(PeerRuntimeError::Closed);
+    };
     let request_id = request.envelope().request_id.clone();
+    let source_node = request.envelope().source.node_id.clone();
     let admission_context = request.admission_cancellation_context();
     let registration = match handle
         .open_http_stream(
@@ -1397,17 +1582,37 @@ pub(crate) async fn handle_peer_http_stream(
         .unwrap_or_default()
         .min(tunnel_http_bridge::MAX_DEADLINE);
     let deadline = tokio::time::Instant::now() + token_remaining;
-    let (hop_writer, hop_reader, hop) = spawn_peer_hop(send, recv, deadline);
-    let (actor_writer, actor_reader, signal_task) = actor_carriers(&handle, registration);
+    let aggregate = handle.http_hop_aggregates().for_peer(&source_node);
+    let (hop_writer, hop_reader, hop) = spawn_peer_hop(send, recv, deadline, aggregate);
+    let (actor_writer, actor_reader, signal_task, freeze) = actor_carriers(&handle, registration);
+    // The ingress's progress clocks pause for exactly this owner's freeze.
+    let pause_task = tokio::spawn(hop_writer.pauser().relay(freeze));
     let (up_finished_tx, up_finished) = watch::channel(false);
     let (down_finished_tx, down_finished) = watch::channel(false);
     let (up_tx, up_rx, up_stats) = channel(HANDOFF_CAPACITY);
     let (down_tx, down_rx, down_stats) = channel(HANDOFF_CAPACITY);
+    let verdict = Arc::new(OwnerVerdict::default());
+    let (method_tx, method_rx) = watch::channel(None);
+    let request_writer = OwnerRequestWriter::new(
+        actor_writer,
+        export.profile.request.clone(),
+        method_tx,
+        export.fixture_hold.clone(),
+        Arc::clone(&verdict),
+        down_tx.clone(),
+    );
+    let response_writer = OwnerResponseWriter::new(
+        hop_writer,
+        export.profile.response.clone(),
+        method_rx,
+        Arc::clone(&verdict),
+        up_tx.clone(),
+    );
     let up_in = tokio::spawn(pump_inbound(hop_reader, up_tx));
     let up_out = tokio::spawn(pump_outbound(
         up_rx,
         FinObserved {
-            inner: actor_writer,
+            inner: request_writer,
             finished: up_finished_tx,
         },
     ));
@@ -1415,7 +1620,7 @@ pub(crate) async fn handle_peer_http_stream(
     let down_out = tokio::spawn(pump_outbound(
         down_rx,
         FinObserved {
-            inner: hop_writer,
+            inner: response_writer,
             finished: down_finished_tx,
         },
     ));
@@ -1447,8 +1652,14 @@ pub(crate) async fn handle_peer_http_stream(
     up_in.abort();
     down_in.abort();
     signal_task.abort();
+    pause_task.abort();
+    let _ = pause_task.await;
     let send_high_water = hop.send_in_flight_high_water();
     let receive_high_water = hop.receive_queue_high_water();
+    let (aggregate_send, aggregate_receive) = hop.aggregate_high_water();
+    handle
+        .http_forward_diagnostics()
+        .note_hop_aggregate(aggregate_send, aggregate_receive);
     let closed = timeout(
         Duration::from_secs(5),
         handle.close_echo_stream_with_cause(key, stream_id, operation_id, None),
@@ -1462,6 +1673,7 @@ pub(crate) async fn handle_peer_http_stream(
         Some(OutboundEnd::Finished) | None => Outcome::Complete,
         Some(_) => Outcome::Aborted,
     };
+    let verdict = verdict.get();
     handle
         .http_forward_diagnostics()
         .record_exchange(HttpExchangeRecord {
@@ -1476,8 +1688,11 @@ pub(crate) async fn handle_peer_http_stream(
             peer_window: PEER_HOP_WINDOW_BYTES,
             request_outcome: outcome_label(aborted(up_end)),
             response_outcome: outcome_label(aborted(down_end)),
-            error_code: None,
-            execution: Execution::Unknown.as_str(),
+            error_code: verdict.map(|detail| detail.code.as_str()),
+            execution: verdict
+                .map_or(Execution::Unknown, |detail| detail.execution)
+                .as_str(),
+            progress_expired: None,
         });
     Ok(())
 }
@@ -1485,6 +1700,182 @@ pub(crate) async fn handle_peer_http_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tunnel_cluster::peer_frame::StreamBudget;
+
+    /// An in-memory peer request direction.  The "network" is unbounded:
+    /// only the hop credit and the per-peer aggregate may bound it.
+    struct FakeSend {
+        tx: mpsc::UnboundedSender<Vec<u8>>,
+    }
+
+    #[allow(clippy::manual_async_fn)]
+    impl PeerSendHalf for FakeSend {
+        fn send_record<'a>(
+            &'a mut self,
+            body: &'a [u8],
+        ) -> impl Future<Output = Result<(), PeerRuntimeError>> + Send + 'a {
+            let sent = self.tx.send(body.to_vec());
+            async move { sent.map_err(|_| PeerRuntimeError::Closed) }
+        }
+
+        fn finish(&mut self) -> impl Future<Output = Result<(), PeerRuntimeError>> + Send + '_ {
+            async { Ok(()) }
+        }
+
+        fn cancel(&mut self) {}
+    }
+
+    struct FakeRecv {
+        rx: mpsc::UnboundedReceiver<Vec<u8>>,
+        budget: StreamBudget,
+    }
+
+    #[allow(clippy::manual_async_fn)]
+    impl PeerRecvHalf for FakeRecv {
+        fn recv_record(
+            &mut self,
+            _deadline: tokio::time::Instant,
+        ) -> impl Future<Output = Result<Option<PeerRecord>, PeerRuntimeError>> + Send + '_
+        {
+            async move {
+                match self.rx.recv().await {
+                    Some(body) => Ok(Some(
+                        self.budget
+                            .record_from_slice(PeerRecordKind::ConsumerChunk, &body)?,
+                    )),
+                    None => Ok(None),
+                }
+            }
+        }
+
+        fn cancel(&mut self) {}
+    }
+
+    struct HopPair {
+        receiver_reader: PeerHopReader,
+        _sender: PeerHop,
+        _receiver: PeerHop,
+        _sender_reader: PeerHopReader,
+        _receiver_writer: PeerHopWriter,
+    }
+
+    fn hop_pair(
+        send_aggregate: &Arc<HopAggregate>,
+        receive_aggregate: &Arc<HopAggregate>,
+    ) -> (PeerHopWriter, HopPair) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3_600);
+        let (forward_tx, forward_rx) = mpsc::unbounded_channel();
+        let (back_tx, back_rx) = mpsc::unbounded_channel();
+        let connection = tunnel_cluster::peer_frame::ConnectionBudget::new();
+        let (sender_writer, sender_reader, sender) = spawn_peer_hop(
+            FakeSend { tx: forward_tx },
+            FakeRecv {
+                rx: back_rx,
+                budget: connection.open_stream().expect("stream"),
+            },
+            deadline,
+            Arc::clone(send_aggregate),
+        );
+        let (receiver_writer, receiver_reader, receiver) = spawn_peer_hop(
+            FakeSend { tx: back_tx },
+            FakeRecv {
+                rx: forward_rx,
+                budget: connection.open_stream().expect("stream"),
+            },
+            deadline,
+            Arc::clone(receive_aggregate),
+        );
+        (
+            sender_writer,
+            HopPair {
+                receiver_reader,
+                _sender: sender,
+                _receiver: receiver,
+                _sender_reader: sender_reader,
+                _receiver_writer: receiver_writer,
+            },
+        )
+    }
+
+    const STREAMS: usize = 40;
+    const CHUNKS: usize = 8;
+    const CHUNK: usize = 65_528;
+
+    /// Saturate `STREAMS` hops to one peer whose receivers do not read, and
+    /// return the peak in-flight and queued aggregate bytes.
+    async fn saturate(limit: usize) -> (u64, u64, Vec<HopPair>, Vec<JoinHandle<bool>>) {
+        let send_aggregate = HopAggregate::new(limit);
+        let receive_aggregate = HopAggregate::new(limit);
+        let mut pairs = Vec::new();
+        let mut writers = Vec::new();
+        for _ in 0..STREAMS {
+            let (mut writer, pair) = hop_pair(&send_aggregate, &receive_aggregate);
+            writers.push(tokio::spawn(async move {
+                for _ in 0..CHUNKS {
+                    if writer.data(Bytes::from(vec![7u8; CHUNK])).await.is_err() {
+                        return false;
+                    }
+                }
+                writer.finish().await.is_ok()
+            }));
+            pairs.push(pair);
+        }
+        // Virtual time: every task is blocked on credit once this elapses.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let (sent, _) = send_aggregate.current();
+        let (_, queued) = receive_aggregate.current();
+        (sent, queued, pairs, writers)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn many_saturated_http_hops_to_one_peer_share_one_connection_bound() {
+        let window = PEER_HOP_WINDOW_BYTES as u64;
+        // Red: without the shared bound every stream fills its own window,
+        // which on one connection exceeds the per-direction share of the
+        // 8 MiB ceiling.
+        let (unbounded_sent, _, pairs, writers) = saturate(usize::MAX / 4).await;
+        assert!(
+            unbounded_sent > HOP_AGGREGATE_BYTES as u64,
+            "control run must exceed the aggregate: {unbounded_sent}"
+        );
+        for writer in writers {
+            writer.abort();
+        }
+        drop(pairs);
+
+        // Green: the shared bound holds for the sender and the receiver.
+        let (sent, queued, pairs, writers) = saturate(HOP_AGGREGATE_BYTES).await;
+        assert!(sent <= HOP_AGGREGATE_BYTES as u64, "sent {sent}");
+        assert!(queued <= HOP_AGGREGATE_BYTES as u64, "queued {queued}");
+        assert!(
+            sent + window > HOP_AGGREGATE_BYTES as u64,
+            "the bound was reached, not met vacuously: {sent}"
+        );
+        // Draining every receiver lets every blocked writer finish: the
+        // bound is backpressure, not failure.
+        let mut readers = Vec::new();
+        for pair in pairs {
+            readers.push(tokio::spawn(async move {
+                // Move the whole pair: dropping its other halves would reset
+                // the stream.
+                let mut pair = pair;
+                let mut bytes = 0usize;
+                loop {
+                    match pair.receiver_reader.next().await {
+                        CarrierEvent::Data(data) => bytes += data.len(),
+                        CarrierEvent::Fin => return bytes,
+                        other => panic!("unexpected hop event {other:?}"),
+                    }
+                }
+            }));
+        }
+        for writer in writers {
+            assert!(writer.await.expect("join"), "every write completed");
+        }
+        for reader in readers {
+            assert_eq!(reader.await.expect("join"), CHUNKS * CHUNK);
+        }
+    }
 
     #[test]
     fn hop_records_round_trip_and_reject_mutations() {

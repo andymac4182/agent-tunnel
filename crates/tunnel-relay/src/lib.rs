@@ -40,11 +40,14 @@ pub use consumer_write_diagnostics::{
     ConsumerIngressKind, ConsumerWriteDiagnosticSnapshot, ConsumerWriteScope,
     ConsumerWriteTimeoutSnapshot,
 };
-pub use http::forward::{HttpForwardExport, PEER_HOP_WINDOW_BYTES, PEER_HOP_WINDOW_RECORDS};
+pub use http::forward::{
+    HOLD_CEILING, HOP_AGGREGATE_BYTES, HttpForwardExport, HttpRelayHold, HttpRelayHoldPoint,
+    PEER_HOP_WINDOW_BYTES, PEER_HOP_WINDOW_RECORDS,
+};
 pub use http::{
     ConsumerUpgradeBarrier, ControlAttachBarrier, PeerAdmissionBarrier, PeerAdmissionScope,
     consumer_router, device_router, device_router_with_peer_and_barrier, peer_ingress_handler,
-    router, router_with_peer,
+    peer_ingress_handler_with_http_forward, router, router_with_peer,
 };
 pub use membership_runtime::{
     AdmissionDeadline, CheckpointAuthority, CheckpointAuthorityError, CheckpointRequest,

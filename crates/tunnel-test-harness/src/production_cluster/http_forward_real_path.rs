@@ -658,6 +658,7 @@ pub async fn verify() -> Result<HttpForwardRealPathEvidence> {
     harness.http_forward = Some(HttpForwardExport {
         profile: Arc::clone(&profile),
         config,
+        fixture_hold: None,
     });
     let mut cluster = match ProductionCluster::start(&mut harness).await {
         Ok(cluster) => cluster,

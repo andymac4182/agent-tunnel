@@ -28,6 +28,7 @@ pub mod device;
 mod exchange;
 pub mod normalize;
 pub mod owner;
+pub mod progress;
 mod pump;
 pub mod status;
 pub mod stream;
@@ -38,9 +39,12 @@ pub use carrier::{
     OutboundEnd, detail_from_reason, detail_from_status, pump_inbound, pump_outbound,
     reset_reason_for, result_outcome,
 };
-pub use device::{HandlerCancellation, serve};
+pub use device::{HandlerCancellation, serve, serve_paused};
 pub use normalize::NormalizeError;
-pub use owner::{ExchangeHandle, forward};
+pub use owner::{ExchangeHandle, forward, forward_paused, rejection_response};
+pub use progress::{
+    MAX_PROGRESS_BUDGET, PauseController, PauseSignal, ProgressBudgets, ProgressKind,
+};
 pub use status::{
     ExchangeReport, Execution, GatewayError, Origin, Outcome, ResetDetail, gateway_status,
 };
@@ -48,6 +52,9 @@ pub use stream::{
     Frame, FrameReceiver, FrameSender, QueueStats, ResetNotifier, ResetSignal, SendError,
     SignaledReset, channel, reset_signal_pair,
 };
+/// The codec's payload-free record-position tracker, re-exported for carrier
+/// endpoints that record transport diagnostics.
+pub use tunnel_http_forward::{RecordPosition, RecordTracker, TrackerSnapshot};
 
 use std::time::Duration;
 
@@ -82,6 +89,8 @@ pub enum ConfigError {
     Deadline,
     /// Zero, or above [`MAX_BODY_QUEUE`].
     BodyQueue,
+    /// A transport progress budget of zero or above [`MAX_PROGRESS_BUDGET`].
+    ProgressBudget,
 }
 
 impl core::fmt::Display for ConfigError {
@@ -98,6 +107,7 @@ impl std::error::Error for ConfigError {}
 pub struct BridgeConfig {
     body_queue: usize,
     deadline: Duration,
+    progress: ProgressBudgets,
 }
 
 impl Default for BridgeConfig {
@@ -105,11 +115,24 @@ impl Default for BridgeConfig {
         Self {
             body_queue: DEFAULT_BODY_QUEUE,
             deadline: DEFAULT_DEADLINE,
+            progress: ProgressBudgets::default(),
         }
     }
 }
 
 impl BridgeConfig {
+    /// Set the transport progress budgets (each already bounded by
+    /// [`ProgressBudgets`]).
+    #[must_use]
+    pub const fn with_progress(self, progress: ProgressBudgets) -> Self {
+        Self { progress, ..self }
+    }
+
+    #[must_use]
+    pub const fn progress(&self) -> ProgressBudgets {
+        self.progress
+    }
+
     /// Set the absolute application deadline for the whole exchange.  It
     /// also bounds terminal discard of a peer that never finishes.
     ///

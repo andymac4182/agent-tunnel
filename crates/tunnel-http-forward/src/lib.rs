@@ -14,6 +14,7 @@ mod json;
 pub mod progress;
 pub mod reader;
 pub mod record;
+pub mod tracker;
 pub mod validate;
 
 pub use decoder::{PartialRecord, RecordDecoder, RecordEvent};
@@ -31,6 +32,7 @@ pub use record::{
     END_RECORD, MAX_BODY_PAYLOAD_LEN, MAX_HEAD_PAYLOAD_LEN, MAX_RECORD_LEN, RECORD_HEADER_LEN,
     RecordHeader, RecordKind, encode_body, encode_record,
 };
+pub use tracker::{RecordPosition, RecordTracker, TrackerSnapshot};
 pub use validate::{
     CREDENTIAL_QUERY_PARAMETERS, FORBIDDEN_HEADER_PREFIXES, FORBIDDEN_HEADERS, HeaderPolicy,
     MAX_BODY_LIMIT, MAX_HEADER_FIELDS, MAX_HEADER_NAME_LEN, MAX_HEADER_TOTAL_BYTES,

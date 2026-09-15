@@ -1743,6 +1743,9 @@ async fn run_m2_session(
                 }
             }
         }
+        // HTTP exchanges' progress clocks pause for exactly the writer
+        // freeze this event may have started or ended.
+        actor.publish_http_freeze();
     };
     readiness.send(Readiness::Stopping).ok();
     cancellation.cancel();
@@ -4602,6 +4605,26 @@ impl M2Actor {
             stream.operation_id == cancel.operation_id
                 && self.config.exports.contains_key(&stream.service_id)
         });
+        let http_stream = self
+            .streams
+            .get(&cancel.stream_id)
+            .is_some_and(M2Stream::is_http);
+        if matches_operation && http_stream {
+            // An owner CANCEL for an HTTP stream stops the handler out of
+            // band at once.  The bridge then emits the stream's ordered
+            // RESET(CANCELLED) with its RESULT_STATUS; only an exchange that
+            // already ended needs the RESET here.
+            if self.http_cancel(cancel.stream_id) {
+                self.emit_or_defer(PendingOutput {
+                    stream_id: cancel.stream_id,
+                    kind: FrameKind::Reset,
+                    payload: Vec::new(),
+                    reset_reason: Some(tunnel_protocol::reset_reason::CANCELLED),
+                })
+                .await?;
+            }
+            return Ok(());
+        }
         if matches_operation {
             self.http_abort(cancel.stream_id, tunnel_protocol::reset_reason::CANCELLED);
             let pending_bytes = {
