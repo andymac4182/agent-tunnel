@@ -857,6 +857,24 @@ Drop initialization/session/prompt/permission/DELETE acknowledgments before and 
 
 Repeat across three relays with GET/POST entering a non-owner, peer key rotation, owner loss, grant expiry/revocation and both forwarding segments saturated. Test forged internal identity headers, another user's connection/session IDs, fixed executable/cwd/argument/environment policy, and rejected consumer MCP attachments. Authenticate every HTTP request and SSE subscription; renewed tokens cannot transfer ownership. Verify per-principal child/state isolation, minimal environment, capped stderr, output-credit stall, reserved cancellation capacity, and process-group/job termination and descendant reaping on each supported OS. Only a verified sandbox profile may claim restricted execution; synthetic process-policy tests never run an agent on the user's active desktop.
 
+## HTTP forwarding over the real path (`verify-m3-http-forward-real-path`)
+
+```sh
+TEST_REDIS_URL=redis://127.0.0.1:63790/ scripts/m3-harness-verify.sh
+cargo run -p tunnel-test-harness --locked -- verify-m3-http-forward-real-path
+```
+
+Implementation gate 3 of [http-forwarding.md](http-forwarding.md). The gate starts the three-relay production cluster with an `http-forward` service and grant seeded for one device, attaches that device's `tunnel-client` (with a registered in-process handler) to relay-a so relay-a owns it, and sends every consumer request through relay-c, so each exchange crosses the public Axum route, the credited peer HTTP/3 hop, the owner actor stream and the device data WebSocket. The validator (`validate_http_forward_real_path_evidence` in `production_cluster/http_forward_real_path.rs`) is re-run at the command boundary, and its unit test rejects every single-field mutation of passing evidence.
+
+It proves, in one run:
+
+* **Saturation with concurrent work.** A 16 MiB `/echo` upload is echoed back by the handler while the consumer does not read the response for 2.5 s; the upload writer must have stalled below its total. While it is stalled, `/events` is cancelled by a consumer disconnect and `/permission` must answer within 2 s. The cancelled exchange must end with the owner stream released by `RESET(4005 CANCELLED)`, the ingress recording `HTTP_CANCELLED` with an aborted response, the device response aborted (never completed) and the handler's cancellation token fired within 5 s of the disconnect. The same `/permission` request is also answered through the owner's own public route.
+* **Bounded queues at every hop**, from payload-free diagnostics: ingress request/response handoffs ≤ 65,536; ingress response body queue ≤ 4 × 65,528; peer in-flight and receive queues ≤ 196,608 (inside the 256 KiB per-stream budget) at both ends; owner and device receive buffers ≤ the 131,072-byte window; owner and device parked writes ≤ 65,536; owner replay ≤ 131,072; owner session data high-water ≤ its data limit. Each saturated hop must also exceed half its window, so a bound cannot pass vacuously.
+* **Checksums both ways.** The handler's SHA-256 of the received upload and the consumer's SHA-256 of the echo both equal the SHA-256 of the 16 MiB synthetic source, and the echo body ends cleanly.
+* **No credential or address leakage.** The consumer sends a valid bearer and a synthetic cookie. The handler must see neither `authorization`, `cookie`, `host`, forwarded-identity nor `x-agent-tunnel-*` fields, and no header value may contain the token, the cookie value or any relay consumer, device or peer address; the consumer's response headers are checked the same way. An `x-agent-tunnel-owner` probe must be refused with 400 and an unauthenticated probe with 401, before the handler is ever invoked.
+
+It deliberately does not cover rotation, freeze or recovery on HTTP streams (gate 4), per-profile ACP/MCP/CUA allowlists (gate 5), HTTP/2 consumers, owner-side record re-validation, or control `CANCEL` for HTTP streams; see "Not proven by gate 3" in [http-forwarding.md](http-forwarding.md#pinned-in-code-gate-3). Set `M3_HTTP_FORWARD_DIAGNOSTICS=1` to print the payload-free per-hop records.
+
 ## MCP and computer-use integration
 
 For MCP, test against a pinned SDK/server fixture with initialization, negotiated capabilities, request/response correlation, notifications, cancellation, concurrent calls, structured errors, and streaming behavior for each supported transport profile. Exercise a long-running request across rotation. Confirm that MCP session state and its lifecycle follow the adapter contract instead of being inferred from the lifetime of one data WebSocket. Keep other exposed capabilities functional while MCP work is active.
