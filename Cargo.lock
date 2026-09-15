@@ -2544,6 +2544,17 @@ name = "tunnel-http-forward"
 version = "0.1.0"
 
 [[package]]
+name = "tunnel-mcp"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "http",
+ "serde_json",
+ "tunnel-http-bridge",
+ "tunnel-http-forward",
+]
+
+[[package]]
 name = "tunnel-protocol"
 version = "0.1.0"
 dependencies = [
