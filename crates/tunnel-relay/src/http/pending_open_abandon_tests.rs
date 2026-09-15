@@ -315,6 +315,7 @@ impl AbandonedUpgradeStage {
             consumer_upgrade_barrier: Some(barrier.clone()),
             peer_admission_barrier: None,
             control_attach_barrier: None,
+            http_forward: None,
         };
         let router = Router::new()
             .route(

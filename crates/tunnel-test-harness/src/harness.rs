@@ -44,6 +44,10 @@ pub struct HarnessOptions {
     /// the fail-closed admission matrix and stays disabled everywhere else, so
     /// no existing gate's service or grant counts change.
     pub ambiguous_echo_service: bool,
+    /// Seed an active `http-forward` service (with `http:invoke` grants that
+    /// mirror the primary echo grants) on the first tenant-A device.  Only the
+    /// HTTP forwarding gate enables it.
+    pub http_forward_service: bool,
 }
 
 impl Default for HarnessOptions {
@@ -57,6 +61,7 @@ impl Default for HarnessOptions {
             shared_device_uuid: false,
             shared_fixture_identity: None,
             ambiguous_echo_service: false,
+            http_forward_service: false,
         }
     }
 }
@@ -116,6 +121,12 @@ impl HarnessOptions {
     /// admission matrix's ambiguous-target scenario.
     pub fn ambiguous_echo_service(mut self, value: bool) -> Self {
         self.ambiguous_echo_service = value;
+        self
+    }
+
+    /// Opt into the `http-forward` service used by the HTTP forwarding gate.
+    pub fn http_forward_service(mut self, value: bool) -> Self {
+        self.http_forward_service = value;
         self
     }
 
@@ -234,6 +245,23 @@ impl Harness {
         } else {
             None
         };
+        let http_forward_service = if options.http_forward_service {
+            let device_id = match topology.devices_a.first() {
+                Some(device) => device.id,
+                None => {
+                    let error = HarnessError::InvalidInput(
+                        "http-forward service requires a tenant-A device".to_owned(),
+                    );
+                    return Err(with_redis_cleanup(error, redis.close().await));
+                }
+            };
+            match topology.push_http_forward_service(&mut fixture, device_id) {
+                Ok(service_id) => Some(service_id),
+                Err(error) => return Err(with_redis_cleanup(error, redis.close().await)),
+            }
+        } else {
+            None
+        };
         if let Err(error) = catalog.seed_fixture(&fixture).await {
             let error = HarnessError::Redis(format!("seeding production Redis catalog: {error}"));
             // A seed is one-shot. Discard a failed fixture, including partial
@@ -255,6 +283,8 @@ impl Harness {
             production_catalog: Some(catalog),
             production_relay: None,
             rotation: options.rotation,
+            http_forward: None,
+            http_forward_service,
         })
     }
 }
@@ -276,6 +306,11 @@ pub struct RunningHarness {
     production_catalog: Option<RedisCatalog>,
     production_relay: Option<RunningRelay>,
     rotation: RotationConfig,
+    /// Optional `http-forward/1` export served by production cluster relays
+    /// started from this harness (the implementation gate 3 fixture).
+    pub http_forward: Option<tunnel_relay::HttpForwardExport>,
+    /// The seeded `http-forward` service, when requested.
+    pub http_forward_service: Option<uuid::Uuid>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -262,6 +262,59 @@ impl FixtureTopology {
         &self.devices_b[0]
     }
 
+    /// Append an active `http-forward` service to `device_id`.  Every
+    /// principal granted the device's primary echo service receives exactly
+    /// the `http:invoke` operation on it, so the HTTP routes are authorized by
+    /// their own grant operation and never by an echo grant.  Apply before the
+    /// harness's single catalog seed.
+    pub fn push_http_forward_service(
+        &self,
+        fixture: &mut CatalogFixture,
+        device_id: Uuid,
+    ) -> Result<Uuid> {
+        let device = self
+            .all_devices()
+            .find(|device| device.id == device_id)
+            .ok_or_else(|| {
+                HarnessError::InvalidInput(format!(
+                    "http-forward service references unknown device {device_id}"
+                ))
+            })?;
+        let primary = self.service_ids.get(&device_id).copied().ok_or_else(|| {
+            HarnessError::InvalidInput(format!("device {device_id} has no service id"))
+        })?;
+        let service_id = Uuid::new_v4();
+        fixture.services.push(ServiceSpec {
+            tenant_id: device.tenant_id,
+            device_id,
+            service_id,
+            service_type: "http-forward".to_owned(),
+            display_name: "Synthetic in-process HTTP export".to_owned(),
+            capabilities: serde_json::json!({"operations": ["http:invoke"]}),
+            version: 1,
+            active: true,
+        });
+        let mirrored = fixture
+            .grants
+            .iter()
+            .filter(|grant| grant.device_id == device_id && grant.service_id == primary)
+            .map(|grant| GrantSpec {
+                service_id,
+                permissions: PermissionSet {
+                    operations: ["http:invoke".to_owned()].into_iter().collect(),
+                },
+                ..grant.clone()
+            })
+            .collect::<Vec<_>>();
+        if mirrored.is_empty() {
+            return Err(HarnessError::InvalidInput(format!(
+                "device {device_id} has no primary grant to mirror"
+            )));
+        }
+        fixture.grants.extend(mirrored);
+        Ok(service_id)
+    }
+
     /// Append a second active `echo` service to `device_id` so the public
     /// service-type label resolves to more than one live target.
     ///

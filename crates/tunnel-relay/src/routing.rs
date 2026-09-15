@@ -228,6 +228,19 @@ pub fn resolve_echo_service(
     services: &[ServiceRecord],
     target: ServiceTarget<'_>,
 ) -> Result<Uuid, ServiceResolutionError> {
+    resolve_service(services, target, crate::ECHO_SERVICE_TYPE)
+}
+
+/// Resolve one service target to an active service of exactly
+/// `service_type`, under the same identifier, label and ambiguity rules as
+/// [`resolve_echo_service`].  The HTTP forwarding routes use this with
+/// [`crate::HTTP_FORWARD_SERVICE_TYPE`], so an echo service can never be
+/// reached through an HTTP route or the reverse.
+pub fn resolve_service(
+    services: &[ServiceRecord],
+    target: ServiceTarget<'_>,
+    service_type: &str,
+) -> Result<Uuid, ServiceResolutionError> {
     let service_id = match target {
         ServiceTarget::Id(service_id) => service_id,
         ServiceTarget::Label(label) => {
@@ -245,7 +258,7 @@ pub fn resolve_echo_service(
     let dispatchable = services.iter().any(|candidate| {
         candidate.service_id == service_id
             && candidate.active
-            && candidate.service_type == crate::ECHO_SERVICE_TYPE
+            && candidate.service_type == service_type
     });
     if dispatchable {
         Ok(service_id)

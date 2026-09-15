@@ -115,6 +115,38 @@ impl fmt::Debug for Frame {
     }
 }
 
+/// The shared numeric RESET reason-code registry (docs/protocol.md,
+/// "Proposed binary data framing").  A RESET carries exactly one of these
+/// codes in network byte order.  Adapter-specific detail travels separately
+/// in bounded `RESULT_STATUS` metadata, never as a private numeric extension.
+pub mod reset_reason {
+    /// The stream's frozen authorization expired or was invalidated.
+    pub const AUTHORIZATION_EXPIRED: u16 = 4_001;
+    /// A protocol violation, a mirrored peer RESET, or an unknown stream.
+    pub const PROTOCOL: u16 = 4_002;
+    /// An adapter record exceeded its bound or was malformed.
+    pub const RECORD_LIMIT: u16 = 4_003;
+    /// The application adapter failed, timed out, or rejected the exchange.
+    pub const ADAPTER_FAILURE: u16 = 4_004;
+    /// The operation was cancelled (consumer disconnect or explicit cancel).
+    pub const CANCELLED: u16 = 4_005;
+
+    /// Every registered code, in ascending order.
+    pub const ALL: [u16; 5] = [
+        AUTHORIZATION_EXPIRED,
+        PROTOCOL,
+        RECORD_LIMIT,
+        ADAPTER_FAILURE,
+        CANCELLED,
+    ];
+
+    /// Whether `code` is registered.
+    #[must_use]
+    pub fn is_registered(code: u16) -> bool {
+        ALL.contains(&code)
+    }
+}
+
 impl Frame {
     /// Construct a frame with the fixed protocol version and no flags.
     #[must_use]

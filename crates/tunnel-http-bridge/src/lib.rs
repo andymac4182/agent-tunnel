@@ -23,6 +23,7 @@
 //! never a fabricated END.
 
 pub mod body;
+pub mod carrier;
 pub mod device;
 mod exchange;
 pub mod normalize;
@@ -32,6 +33,11 @@ pub mod status;
 pub mod stream;
 
 pub use body::{BodyError, BodySender, ChannelBody};
+pub use carrier::{
+    CarrierClosed, CarrierEvent, CarrierReader, CarrierWriter, HANDOFF_CAPACITY, InboundEnd,
+    OutboundEnd, detail_from_reason, detail_from_status, pump_inbound, pump_outbound,
+    reset_reason_for, result_outcome,
+};
 pub use device::{HandlerCancellation, serve};
 pub use normalize::NormalizeError;
 pub use owner::{ExchangeHandle, forward};
@@ -39,7 +45,8 @@ pub use status::{
     ExchangeReport, Execution, GatewayError, Origin, Outcome, ResetDetail, gateway_status,
 };
 pub use stream::{
-    Frame, FrameReceiver, FrameSender, QueueStats, ResetSignal, SendError, SignaledReset, channel,
+    Frame, FrameReceiver, FrameSender, QueueStats, ResetNotifier, ResetSignal, SendError,
+    SignaledReset, channel, reset_signal_pair,
 };
 
 use std::time::Duration;

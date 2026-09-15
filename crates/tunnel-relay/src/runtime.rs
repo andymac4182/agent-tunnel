@@ -570,6 +570,8 @@ pub struct RelaySnapshot {
     pub session_terminal_events: Vec<SessionTerminalEvent>,
     /// Bounded per-stream terminal latches captured before STREAM_FORGET.
     pub stream_terminal_events: Vec<StreamTerminalEvent>,
+    /// Bounded `http-forward/1` hop high-water records (payload-free).
+    pub http_forward: crate::http_forward_diagnostics::HttpForwardDiagnosticSnapshot,
     /// Bounded receipts for an actual connector FIN/RESET. These are separate
     /// from the immutable first-terminal latches above because a connector
     /// terminal frame may arrive after the first logical terminal transition.

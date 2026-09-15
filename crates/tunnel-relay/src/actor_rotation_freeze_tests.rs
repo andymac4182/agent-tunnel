@@ -278,6 +278,7 @@ impl FreezeFixture {
                 admission_lease: CancellationToken::new(),
                 admission_deadline: Instant::now() + StdDuration::from_secs(60),
                 authorization_failure_code: None,
+                http: None,
             },
         );
         Self {

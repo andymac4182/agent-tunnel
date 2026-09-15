@@ -695,6 +695,113 @@ impl Cancel {
     }
 }
 
+/// The maximum serialized size of the adapter-specific `RESULT_STATUS`
+/// detail object (docs/http-forwarding.md, "Cancellation, resets, and
+/// execution uncertainty").
+pub const MAX_RESULT_DETAIL_BYTES: usize = 512;
+/// The maximum length of one `RESULT_STATUS` detail token.
+pub const MAX_RESULT_TOKEN_BYTES: usize = 64;
+
+/// The closed `RESULT_STATUS` outcome vocabulary from docs/protocol.md
+/// "Delivery guarantees and side effects".
+pub const RESULT_OUTCOMES: [&str; 4] = ["succeeded", "failed", "cancelled", "outcome_unknown"];
+
+/// Bounded adapter-specific detail carried by `RESULT_STATUS`.  Both fields
+/// are closed-vocabulary tokens chosen by the adapter; neither may carry
+/// payload, header, path or credential text.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResultDetail {
+    pub code: String,
+    pub execution: String,
+}
+
+/// RESULT_STATUS reports one stream operation's actual or unknown outcome
+/// independently of its outer RESET reason code.  It is sent on the control
+/// socket, so it is not ordered with the data socket's RESET: a receiver
+/// correlates it by stream and operation identity.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResultStatus {
+    pub message_id: String,
+    pub session_id: String,
+    #[serde(with = "decimal_u64")]
+    pub epoch: u64,
+    #[serde(with = "decimal_u64")]
+    pub stream_id: u64,
+    pub operation_id: String,
+    pub outcome: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<ResultDetail>,
+}
+
+impl ResultStatus {
+    #[must_use]
+    pub fn new(
+        message_id: impl Into<String>,
+        session_id: impl Into<String>,
+        epoch: u64,
+        stream_id: u64,
+        operation_id: impl Into<String>,
+        outcome: impl Into<String>,
+        detail: Option<ResultDetail>,
+    ) -> Self {
+        Self {
+            message_id: message_id.into(),
+            session_id: session_id.into(),
+            epoch,
+            stream_id,
+            operation_id: operation_id.into(),
+            outcome: outcome.into(),
+            detail,
+        }
+    }
+}
+
+fn validate_result_token(field: &'static str, value: &str) -> Result<(), ControlError> {
+    if value.is_empty()
+        || value.len() > MAX_RESULT_TOKEN_BYTES
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        return Err(ControlError::InvalidIdentifier {
+            field,
+            length: value.len(),
+            maximum: MAX_RESULT_TOKEN_BYTES,
+        });
+    }
+    Ok(())
+}
+
+fn validate_result_status(message: &ResultStatus) -> Result<(), ControlError> {
+    validate_id("session_id", &message.session_id)?;
+    validate_nonzero_counter("stream_id", message.stream_id)?;
+    validate_id("operation_id", &message.operation_id)?;
+    if !RESULT_OUTCOMES.contains(&message.outcome.as_str()) {
+        return Err(ControlError::InvalidIdentifier {
+            field: "outcome",
+            length: message.outcome.len(),
+            maximum: MAX_RESULT_TOKEN_BYTES,
+        });
+    }
+    if let Some(detail) = &message.detail {
+        validate_result_token("detail.code", &detail.code)?;
+        validate_result_token("detail.execution", &detail.execution)?;
+        let length = serde_json::to_vec(detail)
+            .map_err(ControlError::Json)?
+            .len();
+        if length > MAX_RESULT_DETAIL_BYTES {
+            return Err(ControlError::ValueTooLong {
+                field: "detail",
+                length,
+                maximum: MAX_RESULT_DETAIL_BYTES,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// GOAWAY stops new stream admission and begins bounded shutdown.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -876,6 +983,7 @@ pub enum ControlMessage {
     Ping(Ping),
     Pong(Pong),
     Cancel(Cancel),
+    ResultStatus(ResultStatus),
     GoAway(GoAway),
     AuthorizationChallenge(AuthorizationChallenge),
     AuthorizationConfirmed(AuthorizationConfirmed),
@@ -919,6 +1027,7 @@ impl ControlMessage {
             Self::Ping(message) => &message.message_id,
             Self::Pong(message) => &message.message_id,
             Self::Cancel(message) => &message.message_id,
+            Self::ResultStatus(message) => &message.message_id,
             Self::GoAway(message) => &message.message_id,
             Self::AuthorizationChallenge(message) => &message.message_id,
             Self::AuthorizationConfirmed(message) => &message.message_id,
@@ -986,6 +1095,7 @@ impl ControlMessage {
             | Self::Open(_)
             | Self::Ping(_)
             | Self::Cancel(_)
+            | Self::ResultStatus(_)
             | Self::GoAway(_)
             | Self::AuthorizationChallenge(_)
             | Self::AuthorizationInvalidated(_)
@@ -1007,6 +1117,7 @@ impl ControlMessage {
             Self::Ping(_) => "PING",
             Self::Pong(_) => "PONG",
             Self::Cancel(_) => "CANCEL",
+            Self::ResultStatus(_) => "RESULT_STATUS",
             Self::GoAway(_) => "GOAWAY",
             Self::AuthorizationChallenge(_) => "AUTHORIZATION_CHALLENGE",
             Self::AuthorizationConfirmed(_) => "AUTHORIZATION_CONFIRMED",
@@ -1138,6 +1249,7 @@ impl ControlMessage {
                     validate_reason("reason", reason)?;
                 }
             }
+            Self::ResultStatus(message) => validate_result_status(message)?,
             Self::GoAway(message) => {
                 validate_id("session_id", &message.session_id)?;
                 validate_reason("reason", &message.reason)?;
@@ -1770,6 +1882,66 @@ impl std::error::Error for ControlError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn result_status(detail: Option<ResultDetail>) -> ControlMessage {
+        ControlMessage::ResultStatus(ResultStatus::new(
+            "m-result",
+            "session-1",
+            7,
+            9,
+            "operation-1",
+            "failed",
+            detail,
+        ))
+    }
+
+    #[test]
+    fn result_status_round_trips_with_bounded_closed_detail() {
+        let message = result_status(Some(ResultDetail {
+            code: "HTTP_CANCELLED".to_owned(),
+            execution: "dispatched".to_owned(),
+        }));
+        let encoded = encode_control(&message).expect("valid result status");
+        let json = String::from_utf8(encoded.clone()).expect("JSON UTF-8");
+        assert!(json.contains("\"type\":\"RESULT_STATUS\""));
+        assert!(json.contains("\"stream_id\":\"9\""));
+        assert_eq!(decode_control(&encoded).expect("round trip"), message);
+        assert!(encode_control(&result_status(None)).is_ok());
+    }
+
+    #[test]
+    fn result_status_rejects_open_vocabulary_and_free_text_detail() {
+        let mut outcome = ResultStatus::new("m", "s", 1, 1, "op", "done", None);
+        assert!(
+            ControlMessage::ResultStatus(outcome.clone())
+                .validate()
+                .is_err()
+        );
+        outcome.outcome = "cancelled".to_owned();
+        assert!(ControlMessage::ResultStatus(outcome).validate().is_ok());
+        for (code, execution) in [
+            ("", "unknown"),
+            ("HTTP CANCELLED", "unknown"),
+            ("HTTP_CANCELLED", "Bearer secret"),
+            ("HTTP_CANCELLED", "/private/path"),
+        ] {
+            let message = result_status(Some(ResultDetail {
+                code: code.to_owned(),
+                execution: execution.to_owned(),
+            }));
+            assert!(message.validate().is_err(), "{code:?}/{execution:?}");
+        }
+        let long = result_status(Some(ResultDetail {
+            code: "A".repeat(MAX_RESULT_TOKEN_BYTES + 1),
+            execution: "unknown".to_owned(),
+        }));
+        assert!(long.validate().is_err());
+        let zero_stream =
+            ControlMessage::ResultStatus(ResultStatus::new("m", "s", 1, 0, "op", "failed", None));
+        assert!(zero_stream.validate().is_err());
+        let unknown_field = br#"{"type":"RESULT_STATUS","message_id":"m","session_id":"s","epoch":"1","stream_id":"1","operation_id":"op","outcome":"failed","body":"x"}"#;
+        assert!(decode_control(unknown_field).is_err());
+    }
 
     fn ping() -> ControlMessage {
         ControlMessage::Ping(Ping::new("m-1", "session-1", 7, u64::MAX))

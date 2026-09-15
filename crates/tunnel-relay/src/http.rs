@@ -594,13 +594,12 @@ use crate::{
         forwarded_consumer_bearer,
     },
     peer_transport_diagnostics::{PeerTransportDiagnosticOutcome, PeerTransportDiagnosticRole},
-    routing::{
-        OwnerRoute, OwnerRoutingError, OwnerScope, ServiceResolutionError, ServiceTarget,
-        resolve_echo_service,
-    },
+    routing::{OwnerRoute, OwnerRoutingError, OwnerScope, ServiceResolutionError, ServiceTarget},
     runtime::StreamTerminalCause,
     wire::{self, MAX_BODY_BYTES, MAX_CONTROL_BYTES},
 };
+
+pub(crate) mod forward;
 
 /// Per-owner-scope consumer admission permits.
 ///
@@ -762,6 +761,10 @@ pub(crate) struct HttpState {
     /// the control stream and emits the WELCOME.  `None` on every ordinary
     /// relay path, including every consumer route.
     pub(crate) control_attach_barrier: Option<Arc<ControlAttachBarrier>>,
+    /// The `http-forward/1` export served on this relay's public routes.  `None`
+    /// (every production caller today) leaves the HTTP routes answering 404:
+    /// per-profile allowlists are implementation gate 5.
+    pub(crate) http_forward: Option<crate::http::forward::HttpForwardExport>,
 }
 
 /// Build both public consumer and device WebSocket routes. Run this router
@@ -835,6 +838,7 @@ pub fn consumer_router_with_peer_and_barrier(
         peer,
         consumer_upgrade_barrier,
         None,
+        None,
     )
 }
 
@@ -842,6 +846,7 @@ pub fn consumer_router_with_peer_and_barrier(
 /// pre-H3 admission barrier is deliberately separate from the older post-
 /// admission upgrade barrier; ordinary production callers pass `None` for
 /// both and retain the existing route.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn consumer_router_with_peer_and_barriers(
     handle: RelayHandle,
     catalog: SharedCatalog,
@@ -850,6 +855,7 @@ pub(crate) fn consumer_router_with_peer_and_barriers(
     peer: Option<Arc<PeerRuntime>>,
     consumer_upgrade_barrier: Option<Arc<ConsumerUpgradeBarrier>>,
     peer_admission_barrier: Option<Arc<PeerAdmissionBarrier>>,
+    http_forward: Option<crate::http::forward::HttpForwardExport>,
 ) -> Router {
     let state = HttpState {
         handle,
@@ -865,6 +871,7 @@ pub(crate) fn consumer_router_with_peer_and_barriers(
         consumer_upgrade_barrier,
         peer_admission_barrier,
         control_attach_barrier: None,
+        http_forward,
     };
     Router::new()
         .merge(health::router::<HttpState>(state.peer.clone()))
@@ -874,6 +881,10 @@ pub(crate) fn consumer_router_with_peer_and_barriers(
         .route(
             "/v1/devices/{device}/services/{service}/stream",
             get(echo_stream),
+        )
+        .route(
+            "/v1/devices/{device}/services/{service}/http/{*path}",
+            axum::routing::any(crate::http::forward::http_forward_route),
         )
         // A known path with an unserved method is a typed not-dispatched
         // rejection, so a GET/HEAD/OPTIONS shape at the POST-only echo route
@@ -927,6 +938,7 @@ pub fn device_router_with_peer_and_barrier(
         consumer_upgrade_barrier: None,
         peer_admission_barrier: None,
         control_attach_barrier,
+        http_forward: None,
     };
     Router::new()
         .route("/v1/tunnel/control", get(control))
@@ -2183,6 +2195,23 @@ async fn service_and_grant(
     device_id: Uuid,
     service: &str,
 ) -> Result<(Uuid, tunnel_catalog::GrantSnapshot), Response> {
+    service_and_grant_of_type(
+        state,
+        consumer,
+        device_id,
+        service,
+        crate::ECHO_SERVICE_TYPE,
+    )
+    .await
+}
+
+pub(crate) async fn service_and_grant_of_type(
+    state: &HttpState,
+    consumer: &tunnel_catalog::AuthenticatedConsumer,
+    device_id: Uuid,
+    service: &str,
+    service_type: &str,
+) -> Result<(Uuid, tunnel_catalog::GrantSnapshot), Response> {
     let filter = DeviceListFilter::default();
     let Some(catalog) = state.catalog.as_ref() else {
         return Err(error_response(
@@ -2210,8 +2239,12 @@ async fn service_and_grant(
     // The shared resolver decides identifier-versus-label, existence and
     // ambiguity for every path; this route only maps its typed outcome onto
     // the public response and never selects a first match itself.
-    let service_id = resolve_echo_service(&device.services, ServiceTarget::parse(service))
-        .map_err(service_resolution_response)?;
+    let service_id = crate::routing::resolve_service(
+        &device.services,
+        ServiceTarget::parse(service),
+        service_type,
+    )
+    .map_err(service_resolution_response)?;
     let read_started = Utc::now();
     let grant = catalog
         .authorize(consumer, device_id, service_id, read_started, Utc::now())
@@ -2875,6 +2908,37 @@ async fn handle_peer_ingress_inner(
             let device = resolve_peer_device(&catalog, &request_body.authentication, now).await?;
             handle_peer_device_data(request, handle.clone(), device, fault).await
         }
+        InternalRequest::ConsumerStreams(request_body)
+            if request_body.required_scope == crate::HTTP_FORWARD_OPERATION =>
+        {
+            // The owner re-runs the shared resolver for the HTTP export type
+            // and re-authorizes the grant operation itself; mTLS only
+            // authenticated the forwarding relay.
+            let access = owner_access.ok_or_else(|| {
+                PeerRuntimeError::Membership("consumer authentication failed".to_owned())
+            })?;
+            let grant = owner_stream_grant_of_type(
+                &catalog,
+                &access.consumer,
+                destination.device_id,
+                destination.service_id,
+                access.expires_at,
+                crate::HTTP_FORWARD_SERVICE_TYPE,
+                crate::HTTP_FORWARD_OPERATION,
+            )
+            .await?;
+            crate::http::forward::handle_peer_http_stream(
+                request,
+                handle.clone(),
+                access.consumer,
+                destination.device_id,
+                destination.service_id,
+                grant,
+                access.expires_at,
+                fault,
+            )
+            .await
+        }
         InternalRequest::ConsumerStreams(request_body) => {
             let access = owner_access.ok_or_else(|| {
                 PeerRuntimeError::Membership("consumer authentication failed".to_owned())
@@ -2943,6 +3007,27 @@ async fn owner_stream_grant(
     service_id: Uuid,
     expires_at: chrono::DateTime<Utc>,
 ) -> Result<tunnel_catalog::GrantSnapshot, PeerRuntimeError> {
+    owner_stream_grant_of_type(
+        catalog,
+        consumer,
+        device_id,
+        service_id,
+        expires_at,
+        crate::ECHO_SERVICE_TYPE,
+        crate::ECHO_OPERATION,
+    )
+    .await
+}
+
+async fn owner_stream_grant_of_type(
+    catalog: &SharedCatalog,
+    consumer: &tunnel_catalog::AuthenticatedConsumer,
+    device_id: Uuid,
+    service_id: Uuid,
+    expires_at: chrono::DateTime<Utc>,
+    service_type: &str,
+    operation: &str,
+) -> Result<tunnel_catalog::GrantSnapshot, PeerRuntimeError> {
     let devices = catalog
         .list_devices_filtered(consumer, &DeviceListFilter::default(), Utc::now())
         .await
@@ -2959,14 +3044,18 @@ async fn owner_stream_grant(
     // envelope carries an identifier, never a label, so a duplicate label
     // cannot reach dispatch here either: an ambiguous or missing target is
     // refused before any stream is opened.
-    let service_id = resolve_echo_service(&device.services, ServiceTarget::Id(service_id))
-        .map_err(|error| PeerRuntimeError::Membership(error.to_string()))?;
+    let service_id = crate::routing::resolve_service(
+        &device.services,
+        ServiceTarget::Id(service_id),
+        service_type,
+    )
+    .map_err(|error| PeerRuntimeError::Membership(error.to_string()))?;
     let grant = catalog
         .authorize(consumer, device_id, service_id, Utc::now(), Utc::now())
         .await
         .map_err(|_| PeerRuntimeError::Membership("authorization unavailable".to_owned()))?
         .ok_or_else(|| PeerRuntimeError::Membership("service is not authorized".to_owned()))?;
-    if !grant.permissions.allows(crate::ECHO_OPERATION) {
+    if !grant.permissions.allows(operation) {
         return Err(PeerRuntimeError::Membership(
             "service is not authorized".to_owned(),
         ));

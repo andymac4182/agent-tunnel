@@ -35,6 +35,8 @@ uuid = { version = "1.18", features = ["v4", "serde"] }
 tunnel-core.workspace = true
 tunnel-catalog = { path = "../tunnel-catalog" }
 tunnel-cluster = { path = "../tunnel-cluster" }
+tunnel-http-bridge = { path = "../tunnel-http-bridge" }
+tunnel-http-forward = { path = "../tunnel-http-forward" }
 tunnel-protocol = { path = "../tunnel-protocol" }
 tunnel-transport = { path = "../tunnel-transport" }
 serde.workspace = true

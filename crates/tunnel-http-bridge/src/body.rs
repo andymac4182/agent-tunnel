@@ -16,6 +16,8 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tunnel_http_forward::HttpErrorCode;
 
+use crate::stream::QueueStats;
+
 /// A body stream error.  It carries only the sanitized code.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct BodyError {
@@ -46,6 +48,7 @@ enum Terminal {
 #[derive(Debug, Default)]
 struct Shared {
     terminal: OnceLock<Terminal>,
+    stats: Arc<QueueStats>,
 }
 
 /// The pump's half.
@@ -64,7 +67,14 @@ impl BodySender {
     /// # Errors
     /// [`BodyClosed`] when the body was dropped.
     pub async fn send(&self, data: Bytes) -> Result<(), BodyClosed> {
-        self.tx.send(data).await.map_err(|_| BodyClosed)
+        let len = data.len();
+        // Charged before the send so the reader never releases bytes that
+        // were not yet counted.
+        self.shared.stats.add(len);
+        self.tx.send(data).await.map_err(|_| {
+            self.shared.stats.sub(len);
+            BodyClosed
+        })
     }
 
     /// End the body successfully after already queued chunks.
@@ -125,6 +135,13 @@ impl ChannelBody {
         (sender, body)
     }
 
+    /// Byte accounting for chunks queued between the pump and this body's
+    /// reader: the current occupancy and its high-water mark.
+    #[must_use]
+    pub fn stats(&self) -> Arc<QueueStats> {
+        Arc::clone(&self.shared.stats)
+    }
+
     /// A complete body of known bytes.
     #[must_use]
     pub fn full(data: Bytes) -> Self {
@@ -132,6 +149,7 @@ impl ChannelBody {
         let (sender, body) = Self::channel(1, Some(length), None);
         if !data.is_empty() {
             // A fresh one-slot queue always has room.
+            sender.shared.stats.add(data.len());
             let _ = sender.tx.try_send(data);
         }
         sender.finish();
@@ -174,7 +192,10 @@ impl Body for ChannelBody {
         };
         match rx.poll_recv(cx) {
             Poll::Pending => Poll::Pending,
-            Poll::Ready(Some(data)) => Poll::Ready(Some(Ok(Frame::data(data)))),
+            Poll::Ready(Some(data)) => {
+                this.shared.stats.sub(data.len());
+                Poll::Ready(Some(Ok(Frame::data(data))))
+            }
             Poll::Ready(None) => {
                 this.done = true;
                 match this.shared.terminal.get() {

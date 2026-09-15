@@ -11,6 +11,7 @@
 
 mod config;
 pub mod credentials;
+pub mod http_forward;
 mod m2_runtime;
 
 use config::{ExportConfig, ExportKind, RuntimeConfig};
@@ -359,11 +360,26 @@ impl Drop for ConnectionHandle {
     }
 }
 
+/// Connect the M2 control/data pair with in-process `http-forward/1`
+/// handlers registered for the configured `http-forward` exports.  The M1
+/// profile has no HTTP exports and is rejected.
+pub async fn connect_with_http_handlers(
+    options: ConnectOptions,
+    handlers: http_forward::HttpHandlers,
+) -> Result<ConnectionHandle, ClientError> {
+    if options.profile != TransportProfile::M2 {
+        return Err(ClientError::Invalid(
+            "http-forward exports require the M2 transport profile",
+        ));
+    }
+    m2_runtime::connect_m2(options, handlers).await
+}
+
 /// Connect the control/data pair, perform HELLO/WELCOME and DATA_READY, then
 /// return a handle for the running session actor.
 pub async fn connect(options: ConnectOptions) -> Result<ConnectionHandle, ClientError> {
     if options.profile == TransportProfile::M2 {
-        return m2_runtime::connect_m2(options).await;
+        return m2_runtime::connect_m2(options, http_forward::HttpHandlers::default()).await;
     }
     options.config.validate()?;
     if options.cancellation.is_cancelled() {
@@ -483,6 +499,7 @@ fn configured_services(config: &RuntimeConfig) -> Vec<ServiceAdvertisement> {
                 name.clone(),
                 match export.kind {
                     ExportKind::Echo => "echo",
+                    ExportKind::HttpForward => "http-forward",
                 },
                 "1",
                 ["echo", "data", "fin", "ack"],
@@ -1330,7 +1347,8 @@ impl SessionActor {
             | ControlMessage::Hello(_)
             | ControlMessage::Pong(_)
             | ControlMessage::AuthorizationChallenge(_) => Ok(()),
-            ControlMessage::RotateRequest(_)
+            ControlMessage::ResultStatus(_)
+            | ControlMessage::RotateRequest(_)
             | ControlMessage::RotatePrepare(_)
             | ControlMessage::RotateQuiesce(_)
             | ControlMessage::RotateFrozen(_)

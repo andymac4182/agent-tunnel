@@ -131,9 +131,9 @@ impl RuntimeConfig {
                     "export names must contain 1 to 128 ASCII letters, digits, dots, hyphens, or underscores",
                 ));
             }
-            if export.kind != ExportKind::Echo {
+            if export.kind == ExportKind::HttpForward && export.device_canary.is_some() {
                 return Err(RuntimeConfigError::Invalid(
-                    "M1 exposes only the named echo export",
+                    "an http-forward export has no device_canary",
                 ));
             }
             if let Some(canary) = &export.device_canary
@@ -259,6 +259,11 @@ impl Default for ExportConfig {
 #[serde(rename_all = "lowercase")]
 pub enum ExportKind {
     Echo,
+    /// An `http-forward/1` export.  It is admitted only when an in-process
+    /// handler is registered for the same service identifier; the M1 profile
+    /// never admits it.
+    #[serde(rename = "http-forward")]
+    HttpForward,
 }
 
 /// Resource limits enforced before work enters a client queue.

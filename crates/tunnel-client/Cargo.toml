@@ -10,6 +10,10 @@ publish.workspace = true
 [dependencies]
 tunnel-core.workspace = true
 tunnel-protocol = { path = "../tunnel-protocol" }
+tunnel-http-bridge = { path = "../tunnel-http-bridge" }
+bytes = "1"
+http = "1"
+http-body-util = "0.1"
 tunnel-transport = { path = "../tunnel-transport" }
 futures-util = { version = "0.3.31", features = ["sink", "std"] }
 rcgen = "0.13"

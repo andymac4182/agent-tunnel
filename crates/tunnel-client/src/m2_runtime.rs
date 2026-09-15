@@ -51,6 +51,11 @@ use tunnel_protocol::{
 };
 use url::Url;
 
+#[path = "m2_http.rs"]
+mod m2_http;
+use crate::http_forward::{HttpActorRequest, HttpHandlers};
+use m2_http::{DeviceHttpState, HTTP_FORWARD_OPERATION};
+
 const M2_FEATURE: &str = "ordered-rotation-v1";
 const OWNER_FENCING_FEATURE: &str = "owner-fencing-v1";
 const M1_FEATURES: [&str; 3] = ["m1-control-data", "authorization-challenge", "echo"];
@@ -120,9 +125,9 @@ const M2_PENDING_OPEN_MAX_ESTIMATE: usize = 2 * MAX_CONTROL_MESSAGE_BYTES
 /// grant and device identity; this margin only prevents a long-lived stream
 /// from dispatching at the exact expiry boundary.
 const M2_AUTH_REFRESH_MARGIN: Duration = Duration::from_millis(1_500);
-const M2_RESET_AUTH_EXPIRED: u16 = 4_001;
-const M2_RESET_PROTOCOL: u16 = 4_002;
-const M2_RESET_RECORD_LIMIT: u16 = 4_003;
+const M2_RESET_AUTH_EXPIRED: u16 = tunnel_protocol::reset_reason::AUTHORIZATION_EXPIRED;
+const M2_RESET_PROTOCOL: u16 = tunnel_protocol::reset_reason::PROTOCOL;
+const M2_RESET_RECORD_LIMIT: u16 = tunnel_protocol::reset_reason::RECORD_LIMIT;
 const OWNER_FENCE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 
 fn critical_reserved_bytes(max_queue_bytes: usize) -> usize {
@@ -213,6 +218,7 @@ type M2SupervisorJoin = JoinHandle<Result<(), ClientError>>;
 /// Establish an M2 control/data session and hand ownership to the actor.
 pub(super) async fn connect_m2(
     options: super::ConnectOptions,
+    http_handlers: HttpHandlers,
 ) -> Result<ConnectionHandle, ClientError> {
     options.config.validate()?;
     if options.cancellation.is_cancelled() {
@@ -329,6 +335,7 @@ pub(super) async fn connect_m2(
             control_local_addr,
             active_local_addr,
             None,
+            http_handlers,
         )
         .await
     });
@@ -1266,6 +1273,8 @@ struct M2Stream {
     /// This makes repeated CANCEL/auth-expiry paths idempotent before the
     /// terminal frame reaches the active carrier.
     reset_queued: bool,
+    /// Present only for an `http-forward/1` stream; see `m2_http`.
+    http: Option<DeviceHttpState>,
 }
 
 /// Consume as many complete length-prefixed echo records as are available.
@@ -1335,8 +1344,26 @@ impl M2Stream {
     }
 }
 
+/// Whether a new output of `kind` must be suppressed because the connector
+/// already ended its direction.  Only an HTTP stream's RESET may follow its
+/// FIN.
+fn output_blocked(stream: &M2Stream, kind: FrameKind) -> bool {
+    if stream.is_http() && kind == FrameKind::Reset {
+        stream.output_reset
+    } else {
+        stream.terminal()
+    }
+}
+
 fn queue_reset_once(stream: &mut M2Stream) -> bool {
-    if stream.terminal() || stream.reset_queued {
+    // An HTTP response may complete (FIN) before its upload is aborted; the
+    // protocol lets RESET follow FIN solely to reset the stream.
+    let terminal = if stream.is_http() {
+        stream.output_reset
+    } else {
+        stream.terminal()
+    };
+    if terminal || stream.reset_queued {
         return false;
     }
     stream.reset_queued = true;
@@ -1394,6 +1421,10 @@ struct M2Actor {
     pending_critical_control_bytes: usize,
     data_budget: Arc<QueueBudget>,
     events: mpsc::Sender<ActorEvent>,
+    /// Registered in-process HTTP exports and their diagnostics.
+    http_handlers: HttpHandlers,
+    /// Bounded request channel from HTTP exchange tasks to this actor.
+    http_requests: mpsc::Sender<HttpActorRequest>,
     active: Carrier,
     candidate: Option<Carrier>,
     retiring: Option<Carrier>,
@@ -1503,8 +1534,12 @@ async fn run_m2_session(
     control_local_addr: Option<std::net::SocketAddr>,
     active_local_addr: Option<std::net::SocketAddr>,
     test_writer_gate: Option<super::WriterTestGate>,
+    http_handlers: HttpHandlers,
 ) -> Result<(), ClientError> {
     let (events_tx, mut events_rx) = mpsc::channel(M2_EVENT_CAPACITY);
+    // Each HTTP exchange task holds at most one outstanding request.
+    let (http_requests_tx, mut http_requests_rx) =
+        mpsc::channel(config.limits.max_streams.max(1).saturating_mul(2));
     let (writer_failure_tx, mut writer_failure_rx) = mpsc::channel(2);
     let (control_queue, control_receiver) = OutboundQueue::new(
         config.limits.max_queue_frames.min(16),
@@ -1561,6 +1596,8 @@ async fn run_m2_session(
         pending_critical_control_bytes: 0,
         data_budget,
         events: events_tx.clone(),
+        http_handlers,
+        http_requests: http_requests_tx,
         active,
         candidate: None,
         retiring: None,
@@ -1652,6 +1689,9 @@ async fn run_m2_session(
                 if let Err(error) = actor.flush_pending_outputs().await {
                     break Err(error);
                 }
+                if let Err(error) = actor.retry_all_http_parked().await {
+                    break Err(error);
+                }
                 if let Err(error) = actor.apply_pending_quiesce() {
                     break Err(error);
                 }
@@ -1689,6 +1729,11 @@ async fn run_m2_session(
                     }
                     Some(Err(error)) => break Err(actor.control_lost_error(sanitize_error(&error.to_string()))),
                     None => break Err(actor.control_lost_error("control socket closed".to_owned())),
+                }
+            }
+            Some(request) = http_requests_rx.recv() => {
+                if let Err(error) = actor.handle_http_request(request).await {
+                    break Err(error);
                 }
             }
             event = events_rx.recv() => {
@@ -1978,7 +2023,13 @@ impl M2Actor {
         for stream in self.streams.values() {
             total = total
                 .saturating_add(stream.pending_bytes)
-                .saturating_add(stream.record_buffer.len());
+                .saturating_add(stream.record_buffer.len())
+                .saturating_add(
+                    stream
+                        .http
+                        .as_ref()
+                        .map_or(0, DeviceHttpState::retained_bytes),
+                );
             for direction in [Direction::ConnectorToRelay, Direction::RelayToConnector] {
                 let state = stream.sequence.direction(direction);
                 total = total
@@ -3241,6 +3292,11 @@ impl M2Actor {
             ControlMessage::RotateRequest(_) => Err(ClientError::Protocol(
                 "connector received an unsolicited ROTATE_REQUEST".to_owned(),
             )),
+            // Only the device reports adapter outcomes; the owner never sends
+            // RESULT_STATUS to a connector.
+            ControlMessage::ResultStatus(_) => Err(ClientError::Protocol(
+                "connector received an unsolicited RESULT_STATUS".to_owned(),
+            )),
         }
     }
 
@@ -3833,9 +3889,15 @@ impl M2Actor {
                 "service is not locally allowlisted",
             );
         };
-        if export.kind != super::ExportKind::Echo
-            || !matches!(open.operation.as_str(), "echo" | "echo_stream")
-        {
+        // An HTTP export needs both the local allowlist entry and a
+        // registered in-process handler; the OPEN cannot select anything else.
+        let http_export = (export.kind == super::ExportKind::HttpForward
+            && open.operation == HTTP_FORWARD_OPERATION)
+            .then(|| self.http_handlers.export(&open.service_id).cloned())
+            .flatten();
+        let echo = export.kind == super::ExportKind::Echo
+            && matches!(open.operation.as_str(), "echo" | "echo_stream");
+        if !echo && http_export.is_none() {
             return self.send_open_rejected_journaled(
                 open,
                 "OPERATION_DENIED",
@@ -3969,6 +4031,18 @@ impl M2Actor {
         let stream_slots = self.config.limits.max_streams.max(1);
         let replay_bytes = (self.config.limits.max_queue_bytes / stream_slots).max(1);
         let replay_frames = (self.config.limits.max_queue_frames / stream_slots).max(1);
+        // An HTTP response is written independently of the request, so its
+        // replay and reorder capacity must cover the whole window (the owner
+        // acknowledges on receipt); credit alone then parks a write.
+        let (replay_bytes, replay_frames) = if http_export.is_some() {
+            let window = usize::try_from(initial_credit.max(receive_credit)).unwrap_or(usize::MAX);
+            (
+                replay_bytes.max(window),
+                replay_frames.max(window.div_ceil(MAX_PAYLOAD_LEN).saturating_add(2)),
+            )
+        } else {
+            (replay_bytes, replay_frames)
+        };
         let limits = SequenceLimits::new(
             tunnel_protocol::sequence::DEFAULT_MAX_REPLAY_FRAMES.min(replay_frames),
             tunnel_protocol::sequence::DEFAULT_MAX_REPLAY_BYTES.min(replay_bytes),
@@ -4008,7 +4082,17 @@ impl M2Actor {
             output_fin: false,
             output_reset: false,
             reset_queued: false,
+            http: None,
         };
+        let mut stream = stream;
+        if let Some(http_export) = http_export {
+            stream.http = Some(self.start_http_exchange(
+                open.stream_id,
+                &open.service_id,
+                http_export,
+                receive_credit,
+            ));
+        }
         self.control_queue.try_send_pair(
             opened_message.clone(),
             None,
@@ -4284,8 +4368,10 @@ impl M2Actor {
             .streams
             .iter()
             .filter_map(|(&stream_id, stream)| {
-                if stream.operation != "echo_stream"
-                    || !stream.auth.confirmed
+                if !matches!(
+                    stream.operation.as_str(),
+                    "echo_stream" | HTTP_FORWARD_OPERATION
+                ) || !stream.auth.confirmed
                     || stream.auth.refresh_in_flight
                     || stream.auth.invalidated
                     || self
@@ -4331,8 +4417,10 @@ impl M2Actor {
             let Some(stream) = self.streams.get(&stream_id) else {
                 continue;
             };
-            if stream.operation != "echo_stream"
-                || !stream.auth.confirmed
+            if !matches!(
+                stream.operation.as_str(),
+                "echo_stream" | HTTP_FORWARD_OPERATION
+            ) || !stream.auth.confirmed
                 || stream.auth.refresh_in_flight
                 || stream.auth.invalidated
             {
@@ -4388,8 +4476,10 @@ impl M2Actor {
             let Some(stream) = self.streams.get(&stream_id) else {
                 continue;
             };
-            if stream.operation != "echo_stream"
-                || !stream.auth.confirmed
+            if !matches!(
+                stream.operation.as_str(),
+                "echo_stream" | HTTP_FORWARD_OPERATION
+            ) || !stream.auth.confirmed
                 || stream.auth.refresh_in_flight
                 || stream.auth.invalidated
             {
@@ -4513,6 +4603,7 @@ impl M2Actor {
                 && self.config.exports.contains_key(&stream.service_id)
         });
         if matches_operation {
+            self.http_abort(cancel.stream_id, tunnel_protocol::reset_reason::CANCELLED);
             let pending_bytes = {
                 let stream = self
                     .streams
@@ -5308,6 +5399,10 @@ impl M2Actor {
         // and acknowledged below, so the sequence evidence both sides compare
         // is unchanged.
         let invalidated = stream.auth.invalidated;
+        // HTTP request bytes release receive credit only when the handler
+        // side reads them (see `m2_http`), never on hand-off.
+        let http_stream = stream.is_http();
+        let mut peer_reset_reason = None;
         let mut reset_ready = false;
         let mut reset_delivered = false;
         // Sequence byte credit is cumulative.  Once a DATA frame has been
@@ -5325,7 +5420,10 @@ impl M2Actor {
                     .sequence
                     .mark_delivered(Direction::RelayToConnector, sequence)
                     .map_err(|error| ClientError::Protocol(error.to_string()))?;
-                if ready_frame.kind == FrameKind::Data {
+                if ready_frame.kind == FrameKind::Reset {
+                    peer_reset_reason = ready_frame.reset_reason().ok().flatten();
+                }
+                if ready_frame.kind == FrameKind::Data && !http_stream {
                     released_receive_bytes = released_receive_bytes
                         .checked_add(ready_frame.payload.len())
                         .ok_or_else(|| {
@@ -5368,7 +5466,7 @@ impl M2Actor {
                         .mark_delivered(Direction::RelayToConnector, sequence)
                         .map_err(|error| ClientError::Protocol(error.to_string()))?;
                 }
-                if kind == FrameKind::Data {
+                if kind == FrameKind::Data && !http_stream {
                     released_receive_bytes = released_receive_bytes
                         .checked_add(payload.len())
                         .ok_or_else(|| {
@@ -5379,6 +5477,12 @@ impl M2Actor {
                     FrameKind::Data => self.dispatch_payload(stream_id, payload).await?,
                     FrameKind::Fin => self.dispatch_fin(stream_id).await?,
                     FrameKind::Reset => {
+                        if http_stream && payload.len() == 2 {
+                            self.http_abort(
+                                stream_id,
+                                u16::from_be_bytes([payload[0], payload[1]]),
+                            );
+                        }
                         self.handle_peer_reset(stream_id).await?;
                         reset_delivered = true;
                     }
@@ -5387,7 +5491,13 @@ impl M2Actor {
             }
         }
         if reset_ready && !reset_delivered {
+            if http_stream {
+                self.http_abort(stream_id, peer_reset_reason.unwrap_or(M2_RESET_PROTOCOL));
+            }
             self.handle_peer_reset(stream_id).await?;
+        }
+        if http_stream && matches!(frame.kind, FrameKind::Ack | FrameKind::WindowUpdate) {
+            self.retry_http_parked(stream_id).await?;
         }
         if acknowledge_frame {
             self.defer_ack(&key, stream_id, received_cursor)?;
@@ -5934,10 +6044,14 @@ impl M2Actor {
         }
         let deadline = stream.auth.deadline.min(stream.auth.operation_deadline);
         let streaming = stream.is_streaming();
+        let http = stream.is_http();
         if deadline.expired() {
             return self.expire_stream(stream_id).await;
         }
-        if streaming {
+        if http {
+            self.http_dispatch_payload(stream_id, payload);
+            Ok(())
+        } else if streaming {
             self.dispatch_stream_records(stream_id, payload).await
         } else {
             let canary = self
@@ -6005,6 +6119,20 @@ impl M2Actor {
             stream.is_streaming()
                 && (stream.record_expected.is_some() || !stream.record_buffer.is_empty()),
         );
+        // An HTTP response may finish before the upload does, so only the
+        // request direction's own terminal state blocks its FIN.
+        let http_blocked = stream.auth.invalidated
+            || !stream.auth.confirmed
+            || stream.input_fin
+            || stream.output_reset;
+        if stream.is_http() {
+            if http_blocked {
+                return Ok(());
+            }
+            // The request FIN half-closes only the request direction.
+            self.http_dispatch_fin(stream_id);
+            return Ok(());
+        }
         if blocked {
             return Ok(());
         }
@@ -6068,7 +6196,7 @@ impl M2Actor {
         let stream_terminal = self
             .streams
             .get(&output.stream_id)
-            .is_none_or(M2Stream::terminal);
+            .is_none_or(|stream| output_blocked(stream, output.kind));
         if stream_terminal {
             return Ok(());
         }
@@ -6144,7 +6272,7 @@ impl M2Actor {
             let Some(stream) = self.streams.get(&output.stream_id) else {
                 return Ok(());
             };
-            if stream.terminal() {
+            if output_blocked(stream, output.kind) {
                 return Ok(());
             }
             if output.kind == FrameKind::Reset && !stream.reset_queued {
@@ -7787,6 +7915,7 @@ impl M2Actor {
     }
 
     async fn expire_stream(&mut self, stream_id: u64) -> Result<(), ClientError> {
+        self.http_abort(stream_id, M2_RESET_AUTH_EXPIRED);
         if let Some(stream) = self.streams.get_mut(&stream_id) {
             stream.auth.invalidated = true;
             let pending_bytes = stream.pending_bytes;
@@ -8437,6 +8566,8 @@ mod tests {
             pending_critical_control_bytes: 0,
             data_budget,
             events,
+            http_handlers: HttpHandlers::default(),
+            http_requests: mpsc::channel(1).0,
             active,
             candidate: None,
             retiring: None,
@@ -9457,6 +9588,7 @@ mod tests {
             output_fin: false,
             output_reset: false,
             reset_queued: false,
+            http: None,
         }
     }
 
@@ -13834,6 +13966,7 @@ mod tests {
             None,
             None,
             Some(gate.clone()),
+            HttpHandlers::default(),
         ));
 
         // The test-only writer gate holds the first control item after the

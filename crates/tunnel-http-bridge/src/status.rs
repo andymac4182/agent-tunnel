@@ -28,6 +28,14 @@ impl Execution {
         }
     }
 
+    /// Parse the exact wire spelling; anything else is `None`.
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
+        [Self::NotDispatched, Self::Dispatched, Self::Unknown]
+            .into_iter()
+            .find(|execution| execution.as_str() == text)
+    }
+
     pub(crate) const fn to_u8(self) -> u8 {
         match self {
             Self::NotDispatched => 0,

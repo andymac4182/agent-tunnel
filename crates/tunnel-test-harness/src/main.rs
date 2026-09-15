@@ -1519,6 +1519,74 @@ async fn main() -> ExitCode {
                 )),
             }
         }
+        [command] if command == "verify-m3-http-forward-real-path" => {
+            match tokio::time::timeout(
+                Duration::from_secs(300),
+                tunnel_test_harness::production_cluster::verify_http_forward_real_path(),
+            )
+            .await
+            {
+                Ok(result) => result.and_then(|evidence| {
+                    // Re-validate at the command boundary so a validator
+                    // regression cannot silently pass the command.
+                    tunnel_test_harness::production_cluster::validate_http_forward_real_path_evidence(
+                        &evidence,
+                    )?;
+                    println!(
+                        "M3 http-forward real path passed: relays={} owner={} ingress={} non_owner_ingress={} upload_bytes={} echoed_bytes={} handler_sha256_match={} echo_sha256_match={} saturated_when_probed={} permission_status={} permission_latency_ms={} owner_local_permission_exact={} cancel_owner_release={} cancel_reset_reason={:?} cancel_ingress_error={:?} cancel_device_response_aborted={} handler_cancellation_latency_ms={} ingress_request_handoff_hw={} ingress_response_handoff_hw={} ingress_response_body_hw={} ingress_peer_in_flight_hw={} ingress_peer_receive_hw={} owner_request_handoff_hw={} owner_response_handoff_hw={} owner_peer_in_flight_hw={} owner_peer_receive_hw={} owner_receive_buffer_hw={}/{} owner_parked_hw={} owner_replay_hw={} owner_data_bytes_hw={}/{} device_receive_buffer_hw={}/{} device_parked_hw={} device_request_handoff_hw={} device_response_handoff_hw={} device_request_body_hw={} handler_headers={:?} handler_forbidden_header={} handler_value_leak={} response_header_leak={} internal_header_probe={} unauthenticated={} rejected_probes_dispatched={}",
+                        evidence.relay_count,
+                        evidence.owner_node,
+                        evidence.ingress_node,
+                        evidence.non_owner_ingress,
+                        evidence.upload_bytes,
+                        evidence.echoed_bytes,
+                        evidence.handler_digest_matches_upload,
+                        evidence.echo_digest_matches_upload,
+                        evidence.saturated_when_probed,
+                        evidence.permission_status,
+                        evidence.permission_latency_ms,
+                        evidence.owner_local_permission_exact,
+                        evidence.cancel_owner_release,
+                        evidence.cancel_owner_reset_reason,
+                        evidence.cancel_ingress_error,
+                        evidence.cancel_device_response_aborted,
+                        evidence.handler_cancellation_latency_ms,
+                        evidence.max_ingress_request_handoff,
+                        evidence.max_ingress_response_handoff,
+                        evidence.max_ingress_response_body,
+                        evidence.max_ingress_peer_send_in_flight,
+                        evidence.max_ingress_peer_receive_queue,
+                        evidence.max_owner_request_handoff,
+                        evidence.max_owner_response_handoff,
+                        evidence.max_owner_peer_send_in_flight,
+                        evidence.max_owner_peer_receive_queue,
+                        evidence.max_owner_receive_buffer,
+                        evidence.owner_receive_window,
+                        evidence.max_owner_parked,
+                        evidence.max_owner_replay,
+                        evidence.owner_data_bytes_high_water,
+                        evidence.owner_data_bytes_limit,
+                        evidence.max_device_receive_buffer,
+                        evidence.device_receive_window,
+                        evidence.max_device_parked,
+                        evidence.max_device_request_handoff,
+                        evidence.max_device_response_handoff,
+                        evidence.max_device_request_body,
+                        evidence.handler_header_names,
+                        evidence.handler_saw_forbidden_header,
+                        evidence.handler_header_value_leak,
+                        evidence.consumer_response_header_leak,
+                        evidence.internal_header_probe_status,
+                        evidence.unauthenticated_status,
+                        evidence.rejected_probes_dispatched,
+                    );
+                    Ok(())
+                }),
+                Err(_) => Err(HarnessError::Timeout(
+                    "verify-m3-http-forward-real-path exceeded its bounded deadline".into(),
+                )),
+            }
+        }
         [command] if command == "verify-m7-queue-saturation" => {
             match tokio::time::timeout(
                 Duration::from_secs(240),

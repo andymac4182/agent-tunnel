@@ -34,6 +34,24 @@ impl HttpErrorCode {
             Self::DeadlineExceeded => "HTTP_DEADLINE_EXCEEDED",
         }
     }
+
+    /// Every defined code.
+    pub const ALL: [Self; 8] = [
+        Self::BadRecord,
+        Self::InvalidHead,
+        Self::BodyLimit,
+        Self::LengthMismatch,
+        Self::UnsupportedFeature,
+        Self::StreamInterrupted,
+        Self::Cancelled,
+        Self::DeadlineExceeded,
+    ];
+
+    /// Parse the exact wire spelling; anything else is `None`.
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|code| code.as_str() == text)
+    }
 }
 
 impl fmt::Display for HttpErrorCode {

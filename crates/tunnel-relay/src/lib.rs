@@ -15,6 +15,7 @@ mod consumer_framing;
 mod consumer_write_diagnostics;
 mod health;
 mod http;
+pub mod http_forward_diagnostics;
 pub mod membership_runtime;
 pub mod membership_version_state;
 mod peer_consumer_transport_diagnostics;
@@ -39,6 +40,7 @@ pub use consumer_write_diagnostics::{
     ConsumerIngressKind, ConsumerWriteDiagnosticSnapshot, ConsumerWriteScope,
     ConsumerWriteTimeoutSnapshot,
 };
+pub use http::forward::{HttpForwardExport, PEER_HOP_WINDOW_BYTES, PEER_HOP_WINDOW_RECORDS};
 pub use http::{
     ConsumerUpgradeBarrier, ControlAttachBarrier, PeerAdmissionBarrier, PeerAdmissionScope,
     consumer_router, device_router, device_router_with_peer_and_barrier, peer_ingress_handler,
@@ -93,3 +95,8 @@ pub const PROTOCOL_MAJOR: u8 = 1;
 pub const ECHO_SERVICE_TYPE: &str = "echo";
 /// The fixed operation name used by the echo grant.
 pub const ECHO_OPERATION: &str = "echo:invoke";
+/// The catalog service type of an `http-forward/1` export.
+pub const HTTP_FORWARD_SERVICE_TYPE: &str = "http-forward";
+/// The grant operation (and consumer token scope) for an `http-forward/1`
+/// export.
+pub const HTTP_FORWARD_OPERATION: &str = "http:invoke";
