@@ -101,6 +101,7 @@ const WAIT: Duration = Duration::from_secs(30);
 const POLL: Duration = Duration::from_millis(20);
 const MAX_ROTATIONS_PER_CASE: u64 = 4;
 const OUTCOME_WAIT: Duration = Duration::from_secs(45);
+const MEMBERSHIP_RESIGN_SPACING: Duration = Duration::from_secs(15);
 const FROZEN_PHASES: [&str; 3] = ["quiescing", "draining", "committing"];
 const SSE_EVENTS: [&[&[u8]]; 3] = [
     &[
@@ -763,6 +764,9 @@ struct Gate<'a> {
     ca: Vec<u8>,
     ingress_addr: std::net::SocketAddr,
     last_stream_id: u64,
+    /// When the membership records in force were signed (bootstrap or the
+    /// last case-boundary re-sign).
+    membership_signed_at: Instant,
     session_id: String,
 }
 
@@ -1143,6 +1147,60 @@ impl Gate<'_> {
 
     /// The four request-direction positions share one shape: an upload
     /// whose digest the handler returns.
+    /// Explain a request that never reached the handler with identifiers,
+    /// status codes and counters only.
+    async fn dispatch_failure(
+        &self,
+        error: HarnessError,
+        response: tokio::task::JoinHandle<Result<http::Response<hyper::body::Incoming>>>,
+    ) -> HarnessError {
+        let status = if response.is_finished() {
+            match response.await {
+                Ok(Ok(response)) => {
+                    let status = response.status().as_u16();
+                    let body = timeout(WAIT, read_all(response.into_body()))
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|body| {
+                            String::from_utf8_lossy(&body)
+                                .chars()
+                                .take(200)
+                                .collect::<String>()
+                        });
+                    format!("status {status} body {body:?}")
+                }
+                Ok(Err(error)) => format!("request failed: {error}"),
+                Err(_) => "request task failed".to_owned(),
+            }
+        } else {
+            response.abort();
+            "no response".to_owned()
+        };
+        let ingress = self
+            .ingress_snapshot()
+            .await
+            .map(|snapshot| {
+                snapshot
+                    .http_forward
+                    .exchanges
+                    .iter()
+                    .rev()
+                    .take(2)
+                    .map(|record| (record.role, record.error_code, record.execution))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let owner_streams = self.owner_snapshot().await.ok().and_then(|snapshot| {
+            self.session(&snapshot)
+                .ok()
+                .map(|session| (session.phase.clone(), session.streams.len()))
+        });
+        HarnessError::Process(format!(
+            "{error}: {status}; ingress {ingress:?}; owner {owner_streams:?}"
+        ))
+    }
+
     async fn upload_case(
         &mut self,
         name: &str,
@@ -1163,7 +1221,9 @@ impl Gate<'_> {
                 body,
             )
             .await?;
-        self.state.wait_invoked(&path).await?;
+        if let Err(error) = self.state.wait_invoked(&path).await {
+            return Err(self.dispatch_failure(error, response).await);
+        }
         let stream_id = self.wait_new_stream().await?;
         let chunks = upload_chunks();
         let observation = match hold {
@@ -1782,17 +1842,71 @@ impl Gate<'_> {
     /// version invalidates every peer admission, and with it every in-flight
     /// peer hop, so no case may straddle a refresh; the fixture's 60-second
     /// records outlive any single case.
+    ///
+    /// The refresh also drops the ingress relays' admissions to the owner, so
+    /// both ingress routes the gate uses must answer a `/ping` again, and the
+    /// owner must have reclaimed those pings, before the next case starts.
     async fn fresh_membership(&mut self) -> Result<()> {
-        self.cluster.resign_membership_now().await.map(|_| ())
+        // Re-sign no more often than the chaos gate's background interval;
+        // every case is shorter than the remaining record lifetime.
+        if self.membership_signed_at.elapsed() < MEMBERSHIP_RESIGN_SPACING {
+            return Ok(());
+        }
+        self.cluster.resign_membership_now().await?;
+        self.membership_signed_at = Instant::now();
+        for node in ["relay-c", "relay-b"] {
+            let address = self.cluster.relay(node)?.consumer_addr()?;
+            if let Err(error) = self.wait_route_ready(address).await {
+                let readiness = self
+                    .cluster
+                    .relays
+                    .iter()
+                    .map(|relay| {
+                        (
+                            relay.node_id.clone(),
+                            relay.membership.readiness(),
+                            relay.peer_runtime.is_ready(),
+                            relay
+                                .membership
+                                .snapshot()
+                                .memberships
+                                .iter()
+                                .map(|membership| membership.record_version)
+                                .collect::<Vec<_>>(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                return Err(HarnessError::Process(format!(
+                    "{node}: {error}; readiness {readiness:?}"
+                )));
+            }
+        }
+        let deadline = Instant::now() + WAIT;
+        loop {
+            let snapshot = self.owner_snapshot().await?;
+            if self.session(&snapshot)?.streams.is_empty() {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(HarnessError::Timeout(
+                    "owner kept a stream after the route checks".into(),
+                ));
+            }
+            sleep(POLL).await;
+        }
     }
 
     /// Before owner loss, confirm relay-c's route to the owner answers.
     async fn wait_route_recovered(&self) -> Result<()> {
+        self.wait_route_ready(self.ingress_addr).await
+    }
+
+    /// Wait until a `/ping` through `ingress_addr` is answered by the device.
+    async fn wait_route_ready(&self, ingress_addr: std::net::SocketAddr) -> Result<()> {
         let deadline = Instant::now() + OUTCOME_WAIT;
         loop {
             let attempt = async {
-                let (mut sender, connection) =
-                    connect_consumer(self.ingress_addr, &self.ca).await?;
+                let (mut sender, connection) = connect_consumer(ingress_addr, &self.ca).await?;
                 let connection = tokio::spawn(async move {
                     let _ = connection.await;
                 });
@@ -1809,15 +1923,29 @@ impl Gate<'_> {
                 let status = response.status().as_u16();
                 let body = read_all(response.into_body()).await;
                 connection.abort();
-                Ok::<_, HarnessError>(status == 200 && body.as_deref() == Some(b"pong".as_slice()))
+                if status == 200 && body.as_deref() == Some(b"pong".as_slice()) {
+                    Ok(None)
+                } else {
+                    // Relay error bodies carry only a code and a fixed message.
+                    Ok::<_, HarnessError>(Some(format!(
+                        "status {status} {:?}",
+                        body.map(|body| String::from_utf8_lossy(&body)
+                            .chars()
+                            .take(160)
+                            .collect::<String>())
+                    )))
+                }
             };
-            if matches!(timeout(Duration::from_secs(5), attempt).await, Ok(Ok(true))) {
-                return Ok(());
-            }
+            let last = match timeout(Duration::from_secs(5), attempt).await {
+                Ok(Ok(None)) => return Ok(()),
+                Ok(Ok(Some(failure))) => failure,
+                Ok(Err(error)) => error.to_string(),
+                Err(_) => "ping timed out".to_owned(),
+            };
             if Instant::now() >= deadline {
-                return Err(HarnessError::Timeout(
-                    "peer route did not recover after the blackhole".into(),
-                ));
+                return Err(HarnessError::Timeout(format!(
+                    "the peer route from {ingress_addr} to the owner did not answer: {last}"
+                )));
             }
             sleep(Duration::from_millis(250)).await;
         }
@@ -2100,6 +2228,7 @@ async fn run(
             ca: harness.pki.server_ca.certificate_der.clone(),
             ingress_addr,
             last_stream_id: 0,
+            membership_signed_at: Instant::now(),
             session_id: session.session_id.clone(),
         };
         let only = std::env::var("M3_ROTATION_CASES").ok();

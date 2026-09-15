@@ -4377,6 +4377,7 @@ impl M2Actor {
                 ) || !stream.auth.confirmed
                     || stream.auth.refresh_in_flight
                     || stream.auth.invalidated
+                    || stream.http_exchange_settled()
                     || self
                         .pending_authorization_refreshes
                         .contains_key(&stream_id)
@@ -7938,6 +7939,15 @@ impl M2Actor {
     }
 
     async fn expire_stream(&mut self, stream_id: u64) -> Result<(), ClientError> {
+        if self
+            .streams
+            .get(&stream_id)
+            .is_some_and(M2Stream::http_exchange_settled)
+        {
+            // Both terminals are in place; only the owner's STREAM_FORGET
+            // remains, and a RESET now would be one it never acknowledges.
+            return Ok(());
+        }
         self.http_abort(stream_id, M2_RESET_AUTH_EXPIRED);
         if let Some(stream) = self.streams.get_mut(&stream_id) {
             stream.auth.invalidated = true;

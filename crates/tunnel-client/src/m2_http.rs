@@ -271,6 +271,24 @@ impl M2Stream {
     pub(super) fn is_http(&self) -> bool {
         self.http.is_some()
     }
+
+    /// An HTTP exchange whose response FIN is sequenced and whose request
+    /// FIN was received in order has nothing left to authorize: no request
+    /// byte can follow, and the handler's response is complete.  Expiring
+    /// its authorization would only emit a RESET after the FIN while the
+    /// owner, having seen both terminals, is already reclaiming the stream —
+    /// a RESET the owner never acknowledges, so the connector could never
+    /// prove the owner's STREAM_FORGET.
+    pub(super) fn http_exchange_settled(&self) -> bool {
+        if !self.is_http() || !self.output_fin || self.output_reset {
+            return false;
+        }
+        let received = self.sequence.direction(Direction::RelayToConnector);
+        matches!(
+            received.receive_terminal(),
+            Some(tunnel_protocol::Terminal::Fin)
+        ) && received.receive_terminal_sequence() == Some(received.recv_contiguous())
+    }
 }
 
 impl M2Actor {
@@ -910,5 +928,69 @@ mod tests {
         assert!(signal.is_paused());
         http.publish_freeze(false);
         assert!(!signal.is_paused());
+    }
+
+    fn http_stream(state: Option<DeviceHttpState>) -> M2Stream {
+        let started = Instant::now();
+        let deadline = DualDeadline::new(started, SystemTime::now(), Duration::from_secs(1))
+            .expect("test deadline");
+        M2Stream {
+            export: crate::ExportConfig::default(),
+            operation_id: "operation".to_owned(),
+            service_id: "service".to_owned(),
+            operation: HTTP_FORWARD_OPERATION.to_owned(),
+            auth: AuthContext {
+                challenge_id: "challenge".to_owned(),
+                nonce: "nonce".to_owned(),
+                permission_digest: "permission".to_owned(),
+                grant_revision: 1,
+                deadline,
+                operation_deadline: deadline,
+                confirmed: true,
+                refresh_in_flight: false,
+                invalidated: false,
+            },
+            sequence: StreamState::new(1, 1024).expect("test sequence"),
+            pending: VecDeque::new(),
+            pending_bytes: 0,
+            record_buffer: Vec::new(),
+            record_expected: None,
+            input_fin: false,
+            input_reset: false,
+            output_fin: false,
+            output_reset: false,
+            reset_queued: false,
+            http: state,
+        }
+    }
+
+    #[test]
+    fn only_an_exchange_with_both_fins_is_settled_for_authorization() {
+        let (http, _, ()) = state();
+        let mut stream = http_stream(Some(http));
+        assert!(!stream.http_exchange_settled(), "nothing ended yet");
+        stream.output_fin = true;
+        assert!(
+            !stream.http_exchange_settled(),
+            "the request FIN has not arrived: request bytes may still need authorization"
+        );
+        let fin = Frame::fin(1, 1, 1, 1, 0);
+        stream
+            .sequence
+            .receive_frame(Direction::RelayToConnector, &fin)
+            .expect("request FIN");
+        assert!(stream.http_exchange_settled());
+        stream.output_reset = true;
+        assert!(
+            !stream.http_exchange_settled(),
+            "a reset exchange is not settled"
+        );
+
+        let mut echo = http_stream(None);
+        echo.output_fin = true;
+        echo.sequence
+            .receive_frame(Direction::RelayToConnector, &fin)
+            .expect("request FIN");
+        assert!(!echo.http_exchange_settled(), "only HTTP streams");
     }
 }
