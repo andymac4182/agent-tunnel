@@ -8,7 +8,18 @@
 //!   and its consumers see an interruption.
 //! * stderr is drained so the child cannot block on it, and only its byte
 //!   count is kept: it is never forwarded, logged or retained.
-//! * Dropping the [`ChildHandle`] kills the process; the supervisor reaps it.
+//! * The child is started in its own process group, and every end of its
+//!   life (kill, crash, normal exit, session end) signals the whole group
+//!   with `SIGKILL`, so a wrapper (`npx`, `uvx`, a shell script) cannot leave
+//!   the real server or its helpers running.  The group signal goes through
+//!   `rustix` (a maintained safe wrapper), keeping this crate
+//!   `forbid(unsafe_code)`.  A descendant that leaves the group (`setsid`,
+//!   `setpgid`, a daemon double fork) is outside this boundary and is not
+//!   killed.  The group is signalled after the leader is reaped; POSIX keeps
+//!   a process-group ID from being reused while any member lives, so the
+//!   signal reaches only surviving members of this group.
+//! * Dropping the [`ChildHandle`] kills the process group; the supervisor
+//!   reaps the leader.
 //!   No lock is held across child I/O: a writer task owns stdin, a reader
 //!   task owns stdout and a supervisor task owns the process.
 
@@ -75,6 +86,8 @@ pub struct ChildCounters {
     pub invalid_output: AtomicU64,
     pub stderr_bytes: AtomicU64,
     pub running: AtomicU64,
+    /// Process-group kills sent (each end of a child's life sends one).
+    pub group_kills: AtomicU64,
 }
 
 /// A spawn failure.  Carries no path or OS message.
@@ -141,6 +154,8 @@ pub fn spawn(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
     for name in &backend.inherit_env {
         if let Some(value) = std::env::var_os(name) {
             command.env(name, value);
@@ -157,6 +172,7 @@ pub fn spawn(
         counters.spawn_failed.fetch_add(1, Ordering::Relaxed);
         return Err(SpawnError);
     };
+    let group = child.id();
     counters.spawned.fetch_add(1, Ordering::Relaxed);
     counters.running.fetch_add(1, Ordering::Relaxed);
 
@@ -185,6 +201,12 @@ pub fn spawn(
                 let _ = child.wait().await;
             }
         }
+        // Whatever ended the leader, no member of its group may outlive it.
+        if kill_group(group) {
+            supervisor_counters
+                .group_kills
+                .fetch_add(1, Ordering::Relaxed);
+        }
         supervisor_counters.exited.fetch_add(1, Ordering::Relaxed);
         supervisor_counters.running.fetch_sub(1, Ordering::Relaxed);
         let _ = exited_tx.send(true);
@@ -198,6 +220,26 @@ pub fn spawn(
         },
         events_rx,
     ))
+}
+
+/// Send `SIGKILL` to the process group led by `leader`.  Returns whether a
+/// group signal was attempted.
+#[cfg(unix)]
+fn kill_group(leader: Option<u32>) -> bool {
+    let Some(pid) = leader
+        .and_then(|pid| i32::try_from(pid).ok())
+        .and_then(rustix::process::Pid::from_raw)
+    else {
+        return false;
+    };
+    // ESRCH (no surviving member) is expected and ignored.
+    let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+    true
+}
+
+#[cfg(not(unix))]
+fn kill_group(_leader: Option<u32>) -> bool {
+    false
 }
 
 async fn write_stdin(

@@ -124,7 +124,10 @@ impl McpProfile {
     #[must_use]
     pub const fn routes(self) -> &'static [Method] {
         match self {
-            Self::V2026_07_28 => &[Method::Post],
+            // GET and DELETE are routed only so the device can answer the
+            // specification's 405 (see `message::validate_get`); they carry
+            // no body and never reach a backend.
+            Self::V2026_07_28 => &[Method::Post, Method::Get, Method::Delete],
             Self::V2025_11_25 => &[Method::Post, Method::Get, Method::Delete],
         }
     }

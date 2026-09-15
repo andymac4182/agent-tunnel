@@ -40,9 +40,21 @@ pub fn fixture_binary() -> PathBuf {
 }
 
 pub fn stdio_export(profile: &str, workspace: &Path, max_children: usize) -> McpExport {
+    stdio_export_with(profile, workspace, max_children, &fixture_binary(), "")
+}
+
+/// A stdio export with an explicit command (for example a wrapper script)
+/// and extra `[backend]` lines.
+pub fn stdio_export_with(
+    profile: &str,
+    workspace: &Path,
+    max_children: usize,
+    command: &Path,
+    extra_backend: &str,
+) -> McpExport {
     let text = format!(
-        "profile = \"{profile}\"\n[backend]\nkind = \"stdio\"\ncommand = \"{}\"\nargs = [\"stdio\"]\nworkspace = \"{}\"\nmax_children = {max_children}\n[limits]\nrequest_body_bytes = 65536\njson_response_bytes = 1048576\nsse_response_bytes = 4194304\n",
-        fixture_binary().display(),
+        "profile = \"{profile}\"\n[backend]\nkind = \"stdio\"\ncommand = \"{}\"\nargs = [\"stdio\"]\nworkspace = \"{}\"\nmax_children = {max_children}\n{extra_backend}[limits]\nrequest_body_bytes = 65536\njson_response_bytes = 1048576\nsse_response_bytes = 4194304\n",
+        command.display(),
         workspace.display(),
     );
     let config: McpExportConfig = toml_config(&text);

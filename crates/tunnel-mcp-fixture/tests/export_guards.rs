@@ -96,7 +96,7 @@ async fn unlisted_routes_headers_and_versions_never_reach_the_child() {
         let response = within(exchange(&export, post(&extra, body.clone()))).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{name}");
     }
-    // GET and DELETE are not routes of the 2026 profile.
+    // GET and DELETE have no meaning in the 2026 profile: 405, no child.
     for method in ["GET", "DELETE"] {
         let request = Request::builder()
             .method(method)
@@ -106,7 +106,11 @@ async fn unlisted_routes_headers_and_versions_never_reach_the_child() {
             .body(Full::new(Bytes::new()))
             .expect("request");
         let response = within(exchange(&export, request)).await;
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{method}");
+        assert_eq!(
+            response.status(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "{method}"
+        );
     }
     // Buffered validation: a header/body mismatch is a local -32020.
     let mut mismatch = headers.clone();
@@ -129,7 +133,8 @@ async fn unlisted_routes_headers_and_versions_never_reach_the_child() {
         error["error"]["data"]["supported"],
         serde_json::json!(["2026-07-28"])
     );
-    // A client notification has no per-request child to reach.
+    // A client notification has no per-request child to reach: 202, no
+    // body, dropped.
     let notification =
         r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1}}"#;
     let response = within(exchange(
@@ -139,12 +144,15 @@ async fn unlisted_routes_headers_and_versions_never_reach_the_child() {
                 ("content-type", "application/json"),
                 ("accept", "application/json, text/event-stream"),
                 ("mcp-protocol-version", "2026-07-28"),
+                ("mcp-method", "notifications/cancelled"),
             ],
             notification,
         ),
     ))
     .await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert!(body_bytes(response).await.expect("body").is_empty());
+    assert_eq!(export.diagnostics().notifications_dropped, 1);
     // A body over the request limit is refused before dispatch.
     let (headers, _) = current_call("2", "echo", "{}", "");
     let oversized = format!(

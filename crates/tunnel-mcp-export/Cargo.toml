@@ -28,6 +28,10 @@ tunnel-mcp = { path = "../tunnel-mcp" }
 url = "2.5"
 uuid = { version = "1.18", features = ["v4"] }
 
+[target.'cfg(unix)'.dependencies]
+# Safe process-group signalling for supervised stdio children.
+rustix = { version = "1.1", default-features = false, features = ["process", "std"] }
+
 [dev-dependencies]
 tempfile = "3.21"
 tokio = { version = "1.48", features = ["io-util", "macros", "net", "process", "rt", "rt-multi-thread", "sync", "time"] }

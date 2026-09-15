@@ -16,8 +16,8 @@
 //! interrupts the exchange (never a fabricated JSON-RPC result, never a
 //! replay).  Closing the response stream is cancellation: the bridge writes
 //! `notifications/cancelled` with the request ID to the child, allows
-//! [`CANCEL_GRACE`] and kills it.  Client notifications and responses have
-//! no per-request child to reach and are refused with 400.
+//! [`CANCEL_GRACE`] and kills it.  A client notification has no addressee (no
+//! per-request child exists for it) and is accepted with 202 and dropped.
 //!
 //! **2025-11-25** (sessions).  `initialize` without `Mcp-Session-Id` starts
 //! one child and one session, identified by a random 128-bit ID returned in
@@ -27,7 +27,10 @@
 //! single standalone GET stream, or waits in a bounded backlog until one
 //! opens.  A disconnect is not cancellation in this revision: the client
 //! POSTs `notifications/cancelled`, which is forwarded unchanged.  DELETE
-//! kills the child.  A child crash ends the session: open streams are
+//! kills the child.  A session idle for the configured `session_idle_seconds`
+//! (no POST, no newly opened GET, no request in flight; an open GET stream
+//! alone does not count) ends the same way, and a request whose consumer
+//! lets its stream queue fill has only that stream interrupted.  A child crash ends the session: open streams are
 //! interrupted and later requests get 404.
 
 use std::collections::{HashMap, VecDeque};
@@ -60,6 +63,10 @@ use crate::{ExportCounters, ExportError};
 pub const CANCEL_GRACE: Duration = Duration::from_secs(1);
 /// Server messages kept for a legacy session without a GET stream.
 pub const MAX_BACKLOG_MESSAGES: usize = 64;
+/// Messages queued towards one legacy request's response stream.  The
+/// session pump never waits on a stream: a consumer that lets this queue fill
+/// has only its own stream interrupted.
+pub const SESSION_STREAM_QUEUE: usize = 64;
 
 /// What a request's response stream receives.
 #[derive(Debug)]
@@ -247,6 +254,17 @@ impl StdioExport {
         message: McpMessage,
         cancel: CancellationToken,
     ) -> Result<Response<ExportBody>, ExportError> {
+        if message.kind == MessageKind::Notification {
+            // A 2026 client notification has no addressee: every request has
+            // its own child, which exists only for that request's lifetime,
+            // and this revision defines no client notification over HTTP
+            // (cancellation is closing the response stream).  Accept it as the
+            // transport requires (202, no body) and drop it.
+            self.counters
+                .notifications_dropped
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(no_body(StatusCode::ACCEPTED));
+        }
         let (MessageKind::Request, Some(id)) = (message.kind, message.id.clone()) else {
             return Ok(self.reject(&McpRejection {
                 status: 400,
@@ -423,16 +441,38 @@ impl StdioExport {
                 supported: None,
             }));
         };
+        session.touch();
         match (message.kind, message.id.clone()) {
             (MessageKind::Request, Some(id)) => {
-                let Some(routed) = session.register(&id, message.progress_token()) else {
-                    return Ok(self.reject(&McpRejection {
-                        status: 400,
-                        code: codes::INVALID_REQUEST,
-                        message: "a request with this id is already in flight",
-                        id: Some(id),
-                        supported: None,
-                    }));
+                let routed = match session.register(&id, message.progress_token()) {
+                    Ok(routed) => routed,
+                    Err(RegisterError::Ended) => {
+                        return Ok(self.reject(&McpRejection {
+                            status: 404,
+                            code: codes::INVALID_REQUEST,
+                            message: "session not found",
+                            id: Some(id),
+                            supported: None,
+                        }));
+                    }
+                    Err(RegisterError::DuplicateId) => {
+                        return Ok(self.reject(&McpRejection {
+                            status: 400,
+                            code: codes::INVALID_REQUEST,
+                            message: "a request with this id is already in flight",
+                            id: Some(id),
+                            supported: None,
+                        }));
+                    }
+                    Err(RegisterError::DuplicateProgressToken) => {
+                        return Ok(self.reject(&McpRejection {
+                            status: 400,
+                            code: codes::INVALID_REQUEST,
+                            message: "a request with this progress token is already in flight",
+                            id: Some(id),
+                            supported: None,
+                        }));
+                    }
                 };
                 if session.child.send(&message.compact).await.is_err() {
                     session.unregister(&id_key(&id));
@@ -484,8 +524,10 @@ impl StdioExport {
             router: Mutex::new(Router::default()),
             _slot: permit,
             backlog_limit: usize::try_from(self.limits.json_response_body()).unwrap_or(usize::MAX),
+            idle: self.backend.session_idle,
+            last_activity: Mutex::new(tokio::time::Instant::now()),
         });
-        let Some(routed) = session.register(&id, message.progress_token()) else {
+        let Ok(routed) = session.register(&id, message.progress_token()) else {
             return Err(ExportError);
         };
         self.sessions
@@ -552,6 +594,9 @@ impl StdioExport {
                 supported: None,
             }));
         };
+        // Opening the stream is activity; holding it open is not, so an idle
+        // client cannot pin a child and its slot with one open GET.
+        session.touch();
         let (stream_tx, mut stream_rx) = mpsc::channel(MAX_BACKLOG_MESSAGES + 1);
         if !session.open_standalone(&stream_tx) {
             return Ok(self.reject(&McpRejection {
@@ -726,6 +771,18 @@ struct Session {
     router: Mutex<Router>,
     _slot: OwnedSemaphorePermit,
     backlog_limit: usize,
+    /// The idle deadline: a session with no POST, no newly opened GET and no
+    /// in-flight request for this long ends as if its child had exited.
+    idle: std::time::Duration,
+    last_activity: Mutex<tokio::time::Instant>,
+}
+
+/// Why a legacy request could not be registered.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RegisterError {
+    Ended,
+    DuplicateId,
+    DuplicateProgressToken,
 }
 
 impl Session {
@@ -735,18 +792,47 @@ impl Session {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn register(&self, id: &Value, progress: Option<&Value>) -> Option<mpsc::Receiver<Routed>> {
+    fn touch(&self) {
+        *self
+            .last_activity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = tokio::time::Instant::now();
+    }
+
+    fn idle_deadline(&self) -> tokio::time::Instant {
+        *self
+            .last_activity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            + self.idle
+    }
+
+    fn register(
+        &self,
+        id: &Value,
+        progress: Option<&Value>,
+    ) -> Result<mpsc::Receiver<Routed>, RegisterError> {
         let key = id_key(id);
         let mut router = self.router();
-        if router.ended || router.pending.contains_key(&key) {
-            return None;
+        if router.ended {
+            return Err(RegisterError::Ended);
         }
-        let (tx, rx) = mpsc::channel(crate::body::STREAM_QUEUE);
+        if router.pending.contains_key(&key) {
+            return Err(RegisterError::DuplicateId);
+        }
+        let token = progress.map(id_key);
+        if token
+            .as_ref()
+            .is_some_and(|token| router.progress.contains_key(token))
+        {
+            return Err(RegisterError::DuplicateProgressToken);
+        }
+        let (tx, rx) = mpsc::channel(SESSION_STREAM_QUEUE);
         router.pending.insert(key.clone(), tx);
-        if let Some(token) = progress {
-            router.progress.insert(id_key(token), key);
+        if let Some(token) = token {
+            router.progress.insert(token, key);
         }
-        Some(rx)
+        Ok(rx)
     }
 
     fn unregister(&self, key: &str) {
@@ -788,7 +874,7 @@ impl Session {
 }
 
 enum Destination {
-    Request(mpsc::Sender<Routed>, bool),
+    Request(mpsc::Sender<Routed>, bool, String),
     Standalone(mpsc::Sender<Routed>),
     Backlogged,
     Overflow,
@@ -801,8 +887,24 @@ async fn run_session(
     sessions: Arc<Mutex<HashMap<String, Arc<Session>>>>,
     counters: Arc<ExportCounters>,
 ) {
-    while let Some(event) = events.recv().await {
-        let ChildEvent::Message(message) = event else {
+    loop {
+        let event = tokio::select! {
+            event = events.recv() => event,
+            () = tokio::time::sleep_until(session.idle_deadline()) => {
+                if tokio::time::Instant::now() < session.idle_deadline() {
+                    continue;
+                }
+                // An in-flight request is activity (it is bounded by its own
+                // exchange deadline); otherwise the session has expired.
+                if session.router().pending.is_empty() {
+                    counters.sessions_expired.fetch_add(1, Ordering::Relaxed);
+                    break;
+                }
+                session.touch();
+                continue;
+            }
+        };
+        let Some(ChildEvent::Message(message)) = event else {
             break;
         };
         let destination = {
@@ -813,7 +915,7 @@ async fn run_session(
                 let key = id_key(id);
                 router.progress.retain(|_, request| *request != key);
                 match router.pending.remove(&key) {
-                    Some(sender) => Destination::Request(sender, true),
+                    Some(sender) => Destination::Request(sender, true, key),
                     None => Destination::Dropped,
                 }
             } else {
@@ -826,10 +928,14 @@ async fn run_session(
                     .as_ref()
                     .filter(|_| id.is_none())
                     .and_then(|token| router.progress.get(token))
-                    .and_then(|key| router.pending.get(key))
-                    .cloned();
-                if let Some(sender) = request {
-                    Destination::Request(sender, false)
+                    .and_then(|key| {
+                        router
+                            .pending
+                            .get(key)
+                            .map(|sender| (sender.clone(), key.clone()))
+                    });
+                if let Some((sender, key)) = request {
+                    Destination::Request(sender, false, key)
                 } else if let Some(standalone) =
                     router.standalone.clone().filter(|open| !open.is_closed())
                 {
@@ -847,19 +953,35 @@ async fn run_session(
             }
         };
         match destination {
-            Destination::Request(sender, is_final) => {
+            Destination::Request(sender, is_final, key) => {
                 let routed = if is_final {
                     Routed::Final(message.compact)
                 } else {
                     Routed::Interim(message.compact)
                 };
-                if sender.send(routed).await.is_err() {
-                    counters.undeliverable.fetch_add(1, Ordering::Relaxed);
+                match sender.try_send(routed) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        // Fail fast: interrupt only this request's stream (its
+                        // queue closes once every sender is gone).
+                        session.unregister(&key);
+                        counters.stalled_streams.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        counters.undeliverable.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
             Destination::Standalone(sender) => {
-                if sender.send(Routed::Interim(message.compact)).await.is_err() {
-                    counters.undeliverable.fetch_add(1, Ordering::Relaxed);
+                match sender.try_send(Routed::Interim(message.compact)) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        session.router().standalone = None;
+                        counters.stalled_streams.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        counters.undeliverable.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
             Destination::Backlogged => {}
@@ -888,7 +1010,9 @@ async fn run_session(
         )
     };
     for sender in pending.into_iter().chain(standalone) {
-        let _ = sender.send(Routed::Ended).await;
+        // A full queue closes when this last sender drops, which interrupts
+        // that stream just the same.
+        let _ = sender.try_send(Routed::Ended);
     }
     sessions
         .lock()

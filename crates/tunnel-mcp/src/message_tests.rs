@@ -151,6 +151,43 @@ fn the_2026_header_body_rules_reject_mismatches_with_header_mismatch() {
             .code,
         codes::HEADER_MISMATCH
     );
+    // Notifications also carry the version and a matching Mcp-Method.
+    let notification =
+        br#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1}}"#;
+    assert!(
+        validate_post(
+            profile,
+            &to_map(&headers_2026("notifications/cancelled", None)),
+            notification
+        )
+        .is_ok()
+    );
+    let mut no_version = headers_2026("notifications/cancelled", None);
+    no_version.retain(|(name, _)| *name != "mcp-protocol-version");
+    assert_eq!(
+        validate_post(profile, &to_map(&no_version), notification)
+            .unwrap_err()
+            .code,
+        codes::HEADER_MISMATCH
+    );
+    let mut no_method = headers_2026("notifications/cancelled", None);
+    no_method.retain(|(name, _)| *name != "mcp-method");
+    assert_eq!(
+        validate_post(profile, &to_map(&no_method), notification)
+            .unwrap_err()
+            .code,
+        codes::HEADER_MISMATCH
+    );
+    assert_eq!(
+        validate_post(
+            profile,
+            &to_map(&headers_2026("notifications/progress", None)),
+            notification
+        )
+        .unwrap_err()
+        .code,
+        codes::HEADER_MISMATCH
+    );
     // A JSON-RPC response from the client is not allowed in this revision.
     let response = br#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
     assert_eq!(

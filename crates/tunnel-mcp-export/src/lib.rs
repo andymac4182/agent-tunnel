@@ -56,6 +56,9 @@ pub struct ExportCounters {
     pub undeliverable: AtomicU64,
     pub dispatched: AtomicU64,
     pub backend_errors: AtomicU64,
+    pub sessions_expired: AtomicU64,
+    pub stalled_streams: AtomicU64,
+    pub notifications_dropped: AtomicU64,
 }
 
 /// A snapshot of [`ExportCounters`].
@@ -79,6 +82,10 @@ pub struct ExportDiagnostics {
     pub undeliverable: u64,
     pub dispatched: u64,
     pub backend_errors: u64,
+    pub sessions_expired: u64,
+    pub stalled_streams: u64,
+    pub notifications_dropped: u64,
+    pub child_group_kills: u64,
 }
 
 impl ExportCounters {
@@ -103,6 +110,10 @@ impl ExportCounters {
             undeliverable: load(&self.undeliverable),
             dispatched: load(&self.dispatched),
             backend_errors: load(&self.backend_errors),
+            sessions_expired: load(&self.sessions_expired),
+            stalled_streams: load(&self.stalled_streams),
+            notifications_dropped: load(&self.notifications_dropped),
+            child_group_kills: load(&self.children.group_kills),
         }
     }
 }

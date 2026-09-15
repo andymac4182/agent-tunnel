@@ -84,6 +84,10 @@ pub enum McpBackendConfig {
         /// profile, sessions for the 2025 profile).
         #[serde(default = "default_max_children")]
         max_children: usize,
+        /// Legacy (2025-11-25) session idle deadline in seconds (default
+        /// 600, 1..=86400).  Ignored by the 2026 profile.
+        #[serde(default = "default_session_idle_seconds")]
+        session_idle_seconds: u64,
     },
     /// A fixed local Streamable HTTP server.
     #[serde(rename = "streamable-http")]
@@ -121,6 +125,15 @@ impl std::fmt::Debug for McpBackendConfig {
                 .finish_non_exhaustive(),
         }
     }
+}
+
+/// The default legacy session idle deadline (10 minutes).
+pub const DEFAULT_SESSION_IDLE_SECONDS: u64 = 600;
+/// The ceiling on the legacy session idle deadline (24 hours).
+pub const MAX_SESSION_IDLE_SECONDS: u64 = 86_400;
+
+const fn default_session_idle_seconds() -> u64 {
+    DEFAULT_SESSION_IDLE_SECONDS
 }
 
 const fn default_max_children() -> usize {
@@ -169,6 +182,7 @@ pub struct StdioBackend {
     pub inherit_env: Vec<String>,
     pub workspace: PathBuf,
     pub max_children: usize,
+    pub session_idle: std::time::Duration,
 }
 
 /// A validated fixed HTTP backend.
@@ -251,6 +265,7 @@ impl McpExportConfig {
                 inherit_env,
                 workspace,
                 max_children,
+                session_idle_seconds,
             } => {
                 if !absolute(command) {
                     return Err(McpConfigError(
@@ -278,6 +293,11 @@ impl McpExportConfig {
                         "mcp.backend environment names must be distinct uppercase identifiers (at most 64) with values without NUL",
                     ));
                 }
+                if *session_idle_seconds == 0 || *session_idle_seconds > MAX_SESSION_IDLE_SECONDS {
+                    return Err(McpConfigError(
+                        "mcp.backend.session_idle_seconds must be between 1 and 86400",
+                    ));
+                }
                 if *max_children == 0 || *max_children > MAX_CHILDREN {
                     return Err(McpConfigError(
                         "mcp.backend.max_children must be between 1 and 64",
@@ -290,6 +310,7 @@ impl McpExportConfig {
                     inherit_env: inherit_env.clone(),
                     workspace: workspace.clone(),
                     max_children: *max_children,
+                    session_idle: std::time::Duration::from_secs(*session_idle_seconds),
                 })
             }
             McpBackendConfig::StreamableHttp {
@@ -355,23 +376,12 @@ fn parse_backend_url(text: &str) -> Result<HttpBackend, McpConfigError> {
 }
 
 fn tunnel_http_bridge_path_ok(path: &str) -> Result<(), ()> {
-    // The same canonical path rule the codec applies to export paths.
-    if path.is_empty()
-        || path == "/"
-        || !path.starts_with('/')
-        || path.len() > 1024
-        || path.split('/').skip(1).any(|segment| {
-            segment.is_empty()
-                || segment == "."
-                || segment == ".."
-                || !segment.bytes().all(|byte| {
-                    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~')
-                })
-        })
-    {
+    // The codec's canonical export-path rule, plus: the backend endpoint is
+    // never the bare root.
+    if path == "/" {
         return Err(());
     }
-    Ok(())
+    tunnel_http_forward::validate_path(path).map_err(|_| ())
 }
 
 #[cfg(test)]
@@ -470,6 +480,8 @@ url = "http://[::1]:9/mcp"
             replace("kind = \"stdio\"", "kind = \"shell\""),
             format!("{STDIO}max_children = 0\n"),
             format!("{STDIO}max_children = 65\n"),
+            format!("{STDIO}session_idle_seconds = 0\n"),
+            format!("{STDIO}session_idle_seconds = 86401\n"),
             format!("{STDIO}shell = true\n"),
             STDIO.replace(
                 "profile = \"mcp-2026-07-28\"",

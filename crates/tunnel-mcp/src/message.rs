@@ -9,7 +9,9 @@
 //! * both: `Content-Type: application/json`, an `Accept` covering
 //!   `application/json` and `text/event-stream`, one strict JSON object with
 //!   `"jsonrpc":"2.0"` (no batches), a string or integer request ID;
-//! * 2026-07-28: `MCP-Protocol-Version` is required on requests and must be
+//! * 2026-07-28: `MCP-Protocol-Version` and `Mcp-Method` (equal to the body
+//!   `method`) are required on requests and notifications;
+//!   `MCP-Protocol-Version` must be
 //!   `2026-07-28` and equal `params._meta["io.modelcontextprotocol/
 //!   protocolVersion"]`; `Mcp-Method` must equal `method`; `Mcp-Name`
 //!   (Base64 sentinel decoded) must equal `params.name` for `tools/call` and
@@ -338,10 +340,9 @@ fn check_2026(
             ));
         }
         (_, Some(PROTOCOL_2026_07_28)) => {}
-        (MessageKind::Request, None) => {
+        (MessageKind::Request | MessageKind::Notification, None) => {
             return Err(mismatch("missing required MCP-Protocol-Version header"));
         }
-        (MessageKind::Notification, None) => {}
         (_, Some(_)) => {
             let mut rejection = McpRejection::new(
                 400,
@@ -359,6 +360,10 @@ fn check_2026(
             return Err(mismatch("an Mcp-Param header value is not representable"));
         }
     }
+    let method = message.method.as_deref().unwrap_or_default();
+    if header(headers, headers::MCP_METHOD) != Some(method) {
+        return Err(mismatch("Mcp-Method is missing or does not match the body"));
+    }
     if message.kind != MessageKind::Request {
         return Ok(());
     }
@@ -371,10 +376,6 @@ fn check_2026(
         return Err(mismatch(
             "MCP-Protocol-Version does not match the request _meta protocol version",
         ));
-    }
-    let method = message.method.as_deref().unwrap_or_default();
-    if header(headers, headers::MCP_METHOD) != Some(method) {
-        return Err(mismatch("Mcp-Method is missing or does not match the body"));
     }
     let name_field = match method {
         "tools/call" | "prompts/get" => Some("name"),

@@ -131,14 +131,14 @@ fn the_2026_profile_accepts_exactly_post_mcp_and_its_metadata_headers() {
             "{name}"
         );
     }
-    for method in [
-        Method::Get,
-        Method::Delete,
-        Method::Put,
-        Method::Head,
-        Method::Options,
-        Method::Patch,
-    ] {
+    for method in [Method::Get, Method::Delete] {
+        assert_eq!(
+            check_request(&profile, &request(method, "/mcp", &[])),
+            Ok(()),
+            "{method:?} reaches the device, which answers 405"
+        );
+    }
+    for method in [Method::Put, Method::Head, Method::Options, Method::Patch] {
         assert_eq!(
             check_request(&profile, &request(method, "/mcp", &[])),
             Err(CodecError::RouteNotAllowed),
