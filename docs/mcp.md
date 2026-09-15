@@ -60,7 +60,8 @@ The two profiles are separate `McpProfile` values with separate tables. There is
 | | `mcp-2026-07-28` | `mcp-2025-11-25` |
 | --- | --- | --- |
 | `MCP-Protocol-Version` | `2026-07-28` | `2025-11-25` |
-| Routes (export path) | `POST /mcp` | `POST /mcp`, `GET /mcp`, `DELETE /mcp` |
+| Routes (export path) | `POST /mcp`; `GET` and `DELETE /mcp` are routed only to be answered 405 | `POST /mcp`, `GET /mcp`, `DELETE /mcp` |
+| stdio server requirement | implements 2026-07-28 itself over stdio (`server/discover`, per-request `_meta`, no `initialize`); no lifecycle translation; one child per request, so no server state across requests | implements 2025-11-25 over stdio (`initialize` lifecycle); one child per session |
 | Request headers | `content-type`, `accept`, `mcp-protocol-version`, `mcp-method`, `mcp-name`, prefix `mcp-param-` | `content-type`, `accept`, `mcp-protocol-version`, `mcp-session-id`, `last-event-id` |
 | Response headers | `content-type`, `cache-control`, `x-accel-buffering` | `content-type`, `cache-control`, `x-accel-buffering`, `mcp-session-id` |
 | Query | none | none |
@@ -77,6 +78,7 @@ The two profiles are separate `McpProfile` values with separate tables. There is
 
   The codec's response limit is the SSE limit. The device applies the JSON limit by content type, and to each child stdout message.
 - **Zero-body rules.** A POST carries one JSON object. GET and DELETE carry no body; a non-empty one is refused with 400. 202 and 204 responses are sent with no body.
+- **2026 GET and DELETE.** The specification says a 2026-only server SHOULD answer GET and DELETE with 405. The codec can only refuse an unlisted route as `HTTP_INVALID_HEAD` (400), so the 2026 profile routes GET and DELETE to the device. The device answers 405 with a JSON-RPC error that has no ID, before any backend is involved.
 
 ### Dispatch policy (buffer before dispatch)
 
@@ -90,8 +92,8 @@ The device collects the complete request body within its limit and validates it 
 The profile-specific checks follow.
 
 - **2026-07-28.**
-  - `MCP-Protocol-Version` is required on requests, and it must equal `params._meta["io.modelcontextprotocol/protocolVersion"]`.
-  - `Mcp-Method` must equal `method`.
+  - `MCP-Protocol-Version` and `Mcp-Method` are required on both requests and notifications. `Mcp-Method` must equal the body `method`.
+  - On requests, `MCP-Protocol-Version` must also equal `params._meta["io.modelcontextprotocol/protocolVersion"]`.
   - `Mcp-Name` must equal `params.name` for `tools/call` and `prompts/get`, and `params.uri` for `resources/read`. A Base64 sentinel value is decoded before the comparison.
   - Every `Mcp-Param-*` value must be representable.
   - A failed check gets 400 with `-32020`, or `-32022` plus `data.supported` for another version. A client JSON-RPC response gets 400.
@@ -114,14 +116,18 @@ Rejections are local JSON-RPC errors with fixed messages. They never echo header
 - Dropping the response body closes the backend connection. For 2026-07-28 that is the cancellation signal.
 - A failure before the request is written is a 502 JSON-RPC error. A failure after it is an interruption (`HTTP_STREAM_INTERRUPTED`, execution `dispatched`), never a fabricated result.
 
-**Stdio backend** (`kind = "stdio"`).
+**Stdio backend** (`kind = "stdio"`). The server must implement the selected revision itself; see the profile table. The bridge never translates lifecycles.
 
 - The command and workspace are absolute paths. Arguments are fixed, up to 64 values of up to 4096 bytes each.
 - The child environment is cleared first; then explicit values and allowlisted inherited names are set. Nothing runs through a shell.
 - `max_children` is 1 to 64, default 8.
+- `session_idle_seconds` is 1 to 86400, default 600. It applies to 2025-11-25 sessions only.
 - stdout carries newline-delimited JSON-RPC. Each line must be one strict object within the JSON limit; otherwise the child is killed and its exchanges are interrupted.
 - stderr is drained, and only its byte count is kept.
-- A dropped handle kills and reaps the child.
+- **Process group.** The child runs in its own process group (`process_group(0)`). Every end of its life sends `SIGKILL` to the whole group through `rustix`, so the crate keeps `forbid(unsafe_code)`. That covers a kill on a dropped handle or cancellation, a crash, a normal exit and a session end. A wrapper such as `npx`, `uvx` or a shell script therefore cannot orphan the real server.
+  - **Boundary.** A descendant that leaves the group (`setsid`, `setpgid`, or a daemonizing double fork) is not killed.
+  - **Ordering.** The group is signalled after the leader is reaped. POSIX does not reuse a process-group ID while any member lives.
+  - **Tracked.** The residue is recorded as M3-09 in [tasks.md](tasks.md).
 
 **2026-07-28 over stdio.**
 
@@ -129,13 +135,19 @@ Rejections are local JSON-RPC errors with fixed messages. They never echo header
 - **Response shape.** If the first message is the final response, it is returned as `application/json`. Otherwise the response is SSE: the child's notifications, then the final response, each forwarded as the child's exact line.
 - **Protocol violations.** A child request on that stream, or a response for another ID, is a violation: the child is killed and the exchange interrupted.
 - **Cancellation.** Closing the response stream makes the bridge write `notifications/cancelled` with the original request ID to the child. It then allows 1 s and kills the child.
-- **Refused messages.** Client notifications and responses get 400, because no per-request child exists to receive them.
+- **Client messages.** A client notification gets 202 with no body and is dropped: no per-request child exists to receive it, and this revision defines no client notification over HTTP. A client JSON-RPC response gets 400.
+- **Server requirements.** A server implementing only 2025-11-25 cannot be exported under this profile. Because each request gets a fresh process, the server keeps no state across requests.
 
 **2025-11-25 over stdio.**
 
 - **Sessions.** An `initialize` without `Mcp-Session-Id` starts one child and one session. Its random 128-bit ID is returned in `Mcp-Session-Id` only when the result succeeds. A request without the header gets 400; an unknown session gets 404.
 - **Routing.** A response is routed to its POST by ID. A notification carrying that request's `progressToken` follows the request. Every other server message, including server requests, goes to the one standalone GET stream (a second one gets 409). With no GET stream, such messages wait in a backlog bounded to 64 messages and the JSON limit; an overflow ends the session.
 - **Disconnects.** A disconnect is not cancellation. The client's POSTed `notifications/cancelled` is forwarded unchanged.
+- **Duplicates.** A request whose ID, or whose `progressToken`, is already in flight on the session gets 400. A reused token is never rebound to another request.
+- **Stalled streams.** The session's stdout pump never waits on one stream. When a request's stream queue (64 messages) or the GET stream's queue is full, only that stream is interrupted (`stalled_streams`).
+- **Idle expiry.** A session with no POST, no newly opened GET and no request in flight for `session_idle_seconds` ends as if its child had exited.
+  - **Effect.** Its streams are interrupted, the process group is killed, the slot is freed and later requests get 404.
+  - **Why an open GET does not count.** Holding a GET open is not activity, so an idle client cannot pin a child and its slot with one GET.
 - **Session end.** DELETE kills the child (204). A crash ends the session: open streams are interrupted and later requests get 404. The rmcp client then re-initializes, and the crashed call is not replayed.
 
 ### Relay (gate 5)
@@ -153,7 +165,8 @@ Rejections are local JSON-RPC errors with fixed messages. They never echo header
 - **`tunnel-mcp-fixture`.** The pinned rmcp client talks over a Unix-socket gateway through the gate-2 bridge `forward`/`serve` to both export kinds and both profiles.
   - `rmcp_stdio`: discovery or initialize, `_meta` and arguments preserved, image content, ordered progress, a byte-exact 300 KiB result, stream-close cancellation reaching the child as `notifications/cancelled` (2026), a forwarded client cancel (2025), and a crash that is interrupted, not replayed, with stderr not leaked.
   - `rmcp_http`: the same flows against rmcp's own Streamable HTTP server.
-  - `export_guards`: unlisted headers, routes and versions never spawn a child; `-32020` and `-32022`; 413; four concurrent requests reusing the ID `9007199254740993` with distinct progress tokens are isolated and byte-exact; an oversized child line is interrupted; 4 MiB of stderr is drained and not forwarded; `max_children` gives 503; legacy session 400, 404, 409 and DELETE; hostile loopback backends (redirect to a metadata address, a 401 challenge, gzip, private response headers) and a closed port.
+  - `session_lifecycle`: idle expiry with an open GET; activity keeps a session alive; a stalled consumer does not block another request on the same session; duplicate progress tokens get 400; a wrapper's grandchild dies with its process group after a completed 2026 request, a crash, or a legacy DELETE.
+  - `export_guards`: unlisted headers, routes and versions never spawn a child; 2026 GET and DELETE get 405 and a 2026 notification gets 202; `-32020` and `-32022`; 413; four concurrent requests reusing the ID `9007199254740993` with distinct progress tokens are isolated and byte-exact; an oversized child line is interrupted; 4 MiB of stderr is drained and not forwarded; `max_children` gives 503; legacy session 400, 404, 409 and DELETE; hostile loopback backends (redirect to a metadata address, a 401 challenge, gzip, private response headers) and a closed port.
 - **`tunnel-client`.** Configuration parsing, handler registration and `Debug` redaction.
 - **`tunnel-relay`.** Profile selection, `[http_forward]` parsing, and no interposer or `test-fixtures` feature.
 
@@ -161,10 +174,10 @@ Rejections are local JSON-RPC errors with fixed messages. They never echo header
 
 - A real cloud-side client through non-owner ingress, the HTTP/3 hop and the rotating tunnel. The end-to-end tests use the in-process gate-2 bridge (M3-03).
 - Rotation during MCP streams, and a streaming call across three rotations (M3-03).
-- Session or consumer isolation bound to the authenticated principal. The device cannot see the principal, so legacy session IDs are unguessable but not principal-scoped (M3-04).
+- Session or consumer isolation bound to the authenticated principal (M3-04 acceptance). The device cannot see the principal, so legacy session IDs are unguessable but not principal-scoped (M3-04).
 - Concurrent consumers through the relay, revocation, lost acknowledgements and unknown tool outcomes across relays (M3-04).
-- Resources, prompts, subscriptions (`subscriptions/listen`), MRTR input requests, sampling and elicitation. The bridge forwards them as raw messages, but no test exercises them.
-- `Last-Event-ID` resume. The stdio bridge emits no event IDs, so a legacy stream cannot resume; an HTTP backend's own resume is forwarded but untested.
-- HTTP/2 consumers, browser `Origin` handling, OAuth protected-resource discovery and audience checks.
-- Process-tree cleanup: only the direct child is killed. Non-Unix hosts: the end-to-end tests are `cfg(unix)`.
+- Resources, prompts, subscriptions (`subscriptions/listen`), MRTR input requests, sampling and elicitation. The bridge forwards them as raw messages, but no test exercises them (M3-13).
+- `Last-Event-ID` resume. The stdio bridge emits no event IDs, so a legacy stream cannot resume; an HTTP backend's own resume is forwarded but untested (M3-10).
+- Browser `Origin` handling, OAuth protected-resource discovery and audience checks (M3-11). HTTP/2 consumers (M3-12).
+- Descendants that leave the child's process group (M3-09). Non-Unix hosts, where the group kill is absent and the end-to-end tests are `cfg(unix)` (M3-12).
 - Throughput and cost of one child per 2026 request with real servers.
