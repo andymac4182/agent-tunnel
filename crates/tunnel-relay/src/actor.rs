@@ -5087,28 +5087,6 @@ impl RelayActor {
                 return false;
             };
             let queued = self.session_for(key).is_some_and(|session| {
-                // The connector validates FORGET against its own sender state,
-                // which needs this relay's ACK of its terminal.  That ACK went
-                // out on the carrier the terminal arrived on; when that was a
-                // retiring carrier closed right after, the ACK can be lost and
-                // the proof could never converge.  Re-advertise the final
-                // cumulative ACK on the current carrier first: ACKs are
-                // unsequenced and a duplicate cannot decrease progress.
-                if let Some(data_tx) = session.data_tx.as_ref()
-                    && let Some(stream) = session.streams.get(&stream_id)
-                    && let Ok(ack) = Frame::ack(
-                        key.epoch,
-                        session.generation,
-                        stream_id,
-                        stream
-                            .sequence
-                            .direction(Direction::ConnectorToRelay)
-                            .recv_contiguous(),
-                    )
-                    .encode()
-                {
-                    let _ = queue_data(data_tx, &session.queue_budget, ack);
-                }
                 queue_control(&session.control_tx, &session.queue_budget, encoded).is_ok()
             });
             if !queued {
