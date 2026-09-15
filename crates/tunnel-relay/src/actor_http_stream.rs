@@ -114,7 +114,6 @@ pub(crate) struct HttpStreamState {
     reset_sequence: Option<(u64, u64)>,
     reset_deferred_by_freeze: bool,
     cancel_sent: bool,
-    cancel_undeliverable: bool,
     freeze_capture: Option<HttpFreezeCapture>,
 }
 
@@ -139,8 +138,17 @@ pub(crate) struct HttpStreamRegistration {
 pub(crate) struct HttpResetOutcome {
     /// The RESET was queued, deferred in order, or already present.
     pub(crate) accepted: bool,
-    /// A required control `CANCEL` could not enter the control queue.
-    pub(crate) cancel_undeliverable: bool,
+}
+
+/// Actor-wide HTTP bookkeeping done between commands.
+#[derive(Debug, Default)]
+pub(crate) struct HttpMaintenance {
+    /// Sessions whose required HTTP `CANCEL` could not be queued, collected
+    /// where the send was refused and fenced after the command.
+    pub(crate) cancel_undeliverable: Vec<SessionKey>,
+    /// How many sessions had their HTTP streams visited to re-publish a
+    /// freeze transition (a local counter for regression tests).
+    pub(crate) freeze_stream_scans: u64,
 }
 
 impl HttpStreamState {
@@ -174,7 +182,6 @@ impl HttpStreamState {
                 reset_sequence: None,
                 reset_deferred_by_freeze: false,
                 cancel_sent: false,
-                cancel_undeliverable: false,
                 freeze_capture: None,
             },
             HttpStreamWatchers {
@@ -234,15 +241,8 @@ impl HttpStreamState {
         !self.cancel_sent && !self.peer_fin && self.peer_reset.is_none()
     }
 
-    pub(crate) fn note_cancel(&mut self, delivered: bool) {
+    pub(crate) fn note_cancel(&mut self) {
         self.cancel_sent = true;
-        if !delivered {
-            self.cancel_undeliverable = true;
-        }
-    }
-
-    pub(crate) fn take_cancel_undeliverable(&mut self) -> bool {
-        std::mem::take(&mut self.cancel_undeliverable)
     }
 
     /// Publish this owner's writer-freeze state to the exchange task.
@@ -571,9 +571,26 @@ impl RelayActor {
             .get_mut(&stream_id)
             .and_then(|stream| stream.http.as_mut())
         {
-            http.note_cancel(delivered);
+            http.note_cancel();
         }
         delivered
+    }
+
+    /// Send the scoped `CANCEL` a local cancellation needs, when it needs
+    /// one, and remember the session for fencing if it could not be queued.
+    pub(super) fn cancel_http_if_needed(&mut self, key: &SessionKey, stream_id: u64, reason: u16) {
+        let undeliverable = self.session_mut(key).is_some_and(|session| {
+            let needed = reason == reset_reason::CANCELLED
+                && session
+                    .streams
+                    .get(&stream_id)
+                    .and_then(|stream| stream.http.as_ref())
+                    .is_some_and(HttpStreamState::cancel_needed);
+            needed && !Self::send_http_cancel(session, stream_id)
+        });
+        if undeliverable {
+            self.http_maintenance.cancel_undeliverable.push(key.clone());
+        }
     }
 
     /// Reset an HTTP stream with a registered reason code.  Parked chunks
@@ -636,35 +653,66 @@ impl RelayActor {
                 // A FIN that was only pending was never sequenced, so the
                 // RESET replaces it.
                 stream.pending_terminal = Some(Terminal::Reset(reason));
-                let cancel = reason == reset_reason::CANCELLED
-                    && stream
-                        .http
-                        .as_ref()
-                        .is_some_and(|http| http.cancel_needed());
                 if let Some(http) = stream.http.as_mut() {
                     http.note_reset_deferred();
                 }
-                if cancel && !Self::send_http_cancel(session, stream_id) {
-                    outcome.cancel_undeliverable = true;
+                true
+            } else {
+                stream.pending_terminal = None;
+                let queued = Self::queue_stream_terminal_frame_mode(
+                    session,
+                    stream_id,
+                    Terminal::Reset(reason),
+                    true,
+                );
+                if !queued && let Some(stream) = session.streams.get_mut(&stream_id) {
+                    // Keep the RESET for an ordered retry (every tick while
+                    // the failure deadline runs, and on ACK/WINDOW_UPDATE):
+                    // a refused writer queue must not strand the device.
+                    stream.pending_terminal = Some(Terminal::Reset(reason));
+                    stream.terminal_fin_failure = true;
                 }
-                return outcome;
+                queued
             }
-            stream.pending_terminal = None;
-            let queued = Self::queue_stream_terminal_frame_mode(
-                session,
-                stream_id,
-                Terminal::Reset(reason),
-                true,
-            );
-            if !queued && let Some(stream) = session.streams.get_mut(&stream_id) {
-                stream.terminal_fin_failure = true;
-            }
-            queued
         };
         if !queued {
             self.arm_terminal_fin_failure_deadline(key);
         }
+        // The device must learn of a cancellation that is not on the wire
+        // yet — deferred behind a freeze or refused by the writer queue — so
+        // it is also sent out of band.
+        let deferred = self
+            .session_for(key)
+            .and_then(|session| session.streams.get(&stream_id))
+            .is_some_and(|stream| stream.pending_terminal.is_some());
+        if deferred {
+            self.cancel_http_if_needed(key, stream_id, reason);
+        }
         outcome
+    }
+
+    /// Retry the ordered terminals a refused writer queue left pending on a
+    /// session whose terminal-failure deadline is running.
+    pub(super) fn retry_failed_terminals(&mut self, key: &SessionKey) {
+        let stream_ids = self
+            .session_for(key)
+            .filter(|session| session.terminal_fin_failure_deadline.is_some())
+            .map(|session| {
+                let mut ids = session
+                    .streams
+                    .iter()
+                    .filter(|(_, stream)| {
+                        stream.terminal_fin_failure && stream.pending_terminal.is_some()
+                    })
+                    .map(|(stream_id, _)| *stream_id)
+                    .collect::<Vec<_>>();
+                ids.sort_unstable();
+                ids
+            })
+            .unwrap_or_default();
+        for stream_id in stream_ids {
+            self.flush_pending_terminal(key, stream_id);
+        }
     }
 
     /// Retain the connector's bounded `RESULT_STATUS` detail for the exact
@@ -689,23 +737,51 @@ impl RelayActor {
         }
     }
 
-    /// Publish every HTTP stream's writer-freeze state and fence a session
-    /// whose required cancellation could not be delivered.  Called after
-    /// each actor command, so an exchange task's progress clock pauses for
-    /// exactly the owner's recorded freeze.
-    pub(super) async fn after_command_http_maintenance(&mut self) {
-        let mut undeliverable = Vec::new();
-        for session in self.sessions.values_mut() {
-            let frozen = Self::rotation_frozen(session);
-            for stream in session.streams.values_mut() {
-                if let Some(http) = stream.http.as_mut() {
-                    http.publish_freeze(frozen);
-                    if http.take_cancel_undeliverable() {
-                        undeliverable.push(session.key.clone());
-                    }
-                }
+    /// Re-publish one session's writer-freeze state to its HTTP exchange
+    /// tasks when, and only when, it changed since the last publication.
+    /// Returns whether the session's streams were visited.
+    pub(super) fn refresh_session_http_freeze(session: &mut DeviceSession) -> bool {
+        let frozen = Self::rotation_frozen(session);
+        if frozen == session.http_freeze_published {
+            return false;
+        }
+        session.http_freeze_published = frozen;
+        for stream in session.streams.values_mut() {
+            if let Some(http) = stream.http.as_ref() {
+                http.publish_freeze(frozen);
             }
         }
+        true
+    }
+
+    /// After one command: re-publish the writer-freeze state of the sessions
+    /// that command could have changed (streams are visited only on an actual
+    /// freeze transition), and fence any session whose required HTTP
+    /// cancellation could not be queued.  Per-frame traffic names its
+    /// session, so this is O(1) for it rather than O(devices × streams).
+    pub(super) async fn after_command_http_maintenance(&mut self, scope: HttpMaintenanceScope) {
+        let visited = match scope {
+            HttpMaintenanceScope::None => 0,
+            HttpMaintenanceScope::Session(scope) => {
+                self.sessions.get_mut(&scope).map_or(0, |session| {
+                    usize::from(Self::refresh_session_http_freeze(session))
+                })
+            }
+            HttpMaintenanceScope::All => self
+                .sessions
+                .values_mut()
+                .map(|session| usize::from(Self::refresh_session_http_freeze(session)))
+                .sum(),
+        };
+        self.http_maintenance.freeze_stream_scans = self
+            .http_maintenance
+            .freeze_stream_scans
+            .saturating_add(visited as u64);
+        if self.http_maintenance.cancel_undeliverable.is_empty() {
+            return;
+        }
+        let mut undeliverable = std::mem::take(&mut self.http_maintenance.cancel_undeliverable);
+        undeliverable.sort_by(|left, right| left.session_id.cmp(&right.session_id));
         undeliverable.dedup();
         for key in undeliverable {
             tracing::warn!(
@@ -1042,10 +1118,8 @@ mod tests {
         let (mut http, _) = state();
         assert!(http.cancel_needed());
         http.note_reset_deferred();
-        http.note_cancel(false);
+        http.note_cancel();
         assert!(!http.cancel_needed(), "at most one CANCEL per stream");
-        assert!(http.take_cancel_undeliverable());
-        assert!(!http.take_cancel_undeliverable());
         http.note_terminal_sequenced(Terminal::Fin, 4, 1);
         http.note_terminal_sequenced(Terminal::Reset(reset_reason::CANCELLED), 5, 2);
         http.note_terminal_sequenced(Terminal::Reset(reset_reason::CANCELLED), 6, 3);

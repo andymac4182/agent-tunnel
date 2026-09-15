@@ -75,10 +75,10 @@ use crate::{
 
 #[path = "actor_http_stream.rs"]
 mod http_stream;
-use http_stream::HttpStreamState;
 pub(crate) use http_stream::{
     HTTP_FORWARD_STREAM_OPERATION, HttpPeerReset, HttpRead, HttpStreamRegistration,
 };
+use http_stream::{HttpMaintenance, HttpStreamState};
 
 const AUTHORIZATION_LIFETIME: Duration = Duration::from_secs(5);
 /// Reason recorded when a device answers with a challenge whose frozen
@@ -1674,6 +1674,9 @@ struct DeviceSession {
     /// published. It is retained while the marked stream tombstone remains,
     /// regardless of unrelated owner FORGET progress.
     terminal_fin_failure_deadline: Option<Instant>,
+    /// The writer-freeze state last published to this session's HTTP
+    /// exchange tasks; streams are re-published only when it changes.
+    http_freeze_published: bool,
     rotation: Option<RotationRuntime>,
     last_rotation: Instant,
     rotations_completed: u64,
@@ -1834,6 +1837,56 @@ enum Command {
     },
 }
 
+/// Which sessions' HTTP writer-freeze state one command can have changed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum HttpMaintenanceScope {
+    /// Only this device session (the command names it).
+    Session(DeviceScope),
+    /// Possibly any session (ticks, registrations and other unkeyed work).
+    All,
+    /// No rotation state can change (read-only commands).
+    None,
+}
+
+impl Command {
+    /// The sessions whose rotation phase this command can change.  Per-frame
+    /// and per-exchange traffic names its session, so the post-command HTTP
+    /// maintenance touches that one session rather than every device.
+    fn http_maintenance_scope(&self) -> HttpMaintenanceScope {
+        match self {
+            Self::InboundControl { key, .. }
+            | Self::DisconnectControl(key)
+            | Self::RetryRecovery { key }
+            | Self::CatalogTicketResolved { key, .. }
+            | Self::ChallengeAuthorized { key, .. }
+            | Self::MaintenanceResult { key, .. }
+            | Self::OwnerWriteReconciled { key, .. }
+            | Self::WriteEchoStream { key, .. }
+            | Self::CloseEchoStream { key, .. }
+            | Self::ReadHttpStream { key, .. }
+            | Self::FinishHttpStream { key, .. }
+            | Self::ResetHttpStream { key, .. } => HttpMaintenanceScope::Session(key.scope()),
+            Self::InboundData { carrier, .. } | Self::DisconnectData(carrier) => {
+                HttpMaintenanceScope::Session(carrier.session.scope())
+            }
+            Self::Snapshot { .. } | Self::RecordConsumerResponseTimeout { .. } => {
+                HttpMaintenanceScope::None
+            }
+            Self::RegisterControl { .. }
+            | Self::AttachData { .. }
+            | Self::DispatchEcho { .. }
+            | Self::Tick
+            | Self::Shutdown(_)
+            | Self::RegisterResolved { .. }
+            | Self::RegisterForwardedControl { .. }
+            | Self::AttachResolved { .. }
+            | Self::AttachForwardedData { .. }
+            | Self::OpenEchoStream { .. }
+            | Self::OpenHttpStream { .. } => HttpMaintenanceScope::All,
+        }
+    }
+}
+
 /// Registration returned to an authenticated consumer WebSocket.  The
 /// operation and stream identifiers remain stable for the lifetime of that
 /// socket; application records are multiplexed within the one logical stream.
@@ -1938,6 +1991,7 @@ impl RelayHandle {
             peer_consumer_diagnostics: handle.peer_consumer_diagnostics.clone(),
             peer_fault_diagnostics: handle.peer_fault_diagnostics.clone(),
             http_forward_diagnostics: handle.http_forward_diagnostics.clone(),
+            http_maintenance: HttpMaintenance::default(),
             cleanup_dispatcher: Some(cleanup.dispatcher()),
             cleanup: Some(cleanup),
             background_tasks: JoinSet::new(),
@@ -2669,6 +2723,7 @@ struct RelayActor {
     peer_consumer_diagnostics: PeerConsumerDiagnostics,
     peer_fault_diagnostics: PeerFaultDiagnostics,
     http_forward_diagnostics: HttpForwardDiagnostics,
+    http_maintenance: HttpMaintenance,
     cleanup_dispatcher: Option<CleanupDispatcher>,
     cleanup: Option<CleanupWorker>,
     background_tasks: JoinSet<()>,
@@ -2717,9 +2772,10 @@ impl RelayActor {
                 command = self.rx.recv() => {
                     let Some(command) = command else { break; };
                     let shutdown = matches!(command, Command::Shutdown(_));
+                    let scope = command.http_maintenance_scope();
                     self.handle(command).await;
                     if !shutdown {
-                        self.after_command_http_maintenance().await;
+                        self.after_command_http_maintenance(scope).await;
                     }
                     if shutdown || self.shutting_down {
                         break;
@@ -3764,6 +3820,7 @@ impl RelayActor {
                 forgotten_stream_through: 0,
                 owner_forget_deadline: None,
                 terminal_fin_failure_deadline: None,
+                http_freeze_published: false,
                 rotation,
                 last_rotation: Instant::now(),
                 rotations_completed: 0,
@@ -5873,18 +5930,6 @@ impl RelayActor {
                     }
                 }
             }
-            // A deferred HTTP cancellation also reaches the device out of
-            // band, so the handler stops before the RESET's sequence slot.
-            if writer_frozen
-                && matches!(close_terminal, Terminal::Reset(_))
-                && session
-                    .streams
-                    .get(&stream_id)
-                    .and_then(|stream| stream.http.as_ref())
-                    .is_some_and(HttpStreamState::cancel_needed)
-            {
-                let _ = Self::send_http_cancel(session, stream_id);
-            }
             if writer_frozen {
                 TerminalDisposition::Deferred
             } else if Self::queue_stream_terminal_frame_mode(
@@ -5928,6 +5973,23 @@ impl RelayActor {
             // sequence above remains unchanged; no phantom FIN is published.
             // A *deferred* terminal is not a failure and arms no deadline.
             self.arm_terminal_fin_failure_deadline(key);
+            // An HTTP stream keeps its refused terminal for an ordered retry
+            // while that deadline runs.
+            if let Some(stream) = self
+                .session_mut(key)
+                .and_then(|session| session.streams.get_mut(&stream_id))
+                && stream.http.is_some()
+            {
+                stream.pending_terminal = Some(close_terminal);
+            }
+        }
+        // A cancellation that is not on the wire yet (deferred behind a
+        // freeze or refused by the writer queue) also reaches the device out
+        // of band, so the handler stops before the RESET's sequence slot.
+        if !matches!(disposition, TerminalDisposition::Emitted)
+            && let Terminal::Reset(reason) = close_terminal
+        {
+            self.cancel_http_if_needed(key, stream_id, reason);
         }
         // Keep the exact stream sequence as a bounded terminal tombstone so
         // a valid late ACK/FIN cannot become UNKNOWN_STREAM and tear down an
@@ -11918,6 +11980,7 @@ impl RelayActor {
                 // message IDs make this idempotent once QUIESCE is queued.
                 self.begin_rotation_quiesce(&key);
             }
+            self.retry_failed_terminals(&key);
             let terminal_fin_failure_expired = self.session_for(&key).is_some_and(|session| {
                 session
                     .terminal_fin_failure_deadline
@@ -14842,6 +14905,7 @@ mod stream_identity_tests {
             forgotten_stream_through: 0,
             owner_forget_deadline: None,
             terminal_fin_failure_deadline: None,
+            http_freeze_published: false,
             rotation: None,
             last_rotation: std::time::Instant::now(),
             rotations_completed: 0,
@@ -14886,6 +14950,7 @@ mod stream_identity_tests {
             peer_consumer_diagnostics: super::PeerConsumerDiagnostics::default(),
             peer_fault_diagnostics: super::PeerFaultDiagnostics::default(),
             http_forward_diagnostics: super::HttpForwardDiagnostics::default(),
+            http_maintenance: super::HttpMaintenance::default(),
             cleanup_dispatcher: None,
             cleanup: None,
             background_tasks: tokio::task::JoinSet::new(),
@@ -16711,6 +16776,7 @@ mod stream_identity_tests {
                     forgotten_stream_through: 0,
                     owner_forget_deadline: None,
                     terminal_fin_failure_deadline: None,
+                    http_freeze_published: false,
                     rotation: None,
                     last_rotation: std::time::Instant::now(),
                     rotations_completed: 0,
@@ -18673,6 +18739,7 @@ mod stream_identity_tests {
             forgotten_stream_through: 0,
             owner_forget_deadline: None,
             terminal_fin_failure_deadline: None,
+            http_freeze_published: false,
             rotation: None,
             last_rotation: std::time::Instant::now(),
             rotations_completed: 0,
