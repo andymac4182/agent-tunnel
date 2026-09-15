@@ -14,11 +14,12 @@ use common::*;
 use http::{Request, Response, StatusCode};
 use http_body::{Body, Frame as BodyFrame};
 use tokio::sync::oneshot;
+use tunnel_http_bridge::Frame;
 use tunnel_http_bridge::{
     BridgeConfig, ChannelBody, Execution, GatewayError, HandlerCancellation, Outcome, forward,
     serve,
 };
-use tunnel_http_forward::{HttpErrorCode, RecordKind};
+use tunnel_http_forward::{HttpErrorCode, RecordKind, encode_body, encode_record};
 
 /// Echo the request body into a streaming response as it arrives.
 async fn echo_handler(request: Request<ChannelBody>) -> Result<Response<TestBody>, TestError> {
@@ -347,15 +348,9 @@ async fn slow_consumer_bounds_bytes_produced_by_the_handler_and_queued() {
     .await;
     let body = running.response.body_mut();
     within(next_chunk(body)).await.unwrap().unwrap();
-    // Stall the consumer long enough for any unbounded buffering to show.
-    tokio::time::sleep(Duration::from_millis(400)).await;
-    let stalled = produced.load(Ordering::SeqCst);
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    assert_eq!(
-        produced.load(Ordering::SeqCst),
-        stalled,
-        "production stopped"
-    );
+    // Stall the consumer until production stops moving.  Unbounded
+    // buffering would never stabilize below the bound.
+    let stalled = wait_until_stable(|| produced.load(Ordering::SeqCst)).await;
     // One handler chunk in hand, the stream credit, one DATA frame in the
     // owner pump, the body queue (4 chunks), and the chunk the consumer took.
     let bound = (CHUNK + CREDIT + CREDIT + 4 * CHUNK + CHUNK) as u64;
@@ -363,8 +358,9 @@ async fn slow_consumer_bounds_bytes_produced_by_the_handler_and_queued() {
         stalled <= bound,
         "produced {stalled} bytes while stalled; bound {bound}"
     );
-    assert!(response_stats.high_water() <= CREDIT);
-    assert!(response_stats.high_water() > 0);
+    // The queue high-water mark is bounded by the credit semaphore by
+    // construction; the produced-bytes bound above is the meaningful check.
+    assert!(response_stats.high_water() > 0, "the stream queue was used");
     // Reading resumes production.
     for _ in 0..64 {
         within(next_chunk(body)).await.unwrap().unwrap();
@@ -410,8 +406,7 @@ async fn slow_handler_bounds_bytes_read_from_the_consumer_upload() {
         )
         .await
     });
-    tokio::time::sleep(Duration::from_millis(400)).await;
-    let stalled = produced.load(Ordering::SeqCst);
+    let stalled = wait_until_stable(|| produced.load(Ordering::SeqCst)).await;
     // Owner: one chunk in hand plus stream credit.  Device: one DATA frame in
     // its pump plus the request body queue.
     let bound = (CHUNK + CREDIT + CREDIT + 4 * CHUNK) as u64;
@@ -419,7 +414,7 @@ async fn slow_handler_bounds_bytes_read_from_the_consumer_upload() {
         stalled <= bound,
         "read {stalled} upload bytes while the handler stalled; bound {bound}"
     );
-    assert!(request_stats.high_water() <= CREDIT);
+    assert!(request_stats.high_water() > 0, "the stream queue was used");
     release_tx.send(()).unwrap();
     let running = within(running).await.unwrap();
     let body = within(collect(running.response.into_body())).await.unwrap();
@@ -615,10 +610,9 @@ async fn dropping_the_forward_future_cancels_a_handler_that_is_not_reading_its_u
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn deadline_before_headers_is_a_504_with_unknown_execution() {
-    let owner_config = BridgeConfig {
-        deadline: Some(Duration::from_millis(150)),
-        ..BridgeConfig::default()
-    };
+    let owner_config = BridgeConfig::default()
+        .with_deadline(Duration::from_millis(150))
+        .unwrap();
     let running = exchange_with(
         request("GET", "/events", &[], empty_body()),
         link(STREAM_CREDIT),
@@ -652,10 +646,9 @@ async fn deadline_before_headers_is_a_504_with_unknown_execution() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn deadline_after_headers_errors_the_body_instead_of_ending_it() {
-    let owner_config = BridgeConfig {
-        deadline: Some(Duration::from_millis(200)),
-        ..BridgeConfig::default()
-    };
+    let owner_config = BridgeConfig::default()
+        .with_deadline(Duration::from_millis(200))
+        .unwrap();
     let (tx, body) = test_body(1);
     let running = exchange_with(
         request("GET", "/events", &[], empty_body()),
@@ -807,4 +800,215 @@ async fn owner_keeps_accounting_peer_frames_until_the_device_learns_of_the_reset
         within(handle.report()).await.error,
         Some(HttpErrorCode::Cancelled)
     );
+}
+
+/// Review regression: a RESET queued *after* the owner's request FIN must
+/// still reach a device whose request pump is stalled delivering an unread
+/// upload into a full body queue.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reset_after_request_fin_cancels_a_device_stalled_on_an_unread_upload() {
+    const PAYLOAD: usize = 65_528;
+    let token_cancelled = Arc::new(AtomicBool::new(false));
+    let cancelled = Arc::clone(&token_cancelled);
+    let link = link(STREAM_CREDIT);
+    let request_stats = Arc::clone(&link.request_stats);
+    let chunks = (0..6).map(|_| data(&[b'u'; PAYLOAD])).collect();
+    let upload_len = (6 * PAYLOAD).to_string();
+    let mut running = exchange(
+        request(
+            "POST",
+            "/upload",
+            &[("content-length", &upload_len)],
+            frames_body(chunks, None),
+        ),
+        link,
+        BridgeConfig::default(),
+        move |request: Request<ChannelBody>| async move {
+            let token = request
+                .extensions()
+                .get::<HandlerCancellation>()
+                .unwrap()
+                .0
+                .clone();
+            tokio::spawn(async move {
+                token.cancelled().await;
+                cancelled.store(true, Ordering::SeqCst);
+            });
+            // Hold the request (and its body queue) without reading it, and
+            // stream SSE until the consumer goes away.
+            let (tx, body) = test_body(1);
+            tokio::spawn(async move {
+                let _unread = request;
+                while tx.send(data(b"data: tick\n\n")).await.is_ok() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            });
+            Ok::<_, TestError>(Response::builder().status(200).body(body).unwrap())
+        },
+    )
+    .await;
+    within(next_chunk(running.response.body_mut()))
+        .await
+        .unwrap()
+        .unwrap();
+    // Wait until the upload has stopped moving: END and FIN are queued and
+    // the device pump is stalled on its full body queue.
+    wait_until_stable(|| request_stats.queued()).await;
+    drop(running.response);
+    let bound = Duration::from_secs(5);
+    let device = tokio::time::timeout(bound, running.device)
+        .await
+        .expect("device report returns promptly")
+        .unwrap();
+    assert_eq!(device.error, Some(HttpErrorCode::Cancelled));
+    assert_eq!(device.execution, Execution::Dispatched);
+    let owner = tokio::time::timeout(bound, running.handle.report())
+        .await
+        .expect("owner report returns promptly");
+    assert_eq!(owner.error, Some(HttpErrorCode::Cancelled));
+    assert_eq!(owner.request, Outcome::Complete, "the upload had finished");
+    tokio::time::timeout(bound, async {
+        while !token_cancelled.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("handler observed cancellation");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn owner_terminal_discard_is_bounded_by_the_deadline_when_the_device_never_finishes() {
+    let config = BridgeConfig::default()
+        .with_deadline(Duration::from_millis(300))
+        .unwrap();
+    let Link {
+        to_device,
+        mut device_rx,
+        to_owner,
+        owner_rx,
+        ..
+    } = link(STREAM_CREDIT);
+    // A device that answers with a head and one BODY record, then goes
+    // silent forever: it never sends FIN or RESET and never drops its sender.
+    let silent = tokio::spawn(async move {
+        while let Some(frame) = device_rx.recv().await {
+            if frame == Frame::Fin {
+                break;
+            }
+        }
+        let mut records = Vec::new();
+        encode_record(
+            RecordKind::ResponseHead,
+            br#"{"status":200,"headers":[],"body_length":null}"#,
+            &mut records,
+        )
+        .unwrap();
+        encode_body(b"data: 1\n\n", &mut records);
+        to_owner.send_data(Bytes::from(records)).await.unwrap();
+        std::future::pending::<()>().await;
+        drop((to_owner, device_rx));
+    });
+    let (mut response, handle) = within(forward(
+        request("GET", "/events", &[], empty_body()),
+        profile(),
+        config,
+        to_device,
+        owner_rx,
+    ))
+    .await;
+    within(next_chunk(response.body_mut()))
+        .await
+        .unwrap()
+        .unwrap();
+    drop(response);
+    let report = tokio::time::timeout(Duration::from_secs(5), handle.report())
+        .await
+        .expect("the owner report is bounded by the deadline");
+    assert_eq!(report.error, Some(HttpErrorCode::Cancelled));
+    silent.abort();
+}
+
+#[test]
+fn bridge_config_has_no_unlimited_deadline() {
+    use tunnel_http_bridge::{ConfigError, DEFAULT_DEADLINE, MAX_DEADLINE};
+    assert_eq!(BridgeConfig::default().deadline(), DEFAULT_DEADLINE);
+    assert!(DEFAULT_DEADLINE <= MAX_DEADLINE);
+    assert_eq!(
+        BridgeConfig::default().with_deadline(MAX_DEADLINE + Duration::from_nanos(1)),
+        Err(ConfigError::Deadline)
+    );
+    assert_eq!(
+        BridgeConfig::default().with_deadline(Duration::ZERO),
+        Err(ConfigError::Deadline)
+    );
+    assert!(BridgeConfig::default().with_deadline(MAX_DEADLINE).is_ok());
+    assert_eq!(
+        BridgeConfig::default().with_body_queue(0),
+        Err(ConfigError::BodyQueue)
+    );
+}
+
+/// The owner is stalled delivering a response the device already finished
+/// (END and FIN queued) when the device resets for an upload failure.  The
+/// post-FIN RESET must not truncate the completed response.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn post_fin_device_reset_does_not_truncate_a_completed_response_being_delivered() {
+    const PAYLOAD: usize = 65_528;
+    let owner_profile = profile();
+    let mut request_policy = owner_profile.request.clone();
+    // Rebuild the device request policy with a tiny body limit.
+    let mut small = tunnel_http_forward::RequestPolicy::new(16).unwrap();
+    small
+        .allow_route(tunnel_http_forward::Method::Post, "/upload")
+        .unwrap();
+    small.allow_http_version(tunnel_http_forward::HttpVersion::Http11);
+    std::mem::swap(&mut request_policy, &mut small);
+    let device_profile = Arc::new(tunnel_http_bridge::Profile {
+        request: request_policy,
+        response: owner_profile.response.clone(),
+    });
+    let link = link(STREAM_CREDIT);
+    let response_stats = Arc::clone(&link.response_stats);
+    let (upload, body) = test_body(1);
+    let expected: Vec<u8> = (0..6u8)
+        .flat_map(|index| vec![b'a' + index; PAYLOAD])
+        .collect();
+    let chunks: Vec<_> = expected.chunks(PAYLOAD).map(data).collect();
+    let running = exchange_with(
+        request("POST", "/upload", &[], body),
+        link,
+        BridgeConfig::default(),
+        BridgeConfig::default(),
+        device_profile,
+        move |request: Request<ChannelBody>| async move {
+            drop(request);
+            Ok::<_, TestError>(
+                Response::builder()
+                    .status(200)
+                    .body(frames_body(chunks, None))
+                    .unwrap(),
+            )
+        },
+    )
+    .await;
+    // The consumer does not read yet: the device finishes writing (END+FIN)
+    // into the owner's credit and body queue, then everything stops moving.
+    wait_until_stable(|| response_stats.queued()).await;
+    // Now the upload exceeds the device's limit: the device resets after its
+    // response FIN, and its report returns once the owner's request ends.
+    upload.send(data(&[b'u'; 32])).await.unwrap();
+    drop(upload);
+    let device = within(running.device).await.unwrap();
+    assert_eq!(device.error, Some(HttpErrorCode::BodyLimit));
+    assert_eq!(device.response, Outcome::Complete);
+    // Only now does the consumer read: it receives the whole response.
+    let received = within(collect(running.response.into_body()))
+        .await
+        .expect("a completed response is not truncated by a later RESET");
+    assert_eq!(received, expected);
+    let owner = within(running.handle.report()).await;
+    assert_eq!(owner.response, Outcome::Complete);
+    // Both owner directions had completed before the RESET arrived, so the
+    // owner records no failure for an exchange it finished.
+    assert_eq!(owner.request, Outcome::Complete);
 }

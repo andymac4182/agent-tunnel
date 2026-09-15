@@ -112,7 +112,7 @@ pub const fn gateway_status(
 
 /// Build a gateway response carrying only the sanitized code and execution.
 pub(crate) fn gateway_response(
-    origin: Origin,
+    status: StatusCode,
     code: HttpErrorCode,
     execution: Execution,
 ) -> Response<ChannelBody> {
@@ -122,7 +122,7 @@ pub(crate) fn gateway_response(
         execution.as_str()
     );
     let mut response = Response::new(ChannelBody::full(Bytes::from(json)));
-    *response.status_mut() = gateway_status(origin, code, execution);
+    *response.status_mut() = status;
     let headers = response.headers_mut();
     headers.insert(
         header::CONTENT_TYPE,

@@ -7,8 +7,10 @@
 //! [`request_head`]; every other field is handed to the codec's strict
 //! allowlist, so an unknown header fails instead of disappearing.
 
+use core::fmt;
+
 use bytes::Bytes;
-use http::{HeaderMap, Version, request, response};
+use http::{HeaderMap, StatusCode, Version, request, response};
 use tunnel_http_forward::{
     CodecError, HeaderField, HttpErrorCode, HttpVersion, Method, RequestHead, RequestPolicy,
     ResponseHead, ResponsePolicy, encode_request_head, encode_response_head,
@@ -36,6 +38,9 @@ pub enum NormalizeError {
     UnsupportedConnectionOption,
     /// An `expect` value other than `100-continue`.
     UnsupportedExpectation,
+    /// `connection`, `keep-alive` or `proxy-connection` in an HTTP/2 request,
+    /// which RFC 9113 section 8.2.2 makes malformed.
+    ConnectionSpecificField,
     /// A value that is not visible ASCII, space, or tab.
     InvalidHeaderValue,
     /// A declared length above the direction's body limit.
@@ -59,9 +64,24 @@ impl NormalizeError {
             Self::DuplicateContentLength
             | Self::InvalidContentLength
             | Self::TransferEncodingWithContentLength
+            | Self::ConnectionSpecificField
             | Self::InvalidHeaderValue => HttpErrorCode::InvalidHead,
             Self::DeclaredLengthExceedsLimit => HttpErrorCode::BodyLimit,
             Self::Codec(error) => error.code(),
+        }
+    }
+
+    /// The ordinary client-error status for rejecting the consumer's request.
+    #[must_use]
+    pub const fn status(self) -> StatusCode {
+        match self {
+            // RFC 9110 section 15.5.18.
+            Self::UnsupportedExpectation => StatusCode::EXPECTATION_FAILED,
+            other => crate::status::gateway_status(
+                crate::status::Origin::Consumer,
+                other.code(),
+                crate::status::Execution::NotDispatched,
+            ),
         }
     }
 }
@@ -114,6 +134,11 @@ fn scan_headers(
             }
             // Transport fields the ingress HTTP connection has consumed.  The
             // authoritative service comes from OPEN, never from `host`.
+            (Side::Ingress, "connection" | "keep-alive" | "proxy-connection")
+                if version != Version::HTTP_11 =>
+            {
+                return Err(NormalizeError::ConnectionSpecificField);
+            }
             (Side::Ingress, "host" | "keep-alive") => {}
             (Side::Ingress, "connection") => {
                 let supported = text.split(',').map(trim_ows).all(|option| {
@@ -153,14 +178,29 @@ fn scan_headers(
 }
 
 /// A validated request head and its encoded `REQUEST_HEAD` record.
-#[derive(Clone, Debug)]
+/// `Debug` prints the payload-free head summary and the record length.
+#[derive(Clone)]
 pub struct IngressRequest {
     pub head: RequestHead,
     pub record: Bytes,
 }
 
-/// Normalize a consumer request.  The ingress consumes `host`,
-/// `keep-alive`, `connection: keep-alive|close`, `expect: 100-continue`,
+impl fmt::Debug for IngressRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("IngressRequest")
+            .field("method", &self.head.method)
+            .field("http_version", &self.head.http_version)
+            .field("headers_len", &self.head.headers.len())
+            .field("body_length", &self.head.body_length)
+            .field("record_len", &self.record.len())
+            .finish()
+    }
+}
+
+/// Normalize a consumer request.  The ingress consumes `host`; for
+/// HTTP/1.1 only, `keep-alive` and `connection: keep-alive|close`;
+/// `expect: 100-continue`,
 /// a single HTTP/1.1 `transfer-encoding: chunked` (already decoded into body
 /// octets by the HTTP library), and `content-length` (carried as the typed
 /// `body_length`).  Any URI scheme and authority are transport routing and
@@ -209,7 +249,8 @@ pub fn request_head(
 }
 
 /// A validated handler response head and its encoded `RESPONSE_HEAD` record.
-#[derive(Clone, Debug)]
+/// `Debug` prints status, counts and lengths only.
+#[derive(Clone)]
 pub struct HandlerResponse {
     pub head: ResponseHead,
     pub record: Bytes,
@@ -217,9 +258,25 @@ pub struct HandlerResponse {
     pub zero_body: bool,
 }
 
+impl fmt::Debug for HandlerResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HandlerResponse")
+            .field("status", &self.head.status)
+            .field("headers_len", &self.head.headers.len())
+            .field("body_length", &self.head.body_length)
+            .field("record_len", &self.record.len())
+            .field("zero_body", &self.zero_body)
+            .finish()
+    }
+}
+
 /// Normalize an in-process handler's response head.  Only `content-length`
-/// is consumed (as `body_length`); nothing is silently dropped.
-/// `exact_body_len` is the body's exact size hint, if it has one.
+/// is consumed (as `body_length`); nothing else is dropped.  For a HEAD
+/// request or a 304 it is a representation-size hint and is not forwarded;
+/// for 204 and 205 only `0` is accepted.  Actual body bytes are never
+/// allowed on these responses.  `exact_body_len` is the body's exact size
+/// hint, if it has one.
 ///
 /// # Errors
 /// Any framing, feature, zero-body, limit, or codec validation failure.
@@ -230,20 +287,27 @@ pub fn response_head(
     policy: &ResponsePolicy,
 ) -> Result<HandlerResponse, NormalizeError> {
     let (headers, declared) = scan_headers(&parts.headers, Side::Handler, Version::HTTP_11)?;
-    if let (Some(declared), Some(exact)) = (declared, exact_body_len)
-        && declared != exact
-    {
-        return Err(NormalizeError::Codec(CodecError::BodyLongerThanDeclared));
-    }
     let status = parts.status.as_u16();
     let zero_body = tunnel_http_forward::requires_zero_body(request_method, status);
     let body_length = if zero_body {
-        // v1 forwards no representation-size hint for these responses.
-        if declared.is_some() || exact_body_len.is_some_and(|length| length != 0) {
+        // v1 forwards no representation-size hint for these responses.  A
+        // HEAD or 304 Content-Length describes the selected representation
+        // (RFC 9110 sections 8.6 and 15.4.5), so it is dropped; a 204 or 205
+        // has no content, so only an explicit `0` is tolerated.
+        let representation_hint = request_method == Method::Head || status == 304;
+        if !representation_hint && declared.is_some_and(|length| length != 0) {
+            return Err(NormalizeError::Codec(CodecError::BodyForbidden));
+        }
+        if exact_body_len.is_some_and(|length| length != 0) {
             return Err(NormalizeError::Codec(CodecError::BodyForbidden));
         }
         Some(0)
     } else {
+        if let (Some(declared), Some(exact)) = (declared, exact_body_len)
+            && declared != exact
+        {
+            return Err(NormalizeError::Codec(CodecError::BodyLongerThanDeclared));
+        }
         declared.or(exact_body_len)
     };
     let head = ResponseHead {

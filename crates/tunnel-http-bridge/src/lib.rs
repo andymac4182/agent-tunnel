@@ -38,7 +38,9 @@ pub use owner::{ExchangeHandle, forward};
 pub use status::{
     ExchangeReport, Execution, GatewayError, Origin, Outcome, ResetDetail, gateway_status,
 };
-pub use stream::{Frame, FrameReceiver, FrameSender, QueueStats, ResetSignal, SendError, channel};
+pub use stream::{
+    Frame, FrameReceiver, FrameSender, QueueStats, ResetSignal, SendError, SignaledReset, channel,
+};
 
 use std::time::Duration;
 
@@ -52,21 +54,81 @@ pub struct Profile {
     pub response: ResponsePolicy,
 }
 
-/// Per-exchange adapter limits.
+/// The default absolute application deadline for one exchange.
+pub const DEFAULT_DEADLINE: Duration = Duration::from_secs(300);
+/// The hard ceiling on a configured deadline.  There is no unlimited value.
+pub const MAX_DEADLINE: Duration = Duration::from_secs(24 * 60 * 60);
+/// The default body queue, in chunks.
+pub const DEFAULT_BODY_QUEUE: usize = 4;
+/// The hard ceiling on the body queue, in chunks.
+pub const MAX_BODY_QUEUE: usize = 64;
+
+/// A rejected adapter configuration.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ConfigError {
+    /// Zero, or above [`MAX_DEADLINE`].
+    Deadline,
+    /// Zero, or above [`MAX_BODY_QUEUE`].
+    BodyQueue,
+}
+
+impl core::fmt::Display for ConfigError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(formatter, "invalid http bridge configuration: {self:?}")
+    }
+}
+
+impl std::error::Error for ConfigError {}
+
+/// Per-exchange adapter limits.  Both are finite and bounded by
+/// construction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BridgeConfig {
-    /// Capacity, in chunks, of the queue between a pump and the local HTTP
-    /// body it feeds.  Each chunk is at most one BODY payload (65,528 bytes).
-    pub body_queue: usize,
-    /// Absolute wall-clock application deadline for the whole exchange.
-    pub deadline: Option<Duration>,
+    body_queue: usize,
+    deadline: Duration,
 }
 
 impl Default for BridgeConfig {
     fn default() -> Self {
         Self {
-            body_queue: 4,
-            deadline: None,
+            body_queue: DEFAULT_BODY_QUEUE,
+            deadline: DEFAULT_DEADLINE,
         }
+    }
+}
+
+impl BridgeConfig {
+    /// Set the absolute application deadline for the whole exchange.  It
+    /// also bounds terminal discard of a peer that never finishes.
+    ///
+    /// # Errors
+    /// [`ConfigError::Deadline`] for zero or above [`MAX_DEADLINE`].
+    pub fn with_deadline(self, deadline: Duration) -> Result<Self, ConfigError> {
+        if deadline.is_zero() || deadline > MAX_DEADLINE {
+            return Err(ConfigError::Deadline);
+        }
+        Ok(Self { deadline, ..self })
+    }
+
+    /// Set the queue capacity, in chunks, between a pump and the local HTTP
+    /// body it feeds.  Each chunk is at most one BODY payload.
+    ///
+    /// # Errors
+    /// [`ConfigError::BodyQueue`] for zero or above [`MAX_BODY_QUEUE`].
+    pub fn with_body_queue(self, body_queue: usize) -> Result<Self, ConfigError> {
+        if body_queue == 0 || body_queue > MAX_BODY_QUEUE {
+            return Err(ConfigError::BodyQueue);
+        }
+        Ok(Self { body_queue, ..self })
+    }
+
+    #[must_use]
+    pub const fn deadline(&self) -> Duration {
+        self.deadline
+    }
+
+    #[must_use]
+    pub const fn body_queue(&self) -> usize {
+        self.body_queue
     }
 }

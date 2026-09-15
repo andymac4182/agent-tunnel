@@ -4,11 +4,13 @@
 //! DATA is charged byte-for-byte against a credit semaphore that is released
 //! only when the receiver takes the frame, so a sender cannot outrun its
 //! receiver.  FIN and RESET are ordered behind earlier DATA but use two
-//! reserved queue slots, so exhausted byte credit can never block them.  A
-//! RESET sent before FIN also raises an out-of-band [`ResetSignal`], standing
-//! in for scoped control cancellation: a receiver stalled on its own
-//! downstream can stop work before the queued RESET reaches it.
+//! reserved queue slots, so exhausted byte credit can never block them.  Any
+//! RESET also raises an out-of-band [`ResetSignal`], standing in for scoped
+//! control cancellation: a receiver stalled on its own downstream can stop
+//! work before the queued RESET reaches it, even when the RESET is queued
+//! behind an earlier FIN.
 
+use core::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
@@ -17,12 +19,34 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 
 use crate::status::ResetDetail;
 
-/// One ordered item of the stream.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// One ordered item of the stream.  `Debug` prints DATA lengths only.
+#[derive(Clone, Eq, PartialEq)]
 pub enum Frame {
     Data(Bytes),
     Fin,
     Reset(ResetDetail),
+}
+
+impl fmt::Debug for Frame {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Data(data) => formatter
+                .debug_struct("Data")
+                .field("payload_len", &data.len())
+                .finish(),
+            Self::Fin => formatter.write_str("Fin"),
+            Self::Reset(detail) => formatter.debug_tuple("Reset").field(detail).finish(),
+        }
+    }
+}
+
+/// What the peer's RESET signal carries.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct SignaledReset {
+    pub detail: ResetDetail,
+    /// The peer had already queued FIN for this direction, so every earlier
+    /// DATA frame of the direction is complete.
+    pub after_fin: bool,
 }
 
 /// Byte accounting for the queue, for tests and diagnostics.
@@ -74,7 +98,7 @@ const RESET: u8 = 2;
 
 struct SenderState {
     state: AtomicU8,
-    signal: watch::Sender<Option<ResetDetail>>,
+    signal: watch::Sender<Option<SignaledReset>>,
 }
 
 /// Why a send did not happen.
@@ -163,9 +187,12 @@ impl FrameSender {
         if previous == RESET {
             return false;
         }
-        if previous == OPEN {
-            self.state.signal.send_replace(Some(detail));
-        }
+        // Every emitted RESET is signalled.  A RESET queued behind FIN still
+        // cancels a receiver that is stalled and cannot reach the queue.
+        self.state.signal.send_replace(Some(SignaledReset {
+            detail,
+            after_fin: previous == FIN,
+        }));
         // A closed receiver needs no RESET; a full queue is impossible
         // because two slots are reserved for FIN and RESET.
         let _ = self.tx.try_send(self.envelope(Frame::Reset(detail)));
@@ -176,6 +203,13 @@ impl FrameSender {
     #[must_use]
     pub fn is_closed(&self) -> bool {
         self.tx.is_closed()
+    }
+
+    /// DATA credit capacity: a send no larger than this is one queue item,
+    /// so it is either wholly queued or not queued at all.
+    #[must_use]
+    pub const fn capacity(&self) -> usize {
+        self.capacity
     }
 
     fn envelope(&self, frame: Frame) -> Envelope {
@@ -191,7 +225,7 @@ impl FrameSender {
 /// The receiving half.
 pub struct FrameReceiver {
     rx: mpsc::Receiver<Envelope>,
-    signal: watch::Receiver<Option<ResetDetail>>,
+    signal: watch::Receiver<Option<SignaledReset>>,
     terminated: bool,
 }
 
@@ -223,7 +257,7 @@ impl FrameReceiver {
         }
     }
 
-    /// A handle that resolves when the peer resets before FIN.
+    /// A handle that resolves when the peer emits RESET.
     #[must_use]
     pub fn reset_signal(&self) -> ResetSignal {
         ResetSignal {
@@ -232,19 +266,35 @@ impl FrameReceiver {
     }
 }
 
-/// Resolves once the peer has queued a RESET before its FIN.
+/// Resolves once the peer has queued a RESET.
 #[derive(Clone)]
 pub struct ResetSignal {
-    rx: watch::Receiver<Option<ResetDetail>>,
+    rx: watch::Receiver<Option<SignaledReset>>,
 }
 
 impl ResetSignal {
-    /// Wait for the peer's early RESET.  Pends forever if none arrives.
-    pub async fn wait(&mut self) -> ResetDetail {
+    /// Wait for any peer RESET, including one queued after FIN.  Pends
+    /// forever if none arrives.
+    pub async fn wait(&mut self) -> SignaledReset {
         if let Ok(value) = self.rx.wait_for(Option::is_some).await
-            && let Some(detail) = *value
+            && let Some(reset) = *value
         {
-            return detail;
+            return reset;
+        }
+        std::future::pending().await
+    }
+
+    /// Wait for a peer RESET queued before its FIN.  A receiver delivering a
+    /// direction the peer already finished uses this, so a later RESET never
+    /// truncates bytes the peer completed; it sees that RESET in order.
+    pub async fn wait_before_fin(&mut self) -> ResetDetail {
+        if let Ok(value) = self
+            .rx
+            .wait_for(|reset| reset.is_some_and(|reset| !reset.after_fin))
+            .await
+            && let Some(reset) = *value
+        {
+            return reset.detail;
         }
         std::future::pending().await
     }

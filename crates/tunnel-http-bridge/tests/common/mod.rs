@@ -136,6 +136,27 @@ pub fn full(bytes: &[u8]) -> TestBody {
     frames_body(vec![data(bytes)], Some(bytes.len() as u64))
 }
 
+/// Poll `value` every 50 ms until it is unchanged for three consecutive
+/// polls, within the overall test bound, and return the stable value.
+pub async fn wait_until_stable<T: PartialEq + Copy>(value: impl Fn() -> T) -> T {
+    within(async {
+        let mut last = value();
+        let mut stable = 0;
+        while stable < 3 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let now = value();
+            if now == last {
+                stable += 1;
+            } else {
+                stable = 0;
+                last = now;
+            }
+        }
+        last
+    })
+    .await
+}
+
 pub async fn within<T>(future: impl Future<Output = T>) -> T {
     tokio::time::timeout(Duration::from_secs(20), future)
         .await
@@ -359,10 +380,10 @@ pub fn tap_with_reset_delay(
                         tokio::select! {
                             biased;
                             sent = out.send_data(piece) => if sent.is_err() { return },
-                            detail = signal.wait() => {
-                                task_log.lock().unwrap().reset = Some(detail);
+                            reset = signal.wait() => {
+                                task_log.lock().unwrap().reset = Some(reset.detail);
                                 tokio::time::sleep(reset_delay).await;
-                                out.reset(detail);
+                                out.reset(reset.detail);
                                 return;
                             }
                         }

@@ -49,7 +49,6 @@ struct Shared {
 }
 
 /// The pump's half.
-#[derive(Debug)]
 pub struct BodySender {
     tx: mpsc::Sender<Bytes>,
     shared: Arc<Shared>,
@@ -79,8 +78,19 @@ impl BodySender {
     }
 }
 
-/// A streaming body backed by a bounded queue.
-#[derive(Debug)]
+impl fmt::Debug for BodySender {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BodySender")
+            .field(
+                "queued_chunks",
+                &(self.tx.max_capacity() - self.tx.capacity()),
+            )
+            .finish()
+    }
+}
+
+/// A streaming body backed by a bounded queue.  `Debug` prints no bytes.
 pub struct ChannelBody {
     rx: Option<mpsc::Receiver<Bytes>>,
     shared: Arc<Shared>,
@@ -126,6 +136,20 @@ impl ChannelBody {
         }
         sender.finish();
         body
+    }
+}
+
+impl fmt::Debug for ChannelBody {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ChannelBody")
+            .field(
+                "queued_chunks",
+                &self.rx.as_ref().map_or(0, mpsc::Receiver::len),
+            )
+            .field("length", &self.length)
+            .field("done", &self.done)
+            .finish()
     }
 }
 

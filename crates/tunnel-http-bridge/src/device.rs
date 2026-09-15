@@ -3,13 +3,14 @@
 //! [`serve`] takes no address and opens no listener: the decoded request is
 //! passed to the handler by a direct call on a spawned task.
 
-use std::future::{Future, pending};
+use std::future::Future;
 use std::sync::Arc;
 
 use bytes::Bytes;
 use http::{HeaderName, HeaderValue, Request, Response, Uri, Version};
 use http_body::Body;
 use tokio::sync::oneshot;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tunnel_http_forward::{
     HttpErrorCode, HttpVersion, Method, RequestEvent, RequestHead, RequestReader,
@@ -89,6 +90,7 @@ where
     E: Send + 'static,
 {
     let exchange = Exchange::new(to_owner, Execution::NotDispatched);
+    let deadline_at = Instant::now() + config.deadline();
     let cancel = CancellationToken::new();
     let (dispatch_tx, dispatch_rx) = oneshot::channel();
     let request = request_pump(
@@ -96,17 +98,13 @@ where
         from_owner,
         RequestReader::new(profile.request.clone()),
         dispatch_tx,
-        config.body_queue,
+        config.body_queue(),
         &cancel,
+        deadline_at,
     );
     let response = response_pump(&exchange, &profile, dispatch_rx, handler);
     let watchdog = async {
-        let deadline = async {
-            match config.deadline {
-                Some(deadline) => tokio::time::sleep(deadline).await,
-                None => pending().await,
-            }
-        };
+        let deadline = tokio::time::sleep_until(deadline_at);
         let finished = async {
             exchange.request_terminal.cancelled().await;
             exchange.response_terminal.cancelled().await;
@@ -132,6 +130,7 @@ async fn request_pump(
     dispatch: oneshot::Sender<(Method, Request<ChannelBody>)>,
     queue: usize,
     cancel: &CancellationToken,
+    deadline_at: Instant,
 ) {
     let mut signal = from_owner.reset_signal();
     let mut dispatch = Some(dispatch);
@@ -207,8 +206,11 @@ async fn request_pump(
                                 sent = sender.send(chunk) => if sent.is_err() {
                                     body = None;
                                 },
-                                detail = signal.wait() => {
-                                    exchange.abort(detail.code);
+                                // Any RESET, even one queued behind the
+                                // owner's FIN: this pump cannot reach the
+                                // queue while the handler is not reading.
+                                reset = signal.wait() => {
+                                    exchange.abort(reset.detail.code);
                                     break 'frames;
                                 }
                             }
@@ -223,7 +225,8 @@ async fn request_pump(
         sender.fail(exchange.error_code());
     }
     if !peer_terminated {
-        from_owner.discard_until_terminal().await;
+        // Bounded by the exchange deadline.
+        let _ = tokio::time::timeout_at(deadline_at, from_owner.discard_until_terminal()).await;
     }
 }
 

@@ -1,6 +1,5 @@
 //! The owner-side ingress adapter.
 
-use std::future::pending;
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
@@ -8,6 +7,7 @@ use http::{HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode, he
 use http_body::Body;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tunnel_http_forward::{
     HttpErrorCode, Method, ResponseEvent, ResponseHead, ResponseReader, requires_zero_body,
@@ -17,7 +17,9 @@ use crate::body::{BodySender, ChannelBody};
 use crate::exchange::{Dir, Exchange};
 use crate::normalize;
 use crate::pump::{self, PumpError};
-use crate::status::{ExchangeReport, Execution, Origin, Outcome, ResetDetail, gateway_response};
+use crate::status::{
+    ExchangeReport, Execution, Origin, Outcome, ResetDetail, gateway_response, gateway_status,
+};
 use crate::stream::{Frame, FrameReceiver, FrameSender};
 use crate::{BridgeConfig, Profile};
 
@@ -101,7 +103,7 @@ impl Owner {
 }
 
 fn rejected(
-    origin: Origin,
+    status: StatusCode,
     code: HttpErrorCode,
     execution: Execution,
 ) -> (Response<ChannelBody>, ExchangeHandle) {
@@ -112,7 +114,7 @@ fn rejected(
         error: Some(code),
     };
     (
-        gateway_response(origin, code, execution),
+        gateway_response(status, code, execution),
         ExchangeHandle {
             task: tokio::spawn(async move { report }),
             consumer: CancellationToken::new(),
@@ -140,15 +142,8 @@ where
     let (parts, body) = request.into_parts();
     let ingress = match normalize::request_head(&parts, &profile.request) {
         Ok(ingress) => ingress,
-        Err(error) => return rejected(Origin::Consumer, error.code(), Execution::NotDispatched),
+        Err(error) => return rejected(error.status(), error.code(), Execution::NotDispatched),
     };
-    if to_device.is_closed() {
-        return rejected(
-            Origin::Upstream,
-            HttpErrorCode::StreamInterrupted,
-            Execution::NotDispatched,
-        );
-    }
     let method = ingress.head.method;
     let declared = ingress.head.body_length;
     let (head_tx, head_rx) = oneshot::channel();
@@ -177,14 +172,23 @@ where
     drop(guard.disarm());
     let response = match outcome {
         Ok(HeadOutcome::Committed(response)) => response,
-        Ok(HeadOutcome::Failed(origin, detail)) => {
-            gateway_response(origin, detail.code, detail.execution)
-        }
-        Err(_) => gateway_response(
-            Origin::Upstream,
-            HttpErrorCode::StreamInterrupted,
-            owner.exchange.execution(),
+        Ok(HeadOutcome::Failed(origin, detail)) => gateway_response(
+            gateway_status(origin, detail.code, detail.execution),
+            detail.code,
+            detail.execution,
         ),
+        Err(_) => {
+            let execution = owner.exchange.execution();
+            gateway_response(
+                gateway_status(
+                    Origin::Upstream,
+                    HttpErrorCode::StreamInterrupted,
+                    execution,
+                ),
+                HttpErrorCode::StreamInterrupted,
+                execution,
+            )
+        }
     };
     (response, handle)
 }
@@ -204,13 +208,20 @@ where
     B: Body<Data = Bytes> + Send + 'static,
 {
     let exchange = &owner.exchange;
+    let deadline_at = Instant::now() + config.deadline();
     let request = async {
-        // From the first queued head byte, the request may reach the device.
-        exchange.set_execution(Execution::Unknown);
+        // A head no larger than the credit capacity is one queue item: it is
+        // either wholly queued or not queued at all.  Only once it is queued
+        // can the request reach the device.  A larger head could be partly
+        // queued before a failure, so it is `unknown` from the start.
+        if head_record.len() > exchange.peer.capacity() {
+            exchange.set_execution(Execution::Unknown);
+        }
         if let Err(error) = pump::send(exchange, head_record).await {
             owner.pump_failed(error);
             return;
         }
+        exchange.set_execution(Execution::Unknown);
         let body = std::pin::pin!(body);
         match pump::pump_body(exchange, body, declared, profile.request.body_limit()).await {
             Ok(()) => exchange.complete(Dir::Request),
@@ -222,18 +233,14 @@ where
         from_device,
         ResponseReader::new(profile.response.clone(), method),
         method,
-        config.body_queue,
+        config.body_queue(),
+        deadline_at,
     );
     let pumps = async {
         tokio::join!(request, response);
     };
     let watchdog = async {
-        let deadline = async {
-            match config.deadline {
-                Some(deadline) => tokio::time::sleep(deadline).await,
-                None => pending().await,
-            }
-        };
+        let deadline = tokio::time::sleep_until(deadline_at);
         let finished = async {
             exchange.request_terminal.cancelled().await;
             exchange.response_terminal.cancelled().await;
@@ -281,6 +288,7 @@ async fn response_pump(
     mut reader: ResponseReader,
     method: Method,
     queue: usize,
+    deadline_at: Instant,
 ) {
     let exchange = &owner.exchange;
     let mut signal = from_device.reset_signal();
@@ -361,7 +369,11 @@ async fn response_pump(
                                     owner.fail(Origin::Consumer, HttpErrorCode::Cancelled);
                                     break 'frames;
                                 },
-                                detail = signal.wait() => {
+                                // Only a RESET before the device's FIN: bytes
+                                // of a response the device completed are
+                                // delivered, and a later RESET is seen in
+                                // order (it then aborts only the upload).
+                                detail = signal.wait_before_fin() => {
                                     owner.peer_reset(detail);
                                     break 'frames;
                                 }
@@ -377,6 +389,8 @@ async fn response_pump(
         sender.fail(exchange.error_code());
     }
     if !peer_terminated {
-        from_device.discard_until_terminal().await;
+        // Bounded by the exchange deadline: a peer that never finishes
+        // cannot hold this exchange open.
+        let _ = tokio::time::timeout_at(deadline_at, from_device.discard_until_terminal()).await;
     }
 }

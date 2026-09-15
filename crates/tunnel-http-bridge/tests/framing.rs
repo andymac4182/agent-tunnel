@@ -95,7 +95,7 @@ async fn duplicate_or_conflicting_content_length_is_rejected_before_dispatch() {
 
 #[tokio::test]
 async fn unsupported_framing_and_features_are_rejected_before_dispatch() {
-    let cases: [(&str, &[(&str, &str)]); 7] = [
+    let cases: [(&str, &[(&str, &str)]); 6] = [
         ("POST", &[("transfer-encoding", "gzip, chunked")]),
         ("POST", &[("trailer", "x-checksum")]),
         ("POST", &[("content-encoding", "gzip")]),
@@ -107,7 +107,6 @@ async fn unsupported_framing_and_features_are_rejected_before_dispatch() {
             "POST",
             &[("connection", "x-case"), ("x-case", "hop-by-hop")],
         ),
-        ("POST", &[("expect", "103-checkpoint")]),
         ("CONNECT", &[]),
     ];
     for (method, headers) in cases {
@@ -523,14 +522,20 @@ async fn handler_body_or_length_on_a_zero_body_response_is_rejected_before_heade
         } else {
             "/status"
         };
-        let cases = [
+        let mut cases = vec![
             // Streaming data with no size hint: found by draining.
             with_status(status, &[], frames_body(vec![data(b"x")], None)),
             // A known non-zero size.
             with_status(status, &[], full(b"abc")),
-            // A representation length header.
-            with_status(status, &[("content-length", "12")], empty_body()),
         ];
+        if status == 204 || status == 205 {
+            // No content exists, so a non-zero length is contradictory.
+            cases.push(with_status(
+                status,
+                &[("content-length", "12")],
+                empty_body(),
+            ));
+        }
         for response in cases {
             let running = respond(method, uri, response).await;
             expect_gateway(
@@ -922,7 +927,7 @@ fn normalization_names_the_specific_rejection() {
     use tunnel_http_forward::{CodecError, HeaderRule};
     let policy = profile().request.clone();
     type Case<'a> = (&'a str, &'a [(&'a str, &'a str)], NormalizeError);
-    let cases: [Case<'_>; 9] = [
+    let cases: [Case<'_>; 10] = [
         (
             "POST",
             &[("trailer", "x-checksum")],
@@ -965,6 +970,11 @@ fn normalization_names_the_specific_rejection() {
         ),
         (
             "POST",
+            &[("expect", "103-checkpoint")],
+            NormalizeError::UnsupportedExpectation,
+        ),
+        (
+            "POST",
             &[("x-unlisted", "1")],
             NormalizeError::Codec(CodecError::InvalidHeader(HeaderRule::NotAllowed)),
         ),
@@ -982,6 +992,22 @@ fn normalization_names_the_specific_rejection() {
         NormalizeError::UnsupportedTransferEncoding,
         "chunked framing does not exist in HTTP/2"
     );
+    for field in ["connection", "keep-alive", "proxy-connection"] {
+        let value = if field == "connection" {
+            "keep-alive"
+        } else {
+            "1"
+        };
+        let mut parts = request("POST", "/upload", &[(field, value)], ())
+            .into_parts()
+            .0;
+        parts.version = http::Version::HTTP_2;
+        assert_eq!(
+            request_head(&parts, &policy).unwrap_err(),
+            NormalizeError::ConnectionSpecificField,
+            "RFC 9113 section 8.2.2: {field}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1085,4 +1111,125 @@ async fn owner_does_not_end_the_response_body_at_end_without_fin() {
     let error = within(next_chunk(&mut body)).await.unwrap().unwrap_err();
     assert_eq!(error.code(), HttpErrorCode::StreamInterrupted);
     assert_eq!(within(handle.report()).await.response, Outcome::Aborted);
+}
+
+#[tokio::test]
+async fn unsupported_expectation_is_417_before_dispatch() {
+    let response = rejected_at_ingress(request(
+        "POST",
+        "/upload",
+        &[("expect", "103-checkpoint")],
+        empty_body(),
+    ))
+    .await;
+    expect_gateway(
+        &response,
+        StatusCode::EXPECTATION_FAILED,
+        HttpErrorCode::UnsupportedFeature,
+        Execution::NotDispatched,
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn representation_content_length_on_head_and_304_is_dropped_not_rejected() {
+    for (method, uri, status, length) in [
+        ("HEAD", "/events", 200, "1234"),
+        ("GET", "/status", 304, "1234"),
+        ("GET", "/status", 204, "0"),
+        ("GET", "/status", 205, "0"),
+    ] {
+        let running = respond(
+            method,
+            uri,
+            with_status(status, &[("content-length", length)], empty_body()),
+        )
+        .await;
+        assert_eq!(
+            running.response.status().as_u16(),
+            status,
+            "{method} {status}"
+        );
+        assert!(gateway(&running.response).is_none());
+        assert!(
+            running.response.headers().get("content-length").is_none(),
+            "no representation length is forwarded"
+        );
+        assert!(
+            within(collect(running.response.into_body()))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let device = within(running.device).await.unwrap();
+        assert_eq!(device.error, None);
+        assert_eq!(device.response, Outcome::Complete);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn device_gone_before_the_head_is_queued_is_503_not_dispatched() {
+    let Link {
+        to_device,
+        device_rx,
+        owner_rx,
+        ..
+    } = link(STREAM_CREDIT);
+    drop(device_rx);
+    let (response, handle) = within(forward(
+        request("GET", "/events", &[], empty_body()),
+        profile(),
+        BridgeConfig::default(),
+        to_device,
+        owner_rx,
+    ))
+    .await;
+    expect_gateway(
+        &response,
+        StatusCode::SERVICE_UNAVAILABLE,
+        HttpErrorCode::StreamInterrupted,
+        Execution::NotDispatched,
+    );
+    assert_eq!(
+        within(handle.report()).await.execution,
+        Execution::NotDispatched
+    );
+}
+
+#[tokio::test]
+async fn debug_output_never_contains_payload_or_header_values() {
+    use tunnel_http_bridge::normalize::{request_head, response_head};
+    const SENTINEL: &str = "SENTINEL-payload-7f3a";
+    let frame = Frame::Data(Bytes::from(format!("data: {SENTINEL}\n\n")));
+    let body = ChannelBody::full(Bytes::from(SENTINEL));
+    let (parts, ()) = request("POST", "/upload", &[("x-case", SENTINEL)], ()).into_parts();
+    let ingress = request_head(&parts, &profile().request).unwrap();
+    assert!(String::from_utf8_lossy(&ingress.record).contains(SENTINEL));
+    let (parts, ()) = Response::builder()
+        .status(200)
+        .header("x-case", SENTINEL)
+        .body(())
+        .unwrap()
+        .into_parts();
+    let handler = response_head(
+        &parts,
+        None,
+        tunnel_http_forward::Method::Get,
+        &profile().response,
+    )
+    .unwrap();
+    assert!(String::from_utf8_lossy(&handler.record).contains(SENTINEL));
+    let (sender, channel_body) = ChannelBody::channel(1, None, None);
+    sender.send(Bytes::from(SENTINEL)).await.unwrap();
+    for rendered in [
+        format!("{frame:?}"),
+        format!("{body:?}"),
+        format!("{ingress:?}"),
+        format!("{handler:?}"),
+        format!("{channel_body:?}"),
+        format!("{sender:?}"),
+    ] {
+        assert!(!rendered.contains(SENTINEL), "{rendered}");
+        assert!(!rendered.contains("SENTINEL"), "{rendered}");
+    }
+    assert_eq!(format!("{frame:?}"), "Data { payload_len: 29 }");
 }
