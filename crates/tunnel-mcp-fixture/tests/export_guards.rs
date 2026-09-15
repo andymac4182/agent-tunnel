@@ -243,7 +243,7 @@ async fn child_output_limits_stderr_and_child_process_limits_hold() {
         drop(response);
     });
     for _ in 0..200 {
-        if export.diagnostics().children_running == 1 {
+        if common::count_lines(&workspace.path().join("invocations.log"), "sleep") == 1 {
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
