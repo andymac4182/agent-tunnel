@@ -969,17 +969,23 @@ mod tests {
         let (http, _, ()) = state();
         let mut stream = http_stream(Some(http));
         assert!(!stream.http_exchange_settled(), "nothing ended yet");
-        stream.output_fin = true;
-        assert!(
-            !stream.http_exchange_settled(),
-            "the request FIN has not arrived: request bytes may still need authorization"
-        );
         let fin = Frame::fin(1, 1, 1, 1, 0);
         stream
             .sequence
             .receive_frame(Direction::RelayToConnector, &fin)
             .expect("request FIN");
+        assert!(
+            !stream.http_exchange_settled(),
+            "the response is still running and its writes need authorization"
+        );
+        stream.output_fin = true;
         assert!(stream.http_exchange_settled());
+        let mut upload = http_stream(Some(state().0));
+        upload.output_fin = true;
+        assert!(
+            !upload.http_exchange_settled(),
+            "the request FIN has not arrived: request bytes may still need authorization"
+        );
         stream.output_reset = true;
         assert!(
             !stream.http_exchange_settled(),
