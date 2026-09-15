@@ -207,6 +207,10 @@ pub struct HttpForwardRotationEvidence {
     pub steady_state_sockets: Vec<usize>,
     /// The most device TCP connections ever open at once before owner loss.
     pub device_socket_peak: u64,
+    /// The effective case-boundary membership re-sign spacing, in
+    /// milliseconds.  A run shortened by `M3_ROTATION_RESIGN_SPACING_MS` is a
+    /// defect reproduction, not gate evidence.
+    pub resign_spacing_ms: u128,
 }
 
 fn case<'a>(
@@ -293,6 +297,10 @@ pub fn validate_http_forward_rotation_evidence(
 ) -> Result<()> {
     let mut checks: Vec<(String, bool)> = vec![
         ("three relays".into(), evidence.relay_count == 3),
+        (
+            "membership re-sign spacing not shortened by an override".into(),
+            evidence.resign_spacing_ms >= MEMBERSHIP_RESIGN_SPACING.as_millis(),
+        ),
         ("non-owner ingress".into(), evidence.non_owner_ingress),
         (
             "one device session across every rotation case".into(),
@@ -2140,6 +2148,7 @@ async fn run(
 ) -> Result<HttpForwardRotationEvidence> {
     let mut evidence = HttpForwardRotationEvidence {
         relay_count: cluster.relays.len(),
+        resign_spacing_ms: resign_spacing().as_millis(),
         ..HttpForwardRotationEvidence::default()
     };
     let device = harness
@@ -2481,6 +2490,7 @@ mod tests {
         let race_observation = observation("cancel-race", 1);
         HttpForwardRotationEvidence {
             relay_count: 3,
+            resign_spacing_ms: MEMBERSHIP_RESIGN_SPACING.as_millis(),
             owner_node: "relay-a".into(),
             ingress_node: "relay-c".into(),
             non_owner_ingress: true,
@@ -2553,6 +2563,7 @@ mod tests {
         type Mutation = (&'static str, fn(&mut HttpForwardRotationEvidence));
         let mutations: Vec<Mutation> = vec![
             ("relays", |e| e.relay_count = 2),
+            ("resign spacing override", |e| e.resign_spacing_ms = 350),
             ("ingress", |e| e.non_owner_ingress = false),
             ("session", |e| e.session_stable = false),
             ("probe status", |e| e.admission_probe.status = 403),

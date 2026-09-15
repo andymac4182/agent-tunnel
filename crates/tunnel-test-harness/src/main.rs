@@ -1631,8 +1631,9 @@ async fn main() -> ExitCode {
                         .join(" ");
                     let race = &evidence.cancel_race;
                     println!(
-                        "M3 http-forward rotation passed: relays={} owner={} ingress={} non_owner_ingress={} session_stable={} rotations_completed={} steady_state_sockets={:?} device_socket_peak={} admission_probe={:?} cases=[{}] cancel_race=(stream={} freeze_polls={} held={} handler_cancelled_while_frozen={} still_frozen={} deferred_reset={} unsequenced={} cancel_sent={} device_cancel={} reset_sequence={:?} relay_fence={:?} reset_generation={:?} new_generation={:?} forgotten={}) lost_ack=({:?}) owner_loss=({:?})",
+                        "M3 http-forward rotation passed: relays={} resign_spacing_ms={} owner={} ingress={} non_owner_ingress={} session_stable={} rotations_completed={} steady_state_sockets={:?} device_socket_peak={} admission_probe={:?} cases=[{}] cancel_race=(stream={} freeze_polls={} held={} handler_cancelled_while_frozen={} still_frozen={} deferred_reset={} unsequenced={} cancel_sent={} device_cancel={} reset_sequence={:?} relay_fence={:?} reset_generation={:?} new_generation={:?} forgotten={}) lost_ack=({:?}) owner_loss=({:?})",
                         evidence.relay_count,
+                        evidence.resign_spacing_ms,
                         evidence.owner_node,
                         evidence.ingress_node,
                         evidence.non_owner_ingress,
