@@ -104,6 +104,8 @@ gate "M7 authenticated peer body fragmentation and malformed records" \
   cargo run --locked -p tunnel-test-harness -- verify-m7-peer-fragmentation
 gate "M7 EC-044 reordered, duplicate and late frames through a real peer forward" \
   cargo run --locked -p tunnel-test-harness -- verify-m7-ec044-peer-frames
+gate "M7 reserved control delivery and frame ordering on one saturated non-owner-ingress route" \
+  cargo run --locked -p tunnel-test-harness -- verify-m7-saturated-peer-frames
 gate "M7 Redis-backed cluster acceptance" \
   cargo run --locked -p tunnel-test-harness -- verify-m7-cluster
 gate "M7 production relay acceptance" \

@@ -72,6 +72,9 @@ use uuid::Uuid;
 
 use crate::{ClusterFixture, FixturePki, HarnessError, Result};
 
+/// M7-I07/M7-C22 conjunction gate built on this module's fixture.
+pub mod saturated;
+
 const OWNER_NODE_ID: &str = "relay-a";
 const SOURCE_NODE_ID: &str = "relay-b";
 const SERVER_NAME: &str = "localhost";
@@ -400,28 +403,73 @@ impl PeerBindingProvider for FixtureBindings {
     }
 }
 
-struct RunningFixture {
-    catalog: Arc<MemoryCatalog>,
-    handle: RelayHandle,
-    client: PeerClient,
-    destination: PeerDestination,
+/// Optional fixture shape requested by a gate built on this module.
+#[derive(Clone, Default)]
+pub(crate) struct FixtureSetup {
+    /// Transport limits for a second, independent peer client.  The
+    /// connection-level QUIC receive window is `max_connection_body_bytes`
+    /// (`configure_quic_connection`), so a small value here is what lets a
+    /// gate stop reading and block the owner's physical carrier writer.
+    pub(crate) carrier_client_limits: Option<PeerTransportLimits>,
+    /// QUIC transport configuration for that second client.  The
+    /// flow-control windows advertised at the handshake are what decide how
+    /// many wire bytes the owner's physical writer can hand off before it
+    /// blocks; they cannot be lowered afterwards.
+    pub(crate) carrier_transport: Option<Arc<quinn::TransportConfig>>,
+    /// Run the owner's peer server with an independent planned-shutdown
+    /// signal so a gate can request a real HTTP/3 GOAWAY drain without
+    /// cancelling the fixture.
+    pub(crate) planned_drain: bool,
+}
+
+pub(crate) struct RunningFixture {
+    pub(crate) catalog: Arc<MemoryCatalog>,
+    pub(crate) handle: RelayHandle,
+    pub(crate) client: PeerClient,
+    /// Second peer client, present only when [`FixtureSetup`] asked for one.
+    pub(crate) carrier_client: Option<PeerClient>,
+    pub(crate) destination: PeerDestination,
+    /// The owner peer listener's own bounded diagnostics, so a gate can assert
+    /// the planned HTTP/3 GOAWAY was actually written rather than inferring it
+    /// from a client-side refusal.
+    pub(crate) server_diagnostics: Arc<tunnel_transport::PeerServerDiagnostics>,
     runtime: Arc<PeerRuntime>,
     owner_token: std::sync::Mutex<OwnerToken>,
     last_ingress_error: Arc<std::sync::Mutex<Option<String>>>,
     source_boot_id: String,
-    consumer_token: String,
+    pub(crate) consumer_token: String,
     cancel: CancellationToken,
+    /// Planned GOAWAY drain signal, present only when requested.
+    planned: Option<CancellationToken>,
     server_task: JoinHandle<std::result::Result<(), PeerTransportError>>,
 }
 
 impl RunningFixture {
-    async fn shutdown(mut self) -> Result<()> {
+    pub(crate) async fn shutdown(mut self) -> Result<()> {
         self.cancel.cancel();
         let deadline = Instant::now() + CLEANUP_TIMEOUT;
         let mut errors = Vec::new();
 
-        if let Err(error) = join_server(&mut self.server_task, deadline).await {
+        // A gate that asked for the planned GOAWAY drain has already put the
+        // listener into it; the emergency cancellation above then ends that
+        // drain, and the server reports the cancellation it was given.  That
+        // is the expected shape for such a gate, not a cleanup failure.
+        let planned_drain_requested = self
+            .planned
+            .as_ref()
+            .is_some_and(tokio_util::sync::CancellationToken::is_cancelled);
+        if let Err(error) = join_server(&mut self.server_task, deadline).await
+            && !(planned_drain_requested
+                && matches!(error, HarnessError::Http(ref text) if text.contains("cancelled")))
+        {
             errors.push(format!("server: {error}"));
+        }
+        if let Some(carrier) = self.carrier_client.take() {
+            match timeout_at(deadline, carrier.shutdown()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => errors.push(format!("carrier client: {error}")),
+                Err(_) => errors.push("carrier client: shutdown deadline exceeded".to_owned()),
+            }
         }
         match timeout_at(deadline, self.client.shutdown()).await {
             Ok(Ok(())) => {}
@@ -452,7 +500,22 @@ impl RunningFixture {
 impl RunningFixture {
     /// Bounded suffix naming the owner's own last ingress rejection, so a
     /// transport-level admission failure is diagnosable without tracing.
-    fn owner_token(&self) -> OwnerToken {
+    /// Request the owner peer listener's planned HTTP/3 GOAWAY drain.
+    ///
+    /// Only available when the fixture was started with
+    /// [`FixtureSetup::planned_drain`]; it is independent of the emergency
+    /// cancellation used by [`Self::shutdown`].
+    pub(crate) fn request_planned_goaway(&self) -> Result<()> {
+        let planned = self.planned.as_ref().ok_or_else(|| {
+            HarnessError::InvalidInput(
+                "peer fixture was not started with a planned drain seam".to_owned(),
+            )
+        })?;
+        planned.cancel();
+        Ok(())
+    }
+
+    pub(crate) fn owner_token(&self) -> OwnerToken {
         self.owner_token
             .lock()
             .expect("ec044 owner token lock")
@@ -496,10 +559,10 @@ async fn join_server(
 }
 
 /// A raw peer stream plus its own bounded record decoder.
-struct RawStream {
+pub(crate) struct RawStream {
     label: &'static str,
-    send: PeerClientSend,
-    recv: PeerClientRecv,
+    pub(crate) send: PeerClientSend,
+    pub(crate) recv: PeerClientRecv,
     decoder: PeerRecordDecoder,
     // The connection budget must outlive the stream budget held by the
     // decoder; keeping it here ties both to the stream's lifetime.
@@ -513,26 +576,33 @@ impl RawStream {
         route: InternalRoute,
         label: &'static str,
     ) -> Result<Self> {
-        let connection = fixture
-            .client
-            .connect(fixture.destination.clone())
+        Self::open_on(fixture, &fixture.client, route, label)
             .await
-            .map_err(|error| http_error("connecting ec044 peer stream", error))?;
+            .map_err(|error| http_error("opening ec044 peer stream", error))
+    }
+
+    /// Open a peer stream on an explicitly chosen client, returning the typed
+    /// transport error so a caller can distinguish a post-GOAWAY refusal from
+    /// any other admission failure.
+    pub(crate) async fn open_on(
+        fixture: &RunningFixture,
+        client: &PeerClient,
+        route: InternalRoute,
+        label: &'static str,
+    ) -> std::result::Result<Self, PeerTransportError> {
+        let connection = client.connect(fixture.destination.clone()).await?;
         let request = Request::builder()
             .method("POST")
             .uri(format!("https://{SERVER_NAME}{}", PeerRuntime::path(route)))
             .header("content-type", "application/octet-stream")
             .body(())
-            .map_err(|error| HarnessError::Http(format!("building ec044 peer request: {error}")))?;
-        let stream = connection
-            .open(request)
-            .await
-            .map_err(|error| http_error("opening ec044 peer stream", error))?;
+            .map_err(|error| PeerTransportError::H3(format!("building peer request: {error}")))?;
+        let stream = connection.open(request).await?;
         let (send, recv) = stream.split();
         let budget = ConnectionBudget::new();
         let stream_budget = budget
             .open_stream()
-            .map_err(|error| HarnessError::Http(format!("ec044 stream budget: {error}")))?;
+            .map_err(|error| PeerTransportError::H3(format!("stream budget: {error}")))?;
         Ok(Self {
             label,
             send,
@@ -543,14 +613,18 @@ impl RawStream {
         })
     }
 
-    async fn send_record(&mut self, kind: PeerRecordKind, body: &[u8]) -> Result<()> {
+    pub(crate) async fn send_record(&mut self, kind: PeerRecordKind, body: &[u8]) -> Result<()> {
         self.send
             .send_chunk(Bytes::from(wire_record(kind, body)?))
             .await
             .map_err(|error| http_error("sending ec044 peer record", error))
     }
 
-    async fn expect_ok(&mut self, running: &RunningFixture, context: &str) -> Result<()> {
+    pub(crate) async fn expect_ok(
+        &mut self,
+        running: &RunningFixture,
+        context: &str,
+    ) -> Result<()> {
         let response = timeout(STEP_TIMEOUT, self.recv.recv_response())
             .await
             .map_err(|_| HarnessError::Timeout(format!("{context} response deadline")))?
@@ -570,7 +644,7 @@ impl RawStream {
     }
 
     /// Read the next decoded peer record, or `None` at a clean end of body.
-    async fn next_record(&mut self) -> Result<Option<PeerRecord>> {
+    pub(crate) async fn next_record(&mut self) -> Result<Option<PeerRecord>> {
         loop {
             if !self.pending.is_empty() {
                 return Ok(Some(self.pending.remove(0)));
@@ -594,13 +668,19 @@ impl RawStream {
 
     /// Drain whatever records are already buffered without blocking on a
     /// fresh chunk.  Used to prove that nothing further arrived.
-    fn drain_buffered(&mut self) -> Vec<PeerRecord> {
+    pub(crate) fn drain_buffered(&mut self) -> Vec<PeerRecord> {
         std::mem::take(&mut self.pending)
     }
 }
 
-/// Run the EC-044 peer-path frame gate.
-pub async fn verify() -> Result<PeerFrameEvidence> {
+/// Build the ephemeral PKI, cluster fixture and running owner relay this
+/// module's gates share.
+///
+/// `setup` is the only difference between them: the EC-044 gate runs the
+/// default shape, and the saturated conjunction gate additionally asks for a
+/// second, deliberately small-windowed peer client for the device data
+/// carrier and for the owner's planned GOAWAY drain seam.
+pub(crate) async fn start_running(setup: FixtureSetup) -> Result<RunningFixture> {
     let pki = FixturePki::new()?;
     let mut cluster = ClusterFixture::new(&pki)?;
     cluster
@@ -613,7 +693,12 @@ pub async fn verify() -> Result<PeerFrameEvidence> {
         .release_ports();
 
     let source_binding = verified_binding(&cluster, SOURCE_NODE_ID)?;
-    let running = start_fixture(&cluster, source_binding).await?;
+    start_fixture(&cluster, source_binding, setup).await
+}
+
+/// Run the EC-044 peer-path frame gate.
+pub async fn verify() -> Result<PeerFrameEvidence> {
+    let running = start_running(FixtureSetup::default()).await?;
 
     let run_result = match timeout(PHASE_TIMEOUT.saturating_mul(4), run_phases(&running)).await {
         Ok(result) => result,
@@ -702,12 +787,17 @@ struct FrameContext {
 }
 
 /// One open consumer request whose records are outstanding at the owner.
-struct ConsumerPhase {
-    stream: RawStream,
-    stream_id: u64,
+pub(crate) struct ConsumerPhase {
+    pub(crate) stream: RawStream,
+    pub(crate) stream_id: u64,
     /// Relay-to-connector sequence of the last request frame observed on the
     /// data carrier.  Connector frames acknowledge it.
-    relay_last_emitted: u64,
+    pub(crate) relay_last_emitted: u64,
+    /// Grant identity the owner published in its `OPEN` metadata.  A later
+    /// authorization challenge must reproduce it exactly or the owner refuses
+    /// it as a mismatched challenge before any catalog read.
+    pub(crate) permission_digest: String,
+    pub(crate) grant_revision: u64,
 }
 
 /// Open a consumer peer stream, dispatch `OUTSTANDING_RECORDS` request
@@ -790,6 +880,16 @@ async fn open_consumer_phase(
         stream,
         stream_id,
         relay_last_emitted,
+        permission_digest: open
+            .metadata
+            .get("permission_digest")
+            .cloned()
+            .unwrap_or_default(),
+        grant_revision: open
+            .metadata
+            .get("grant_revision")
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0),
     })
 }
 
@@ -1471,6 +1571,7 @@ fn consumer_envelope(running: &RunningFixture, label: &str) -> Result<RequestEnv
 async fn start_fixture(
     cluster: &ClusterFixture,
     source_binding: VerifiedPeerBinding,
+    setup: FixtureSetup,
 ) -> Result<RunningFixture> {
     let owner = cluster
         .node(OWNER_NODE_ID)
@@ -1522,7 +1623,7 @@ async fn start_fixture(
     )
     .map_err(|error| HarnessError::Http(format!("ec044 source pin provider: {error}")))?;
 
-    let owner_client = make_client(owner, &source_pin, limits.clone())?;
+    let owner_client = make_client(owner, &source_pin, limits.clone(), None)?;
     let identity = RelayIdentity::new(
         cluster.deployment_incarnation.clone(),
         owner.node_id.clone(),
@@ -1566,22 +1667,51 @@ async fn start_fixture(
     )
     .map_err(|error| HarnessError::Http(format!("ec044 peer server: {error}")))?;
 
-    let client = make_client(source, &owner_pin, limits)?;
+    let server_diagnostics = server.diagnostics();
+    let client = make_client(source, &owner_pin, limits, None)?;
+    // A second client for the device data carrier when a gate needs one: it
+    // presents the same source peer identity on its own QUIC connection, so
+    // its connection-level receive window is independent of the control and
+    // consumer streams multiplexed on `client`.
+    let carrier_client = match setup.carrier_client_limits {
+        Some(carrier_limits) => {
+            carrier_limits.validate().map_err(|error| {
+                HarnessError::InvalidInput(format!("peer carrier client limits: {error}"))
+            })?;
+            Some(make_client(
+                source,
+                &owner_pin,
+                carrier_limits,
+                setup.carrier_transport.clone(),
+            )?)
+        }
+        None => None,
+    };
     let destination = PeerDestination::new(owner.addresses.udp, SERVER_NAME);
     let cancel = CancellationToken::new();
-    let server_task = tokio::spawn(server.serve(cancel.clone()));
+    let (planned, server_task) = if setup.planned_drain {
+        let planned = CancellationToken::new();
+        let task =
+            tokio::spawn(server.serve_with_planned_shutdown(cancel.clone(), planned.clone()));
+        (Some(planned), task)
+    } else {
+        (None, tokio::spawn(server.serve(cancel.clone())))
+    };
 
     Ok(RunningFixture {
         catalog,
         handle,
         client,
+        carrier_client,
         destination,
+        server_diagnostics,
         runtime,
         owner_token: std::sync::Mutex::new(bootstrap.token),
         last_ingress_error,
         source_boot_id: source.boot_id.clone(),
         consumer_token,
         cancel,
+        planned,
         server_task,
     })
 }
@@ -1610,15 +1740,23 @@ fn make_client(
     node: &crate::cluster_fixture::RelayNodeFixture,
     approved_pin: &tunnel_transport::SpkiSha256,
     limits: PeerTransportLimits,
+    transport: Option<Arc<quinn::TransportConfig>>,
 ) -> Result<PeerClient> {
     let mut endpoint = quinn::Endpoint::client(SocketAddr::from(([127, 0, 0, 1], 0)))
         .map_err(|error| HarnessError::Http(format!("binding ec044 peer client: {error}")))?;
-    let config = load_peer_client_config_from_pem(
+    let mut config = load_peer_client_config_from_pem(
         node.peer_certificate_chain_pem().as_bytes(),
         node.peer_certificate.private_key_pem.as_bytes(),
         node.peer_ca_pem().as_bytes(),
     )
     .map_err(|error| HarnessError::Pki(format!("ec044 client TLS: {error}")))?;
+    // A caller-supplied QUIC transport configuration is how a gate advertises
+    // a deliberately small receive window at the handshake.  Lowering it after
+    // the handshake cannot revoke flow-control credit the peer already holds,
+    // so it has to be set here.
+    if let Some(transport) = transport {
+        config.transport_config(transport);
+    }
     endpoint.set_default_client_config(config);
     let pins = ApprovedPeerPins::new([*approved_pin])
         .map_err(|error| HarnessError::Http(format!("ec044 client pins: {error}")))?;
