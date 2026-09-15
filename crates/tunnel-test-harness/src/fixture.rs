@@ -272,6 +272,23 @@ impl FixtureTopology {
         fixture: &mut CatalogFixture,
         device_id: Uuid,
     ) -> Result<Uuid> {
+        self.push_http_forward_service_with_profile(
+            fixture,
+            device_id,
+            crate::FIXTURE_HTTP_FORWARD_PROFILE,
+            "Synthetic in-process HTTP export",
+        )
+    }
+
+    /// Like [`Self::push_http_forward_service`], with the service record's
+    /// `http_forward_profile` capability naming `profile`.
+    pub fn push_http_forward_service_with_profile(
+        &self,
+        fixture: &mut CatalogFixture,
+        device_id: Uuid,
+        profile: &str,
+        display_name: &str,
+    ) -> Result<Uuid> {
         let device = self
             .all_devices()
             .find(|device| device.id == device_id)
@@ -289,10 +306,10 @@ impl FixtureTopology {
             device_id,
             service_id,
             service_type: "http-forward".to_owned(),
-            display_name: "Synthetic in-process HTTP export".to_owned(),
+            display_name: display_name.to_owned(),
             capabilities: serde_json::json!({
                 "operations": ["http:invoke"],
-                (tunnel_relay::HTTP_FORWARD_PROFILE_CAPABILITY): crate::FIXTURE_HTTP_FORWARD_PROFILE,
+                (tunnel_relay::HTTP_FORWARD_PROFILE_CAPABILITY): profile,
             }),
             version: 1,
             active: true,

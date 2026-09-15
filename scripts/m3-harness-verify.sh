@@ -28,5 +28,7 @@ gate "M3 http-forward/1 gate 3 over non-owner ingress, peer HTTP/3 and the devic
   cargo run --locked -p tunnel-test-harness -- verify-m3-http-forward-real-path
 gate "M3 http-forward/1 gate 4 rotation points, CANCEL/RESET race and outcome_unknown" \
   cargo run --locked -p tunnel-test-harness -- verify-m3-http-forward-rotation
+gate "M3 MCP cloud client (rmcp) over non-owner ingress and the rotating tunnel to stdio and Streamable HTTP exports" \
+  cargo run --locked -p tunnel-test-harness -- verify-m3-mcp-cloud-client
 
 echo "m3-harness-verify: implemented M3 harness suite passed" >&2

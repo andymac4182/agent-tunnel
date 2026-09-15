@@ -53,7 +53,7 @@ pub use fixture::{
     ConsumerFixture, DeviceFixture, FixtureTopology, PrincipalFixture, SharedFixtureIdentity,
     TenantFixture,
 };
-pub use harness::{Harness, HarnessOptions, RunningHarness};
+pub use harness::{Harness, HarnessOptions, MCP_GATE_SERVICES, McpServiceFixture, RunningHarness};
 pub use oidc::{OidcClaims, OidcFixture, OidcTokenOptions};
 pub use pki::{
     CertificateAuthority, CertificateMaterial, CertificateProfile, CertificateRole, FixturePki,

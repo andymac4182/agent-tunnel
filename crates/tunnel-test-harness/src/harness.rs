@@ -48,6 +48,27 @@ pub struct HarnessOptions {
     /// mirror the primary echo grants) on the first tenant-A device.  Only the
     /// HTTP forwarding gate enables it.
     pub http_forward_service: bool,
+    /// Seed the four MCP `http-forward` services of the M3-03 cloud-client
+    /// gate ([`MCP_GATE_SERVICES`]) on the first tenant-A device, each with
+    /// mirrored `http:invoke` grants.  Only that gate enables it.
+    pub mcp_services: bool,
+}
+
+/// The MCP services the M3-03 gate seeds: `(label, profile)`.  The label
+/// names the device export kind the gate configures for the service.
+pub const MCP_GATE_SERVICES: [(&str, &str); 4] = [
+    ("stdio-2026", "mcp-2026-07-28"),
+    ("stdio-2025", "mcp-2025-11-25"),
+    ("http-2026", "mcp-2026-07-28"),
+    ("http-2025", "mcp-2025-11-25"),
+];
+
+/// One seeded MCP service.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct McpServiceFixture {
+    pub label: &'static str,
+    pub profile: &'static str,
+    pub service_id: uuid::Uuid,
 }
 
 impl Default for HarnessOptions {
@@ -62,6 +83,7 @@ impl Default for HarnessOptions {
             shared_fixture_identity: None,
             ambiguous_echo_service: false,
             http_forward_service: false,
+            mcp_services: false,
         }
     }
 }
@@ -127,6 +149,12 @@ impl HarnessOptions {
     /// Opt into the `http-forward` service used by the HTTP forwarding gate.
     pub fn http_forward_service(mut self, value: bool) -> Self {
         self.http_forward_service = value;
+        self
+    }
+
+    /// Opt into the four MCP services used by the M3-03 cloud-client gate.
+    pub fn mcp_services(mut self, value: bool) -> Self {
+        self.mcp_services = value;
         self
     }
 
@@ -262,6 +290,29 @@ impl Harness {
         } else {
             None
         };
+        let mut mcp_services = Vec::new();
+        if options.mcp_services {
+            let Some(device_id) = topology.devices_a.first().map(|device| device.id) else {
+                let error =
+                    HarnessError::InvalidInput("MCP services require a tenant-A device".to_owned());
+                return Err(with_redis_cleanup(error, redis.close().await));
+            };
+            for (label, profile) in MCP_GATE_SERVICES {
+                match topology.push_http_forward_service_with_profile(
+                    &mut fixture,
+                    device_id,
+                    profile,
+                    "Synthetic MCP export",
+                ) {
+                    Ok(service_id) => mcp_services.push(McpServiceFixture {
+                        label,
+                        profile,
+                        service_id,
+                    }),
+                    Err(error) => return Err(with_redis_cleanup(error, redis.close().await)),
+                }
+            }
+        }
         if let Err(error) = catalog.seed_fixture(&fixture).await {
             let error = HarnessError::Redis(format!("seeding production Redis catalog: {error}"));
             // A seed is one-shot. Discard a failed fixture, including partial
@@ -285,6 +336,7 @@ impl Harness {
             rotation: options.rotation,
             http_forward: None,
             http_forward_service,
+            mcp_services,
         })
     }
 }
@@ -311,6 +363,8 @@ pub struct RunningHarness {
     pub http_forward: Option<tunnel_relay::HttpForwardExports>,
     /// The seeded `http-forward` service, when requested.
     pub http_forward_service: Option<uuid::Uuid>,
+    /// The seeded MCP services, when requested.
+    pub mcp_services: Vec<McpServiceFixture>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -129,6 +129,15 @@ pub use http_forward_rotation::{
     OutcomeUnknownEvidence, ROTATION_CASES, RotationCaseEvidence, position_matches,
     validate_http_forward_rotation_evidence, verify as verify_http_forward_rotation,
 };
+mod mcp_cloud_client;
+pub use mcp_cloud_client::{
+    CancellationEvidence as McpCancellationEvidence, CrashEvidence as McpCrashEvidence,
+    DiscoveryEvidence as McpDiscoveryEvidence, HeldRotationEvidence as McpHeldRotationEvidence,
+    MCP_CASES, MCP_GATE_ROTATION, McpCloudClientEvidence, McpComboEvidence,
+    NotificationEvidence as McpNotificationEvidence, StreamingEvidence as McpStreamingEvidence,
+    WireCounts as McpWireCounts, validate_mcp_cloud_client_evidence,
+    verify as verify_mcp_cloud_client,
+};
 mod lifecycle;
 pub use lifecycle::{LifecycleEvidence, validate_lifecycle_evidence, verify as verify_lifecycle};
 mod key_rotation;
@@ -1399,6 +1408,9 @@ struct ProductionRelay {
     membership: Arc<MembershipRuntime>,
     membership_handle: Option<MembershipRuntimeHandle>,
     pins: SharedPeerPins,
+    /// Set when a membership invalidation's pin publication failed closed
+    /// because the runtime was momentarily not Ready (M7-C81).
+    pin_publication_pending: Arc<std::sync::atomic::AtomicBool>,
     peer_runtime: Arc<PeerRuntime>,
     peer_capacity: usize,
     consumer_socket_diagnostics: Option<AcceptedSocketDiagnostics>,
@@ -2312,6 +2324,7 @@ impl ProductionCluster {
             let task = tokio::spawn(peer_refresh_loop(
                 Arc::clone(&relay.membership),
                 relay.pins.clone(),
+                Arc::clone(&relay.pin_publication_pending),
                 Arc::clone(&relay.peer_runtime),
                 relay.node_id.clone(),
                 relay.peer_capacity,
@@ -5373,8 +5386,17 @@ async fn start_relay(
     // refresh, and differs from the serving relay's callback contract.  The
     // transport pin watcher still closes connections whose certificate is no
     // longer approved; the next bounded probe records the affected route.
+    //
+    // A re-signed record can invalidate an admission while the runtime is
+    // momentarily not Ready.  That publication fails closed (empty pins), and
+    // nothing else republishes here, so every peer stayed untrusted for good
+    // (M7-C81).  The failure is remembered and retried by the refresh loop
+    // once the runtime is Ready again; an explicit withdrawal (which is not a
+    // failed publication) is still held.
     let pin_membership = Arc::clone(&membership);
     let pin_updates = pins.clone();
+    let pin_publication_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let pending = Arc::clone(&pin_publication_pending);
     membership.set_invalidation_callback(Some(Arc::new(move |_identity, _reason| {
         if let Err(error) = publish_verified_pins(&pin_membership, &pin_updates) {
             tracing::warn!(
@@ -5382,6 +5404,9 @@ async fn start_relay(
                 "production membership pin publication failed closed"
             );
             let _ = pin_updates.replace(std::iter::empty::<SpkiSha256>());
+            pending.store(true, std::sync::atomic::Ordering::SeqCst);
+        } else {
+            pending.store(false, std::sync::atomic::Ordering::SeqCst);
         }
     })));
 
@@ -5621,6 +5646,7 @@ async fn start_relay(
         membership,
         membership_handle: Some(membership_handle),
         pins,
+        pin_publication_pending,
         peer_runtime,
         peer_capacity,
         consumer_socket_diagnostics,
@@ -5841,6 +5867,7 @@ async fn membership_resign_loop(
 async fn peer_refresh_loop(
     membership: Arc<MembershipRuntime>,
     pins: SharedPeerPins,
+    pin_publication_pending: Arc<std::sync::atomic::AtomicBool>,
     peer: Arc<PeerRuntime>,
     local_node_id: String,
     configured_capacity: usize,
@@ -5855,7 +5882,14 @@ async fn peer_refresh_loop(
             _ = ticker.tick() => {
                 // Pin publication is driven by verified membership invalidation
                 // above.  Avoid refreshing it here so a focused key-revocation
-                // fixture can hold an explicit withdrawal until restoration.
+                // fixture can hold an explicit withdrawal until restoration;
+                // only a publication that failed closed is retried.
+                if pin_publication_pending.load(std::sync::atomic::Ordering::SeqCst)
+                    && matches!(membership.readiness(), MembershipReadiness::Ready)
+                    && publish_verified_pins(&membership, &pins).is_ok()
+                {
+                    pin_publication_pending.store(false, std::sync::atomic::Ordering::SeqCst);
+                }
                 if pins.snapshot().is_empty() {
                     // No approved peer key material is published, so there is
                     // no trust evidence to admit any peer.

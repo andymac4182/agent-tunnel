@@ -19,6 +19,14 @@ hyper = { version = "1.7", features = ["http1", "client"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 jsonwebtoken = { version = "10.3.0", features = ["rust_crypto"] }
 rcgen = "0.13"
+# The M3-03 gate's cloud-side client is the pinned official Rust MCP SDK
+# (docs/mcp.md, "Pinned in code").
+rmcp = { version = "=3.4.0", default-features = false, features = [
+    "client",
+    "transport-streamable-http-client-unix-socket",
+] }
+rustix = { version = "1.1", default-features = false, features = ["process", "std"] }
+sse-stream = "0.2"
 rsa = { version = "0.9", features = ["pem"] }
 quinn = { version = "0.11.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
@@ -42,6 +50,8 @@ tunnel-cluster = { path = "../tunnel-cluster" }
 tunnel-client = { path = "../tunnel-client" }
 tunnel-http-bridge = { path = "../tunnel-http-bridge" }
 tunnel-http-forward = { path = "../tunnel-http-forward" }
+tunnel-mcp-export = { path = "../tunnel-mcp-export" }
+tunnel-mcp-fixture = { path = "../tunnel-mcp-fixture" }
 tunnel-core = { path = "../tunnel-core" }
 tokio-util = { version = "0.7", features = ["rt"] }
 tunnel-relay = { path = "../tunnel-relay" }
