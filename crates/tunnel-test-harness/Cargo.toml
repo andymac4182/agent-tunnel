@@ -40,6 +40,8 @@ tokio-tungstenite = { version = "0.30", default-features = false, features = ["c
 tunnel-catalog = { path = "../tunnel-catalog" }
 tunnel-cluster = { path = "../tunnel-cluster" }
 tunnel-client = { path = "../tunnel-client" }
+tunnel-http-bridge = { path = "../tunnel-http-bridge" }
+tunnel-http-forward = { path = "../tunnel-http-forward" }
 tunnel-core = { path = "../tunnel-core" }
 tokio-util = { version = "0.7", features = ["rt"] }
 tunnel-relay = { path = "../tunnel-relay" }

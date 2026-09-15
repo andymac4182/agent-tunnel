@@ -210,7 +210,7 @@ pub(crate) struct OpenRequest<'a> {
 
 pub(crate) fn open(request: OpenRequest<'_>) -> ControlMessage {
     let (initial_send_window, initial_receive_window) = match request.operation {
-        "echo_stream" => (
+        "echo_stream" | crate::actor::HTTP_FORWARD_STREAM_OPERATION => (
             M2_INITIAL_WINDOW_BYTES as u64,
             M2_INITIAL_WINDOW_BYTES as u64,
         ),

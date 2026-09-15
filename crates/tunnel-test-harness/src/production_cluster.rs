@@ -118,6 +118,11 @@ mod pressure;
 pub use pressure::PressureEvidence;
 mod queue_saturation;
 pub use queue_saturation::{QueueSaturationEvidence, validate_queue_saturation_evidence};
+mod http_forward_real_path;
+pub use http_forward_real_path::{
+    HttpForwardRealPathEvidence, validate_http_forward_real_path_evidence,
+    verify as verify_http_forward_real_path,
+};
 mod lifecycle;
 pub use lifecycle::{LifecycleEvidence, validate_lifecycle_evidence, verify as verify_lifecycle};
 mod key_rotation;
@@ -5498,6 +5503,7 @@ async fn start_relay(
                 consumer_upgrade_barrier,
                 consumer_peer_admission_barrier,
                 device_control_attach_barrier,
+                http_forward: harness.http_forward.clone(),
             },
         )
         .await

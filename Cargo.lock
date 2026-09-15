@@ -2478,7 +2478,10 @@ dependencies = [
 name = "tunnel-client"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "futures-util",
+ "http",
+ "http-body-util",
  "rcgen",
  "rustls",
  "rustls-pemfile",
@@ -2490,6 +2493,7 @@ dependencies = [
  "tokio-util",
  "toml",
  "tunnel-core",
+ "tunnel-http-bridge",
  "tunnel-protocol",
  "tunnel-transport",
  "url",
@@ -2532,6 +2536,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tunnel-http-forward",
+ "tunnel-protocol",
 ]
 
 [[package]]
@@ -2583,6 +2588,8 @@ dependencies = [
  "tunnel-catalog",
  "tunnel-cluster",
  "tunnel-core",
+ "tunnel-http-bridge",
+ "tunnel-http-forward",
  "tunnel-protocol",
  "tunnel-transport",
  "uuid",
@@ -2622,6 +2629,8 @@ dependencies = [
  "tunnel-client",
  "tunnel-cluster",
  "tunnel-core",
+ "tunnel-http-bridge",
+ "tunnel-http-forward",
  "tunnel-protocol",
  "tunnel-relay",
  "tunnel-transport",

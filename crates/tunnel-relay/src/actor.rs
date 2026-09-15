@@ -50,6 +50,7 @@ use crate::{
     config::{RelayLimits, RelayOptions},
     consumer_write_diagnostics::{ConsumerWriteDiagnostics, ConsumerWriteScope},
     http,
+    http_forward_diagnostics::HttpForwardDiagnostics,
     membership_runtime::PeerAdmissionCancellation,
     peer_consumer_transport_diagnostics::{
         PeerConsumerDiagnosticContext, PeerConsumerDiagnosticH3Code, PeerConsumerDiagnosticRole,
@@ -70,6 +71,13 @@ use crate::{
         StreamTerminalReceiptEvent,
     },
     wire::{self, WireError},
+};
+
+#[path = "actor_http_stream.rs"]
+mod http_stream;
+use http_stream::HttpStreamState;
+pub(crate) use http_stream::{
+    HTTP_FORWARD_STREAM_OPERATION, HttpPeerReset, HttpRead, HttpStreamRegistration,
 };
 
 const AUTHORIZATION_LIFETIME: Duration = Duration::from_secs(5);
@@ -1437,6 +1445,32 @@ struct M2Stream {
     /// Closed payload-free authorization cause retained for the bounded
     /// diagnostic snapshot.  This is one failure marker, never a history.
     authorization_failure_code: Option<&'static str>,
+    /// Present only for an `http-forward/1` stream; see `actor_http_stream`.
+    http: Option<HttpStreamState>,
+}
+
+/// The reply channel of one consumer stream admission.
+enum StreamAdmissionReply {
+    Echo(oneshot::Sender<Result<ConsumerStreamRegistration, RelayError>>),
+    Http(oneshot::Sender<Result<HttpStreamRegistration, RelayError>>),
+}
+
+impl StreamAdmissionReply {
+    const fn is_http(&self) -> bool {
+        matches!(self, Self::Http(_))
+    }
+
+    /// Report a refused admission.  Successful admissions are sent by the
+    /// admission path itself with the variant-specific registration.
+    fn send(self, result: Result<ConsumerStreamRegistration, RelayError>) -> Result<(), ()> {
+        let Err(error) = result else {
+            unreachable!("successful admissions are replied to explicitly");
+        };
+        match self {
+            Self::Echo(response) => response.send(Err(error)).map_err(drop),
+            Self::Http(response) => response.send(Err(error)).map_err(drop),
+        }
+    }
 }
 
 type PendingConsumerRecord = (Vec<u8>, oneshot::Sender<Result<Vec<u8>, EchoOutcome>>);
@@ -1764,6 +1798,34 @@ enum Command {
         cause: Option<StreamTerminalCause>,
         response: oneshot::Sender<bool>,
     },
+    OpenHttpStream {
+        consumer: AuthenticatedConsumer,
+        device_id: Uuid,
+        service_id: Uuid,
+        grant: GrantSnapshot,
+        consumer_expires_at: chrono::DateTime<Utc>,
+        request_id: Option<String>,
+        response: oneshot::Sender<Result<HttpStreamRegistration, RelayError>>,
+    },
+    ReadHttpStream {
+        key: SessionKey,
+        stream_id: u64,
+        operation_id: String,
+        response: oneshot::Sender<HttpRead>,
+    },
+    FinishHttpStream {
+        key: SessionKey,
+        stream_id: u64,
+        operation_id: String,
+        response: oneshot::Sender<bool>,
+    },
+    ResetHttpStream {
+        key: SessionKey,
+        stream_id: u64,
+        operation_id: String,
+        reason: u16,
+        response: oneshot::Sender<bool>,
+    },
     RecordConsumerResponseTimeout {
         scope: ConsumerWriteScope,
     },
@@ -1803,6 +1865,7 @@ pub struct RelayHandle {
     peer_transport_diagnostics: PeerTransportDiagnostics,
     peer_consumer_diagnostics: PeerConsumerDiagnostics,
     peer_fault_diagnostics: PeerFaultDiagnostics,
+    http_forward_diagnostics: HttpForwardDiagnostics,
     actor_completion: ActorCompletion,
     maintenance_completion: ActorCompletion,
     background_failure: Arc<AtomicBool>,
@@ -1839,6 +1902,7 @@ impl RelayHandle {
             peer_transport_diagnostics: PeerTransportDiagnostics::default(),
             peer_consumer_diagnostics: PeerConsumerDiagnostics::default(),
             peer_fault_diagnostics: PeerFaultDiagnostics::default(),
+            http_forward_diagnostics: HttpForwardDiagnostics::default(),
             actor_completion: actor_completion.clone(),
             maintenance_completion: maintenance_completion.clone(),
             background_failure: background_failure.clone(),
@@ -1871,6 +1935,7 @@ impl RelayHandle {
             peer_transport_diagnostics: handle.peer_transport_diagnostics.clone(),
             peer_consumer_diagnostics: handle.peer_consumer_diagnostics.clone(),
             peer_fault_diagnostics: handle.peer_fault_diagnostics.clone(),
+            http_forward_diagnostics: handle.http_forward_diagnostics.clone(),
             cleanup_dispatcher: Some(cleanup.dispatcher()),
             cleanup: Some(cleanup),
             background_tasks: JoinSet::new(),
@@ -2154,6 +2219,127 @@ impl RelayHandle {
             code: "REVERSE_CHANNEL_INTERRUPTED",
             execution: "unknown",
         })?
+    }
+
+    /// Admit one `http-forward/1` logical stream.  `request_id` is the peer
+    /// request identity when the consumer arrived through another relay.
+    pub(crate) async fn open_http_stream(
+        &self,
+        consumer: AuthenticatedConsumer,
+        device_id: Uuid,
+        service_id: Uuid,
+        grant: GrantSnapshot,
+        consumer_expires_at: chrono::DateTime<Utc>,
+        request_id: Option<String>,
+    ) -> Result<HttpStreamRegistration, RelayError> {
+        let (response, receiver) = oneshot::channel();
+        self.tx
+            .send(Command::OpenHttpStream {
+                consumer,
+                device_id,
+                service_id,
+                grant,
+                consumer_expires_at,
+                request_id,
+                response,
+            })
+            .await
+            .map_err(|_| RelayError::Shutdown)?;
+        receiver.await.map_err(|_| RelayError::Shutdown)?
+    }
+
+    /// Send one raw DATA chunk on an HTTP stream.  Resolves once the chunk is
+    /// sequenced toward the device; it waits (parked in the actor, charged to
+    /// the session budget) while send credit is exhausted.
+    pub(crate) async fn write_http_stream(
+        &self,
+        key: SessionKey,
+        stream_id: u64,
+        operation_id: String,
+        body: Vec<u8>,
+    ) -> Result<(), EchoOutcome> {
+        self.write_echo_stream(key, stream_id, operation_id, body)
+            .await
+            .map(drop)
+    }
+
+    /// Submit one ordered HTTP stream read and return its reply receiver.
+    /// Dropping this future before it resolves submits nothing; once it
+    /// resolves the caller owns the receiver, so an outstanding read survives
+    /// the caller's own cancellation.  `None` means the actor is gone.
+    pub(crate) async fn begin_read_http_stream(
+        &self,
+        key: SessionKey,
+        stream_id: u64,
+        operation_id: String,
+    ) -> Option<oneshot::Receiver<HttpRead>> {
+        let (response, receiver) = oneshot::channel();
+        self.tx
+            .send(Command::ReadHttpStream {
+                key,
+                stream_id,
+                operation_id,
+                response,
+            })
+            .await
+            .ok()?;
+        Some(receiver)
+    }
+
+    /// Queue the owner's FIN on an HTTP stream.
+    pub(crate) async fn finish_http_stream(
+        &self,
+        key: SessionKey,
+        stream_id: u64,
+        operation_id: String,
+    ) -> bool {
+        let (response, receiver) = oneshot::channel();
+        if self
+            .tx
+            .send(Command::FinishHttpStream {
+                key,
+                stream_id,
+                operation_id,
+                response,
+            })
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        receiver.await.unwrap_or(false)
+    }
+
+    /// Queue the owner's RESET on an HTTP stream.
+    pub(crate) async fn reset_http_stream(
+        &self,
+        key: SessionKey,
+        stream_id: u64,
+        operation_id: String,
+        reason: u16,
+    ) -> bool {
+        let (response, receiver) = oneshot::channel();
+        if self
+            .tx
+            .send(Command::ResetHttpStream {
+                key,
+                stream_id,
+                operation_id,
+                reason,
+                response,
+            })
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        receiver.await.unwrap_or(false)
+    }
+
+    /// The bounded HTTP forwarding diagnostics shared by every hop on this
+    /// relay.
+    pub(crate) fn http_forward_diagnostics(&self) -> &HttpForwardDiagnostics {
+        &self.http_forward_diagnostics
     }
 
     /// Close one consumer stream, carrying the typed first cause the calling
@@ -2475,6 +2661,7 @@ struct RelayActor {
     peer_transport_diagnostics: PeerTransportDiagnostics,
     peer_consumer_diagnostics: PeerConsumerDiagnostics,
     peer_fault_diagnostics: PeerFaultDiagnostics,
+    http_forward_diagnostics: HttpForwardDiagnostics,
     cleanup_dispatcher: Option<CleanupDispatcher>,
     cleanup: Option<CleanupWorker>,
     background_tasks: JoinSet<()>,
@@ -2776,6 +2963,52 @@ impl RelayActor {
                     &operation_id,
                     cause,
                 ));
+            }
+            Command::OpenHttpStream {
+                consumer,
+                device_id,
+                service_id,
+                grant,
+                consumer_expires_at,
+                request_id,
+                response,
+            } => {
+                self.open_consumer_stream(
+                    consumer,
+                    device_id,
+                    service_id,
+                    grant,
+                    consumer_expires_at,
+                    request_id,
+                    StreamAdmissionReply::Http(response),
+                );
+            }
+            Command::ReadHttpStream {
+                key,
+                stream_id,
+                operation_id,
+                response,
+            } => {
+                self.read_http_stream(&key, stream_id, &operation_id, response);
+            }
+            Command::FinishHttpStream {
+                key,
+                stream_id,
+                operation_id,
+                response,
+            } => {
+                let _ = response.send(self.finish_http_stream(&key, stream_id, &operation_id));
+            }
+            Command::ResetHttpStream {
+                key,
+                stream_id,
+                operation_id,
+                reason,
+                response,
+            } => {
+                let _ =
+                    response.send(self.reset_http_stream(&key, stream_id, &operation_id, reason));
+                let _ = self.flush_owner_stream_forgets(&key);
             }
             Command::RecordConsumerResponseTimeout { scope } => {
                 self.consumer_write_diagnostics.record_timeout(scope);
@@ -4231,13 +4464,46 @@ impl RelayActor {
         request_id: Option<String>,
         response: oneshot::Sender<Result<ConsumerStreamRegistration, RelayError>>,
     ) {
+        self.open_consumer_stream(
+            consumer,
+            device_id,
+            service_id,
+            grant,
+            consumer_expires_at,
+            request_id,
+            StreamAdmissionReply::Echo(response),
+        );
+    }
+
+    /// Admit one consumer logical stream: the echo record stream, or an
+    /// `http-forward/1` stream when `response` is the HTTP reply.  Both share
+    /// every admission, authorization, limit and sequence rule; only the
+    /// grant operation, the OPEN operation name and the stream's HTTP state
+    /// differ.
+    #[allow(clippy::too_many_arguments)] // Exact authorization, lifetime, request, and reply context.
+    fn open_consumer_stream(
+        &mut self,
+        consumer: AuthenticatedConsumer,
+        device_id: Uuid,
+        service_id: Uuid,
+        grant: GrantSnapshot,
+        consumer_expires_at: chrono::DateTime<Utc>,
+        request_id: Option<String>,
+        response: StreamAdmissionReply,
+    ) {
+        let http = response.is_http();
+        let required_operation = if http {
+            crate::HTTP_FORWARD_OPERATION
+        } else {
+            crate::ECHO_OPERATION
+        };
         if grant.valid_until <= Utc::now()
             || consumer_expires_at <= Utc::now()
             || grant.tenant_id != consumer.tenant_id
             || grant.principal_id != consumer.principal_id
             || grant.device_id != device_id
             || grant.service_id != service_id
-            || !grant.permissions.allows(crate::ECHO_OPERATION)
+            || !grant.permissions.allows(required_operation)
         {
             let _ = response.send(Err(RelayError::Forbidden));
             return;
@@ -4311,7 +4577,11 @@ impl RelayActor {
             body_len: 0,
             grant_revision: grant.revision,
             digest: &digest,
-            operation: "echo_stream",
+            operation: if http {
+                HTTP_FORWARD_STREAM_OPERATION
+            } else {
+                "echo_stream"
+            },
         });
         let open_message_id = match &open_message {
             ControlMessage::Open(open) => open.message_id.clone(),
@@ -4339,6 +4609,16 @@ impl RelayActor {
         let minimum_record_bytes = wire::MAX_BODY_BYTES
             .saturating_add(MAX_ECHO_RESPONSE_EXTRA_BYTES)
             .saturating_add(4);
+        // An HTTP stream sends independently of responses, so its replay and
+        // reorder capacity must cover the whole advertised window: the
+        // connector acknowledges on receipt, so unacknowledged bytes never
+        // exceed the window, and credit (not replay capacity) is then the
+        // only thing that parks a write.
+        let minimum_record_bytes = if http {
+            minimum_record_bytes.max(wire::M2_INITIAL_WINDOW_BYTES)
+        } else {
+            minimum_record_bytes
+        };
         let per_stream_queue =
             (self.options.limits.max_queue_bytes / stream_slots).max(minimum_record_bytes);
         let per_stream_frames = (self.options.limits.max_queue_messages / stream_slots).max(1);
@@ -4364,6 +4644,12 @@ impl RelayActor {
         let admission_lease = CancellationToken::new();
         let admission_deadline = Instant::now() + self.options.limits.operation_timeout;
         let registration_key = session.key.clone();
+        let (http_state, http_watchers) = if http {
+            let (state, reset, status) = HttpStreamState::new();
+            (Some(state), Some((reset, status)))
+        } else {
+            (None, None)
+        };
         session.streams.insert(
             stream_id,
             M2Stream {
@@ -4401,6 +4687,7 @@ impl RelayActor {
                 admission_lease: admission_lease.clone(),
                 admission_deadline,
                 authorization_failure_code: None,
+                http: http_state,
             },
         );
         let registration = ConsumerStreamRegistration {
@@ -4410,7 +4697,33 @@ impl RelayActor {
             closed,
             admission_lease,
         };
-        self.send_echo_registration(response, registration);
+        match (response, http_watchers) {
+            (StreamAdmissionReply::Http(response), Some((peer_reset, result_status))) => {
+                // The HTTP ingress has no upgrade callback: it owns the
+                // registration from this reply onwards.
+                registration.claim_admission();
+                if let Some(returned) = send_registration(
+                    response,
+                    Ok(HttpStreamRegistration {
+                        base: registration,
+                        peer_reset,
+                        result_status,
+                    }),
+                ) {
+                    self.remove_echo_stream(
+                        &returned.base.key,
+                        returned.base.stream_id,
+                        &returned.base.operation_id,
+                    );
+                }
+            }
+            (StreamAdmissionReply::Echo(response), _) => {
+                self.send_echo_registration(response, registration);
+            }
+            (StreamAdmissionReply::Http(_), None) => {
+                unreachable!("an HTTP admission always creates HTTP stream state")
+            }
+        }
     }
 
     fn send_echo_registration(
@@ -4469,6 +4782,11 @@ impl RelayActor {
         release_budget: bool,
     ) {
         stream.closed.cancel();
+        // Unread HTTP bytes can never be delivered after release; return
+        // their charge so the tombstone is reclaimable.
+        if let Some(discarded) = stream.http.as_mut().map(HttpStreamState::release) {
+            release_m2_bytes(queue_budget, stream, discarded);
+        }
         if release_budget {
             queue_budget.release(stream.budget_bytes);
             stream.budget_bytes = 0;
@@ -4839,6 +5157,20 @@ impl RelayActor {
         stream_id: u64,
         terminal: Terminal,
     ) -> bool {
+        Self::queue_stream_terminal_frame_mode(session, stream_id, terminal, false)
+    }
+
+    /// Queue one relay->connector terminal frame.  An HTTP stream may follow
+    /// its own FIN with a RESET (docs/protocol.md: RESET "may follow FIN
+    /// solely to reset the stream"), so an unfinished response can still be
+    /// aborted after the request half-closed; an echo stream keeps its first
+    /// terminal.
+    fn queue_stream_terminal_frame_mode(
+        session: &mut DeviceSession,
+        stream_id: u64,
+        terminal: Terminal,
+        reset_after_fin: bool,
+    ) -> bool {
         let Some(data_tx) = session.data_tx.clone() else {
             return false;
         };
@@ -4849,8 +5181,10 @@ impl RelayActor {
             return true;
         };
         let send_direction = stream.sequence.direction(Direction::RelayToConnector);
-        if send_direction.send_terminal().is_some() {
-            return true;
+        match send_direction.send_terminal() {
+            None => {}
+            Some(Terminal::Fin) if reset_after_fin && matches!(terminal, Terminal::Reset(_)) => {}
+            Some(_) => return true,
         }
         let Some(sequence) = send_direction.last_emitted().checked_add(1) else {
             return false;
@@ -5009,13 +5343,22 @@ impl RelayActor {
             }));
             return;
         };
-        if stream.operation_id != operation_id || stream.terminal {
+        if stream.operation_id != operation_id
+            || stream.terminal
+            || stream
+                .http
+                .as_ref()
+                .is_some_and(HttpStreamState::local_terminal)
+        {
             let _ = response.send(Err(EchoOutcome::Failure {
                 code: "STREAM_NOT_FOUND",
                 execution: "not_dispatched",
             }));
             return;
         }
+        // An HTTP stream carries raw record bytes: no length prefix, and a
+        // write completes when its chunk is sequenced.
+        let raw = stream.http.is_some();
         if stream.grant.valid_until <= now || stream.consumer_expires_at <= now {
             stream.authorization_failure_code = Some("AUTHORIZATION_EXPIRED");
             let _ = response.send(Err(EchoOutcome::Failure {
@@ -5103,7 +5446,8 @@ impl RelayActor {
             }
             return;
         }
-        let Some(record_len) = body.len().checked_add(4) else {
+        let prefix_len = if raw { 0 } else { 4 };
+        let Some(record_len) = body.len().checked_add(prefix_len) else {
             let _ = response.send(Err(EchoOutcome::Failure {
                 code: "BODY_LIMIT",
                 execution: "not_dispatched",
@@ -5128,7 +5472,8 @@ impl RelayActor {
         let record_fits_credit = send_direction
             .sent_bytes()
             .checked_add(record_len_u64)
-            .is_some_and(|attempted| attempted <= send_direction.send_credit());
+            .is_some_and(|attempted| attempted <= send_direction.send_credit())
+            && (!raw || Self::http_chunk_fits_replay(send_direction, record_len));
         if !record_fits_credit {
             // Attribution only: the record is parked exactly as before, and
             // this marker records *why* it is parked so a terminal reached
@@ -5146,13 +5491,19 @@ impl RelayActor {
             } else {
                 stream.pending_record_bytes =
                     stream.pending_record_bytes.saturating_add(body.len());
+                let parked = stream.pending_record_bytes;
+                if let Some(http) = stream.http.as_mut() {
+                    http.note_parked(parked);
+                }
                 stream.pending_records.push_back((body, response));
             }
             return;
         }
 
         let mut record = Vec::with_capacity(record_len);
-        record.extend_from_slice(&record_len_u32.to_be_bytes());
+        if !raw {
+            record.extend_from_slice(&record_len_u32.to_be_bytes());
+        }
         record.extend_from_slice(&body);
         // Sequence reservation and enqueue are one transaction for the whole
         // record (docs/m7-edge-cases.md EC-030): the sequence numbers are
@@ -5260,8 +5611,35 @@ impl RelayActor {
         }
         stream.sequence = candidate_sequence;
         stream.send_bytes = stream.send_bytes.saturating_add(body.len());
-        stream.response_records.push_back(response);
+        if raw {
+            let replay = stream
+                .sequence
+                .direction(Direction::RelayToConnector)
+                .replay_bytes();
+            if let Some(http) = stream.http.as_mut() {
+                http.note_replay(replay);
+            }
+            let _ = response.send(Ok(Vec::new()));
+        } else {
+            stream.response_records.push_back(response);
+        }
         self.record_application_dispatch();
+    }
+
+    /// Whether one raw HTTP chunk fits the stream's retained replay capacity.
+    /// Unlike an echo record, an HTTP write never waits for a response, so a
+    /// chunk the replay buffer cannot retain parks until ACKs release it
+    /// instead of failing the stream.
+    fn http_chunk_fits_replay(direction: &tunnel_protocol::DirectionState, len: usize) -> bool {
+        let limits = direction.limits();
+        direction
+            .replay_bytes()
+            .checked_add(len)
+            .is_some_and(|bytes| bytes <= limits.max_replay_bytes)
+            && direction
+                .replay_len()
+                .checked_add(len.div_ceil(tunnel_protocol::MAX_PAYLOAD_LEN).max(1))
+                .is_some_and(|frames| frames <= limits.max_replay_frames)
     }
 
     /// Retry records held back by cumulative send credit in FIFO order.  The
@@ -5292,15 +5670,18 @@ impl RelayActor {
                         return None;
                     }
                     let (body, _) = stream.pending_records.front()?;
-                    let record_len = body.len().checked_add(4)?;
-                    let record_len = u64::try_from(record_len).ok()?;
+                    let raw = stream.http.is_some();
+                    let record_len = body.len().checked_add(if raw { 0 } else { 4 })?;
                     let direction = stream.sequence.direction(Direction::RelayToConnector);
+                    let fits_replay = !raw || Self::http_chunk_fits_replay(direction, record_len);
+                    let record_len = u64::try_from(record_len).ok()?;
                     Some((
                         body.len(),
-                        direction
-                            .sent_bytes()
-                            .checked_add(record_len)
-                            .is_some_and(|attempted| attempted <= direction.send_credit()),
+                        fits_replay
+                            && direction
+                                .sent_bytes()
+                                .checked_add(record_len)
+                                .is_some_and(|attempted| attempted <= direction.send_credit()),
                         stream.operation_id.clone(),
                     ))
                 })
@@ -5402,6 +5783,8 @@ impl RelayActor {
         // Set only by the terminal-frame refusal below, from state sampled at
         // the refusal itself.
         let mut queue_exhausted = false;
+        let mut close_terminal = Terminal::Fin;
+        let http_diagnostics = self.http_forward_diagnostics.clone();
         let disposition = {
             let Some(session) = self.session_mut(key) else {
                 return true;
@@ -5415,7 +5798,13 @@ impl RelayActor {
                 let Some(stream) = session.streams.get_mut(&stream_id) else {
                     return true;
                 };
-                if stream.operation_id != operation_id || stream.terminal {
+                if stream.operation_id != operation_id {
+                    return true;
+                }
+                if stream.terminal {
+                    // A connector RESET already ended an HTTP stream; its
+                    // bounded high-water record is still taken once here.
+                    Self::record_http_owner_stream(stream, &http_diagnostics);
                     return true;
                 }
                 // The public ingress also enforces the verified token deadline
@@ -5429,17 +5818,35 @@ impl RelayActor {
                 {
                     stream.authorization_failure_code = Some("AUTHORIZATION_EXPIRED");
                 }
+                // An HTTP stream closes with FIN only when both directions
+                // already finished; anything else is a cancellation, so
+                // truncation can never look like a completed exchange.
+                if let Some(http) = stream.http.as_mut()
+                    && !http.completed()
+                {
+                    close_terminal = Terminal::Reset(tunnel_protocol::reset_reason::CANCELLED);
+                    http.mark_local_reset(tunnel_protocol::reset_reason::CANCELLED);
+                }
                 if writer_frozen {
                     // Hold the terminal behind any deferred application
                     // records; it is emitted after activation with the
                     // continuing sequence, never on the frozen carrier.  This
                     // is bounded backpressure, not a publication failure.
-                    stream.pending_terminal.get_or_insert(Terminal::Fin);
+                    if matches!(close_terminal, Terminal::Reset(_)) {
+                        stream.pending_terminal = Some(close_terminal);
+                    } else {
+                        stream.pending_terminal.get_or_insert(Terminal::Fin);
+                    }
                 }
             }
             if writer_frozen {
                 TerminalDisposition::Deferred
-            } else if Self::queue_stream_terminal_frame(session, stream_id, Terminal::Fin) {
+            } else if Self::queue_stream_terminal_frame_mode(
+                session,
+                stream_id,
+                close_terminal,
+                matches!(close_terminal, Terminal::Reset(_)),
+            ) {
                 TerminalDisposition::Emitted
             } else {
                 // Sampled at the refusal itself, not reconstructed later: a
@@ -5514,6 +5921,7 @@ impl RelayActor {
                     stream.terminal_fin_failure = true;
                 }
                 Self::release_echo_stream_state(stream, &queue_budget, false);
+                Self::record_http_owner_stream(stream, &http_diagnostics);
             }
         }
         if let Some(event) = pending_unregister {
@@ -9458,6 +9866,12 @@ impl RelayActor {
                     });
                 }
             }
+            ControlMessage::ResultStatus(status) => {
+                if status.session_id != key.session_id || status.epoch != key.epoch {
+                    return;
+                }
+                self.accept_http_result_status(&key, &status);
+            }
             ControlMessage::Cancel(cancel) => {
                 if cancel.session_id != key.session_id || cancel.epoch != key.epoch {
                     return;
@@ -10701,6 +11115,8 @@ impl RelayActor {
         let received_stream_id = frame.stream_id;
         let retry_stream = (!carrier_is_candidate && frame.kind == FrameKind::WindowUpdate)
             .then_some(frame.stream_id);
+        let retry_http_stream =
+            (!carrier_is_candidate && frame.kind == FrameKind::Ack).then_some(frame.stream_id);
         let mut invalid = false;
         let mut deferred_rejected = false;
         let mut fence_violation = false;
@@ -10927,6 +11343,42 @@ impl RelayActor {
                 let mut delivered_through = None;
                 for ready_frame in ready {
                     delivered_through = Some(ready_frame.sequence);
+                    if let Some(http) = stream.http.as_mut() {
+                        // Raw record bytes wait for the reader, charged to
+                        // the session budget and bounded by the advertised
+                        // window; FIN half-closes only the response direction.
+                        match ready_frame.kind {
+                            FrameKind::Data => {
+                                if !http.accept_data(
+                                    &ready_frame.payload,
+                                    wire::M2_INITIAL_WINDOW_BYTES,
+                                ) {
+                                    invalid = true;
+                                    break;
+                                }
+                            }
+                            FrameKind::Fin => {
+                                stream_terminal_receipt_observed = true;
+                                http.accept_fin();
+                            }
+                            FrameKind::Reset => {
+                                stream_terminal_receipt_observed = true;
+                                let reason = ready_frame
+                                    .reset_reason()
+                                    .ok()
+                                    .flatten()
+                                    .unwrap_or(tunnel_protocol::reset_reason::PROTOCOL);
+                                let discarded = http.accept_reset(reason);
+                                release_m2_bytes(&queue_budget, stream, discarded);
+                                if !stream.terminal {
+                                    stream_terminal_transitioned = true;
+                                    stream.terminal = true;
+                                }
+                            }
+                            FrameKind::Ack | FrameKind::WindowUpdate => {}
+                        }
+                        continue;
+                    }
                     if ready_frame.kind == FrameKind::Data {
                         if stream
                             .response_bytes
@@ -11033,6 +11485,12 @@ impl RelayActor {
                     .sequence
                     .direction(Direction::ConnectorToRelay)
                     .receive_terminal();
+                if stream.http.is_some() && matches!(peer_terminal, Some(Terminal::Fin)) {
+                    // An HTTP response FIN is a half-close: the upload may
+                    // still be in progress, so the owner never answers it
+                    // with a FIN of its own.
+                    peer_terminal = None;
+                }
                 if peer_terminal.is_some() {
                     // The connector's terminal ends its side of the stream:
                     // a half-received response record can never complete
@@ -11236,6 +11694,19 @@ impl RelayActor {
         }
         if let Some(terminal) = peer_terminal {
             let _ = self.queue_peer_terminal_reply(&key, received_stream_id, terminal);
+        }
+        // An HTTP chunk may be parked for replay capacity rather than credit;
+        // the connector's ACK is what releases that capacity.
+        if let Some(stream_id) = retry_http_stream
+            && self.session_for(&key).is_some_and(|session| {
+                session
+                    .streams
+                    .get(&stream_id)
+                    .is_some_and(|stream| stream.http.is_some())
+            })
+        {
+            self.retry_pending_echo_records(&key, stream_id);
+            self.flush_pending_terminal(&key, stream_id);
         }
         if let Some(stream_id) = retry_stream {
             self.retry_pending_echo_records(&key, stream_id);
@@ -12644,6 +13115,7 @@ impl RelayActor {
             owner_unregister_events: self.owner_unregister_events.iter().cloned().collect(),
             session_terminal_events: self.session_terminal_events.iter().cloned().collect(),
             stream_terminal_events: self.stream_terminal_events.iter().cloned().collect(),
+            http_forward: self.http_forward_diagnostics.snapshot(),
             stream_terminal_receipt_events: self
                 .stream_terminal_receipt_events
                 .iter()
@@ -13244,6 +13716,9 @@ pub struct ListenerSocketOptions {
     /// Optional one-shot fixture gate on an owner-local device control socket,
     /// after the device's HELLO and before the WELCOME-producing registration.
     pub device_control_attach_barrier: Option<Arc<crate::http::ControlAttachBarrier>>,
+    /// Optional `http-forward/1` export for the public HTTP routes.  Production
+    /// callers leave it `None` until gate 5 pins per-profile allowlists.
+    pub http_forward: Option<crate::http::forward::HttpForwardExport>,
 }
 
 impl Relay {
@@ -13432,6 +13907,7 @@ impl Relay {
             peer_runtime.clone(),
             listener_options.consumer_upgrade_barrier.clone(),
             listener_options.consumer_peer_admission_barrier.clone(),
+            listener_options.http_forward.clone(),
         );
         let device_router = http::device_router_with_peer_and_barrier(
             handle.clone(),
@@ -13644,6 +14120,7 @@ mod stream_identity_tests {
                     admission_deadline: std::time::Instant::now()
                         + std::time::Duration::from_secs(60),
                     authorization_failure_code: None,
+                    http: None,
                 },
             );
         }
@@ -13802,6 +14279,7 @@ mod stream_identity_tests {
                     admission_deadline: std::time::Instant::now()
                         + std::time::Duration::from_secs(60),
                     authorization_failure_code: None,
+                    http: None,
                 },
             );
         }
@@ -14338,6 +14816,7 @@ mod stream_identity_tests {
             peer_transport_diagnostics: super::PeerTransportDiagnostics::default(),
             peer_consumer_diagnostics: super::PeerConsumerDiagnostics::default(),
             peer_fault_diagnostics: super::PeerFaultDiagnostics::default(),
+            http_forward_diagnostics: super::HttpForwardDiagnostics::default(),
             cleanup_dispatcher: None,
             cleanup: None,
             background_tasks: tokio::task::JoinSet::new(),

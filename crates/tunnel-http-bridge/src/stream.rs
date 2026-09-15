@@ -69,12 +69,12 @@ impl QueueStats {
         self.high_water.load(Ordering::SeqCst)
     }
 
-    fn add(&self, len: usize) {
+    pub(crate) fn add(&self, len: usize) {
         let now = self.queued.fetch_add(len, Ordering::SeqCst) + len;
         self.high_water.fetch_max(now, Ordering::SeqCst);
     }
 
-    fn sub(&self, len: usize) {
+    pub(crate) fn sub(&self, len: usize) {
         self.queued.fetch_sub(len, Ordering::SeqCst);
     }
 }
@@ -199,6 +199,28 @@ impl FrameSender {
         true
     }
 
+    /// Raise the peer-RESET signal without queuing a frame or changing this
+    /// direction's state.  A carrier adapter uses this when it learns of a
+    /// peer RESET that follows the peer's FIN before it has delivered the
+    /// preceding ordered DATA and FIN: a stalled receiver can stop promptly,
+    /// while the ordered frames (and the RESET itself, queued later with
+    /// [`Self::reset`]) still arrive in sequence.  Only the first signal is
+    /// kept.
+    pub fn signal_reset(&self, reset: SignaledReset) {
+        self.state.signal.send_if_modified(|current| {
+            if current.is_some() {
+                return false;
+            }
+            *current = Some(reset);
+            true
+        });
+    }
+
+    /// Resolves once the receiver is gone.
+    pub async fn closed(&self) {
+        self.tx.closed().await;
+    }
+
     /// True when the receiver is gone.
     #[must_use]
     pub fn is_closed(&self) -> bool {
@@ -305,6 +327,39 @@ impl ResetSignal {
         }
         std::future::pending().await
     }
+}
+
+/// The notifying half of a standalone [`ResetSignal`], for carrier adapters
+/// that learn of a peer RESET out of band (ahead of ordered delivery).
+#[derive(Clone)]
+pub struct ResetNotifier {
+    tx: Arc<watch::Sender<Option<SignaledReset>>>,
+}
+
+impl ResetNotifier {
+    /// Record the peer RESET.  Only the first notification is kept.
+    pub fn notify(&self, reset: SignaledReset) {
+        self.tx.send_if_modified(|current| {
+            if current.is_some() {
+                return false;
+            }
+            *current = Some(reset);
+            true
+        });
+    }
+
+    /// Whether a RESET was already notified.
+    #[must_use]
+    pub fn is_notified(&self) -> bool {
+        self.tx.borrow().is_some()
+    }
+}
+
+/// A standalone out-of-band RESET signal pair.
+#[must_use]
+pub fn reset_signal_pair() -> (ResetNotifier, ResetSignal) {
+    let (tx, rx) = watch::channel(None);
+    (ResetNotifier { tx: Arc::new(tx) }, ResetSignal { rx })
 }
 
 /// Build one bounded direction with `capacity_bytes` of DATA credit
