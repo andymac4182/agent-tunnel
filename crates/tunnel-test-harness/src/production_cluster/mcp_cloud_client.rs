@@ -102,9 +102,9 @@ pub const LOG_COUNT: u64 = 5;
 pub const STREAM_EVENTS: u64 = 48;
 pub const STREAM_EVENT_BYTES: usize = 4096;
 /// The events after which the stream waits for a rotation observation.
-pub const STREAM_GATES: [u64; 2] = [15, 31];
-/// The distinct rotations a stream must span.
-pub const STREAM_MIN_ROTATIONS: usize = 2;
+pub const STREAM_GATES: [u64; 3] = [11, 23, 35];
+/// The distinct rotations a stream must span (docs/mcp.md, M3 acceptance).
+pub const STREAM_MIN_ROTATIONS: usize = 3;
 const MAX_ROTATIONS_PER_WAIT: u64 = 4;
 /// The longest one observation wait lasts.
 pub const OBSERVATION_BOUND: Duration = Duration::from_secs(
@@ -2241,7 +2241,7 @@ mod tests {
             kind: kind.to_owned(),
             profile: profile.to_owned(),
             session_stable: true,
-            session_rotations: 4,
+            session_rotations: 5,
             highest_call_stream_id: 40,
             discovery: DiscoveryEvidence {
                 negotiated_version: protocol_of(profile).to_owned(),
@@ -2335,6 +2335,7 @@ mod tests {
                 observations: vec![
                     observation(7, rotation_base + 2),
                     observation(7, rotation_base + 3),
+                    observation(7, rotation_base + 4),
                 ],
                 invocations: 1,
                 children_spawned: u64::from(stdio && current),
@@ -2354,15 +2355,15 @@ mod tests {
             relay_profiles: vec![PROFILE_2025.into(), PROFILE_2026.into()],
             device_sessions: 4,
             device_session_stable: true,
-            rotations_completed: 16,
+            rotations_completed: 20,
             sidecar_connections: 100,
             ingress_exchanges_recorded: 90,
             owner_exchanges_recorded: 90,
             combos: vec![
                 combo(KIND_STDIO, PROFILE_2026, 1),
-                combo(KIND_STDIO, PROFILE_2025, 5),
-                combo(KIND_HTTP, PROFILE_2026, 9),
-                combo(KIND_HTTP, PROFILE_2025, 13),
+                combo(KIND_STDIO, PROFILE_2025, 6),
+                combo(KIND_HTTP, PROFILE_2026, 11),
+                combo(KIND_HTTP, PROFILE_2025, 16),
             ],
             leftover_processes: 0,
             resign_spacing_ms: MEMBERSHIP_RESIGN_SPACING.as_millis(),
@@ -2422,7 +2423,7 @@ mod tests {
                 e.combos[1].session_stable = false
             }),
             ("combo rotations", |e| {
-                e.combos[1].session_rotations = 3;
+                e.combos[1].session_rotations = 4;
                 e.rotations_completed = 19;
             }),
             ("version", |e| {
