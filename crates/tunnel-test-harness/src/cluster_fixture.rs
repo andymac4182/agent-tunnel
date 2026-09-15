@@ -258,6 +258,34 @@ pub struct MembershipRecordOptions {
     pub expires_at: DateTime<Utc>,
 }
 
+/// The parts of a relay node fixture a membership record actually commits to.
+///
+/// A long-running fixture has to re-sign its records from a background task,
+/// which cannot borrow the node fixture itself.  Capturing exactly the two
+/// committed values keeps that task honest: it can refresh a record's validity
+/// window, and it cannot change which node or which peer certificate the
+/// record names.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MembershipNodeIdentity {
+    pub node_id: String,
+    pub peer_spki_sha256: String,
+}
+
+/// Explicit inputs for one signed membership record that uses the fixture's
+/// default single-key set but needs a caller-chosen lifetime.
+///
+/// Grouped rather than passed positionally because the lifetime is the fourth
+/// quantity that varies together with the record version, endpoint and issue
+/// instant, and the same grouping is already how
+/// [`MembershipRecordOptions`] carries an explicit key set.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MembershipLifetimeOptions {
+    pub record_version: u64,
+    pub peer_endpoint: SocketAddr,
+    pub now: DateTime<Utc>,
+    pub lifetime: Duration,
+}
+
 /// A signed membership record with both the payload and opaque envelope bytes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SignedMembershipFixture {
@@ -396,26 +424,89 @@ impl TestMembershipAuthority {
         peer_endpoint: SocketAddr,
         now: DateTime<Utc>,
     ) -> Result<SignedMembershipFixture> {
-        let peer_spki = node.peer_spki_fingerprint()?;
+        self.sign_membership_with_endpoint_and_lifetime(
+            deployment_id,
+            deployment_incarnation,
+            node,
+            MembershipLifetimeOptions {
+                record_version,
+                peer_endpoint,
+                now,
+                lifetime: M7_MEMBERSHIP_LIFETIME,
+            },
+        )
+    }
+
+    /// Sign one relay membership record with an explicitly advertised peer
+    /// endpoint **and an explicit record/key lifetime**.
+    ///
+    /// [`M7_MEMBERSHIP_LIFETIME`] is deliberately short so the trust-expiry
+    /// gates can watch a record lapse inside a bounded run.  A long-running
+    /// fixture that must stay continuously trusted (the production cluster,
+    /// whose records are signed once at bootstrap and never re-signed) needs a
+    /// lifetime that outlives its whole scenario instead, because the relay's
+    /// trust deadline is
+    /// `min(checkpoint_expiry, record.expires_at, peer_key.expires_at)` and
+    /// only the checkpoint is minted fresh on each reconcile pass.
+    pub fn sign_membership_with_endpoint_and_lifetime(
+        &self,
+        deployment_id: &str,
+        deployment_incarnation: &str,
+        node: &RelayNodeFixture,
+        options: MembershipLifetimeOptions,
+    ) -> Result<SignedMembershipFixture> {
+        self.sign_membership_identity(
+            deployment_id,
+            deployment_incarnation,
+            &MembershipNodeIdentity {
+                node_id: node.node_id.clone(),
+                peer_spki_sha256: node.peer_spki_fingerprint()?,
+            },
+            options,
+        )
+    }
+
+    /// Sign one membership record from the node identity alone.
+    ///
+    /// This is the form a background re-signer uses.  It exists because the
+    /// relay's verifier caps a record's lifetime at the product maximum, so a
+    /// fixture whose scenario outlives that cap cannot buy itself a longer
+    /// record; it has to keep issuing fresh ones inside the cap, exactly as a
+    /// real control plane does.  The caller supplies a strictly increasing
+    /// record version, since the verifier replaces a record only with a newer
+    /// one.
+    pub fn sign_membership_identity(
+        &self,
+        deployment_id: &str,
+        deployment_incarnation: &str,
+        identity: &MembershipNodeIdentity,
+        options: MembershipLifetimeOptions,
+    ) -> Result<SignedMembershipFixture> {
+        let MembershipLifetimeOptions {
+            record_version,
+            peer_endpoint,
+            now,
+            lifetime,
+        } = options;
         let payload = FixtureMembershipPayload {
             schema_version: MEMBERSHIP_SCHEMA_VERSION,
             deployment_id: deployment_id.to_owned(),
             deployment_incarnation: deployment_incarnation.to_owned(),
-            node_id: node.node_id.clone(),
+            node_id: identity.node_id.clone(),
             record_version,
             roles: vec![RELAY_PEER_ROLE.to_owned()],
             peer_endpoint: peer_endpoint.to_string(),
             server_name: DEFAULT_SERVER_NAME.to_owned(),
             keys: vec![FixturePeerKey {
-                key_id: format!("{}-peer", node.node_id),
-                spki_sha256: peer_spki,
+                key_id: format!("{}-peer", identity.node_id),
+                spki_sha256: identity.peer_spki_sha256.clone(),
                 not_before: now,
-                expires_at: now + M7_MEMBERSHIP_LIFETIME,
+                expires_at: now + lifetime,
                 revoked: false,
             }],
             issued_at: now,
             not_before: now,
-            expires_at: now + M7_MEMBERSHIP_LIFETIME,
+            expires_at: now + lifetime,
         };
         let signed = self
             .issuer

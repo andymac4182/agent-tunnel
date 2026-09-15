@@ -54,6 +54,11 @@ use rotation_barrier::{
 };
 use uuid::Uuid;
 
+/// The smallest window in which a two-tenant keepalive round trip can be
+/// expected to complete. Below this, the pre-rotation loop waits for the arm
+/// point rather than starting a round trip it would have to fail.
+const KEEPALIVE_ROUND_TRIP_ALLOWANCE: Duration = Duration::from_millis(750);
+
 const EXPIRY_STARTUP_TIMEOUT: Duration = Duration::from_secs(90);
 const EXPIRY_PHASE_TIMEOUT: Duration = Duration::from_secs(20);
 const EXPIRY_POLL: Duration = Duration::from_millis(50);
@@ -1385,9 +1390,23 @@ async fn wait_for_pre_rotation_barrier_window(
                     .into(),
             ));
         }
-        let keepalive_window = remaining
-            .min(arm_at.saturating_duration_since(now))
-            .min(Duration::from_secs(2));
+        // Never start a keepalive that cannot finish. The window used to be
+        // bounded by the time left until `arm_at`, which shrinks to nothing as
+        // the loop approaches it, so an iteration landing a few milliseconds
+        // short gave `round_trip_all` a window no real two-tenant round trip
+        // could meet and failed the gate on a timeout while both CLIs were
+        // healthy and active. That is why this gate failed intermittently
+        // inside the C11 bundle, where slower snapshot polling makes the
+        // landing point more variable. The keepalives exist to hold the
+        // session warm until the arm point, so when there is not room for
+        // another one, wait out the remainder instead of forcing a doomed
+        // attempt.
+        let until_arm = arm_at.saturating_duration_since(now);
+        if until_arm < KEEPALIVE_ROUND_TRIP_ALLOWANCE {
+            sleep(until_arm).await;
+            return Ok(());
+        }
+        let keepalive_window = remaining.min(until_arm).min(Duration::from_secs(2));
         timeout(keepalive_window, streams.round_trip_all())
             .await
             .map_err(|_| {

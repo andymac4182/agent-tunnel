@@ -29,6 +29,115 @@ use crate::peer_runtime::{PeerOpenDiagnostic, PeerOpenDiagnosticStage, PeerRunti
 /// Maximum number of recent tuples retained in the ring.
 pub const MAX_RECENT_PEER_FAULTS: usize = 32;
 
+/// Maximum number of task closure records retained in the ring.
+pub const MAX_TASK_CLOSURES: usize = 32;
+
+/// Which relay task body reached its ordinary lifecycle end.
+///
+/// This is a lifecycle position, not a fault: the peer fault vocabulary above
+/// names peer ingress and owner-side *failures*, and an ordinary socket close
+/// is neither.  Keeping the two vocabularies apart is what stops a routine
+/// close from inflating `fault_count` or a per-stage fault latch.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskClosureStage {
+    /// The owner-local device control socket task.
+    Control,
+    /// The owner-local device data carrier task.
+    Data,
+    /// The public consumer stream adapter task.
+    ConsumerStream,
+}
+
+impl TaskClosureStage {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Control => "control",
+            Self::Data => "data",
+            Self::ConsumerStream => "consumer_stream",
+        }
+    }
+}
+
+/// Closed, payload-free causes for one task closure.
+///
+/// Every variant is a structural property of the socket loop's exit.  None is
+/// derived from a request body, header, ticket, endpoint or error text.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskClosureCause {
+    /// The remote endpoint closed, ended or errored its half of the socket.
+    PeerClosed,
+    /// A relay-to-peer write did not complete.
+    WriteFailed,
+    /// A bounded codec rejected an inbound frame.
+    ProtocolError,
+    /// An inbound frame exceeded this socket's bounded input window.
+    RecordTooLarge,
+    /// A message kind this socket does not serve arrived.
+    UnexpectedMessage,
+    /// The relay actor closed the socket, or its outbound channel ended.
+    ServerClose,
+    /// The owner closed the consumer stream under the adapter.
+    StreamClosed,
+    /// The absolute consumer authorization deadline elapsed.
+    Expired,
+    /// A stream write returned a typed failure or an unusable response frame.
+    StreamFailed,
+}
+
+impl TaskClosureCause {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PeerClosed => "peer_closed",
+            Self::WriteFailed => "write_failed",
+            Self::ProtocolError => "protocol_error",
+            Self::RecordTooLarge => "record_too_large",
+            Self::UnexpectedMessage => "unexpected_message",
+            Self::ServerClose => "server_close",
+            Self::StreamClosed => "stream_closed",
+            Self::Expired => "expired",
+            Self::StreamFailed => "stream_failed",
+        }
+    }
+}
+
+/// Bounded correlation identifiers for one task closure.
+///
+/// The fields are the same owner-registration identifiers
+/// [`crate::runtime::OwnerUnregisterEvent`] carries, so a closure record and
+/// the tombstone for the state it refers to can be matched without any
+/// request-derived content passing through.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskClosureScope {
+    pub tenant_id: Uuid,
+    pub device_id: Uuid,
+    pub session_id: String,
+    pub epoch: u64,
+    /// Present only for the consumer adapter, whose unregistered owner state
+    /// is one stream inside the session rather than the session itself.
+    pub stream_id: Option<u64>,
+}
+
+/// One bounded task closure tuple with its correlation identifiers.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct TaskClosureEventSnapshot {
+    /// Position on the shared diagnostic clock, drawn from the same counter
+    /// as peer fault tuples and owner unregister stamps.
+    pub sequence: u64,
+    /// Milliseconds from this relay process's monotonic diagnostic origin.
+    pub observed_at_ms: u64,
+    pub stage: TaskClosureStage,
+    pub cause: TaskClosureCause,
+    pub tenant_id: Uuid,
+    pub device_id: Uuid,
+    pub session_id: String,
+    pub epoch: u64,
+    pub stream_id: Option<u64>,
+}
+
 /// The relay-local side that observed the peer fault.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -266,6 +375,25 @@ pub struct PeerFaultEventSnapshot {
     pub request_id: Option<String>,
 }
 
+/// One payload-free position on the peer fault diagnostic clock.
+///
+/// A stamp carries a sequence number and a monotonic millisecond reading and
+/// nothing else: no request, route, body, status or peer identity.  It is
+/// drawn from the *same* counter and the same process origin that
+/// [`PeerFaultDiagnostics::record`] uses for a fault tuple, so a stamp and a
+/// tuple can be totally ordered against each other.  This is what makes the
+/// EC-061 ordering clause observable from outside: the relay stamps the
+/// unregister of the owner state a fault tuple refers to, and
+/// `fault.sequence < unregister.sequence` proves the tuple was recorded
+/// first rather than merely coexisting with it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct DiagnosticStamp {
+    /// Saturating process-local sequence number, shared with fault tuples.
+    pub sequence: u64,
+    /// Milliseconds from this relay process's monotonic diagnostic origin.
+    pub at_ms: u64,
+}
+
 /// Redacted peer fault tuples retained by the typed relay snapshot.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct PeerFaultDiagnosticSnapshot {
@@ -284,6 +412,15 @@ pub struct PeerFaultDiagnosticSnapshot {
     /// The most recent tuples, oldest first, bounded by
     /// [`MAX_RECENT_PEER_FAULTS`].
     pub recent: Vec<PeerFaultEventSnapshot>,
+    /// Saturating count per task closure stage label.
+    pub closure_stage_counts: BTreeMap<&'static str, u64>,
+    /// Saturating count per task closure cause label.
+    pub closure_cause_counts: BTreeMap<&'static str, u64>,
+    /// The most recent task closure tuples, oldest first, bounded by
+    /// [`MAX_TASK_CLOSURES`].  These are lifecycle ends, not faults: they are
+    /// kept in their own ring so a routine close never appears in
+    /// `fault_count`, `cause_counts`, `last_by_stage` or `recent`.
+    pub closures: Vec<TaskClosureEventSnapshot>,
 }
 
 #[derive(Default)]
@@ -296,6 +433,9 @@ struct PeerFaultDiagnosticState {
     cause_counts: BTreeMap<&'static str, u64>,
     last_by_stage: BTreeMap<&'static str, PeerFaultEventSnapshot>,
     recent: VecDeque<PeerFaultEventSnapshot>,
+    closure_stage_counts: BTreeMap<&'static str, u64>,
+    closure_cause_counts: BTreeMap<&'static str, u64>,
+    closures: VecDeque<TaskClosureEventSnapshot>,
 }
 
 /// Cloneable bounded state for peer fault tuples.
@@ -348,6 +488,91 @@ impl PeerFaultDiagnostics {
         state.recent.push_back(event);
     }
 
+    /// Record one bounded task closure tuple and return its position on the
+    /// shared diagnostic clock.
+    ///
+    /// EC-061 requires every closure to report a bounded lifecycle stage and
+    /// cause *before* the owner state it refers to is unregistered.  The
+    /// sequence here is drawn from the same mutex-protected counter that
+    /// [`Self::record`] and [`Self::stamp`] use, so a closure tuple and an
+    /// owner unregister tombstone are totally ordered against each other by
+    /// the identical predicate: `closure.sequence < unregister.sequence`
+    /// proves this call released the shared mutex before the unregister's
+    /// stamp acquired it, and therefore before the removal that follows that
+    /// stamp in program order.
+    ///
+    /// A closure is not a fault.  It touches only the closure ring and the
+    /// closure counters; `fault_count`, `cause_counts`, `last_by_stage` and
+    /// `recent` keep their existing shape and meaning, so an ordinary
+    /// lifecycle end can never be misread as a peer fault.  The call takes no
+    /// session lock and performs no I/O, so it cannot change when the close
+    /// it attributes actually lands.
+    pub(crate) fn record_closure(
+        &self,
+        scope: &TaskClosureScope,
+        stage: TaskClosureStage,
+        cause: TaskClosureCause,
+    ) -> DiagnosticStamp {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.sequence = state.sequence.saturating_add(1);
+        let stamp = DiagnosticStamp {
+            sequence: state.sequence,
+            at_ms: diagnostic_now_ms(),
+        };
+        let event = TaskClosureEventSnapshot {
+            sequence: stamp.sequence,
+            observed_at_ms: stamp.at_ms,
+            stage,
+            cause,
+            tenant_id: scope.tenant_id,
+            device_id: scope.device_id,
+            session_id: scope.session_id.clone(),
+            epoch: scope.epoch,
+            stream_id: scope.stream_id,
+        };
+        let stage_count = state
+            .closure_stage_counts
+            .entry(stage.as_str())
+            .or_default();
+        *stage_count = stage_count.saturating_add(1);
+        let cause_count = state
+            .closure_cause_counts
+            .entry(cause.as_str())
+            .or_default();
+        *cause_count = cause_count.saturating_add(1);
+        if state.closures.len() >= MAX_TASK_CLOSURES {
+            state.closures.pop_front();
+        }
+        state.closures.push_back(event);
+        stamp
+    }
+
+    /// Draw the next position on this relay's diagnostic clock without
+    /// recording a fault.
+    ///
+    /// The sequence comes from the same mutex-protected counter as
+    /// [`Self::record`], so acquiring a stamp establishes a real happens-after
+    /// relationship with every tuple that already holds a lower sequence.  The
+    /// caller stamps the moment *before* it unregisters owner state, so a
+    /// tuple with a lower sequence is provably recorded first.  It retains
+    /// nothing and is not itself a fault: no counter, ring or per-stage latch
+    /// is touched.
+    #[must_use]
+    pub(crate) fn stamp(&self) -> DiagnosticStamp {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.sequence = state.sequence.saturating_add(1);
+        DiagnosticStamp {
+            sequence: state.sequence,
+            at_ms: diagnostic_now_ms(),
+        }
+    }
+
     /// Return the bounded typed view used by the relay snapshot.
     #[must_use]
     pub(crate) fn snapshot(&self) -> PeerFaultDiagnosticSnapshot {
@@ -363,6 +588,9 @@ impl PeerFaultDiagnostics {
             cause_counts: state.cause_counts.clone(),
             last_by_stage: state.last_by_stage.clone(),
             recent: state.recent.iter().cloned().collect(),
+            closure_stage_counts: state.closure_stage_counts.clone(),
+            closure_cause_counts: state.closure_cause_counts.clone(),
+            closures: state.closures.iter().cloned().collect(),
         }
     }
 }
@@ -693,6 +921,52 @@ mod tests {
             snapshot.last_by_stage.get("head").map(|event| event.cause),
             Some(PeerFaultCause::TransportGoAway)
         );
+    }
+
+    #[test]
+    fn stamps_and_fault_tuples_share_one_sequence_and_one_clock() {
+        let diagnostics = PeerFaultDiagnostics::default();
+        let context = PeerFaultContext::unrouted(Uuid::from_u128(1), Uuid::from_u128(2), None);
+        diagnostics.record(
+            &context,
+            PeerFaultRole::Owner,
+            PeerOpenDiagnosticStage::Body,
+            PeerFaultCause::Closed,
+        );
+        let first = diagnostics.stamp();
+        diagnostics.record(
+            &context,
+            PeerFaultRole::Owner,
+            PeerOpenDiagnosticStage::Head,
+            PeerFaultCause::Closed,
+        );
+        let second = diagnostics.stamp();
+
+        let snapshot = diagnostics.snapshot();
+        let before = snapshot
+            .last_by_stage
+            .get("body")
+            .expect("first tuple retained");
+        let after = snapshot
+            .last_by_stage
+            .get("head")
+            .expect("second tuple retained");
+        // One counter, interleaved: a stamp is comparable with a tuple.
+        assert_eq!(
+            (
+                before.sequence,
+                first.sequence,
+                after.sequence,
+                second.sequence
+            ),
+            (1, 2, 3, 4)
+        );
+        assert!(before.observed_at_ms <= first.at_ms);
+        assert!(first.at_ms <= after.observed_at_ms);
+        assert!(after.observed_at_ms <= second.at_ms);
+        // A stamp is not a fault: only the two records are counted.
+        assert_eq!(snapshot.fault_count, 2);
+        assert_eq!(snapshot.recent.len(), 2);
     }
 
     #[test]

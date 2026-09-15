@@ -40,8 +40,9 @@ pub use consumer_write_diagnostics::{
     ConsumerWriteTimeoutSnapshot,
 };
 pub use http::{
-    ConsumerUpgradeBarrier, PeerAdmissionBarrier, PeerAdmissionScope, consumer_router,
-    device_router, peer_ingress_handler, router, router_with_peer,
+    ConsumerUpgradeBarrier, ControlAttachBarrier, PeerAdmissionBarrier, PeerAdmissionScope,
+    consumer_router, device_router, device_router_with_peer_and_barrier, peer_ingress_handler,
+    router, router_with_peer,
 };
 pub use membership_runtime::{
     AdmissionDeadline, CheckpointAuthority, CheckpointAuthorityError, CheckpointRequest,
@@ -58,8 +59,9 @@ pub use peer_consumer_transport_diagnostics::{
     PeerConsumerDiagnosticSnapshot,
 };
 pub use peer_fault_diagnostics::{
-    MAX_RECENT_PEER_FAULTS, PeerFaultCause, PeerFaultContext, PeerFaultDiagnosticSnapshot,
-    PeerFaultEventSnapshot, PeerFaultObserver, PeerFaultRole,
+    DiagnosticStamp, MAX_RECENT_PEER_FAULTS, MAX_TASK_CLOSURES, PeerFaultCause, PeerFaultContext,
+    PeerFaultDiagnosticSnapshot, PeerFaultEventSnapshot, PeerFaultObserver, PeerFaultRole,
+    TaskClosureCause, TaskClosureEventSnapshot, TaskClosureScope, TaskClosureStage,
 };
 pub use peer_runtime::peer_readiness::{
     PeerListenerState, PeerProbeState, PeerReadiness, PeerReadinessError, PeerReadinessSnapshot,
@@ -78,9 +80,9 @@ pub use recovery::{
     RecoveryOutcome, RecoveryWorkflowConfig, RecoveryWorkflowError,
 };
 pub use runtime::{
-    RelayCarrierSnapshot, RelayRotationSnapshot, RelaySessionSnapshot, RelaySnapshot,
-    RelayStreamSnapshot, RotationDeadlineEvent, StreamTerminalCause, StreamTerminalEvent,
-    StreamTerminalReceiptEvent,
+    OwnerUnregisterEvent, OwnerUnregisterKind, RelayCarrierSnapshot, RelayRotationSnapshot,
+    RelaySessionSnapshot, RelaySnapshot, RelayStreamSnapshot, RotationDeadlineEvent,
+    StreamTerminalCause, StreamTerminalEvent, StreamTerminalReceiptEvent,
 };
 pub use wire::{MAX_BODY_BYTES, MAX_CONTROL_BYTES};
 

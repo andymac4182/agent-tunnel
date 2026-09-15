@@ -17,7 +17,8 @@ use c11_window::{
 };
 pub use c11_window::{C11MatrixReport, PEER_FAULT_CAUSES, PEER_FAULT_STAGES};
 pub use og02_correlation::{
-    OG02_CORRELATION_FIELDS, Og02CorrelationReport, Og02RowReport, verify_og02_correlation,
+    OG02_CORRELATION_FIELDS, Og02CorrelationReport, Og02RowReport, Og02Shortfall,
+    og02_row_shortfall, verify_og02_correlation,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -189,9 +190,16 @@ const CASES: [MatrixCase; 8] = [
         outcome: RunOutcome::Success,
         required_sentinels: PRODUCTION_SENTINELS,
         // The production gate composes the concurrent same-identifier tenant
-        // race (four managed CLI roles) with its single production CLI.
+        // race (four managed CLI roles) with two production CLI roles: the
+        // scenario's own long-lived client, and a second one on its own
+        // private device fanout whose only purpose is the measured shutdown
+        // join.  The second cannot reuse the first, because the owner-death
+        // phase needs an owner that was abandoned rather than released, and it
+        // cannot share the fixture fanout, whose ordered route slots the rest
+        // of the gate asserts on.  The count stays exact so a third,
+        // unexplained CLI still fails this scan.
         required_inner_process_counts: &[
-            ("m7-production-cli", 1),
+            ("m7-production-cli", 2),
             ("m7-tenant-race-first", 1),
             ("m7-tenant-race-second", 1),
             ("m7-tenant-race-sibling", 1),
@@ -305,10 +313,15 @@ async fn run_case(
     crate::c11_capture::harden_capture_directory(capture_dir.path())?;
     let captured = run_harness_child(binary, case.command, &capture_dir).await?;
     if !captured.status.success() {
+        let preserved = preserve_child_failure(case.name, &captured);
         return Err(HarnessError::Process(format!(
-            "C11 {} acceptance child exited unsuccessfully: {}",
+            "C11 {} acceptance child exited unsuccessfully: {}{}",
             case.name,
-            child_failure_summary(&captured)
+            child_failure_summary(&captured),
+            preserved.map_or_else(String::new, |path| format!(
+                ",preserved={}",
+                path.to_string_lossy()
+            ))
         )));
     }
     let sentinels = captured.sentinels;
@@ -491,6 +504,25 @@ fn sentinel_kind_label(kind: SentinelKind) -> &'static str {
 /// payloads, paths, or endpoints, so no line or tail is ever copied into this
 /// error.  The private capture directory remains available to the caller until
 /// this case returns and is scanned by the normal success path.
+/// Preserve a failing child's own stderr for diagnosis, when the operator asks.
+///
+/// The bundle's error deliberately carries counts and markers rather than child
+/// bytes, and the capture directory is a `TempDir` that is removed when the case
+/// ends, so an intermittent child failure leaves nothing to diagnose from. When
+/// `C11_CHILD_FAILURE_DIR` names a directory, the bytes are written there and
+/// the error names the path. The error still carries no child content: a path is
+/// not payload, and the operator opts in by setting the variable.
+fn preserve_child_failure(case: &str, child: &ChildOutput) -> Option<PathBuf> {
+    let directory = std::env::var_os("C11_CHILD_FAILURE_DIR").map(PathBuf::from)?;
+    std::fs::create_dir_all(&directory).ok()?;
+    let started = now_millis().unwrap_or_default();
+    let path = directory.join(format!("c11-child-{case}-{started}.stderr"));
+    std::fs::write(&path, &child.stderr.bytes).ok()?;
+    let stdout_path = directory.join(format!("c11-child-{case}-{started}.stdout"));
+    std::fs::write(&stdout_path, &child.stdout.bytes).ok()?;
+    Some(path)
+}
+
 fn child_failure_summary(child: &ChildOutput) -> String {
     let mut markers = BTreeSet::new();
     for bytes in [&child.stdout.bytes[..], &child.stderr.bytes[..]] {

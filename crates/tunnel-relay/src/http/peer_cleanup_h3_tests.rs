@@ -1036,14 +1036,42 @@ async fn peer_device_control_duplicate_owner_is_refused_before_admission_cleanup
         .send_chunk(hello_record("staged-duplicate-hello", device_id()))
         .await
         .expect("send duplicate control HELLO");
+    // The property this case is about is that the duplicate claim is refused
+    // before any post-admission cleanup guard is installed, and that neither
+    // the live owner nor the sibling is disturbed.  It used to observe that by
+    // asserting no response was committed at all, which is the one wire
+    // behaviour the relay must NOT have: finishing the request stream without
+    // response headers is a connection-level error at the ingress and takes
+    // every other forwarded carrier on that connection down with it (see
+    // `peer_device_control_refusal_responds_and_preserves_the_connection_sibling_carrier`).
+    // The refusal is now committed as a status, and the assertions below are
+    // the same ones, made against the outcome rather than against the absence
+    // of one.
     let response = timeout(Duration::from_secs(3), stream.recv_response())
         .await
-        .expect("duplicate response deadline");
-    assert!(
-        response.is_err(),
-        "duplicate owner must be refused before a response is committed"
+        .expect("duplicate response deadline")
+        .expect("a duplicate owner claim must be answered, not dropped bare");
+    assert_eq!(
+        response.status(),
+        StatusCode::CONFLICT,
+        "a duplicate exact-scope owner keeps its own refusal status"
     );
-    wait_handler_error(&fixture, returned_errors_before).await;
+    // The refusal is still counted, in the place that names what it was: the
+    // actor's control registration conflict counter rather than a transport
+    // error return.
+    let conflicts = wait_snapshot(&fixture.handle, |snapshot| {
+        snapshot.control_registration_conflicts > 0
+    })
+    .await;
+    assert!(
+        conflicts.control_registration_conflicts > 0,
+        "a refused duplicate owner must be recorded as a registration conflict"
+    );
+    assert_eq!(
+        fixture.returned_errors.load(Ordering::Acquire),
+        returned_errors_before,
+        "an answered refusal is not a returned handler error"
+    );
 
     let snapshot = wait_snapshot(&fixture.handle, |snapshot| {
         find_session(snapshot, device_id()).is_some_and(|session| {
@@ -3092,5 +3120,251 @@ async fn peer_consumer_decode_failure_drains_safe_events_and_cancels_both_halves
     // within their bounded deadlines with no stranded stream task.
     drop(client_send);
     drop(client_recv);
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn peer_device_control_refusal_responds_and_preserves_the_connection_sibling_carrier() {
+    // The forwarded control path has the same shape as the forwarded data path
+    // and the same defect.  A duplicate owner claim is an ordinary refusal:
+    // this relay already holds a session for the device, so a second forwarded
+    // HELLO is answered `OwnerBusy`.  Returning there without ever sending
+    // response headers finishes the HTTP/3 request stream bare, which the
+    // ingress relay's client raises as a CONNECTION-level error and which
+    // takes every other forwarded carrier on that connection down with it.
+    //
+    // This admits a healthy data carrier first, then presents a second
+    // forwarded HELLO for the same device over the same peer connection.  The
+    // refusal must be a responded, stream-scoped outcome and the healthy
+    // carrier must still be attached afterwards.
+    let fixture = H3PeerFixture::new().await;
+    let target = register_control(
+        &fixture,
+        DEVICE_SPKI,
+        device_id(),
+        "staged-refusal-control-target",
+    )
+    .await;
+    let target_session_id = target.session_id.clone();
+    let target_epoch = target.epoch;
+    let target_ticket = target.ticket.clone();
+    let mut target_rx = target.rx;
+
+    let owner = current_target_owner(&fixture).await;
+    let mut carrier = open_raw(&fixture, InternalRoute::DeviceData).await;
+    admit_device_data(
+        &mut carrier,
+        &owner.token,
+        &target_ticket,
+        "staged-refusal-control-request",
+        "staged-refusal-control-stream",
+    )
+    .await;
+    let admitted = wait_snapshot(&fixture.handle, |snapshot| {
+        find_session(snapshot, device_id()).is_some_and(|session| {
+            session.session_id == target_session_id
+                && session.epoch == target_epoch
+                && session.sockets == 2
+        })
+    })
+    .await;
+    let carrier_before = find_session(&admitted, device_id())
+        .expect("refusal target session after admission")
+        .clone();
+    drain_control_queue(&mut target_rx).await;
+
+    // A second forwarded HELLO for a device this relay already owns.
+    let mut refused = open_raw(&fixture, InternalRoute::DeviceControl).await;
+    let envelope = device_envelope(
+        InternalRoute::DeviceControl,
+        "staged-refusal-duplicate-request",
+        "staged-refusal-duplicate-stream",
+        &owner.token,
+    );
+    refused
+        .send_chunk(encode_peer_record(
+            PeerRecordKind::CompleteControlText,
+            &envelope
+                .encode()
+                .expect("encode duplicate control envelope"),
+        ))
+        .await
+        .expect("send duplicate control envelope");
+    let mut hello = Hello::new(
+        "staged-refusal-duplicate-hello",
+        device_id().to_string(),
+        1,
+        0,
+    );
+    hello.features = vec![
+        wire::M1_PROFILE_FEATURE.to_owned(),
+        wire::ORDERED_ROTATION_FEATURE.to_owned(),
+        "echo".to_owned(),
+    ];
+    refused
+        .send_chunk(encode_peer_record(
+            PeerRecordKind::CompleteControlText,
+            wire::encode_control_message(&ControlMessage::Hello(hello))
+                .expect("encode duplicate HELLO")
+                .as_bytes(),
+        ))
+        .await
+        .expect("send duplicate HELLO");
+
+    let response = timeout(Duration::from_secs(3), refused.recv_response())
+        .await
+        .expect("refused control response deadline")
+        .expect("a refused forwarded control attach must answer with response headers");
+    assert!(
+        !response.status().is_success(),
+        "a refused forwarded control attach must report a non-success status, got {}",
+        response.status()
+    );
+
+    // The healthy carrier on the same connection is untouched.
+    let after = wait_snapshot_for(&fixture.handle, Duration::from_secs(3), &mut |snapshot| {
+        find_session(snapshot, device_id()).is_some_and(|session| {
+            session.session_id == target_session_id
+                && session.epoch == target_epoch
+                && session.sockets == 2
+        })
+    })
+    .await;
+    let carrier_after = find_session(&after, device_id())
+        .expect("refusal target session survives the duplicate control claim");
+    assert_eq!(
+        carrier_after.active_generation, carrier_before.active_generation,
+        "a refused control attach must not disturb the installed carrier generation"
+    );
+    assert_eq!(
+        carrier_after.active_connection_id, carrier_before.active_connection_id,
+        "a refused control attach must not disturb the installed carrier identity"
+    );
+    assert_eq!(
+        carrier_after.phase, carrier_before.phase,
+        "a refused control attach must not move the session out of its phase"
+    );
+
+    refused.cancel();
+    drop(refused);
+    carrier.cancel();
+    drop(carrier);
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn peer_device_data_refusal_responds_and_preserves_the_connection_sibling_carrier() {
+    // A refused forwarded device data attachment is an ordinary outcome, not a
+    // peer protocol violation.  The owner must answer it with response headers
+    // and finish that one request stream.  Finishing the stream without ever
+    // responding makes the ingress relay's HTTP/3 client raise a
+    // CONNECTION-level `H3_FRAME_UNEXPECTED`, which tears down the shared peer
+    // connection to this owner and takes every other forwarded carrier
+    // multiplexed on it with it -- including a healthy installed one, whose
+    // loss the owner then reports as `RECOVERY_START_FAILED`.
+    //
+    // So this opens a healthy carrier first, then presents the same
+    // already-consumed ticket on a second request over the same connection.
+    // The refusal must be a responded, stream-scoped outcome and the healthy
+    // carrier must still be attached afterwards.
+    let fixture = H3PeerFixture::new().await;
+    let target = register_control(
+        &fixture,
+        DEVICE_SPKI,
+        device_id(),
+        "staged-refusal-data-target",
+    )
+    .await;
+    let target_session_id = target.session_id.clone();
+    let target_epoch = target.epoch;
+    let target_ticket = target.ticket.clone();
+    let mut target_rx = target.rx;
+
+    let owner = current_target_owner(&fixture).await;
+    let mut carrier = open_raw(&fixture, InternalRoute::DeviceData).await;
+    admit_device_data(
+        &mut carrier,
+        &owner.token,
+        &target_ticket,
+        "staged-refusal-data-request",
+        "staged-refusal-data-stream",
+    )
+    .await;
+    let admitted = wait_snapshot(&fixture.handle, |snapshot| {
+        find_session(snapshot, device_id()).is_some_and(|session| {
+            session.session_id == target_session_id
+                && session.epoch == target_epoch
+                && session.sockets == 2
+        })
+    })
+    .await;
+    let carrier_before = find_session(&admitted, device_id())
+        .expect("refusal target session after admission")
+        .clone();
+    drain_control_queue(&mut target_rx).await;
+
+    // The one-use ticket above is now spent.  Present it again on a second
+    // request over the same peer connection.
+    let mut refused = open_raw(&fixture, InternalRoute::DeviceData).await;
+    let envelope = device_envelope(
+        InternalRoute::DeviceData,
+        "staged-refusal-reuse-request",
+        "staged-refusal-reuse-stream",
+        &owner.token,
+    );
+    refused
+        .send_chunk(encode_peer_record(
+            PeerRecordKind::CompleteControlText,
+            &envelope.encode().expect("encode refused data envelope"),
+        ))
+        .await
+        .expect("send refused data envelope");
+    refused
+        .send_chunk(encode_peer_record(
+            PeerRecordKind::CompleteControlText,
+            format!("Bearer {target_ticket}").as_bytes(),
+        ))
+        .await
+        .expect("send refused data ticket");
+
+    let response = timeout(Duration::from_secs(3), refused.recv_response())
+        .await
+        .expect("refused data response deadline")
+        .expect("a refused forwarded data attach must answer with response headers");
+    assert!(
+        !response.status().is_success(),
+        "a refused forwarded data attach must report a non-success status, got {}",
+        response.status()
+    );
+
+    // The healthy carrier on the same connection is untouched: same session,
+    // same epoch, still two sockets, same active carrier identity.
+    let after = wait_snapshot_for(&fixture.handle, Duration::from_secs(3), &mut |snapshot| {
+        find_session(snapshot, device_id()).is_some_and(|session| {
+            session.session_id == target_session_id
+                && session.epoch == target_epoch
+                && session.sockets == 2
+        })
+    })
+    .await;
+    let carrier_after =
+        find_session(&after, device_id()).expect("refusal target session survives the refusal");
+    assert_eq!(
+        carrier_after.active_generation, carrier_before.active_generation,
+        "a refused attach must not disturb the installed carrier generation"
+    );
+    assert_eq!(
+        carrier_after.active_connection_id, carrier_before.active_connection_id,
+        "a refused attach must not disturb the installed carrier identity"
+    );
+    assert_eq!(
+        carrier_after.phase, carrier_before.phase,
+        "a refused attach must not move the session out of its phase"
+    );
+
+    refused.cancel();
+    drop(refused);
+    carrier.cancel();
+    drop(carrier);
     fixture.shutdown().await;
 }

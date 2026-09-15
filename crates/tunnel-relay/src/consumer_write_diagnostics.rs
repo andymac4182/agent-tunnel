@@ -14,6 +14,8 @@ use serde::Serialize;
 use tokio::time::{Instant, timeout_at};
 use uuid::Uuid;
 
+use crate::runtime::StreamTerminalCause;
+
 /// The outcome of one bounded public response write.
 ///
 /// A timeout is distinct from a completed write, an authorization expiry,
@@ -36,6 +38,21 @@ impl ConsumerWriteOutcome {
     #[must_use]
     pub(crate) const fn is_timed_out(self) -> bool {
         matches!(self, Self::TimedOut)
+    }
+
+    /// The typed stream terminal cause this write outcome proves, if any.
+    ///
+    /// Only the relay's own physical write deadline proves a physical write
+    /// timeout. `Expired` is the consumer's absolute authorization lifetime,
+    /// `Failed` is a transport error whose text never crosses this boundary,
+    /// and `Sent` closes nothing: all three stay unclassified so a later
+    /// close keeps whatever cause its own site can prove.
+    #[must_use]
+    pub(crate) const fn terminal_cause(self) -> Option<StreamTerminalCause> {
+        match self {
+            Self::TimedOut => Some(StreamTerminalCause::PhysicalWriteTimeout),
+            Self::Sent | Self::Expired | Self::Failed => None,
+        }
     }
 }
 

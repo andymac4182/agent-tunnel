@@ -728,6 +728,36 @@ async fn run_inner(
         }
     };
     let abandoned_registration_observed = observed_active == PRE_ABANDON_ACTIVE_STREAMS + 1;
+    // Identify the abandoned stream itself.  Stream IDs are allocated
+    // monotonically and never reused, and this phase opens one stream at a
+    // time, so the newest retained ID is the registration that was just
+    // abandoned.  Its identity is what makes the connector-side retirement
+    // barrier below observable rather than assumed.
+    let abandoned_stream_id = match max_stream_id(owner_relay, device.tenant_id, device.id).await {
+        Ok(Some(stream_id)) => stream_id,
+        Ok(None) => {
+            return Err(phase_failure(
+                HarnessError::Process("owner-local abandoned stream is missing".into()),
+                "abandon",
+                2,
+                owner_relay,
+                device.id,
+                resources.process.as_mut(),
+            )
+            .await);
+        }
+        Err(error) => {
+            return Err(phase_failure(
+                error,
+                "abandon",
+                2,
+                owner_relay,
+                device.id,
+                resources.process.as_mut(),
+            )
+            .await);
+        }
+    };
     // Capture the owner state at the exact registration/drop boundary.  The
     // later reclaim poll preserves its last present snapshot, but this
     // before-drop sample is needed to distinguish a close caused immediately
@@ -774,13 +804,44 @@ async fn run_inner(
     let owner_session_epoch_stable = reclaimed_identity == owner_identity;
 
     // Relay-side active-count reclamation is not the connector-side admission
-    // barrier.  The abandoned stream's terminal FIN is queued on the same
-    // ordered data carrier as the next retained-stream response; an exact
-    // empty-record round trip on the anchor therefore proves that the device
-    // actor has processed that FIN before we send a replacement OPEN.  Without
-    // this barrier a connector can still count all 64 streams while the relay
-    // has already dropped one, causing the replacement to receive a transient
-    // bounded RESOURCE_EXHAUSTED refusal and disappear from the relay snapshot.
+    // barrier.  The connector keeps charging the abandoned stream against its
+    // own `max_streams` budget until it emits its own terminal frame for that
+    // exact stream; until then a replacement OPEN the relay admits is refused
+    // with a bounded RESOURCE_EXHAUSTED and the fresh public socket closes
+    // without a response.
+    //
+    // A round trip on another stream does not prove that: the relay's FIN for
+    // the abandoned stream and the anchor's record travel the same ordered
+    // carrier, but the connector buffers an inbound FIN per stream while that
+    // stream's authorization is unconfirmed, so the anchor's response can
+    // overtake it.  Wait on the connector's own terminal frame for the
+    // abandoned stream instead, which the owner snapshot reports as its
+    // connector->relay receive cursor.  The anchor round trip is kept as well;
+    // both must hold.
+    if let Err(error) = wait_for_connector_stream_retirement(
+        owner_relay,
+        device.tenant_id,
+        device.id,
+        &owner_identity,
+        abandoned_stream_id,
+        STREAM_COUNT_TIMEOUT,
+    )
+    .await
+    {
+        let cluster_sessions = cluster_session_diagnostic(cluster, device.id).await;
+        let error = HarnessError::Process(format!(
+            "{error}; pre_abandon_snapshot={pre_abandon_snapshot}; cluster_sessions={cluster_sessions}"
+        ));
+        return Err(phase_failure(
+            error,
+            "reclaim_barrier",
+            1,
+            owner_relay,
+            device.id,
+            resources.process.as_mut(),
+        )
+        .await);
+    }
     let connector_reclaim_barrier = match resources.streams.get_mut(1) {
         Some(anchor) => match timeout(
             RECLAIM_BARRIER_TIMEOUT,
@@ -1609,6 +1670,101 @@ async fn wait_for_stream_counts(
                 last_present_snapshot
                     .as_deref()
                     .unwrap_or("unavailable=none")
+            )));
+        }
+        sleep(STREAM_COUNT_POLL.min(remaining)).await;
+    }
+}
+
+/// Highest stream ID the owner relay currently retains for the device.
+///
+/// Relay stream IDs are allocated monotonically per session and are never
+/// reused, so the newest admitted stream is the maximum retained ID.  The
+/// phase opens streams one at a time, so this identifies the stream the
+/// caller just opened without reaching into relay internals.
+async fn max_stream_id(
+    relay: &ProductionRelay,
+    tenant_id: Uuid,
+    device_id: Uuid,
+) -> Result<Option<u64>> {
+    let snapshot = relay.snapshot().await?;
+    let session = snapshot
+        .sessions
+        .iter()
+        .find(|session| {
+            session.tenant_id == tenant_id.to_string() && session.device_id == device_id.to_string()
+        })
+        .ok_or_else(|| HarnessError::Process("owner-local device session is missing".into()))?;
+    Ok(session.streams.iter().map(|stream| stream.stream_id).max())
+}
+
+/// Wait for the connector to retire the abandoned stream's admission slot.
+///
+/// Relay-side reclamation is only one side of the admission ledger.  The
+/// connector charges the stream against its own `max_streams` budget until it
+/// emits its own terminal frame for that stream, and that frame is an
+/// observable protocol event, not an elapsed interval: the owner relay's
+/// snapshot exposes the connector->relay receive cursor per stream, and for a
+/// stream that carried no application data the only frame that can advance it
+/// is the connector's FIN or RESET.  A stream that has already left the
+/// retained table has additionally completed its STREAM_FORGET, which happens
+/// strictly after that terminal frame.
+///
+/// This waits on that event and fails the phase when it does not arrive
+/// inside the existing bound.  It is a precondition on the reclaim probe, not
+/// a retry of it and not a relaxation of anything the phase asserts: the
+/// reclaim probe itself still has to succeed on its first attempt.
+async fn wait_for_connector_stream_retirement(
+    relay: &ProductionRelay,
+    tenant_id: Uuid,
+    device_id: Uuid,
+    expected_identity: &SessionIdentity,
+    stream_id: u64,
+    budget: Duration,
+) -> Result<()> {
+    let deadline = Instant::now() + budget;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(HarnessError::Timeout(format!(
+                "owner-local connector did not retire abandoned stream {stream_id} within bound"
+            )));
+        }
+        let snapshot = match timeout(remaining, relay.snapshot()).await {
+            Ok(result) => result?,
+            Err(_) => {
+                return Err(HarnessError::Timeout(format!(
+                    "owner-local snapshot timed out before abandoned stream {stream_id} retired"
+                )));
+            }
+        };
+        let session = snapshot
+            .sessions
+            .iter()
+            .find(|session| {
+                session.tenant_id == tenant_id.to_string()
+                    && session.device_id == device_id.to_string()
+            })
+            .ok_or_else(|| HarnessError::Process("owner-local device session is missing".into()))?;
+        if session.session_id != expected_identity.session_id
+            || session.epoch != expected_identity.epoch
+        {
+            return Err(HarnessError::Process(
+                "owner-local connector retirement phase changed session identity".into(),
+            ));
+        }
+        let retired = session
+            .streams
+            .iter()
+            .find(|stream| stream.stream_id == stream_id)
+            .is_none_or(|stream| stream.recv_contiguous_connector_to_relay > 0);
+        if retired {
+            return Ok(());
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(HarnessError::Timeout(format!(
+                "owner-local connector did not retire abandoned stream {stream_id} within bound"
             )));
         }
         sleep(STREAM_COUNT_POLL.min(remaining)).await;

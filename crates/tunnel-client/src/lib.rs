@@ -2018,6 +2018,23 @@ fn sanitize_error(error: &str) -> String {
     "transport failure".to_owned()
 }
 
+/// Map a forget-barrier failure detail onto a bounded label.
+///
+/// Every detail this crate attaches to that scope is a fixed string written
+/// here, so the allowlist is exhaustive by construction; anything else stays
+/// opaque, exactly as transport details do elsewhere.
+fn safe_barrier_detail(detail: &str) -> &'static str {
+    match detail {
+        "carrier disappeared before barrier completion" => {
+            "carrier disappeared before barrier completion"
+        }
+        "data writer stopped before barrier completion" => {
+            "data writer stopped before barrier completion"
+        }
+        _ => "bounded barrier state failure",
+    }
+}
+
 fn safe_rotation_detail(detail: &str) -> String {
     // Only expose a closed set of state diagnostics.  Rotation details are
     // otherwise intentionally opaque because transport errors can originate
@@ -2151,6 +2168,15 @@ impl ClientError {
             {
                 format!("{scope} failed: {}", safe_rotation_detail(detail))
             }
+            // The forget barrier's details are a closed set this crate writes
+            // itself, naming which half of the carrier went away, so they can
+            // be surfaced under the same allowlist discipline as rotation
+            // details.  Without this the failure reads only as "stream forget
+            // barrier failed", which is what made two survey failures in
+            // different gates unexplainable.
+            Self::Transport { scope, detail } if *scope == "stream forget barrier" => {
+                format!("{scope} failed: {}", safe_barrier_detail(detail))
+            }
             Self::Transport { scope, .. } => format!("{scope} failed"),
             Self::OwnerBusy => {
                 "device already has an active owner; stop it before starting another session"
@@ -2187,6 +2213,49 @@ impl Error for ClientError {
 impl From<RuntimeConfigError> for ClientError {
     fn from(error: RuntimeConfigError) -> Self {
         Self::Config(error)
+    }
+}
+
+#[cfg(test)]
+mod barrier_detail_tests {
+    use super::{ClientError, safe_barrier_detail};
+
+    #[test]
+    fn forget_barrier_failures_name_which_half_went_away() {
+        // The two details this crate writes reach the operator intact, so a
+        // barrier failure says which half of the carrier went away instead of
+        // only that the barrier failed.
+        for detail in [
+            "carrier disappeared before barrier completion",
+            "data writer stopped before barrier completion",
+        ] {
+            let error = ClientError::Transport {
+                scope: "stream forget barrier",
+                detail: detail.to_owned(),
+            };
+            let message = error.safe_message();
+            assert!(
+                message.contains(detail),
+                "barrier failure must name its bounded detail, got {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unrecognised_barrier_detail_stays_opaque() {
+        // The allowlist is exhaustive for what this crate writes; anything
+        // else must not reach the operator, because a transport detail can
+        // originate below the protocol boundary.
+        assert_eq!(
+            safe_barrier_detail("connection refused by 203.0.113.7:4433"),
+            "bounded barrier state failure"
+        );
+        let error = ClientError::Transport {
+            scope: "stream forget barrier",
+            detail: "connection refused by 203.0.113.7:4433".to_owned(),
+        };
+        let message = error.safe_message();
+        assert!(!message.contains("203.0.113.7"), "detail leaked: {message}");
     }
 }
 

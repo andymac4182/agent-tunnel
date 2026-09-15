@@ -22,6 +22,18 @@ pub enum HarnessError {
     Proxy(String),
     Http(String),
     Process(String),
+    /// A managed `tunnel-client` CLI exited before it reached readiness.
+    /// `code` is the process exit code when the CLI terminated normally, which
+    /// maps onto the CLI's own closed typed-diagnostic vocabulary, and `None`
+    /// when it died from a signal and carries no typed diagnostic.
+    CliExitedBeforeReady {
+        stage: &'static str,
+        code: Option<i32>,
+        /// The CLI's own typed diagnostic code from its `--json` output, when
+        /// it emitted one and the code is a recognised constant.  Never free
+        /// text and never a payload.
+        diagnostic_code: Option<&'static str>,
+    },
     InvalidInput(String),
     Timeout(String),
     Unsupported(String),
@@ -45,6 +57,26 @@ impl fmt::Display for HarnessError {
             Self::Proxy(message) => write!(f, "TCP proxy error: {message}"),
             Self::Http(message) => write!(f, "HTTP/TLS probe error: {message}"),
             Self::Process(message) => write!(f, "managed process error: {message}"),
+            Self::CliExitedBeforeReady {
+                stage,
+                code,
+                diagnostic_code,
+            } => {
+                match code {
+                    Some(code) => write!(
+                        f,
+                        "tunnel-client CLI exited before {stage} readiness: exit status: {code}"
+                    )?,
+                    None => write!(
+                        f,
+                        "tunnel-client CLI exited before {stage} readiness without an exit code"
+                    )?,
+                }
+                match diagnostic_code {
+                    Some(diagnostic_code) => write!(f, " ({diagnostic_code})"),
+                    None => Ok(()),
+                }
+            }
             Self::InvalidInput(message) => write!(f, "invalid harness input: {message}"),
             Self::Timeout(message) => write!(f, "harness timeout: {message}"),
             Self::Unsupported(message) => write!(f, "unsupported harness operation: {message}"),

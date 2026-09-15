@@ -2804,6 +2804,40 @@ fn connect_failure_to_harness(error: ConnectFailure) -> HarnessError {
     }
 }
 
+/// Payload-free evidence from the settled M2 proxy, once every retired socket
+/// has closed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProxyRetirementEvidence {
+    /// Rotations the plan required, which sets the socket floor.
+    pub rotations: u64,
+    /// Sockets the proxy accepted over the whole run.
+    pub accepted: u64,
+    /// Highest concurrent socket count the proxy observed.
+    pub peak_active: u64,
+}
+
+/// Bounds on a settled M2 proxy: every rotation must have cost a socket, and
+/// the carrier replacement must never have held more than the control socket
+/// plus an old and a new data carrier at once.
+pub fn validate_proxy_retirement_evidence(evidence: &ProxyRetirementEvidence) -> Result<()> {
+    if evidence.accepted < 2 + evidence.rotations {
+        return Err(HarnessError::Process(format!(
+            "M2 proxy accepted {} sockets; expected control, initial data, and rotations",
+            evidence.accepted
+        )));
+    }
+    if evidence.peak_active > MAX_PROXY_PEAK_ACTIVE_SOCKETS {
+        return Err(HarnessError::Process(format!(
+            "M2 proxy peak active sockets exceeded three: {}",
+            evidence.peak_active
+        )));
+    }
+    Ok(())
+}
+
+/// Control socket plus one old and one new data carrier during a replacement.
+const MAX_PROXY_PEAK_ACTIVE_SOCKETS: u64 = 3;
+
 async fn verify_proxy_retirement(harness: &RunningHarness, rotations: u64) -> Result<()> {
     let Some(proxy) = harness.proxy.as_ref() else {
         return Err(HarnessError::InvalidInput(
@@ -2814,19 +2848,15 @@ async fn verify_proxy_retirement(harness: &RunningHarness, rotations: u64) -> Re
     loop {
         let stats = proxy.stats();
         if stats.active == 0 && stats.completed == stats.accepted {
-            if stats.accepted < 2 + rotations {
-                return Err(HarnessError::Process(format!(
-                    "M2 proxy accepted {} sockets; expected control, initial data, and rotations",
-                    stats.accepted
-                )));
-            }
-            if proxy.diagnostics().peak_active > 3 {
-                return Err(HarnessError::Process(format!(
-                    "M2 proxy peak active sockets exceeded three: {}",
-                    proxy.diagnostics().peak_active
-                )));
-            }
-            return Ok(());
+            // The settle condition above stays in the loop, because it is a
+            // transient state this has to wait for.  The bounds below are
+            // properties of the settled result, so they are checked by a pure
+            // validator that a mutation table can exercise.
+            return validate_proxy_retirement_evidence(&ProxyRetirementEvidence {
+                rotations,
+                accepted: stats.accepted,
+                peak_active: proxy.diagnostics().peak_active,
+            });
         }
         if Instant::now() >= deadline {
             return Err(HarnessError::Timeout(format!(
@@ -2953,9 +2983,158 @@ fn stream_id_hint(stream: &ConsumerStream) -> Option<u64> {
 
 #[cfg(test)]
 mod c17_validator_tests {
-    use super::assert_expected_control_loss;
+    use super::{
+        ContinuousTrafficEvidence, ProxyRetirementEvidence, assert_expected_control_loss,
+        require_m2_continuous_traffic_evidence, validate_proxy_retirement_evidence,
+    };
     use crate::acceptance_test_support::assert_rejected;
     use tunnel_client::{ClientError, Readiness};
+
+    /// Complete continuous-traffic evidence: three rotations carrying 100
+    /// records, with every cursor agreeing and no replay, terminal connector
+    /// phase or stray response.
+    /// A settled proxy from a three-rotation run: control, initial data and
+    /// one socket per rotation, never more than three at once.
+    fn valid_proxy_retirement_evidence() -> ProxyRetirementEvidence {
+        ProxyRetirementEvidence {
+            rotations: 3,
+            accepted: 5,
+            peak_active: 3,
+        }
+    }
+
+    fn valid_continuous_traffic_evidence() -> ContinuousTrafficEvidence {
+        ContinuousTrafficEvidence {
+            rotations_required: 3,
+            rotations_observed: 3,
+            records_round_tripped: 100,
+            records_during_freeze: 2,
+            handover_phases_observed: ["quiescing".to_owned(), "draining".to_owned()]
+                .into_iter()
+                .collect(),
+            relay_emitted_delta: 100,
+            relay_received_delta: 100,
+            relay_last_emitted: 100,
+            relay_peer_acked: 100,
+            relay_recv_contiguous: 100,
+            relay_delivered_contiguous: 100,
+            client_emitted_sequences: 100,
+            client_received_sequences: 100,
+            total_replayed_frames: 0,
+            connector_terminal_phase_observed: false,
+            stray_response_observed: false,
+        }
+    }
+
+    #[test]
+    fn m2_continuous_traffic_validator_accepts_complete_evidence() {
+        require_m2_continuous_traffic_evidence(&valid_continuous_traffic_evidence())
+            .expect("complete continuous-traffic evidence is valid");
+    }
+
+    #[test]
+    fn every_m2_continuous_traffic_condition_names_itself_and_is_load_bearing() {
+        // One case per condition in the validator.  Each mutates exactly the
+        // state that condition covers, and the rejection must name that
+        // condition, so a guard that stopped being load-bearing shows up as a
+        // case that no longer fails.
+        type Mutate = fn(&mut ContinuousTrafficEvidence);
+        let cases: [(&str, Mutate); 11] = [
+            ("rotations_observed_at_least_required", |e| {
+                e.rotations_observed = e.rotations_required - 1
+            }),
+            ("records_round_tripped_nonzero", |e| {
+                // Zero records, with every cursor moved to match, so only the
+                // nonzero condition can catch it.
+                e.records_round_tripped = 0;
+                e.relay_emitted_delta = 0;
+                e.relay_received_delta = 0;
+                e.relay_last_emitted = 0;
+                e.relay_peer_acked = 0;
+                e.relay_recv_contiguous = 0;
+                e.relay_delivered_contiguous = 0;
+                e.client_emitted_sequences = 0;
+                e.client_received_sequences = 0;
+            }),
+            ("records_during_freeze_nonzero", |e| {
+                e.records_during_freeze = 0
+            }),
+            ("relay_emitted_contiguous", |e| e.relay_emitted_delta -= 1),
+            ("relay_received_contiguous", |e| e.relay_received_delta -= 1),
+            ("relay_peer_acked_reaches_last_emitted", |e| {
+                e.relay_peer_acked -= 1
+            }),
+            ("relay_delivered_reaches_received", |e| {
+                e.relay_delivered_contiguous -= 1
+            }),
+            ("client_relay_cursors_agree", |e| {
+                e.client_received_sequences -= 1
+            }),
+            ("no_replayed_frames", |e| e.total_replayed_frames = 1),
+            ("connector_never_terminal", |e| {
+                e.connector_terminal_phase_observed = true
+            }),
+            ("no_stray_response", |e| e.stray_response_observed = true),
+        ];
+        for (condition, mutate) in cases {
+            let mut evidence = valid_continuous_traffic_evidence();
+            mutate(&mut evidence);
+            // assert_rejected already requires the diagnostic to name the
+            // condition, which is the load-bearing part of this case.
+            assert_rejected(require_m2_continuous_traffic_evidence(&evidence), condition);
+        }
+    }
+
+    #[test]
+    fn proxy_retirement_validator_accepts_a_settled_proxy() {
+        validate_proxy_retirement_evidence(&valid_proxy_retirement_evidence())
+            .expect("a settled proxy within both bounds is valid");
+    }
+
+    #[test]
+    fn every_proxy_retirement_bound_is_load_bearing() {
+        // One socket short of the floor: a rotation that cost no socket.
+        let mut short = valid_proxy_retirement_evidence();
+        short.accepted = 2 + short.rotations - 1;
+        assert_rejected(validate_proxy_retirement_evidence(&short), "accepted");
+
+        // One above the peak bound: a replacement that held a fourth socket.
+        let mut peaked = valid_proxy_retirement_evidence();
+        peaked.peak_active = 4;
+        assert_rejected(
+            validate_proxy_retirement_evidence(&peaked),
+            "peak active sockets exceeded three",
+        );
+
+        // The floor tracks the rotation count rather than a fixed number.
+        let mut more_rotations = valid_proxy_retirement_evidence();
+        more_rotations.rotations += 1;
+        assert_rejected(
+            validate_proxy_retirement_evidence(&more_rotations),
+            "accepted",
+        );
+
+        // Exactly at each bound is accepted, so neither is off by one.
+        let mut exact = valid_proxy_retirement_evidence();
+        exact.accepted = 2 + exact.rotations;
+        exact.peak_active = 3;
+        validate_proxy_retirement_evidence(&exact)
+            .expect("evidence exactly at both bounds is valid");
+    }
+
+    #[test]
+    fn a_rotation_requirement_of_zero_is_refused() {
+        // `rotations_required > 0` is part of the first condition and is not
+        // reachable by lowering the observed count, so it gets its own case:
+        // a plan that requires no rotation cannot satisfy this stage.
+        let mut evidence = valid_continuous_traffic_evidence();
+        evidence.rotations_required = 0;
+        evidence.rotations_observed = 0;
+        assert_rejected(
+            require_m2_continuous_traffic_evidence(&evidence),
+            "rotations_observed_at_least_required",
+        );
+    }
 
     fn control_read_loss() -> ClientError {
         ClientError::Transport {

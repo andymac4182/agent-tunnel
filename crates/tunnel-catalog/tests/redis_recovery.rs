@@ -530,16 +530,25 @@ async fn recovery_rejects_oversized_namespace_key_before_materialization() {
 async fn recovery_rejects_cumulative_namespace_key_bytes() {
     let fixture = fixture().await;
     let suffix = "b".repeat(8_000);
-    let mut command = redis::cmd("MSET");
-    for index in 0..530 {
-        command
-            .arg(format!(
-                "tunnel-catalog:{}:key-budget:{index:04}:{suffix}",
-                fixture.namespace
-            ))
-            .arg("x");
+    // Staged in batches rather than one 4 MB MSET.  The cumulative key bytes
+    // this case is about are unchanged -- 530 keys of the same size either way
+    // -- but a single command that large timed out against a Redis carrying
+    // the rest of the gate survey, which turned an assertion about the
+    // catalog's bound into an assertion about how busy the server was.
+    const KEY_BUDGET_KEYS: usize = 530;
+    const KEY_BUDGET_BATCH: usize = 50;
+    for batch_start in (0..KEY_BUDGET_KEYS).step_by(KEY_BUDGET_BATCH) {
+        let mut command = redis::cmd("MSET");
+        for index in batch_start..(batch_start + KEY_BUDGET_BATCH).min(KEY_BUDGET_KEYS) {
+            command
+                .arg(format!(
+                    "tunnel-catalog:{}:key-budget:{index:04}:{suffix}",
+                    fixture.namespace
+                ))
+                .arg("x");
+        }
+        raw_unit(&fixture.url, &mut command).await;
     }
-    raw_unit(&fixture.url, &mut command).await;
 
     let error = fixture
         .catalog

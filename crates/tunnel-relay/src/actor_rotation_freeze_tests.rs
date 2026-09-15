@@ -245,6 +245,7 @@ impl FreezeFixture {
                 // These fixtures build admitted streams; a deferred
                 // pre-admission terminal cause never applies to them.
                 deferred_terminal_cause: None,
+                credit_held: false,
                 open_message_id: OPEN_MESSAGE_ID.to_owned(),
                 operation_id: OPERATION_ID.to_owned(),
                 request_id: None,
@@ -2187,4 +2188,147 @@ async fn retired_carrier_frames_after_commit_are_dropped_without_touching_stream
             .map(|event| event.reason),
         Some("STALE_DATA")
     );
+}
+
+/// M7-C66: a beyond-fence frame that races ahead of FROZEN must fail closed.
+///
+/// The forward check added with M7-C65 is anchored on the processed FROZEN, so
+/// it can only refuse a frame that arrives after the fence is known. A frame
+/// beyond the fence that arrives first is admitted and advances the receive
+/// cursor, and the relay then accepts an attestation that contradicts its own
+/// state, leaving the drain proof unprovable. The check is retroactive: when
+/// FROZEN arrives, a settled receive cursor above the attested fence fails the
+/// session closed.
+#[tokio::test]
+async fn beyond_fence_frame_before_frozen_fails_closed_when_the_fence_arrives() {
+    let mut fixture = FreezeFixture::new("beyond-fence-early", false);
+    // Two outstanding records, so two inbound responses are both solicited and
+    // the scenario turns on the fence rather than on an unsolicited reply.
+    let _first = fixture.write(b"before-fence-1");
+    let _second = fixture.write(b"before-fence-2");
+    assert_eq!(sequenced(&drain_data(&mut fixture.old_rx)).len(), 2);
+    fixture.quiesce();
+    assert!(fixture.complete_barrier().is_empty());
+
+    // The connector will attest a fence of 1, but this frame at sequence 2
+    // arrives while the relay still has no fence to compare against.
+    let epoch = fixture.key.epoch;
+    let old_generation = fixture.attempt.old_generation;
+    let mut payload = 7_u32.to_be_bytes().to_vec();
+    payload.extend_from_slice(b"beyond!");
+    fixture
+        .actor
+        .inbound_m2_stream_data(
+            fixture.old_carrier.clone(),
+            Frame::data(epoch, old_generation, STREAM_ID, 1, 1, payload.clone()),
+            false,
+        )
+        .await;
+    fixture
+        .actor
+        .inbound_m2_stream_data(
+            fixture.old_carrier.clone(),
+            Frame::data(epoch, old_generation, STREAM_ID, 2, 1, payload),
+            false,
+        )
+        .await;
+    let _ = drain_data(&mut fixture.old_rx);
+    assert!(
+        fixture.actor.sessions.contains_key(&fixture.key.scope()),
+        "the frame is admitted before the fence exists; nothing can reject it yet (closed with {:?})",
+        fixture
+            .actor
+            .session_terminal_events
+            .back()
+            .map(|event| event.reason)
+    );
+
+    // The attestation now contradicts the relay's own receive cursor. Drive the
+    // handler directly: the `connector_frozen` helper asserts the rotation
+    // reaches Draining, which is exactly what must not happen here.
+    let snapshot = FenceSnapshot::new(
+        fixture.snapshot_id.clone(),
+        vec![StreamFence::new(STREAM_ID, Direction::ConnectorToRelay, 1)],
+    );
+    fixture
+        .actor
+        .handle_rotate_frozen(
+            &fixture.key,
+            RotateFrozen {
+                message_id: CONNECTOR_FROZEN_ID.to_owned(),
+                reply_to: fixture.quiesce_message_id.clone(),
+                attempt: fixture.attempt.clone(),
+                snapshot,
+            },
+        )
+        .await;
+    assert!(
+        !fixture.actor.sessions.contains_key(&fixture.key.scope()),
+        "an attested fence below the settled receive cursor must fail the session closed"
+    );
+    assert_eq!(
+        fixture
+            .actor
+            .session_terminal_events
+            .back()
+            .map(|event| event.reason),
+        Some("FENCE_VIOLATION")
+    );
+}
+
+/// Companion negative: the in-flight frames the drain exists to receive must
+/// still be admitted.
+///
+/// A connector flushes frames queued before its own freeze, and those are valid
+/// right up to the fence it is about to attest. If anyone later tightens the
+/// check above into a forward bound anchored on the relay's cursor at quiesce,
+/// this test fails loudly rather than the rejection showing up as a stalled
+/// rotation in production.
+#[tokio::test]
+async fn in_flight_frames_before_frozen_within_the_fence_are_admitted() {
+    let mut fixture = FreezeFixture::new("within-fence-early", false);
+    let _first = fixture.write(b"before-fence-1");
+    let _second = fixture.write(b"before-fence-2");
+    assert_eq!(sequenced(&drain_data(&mut fixture.old_rx)).len(), 2);
+    fixture.quiesce();
+    assert!(fixture.complete_barrier().is_empty());
+
+    let epoch = fixture.key.epoch;
+    let old_generation = fixture.attempt.old_generation;
+    let mut payload = 7_u32.to_be_bytes().to_vec();
+    payload.extend_from_slice(b"in-flig");
+    fixture
+        .actor
+        .inbound_m2_stream_data(
+            fixture.old_carrier.clone(),
+            Frame::data(epoch, old_generation, STREAM_ID, 1, 1, payload.clone()),
+            false,
+        )
+        .await;
+    fixture
+        .actor
+        .inbound_m2_stream_data(
+            fixture.old_carrier.clone(),
+            Frame::data(epoch, old_generation, STREAM_ID, 2, 1, payload),
+            false,
+        )
+        .await;
+    let _ = drain_data(&mut fixture.old_rx);
+
+    // The connector attests exactly what it sent, so both frames are inside
+    // the fence and the rotation proceeds.
+    fixture.connector_frozen(2).await;
+    assert!(
+        fixture.actor.sessions.contains_key(&fixture.key.scope()),
+        "frames flushed before the connector's freeze are legitimate up to the attested fence"
+    );
+    assert_ne!(
+        fixture
+            .actor
+            .session_terminal_events
+            .back()
+            .map(|event| event.reason),
+        Some("FENCE_VIOLATION")
+    );
+    assert_eq!(fixture.phase(), RotationPhase::Draining);
 }

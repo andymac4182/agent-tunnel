@@ -1964,6 +1964,7 @@ fn admission_error_kind(error: &HarnessError) -> &'static str {
         HarnessError::Json(_) => "json",
         HarnessError::InvalidInput(_) => "invalid_input",
         HarnessError::Process(_) => "process",
+        HarnessError::CliExitedBeforeReady { .. } => "cli_exited_before_ready",
         HarnessError::Redis(_) => "redis",
         HarnessError::Proxy(_) => "proxy",
         HarnessError::Pki(_) => "pki",

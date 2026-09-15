@@ -53,6 +53,37 @@ The transport command exercises real mTLS/H3 fault cases. The cluster command
 uses a synthetic owner callback. The production command uses real relay actors,
 CLI/device WebSockets and public consumers across three relays.
 
+`verify-m7-production` also records and asserts the IN-10/OG-05 heartbeat,
+liveness and shutdown evidence, printed as a
+`M7 production heartbeat/liveness/shutdown:` line and enforced by
+`validate_production_liveness_evidence`:
+
+- **Heartbeat.** The relay actor's owner-lease renewal is the only periodic
+  authority round trip the product actually performs end to end, so the gate
+  samples `Catalog::current_owner` for both tenant device scopes across the
+  whole run and counts each advance of `lease_expires_at` per owner token.
+  Every measured interval must fall inside `[owner_lease / 3, owner_lease]`,
+  both edges derived from the fixture's configured
+  `PRODUCTION_OWNER_LEASE`: the actor marks a lease due for renewal at
+  `last_lease_renewal.elapsed() >= owner_lease / 3`, and a renewal later than
+  the lease itself would have fenced the owner. The protocol `PING`/`PONG`
+  pair is deliberately *not* used as heartbeat evidence — both peers answer an
+  inbound `PING`, but nothing in the product emits one and the `WELCOME`
+  heartbeat interval/timeout fields are advertised without being driven, so
+  asserting on them would require adding a product heartbeat purely for the
+  test.
+- **Liveness vs readiness.** The gate probes one surviving relay's `/livez`
+  and `/readyz` before and after the owner relay is shut down and requires
+  both a ready and an unready observation, with the live envelope still served
+  at the moment readiness failed closed.
+- **Shutdown.** A dedicated real CLI epoch on its own device fanout (so the
+  shared fixture's ordered route schedule and socket accounting are unchanged)
+  is interrupted with `SIGINT`, and its join is *measured*. The measured
+  duration must land inside one complete configured rotation cycle
+  (`interval + handshake_timeout + overlap` from the fixture's `ROTATION`), the
+  process must exit through its own stop path rather than be force-killed, and
+  the stopped CLI must have released its Redis owner.
+
 ### Bounded multi-fault chaos classification (`verify-m7-chaos`)
 
 ```sh
@@ -65,25 +96,72 @@ repeats owner kill, CLI process pause and peer UDP loss and exercises a full
 Redis pause once, each built from an existing fault injector: Redis pause
 (`ProxyHandle::pause_all`), non-owner peer UDP loss (`set_peer_path_drop`), CLI
 process pause (`SIGSTOP`/`SIGCONT` via `ProcessPauseGuard`) and owner kill
-(`SIGKILL` of the owning `tunnel-client`). A full Redis pause expires the
-in-process fixture's signed membership lease, which does not re-arm for a second
-full outage on the same long-lived cluster (a fixture limitation, not a protocol
-one), so Redis pause is scheduled once while the other three faults repeat.
+(`SIGKILL` of the owning `tunnel-client`). Redis pause is scheduled once, as
+the terminal round, while the other three faults repeat.
+
+The signed membership lease is **not** latched: the membership supervisor keeps
+reconciling and restores `Ready` from the current pass alone once a
+strictly-newer signed checkpoint and a catalog snapshot land together
+(`crates/tunnel-relay/src/membership_runtime.rs`). The round records whether
+that re-arm happened as `redis_membership_recovery=`, observed over a bounded
+budget and **never asserted**, because it is measurably position-dependent in
+this fixture:
+
+* with the Redis pause mid-schedule, every relay returns to `Ready` on its own
+  (observed at roughly 28 s after resume);
+* as the terminal round of a ~60-second run it does not re-arm at all
+  (0/3 relays Ready after 45 s of waiting).
+
+The fixture's signed membership record lifetime is itself 60 seconds with a
+20-second refresh (`membership_record_lifetime_seconds` /
+`membership_refresh_seconds` in `production_cluster.rs`), so by the last round
+there is no headroom left to absorb a full outage. Even in the mid-schedule
+position where membership does re-arm, the cluster cannot be *reused*: the
+record expires again shortly afterwards (`MembershipExpired`) and every fresh
+owner CLI then fails its device control WebSocket handshake with a typed
+`TRANSPORT_ERROR` on all three relays. Repeating the Redis fault with an
+observed *session* recovery therefore needs a fixture change to the membership
+record lifetime and its refresh across an outage -- not a schedule change -- so
+the round is left terminal rather than given a recovery it does not have.
 Every observed close or interruption is mapped into the closed vocabulary the
 diagnostics already use — `bounded_close`, `admission_unavailable`,
-`peer_unavailable`, `owner_released`, `outcome_unknown`, `unclassified`.
-Unknown outcomes (a timed-out or unsendable probe) are preserved as
-`outcome_unknown`, not discarded; an observation that matches no bucket (for
-example an echo from a killed or paused owner, or an unexpected HTTP status) is
-recorded as `unclassified`. Each round recycles the owner session, so
-device-fanout reconnect sockets are counted per round. `validate_chaos_evidence`
-blocks release when any interruption is unclassified, when the peak per-round
-reconnect rate exceeds the documented threshold of 12.000 sockets/second
-(`reconnect_rate_threshold_milli = 12000`), when the concurrent device-fanout
-socket peak exceeds four, when a fault type was never exercised, or when a
-per-round or final recovery echo did not succeed. The gate runs as part of
+`peer_unavailable`, `owner_released`, `outcome_unknown`,
+`client_exit_before_ready`, `unclassified`. Unknown outcomes (a timed-out or
+unsendable probe) are preserved as `outcome_unknown`, not discarded; an
+observation that matches no bucket (for example an echo from a killed or paused
+owner, or an unexpected HTTP status) is recorded as `unclassified`.
+
+A `tunnel-client` that exits before readiness on the establish path is
+classified rather than surfaced as an opaque harness error: the CLI's exit codes
+are their own closed vocabulary (`CliError::exit_code` in
+`crates/tunnel-client/src/main.rs` — 1 other, 2 invocation/config, 3 credential,
+4 transport or supervisor-absent, 5 deadline exceeded, 6 outcome unknown), and
+its typed `--json` diagnostic code is carried alongside. Such an exit is counted
+in `client_exit_before_ready`; the validator requires every one of them to have
+carried a typed exit code, so a signal death or an unexpected success exit
+blocks release.
+
+Reconnects are measured **at second scale and attributed to the client**. The
+fanout fixture records the exact instant of every accepted device-fanout socket,
+and each round brackets its own deliberate session recycle, so the enforced
+metric `max_cli_reconnects_per_window` is the largest number of
+*client-attributed* accepts inside any real one-second window, with the
+fixture's recycle sockets (roughly two per round) excluded and bounded
+separately by `max_recycle_sockets_round`. The previous whole-round average is
+retained only for continuity: a ten-reconnect burst inside a ten-second round
+averaged to one per second and passed a twelve-per-second threshold, which the
+windowed metric now catches.
+
+`validate_chaos_evidence` blocks release when any interruption is unclassified,
+when client-attributed reconnects in any one-second window exceed the documented
+ceiling of four, when a recycle exceeds six sockets, when accept instants were
+evicted (making the window an undercount), when the reconnect attribution totals
+disagree, when a pre-readiness CLI exit carried no typed exit code, when the
+concurrent
+device-fanout socket peak exceeds four, when a fault type was never exercised,
+or when a per-round or final recovery echo did not succeed. The gate runs as part of
 `scripts/m7-harness-verify.sh`. Its structured validator and its table-driven
-M7-C17 mutation case live in `crates/tunnel-test-harness/src/production_cluster/chaos.rs`.
+M7-C17 mutation cases live in `crates/tunnel-test-harness/src/production_cluster/chaos.rs`.
 
 ### Evidence-promotion guard (`scripts/m7-evidence-guard.py`)
 
@@ -366,13 +444,42 @@ forwarders and the catalog namespace. The deterministic statement of the same
 replacement rule is `tunnel-cluster`'s
 `membership::tests::peer_key_replacement_walks_old_then_overlap_then_new`.
 
-Two boundaries are deliberate and not claimed by this gate. The typed public
+The replacement process is then required to serve, not merely to converge. Once
+A is ready again, the gate waits for the replacement's own `/readyz`, attaches a
+fresh device session to the device listener that process now owns, reads the
+owner claim back from Redis and requires it to name the same node and deployment
+incarnation under a **different `boot_id`** from the claim the retired process
+held, with a fresh session id and a higher owner epoch, and then drives a public
+consumer request into relay A which must return the exact canary and payload
+bytes across the replaced peer route. The session must still be the one the
+replacement served when it is stopped, and its generation must not have moved
+across the canary. Typical evidence is
+`replacement_epoch=2 replacement_device_generation=1 replacement_canary_attempts=9`.
+
+Two convergence tolerances are bounded and counted rather than silent. The
+device attach is retried inside the transition deadline, because a relay that
+is still failing closed refuses it at the upgrade or during the control
+handshake. The canary tolerates the typed `503` pre-dispatch boundary
+(`CLUSTER_UNREADY` while A's readiness is still converging, `PEER_UNTRUSTED`
+while A's peer trust for the replacement is), and at most two `401` outcomes.
+The `401` allowance exists because the relay maps a *catalog* failure inside
+consumer authentication to `UNAUTHORIZED` rather than to the
+`AUTHORIZATION_UNAVAILABLE` boundary that sits beside it in the same function,
+so an authority blip during convergence is indistinguishable at the HTTP
+boundary from a real rejection; the third `401` fails the gate, so a genuinely
+broken authorization can never be waited out. Both counts appear in the
+evidence line, and four consecutive local runs recorded `pre_dispatch_401=0`.
+Relay A's own signed record is also re-issued at a higher version before the
+replacement process boots: every record in this fixture carries a lifetime
+shorter than the relay's 60-second bound, and without that refresh the
+replacement's peer trust for relay A ages out mid-phase.
+
+One boundary is deliberate and not claimed by this gate: the typed public
 outcome across the retired route is the readiness boundary rather than
 `PEER_UNTRUSTED`, because the relay withdraws that route from readiness before a
 consumer request reaches peer resolution; the pin failure itself is observed on
 the authenticated probe path, where A dials the retired certificate, refuses it
-and opens no stream. And the **replacement process's own public admission is not
-exercised**. The non-convergence originally recorded here — a relay booting
+and opens no stream. The non-convergence originally recorded here — a relay booting
 beside a peer flapping between ready and unready never reaching `/readyz` ready
 within 20 s (0 of 123 samples) — was a product defect and has been fixed: probe
 admission required the *receiving* relay's readiness-derived route set, which
@@ -382,11 +489,36 @@ was reachable but momentarily unready refused the probe and the prober observed
 Reachability is now measured independently of the responder's own readiness; see
 the readiness paragraph in [cluster.md](cluster.md) and the deterministic
 regressions `real_h3_probe_converges_while_peer_cluster_readiness_is_withdrawn`
-and `real_h3_probe_converges_across_a_peer_readiness_flap`. The replacement boot
-is still asserted only through relay A: A's readiness recovers on the
-replacement route and A accepts the replacement certificate on the private path.
-A device session and consumer request served *by* a replaced process remain
-uncovered; see the M7-C06 tracker row.
+and `real_h3_probe_converges_across_a_peer_readiness_flap`. With that fix in
+place the replacement boot is now asserted through the replacement process
+itself as described above, so a device session and consumer request served *by*
+the replaced process are covered by this gate.
+
+### Live-catalog Redis process restart
+
+```sh
+bash scripts/m7-redis-lane-restart-verify.sh
+```
+
+Requires Docker; the script owns one pinned, loopback-only Redis container on a
+fixed host port and never touches `TEST_REDIS_URL`. `tunnel-test-harness
+redis-lane-restart` connects **one** `RedisCatalog` to that container, seeds its
+synthetic fixture through the production `Catalog` contract, serves a read, and
+signals the script through a two-word handshake file. The script then restarts
+that Redis process on the same port and signals back, so the same live catalog
+meets a genuinely new `run_id` on a real socket rather than a fake authority.
+
+The gate requires the primary's `run_id` to differ across the restart, the
+catalog to have served a read before it, the first post-restart command to fail
+closed without replay, the very next command to be refused with the typed
+`CatalogError::Conflict("Redis server run id")`, and every one of the remaining
+twelve bounded commands to be refused with that same typed conflict — never a
+value, never another typed shape. A catalog connected *after* the restart then
+reads the seeded authorization back, so the refusal is specific to the identity
+the first catalog verified rather than a client that stopped working. Evidence
+is one payload-free line naming both run identifiers and the per-command outcome
+sequence. This is the process-level counterpart to `redis_lane_reconnect`, which
+severs the socket without changing the primary.
 
 ## Deterministic transport and state-machine tests
 
@@ -768,3 +900,47 @@ Keep fast unit/config/codec tests in every pull request. Add protocol and adapte
 For release artifacts, build for every advertised OS/architecture, record checksums and provenance, then download and unpack those artifacts into clean temporary environments. Execute their help/version/config checks and launch the packaged relay and device for a real consumer-to-device operation and a rotation. Verify that expected configuration examples, notices, and required runtime assets are present and that no workspace-only dependency is masking a missing file. macOS/Linux/Windows CI success is not by itself evidence for every architecture on those systems.
 
 For the local macOS-arm64 CLI scope of IN-10/OG-05, `scripts/m7-local-source-parity-build.sh` builds the workspace binaries from an immutable copy of the current `HEAD` source inputs (crates, vendor, examples, root Cargo metadata) and emits an immutable `source-parity-receipt.txt` tying the copied source digest to each binary's sha256. `scripts/m7-local-artifact-verify.sh --build-receipt <receipt>` then cross-checks that receipt — the recorded base `HEAD`, tracked-diff digest and worktree-status digest must equal the current checkout's, and every supplied binary's sha256 must equal the receipt's digest — and only then records `binary_provenance=verified` and source-to-binary provenance as verified; any mismatch is fatal, so provenance is never falsely claimed. Without `--build-receipt` the verifier still records provenance as unverified. Both scripts are single-host, local macOS-arm64, this-source-only observers; they make no release, other-OS/architecture, hosted-CI or full-M7-row claim, and neither builds nor mutates the original checkout. Drive the source-matched CLI into an acceptance gate by exporting `TUNNEL_CLIENT_BIN=<bundle>/bin/tunnel-client` (the verifier writes a `tunnel-client-env.sh` for this) so `verify-m7-production` and `verify-m7-chaos`/`verify-m7-i08-recovery-attempts` record heartbeat, liveness, bounded shutdown and no-reconnect-storm evidence against the exact receipt-matched binary.
+
+## Survey stability, measured 2026-09-14
+
+The full gate survey is not a stable pass/fail signal on this machine, and the
+reason is worth stating plainly rather than discovering again.
+
+Five consecutive surveys returned 75/75, 72/75, 73/75, 74/75 and 69/75, and the
+failing gates were almost entirely different each time. Three findings came out
+of chasing them:
+
+* Some were real defects the survey deserves credit for: a peer transport
+  reporting a clean remote close as a failure, a refused forwarded device
+  attachment collapsing a shared peer connection, and a diagnostics scanner
+  that correctly refused a vocabulary it had not been taught.
+* Some were the survey's own doing: a 4 MB write timing out against a Redis
+  carrying the rest of the run, and a failing diagnostics child whose stderr
+  was discarded because the survey never set `C11_CHILD_FAILURE_DIR`.
+* Some were the machine. One failure was a CLI killed with signal 9, which is
+  memory pressure, not a product result. Disk reached 97% during this work.
+
+Reducing the parallel lane from three jobs to two did **not** stabilise it: that
+run still failed five gates, again a different five. So parallelism is not the
+single cause and the cap is not the fix.
+
+What follows from this: a single survey result is evidence about one run, not
+about the branch. A gate that fails once should be rerun standalone on an idle
+machine before it is called a defect, and a gate that passes once should not be
+recorded as verified on that basis alone. Where a gate has been measured
+repeatedly, the measured rate belongs in its row. The owner-local stream
+capacity gate, for instance, fails roughly half of its standalone runs and its
+earlier clean survey results were luck.
+
+### Chaos gate startup flake, measured 2026-09-15
+
+`verify-m7-chaos` sometimes fails before its scenario starts, with the owner CLI
+exiting before production readiness and a typed `TRANSPORT_ERROR`. Measured
+rates: zero failures in four consecutive standalone runs on an idle machine, and
+one in three under six competing CPU hogs. It is a startup condition, not a
+classification result: when it fires, no round has run.
+
+It is recorded rather than fixed because it has not been reproduced under
+instrumentation and the cause is not established. Do not read a single chaos
+failure of this shape as a classification finding; rerun it standalone first,
+and check whether the failure names a round.

@@ -1662,3 +1662,136 @@ async fn exhausted_connection_pool_is_typed_capacity_not_a_timeout() -> TestResu
     let _ = second.shutdown().await;
     Ok(())
 }
+
+/// A raw authenticated HTTP/3 owner that admits one request, announces its
+/// planned close, and then ends the connection cleanly while the client still
+/// holds that stream's lease.
+///
+/// This is the wire shape a relay observes when a peer completes its own
+/// planned drain first: the GOAWAY arrives, and the connection is closed with
+/// `H3_NO_ERROR` before the local stream lease is returned.
+struct CleanCloseDuringDrainFixture {
+    destination: PeerDestination,
+    admitted: Arc<Notify>,
+    task: JoinHandle<TestResult>,
+}
+
+impl CleanCloseDuringDrainFixture {
+    fn start(pki: &FixturePki, server_leaf: &Leaf) -> Self {
+        let server_config = load_peer_server_config_from_pem(
+            pki.chain(server_leaf).as_bytes(),
+            server_leaf.private_key_pem.as_bytes(),
+            pki.ca_pem.as_bytes(),
+        )
+        .expect("clean-close server TLS config");
+        let endpoint =
+            quinn::Endpoint::server(server_config, SocketAddr::from(([127, 0, 0, 1], 0)))
+                .expect("clean-close server endpoint");
+        let address = endpoint.local_addr().expect("clean-close server address");
+        let admitted = Arc::new(Notify::new());
+        let task = tokio::spawn(serve_clean_close_during_drain(
+            endpoint,
+            Arc::clone(&admitted),
+        ));
+        Self {
+            destination: PeerDestination::new(address, SERVER_NAME.to_owned()),
+            admitted,
+            task,
+        }
+    }
+
+    async fn join(self) -> TestResult {
+        timeout(CASE_TIMEOUT, self.task)
+            .await
+            .map_err(|_| "clean-close server did not join")??
+    }
+}
+
+async fn serve_clean_close_during_drain(
+    endpoint: quinn::Endpoint,
+    admitted: Arc<Notify>,
+) -> TestResult {
+    let incoming = timeout(CASE_TIMEOUT, endpoint.accept())
+        .await?
+        .ok_or("clean-close server saw no incoming connection")?;
+    let connection = timeout(CASE_TIMEOUT, incoming).await??;
+    let quic = h3_quinn::Connection::new(connection.clone());
+    let mut h3_connection =
+        timeout(CASE_TIMEOUT, h3::server::builder().build::<_, Bytes>(quic)).await??;
+    let resolver = timeout(CASE_TIMEOUT, h3_connection.accept())
+        .await??
+        .ok_or("clean-close server ended before the first request")?;
+    let (request, _stream) = resolver.resolve_request().await?;
+    if request.uri().path() != GOAWAY_PATH {
+        return Err(format!("unexpected clean-close path: {}", request.uri().path()).into());
+    }
+    // The request is admitted and deliberately left unanswered: the client
+    // keeps its stream lease for the whole of the planned close below.
+    admitted.notify_waiters();
+    // Announce the planned close, give the client's driver time to observe the
+    // GOAWAY frame, then end the connection with no error.
+    let _ = timeout(CASE_TIMEOUT, h3_connection.shutdown(0)).await;
+    sleep(GOAWAY_DRAIN_QUIET).await;
+    let clean_close_code = quinn::VarInt::from_u64(h3::error::Code::H3_NO_ERROR.value())
+        .expect("H3_NO_ERROR fits a QUIC application close code");
+    connection.close(clean_close_code, b"planned close complete");
+    endpoint.close(clean_close_code, b"clean-close server shutdown");
+    Ok(())
+}
+
+/// Regression: a peer that finishes its own planned close while this relay
+/// still holds a stream lease ends the connection with no error, and that is
+/// not a transport failure.
+///
+/// The client driver races two ways out of a remote planned close: the stream
+/// leases drain, or the connection goes idle first.  Only the second branch
+/// sees the close directly, and it reported every close as an HTTP/3 error
+/// regardless of what the close said, so a clean remote close surfaced as
+/// `peer transport failed` from `shutdown` whenever that branch won the race.
+/// The gate that exercises a real GOAWAY rotation failed in exactly that way,
+/// intermittently, for as long as the two branches classified the same
+/// condition differently.
+#[tokio::test]
+async fn peer_client_treats_a_clean_remote_close_during_drain_as_success() -> TestResult {
+    let pki = FixturePki::new();
+    let client_leaf = pki.issue_peer("clean-close-client");
+    let server_leaf = pki.issue_peer("clean-close-server");
+    let server = CleanCloseDuringDrainFixture::start(&pki, &server_leaf);
+
+    let mut client_endpoint = quinn::Endpoint::client(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .expect("clean-close client endpoint");
+    let client_config = load_peer_client_config_from_pem(
+        pki.chain(&client_leaf).as_bytes(),
+        client_leaf.private_key_pem.as_bytes(),
+        pki.ca_pem.as_bytes(),
+    )
+    .expect("clean-close client TLS config");
+    client_endpoint.set_default_client_config(client_config);
+    let pins = ApprovedPeerPins::new([
+        spki_sha256_from_der(&server_leaf.der).expect("clean-close server pin")
+    ])
+    .expect("clean-close client pins");
+    let client = PeerClient::new(client_endpoint, pins, limits()).expect("clean-close client");
+
+    let scenario = async {
+        let connection = client.connect(server.destination.clone()).await?;
+        let admitted = connection.open(request()).await?;
+        timeout(CASE_TIMEOUT, server.admitted.notified())
+            .await
+            .map_err(|_| "clean-close server did not admit the stream")?;
+        // Hold the lease across the remote's planned close so the driver's
+        // idle branch, not its permit branch, observes the close.
+        sleep(GOAWAY_DRAIN_QUIET * 3).await;
+        drop(admitted);
+        Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+    }
+    .await;
+
+    // The assertion: a clean remote close is not a transport failure.
+    let client_shutdown = client.shutdown().await;
+    let server_join = server.join().await;
+    scenario?;
+    server_join?;
+    client_shutdown?;
+    Ok(())
+}

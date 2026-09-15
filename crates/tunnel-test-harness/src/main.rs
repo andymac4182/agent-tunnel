@@ -1,7 +1,8 @@
 use std::{process::ExitCode, time::Duration};
 use tunnel_test_harness::{
     ClusterFixture, FixturePki, HarnessError, acceptance, acceptance_command_exit_code,
-    cluster_acceptance, cluster_transport, m2_acceptance, redis_restart, redis_tls,
+    cluster_acceptance, cluster_transport, m2_acceptance, redis_lane_restart, redis_restart,
+    redis_tls,
 };
 
 #[tokio::main]
@@ -188,11 +189,93 @@ async fn main() -> ExitCode {
                         race.successor_canary,
                         race.elapsed_ms,
                     );
+                    let liveness = &evidence.liveness;
+                    println!(
+                        "M7 production heartbeat/liveness/shutdown: owner_lease_ms={} heartbeat_window_ms=[{},{}] heartbeat_owner_tokens={} heartbeat_round_trips={} heartbeat_intervals={} longest_heartbeat_run={} observed_interval_ms=[{},{}] intervals_within_bounds={} livez={}/{} readyz_ready={} readyz_unready={}/{} live_while_unready={} cli_shutdown_join_ms={} cli_shutdown_bound_ms={} cli_shutdown_within_bound={} cli_shutdown_graceful_exit={} cli_shutdown_owner_released={}",
+                        liveness.owner_lease_ms,
+                        liveness.heartbeat_minimum_interval_ms,
+                        liveness.heartbeat_maximum_interval_ms,
+                        liveness.heartbeat_owner_tokens,
+                        liveness.heartbeat_round_trips,
+                        liveness.heartbeat_intervals,
+                        liveness.longest_heartbeat_run_intervals,
+                        liveness.observed_minimum_interval_ms,
+                        liveness.observed_maximum_interval_ms,
+                        liveness.heartbeat_intervals_within_bounds,
+                        liveness.livez_live,
+                        liveness.livez_probes,
+                        liveness.readyz_ready,
+                        liveness.readyz_unready,
+                        liveness.readyz_probes,
+                        liveness.liveness_up_while_readiness_false,
+                        liveness.cli_shutdown_join_ms,
+                        liveness.cli_shutdown_join_bound_ms,
+                        liveness.cli_shutdown_joined_within_bound,
+                        liveness.cli_shutdown_graceful_exit,
+                        liveness.cli_shutdown_owner_released,
+                    );
                 }),
                 Err(_) => Err(HarnessError::Process(
                     "M7 production acceptance exceeded 300 seconds".to_owned(),
                 )),
             }
+        }
+        [command] if command == "verify-m7-i08-partial-response-rotation" => {
+            tunnel_test_harness::production_cluster::verify_i08_partial_response_rotation()
+                .await
+                .and_then(|evidence| {
+                    tunnel_test_harness::production_cluster::validate_i08_partial_response_evidence(
+                        &evidence,
+                    )?;
+                    println!(
+                        "M7 I08 partial-response rotation passed: relays={} session={} epoch={} stream={} operation={} fid={} synthetic_operation={} request_record_bytes={} response_record_bytes={} response_frames={} resume_unit={} byte_cursor_resume_supported={} responses_delivered={} checksums_matched={} multi_chunk={} bracketing_commit={} partial_resume_offsets={:?} cursor_gaps={} duplicated_bytes={} rotations_retaining_replay={} rotations={} adapter_shutdown_phase={} adapter_shutdown_in_overlap={} adapter_shutdown_graceful={} post_shutdown_outcome={} socket_high_water={} cleanup_joined={} elapsed_ms={}",
+                        evidence.relay_count,
+                        evidence.session_id,
+                        evidence.epoch,
+                        evidence.stream_id,
+                        evidence.tunnel_operation_id,
+                        evidence.synthetic_fid,
+                        evidence.synthetic_operation_id,
+                        evidence.request_record_bytes,
+                        evidence.response_record_bytes,
+                        evidence.response_frames,
+                        evidence.resume_unit,
+                        evidence.byte_cursor_resume_supported,
+                        evidence.responses_delivered,
+                        evidence.responses_checksum_matched,
+                        evidence.responses_multi_chunk,
+                        evidence.responses_bracketing_commit,
+                        evidence.partial_resume_offsets,
+                        evidence.cursor_gaps,
+                        evidence.duplicated_bytes,
+                        evidence.rotations_retaining_replay,
+                        evidence.rotations.len(),
+                        evidence.adapter_shutdown_phase,
+                        evidence.adapter_shutdown_in_overlap,
+                        evidence.adapter_shutdown_graceful,
+                        evidence.post_shutdown_outcome,
+                        evidence.socket_high_water,
+                        evidence.cleanup_joined,
+                        evidence.elapsed_ms,
+                    );
+                    for rotation in &evidence.rotations {
+                        println!(
+                            "M7 I08 partial rotation: number={} old_generation={} new_generation={} relay_fence={} relay_ack={} connector_fence={} connector_ack={} candidate_ready={} commit_accepted={} old_closed={} replay_frames={}",
+                            rotation.rotation,
+                            rotation.attempt.old_generation,
+                            rotation.attempt.new_generation,
+                            rotation.relay_fence_sequence,
+                            rotation.relay_ack_sequence,
+                            rotation.connector_fence_sequence,
+                            rotation.connector_ack_sequence,
+                            rotation.candidate_ready,
+                            rotation.commit_accepted,
+                            rotation.old_socket_closed,
+                            rotation.replay_frames,
+                        );
+                    }
+                    Ok(())
+                })
         }
         [command] if command == "verify-m7-i08-synthetic-rotation" => {
             tunnel_test_harness::production_cluster::verify_i08_synthetic_rotation()
@@ -380,7 +463,7 @@ async fn main() -> ExitCode {
                 .and_then(|evidence| {
                     tunnel_test_harness::production_cluster::validate_ec041_device_attachment_evidence(&evidence)?;
                     println!(
-                        "M7 EC-041 device attachment race passed: relays={} predecessor_owner={} successor_owner={} full_owner_replaced={} predecessor_gen={} successor_gen={} stale_rejected={} stale_data_ready_absent={} stale_session_unchanged={} distinct_ingress={} winner_count={} loser_count={} data_ready_count={} winner_gen={} winner_carrier_installed={} loser_no_counter_reset={} reuse_rejected={} reuse_data_ready_absent={} cleanup_joined={}",
+                        "M7 EC-041 device attachment race passed: relays={} predecessor_owner={} successor_owner={} full_owner_replaced={} predecessor_gen={} successor_gen={} stale_rejected={} stale_data_ready_absent={} stale_session_unchanged={} distinct_ingress={} winner_count={} loser_count={} data_ready_count={} winner_gen={} winner_carrier_installed={} loser_no_counter_reset={} reuse_rejected={} reuse_data_ready_absent={} control_barrier_held={} control_barrier_hits={} control_owner_changed_while_held={} control_interloper_owner={} control_revalidated={} control_outcome={:?} control_single_owner={} control_no_stale_welcome={} winner_stream_count={} winner_cursors_advanced={} winner_cursors_unchanged={} loser_no_stream_row={} cleanup_joined={}",
                         evidence.relay_count,
                         evidence.predecessor_owner_complete,
                         evidence.successor_owner_complete,
@@ -399,6 +482,18 @@ async fn main() -> ExitCode {
                         evidence.loser_caused_no_counter_reset,
                         evidence.fresh_ticket_reuse_rejected,
                         evidence.fresh_ticket_reuse_data_ready_absent,
+                        evidence.control_attach_barrier_held,
+                        evidence.control_attach_barrier_hits,
+                        evidence.control_owner_changed_while_held,
+                        evidence.control_interloper_owner_node_matched,
+                        evidence.control_attach_revalidated,
+                        evidence.control_attach_outcome,
+                        evidence.control_single_owner_after_race,
+                        evidence.control_no_stale_owner_welcome,
+                        evidence.winner_stream_count,
+                        evidence.winner_stream_cursors_advanced,
+                        evidence.winner_stream_cursors_unchanged,
+                        evidence.loser_created_no_stream_row,
                         evidence.cleanup_joined,
                     );
                     Ok(())
@@ -412,7 +507,7 @@ async fn main() -> ExitCode {
                 .and_then(|evidence| {
                     tunnel_test_harness::production_cluster::validate_ec025_handover_evidence(&evidence)?;
                     println!(
-                        "M7 EC-025 cross-relay handover passed: relays={} ingress_not_owner={} owner_unchanged={} baseline_exact_owner={} exact_owner_scope_observed={} barrier_completed_exact_owner={} peer_delay_typed_not_dispatched={} peer_delay_zero_dispatch={} rotation_observed={} across_rotation_no_foreign_dispatch={} across_rotation_completed_or_typed={} across_rotation_completed={} across_rotation_interrupted={} across_rotation_not_dispatched={} cleanup_joined={}",
+                        "M7 EC-025 cross-relay handover passed: relays={} ingress_not_owner={} owner_unchanged={} baseline_exact_owner={} exact_owner_scope_observed={} barrier_completed_exact_owner={} peer_delay_typed_not_dispatched={} peer_delay_zero_dispatch={} rotation_observed={} across_rotation_no_foreign_dispatch={} across_rotation_completed_or_typed={} across_rotation_completed={} across_rotation_interrupted={} across_rotation_not_dispatched={} trust_crossing_scope_observed={} trust_crossing_healthy_baseline={} trust_crossing_withdrawn_while_held={} trust_crossing_still_held={} trust_crossing_status={} trust_crossing_code={} trust_crossing_execution={} trust_crossing_delta_a={} trust_crossing_delta_b={} trust_crossing_delta_c={} trust_crossing_owner_delta={} trust_crossing_fault_role={} trust_crossing_fault_stage={} trust_crossing_fault_cause={} cleanup_joined={}",
                         evidence.relay_count,
                         evidence.ingress_is_not_owner,
                         evidence.owner_node_unchanged,
@@ -427,6 +522,24 @@ async fn main() -> ExitCode {
                         evidence.across_rotation_completed,
                         evidence.across_rotation_interrupted,
                         evidence.across_rotation_not_dispatched,
+                        evidence.trust_crossing.scope_observed,
+                        evidence.trust_crossing.healthy_baseline_completed,
+                        evidence.trust_crossing.withdrawn_while_held,
+                        evidence.trust_crossing.still_held_at_withdrawal,
+                        evidence.trust_crossing.refusal_status,
+                        evidence.trust_crossing.refusal_code.as_deref().unwrap_or("-"),
+                        evidence
+                            .trust_crossing
+                            .refusal_execution
+                            .as_deref()
+                            .unwrap_or("-"),
+                        evidence.trust_crossing.dispatch_delta[0],
+                        evidence.trust_crossing.dispatch_delta[1],
+                        evidence.trust_crossing.dispatch_delta[2],
+                        evidence.trust_crossing.owner_dispatch_delta,
+                        evidence.trust_crossing.fault_role.as_deref().unwrap_or("-"),
+                        evidence.trust_crossing.fault_stage.as_deref().unwrap_or("-"),
+                        evidence.trust_crossing.fault_cause.as_deref().unwrap_or("-"),
                         evidence.cleanup_joined,
                     );
                     Ok(())
@@ -827,6 +940,40 @@ async fn main() -> ExitCode {
                 )),
             }
         }
+        [command] if command == "verify-m7-ec044-peer-frames" => {
+            match tokio::time::timeout(
+                Duration::from_secs(180),
+                tunnel_test_harness::peer_frames::verify(),
+            )
+            .await
+            {
+                Ok(result) => result.and_then(|evidence| {
+                    evidence.validate()?;
+                    println!("{}", evidence.evidence_line());
+                    Ok(())
+                }),
+                Err(_) => Err(HarnessError::Timeout(
+                    "M7 EC-044 peer-frame acceptance exceeded 180 seconds".into(),
+                )),
+            }
+        }
+        [command] if command == "verify-m7-saturated-peer-frames" => {
+            match tokio::time::timeout(
+                Duration::from_secs(240),
+                tunnel_test_harness::peer_frames::saturated::verify(),
+            )
+            .await
+            {
+                Ok(result) => result.and_then(|evidence| {
+                    evidence.validate()?;
+                    println!("{}", evidence.evidence_line());
+                    Ok(())
+                }),
+                Err(_) => Err(HarnessError::Timeout(
+                    "M7 saturated peer-frame acceptance exceeded 240 seconds".into(),
+                )),
+            }
+        }
         [command] if command == "verify-m7-concurrent-load" => {
             match tokio::time::timeout(
                 Duration::from_secs(240),
@@ -1102,6 +1249,42 @@ async fn main() -> ExitCode {
                         evidence.sibling_dispatch_advanced,
                         evidence.fresh_approved_record_version,
                         evidence.fresh_approved_trust_recovered,
+                        evidence.recovery_echo,
+                        evidence.fanout_peak_open,
+                        evidence.elapsed_ms,
+                    );
+                    Ok(())
+                })
+        }
+        [command] if command == "verify-m7-membership-hint-drop" => {
+            tunnel_test_harness::production_cluster::verify_membership_hint_drop()
+                .await
+                .and_then(|evidence| {
+                    tunnel_test_harness::production_cluster::validate_membership_hint_drop_evidence(
+                        &evidence,
+                    )?;
+                    println!(
+                        "M7 membership hint drop passed: relays={} overlap_version={} withdrawal_version={} target_hints_dropped={} other_hints_dropped={} publications_in_window={} overlap_converged={} overlap_stream_survived={} key_left_verifier={} overlap_stream_interrupted={} dispatch_unchanged={} withdrawn_admission_refused={} withdrawn_outcome={:?} sibling_stream_survived={} sibling_dispatch_advanced={} refresh_bound_ms={} reconcile_tick_ms={} observed_convergence_ms={} observed_refusal_ms={} recovery_version={} recovery_echo={} peak_sockets={} elapsed_ms={}",
+                        evidence.relay_count,
+                        evidence.overlap_record_version,
+                        evidence.withdrawal_record_version,
+                        evidence.target_hints_dropped,
+                        evidence.other_hints_dropped,
+                        evidence.publications_during_drop_window,
+                        evidence.overlap_both_keys_converged,
+                        evidence.overlap_stream_survived,
+                        evidence.withdrawn_key_left_verifier,
+                        evidence.overlap_stream_interrupted_after_withdrawal,
+                        evidence.target_dispatch_unchanged,
+                        evidence.withdrawn_key_admission_refused,
+                        evidence.withdrawn_admission_outcome,
+                        evidence.sibling_stream_survived,
+                        evidence.sibling_dispatch_advanced,
+                        evidence.membership_refresh_bound_ms,
+                        evidence.reconcile_tick_ms,
+                        evidence.observed_convergence_ms,
+                        evidence.observed_refusal_ms,
+                        evidence.recovery_record_version,
                         evidence.recovery_echo,
                         evidence.fanout_peak_open,
                         evidence.elapsed_ms,
@@ -1433,10 +1616,11 @@ async fn main() -> ExitCode {
                 .map(|evidence| {
                     for row in &evidence.rows {
                         println!(
-                            "M7 OG-02 row={} command={} correlation={} missing={} peer_fault_tuples={} tuples={} captured_streams={} captured_bytes={} started_ms={} ended_ms={}",
+                            "M7 OG-02 row={} command={} correlation={} peer_fault_required={} missing={} peer_fault_tuples={} tuples={} captured_streams={} captured_bytes={} started_ms={} ended_ms={}",
                             row.name,
                             row.command,
                             if row.complete { "complete" } else { "incomplete" },
+                            row.peer_fault_required,
                             if row.missing_fields.is_empty() {
                                 "none".to_owned()
                             } else {
@@ -1497,6 +1681,29 @@ async fn main() -> ExitCode {
                     "Redis restart probe exceeded 30 seconds".to_owned(),
                 )),
             }
+        }
+        [
+            command,
+            url_flag,
+            url,
+            namespace_flag,
+            namespace,
+            handshake_flag,
+            handshake,
+        ] if command == "redis-lane-restart"
+            && url_flag == "--redis-url"
+            && namespace_flag == "--namespace"
+            && handshake_flag == "--handshake-file" =>
+        {
+            // The owning script restarts the Redis process between this
+            // command's two handshake signals, so the command's own bound is
+            // the module's bounded wait plus its bounded post-restart probes.
+            redis_lane_restart::run(url, namespace, handshake)
+                .await
+                .map(|evidence| {
+                    println!("{}", evidence.evidence_line());
+                })
+                .map_err(|error| HarnessError::Redis(error.to_string()))
         }
         [] => {
             print_help();
@@ -1924,7 +2131,7 @@ fn require_m7_queue_saturation_evidence(
 
 fn print_help() {
     println!(
-        "Usage: tunnel-test-harness verify\n       tunnel-test-harness verify-m2\n       tunnel-test-harness verify-m2-default\n       tunnel-test-harness verify-m2-faults\n       tunnel-test-harness verify-m7-transport\n       tunnel-test-harness verify-m7-redis-tls\n       tunnel-test-harness verify-m7-cluster\n       tunnel-test-harness verify-m7-production\n       tunnel-test-harness verify-m7-i08-synthetic-rotation\n       tunnel-test-harness verify-m7-i08-goaway-rotation\n       tunnel-test-harness verify-m7-i08-rotation-faults\n       tunnel-test-harness verify-m7-i08-recovery-attempts\n       tunnel-test-harness verify-m7-admission-framing\n       tunnel-test-harness verify-m7-ec041-device-attachment\n       tunnel-test-harness verify-m7-ec023-owner-death\n       tunnel-test-harness verify-m7-ec025-handover\n       tunnel-test-harness verify-m7-admission\n       tunnel-test-harness verify-m7-i04-fail-closed\n       tunnel-test-harness verify-m7-queue-saturation\n       tunnel-test-harness verify-m7-remote-body-limits\n       tunnel-test-harness verify-m7-device-revocation\n       tunnel-test-harness verify-m7-credential-expiry-rotation\n       tunnel-test-harness verify-m7-redis-partition\n       tunnel-test-harness verify-m7-process-pause\n       tunnel-test-harness verify-m7-chaos\n       tunnel-test-harness verify-m7-pressure\n       tunnel-test-harness verify-m7-c11-diagnostics\n       tunnel-test-harness verify-m7-og02-correlation\n       tunnel-test-harness verify-m7-lifecycle\n       tunnel-test-harness verify-m7-side-effect\n       tunnel-test-harness verify-m7-side-effect-late\n       tunnel-test-harness verify-m7-public-abandoned-upgrade\n       tunnel-test-harness verify-m7-owner-loss-effect\n       tunnel-test-harness verify-m7-timing-boundaries\n       tunnel-test-harness verify-m7-peer-fragmentation\n       tunnel-test-harness verify-m7-pending-owner\n       tunnel-test-harness verify-m7-successor-pending-owner\n       tunnel-test-harness verify-m7-concurrent-load\n       tunnel-test-harness verify-m7-key-rotation\n       tunnel-test-harness verify-m7-peer-readiness\n       tunnel-test-harness verify-m7-peer-capacity\n       tunnel-test-harness verify-m7-owner-local-capacity\n       tunnel-test-harness verify-m7-owner-contention\n       tunnel-test-harness verify-m7-trust-expiry\n       tunnel-test-harness redis-restart-{{seed|check}} --redis-url URL --namespace NAME --receipt-file PATH\n\nverify, verify-m2, and verify-m7-redis-tls commands require TEST_REDIS_URL and built workspace binaries.\nRuns real Redis, HTTPS, device mTLS WebSocket, CLI and HTTP/3 acceptance checks.\nverify-m2 drives a long-lived public echo WebSocket through accelerated real rotations;\nverify-m2-default repeats the same flow at the 300-second policy.\nverify-m2-faults closes exact control/data/candidate sockets and checks explicit recovery outcomes.\nverify-m7-transport proves bounded peer mTLS/HTTP3 duplex exchange and negative identity cases.\nverify-m7-redis-tls proves the authenticated Redis TLS catalog connection and rejection cases.\nverify-m7-cluster connects three real relay peer listeners through signed membership,\nRedis owner fencing, control/data replacement generations and consumer ingress.\nverify-m7-production exercises the production relay actor, signed Redis directory,\nclient WebSockets and public consumer routing across three relays.\nverify-m7-i08-synthetic-rotation verifies a real CLI and checksummed synthetic Echo records across three same-owner rotations.\nverify-m7-i08-recovery-attempts fails every retained-recovery attachment of a real CLI at the opaque\ndevice fanout after the owner attached it: three attempts under one absolute episode deadline end in\nthe typed exhaustion diagnostic, then a second attempt recovers the same session and stream.\nverify-m7-admission exercises public negative admission, route allowlisting,\nforged identity-header rejection and selected-owner failure across three relays.\nverify-m7-i04-fail-closed proves the fail-closed admission, readiness, routing and\nfallback matrix with a request-body sentinel: absent/unknown/inactive/ambiguous and\ncaller-destination targets rejected before any body read or owner selection, a\ncaller-named peer address never reached, an empty body distinguished from a failed\nbody, consumed/unpolled/failed bodies under a real owner process loss with no\nreselection, GET/HEAD/OPTIONS shapes at the lost owner's route typed and never\nreselected, the duplicate service label ambiguous through the stream upgrade too,\none bounded consumer-driven safe retry bridging successor readiness, and the\nexcluded browser route boundary recorded.\nverify-m7-ec041-device-attachment races two real device data attachments through two distinct\nnon-owner ingress relays after a successor owner replaces the complete owner token: a stale\npredecessor ticket and an already-consumed ticket are refused with a transport close and no\nDATA_READY, exactly one concurrent attachment wins, and the losing attachment resets no counter.\nverify-m7-device-revocation proves live Redis device-credential revocation,\nexisting-stream withdrawal, exact no-owner admission, and tenant sibling survival.\nverify-m7-credential-expiry-rotation proves a sixteen-second consumer credential\nexpires inside one exact candidate/old scheduled rotation and refresh challenge\nafter admitted baseline echo, with issuer/audience/subject identity and typed\nterminal checks.\nverify-m7-pressure exercises bounded production resource pressure, cancellation, and recovery.\nverify-m7-lifecycle holds one consumer response path and checks cancellation, sibling survival, and fresh-stream recovery.\nverify-m7-side-effect-late proves owner-side receipt and terminal rejection of one late DATA/FIN pair after a selected peer fault.\nverify-m7-public-abandoned-upgrade proves real owner-local and remote public WebSocket upgrades after admission, no 101 response, exact registration reclamation, capacity rejection, and sibling recovery.\nverify-m7-key-rotation exercises bounded recovery after peer-pin withdrawal during scheduled rotation.\nverify-m7-og02-correlation drives the credential-expiry, trust-expiry, GOAWAY, recovery-attempt,\nlease-expiry, queue-saturation and remote-body-limit gates through the C11 capture scanner and\nreports per row whether the joined window carries complete OG-02 correlation and the relay's\nbounded peer stage/cause tuples; declared-complete rows are enforced.\nverify-m7-peer-readiness exercises authenticated peer path loss and fresh-path readiness recovery.\nverify-m7-owner-contention exercises concurrent CLI claims, terminal rejection and fenced successor cleanup.\nverify-m7-chaos cycles owner kill, peer UDP loss, Redis pause and CLI process pause against three relays for a fixed number of rounds, classifies every close/interruption into the closed diagnostics vocabulary, preserves unknown outcomes, and fails on any unclassified interruption or reconnect rate above the documented threshold.\nverify-m7-trust-expiry exercises signed peer-key expiry without a Redis invalidation hint,\npooled-stream closure, unrelated peer survival, and fresh signed-trust recovery.\nUses isolated Redis namespaces, ephemeral certificates and synthetic echo data.\nRun restart probes through scripts/m1-redis-restart-verify.sh.\nSet M2_HARNESS_TIMEOUT_SECONDS to override a bounded M2 command timeout."
+        "Usage: tunnel-test-harness verify\n       tunnel-test-harness verify-m2\n       tunnel-test-harness verify-m2-default\n       tunnel-test-harness verify-m2-faults\n       tunnel-test-harness verify-m7-transport\n       tunnel-test-harness verify-m7-redis-tls\n       tunnel-test-harness verify-m7-cluster\n       tunnel-test-harness verify-m7-production\n       tunnel-test-harness verify-m7-i08-synthetic-rotation\n       tunnel-test-harness verify-m7-i08-partial-response-rotation\n       tunnel-test-harness verify-m7-i08-goaway-rotation\n       tunnel-test-harness verify-m7-i08-rotation-faults\n       tunnel-test-harness verify-m7-i08-recovery-attempts\n       tunnel-test-harness verify-m7-admission-framing\n       tunnel-test-harness verify-m7-ec041-device-attachment\n       tunnel-test-harness verify-m7-ec023-owner-death\n       tunnel-test-harness verify-m7-ec025-handover\n       tunnel-test-harness verify-m7-admission\n       tunnel-test-harness verify-m7-i04-fail-closed\n       tunnel-test-harness verify-m7-queue-saturation\n       tunnel-test-harness verify-m7-remote-body-limits\n       tunnel-test-harness verify-m7-device-revocation\n       tunnel-test-harness verify-m7-credential-expiry-rotation\n       tunnel-test-harness verify-m7-redis-partition\n       tunnel-test-harness verify-m7-process-pause\n       tunnel-test-harness verify-m7-chaos\n       tunnel-test-harness verify-m7-pressure\n       tunnel-test-harness verify-m7-c11-diagnostics\n       tunnel-test-harness verify-m7-og02-correlation\n       tunnel-test-harness verify-m7-lifecycle\n       tunnel-test-harness verify-m7-side-effect\n       tunnel-test-harness verify-m7-side-effect-late\n       tunnel-test-harness verify-m7-public-abandoned-upgrade\n       tunnel-test-harness verify-m7-owner-loss-effect\n       tunnel-test-harness verify-m7-timing-boundaries\n       tunnel-test-harness verify-m7-peer-fragmentation\n       tunnel-test-harness verify-m7-ec044-peer-frames\n       tunnel-test-harness verify-m7-saturated-peer-frames\n       tunnel-test-harness verify-m7-pending-owner\n       tunnel-test-harness verify-m7-successor-pending-owner\n       tunnel-test-harness verify-m7-concurrent-load\n       tunnel-test-harness verify-m7-key-rotation\n       tunnel-test-harness verify-m7-peer-readiness\n       tunnel-test-harness verify-m7-peer-capacity\n       tunnel-test-harness verify-m7-owner-local-capacity\n       tunnel-test-harness verify-m7-owner-contention\n       tunnel-test-harness verify-m7-trust-expiry\n       tunnel-test-harness verify-m7-membership-hint-drop\n       tunnel-test-harness redis-restart-{{seed|check}} --redis-url URL --namespace NAME --receipt-file PATH\n       tunnel-test-harness redis-lane-restart --redis-url URL --namespace NAME --handshake-file PATH\n\nverify, verify-m2, and verify-m7-redis-tls commands require TEST_REDIS_URL and built workspace binaries.\nRuns real Redis, HTTPS, device mTLS WebSocket, CLI and HTTP/3 acceptance checks.\nverify-m2 drives a long-lived public echo WebSocket through accelerated real rotations;\nverify-m2-default repeats the same flow at the 300-second policy.\nverify-m2-faults closes exact control/data/candidate sockets and checks explicit recovery outcomes.\nverify-m7-transport proves bounded peer mTLS/HTTP3 duplex exchange and negative identity cases.\nverify-m7-redis-tls proves the authenticated Redis TLS catalog connection and rejection cases.\nverify-m7-cluster connects three real relay peer listeners through signed membership,\nRedis owner fencing, control/data replacement generations and consumer ingress.\nverify-m7-production exercises the production relay actor, signed Redis directory,\nclient WebSockets and public consumer routing across three relays.\nverify-m7-i08-synthetic-rotation verifies a real CLI and checksummed synthetic Echo records across three same-owner rotations.\nverify-m7-i08-partial-response-rotation drives maximum-size multi-frame synthetic adapter responses\ncontinuously across three same-owner rotations and records what the product actually guarantees for a\npartly delivered response: the received prefix equals the source prefix at every observed consumer byte\ncursor, the reassembled response matches a checksum derived from the source rather than the delivery\npath, no bytes are duplicated, each rotation drains to an exact frame-sequence fence, and the adapter is\nshut down inside a rotation overlap window with a typed post-shutdown outcome.  The resume unit is\nrecorded as frame_sequence because the connector emits a response's frames without yielding and the\nrelay fences on last_emitted, so byte-offset resumption inside a record is not a state the product has.\nverify-m7-i08-recovery-attempts fails every retained-recovery attachment of a real CLI at the opaque\ndevice fanout after the owner attached it: three attempts under one absolute episode deadline end in\nthe typed exhaustion diagnostic, then a second attempt recovers the same session and stream.\nverify-m7-admission exercises public negative admission, route allowlisting,\nforged identity-header rejection and selected-owner failure across three relays.\nverify-m7-i04-fail-closed proves the fail-closed admission, readiness, routing and\nfallback matrix with a request-body sentinel: absent/unknown/inactive/ambiguous and\ncaller-destination targets rejected before any body read or owner selection, a\ncaller-named peer address never reached, an empty body distinguished from a failed\nbody, consumed/unpolled/failed bodies under a real owner process loss with no\nreselection, GET/HEAD/OPTIONS shapes at the lost owner's route typed and never\nreselected, the duplicate service label ambiguous through the stream upgrade too,\none bounded consumer-driven safe retry bridging successor readiness, and the\nexcluded browser route boundary recorded.\nverify-m7-ec041-device-attachment races two real device data attachments through two distinct\nnon-owner ingress relays after a successor owner replaces the complete owner token: a stale\npredecessor ticket and an already-consumed ticket are refused with a transport close and no\nDATA_READY, exactly one concurrent attachment wins, and the losing attachment resets no counter.\nverify-m7-device-revocation proves live Redis device-credential revocation,\nexisting-stream withdrawal, exact no-owner admission, and tenant sibling survival.\nverify-m7-credential-expiry-rotation proves a sixteen-second consumer credential\nexpires inside one exact candidate/old scheduled rotation and refresh challenge\nafter admitted baseline echo, with issuer/audience/subject identity and typed\nterminal checks.\nverify-m7-pressure exercises bounded production resource pressure, cancellation, and recovery.\nverify-m7-lifecycle holds one consumer response path and checks cancellation, sibling survival, and fresh-stream recovery.\nverify-m7-side-effect-late proves owner-side receipt and terminal rejection of one late DATA/FIN pair after a selected peer fault.\nverify-m7-public-abandoned-upgrade proves real owner-local and remote public WebSocket upgrades after admission, no 101 response, exact registration reclamation, capacity rejection, and sibling recovery.\nverify-m7-key-rotation exercises bounded recovery after peer-pin withdrawal during scheduled rotation.\nverify-m7-ec044-peer-frames injects reordered, duplicate and late device frames through a real\nmTLS/HTTP3 ingress-to-owner CompleteDeviceData forward into a live relay actor behind the\nproduction peer ingress handler: the owner's delivered contiguous cursor advances only for\nlegitimately ordered frames, a duplicate adds nothing, and a DATA frame after the terminal FIN\nleaves exactly one stream terminal, a typed INVALID_SEQUENCE close, an owner peer-fault tuple at\nthe forwarded-body stage, and no adapter bytes past the FIN cursor.\nverify-m7-saturated-peer-frames proves the M7-I07/M7-C22 conjunction on one genuinely saturated\nnon-owner-ingress route: the full 64-stream per-device cap is admitted with one 20,000-byte\nin-flight record each and the owner's bounded outbound data channel is held above a quarter of its\nconfigured slots, while a real AUTHORIZATION_INVALIDATED revocation close is delivered on the\ncontrol plane and acted on with the typed GRANT_UNAVAILABLE code and no dispatch, reordered,\nduplicate and post-FIN frames are injected on that same saturated carrier with the delivered\ncontiguous cursor advancing only for legitimate ordering and nothing delivered twice, a planned\npeer HTTP/3 GOAWAY refuses fresh peer streams while a sibling stream admitted before it completes\nits outstanding round trip, and the first stream terminal identity is re-sampled and immutable.\nverify-m7-og02-correlation drives the credential-expiry, trust-expiry, GOAWAY, recovery-attempt,\nlease-expiry, queue-saturation, remote-body-limit, Redis-partition, owner-loss and I04 fail-closed\ngates through the C11 capture scanner and reports per row whether the joined window carries\ncomplete OG-02 correlation and the relay's bounded peer stage/cause tuples. Completeness is\nper row: every row must carry all seven correlation families, and only a row declaring\npeer_fault_required must also carry a typed peer stage/cause tuple.\nlease-expiry, queue-saturation and remote-body-limit gates through the C11 capture scanner and\nreports per row whether the joined window carries complete OG-02 correlation and the relay's\nbounded peer stage/cause tuples; declared-complete rows are enforced.\nverify-m7-peer-readiness exercises authenticated peer path loss and fresh-path readiness recovery.\nverify-m7-owner-contention exercises concurrent CLI claims, terminal rejection and fenced successor cleanup.\nverify-m7-chaos cycles owner kill, peer UDP loss, Redis pause and CLI process pause against three relays for a fixed number of rounds, classifies every close/interruption into the closed diagnostics vocabulary, preserves unknown outcomes, and fails on any unclassified interruption or reconnect rate above the documented threshold.\nverify-m7-trust-expiry exercises signed peer-key expiry without a Redis invalidation hint,\npooled-stream closure, unrelated peer survival, and fresh signed-trust recovery.\nverify-m7-membership-hint-drop drops the process-local invalidation hint entirely and requires\nconvergence from the bounded membership refresh alone: a stream established during the staged\nkey overlap keeps delivering and is torn down only once the old key leaves the verifier, a\nnon-rotated identity's stream is untouched, and the withdrawn key is refused with a typed\nno-dispatch outcome inside the membership refresh bound.\nUses isolated Redis namespaces, ephemeral certificates and synthetic echo data.\nRun restart probes through scripts/m1-redis-restart-verify.sh.\nRun the live-catalog Redis process restart through scripts/m7-redis-lane-restart-verify.sh;\nredis-lane-restart keeps one catalog alive across a restart the script performs and requires\nthe typed run-identifier conflict on every command afterwards.\nSet M2_HARNESS_TIMEOUT_SECONDS to override a bounded M2 command timeout."
     );
 }
 

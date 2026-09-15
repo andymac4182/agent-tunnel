@@ -2,12 +2,13 @@
 //!
 //! One real three-relay production cluster (relays connected to Redis through
 //! an opaque TCP proxy so Redis can be paused) is driven through a fixed
-//! schedule of chaos rounds ([`CHAOS_SCHEDULE`], seven rounds) that repeat
-//! owner kill, CLI process pause and peer UDP loss and exercise a full Redis
-//! pause once, all built from existing fault injectors rather than new
-//! mechanisms.  A full Redis pause is the terminal round: it expires the
-//! in-process fixture's signed membership lease (a fixture limitation, not a
-//! protocol one), so the run does not attempt to reuse the cluster after it.
+//! schedule of chaos rounds ([`CHAOS_SCHEDULE`], eight rounds) that repeat
+//! owner kill, CLI process pause, peer UDP loss and a full Redis pause, all
+//! built from existing fault injectors rather than new mechanisms.  No round
+//! is terminal: a full Redis pause drives every relay's membership runtime
+//! Unready, and the round waits for it to return to `Ready` on its own before
+//! recycling the owner session and echoing, so post-pause recovery is
+//! observed rather than assumed.
 //!
 //! * `OwnerKill`  — the owning `tunnel-client` process is abruptly `SIGKILL`ed
 //!   (`send_managed_process_signal`) and the admitted consumer stream must close
@@ -25,11 +26,20 @@
 //! the diagnostics already use ([`InterruptionClass`]).  Unknown outcomes are
 //! preserved as [`InterruptionClass::OutcomeUnknown`] rather than discarded, and
 //! any interruption that maps to no vocabulary bucket is recorded as
-//! unclassified.  Every round then recycles the owner session (join predecessor,
-//! start a fresh one) so device-fanout reconnect sockets are counted per round
-//! and the peak per-second rate is bounded: a reconnect storm fails the gate.
-//! Release is blocked (validation fails) on any unclassified interruption, any
-//! reconnect rate above the documented threshold, or a missing recovery.
+//! unclassified.  A `tunnel-client` that exits before readiness on the
+//! establish path is classified too, from the CLI's own typed exit-code
+//! vocabulary, instead of surfacing as an opaque harness error.
+//!
+//! Every round then recycles the owner session (join predecessor, start a
+//! fresh one).  The fixture records the exact instant of every accepted
+//! device-fanout socket, so the enforced reconnect metric is the most
+//! *client-attributed* accepts inside any real one-second window: the
+//! fixture's own recycle sockets are bracketed out (they are bounded
+//! separately), and a burst can no longer be averaged away across a whole
+//! round.  Release is blocked (validation fails) on any unclassified
+//! interruption, a client reconnect burst above the documented ceiling, an
+//! untyped pre-readiness CLI exit, an unrepeated or unrecovered Redis pause,
+//! or a missing recovery.
 
 use chrono::Utc;
 use std::time::{Duration, Instant};
@@ -53,27 +63,58 @@ use super::{
     wait_for_fanout_drained,
 };
 
-/// The fixed chaos schedule.  Owner kill, CLI process pause and peer UDP loss
-/// are each repeated; a full Redis pause is exercised once.  Pausing *all*
-/// proxied Redis sockets expires this in-process fixture's signed membership
-/// lease, and the membership runtime does not re-arm for continued reuse after
-/// a second full outage on the same long-lived cluster (a limitation of the
-/// in-process fixture, not of the protocol), so a second full Redis pause would
-/// leave the cluster unroutable.  Each of the four faults still appears at
-/// least once and the non-Redis faults are cycled repeatedly.
-const CHAOS_SCHEDULE: [Fault; 7] = [
+/// The fixed chaos schedule.  Every fault type is repeated, the full Redis
+/// pause included, and **no round is terminal**.
+///
+/// Pausing *all* proxied Redis sockets drives each relay's membership runtime
+/// Unready, because its signed checkpoint cannot be refreshed against an
+/// unreachable catalog.  That state is **not** latched: the supervisor keeps
+/// reconciling on its interval and restores `Ready` from a single successful
+/// pass.  Each Redis round therefore waits for every relay's membership
+/// runtime to return to `Ready` on its own, asserts it, and then reuses the
+/// cluster -- recycling the owner session and echoing on it -- so post-pause
+/// recovery is observed at the *session* level rather than assumed.
+///
+/// Why that assertion is deterministic rather than positional.  The relay's
+/// trust deadline is
+/// `min(checkpoint_expiry, record.expires_at, peer_key.expires_at)`.  The
+/// checkpoint is minted fresh for every reconcile request, but this fixture
+/// signed each relay's membership record and peer key exactly **once**, at
+/// bootstrap, with `record_version = 1`, and never re-signed or republished
+/// them.  Their `expires_at` was therefore an absolute wall-clock deadline
+/// measured from cluster startup, not a sliding window: at the 60-second
+/// record lifetime, membership trust lapsed partway through this scenario no
+/// matter what the schedule did.  A Redis round placed early
+/// re-armed; the same round placed late could not, because there was no valid
+/// record left to re-arm *to*.  That, not any latch and not the relay's own
+/// `membership_record_lifetime_seconds` (which is pinned at the product
+/// maximum of 60 and is a separate quantity), is what made the observation
+/// position-dependent and unassertable.
+///
+/// A longer record is not available to buy: the relay's verifier caps a record
+/// at the product maximum of 60 seconds, and a fixture record signed past that
+/// cap is refused outright, so the cluster never reaches Ready at all.  The
+/// fixture therefore keeps *issuing* records instead, on the interval named by
+/// `MEMBERSHIP_RESIGN_INTERVAL`, which is what a real control plane does and
+/// which widens nothing the relay will accept.  Membership trust then cannot
+/// lapse mid-run and a Redis round re-arms from its own reconcile loop
+/// wherever it sits.  Both Redis rounds below are followed by further rounds,
+/// so cluster *reuse* after a full outage is proved by the rounds that come
+/// after them and not merely by the last one passing.
+const CHAOS_SCHEDULE: [Fault; 8] = [
     Fault::PeerLoss,
     Fault::CliPause,
-    Fault::OwnerKill,
-    Fault::PeerLoss,
-    Fault::CliPause,
-    Fault::OwnerKill,
     Fault::RedisPause,
+    Fault::OwnerKill,
+    Fault::PeerLoss,
+    Fault::CliPause,
+    Fault::RedisPause,
+    Fault::OwnerKill,
 ];
 const CHAOS_ROUNDS: usize = CHAOS_SCHEDULE.len();
 /// Whole-scenario wall-clock bound.  Cleanup joins are still owned by the
 /// scenario itself; this is the outer safety net.
-const CHAOS_SCENARIO_DEADLINE: Duration = Duration::from_secs(300);
+const CHAOS_SCENARIO_DEADLINE: Duration = Duration::from_secs(420);
 /// A slow rotation keeps a bounded chaos round from rotating its data carrier,
 /// so the only device-fanout reconnects are the deliberate per-round recycles.
 const CHAOS_ROTATION: RotationConfig = RotationConfig {
@@ -94,6 +135,41 @@ const CHAOS_SOCKET_BOUND: usize = 4;
 /// 6-7/second); a genuine client reconnect storm re-dials many dozens to
 /// hundreds of times per second, far above this ceiling.
 const RECONNECT_RATE_THRESHOLD_MILLI: u64 = 12_000;
+/// Second-scale reconnect window.  The OG-08 clause is about reconnects at
+/// *second scale*, so the gate measures the largest number of CLI-attributed
+/// device-fanout accepts that fall inside any one-second window, computed from
+/// exact accept instants.  A per-round average cannot see a burst: ten
+/// reconnects inside a ten-second round average to one per second.
+const RECONNECT_WINDOW: Duration = Duration::from_secs(1);
+/// Ceiling for CLI-attributed device-fanout accepts inside any one-second
+/// window.  The fixture's own recycle sockets are excluded from this count
+/// (see `fixture_windows` in `run_chaos`), so this measures client reconnects
+/// only.  A healthy run re-dials nothing outside the deliberate recycles; a
+/// genuine reconnect storm re-dials many times inside one second.
+const MAX_CLI_RECONNECTS_PER_WINDOW: usize = 4;
+/// Bound on the fixture's own sockets for one deliberate recycle (join the
+/// predecessor, start a fresh CLI).  Excluding recycle sockets from the
+/// client-attributed metric would hide a storm *during* establishment, so the
+/// excluded population is bounded in its own right.
+const MAX_RECYCLE_SOCKETS_PER_ROUND: u64 = 6;
+/// Budget for observing whether every relay's membership runtime returns to
+/// `Ready` after a full Redis outage ends.  The supervisor reconciles on the
+/// fixture's one-second interval and each pass is itself bounded, so this
+/// covers many reconcile attempts.
+///
+/// This is now **asserted**, not merely recorded: with membership trust no
+/// longer lapsing mid-run (see [`CHAOS_SCHEDULE`]) a re-arm needs one
+/// successful reconcile pass, which is a small multiple of the reconcile
+/// interval.  The budget is nonetheless generous, because the old 10-second
+/// budget was itself too short to see the ~28-second re-arm that the expired
+/// fixture record used to force, and a budget that cannot observe the recovery
+/// it asserts would be its own source of flakiness.
+const MEMBERSHIP_OBSERVE_BUDGET: Duration = Duration::from_secs(45);
+/// Minimum number of full Redis pause rounds.  The OG-08 clause asks for the
+/// Redis fault to be *repeated* with observed recovery, so a schedule that
+/// quietly fell back to a single terminal Redis round fails validation rather
+/// than passing with weaker evidence.
+const MIN_REDIS_PAUSE_ROUNDS: usize = 2;
 /// Preserved-unknown ceiling: a bounded chaos run may legitimately time a probe
 /// out once, but a run that is mostly ambiguous is not evidence.
 const MAX_UNKNOWN_OUTCOMES: usize = 2;
@@ -130,6 +206,12 @@ pub enum InterruptionClass {
     /// A preserved unknown outcome: a bounded probe timed out or could not be
     /// sent.  It is retained, not discarded, and not treated as a success.
     OutcomeUnknown,
+    /// A managed `tunnel-client` exited before it reached readiness, carrying
+    /// one of the CLI's own typed exit codes.  This is a real interruption of
+    /// the recovery path, so it is given a class and recorded as evidence
+    /// rather than surfacing as an opaque harness error or being silently
+    /// rerun.
+    ClientExitBeforeReady,
     /// The observation matched no vocabulary bucket (e.g. an unexpected echo or
     /// HTTP status).  Any occurrence blocks release.
     Unclassified,
@@ -143,6 +225,7 @@ impl InterruptionClass {
             Self::PeerUnavailable => "peer_unavailable",
             Self::OwnerReleased => "owner_released",
             Self::OutcomeUnknown => "outcome_unknown",
+            Self::ClientExitBeforeReady => "client_exit_before_ready",
             Self::Unclassified => "unclassified",
         }
     }
@@ -184,16 +267,67 @@ pub struct ChaosEvidence {
     pub unclassified_interruptions: usize,
     /// Preserved `OutcomeUnknown` rounds.  Retained, bounded, never a success.
     pub unknown_outcomes_preserved: usize,
+    /// Preserved unknowns that came from a peer-loss round.
+    ///
+    /// Recorded because the ceiling alone says only "not too many".  A
+    /// blackholed peer path is the one fault in this schedule whose outcome is
+    /// legitimately unknown: the relay forwards toward the owner and then
+    /// loses the path, so whether the request was dispatched genuinely cannot
+    /// be determined, and it says so with a typed `execution=unknown`.  Every
+    /// other fault in the schedule has a determinate answer, so an unknown
+    /// arising anywhere else is a gap in the vocabulary rather than an
+    /// honest ambiguity, and the validator rejects it even while the ceiling
+    /// would still accept the count.
+    pub peer_loss_unknown_outcomes: usize,
     pub class_bounded_close: usize,
     pub class_admission_unavailable: usize,
     pub class_peer_unavailable: usize,
     pub class_owner_released: usize,
-    /// Total device-fanout sockets accepted across all rounds (reconnects).
+    /// Pre-readiness CLI exits that carried a typed CLI exit code.
+    pub class_client_exit_before_ready: usize,
+    /// Total device-fanout sockets accepted across all rounds (reconnects),
+    /// client reconnects and fixture recycles together.
     pub reconnect_sockets_total: u64,
-    /// Peak per-round reconnect rate (sockets/second) scaled by 1000.
+    /// Peak per-round reconnect rate (sockets/second) scaled by 1000.  This is
+    /// a whole-round average and is retained only for continuity; the
+    /// second-scale clause is enforced on `max_cli_reconnects_per_window`.
     pub max_reconnect_rate_milli: u64,
     /// Documented reconnect ceiling used by [`validate_chaos_evidence`].
     pub reconnect_rate_threshold_milli: u64,
+    /// Device-fanout accepts attributed to the client: inside the measured
+    /// span and outside every fixture-owned recycle bracket.
+    pub cli_reconnect_sockets: u64,
+    /// Device-fanout accepts owned by the fixture's deliberate per-round
+    /// session recycles, excluded from the client-attributed metric.
+    pub fixture_recycle_sockets: u64,
+    /// Largest fixture recycle, in sockets, of any single round.
+    pub max_recycle_sockets_round: u64,
+    /// Enforced second-scale metric: the most CLI-attributed device-fanout
+    /// accepts inside any one `reconnect_window_ms` window.
+    pub max_cli_reconnects_per_window: usize,
+    /// Width of that window in milliseconds.
+    pub reconnect_window_ms: u64,
+    /// Documented ceiling for `max_cli_reconnects_per_window`.
+    pub max_cli_reconnects_allowed: usize,
+    /// Accept instants evicted by the fixture's bounded ring.  Non-zero means
+    /// the window measurement undercounted, so it is not evidence.
+    pub accept_instants_dropped: u64,
+    /// Pre-readiness CLI exits observed on the establish path.
+    pub client_exit_before_ready: usize,
+    /// Those that carried a typed CLI exit code and were classified.
+    pub client_exit_classified: usize,
+    /// Whether every relay's membership runtime returned to `Ready` on its own
+    /// within the observation budget after the full Redis outage.
+    ///
+    /// Asserted, not merely recorded, and true only if *every* Redis round
+    /// re-armed.  Membership trust no longer lapses mid-run, so the re-arm no
+    /// longer depends on the round's position in the schedule.  See
+    /// [`CHAOS_SCHEDULE`].
+    pub redis_membership_recovery_observed: bool,
+    /// Number of Redis rounds that observed every relay return to `Ready`
+    /// within the budget.  Must equal `redis_pause_rounds`, so a schedule that
+    /// silently stopped repeating the Redis fault cannot pass.
+    pub redis_recovery_rounds: usize,
     /// Highest concurrent open device-fanout socket count observed.
     pub fanout_peak_open: usize,
     /// A fresh consumer echo succeeded after every single round.
@@ -205,14 +339,66 @@ pub struct ChaosEvidence {
 }
 
 /// The complete closed classification vocabulary, in a stable order.
-const CLASS_VOCABULARY: [InterruptionClass; 6] = [
+const CLASS_VOCABULARY: [InterruptionClass; 7] = [
     InterruptionClass::BoundedClose,
     InterruptionClass::AdmissionUnavailable,
     InterruptionClass::PeerUnavailable,
     InterruptionClass::OwnerReleased,
     InterruptionClass::OutcomeUnknown,
+    InterruptionClass::ClientExitBeforeReady,
     InterruptionClass::Unclassified,
 ];
+
+/// The `tunnel-client` CLI's exit codes are a closed, documented vocabulary
+/// (`crates/tunnel-client/src/main.rs`, `CliError::exit_code`): 1 other,
+/// 2 invocation/config, 3 credential, 4 transport or supervisor-absent,
+/// 5 deadline exceeded, 6 outcome unknown.  A pre-readiness exit carrying one
+/// of those codes is a classified interruption.  Anything else — a signal death
+/// with no exit code, or a success exit that should not have happened before
+/// readiness — matches no bucket and blocks release.
+const CLIENT_EXIT_CODES: [i32; 6] = [1, 2, 3, 4, 5, 6];
+
+/// Map a pre-readiness CLI exit onto the closed vocabulary.
+fn classify_client_exit(code: Option<i32>) -> InterruptionClass {
+    match code {
+        Some(code) if CLIENT_EXIT_CODES.contains(&code) => InterruptionClass::ClientExitBeforeReady,
+        _ => InterruptionClass::Unclassified,
+    }
+}
+
+/// Accept instants attributable to the client: inside the measured span and
+/// outside every fixture-owned recycle bracket.
+fn cli_accept_instants(
+    accepts: &[Instant],
+    from: Instant,
+    to: Instant,
+    fixture_windows: &[(Instant, Instant)],
+) -> Vec<Instant> {
+    accepts
+        .iter()
+        .copied()
+        .filter(|at| *at >= from && *at <= to)
+        .filter(|at| {
+            !fixture_windows
+                .iter()
+                .any(|(start, end)| at >= start && at <= end)
+        })
+        .collect()
+}
+
+/// Largest number of instants falling inside any `window`-long span.  The
+/// input must be sorted ascending, which the accept ring already guarantees.
+fn max_instants_in_window(sorted: &[Instant], window: Duration) -> usize {
+    let mut peak = 0;
+    for (index, start) in sorted.iter().enumerate() {
+        let count = sorted[index..]
+            .iter()
+            .take_while(|at| at.duration_since(*start) < window)
+            .count();
+        peak = peak.max(count);
+    }
+    peak
+}
 
 impl ChaosEvidence {
     #[must_use]
@@ -224,9 +410,14 @@ impl ChaosEvidence {
             .join(",");
         format!(
             "relays={} rounds={} owner_kill={} cli_pause={} peer_loss={} redis_pause={} \
-classified={} unclassified={} unknown_preserved={} bounded_close={} admission_unavailable={} \
-peer_unavailable={} owner_released={} reconnect_sockets={} max_reconnect_rate_milli={} \
-reconnect_threshold_milli={} fanout_peak_open={} recovered_each_round={} final_recovery={} \
+classified={} unclassified={} unknown_preserved={} unknown_from_peer_loss={} \
+bounded_close={} admission_unavailable={} \
+peer_unavailable={} owner_released={} client_exit_class={} reconnect_sockets={} \
+max_reconnect_rate_milli={} reconnect_threshold_milli={} cli_reconnect_sockets={} \
+fixture_recycle_sockets={} max_recycle_sockets_round={} max_cli_reconnects_per_window={} \
+reconnect_window_ms={} max_cli_reconnects_allowed={} accept_instants_dropped={} \
+client_exit_before_ready={} client_exit_classified={} redis_membership_recovery={} \
+redis_recovery_rounds={} fanout_peak_open={} recovered_each_round={} final_recovery={} \
 cleanup_joined={} elapsed_ms={} vocabulary={}",
             self.relay_count,
             self.rounds,
@@ -237,13 +428,26 @@ cleanup_joined={} elapsed_ms={} vocabulary={}",
             self.classified_interruptions,
             self.unclassified_interruptions,
             self.unknown_outcomes_preserved,
+            self.peer_loss_unknown_outcomes,
             self.class_bounded_close,
             self.class_admission_unavailable,
             self.class_peer_unavailable,
             self.class_owner_released,
+            self.class_client_exit_before_ready,
             self.reconnect_sockets_total,
             self.max_reconnect_rate_milli,
             self.reconnect_rate_threshold_milli,
+            self.cli_reconnect_sockets,
+            self.fixture_recycle_sockets,
+            self.max_recycle_sockets_round,
+            self.max_cli_reconnects_per_window,
+            self.reconnect_window_ms,
+            self.max_cli_reconnects_allowed,
+            self.accept_instants_dropped,
+            self.client_exit_before_ready,
+            self.client_exit_classified,
+            self.redis_membership_recovery_observed,
+            self.redis_recovery_rounds,
             self.fanout_peak_open,
             self.recovered_after_each_round,
             self.final_recovery_echo,
@@ -282,6 +486,18 @@ pub fn validate_chaos_evidence(evidence: &ChaosEvidence) -> Result<()> {
     {
         return Err(reject("each_fault_type_exercised"));
     }
+    // OG-08 requires the Redis fault to be *repeated* with recovery observed
+    // after it, not exercised once as a terminal round.
+    if evidence.redis_pause_rounds < MIN_REDIS_PAUSE_ROUNDS {
+        return Err(reject("redis_pause_repeated"));
+    }
+    // Every Redis round must have observed the re-arm, not just one of them.
+    if evidence.redis_recovery_rounds != evidence.redis_pause_rounds {
+        return Err(reject("redis_recovery_observed_each_round"));
+    }
+    if !evidence.redis_membership_recovery_observed {
+        return Err(reject("redis_membership_recovery_observed"));
+    }
     if evidence.unclassified_interruptions != 0 {
         return Err(reject("no_unclassified_interruption"));
     }
@@ -291,18 +507,57 @@ pub fn validate_chaos_evidence(evidence: &ChaosEvidence) -> Result<()> {
     let class_total = evidence.class_bounded_close
         + evidence.class_admission_unavailable
         + evidence.class_peer_unavailable
-        + evidence.class_owner_released;
+        + evidence.class_owner_released
+        + evidence.class_client_exit_before_ready;
     if class_total != evidence.classified_interruptions {
         return Err(reject("class_tally_matches_classified"));
     }
     if evidence.unknown_outcomes_preserved > MAX_UNKNOWN_OUTCOMES {
         return Err(reject("unknown_outcomes_within_bound"));
     }
+    // Every preserved unknown must be attributable to a peer-loss round.  This
+    // is what the ceiling cannot say: a run sitting at the ceiling is fine when
+    // both unknowns are the two blackholed peer paths, and is a finding when
+    // one of them came from a fault whose outcome should have been determinate.
+    if evidence.peer_loss_unknown_outcomes != evidence.unknown_outcomes_preserved {
+        return Err(reject("unknown_outcomes_attributed_to_peer_loss"));
+    }
+    if evidence.peer_loss_unknown_outcomes > evidence.peer_loss_rounds {
+        return Err(reject("peer_loss_unknowns_within_peer_loss_rounds"));
+    }
     if evidence.reconnect_rate_threshold_milli != RECONNECT_RATE_THRESHOLD_MILLI {
         return Err(reject("documented_reconnect_threshold"));
     }
     if evidence.max_reconnect_rate_milli > evidence.reconnect_rate_threshold_milli {
         return Err(reject("reconnect_rate_within_threshold"));
+    }
+    // Second-scale clause: the enforced reconnect metric is a real one-second
+    // window over client-attributed accepts, not a whole-round average.
+    if evidence.reconnect_window_ms != RECONNECT_WINDOW.as_millis() as u64 {
+        return Err(reject("documented_reconnect_window"));
+    }
+    if evidence.max_cli_reconnects_allowed != MAX_CLI_RECONNECTS_PER_WINDOW {
+        return Err(reject("documented_cli_reconnect_ceiling"));
+    }
+    if evidence.accept_instants_dropped != 0 {
+        return Err(reject("accept_instants_not_evicted"));
+    }
+    if evidence.max_cli_reconnects_per_window > evidence.max_cli_reconnects_allowed {
+        return Err(reject("cli_reconnect_window_within_ceiling"));
+    }
+    // The excluded (fixture) population is bounded in its own right, so
+    // excluding it cannot hide a storm during establishment.
+    if evidence.max_recycle_sockets_round > MAX_RECYCLE_SOCKETS_PER_ROUND {
+        return Err(reject("recycle_sockets_within_bound"));
+    }
+    if evidence.cli_reconnect_sockets + evidence.fixture_recycle_sockets
+        != evidence.reconnect_sockets_total
+    {
+        return Err(reject("reconnect_attribution_totals_match"));
+    }
+    // Every pre-readiness CLI exit must carry a typed CLI exit code.
+    if evidence.client_exit_classified != evidence.client_exit_before_ready {
+        return Err(reject("client_exit_before_ready_classified"));
     }
     if evidence.fanout_peak_open > CHAOS_SOCKET_BOUND {
         return Err(reject("fanout_peak_within_bound"));
@@ -335,6 +590,15 @@ struct ChaosContext<'a> {
     tenant_id: Uuid,
     service_id: Uuid,
     canary: Vec<u8>,
+    /// Pre-readiness CLI exits seen on the establish path, and how many of
+    /// those carried a typed CLI exit code.
+    client_exit_before_ready: usize,
+    client_exit_classified: usize,
+    /// Whether every relay's membership runtime returned to `Ready` on its own
+    /// after the full Redis outage ended.
+    redis_membership_recovery_observed: bool,
+    /// How many Redis rounds observed that re-arm.
+    redis_recovery_rounds: usize,
 }
 
 /// Bounded chaos gate entrypoint.
@@ -377,6 +641,15 @@ pub async fn verify() -> Result<ChaosEvidence> {
             return Err(error);
         }
     };
+    // This scenario runs longer than one membership record's maximum lifetime,
+    // so the fixture has to keep issuing fresh records; see [`CHAOS_SCHEDULE`]
+    // for what depended on that and why a longer record is not available.
+    if let Err(error) = cluster.start_membership_resigning().await {
+        let _ = cluster.shutdown().await;
+        let _ = harness.shutdown().await;
+        let _ = redis_proxy.shutdown().await;
+        return Err(error);
+    }
 
     let scenario = match timeout(
         CHAOS_SCENARIO_DEADLINE,
@@ -470,6 +743,10 @@ async fn run_chaos(
         tenant_id: device.tenant_id,
         service_id,
         canary,
+        client_exit_before_ready: 0,
+        client_exit_classified: 0,
+        redis_membership_recovery_observed: false,
+        redis_recovery_rounds: 0,
     };
 
     let mut evidence = ChaosEvidence {
@@ -482,13 +759,26 @@ async fn run_chaos(
         classified_interruptions: 0,
         unclassified_interruptions: 0,
         unknown_outcomes_preserved: 0,
+        peer_loss_unknown_outcomes: 0,
         class_bounded_close: 0,
         class_admission_unavailable: 0,
         class_peer_unavailable: 0,
         class_owner_released: 0,
+        class_client_exit_before_ready: 0,
         reconnect_sockets_total: 0,
         max_reconnect_rate_milli: 0,
         reconnect_rate_threshold_milli: RECONNECT_RATE_THRESHOLD_MILLI,
+        cli_reconnect_sockets: 0,
+        fixture_recycle_sockets: 0,
+        max_recycle_sockets_round: 0,
+        max_cli_reconnects_per_window: 0,
+        reconnect_window_ms: RECONNECT_WINDOW.as_millis() as u64,
+        max_cli_reconnects_allowed: MAX_CLI_RECONNECTS_PER_WINDOW,
+        accept_instants_dropped: 0,
+        client_exit_before_ready: 0,
+        client_exit_classified: 0,
+        redis_membership_recovery_observed: false,
+        redis_recovery_rounds: 0,
         fanout_peak_open: 0,
         recovered_after_each_round: true,
         final_recovery_echo: false,
@@ -501,6 +791,12 @@ async fn run_chaos(
     let mut session = establish_session_retrying(&mut context).await?;
     hard_recovery_echo(&mut context, &mut session).await?;
 
+    // Reconnect attribution starts once the baseline session is live, so the
+    // fixture's own baseline establishment is never counted as a reconnect.
+    let measure_from = Instant::now();
+    // Half-open brackets around the fixture's deliberate session recycles.
+    // Accepts inside them are fixture churn, not client reconnects.
+    let mut fixture_windows: Vec<(Instant, Instant)> = Vec::new();
     let mut recovered_each_round = true;
     for &fault in CHAOS_SCHEDULE.iter() {
         let round_started = Instant::now();
@@ -524,6 +820,9 @@ async fn run_chaos(
             );
         }
         tally_class(&mut evidence, class);
+        if class == InterruptionClass::OutcomeUnknown && fault == Fault::PeerLoss {
+            evidence.peer_loss_unknown_outcomes += 1;
+        }
         match fault {
             Fault::RedisPause => evidence.redis_pause_rounds += 1,
             Fault::PeerLoss => evidence.peer_loss_rounds += 1,
@@ -532,30 +831,24 @@ async fn run_chaos(
         }
         evidence.rounds += 1;
 
-        // Recovery policy per fault:
-        // * OwnerKill / CliPause / PeerLoss disturb the live session (a killed
-        //   process, a consumed probe stream, or a black-holed owner peer
-        //   path), so recycle it and echo on the fresh one.  Peer UDP loss does
-        //   not affect the Redis-backed membership, so the cluster stays
-        //   routable and the recycle succeeds.
-        // * RedisPause is terminal: it expires the in-process membership lease,
-        //   so the cluster is not reused — classify only, recover nothing.
-        match fault {
-            Fault::OwnerKill | Fault::CliPause | Fault::PeerLoss => {
-                session = recycle_session(&mut context, session).await?;
-                record_recovery(
-                    &mut evidence,
-                    &mut recovered_each_round,
-                    soft_recovery_echo(&mut context, &mut session).await?,
-                );
-            }
-            Fault::RedisPause => {}
-        }
+        // Recovery policy is now uniform: every fault disturbs the live
+        // session, so every round recycles it and echoes on the fresh one.
+        // The recycle is the fixture's own churn, so it is bracketed out of
+        // the client-attributed reconnect metric.  RedisPause has already
+        // asserted its membership re-arm and re-published peer pins inside
+        // `run_redis_pause`, so the cluster is routable again here.
+        let recycle_from = Instant::now();
+        session = recycle_session(&mut context, session).await?;
+        fixture_windows.push((recycle_from, Instant::now()));
+        record_recovery(
+            &mut evidence,
+            &mut recovered_each_round,
+            soft_recovery_echo(&mut context, &mut session).await?,
+        );
 
         let accepted_after = context.cluster.device_fanout.diagnostics().accepted;
         let round_ms = u64::try_from(round_started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let delta = accepted_after.saturating_sub(accepted_before);
-        evidence.reconnect_sockets_total += delta;
         let rate_milli = delta
             .saturating_mul(1_000_000)
             .checked_div(round_ms)
@@ -563,6 +856,46 @@ async fn run_chaos(
         evidence.max_reconnect_rate_milli = evidence.max_reconnect_rate_milli.max(rate_milli);
     }
     evidence.recovered_after_each_round = recovered_each_round;
+
+    // Second-scale reconnect measurement.  The fixture records the exact
+    // instant of every accepted device-fanout socket, so the rate is a real
+    // one-second window over client-attributed accepts rather than a count
+    // divided by a whole round.
+    let measure_to = Instant::now();
+    let diagnostics = context.cluster.device_fanout.diagnostics();
+    evidence.accept_instants_dropped = diagnostics.dropped_accepts;
+    let in_span: Vec<Instant> = diagnostics
+        .recent_accepts
+        .iter()
+        .copied()
+        .filter(|at| *at >= measure_from && *at <= measure_to)
+        .collect();
+    let cli_accepts = cli_accept_instants(
+        &diagnostics.recent_accepts,
+        measure_from,
+        measure_to,
+        &fixture_windows,
+    );
+    evidence.reconnect_sockets_total = in_span.len() as u64;
+    evidence.cli_reconnect_sockets = cli_accepts.len() as u64;
+    evidence.fixture_recycle_sockets = evidence
+        .reconnect_sockets_total
+        .saturating_sub(evidence.cli_reconnect_sockets);
+    evidence.max_recycle_sockets_round = fixture_windows
+        .iter()
+        .map(|(start, end)| {
+            in_span
+                .iter()
+                .filter(|at| *at >= start && *at <= end)
+                .count() as u64
+        })
+        .max()
+        .unwrap_or(0);
+    evidence.max_cli_reconnects_per_window = max_instants_in_window(&cli_accepts, RECONNECT_WINDOW);
+    evidence.client_exit_before_ready = context.client_exit_before_ready;
+    evidence.client_exit_classified = context.client_exit_classified;
+    evidence.redis_membership_recovery_observed = context.redis_membership_recovery_observed;
+    evidence.redis_recovery_rounds = context.redis_recovery_rounds;
 
     teardown_session(&mut context, session).await?;
     evidence.fanout_peak_open = context.cluster.device_fanout.diagnostics().peak_open;
@@ -601,6 +934,10 @@ fn tally_class(evidence: &mut ChaosEvidence, class: InterruptionClass) {
             evidence.classified_interruptions += 1;
             evidence.class_owner_released += 1;
         }
+        InterruptionClass::ClientExitBeforeReady => {
+            evidence.classified_interruptions += 1;
+            evidence.class_client_exit_before_ready += 1;
+        }
     }
 }
 
@@ -630,6 +967,37 @@ async fn establish_session_retrying(context: &mut ChaosContext<'_>) -> Result<Se
         match establish_session(context).await {
             Ok(session) => return Ok(session),
             Err(error) => {
+                // A CLI that exits before readiness is a real interruption of
+                // the recovery path.  Give it a class from the CLI's own typed
+                // exit-code vocabulary and record it as evidence, instead of
+                // letting it surface as an opaque harness error or vanish into
+                // a silent rerun.  An exit carrying no typed code is
+                // unclassified and blocks release.
+                if let HarnessError::CliExitedBeforeReady {
+                    code,
+                    diagnostic_code,
+                    ..
+                } = &error
+                {
+                    let class = classify_client_exit(*code);
+                    context.client_exit_before_ready += 1;
+                    if class == InterruptionClass::ClientExitBeforeReady {
+                        context.client_exit_classified += 1;
+                    }
+                    let fanout = context.cluster.device_fanout.diagnostics();
+                    tracing::warn!(
+                        attempt = attempt + 1,
+                        exit_code = ?code,
+                        diagnostic_code = ?diagnostic_code,
+                        class = class.label(),
+                        fanout_open = fanout.open_count(),
+                        fanout_accepted = fanout.accepted,
+                        fanout_closed = fanout.closed_count,
+                        fanout_peak = fanout.peak_open,
+                        stage = "chaos_client_exit_before_ready",
+                        "owner CLI exited before readiness on the establish path"
+                    );
+                }
                 last_error = Some(error);
                 if attempt + 1 < MAX_ESTABLISH_ATTEMPTS {
                     sleep(ESTABLISH_RETRY_DELAY).await;
@@ -783,11 +1151,21 @@ async fn ensure_owner_released(context: &ChaosContext<'_>) -> Result<()> {
     }
 }
 
-/// RedisPause round (terminal): pause every proxied Redis socket, prove
+/// RedisPause round: pause every proxied Redis socket, prove
 /// admission fails closed with a typed authorization/cluster-unready response,
-/// then resume.  This is the last round; the run does not reuse the cluster
-/// afterward because a full Redis outage expires the in-process membership
-/// lease, so no cluster-readiness wait is attempted here.
+/// then resume and **wait for every relay's membership runtime to return to
+/// `Ready`**.
+///
+/// The full outage drives each membership runtime Unready because its signed
+/// checkpoint cannot be refreshed against an unreachable catalog.  That state
+/// is not latched: the supervisor keeps reconciling on its interval and
+/// restores `Ready` from the current pass alone once a strictly-newer signed
+/// checkpoint and a catalog snapshot land together.  Waiting for that here
+/// turns the re-arm into an asserted observation instead of an assumption.
+///
+/// The cluster is then reused: the caller recycles the owner session and
+/// echoes on it, and further rounds follow, so recovery after a full Redis
+/// outage is proved at the session level and not only at the membership level.
 async fn run_redis_pause(context: &mut ChaosContext<'_>) -> Result<InterruptionClass> {
     let ingress = context.cluster.relay(OWNER_INGRESS_NODE)?.consumer_addr()?;
     context.redis_proxy.pause_all().await?;
@@ -812,7 +1190,45 @@ async fn run_redis_pause(context: &mut ChaosContext<'_>) -> Result<InterruptionC
     match (probe, resume) {
         (Err(error), _) => Err(error),
         (Ok(_), Err(error)) => Err(error),
-        (Ok(class), Ok(())) => Ok(class),
+        (Ok(class), Ok(())) => {
+            // Observed and never forced: whether every relay's membership
+            // runtime re-arms to `Ready` by its own reconcile loop after the
+            // outage.  This is now asserted, because membership trust no
+            // longer lapses mid-run and the re-arm is position-independent.
+            let recovered = context
+                .cluster
+                .observe_membership_readiness(MEMBERSHIP_OBSERVE_BUDGET)
+                .await;
+            tracing::info!(
+                recovered,
+                stage = "chaos_redis_membership_recovery",
+                "observed whether membership re-armed after the full Redis outage"
+            );
+            if !recovered {
+                return Err(HarnessError::Timeout(
+                    "chaos redis round: membership did not return to Ready after the outage".into(),
+                ));
+            }
+            // Every Redis round must re-arm, not just the first, so the
+            // evidence records the conjunction rather than the last round.
+            context.redis_membership_recovery_observed = true;
+            context.redis_recovery_rounds += 1;
+
+            // The fixture publishes peer pins from the membership
+            // *invalidation* callback only, which is edge-triggered: the
+            // outage emptied each relay's pin set and nothing re-publishes it
+            // when the runtime returns to `Ready`.  That gap is in the
+            // fixture's wiring, not the membership runtime and not the
+            // protocol, so re-publish explicitly before the cluster is reused
+            // -- exactly as the key-revocation probe does after it
+            // deliberately revokes pins.
+            context.cluster.republish_peer_pins()?;
+            context
+                .cluster
+                .wait_for_peer_readiness(PEER_RECOVERY_TIMEOUT)
+                .await?;
+            Ok(class)
+        }
     }
 }
 
@@ -1051,10 +1467,12 @@ fn classify_probe(probe: ProcessPauseProbeOutcome) -> InterruptionClass {
 #[cfg(test)]
 mod tests {
     use super::{
-        CHAOS_ROUNDS, ChaosEvidence, InterruptionClass, MAX_UNKNOWN_OUTCOMES,
-        RECONNECT_RATE_THRESHOLD_MILLI, validate_chaos_evidence,
+        CHAOS_ROUNDS, ChaosEvidence, InterruptionClass, MAX_CLI_RECONNECTS_PER_WINDOW,
+        MAX_RECYCLE_SOCKETS_PER_ROUND, MAX_UNKNOWN_OUTCOMES, RECONNECT_RATE_THRESHOLD_MILLI,
+        RECONNECT_WINDOW, classify_client_exit, max_instants_in_window, validate_chaos_evidence,
     };
     use crate::acceptance_test_support::assert_failed;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn a_typed_unknown_peer_outcome_is_preserved_not_unclassified() {
@@ -1089,26 +1507,39 @@ mod tests {
     }
 
     fn valid_evidence() -> ChaosEvidence {
-        // Schedule: peer-loss x2 -> peer_unavailable, redis-pause x1 ->
+        // Schedule: peer-loss x2 -> peer_unavailable, redis-pause x2 ->
         // admission_unavailable, cli-pause x2 -> bounded_close, owner-kill x2
-        // -> owner_released.  Seven classified rounds.
+        // -> owner_released.  Eight classified rounds.
         ChaosEvidence {
             relay_count: 3,
             rounds: CHAOS_ROUNDS,
             owner_kill_rounds: 2,
             cli_pause_rounds: 2,
             peer_loss_rounds: 2,
-            redis_pause_rounds: 1,
-            classified_interruptions: 7,
+            redis_pause_rounds: 2,
+            classified_interruptions: 8,
             unclassified_interruptions: 0,
             unknown_outcomes_preserved: 0,
+            peer_loss_unknown_outcomes: 0,
             class_bounded_close: 2,
-            class_admission_unavailable: 1,
+            class_admission_unavailable: 2,
             class_peer_unavailable: 2,
             class_owner_released: 2,
-            reconnect_sockets_total: 14,
+            class_client_exit_before_ready: 0,
+            reconnect_sockets_total: 12,
             max_reconnect_rate_milli: 600,
             reconnect_rate_threshold_milli: RECONNECT_RATE_THRESHOLD_MILLI,
+            cli_reconnect_sockets: 0,
+            fixture_recycle_sockets: 12,
+            max_recycle_sockets_round: 2,
+            max_cli_reconnects_per_window: 0,
+            reconnect_window_ms: RECONNECT_WINDOW.as_millis() as u64,
+            max_cli_reconnects_allowed: MAX_CLI_RECONNECTS_PER_WINDOW,
+            accept_instants_dropped: 0,
+            client_exit_before_ready: 0,
+            client_exit_classified: 0,
+            redis_membership_recovery_observed: true,
+            redis_recovery_rounds: 2,
             fanout_peak_open: 3,
             recovered_after_each_round: true,
             final_recovery_echo: true,
@@ -1125,6 +1556,7 @@ mod tests {
             InterruptionClass::PeerUnavailable,
             InterruptionClass::OwnerReleased,
             InterruptionClass::OutcomeUnknown,
+            InterruptionClass::ClientExitBeforeReady,
             InterruptionClass::Unclassified,
         ] {
             assert!(!class.label().is_empty());
@@ -1135,12 +1567,58 @@ mod tests {
     fn complete_chaos_evidence_passes() {
         assert!(validate_chaos_evidence(&valid_evidence()).is_ok());
         // One preserved unknown outcome (converted from one classified round) is
-        // still accepted: six classified plus one preserved unknown is seven.
+        // still accepted: seven classified plus one preserved unknown is eight,
+        // which is the round count of the current schedule.
         let mut with_unknown = valid_evidence();
-        with_unknown.classified_interruptions = 6;
+        with_unknown.classified_interruptions = 7;
         with_unknown.class_owner_released = 1;
         with_unknown.unknown_outcomes_preserved = 1;
+        with_unknown.peer_loss_unknown_outcomes = 1;
         assert!(validate_chaos_evidence(&with_unknown).is_ok());
+    }
+
+    #[test]
+    fn a_pre_readiness_cli_exit_is_classified_only_for_typed_exit_codes() {
+        // The CLI's documented exit codes are a closed vocabulary.
+        for code in [1, 2, 3, 4, 5, 6] {
+            assert_eq!(
+                classify_client_exit(Some(code)),
+                InterruptionClass::ClientExitBeforeReady,
+                "exit code {code} is a typed CLI diagnostic"
+            );
+        }
+        // A signal death carries no exit code, and a success exit before
+        // readiness is not a diagnostic at all.  Neither is classified.
+        assert_eq!(classify_client_exit(None), InterruptionClass::Unclassified);
+        assert_eq!(
+            classify_client_exit(Some(0)),
+            InterruptionClass::Unclassified
+        );
+        assert_eq!(
+            classify_client_exit(Some(7)),
+            InterruptionClass::Unclassified
+        );
+    }
+
+    #[test]
+    fn the_reconnect_metric_sees_a_burst_a_round_average_would_hide() {
+        let base = Instant::now();
+        // Ten reconnects inside one second, then silence: exactly the shape the
+        // old whole-round average scored as 1/s and passed.
+        let burst: Vec<Instant> = (0..10)
+            .map(|index| base + Duration::from_millis(index * 50))
+            .collect();
+        assert_eq!(max_instants_in_window(&burst, RECONNECT_WINDOW), 10);
+        assert!(
+            max_instants_in_window(&burst, RECONNECT_WINDOW) > MAX_CLI_RECONNECTS_PER_WINDOW,
+            "a ten-reconnect burst must exceed the ceiling"
+        );
+        // The same ten spread evenly over ten seconds stay within the window.
+        let spread: Vec<Instant> = (0..10)
+            .map(|index| base + Duration::from_millis(index * 1_000))
+            .collect();
+        assert_eq!(max_instants_in_window(&spread, RECONNECT_WINDOW), 1);
+        assert_eq!(max_instants_in_window(&[], RECONNECT_WINDOW), 0);
     }
 
     #[test]
@@ -1158,10 +1636,57 @@ mod tests {
                 // Keep the round tally and class totals consistent while zeroing
                 // one fault type (move owner-kill's rounds into redis-pause).
                 e.owner_kill_rounds = 0;
-                e.redis_pause_rounds = 3;
+                e.redis_pause_rounds = 4;
                 e.class_owner_released = 0;
-                e.class_admission_unavailable = 3;
+                e.class_admission_unavailable = 4;
             }),
+            // An unknown that did not come from a blackholed peer path is a
+            // gap in the vocabulary, even while the ceiling still accepts the
+            // count.
+            (
+                "unknown_from_another_fault",
+                "unknown_outcomes_attributed_to_peer_loss",
+                |e| {
+                    e.classified_interruptions -= 1;
+                    e.class_bounded_close -= 1;
+                    e.unknown_outcomes_preserved += 1;
+                },
+            ),
+            // More unknowns than there were peer-loss rounds to explain them.
+            (
+                "unknowns_exceed_peer_loss_rounds",
+                "peer_loss_unknowns_within_peer_loss_rounds",
+                |e| {
+                    // One peer-loss round, but two unknowns claimed for it:
+                    // the round tally and every earlier guard still agree, so
+                    // only this rule can catch the over-attribution.
+                    e.peer_loss_rounds = 1;
+                    e.cli_pause_rounds = 3;
+                    e.class_peer_unavailable = 0;
+                    e.classified_interruptions = 6;
+                    e.unknown_outcomes_preserved = 2;
+                    e.peer_loss_unknown_outcomes = 2;
+                },
+            ),
+            // The Redis fault must be repeated, not exercised once.
+            ("redis_single_round", "redis_pause_repeated", |e| {
+                e.redis_pause_rounds = 1;
+                e.cli_pause_rounds = 3;
+                e.class_admission_unavailable = 1;
+                e.class_bounded_close = 3;
+                e.redis_recovery_rounds = 1;
+            }),
+            // Recovery must be observed after every Redis round.
+            (
+                "redis_recovery_partial",
+                "redis_recovery_observed_each_round",
+                |e| e.redis_recovery_rounds = 1,
+            ),
+            (
+                "redis_recovery_absent",
+                "redis_membership_recovery_observed",
+                |e| e.redis_membership_recovery_observed = false,
+            ),
             ("cli_pause_missing", "each_fault_type_exercised", |e| {
                 e.cli_pause_rounds = 0;
                 e.peer_loss_rounds = 4;
@@ -1179,12 +1704,47 @@ mod tests {
             ("unknown_over_bound", "unknown_outcomes_within_bound", |e| {
                 let excess = MAX_UNKNOWN_OUTCOMES + 1;
                 e.unknown_outcomes_preserved = excess;
+                e.peer_loss_unknown_outcomes = excess;
                 e.classified_interruptions = CHAOS_ROUNDS - excess;
                 e.class_bounded_close = 0;
                 e.class_peer_unavailable = 0;
                 e.class_owner_released = 0;
                 e.class_admission_unavailable = CHAOS_ROUNDS - excess;
             }),
+            // Second-scale reconnect clause.
+            ("window_constant", "documented_reconnect_window", |e| {
+                e.reconnect_window_ms = RECONNECT_WINDOW.as_millis() as u64 + 1
+            }),
+            (
+                "cli_ceiling_constant",
+                "documented_cli_reconnect_ceiling",
+                |e| e.max_cli_reconnects_allowed = MAX_CLI_RECONNECTS_PER_WINDOW + 1,
+            ),
+            ("accepts_evicted", "accept_instants_not_evicted", |e| {
+                e.accept_instants_dropped = 1
+            }),
+            (
+                "cli_reconnect_burst",
+                "cli_reconnect_window_within_ceiling",
+                |e| e.max_cli_reconnects_per_window = MAX_CLI_RECONNECTS_PER_WINDOW + 1,
+            ),
+            ("recycle_unbounded", "recycle_sockets_within_bound", |e| {
+                e.max_recycle_sockets_round = MAX_RECYCLE_SOCKETS_PER_ROUND + 1
+            }),
+            (
+                "attribution_mismatch",
+                "reconnect_attribution_totals_match",
+                |e| e.cli_reconnect_sockets = 1,
+            ),
+            // Pre-readiness CLI exit clause.
+            (
+                "client_exit_untyped",
+                "client_exit_before_ready_classified",
+                |e| {
+                    e.client_exit_before_ready = 1;
+                    e.client_exit_classified = 0;
+                },
+            ),
             (
                 "threshold_constant",
                 "documented_reconnect_threshold",

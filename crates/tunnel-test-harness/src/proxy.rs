@@ -1501,6 +1501,61 @@ mod tests {
         proxy.shutdown().await.expect("shutdown");
     }
 
+    /// `shutdown` tears down live proxied connections, not just the listener.
+    ///
+    /// A fixture that intercepts a socket through a `TcpProxy` and then hands
+    /// that socket to something longer-lived must keep the proxy alive for as
+    /// long as the socket is in use.  Shutting the proxy down closes both
+    /// halves of the connection underneath the holder, which a server on the
+    /// other end sees as the peer disconnecting.  EC-041's control handoff
+    /// regressed exactly this way, so the behaviour is pinned here.
+    #[tokio::test]
+    async fn shutdown_closes_established_proxied_connections() {
+        let target = TcpListener::bind(("127.0.0.1", 0)).await.expect("target");
+        let target_addr = target.local_addr().expect("target addr");
+        let (peer_closed_tx, peer_closed_rx) = oneshot::channel();
+        let target_task = tokio::spawn(async move {
+            let (mut stream, _) = target.accept().await.expect("accept");
+            let mut bytes = [0_u8; 4];
+            stream.read_exact(&mut bytes).await.expect("read");
+            stream.write_all(&bytes).await.expect("write");
+            // Block until the proxy drops this connection: a clean end of
+            // stream here is the server observing its peer disappear.
+            let mut rest = Vec::new();
+            let trailing = stream.read_to_end(&mut rest).await.expect("read to end");
+            let _ = peer_closed_tx.send(trailing);
+        });
+        let proxy = TcpProxy::bind(target_addr, ProxyConfig::default())
+            .await
+            .expect("proxy");
+        let mut client = tokio::net::TcpStream::connect(proxy.local_addr())
+            .await
+            .expect("client");
+        client.write_all(b"live").await.expect("client write");
+        let mut response = [0_u8; 4];
+        client.read_exact(&mut response).await.expect("client read");
+        assert_eq!(&response, b"live", "the connection is established and live");
+
+        proxy.shutdown().await.expect("shutdown");
+
+        // The target end of the proxied connection is closed by the shutdown.
+        let trailing = timeout(Duration::from_secs(5), peer_closed_rx)
+            .await
+            .expect("target observes the proxied connection close")
+            .expect("target task reports the close");
+        assert_eq!(trailing, 0, "no trailing bytes precede the close");
+
+        // The client end is closed too, so the holder of the socket cannot go
+        // on using it after the proxy it came from was shut down.
+        let mut after = [0_u8; 1];
+        let read = timeout(Duration::from_secs(5), client.read(&mut after))
+            .await
+            .expect("client read completes")
+            .expect("client read");
+        assert_eq!(read, 0, "the client half is closed by the proxy shutdown");
+        target_task.await.expect("target task");
+    }
+
     #[tokio::test]
     async fn drop_fault_is_visible() {
         let target = TcpListener::bind(("127.0.0.1", 0)).await.expect("target");

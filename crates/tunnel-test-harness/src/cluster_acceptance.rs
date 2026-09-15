@@ -89,6 +89,292 @@ pub struct ClusterAcceptanceEvidence {
     pub owner_death_interrupted: bool,
 }
 
+/// Required number of accepted control arrivals.
+const EXPECTED_CONTROL_ROUTES: usize = 1;
+/// Required number of accepted data arrivals across active and replacements.
+const EXPECTED_DATA_ROUTES: usize = 3;
+/// Required number of accepted consumer arrivals.
+const EXPECTED_CONSUMER_ROUTES: usize = 1;
+/// Required number of replacement data generations accepted in order.
+const EXPECTED_REPLACEMENT_GENERATIONS: usize = 2;
+/// Required number of distinct owner nodes selected by the catalog.
+const EXPECTED_OWNER_NODES: usize = 3;
+
+/// Diagnostic prefix for the route-stage contract, retained from the inline
+/// assertion this validator replaced.
+const ROUTE_ASSERTION: &str = "M7 cluster acceptance assertion failed";
+/// Diagnostic prefix for the owner-topology contract, retained from the
+/// inline assertion this validator replaced.
+const OWNER_ASSERTION: &str = "M7 cluster direct-owner assertion failed";
+
+/// Route-stage counters and flags observed while the peers are still running.
+///
+/// This is the exact set the gate checked inline before shutting the peers
+/// down, so the stage boundary and its ordering are preserved.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ClusterRouteEvidence {
+    /// Number of accepted control arrivals.
+    pub control_routes: usize,
+    /// Number of accepted data arrivals across active and replacements.
+    pub data_routes: usize,
+    /// Number of accepted consumer arrivals.
+    pub consumer_routes: usize,
+    /// Number of replacement data generations accepted in order.
+    pub replacement_generations: usize,
+    /// Whether a duplicate request ID was rejected before response headers.
+    pub replay_rejected: bool,
+    /// Whether a live owner refused a competing claim and stale cleanup was fenced.
+    pub owner_fencing_rejected: bool,
+    /// Whether removing the approved peer pins prevented a new connection.
+    pub key_revocation_rejected: bool,
+    /// Whether owner release made a fresh route lookup fail closed.
+    pub owner_death_interrupted: bool,
+}
+
+/// Owner-topology observations taken after the peers joined.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ClusterOwnerTopologyEvidence {
+    /// Number of distinct owner nodes selected by the catalog.
+    pub owner_count: usize,
+    /// Whether every accepted route consumed exactly one peer hop.
+    pub direct_hops_only: bool,
+}
+
+/// One named condition of the cluster evidence contract.
+///
+/// `detail` carries counters and flags only: no payloads and no credentials.
+#[derive(Clone, Debug)]
+struct EvidenceCondition {
+    name: &'static str,
+    satisfied: bool,
+    detail: String,
+}
+
+impl EvidenceCondition {
+    fn new(name: &'static str, satisfied: bool, detail: String) -> Self {
+        Self {
+            name,
+            satisfied,
+            detail,
+        }
+    }
+
+    fn count(name: &'static str, observed: usize, expected: usize) -> Self {
+        Self::new(
+            name,
+            observed == expected,
+            format!("expected {expected}, observed {observed}"),
+        )
+    }
+
+    fn flag(name: &'static str, observed: bool) -> Self {
+        Self::new(name, observed, "required flag was false".to_owned())
+    }
+}
+
+fn cluster_route_conditions(evidence: &ClusterRouteEvidence) -> Vec<EvidenceCondition> {
+    vec![
+        EvidenceCondition::count(
+            "control_routes",
+            evidence.control_routes,
+            EXPECTED_CONTROL_ROUTES,
+        ),
+        EvidenceCondition::count("data_routes", evidence.data_routes, EXPECTED_DATA_ROUTES),
+        EvidenceCondition::count(
+            "consumer_routes",
+            evidence.consumer_routes,
+            EXPECTED_CONSUMER_ROUTES,
+        ),
+        EvidenceCondition::count(
+            "replacement_generations",
+            evidence.replacement_generations,
+            EXPECTED_REPLACEMENT_GENERATIONS,
+        ),
+        EvidenceCondition::flag("replay_rejected", evidence.replay_rejected),
+        EvidenceCondition::flag("owner_fencing_rejected", evidence.owner_fencing_rejected),
+        EvidenceCondition::flag("key_revocation_rejected", evidence.key_revocation_rejected),
+        EvidenceCondition::flag("owner_death_interrupted", evidence.owner_death_interrupted),
+    ]
+}
+
+fn cluster_owner_topology_conditions(
+    evidence: &ClusterOwnerTopologyEvidence,
+) -> Vec<EvidenceCondition> {
+    vec![
+        EvidenceCondition::count("owner_count", evidence.owner_count, EXPECTED_OWNER_NODES),
+        EvidenceCondition::flag("direct_hops_only", evidence.direct_hops_only),
+    ]
+}
+
+fn first_failure(prefix: &str, conditions: Vec<EvidenceCondition>) -> Result<()> {
+    match conditions
+        .into_iter()
+        .find(|condition| !condition.satisfied)
+    {
+        Some(condition) => Err(HarnessError::Http(format!(
+            "{prefix}: {} {}",
+            condition.name, condition.detail
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// Validate the route-stage contract of the three-relay gate.
+pub fn validate_cluster_route_evidence(evidence: &ClusterRouteEvidence) -> Result<()> {
+    first_failure(ROUTE_ASSERTION, cluster_route_conditions(evidence))
+}
+
+/// Validate the owner-topology contract of the three-relay gate.
+pub fn validate_cluster_owner_topology_evidence(
+    evidence: &ClusterOwnerTopologyEvidence,
+) -> Result<()> {
+    first_failure(OWNER_ASSERTION, cluster_owner_topology_conditions(evidence))
+}
+
+/// Validate a complete evidence value against both staged contracts, in the
+/// order the gate observes them.
+pub fn validate_cluster_acceptance_evidence(evidence: &ClusterAcceptanceEvidence) -> Result<()> {
+    validate_cluster_route_evidence(&evidence.route_evidence())?;
+    validate_cluster_owner_topology_evidence(&evidence.owner_topology_evidence())
+}
+
+impl ClusterAcceptanceEvidence {
+    /// Project the route-stage view checked before peer shutdown.
+    pub fn route_evidence(&self) -> ClusterRouteEvidence {
+        ClusterRouteEvidence {
+            control_routes: self.control_routes,
+            data_routes: self.data_routes,
+            consumer_routes: self.consumer_routes,
+            replacement_generations: self.replacement_generations,
+            replay_rejected: self.replay_rejected,
+            owner_fencing_rejected: self.owner_fencing_rejected,
+            key_revocation_rejected: self.key_revocation_rejected,
+            owner_death_interrupted: self.owner_death_interrupted,
+        }
+    }
+
+    /// Project the owner-topology view checked after peer shutdown.
+    pub fn owner_topology_evidence(&self) -> ClusterOwnerTopologyEvidence {
+        ClusterOwnerTopologyEvidence {
+            owner_count: self.owner_count,
+            direct_hops_only: self.direct_hops_only,
+        }
+    }
+}
+
+#[cfg(test)]
+mod c17_cluster_validator_tests {
+    use super::{
+        ClusterAcceptanceEvidence, EXPECTED_CONSUMER_ROUTES, EXPECTED_CONTROL_ROUTES,
+        EXPECTED_DATA_ROUTES, EXPECTED_OWNER_NODES, EXPECTED_REPLACEMENT_GENERATIONS,
+        cluster_owner_topology_conditions, cluster_route_conditions,
+        validate_cluster_acceptance_evidence,
+    };
+    use crate::acceptance_test_support::assert_failed;
+
+    fn valid_evidence() -> ClusterAcceptanceEvidence {
+        ClusterAcceptanceEvidence {
+            relay_count: 3,
+            tenant_count: 2,
+            device_count: 3,
+            owner_count: EXPECTED_OWNER_NODES,
+            control_routes: EXPECTED_CONTROL_ROUTES,
+            data_routes: EXPECTED_DATA_ROUTES,
+            consumer_routes: EXPECTED_CONSUMER_ROUTES,
+            replacement_generations: EXPECTED_REPLACEMENT_GENERATIONS,
+            direct_hops_only: true,
+            replay_rejected: true,
+            owner_fencing_rejected: true,
+            key_revocation_rejected: true,
+            owner_death_interrupted: true,
+        }
+    }
+
+    type Case = (&'static str, fn(&mut ClusterAcceptanceEvidence));
+
+    /// One mutation per condition the gate checked inline.
+    const CASES: &[Case] = &[
+        ("control_routes", |e| e.control_routes = 0),
+        ("data_routes", |e| e.data_routes = 2),
+        ("consumer_routes", |e| e.consumer_routes = 0),
+        ("replacement_generations", |e| e.replacement_generations = 1),
+        ("replay_rejected", |e| e.replay_rejected = false),
+        ("owner_fencing_rejected", |e| {
+            e.owner_fencing_rejected = false
+        }),
+        ("key_revocation_rejected", |e| {
+            e.key_revocation_rejected = false
+        }),
+        ("owner_death_interrupted", |e| {
+            e.owner_death_interrupted = false
+        }),
+        ("owner_count", |e| e.owner_count = 2),
+        ("direct_hops_only", |e| e.direct_hops_only = false),
+    ];
+
+    #[test]
+    fn cluster_validator_accepts_complete_evidence() {
+        validate_cluster_acceptance_evidence(&valid_evidence())
+            .expect("complete M7 cluster evidence is valid");
+    }
+
+    #[test]
+    fn every_cluster_flag_and_count_reaches_the_shared_exit_path() {
+        assert_eq!(
+            CASES.len(),
+            cluster_route_conditions(&valid_evidence().route_evidence()).len()
+                + cluster_owner_topology_conditions(&valid_evidence().owner_topology_evidence())
+                    .len(),
+            "every validated condition needs its own mutation case"
+        );
+        for &(name, mutate) in CASES {
+            let mut evidence = valid_evidence();
+            mutate(&mut evidence);
+            let diagnostic = assert_failed(validate_cluster_acceptance_evidence(&evidence));
+            assert!(
+                !diagnostic.is_empty(),
+                "{name} produced an empty diagnostic"
+            );
+        }
+    }
+
+    #[test]
+    fn every_cluster_rejection_names_its_condition() {
+        for &(name, mutate) in CASES {
+            let mut evidence = valid_evidence();
+            mutate(&mut evidence);
+            let diagnostic = assert_failed(validate_cluster_acceptance_evidence(&evidence));
+            assert!(
+                diagnostic.contains(name),
+                "{name}: expected the condition name in diagnostic {diagnostic}"
+            );
+        }
+    }
+
+    /// Leave-one-out: each mutant is rejected by its own guard and by no
+    /// other, so deleting that guard would let the mutant through.
+    #[test]
+    fn every_cluster_guard_is_load_bearing() {
+        for &(name, mutate) in CASES {
+            let mut evidence = valid_evidence();
+            mutate(&mut evidence);
+            let failing = cluster_route_conditions(&evidence.route_evidence())
+                .into_iter()
+                .chain(cluster_owner_topology_conditions(
+                    &evidence.owner_topology_evidence(),
+                ))
+                .filter(|condition| !condition.satisfied)
+                .map(|condition| condition.name)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                failing,
+                vec![name],
+                "{name} must be the only guard rejecting its own mutation"
+            );
+        }
+    }
+}
+
 #[derive(Default)]
 struct Observation {
     request_ids: BTreeSet<String>,
@@ -221,21 +507,21 @@ async fn verify_with_redis(redis: &RedisLease) -> Result<ClusterAcceptanceEviden
     let owner_death_interrupted =
         owner_death_case(&catalog, &cluster, &owners, &topology, &mut peers).await?;
 
-    if scenario.control_routes != 1
-        || scenario.data_routes != 3
-        || scenario.consumer_routes != 1
-        || scenario.replacement_generations != 2
-        || !replay_rejected
-        || !owner_fencing_rejected
-        || !key_revocation_rejected
-        || !owner_death_interrupted
-    {
+    let route_evidence = ClusterRouteEvidence {
+        control_routes: scenario.control_routes,
+        data_routes: scenario.data_routes,
+        consumer_routes: scenario.consumer_routes,
+        replacement_generations: scenario.replacement_generations,
+        replay_rejected,
+        owner_fencing_rejected,
+        key_revocation_rejected,
+        owner_death_interrupted,
+    };
+    if let Err(error) = validate_cluster_route_evidence(&route_evidence) {
         for peer in peers.drain(..) {
             let _ = peer.shutdown().await;
         }
-        return Err(HarnessError::Http(
-            "M7 cluster acceptance assertion failed".into(),
-        ));
+        return Err(error);
     }
 
     for peer in peers.drain(..) {
@@ -253,25 +539,25 @@ async fn verify_with_redis(redis: &RedisLease) -> Result<ClusterAcceptanceEviden
         .routes
         .iter()
         .all(|route| route.route != InternalRoute::Health && route.source_node != route.owner_node);
-    if owner_count != 3 || !direct_hops_only {
-        return Err(HarnessError::Http(
-            "M7 cluster direct-owner assertion failed".into(),
-        ));
-    }
+    let owner_topology_evidence = ClusterOwnerTopologyEvidence {
+        owner_count,
+        direct_hops_only,
+    };
+    validate_cluster_owner_topology_evidence(&owner_topology_evidence)?;
     Ok(ClusterAcceptanceEvidence {
         relay_count: cluster.nodes.len(),
         tenant_count: 2,
         device_count: 3,
-        owner_count,
-        control_routes: scenario.control_routes,
-        data_routes: scenario.data_routes,
-        consumer_routes: scenario.consumer_routes,
-        replacement_generations: scenario.replacement_generations,
-        direct_hops_only,
-        replay_rejected,
-        owner_fencing_rejected,
-        key_revocation_rejected,
-        owner_death_interrupted,
+        owner_count: owner_topology_evidence.owner_count,
+        control_routes: route_evidence.control_routes,
+        data_routes: route_evidence.data_routes,
+        consumer_routes: route_evidence.consumer_routes,
+        replacement_generations: route_evidence.replacement_generations,
+        direct_hops_only: owner_topology_evidence.direct_hops_only,
+        replay_rejected: route_evidence.replay_rejected,
+        owner_fencing_rejected: route_evidence.owner_fencing_rejected,
+        key_revocation_rejected: route_evidence.key_revocation_rejected,
+        owner_death_interrupted: route_evidence.owner_death_interrupted,
     })
 }
 

@@ -735,11 +735,24 @@ async fn durable_key_and_generation_phantom_before_exec_refuse_activation() {
             panic!("bounded activation retry deadline");
         }
     };
-    assert!(matches!(
-        result,
+    // Named rather than asserted with a bare `matches!`.  This case failed
+    // three times inside the full gate survey and passed every standalone run,
+    // and the bare assertion said only "assertion failed", which made those
+    // failures unexplainable.  The distinction that matters is whether the
+    // activation was refused for some other reason, which is noise, or
+    // committed, which would be this safety property failing open under load.
+    match &result {
         Err(tunnel_catalog::CatalogError::Serialization(message))
-            if message == "orphan Redis index or direct lookup"
-    ));
+            if message == "orphan Redis index or direct lookup" => {}
+        Ok(()) => panic!(
+            "activation committed a stale approval over an orphan durable key; \
+             this safety property failed open"
+        ),
+        other => panic!(
+            "activation was refused, but not as the orphan rejection this case \
+             requires: {other:?}"
+        ),
+    }
     assert_eq!(
         active_incarnation(&fixture.upstream_url, &fixture.namespace).await,
         INITIAL_INCARC

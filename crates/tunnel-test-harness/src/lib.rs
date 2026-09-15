@@ -13,7 +13,9 @@ pub mod cluster_transport;
 pub mod m2_acceptance;
 pub mod peer;
 pub mod peer_fragmentation;
+pub mod peer_frames;
 pub mod production_cluster;
+pub mod redis_lane_restart;
 pub mod redis_restart;
 pub mod redis_tls;
 

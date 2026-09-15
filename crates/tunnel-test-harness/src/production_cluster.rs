@@ -10,7 +10,10 @@
 //! to the live owner actor.
 
 use crate::acceptance::helpers::write_device_profile;
-use crate::cluster_fixture::TestMembershipAuthority;
+use crate::cluster_fixture::{
+    M7_MEMBERSHIP_LIFETIME, MembershipLifetimeOptions, MembershipNodeIdentity,
+    TestMembershipAuthority,
+};
 use crate::{
     ClusterFixture, Harness, HarnessError, HarnessOptions, ManagedProcess, OidcTokenOptions,
     ProcessSpec, ProxyConfig, ProxyHandle, Result, RunningHarness, TcpProxy,
@@ -30,7 +33,7 @@ use std::{
     path::{Path, PathBuf},
     pin::Pin,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -52,11 +55,11 @@ use tunnel_client::{ConnectOptions, ConnectionHandle, ConnectionStatus, Transpor
 use tunnel_core::RotationConfig;
 use tunnel_relay::{
     CheckpointAuthority, CheckpointAuthorityError, CheckpointRequest, CheckpointResponse,
-    ClusterConfig, ConsumerUpgradeBarrier, ListenerSocketOptions, MembershipReadiness,
-    MembershipRuntime, MembershipRuntimeConfig, MembershipRuntimeHandle,
+    ClusterConfig, ConsumerUpgradeBarrier, ControlAttachBarrier, ListenerSocketOptions,
+    MembershipReadiness, MembershipRuntime, MembershipRuntimeConfig, MembershipRuntimeHandle,
     MembershipVersionStateIdentity, MembershipVersionStateStore, PeerAdmissionBarrier,
-    PeerListenerConfig, PeerReadiness, PeerRouteTarget, PeerRuntime, RelayOptions, RelaySnapshot,
-    RunningRelay, ServeConfig,
+    PeerFaultEventSnapshot, PeerListenerConfig, PeerReadiness, PeerRouteTarget, PeerRuntime,
+    RelayOptions, RelaySnapshot, RunningRelay, ServeConfig,
     routing::{OwnerRouter, RelayIdentity},
 };
 use tunnel_transport::{
@@ -74,8 +77,9 @@ mod m7_i08_recovery_attempts;
 mod m7_i08_rotation_faults;
 mod pending_owner;
 pub use c11_diagnostics::{
-    C11MatrixReport, OG02_CORRELATION_FIELDS, Og02CorrelationReport, Og02RowReport,
-    PEER_FAULT_CAUSES, PEER_FAULT_STAGES, verify_c11_diagnostics, verify_og02_correlation,
+    C11MatrixReport, OG02_CORRELATION_FIELDS, Og02CorrelationReport, Og02RowReport, Og02Shortfall,
+    PEER_FAULT_CAUSES, PEER_FAULT_STAGES, og02_row_shortfall, verify_c11_diagnostics,
+    verify_og02_correlation,
 };
 pub use concurrent_load::{
     ConcurrentLoadEvidence, validate_concurrent_load_evidence, verify as verify_concurrent_load,
@@ -85,8 +89,9 @@ pub use i08_goaway_rotation::{
     verify as verify_i08_goaway_rotation,
 };
 pub use i08_synthetic_rotation::{
-    I08Evidence, I08RotationEvidence, validate_i08_evidence,
-    verify as verify_i08_synthetic_rotation,
+    I08Evidence, I08PartialResponseEvidence, I08RotationEvidence, validate_i08_evidence,
+    validate_i08_partial_response_evidence, verify as verify_i08_synthetic_rotation,
+    verify_partial_response_rotation as verify_i08_partial_response_rotation,
 };
 pub use m7_i08_recovery_attempts::{
     AttemptObservation, CursorSample, I08RecoveryAttemptEvidence, RecoveryEpisodeEvidence,
@@ -168,7 +173,8 @@ pub use owner_death_admission::{
 };
 mod handover_peer_grace;
 pub use handover_peer_grace::{
-    Ec025HandoverEvidence, validate_ec025_handover_evidence, verify as verify_ec025_handover,
+    Ec025HandoverEvidence, Ec025TrustCrossing, validate_ec025_handover_evidence,
+    verify as verify_ec025_handover,
 };
 mod public_abandoned_upgrade;
 pub use public_abandoned_upgrade::{
@@ -197,9 +203,21 @@ mod credential_expiry_rotation;
 pub use credential_expiry_rotation::{
     CredentialExpiryRotationEvidence, validate_credential_expiry_rotation_evidence,
 };
+mod liveness;
+use liveness::{
+    CLI_SHUTDOWN_JOIN_BOUND, HeartbeatScope, OwnerLeaseHeartbeat, heartbeat_maximum_interval,
+    heartbeat_minimum_interval, join_cli_after_interrupt, owner_lease_ms,
+};
+pub use liveness::{ProductionLivenessEvidence, validate_production_liveness_evidence};
+
 mod trust_expiry;
 pub use trust_expiry::{
     TrustExpiryEvidence, validate_trust_expiry_evidence, verify as verify_trust_expiry,
+};
+mod membership_hint_drop;
+pub use membership_hint_drop::{
+    MembershipHintDropEvidence, WithdrawnAdmissionOutcome, validate_membership_hint_drop_evidence,
+    verify as verify_membership_hint_drop,
 };
 
 const DEPLOYMENT_ID: &str = "m7-production-harness";
@@ -210,6 +228,13 @@ const ROTATION: RotationConfig = RotationConfig {
     overlap_seconds: 2,
 };
 const ROTATION_COUNT: u64 = 3;
+/// Owner lease every production-fixture relay is configured with.  It is the
+/// `RelayOptions` default spelled out here so the heartbeat bounds in
+/// [`liveness`] have a single named configuration source instead of a magic
+/// duration, and so changing the fixture's lease policy moves those bounds
+/// with it.  The relay renews a session's lease once a third of this has
+/// elapsed, which is where the observable heartbeat cadence comes from.
+pub(crate) const PRODUCTION_OWNER_LEASE: Duration = Duration::from_secs(30);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 /// Peer HTTP/3 idle timeout applied to every production-fixture relay.  A
 /// pooled consumer stream with no transport operation in either direction
@@ -224,6 +249,46 @@ const CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
 const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
 const REDIS_PARTITION_OPERATION_TIMEOUT: Duration = Duration::from_secs(10);
 const REDIS_PARTITION_AUTHORIZATION_WAIT: Duration = Duration::from_secs(6);
+/// How often the fixture re-signs and republishes every relay's membership
+/// record once re-signing is started.
+///
+/// The records are signed at the fixture's normal lifetime and the relay's
+/// verifier caps a record at the product maximum of 60 seconds, so a scenario
+/// that runs longer than that cannot be given a longer record; it has to be
+/// given fresh ones.  Nothing in the fixture did that, so a record signed once
+/// at bootstrap became an absolute wall-clock deadline measured from cluster
+/// startup, and membership trust lapsed partway through any longer run.  That
+/// made post-fault recovery depend on *when* in the run the fault landed
+/// rather than on the behaviour under test.
+///
+/// The interval is a small fraction of the record lifetime so a single missed
+/// or slow publish cannot expire a record, and it matches how a real control
+/// plane re-issues membership well before expiry.
+const MEMBERSHIP_RESIGN_INTERVAL: Duration = Duration::from_secs(15);
+/// How long publishing may keep failing before the re-signer is treated as
+/// broken rather than as riding out a deliberate outage.
+///
+/// A scenario that pauses Redis on purpose makes the publish fail for as long
+/// as the pause lasts, so a re-signer that gave up on the first error would die
+/// in exactly the gate that needs it.  It retries instead, and gives up only
+/// once the failures have spanned a full record lifetime, because past that the
+/// record it would refresh has expired anyway and membership trust really has
+/// lapsed.
+///
+/// This is measured as elapsed time rather than as a count of failed rounds.
+/// A count at the normal interval is the same rule only while every retry is
+/// exactly one interval apart: four failures at fifteen seconds is sixty
+/// seconds precisely, so any slowness pushes an outage that is well inside the
+/// lifetime over the threshold.  That is what happened on a loaded machine,
+/// where a deliberate six-second pause was reported as a re-signer that had
+/// failed for five consecutive rounds.
+const MEMBERSHIP_RESIGN_FAILURE_GRACE: Duration =
+    Duration::from_secs(M7_MEMBERSHIP_LIFETIME.num_seconds().unsigned_abs());
+/// Retry interval while a publish is failing.
+///
+/// Much shorter than the ordinary interval so a brief outage is ridden out
+/// within it rather than consuming whole scheduled rounds.
+const MEMBERSHIP_RESIGN_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const REDIS_PARTITION_POLL: Duration = Duration::from_millis(25);
 const REDIS_RECOVERY_TIMEOUT: Duration = Duration::from_secs(15);
 const PUBLIC_HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -290,6 +355,9 @@ pub struct ProductionClusterEvidence {
     pub key_revocation_rejected: bool,
     /// Whether owner shutdown produced an explicit no-owner interruption.
     pub owner_death_interrupted: bool,
+    /// IN-10/OG-05 heartbeat, liveness/readiness and bounded CLI shutdown
+    /// evidence recorded from the real CLI and relay during this run.
+    pub liveness: ProductionLivenessEvidence,
     /// Wall-clock seconds elapsed before the three replacement generations.
     pub elapsed_seconds: u64,
 }
@@ -1010,6 +1078,57 @@ fn validate_public_health_response(
     Ok(())
 }
 
+/// Bounded wait for readiness to fail closed after a peer route is lost.  It
+/// matches the C20 peer-readiness gate's own loss deadline; it is a timeout,
+/// not an asserted bound.
+const PEER_ROUTE_READINESS_TIMEOUT: Duration = Duration::from_secs(12);
+const HEALTH_SPLIT_POLL: Duration = Duration::from_millis(100);
+
+/// Counted `/livez` and `/readyz` observations from one production run.
+#[derive(Clone, Copy, Debug, Default)]
+struct HealthSplitObservation {
+    livez_probes: usize,
+    livez_live: usize,
+    readyz_probes: usize,
+    readyz_ready: usize,
+    readyz_unready: usize,
+    liveness_up_while_readiness_false: bool,
+}
+
+/// Probe one relay's public `/livez` and `/readyz` once and classify both
+/// answers into the fixed redacted envelopes.  Returns whether liveness
+/// answered live and whether readiness failed closed.
+async fn probe_health_pair(
+    consumer_addr: SocketAddr,
+    server_ca_der: &[u8],
+    observation: &mut HealthSplitObservation,
+) -> Result<(bool, bool)> {
+    let live = public_health_request(consumer_addr, server_ca_der, "/livez").await?;
+    observation.livez_probes += 1;
+    let live_ok = validate_public_health_response(&live, "/livez", 200, LIVEZ_BODY).is_ok();
+    if live_ok {
+        observation.livez_live += 1;
+    }
+    let ready = public_health_request(consumer_addr, server_ca_der, "/readyz").await?;
+    observation.readyz_probes += 1;
+    let ready_ok = validate_public_health_response(&ready, "/readyz", 200, READYZ_BODY).is_ok();
+    let unready_ok = validate_public_health_response(&ready, "/readyz", 503, UNREADYZ_BODY).is_ok();
+    match (ready_ok, unready_ok) {
+        (true, false) => observation.readyz_ready += 1,
+        (false, true) => observation.readyz_unready += 1,
+        _ => {
+            return Err(HarnessError::Http(format!(
+                "public /readyz returned neither the ready nor the unready envelope: status {}",
+                ready.status
+            )));
+        }
+    }
+    if live_ok && unready_ok {
+        observation.liveness_up_while_readiness_false = true;
+    }
+    Ok((live_ok, unready_ok))
+}
+
 async fn assert_public_health_ready(consumer_addr: SocketAddr, server_ca_der: &[u8]) -> Result<()> {
     let live = public_health_request(consumer_addr, server_ca_der, "/livez").await?;
     validate_public_health_response(&live, "/livez", 200, LIVEZ_BODY)?;
@@ -1131,6 +1250,9 @@ fn validate_production_evidence(evidence: &ProductionClusterEvidence) -> Result<
     // contracts are mandatory parts of this gate, not optional extras.
     validate_concurrent_tenant_isolation_evidence(&evidence.tenant_isolation, ROTATION_COUNT)?;
     validate_owner_race_evidence(&evidence.owner_race)?;
+    // IN-10/OG-05: heartbeat, liveness/readiness and the measured bounded
+    // shutdown join are mandatory parts of this gate too.
+    validate_production_liveness_evidence(&evidence.liveness)?;
     // The legacy summary flag must agree with the structured evidence.
     if !evidence.same_uuid_tenant_isolation_verified {
         return Err(HarnessError::Process(
@@ -1222,6 +1344,41 @@ struct ProductionCluster {
     catalog: SharedCatalog,
     membership_records: usize,
     checkpoint_authority: Arc<FixtureCheckpointAuthority>,
+    /// Everything a background re-signer needs to keep issuing fresh
+    /// membership records, captured at startup while the harness is in scope.
+    membership_resign_inputs: MembershipResignInputs,
+    membership_resign_cancel: CancellationToken,
+    membership_resign: Option<JoinHandle<()>>,
+    /// First error the re-signer hit, if any.  A re-signer that died silently
+    /// would turn into flakiness in whatever gate relied on it, so the failure
+    /// is kept and surfaced instead of logged and forgotten.
+    membership_resign_error: Arc<Mutex<Option<String>>>,
+}
+
+/// Startup-captured inputs for the membership re-signer.
+#[derive(Clone)]
+struct MembershipResignInputs {
+    redis_url: String,
+    redis_namespace: String,
+    deployment_id: String,
+    deployment_incarnation: String,
+    /// Node identity and the peer endpoint its record advertises, in the same
+    /// order the bootstrap records were signed.
+    nodes: Vec<(MembershipNodeIdentity, SocketAddr)>,
+    /// Record version the next re-signing round issues.  Bootstrap published
+    /// version 1, and the verifier replaces a record only with a newer one.
+    next_record_version: u64,
+}
+
+/// Inputs for one bounded IN-10/OG-05 CLI shutdown-join measurement.
+#[derive(Clone, Copy)]
+struct CliShutdownJoinContext<'a> {
+    harness: &'a RunningHarness,
+    device: &'a crate::fixture::DeviceFixture,
+    service_id: Uuid,
+    canary: &'a str,
+    token: &'a str,
+    consumer_addr: SocketAddr,
 }
 
 struct ProductionRelay {
@@ -1261,6 +1418,164 @@ fn private_fixture_directory() -> Result<TempDir> {
     let path = files.path().to_string_lossy();
     crate::c11_capture::record_sentinel("filesystem_path", path.as_bytes())?;
     Ok(files)
+}
+
+/// One relay's latest bounded peer-fault tuple for a stage, joined with the
+/// node that recorded it and that stage's saturating count.
+#[derive(Clone, Debug)]
+pub(crate) struct RelayPeerFaultStage {
+    pub(crate) node_id: String,
+    pub(crate) stage: &'static str,
+    pub(crate) count: u64,
+    pub(crate) event: PeerFaultEventSnapshot,
+}
+
+/// The bounded correlation a gate requires of the tuple it induced.
+///
+/// Only identifiers the gate itself chose are named here: the relay mints the
+/// peer `request_id` internally, so it is required to be present rather than
+/// to equal a value the gate could not know.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PeerFaultCorrelation<'a> {
+    pub(crate) tenant_id: Uuid,
+    pub(crate) device_id: Uuid,
+    /// When set, the tuple must name this relay as the selected owner.
+    pub(crate) owner_node_id: Option<&'a str>,
+    /// When set, the tuple's owner epoch must equal this claim's epoch.
+    pub(crate) owner_epoch: Option<u64>,
+    /// When set, the tuple must carry this exact service identifier.
+    pub(crate) service_id: Option<Uuid>,
+    /// Require a bounded session identifier and a peer request identifier.
+    /// A fault raised before an owner token is selected carries neither.
+    pub(crate) require_request_identity: bool,
+}
+
+/// The summed `stage_counts` entry for one stage label across every relay.
+///
+/// A gate takes this before and after the fault it induces so it asserts the
+/// stage was *gained*, never that the cluster happens to carry one.
+pub(crate) fn peer_fault_stage_count(stages: &[RelayPeerFaultStage], stage: &str) -> u64 {
+    stages
+        .iter()
+        .filter(|candidate| candidate.stage == stage)
+        .map(|candidate| candidate.count)
+        .sum()
+}
+
+/// Render every observed stage tuple for a diagnostic message.
+pub(crate) fn format_peer_fault_stages(stages: &[RelayPeerFaultStage]) -> String {
+    if stages.is_empty() {
+        return "none".to_owned();
+    }
+    stages
+        .iter()
+        .map(|stage| {
+            format!(
+                "{}:{}/{}/{}x{}",
+                stage.node_id,
+                stage.event.role.as_str(),
+                stage.stage,
+                stage.event.cause.as_str(),
+                stage.count,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Require exactly one bounded `role/stage/cause` tuple with the correlation
+/// identifiers of the request the gate issued.
+///
+/// `stage_counts` must have *gained* the stage against the pre-fault reading
+/// in `before`, and `last_by_stage[stage]` must carry the gate's own scope.
+/// The failure text lists everything that was observed instead, so a gate that
+/// stops producing the fault reports what it produced rather than a bare
+/// absence.
+pub(crate) fn require_peer_fault_stage(
+    gate: &str,
+    before: &[RelayPeerFaultStage],
+    stages: &[RelayPeerFaultStage],
+    role: &str,
+    stage: &str,
+    cause: &str,
+    correlation: PeerFaultCorrelation<'_>,
+) -> Result<RelayPeerFaultStage> {
+    let baseline = peer_fault_stage_count(before, stage);
+    let gained = peer_fault_stage_count(stages, stage);
+    if gained <= baseline {
+        return Err(HarnessError::Process(format!(
+            "{gate} did not gain a {stage} stage_counts entry ({baseline} before, {gained} after); observed {}",
+            format_peer_fault_stages(stages)
+        )));
+    }
+    let observed = stages
+        .iter()
+        .find(|candidate| {
+            candidate.stage == stage
+                && candidate.event.role.as_str() == role
+                && candidate.event.cause.as_str() == cause
+        })
+        .ok_or_else(|| {
+            HarnessError::Process(format!(
+                "{gate} recorded no {role}/{stage}/{cause} peer fault; observed {}",
+                format_peer_fault_stages(stages)
+            ))
+        })?
+        .clone();
+    if observed.count == 0 {
+        return Err(HarnessError::Process(format!(
+            "{gate} {role}/{stage}/{cause} carried a zero stage_counts entry"
+        )));
+    }
+    let event = &observed.event;
+    if event.tenant_id != correlation.tenant_id || event.device_id != correlation.device_id {
+        return Err(HarnessError::Process(format!(
+            "{gate} {role}/{stage}/{cause} tuple was recorded for a different tenant/device scope"
+        )));
+    }
+    if let Some(expected) = correlation.owner_node_id
+        && event.owner_node_id.as_deref() != Some(expected)
+    {
+        return Err(HarnessError::Process(format!(
+            "{gate} {role}/{stage}/{cause} tuple named owner {:?}, expected {expected}",
+            event.owner_node_id
+        )));
+    }
+    if let Some(expected) = correlation.owner_epoch
+        && event.owner_epoch != Some(expected)
+    {
+        return Err(HarnessError::Process(format!(
+            "{gate} {role}/{stage}/{cause} tuple carried owner epoch {:?}, expected {expected}",
+            event.owner_epoch
+        )));
+    }
+    if let Some(expected) = correlation.service_id
+        && event.service_id != Some(expected)
+    {
+        return Err(HarnessError::Process(format!(
+            "{gate} {role}/{stage}/{cause} tuple carried service {:?}, expected {expected}",
+            event.service_id
+        )));
+    }
+    if correlation.require_request_identity {
+        if event.session_id.as_deref().unwrap_or_default().is_empty() {
+            return Err(HarnessError::Process(format!(
+                "{gate} {role}/{stage}/{cause} tuple carried no session identifier"
+            )));
+        }
+        if event.request_id.as_deref().unwrap_or_default().is_empty() {
+            return Err(HarnessError::Process(format!(
+                "{gate} {role}/{stage}/{cause} tuple carried no peer request identifier"
+            )));
+        }
+    }
+    // The accepted tuple is the row's evidence, so record it on the run's own
+    // transcript.  Every field here is a closed label or a relay node id.
+    eprintln!(
+        "peer fault stage accepted: {gate} {}/{role}/{stage}/{cause} stage_counts {baseline}->{gained}",
+        observed.node_id
+    );
+    Ok(observed)
 }
 
 impl ProductionRelay {
@@ -1571,6 +1886,7 @@ impl ProductionCluster {
             barriers,
             Some(max_pending_operations),
             None,
+            BTreeMap::new(),
         )
         .await
     }
@@ -1592,6 +1908,7 @@ impl ProductionCluster {
             BTreeMap::new(),
             None,
             Some((target_node_id, barrier)),
+            BTreeMap::new(),
         )
         .await
     }
@@ -1621,6 +1938,31 @@ impl ProductionCluster {
             upgrade_barriers,
             Some(max_pending_operations),
             Some((target_node_id, peer_admission_barrier)),
+            BTreeMap::new(),
+        )
+        .await
+    }
+
+    /// Start a three-relay cluster with one-shot device control-attach
+    /// barriers keyed by relay node ID.  Each barrier holds exactly one
+    /// owner-local device control socket between its `HELLO` and the
+    /// registration that produces its `WELCOME`.  An empty map preserves the
+    /// ordinary production harness path.  The barrier is single-use: once
+    /// released it is a pass-through for every later control attach, so a
+    /// caller must make its phase order explicit.
+    pub(super) async fn start_with_control_attach_barriers(
+        harness: &mut RunningHarness,
+        control_attach_barriers: BTreeMap<String, Arc<ControlAttachBarrier>>,
+    ) -> Result<Self> {
+        let catalog = Arc::new(harness.production_catalog()?.clone()) as SharedCatalog;
+        Self::start_with_catalog_send_buffer_and_barriers(
+            harness,
+            catalog,
+            None,
+            BTreeMap::new(),
+            None,
+            None,
+            control_attach_barriers,
         )
         .await
     }
@@ -1656,6 +1998,7 @@ impl ProductionCluster {
             BTreeMap::new(),
             None,
             None,
+            BTreeMap::new(),
         )
         .await
     }
@@ -1667,6 +2010,7 @@ impl ProductionCluster {
         upgrade_barriers: BTreeMap<String, Arc<ConsumerUpgradeBarrier>>,
         max_pending_operations: Option<usize>,
         peer_admission_barrier: Option<(&'static str, Arc<PeerAdmissionBarrier>)>,
+        control_attach_barriers: BTreeMap<String, Arc<ControlAttachBarrier>>,
     ) -> Result<Self> {
         let mut fixture =
             ClusterFixture::with_deployment(&harness.pki, DEPLOYMENT_ID, DEPLOYMENT_INCARCATION)?;
@@ -1751,6 +2095,9 @@ impl ProductionCluster {
             }
         };
         let membership_now = Utc::now();
+        // Captured while the node fixtures are in scope so a background
+        // re-signer can keep issuing fresh records without borrowing them.
+        let mut resign_nodes: Vec<(MembershipNodeIdentity, SocketAddr)> = Vec::new();
         for node in &fixture.nodes {
             let peer_endpoint = match peer_proxies
                 .get(&node.node_id)
@@ -1785,6 +2132,22 @@ impl ProductionCluster {
                     return Err(startup_cleanup_error(error, cleanup_errors));
                 }
             };
+            let peer_spki_sha256 = match node.peer_spki_fingerprint() {
+                Ok(digest) => digest,
+                Err(error) => {
+                    let cleanup_errors =
+                        shutdown_peer_proxies_until(&mut peer_proxies, startup_cleanup_deadline)
+                            .await;
+                    return Err(startup_cleanup_error(error, cleanup_errors));
+                }
+            };
+            resign_nodes.push((
+                MembershipNodeIdentity {
+                    node_id: node.node_id.clone(),
+                    peer_spki_sha256,
+                },
+                peer_endpoint,
+            ));
             fixture.memberships.insert(node.node_id.clone(), membership);
         }
         let trusted_publisher = match membership_authority.trusted_key() {
@@ -1889,6 +2252,7 @@ impl ProductionCluster {
                 (target_node_id == node.node_id.as_str()).then_some(bytes)
             });
             let upgrade_barrier = upgrade_barriers.get(&node.node_id).cloned();
+            let control_attach_barrier = control_attach_barriers.get(&node.node_id).cloned();
             let peer_admission_barrier =
                 peer_admission_barrier
                     .as_ref()
@@ -1910,6 +2274,7 @@ impl ProductionCluster {
                 send_buffer_bytes,
                 upgrade_barrier,
                 peer_admission_barrier,
+                control_attach_barrier,
                 max_pending_operations,
                 startup_cleanup_deadline,
             )
@@ -2041,6 +2406,14 @@ impl ProductionCluster {
                 }
             };
 
+        let resign_inputs = MembershipResignInputs {
+            redis_url: harness.redis.redis_url().to_owned(),
+            redis_namespace: harness.redis.namespace().to_owned(),
+            deployment_id: fixture.deployment_id.clone(),
+            deployment_incarnation: fixture.deployment_incarnation.clone(),
+            nodes: resign_nodes,
+            next_record_version: 2,
+        };
         let cluster = Self {
             fixture,
             _files: files,
@@ -2051,6 +2424,10 @@ impl ProductionCluster {
             catalog,
             membership_records: membership_records.len(),
             checkpoint_authority: authority,
+            membership_resign_inputs: resign_inputs,
+            membership_resign_cancel: CancellationToken::new(),
+            membership_resign: None,
+            membership_resign_error: Arc::new(Mutex::new(None)),
         };
         if let Err(error) = cluster.wait_for_peer_readiness(STARTUP_TIMEOUT).await {
             let cleanup_deadline = tokio::time::Instant::now() + CLEANUP_TIMEOUT;
@@ -2095,6 +2472,20 @@ impl ProductionCluster {
                 HarnessError::InvalidInput("production device has no echo service".into())
             })?;
         let canary = format!("m7-production:{}", device.id);
+        // IN-10/OG-05: start counting the relay's owner-lease heartbeat for
+        // both tenant scopes before the first session claims an owner, so the
+        // renewals are observed as they happen rather than reconstructed.
+        let mut heartbeat_scopes = vec![HeartbeatScope {
+            tenant_id: device.tenant_id,
+            device_id: device.id,
+        }];
+        if let Some(tenant_b_device) = harness.topology.devices_b.first() {
+            heartbeat_scopes.push(HeartbeatScope {
+                tenant_id: tenant_b_device.tenant_id,
+                device_id: tenant_b_device.id,
+            });
+        }
+        let heartbeat = OwnerLeaseHeartbeat::start(self.catalog.clone(), heartbeat_scopes);
         let profile_directory = tempdir().map_err(HarnessError::Io)?;
         let mut profile = write_device_profile(
             profile_directory.path(),
@@ -2560,6 +2951,28 @@ impl ProductionCluster {
         self.wait_for_no_owner(device_b.tenant_id, device_b.id)
             .await?;
 
+        // IN-10/OG-05 bounded shutdown evidence.  A dedicated real CLI epoch
+        // is interrupted and *joined with a measured duration* against a
+        // bound taken from the fixture's rotation policy, and its Redis owner
+        // must be released by that stop.
+        //
+        // It is deliberately a separate epoch on its own device fanout.  The
+        // owner-death phase below still needs an owner that was abandoned
+        // rather than released, so this measurement must not consume it; and
+        // routing it through a private fanout keeps the shared fixture's
+        // ordered route schedule, socket counts and three-socket peak exactly
+        // as every other assertion in this gate already expects.
+        let (cli_shutdown, cli_shutdown_owner_released) = self
+            .measure_cli_shutdown_join(&CliShutdownJoinContext {
+                harness,
+                device,
+                service_id,
+                canary: &canary,
+                token: &token,
+                consumer_addr: relay_c_consumer_addr,
+            })
+            .await?;
+
         let (cli_process, mut cli_stream) = start_cli_smoke(
             harness,
             self.device_fanout.local_addr(),
@@ -2606,6 +3019,16 @@ impl ProductionCluster {
                 ..OidcTokenOptions::default()
             },
         )?;
+        // IN-10/OG-05 liveness/readiness split.  Record the surviving
+        // ingress answering both the live and the ready envelope first, so a
+        // relay that was wedged unready all along cannot satisfy the split.
+        let mut health = HealthSplitObservation::default();
+        probe_health_pair(
+            owner_death_relay_addr,
+            &harness.pki.server_ca.certificate_der,
+            &mut health,
+        )
+        .await?;
         self.shutdown_node(&cli_owner.token.node_id).await?;
         let owner_death_interrupted = match open_consumer_stream(
             owner_death_relay_addr,
@@ -2637,6 +3060,59 @@ impl ProductionCluster {
                 "owner shutdown did not produce a no-owner interruption".into(),
             ));
         }
+        // Losing a required signed peer route must fail this relay's
+        // readiness closed while its process-only liveness keeps answering:
+        // docs/cluster.md's rule that liveness may stay up while readiness
+        // goes false.
+        let readiness_deadline = Instant::now() + PEER_ROUTE_READINESS_TIMEOUT;
+        loop {
+            let (live_ok, unready_ok) = probe_health_pair(
+                owner_death_relay_addr,
+                &harness.pki.server_ca.certificate_der,
+                &mut health,
+            )
+            .await?;
+            if unready_ok {
+                if !live_ok {
+                    return Err(HarnessError::Process(
+                        "production /livez stopped answering when readiness failed closed".into(),
+                    ));
+                }
+                break;
+            }
+            if Instant::now() >= readiness_deadline {
+                return Err(HarnessError::Timeout(
+                    "production /readyz did not fail closed after the owner relay was shut down"
+                        .into(),
+                ));
+            }
+            sleep(HEALTH_SPLIT_POLL).await;
+        }
+
+        let heartbeat = heartbeat.join().await?;
+        let liveness = ProductionLivenessEvidence {
+            owner_lease_ms: owner_lease_ms(),
+            heartbeat_minimum_interval_ms: heartbeat_minimum_interval().as_millis() as u64,
+            heartbeat_maximum_interval_ms: heartbeat_maximum_interval().as_millis() as u64,
+            heartbeat_owner_tokens: heartbeat.owner_tokens,
+            heartbeat_round_trips: heartbeat.round_trips,
+            heartbeat_intervals: heartbeat.intervals_ms.len(),
+            longest_heartbeat_run_intervals: heartbeat.longest_run_intervals,
+            observed_minimum_interval_ms: heartbeat.minimum_interval_ms(),
+            observed_maximum_interval_ms: heartbeat.maximum_interval_ms(),
+            heartbeat_intervals_within_bounds: heartbeat.within_bounds(),
+            livez_probes: health.livez_probes,
+            livez_live: health.livez_live,
+            readyz_probes: health.readyz_probes,
+            readyz_ready: health.readyz_ready,
+            readyz_unready: health.readyz_unready,
+            liveness_up_while_readiness_false: health.liveness_up_while_readiness_false,
+            cli_shutdown_join_bound_ms: CLI_SHUTDOWN_JOIN_BOUND.as_millis() as u64,
+            cli_shutdown_join_ms: cli_shutdown.join_ms,
+            cli_shutdown_joined_within_bound: cli_shutdown.within_bound,
+            cli_shutdown_graceful_exit: cli_shutdown.graceful_exit,
+            cli_shutdown_owner_released,
+        };
 
         let final_status = client_status_after_stop(&client);
         let fanout = wait_for_fanout_drained(&self.device_fanout, "device").await?;
@@ -2693,8 +3169,102 @@ impl ProductionCluster {
             stale_owner_rejected,
             key_revocation_rejected,
             owner_death_interrupted,
+            liveness,
             elapsed_seconds: elapsed.as_secs(),
         })
+    }
+
+    /// Run one real CLI epoch on a private device fanout, interrupt it, and
+    /// measure the join plus the Redis owner release.
+    ///
+    /// The private fanout is the point: the shared fixture fanout carries an
+    /// ordered route schedule and bounded socket accounting that the rest of
+    /// this gate asserts on, so the shutdown epoch must not consume slots in
+    /// it.  The fanout is always joined before returning, on success or
+    /// failure.
+    async fn measure_cli_shutdown_join(
+        &mut self,
+        context: &CliShutdownJoinContext<'_>,
+    ) -> Result<(liveness::CliShutdownJoin, bool)> {
+        let targets = ["relay-a", "relay-b", "relay-c"]
+            .into_iter()
+            .map(|node_id| {
+                self.relays
+                    .iter()
+                    .find(|relay| relay.node_id == node_id)
+                    .and_then(|relay| relay.running.as_ref().map(|running| running.device_addr))
+                    .ok_or_else(|| {
+                        HarnessError::InvalidInput(format!(
+                            "shutdown-join fanout has no device listener for {node_id}"
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut fanout = FanoutProxy::bind(targets, FanoutProxyConfig::default()).await?;
+        let outcome = self.run_cli_shutdown_join(context, &fanout).await;
+        let cleanup = fanout
+            .shutdown_until(tokio::time::Instant::now() + CLEANUP_TIMEOUT)
+            .await;
+        match (outcome, cleanup) {
+            (Ok(outcome), Ok(())) => Ok(outcome),
+            (Ok(_), Err(cleanup)) => Err(HarnessError::Process(format!(
+                "shutdown-join fanout cleanup: {cleanup}"
+            ))),
+            (Err(error), Ok(())) => Err(error),
+            (Err(error), Err(cleanup)) => Err(HarnessError::Process(format!(
+                "{error}; shutdown-join fanout cleanup: {cleanup}"
+            ))),
+        }
+    }
+
+    async fn run_cli_shutdown_join(
+        &mut self,
+        context: &CliShutdownJoinContext<'_>,
+        fanout: &FanoutProxyHandle,
+    ) -> Result<(liveness::CliShutdownJoin, bool)> {
+        let CliShutdownJoinContext {
+            harness,
+            device,
+            service_id,
+            canary,
+            token,
+            consumer_addr,
+        } = *context;
+        let profile_directory = tempdir().map_err(HarnessError::Io)?;
+        let mut profile = write_device_profile(
+            profile_directory.path(),
+            device.id,
+            service_id,
+            canary,
+            fanout.local_addr(),
+            &device.certificate.certificate_pem,
+            &device.certificate.private_key_pem,
+            &harness.pki.server_ca.certificate_pem,
+        )?;
+        profile.config.rotation = ROTATION;
+        profile.config.validate().map_err(|error| {
+            HarnessError::InvalidInput(format!("shutdown-join client config: {error}"))
+        })?;
+        let (process, mut stream) = start_cli_smoke(
+            harness,
+            fanout.local_addr(),
+            consumer_addr,
+            &profile,
+            token,
+            device.id,
+            service_id,
+        )
+        .await?;
+        stream
+            .round_trip(b"production-record-cli-shutdown", canary.as_bytes())
+            .await?;
+        stream.close().await?;
+        let shutdown = join_cli_after_interrupt(process).await?;
+        let owner_released = self
+            .wait_for_no_owner(device.tenant_id, device.id)
+            .await
+            .is_ok();
+        Ok((shutdown, owner_released))
     }
 
     async fn run_process_pause(
@@ -4205,6 +4775,106 @@ impl ProductionCluster {
         }
     }
 
+    /// Observe, without forcing or failing, whether every relay's membership
+    /// runtime returns to `Ready` within `budget`.
+    ///
+    /// A full Redis outage drives each relay's membership runtime Unready: its
+    /// signed checkpoint cannot be refreshed against an unreachable catalog.
+    /// The runtime is not latched -- its supervisor keeps reconciling and
+    /// restores `Ready` once a strictly-newer signed checkpoint and a catalog
+    /// snapshot land in the same pass.  With
+    /// membership re-signing started (see [`MEMBERSHIP_RESIGN_INTERVAL`]) the
+    /// re-arm no longer depends on when in the run the outage lands, so a
+    /// caller that started re-signing may assert this rather than merely
+    /// record it.  It still returns
+    /// the observation instead of failing, so the caller owns the diagnostic.
+    async fn observe_membership_readiness(&self, budget: Duration) -> bool {
+        let deadline = Instant::now() + budget;
+        loop {
+            if self
+                .relays
+                .iter()
+                .all(|relay| matches!(relay.membership.readiness(), MembershipReadiness::Ready))
+            {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Re-publish every relay's verified peer pins from its current membership
+    /// snapshot, retrying until each relay's runtime is Ready enough to supply
+    /// them.
+    ///
+    /// This fixture publishes peer pins from the membership *invalidation*
+    /// callback only, which is edge-triggered: a full Redis outage drives
+    /// membership Unready, that callback empties the pin set, and nothing
+    /// re-publishes it when the runtime later returns to `Ready`.  The gap is
+    /// in the fixture's wiring, not in the membership runtime (which does
+    /// re-arm on its own) and not in the protocol, so a caller that has
+    /// observed readiness return re-publishes explicitly -- exactly as the
+    /// key-revocation probe does after it deliberately revokes pins.
+    /// Start re-signing and republishing every relay's membership record on a
+    /// fixed interval until shutdown.
+    ///
+    /// Opt-in, and started by the scenario that needs it rather than by every
+    /// cluster, because a background version bump would collide with any gate
+    /// that publishes its own record at a chosen version (the trust-expiry,
+    /// key-overlap and handover gates all do).  Those gates keep the original
+    /// behaviour of a record signed once at bootstrap.
+    ///
+    /// Each round issues a record at the fixture's normal lifetime with a
+    /// strictly newer version, which is what the relay's verifier requires to
+    /// replace one.  Nothing here widens what the relay will accept: the
+    /// record lifetime stays inside the product maximum, and the record still
+    /// names the same node and the same peer certificate digest.
+    async fn start_membership_resigning(&mut self) -> Result<()> {
+        if self.membership_resign.is_some() {
+            return Err(HarnessError::InvalidInput(
+                "membership re-signing is already running for this cluster".into(),
+            ));
+        }
+        let inputs = self.membership_resign_inputs.clone();
+        let publisher =
+            RedisMembershipPublisher::connect(&inputs.redis_url, &inputs.redis_namespace)
+                .await
+                .map_err(|error| {
+                    HarnessError::Redis(format!("connecting membership re-signer: {error}"))
+                })?;
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(membership_resign_loop(
+            Arc::clone(&self.checkpoint_authority),
+            inputs,
+            publisher,
+            MEMBERSHIP_RESIGN_INTERVAL,
+            Arc::clone(&self.membership_resign_error),
+            cancel.clone(),
+        ));
+        self.membership_resign_cancel = cancel;
+        self.membership_resign = Some(task);
+        Ok(())
+    }
+
+    /// The first error the membership re-signer hit, if it hit one.
+    fn membership_resign_failure(&self) -> Option<String> {
+        self.membership_resign_error
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+    }
+
+    fn republish_peer_pins(&self) -> Result<()> {
+        for relay in &self.relays {
+            publish_verified_pins(&relay.membership, &relay.pins)?;
+        }
+        Ok(())
+    }
+
+    /// Wait until every relay's peer runtime reports ready, or fail with the
+    /// count that got there before the budget expired.
     async fn wait_for_peer_readiness(&self, budget: Duration) -> Result<()> {
         let deadline = Instant::now() + budget;
         loop {
@@ -4228,6 +4898,32 @@ impl ProductionCluster {
             }
             sleep(Duration::from_millis(50)).await;
         }
+    }
+
+    /// Join every running relay's bounded `last_by_stage` peer-fault view with
+    /// the node that produced it and the stage's saturating count.
+    ///
+    /// This reads only the typed relay snapshot, so it carries no error text
+    /// and no endpoint: the tuple's own correlation identifiers are what a
+    /// gate asserts on.
+    async fn peer_fault_stages(&self) -> Result<Vec<RelayPeerFaultStage>> {
+        let mut stages = Vec::new();
+        for relay in &self.relays {
+            if relay.running.is_none() {
+                continue;
+            }
+            let snapshot = relay.snapshot().await?;
+            let diagnostics = snapshot.peer_fault_diagnostics;
+            for (stage, event) in diagnostics.last_by_stage {
+                stages.push(RelayPeerFaultStage {
+                    node_id: relay.node_id.clone(),
+                    stage,
+                    count: diagnostics.stage_counts.get(stage).copied().unwrap_or(0),
+                    event,
+                });
+            }
+        }
+        Ok(stages)
     }
 
     fn set_peer_path_drop(&self, node_id: &str, drop_packets: bool) -> Result<()> {
@@ -4346,6 +5042,21 @@ impl ProductionCluster {
 
     async fn shutdown_until(mut self, deadline: tokio::time::Instant) -> Result<()> {
         let mut errors = Vec::new();
+        self.membership_resign_cancel.cancel();
+        if let Some(mut task) = self.membership_resign.take() {
+            match timeout_at(deadline, &mut task).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => errors.push(format!("membership re-signer failed: {error}")),
+                Err(_) => {
+                    task.abort();
+                    let _ = task.await;
+                    errors.push("membership re-signer did not stop by its deadline".to_owned());
+                }
+            }
+        }
+        if let Some(failure) = self.membership_resign_failure() {
+            errors.push(format!("membership re-signer reported: {failure}"));
+        }
         if let Err(error) = capture_c11_cluster_diagnostics(&self, deadline).await {
             errors.push(format!("C11 cluster diagnostics: {error}"));
         }
@@ -4469,6 +5180,7 @@ async fn start_relay(
     consumer_send_buffer_bytes: Option<u32>,
     consumer_upgrade_barrier: Option<Arc<ConsumerUpgradeBarrier>>,
     consumer_peer_admission_barrier: Option<Arc<PeerAdmissionBarrier>>,
+    device_control_attach_barrier: Option<Arc<ControlAttachBarrier>>,
     max_pending_operations: Option<usize>,
     startup_cleanup_deadline: tokio::time::Instant,
 ) -> Result<ProductionRelay> {
@@ -4719,6 +5431,10 @@ async fn start_relay(
     options.boot_id = node.boot_id.clone();
     options.deployment_incarnation = fixture.deployment_incarnation.clone();
     options.rotation = harness.rotation_config();
+    // Same value as `RelayOptions::new`, stated explicitly: the IN-10/OG-05
+    // heartbeat bounds are derived from this configured lease, so the fixture
+    // must name it rather than inherit it silently.
+    options.owner_lease = PRODUCTION_OWNER_LEASE;
     if let Some(max_pending_operations) = max_pending_operations {
         options.limits.max_pending_operations = max_pending_operations;
     }
@@ -4781,6 +5497,7 @@ async fn start_relay(
                 },
                 consumer_upgrade_barrier,
                 consumer_peer_admission_barrier,
+                device_control_attach_barrier,
             },
         )
         .await
@@ -4920,6 +5637,109 @@ fn required_peer_routes(
         .collect()
 }
 
+/// Re-sign and republish every relay's membership record on a fixed interval.
+///
+/// The relay's verifier caps a record's lifetime at the product maximum, so a
+/// scenario that outlives that cap cannot hold a longer record and has to be
+/// issued fresh ones, exactly as a real control plane issues them.  The first
+/// failure is kept in `failure` rather than only logged, so a re-signer that
+/// dies cannot quietly become flakiness in the gate that depends on it.
+async fn membership_resign_loop(
+    authority: Arc<FixtureCheckpointAuthority>,
+    inputs: MembershipResignInputs,
+    publisher: RedisMembershipPublisher,
+    interval: Duration,
+    failure: Arc<Mutex<Option<String>>>,
+    shutdown: CancellationToken,
+) {
+    let record_failure = |message: String| {
+        if let Ok(mut guard) = failure.lock()
+            && guard.is_none()
+        {
+            *guard = Some(message);
+        }
+    };
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // The first tick completes immediately; the bootstrap record was just
+    // published, so skip it and re-sign one interval later.
+    ticker.tick().await;
+    let mut record_version = inputs.next_record_version;
+    let mut failing_since: Option<Instant> = None;
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => break,
+            _ = ticker.tick() => {
+                let now = Utc::now();
+                let mut round_failed = false;
+                for (identity, peer_endpoint) in &inputs.nodes {
+                    let signed = match authority.issuer.sign_membership_identity(
+                        &inputs.deployment_id,
+                        &inputs.deployment_incarnation,
+                        identity,
+                        MembershipLifetimeOptions {
+                            record_version,
+                            peer_endpoint: *peer_endpoint,
+                            now,
+                            lifetime: M7_MEMBERSHIP_LIFETIME,
+                        },
+                    ) {
+                        Ok(signed) => signed,
+                        Err(error) => {
+                            record_failure(format!(
+                                "re-signing membership for {}: {error}",
+                                identity.node_id
+                            ));
+                            return;
+                        }
+                    };
+                    if let Err(error) = publisher
+                        .publish_signed_membership_for_node(
+                            &identity.node_id,
+                            &signed.catalog_record(),
+                        )
+                        .await
+                    {
+                        // A deliberate Redis outage makes this fail for as long
+                        // as it lasts.  Retry on the next tick rather than
+                        // dying inside the scenario that paused it.
+                        round_failed = true;
+                        tracing::debug!(
+                            node_id = %identity.node_id,
+                            ?error,
+                            stage = "membership_resign_publish",
+                            "membership republish failed; retrying on the next interval"
+                        );
+                        break;
+                    }
+                }
+                if round_failed {
+                    let since = *failing_since.get_or_insert_with(Instant::now);
+                    let failing_for = since.elapsed();
+                    if failing_for > MEMBERSHIP_RESIGN_FAILURE_GRACE {
+                        record_failure(format!(
+                            "membership republish kept failing for {} seconds, which is longer \
+                             than one record lifetime",
+                            failing_for.as_secs()
+                        ));
+                        return;
+                    }
+                    // Retry sooner than the ordinary interval so a brief
+                    // deliberate outage is ridden out inside the grace rather
+                    // than consuming whole scheduled rounds.
+                    tokio::select! {
+                        _ = shutdown.cancelled() => break,
+                        () = sleep(MEMBERSHIP_RESIGN_RETRY_INTERVAL) => {}
+                    }
+                    continue;
+                }
+                failing_since = None;
+                record_version = record_version.saturating_add(1);
+            }
+        }
+    }
+}
+
 async fn peer_refresh_loop(
     membership: Arc<MembershipRuntime>,
     pins: SharedPeerPins,
@@ -5040,11 +5860,17 @@ async fn start_cli_smoke(
             }
         };
         if let Some(status) = status {
+            // Typed, not stringly: the CLI's exit code is its own closed
+            // diagnostic vocabulary, so a caller (the chaos gate) can classify
+            // this interruption instead of treating it as a harness failure.
+            let diagnostic_code = cli_diagnostic_code(&process.stdout(), &process.stderr());
             return Err(cleanup_cli_startup_failure(
                 process,
-                HarnessError::Process(format!(
-                    "tunnel-client CLI exited before production readiness: {status}"
-                )),
+                HarnessError::CliExitedBeforeReady {
+                    stage: "production",
+                    code: status.code(),
+                    diagnostic_code,
+                },
             )
             .await);
         }
@@ -5072,6 +5898,51 @@ async fn start_cli_smoke(
             }
         }
     }
+}
+
+/// Recognised `tunnel-client` diagnostic codes.  Only these are surfaced, so
+/// a CLI failure can never smuggle free text or payload into harness evidence.
+const CLI_DIAGNOSTIC_CODES: [&str; 12] = [
+    "INVALID_INVOCATION",
+    "CONFIG_ERROR",
+    "INVALID_CONFIG",
+    "CREDENTIAL_ERROR",
+    "CREDENTIAL_MISSING",
+    "CREDENTIAL_INVALID",
+    "CREDENTIAL_KEY_MISMATCH",
+    "CREDENTIAL_PERMISSIONS",
+    "CREDENTIAL_EXPIRED",
+    "CREDENTIAL_NOT_YET_VALID",
+    "TRANSPORT_ERROR",
+    "SUPERVISOR_ABSENT",
+];
+
+/// Extract the CLI's own typed diagnostic code from its `--json` output.
+///
+/// The CLI emits one JSON object per line with an optional `error.code`.  Only
+/// a code in [`CLI_DIAGNOSTIC_CODES`] is returned, as a `'static` constant, so
+/// the result is a closed vocabulary rather than captured process output.
+fn cli_diagnostic_code(stdout: &[u8], stderr: &[u8]) -> Option<&'static str> {
+    let mut found = None;
+    for stream in [stdout, stderr] {
+        for line in String::from_utf8_lossy(stream).lines() {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let Some(code) = value.get("error").and_then(|error| error.get("code")) else {
+                continue;
+            };
+            let Some(code) = code.as_str() else { continue };
+            if let Some(known) = CLI_DIAGNOSTIC_CODES
+                .iter()
+                .find(|candidate| **candidate == code)
+            {
+                // Keep the last emitted code: it is the terminal one.
+                found = Some(*known);
+            }
+        }
+    }
+    found
 }
 
 async fn cleanup_cli_startup_failure(
@@ -5856,9 +6727,9 @@ fn connect_failure_to_harness(error: StreamConnectFailure) -> HarnessError {
 mod tests {
     use super::{
         ConcurrentTenantIsolationEvidence, OwnerRaceEvidence, ProcessPauseProbeOutcome,
-        ProductionClusterEvidence, ROTATION_COUNT, RedisPartitionEvidence,
-        is_explicit_no_owner_response, is_partition_admission_response, is_peer_recovery_response,
-        redacted_admission_failure, validate_production_evidence,
+        ProductionClusterEvidence, ProductionLivenessEvidence, ROTATION_COUNT,
+        RedisPartitionEvidence, is_explicit_no_owner_response, is_partition_admission_response,
+        is_peer_recovery_response, redacted_admission_failure, validate_production_evidence,
         validate_redis_partition_evidence,
     };
     use crate::acceptance_test_support::{assert_failed, assert_rejected};
@@ -5884,7 +6755,36 @@ mod tests {
             stale_owner_rejected: true,
             key_revocation_rejected: true,
             owner_death_interrupted: true,
+            liveness: valid_liveness(),
             elapsed_seconds: 9,
+        }
+    }
+
+    fn valid_liveness() -> ProductionLivenessEvidence {
+        let lease = super::owner_lease_ms();
+        let minimum = super::heartbeat_minimum_interval().as_millis() as u64;
+        ProductionLivenessEvidence {
+            owner_lease_ms: lease,
+            heartbeat_minimum_interval_ms: minimum,
+            heartbeat_maximum_interval_ms: lease,
+            heartbeat_owner_tokens: 2,
+            heartbeat_round_trips: 3,
+            heartbeat_intervals: 3,
+            longest_heartbeat_run_intervals: 2,
+            observed_minimum_interval_ms: minimum + 10,
+            observed_maximum_interval_ms: minimum + 90,
+            heartbeat_intervals_within_bounds: true,
+            livez_probes: 3,
+            livez_live: 3,
+            readyz_probes: 3,
+            readyz_ready: 1,
+            readyz_unready: 2,
+            liveness_up_while_readiness_false: true,
+            cli_shutdown_join_bound_ms: super::CLI_SHUTDOWN_JOIN_BOUND.as_millis() as u64,
+            cli_shutdown_join_ms: 150,
+            cli_shutdown_joined_within_bound: true,
+            cli_shutdown_graceful_exit: true,
+            cli_shutdown_owner_released: true,
         }
     }
 
@@ -5993,6 +6893,55 @@ mod tests {
             let mut evidence = valid_evidence();
             mutate(&mut evidence);
             assert_rejected(validate_production_evidence(&evidence), name);
+        }
+    }
+
+    /// IN-10/OG-05: the production gate must fail when the heartbeat,
+    /// liveness/readiness or bounded-shutdown evidence is missing or
+    /// weakened, exactly like the isolation and race sub-gates.  Without
+    /// these the row's `records heartbeat/liveness and shutdown evidence`
+    /// clause is unasserted and the run only proves the gateway path.
+    #[test]
+    fn production_evidence_rejects_weakened_liveness_subgate() {
+        type Mutate = (&'static str, fn(&mut ProductionClusterEvidence));
+        let mutations: [Mutate; 7] = [
+            // The session stayed up but no heartbeat was ever counted.
+            ("counted owner-lease renewals", |e| {
+                e.liveness.heartbeat_round_trips = 0;
+                e.liveness.heartbeat_intervals = 0;
+                e.liveness.longest_heartbeat_run_intervals = 0;
+            }),
+            // A renewal landed outside the configured lease window.
+            ("escaped the configured window", |e| {
+                e.liveness.observed_maximum_interval_ms =
+                    e.liveness.heartbeat_maximum_interval_ms + 1;
+            }),
+            // The bound was invented instead of derived from the lease.
+            ("is not derived from owner_lease_ms", |e| {
+                e.liveness.heartbeat_minimum_interval_ms += 1;
+            }),
+            // Readiness never failed closed, so the two endpoints were never
+            // distinguished.
+            ("readyz_unready was zero", |e| {
+                e.liveness.readyz_probes = e.liveness.readyz_ready;
+                e.liveness.readyz_unready = 0;
+            }),
+            ("were never distinguished", |e| {
+                e.liveness.liveness_up_while_readiness_false = false;
+            }),
+            // The CLI ignored its interrupt and had to be force-killed.
+            ("force-killed rather than joined", |e| {
+                e.liveness.cli_shutdown_graceful_exit = false;
+            }),
+            // The measured join outran its bound.
+            ("exceeded its bound", |e| {
+                e.liveness.cli_shutdown_join_ms = e.liveness.cli_shutdown_join_bound_ms + 1;
+            }),
+        ];
+        for (expected, mutate) in mutations {
+            let mut evidence = valid_evidence();
+            mutate(&mut evidence);
+            assert_rejected(validate_production_evidence(&evidence), expected);
         }
     }
 

@@ -55,15 +55,19 @@ use crate::{
         PeerConsumerDiagnosticContext, PeerConsumerDiagnosticH3Code, PeerConsumerDiagnosticRole,
         PeerConsumerDiagnostics,
     },
-    peer_fault_diagnostics::{PeerFaultCause, PeerFaultDiagnostics, PeerFaultObserver},
+    peer_fault_diagnostics::{
+        DiagnosticStamp, PeerFaultCause, PeerFaultDiagnostics, PeerFaultObserver, TaskClosureCause,
+        TaskClosureScope, TaskClosureStage,
+    },
     peer_runtime::{PeerOpenDiagnosticStage, PeerRuntimeError, peer_readiness::PeerListenerState},
     peer_transport_diagnostics::{
         PeerTransportDiagnosticOutcome, PeerTransportDiagnosticRole, PeerTransportDiagnostics,
     },
     runtime::{
-        self, CarrierContext, RelayRotationSnapshot, RelaySessionSnapshot, RelaySnapshot,
-        RelayStreamSnapshot, RotationDeadlineEvent, RuntimeProfile, SessionTerminalEvent,
-        StreamTerminalCause, StreamTerminalEvent, StreamTerminalReceiptEvent,
+        self, CarrierContext, OwnerUnregisterEvent, OwnerUnregisterKind, RelayRotationSnapshot,
+        RelaySessionSnapshot, RelaySnapshot, RelayStreamSnapshot, RotationDeadlineEvent,
+        RuntimeProfile, SessionTerminalEvent, StreamTerminalCause, StreamTerminalEvent,
+        StreamTerminalReceiptEvent,
     },
     wire::{self, WireError},
 };
@@ -74,6 +78,14 @@ const AUTHORIZATION_LIFETIME: Duration = Duration::from_secs(5);
 /// narrower reasons mapped in `authorization_failure_code`, so it carries the
 /// existing `AUTHORIZATION_INVALIDATED` code rather than adding a new one.
 const CHALLENGE_MISMATCH_REASON: &str = "challenge mismatch";
+/// Reason returned for a device authorization request whose stream reached a
+/// terminal state while the request was outstanding.  The stream is already
+/// terminal here, so this answer changes no relay stream state; it exists so
+/// the connector learns the outcome of its own challenge immediately instead
+/// of holding the stream — and its admission slot — until its independent
+/// grant deadline expires.  It carries the existing `AUTHORIZATION_INVALIDATED`
+/// code like every other reason outside `authorization_failure_code`.
+const TERMINAL_STREAM_CHALLENGE_REASON: &str = "stream closed";
 const OWNER_LEASE_SAFETY_MARGIN: Duration = Duration::from_secs(5);
 const MAX_ECHO_RESPONSE_EXTRA_BYTES: usize = 256;
 const INITIAL_ATTACHMENT_PURPOSE: &str = "initial";
@@ -84,6 +96,10 @@ const RUNNING_RELAY_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 const TERMINAL_CLEANUP_QUEUE_CAPACITY: usize = 64;
 const MAX_ROTATION_DEADLINE_EVENTS: usize = 8;
 const MAX_SESSION_TERMINAL_EVENTS: usize = 16;
+/// Bound on retained owner-unregister tombstones.  Each entry is four small
+/// identifiers plus two integers, so the ring is fixed-size regardless of how
+/// many devices, sessions or carriers churn through the relay.
+const MAX_OWNER_UNREGISTER_EVENTS: usize = 32;
 const MAX_STREAM_TERMINAL_EVENTS: usize = 32;
 const MAX_STREAM_TERMINAL_RECEIPT_EVENTS: usize = 32;
 const OWNER_FORGET_FAILURE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1174,6 +1190,12 @@ impl QueueBudget {
         self.limit.saturating_sub(self.control_reserved)
     }
 
+    /// No data-lane headroom remains: any further data reservation, however
+    /// small, is refused.  Read-only; it charges and releases nothing.
+    fn data_exhausted(&self) -> bool {
+        self.used() >= self.data_limit()
+    }
+
     fn pressure(&self) -> &QueuePressure {
         &self.pressure
     }
@@ -1399,6 +1421,13 @@ struct M2Stream {
     /// pending.  It is applied to the deferred terminal transition once the
     /// connector admits the stream; a rejected OPEN never has a terminal.
     deferred_terminal_cause: Option<StreamTerminalCause>,
+    /// The head of the bounded relay-to-connector FIFO is parked because the
+    /// connector has not advertised enough cumulative send credit for the
+    /// complete record.  This is set only by the credit admission decision
+    /// and cleared only when that record is finally admitted, so a close can
+    /// attribute a delayed-credit terminal without inspecting queue depth.
+    /// It is payload-free and never changes when a record is emitted.
+    credit_held: bool,
     closed: CancellationToken,
     /// The public WebSocket upgrade owns this lease until Axum invokes its
     /// callback.  The actor tick expires an unclaimed lease so a client that
@@ -1833,6 +1862,7 @@ impl RelayHandle {
             control_registration_conflicts: 0,
             maintenance_cursor: None,
             rotation_deadline_events: VecDeque::new(),
+            owner_unregister_events: VecDeque::new(),
             session_terminal_events: VecDeque::new(),
             stream_terminal_events: VecDeque::new(),
             stream_terminal_receipt_events: VecDeque::new(),
@@ -2126,16 +2156,9 @@ impl RelayHandle {
         })?
     }
 
-    pub(crate) async fn close_echo_stream(
-        &self,
-        key: SessionKey,
-        stream_id: u64,
-        operation_id: String,
-    ) -> bool {
-        self.close_echo_stream_with_cause(key, stream_id, operation_id, None)
-            .await
-    }
-
+    /// Close one consumer stream, carrying the typed first cause the calling
+    /// handler proved at its own exit. `None` leaves the classification to
+    /// the actor's close site, which owns the queue and credit facts.
     pub(crate) async fn close_echo_stream_with_cause(
         &self,
         key: SessionKey,
@@ -2223,6 +2246,24 @@ impl RelayHandle {
         cause: PeerFaultCause,
     ) {
         observer.record_tuple(&self.peer_fault_diagnostics, stage, cause);
+    }
+
+    /// Record one bounded `(stage, cause)` closure tuple for a relay task
+    /// body that has reached its ordinary lifecycle end.
+    ///
+    /// EC-061: callers invoke this *before* handing the close to the actor,
+    /// so the tuple is on the shared diagnostic clock strictly before the
+    /// owner unregister it refers to is stamped.  It does not enter the actor
+    /// mailbox, take a session lock or perform I/O, so it cannot change when
+    /// the task ends or what it emits on the wire; it is attribution only.
+    pub(crate) fn record_task_closure(
+        &self,
+        scope: &TaskClosureScope,
+        stage: TaskClosureStage,
+        cause: TaskClosureCause,
+    ) -> DiagnosticStamp {
+        self.peer_fault_diagnostics
+            .record_closure(scope, stage, cause)
     }
 
     /// Redacted diagnostics for an internal harness.  No route exposes this
@@ -2416,6 +2457,7 @@ struct RelayActor {
     /// Bounded relay-local latches captured immediately before fail-closed
     /// session removal. These are diagnostics-only and never keep a session
     /// alive or change the close decision.
+    owner_unregister_events: VecDeque<OwnerUnregisterEvent>,
     session_terminal_events: VecDeque<SessionTerminalEvent>,
     /// Bounded stream terminal latches captured at the actual first terminal
     /// transition. They survive STREAM_FORGET/session removal so a snapshot
@@ -4354,6 +4396,7 @@ impl RelayActor {
                 open_pending: true,
                 registration_dropped: false,
                 deferred_terminal_cause: None,
+                credit_held: false,
                 closed: closed.clone(),
                 admission_lease: admission_lease.clone(),
                 admission_deadline,
@@ -5087,6 +5130,11 @@ impl RelayActor {
             .checked_add(record_len_u64)
             .is_some_and(|attempted| attempted <= send_direction.send_credit());
         if !record_fits_credit {
+            // Attribution only: the record is parked exactly as before, and
+            // this marker records *why* it is parked so a terminal reached
+            // while it is still parked can name delayed credit instead of a
+            // generic close.  It changes no admission or queue decision.
+            stream.credit_held = true;
             if stream.pending_records.len() >= max_pending_operations
                 || stream.pending_record_bytes.saturating_add(body.len()) > max_queue_bytes
                 || !reserve_m2_bytes(&queue_budget, stream, body.len())
@@ -5267,6 +5315,11 @@ impl RelayActor {
                 let queue_budget = session.queue_budget.clone();
                 let stream = session.streams.get_mut(&stream_id)?;
                 let pending = stream.pending_records.pop_front()?;
+                // The head record the credit decision parked is admitted now,
+                // so the delayed-credit marker no longer describes this
+                // stream.  `write_echo_stream_inner` re-arms it below if the
+                // next record is parked for credit again.
+                stream.credit_held = false;
                 stream.pending_record_bytes = stream.pending_record_bytes.saturating_sub(body_len);
                 release_m2_bytes(&queue_budget, stream, body_len);
                 Some(pending)
@@ -5304,6 +5357,14 @@ impl RelayActor {
         // OPENED (a real FIN) or REJECTED (a no-stream FORGET).  The actor
         // tick fails the fenced session closed if neither arrives by the
         // admission deadline.  Repeated closes are idempotent here.
+        //
+        // EC-061: the diagnostic clock is cloned out before any session
+        // borrow so both release sites below can stamp inside their borrow.
+        // Stamping is attribution only; it takes no session lock.
+        let fault_clock = self.peer_fault_diagnostics.clone();
+        let tenant_id = key.tenant_id;
+        let mut pending_unregister: Option<OwnerUnregisterEvent> = None;
+        let mut released_pending_open = false;
         if let Some(session) = self.session_mut(key) {
             let queue_budget = session.queue_budget.clone();
             if let Some(stream) = session.streams.get_mut(&stream_id)
@@ -5316,10 +5377,31 @@ impl RelayActor {
                 if stream.deferred_terminal_cause.is_none() {
                     stream.deferred_terminal_cause = cause;
                 }
+                // EC-061 ordering: every guard that decides this release has
+                // already passed, and the release is the next statement.  A
+                // closure tuple with a lower sequence is therefore provably
+                // recorded before this registration was dropped.  Stamping
+                // after the release would be unsound: a tuple recorded in the
+                // window between them would still compare as ordered.
+                pending_unregister = Some(Self::owner_unregister_event(
+                    &fault_clock,
+                    tenant_id,
+                    key,
+                    OwnerUnregisterKind::ConsumerStream,
+                ));
                 Self::release_echo_stream_state(stream, &queue_budget, false);
-                return true;
+                released_pending_open = true;
             }
         }
+        if let Some(event) = pending_unregister.take() {
+            self.retain_owner_unregister_event(event);
+        }
+        if released_pending_open {
+            return true;
+        }
+        // Set only by the terminal-frame refusal below, from state sampled at
+        // the refusal itself.
+        let mut queue_exhausted = false;
         let disposition = {
             let Some(session) = self.session_mut(key) else {
                 return true;
@@ -5360,6 +5442,21 @@ impl RelayActor {
             } else if Self::queue_stream_terminal_frame(session, stream_id, Terminal::Fin) {
                 TerminalDisposition::Emitted
             } else {
+                // Sampled at the refusal itself, not reconstructed later: a
+                // *live* carrier whose bounded writer slots or data-lane byte
+                // budget have no headroom is queue exhaustion.  A missing,
+                // closed or unencodable carrier is carrier loss, which this
+                // site deliberately leaves unclassified.
+                let carrier_live = session
+                    .data_tx
+                    .as_ref()
+                    .is_some_and(|data_tx| !data_tx.is_closed());
+                let slots_full = session
+                    .data_tx
+                    .as_ref()
+                    .is_some_and(|data_tx| data_tx.capacity() == 0);
+                let budget_full = session.queue_budget.data_exhausted();
+                queue_exhausted = carrier_live && (slots_full || budget_full);
                 TerminalDisposition::Failed
             }
         };
@@ -5388,22 +5485,61 @@ impl RelayActor {
         // connector's StreamForget proof removes a tombstone; no identity is
         // silently evicted while late frames remain possible.
         let mut transitioned = false;
+        // Sampled inside the same borrow that flips the terminal flag, before
+        // `release_echo_stream_state` drains the parked records, so the
+        // close-site facts are read from live state and not reconstructed.
+        let mut credit_held = false;
         if let Some(session) = self.session_mut(key) {
             let queue_budget = session.queue_budget.clone();
             if let Some(stream) = session.streams.get_mut(&stream_id)
                 && stream.operation_id == operation_id
             {
                 transitioned = !stream.terminal;
+                if transitioned {
+                    // EC-061 ordering: the first terminal transition is the
+                    // one that actually releases this stream's owner-side
+                    // registration.  Stamp here, after the guard that decides
+                    // it and before any of the release runs; a repeat close
+                    // releases nothing new and must not tombstone again.
+                    pending_unregister = Some(Self::owner_unregister_event(
+                        &fault_clock,
+                        tenant_id,
+                        key,
+                        OwnerUnregisterKind::ConsumerStream,
+                    ));
+                }
                 stream.terminal = true;
+                credit_held = stream.credit_held && !stream.pending_records.is_empty();
                 if !fin_queued {
                     stream.terminal_fin_failure = true;
                 }
                 Self::release_echo_stream_state(stream, &queue_budget, false);
             }
         }
+        if let Some(event) = pending_unregister {
+            self.retain_owner_unregister_event(event);
+        }
+        // A caller that proved a cause at its own close site always wins: the
+        // membership/route transition, the physical write deadline and the
+        // planned drain are established where they happen and are passed in.
+        // Only when no such proof exists does this site classify from the two
+        // facts it owns itself, in proximity order.  Anything else stays
+        // deliberately unclassified rather than guessing.
+        let close_site_cause = if queue_exhausted {
+            Some(StreamTerminalCause::QueueExhausted)
+        } else if credit_held {
+            Some(StreamTerminalCause::DelayedCredit)
+        } else {
+            None
+        };
         if transitioned
-            && let Some(event) =
-                self.stream_terminal_event(key, stream_id, operation_id, "STREAM_CLOSED", cause)
+            && let Some(event) = self.stream_terminal_event(
+                key,
+                stream_id,
+                operation_id,
+                "STREAM_CLOSED",
+                cause.or(close_site_cause),
+            )
         {
             self.retain_stream_terminal_event(event);
         }
@@ -7161,6 +7297,30 @@ impl RelayActor {
             .flatten()
     }
 
+    /// A stream whose settled receive cursor is above the fence the connector
+    /// attests for it.
+    fn fence_violation_at_frozen(
+        &self,
+        key: &SessionKey,
+        snapshot: &tunnel_protocol::rotation_control::FenceSnapshot,
+        direction: Direction,
+    ) -> Option<BeyondFenceObservation> {
+        let session = self.session_for(key)?;
+        snapshot
+            .entries
+            .iter()
+            .filter(|entry| entry.direction == direction)
+            .find_map(|entry| {
+                let stream = session.streams.get(&entry.stream_id)?;
+                let observed = stream.sequence.direction(direction).recv_contiguous();
+                (observed > entry.last_emitted).then_some(BeyondFenceObservation {
+                    stream_id: entry.stream_id,
+                    attested_fence: entry.last_emitted,
+                    observed_recv_contiguous: observed,
+                })
+            })
+    }
+
     async fn handle_rotate_frozen(
         &mut self,
         key: &SessionKey,
@@ -7189,6 +7349,34 @@ impl RelayActor {
         // Empty rosters therefore remain unambiguous and every non-empty
         // entry is checked by the pure state machine against this direction.
         let direction = Direction::ConnectorToRelay;
+        // M7-C66: the connector's attested fence is the first moment the relay
+        // learns what the connector claims it emitted on the old carrier. The
+        // forward check in `inbound_data` (M7-C65) can only refuse frames that
+        // arrive after FROZEN is processed, so a frame beyond the fence that
+        // raced ahead of it was admitted and advanced the receive cursor. That
+        // makes the connector's own attestation inconsistent with the relay's
+        // state, and the drain proof built from it unprovable.
+        //
+        // The check is deliberately retroactive rather than a forward bound.
+        // Before FROZEN there is no fence to compare against, and a connector
+        // legitimately flushes frames queued before its own freeze, so any
+        // bound derived from the relay's cursor at quiesce would reject exactly
+        // the in-flight frames the drain exists to receive. Comparing the
+        // settled receive cursor against the fence once it arrives rejects only
+        // the frames the connector says it never sent.
+        if let Some(violation) = self.fence_violation_at_frozen(key, &frozen.snapshot, direction) {
+            tracing::warn!(
+                device_id = %key.device_id,
+                session_id = %key.session_id,
+                epoch = key.epoch,
+                stream_id = violation.stream_id,
+                attested_fence = violation.attested_fence,
+                observed_recv_contiguous = violation.observed_recv_contiguous,
+                stage = "connector_frozen_beyond_fence",
+            );
+            self.protocol_failure(key, "FENCE_VIOLATION").await;
+            return;
+        }
         let result = self.with_rotation_mut(key, |_session, rotation| {
             rotation.state.frozen(
                 &frozen.attempt,
@@ -7720,6 +7908,41 @@ impl RelayActor {
             reason: runtime::terminal_close_reason(reason),
             cause,
         })
+    }
+
+    /// Stamp the diagnostic clock for an owner-state removal that is about to
+    /// happen, and build its bounded tombstone.
+    ///
+    /// EC-061 ordering: this MUST be called after every guard that decides the
+    /// removal will occur and immediately before the state is actually
+    /// removed.  Stamping earlier would tombstone a removal that never
+    /// happened; stamping later would weaken the proof, because a fault tuple
+    /// with a lower sequence could then have been recorded in the window
+    /// between the removal and the stamp.  The stamp itself performs no I/O
+    /// and takes no session lock, so it cannot change when the removal lands.
+    fn owner_unregister_event(
+        diagnostics: &PeerFaultDiagnostics,
+        tenant_id: Uuid,
+        key: &SessionKey,
+        kind: OwnerUnregisterKind,
+    ) -> OwnerUnregisterEvent {
+        let stamp = diagnostics.stamp();
+        OwnerUnregisterEvent {
+            sequence: stamp.sequence,
+            unregistered_at_ms: stamp.at_ms,
+            kind,
+            tenant_id: tenant_id.to_string(),
+            device_id: key.device_id.to_string(),
+            session_id: key.session_id.clone(),
+            epoch: key.epoch,
+        }
+    }
+
+    fn retain_owner_unregister_event(&mut self, event: OwnerUnregisterEvent) {
+        if self.owner_unregister_events.len() >= MAX_OWNER_UNREGISTER_EVENTS {
+            self.owner_unregister_events.pop_front();
+        }
+        self.owner_unregister_events.push_back(event);
     }
 
     fn retain_session_terminal_event(&mut self, event: SessionTerminalEvent) {
@@ -9492,6 +9715,11 @@ impl RelayActor {
         enum MismatchedChallenge {
             Pending,
             Stream,
+            /// The challenge names a stream that is already terminal.  It can
+            /// never be confirmed, and the connector is still holding the
+            /// stream while it waits for an answer, so it is refused with the
+            /// exact typed invalidation instead of being dropped.
+            TerminalStream,
         }
         let mut mismatched = None;
         let Some(session) = self.session_mut(&key) else {
@@ -9520,15 +9748,18 @@ impl RelayActor {
                 ))
             }
         } else if let Some(stream) = session.streams.get_mut(&message.stream_id) {
-            if stream.authorization_in_flight || stream.terminal {
+            if stream.authorization_in_flight {
                 return;
             }
             let expected_digest =
                 wire::permission_digest(&stream.grant, &stream.service_id.to_string());
-            if challenge.permission_digest != expected_digest
+            let identity_mismatch = challenge.permission_digest != expected_digest
                 || challenge.grant_revision != stream.grant.revision
-                || challenge.service_id != stream.service_id.to_string()
-            {
+                || challenge.service_id != stream.service_id.to_string();
+            if stream.terminal {
+                mismatched = Some(MismatchedChallenge::TerminalStream);
+                None
+            } else if identity_mismatch {
                 mismatched = Some(MismatchedChallenge::Stream);
                 None
             } else {
@@ -9568,6 +9799,13 @@ impl RelayActor {
                 ),
                 Some(MismatchedChallenge::Stream) => {
                     self.invalidate_stream_challenge(&key, &challenge, CHALLENGE_MISMATCH_REASON);
+                }
+                Some(MismatchedChallenge::TerminalStream) => {
+                    self.answer_terminal_stream_challenge(
+                        &key,
+                        &challenge,
+                        TERMINAL_STREAM_CHALLENGE_REASON,
+                    );
                 }
                 None => {}
             }
@@ -9934,6 +10172,25 @@ impl RelayActor {
                 )
             })
         else {
+            // The stream reached its terminal state while this authorization
+            // was in flight to the catalog.  The connector is still holding
+            // the stream open waiting for the answer to this exact challenge,
+            // so answer it instead of dropping it; see
+            // `answer_terminal_stream_challenge`.
+            let stranded = self
+                .session_for(&key)
+                .and_then(|session| session.streams.get(&challenge.stream_id))
+                .is_some_and(|stream| {
+                    stream.terminal
+                        && stream.challenge_id.as_deref() == Some(challenge.challenge_id.as_str())
+                });
+            if stranded {
+                self.answer_terminal_stream_challenge(
+                    &key,
+                    &challenge,
+                    TERMINAL_STREAM_CHALLENGE_REASON,
+                );
+            }
             return;
         };
         if challenge_id.as_deref() != Some(challenge.challenge_id.as_str()) {
@@ -10077,6 +10334,47 @@ impl RelayActor {
             "device authorization unavailable" => "DEVICE_AUTHORIZATION_UNAVAILABLE",
             _ => "AUTHORIZATION_INVALIDATED",
         }
+    }
+
+    /// Answer one device authorization request whose stream has already
+    /// reached a terminal state.
+    ///
+    /// A stream can go terminal while its challenge is still outstanding: the
+    /// public consumer registration is dropped, the unclaimed admission lease
+    /// expires, or the stream closes normally, all of which can land between
+    /// the connector's `AUTHORIZATION_CHALLENGE` and the relay's catalog
+    /// answer.  The relay releases its own admission slot at that terminal
+    /// transition, but the connector keeps the stream — and the slot it
+    /// charges against its own `max_streams` — until it learns the outcome of
+    /// its challenge; a silently dropped challenge therefore leaves the two
+    /// sides disagreeing about capacity for the connector's whole grant
+    /// deadline, and a replacement OPEN admitted by the relay is refused with
+    /// `RESOURCE_EXHAUSTED` by the connector.
+    ///
+    /// The invalidation is the same typed outcome the connector reaches on
+    /// its own deadline, delivered immediately and correlated to the exact
+    /// challenge.  The stream is already terminal, so no relay stream state
+    /// changes here: in particular this must not use
+    /// `invalidate_stream_challenge`, which would record FIN debt and arm the
+    /// fail-closed terminal-FIN deadline for a stream whose FIN was queued
+    /// normally.
+    fn answer_terminal_stream_challenge(
+        &mut self,
+        key: &SessionKey,
+        challenge: &DeviceChallenge,
+        reason: &str,
+    ) {
+        let _ = self.send_control(
+            key,
+            wire::authorization_invalidated(
+                &key.session_id,
+                key.epoch,
+                challenge.stream_id,
+                &challenge.challenge_id,
+                challenge.grant_revision,
+                reason,
+            ),
+        );
     }
 
     fn invalidate_stream_challenge(
@@ -11429,7 +11727,15 @@ impl RelayActor {
             })
             .unwrap_or_default();
         for (stream_id, operation_id) in expired_admissions {
-            let _ = self.close_echo_stream(key, stream_id, &operation_id);
+            // The filter above *is* the proof: an uncancelled admission lease
+            // whose absolute admission deadline has passed. Attribute the
+            // terminal to that lease instead of closing it generically.
+            let _ = self.close_echo_stream_with_cause(
+                key,
+                stream_id,
+                &operation_id,
+                Some(StreamTerminalCause::AdmissionLeaseExpired),
+            );
         }
     }
 
@@ -11551,10 +11857,17 @@ impl RelayActor {
         let mut candidate_abort: Option<(RotationAttemptIdentity, String, u64)> = None;
         let mut candidate_failure = false;
         let mut candidate_lost_after_deadline = false;
+        // EC-061: stamps are allocated inside the session borrow, immediately
+        // before the carrier registrations are cleared, and retained once the
+        // borrow ends.  The retained order does not matter -- the sequence
+        // each stamp carries is what orders it against the fault tuples.
+        let fault_clock = self.peer_fault_diagnostics.clone();
+        let mut unregisters: Vec<OwnerUnregisterEvent> = Vec::new();
         if let Some(session) = self.sessions.get_mut(&key.scope()) {
             if session.key != key {
                 return;
             }
+            let tenant_id = session.identity.tenant_id;
             let active = session
                 .active_carrier
                 .as_ref()
@@ -11572,11 +11885,26 @@ impl RelayActor {
                 return;
             }
             if active {
+                // Stamped before the two registrations below are dropped.
+                unregisters.push(Self::owner_unregister_event(
+                    &fault_clock,
+                    tenant_id,
+                    &key,
+                    OwnerUnregisterKind::DataCarrier,
+                ));
                 session.data_tx = None;
                 session.active_carrier = None;
                 active_lost = true;
             }
             if candidate && let Some(rotation) = session.rotation.as_mut() {
+                // Every branch below clears `rotation.candidate`; stamp once,
+                // here, before any of them runs.
+                unregisters.push(Self::owner_unregister_event(
+                    &fault_clock,
+                    tenant_id,
+                    &key,
+                    OwnerUnregisterKind::RotationCandidate,
+                ));
                 if rotation.recovery.is_some() {
                     // Recovery retries carry the immutable episode roster and
                     // close evidence into a fresh attempt.  They never reuse
@@ -11698,6 +12026,9 @@ impl RelayActor {
                     });
                 }
             }
+        }
+        for event in unregisters {
+            self.retain_owner_unregister_event(event);
         }
         if candidate_lost_after_deadline {
             // Mirror the maintenance tick exactly: latch the typed deadline
@@ -11825,9 +12156,25 @@ impl RelayActor {
         if let Some(event) = terminal_event {
             self.retain_session_terminal_event(event);
         }
+        // EC-061 ordering: stamp the shared diagnostic clock after the
+        // identity guard above has decided this session will be removed and
+        // immediately before the removal itself.  Any peer fault tuple with a
+        // lower sequence is therefore provably recorded before this
+        // unregister rather than merely coexisting with it.
+        let unregister = self.sessions.get(&key.scope()).map(|session| {
+            Self::owner_unregister_event(
+                &self.peer_fault_diagnostics,
+                session.identity.tenant_id,
+                key,
+                OwnerUnregisterKind::Session,
+            )
+        });
         let Some(mut session) = self.sessions.remove(&key.scope()) else {
             return;
         };
+        if let Some(event) = unregister {
+            self.retain_owner_unregister_event(event);
+        }
         // A successor session must never inherit a retryable FORGET identity.
         self.owner_forgets.remove(key);
         if session.closed {
@@ -11923,11 +12270,16 @@ impl RelayActor {
                 cause,
                 response,
             } => {
+                // Reaching this arm *is* the proof of a planned drain: the
+                // command queue is already closed and only terminal-shaped
+                // commands are completed here. A cause the closing handler
+                // proved for itself stays exactly as it was; only an
+                // otherwise unclassified close is named a planned drain.
                 let _ = response.send(self.close_echo_stream_with_cause(
                     &key,
                     stream_id,
                     &operation_id,
-                    cause,
+                    cause.or(Some(StreamTerminalCause::PlannedDrain)),
                 ));
             }
             Command::Shutdown(response) => {
@@ -12289,6 +12641,7 @@ impl RelayActor {
             peer_consumer_diagnostics: self.peer_consumer_diagnostics.snapshot(),
             peer_fault_diagnostics: self.peer_fault_diagnostics.snapshot(),
             rotation_deadline_events: self.rotation_deadline_events.iter().cloned().collect(),
+            owner_unregister_events: self.owner_unregister_events.iter().cloned().collect(),
             session_terminal_events: self.session_terminal_events.iter().cloned().collect(),
             stream_terminal_events: self.stream_terminal_events.iter().cloned().collect(),
             stream_terminal_receipt_events: self
@@ -12743,6 +13096,15 @@ pub struct RunningRelay {
     pub device_addr: std::net::SocketAddr,
 }
 
+/// Payload-free record of a receive cursor that sits above the connector's
+/// attested fence for the same stream.
+#[derive(Clone, Copy, Debug)]
+struct BeyondFenceObservation {
+    stream_id: u64,
+    attested_fence: u64,
+    observed_recv_contiguous: u64,
+}
+
 impl RunningRelay {
     /// Return the same redacted, in-process diagnostics as [`RelayHandle`].
     /// The listener wrapper intentionally adds no unauthenticated debug
@@ -12879,6 +13241,9 @@ pub struct ListenerSocketOptions {
     pub consumer_upgrade_barrier: Option<Arc<crate::http::ConsumerUpgradeBarrier>>,
     /// Optional fixture-only hold immediately before remote H3 admission.
     pub consumer_peer_admission_barrier: Option<Arc<crate::http::PeerAdmissionBarrier>>,
+    /// Optional one-shot fixture gate on an owner-local device control socket,
+    /// after the device's HELLO and before the WELCOME-producing registration.
+    pub device_control_attach_barrier: Option<Arc<crate::http::ControlAttachBarrier>>,
 }
 
 impl Relay {
@@ -13068,11 +13433,12 @@ impl Relay {
             listener_options.consumer_upgrade_barrier.clone(),
             listener_options.consumer_peer_admission_barrier.clone(),
         );
-        let device_router = http::device_router_with_peer(
+        let device_router = http::device_router_with_peer_and_barrier(
             handle.clone(),
             Some(catalog.clone()),
             options.limits.clone(),
             peer_runtime.clone(),
+            listener_options.device_control_attach_barrier.clone(),
         );
         let consumer_cancel = cancel.child_token();
         let device_cancel = cancel.child_token();
@@ -13136,10 +13502,11 @@ mod stream_identity_tests {
         AUTHORITY_UNAVAILABLE, CarrierKey, ChallengeAuthorizationResult, ControlOutbound,
         ControlRegistration, DataCarrier, DataOutbound, DataRegistration, DeviceChallenge,
         DeviceScope, DeviceSession, DispatchRequest, M2Stream, MAX_MAINTENANCE_AUTHORITY_IN_FLIGHT,
-        MAX_ROTATION_TOMBSTONES, MaintenanceAuthorityCategory, MaintenanceAuthorityFailure,
-        MaintenanceAuthorityOperation, QueueBudget, RecoveryRuntime, RelayActor, RelayError,
-        RelayHandle, RotationJournalDecision, RotationRuntime, SessionKey,
-        TerminalCleanupDispatcher, allocate_stream_id, maintenance_authority_category,
+        MAX_OWNER_UNREGISTER_EVENTS, MAX_ROTATION_TOMBSTONES, MaintenanceAuthorityCategory,
+        MaintenanceAuthorityFailure, MaintenanceAuthorityOperation, OwnerUnregisterKind,
+        PeerFaultCause, QueueBudget, RecoveryRuntime, RelayActor, RelayError, RelayHandle,
+        RotationJournalDecision, RotationRuntime, SessionKey, TerminalCleanupDispatcher,
+        allocate_stream_id, maintenance_authority_category,
     };
     use chrono::{Duration, Utc};
     use tokio::sync::{mpsc, oneshot};
@@ -13271,6 +13638,7 @@ mod stream_identity_tests {
                     open_pending: false,
                     registration_dropped: false,
                     deferred_terminal_cause: None,
+                    credit_held: false,
                     closed: tokio_util::sync::CancellationToken::new(),
                     admission_lease: tokio_util::sync::CancellationToken::new(),
                     admission_deadline: std::time::Instant::now()
@@ -13428,6 +13796,7 @@ mod stream_identity_tests {
                     open_pending: false,
                     registration_dropped: false,
                     deferred_terminal_cause: None,
+                    credit_held: false,
                     closed: tokio_util::sync::CancellationToken::new(),
                     admission_lease: tokio_util::sync::CancellationToken::new(),
                     admission_deadline: std::time::Instant::now()
@@ -13666,6 +14035,220 @@ mod stream_identity_tests {
         hello
     }
 
+    /// EC-061 correlation identity for a fault tuple raised against the owner
+    /// state the test is about to unregister.
+    fn ec061_fault_context(key: &SessionKey) -> crate::peer_fault_diagnostics::PeerFaultContext {
+        crate::peer_fault_diagnostics::PeerFaultContext {
+            tenant_id: key.tenant_id,
+            device_id: key.device_id,
+            session_id: Some(key.session_id.clone()),
+            owner_epoch: Some(key.epoch),
+            owner_node_id: Some("test-node".to_owned()),
+            service_id: None,
+            request_id: None,
+        }
+    }
+
+    fn ec061_identity(key: &SessionKey, now: chrono::DateTime<Utc>) -> DeviceIdentity {
+        DeviceIdentity {
+            tenant_id: key.tenant_id,
+            device_id: key.device_id,
+            owner_user_id: Uuid::from_u128(4),
+            credential_id: Uuid::from_u128(5),
+            spki_fingerprint: "test-spki".to_owned(),
+            credential_not_before: now - Duration::minutes(1),
+            expires_at: now + Duration::minutes(1),
+            credential_revoked_at: None,
+            device_active: true,
+            credential_active: true,
+            device_version: 1,
+            owner_epoch: 1,
+            last_seen_at: Some(now),
+        }
+    }
+
+    /// EC-061 ordering clause, data-carrier leg.  The relay records the peer
+    /// fault tuple and then unregisters the forwarded data carrier the tuple
+    /// refers to.  Both events draw from one diagnostic clock, so the ordering
+    /// is decidable instead of merely coexistent.
+    #[tokio::test]
+    async fn peer_fault_tuple_is_sequenced_before_the_data_carrier_it_refers_to_is_unregistered() {
+        let now = Utc::now();
+        let key = SessionKey {
+            tenant_id: Uuid::from_u128(1),
+            device_id: Uuid::from_u128(2),
+            session_id: "ec061-carrier".to_owned(),
+            epoch: 1,
+        };
+        let (mut actor, _registration) =
+            admitted_control_actor(ec061_identity(&key, now), key.clone());
+        let (data_tx, _data_rx) = mpsc::channel(actor.options.limits.max_queue_messages);
+        let carrier = CarrierKey {
+            session: key.clone(),
+            generation: 1,
+            connection_id: "ec061-carrier-data".to_owned(),
+        };
+        {
+            let session = actor.sessions.get_mut(&key.scope()).expect("test session");
+            session.data_tx = Some(data_tx.clone());
+            session.active_carrier = Some(DataCarrier {
+                context: carrier.context(),
+                tx: data_tx,
+            });
+        }
+
+        // This mirrors the owner-side peer data close path exactly: the
+        // record call precedes `disconnect_data` for the same carrier.
+        actor.peer_fault_diagnostics.record(
+            &ec061_fault_context(&key),
+            crate::peer_fault_diagnostics::PeerFaultRole::Owner,
+            crate::PeerOpenDiagnosticStage::Body,
+            PeerFaultCause::Closed,
+        );
+        actor.disconnect_data(carrier).await;
+
+        let session = actor.sessions.get(&key.scope()).expect("session retained");
+        assert!(
+            session.active_carrier.is_none() && session.data_tx.is_none(),
+            "the data carrier registration is actually gone"
+        );
+
+        let snapshot = actor.snapshot();
+        let unregister = snapshot
+            .owner_unregister_events
+            .iter()
+            .find(|event| {
+                event.kind == OwnerUnregisterKind::DataCarrier
+                    && event.session_id == key.session_id
+                    && event.device_id == key.device_id.to_string()
+                    && event.epoch == key.epoch
+            })
+            .expect("data carrier tombstone retained after the unregister");
+        let fault = snapshot
+            .peer_fault_diagnostics
+            .last_by_stage
+            .get("body")
+            .expect("fault tuple retained for the carrier");
+        assert_eq!(fault.session_id.as_deref(), Some(key.session_id.as_str()));
+        assert!(
+            fault.sequence < unregister.sequence,
+            "fault tuple {} must be sequenced before the unregister {} it refers to",
+            fault.sequence,
+            unregister.sequence,
+        );
+        assert!(
+            fault.observed_at_ms <= unregister.unregistered_at_ms,
+            "fault tuple timestamp {} must not follow the unregister timestamp {}",
+            fault.observed_at_ms,
+            unregister.unregistered_at_ms,
+        );
+    }
+
+    /// EC-061 ordering clause, session leg, with its own negative control: a
+    /// tuple recorded after the session is removed lands on the far side of
+    /// the same tombstone, so the assertion above is not vacuous.
+    #[tokio::test]
+    async fn session_unregister_separates_fault_tuples_recorded_before_and_after_it() {
+        let now = Utc::now();
+        let key = SessionKey {
+            tenant_id: Uuid::from_u128(1),
+            device_id: Uuid::from_u128(2),
+            session_id: "ec061-session".to_owned(),
+            epoch: 1,
+        };
+        let (mut actor, _registration) =
+            admitted_control_actor(ec061_identity(&key, now), key.clone());
+        let context = ec061_fault_context(&key);
+
+        actor.peer_fault_diagnostics.record(
+            &context,
+            crate::peer_fault_diagnostics::PeerFaultRole::Owner,
+            crate::PeerOpenDiagnosticStage::Body,
+            PeerFaultCause::Closed,
+        );
+        actor.close_session(&key, "CONTROL_CLOSED").await;
+        assert!(!actor.sessions.contains_key(&key.scope()));
+        // Negative control: the same tuple shape, recorded after the removal.
+        actor.peer_fault_diagnostics.record(
+            &context,
+            crate::peer_fault_diagnostics::PeerFaultRole::Owner,
+            crate::PeerOpenDiagnosticStage::Head,
+            PeerFaultCause::Closed,
+        );
+
+        let snapshot = actor.snapshot();
+        let unregister = snapshot
+            .owner_unregister_events
+            .iter()
+            .find(|event| {
+                event.kind == OwnerUnregisterKind::Session && event.session_id == key.session_id
+            })
+            .expect("session tombstone retained after removal");
+        let before = snapshot
+            .peer_fault_diagnostics
+            .last_by_stage
+            .get("body")
+            .expect("tuple recorded before the unregister");
+        let after = snapshot
+            .peer_fault_diagnostics
+            .last_by_stage
+            .get("head")
+            .expect("tuple recorded after the unregister");
+        assert!(
+            before.sequence < unregister.sequence,
+            "tuple {} recorded before the removal must precede the tombstone {}",
+            before.sequence,
+            unregister.sequence,
+        );
+        assert!(
+            after.sequence > unregister.sequence,
+            "tuple {} recorded after the removal must follow the tombstone {}; \
+             an assertion that cannot fail here proves nothing",
+            after.sequence,
+            unregister.sequence,
+        );
+        assert_eq!(unregister.tenant_id, key.tenant_id.to_string());
+        assert_eq!(unregister.epoch, key.epoch);
+    }
+
+    /// The tombstone ring is fixed-size: unbounded unregister churn cannot
+    /// grow the retained state.
+    #[test]
+    fn owner_unregister_tombstones_stay_bounded_under_churn() {
+        let now = Utc::now();
+        let key = SessionKey {
+            tenant_id: Uuid::from_u128(1),
+            device_id: Uuid::from_u128(2),
+            session_id: "ec061-churn".to_owned(),
+            epoch: 1,
+        };
+        let (mut actor, _registration) =
+            admitted_control_actor(ec061_identity(&key, now), key.clone());
+        let overflow = MAX_OWNER_UNREGISTER_EVENTS + 7;
+        for _ in 0..overflow {
+            let event = RelayActor::owner_unregister_event(
+                &actor.peer_fault_diagnostics,
+                key.tenant_id,
+                &key,
+                OwnerUnregisterKind::Session,
+            );
+            actor.retain_owner_unregister_event(event);
+        }
+        assert_eq!(
+            actor.owner_unregister_events.len(),
+            MAX_OWNER_UNREGISTER_EVENTS
+        );
+        // The ring keeps the newest window, and the sequence is monotonic.
+        let sequences: Vec<u64> = actor
+            .owner_unregister_events
+            .iter()
+            .map(|event| event.sequence)
+            .collect();
+        assert_eq!(sequences.first().copied(), Some(8));
+        assert_eq!(sequences.last().copied(), Some(overflow as u64));
+        assert!(sequences.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
     pub(super) fn admitted_control_actor(
         identity: DeviceIdentity,
         key: SessionKey,
@@ -13746,6 +14329,7 @@ mod stream_identity_tests {
             control_registration_conflicts: 0,
             maintenance_cursor: None,
             rotation_deadline_events: VecDeque::new(),
+            owner_unregister_events: VecDeque::new(),
             session_terminal_events: VecDeque::new(),
             stream_terminal_events: VecDeque::new(),
             stream_terminal_receipt_events: VecDeque::new(),
@@ -16148,6 +16732,167 @@ mod stream_identity_tests {
                 .is_some_and(|until| until <= projected_token_expiry),
             "dispatch gate must not outlive the consumer credential"
         );
+    }
+
+    /// A stream that goes terminal while its authorization is in flight must
+    /// still receive the answer to that exact challenge.  The relay releases
+    /// its admission slot at the terminal transition, but the connector holds
+    /// the stream — and the slot it charges against its own `max_streams` —
+    /// until the challenge it sent is answered.  Dropping the resolution
+    /// leaves the two sides disagreeing about capacity for the connector's
+    /// whole grant deadline, so a replacement OPEN the relay admits is
+    /// refused by the connector with `RESOURCE_EXHAUSTED`.
+    #[tokio::test]
+    async fn terminal_stream_challenge_resolution_is_answered_to_the_connector() {
+        let now = Utc::now();
+        let tenant_id = Uuid::from_u128(611);
+        let device_id = Uuid::from_u128(612);
+        let principal_id = Uuid::from_u128(613);
+        let service_id = Uuid::from_u128(614);
+        let identity = DeviceIdentity {
+            tenant_id,
+            device_id,
+            owner_user_id: principal_id,
+            credential_id: Uuid::from_u128(615),
+            spki_fingerprint: "terminal-challenge-spki".to_owned(),
+            credential_not_before: now - Duration::minutes(1),
+            expires_at: now + Duration::minutes(1),
+            credential_revoked_at: None,
+            device_active: true,
+            credential_active: true,
+            device_version: 1,
+            owner_epoch: 1,
+            last_seen_at: Some(now),
+        };
+        let consumer = AuthenticatedConsumer {
+            tenant_id,
+            principal_id,
+        };
+        let grant = GrantSnapshot {
+            tenant_id,
+            principal_id,
+            device_id,
+            service_id,
+            revision: 1,
+            permissions: PermissionSet {
+                operations: BTreeSet::from(["echo:invoke".to_owned()]),
+            },
+            constraints: serde_json::json!({}),
+            valid_until: now + Duration::minutes(1),
+            read_started_at: now,
+        };
+        let key = SessionKey {
+            tenant_id,
+            device_id,
+            session_id: "terminal-challenge".to_owned(),
+            epoch: 1,
+        };
+        let (mut actor, mut control) = admitted_control_actor(identity.clone(), key.clone());
+        let (data_tx, mut data_rx) = mpsc::channel(actor.options.limits.max_queue_messages);
+        let session = actor.sessions.get_mut(&key.scope()).expect("test session");
+        session.profile = super::RuntimeProfile::M2;
+        session.data_tx = Some(data_tx.clone());
+        session.active_carrier = Some(DataCarrier {
+            context: CarrierContext::new(
+                key.session_id.clone(),
+                key.epoch,
+                1,
+                "terminal-challenge-data".to_owned(),
+            ),
+            tx: data_tx,
+        });
+        let (open_tx, open_rx) = oneshot::channel();
+        actor.open_echo_stream(
+            consumer,
+            device_id,
+            service_id,
+            grant.clone(),
+            now + Duration::minutes(1),
+            open_tx,
+        );
+        let admitted = open_rx
+            .await
+            .expect("open response")
+            .expect("stream admitted");
+        drop(control.rx.try_recv().expect("OPEN queued"));
+        // The connector answered OPENED and raised its initial challenge, so
+        // the relay is waiting on the catalog for this exact challenge.
+        let challenge_id = "terminal-challenge-id";
+        let started_at_ms = super::monotonic_millis();
+        {
+            let stream = actor
+                .sessions
+                .get_mut(&key.scope())
+                .expect("test session")
+                .streams
+                .get_mut(&admitted.stream_id)
+                .expect("admitted stream");
+            stream.open_pending = false;
+            stream.authorization_in_flight = true;
+            stream.authorization_started_at_ms = Some(started_at_ms);
+            stream.authorization_deadline_ms = Some(started_at_ms + 2_000);
+            stream.challenge_id = Some(challenge_id.to_owned());
+        }
+        // The public consumer registration disappears while that catalog read
+        // is outstanding: the stream goes terminal and the relay releases its
+        // own admission slot.
+        assert!(actor.close_echo_stream(&key, admitted.stream_id, &admitted.operation_id));
+        assert!(actor.sessions[&key.scope()].streams[&admitted.stream_id].terminal);
+        assert!(data_rx.try_recv().is_ok(), "terminal FIN must be queued");
+        let owner_token = actor.sessions[&key.scope()].owner.clone();
+        actor.finish_stream_challenge(
+            key.clone(),
+            DeviceChallenge {
+                message_id: "terminal-challenge-auth".to_owned(),
+                stream_id: admitted.stream_id,
+                service_id: service_id.to_string(),
+                challenge_id: challenge_id.to_owned(),
+                nonce: "terminal-challenge-nonce".to_owned(),
+                permission_digest: super::wire::permission_digest(&grant, &service_id.to_string()),
+                grant_revision: grant.revision,
+                received_at: std::time::Instant::now(),
+                lifetime: std::time::Duration::from_secs(2),
+            },
+            Ok((
+                Some(grant.clone()),
+                Some(OwnerClaim {
+                    token: owner_token,
+                    lease_expires_at: now + Duration::minutes(1),
+                }),
+                Some(identity),
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(60)),
+            )),
+        );
+        let mut invalidated = None;
+        while let Ok(outbound) = control.rx.try_recv() {
+            if let ControlOutbound::Text(mut text) = outbound {
+                let message = super::wire::parse_control(text.as_bytes())
+                    .expect("queued control must decode");
+                text.release();
+                match message {
+                    ControlMessage::AuthorizationInvalidated(message) => {
+                        invalidated = Some(message);
+                    }
+                    ControlMessage::AuthorizationConfirmed(_) => {
+                        panic!("a terminal stream must never be confirmed");
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let invalidated =
+            invalidated.expect("a terminal stream's challenge must be answered, not dropped");
+        assert_eq!(invalidated.session_id, key.session_id);
+        assert_eq!(invalidated.epoch, key.epoch);
+        assert_eq!(invalidated.stream_id, admitted.stream_id);
+        assert_eq!(invalidated.challenge_id, challenge_id);
+        assert_eq!(invalidated.grant_revision, grant.revision);
+        // The answer reports the already-terminal stream; it must not invent
+        // FIN debt or arm the fail-closed terminal-FIN deadline for a stream
+        // whose FIN was queued normally above.
+        let session = &actor.sessions[&key.scope()];
+        assert!(!session.streams[&admitted.stream_id].terminal_fin_failure);
+        assert!(session.terminal_fin_failure_deadline.is_none());
     }
 
     #[tokio::test]

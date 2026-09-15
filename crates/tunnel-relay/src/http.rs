@@ -26,7 +26,7 @@ use tokio::{
     sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot},
     time::{timeout, timeout_at},
 };
-use tunnel_catalog::{DeviceListFilter, OidcVerifier, SharedCatalog};
+use tunnel_catalog::{DeviceListFilter, OidcError, OidcVerifier, SharedCatalog};
 use tunnel_protocol::{CONTROL_OWNER_BUSY_CLOSE_CODE, CONTROL_OWNER_BUSY_CLOSE_REASON};
 use tunnel_transport::{PeerTransportError, TlsIdentity};
 use uuid::Uuid;
@@ -188,6 +188,151 @@ impl ConsumerUpgradeBarrier {
             // The harness normally releases after observing the client
             // disconnect.  A bounded fallback prevents a fixture bug or
             // shutdown race from holding an HTTP admission task forever.
+            self.release();
+        }
+    }
+}
+
+/// One-shot fixture seam immediately after the device's `HELLO` has been
+/// received and parsed on an owner-local device control socket, and
+/// immediately before the relay registers the control stream and produces the
+/// `WELCOME`.  It mirrors [`ConsumerUpgradeBarrier`] exactly: it is optional,
+/// is `None` on every ordinary relay path, and changes no product behaviour
+/// when absent.  The harness can arm it, observe the exact server-side point
+/// between `HELLO` and `WELCOME`, change device ownership while the handler is
+/// held, and release, without relying on a timing sleep.
+///
+/// Like [`ConsumerUpgradeBarrier`] and unlike [`PeerAdmissionBarrier`], a
+/// released barrier is a *pass-through*, never a refusal: a later control
+/// attach observes the failed `ARMED -> HELD` transition and proceeds
+/// immediately.  It is nonetheless single-use, because `arm` only succeeds
+/// from `IDLE`, so a fixture must make its phase order explicit and hold the
+/// one control attach it actually intends to race.
+#[derive(Clone, Debug)]
+pub struct ControlAttachBarrier {
+    state: Arc<ControlAttachBarrierState>,
+}
+
+#[derive(Debug)]
+struct ControlAttachBarrierState {
+    /// One-shot state machine: idle -> armed -> held -> released, identical to
+    /// the consumer upgrade barrier so a stale second arm cannot reset the
+    /// state of a request already held between HELLO and WELCOME.
+    phase: AtomicU8,
+    hits: AtomicU64,
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+impl Default for ControlAttachBarrier {
+    fn default() -> Self {
+        Self {
+            state: Arc::new(ControlAttachBarrierState {
+                phase: AtomicU8::new(BARRIER_IDLE),
+                hits: AtomicU64::new(0),
+                reached: tokio::sync::Notify::new(),
+                release: tokio::sync::Notify::new(),
+            }),
+        }
+    }
+}
+
+impl ControlAttachBarrier {
+    /// Arm exactly one device control-attach interception.  A second arm is
+    /// rejected so a stale notification cannot be mistaken for the selected
+    /// control socket.
+    pub fn arm(&self) -> bool {
+        self.state
+            .phase
+            .compare_exchange(
+                BARRIER_IDLE,
+                BARRIER_ARMED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// Wait until the selected handler reaches the post-HELLO, pre-WELCOME
+    /// boundary.
+    pub async fn wait_reached(&self) {
+        loop {
+            if self.state.hits.load(Ordering::Acquire) != 0 {
+                return;
+            }
+            if self.state.phase.load(Ordering::Acquire) == BARRIER_RELEASED {
+                return;
+            }
+            let notified = self.state.reached.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.state.hits.load(Ordering::Acquire) != 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Release the held control attach.  The release is sticky, so a
+    /// cancellation/reordering race cannot strand the handler.
+    pub fn release(&self) {
+        let mut phase = self.state.phase.load(Ordering::Acquire);
+        loop {
+            match phase {
+                BARRIER_ARMED | BARRIER_HELD => {
+                    match self.state.phase.compare_exchange(
+                        phase,
+                        BARRIER_RELEASED,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    ) {
+                        Ok(_) => {
+                            self.state.release.notify_waiters();
+                            return;
+                        }
+                        Err(next) => phase = next,
+                    }
+                }
+                BARRIER_IDLE | BARRIER_RELEASED => return,
+                _ => return,
+            }
+        }
+    }
+
+    pub fn hit_count(&self) -> u64 {
+        self.state.hits.load(Ordering::Acquire)
+    }
+
+    /// Report whether the one-shot fixture handler is still holding the
+    /// control attach between HELLO and WELCOME.
+    pub fn is_held(&self) -> bool {
+        self.state.phase.load(Ordering::Acquire) == BARRIER_HELD
+    }
+
+    async fn wait_before_control_attach(&self, budget: Duration) {
+        if self
+            .state
+            .phase
+            .compare_exchange(
+                BARRIER_ARMED,
+                BARRIER_HELD,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return;
+        }
+        self.state.hits.fetch_add(1, Ordering::AcqRel);
+        self.state.reached.notify_waiters();
+        let notified = self.state.release.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if self.state.phase.load(Ordering::Acquire) != BARRIER_RELEASED
+            && timeout(budget, notified.as_mut()).await.is_err()
+        {
+            // A bounded fallback prevents a fixture bug or shutdown race from
+            // holding a device control task forever.
             self.release();
         }
     }
@@ -424,7 +569,8 @@ use tunnel_cluster::{
 
 use crate::{
     actor::{
-        ConsumerStreamRegistration, EchoOutcome, RelayError, RelayHandle, TerminalCleanupGuard,
+        CarrierKey, ConsumerStreamRegistration, EchoOutcome, RelayError, RelayHandle, SessionKey,
+        TerminalCleanupGuard,
     },
     config::RelayLimits,
     consumer_framing::{ConsumerRecordAssembler, ConsumerRecordCursor, ConsumerRecordLimit},
@@ -437,7 +583,10 @@ use crate::{
         PeerConsumerDiagnosticContext, PeerConsumerDiagnosticH3Code, PeerConsumerDiagnosticRole,
         classify_h3_code,
     },
-    peer_fault_diagnostics::{PeerFaultCause, PeerFaultContext, PeerFaultObserver, PeerFaultRole},
+    peer_fault_diagnostics::{
+        PeerFaultCause, PeerFaultContext, PeerFaultObserver, PeerFaultRole, TaskClosureCause,
+        TaskClosureScope, TaskClosureStage,
+    },
     peer_runtime::{
         InboundPeerRequest, OWNER_NOT_READY_RETRY_AFTER_MS, PeerExchangeRecv, PeerExchangeSend,
         PeerIngressHandler, PeerOpenDiagnostic, PeerOpenDiagnosticStage, PeerRuntime,
@@ -608,6 +757,11 @@ pub(crate) struct HttpState {
     /// Fixture-only one-shot gate after public readiness and exact owner-route
     /// resolution but before the remote H3 admission attempt.
     pub(crate) peer_admission_barrier: Option<Arc<PeerAdmissionBarrier>>,
+    /// Fixture-only one-shot gate on an owner-local device control socket,
+    /// after the device's HELLO is received and before the relay registers
+    /// the control stream and emits the WELCOME.  `None` on every ordinary
+    /// relay path, including every consumer route.
+    pub(crate) control_attach_barrier: Option<Arc<ControlAttachBarrier>>,
 }
 
 /// Build both public consumer and device WebSocket routes. Run this router
@@ -710,6 +864,7 @@ pub(crate) fn consumer_router_with_peer_and_barriers(
         peer,
         consumer_upgrade_barrier,
         peer_admission_barrier,
+        control_attach_barrier: None,
     };
     Router::new()
         .merge(health::router::<HttpState>(state.peer.clone()))
@@ -741,6 +896,20 @@ pub fn device_router_with_peer(
     limits: RelayLimits,
     peer: Option<Arc<PeerRuntime>>,
 ) -> Router {
+    device_router_with_peer_and_barrier(handle, catalog, limits, peer, None)
+}
+
+/// Build device routes with an optional fixture-only control-attach barrier.
+/// The barrier is deliberately separate from the ordinary device route so
+/// production callers keep the existing no-gate behaviour; passing `None`
+/// reproduces `device_router_with_peer` exactly.
+pub fn device_router_with_peer_and_barrier(
+    handle: RelayHandle,
+    catalog: Option<SharedCatalog>,
+    limits: RelayLimits,
+    peer: Option<Arc<PeerRuntime>>,
+    control_attach_barrier: Option<Arc<ControlAttachBarrier>>,
+) -> Router {
     let state = HttpState {
         handle,
         catalog,
@@ -757,6 +926,7 @@ pub fn device_router_with_peer(
         peer,
         consumer_upgrade_barrier: None,
         peer_admission_barrier: None,
+        control_attach_barrier,
     };
     Router::new()
         .route("/v1/tunnel/control", get(control))
@@ -874,13 +1044,8 @@ async fn echo(
         .await
     {
         Ok(value) => value,
-        Err(_) => {
-            return error_response(
-                StatusCode::UNAUTHORIZED,
-                "UNAUTHORIZED",
-                "consumer authentication failed",
-                "not_dispatched",
-            );
+        Err(error) => {
+            return consumer_authentication_response(&error);
         }
     };
     let device_id = match parse_uuid(&device) {
@@ -1238,13 +1403,8 @@ async fn echo_stream(
         .await
     {
         Ok(value) => value,
-        Err(_) => {
-            return error_response(
-                StatusCode::UNAUTHORIZED,
-                "UNAUTHORIZED",
-                "consumer authentication failed",
-                "not_dispatched",
-            );
+        Err(error) => {
+            return consumer_authentication_response(&error);
         }
     };
     let device_id = match parse_uuid(&device) {
@@ -1497,6 +1657,21 @@ async fn handle_consumer_stream(
     let stream_id = registration.stream_id;
     let operation_id = registration.operation_id.clone();
     let mut assembler = ConsumerRecordAssembler::new(STREAM_RECORD_LIMIT);
+    // The typed first cause this handler can prove for itself.  Only the
+    // relay's own physical response-write deadline is established here; every
+    // other exit stays unclassified so the actor's own close site keeps
+    // whatever it can prove.
+    let mut terminal_cause: Option<StreamTerminalCause> = None;
+    // EC-061: the bounded closure cause for this adapter.  It is distinct
+    // from `terminal_cause` above, which is the stream's typed terminal
+    // classification carried to the actor's close site and can stay `None`;
+    // this one always names the structural reason the adapter loop stopped.
+    // It is observational: no exit decision below reads it.
+    // Deliberately uninitialised: every exit from the loop below assigns a
+    // cause before it breaks, and leaving this without a default makes the
+    // compiler prove that rather than a comment claim it.  A new exit path
+    // that forgets to name its cause fails to compile.
+    let closure_cause: TaskClosureCause;
     let expires_in = (consumer_expires_at - Utc::now())
         .to_std()
         .unwrap_or_default();
@@ -1505,16 +1680,20 @@ async fn handle_consumer_stream(
     'connection: loop {
         let message = tokio::select! {
             biased;
-            _ = registration.closed.cancelled() => break,
-            _ = &mut expires => break,
+            _ = registration.closed.cancelled() => { closure_cause = TaskClosureCause::StreamClosed; break; }
+            _ = &mut expires => { closure_cause = TaskClosureCause::Expired; break; }
             message = socket.next() => message,
         };
         let Some(message) = message else {
+            closure_cause = TaskClosureCause::PeerClosed;
             break;
         };
         let message = match message {
             Ok(message) => message,
-            Err(_) => break,
+            Err(_) => {
+                closure_cause = TaskClosureCause::PeerClosed;
+                break;
+            }
         };
         match message {
             Message::Binary(bytes) => {
@@ -1528,6 +1707,7 @@ async fn handle_consumer_stream(
                         ingress = "local",
                         "consumer record rejected"
                     );
+                    closure_cause = TaskClosureCause::ProtocolError;
                     break 'connection;
                 }
                 loop {
@@ -1541,6 +1721,7 @@ async fn handle_consumer_stream(
                                 ingress = "local",
                                 "consumer record rejected"
                             );
+                            closure_cause = TaskClosureCause::ProtocolError;
                             break 'connection;
                         }
                     };
@@ -1566,15 +1747,22 @@ async fn handle_consumer_stream(
                     .await
                     {
                         BoundedStreamWrite::Completed(result) => result,
-                        BoundedStreamWrite::StreamClosed | BoundedStreamWrite::Expired => {
+                        BoundedStreamWrite::StreamClosed => {
+                            closure_cause = TaskClosureCause::StreamClosed;
+                            break 'connection;
+                        }
+                        BoundedStreamWrite::Expired => {
+                            closure_cause = TaskClosureCause::Expired;
                             break 'connection;
                         }
                         BoundedStreamWrite::PeerEvent(never) => match never {},
                     };
                     let Ok(response) = result else {
+                        closure_cause = TaskClosureCause::StreamFailed;
                         break 'connection;
                     };
                     if response.len() < 4 {
+                        closure_cause = TaskClosureCause::StreamFailed;
                         break 'connection;
                     }
                     let response_len =
@@ -1583,6 +1771,7 @@ async fn handle_consumer_stream(
                     if response_len > MAX_BODY_BYTES.saturating_add(MAX_ECHO_CANARY_BYTES)
                         || response_len.saturating_add(4) != response.len()
                     {
+                        closure_cause = TaskClosureCause::StreamFailed;
                         break 'connection;
                     }
                     let outcome =
@@ -1596,13 +1785,22 @@ async fn handle_consumer_stream(
                             ))
                             .await;
                     }
+                    // The stall itself is the proof, taken from the same
+                    // outcome the bounded diagnostic already counts. The
+                    // first such outcome wins; nothing about the loop's exit
+                    // decision below changes.
+                    if terminal_cause.is_none() {
+                        terminal_cause = outcome.terminal_cause();
+                    }
                     if !outcome.is_sent() {
+                        closure_cause = TaskClosureCause::WriteFailed;
                         break 'connection;
                     }
                 }
             }
             Message::Ping(payload) => {
                 if !send_socket(&mut socket, Message::Pong(payload)).await {
+                    closure_cause = TaskClosureCause::WriteFailed;
                     break;
                 }
             }
@@ -1610,17 +1808,66 @@ async fn handle_consumer_stream(
                 // Tungstenite queues the peer's close reply while reading.
                 // Flush it before dropping the upgraded TLS connection.
                 let _ = timeout(Duration::from_secs(5), socket.flush()).await;
+                closure_cause = TaskClosureCause::PeerClosed;
                 break;
             }
             Message::Pong(_) => {}
-            Message::Text(_) => break,
+            Message::Text(_) => {
+                closure_cause = TaskClosureCause::UnexpectedMessage;
+                break;
+            }
         }
     }
     let _ = send_socket(&mut socket, Message::Close(None)).await;
+    finish_consumer_task(
+        &handle,
+        key,
+        stream_id,
+        operation_id,
+        terminal_cause,
+        closure_cause,
+        &mut cleanup,
+    )
+    .await;
+}
+
+/// EC-061: the single exit of the public consumer stream adapter.
+///
+/// The closure tuple is recorded before the close command is sent, so it is
+/// strictly below the `ConsumerStream` unregister tombstone the actor stamps
+/// at the first terminal transition inside `close_echo_stream_with_cause`,
+/// where this stream's owner-side registration is actually released.
+///
+/// `terminal_cause` and the closure cause are deliberately separate.  The
+/// first is the stream's typed terminal classification and is allowed to stay
+/// `None` so the actor's own close site keeps whatever it can prove; the
+/// second always names why this adapter stopped.  Neither is read by any exit
+/// decision, and recording performs no I/O and enters no mailbox.
+#[allow(clippy::too_many_arguments)]
+async fn finish_consumer_task(
+    handle: &RelayHandle,
+    key: SessionKey,
+    stream_id: u64,
+    operation_id: String,
+    terminal_cause: Option<StreamTerminalCause>,
+    closure_cause: TaskClosureCause,
+    cleanup: &mut TerminalCleanupGuard,
+) {
+    handle.record_task_closure(
+        &TaskClosureScope {
+            tenant_id: key.tenant_id,
+            device_id: key.device_id,
+            session_id: key.session_id.clone(),
+            epoch: key.epoch,
+            stream_id: Some(stream_id),
+        },
+        TaskClosureStage::ConsumerStream,
+        closure_cause,
+    );
     if matches!(
         timeout(
             Duration::from_secs(5),
-            handle.close_echo_stream(key, stream_id, operation_id),
+            handle.close_echo_stream_with_cause(key, stream_id, operation_id, terminal_cause),
         )
         .await,
         Ok(true)
@@ -2002,14 +2249,35 @@ async fn authenticate(
             .map(|value| value.consumer),
         None => oidc.authenticate(&**catalog, authorization, None).await,
     }
-    .map_err(|_| {
-        error_response(
-            StatusCode::UNAUTHORIZED,
-            "UNAUTHORIZED",
-            "consumer authentication failed",
+    .map_err(|error| consumer_authentication_response(&error))
+}
+
+/// Map a consumer authentication failure onto its public response.
+///
+/// A credential the relay evaluated and rejected is `401 UNAUTHORIZED`.  A
+/// failure to reach the catalog is not: the credential was never evaluated, so
+/// reporting it as a rejection tells a consumer holding perfectly good
+/// credentials that they were refused, and is indistinguishable at the HTTP
+/// boundary from a real refusal.  That case takes the
+/// `AUTHORIZATION_UNAVAILABLE` boundary this module already defines for an
+/// absent catalog, which is the same condition reached a moment later.
+///
+/// Both remain `not_dispatched`: neither reaches an owner.
+fn consumer_authentication_response(error: &OidcError) -> Response {
+    if matches!(error, OidcError::Catalog(_)) {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "AUTHORIZATION_UNAVAILABLE",
+            "consumer authorization is unavailable",
             "not_dispatched",
-        )
-    })
+        );
+    }
+    error_response(
+        StatusCode::UNAUTHORIZED,
+        "UNAUTHORIZED",
+        "consumer authentication failed",
+        "not_dispatched",
+    )
 }
 
 fn bearer(headers: &HeaderMap) -> &str {
@@ -2241,7 +2509,23 @@ async fn cluster_readiness_gate(
 async fn handle_control_ingress(socket: WebSocket, identity: TlsIdentity, state: HttpState) {
     match remote_device_route(&state, &identity, true).await {
         Ok(Some((peer, route))) => {
-            if let Err(error) = handle_remote_device_control(socket, identity, peer, route).await {
+            // The forwarded attach is answered on its own request stream, and
+            // a duplicate exact-scope owner is answered `409 CONFLICT`.  That
+            // is the same refusal the owner-local path closes with
+            // `OWNER_BUSY`, so the device must see the same typed, bounded,
+            // non-retryable close whichever relay it reached.  Dropping the
+            // status here left a remote duplicate claim reporting an untyped
+            // transport failure while a local one reported the exact terminal
+            // diagnostic, for the same condition.
+            let mut socket = socket;
+            let forwarded = handle_remote_device_control(&mut socket, identity, peer, route).await;
+            if let Err(error) = forwarded {
+                if matches!(
+                    error,
+                    PeerRuntimeError::RemoteStatus(status) if status == StatusCode::CONFLICT
+                ) {
+                    let _ = send_socket(&mut socket, owner_busy_close()).await;
+                }
                 tracing::debug!(?error, "remote device control forwarding stopped");
             }
         }
@@ -2251,7 +2535,16 @@ async fn handle_control_ingress(socket: WebSocket, identity: TlsIdentity, state:
                 let _ = send_socket(&mut socket, Message::Close(None)).await;
                 return;
             }
-            handle_control(socket, identity, state.handle).await;
+            let control_attach_barrier = state.control_attach_barrier.clone();
+            let operation_timeout = state.limits.operation_timeout;
+            handle_control(
+                socket,
+                identity,
+                state.handle,
+                control_attach_barrier,
+                operation_timeout,
+            )
+            .await;
         }
         Err(error) => {
             tracing::debug!(?error, "device control owner lookup failed");
@@ -2299,7 +2592,7 @@ fn is_no_live_owner(error: &PeerRuntimeError) -> bool {
 }
 
 async fn handle_remote_device_control(
-    mut socket: WebSocket,
+    socket: &mut WebSocket,
     identity: TlsIdentity,
     peer: Arc<PeerRuntime>,
     route: OwnerRoute,
@@ -2337,7 +2630,7 @@ async fn handle_remote_device_control(
                         send.send_message(PeerRecordKind::CompleteControlText, text.as_bytes()).await?;
                     }
                     Message::Ping(payload) => {
-                        if !send_socket(&mut socket, Message::Pong(payload)).await { break; }
+                        if !send_socket(&mut *socket, Message::Pong(payload)).await { break; }
                     }
                     Message::Close(_) => break,
                     Message::Pong(_) => {}
@@ -2349,7 +2642,7 @@ async fn handle_remote_device_control(
                 match record.kind() {
                     PeerRecordKind::CompleteControlText => {
                         let text = record.as_text().map_err(PeerRuntimeError::Frame)?;
-                        if !send_socket(&mut socket, Message::Text(text.to_owned().into())).await { break; }
+                        if !send_socket(&mut *socket, Message::Text(text.to_owned().into())).await { break; }
                     }
                     PeerRecordKind::Close => break,
                     _ => break,
@@ -2359,7 +2652,7 @@ async fn handle_remote_device_control(
     }
     send.cancel();
     recv.cancel();
-    let _ = send_socket(&mut socket, Message::Close(None)).await;
+    let _ = send_socket(&mut *socket, Message::Close(None)).await;
     Ok(())
 }
 
@@ -2700,10 +2993,31 @@ async fn handle_peer_device_control(
         tunnel_protocol::ControlMessage::Hello(hello) => hello,
         _ => return Err(PeerRuntimeError::UnexpectedRecord(first.kind())),
     };
-    let registration = handle
-        .register_forwarded_control(device, spki, hello)
-        .await
-        .map_err(|_| PeerRuntimeError::Closed)?;
+    // A refused registration -- a duplicate owner claim, an unauthorized
+    // device, or a HELLO this cluster will not admit -- is an ordinary outcome
+    // of this request, not a peer protocol violation.  It must be answered on
+    // this request stream and finished, for the same reason the forwarded data
+    // attachment below must be: returning here without responding finishes the
+    // HTTP/3 request stream with no response headers, which the ingress
+    // relay's h3 client raises as a CONNECTION-level `H3_FRAME_UNEXPECTED`,
+    // tearing down the whole peer connection to this owner along with every
+    // other forwarded device carrier multiplexed on it.
+    let registration = match handle.register_forwarded_control(device, spki, hello).await {
+        Ok(registration) => registration,
+        Err(error) => {
+            // A duplicate exact-scope owner keeps its own status, because the
+            // local control path treats that refusal as its own typed outcome
+            // rather than folding it in with an unauthorized device.  Neither
+            // status carries session, owner, or device detail.
+            let status = if matches!(error, RelayError::OwnerBusy) {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::FORBIDDEN
+            };
+            send.respond(status).await?;
+            return send.finish().await;
+        }
+    };
     let key = registration.key.clone();
     let welcome = registration.welcome;
     let mut outbound = registration.rx;
@@ -2777,10 +3091,28 @@ async fn handle_peer_device_data(
         .or_else(|| ticket_record.as_text().ok()?.strip_prefix("bearer "))
         .ok_or(PeerRuntimeError::Closed)?
         .to_owned();
-    let registration = handle
-        .attach_forwarded_data(device, spki, ticket)
-        .await
-        .map_err(|_| PeerRuntimeError::Closed)?;
+    // A refused attachment -- a spent, unknown, or wrong-session attachment
+    // ticket -- is an ordinary outcome of this request, not a peer protocol
+    // violation.  It must be answered on this request stream and finished.
+    //
+    // Returning here without responding leaves the HTTP/3 request stream
+    // finished with no response headers, which the ingress relay's h3 client
+    // raises as a CONNECTION-level `H3_FRAME_UNEXPECTED`.  That tears down the
+    // whole peer connection to this owner and with it every other forwarded
+    // device carrier multiplexed on it, including healthy installed ones; the
+    // owner then sees those carriers vanish and closes their sessions with
+    // `RECOVERY_START_FAILED`.  One refused attachment must never cost another
+    // device its session.
+    let registration = match handle.attach_forwarded_data(device, spki, ticket).await {
+        Ok(registration) => registration,
+        Err(_) => {
+            // Forbidden, not unavailable: the ticket was refused on its merits
+            // and retrying the same attachment cannot succeed.  The status
+            // carries no ticket, session, or owner detail.
+            send.respond(StatusCode::FORBIDDEN).await?;
+            return send.finish().await;
+        }
+    };
     let carrier = registration.carrier.clone();
     let mut outbound = registration.rx;
     let mut cleanup = handle.data_cleanup_guard(carrier.clone());
@@ -3301,7 +3633,13 @@ async fn handle_peer_consumer_stream(
     result
 }
 
-async fn handle_control(mut socket: WebSocket, identity: TlsIdentity, handle: RelayHandle) {
+async fn handle_control(
+    mut socket: WebSocket,
+    identity: TlsIdentity,
+    handle: RelayHandle,
+    control_attach_barrier: Option<Arc<ControlAttachBarrier>>,
+    operation_timeout: Duration,
+) {
     let first = match timeout(Duration::from_secs(10), socket.next()).await {
         Ok(Some(Ok(Message::Text(text)))) => text,
         _ => return,
@@ -3310,6 +3648,11 @@ async fn handle_control(mut socket: WebSocket, identity: TlsIdentity, handle: Re
         Ok(value) => value,
         Err(_) => return,
     };
+    // Fixture-only seam strictly between the device's HELLO and the
+    // registration that produces its WELCOME.  Absent on every ordinary path.
+    if let Some(barrier) = control_attach_barrier.as_ref() {
+        barrier.wait_before_control_attach(operation_timeout).await;
+    }
     let registration = match handle.register_control(identity, hello).await {
         Ok(value) => value,
         Err(error) => {
@@ -3322,15 +3665,19 @@ async fn handle_control(mut socket: WebSocket, identity: TlsIdentity, handle: Re
     let key = registration.key.clone();
     let mut cleanup = handle.control_cleanup_guard(key.clone());
     if !send_socket(&mut socket, Message::Text(registration.welcome.into())).await {
-        if matches!(
-            timeout(Duration::from_secs(5), handle.disconnect_control(key)).await,
-            Ok(true)
-        ) {
-            cleanup.disarm();
-        }
+        finish_control_task(&handle, key, TaskClosureCause::WriteFailed, &mut cleanup).await;
         return;
     }
     let mut rx = registration.rx;
+    // EC-061: the closure cause for this task body.  Every exit from the loop
+    // below sets it before breaking, so the tuple names the structural reason
+    // the socket stopped rather than being reconstructed afterwards.  It is
+    // observational: no branch, timeout or wire emission depends on it.
+    // Deliberately uninitialised: every exit from the loop below assigns a
+    // cause before it breaks, and leaving this without a default makes the
+    // compiler prove that rather than a comment claim it.  A new exit path
+    // that forgets to name its cause fails to compile.
+    let closure_cause: TaskClosureCause;
     loop {
         tokio::select! {
             inbound = socket.next() => {
@@ -3338,11 +3685,16 @@ async fn handle_control(mut socket: WebSocket, identity: TlsIdentity, handle: Re
                     Some(Ok(Message::Text(text))) if text.len() <= MAX_CONTROL_BYTES => {
                         if let Ok(message) = wire::parse_control(text.as_bytes()) {
                             let _ = handle.inbound_control(key.clone(), message).await;
-                        } else { break; }
+                        } else { closure_cause = TaskClosureCause::ProtocolError; break; }
                     }
-                    Some(Ok(Message::Ping(payload))) => { if !send_socket(&mut socket, Message::Pong(payload)).await { break; } }
-                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
-                    _ => break,
+                    Some(Ok(Message::Ping(payload))) => { if !send_socket(&mut socket, Message::Pong(payload)).await { closure_cause = TaskClosureCause::WriteFailed; break; } }
+                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => { closure_cause = TaskClosureCause::PeerClosed; break; }
+                    // The guarded text arm above already took every in-window
+                    // control frame, so this arm is exactly the over-window
+                    // one.  It breaks as it always did; only the attribution
+                    // is new.
+                    Some(Ok(Message::Text(_))) => { closure_cause = TaskClosureCause::RecordTooLarge; break; }
+                    _ => { closure_cause = TaskClosureCause::UnexpectedMessage; break; }
                 }
             }
             outbound = rx.recv() => {
@@ -3351,9 +3703,9 @@ async fn handle_control(mut socket: WebSocket, identity: TlsIdentity, handle: Re
                         let (text, mut charge) = text.into_parts();
                         let sent = send_socket(&mut socket, Message::Text(text.into())).await;
                         charge.release();
-                        if !sent { break; }
+                        if !sent { closure_cause = TaskClosureCause::WriteFailed; break; }
                     }
-                    Some(crate::actor::ControlOutbound::Close) | None => { let _ = send_socket(&mut socket, Message::Close(None)).await; break; }
+                    Some(crate::actor::ControlOutbound::Close) | None => { let _ = send_socket(&mut socket, Message::Close(None)).await; closure_cause = TaskClosureCause::ServerClose; break; }
                 }
             }
         }
@@ -3362,6 +3714,35 @@ async fn handle_control(mut socket: WebSocket, identity: TlsIdentity, handle: Re
     // The actor may still hold a sender until it processes the disconnect.
     rx.close();
     while rx.try_recv().is_ok() {}
+    finish_control_task(&handle, key, closure_cause, &mut cleanup).await;
+}
+
+/// EC-061: the single exit of the owner-local control task.
+///
+/// The bounded closure tuple is recorded *before* the disconnect command is
+/// sent, so it is strictly below the `Session` unregister tombstone the actor
+/// stamps when `close_session` removes the session this key names.  Both
+/// statements live in one function precisely so the ordering is exercised by
+/// a regression instead of being asserted in prose.  Recording takes only the
+/// diagnostics mutex: it performs no I/O, enters no actor mailbox and takes
+/// no session lock, so it cannot change when the disconnect lands.
+async fn finish_control_task(
+    handle: &RelayHandle,
+    key: SessionKey,
+    cause: TaskClosureCause,
+    cleanup: &mut TerminalCleanupGuard,
+) {
+    handle.record_task_closure(
+        &TaskClosureScope {
+            tenant_id: key.tenant_id,
+            device_id: key.device_id,
+            session_id: key.session_id.clone(),
+            epoch: key.epoch,
+            stream_id: None,
+        },
+        TaskClosureStage::Control,
+        cause,
+    );
     if matches!(
         timeout(Duration::from_secs(5), handle.disconnect_control(key)).await,
         Ok(true)
@@ -3383,6 +3764,12 @@ async fn handle_data(
     let carrier = registration.carrier.clone();
     let mut cleanup = handle.data_cleanup_guard(carrier.clone());
     let mut rx = registration.rx;
+    // EC-061: see `handle_control`.  Every break below sets this first.
+    // Deliberately uninitialised: every exit from the loop below assigns a
+    // cause before it breaks, and leaving this without a default makes the
+    // compiler prove that rather than a comment claim it.  A new exit path
+    // that forgets to name its cause fails to compile.
+    let closure_cause: TaskClosureCause;
     loop {
         tokio::select! {
             inbound = socket.next() => {
@@ -3390,9 +3777,12 @@ async fn handle_data(
                     Some(Ok(Message::Binary(bytes))) if bytes.len() <= tunnel_protocol::frame::MAX_FRAME_LEN => {
                         let _ = handle.inbound_data(carrier.clone(), bytes.to_vec()).await;
                     }
-                    Some(Ok(Message::Ping(payload))) => { if !send_socket(&mut socket, Message::Pong(payload)).await { break; } }
-                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
-                    _ => break,
+                    Some(Ok(Message::Ping(payload))) => { if !send_socket(&mut socket, Message::Pong(payload)).await { closure_cause = TaskClosureCause::WriteFailed; break; } }
+                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => { closure_cause = TaskClosureCause::PeerClosed; break; }
+                    // The guarded binary arm above took every in-window data
+                    // frame, so this arm is exactly the over-window one.
+                    Some(Ok(Message::Binary(_))) => { closure_cause = TaskClosureCause::RecordTooLarge; break; }
+                    _ => { closure_cause = TaskClosureCause::UnexpectedMessage; break; }
                 }
             }
             outbound = rx.recv() => {
@@ -3401,18 +3791,43 @@ async fn handle_data(
                         let (bytes, mut charge) = bytes.into_parts();
                         let sent = send_socket(&mut socket, Message::Binary(bytes.into())).await;
                         charge.release();
-                        if !sent { break; }
+                        if !sent { closure_cause = TaskClosureCause::WriteFailed; break; }
                     }
                     Some(crate::actor::DataOutbound::Barrier(done)) => {
                         let _ = done.send(());
                     }
-                    Some(crate::actor::DataOutbound::Close) | None => { let _ = send_socket(&mut socket, Message::Close(None)).await; break; }
+                    Some(crate::actor::DataOutbound::Close) | None => { let _ = send_socket(&mut socket, Message::Close(None)).await; closure_cause = TaskClosureCause::ServerClose; break; }
                 }
             }
         }
     }
     rx.close();
     while rx.try_recv().is_ok() {}
+    finish_data_task(&handle, carrier, closure_cause, &mut cleanup).await;
+}
+
+/// EC-061: the single exit of the owner-local data carrier task.
+///
+/// The closure tuple is recorded before the disconnect command is sent, so it
+/// is strictly below the `DataCarrier` unregister tombstone the actor stamps
+/// in `disconnect_data_at` when it drops `data_tx` and `active_carrier`.
+async fn finish_data_task(
+    handle: &RelayHandle,
+    carrier: CarrierKey,
+    cause: TaskClosureCause,
+    cleanup: &mut TerminalCleanupGuard,
+) {
+    handle.record_task_closure(
+        &TaskClosureScope {
+            tenant_id: carrier.session.tenant_id,
+            device_id: carrier.session.device_id,
+            session_id: carrier.session.session_id.clone(),
+            epoch: carrier.session.epoch,
+            stream_id: None,
+        },
+        TaskClosureStage::Data,
+        cause,
+    );
     if matches!(
         timeout(Duration::from_secs(5), handle.disconnect_data(carrier)).await,
         Ok(true)
@@ -3580,6 +3995,19 @@ fn peer_failure_response(error: PeerRuntimeError) -> Response {
             "not_dispatched",
         ),
         PeerRuntimeError::Transport(PeerTransportError::GoAway) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "PEER_UNAVAILABLE",
+            "not_dispatched",
+        ),
+        // Every site that raises transport capacity does so strictly before
+        // anything is written to the owner: acquiring a connection permit,
+        // acquiring a stream permit on an existing connection, and the dial
+        // pool's destination bound.  The request cannot have reached the
+        // owner, so this is `not_dispatched`, and reporting it as `unknown`
+        // denied a consumer a retry it is entitled to make for a safe request.
+        // It stays `PEER_UNAVAILABLE`: from the consumer's side this ingress
+        // could not reach the owner at all.
+        PeerRuntimeError::Transport(PeerTransportError::Capacity) => (
             StatusCode::SERVICE_UNAVAILABLE,
             "PEER_UNAVAILABLE",
             "not_dispatched",
@@ -3768,10 +4196,10 @@ fn error_response(
 #[cfg(test)]
 mod tests {
     use super::{
-        ConsumerUpgradeBarrier, PeerAdmissionBarrier, PeerAdmissionBarrierError,
-        PeerAdmissionScope, forwarded_bearer_token, is_no_live_owner, method_not_allowed,
-        owner_busy_close, peer_consumer_diagnostic_outcome, peer_failure_response,
-        service_resolution_response, stream_limit_response,
+        ConsumerUpgradeBarrier, ControlAttachBarrier, PeerAdmissionBarrier,
+        PeerAdmissionBarrierError, PeerAdmissionScope, forwarded_bearer_token, is_no_live_owner,
+        method_not_allowed, owner_busy_close, peer_consumer_diagnostic_outcome,
+        peer_failure_response, service_resolution_response, stream_limit_response,
     };
     use crate::{
         peer_runtime::PeerRuntimeError,
@@ -3809,6 +4237,65 @@ mod tests {
         assert!(!barrier.is_held());
         waiter.await.expect("bounded barrier waiter");
         assert!(!barrier.arm());
+    }
+
+    #[tokio::test]
+    async fn control_attach_barrier_is_one_shot_and_bounded() {
+        let barrier = ControlAttachBarrier::default();
+        assert!(barrier.arm());
+        assert!(!barrier.arm());
+
+        let waiter = tokio::spawn({
+            let barrier = barrier.clone();
+            async move {
+                barrier
+                    .wait_before_control_attach(std::time::Duration::from_secs(1))
+                    .await;
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), barrier.wait_reached())
+            .await
+            .expect("control attach barrier should be reached");
+        assert_eq!(barrier.hit_count(), 1);
+        assert!(barrier.is_held());
+        assert!(!barrier.arm());
+        barrier.release();
+        assert!(!barrier.is_held());
+        waiter.await.expect("bounded control attach waiter");
+        assert!(!barrier.arm());
+    }
+
+    /// A released control-attach barrier is a pass-through, never a refusal:
+    /// a later control attach returns immediately and adds no hit.  This is
+    /// the property that makes the seam invisible to every control socket
+    /// other than the single one a fixture deliberately races.
+    #[tokio::test]
+    async fn released_control_attach_barrier_passes_later_attaches_through() {
+        let barrier = ControlAttachBarrier::default();
+        assert!(barrier.arm());
+        barrier.release();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            barrier.wait_before_control_attach(std::time::Duration::from_secs(30)),
+        )
+        .await
+        .expect("a released barrier must not hold a later control attach");
+        assert_eq!(barrier.hit_count(), 0);
+        assert!(!barrier.is_held());
+    }
+
+    /// An unarmed barrier holds nothing at all, so the seam cannot change
+    /// relay behaviour before a fixture arms it.
+    #[tokio::test]
+    async fn idle_control_attach_barrier_holds_nothing() {
+        let barrier = ControlAttachBarrier::default();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            barrier.wait_before_control_attach(std::time::Duration::from_secs(30)),
+        )
+        .await
+        .expect("an idle barrier must not hold a control attach");
+        assert_eq!(barrier.hit_count(), 0);
     }
 
     fn peer_admission_test_scope(seed: u128) -> PeerAdmissionScope {
@@ -4013,6 +4500,25 @@ mod tests {
         assert_eq!(capacity_body["code"], "STREAM_LIMIT");
         assert_eq!(capacity_body["execution"], "not_dispatched");
         assert_eq!(capacity_body["retryable"], true);
+
+        // Ingress-local transport capacity: every site that raises it does so
+        // before anything is written to the owner -- the connection permit,
+        // the per-connection stream permit, and the dial pool's destination
+        // bound -- so the request provably never reached the owner.  Reporting
+        // it as `unknown` claimed uncertainty the relay does not have and
+        // denied a consumer the retry a safe request is entitled to.
+        let transport_capacity = peer_failure_response(PeerRuntimeError::Transport(
+            tunnel_transport::PeerTransportError::Capacity,
+        ));
+        assert_eq!(transport_capacity.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let transport_capacity_body = axum::body::to_bytes(transport_capacity.into_body(), 1024)
+            .await
+            .expect("bounded transport capacity body");
+        let transport_capacity_body: serde_json::Value =
+            serde_json::from_slice(&transport_capacity_body)
+                .expect("transport capacity response JSON");
+        assert_eq!(transport_capacity_body["code"], "PEER_UNAVAILABLE");
+        assert_eq!(transport_capacity_body["execution"], "not_dispatched");
     }
 
     #[tokio::test]
@@ -4268,6 +4774,59 @@ mod peer_cleanup_tests;
 
 #[cfg(test)]
 mod pending_open_abandon_tests;
+
+#[cfg(test)]
+mod task_closure_tests;
+
+#[cfg(test)]
+mod consumer_authentication_status_tests {
+    use super::{StatusCode, consumer_authentication_response};
+    use tunnel_catalog::{CatalogError, OidcError};
+
+    #[tokio::test]
+    async fn a_catalog_failure_is_unavailable_not_a_credential_rejection() {
+        // The credential was never evaluated, so calling it rejected tells a
+        // consumer holding good credentials that they were refused, and is
+        // indistinguishable at the HTTP boundary from a real refusal.
+        let response = consumer_authentication_response(&OidcError::Catalog(
+            CatalogError::Conflict("catalog unreachable"),
+        ));
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .expect("bounded body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("response JSON");
+        assert_eq!(body["code"], "AUTHORIZATION_UNAVAILABLE");
+        assert_eq!(body["execution"], "not_dispatched");
+    }
+
+    #[tokio::test]
+    async fn an_evaluated_credential_is_still_rejected_as_unauthorized() {
+        // The other direction matters just as much: an availability status
+        // must not start swallowing genuine credential rejections.
+        for error in [
+            OidcError::InvalidToken,
+            OidcError::DisallowedAlgorithm,
+            OidcError::MissingKeyId,
+            OidcError::UnknownKey,
+            OidcError::InsufficientScope,
+            OidcError::UnknownConsumer,
+        ] {
+            let response = consumer_authentication_response(&error);
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "an evaluated credential failure must stay a rejection"
+            );
+            let body = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .expect("bounded body");
+            let body: serde_json::Value = serde_json::from_slice(&body).expect("response JSON");
+            assert_eq!(body["code"], "UNAUTHORIZED");
+            assert_eq!(body["execution"], "not_dispatched");
+        }
+    }
+}
 
 #[cfg(test)]
 mod tenant_admission_tests;

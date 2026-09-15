@@ -54,6 +54,12 @@ gate "catalog authority lane reconnect tests" \
 gate "catalog maintenance queue tests" \
   cargo test -p tunnel-catalog --test redis_maintenance_queue --locked -- --ignored --test-threads=1
 
+# The live-catalog Redis restart gate owns its own pinned loopback Redis and
+# restarts that process while one catalog stays connected to it, so it does not
+# touch TEST_REDIS_URL.  It requires Docker and must run from the repository root.
+gate "live-catalog Redis process restart refuses a changed run identifier" \
+  bash scripts/m7-redis-lane-restart-verify.sh
+
 gate "operator recovery CLI tests" \
   cargo test -p tunnel-relay --test recovery_cli --locked -- --test-threads=1
 gate "operator recovery workflow tests" \
@@ -102,12 +108,18 @@ gate "M7 transport acceptance" \
   cargo run --locked -p tunnel-test-harness -- verify-m7-transport
 gate "M7 authenticated peer body fragmentation and malformed records" \
   cargo run --locked -p tunnel-test-harness -- verify-m7-peer-fragmentation
+gate "M7 EC-044 reordered, duplicate and late frames through a real peer forward" \
+  cargo run --locked -p tunnel-test-harness -- verify-m7-ec044-peer-frames
+gate "M7 reserved control delivery and frame ordering on one saturated non-owner-ingress route" \
+  cargo run --locked -p tunnel-test-harness -- verify-m7-saturated-peer-frames
 gate "M7 Redis-backed cluster acceptance" \
   cargo run --locked -p tunnel-test-harness -- verify-m7-cluster
 gate "M7 production relay acceptance" \
   cargo run --locked -p tunnel-test-harness -- verify-m7-production
 gate "M7 synthetic Echo through actual CLI same-owner rotations" \
   cargo run --locked -p tunnel-test-harness -- verify-m7-i08-synthetic-rotation
+gate "M7 partly delivered maximum-size synthetic response across same-owner rotations" \
+  cargo run --locked -p tunnel-test-harness -- verify-m7-i08-partial-response-rotation
 gate "M7 planned retirement and unexpected active-carrier recovery/failure" \
   cargo run --locked -p tunnel-test-harness -- verify-m7-i08-rotation-faults
 gate "M7 three failed recovery attempts and second-attempt recovery" \
@@ -122,6 +134,8 @@ gate "M7 peer-key revocation during rotation acceptance" \
   cargo run --locked -p tunnel-test-harness -- verify-m7-key-rotation
 gate "M7 signed peer trust expiry after a missed invalidation hint" \
   cargo run --locked -p tunnel-test-harness -- verify-m7-trust-expiry
+gate "M7 membership convergence from the bounded refresh with the hint dropped" \
+  cargo run --locked -p tunnel-test-harness -- verify-m7-membership-hint-drop
 gate "M7 peer-route readiness loss and recovery acceptance" \
   cargo run --locked -p tunnel-test-harness -- verify-m7-peer-readiness
 gate "M7 occupied peer capacity and admitted-stream survival" \
