@@ -53,7 +53,7 @@ pub(super) struct DeviceHttpState {
     freeze: PauseController,
     /// Framing of the owner→device bytes received in order.
     request_tracker: RecordTracker,
-    cancel_received: bool,
+    pub(super) cancel_received: bool,
     task: Option<JoinHandle<()>>,
 }
 
@@ -126,7 +126,7 @@ impl WriteRoom {
 }
 
 impl DeviceHttpState {
-    fn new(
+    pub(super) fn new(
         notifier: ResetNotifier,
         receive_window: u64,
         freeze: PauseController,
@@ -278,9 +278,12 @@ impl M2Stream {
     /// its authorization would only emit a RESET after the FIN while the
     /// owner, having seen both terminals, is already reclaiming the stream —
     /// a RESET the owner never acknowledges, so the connector could never
-    /// prove the owner's STREAM_FORGET.
-    pub(super) fn http_exchange_settled(&self) -> bool {
-        if !self.is_http() || !self.output_fin || self.output_reset {
+    /// prove the owner's STREAM_FORGET.  `response_fin_deferred` reports a
+    /// response FIN already retained for the carrier behind a writer freeze
+    /// or a full queue: it follows every response byte in order, so the
+    /// exchange is settled just the same.
+    pub(super) fn http_exchange_settled(&self, response_fin_deferred: bool) -> bool {
+        if !self.is_http() || !(self.output_fin || response_fin_deferred) || self.output_reset {
             return false;
         }
         let received = self.sequence.direction(Direction::RelayToConnector);
@@ -292,6 +295,19 @@ impl M2Stream {
 }
 
 impl M2Actor {
+    /// Whether this HTTP exchange is settled (see
+    /// [`M2Stream::http_exchange_settled`]), counting a response FIN that is
+    /// retained for the carrier but not yet sequenced.
+    pub(super) fn http_stream_settled(&self, stream_id: u64) -> bool {
+        let fin_deferred = self
+            .pending_outputs
+            .iter()
+            .any(|output| output.stream_id == stream_id && output.kind == FrameKind::Fin);
+        self.streams
+            .get(&stream_id)
+            .is_some_and(|stream| stream.http_exchange_settled(fin_deferred))
+    }
+
     /// Build the HTTP state for an admitted stream and start its exchange
     /// task.  The handler is only invoked after a validated request head,
     /// which can only arrive after the stream's authorization is confirmed.
@@ -968,27 +984,31 @@ mod tests {
     fn only_an_exchange_with_both_fins_is_settled_for_authorization() {
         let (http, _, ()) = state();
         let mut stream = http_stream(Some(http));
-        assert!(!stream.http_exchange_settled(), "nothing ended yet");
+        assert!(!stream.http_exchange_settled(false), "nothing ended yet");
         let fin = Frame::fin(1, 1, 1, 1, 0);
         stream
             .sequence
             .receive_frame(Direction::RelayToConnector, &fin)
             .expect("request FIN");
         assert!(
-            !stream.http_exchange_settled(),
+            !stream.http_exchange_settled(false),
             "the response is still running and its writes need authorization"
         );
+        assert!(
+            stream.http_exchange_settled(true),
+            "a response FIN retained behind a freeze settles the exchange too"
+        );
         stream.output_fin = true;
-        assert!(stream.http_exchange_settled());
+        assert!(stream.http_exchange_settled(false));
         let mut upload = http_stream(Some(state().0));
         upload.output_fin = true;
         assert!(
-            !upload.http_exchange_settled(),
+            !upload.http_exchange_settled(false),
             "the request FIN has not arrived: request bytes may still need authorization"
         );
         stream.output_reset = true;
         assert!(
-            !stream.http_exchange_settled(),
+            !stream.http_exchange_settled(false),
             "a reset exchange is not settled"
         );
 
@@ -997,6 +1017,6 @@ mod tests {
         echo.sequence
             .receive_frame(Direction::RelayToConnector, &fin)
             .expect("request FIN");
-        assert!(!echo.http_exchange_settled(), "only HTTP streams");
+        assert!(!echo.http_exchange_settled(false), "only HTTP streams");
     }
 }
