@@ -182,12 +182,12 @@ Recoverable loss with retained outer sequence/parser state replays only missing 
 
 `crates/tunnel-http-forward` resolves the following points that the prose above leaves open. Each is peer-observable, so changing one is a protocol change.
 
-- **Header limits.** A HEAD payload is at most 16,384 bytes. A BODY payload is 1–65,528 bytes. An END payload is exactly zero bytes.
+- **Record payload limits.** A HEAD payload is 1–16,384 bytes; an empty HEAD is rejected. A BODY payload is 1–65,528 bytes. An END payload is exactly zero bytes.
 - **Forbidden headers → `HTTP_INVALID_HEAD`.** These are rejected in both directions, and no policy can allow them: `host`, `connection`, `keep-alive`, `proxy-connection`, `content-length`, `authorization`, `proxy-authorization`, `proxy-authenticate`, `cookie`, `set-cookie`, and the `x-agent-tunnel-*` prefix.
 - **Forwarded identity headers.** These are forbidden in the same way. The enumerated set is `forwarded`, `via`, `x-real-ip`, `x-client-ip`, `true-client-ip`, `cf-connecting-ip`, and the `x-forwarded-*` prefix.
 - **Unsupported headers → `HTTP_UNSUPPORTED_FEATURE`.** These are also rejected unconditionally and cannot be allowed: `transfer-encoding`, `te`, `trailer`, `upgrade`, and `expect`. A consumer HTTP version that the selected policy does not accept also maps to `HTTP_UNSUPPORTED_FEATURE`.
 - **Header values.** The codec rejects a value with leading or trailing space or tab; it does not trim. Ingress trims boundary optional whitespace once, as required above, before it encodes the head.
-- **Header ordering.** Names and values are checked first (lowercase token characters; printable ASCII or tab), then the 32-field and 8 KiB totals. The forbidden and unsupported classification runs next, before the allowlist lookup.
+- **Header ordering.** The 32-field count is checked first. Then, per field in order: the name (lowercase token characters), the value (printable ASCII or tab), the running 8 KiB total, the forbidden and unsupported classification, the allowlist lookup, and the singleton repeat check.
 - **Query alphabet.** Raw query bytes are RFC 3986 query characters, excluding `+` (form-decoding ambiguity) and `;` (legacy separator ambiguity).
 - **Query pairs.** Pairs are split on `&`, and an empty pair is rejected. Only the first `=` separates key from value. A later `=` is value data, so base64 padding such as `cursor=YWJjZA==` is accepted.
 - **Query keys.** Keys must be literal: a percent-encoded key is rejected even if it decodes to an allowed name. The decoded key is compared ASCII-case-insensitively against a credential list that no policy can allow: `access_token`, `id_token`, `refresh_token`, `token`, `api_key`, `apikey`, `api-key`, `key`, `password`, `passwd`, `secret`, `client_secret`, `auth`, `authorization`, `session_token`, `x-amz-security-token`, `x-amz-signature`, `sig`, and `signature`.
