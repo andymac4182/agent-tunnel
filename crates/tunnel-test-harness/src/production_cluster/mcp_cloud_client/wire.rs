@@ -205,6 +205,9 @@ pub struct WireCounts {
     pub standalone_refused: u64,
     /// GET attempts without a session (stateless response resumption).
     pub resume_attempts: u64,
+    /// The `seq` field of each `notifications/message` log in wire arrival
+    /// order, across every stream of the client.
+    pub log_seqs: Vec<u64>,
     /// `notifications/message` events on POST response streams.
     pub logs_on_request_streams: u64,
     /// `notifications/message` events on standalone GET streams.
@@ -323,6 +326,9 @@ impl WireLedger {
                     }
                 }
                 if value.get("id").is_none() && method == "notifications/message" {
+                    if let Some(seq) = value["params"]["data"]["seq"].as_u64() {
+                        inner.counts.log_seqs.push(seq);
+                    }
                     if standalone {
                         inner.counts.logs_on_standalone_streams += 1;
                     } else {

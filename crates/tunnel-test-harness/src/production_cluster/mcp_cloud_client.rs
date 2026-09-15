@@ -162,8 +162,13 @@ pub struct DiscoveryEvidence {
 pub struct NotificationEvidence {
     pub progress_values: Vec<u64>,
     pub progress_result_exact: bool,
+    /// The `seq` of every log the client handler received, sorted: rmcp may
+    /// run notification handlers concurrently, so only the wire order in
+    /// `wire.log_seqs` is ordering evidence.
     pub log_seqs: Vec<u64>,
     pub log_data_exact: bool,
+    /// Whether the handler also saw the logs in order (reported only).
+    pub log_handler_order_exact: bool,
     pub log_result_exact: bool,
     pub wire: WireCounts,
 }
@@ -471,8 +476,9 @@ pub fn validate_mcp_cloud_client_evidence(evidence: &McpCloudClientEvidence) -> 
                     && n.progress_result_exact,
             ),
             (
-                format!("{name} notifications: ordered log messages"),
+                format!("{name} notifications: every log message, in wire order"),
                 n.log_seqs == (0..LOG_COUNT).collect::<Vec<_>>()
+                    && n.wire.log_seqs == (0..LOG_COUNT).collect::<Vec<_>>()
                     && n.log_data_exact
                     && n.log_result_exact,
             ),
@@ -1357,12 +1363,20 @@ impl Gate<'_> {
                 .wait_for(WAIT, |handler| handler.logs().len() as u64 >= LOG_COUNT)
                 .await;
             let logs = handler.logs();
-            evidence.log_seqs = logs
+            let received = logs
                 .iter()
                 .filter_map(|data| data["seq"].as_u64())
-                .collect();
-            evidence.log_data_exact = logs.len() as u64 == LOG_COUNT
-                && logs.iter().enumerate().all(|(index, data)| {
+                .collect::<Vec<_>>();
+            evidence.log_handler_order_exact = received == (0..LOG_COUNT).collect::<Vec<_>>();
+            evidence.log_seqs = {
+                let mut sorted = received;
+                sorted.sort_unstable();
+                sorted
+            };
+            let mut sorted_logs = logs.clone();
+            sorted_logs.sort_by_key(|data| data["seq"].as_u64().unwrap_or(u64::MAX));
+            evidence.log_data_exact = sorted_logs.len() as u64 == LOG_COUNT
+                && sorted_logs.iter().enumerate().all(|(index, data)| {
                     *data == tunnel_mcp_fixture::log_data(&label, index as u64)
                 });
             Ok::<_, HarnessError>(())
@@ -2250,8 +2264,10 @@ mod tests {
                 progress_result_exact: true,
                 log_seqs: (0..LOG_COUNT).collect(),
                 log_data_exact: true,
+                log_handler_order_exact: true,
                 log_result_exact: true,
                 wire: WireCounts {
+                    log_seqs: (0..LOG_COUNT).collect(),
                     logs_on_request_streams: if current { LOG_COUNT } else { 0 },
                     logs_on_standalone_streams: if current { 0 } else { LOG_COUNT },
                     standalone_opened: u64::from(!current),
@@ -2451,8 +2467,11 @@ mod tests {
             ("progress result", |e| {
                 e.combos[0].notifications.progress_result_exact = false;
             }),
-            ("log order", |e| {
-                e.combos[1].notifications.log_seqs.swap(0, 1)
+            ("log seq missing", |e| {
+                e.combos[1].notifications.log_seqs.pop();
+            }),
+            ("log wire order", |e| {
+                e.combos[1].notifications.wire.log_seqs.swap(0, 1);
             }),
             ("log data", |e| {
                 e.combos[1].notifications.log_data_exact = false
