@@ -111,6 +111,9 @@ pub struct RelayStreamSnapshot {
     /// authoritative admission check.  This is deliberately a closed,
     /// payload-free code rather than the internal reason string.
     pub authorization_failure_code: Option<&'static str>,
+    /// Live record-position and holding counters for an `http-forward/1`
+    /// stream; absent for every other stream.
+    pub http: Option<crate::http_forward_diagnostics::RelayHttpStreamSnapshot>,
 }
 
 /// Payload-free transient rotation evidence for bounded acceptance probes.

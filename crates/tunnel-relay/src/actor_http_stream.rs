@@ -1,9 +1,9 @@
 //! Owner-actor support for `http-forward/1` logical streams (implementation
-//! gate 3 of docs/http-forwarding.md).
+//! gates 3 and 4 of docs/http-forwarding.md).
 //!
 //! An HTTP stream reuses the M2 stream admission, authorization challenge,
 //! sequence, replay, rotation-freeze and FORGET machinery of the consumer
-//! echo stream.  It differs in four ways:
+//! echo stream.  It differs in these ways:
 //!
 //! * DATA carries raw `http-forward/1` record bytes: no length prefix, and a
 //!   write resolves when its chunk is sequenced (or parks for send credit or
@@ -20,12 +20,23 @@
 //!   retained for the reader.  A close that cannot prove both directions
 //!   finished emits `RESET(CANCELLED)`, never a FIN, so truncation can never
 //!   look like completion.
+//! * Gate 4: the owner follows the record framing of what it sequenced and
+//!   what it received (headers only, never payload), publishes its rotation
+//!   freeze to the exchange tasks so their progress budgets pause, captures
+//!   each HTTP stream's record position when it freezes for a scheduled
+//!   rotation, and sends a scoped control `CANCEL` when a local
+//!   `RESET(CANCELLED)` has to wait behind that freeze.
 
 use tokio::sync::watch;
+use tunnel_http_bridge::{PauseController, PauseSignal};
+use tunnel_http_forward::{RecordTracker, TrackerSnapshot};
 use tunnel_protocol::{ResultDetail, reset_reason};
 
 use super::*;
-use crate::http_forward_diagnostics::HttpOwnerStreamRecord;
+use crate::http_forward_diagnostics::{
+    HttpForgetRecord, HttpOwnerStreamRecord, HttpRecordPosition, HttpRotationObservation,
+    RelayHttpStreamSnapshot,
+};
 
 /// The OPEN operation name for an HTTP forwarding stream.
 pub(crate) const HTTP_FORWARD_STREAM_OPERATION: &str = "http_forward";
@@ -48,6 +59,32 @@ pub(crate) enum HttpRead {
     Closed,
 }
 
+/// What the actor does with one read request, decided from stream state
+/// alone.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum ReadStep {
+    /// Answer immediately.
+    Reply(HttpRead),
+    /// Deliver this chunk; its bytes are now owed as receive credit.
+    Chunk(Vec<u8>),
+    /// Nothing to deliver yet: park the reader.
+    Park,
+}
+
+/// The owner's record position and holdings when it froze its writer for a
+/// scheduled rotation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct HttpFreezeCapture {
+    pub(crate) request: TrackerSnapshot,
+    pub(crate) request_fin_sequenced: bool,
+    pub(crate) response: TrackerSnapshot,
+    pub(crate) response_fin_received: bool,
+    pub(crate) parked_bytes: usize,
+    pub(crate) receive_buffered: usize,
+    pub(crate) deferred_terminal: Option<&'static str>,
+    pub(crate) frozen_last_emitted: u64,
+}
+
 /// Per-stream HTTP state on the owner.
 pub(crate) struct HttpStreamState {
     chunks: VecDeque<Vec<u8>>,
@@ -67,7 +104,25 @@ pub(crate) struct HttpStreamState {
     local_reset: Option<u16>,
     reset_tx: watch::Sender<Option<HttpPeerReset>>,
     status_tx: watch::Sender<Option<ResultDetail>>,
+    freeze_tx: PauseController,
     recorded: bool,
+    /// Framing of the owner→device bytes actually sequenced.
+    request_tracker: RecordTracker,
+    /// Framing of the device→owner bytes received in order.
+    response_tracker: RecordTracker,
+    request_fin_sequenced: bool,
+    reset_sequence: Option<(u64, u64)>,
+    reset_deferred_by_freeze: bool,
+    cancel_sent: bool,
+    freeze_capture: Option<HttpFreezeCapture>,
+}
+
+/// The watchers an HTTP ingress task receives with its registration.
+pub(crate) struct HttpStreamWatchers {
+    pub(crate) peer_reset: watch::Receiver<Option<HttpPeerReset>>,
+    pub(crate) result_status: watch::Receiver<Option<ResultDetail>>,
+    /// Paused while this owner's writer is frozen for rotation or recovery.
+    pub(crate) freeze: PauseSignal,
 }
 
 /// The registration an HTTP ingress task receives.
@@ -75,16 +130,33 @@ pub(crate) struct HttpStreamRegistration {
     pub(crate) base: ConsumerStreamRegistration,
     pub(crate) peer_reset: watch::Receiver<Option<HttpPeerReset>>,
     pub(crate) result_status: watch::Receiver<Option<ResultDetail>>,
+    pub(crate) freeze: PauseSignal,
+}
+
+/// What `reset_http_stream` did.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct HttpResetOutcome {
+    /// The RESET was queued, deferred in order, or already present.
+    pub(crate) accepted: bool,
+}
+
+/// Actor-wide HTTP bookkeeping done between commands.
+#[derive(Debug, Default)]
+pub(crate) struct HttpMaintenance {
+    /// Sessions whose required HTTP `CANCEL` could not be queued, collected
+    /// where the send was refused and fenced after the command.
+    pub(crate) cancel_undeliverable: Vec<SessionKey>,
+    /// How many sessions had their HTTP streams visited to re-publish a
+    /// freeze transition (a local counter for regression tests).
+    pub(crate) freeze_stream_scans: u64,
 }
 
 impl HttpStreamState {
-    pub(crate) fn new() -> (
-        Self,
-        watch::Receiver<Option<HttpPeerReset>>,
-        watch::Receiver<Option<ResultDetail>>,
-    ) {
+    pub(crate) fn new(frozen: bool) -> (Self, HttpStreamWatchers) {
         let (reset_tx, reset_rx) = watch::channel(None);
         let (status_tx, status_rx) = watch::channel(None);
+        let freeze_tx = PauseController::new(frozen);
+        let freeze_rx = freeze_tx.signal();
         (
             Self {
                 chunks: VecDeque::new(),
@@ -102,10 +174,21 @@ impl HttpStreamState {
                 local_reset: None,
                 reset_tx,
                 status_tx,
+                freeze_tx,
                 recorded: false,
+                request_tracker: RecordTracker::new(),
+                response_tracker: RecordTracker::new(),
+                request_fin_sequenced: false,
+                reset_sequence: None,
+                reset_deferred_by_freeze: false,
+                cancel_sent: false,
+                freeze_capture: None,
             },
-            reset_rx,
-            status_rx,
+            HttpStreamWatchers {
+                peer_reset: reset_rx,
+                result_status: status_rx,
+                freeze: freeze_rx,
+            },
         )
     }
 
@@ -123,6 +206,71 @@ impl HttpStreamState {
 
     pub(crate) fn note_replay(&mut self, replay_bytes: usize) {
         self.replay_high_water = self.replay_high_water.max(replay_bytes);
+    }
+
+    /// Follow the framing of a chunk that was just sequenced toward the
+    /// device.  Only record headers are inspected.
+    pub(crate) fn observe_sequenced(&mut self, chunk: &[u8]) {
+        self.request_tracker.observe(chunk);
+    }
+
+    /// The owner's terminal frame was sequenced on `generation`.
+    pub(crate) fn note_terminal_sequenced(
+        &mut self,
+        terminal: Terminal,
+        sequence: u64,
+        generation: u64,
+    ) {
+        match terminal {
+            Terminal::Fin => self.request_fin_sequenced = true,
+            Terminal::Reset(_) => {
+                self.reset_sequence.get_or_insert((sequence, generation));
+            }
+        }
+    }
+
+    /// A RESET was deferred behind the rotation freeze.
+    pub(crate) fn note_reset_deferred(&mut self) {
+        self.reset_deferred_by_freeze = true;
+    }
+
+    /// Whether a local cancellation still needs the device to learn of it
+    /// out of band: the device has neither finished nor reset its direction
+    /// and no CANCEL was sent yet.
+    pub(crate) const fn cancel_needed(&self) -> bool {
+        !self.cancel_sent && !self.peer_fin && self.peer_reset.is_none()
+    }
+
+    pub(crate) fn note_cancel(&mut self) {
+        self.cancel_sent = true;
+    }
+
+    /// Publish this owner's writer-freeze state to the exchange task.
+    pub(crate) fn publish_freeze(&self, frozen: bool) {
+        self.freeze_tx.set(frozen);
+    }
+
+    /// Capture the record position at a scheduled rotation freeze.
+    pub(crate) fn capture_freeze(
+        &mut self,
+        parked_bytes: usize,
+        pending_terminal: Option<Terminal>,
+        last_emitted: u64,
+    ) {
+        self.freeze_capture = Some(HttpFreezeCapture {
+            request: self.request_tracker.snapshot(),
+            request_fin_sequenced: self.request_fin_sequenced,
+            response: self.response_tracker.snapshot(),
+            response_fin_received: self.peer_fin,
+            parked_bytes,
+            receive_buffered: self.buffered,
+            deferred_terminal: terminal_label(pending_terminal),
+            frozen_last_emitted: last_emitted,
+        });
+    }
+
+    pub(crate) fn take_freeze_capture(&mut self) -> Option<HttpFreezeCapture> {
+        self.freeze_capture.take()
     }
 
     /// Whether a close can end this stream with FIN only: the owner already
@@ -144,27 +292,26 @@ impl HttpStreamState {
         if buffered > window {
             return false;
         }
+        self.response_tracker.observe(payload);
         self.buffered = buffered;
         self.buffered_high_water = self.buffered_high_water.max(buffered);
         self.chunks.push_back(payload.to_vec());
-        if let Some(reader) = self.reader.take() {
-            self.serve_parked(reader);
-        }
+        self.wake_reader();
         true
     }
 
-    fn serve_parked(&mut self, reader: oneshot::Sender<HttpRead>) {
+    fn wake_reader(&mut self) {
         // Data is served on the next explicit read so the credit release and
         // WINDOW_UPDATE happen on the actor's read path; a parked reader is
         // only woken here and immediately re-reads.
-        let _ = reader.send(HttpRead::Data(Vec::new()));
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.send(HttpRead::Data(Vec::new()));
+        }
     }
 
     pub(crate) fn accept_fin(&mut self) {
         self.peer_fin = true;
-        if let Some(reader) = self.reader.take() {
-            self.serve_parked(reader);
-        }
+        self.wake_reader();
     }
 
     /// Accept the connector RESET: undelivered bytes are discarded (their
@@ -195,6 +342,53 @@ impl HttpStreamState {
         });
     }
 
+    /// Decide one read.  A delivered chunk moves its bytes from the buffer
+    /// to the owed receive credit; the caller advertises that credit and
+    /// calls [`Self::settle_credit`] once the WINDOW_UPDATE is queued.
+    pub(crate) fn next_read(&mut self, stream_terminal: bool) -> ReadStep {
+        if let Some(reason) = self.peer_reset {
+            return ReadStep::Reply(HttpRead::Reset(reason));
+        }
+        if self.local_reset.is_some() {
+            return ReadStep::Reply(HttpRead::Closed);
+        }
+        if let Some(chunk) = self.chunks.pop_front() {
+            let len = chunk.len();
+            self.buffered = self.buffered.saturating_sub(len);
+            self.delivered_bytes = self.delivered_bytes.saturating_add(len as u64);
+            self.credit_owed = self.credit_owed.saturating_add(len as u64);
+            return ReadStep::Chunk(chunk);
+        }
+        if self.peer_fin && !self.fin_delivered {
+            self.fin_delivered = true;
+            return ReadStep::Reply(HttpRead::Fin);
+        }
+        if stream_terminal {
+            return ReadStep::Reply(HttpRead::Closed);
+        }
+        ReadStep::Park
+    }
+
+    /// Park a reader; a reader it replaces learns the stream closed.
+    pub(crate) fn park_reader(&mut self, reader: oneshot::Sender<HttpRead>) {
+        if let Some(previous) = self.reader.replace(reader) {
+            let _ = previous.send(HttpRead::Closed);
+        }
+    }
+
+    pub(crate) const fn credit_owed(&self) -> u64 {
+        self.credit_owed
+    }
+
+    pub(crate) fn settle_credit(&mut self) {
+        self.credit_owed = 0;
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn buffered(&self) -> usize {
+        self.buffered
+    }
+
     /// Release everything held for the reader.  Returns the discarded bytes
     /// whose budget charge the caller must return.
     pub(crate) fn release(&mut self) -> usize {
@@ -205,6 +399,42 @@ impl HttpStreamState {
             let _ = reader.send(HttpRead::Closed);
         }
         discarded
+    }
+
+    fn live_snapshot(
+        &self,
+        parked_bytes: usize,
+        pending_terminal: Option<Terminal>,
+        send_credit: u64,
+        sent_bytes: u64,
+        frozen: bool,
+    ) -> RelayHttpStreamSnapshot {
+        RelayHttpStreamSnapshot {
+            request: HttpRecordPosition::from(self.request_tracker.snapshot()),
+            request_fin_sequenced: self.request_fin_sequenced,
+            response: HttpRecordPosition::from(self.response_tracker.snapshot()),
+            response_fin_received: self.peer_fin,
+            parked_bytes,
+            receive_buffered_bytes: self.buffered,
+            send_credit,
+            sent_bytes,
+            deferred_terminal: terminal_label(pending_terminal),
+            local_reset: self.local_reset,
+            peer_reset: self.peer_reset,
+            cancel_sent: self.cancel_sent,
+            reset_sequence: self.reset_sequence.map(|(sequence, _)| sequence),
+            reset_generation: self.reset_sequence.map(|(_, generation)| generation),
+            reset_deferred_by_freeze: self.reset_deferred_by_freeze,
+            frozen,
+        }
+    }
+}
+
+const fn terminal_label(terminal: Option<Terminal>) -> Option<&'static str> {
+    match terminal {
+        Some(Terminal::Fin) => Some("fin"),
+        Some(Terminal::Reset(_)) => Some("reset"),
+        None => None,
     }
 }
 
@@ -233,65 +463,48 @@ impl RelayActor {
             let _ = response.send(HttpRead::Closed);
             return;
         }
+        let terminal = stream.terminal;
         let Some(http) = stream.http.as_mut() else {
             let _ = response.send(HttpRead::Closed);
             return;
         };
-        if let Some(reason) = http.peer_reset {
-            let _ = response.send(HttpRead::Reset(reason));
-            return;
-        }
-        if http.local_reset.is_some() {
-            let _ = response.send(HttpRead::Closed);
-            return;
-        }
-        if let Some(chunk) = http.chunks.pop_front() {
-            let len = chunk.len();
-            http.buffered = http.buffered.saturating_sub(len);
-            http.delivered_bytes = http.delivered_bytes.saturating_add(len as u64);
-            http.credit_owed = http.credit_owed.saturating_add(len as u64);
-            let owed = http.credit_owed;
-            release_m2_bytes(&queue_budget, stream, len);
-            stream.receive_bytes = stream.receive_bytes.saturating_add(len);
-            // Advertise the released credit.  The update is applied to the
-            // sequence only once it is queued, so a refused queue slot keeps
-            // the debt for the next read instead of recording credit the
-            // connector never learns about.
-            if let Some(data_tx) = data_tx {
-                let current = stream
-                    .sequence
-                    .direction(Direction::ConnectorToRelay)
-                    .receive_credit();
-                if let Some(limit) = current.checked_add(owed) {
-                    let update = Frame::window_update(epoch, generation, stream_id, limit);
-                    let mut candidate = stream.sequence.clone();
-                    if candidate
-                        .send_frame(Direction::RelayToConnector, &update)
-                        .is_ok()
-                        && let Ok(encoded) = update.encode()
-                        && queue_data(&data_tx, &queue_budget, encoded).is_ok()
-                    {
-                        stream.sequence = candidate;
-                        if let Some(http) = stream.http.as_mut() {
-                            http.credit_owed = 0;
+        match http.next_read(terminal) {
+            ReadStep::Reply(read) => {
+                let _ = response.send(read);
+            }
+            ReadStep::Park => http.park_reader(response),
+            ReadStep::Chunk(chunk) => {
+                let len = chunk.len();
+                let owed = http.credit_owed();
+                release_m2_bytes(&queue_budget, stream, len);
+                stream.receive_bytes = stream.receive_bytes.saturating_add(len);
+                // Advertise the released credit.  The update is applied to
+                // the sequence only once it is queued, so a refused queue
+                // slot keeps the debt for the next read instead of recording
+                // credit the connector never learns about.
+                if let Some(data_tx) = data_tx {
+                    let current = stream
+                        .sequence
+                        .direction(Direction::ConnectorToRelay)
+                        .receive_credit();
+                    if let Some(limit) = current.checked_add(owed) {
+                        let update = Frame::window_update(epoch, generation, stream_id, limit);
+                        let mut candidate = stream.sequence.clone();
+                        if candidate
+                            .send_frame(Direction::RelayToConnector, &update)
+                            .is_ok()
+                            && let Ok(encoded) = update.encode()
+                            && queue_data(&data_tx, &queue_budget, encoded).is_ok()
+                        {
+                            stream.sequence = candidate;
+                            if let Some(http) = stream.http.as_mut() {
+                                http.settle_credit();
+                            }
                         }
                     }
                 }
+                let _ = response.send(HttpRead::Data(chunk));
             }
-            let _ = response.send(HttpRead::Data(chunk));
-            return;
-        }
-        if http.peer_fin && !http.fin_delivered {
-            http.fin_delivered = true;
-            let _ = response.send(HttpRead::Fin);
-            return;
-        }
-        if stream.terminal {
-            let _ = response.send(HttpRead::Closed);
-            return;
-        }
-        if let Some(previous) = http.reader.replace(response) {
-            let _ = previous.send(HttpRead::Closed);
         }
     }
 
@@ -337,38 +550,85 @@ impl RelayActor {
         queued
     }
 
+    /// Queue a scoped control `CANCEL` for an HTTP stream whose local
+    /// cancellation cannot reach the device in order yet.  Returns whether
+    /// it entered the bounded control queue.
+    pub(super) fn send_http_cancel(session: &mut DeviceSession, stream_id: u64) -> bool {
+        let Some(stream) = session.streams.get(&stream_id) else {
+            return true;
+        };
+        let Ok(message) = wire::encode_control_message(&wire::cancel(
+            &session.key.session_id,
+            session.key.epoch,
+            stream_id,
+            &stream.operation_id,
+        )) else {
+            return false;
+        };
+        let delivered = queue_control(&session.control_tx, &session.queue_budget, message).is_ok();
+        if let Some(http) = session
+            .streams
+            .get_mut(&stream_id)
+            .and_then(|stream| stream.http.as_mut())
+        {
+            http.note_cancel();
+        }
+        delivered
+    }
+
+    /// Send the scoped `CANCEL` a local cancellation needs, when it needs
+    /// one, and remember the session for fencing if it could not be queued.
+    pub(super) fn cancel_http_if_needed(&mut self, key: &SessionKey, stream_id: u64, reason: u16) {
+        let undeliverable = self.session_mut(key).is_some_and(|session| {
+            let needed = reason == reset_reason::CANCELLED
+                && session
+                    .streams
+                    .get(&stream_id)
+                    .and_then(|stream| stream.http.as_ref())
+                    .is_some_and(HttpStreamState::cancel_needed);
+            needed && !Self::send_http_cancel(session, stream_id)
+        });
+        if undeliverable {
+            self.http_maintenance.cancel_undeliverable.push(key.clone());
+        }
+    }
+
     /// Reset an HTTP stream with a registered reason code.  Parked chunks
     /// were never sequenced and are dropped; the RESET follows everything
-    /// already emitted, including an earlier FIN.
+    /// already emitted, including an earlier FIN.  A cancellation deferred
+    /// behind the rotation freeze is also sent as a control `CANCEL`, so the
+    /// device stops promptly while the RESET keeps its sequence position.
     pub(super) fn reset_http_stream(
         &mut self,
         key: &SessionKey,
         stream_id: u64,
         operation_id: &str,
         reason: u16,
-    ) -> bool {
+    ) -> HttpResetOutcome {
         let reason = if reset_reason::is_registered(reason) {
             reason
         } else {
             reset_reason::ADAPTER_FAILURE
         };
+        let mut outcome = HttpResetOutcome::default();
         let queued = {
             let Some(session) = self.session_mut(key) else {
-                return false;
+                return outcome;
             };
             let frozen = Self::rotation_frozen(session);
             let queue_budget = session.queue_budget.clone();
             let Some(stream) = session.streams.get_mut(&stream_id) else {
-                return false;
+                return outcome;
             };
             if stream.operation_id != operation_id || stream.terminal || stream.open_pending {
-                return false;
+                return outcome;
             }
             let Some(http) = stream.http.as_mut() else {
-                return false;
+                return outcome;
             };
+            outcome.accepted = true;
             if http.local_reset.is_some() {
-                return true;
+                return outcome;
             }
             http.local_reset = Some(reason);
             let discarded = http.release();
@@ -387,30 +647,72 @@ impl RelayActor {
                 .direction(Direction::RelayToConnector)
                 .send_terminal();
             if matches!(sent_terminal, Some(Terminal::Reset(_))) {
-                return true;
+                return outcome;
             }
             if frozen {
                 // A FIN that was only pending was never sequenced, so the
                 // RESET replaces it.
                 stream.pending_terminal = Some(Terminal::Reset(reason));
-                return true;
+                if let Some(http) = stream.http.as_mut() {
+                    http.note_reset_deferred();
+                }
+                true
+            } else {
+                stream.pending_terminal = None;
+                let queued = Self::queue_stream_terminal_frame_mode(
+                    session,
+                    stream_id,
+                    Terminal::Reset(reason),
+                    true,
+                );
+                if !queued && let Some(stream) = session.streams.get_mut(&stream_id) {
+                    // Keep the RESET for an ordered retry (every tick while
+                    // the failure deadline runs, and on ACK/WINDOW_UPDATE):
+                    // a refused writer queue must not strand the device.
+                    stream.pending_terminal = Some(Terminal::Reset(reason));
+                    stream.terminal_fin_failure = true;
+                }
+                queued
             }
-            stream.pending_terminal = None;
-            let queued = Self::queue_stream_terminal_frame_mode(
-                session,
-                stream_id,
-                Terminal::Reset(reason),
-                true,
-            );
-            if !queued && let Some(stream) = session.streams.get_mut(&stream_id) {
-                stream.terminal_fin_failure = true;
-            }
-            queued
         };
         if !queued {
             self.arm_terminal_fin_failure_deadline(key);
         }
-        queued
+        // The device must learn of a cancellation that is not on the wire
+        // yet — deferred behind a freeze or refused by the writer queue — so
+        // it is also sent out of band.
+        let deferred = self
+            .session_for(key)
+            .and_then(|session| session.streams.get(&stream_id))
+            .is_some_and(|stream| stream.pending_terminal.is_some());
+        if deferred {
+            self.cancel_http_if_needed(key, stream_id, reason);
+        }
+        outcome
+    }
+
+    /// Retry the ordered terminals a refused writer queue left pending on a
+    /// session whose terminal-failure deadline is running.
+    pub(super) fn retry_failed_terminals(&mut self, key: &SessionKey) {
+        let stream_ids = self
+            .session_for(key)
+            .filter(|session| session.terminal_fin_failure_deadline.is_some())
+            .map(|session| {
+                let mut ids = session
+                    .streams
+                    .iter()
+                    .filter(|(_, stream)| {
+                        stream.terminal_fin_failure && stream.pending_terminal.is_some()
+                    })
+                    .map(|(stream_id, _)| *stream_id)
+                    .collect::<Vec<_>>();
+                ids.sort_unstable();
+                ids
+            })
+            .unwrap_or_default();
+        for stream_id in stream_ids {
+            self.flush_pending_terminal(key, stream_id);
+        }
     }
 
     /// Retain the connector's bounded `RESULT_STATUS` detail for the exact
@@ -433,6 +735,171 @@ impl RelayActor {
         if let (Some(http), Some(detail)) = (stream.http.as_ref(), status.detail.clone()) {
             http.accept_status(detail);
         }
+    }
+
+    /// Re-publish one session's writer-freeze state to its HTTP exchange
+    /// tasks when, and only when, it changed since the last publication.
+    /// Returns whether the session's streams were visited.
+    pub(super) fn refresh_session_http_freeze(session: &mut DeviceSession) -> bool {
+        let frozen = Self::rotation_frozen(session);
+        if frozen == session.http_freeze_published {
+            return false;
+        }
+        session.http_freeze_published = frozen;
+        for stream in session.streams.values_mut() {
+            if let Some(http) = stream.http.as_ref() {
+                http.publish_freeze(frozen);
+            }
+        }
+        true
+    }
+
+    /// After one command: re-publish the writer-freeze state of the sessions
+    /// that command could have changed (streams are visited only on an actual
+    /// freeze transition), and fence any session whose required HTTP
+    /// cancellation could not be queued.  Per-frame traffic names its
+    /// session, so this is O(1) for it rather than O(devices × streams).
+    pub(super) async fn after_command_http_maintenance(&mut self, scope: HttpMaintenanceScope) {
+        let visited = match scope {
+            HttpMaintenanceScope::None => 0,
+            HttpMaintenanceScope::Session(scope) => {
+                self.sessions.get_mut(&scope).map_or(0, |session| {
+                    usize::from(Self::refresh_session_http_freeze(session))
+                })
+            }
+            HttpMaintenanceScope::All => self
+                .sessions
+                .values_mut()
+                .map(|session| usize::from(Self::refresh_session_http_freeze(session)))
+                .sum(),
+        };
+        self.http_maintenance.freeze_stream_scans = self
+            .http_maintenance
+            .freeze_stream_scans
+            .saturating_add(visited as u64);
+        if self.http_maintenance.cancel_undeliverable.is_empty() {
+            return;
+        }
+        let mut undeliverable = std::mem::take(&mut self.http_maintenance.cancel_undeliverable);
+        undeliverable.sort_by(|left, right| left.session_id.cmp(&right.session_id));
+        undeliverable.dedup();
+        for key in undeliverable {
+            tracing::warn!(
+                device_id = %key.device_id,
+                session_id = %key.session_id,
+                epoch = key.epoch,
+                phase = "http_cancel_undeliverable",
+                "HTTP CANCEL could not enter the control queue; fencing the session"
+            );
+            self.close_session(&key, CANCEL_UNDELIVERABLE).await;
+        }
+    }
+
+    /// Capture each HTTP stream's record position as the owner freezes its
+    /// writer at QUIESCE.
+    pub(super) fn capture_http_freeze(session: &mut DeviceSession) {
+        for stream in session.streams.values_mut() {
+            let last_emitted = stream
+                .sequence
+                .direction(Direction::RelayToConnector)
+                .last_emitted();
+            let parked = stream.pending_record_bytes;
+            let pending_terminal = stream.pending_terminal;
+            if let Some(http) = stream.http.as_mut() {
+                http.capture_freeze(parked, pending_terminal, last_emitted);
+            }
+        }
+    }
+
+    /// Turn the captured positions into rotation observations at the
+    /// commit decision, adding the fences and acknowledgement cursors.
+    pub(super) fn record_http_rotation_observations(
+        session: &mut DeviceSession,
+        completed: Option<&RelayRotationSnapshot>,
+        rotation: u64,
+        diagnostics: &HttpForwardDiagnostics,
+    ) {
+        let find = |pairs: Option<&Vec<(u64, u64)>>, stream_id: u64| {
+            pairs.and_then(|pairs| {
+                pairs
+                    .iter()
+                    .find(|(id, _)| *id == stream_id)
+                    .map(|(_, value)| *value)
+            })
+        };
+        let attempt = completed.and_then(|snapshot| snapshot.attempt.clone());
+        for (stream_id, stream) in &mut session.streams {
+            let Some(capture) = stream
+                .http
+                .as_mut()
+                .and_then(HttpStreamState::take_freeze_capture)
+            else {
+                continue;
+            };
+            diagnostics.record_rotation(HttpRotationObservation {
+                stream_id: *stream_id,
+                operation_id: stream.operation_id.clone(),
+                request_id: stream.request_id.clone(),
+                rotation,
+                rotation_id: attempt
+                    .as_ref()
+                    .map(|attempt| attempt.rotation_id.clone())
+                    .unwrap_or_default(),
+                old_generation: attempt.as_ref().map_or(0, |attempt| attempt.old_generation),
+                new_generation: attempt.as_ref().map_or(0, |attempt| attempt.new_generation),
+                request: HttpRecordPosition::from(capture.request),
+                request_fin_sequenced: capture.request_fin_sequenced,
+                response: HttpRecordPosition::from(capture.response),
+                response_fin_received: capture.response_fin_received,
+                parked_bytes: capture.parked_bytes,
+                receive_buffered_bytes: capture.receive_buffered,
+                deferred_terminal: capture.deferred_terminal,
+                frozen_last_emitted: capture.frozen_last_emitted,
+                relay_fence: find(
+                    completed.map(|snapshot| &snapshot.relay_fence_sequences),
+                    *stream_id,
+                ),
+                connector_fence: find(
+                    completed.map(|snapshot| &snapshot.connector_fence_sequences),
+                    *stream_id,
+                ),
+                relay_acknowledged: find(
+                    completed.map(|snapshot| &snapshot.relay_ack_sequences),
+                    *stream_id,
+                ),
+                connector_acknowledged: find(
+                    completed.map(|snapshot| &snapshot.connector_ack_sequences),
+                    *stream_id,
+                ),
+            });
+        }
+    }
+
+    /// Record that the owner published `STREAM_FORGET` for an HTTP stream.
+    pub(super) fn record_http_forget(stream: &M2Stream, diagnostics: &HttpForwardDiagnostics) {
+        if stream.http.is_some() {
+            diagnostics.record_forget(HttpForgetRecord {
+                stream_id: stream.sequence.stream_id(),
+                operation_id: stream.operation_id.clone(),
+                request_id: stream.request_id.clone(),
+            });
+        }
+    }
+
+    /// The live, payload-free HTTP view of one stream for the snapshot.
+    pub(super) fn http_stream_snapshot(
+        stream: &M2Stream,
+        frozen: bool,
+    ) -> Option<RelayHttpStreamSnapshot> {
+        let http = stream.http.as_ref()?;
+        let send = stream.sequence.direction(Direction::RelayToConnector);
+        Some(http.live_snapshot(
+            stream.pending_record_bytes,
+            stream.pending_terminal,
+            send.send_credit(),
+            send.sent_bytes(),
+            frozen,
+        ))
     }
 
     /// Record the owner stream's bounded high-water marks once, when the
@@ -467,6 +934,204 @@ impl RelayActor {
             delivered_bytes: http.delivered_bytes,
             release,
             reset_reason,
+            request: HttpRecordPosition::from(http.request_tracker.snapshot()),
+            response: HttpRecordPosition::from(http.response_tracker.snapshot()),
+            reset_sequence: http.reset_sequence.map(|(sequence, _)| sequence),
+            reset_generation: http.reset_sequence.map(|(_, generation)| generation),
+            reset_deferred_by_freeze: http.reset_deferred_by_freeze,
+            cancel_sent: http.cancel_sent,
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tunnel_http_forward::{END_RECORD, RecordKind, RecordPosition, encode_body};
+
+    const WINDOW: usize = 131_072;
+
+    fn state() -> (HttpStreamState, HttpStreamWatchers) {
+        HttpStreamState::new(false)
+    }
+
+    #[test]
+    fn received_data_is_bounded_by_the_window_and_owes_credit_only_when_read() {
+        let (mut http, _) = state();
+        assert!(http.accept_data(&[1; 100_000], WINDOW));
+        assert!(http.accept_data(&[2; 31_072], WINDOW));
+        // One byte above the advertised window is a protocol violation and
+        // is not buffered.
+        assert!(!http.accept_data(&[3; 1], WINDOW));
+        assert_eq!(http.buffered(), WINDOW);
+        assert_eq!(http.credit_owed(), 0, "receipt never releases credit");
+        let ReadStep::Chunk(chunk) = http.next_read(false) else {
+            panic!("expected a chunk");
+        };
+        assert_eq!(chunk.len(), 100_000);
+        assert_eq!(http.buffered(), 31_072);
+        assert_eq!(http.credit_owed(), 100_000);
+        // A refused WINDOW_UPDATE keeps the debt; the next read adds to it.
+        let ReadStep::Chunk(_) = http.next_read(false) else {
+            panic!("expected a chunk");
+        };
+        assert_eq!(http.credit_owed(), WINDOW as u64);
+        http.settle_credit();
+        assert_eq!(http.credit_owed(), 0);
+        assert_eq!(http.next_read(false), ReadStep::Park);
+    }
+
+    #[test]
+    fn response_fin_is_a_half_close_delivered_after_buffered_bytes() {
+        let (mut http, _) = state();
+        let (reader, mut parked) = oneshot::channel();
+        http.park_reader(reader);
+        assert!(http.accept_data(b"abc", WINDOW));
+        assert_eq!(parked.try_recv(), Ok(HttpRead::Data(Vec::new())), "woken");
+        http.accept_fin();
+        assert!(!http.completed(), "the owner has not finished its side");
+        assert!(matches!(http.next_read(false), ReadStep::Chunk(_)));
+        assert_eq!(http.next_read(false), ReadStep::Reply(HttpRead::Fin));
+        // FIN is delivered once; a released stream then reads as closed.
+        assert_eq!(http.next_read(false), ReadStep::Park);
+        assert_eq!(http.next_read(true), ReadStep::Reply(HttpRead::Closed));
+        http.local_fin = true;
+        assert!(http.completed());
+    }
+
+    #[test]
+    fn reset_after_fin_is_published_with_its_order_and_discards_unread_bytes() {
+        let (mut http, watchers) = state();
+        assert!(http.accept_data(&[9; 500], WINDOW));
+        http.accept_fin();
+        assert_eq!(http.accept_reset(reset_reason::CANCELLED), 500);
+        assert_eq!(
+            *watchers.peer_reset.borrow(),
+            Some(HttpPeerReset {
+                reason: reset_reason::CANCELLED,
+                after_fin: true
+            })
+        );
+        // A second RESET keeps the first observation.
+        assert_eq!(http.accept_reset(reset_reason::ADAPTER_FAILURE), 0);
+        assert_eq!(
+            watchers.peer_reset.borrow().map(|reset| reset.reason),
+            Some(reset_reason::CANCELLED)
+        );
+        assert_eq!(
+            http.next_read(false),
+            ReadStep::Reply(HttpRead::Reset(reset_reason::CANCELLED))
+        );
+        assert!(!http.cancel_needed(), "the device already reset");
+    }
+
+    #[test]
+    fn a_parked_reader_learns_of_reset_and_release_exactly_once() {
+        let (mut http, _) = state();
+        let (first, mut first_rx) = oneshot::channel();
+        http.park_reader(first);
+        let (second, mut second_rx) = oneshot::channel();
+        http.park_reader(second);
+        assert_eq!(first_rx.try_recv(), Ok(HttpRead::Closed), "replaced");
+        assert_eq!(http.accept_reset(reset_reason::ADAPTER_FAILURE), 0);
+        assert_eq!(
+            second_rx.try_recv(),
+            Ok(HttpRead::Reset(reset_reason::ADAPTER_FAILURE))
+        );
+        let (mut http, _) = state();
+        assert!(http.accept_data(&[1; 10], WINDOW));
+        let (reader, mut reader_rx) = oneshot::channel();
+        http.park_reader(reader);
+        // Terminal discard: release returns the charge of unread bytes.
+        assert_eq!(http.release(), 10);
+        assert_eq!(reader_rx.try_recv(), Ok(HttpRead::Closed));
+        assert_eq!(http.release(), 0);
+    }
+
+    #[test]
+    fn a_local_reset_closes_reads_and_status_keeps_the_first_detail() {
+        let (mut http, watchers) = state();
+        http.mark_local_reset(reset_reason::CANCELLED);
+        http.mark_local_reset(reset_reason::ADAPTER_FAILURE);
+        assert_eq!(http.local_reset, Some(reset_reason::CANCELLED));
+        assert_eq!(http.next_read(false), ReadStep::Reply(HttpRead::Closed));
+        http.accept_status(ResultDetail {
+            code: "HTTP_CANCELLED".into(),
+            execution: "dispatched".into(),
+        });
+        http.accept_status(ResultDetail {
+            code: "HTTP_BODY_LIMIT".into(),
+            execution: "unknown".into(),
+        });
+        assert_eq!(
+            watchers
+                .result_status
+                .borrow()
+                .as_ref()
+                .map(|detail| detail.code.as_str()),
+            Some("HTTP_CANCELLED")
+        );
+    }
+
+    #[test]
+    fn freeze_publication_and_capture_record_the_exact_position() {
+        let (mut http, watchers) = HttpStreamState::new(false);
+        let mut request = Vec::new();
+        let head = tunnel_http_forward::RecordHeader::new(RecordKind::RequestHead, 2)
+            .expect("head")
+            .encode();
+        request.extend_from_slice(&head);
+        request.extend_from_slice(b"{}");
+        encode_body(&[5; 40], &mut request);
+        // Sequenced: HEAD plus the BODY header and 10 payload bytes.
+        http.observe_sequenced(&request[..10 + 8 + 10]);
+        assert!(http.accept_data(&END_RECORD[..3], WINDOW));
+        http.publish_freeze(true);
+        assert!(watchers.freeze.is_paused());
+        http.capture_freeze(30, Some(Terminal::Reset(reset_reason::CANCELLED)), 7);
+        let capture = http.take_freeze_capture().expect("captured");
+        assert_eq!(capture.request.heads, 1);
+        assert_eq!(capture.request.bodies, 1);
+        assert_eq!(
+            capture.request.position,
+            RecordPosition::Payload {
+                kind: RecordKind::Body,
+                received: 10,
+                total: 40
+            }
+        );
+        assert_eq!(
+            capture.response.position,
+            RecordPosition::Header { received: 3 }
+        );
+        assert_eq!(capture.parked_bytes, 30);
+        assert_eq!(capture.receive_buffered, 3);
+        assert_eq!(capture.deferred_terminal, Some("reset"));
+        assert_eq!(capture.frozen_last_emitted, 7);
+        assert!(http.take_freeze_capture().is_none(), "taken once");
+        http.publish_freeze(false);
+        assert!(!watchers.freeze.is_paused());
+    }
+
+    #[test]
+    fn deferred_terminal_bookkeeping_and_cancel_are_one_shot() {
+        let (mut http, _) = state();
+        assert!(http.cancel_needed());
+        http.note_reset_deferred();
+        http.note_cancel();
+        assert!(!http.cancel_needed(), "at most one CANCEL per stream");
+        http.note_terminal_sequenced(Terminal::Fin, 4, 1);
+        http.note_terminal_sequenced(Terminal::Reset(reset_reason::CANCELLED), 5, 2);
+        http.note_terminal_sequenced(Terminal::Reset(reset_reason::CANCELLED), 6, 3);
+        let snapshot = http.live_snapshot(0, None, 0, 0, false);
+        assert!(snapshot.request_fin_sequenced);
+        assert_eq!(snapshot.reset_sequence, Some(5));
+        assert_eq!(snapshot.reset_generation, Some(2));
+        assert!(snapshot.reset_deferred_by_freeze);
+        assert!(snapshot.cancel_sent);
+        // A device that already finished needs no cancellation.
+        let (mut finished, _) = state();
+        finished.accept_fin();
+        assert!(!finished.cancel_needed());
     }
 }

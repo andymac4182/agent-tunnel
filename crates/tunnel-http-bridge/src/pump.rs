@@ -9,6 +9,7 @@ use tunnel_http_forward::{
 };
 
 use crate::exchange::Exchange;
+use crate::progress::{self, BudgetClock, ProgressKind, WaitMark};
 use crate::stream::SendError;
 
 /// Why a pump stopped early.
@@ -20,11 +21,18 @@ pub(crate) enum PumpError {
     Source(HttpErrorCode),
     /// The outbound stream is gone.
     Sink(HttpErrorCode),
+    /// A transport progress budget expired (`HTTP_DEADLINE_EXCEEDED`).
+    Progress(ProgressKind),
 }
 
 /// Queue bytes on the exchange's outbound direction, abandoning the wait as
-/// soon as the exchange stops.
+/// soon as the exchange stops.  A send blocked on output credit for longer
+/// than the credit-stall budget (not counting this endpoint's recorded
+/// freeze) fails; each completed send starts a fresh stall clock.
 pub(crate) async fn send(exchange: &Exchange, data: Bytes) -> Result<(), PumpError> {
+    let mut stall = BudgetClock::new(ProgressKind::CreditStall, &exchange.budgets);
+    stall.arm();
+    let mark = WaitMark::now(&exchange.pause);
     tokio::select! {
         biased;
         () = exchange.stop.cancelled() => Err(PumpError::Stopped),
@@ -33,6 +41,9 @@ pub(crate) async fn send(exchange: &Exchange, data: Bytes) -> Result<(), PumpErr
             Err(SendError::Terminated) => Err(PumpError::Stopped),
             Err(SendError::Closed) => Err(PumpError::Sink(HttpErrorCode::StreamInterrupted)),
         },
+        kind = progress::expired([stall], mark, exchange.pause.clone()) => {
+            Err(PumpError::Progress(kind))
+        }
     }
 }
 

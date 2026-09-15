@@ -1743,6 +1743,9 @@ async fn run_m2_session(
                 }
             }
         }
+        // HTTP exchanges' progress clocks pause for exactly the writer
+        // freeze this event may have started or ended.
+        actor.publish_http_freeze();
     };
     readiness.send(Readiness::Stopping).ok();
     cancellation.cancel();
@@ -4374,6 +4377,7 @@ impl M2Actor {
                 ) || !stream.auth.confirmed
                     || stream.auth.refresh_in_flight
                     || stream.auth.invalidated
+                    || self.http_stream_settled(stream_id)
                     || self
                         .pending_authorization_refreshes
                         .contains_key(&stream_id)
@@ -4602,6 +4606,29 @@ impl M2Actor {
             stream.operation_id == cancel.operation_id
                 && self.config.exports.contains_key(&stream.service_id)
         });
+        let http_stream = self
+            .streams
+            .get(&cancel.stream_id)
+            .is_some_and(M2Stream::is_http);
+        if matches_operation && http_stream {
+            // An owner CANCEL for an HTTP stream stops the handler out of
+            // band at once.  The bridge then emits the stream's ordered
+            // RESET(CANCELLED) with its RESULT_STATUS; only an exchange that
+            // already ended needs the RESET here, and a settled exchange
+            // (both FINs, the response FIN possibly still deferred) needs
+            // none: a RESET after its FIN would trail a stream the owner is
+            // already reclaiming, and the owner never acknowledges it.
+            if self.http_cancel(cancel.stream_id) && !self.http_stream_settled(cancel.stream_id) {
+                self.emit_or_defer(PendingOutput {
+                    stream_id: cancel.stream_id,
+                    kind: FrameKind::Reset,
+                    payload: Vec::new(),
+                    reset_reason: Some(tunnel_protocol::reset_reason::CANCELLED),
+                })
+                .await?;
+            }
+            return Ok(());
+        }
         if matches_operation {
             self.http_abort(cancel.stream_id, tunnel_protocol::reset_reason::CANCELLED);
             let pending_bytes = {
@@ -7915,6 +7942,11 @@ impl M2Actor {
     }
 
     async fn expire_stream(&mut self, stream_id: u64) -> Result<(), ClientError> {
+        if self.http_stream_settled(stream_id) {
+            // Both terminals are in place; only the owner's STREAM_FORGET
+            // remains, and a RESET now would be one it never acknowledges.
+            return Ok(());
+        }
         self.http_abort(stream_id, M2_RESET_AUTH_EXPIRED);
         if let Some(stream) = self.streams.get_mut(&stream_id) {
             stream.auth.invalidated = true;
@@ -10013,6 +10045,133 @@ mod tests {
         );
         assert!(!actor.pending_forgets.contains_key(&stream_id));
         assert_eq!(actor.forgotten_stream_through, stream_id);
+    }
+
+    /// An HTTP stream whose request FIN was received in order.
+    fn http_stream_with_request_fin(stream_id: u64) -> M2Stream {
+        let (notifier, _signal) = tunnel_http_bridge::reset_signal_pair();
+        let mut stream = test_stream();
+        stream.operation = HTTP_FORWARD_OPERATION.to_owned();
+        stream.operation_id = format!("http-operation-{stream_id}");
+        stream.sequence = StreamState::new(stream_id, 1024).expect("test sequence");
+        stream.http = Some(m2_http::DeviceHttpState::new(
+            notifier,
+            1024,
+            tunnel_http_bridge::PauseController::new(false),
+            None,
+        ));
+        stream
+            .sequence
+            .receive_frame(
+                Direction::RelayToConnector,
+                &Frame::fin(1, 1, stream_id, 1, 0),
+            )
+            .expect("request FIN");
+        stream
+    }
+
+    fn cancel_for(stream_id: u64) -> Cancel {
+        Cancel::new(
+            format!("cancel-{stream_id}"),
+            "session",
+            1,
+            stream_id,
+            format!("http-operation-{stream_id}"),
+        )
+    }
+
+    /// Review item 2: an owner CANCEL for an exchange whose response FIN is
+    /// already sequenced, or already retained behind a writer freeze, must not
+    /// queue a RESET after that FIN: the owner reclaims the stream on both
+    /// FINs and never acknowledges the trailing RESET.
+    #[tokio::test]
+    async fn owner_cancel_after_a_settled_http_exchange_emits_no_reset() {
+        let (mut actor, _key, mut carrier_receiver, _control) =
+            test_actor_with_carrier(M2_CARRIER_QUEUE_FRAMES);
+
+        let sequenced = 11;
+        let mut stream = http_stream_with_request_fin(sequenced);
+        stream.output_fin = true;
+        actor.streams.insert(sequenced, stream);
+        actor
+            .handle_cancel(cancel_for(sequenced))
+            .await
+            .expect("cancel is accepted");
+        let stream = actor.streams.get(&sequenced).expect("stream retained");
+        assert!(
+            !stream.output_reset && !stream.reset_queued,
+            "no RESET after the sequenced FIN"
+        );
+        assert!(carrier_receiver.try_recv().is_err(), "nothing was queued");
+        assert!(
+            stream
+                .http
+                .as_ref()
+                .is_some_and(|http| http.cancel_received)
+        );
+
+        let deferred = 13;
+        actor
+            .streams
+            .insert(deferred, http_stream_with_request_fin(deferred));
+        actor.writes_frozen = true;
+        actor
+            .emit_or_defer(PendingOutput {
+                stream_id: deferred,
+                kind: FrameKind::Fin,
+                payload: Vec::new(),
+                reset_reason: None,
+            })
+            .await
+            .expect("FIN deferred behind the freeze");
+        actor
+            .handle_cancel(cancel_for(deferred))
+            .await
+            .expect("cancel is accepted");
+        let kinds = actor
+            .pending_outputs
+            .iter()
+            .filter(|output| output.stream_id == deferred)
+            .map(|output| output.kind)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            vec![FrameKind::Fin],
+            "no RESET behind the deferred FIN"
+        );
+        let stream = actor.streams.get(&deferred).expect("stream retained");
+        assert!(!stream.reset_queued);
+
+        // Expiry follows the same rule for the deferred FIN.
+        actor
+            .expire_stream(deferred)
+            .await
+            .expect("expiry of a settled exchange is a no-op");
+        assert_eq!(
+            actor
+                .pending_outputs
+                .iter()
+                .filter(|output| output.stream_id == deferred)
+                .count(),
+            1
+        );
+
+        // An unfinished exchange is still reset by the CANCEL.
+        let unfinished = 15;
+        let mut stream = http_stream_with_request_fin(unfinished);
+        stream.sequence = StreamState::new(unfinished, 1024).expect("test sequence");
+        actor.streams.insert(unfinished, stream);
+        actor
+            .handle_cancel(cancel_for(unfinished))
+            .await
+            .expect("cancel is accepted");
+        assert!(
+            actor
+                .pending_outputs
+                .iter()
+                .any(|output| output.stream_id == unfinished && output.kind == FrameKind::Reset),
+            "an unfinished exchange still gets its RESET"
+        );
     }
 
     #[tokio::test]

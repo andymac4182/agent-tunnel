@@ -21,7 +21,7 @@ tunnel-http-forward = { path = "../tunnel-http-forward" }
 tunnel-protocol = { path = "../tunnel-protocol" }
 
 [dev-dependencies]
-tokio = { version = "1.48", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1.48", features = ["macros", "rt", "rt-multi-thread", "sync", "test-util", "time"] }
 
 [lints]
 workspace = true

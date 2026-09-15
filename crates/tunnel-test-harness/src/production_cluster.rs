@@ -123,6 +123,12 @@ pub use http_forward_real_path::{
     HttpForwardRealPathEvidence, validate_http_forward_real_path_evidence,
     verify as verify_http_forward_real_path,
 };
+mod http_forward_rotation;
+pub use http_forward_rotation::{
+    AdmissionProbeEvidence, CancelRaceEvidence, GATE_ROTATION, HttpForwardRotationEvidence,
+    OutcomeUnknownEvidence, ROTATION_CASES, RotationCaseEvidence, position_matches,
+    validate_http_forward_rotation_evidence, verify as verify_http_forward_rotation,
+};
 mod lifecycle;
 pub use lifecycle::{LifecycleEvidence, validate_lifecycle_evidence, verify as verify_lifecycle};
 mod key_rotation;
@@ -4836,6 +4842,91 @@ impl ProductionCluster {
     /// replace one.  Nothing here widens what the relay will accept: the
     /// record lifetime stays inside the product maximum, and the record still
     /// names the same node and the same peer certificate digest.
+    /// Issue one membership re-signing round now, and return once every
+    /// running relay's verifier retains the new version for every node.
+    ///
+    /// A newer record version invalidates every peer admission bound to the
+    /// old one, and with it every in-flight peer stream.  A gate whose
+    /// streams must not straddle a refresh therefore re-signs at its own case
+    /// boundaries instead of on a background timer.  It cannot be combined
+    /// with [`Self::start_membership_resigning`].
+    async fn resign_membership_now(&mut self) -> Result<u64> {
+        if self.membership_resign.is_some() {
+            return Err(HarnessError::InvalidInput(
+                "membership re-signing is already running in the background".into(),
+            ));
+        }
+        let inputs = &self.membership_resign_inputs;
+        let version = inputs.next_record_version;
+        let publisher =
+            RedisMembershipPublisher::connect(&inputs.redis_url, &inputs.redis_namespace)
+                .await
+                .map_err(|error| {
+                    HarnessError::Redis(format!("connecting membership re-signer: {error}"))
+                })?;
+        let now = Utc::now();
+        for (identity, peer_endpoint) in &inputs.nodes {
+            let signed = self
+                .checkpoint_authority
+                .issuer
+                .sign_membership_identity(
+                    &inputs.deployment_id,
+                    &inputs.deployment_incarnation,
+                    identity,
+                    MembershipLifetimeOptions {
+                        record_version: version,
+                        peer_endpoint: *peer_endpoint,
+                        now,
+                        lifetime: M7_MEMBERSHIP_LIFETIME,
+                    },
+                )
+                .map_err(|error| {
+                    HarnessError::Pki(format!(
+                        "re-signing membership for {}: {error}",
+                        identity.node_id
+                    ))
+                })?;
+            publisher
+                .publish_signed_membership_for_node(&identity.node_id, &signed.catalog_record())
+                .await
+                .map_err(|error| {
+                    HarnessError::Redis(format!(
+                        "publishing membership for {}: {error}",
+                        identity.node_id
+                    ))
+                })?;
+        }
+        self.membership_resign_inputs.next_record_version = version.saturating_add(1);
+        let nodes = self.membership_resign_inputs.nodes.len();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let converged = self
+                .relays
+                .iter()
+                .filter(|relay| relay.running.is_some())
+                .all(|relay| {
+                    let snapshot = relay.membership.snapshot();
+                    snapshot.memberships.len() >= nodes
+                        && snapshot
+                            .memberships
+                            .iter()
+                            .all(|membership| membership.record_version >= version)
+                });
+            if converged {
+                return Ok(version);
+            }
+            if Instant::now() >= deadline {
+                return Err(HarnessError::Timeout(format!(
+                    "membership version {version} did not reach every relay"
+                )));
+            }
+            for relay in self.relays.iter().filter(|relay| relay.running.is_some()) {
+                relay.membership.notify_membership_changed();
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     async fn start_membership_resigning(&mut self) -> Result<()> {
         if self.membership_resign.is_some() {
             return Err(HarnessError::InvalidInput(

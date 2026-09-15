@@ -378,7 +378,7 @@ fn bridge_config() -> Result<BridgeConfig> {
 }
 
 /// Deterministic synthetic bytes for the upload.
-fn synthetic_chunk(offset: usize, len: usize) -> Bytes {
+pub(super) fn synthetic_chunk(offset: usize, len: usize) -> Bytes {
     let mut state = 0x9E37_79B9_7F4A_7C15u64 ^ offset as u64;
     let mut bytes = Vec::with_capacity(len);
     for _ in 0..len {
@@ -402,7 +402,7 @@ struct HandlerState {
     cancelled: Notify,
 }
 
-fn handler_body(receiver: mpsc::Receiver<Bytes>) -> HttpBody {
+pub(super) fn handler_body(receiver: mpsc::Receiver<Bytes>) -> HttpBody {
     let stream = futures_util::stream::unfold(receiver, |mut receiver| async move {
         receiver.recv().await.map(|chunk| {
             (
@@ -414,7 +414,7 @@ fn handler_body(receiver: mpsc::Receiver<Bytes>) -> HttpBody {
     StreamBody::new(stream).boxed()
 }
 
-fn full_body(bytes: &'static [u8]) -> HttpBody {
+pub(super) fn full_body(bytes: &'static [u8]) -> HttpBody {
     Full::new(Bytes::from_static(bytes))
         .map_err(|never| match never {})
         .boxed()
@@ -510,8 +510,8 @@ fn handler(state: Arc<HandlerState>) -> Arc<dyn HttpHandler> {
     )
 }
 
-type Sender = hyper::client::conn::http1::SendRequest<StreamBody<ConsumerStream>>;
-type ConsumerStream = std::pin::Pin<
+pub(super) type Sender = hyper::client::conn::http1::SendRequest<StreamBody<ConsumerStream>>;
+pub(super) type ConsumerStream = std::pin::Pin<
     Box<
         dyn futures_util::Stream<
                 Item = std::result::Result<Frame<Bytes>, Box<dyn std::error::Error + Send + Sync>>,
@@ -519,7 +519,7 @@ type ConsumerStream = std::pin::Pin<
     >,
 >;
 
-async fn connect_consumer(
+pub(super) async fn connect_consumer(
     addr: SocketAddr,
     ca_der: &[u8],
 ) -> Result<(Sender, tokio::task::JoinHandle<()>)> {
@@ -552,17 +552,17 @@ async fn connect_consumer(
     Ok((sender, task))
 }
 
-fn empty_stream() -> StreamBody<ConsumerStream> {
+pub(super) fn empty_stream() -> StreamBody<ConsumerStream> {
     StreamBody::new(Box::pin(futures_util::stream::empty()))
 }
 
-fn once_stream(bytes: &'static [u8]) -> StreamBody<ConsumerStream> {
+pub(super) fn once_stream(bytes: &'static [u8]) -> StreamBody<ConsumerStream> {
     StreamBody::new(Box::pin(futures_util::stream::once(async move {
         Ok(Frame::data(Bytes::from_static(bytes)))
     })))
 }
 
-fn request(
+pub(super) fn request(
     method: &str,
     uri: &str,
     token: Option<&str>,
@@ -658,6 +658,7 @@ pub async fn verify() -> Result<HttpForwardRealPathEvidence> {
     harness.http_forward = Some(HttpForwardExport {
         profile: Arc::clone(&profile),
         config,
+        fixture_hold: None,
     });
     let mut cluster = match ProductionCluster::start(&mut harness).await {
         Ok(cluster) => cluster,

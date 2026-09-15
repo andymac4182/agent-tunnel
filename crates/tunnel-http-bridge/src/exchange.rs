@@ -8,6 +8,7 @@ use std::sync::{Mutex, MutexGuard};
 use tokio_util::sync::CancellationToken;
 use tunnel_http_forward::HttpErrorCode;
 
+use crate::progress::{PauseSignal, ProgressBudgets, ProgressKind};
 use crate::status::{ExchangeReport, Execution, Outcome, ResetDetail};
 use crate::stream::FrameSender;
 
@@ -22,6 +23,7 @@ struct State {
     request: Outcome,
     response: Outcome,
     error: Option<HttpErrorCode>,
+    progress_expired: Option<ProgressKind>,
 }
 
 pub(crate) struct Exchange {
@@ -33,10 +35,18 @@ pub(crate) struct Exchange {
     execution: AtomicU8,
     /// This endpoint's sending direction.
     pub peer: FrameSender,
+    /// This endpoint's recorded rotation freeze, for progress clocks.
+    pub pause: PauseSignal,
+    pub budgets: ProgressBudgets,
 }
 
 impl Exchange {
-    pub fn new(peer: FrameSender, execution: Execution) -> Self {
+    pub fn new(
+        peer: FrameSender,
+        execution: Execution,
+        pause: PauseSignal,
+        budgets: ProgressBudgets,
+    ) -> Self {
         Self {
             stop: CancellationToken::new(),
             request_terminal: CancellationToken::new(),
@@ -45,9 +55,21 @@ impl Exchange {
                 request: Outcome::Pending,
                 response: Outcome::Pending,
                 error: None,
+                progress_expired: None,
             }),
             execution: AtomicU8::new(execution.to_u8()),
             peer,
+            pause,
+            budgets,
+        }
+    }
+
+    /// Record that a progress budget expired; the caller then fails the
+    /// exchange with `HTTP_DEADLINE_EXCEEDED`.
+    pub fn note_progress_expired(&self, kind: ProgressKind) {
+        let mut state = self.lock();
+        if state.error.is_none() {
+            state.progress_expired.get_or_insert(kind);
         }
     }
 
@@ -120,6 +142,7 @@ impl Exchange {
                 request,
                 response,
                 error,
+                ..
             } = &mut *state;
             let first = error.is_none();
             let code = *error.get_or_insert(code);
@@ -155,6 +178,7 @@ impl Exchange {
             response: state.response,
             execution: self.execution(),
             error: state.error,
+            progress_expired: state.progress_expired,
         }
     }
 }

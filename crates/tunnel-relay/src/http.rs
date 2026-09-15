@@ -2779,12 +2779,34 @@ pub fn peer_ingress_handler(
     local_node_id: String,
     local_boot_id: String,
 ) -> impl PeerIngressHandler {
+    peer_ingress_handler_with_http_forward(
+        handle,
+        catalog,
+        oidc,
+        local_node_id,
+        local_boot_id,
+        None,
+    )
+}
+
+/// [`peer_ingress_handler`] for an owner that also validates relayed
+/// `http-forward/1` exchanges against `http_forward`'s profile.  Without an
+/// export the owner refuses forwarded HTTP streams.
+pub fn peer_ingress_handler_with_http_forward(
+    handle: RelayHandle,
+    catalog: SharedCatalog,
+    oidc: Arc<OidcVerifier>,
+    local_node_id: String,
+    local_boot_id: String,
+    http_forward: Option<crate::http::forward::HttpForwardExport>,
+) -> impl PeerIngressHandler {
     move |request: InboundPeerRequest| {
         let handle = handle.clone();
         let catalog = catalog.clone();
         let oidc = oidc.clone();
         let local_node_id = local_node_id.clone();
         let local_boot_id = local_boot_id.clone();
+        let http_forward = http_forward.clone();
         async move {
             handle_peer_ingress(
                 request,
@@ -2793,6 +2815,7 @@ pub fn peer_ingress_handler(
                 oidc,
                 &local_node_id,
                 &local_boot_id,
+                http_forward,
             )
             .await
         }
@@ -2806,6 +2829,7 @@ async fn handle_peer_ingress(
     oidc: Arc<OidcVerifier>,
     local_node_id: &str,
     local_boot_id: &str,
+    http_forward: Option<crate::http::forward::HttpForwardExport>,
 ) -> Result<(), PeerRuntimeError> {
     // The owner-side observer starts at the `owner` stage: every check
     // before the stream is split is this relay's own admission decision.
@@ -2834,6 +2858,7 @@ async fn handle_peer_ingress(
         local_node_id,
         local_boot_id,
         &fault,
+        http_forward,
     )
     .await;
     if let Err(error) = &result {
@@ -2842,6 +2867,7 @@ async fn handle_peer_ingress(
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_peer_ingress_inner(
     request: InboundPeerRequest,
     handle: &RelayHandle,
@@ -2850,6 +2876,7 @@ async fn handle_peer_ingress_inner(
     local_node_id: &str,
     local_boot_id: &str,
     fault: &PeerFaultObserver,
+    http_forward: Option<crate::http::forward::HttpForwardExport>,
 ) -> Result<(), PeerRuntimeError> {
     let envelope = request.envelope().clone();
     let destination = envelope.destination.clone();
@@ -2936,6 +2963,7 @@ async fn handle_peer_ingress_inner(
                 grant,
                 access.expires_at,
                 fault,
+                http_forward,
             )
             .await
         }

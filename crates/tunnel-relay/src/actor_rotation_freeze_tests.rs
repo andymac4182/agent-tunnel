@@ -2333,3 +2333,174 @@ async fn in_flight_frames_before_frozen_within_the_fence_are_admitted() {
     );
     assert_eq!(fixture.phase(), RotationPhase::Draining);
 }
+
+/// Turn the fixture stream into an admitted `http-forward/1` stream.
+fn attach_http(fixture: &mut FreezeFixture) -> super::http_stream::HttpStreamWatchers {
+    let frozen = super::RelayActor::rotation_frozen(fixture.session());
+    let (state, watchers) = super::HttpStreamState::new(frozen);
+    fixture
+        .actor
+        .sessions
+        .get_mut(&fixture.key.scope())
+        .expect("fixture session")
+        .streams
+        .get_mut(&STREAM_ID)
+        .expect("fixture stream")
+        .http = Some(state);
+    watchers
+}
+
+/// Gate-4 review item 1: the post-command HTTP maintenance must not visit
+/// every device's streams for every command.  Per-frame commands name their
+/// session, and a session's streams are visited only when its writer-freeze
+/// state actually changes.
+#[tokio::test]
+async fn http_freeze_is_republished_only_on_its_own_sessions_transition() {
+    use super::HttpMaintenanceScope;
+    let mut fixture = FreezeFixture::new("http-maintenance", false);
+    let watchers = attach_http(&mut fixture);
+    let scope = fixture.key.scope();
+    let unrelated = super::DeviceScope::new(Uuid::from_u128(9_001), Uuid::from_u128(9_002));
+
+    let inbound = super::Command::InboundData {
+        carrier: fixture.old_carrier.clone(),
+        bytes: Vec::new(),
+    };
+    assert_eq!(
+        inbound.http_maintenance_scope(),
+        HttpMaintenanceScope::Session(scope.clone()),
+        "a data frame names its own session"
+    );
+
+    for _ in 0..16 {
+        fixture
+            .actor
+            .after_command_http_maintenance(HttpMaintenanceScope::Session(scope.clone()))
+            .await;
+        fixture
+            .actor
+            .after_command_http_maintenance(HttpMaintenanceScope::All)
+            .await;
+    }
+    assert_eq!(
+        fixture.actor.http_maintenance.freeze_stream_scans, 0,
+        "no stream is visited while the freeze state is unchanged"
+    );
+    assert!(!watchers.freeze.is_paused());
+
+    fixture.quiesce();
+    fixture
+        .actor
+        .after_command_http_maintenance(HttpMaintenanceScope::Session(unrelated))
+        .await;
+    assert_eq!(fixture.actor.http_maintenance.freeze_stream_scans, 0);
+    assert!(
+        !watchers.freeze.is_paused(),
+        "another session's command does not touch this session"
+    );
+
+    fixture
+        .actor
+        .after_command_http_maintenance(HttpMaintenanceScope::Session(scope.clone()))
+        .await;
+    assert!(
+        watchers.freeze.is_paused(),
+        "the freeze transition is published"
+    );
+    for _ in 0..16 {
+        fixture
+            .actor
+            .after_command_http_maintenance(HttpMaintenanceScope::Session(scope.clone()))
+            .await;
+        fixture
+            .actor
+            .after_command_http_maintenance(HttpMaintenanceScope::All)
+            .await;
+    }
+    assert_eq!(
+        fixture.actor.http_maintenance.freeze_stream_scans, 1,
+        "exactly one visit for exactly one transition"
+    );
+}
+
+/// Gate-4 review item 4: a RESET the writer queue refuses outside a freeze
+/// is kept for an ordered retry, and the device learns of the cancellation
+/// out of band meanwhile.
+#[tokio::test]
+async fn refused_http_reset_is_retried_in_order_and_cancels_out_of_band() {
+    let mut fixture = FreezeFixture::new("http-reset-refused", false);
+    let _watchers = attach_http(&mut fixture);
+    let data_tx = fixture
+        .session()
+        .data_tx
+        .clone()
+        .expect("fixture data writer");
+    while data_tx.try_send(super::DataOutbound::Close).is_ok() {}
+    let outcome = fixture.actor.reset_http_stream(
+        &fixture.key,
+        STREAM_ID,
+        OPERATION_ID,
+        tunnel_protocol::reset_reason::CANCELLED,
+    );
+    assert!(outcome.accepted);
+    assert_eq!(
+        fixture.stream().pending_terminal,
+        Some(Terminal::Reset(tunnel_protocol::reset_reason::CANCELLED)),
+        "the refused RESET stays pending"
+    );
+    assert!(fixture.stream().terminal_fin_failure);
+    assert!(fixture.session().terminal_fin_failure_deadline.is_some());
+    assert!(
+        fixture
+            .drain_control()
+            .iter()
+            .any(|message| matches!(message, ControlMessage::Cancel(cancel) if cancel.stream_id == STREAM_ID)),
+        "the device is cancelled out of band"
+    );
+
+    // The writer drains; the next tick retries the RESET in order.
+    let _ = drain_data(&mut fixture.old_rx);
+    fixture.actor.retry_failed_terminals(&fixture.key);
+    assert_eq!(
+        sequenced(&drain_data(&mut fixture.old_rx)),
+        vec![(FrameKind::Reset, 1, fixture.attempt.old_generation)]
+    );
+    assert!(fixture.stream().pending_terminal.is_none());
+    assert!(!fixture.stream().terminal_fin_failure);
+    assert!(fixture.session().terminal_fin_failure_deadline.is_none());
+}
+
+/// Review item 9: an HTTP stream whose RESET is still deferred behind a
+/// freeze defers its owner-stream record to reclamation; a session that ends
+/// first must still record it, exactly once.
+#[tokio::test]
+async fn session_teardown_records_an_http_stream_with_a_deferred_terminal() {
+    let mut fixture = FreezeFixture::new("http-teardown-record", false);
+    let _watchers = attach_http(&mut fixture);
+    fixture.quiesce();
+    assert!(
+        fixture
+            .actor
+            .close_echo_stream(&fixture.key, STREAM_ID, OPERATION_ID)
+    );
+    assert!(fixture.stream().pending_terminal.is_some());
+    let recorded = |fixture: &FreezeFixture| {
+        fixture
+            .actor
+            .http_forward_diagnostics
+            .snapshot()
+            .owner_streams
+            .iter()
+            .filter(|record| record.stream_id == STREAM_ID)
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert!(recorded(&fixture).is_empty(), "deferred to reclamation");
+
+    let key = fixture.key.clone();
+    fixture.actor.close_session(&key, "TEST_TEARDOWN").await;
+    let records = recorded(&fixture);
+    assert_eq!(records.len(), 1, "recorded exactly once at teardown");
+    assert!(records[0].reset_deferred_by_freeze);
+    assert_eq!(records[0].release, "reset");
+}

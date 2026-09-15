@@ -106,6 +106,8 @@ pub struct ChannelBody {
     shared: Arc<Shared>,
     length: Option<u64>,
     done: bool,
+    /// Octets handed to the reader so far.
+    delivered: u64,
     on_drop: Option<CancellationToken>,
 }
 
@@ -130,6 +132,7 @@ impl ChannelBody {
             shared,
             length,
             done: false,
+            delivered: 0,
             on_drop,
         };
         (sender, body)
@@ -194,6 +197,7 @@ impl Body for ChannelBody {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Some(data)) => {
                 this.shared.stats.sub(data.len());
+                this.delivered = this.delivered.saturating_add(data.len() as u64);
                 Poll::Ready(Some(Ok(Frame::data(data))))
             }
             Poll::Ready(None) => {
@@ -222,11 +226,51 @@ impl Body for ChannelBody {
 }
 
 impl Drop for ChannelBody {
+    /// Dropping an unfinished body cancels the exchange, except when the
+    /// reader already took every octet of a declared length: an HTTP server
+    /// stops polling at the declared length, before END and FIN arrive, and
+    /// that is not the consumer going away.  The exchange then completes (or
+    /// fails) on its own END and FIN, which the owner's response pump bounds
+    /// with the FIN-after-END budget from the last declared byte.
     fn drop(&mut self) {
+        let fully_delivered = self.length == Some(self.delivered);
         if self.shared.terminal.get().is_none()
+            && !fully_delivered
             && let Some(token) = &self.on_drop
         {
             token.cancel();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http_body_util::BodyExt;
+
+    #[tokio::test]
+    async fn dropping_a_fully_delivered_declared_body_is_not_a_cancellation() {
+        let token = CancellationToken::new();
+        let (sender, mut body) = ChannelBody::channel(2, Some(3), Some(token.clone()));
+        sender.send(Bytes::from_static(b"abc")).await.expect("send");
+        let frame = body.frame().await.expect("frame").expect("data");
+        assert_eq!(frame.into_data().expect("data").as_ref(), b"abc");
+        // The server stops at the declared length before END and FIN.
+        drop(body);
+        assert!(!token.is_cancelled());
+        drop(sender);
+
+        let token = CancellationToken::new();
+        let (sender, mut body) = ChannelBody::channel(2, Some(6), Some(token.clone()));
+        sender.send(Bytes::from_static(b"abc")).await.expect("send");
+        let _ = body.frame().await;
+        drop(body);
+        assert!(token.is_cancelled(), "a short read is a consumer departure");
+        drop(sender);
+
+        let token = CancellationToken::new();
+        let (_sender, body) = ChannelBody::channel(2, None, Some(token.clone()));
+        drop(body);
+        assert!(token.is_cancelled(), "an unknown length ends only at FIN");
     }
 }

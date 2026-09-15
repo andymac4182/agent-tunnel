@@ -873,7 +873,35 @@ It proves, in one run:
 * **Checksums both ways.** The handler's SHA-256 of the received upload and the consumer's SHA-256 of the echo both equal the SHA-256 of the 16 MiB synthetic source, and the echo body ends cleanly.
 * **No credential or address leakage.** The consumer sends a valid bearer and a synthetic cookie. The handler must see neither `authorization`, `cookie`, `host`, forwarded-identity nor `x-agent-tunnel-*` fields, and no header value may contain the token, the cookie value or any relay consumer, device or peer address; the consumer's response headers are checked the same way. An `x-agent-tunnel-owner` probe must be refused with 400 and an unauthenticated probe with 401, before the handler is ever invoked.
 
-It deliberately does not cover rotation, freeze or recovery on HTTP streams (gate 4), per-profile ACP/MCP/CUA allowlists (gate 5), HTTP/2 consumers, owner-side record re-validation, or control `CANCEL` for HTTP streams; see "Not proven by gate 3" in [http-forwarding.md](http-forwarding.md#pinned-in-code-gate-3). Set `M3_HTTP_FORWARD_DIAGNOSTICS=1` to print the payload-free per-hop records.
+It deliberately does not cover rotation, freeze or recovery on HTTP streams, owner-side record re-validation or control `CANCEL` for HTTP streams (all gate 4, next section), per-profile ACP/MCP/CUA allowlists (gate 5), or HTTP/2 consumers; see "Not proven by gate 3" in [http-forwarding.md](http-forwarding.md#pinned-in-code-gate-3). Set `M3_HTTP_FORWARD_DIAGNOSTICS=1` to print the payload-free per-hop records.
+
+## HTTP forwarding across rotation and faults (`verify-m3-http-forward-rotation`)
+
+```sh
+TEST_REDIS_URL=redis://127.0.0.1:63790/ scripts/m3-harness-verify.sh
+cargo run -p tunnel-test-harness --locked -- verify-m3-http-forward-rotation
+```
+
+Implementation gate 4 of [http-forwarding.md](http-forwarding.md). It uses the same three-relay topology as gate 3: relay-a owns the device and consumers enter through relay-c. The device runs a short scheduled-rotation policy (interval 6 s, handshake 2 s, overlap 5 s), and every device socket passes a TCP proxy, so the gate counts sockets and can pause one direction of one socket. Correctness comes from owner rotation observations, owner and device record logs, handler counters, checksums and diagnostics. It never relies on fixed sleeps. The validator (`validate_http_forward_rotation_evidence` in `production_cluster/http_forward_rotation.rs`) is re-run at the command boundary. Its unit test rejects every listed single-rule mutation of passing evidence, and a second test checks that each upload rotation point is distinct. A run takes about 80 s. `M3_ROTATION_CASES=head,sse,…` selects cases while debugging; a partial run fails validation by design.
+
+It proves, in one run:
+
+* **Refusal before admission.** A head carrying `x-agent-tunnel-owner` is refused with 400. The relay's `ingress_rejected_before_admission` counter rises by one, and the ingress exchange count, owner stream count, owner exchange count and handler invocations stay unchanged.
+* **Seven rotation points.** Each case's HTTP stream is seen by the owner at a completed rotation, captured at QUIESCE and recorded at the COMMIT decision:
+  * `head`: request HEAD only, at a record boundary;
+  * `partial-header`: 3 bytes into a BODY record header;
+  * `partial-body`: inside a BODY payload;
+  * `end-before-fin`: END sequenced, FIN not;
+  * `early-response`: response HEAD while the upload is unfinished;
+  * `credit-stall`: a 6 MiB download the consumer does not read, with the owner receive buffer above half its window;
+  * `sse`: across two distinct rotations, with event bytes split inside a UTF-8 character and inside delimiters.
+
+  The three in-record positions are reached with the owner relay's one-shot fixture hold, released once the observation exists. For every case, the observation's relay fence must equal the owner's frozen `last_emitted`, both acknowledgement cursors must reach their fences, and the new generation must be newer. The handler must be invoked once, and the device must log exactly one HEAD and one END followed by FIN. The consumer must get 200 with an exact body (a SHA-256 digest for uploads, exact bytes for downloads and SSE) that ends cleanly. Neither the device nor the ingress may record an error or progress-budget expiry, and the owner must publish `STREAM_FORGET`.
+* **CANCEL racing a queued RESET.** The data socket's connector→relay bytes are paused after the handler emits one more chunk, so the next rotation freezes and cannot drain. The consumer then disconnects. The handler's cancellation must be observed while the owner is still frozen. The owner must hold `RESET(CANCELLED)` unsequenced behind the freeze and send a scoped `CANCEL`, and the device record must show `cancel_received`. After release, the owner's RESET sequence must be exactly the rotation's relay fence + 1, on the new generation. Device and ingress must record `HTTP_CANCELLED`, and the stream must be forgotten.
+* **Lost acknowledgement and owner loss.** A synthetic side-effect handler blocks after incrementing its counter. The gate then either blackholes relay-a→relay-b for a request entered through relay-b, or shuts relay-a down for one entered through relay-c. Either way the handler count must be 1 before the fault and still 1 at the outcome. The consumer must get a 5xx body whose code and `execution: unknown` map to `outcome_unknown`, and the ingress exchange record must show `unknown` execution.
+* **No extra sockets.** Every settled steady state has exactly two device TCP connections, and the peak before owner loss is at most three. The session ID is unchanged and at least 9 rotations complete.
+
+The fixture's signed membership records live 60 s. A newer record version invalidates in-flight peer hops, so the gate re-signs only at case boundaries, at most every 15 s. After each re-sign it waits for relay-c and relay-b to answer `/ping`, and for the owner to reclaim those pings. Its record, credit-stall and FIN-after-END budgets are 60 s, and a compile-time assertion keeps them above the 44 s bound it waits for one observation, so no case can fail on its own budget first. `M3_ROTATION_RESIGN_SPACING_MS` overrides the re-sign spacing only to reproduce defect M7-C81 in [tasks.md](tasks.md); a run with it is not gate evidence, and the evidence validator refuses any run whose recorded `resign_spacing_ms` is below 15,000. See "Not proven by gate 4" in [http-forwarding.md](http-forwarding.md#pinned-in-code-gate-4) for what this gate does not cover.
 
 ## MCP and computer-use integration
 

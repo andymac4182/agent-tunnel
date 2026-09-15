@@ -16,6 +16,9 @@ use tunnel_http_forward::{
 use crate::body::{BodySender, ChannelBody};
 use crate::exchange::{Dir, Exchange};
 use crate::normalize;
+use crate::progress::{
+    self, BudgetClock, PauseSignal, ProgressKind, WaitMark, track_partial_record,
+};
 use crate::pump::{self, PumpError};
 use crate::status::{
     ExchangeReport, Execution, Origin, Outcome, ResetDetail, gateway_response, gateway_status,
@@ -42,6 +45,7 @@ impl ExchangeHandle {
             response: Outcome::Pending,
             execution: Execution::Unknown,
             error: Some(HttpErrorCode::StreamInterrupted),
+            progress_expired: None,
         })
     }
 }
@@ -83,11 +87,17 @@ impl Owner {
         self.fail(Origin::Upstream, detail.code);
     }
 
+    fn progress_expired(&self, kind: ProgressKind) {
+        self.exchange.note_progress_expired(kind);
+        self.fail(Origin::Upstream, HttpErrorCode::DeadlineExceeded);
+    }
+
     fn pump_failed(&self, error: PumpError) {
         match error {
             PumpError::Stopped => {}
             PumpError::Source(code) => self.fail(Origin::Consumer, code),
             PumpError::Sink(code) => self.fail(Origin::Upstream, code),
+            PumpError::Progress(kind) => self.progress_expired(kind),
         }
     }
 
@@ -112,6 +122,7 @@ fn rejected(
         response: Outcome::Aborted,
         execution,
         error: Some(code),
+        progress_expired: None,
     };
     (
         gateway_response(status, code, execution),
@@ -120,6 +131,15 @@ fn rejected(
             consumer: CancellationToken::new(),
         },
     )
+}
+
+/// The consumer-facing rejection for a request head that fails
+/// normalization: the same status and sanitized `{code, execution}` body
+/// [`forward`] would return, with `not_dispatched` execution.  An ingress
+/// uses it to refuse such a request before it opens any tunnel stream.
+#[must_use]
+pub fn rejection_response(error: normalize::NormalizeError) -> Response<ChannelBody> {
+    gateway_response(error.status(), error.code(), Execution::NotDispatched)
 }
 
 /// Forward one consumer request over one logical stream.
@@ -139,6 +159,30 @@ pub async fn forward<B>(
 where
     B: Body<Data = Bytes> + Send + 'static,
 {
+    forward_paused(
+        request,
+        profile,
+        config,
+        to_device,
+        from_device,
+        PauseSignal::never(),
+    )
+    .await
+}
+
+/// [`forward`] whose progress clocks stop while `pause` reports this
+/// endpoint's (or its owner's relayed) recorded rotation freeze.
+pub async fn forward_paused<B>(
+    request: Request<B>,
+    profile: Arc<Profile>,
+    config: BridgeConfig,
+    to_device: FrameSender,
+    from_device: FrameReceiver,
+    pause: PauseSignal,
+) -> (Response<ChannelBody>, ExchangeHandle)
+where
+    B: Body<Data = Bytes> + Send + 'static,
+{
     let (parts, body) = request.into_parts();
     let ingress = match normalize::request_head(&parts, &profile.request) {
         Ok(ingress) => ingress,
@@ -149,7 +193,12 @@ where
     let (head_tx, head_rx) = oneshot::channel();
     let consumer = CancellationToken::new();
     let owner = Arc::new(Owner {
-        exchange: Exchange::new(to_device, Execution::NotDispatched),
+        exchange: Exchange::new(
+            to_device,
+            Execution::NotDispatched,
+            pause,
+            config.progress(),
+        ),
         head: Mutex::new(Some(head_tx)),
         consumer: consumer.clone(),
     });
@@ -296,14 +345,26 @@ async fn response_pump(
     let mut signal = from_device.reset_signal();
     let mut body: Option<BodySender> = None;
     let mut peer_terminated = false;
+    let pause = exchange.pause.clone();
+    let mut record = BudgetClock::new(ProgressKind::Record, &exchange.budgets);
+    let mut fin = BudgetClock::new(ProgressKind::FinAfterEnd, &exchange.budgets);
+    let mut record_ordinal = None;
+    let mut declared_remaining: Option<u64> = None;
     'frames: loop {
         let listen_only = exchange.is_complete(Dir::Response);
+        let mark = WaitMark::now(&pause);
+        let clocks = [record, fin];
         let frame = tokio::select! {
             biased;
             () = exchange.stop.cancelled() => break,
             () = exchange.request_terminal.cancelled(), if listen_only => return,
             frame = from_device.recv() => frame,
+            kind = progress::expired(clocks, mark, pause.clone()), if !listen_only => {
+                owner.progress_expired(kind);
+                break;
+            }
         };
+        progress::end_wait(&mut [&mut record, &mut fin], mark, &pause);
         if matches!(frame, None | Some(Frame::Reset(_))) {
             peer_terminated = true;
         }
@@ -320,6 +381,7 @@ async fn response_pump(
             }
             Some(Frame::Fin) => match reader.fin() {
                 Ok(()) => {
+                    fin.disarm();
                     if let Some(sender) = body.take() {
                         sender.finish();
                     }
@@ -343,6 +405,10 @@ async fn response_pump(
                     };
                     match event {
                         ResponseEvent::Head(head) => {
+                            declared_remaining = head.body_length;
+                            if declared_remaining == Some(0) {
+                                fin.arm();
+                            }
                             match build_response(head, method, queue, &owner.consumer) {
                                 Ok((response, sender)) => {
                                     // A response head is only sent after the
@@ -364,6 +430,17 @@ async fn response_pump(
                                 continue;
                             };
                             let chunk = bytes.slice_ref(slice);
+                            // After the last declared byte only END and FIN
+                            // may follow, so the FIN-after-END budget covers
+                            // them from here.  The consumer may already have
+                            // released the body at its declared length,
+                            // which is not a cancellation (see `ChannelBody`).
+                            if let Some(remaining) = declared_remaining.as_mut() {
+                                *remaining = remaining.saturating_sub(chunk.len() as u64);
+                                if *remaining == 0 {
+                                    fin.arm();
+                                }
+                            }
                             tokio::select! {
                                 biased;
                                 () = exchange.stop.cancelled() => break 'frames,
@@ -381,9 +458,10 @@ async fn response_pump(
                                 }
                             }
                         }
-                        ResponseEvent::End => {}
+                        ResponseEvent::End => fin.arm(),
                     }
                 }
+                track_partial_record(reader.partial_record(), &mut record, &mut record_ordinal);
             }
         }
     }
