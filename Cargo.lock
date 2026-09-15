@@ -2522,6 +2522,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "tunnel-http-bridge"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "http",
+ "http-body",
+ "http-body-util",
+ "tokio",
+ "tokio-util",
+ "tunnel-http-forward",
+]
+
+[[package]]
 name = "tunnel-http-forward"
 version = "0.1.0"
 
