@@ -1,0 +1,193 @@
+#![forbid(unsafe_code)]
+//! Device-side MCP exports over `http-forward/1` (M3-02).
+//!
+//! An [`McpExport`] is built from validated operator configuration
+//! ([`config::McpExportConfig`]) and served as an in-process HTTP handler by
+//! the connector: [`McpExport::handle`] takes the bridge's typed request and
+//! returns a streaming response.  It carries its selected profile's
+//! `http-forward/1` policies ([`McpExport::profile_policies`]) so the device
+//! validates heads against exactly the allowlist the relay enforces.
+//!
+//! * [`stdio::StdioExport`] supervises a fixed MCP stdio server.
+//! * [`http_backend::HttpBackendExport`] forwards to a fixed loopback
+//!   Streamable HTTP server.
+
+pub mod body;
+pub mod child;
+pub mod config;
+pub mod http_backend;
+pub mod stdio;
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use http::{Request, Response};
+use tunnel_http_bridge::{ChannelBody, Profile};
+use tunnel_mcp::{McpLimits, McpProfile};
+
+pub use body::ExportBody;
+pub use config::{McpBackendConfig, McpConfigError, McpExportConfig, McpLimitsConfig};
+
+/// An exchange the export interrupts instead of answering.  It carries no
+/// message; the peer learns only the bridge's sanitized code.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ExportError;
+
+impl std::fmt::Display for ExportError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("mcp export interrupted the exchange")
+    }
+}
+
+impl std::error::Error for ExportError {}
+
+/// Payload-free counters of one export.
+#[derive(Debug, Default)]
+pub struct ExportCounters {
+    pub children: Arc<child::ChildCounters>,
+    pub rejected: AtomicU64,
+    pub json_responses: AtomicU64,
+    pub sse_responses: AtomicU64,
+    pub streamed_bytes: Arc<AtomicU64>,
+    pub interrupted: AtomicU64,
+    pub cancel_notifications_sent: AtomicU64,
+    pub sessions_opened: AtomicU64,
+    pub sessions_ended: AtomicU64,
+    pub undeliverable: AtomicU64,
+    pub dispatched: AtomicU64,
+    pub backend_errors: AtomicU64,
+}
+
+/// A snapshot of [`ExportCounters`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ExportDiagnostics {
+    pub children_spawned: u64,
+    pub children_spawn_failed: u64,
+    pub children_exited: u64,
+    pub children_killed: u64,
+    pub children_running: u64,
+    pub child_invalid_output: u64,
+    pub child_stderr_bytes: u64,
+    pub rejected: u64,
+    pub json_responses: u64,
+    pub sse_responses: u64,
+    pub streamed_bytes: u64,
+    pub interrupted: u64,
+    pub cancel_notifications_sent: u64,
+    pub sessions_opened: u64,
+    pub sessions_ended: u64,
+    pub undeliverable: u64,
+    pub dispatched: u64,
+    pub backend_errors: u64,
+}
+
+impl ExportCounters {
+    fn snapshot(&self) -> ExportDiagnostics {
+        let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        ExportDiagnostics {
+            children_spawned: load(&self.children.spawned),
+            children_spawn_failed: load(&self.children.spawn_failed),
+            children_exited: load(&self.children.exited),
+            children_killed: load(&self.children.killed),
+            children_running: load(&self.children.running),
+            child_invalid_output: load(&self.children.invalid_output),
+            child_stderr_bytes: load(&self.children.stderr_bytes),
+            rejected: load(&self.rejected),
+            json_responses: load(&self.json_responses),
+            sse_responses: load(&self.sse_responses),
+            streamed_bytes: load(&self.streamed_bytes),
+            interrupted: load(&self.interrupted),
+            cancel_notifications_sent: load(&self.cancel_notifications_sent),
+            sessions_opened: load(&self.sessions_opened),
+            sessions_ended: load(&self.sessions_ended),
+            undeliverable: load(&self.undeliverable),
+            dispatched: load(&self.dispatched),
+            backend_errors: load(&self.backend_errors),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum Kind {
+    Stdio(Arc<stdio::StdioExport>),
+    Http(Arc<http_backend::HttpBackendExport>),
+}
+
+/// One configured MCP export.
+#[derive(Debug, Clone)]
+pub struct McpExport {
+    profile: McpProfile,
+    limits: McpLimits,
+    kind: Arc<Kind>,
+    counters: Arc<ExportCounters>,
+}
+
+impl McpExport {
+    /// Build an export from configuration.  A Streamable HTTP export reads
+    /// its bearer token file here, once.
+    ///
+    /// # Errors
+    /// The first configuration rule violated.
+    pub fn from_config(config: &McpExportConfig) -> Result<Self, McpConfigError> {
+        let validated = config.validate()?;
+        let counters = Arc::new(ExportCounters::default());
+        let kind = match validated.backend {
+            config::ValidatedBackend::Stdio(backend) => {
+                Kind::Stdio(Arc::new(stdio::StdioExport::new(
+                    validated.profile,
+                    validated.limits,
+                    backend,
+                    Arc::clone(&counters),
+                )))
+            }
+            config::ValidatedBackend::Http(backend) => {
+                Kind::Http(Arc::new(http_backend::HttpBackendExport::new(
+                    validated.profile,
+                    validated.limits,
+                    backend,
+                    Arc::clone(&counters),
+                )?))
+            }
+        };
+        Ok(Self {
+            profile: validated.profile,
+            limits: validated.limits,
+            kind: Arc::new(kind),
+            counters,
+        })
+    }
+
+    #[must_use]
+    pub const fn profile(&self) -> McpProfile {
+        self.profile
+    }
+
+    /// The selected profile's `http-forward/1` policies with this export's
+    /// limits.
+    ///
+    /// # Errors
+    /// Only if the pinned profile tables are inconsistent.
+    pub fn profile_policies(&self) -> Result<Profile, tunnel_http_forward::PolicyError> {
+        self.profile.policies(self.limits)
+    }
+
+    /// Payload-free counters.
+    #[must_use]
+    pub fn diagnostics(&self) -> ExportDiagnostics {
+        self.counters.snapshot()
+    }
+
+    /// Serve one exchange in process.
+    ///
+    /// # Errors
+    /// [`ExportError`] when the exchange must be interrupted.
+    pub async fn handle(
+        &self,
+        request: Request<ChannelBody>,
+    ) -> Result<Response<ExportBody>, ExportError> {
+        match &*self.kind {
+            Kind::Stdio(export) => Arc::clone(export).handle(request).await,
+            Kind::Http(export) => Arc::clone(export).handle(request).await,
+        }
+    }
+}

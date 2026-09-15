@@ -1,0 +1,37 @@
+[package]
+name = "tunnel-mcp-export"
+description = "Device-side MCP exports (fixed local Streamable HTTP server or supervised stdio child) over http-forward/1"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The export bridge forwards raw JSON-RPC messages; it deliberately does not
+# re-type them through the MCP SDK (see docs/mcp.md, "Pinned in code").  The
+# official SDK (rmcp) is the pinned client and fixture server in
+# `tunnel-mcp-fixture`.
+[dependencies]
+bytes = "1"
+http = "1"
+http-body = "1"
+http-body-util = "0.1"
+hyper = { version = "1.7", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+serde = { workspace = true }
+serde_json = "1.0"
+tokio = { version = "1.48", features = ["io-util", "macros", "net", "process", "rt", "sync", "time"] }
+tokio-util = { version = "0.7", default-features = false }
+tunnel-http-bridge = { path = "../tunnel-http-bridge" }
+tunnel-http-forward = { path = "../tunnel-http-forward" }
+tunnel-mcp = { path = "../tunnel-mcp" }
+url = "2.5"
+uuid = { version = "1.18", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3.21"
+tokio = { version = "1.48", features = ["io-util", "macros", "net", "process", "rt", "rt-multi-thread", "sync", "time"] }
+toml = { workspace = true }
+
+[lints]
+workspace = true
