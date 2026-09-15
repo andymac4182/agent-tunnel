@@ -2469,3 +2469,38 @@ async fn refused_http_reset_is_retried_in_order_and_cancels_out_of_band() {
     assert!(!fixture.stream().terminal_fin_failure);
     assert!(fixture.session().terminal_fin_failure_deadline.is_none());
 }
+
+/// Review item 9: an HTTP stream whose RESET is still deferred behind a
+/// freeze defers its owner-stream record to reclamation; a session that ends
+/// first must still record it, exactly once.
+#[tokio::test]
+async fn session_teardown_records_an_http_stream_with_a_deferred_terminal() {
+    let mut fixture = FreezeFixture::new("http-teardown-record", false);
+    let _watchers = attach_http(&mut fixture);
+    fixture.quiesce();
+    assert!(
+        fixture
+            .actor
+            .close_echo_stream(&fixture.key, STREAM_ID, OPERATION_ID)
+    );
+    assert!(fixture.stream().pending_terminal.is_some());
+    let recorded = |fixture: &FreezeFixture| {
+        fixture
+            .actor
+            .http_forward_diagnostics
+            .snapshot()
+            .owner_streams
+            .iter()
+            .filter(|record| record.stream_id == STREAM_ID)
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert!(recorded(&fixture).is_empty(), "deferred to reclamation");
+
+    let key = fixture.key.clone();
+    fixture.actor.close_session(&key, "TEST_TEARDOWN").await;
+    let records = recorded(&fixture);
+    assert_eq!(records.len(), 1, "recorded exactly once at teardown");
+    assert!(records[0].reset_deferred_by_freeze);
+    assert_eq!(records[0].release, "reset");
+}

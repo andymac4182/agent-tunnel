@@ -12823,6 +12823,10 @@ impl RelayActor {
         }
         for (_, mut stream) in session.streams.drain() {
             stream.closed.cancel();
+            // An HTTP stream whose record was deferred (a terminal still
+            // pending behind a freeze) or never taken is recorded once here,
+            // so a session teardown cannot lose it.
+            Self::record_http_owner_stream(&mut stream, &self.http_forward_diagnostics);
             queue_budget.release(stream.budget_bytes);
             stream.budget_bytes = 0;
             for (_, waiter) in stream.pending_records.drain(..) {
