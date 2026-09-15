@@ -13851,9 +13851,10 @@ pub struct ListenerSocketOptions {
     /// Optional one-shot fixture gate on an owner-local device control socket,
     /// after the device's HELLO and before the WELCOME-producing registration.
     pub device_control_attach_barrier: Option<Arc<crate::http::ControlAttachBarrier>>,
-    /// Optional `http-forward/1` export for the public HTTP routes.  Production
-    /// callers leave it `None` until gate 5 pins per-profile allowlists.
-    pub http_forward: Option<crate::http::forward::HttpForwardExport>,
+    /// The `http-forward/1` profiles served on the public HTTP routes and
+    /// validated on the owner relay (gate 5).  `ServeConfig` fills it from
+    /// its `[http_forward]` table; `None` answers 404.
+    pub http_forward: Option<crate::http::forward::HttpForwardExports>,
 }
 
 impl Relay {
@@ -13874,6 +13875,30 @@ impl Relay {
             device_tls,
             None,
             ListenerSocketOptions::default(),
+        )
+        .await
+    }
+
+    /// [`Self::start`] with explicit listener options (the configured
+    /// `http-forward/1` profiles, socket options).
+    pub async fn start_with_listener_options(
+        options: RelayOptions,
+        catalog: SharedCatalog,
+        consumer_listener: TcpListener,
+        device_listener: TcpListener,
+        consumer_tls: Arc<rustls::ServerConfig>,
+        device_tls: Arc<rustls::ServerConfig>,
+        listener_options: ListenerSocketOptions,
+    ) -> Result<RunningRelay, RelayError> {
+        Self::start_inner(
+            options,
+            catalog,
+            consumer_listener,
+            device_listener,
+            consumer_tls,
+            device_tls,
+            None,
+            listener_options,
         )
         .await
     }
@@ -13953,9 +13978,14 @@ impl Relay {
         options
             .validate()
             .map_err(|error| RelayError::Config(error.to_string()))?;
-        if let Some(export) = listener_options.http_forward.as_ref() {
-            crate::http::forward::validate_export(export)
-                .map_err(|error| RelayError::Config(error.to_owned()))?;
+        if listener_options
+            .http_forward
+            .as_ref()
+            .is_some_and(crate::http::forward::HttpForwardExports::is_empty)
+        {
+            return Err(RelayError::Config(
+                "an http-forward export set must serve at least one profile".to_owned(),
+            ));
         }
         let handle = RelayHandle::spawn(options.clone(), catalog.clone());
         let cancel = options.shutdown.clone();

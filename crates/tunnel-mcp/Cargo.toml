@@ -1,0 +1,21 @@
+[package]
+name = "tunnel-mcp"
+description = "Pinned MCP Streamable HTTP profiles, per-profile http-forward/1 allowlists and buffered message validation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Deliberately free of the MCP SDK, sockets and child processes: the relay
+# depends on this crate for the profile allowlists only.  The exports that
+# spawn processes or dial local servers live in `tunnel-mcp-export`.
+[dependencies]
+base64 = "0.22"
+http = "1"
+serde_json = "1.0"
+tunnel-http-bridge = { path = "../tunnel-http-bridge" }
+tunnel-http-forward = { path = "../tunnel-http-forward" }
+
+[lints]
+workspace = true

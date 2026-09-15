@@ -992,6 +992,7 @@ fn write_client_config(
             LocalExport {
                 kind: LocalExportKind::Echo,
                 device_canary: Some(canary.to_owned()),
+                mcp: None,
             },
         )]),
         limits: LimitsConfig::default(),

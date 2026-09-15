@@ -30,7 +30,7 @@ use tunnel_http_forward::{
     RequestPolicy, RequestReader, ResponsePolicy, ResponseReader,
 };
 
-use super::hold::{HttpRelayHold, HttpRelayHoldPoint};
+use super::hold::{HttpRelayHoldPoint, HttpRelayInterposer};
 
 /// The first owner-side validation failure of one relayed exchange.
 #[derive(Debug, Default)]
@@ -66,7 +66,7 @@ pub(crate) struct OwnerRequestWriter<W> {
     reader: RequestReader,
     method: watch::Sender<Option<Method>>,
     tracker: RecordTracker,
-    hold: Option<HttpRelayHold>,
+    hold: Option<Arc<dyn HttpRelayInterposer>>,
     verdict: Arc<OwnerVerdict>,
     /// The owner→ingress direction, reset with the owner's detail.
     other: FrameSender,
@@ -77,7 +77,7 @@ impl<W: CarrierWriter> OwnerRequestWriter<W> {
         inner: W,
         policy: RequestPolicy,
         method: watch::Sender<Option<Method>>,
-        hold: Option<HttpRelayHold>,
+        hold: Option<Arc<dyn HttpRelayInterposer>>,
         verdict: Arc<OwnerVerdict>,
         other: FrameSender,
     ) -> Self {
@@ -566,17 +566,80 @@ mod tests {
         );
     }
 
+    /// A minimal interposer for this unit test.  The gate's one-shot hold
+    /// with its self-release ceiling lives in `tunnel-test-harness`.
+    #[derive(Default)]
+    struct TestHold {
+        state: Mutex<(Option<HttpRelayHoldPoint>, bool)>,
+        reached: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    impl TestHold {
+        fn arm(&self, point: HttpRelayHoldPoint) -> bool {
+            let mut state = self.state.lock().unwrap();
+            if state.0.is_some() || state.1 {
+                return false;
+            }
+            state.0 = Some(point);
+            true
+        }
+
+        async fn reached(&self) {
+            loop {
+                let notified = self.reached.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if self.state.lock().unwrap().1 {
+                    return;
+                }
+                notified.await;
+            }
+        }
+
+        fn release(&self) {
+            self.state.lock().unwrap().1 = false;
+            self.release.notify_waiters();
+        }
+    }
+
+    impl HttpRelayInterposer for TestHold {
+        fn armed_point(&self) -> Option<HttpRelayHoldPoint> {
+            self.state.lock().unwrap().0
+        }
+
+        fn hold_at(
+            &self,
+            point: HttpRelayHoldPoint,
+        ) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+            Box::pin(async move {
+                let released = self.release.notified();
+                tokio::pin!(released);
+                released.as_mut().enable();
+                {
+                    let mut state = self.state.lock().unwrap();
+                    if state.0 != Some(point) {
+                        return;
+                    }
+                    *state = (None, true);
+                }
+                self.reached.notify_waiters();
+                released.await;
+            })
+        }
+    }
+
     #[tokio::test]
     async fn an_armed_hold_stops_the_relay_inside_a_body_header_and_before_fin() {
         let (request_policy, _) = policies();
         let actor = Recorder::default();
-        let hold = HttpRelayHold::default();
+        let hold = Arc::new(TestHold::default());
         let (to_ingress, _rx, _) = channel(1 << 16);
         let mut writer = OwnerRequestWriter::new(
             actor.clone(),
             request_policy.clone(),
             watch::channel(None).0,
-            Some(hold.clone()),
+            Some(Arc::clone(&hold) as Arc<dyn HttpRelayInterposer>),
             Arc::new(OwnerVerdict::default()),
             to_ingress,
         );

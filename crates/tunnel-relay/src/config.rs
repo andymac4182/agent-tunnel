@@ -674,6 +674,84 @@ pub struct ServeConfig {
     /// Recovery is opt-in and is never opened by ordinary `serve`.
     #[serde(default)]
     pub recovery: Option<RecoveryConfig>,
+    /// Gate 5: the `http-forward/1` application profiles this relay serves.
+    /// Absent, the public HTTP route answers 404 as before.
+    #[serde(default)]
+    pub http_forward: Option<HttpForwardServeConfig>,
+}
+
+/// The `[http_forward]` table: the pinned application profiles a relay
+/// serves and their finite limits.  Only profiles pinned in code can be
+/// named; a catalog service selects one through its
+/// `http_forward_profile` capability.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct HttpForwardServeConfig {
+    /// For example `["mcp-2026-07-28", "mcp-2025-11-25"]`.
+    pub profiles: Vec<String>,
+    /// Cumulative request body limit (default 1 MiB, at most 16 MiB).
+    #[serde(default)]
+    pub request_body_bytes: Option<u64>,
+    /// Cumulative response body limit, the SSE limit (default 64 MiB, at
+    /// most 1 GiB).
+    #[serde(default)]
+    pub response_body_bytes: Option<u64>,
+    /// Absolute exchange deadline in seconds (default 300, at most 86400).
+    #[serde(default)]
+    pub deadline_seconds: Option<u64>,
+}
+
+impl HttpForwardServeConfig {
+    /// Build the relay's profile set.
+    ///
+    /// # Errors
+    /// No profile, an unpinned or repeated profile, or limits outside their
+    /// bounds.
+    pub fn exports(&self) -> Result<crate::HttpForwardExports, ConfigError> {
+        if self.profiles.is_empty() {
+            return Err(ConfigError::Invalid(
+                "http_forward.profiles must name at least one profile",
+            ));
+        }
+        let defaults = tunnel_mcp::McpLimits::default();
+        let response = self
+            .response_body_bytes
+            .unwrap_or(defaults.sse_response_body());
+        let limits = tunnel_mcp::McpLimits::new(
+            self.request_body_bytes.unwrap_or(defaults.request_body()),
+            response.min(defaults.json_response_body()),
+            response,
+        )
+        .map_err(|_| {
+            ConfigError::Invalid(
+                "http_forward body limits must be 1..=16MiB (request) and 1..=1GiB (response)",
+            )
+        })?;
+        let mut bridge = tunnel_http_bridge::BridgeConfig::default();
+        if let Some(seconds) = self.deadline_seconds {
+            bridge = bridge
+                .with_deadline(Duration::from_secs(seconds))
+                .map_err(|_| {
+                    ConfigError::Invalid("http_forward.deadline_seconds must be 1..=86400")
+                })?;
+        }
+        let mut exports = crate::HttpForwardExports::new();
+        for id in &self.profiles {
+            let profile = tunnel_mcp::McpProfile::parse_id(id).ok_or(ConfigError::Invalid(
+                "http_forward.profiles may name only mcp-2026-07-28 and mcp-2025-11-25",
+            ))?;
+            let policies = profile
+                .policies(limits)
+                .map_err(|_| ConfigError::Invalid("pinned http_forward profile is inconsistent"))?;
+            exports = exports
+                .with_profile(
+                    profile.id(),
+                    crate::HttpForwardExport::new(Arc::new(policies), bridge),
+                )
+                .map_err(|_| ConfigError::Invalid("http_forward.profiles repeats a profile"))?;
+        }
+        Ok(exports)
+    }
 }
 
 impl ServeConfig {
@@ -783,7 +861,27 @@ impl ServeConfig {
             }
             validate_redis_endpoint(selected_url)?;
         }
+        if let Some(http_forward) = &self.http_forward {
+            http_forward.exports()?;
+        }
         Ok(())
+    }
+
+    /// The listener options `serve` uses: default socket options plus the
+    /// configured `http-forward/1` profiles.  No fixture interposer can be
+    /// expressed in configuration.
+    ///
+    /// # Errors
+    /// An invalid `[http_forward]` table.
+    pub fn listener_options(&self) -> Result<crate::ListenerSocketOptions, ConfigError> {
+        Ok(crate::ListenerSocketOptions {
+            http_forward: self
+                .http_forward
+                .as_ref()
+                .map(HttpForwardServeConfig::exports)
+                .transpose()?,
+            ..crate::ListenerSocketOptions::default()
+        })
     }
 
     /// Start both listener roles after the caller has constructed the durable
@@ -819,13 +917,17 @@ impl ServeConfig {
         options.limits.max_pending_operations_per_owner = self.max_pending_operations_per_owner;
         options.limits.max_queue_bytes = self.max_queue_bytes;
         options.rotation = self.rotation.clone();
-        crate::Relay::start(
+        let listener_options = self
+            .listener_options()
+            .map_err(|error| crate::RelayError::Config(error.to_string()))?;
+        crate::Relay::start_with_listener_options(
             options,
             catalog,
             consumer_listener,
             device_listener,
             consumer_tls,
             device_tls,
+            listener_options,
         )
         .await
     }
@@ -855,7 +957,8 @@ impl ServeConfig {
             device_tls,
             peer,
             peer_runtime,
-            crate::ListenerSocketOptions::default(),
+            self.listener_options()
+                .map_err(|error| crate::RelayError::Config(error.to_string()))?,
         )
         .await
     }
@@ -876,6 +979,13 @@ impl ServeConfig {
         peer_runtime: Arc<crate::PeerRuntime>,
         listener_options: crate::ListenerSocketOptions,
     ) -> Result<crate::RunningRelay, crate::RelayError> {
+        let mut listener_options = listener_options;
+        if listener_options.http_forward.is_none() {
+            listener_options.http_forward = self
+                .listener_options()
+                .map_err(|error| crate::RelayError::Config(error.to_string()))?
+                .http_forward;
+        }
         let mut options = options;
         if !self.node_id.is_empty() {
             options.node_id = self.node_id.clone();
@@ -1297,6 +1407,46 @@ consumer_tls_private_key = "consumer-key.pem"
             "{}\nnode_id = \"relay-a\"\n\n[cluster]\ndeployment_id = \"deployment-a\"\npeer_bind = \"127.0.0.1:8443\"\npeer_tls_cert_chain = \"peer-cert.pem\"\npeer_tls_private_key = \"peer-key.pem\"\npeer_tls_client_ca = \"peer-ca.pem\"\nmembership_signer_public_key_path = \"membership-signer.pub\"\nmembership_signer_trust_path = \"membership-trust.pem\"\ncheckpoint_authority_endpoint = \"https://checkpoint.example.test/v1/checkpoint\"\ncheckpoint_authority_trust_path = \"checkpoint-ca.pem\"\nmembership_version_state_path = \"state/membership-version-state.json\"\n\n[cluster.endpoint_policy]\nallowed_ports = [8443]\nrequire_private_ip = true\n",
             valid_toml()
         )
+    }
+
+    #[test]
+    fn http_forward_profiles_are_pinned_configured_and_otherwise_absent() {
+        let config = ServeConfig::parse(valid_toml()).expect("valid");
+        assert!(config.http_forward.is_none());
+        assert!(config.listener_options().unwrap().http_forward.is_none());
+        let configured = format!(
+            "{}\n[http_forward]\nprofiles = [\"mcp-2026-07-28\", \"mcp-2025-11-25\"]\nrequest_body_bytes = 65536\ndeadline_seconds = 60\n",
+            valid_toml()
+        );
+        let config = ServeConfig::parse(&configured).expect("http_forward parses");
+        let options = config.listener_options().unwrap();
+        let exports = options.http_forward.expect("exports");
+        assert_eq!(
+            exports.profile_ids().collect::<Vec<_>>(),
+            vec!["mcp-2025-11-25", "mcp-2026-07-28"]
+        );
+        assert!(
+            !exports.has_fixture_interposer(),
+            "configuration cannot attach a hold"
+        );
+        let selected = exports
+            .select(&serde_json::json!({"http_forward_profile": "mcp-2026-07-28"}))
+            .expect("selected");
+        assert_eq!(selected.profile.request.body_limit(), 65_536);
+        assert_eq!(selected.config.deadline(), Duration::from_secs(60));
+        for broken in [
+            "[http_forward]\nprofiles = []\n",
+            "[http_forward]\nprofiles = [\"mcp-2024-11-05\"]\n",
+            "[http_forward]\nprofiles = [\"fixture\"]\n",
+            "[http_forward]\nprofiles = [\"mcp-2026-07-28\", \"mcp-2026-07-28\"]\n",
+            "[http_forward]\nprofiles = [\"mcp-2026-07-28\"]\nrequest_body_bytes = 0\n",
+            "[http_forward]\nprofiles = [\"mcp-2026-07-28\"]\nresponse_body_bytes = 2000000000\n",
+            "[http_forward]\nprofiles = [\"mcp-2026-07-28\"]\ndeadline_seconds = 0\n",
+            "[http_forward]\nprofiles = [\"mcp-2026-07-28\"]\nfixture_hold = true\n",
+        ] {
+            let input = format!("{}\n{broken}", valid_toml());
+            assert!(ServeConfig::parse(&input).is_err(), "{broken}");
+        }
     }
 
     #[test]

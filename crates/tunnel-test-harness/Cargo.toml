@@ -44,7 +44,7 @@ tunnel-http-bridge = { path = "../tunnel-http-bridge" }
 tunnel-http-forward = { path = "../tunnel-http-forward" }
 tunnel-core = { path = "../tunnel-core" }
 tokio-util = { version = "0.7", features = ["rt"] }
-tunnel-relay = { path = "../tunnel-relay", features = ["test-fixtures"] }
+tunnel-relay = { path = "../tunnel-relay" }
 tunnel-transport = { path = "../tunnel-transport" }
 tunnel-protocol = { path = "../tunnel-protocol" }
 futures-util = { version = "0.3", features = ["sink", "std"] }

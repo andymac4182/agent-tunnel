@@ -290,7 +290,10 @@ impl FixtureTopology {
             service_id,
             service_type: "http-forward".to_owned(),
             display_name: "Synthetic in-process HTTP export".to_owned(),
-            capabilities: serde_json::json!({"operations": ["http:invoke"]}),
+            capabilities: serde_json::json!({
+                "operations": ["http:invoke"],
+                (tunnel_relay::HTTP_FORWARD_PROFILE_CAPABILITY): crate::FIXTURE_HTTP_FORWARD_PROFILE,
+            }),
             version: 1,
             active: true,
         });

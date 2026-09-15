@@ -10,6 +10,8 @@ mod c11_capture;
 pub mod cluster_acceptance;
 pub mod cluster_fixture;
 pub mod cluster_transport;
+/// The gate-4 owner-relay fixture hold (harness only, gate 5).
+pub mod http_relay_hold;
 pub mod m2_acceptance;
 pub mod peer;
 pub mod peer_fragmentation;
@@ -18,6 +20,11 @@ pub mod production_cluster;
 pub mod redis_lane_restart;
 pub mod redis_restart;
 pub mod redis_tls;
+
+/// The catalog profile identifier of the synthetic gate-3/4 `http-forward`
+/// fixture service.  It is not an application profile a production relay
+/// can be configured to serve.
+pub const FIXTURE_HTTP_FORWARD_PROFILE: &str = "fixture-http-forward";
 
 pub use production_cluster::{
     LateResponseEvidence, PublicAbandonedUpgradeEvidence, validate_late_response_evidence,

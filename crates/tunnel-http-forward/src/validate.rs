@@ -97,12 +97,62 @@ struct NameRule {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct HeaderPolicy {
     rules: Vec<NameRule>,
+    /// Name-prefix rules (for example MCP's `mcp-param-{name}` family).  The
+    /// occurrence applies to each complete name separately.
+    prefixes: Vec<NameRule>,
 }
 
 impl HeaderPolicy {
     #[must_use]
     pub const fn new() -> Self {
-        Self { rules: Vec::new() }
+        Self {
+            rules: Vec::new(),
+            prefixes: Vec::new(),
+        }
+    }
+
+    /// Allow every header name that starts with `prefix` and has at least
+    /// one further byte.  The occurrence applies to each complete name.
+    ///
+    /// A prefix must be a valid lowercase token ending in `-`, and it can
+    /// neither cover nor be covered by a forbidden or unsupported name or
+    /// prefix, so a prefix rule never widens the fixed forbidden lists.
+    ///
+    /// # Errors
+    /// Rejects an invalid prefix, one overlapping the forbidden or
+    /// unsupported lists, and a duplicate.
+    pub fn allow_prefix(
+        &mut self,
+        prefix: &str,
+        occurrence: Occurrence,
+    ) -> Result<(), PolicyError> {
+        if validate_header_name(prefix).is_err() || !prefix.ends_with('-') {
+            return Err(PolicyError::InvalidHeaderName);
+        }
+        let overlaps = |name: &str| name.starts_with(prefix) || prefix.starts_with(name);
+        if UNSUPPORTED_HEADERS.iter().any(|name| overlaps(name)) {
+            return Err(PolicyError::UnsupportedHeader);
+        }
+        if FORBIDDEN_HEADERS.iter().any(|name| overlaps(name))
+            || FORBIDDEN_HEADER_PREFIXES.iter().any(|name| overlaps(name))
+        {
+            return Err(PolicyError::ForbiddenHeader);
+        }
+        if self.prefixes.iter().any(|rule| rule.name == prefix) {
+            return Err(PolicyError::DuplicateEntry);
+        }
+        self.prefixes.push(NameRule {
+            name: prefix.to_owned(),
+            occurrence,
+        });
+        Ok(())
+    }
+
+    /// Whether `name` is allowed by an exact or prefix rule.  Forbidden and
+    /// unsupported names are never allowed.
+    #[must_use]
+    pub fn allows(&self, name: &str) -> bool {
+        header_forbidden(name).is_none() && self.occurrence(name).is_some()
     }
 
     /// Allow a header name.
@@ -132,6 +182,11 @@ impl HeaderPolicy {
         self.rules
             .iter()
             .find(|rule| rule.name == name)
+            .or_else(|| {
+                self.prefixes
+                    .iter()
+                    .find(|rule| name.len() > rule.name.len() && name.starts_with(&rule.name))
+            })
             .map(|rule| rule.occurrence)
     }
 }
@@ -527,6 +582,7 @@ mod tests {
     /// guard in `validate_headers` is the only thing that can reject.
     fn permissive(names: &[&str]) -> HeaderPolicy {
         HeaderPolicy {
+            prefixes: Vec::new(),
             rules: names
                 .iter()
                 .map(|name| NameRule {
@@ -535,6 +591,64 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn a_prefix_rule_admits_its_family_only_and_never_widens_the_forbidden_list() {
+        let mut policy = HeaderPolicy::new();
+        policy
+            .allow_prefix("mcp-param-", Occurrence::Singleton)
+            .unwrap();
+        assert_eq!(
+            policy.allow_prefix("mcp-param-", Occurrence::Singleton),
+            Err(PolicyError::DuplicateEntry)
+        );
+        let ok = [HeaderField::new("mcp-param-region", "us-west1")];
+        assert_eq!(validate_headers(&ok, &policy), Ok(()));
+        // The bare prefix is not a member of its own family.
+        let bare = [HeaderField::new("mcp-param-", "x")];
+        assert_eq!(
+            validate_headers(&bare, &policy),
+            Err(HeaderRule::NotAllowed)
+        );
+        let neighbour = [HeaderField::new("mcp-params", "x")];
+        assert_eq!(
+            validate_headers(&neighbour, &policy),
+            Err(HeaderRule::NotAllowed)
+        );
+        // Singleton per complete name; distinct names may each occur once.
+        let repeated = [
+            HeaderField::new("mcp-param-a", "1"),
+            HeaderField::new("mcp-param-a", "2"),
+        ];
+        assert_eq!(
+            validate_headers(&repeated, &policy),
+            Err(HeaderRule::RepeatedSingleton)
+        );
+        let distinct = [
+            HeaderField::new("mcp-param-a", "1"),
+            HeaderField::new("mcp-param-b", "2"),
+        ];
+        assert_eq!(validate_headers(&distinct, &policy), Ok(()));
+        // A prefix overlapping a forbidden or unsupported name/prefix, or not
+        // ending in `-`, cannot be configured.
+        for (prefix, error) in [
+            ("x-", PolicyError::ForbiddenHeader),
+            ("x-forwarded-for-", PolicyError::ForbiddenHeader),
+            ("x-agent-tunnel-extra-", PolicyError::ForbiddenHeader),
+            ("proxy-", PolicyError::ForbiddenHeader),
+            ("te-", PolicyError::UnsupportedHeader),
+            ("mcp-param", PolicyError::InvalidHeaderName),
+            ("Mcp-", PolicyError::InvalidHeaderName),
+        ] {
+            assert_eq!(
+                HeaderPolicy::new().allow_prefix(prefix, Occurrence::Singleton),
+                Err(error),
+                "{prefix}"
+            );
+        }
+        assert!(policy.allows("mcp-param-x"));
+        assert!(!policy.allows("mcp-name"));
     }
 
     #[test]

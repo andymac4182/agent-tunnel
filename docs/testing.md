@@ -907,6 +907,14 @@ The fixture's signed membership records live 60 s. A newer record version invali
 
 For MCP, test against a pinned SDK/server fixture with initialization, negotiated capabilities, request/response correlation, notifications, cancellation, concurrent calls, structured errors, and streaming behavior for each supported transport profile. Exercise a long-running request across rotation. Confirm that MCP session state and its lifecycle follow the adapter contract instead of being inferred from the lifetime of one data WebSocket. Keep other exposed capabilities functional while MCP work is active.
 
+The M3-01/M3-02 suite runs with the ordinary workspace test command. It is not a harness gate and needs no Redis or network, only loopback and a temporary Unix socket:
+
+```sh
+cargo test --locked -p tunnel-mcp -p tunnel-mcp-export -p tunnel-mcp-fixture
+```
+
+`tunnel-mcp-fixture` builds the synthetic rmcp 3.4.0 server binary. Its `rmcp_stdio`, `rmcp_http` and `export_guards` tests run the pinned rmcp client through the in-process gate-2 bridge against the stdio export and the Streamable HTTP export, for both `mcp-2026-07-28` and `mcp-2025-11-25`. [mcp.md](mcp.md#pinned-in-code-m3-01-and-m3-02) lists what they cover and what they do not: the real relay path and rotation are M3-03, and isolation and unknown outcomes are M3-04. The end-to-end tests are `cfg(unix)`.
+
 For CUA, pin each supported backend profile separately. Use recorded synthetic contract fixtures or fake local servers in ordinary CI. The Python computer-server profile requires tests for its `/cmd` response format and its sequential `/ws` request behavior without correlation IDs. If a Rust `cua-driver` profile is selected, validate its own protocol and capability discovery independently. Tunnel credentials must not be forwarded as CUA cloud credentials.
 
 Actual computer-use tests run only in a dedicated disposable VM or isolated test computer with synthetic content. Never target a contributor's live desktop or a normal CI runner desktop. A person grants any required OS screen recording, accessibility, or interactive-session permissions during test-image setup; tests verify both permission-granted and permission-denied behavior without trying to bypass those prompts.

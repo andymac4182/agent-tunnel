@@ -172,6 +172,7 @@ pub(crate) fn write_device_profile(
             LocalExport {
                 kind: LocalExportKind::Echo,
                 device_canary: Some(canary.to_owned()),
+                mcp: None,
             },
         )]
         .into_iter()
