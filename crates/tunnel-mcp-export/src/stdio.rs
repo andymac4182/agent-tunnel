@@ -896,9 +896,16 @@ async fn run_session(
                 }
                 // An in-flight request is activity (it is bounded by its own
                 // exchange deadline); otherwise the session has expired.
-                if session.router().pending.is_empty() {
-                    counters.sessions_expired.fetch_add(1, Ordering::Relaxed);
-                    break;
+                {
+                    // Decide and end under one lock, so a request cannot
+                    // register between the emptiness check and `ended`.
+                    let mut router = session.router();
+                    if router.pending.is_empty() {
+                        router.ended = true;
+                        drop(router);
+                        counters.sessions_expired.fetch_add(1, Ordering::Relaxed);
+                        break;
+                    }
                 }
                 session.touch();
                 continue;

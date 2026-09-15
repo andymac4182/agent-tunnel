@@ -197,6 +197,9 @@ pub fn spawn(
             _ = child.wait() => {}
             () = supervisor_kill.cancelled() => {
                 supervisor_counters.killed.fetch_add(1, Ordering::Relaxed);
+                // Signal the group while its leader is still unreaped, so the
+                // group id cannot have been reissued to another process.
+                let _ = kill_group(group);
                 let _ = child.start_kill();
                 let _ = child.wait().await;
             }

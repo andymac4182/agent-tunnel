@@ -111,11 +111,13 @@ async fn activity_keeps_a_legacy_session_alive() {
         workspace.path(),
         1,
         &fixture_binary(),
-        "session_idle_seconds = 1\n",
+        "session_idle_seconds = 3\n",
     );
     let session = open_session(&export).await;
-    for id in 1..=6u64 {
-        tokio::time::sleep(Duration::from_millis(400)).await;
+    // Five 1 s gaps outlast the 3 s idle limit, with 2 s of margin per
+    // exchange for a loaded host.
+    for id in 1..=5u64 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
         let response = within(exchange(
             &export,
             post(&legacy_headers(Some(&session)), &tools_list(id)),
