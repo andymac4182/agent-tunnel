@@ -58,8 +58,9 @@ pub struct McpExportConfig {
     pub limits: McpLimitsConfig,
 }
 
-/// Where the export's MCP server lives.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Where the export's MCP server lives.  `Debug` prints no argument or
+/// environment values, which may carry operator secrets.
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", deny_unknown_fields)]
 pub enum McpBackendConfig {
     /// A supervised child process speaking MCP over stdio.
@@ -96,6 +97,32 @@ pub enum McpBackendConfig {
     },
 }
 
+impl std::fmt::Debug for McpBackendConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Stdio {
+                args,
+                env,
+                inherit_env,
+                max_children,
+                ..
+            } => formatter
+                .debug_struct("Stdio")
+                .field("args", &args.len())
+                .field("env_names", &env.keys().collect::<Vec<_>>())
+                .field("inherit_env", inherit_env)
+                .field("max_children", max_children)
+                .finish_non_exhaustive(),
+            Self::StreamableHttp {
+                bearer_token_file, ..
+            } => formatter
+                .debug_struct("StreamableHttp")
+                .field("credential", &bearer_token_file.is_some())
+                .finish_non_exhaustive(),
+        }
+    }
+}
+
 const fn default_max_children() -> usize {
     DEFAULT_MAX_CHILDREN
 }
@@ -121,8 +148,20 @@ impl std::fmt::Display for McpConfigError {
 
 impl std::error::Error for McpConfigError {}
 
-/// A validated stdio backend.
-#[derive(Clone, Debug, Eq, PartialEq)]
+impl std::fmt::Debug for StdioBackend {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StdioBackend")
+            .field("args", &self.args.len())
+            .field("env_names", &self.env.keys().collect::<Vec<_>>())
+            .field("max_children", &self.max_children)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A validated stdio backend.  `Debug` prints no argument or environment
+/// values.
+#[derive(Clone, Eq, PartialEq)]
 pub struct StdioBackend {
     pub command: PathBuf,
     pub args: Vec<String>,

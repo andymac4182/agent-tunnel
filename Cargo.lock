@@ -2628,6 +2628,7 @@ dependencies = [
  "toml",
  "tunnel-core",
  "tunnel-http-bridge",
+ "tunnel-mcp-export",
  "tunnel-protocol",
  "tunnel-transport",
  "url",

@@ -280,13 +280,22 @@ fn run_legacy_check_config(path: Option<PathBuf>) -> Result<(), CliError> {
 
 async fn run_connect(path: PathBuf, json: bool) -> Result<(), CliError> {
     let config = load_runtime_config(&path)?;
+    // Configured MCP exports become in-process http-forward/1 handlers; an
+    // http-forward export without one is still refused at OPEN.
+    let handlers = tunnel_client::http_forward::HttpHandlers::new()
+        .with_mcp_exports(&config)
+        .map_err(|error| CliError {
+            code: "CONFIG_ERROR",
+            message: error.to_string(),
+            retryable: false,
+        })?;
     let cancellation = CancellationToken::new();
     let options = ConnectOptions {
         config,
         cancellation: cancellation.clone(),
         profile: tunnel_client::TransportProfile::M2,
     };
-    let handle = match connect(options).await {
+    let handle = match tunnel_client::connect_with_http_handlers(options, handlers).await {
         Ok(handle) => handle,
         Err(error) => {
             let error = CliError::from_client(error);

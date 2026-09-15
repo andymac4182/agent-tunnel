@@ -169,6 +169,58 @@ impl HttpHandlers {
         self.exports.get(service_id)
     }
 
+    /// Whether a handler is registered for `service_id`.
+    #[must_use]
+    pub fn contains(&self, service_id: &str) -> bool {
+        self.exports.contains_key(service_id)
+    }
+
+    /// Register every `[exports.<service>.mcp]` export of a validated
+    /// runtime configuration (M3-02).  Each export carries its selected MCP
+    /// profile's `http-forward/1` policies, so the device validates heads
+    /// against exactly the allowlist the relay enforces, and every request is
+    /// buffered and validated before the stdio child or fixed local server is
+    /// invoked.  A Streamable HTTP export reads its bearer token file here.
+    ///
+    /// # Errors
+    /// The first export configuration rule violated.
+    pub fn with_mcp_exports(
+        mut self,
+        config: &crate::RuntimeConfig,
+    ) -> Result<Self, tunnel_mcp_export::McpConfigError> {
+        for (service_id, export) in &config.exports {
+            let Some(mcp) = &export.mcp else { continue };
+            if export.kind != crate::ExportKind::HttpForward {
+                return Err(tunnel_mcp_export::McpConfigError(
+                    "an mcp table is only valid on an http-forward export",
+                ));
+            }
+            let mcp_export = tunnel_mcp_export::McpExport::from_config(mcp)?;
+            let profile = mcp_export.profile_policies().map_err(|_| {
+                tunnel_mcp_export::McpConfigError("the pinned MCP profile tables are inconsistent")
+            })?;
+            let handler_export = mcp_export.clone();
+            let handler = move |request: Request<ChannelBody>| -> HttpHandlerFuture {
+                let export = handler_export.clone();
+                Box::pin(async move {
+                    export
+                        .handle(request)
+                        .await
+                        .map_err(|_| HttpHandlerError)
+                })
+            };
+            self.exports.insert(
+                service_id.clone(),
+                HttpExport {
+                    profile: Arc::new(profile),
+                    config: BridgeConfig::default(),
+                    handler: Arc::new(handler),
+                },
+            );
+        }
+        Ok(self)
+    }
+
     /// The bounded device-side exchange records.
     #[must_use]
     pub fn diagnostics(&self) -> DeviceHttpDiagnostics {

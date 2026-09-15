@@ -136,6 +136,15 @@ impl RuntimeConfig {
                     "an http-forward export has no device_canary",
                 ));
             }
+            if let Some(mcp) = &export.mcp {
+                if export.kind != ExportKind::HttpForward {
+                    return Err(RuntimeConfigError::Invalid(
+                        "an mcp table is only valid on an http-forward export",
+                    ));
+                }
+                mcp.validate()
+                    .map_err(|error| RuntimeConfigError::Invalid(error.0))?;
+            }
             if let Some(canary) = &export.device_canary
                 && canary.len() > 256
             {
@@ -243,6 +252,9 @@ pub struct ExportConfig {
     /// Optional synthetic response marker.  It is returned by the relay's
     /// test adapter and never treated as a credential or executable path.
     pub device_canary: Option<String>,
+    /// An MCP export served by the connector itself (M3-02): only valid on
+    /// an `http-forward` export.  See `tunnel_mcp_export::config`.
+    pub mcp: Option<tunnel_mcp_export::McpExportConfig>,
 }
 
 impl Default for ExportConfig {
@@ -250,6 +262,7 @@ impl Default for ExportConfig {
         Self {
             kind: ExportKind::Echo,
             device_canary: None,
+            mcp: None,
         }
     }
 }
@@ -589,5 +602,53 @@ ca = "ca.pem"
         assert!(config.validate().is_err());
         config.limits.max_queue_bytes = 256 * 1024;
         assert!(config.validate().is_ok());
+    }
+
+    const MCP_EXPORT: &str = r#"
+[exports.22222222-2222-4222-8222-222222222222]
+type = "http-forward"
+
+[exports.22222222-2222-4222-8222-222222222222.mcp]
+profile = "mcp-2026-07-28"
+
+[exports.22222222-2222-4222-8222-222222222222.mcp.backend]
+kind = "stdio"
+command = "/opt/synthetic/mcp-server"
+args = ["stdio"]
+workspace = "/srv/synthetic-workspace"
+env = { SYNTHETIC_SECRET = "synthetic-env-value" }
+"#;
+
+    #[test]
+    fn mcp_exports_parse_validate_and_register_handlers() {
+        let input = valid_toml().replace(
+            "[exports.echo]\ntype = \"echo\"\ndevice_canary = \"fixture-one\"\n",
+            MCP_EXPORT,
+        );
+        let config = RuntimeConfig::parse(&input).expect("mcp export");
+        let export = &config.exports["22222222-2222-4222-8222-222222222222"];
+        assert_eq!(export.kind, ExportKind::HttpForward);
+        assert!(export.mcp.is_some());
+        // Debug never prints environment values.
+        assert!(!format!("{config:?}").contains("synthetic-env-value"));
+        let handlers = crate::http_forward::HttpHandlers::new()
+            .with_mcp_exports(&config)
+            .expect("handlers");
+        assert!(handlers.contains("22222222-2222-4222-8222-222222222222"));
+
+        // An mcp table on an echo export, an unknown profile, a relative
+        // command and a non-loopback backend are configuration errors.
+        for broken in [
+            input.replace("type = \"http-forward\"", "type = \"echo\""),
+            input.replace("mcp-2026-07-28", "mcp-2024-11-05"),
+            input.replace("/opt/synthetic/mcp-server", "mcp-server"),
+            input.replace(
+                "kind = \"stdio\"\ncommand = \"/opt/synthetic/mcp-server\"\nargs = [\"stdio\"]\nworkspace = \"/srv/synthetic-workspace\"\nenv = { SYNTHETIC_SECRET = \"synthetic-env-value\" }",
+                "kind = \"streamable-http\"\nurl = \"http://192.0.2.10:8080/mcp\"",
+            ),
+            input.replace("args = [\"stdio\"]", "args = [\"stdio\"]\nshell = \"/bin/sh\""),
+        ] {
+            assert!(RuntimeConfig::parse(&broken).is_err(), "{broken}");
+        }
     }
 }
