@@ -89,8 +89,9 @@ pub use i08_goaway_rotation::{
     verify as verify_i08_goaway_rotation,
 };
 pub use i08_synthetic_rotation::{
-    I08Evidence, I08RotationEvidence, validate_i08_evidence,
-    verify as verify_i08_synthetic_rotation,
+    I08Evidence, I08PartialResponseEvidence, I08RotationEvidence, validate_i08_evidence,
+    validate_i08_partial_response_evidence, verify as verify_i08_synthetic_rotation,
+    verify_partial_response_rotation as verify_i08_partial_response_rotation,
 };
 pub use m7_i08_recovery_attempts::{
     AttemptObservation, CursorSample, I08RecoveryAttemptEvidence, RecoveryEpisodeEvidence,
