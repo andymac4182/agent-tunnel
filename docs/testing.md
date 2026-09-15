@@ -877,3 +877,16 @@ recorded as verified on that basis alone. Where a gate has been measured
 repeatedly, the measured rate belongs in its row. The owner-local stream
 capacity gate, for instance, fails roughly half of its standalone runs and its
 earlier clean survey results were luck.
+
+### Chaos gate startup flake, measured 2026-09-15
+
+`verify-m7-chaos` sometimes fails before its scenario starts, with the owner CLI
+exiting before production readiness and a typed `TRANSPORT_ERROR`. Measured
+rates: zero failures in four consecutive standalone runs on an idle machine, and
+one in three under six competing CPU hogs. It is a startup condition, not a
+classification result: when it fires, no round has run.
+
+It is recorded rather than fixed because it has not been reproduced under
+instrumentation and the cause is not established. Do not read a single chaos
+failure of this shape as a classification finding; rerun it standalone first,
+and check whether the failure names a round.
