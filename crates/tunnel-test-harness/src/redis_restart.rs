@@ -166,7 +166,7 @@ pub async fn redis_restart_seed_with_incarnation(
     }
     let catalog = RedisCatalog::connect(redis_url, namespace).await?;
     let now = Utc::now();
-    let fixture = fixture(now);
+    let fixture = restart_fixture(now);
     let tenant_id = fixture.tenants[0].tenant_id;
     let principal_id = fixture.users[0].user_id;
     let device_id = fixture.devices[0].device_id;
@@ -458,7 +458,10 @@ pub async fn check(
     redis_restart_check(redis_url, namespace, receipt_file).await
 }
 
-fn fixture(now: chrono::DateTime<Utc>) -> CatalogFixture {
+/// Shared with the live-catalog restart command in
+/// [`crate::redis_lane_restart`], which seeds the same synthetic records
+/// through the same production `Catalog` contract.
+pub(crate) fn restart_fixture(now: chrono::DateTime<Utc>) -> CatalogFixture {
     let tenant_id = Uuid::new_v4();
     let principal_id = Uuid::new_v4();
     let device_id = Uuid::new_v4();

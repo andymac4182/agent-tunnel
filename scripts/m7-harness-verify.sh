@@ -54,6 +54,12 @@ gate "catalog authority lane reconnect tests" \
 gate "catalog maintenance queue tests" \
   cargo test -p tunnel-catalog --test redis_maintenance_queue --locked -- --ignored --test-threads=1
 
+# The live-catalog Redis restart gate owns its own pinned loopback Redis and
+# restarts that process while one catalog stays connected to it, so it does not
+# touch TEST_REDIS_URL.  It requires Docker and must run from the repository root.
+gate "live-catalog Redis process restart refuses a changed run identifier" \
+  bash scripts/m7-redis-lane-restart-verify.sh
+
 gate "operator recovery CLI tests" \
   cargo test -p tunnel-relay --test recovery_cli --locked -- --test-threads=1
 gate "operator recovery workflow tests" \

@@ -444,13 +444,42 @@ forwarders and the catalog namespace. The deterministic statement of the same
 replacement rule is `tunnel-cluster`'s
 `membership::tests::peer_key_replacement_walks_old_then_overlap_then_new`.
 
-Two boundaries are deliberate and not claimed by this gate. The typed public
+The replacement process is then required to serve, not merely to converge. Once
+A is ready again, the gate waits for the replacement's own `/readyz`, attaches a
+fresh device session to the device listener that process now owns, reads the
+owner claim back from Redis and requires it to name the same node and deployment
+incarnation under a **different `boot_id`** from the claim the retired process
+held, with a fresh session id and a higher owner epoch, and then drives a public
+consumer request into relay A which must return the exact canary and payload
+bytes across the replaced peer route. The session must still be the one the
+replacement served when it is stopped, and its generation must not have moved
+across the canary. Typical evidence is
+`replacement_epoch=2 replacement_device_generation=1 replacement_canary_attempts=9`.
+
+Two convergence tolerances are bounded and counted rather than silent. The
+device attach is retried inside the transition deadline, because a relay that
+is still failing closed refuses it at the upgrade or during the control
+handshake. The canary tolerates the typed `503` pre-dispatch boundary
+(`CLUSTER_UNREADY` while A's readiness is still converging, `PEER_UNTRUSTED`
+while A's peer trust for the replacement is), and at most two `401` outcomes.
+The `401` allowance exists because the relay maps a *catalog* failure inside
+consumer authentication to `UNAUTHORIZED` rather than to the
+`AUTHORIZATION_UNAVAILABLE` boundary that sits beside it in the same function,
+so an authority blip during convergence is indistinguishable at the HTTP
+boundary from a real rejection; the third `401` fails the gate, so a genuinely
+broken authorization can never be waited out. Both counts appear in the
+evidence line, and four consecutive local runs recorded `pre_dispatch_401=0`.
+Relay A's own signed record is also re-issued at a higher version before the
+replacement process boots: every record in this fixture carries a lifetime
+shorter than the relay's 60-second bound, and without that refresh the
+replacement's peer trust for relay A ages out mid-phase.
+
+One boundary is deliberate and not claimed by this gate: the typed public
 outcome across the retired route is the readiness boundary rather than
 `PEER_UNTRUSTED`, because the relay withdraws that route from readiness before a
 consumer request reaches peer resolution; the pin failure itself is observed on
 the authenticated probe path, where A dials the retired certificate, refuses it
-and opens no stream. And the **replacement process's own public admission is not
-exercised**. The non-convergence originally recorded here — a relay booting
+and opens no stream. The non-convergence originally recorded here — a relay booting
 beside a peer flapping between ready and unready never reaching `/readyz` ready
 within 20 s (0 of 123 samples) — was a product defect and has been fixed: probe
 admission required the *receiving* relay's readiness-derived route set, which
@@ -460,11 +489,36 @@ was reachable but momentarily unready refused the probe and the prober observed
 Reachability is now measured independently of the responder's own readiness; see
 the readiness paragraph in [cluster.md](cluster.md) and the deterministic
 regressions `real_h3_probe_converges_while_peer_cluster_readiness_is_withdrawn`
-and `real_h3_probe_converges_across_a_peer_readiness_flap`. The replacement boot
-is still asserted only through relay A: A's readiness recovers on the
-replacement route and A accepts the replacement certificate on the private path.
-A device session and consumer request served *by* a replaced process remain
-uncovered; see the M7-C06 tracker row.
+and `real_h3_probe_converges_across_a_peer_readiness_flap`. With that fix in
+place the replacement boot is now asserted through the replacement process
+itself as described above, so a device session and consumer request served *by*
+the replaced process are covered by this gate.
+
+### Live-catalog Redis process restart
+
+```sh
+bash scripts/m7-redis-lane-restart-verify.sh
+```
+
+Requires Docker; the script owns one pinned, loopback-only Redis container on a
+fixed host port and never touches `TEST_REDIS_URL`. `tunnel-test-harness
+redis-lane-restart` connects **one** `RedisCatalog` to that container, seeds its
+synthetic fixture through the production `Catalog` contract, serves a read, and
+signals the script through a two-word handshake file. The script then restarts
+that Redis process on the same port and signals back, so the same live catalog
+meets a genuinely new `run_id` on a real socket rather than a fake authority.
+
+The gate requires the primary's `run_id` to differ across the restart, the
+catalog to have served a read before it, the first post-restart command to fail
+closed without replay, the very next command to be refused with the typed
+`CatalogError::Conflict("Redis server run id")`, and every one of the remaining
+twelve bounded commands to be refused with that same typed conflict — never a
+value, never another typed shape. A catalog connected *after* the restart then
+reads the seeded authorization back, so the refusal is specific to the identity
+the first catalog verified rather than a client that stopped working. Evidence
+is one payload-free line naming both run identifiers and the per-command outcome
+sequence. This is the process-level counterpart to `redis_lane_reconnect`, which
+severs the socket without changing the primary.
 
 ## Deterministic transport and state-machine tests
 
