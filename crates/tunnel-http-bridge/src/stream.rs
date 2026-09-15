@@ -205,6 +205,13 @@ impl FrameSender {
         self.tx.is_closed()
     }
 
+    /// Whether this direction has queued FIN (and not since RESET).  For
+    /// diagnostics and tests.
+    #[must_use]
+    pub fn fin_sent(&self) -> bool {
+        self.state.state.load(Ordering::SeqCst) == FIN
+    }
+
     /// DATA credit capacity: a send no larger than this is one queue item,
     /// so it is either wholly queued or not queued at all.
     #[must_use]

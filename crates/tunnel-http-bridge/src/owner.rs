@@ -208,7 +208,9 @@ where
     B: Body<Data = Bytes> + Send + 'static,
 {
     let exchange = &owner.exchange;
-    let deadline_at = Instant::now() + config.deadline();
+    let started = Instant::now();
+    let deadline_at = started + config.deadline();
+    let discard_until = started + config.discard_bound();
     let request = async {
         // A head no larger than the credit capacity is one queue item: it is
         // either wholly queued or not queued at all.  Only once it is queued
@@ -234,7 +236,7 @@ where
         ResponseReader::new(profile.response.clone(), method),
         method,
         config.body_queue(),
-        deadline_at,
+        discard_until,
     );
     let pumps = async {
         tokio::join!(request, response);
@@ -288,7 +290,7 @@ async fn response_pump(
     mut reader: ResponseReader,
     method: Method,
     queue: usize,
-    deadline_at: Instant,
+    discard_until: Instant,
 ) {
     let exchange = &owner.exchange;
     let mut signal = from_device.reset_signal();
@@ -389,8 +391,9 @@ async fn response_pump(
         sender.fail(exchange.error_code());
     }
     if !peer_terminated {
-        // Bounded by the exchange deadline: a peer that never finishes
-        // cannot hold this exchange open.
-        let _ = tokio::time::timeout_at(deadline_at, from_device.discard_until_terminal()).await;
+        // Bounded by the deadline plus a short grace: a peer that never
+        // finishes cannot hold the exchange open, but a deadline abort still
+        // gives the peer time to see the RESET instead of a lost receiver.
+        let _ = tokio::time::timeout_at(discard_until, from_device.discard_until_terminal()).await;
     }
 }

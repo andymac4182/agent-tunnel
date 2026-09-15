@@ -90,7 +90,9 @@ where
     E: Send + 'static,
 {
     let exchange = Exchange::new(to_owner, Execution::NotDispatched);
-    let deadline_at = Instant::now() + config.deadline();
+    let started = Instant::now();
+    let deadline_at = started + config.deadline();
+    let discard_until = started + config.discard_bound();
     let cancel = CancellationToken::new();
     let (dispatch_tx, dispatch_rx) = oneshot::channel();
     let request = request_pump(
@@ -100,7 +102,7 @@ where
         dispatch_tx,
         config.body_queue(),
         &cancel,
-        deadline_at,
+        discard_until,
     );
     let response = response_pump(&exchange, &profile, dispatch_rx, handler);
     let watchdog = async {
@@ -130,7 +132,7 @@ async fn request_pump(
     dispatch: oneshot::Sender<(Method, Request<ChannelBody>)>,
     queue: usize,
     cancel: &CancellationToken,
-    deadline_at: Instant,
+    discard_until: Instant,
 ) {
     let mut signal = from_owner.reset_signal();
     let mut dispatch = Some(dispatch);
@@ -225,8 +227,8 @@ async fn request_pump(
         sender.fail(exchange.error_code());
     }
     if !peer_terminated {
-        // Bounded by the exchange deadline.
-        let _ = tokio::time::timeout_at(deadline_at, from_owner.discard_until_terminal()).await;
+        // Bounded by the deadline plus a short grace.
+        let _ = tokio::time::timeout_at(discard_until, from_owner.discard_until_terminal()).await;
     }
 }
 

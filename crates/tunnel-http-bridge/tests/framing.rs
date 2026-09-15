@@ -212,12 +212,13 @@ async fn ingress_consumes_only_transport_fields_and_trims_boundary_whitespace() 
 // ----- exact request Content-Length through the owner pump -------------------
 
 /// Upload `first`, wait until the handler runs, then upload `rest` and end.
-/// Returns the exchange and what the handler's body read saw.
+/// Returns the exchange and what the handler's body read saw, or `None` if
+/// the exchange's RESET cancelled the handler before its read returned.
 async fn upload_with_length(
     declared: &str,
     first: &[u8],
     rest: &[u8],
-) -> (Running, Result<Vec<u8>, HttpErrorCode>) {
+) -> (Running, Option<Result<Vec<u8>, HttpErrorCode>>) {
     let (hint_tx, hint_rx) = tokio::sync::oneshot::channel();
     let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
     let (upload, body) = test_body(4);
@@ -247,24 +248,28 @@ async fn upload_with_length(
         upload.send(data(rest)).await.unwrap();
     }
     drop(upload);
-    let seen = within(seen_rx).await.unwrap();
+    let seen = within(seen_rx).await.ok();
     (within(running).await.unwrap(), seen)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn request_content_length_must_match_the_bytes_exactly() {
     let (running, seen) = upload_with_length("5", b"hel", b"lo").await;
-    assert_eq!(seen, Ok(b"hello".to_vec()));
+    assert_eq!(seen, Some(Ok(b"hello".to_vec())));
     assert_eq!(running.response.status(), StatusCode::OK);
     assert_eq!(within(running.device).await.unwrap().error, None);
 
     for rest in [&b""[..], &b"lo!"[..]] {
         let (running, seen) = upload_with_length("5", b"hel", rest).await;
-        assert_eq!(
-            seen,
-            Err(HttpErrorCode::LengthMismatch),
-            "the handler saw the body fail, not end"
-        );
+        // The handler either sees the body fail or is cancelled by the RESET
+        // first (the device aborts the handler task); it never sees an end.
+        if let Some(seen) = seen {
+            assert_eq!(
+                seen,
+                Err(HttpErrorCode::LengthMismatch),
+                "the handler saw the body fail, not end"
+            );
+        }
         expect_gateway(
             &running.response,
             StatusCode::BAD_REQUEST,

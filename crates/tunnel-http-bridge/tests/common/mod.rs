@@ -380,10 +380,12 @@ pub fn tap_with_reset_delay(
                         tokio::select! {
                             biased;
                             sent = out.send_data(piece) => if sent.is_err() { return },
-                            reset = signal.wait() => {
-                                task_log.lock().unwrap().reset = Some(reset.detail);
+                            // Only a RESET sent before the source's FIN: a
+                            // FIN-then-RESET is forwarded in order, FIN first.
+                            detail = signal.wait_before_fin() => {
+                                task_log.lock().unwrap().reset = Some(detail);
                                 tokio::time::sleep(reset_delay).await;
-                                out.reset(reset.detail);
+                                out.reset(detail);
                                 return;
                             }
                         }

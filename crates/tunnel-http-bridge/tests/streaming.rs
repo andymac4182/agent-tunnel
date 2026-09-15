@@ -812,6 +812,7 @@ async fn reset_after_request_fin_cancels_a_device_stalled_on_an_unread_upload() 
     let cancelled = Arc::clone(&token_cancelled);
     let link = link(STREAM_CREDIT);
     let request_stats = Arc::clone(&link.request_stats);
+    let request_sender = link.to_device.clone();
     let chunks = (0..6).map(|_| data(&[b'u'; PAYLOAD])).collect();
     let upload_len = (6 * PAYLOAD).to_string();
     let mut running = exchange(
@@ -851,9 +852,17 @@ async fn reset_after_request_fin_cancels_a_device_stalled_on_an_unread_upload() 
         .await
         .unwrap()
         .unwrap();
-    // Wait until the upload has stopped moving: END and FIN are queued and
-    // the device pump is stalled on its full body queue.
-    wait_until_stable(|| request_stats.queued()).await;
+    // Deterministic ordering: the owner has queued FIN, and the device pump
+    // has taken the head and five BODY records (four fill its body queue and
+    // one is in hand), leaving exactly the sixth BODY record and END queued.
+    let stalled_queue = 8 + PAYLOAD + 8;
+    within(async {
+        while !(request_sender.fin_sent() && request_stats.queued() == stalled_queue) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    drop(request_sender);
     drop(running.response);
     let bound = Duration::from_secs(5);
     let device = tokio::time::timeout(bound, running.device)
@@ -969,6 +978,7 @@ async fn post_fin_device_reset_does_not_truncate_a_completed_response_being_deli
     });
     let link = link(STREAM_CREDIT);
     let response_stats = Arc::clone(&link.response_stats);
+    let response_sender = link.to_owner.clone();
     let (upload, body) = test_body(1);
     let expected: Vec<u8> = (0..6u8)
         .flat_map(|index| vec![b'a' + index; PAYLOAD])
@@ -991,9 +1001,17 @@ async fn post_fin_device_reset_does_not_truncate_a_completed_response_being_deli
         },
     )
     .await;
-    // The consumer does not read yet: the device finishes writing (END+FIN)
-    // into the owner's credit and body queue, then everything stops moving.
-    wait_until_stable(|| response_stats.queued()).await;
+    // Deterministic ordering: the device has queued its response FIN, and
+    // the owner pump has taken the head and five BODY records (four in the
+    // body queue, one in hand), leaving the sixth BODY record and END queued.
+    let stalled_queue = 8 + PAYLOAD + 8;
+    within(async {
+        while !(response_sender.fin_sent() && response_stats.queued() == stalled_queue) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    drop(response_sender);
     // Now the upload exceeds the device's limit: the device resets after its
     // response FIN, and its report returns once the owner's request ends.
     upload.send(data(&[b'u'; 32])).await.unwrap();
@@ -1011,4 +1029,60 @@ async fn post_fin_device_reset_does_not_truncate_a_completed_response_being_deli
     // Both owner directions had completed before the RESET arrived, so the
     // owner records no failure for an exchange it finished.
     assert_eq!(owner.request, Outcome::Complete);
+}
+
+/// Review regression: when the owner's deadline fires while the device is
+/// busy streaming, the owner must keep accounting device frames long enough
+/// for its RESET to arrive, so the device records the deadline rather than a
+/// vanished receiver.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn owner_deadline_reaches_a_busy_device_as_an_ordered_reset() {
+    const CREDIT: usize = 64 * 1024;
+    let owner_config = BridgeConfig::default()
+        .with_deadline(Duration::from_millis(300))
+        .unwrap();
+    let Link {
+        to_device,
+        device_rx,
+        to_owner,
+        owner_rx,
+        ..
+    } = link(CREDIT);
+    // The owner's RESET reaches the device only after a carrier delay.
+    let (device_rx, _log) =
+        tap_with_reset_delay(device_rx, CREDIT, Vec::new(), Duration::from_millis(150));
+    let device = tokio::spawn(serve(
+        profile(),
+        BridgeConfig::default(),
+        device_rx,
+        to_owner,
+        |_request: Request<ChannelBody>| async move {
+            let (tx, body) = test_body(1);
+            tokio::spawn(async move {
+                while tx.send(data(&[b'x'; 4096])).await.is_ok() {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            });
+            Ok::<_, TestError>(Response::builder().status(200).body(body).unwrap())
+        },
+    ));
+    let (response, handle) = within(forward(
+        request("GET", "/events", &[], empty_body()),
+        profile(),
+        owner_config,
+        to_device,
+        owner_rx,
+    ))
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    // The consumer reads nothing, so the device's writes stall on credit.
+    let owner = within(handle.report()).await;
+    assert_eq!(owner.error, Some(HttpErrorCode::DeadlineExceeded));
+    let device = within(device).await.unwrap();
+    assert_eq!(
+        device.error,
+        Some(HttpErrorCode::DeadlineExceeded),
+        "the device saw the ordered RESET, not an interrupted carrier"
+    );
+    drop(response);
 }

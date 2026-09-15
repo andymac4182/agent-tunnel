@@ -58,6 +58,11 @@ pub struct Profile {
 pub const DEFAULT_DEADLINE: Duration = Duration::from_secs(300);
 /// The hard ceiling on a configured deadline.  There is no unlimited value.
 pub const MAX_DEADLINE: Duration = Duration::from_secs(24 * 60 * 60);
+/// The longest grace after the deadline during which an endpoint that has
+/// aborted keeps discarding peer frames, so its RESET can reach the peer
+/// before the receiver is dropped.  The grace is also capped by the
+/// configured deadline itself.
+pub const DISCARD_GRACE: Duration = Duration::from_secs(5);
 /// The default body queue, in chunks.
 pub const DEFAULT_BODY_QUEUE: usize = 4;
 /// The hard ceiling on the body queue, in chunks.
@@ -125,6 +130,18 @@ impl BridgeConfig {
     #[must_use]
     pub const fn deadline(&self) -> Duration {
         self.deadline
+    }
+
+    /// How long after the exchange starts terminal discard may continue:
+    /// the deadline plus `min(deadline, DISCARD_GRACE)`.
+    #[must_use]
+    pub fn discard_bound(&self) -> Duration {
+        let grace = if self.deadline < DISCARD_GRACE {
+            self.deadline
+        } else {
+            DISCARD_GRACE
+        };
+        self.deadline.saturating_add(grace)
     }
 
     #[must_use]
