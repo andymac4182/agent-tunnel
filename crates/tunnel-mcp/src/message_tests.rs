@@ -86,7 +86,8 @@ fn a_valid_2026_tools_call_preserves_id_meta_and_bytes() {
 fn the_2026_header_body_rules_reject_mismatches_with_header_mismatch() {
     let profile = McpProfile::V2026_07_28;
     let good = call_body("1", "echo", "2026-07-28");
-    let cases: Vec<(Vec<(&'static str, String)>, Vec<u8>, i64)> = vec![
+    type Case = (Vec<(&'static str, String)>, Vec<u8>, i64);
+    let cases: Vec<Case> = vec![
         // Wrong Mcp-Name.
         (
             headers_2026("tools/call", Some("other")),

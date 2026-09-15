@@ -34,7 +34,12 @@ fn post(headers: &[(&str, &str)], body: impl Into<Bytes>) -> Request<Full<Bytes>
     builder.body(Full::new(body.into())).expect("request")
 }
 
-fn current_call(id: &str, tool: &str, arguments: &str, extra_meta: &str) -> (Vec<(&'static str, String)>, String) {
+fn current_call(
+    id: &str,
+    tool: &str,
+    arguments: &str,
+    extra_meta: &str,
+) -> (Vec<(&'static str, String)>, String) {
     let body = format!(
         r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"{tool}","arguments":{arguments},"_meta":{{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{{"name":"raw","version":"1"}},"io.modelcontextprotocol/clientCapabilities":{{}}{extra_meta}}}}}}}"#
     );
@@ -49,7 +54,10 @@ fn current_call(id: &str, tool: &str, arguments: &str, extra_meta: &str) -> (Vec
 }
 
 fn as_refs<'a>(headers: &'a [(&'static str, String)]) -> Vec<(&'static str, &'a str)> {
-    headers.iter().map(|(name, value)| (*name, value.as_str())).collect()
+    headers
+        .iter()
+        .map(|(name, value)| (*name, value.as_str()))
+        .collect()
 }
 
 fn json(bytes: &[u8]) -> serde_json::Value {
@@ -117,9 +125,13 @@ async fn unlisted_routes_headers_and_versions_never_reach_the_child() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let error = json(&body_bytes(response).await.expect("body"));
     assert_eq!(error["error"]["code"], -32022);
-    assert_eq!(error["error"]["data"]["supported"], serde_json::json!(["2026-07-28"]));
+    assert_eq!(
+        error["error"]["data"]["supported"],
+        serde_json::json!(["2026-07-28"])
+    );
     // A client notification has no per-request child to reach.
-    let notification = r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1}}"#;
+    let notification =
+        r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1}}"#;
     let response = within(exchange(
         &export,
         post(
@@ -142,7 +154,11 @@ async fn unlisted_routes_headers_and_versions_never_reach_the_child() {
     let response = within(exchange(&export, post(&as_refs(&headers), oversized))).await;
     assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
 
-    assert_eq!(export.diagnostics().children_spawned, 0, "no child ever ran");
+    assert_eq!(
+        export.diagnostics().children_spawned,
+        0,
+        "no child ever ran"
+    );
     assert!(!workspace.path().join("invocations.log").exists());
 }
 
@@ -155,7 +171,8 @@ async fn concurrent_identical_request_ids_are_isolated_and_preserved_exactly() {
         let export = export.clone();
         tasks.push(tokio::spawn(async move {
             let token = format!(r#","progressToken":"token-{index}""#);
-            let (headers, body) = current_call("9007199254740993", "progress", r#"{"steps":3}"#, &token);
+            let (headers, body) =
+                current_call("9007199254740993", "progress", r#"{"steps":3}"#, &token);
             let response = within(exchange(&export, post(&as_refs(&headers), body))).await;
             assert_eq!(response.status(), StatusCode::OK);
             (index, body_bytes(response).await.expect("body"))
@@ -181,7 +198,10 @@ async fn concurrent_identical_request_ids_are_isolated_and_preserved_exactly() {
     let (headers, body) = current_call(r#""id-ü-\"q\"""#, "echo", "{}", "");
     let response = within(exchange(&export, post(&as_refs(&headers), body))).await;
     let bytes = body_bytes(response).await.expect("body");
-    assert_eq!(messages(&bytes).last().expect("final")["id"], "id-\u{fc}-\"q\"");
+    assert_eq!(
+        messages(&bytes).last().expect("final")["id"],
+        "id-\u{fc}-\"q\""
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -261,7 +281,8 @@ async fn legacy_sessions_require_ids_and_end_on_delete() {
     assert_eq!(session.len(), 32);
     let _ = body_bytes(response).await;
     let with_session = |extra: &[(&'static str, &'static str)]| {
-        let mut headers: Vec<(&str, String)> = base.iter().map(|(n, v)| (*n, (*v).to_owned())).collect();
+        let mut headers: Vec<(&str, String)> =
+            base.iter().map(|(n, v)| (*n, (*v).to_owned())).collect();
         headers.push(("mcp-protocol-version", "2025-11-25".to_owned()));
         headers.push(("mcp-session-id", session.clone()));
         for (name, value) in extra {
@@ -292,7 +313,10 @@ async fn legacy_sessions_require_ids_and_end_on_delete() {
     assert_eq!(listed.last().expect("final")["id"], 1);
     // One standalone GET stream per session.
     let get = |headers: &[(&str, String)]| {
-        let mut builder = Request::builder().method("GET").uri("/mcp").header("host", "gateway.test");
+        let mut builder = Request::builder()
+            .method("GET")
+            .uri("/mcp")
+            .header("host", "gateway.test");
         for (name, value) in headers {
             if *name != "content-type" {
                 builder = builder.header(*name, value.as_str());
@@ -314,13 +338,20 @@ async fn legacy_sessions_require_ids_and_end_on_delete() {
     assert_eq!(second.status(), StatusCode::CONFLICT);
     drop(first);
     // DELETE ends the session and kills its child.
-    let mut delete = Request::builder().method("DELETE").uri("/mcp").header("host", "gateway.test");
+    let mut delete = Request::builder()
+        .method("DELETE")
+        .uri("/mcp")
+        .header("host", "gateway.test");
     for (name, value) in &headers {
         if *name == "mcp-session-id" || *name == "mcp-protocol-version" {
             delete = delete.header(*name, value.as_str());
         }
     }
-    let response = within(exchange(&export, delete.body(Full::new(Bytes::new())).expect("delete"))).await;
+    let response = within(exchange(
+        &export,
+        delete.body(Full::new(Bytes::new())).expect("delete"),
+    ))
+    .await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     let response = within(exchange(&export, post(&refs, list))).await;
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
@@ -336,9 +367,7 @@ async fn legacy_sessions_require_ids_and_end_on_delete() {
 type Recorded = Arc<Mutex<Vec<HashMap<String, String>>>>;
 
 /// A hostile fixed backend answering every request with `response`.
-async fn hostile_backend(
-    response: fn() -> Response<Full<Bytes>>,
-) -> (String, Recorded) {
+async fn hostile_backend(response: fn() -> Response<Full<Bytes>>) -> (String, Recorded) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let address = listener.local_addr().expect("address");
     let recorded: Recorded = Arc::default();
@@ -378,7 +407,8 @@ async fn fixed_http_backends_cannot_redirect_challenge_encode_or_leak_headers() 
     std::fs::write(&token, "synthetic-backend-token\n").expect("token");
     let (headers, body) = current_call("5", "echo", "{}", "");
 
-    let cases: [(fn() -> Response<Full<Bytes>>, StatusCode); 4] = [
+    type Case = (fn() -> Response<Full<Bytes>>, StatusCode);
+    let cases: [Case; 4] = [
         (
             || {
                 Response::builder()
@@ -434,13 +464,30 @@ async fn fixed_http_backends_cannot_redirect_challenge_encode_or_leak_headers() 
         assert_eq!(response.status(), expected, "case {index}");
         let response_headers = response.headers().clone();
         let bytes = body_bytes(response).await.expect("body");
-        for forbidden in ["location", "www-authenticate", "set-cookie", "server", "x-private-address", "content-encoding"] {
-            assert!(response_headers.get(forbidden).is_none(), "case {index}: {forbidden}");
+        for forbidden in [
+            "location",
+            "www-authenticate",
+            "set-cookie",
+            "server",
+            "x-private-address",
+            "content-encoding",
+        ] {
+            assert!(
+                response_headers.get(forbidden).is_none(),
+                "case {index}: {forbidden}"
+            );
         }
         let text = String::from_utf8_lossy(&bytes);
-        assert!(!text.contains("private") && !text.contains("169.254"), "case {index}: {text}");
+        assert!(
+            !text.contains("private") && !text.contains("169.254"),
+            "case {index}: {text}"
+        );
         let seen = recorded.lock().expect("lock").clone();
-        assert_eq!(seen.len(), 1, "case {index}: exactly one backend request, no redirect follow");
+        assert_eq!(
+            seen.len(),
+            1,
+            "case {index}: exactly one backend request, no redirect follow"
+        );
         let request = &seen[0];
         assert_eq!(request["authorization"], "Bearer synthetic-backend-token");
         assert_eq!(request["accept-encoding"], "identity");

@@ -5521,6 +5521,7 @@ async fn start_relay(
         rotation: harness.rotation_config(),
         cluster: Some(cluster_config),
         recovery: None,
+        http_forward: None,
     };
     let mut options = RelayOptions::new(harness.production_oidc_verifier()?);
     options.node_id = node.node_id.clone();

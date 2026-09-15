@@ -45,7 +45,9 @@ use tunnel_http_forward::{
     ResponsePolicy,
 };
 use tunnel_relay::http_forward_diagnostics::{HttpExchangeRecord, HttpOwnerStreamRecord};
-use tunnel_relay::{HttpForwardExport, PEER_HOP_WINDOW_BYTES, PEER_HOP_WINDOW_RECORDS};
+use tunnel_relay::{
+    HttpForwardExport, HttpForwardExports, PEER_HOP_WINDOW_BYTES, PEER_HOP_WINDOW_RECORDS,
+};
 
 use super::{
     CLEANUP_TIMEOUT, ProductionCluster, RunningHarness, SCENARIO_TIMEOUT, STARTUP_TIMEOUT,
@@ -655,11 +657,17 @@ pub async fn verify() -> Result<HttpForwardRealPathEvidence> {
             return Err(error);
         }
     };
-    harness.http_forward = Some(HttpForwardExport {
-        profile: Arc::clone(&profile),
-        config,
-        fixture_hold: None,
-    });
+    let exports = match HttpForwardExports::new().with_profile(
+        crate::FIXTURE_HTTP_FORWARD_PROFILE,
+        HttpForwardExport::new(Arc::clone(&profile), config),
+    ) {
+        Ok(exports) => exports,
+        Err(error) => {
+            let _ = harness.shutdown().await;
+            return Err(HarnessError::InvalidInput(error.to_owned()));
+        }
+    };
+    harness.http_forward = Some(exports);
     let mut cluster = match ProductionCluster::start(&mut harness).await {
         Ok(cluster) => cluster,
         Err(error) => {
@@ -743,6 +751,7 @@ async fn run(
         LocalExport {
             kind: LocalExportKind::HttpForward,
             device_canary: None,
+            mcp: None,
         },
     );
     device_profile

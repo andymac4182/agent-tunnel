@@ -13,7 +13,11 @@ Specification snapshot: `aa8ce049f089f92618340190d4ece141f663310d`.
 - [2026-07-28 Streamable HTTP](https://github.com/modelcontextprotocol/modelcontextprotocol/blob/aa8ce049f089f92618340190d4ece141f663310d/docs/specification/2026-07-28/basic/transports/streamable-http.mdx): request-scoped streaming, current metadata/headers, cancellation, and backward compatibility.
 - [2026-07-28 authorization](https://github.com/modelcontextprotocol/modelcontextprotocol/blob/aa8ce049f089f92618340190d4ece141f663310d/docs/specification/2026-07-28/basic/authorization/index.mdx): protected-resource discovery and scoped, audience-bound HTTP authorization.
 - [2025-11-25 transports](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports): explicit legacy compatibility target.
-- [Official Rust SDK snapshot](https://github.com/modelcontextprotocol/rust-sdk/tree/744b9f904c7f17d589326e61ddbe126cb9d58888): candidate implementation dependency. Select an actual published version and run interoperability fixtures before M3.
+- [Official Rust SDK snapshot](https://github.com/modelcontextprotocol/rust-sdk/tree/744b9f904c7f17d589326e61ddbe126cb9d58888): the earlier candidate snapshot, superseded by the published pin below.
+- **Pinned 2026-09-16 (M3-01):** crates.io [`rmcp` 3.4.0](https://crates.io/crates/rmcp/3.4.0), released 2026-09-15 from [rust-sdk `fd7811fdaa9fefa1c8034534b4d7a31c97204f89`](https://github.com/modelcontextprotocol/rust-sdk/tree/fd7811fdaa9fefa1c8034534b4d7a31c97204f89/crates/rmcp) (commit taken from the crate's `.cargo_vcs_info.json`). `Cargo.lock` checksum `b23c62fe489ac1d401ab32688cfacac3737a8978dc3343e5361464c7724fd3cb`; the manifest requires `=3.4.0`.
+  - Inspected in the published source: protocol versions `2026-07-28`, `2025-11-25` and `2025-06-18`; client lifecycles `Discover`, `Initialize` and `Auto`; stateless 2026 Streamable HTTP serving and legacy sessions; and a Unix-socket Streamable HTTP client.
+  - It is used only as the fixture server and test client. Why the device bridge does not re-type messages through it is recorded in [mcp.md](mcp.md#pinned-in-code-m3-01-and-m3-02).
+  - No conformance suite or non-Rust SDK is pinned yet.
 
 ## Filesystem SDK APIs
 

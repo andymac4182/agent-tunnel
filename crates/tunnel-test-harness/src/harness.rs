@@ -308,7 +308,7 @@ pub struct RunningHarness {
     rotation: RotationConfig,
     /// Optional `http-forward/1` export served by production cluster relays
     /// started from this harness (the implementation gate 3 fixture).
-    pub http_forward: Option<tunnel_relay::HttpForwardExport>,
+    pub http_forward: Option<tunnel_relay::HttpForwardExports>,
     /// The seeded `http-forward` service, when requested.
     pub http_forward_service: Option<uuid::Uuid>,
 }

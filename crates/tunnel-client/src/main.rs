@@ -12,7 +12,7 @@ mod doctor;
 use serde::Serialize;
 use tokio_util::sync::CancellationToken;
 use tunnel_client::{
-    ClientError, ConnectConfig, ConnectOptions, M1_TRANSPORT_FAILURE_POLICY, connect,
+    ClientError, ConnectConfig, ConnectOptions, M1_TRANSPORT_FAILURE_POLICY,
     credentials::{create_csr, import_certificate},
 };
 use tunnel_core::ClientConfig;

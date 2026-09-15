@@ -41,8 +41,9 @@ pub use consumer_write_diagnostics::{
     ConsumerWriteTimeoutSnapshot,
 };
 pub use http::forward::{
-    HOLD_CEILING, HOP_AGGREGATE_BYTES, HttpForwardExport, HttpRelayHold, HttpRelayHoldPoint,
-    PEER_HOP_WINDOW_BYTES, PEER_HOP_WINDOW_RECORDS,
+    HOP_AGGREGATE_BYTES, HTTP_FORWARD_PROFILE_CAPABILITY, HttpForwardExport, HttpForwardExports,
+    HttpRelayHoldPoint, HttpRelayInterposer, MAX_PROFILE_ID_LEN, PEER_HOP_WINDOW_BYTES,
+    PEER_HOP_WINDOW_RECORDS,
 };
 pub use http::{
     ConsumerUpgradeBarrier, ControlAttachBarrier, PeerAdmissionBarrier, PeerAdmissionScope,

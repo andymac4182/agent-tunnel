@@ -2780,6 +2780,7 @@ dependencies = [
  "tunnel-core",
  "tunnel-http-bridge",
  "tunnel-http-forward",
+ "tunnel-mcp",
  "tunnel-protocol",
  "tunnel-transport",
  "uuid",

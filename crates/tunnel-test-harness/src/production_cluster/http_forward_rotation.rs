@@ -55,8 +55,10 @@ use tunnel_relay::http_forward_diagnostics::{
     HttpExchangeRecord, HttpOwnerStreamRecord, HttpRotationObservation, RelayHttpStreamSnapshot,
 };
 use tunnel_relay::{
-    HttpForwardExport, HttpRelayHold, HttpRelayHoldPoint, RelaySessionSnapshot, RelaySnapshot,
+    HttpForwardExport, HttpForwardExports, HttpRelayHoldPoint, RelaySessionSnapshot, RelaySnapshot,
 };
+
+use crate::http_relay_hold::HttpRelayHold;
 
 use super::http_forward_real_path::{
     ConsumerStream, connect_consumer, empty_stream, full_body, handler_body, request,
@@ -2090,11 +2092,17 @@ pub async fn verify() -> Result<HttpForwardRotationEvidence> {
         }
     };
     let hold = HttpRelayHold::default();
-    harness.http_forward = Some(HttpForwardExport {
-        profile: Arc::clone(&profile),
-        config,
-        fixture_hold: Some(hold.clone()),
-    });
+    let exports = match HttpForwardExports::new().with_profile(
+        crate::FIXTURE_HTTP_FORWARD_PROFILE,
+        HttpForwardExport::new(Arc::clone(&profile), config),
+    ) {
+        Ok(exports) => exports.with_fixture_interposer(Arc::new(hold.clone())),
+        Err(error) => {
+            let _ = harness.shutdown().await;
+            return Err(HarnessError::InvalidInput(error.to_owned()));
+        }
+    };
+    harness.http_forward = Some(exports);
     let mut cluster = match ProductionCluster::start(&mut harness).await {
         Ok(cluster) => cluster,
         Err(error) => {
@@ -2190,6 +2198,7 @@ async fn run(
         LocalExport {
             kind: LocalExportKind::HttpForward,
             device_canary: None,
+            mcp: None,
         },
     );
     device_profile

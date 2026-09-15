@@ -66,7 +66,7 @@ mod owner_relay;
 
 pub use aggregate::HOP_AGGREGATE_BYTES;
 pub(crate) use aggregate::{HopAggregate, HopAggregates};
-pub use hold::{HOLD_CEILING, HttpRelayHold, HttpRelayHoldPoint};
+pub use hold::{HttpRelayHoldPoint, HttpRelayInterposer};
 use owner_relay::{OwnerRequestWriter, OwnerResponseWriter, OwnerVerdict};
 
 /// The peer hop's per-direction window, in encoded record bytes: three
@@ -90,40 +90,32 @@ const TAG_RESET: u8 = 3;
 const TAG_CREDIT: u8 = 4;
 const TAG_PAUSE: u8 = 5;
 
-/// The `http-forward/1` export a relay serves on its public HTTP routes and
-/// validates on its owner relay: the selected profile's policies and the
-/// bridge limits.
+/// One `http-forward/1` application profile a relay can serve: the
+/// profile's policies and the bridge limits.
 #[derive(Clone)]
 pub struct HttpForwardExport {
     pub profile: Arc<Profile>,
     pub config: BridgeConfig,
-    /// A fixture hold for the owner's peer relay (implementation gate 4).
-    /// Test infrastructure only: an [`HttpRelayHold`] can be constructed
-    /// only with the `test-fixtures` cargo feature, and a relay built without
-    /// that feature refuses to start with a hold ([`validate_export`]).
-    #[doc(hidden)]
-    pub fixture_hold: Option<HttpRelayHold>,
+    /// Set only when selected from [`HttpForwardExports`] that carry a
+    /// fixture interposer.
+    interposer: Option<Arc<dyn HttpRelayInterposer>>,
 }
 
-/// Refuse an export a production relay must not serve: a fixture hold
-/// without the `test-fixtures` feature.
-///
-/// # Errors
-/// A static description of the refused setting.
-pub(crate) fn validate_export(export: &HttpForwardExport) -> Result<(), &'static str> {
-    check_fixture_hold(export.fixture_hold.is_some(), fixture_holds_enabled())
-}
-
-const fn check_fixture_hold(has_hold: bool, enabled: bool) -> Result<(), &'static str> {
-    if has_hold && !enabled {
-        return Err("http-forward fixture hold requires the test-fixtures feature");
+impl HttpForwardExport {
+    #[must_use]
+    pub fn new(profile: Arc<Profile>, config: BridgeConfig) -> Self {
+        Self {
+            profile,
+            config,
+            interposer: None,
+        }
     }
-    Ok(())
-}
 
-/// Whether this build may honour a fixture hold.
-pub(crate) const fn fixture_holds_enabled() -> bool {
-    cfg!(any(test, feature = "test-fixtures"))
+    /// Whether a fixture interposer is attached (test evidence only).
+    #[must_use]
+    pub fn has_interposer(&self) -> bool {
+        self.interposer.is_some()
+    }
 }
 
 impl core::fmt::Debug for HttpForwardExport {
@@ -131,7 +123,115 @@ impl core::fmt::Debug for HttpForwardExport {
         formatter
             .debug_struct("HttpForwardExport")
             .field("config", &self.config)
+            .field("interposer", &self.interposer.is_some())
             .finish_non_exhaustive()
+    }
+}
+
+/// The catalog service capability naming a service's `http-forward/1`
+/// profile: `{"http_forward_profile": "mcp-2026-07-28"}`.  The capability is
+/// part of the Redis service record, written by the operator's catalog
+/// provisioning, never by a consumer.
+pub const HTTP_FORWARD_PROFILE_CAPABILITY: &str = "http_forward_profile";
+
+/// The longest profile identifier.
+pub const MAX_PROFILE_ID_LEN: usize = 64;
+
+/// The profiles a relay serves, keyed by profile identifier (gate 5).
+///
+/// Every public request and every owner-side peer stream selects its profile
+/// from the resolved catalog service record's
+/// [`HTTP_FORWARD_PROFILE_CAPABILITY`].  A service without the capability,
+/// or naming a profile this relay does not serve, is refused as not found
+/// before its head is normalized, a route is resolved or any stream opens.
+#[derive(Clone, Default)]
+pub struct HttpForwardExports {
+    exports: std::collections::BTreeMap<String, HttpForwardExport>,
+    interposer: Option<Arc<dyn HttpRelayInterposer>>,
+}
+
+impl core::fmt::Debug for HttpForwardExports {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("HttpForwardExports")
+            .field("profiles", &self.exports.keys().collect::<Vec<_>>())
+            .field("interposer", &self.interposer.is_some())
+            .finish()
+    }
+}
+
+impl HttpForwardExports {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Serve `export` for services whose capability names `id`.
+    ///
+    /// # Errors
+    /// An identifier that is empty, longer than [`MAX_PROFILE_ID_LEN`], not
+    /// lowercase ASCII letters, digits, `-`, `.` or `_`, or already present.
+    pub fn with_profile(
+        mut self,
+        id: impl Into<String>,
+        export: HttpForwardExport,
+    ) -> Result<Self, &'static str> {
+        let id = id.into();
+        if id.is_empty()
+            || id.len() > MAX_PROFILE_ID_LEN
+            || !id.bytes().all(|byte| {
+                byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || matches!(byte, b'-' | b'.' | b'_')
+            })
+        {
+            return Err(
+                "http-forward profile identifiers are 1..=64 lowercase letters, digits, '-', '.' or '_'",
+            );
+        }
+        if self.exports.contains_key(&id) {
+            return Err("an http-forward profile is configured twice");
+        }
+        self.exports.insert(id, export);
+        Ok(self)
+    }
+
+    /// Attach a fixture interposer to the owner relay of every profile.
+    /// Test infrastructure only: no implementation exists in this crate and
+    /// the `serve` binary never calls this.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_fixture_interposer(mut self, interposer: Arc<dyn HttpRelayInterposer>) -> Self {
+        self.interposer = Some(interposer);
+        self
+    }
+
+    /// Whether any profile is served.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.exports.is_empty()
+    }
+
+    /// The served profile identifiers.
+    pub fn profile_ids(&self) -> impl Iterator<Item = &str> {
+        self.exports.keys().map(String::as_str)
+    }
+
+    /// Whether a fixture interposer is attached.
+    #[must_use]
+    pub fn has_fixture_interposer(&self) -> bool {
+        self.interposer.is_some()
+    }
+
+    /// The export selected by a service record's capabilities.
+    #[must_use]
+    pub fn select(&self, capabilities: &serde_json::Value) -> Option<HttpForwardExport> {
+        let id = capabilities
+            .get(HTTP_FORWARD_PROFILE_CAPABILITY)?
+            .as_str()?;
+        let mut export = self.exports.get(id)?.clone();
+        export.interposer = self.interposer.clone();
+        Some(export)
     }
 }
 
@@ -1093,7 +1193,7 @@ pub(crate) async fn http_forward_route(
     if let Some(response) = cluster_unready_response(&state) {
         return response;
     }
-    let Some(export) = state.http_forward.clone() else {
+    let Some(exports) = state.http_forward.clone() else {
         return error_response(
             StatusCode::NOT_FOUND,
             "NOT_FOUND",
@@ -1133,7 +1233,7 @@ pub(crate) async fn http_forward_route(
             "not_dispatched",
         );
     };
-    let (service_id, mut grant) = match service_and_grant_of_type(
+    let (service_id, mut grant, capabilities) = match service_and_grant_of_type(
         &state,
         &validated.consumer,
         device_id,
@@ -1158,6 +1258,21 @@ pub(crate) async fn http_forward_route(
         );
     }
     grant.valid_until = grant.valid_until.min(validated.expires_at);
+    // Gate 5: the authorized service's catalog record selects the profile.
+    // A service naming no profile this relay serves is not an HTTP export
+    // here; nothing is normalized, routed or opened for it.
+    let Some(export) = exports.select(&capabilities) else {
+        state
+            .handle
+            .http_forward_diagnostics()
+            .record_ingress_rejection();
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "NOT_FOUND",
+            "not found",
+            "not_dispatched",
+        );
+    };
     let Some(scope_permit) = state
         .scoped_admission
         .try_acquire(OwnerScope::new(grant.tenant_id, device_id))
@@ -1621,10 +1736,7 @@ pub(crate) async fn handle_peer_http_stream(
         actor_writer,
         export.profile.request.clone(),
         method_tx,
-        export
-            .fixture_hold
-            .clone()
-            .filter(|_| fixture_holds_enabled()),
+        export.interposer.clone(),
         Arc::clone(&verdict),
         down_tx.clone(),
     );
@@ -1729,17 +1841,73 @@ mod tests {
     use super::*;
     use tunnel_cluster::peer_frame::StreamBudget;
 
-    /// Review item 6: a fixture hold is refused unless the build enables
-    /// fixture holds.
+    fn export() -> HttpForwardExport {
+        let profile = tunnel_mcp::McpProfile::V2026_07_28
+            .policies(tunnel_mcp::McpLimits::default())
+            .unwrap();
+        HttpForwardExport::new(Arc::new(profile), BridgeConfig::default())
+    }
+
+    /// Gate 5: a service selects its profile only through the catalog
+    /// capability, and anything unlisted selects nothing.
     #[test]
-    fn a_fixture_hold_is_refused_without_the_test_fixtures_feature() {
-        assert!(check_fixture_hold(true, false).is_err());
-        assert!(check_fixture_hold(false, false).is_ok());
-        assert!(check_fixture_hold(true, true).is_ok());
-        assert_eq!(
-            fixture_holds_enabled(),
-            cfg!(any(test, feature = "test-fixtures"))
+    fn profiles_are_selected_only_by_a_listed_catalog_capability() {
+        let exports = HttpForwardExports::new()
+            .with_profile("mcp-2026-07-28", export())
+            .unwrap();
+        assert!(
+            exports
+                .select(&serde_json::json!({"http_forward_profile": "mcp-2026-07-28"}))
+                .is_some()
         );
+        for capabilities in [
+            serde_json::json!({}),
+            serde_json::json!({"operations": ["http:invoke"]}),
+            serde_json::json!({"http_forward_profile": "mcp-2025-11-25"}),
+            serde_json::json!({"http_forward_profile": "MCP-2026-07-28"}),
+            serde_json::json!({"http_forward_profile": ["mcp-2026-07-28"]}),
+            serde_json::json!({"http_forward_profile": null}),
+            serde_json::json!("mcp-2026-07-28"),
+        ] {
+            assert!(exports.select(&capabilities).is_none(), "{capabilities}");
+        }
+        assert!(
+            HttpForwardExports::new()
+                .select(&serde_json::json!({"http_forward_profile": "mcp-2026-07-28"}))
+                .is_none()
+        );
+        for id in ["", "MCP", "mcp 2026", "a/b", &"x".repeat(65)] {
+            assert!(
+                HttpForwardExports::new()
+                    .with_profile(id, export())
+                    .is_err(),
+                "{id}"
+            );
+        }
+        assert!(
+            exports
+                .clone()
+                .with_profile("mcp-2026-07-28", export())
+                .is_err()
+        );
+    }
+
+    /// Review item 6 (resolved in gate 5): no interposer implementation
+    /// exists in this crate, so exports carry none unless a caller attaches
+    /// one explicitly, and the fixture hold is not a cargo feature that
+    /// workspace feature unification could enable.
+    #[test]
+    fn exports_carry_no_interposer_unless_a_fixture_attaches_one() {
+        let exports = HttpForwardExports::new()
+            .with_profile("mcp-2026-07-28", export())
+            .unwrap();
+        assert!(!exports.has_fixture_interposer());
+        let selected = exports
+            .select(&serde_json::json!({"http_forward_profile": "mcp-2026-07-28"}))
+            .unwrap();
+        assert!(!selected.has_interposer());
+        let manifest = include_str!("../../Cargo.toml");
+        assert!(!manifest.contains("test-fixtures"), "the feature is gone");
     }
 
     /// An in-memory peer request direction.  The "network" is unbounded:

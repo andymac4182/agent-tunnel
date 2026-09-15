@@ -764,7 +764,7 @@ pub(crate) struct HttpState {
     /// The `http-forward/1` export served on this relay's public routes.  `None`
     /// (every production caller today) leaves the HTTP routes answering 404:
     /// per-profile allowlists are implementation gate 5.
-    pub(crate) http_forward: Option<crate::http::forward::HttpForwardExport>,
+    pub(crate) http_forward: Option<crate::http::forward::HttpForwardExports>,
 }
 
 /// Build both public consumer and device WebSocket routes. Run this router
@@ -855,7 +855,7 @@ pub(crate) fn consumer_router_with_peer_and_barriers(
     peer: Option<Arc<PeerRuntime>>,
     consumer_upgrade_barrier: Option<Arc<ConsumerUpgradeBarrier>>,
     peer_admission_barrier: Option<Arc<PeerAdmissionBarrier>>,
-    http_forward: Option<crate::http::forward::HttpForwardExport>,
+    http_forward: Option<crate::http::forward::HttpForwardExports>,
 ) -> Router {
     let state = HttpState {
         handle,
@@ -2203,6 +2203,7 @@ async fn service_and_grant(
         crate::ECHO_SERVICE_TYPE,
     )
     .await
+    .map(|(service_id, grant, _)| (service_id, grant))
 }
 
 pub(crate) async fn service_and_grant_of_type(
@@ -2211,7 +2212,7 @@ pub(crate) async fn service_and_grant_of_type(
     device_id: Uuid,
     service: &str,
     service_type: &str,
-) -> Result<(Uuid, tunnel_catalog::GrantSnapshot), Response> {
+) -> Result<(Uuid, tunnel_catalog::GrantSnapshot, serde_json::Value), Response> {
     let filter = DeviceListFilter::default();
     let Some(catalog) = state.catalog.as_ref() else {
         return Err(error_response(
@@ -2245,6 +2246,13 @@ pub(crate) async fn service_and_grant_of_type(
         service_type,
     )
     .map_err(service_resolution_response)?;
+    let capabilities = device
+        .services
+        .iter()
+        .find(|candidate| candidate.service_id == service_id)
+        .map_or(serde_json::Value::Null, |candidate| {
+            candidate.capabilities.clone()
+        });
     let read_started = Utc::now();
     let grant = catalog
         .authorize(consumer, device_id, service_id, read_started, Utc::now())
@@ -2258,7 +2266,7 @@ pub(crate) async fn service_and_grant_of_type(
                 "not_dispatched",
             )
         })?;
-    Ok((service_id, grant))
+    Ok((service_id, grant, capabilities))
 }
 
 async fn authenticate(
@@ -2798,7 +2806,7 @@ pub fn peer_ingress_handler_with_http_forward(
     oidc: Arc<OidcVerifier>,
     local_node_id: String,
     local_boot_id: String,
-    http_forward: Option<crate::http::forward::HttpForwardExport>,
+    http_forward: Option<crate::http::forward::HttpForwardExports>,
 ) -> impl PeerIngressHandler {
     move |request: InboundPeerRequest| {
         let handle = handle.clone();
@@ -2829,7 +2837,7 @@ async fn handle_peer_ingress(
     oidc: Arc<OidcVerifier>,
     local_node_id: &str,
     local_boot_id: &str,
-    http_forward: Option<crate::http::forward::HttpForwardExport>,
+    http_forward: Option<crate::http::forward::HttpForwardExports>,
 ) -> Result<(), PeerRuntimeError> {
     // The owner-side observer starts at the `owner` stage: every check
     // before the stream is split is this relay's own admission decision.
@@ -2876,7 +2884,7 @@ async fn handle_peer_ingress_inner(
     local_node_id: &str,
     local_boot_id: &str,
     fault: &PeerFaultObserver,
-    http_forward: Option<crate::http::forward::HttpForwardExport>,
+    http_forward: Option<crate::http::forward::HttpForwardExports>,
 ) -> Result<(), PeerRuntimeError> {
     let envelope = request.envelope().clone();
     let destination = envelope.destination.clone();
@@ -2944,7 +2952,7 @@ async fn handle_peer_ingress_inner(
             let access = owner_access.ok_or_else(|| {
                 PeerRuntimeError::Membership("consumer authentication failed".to_owned())
             })?;
-            let grant = owner_stream_grant_of_type(
+            let (grant, capabilities) = owner_stream_grant_of_type(
                 &catalog,
                 &access.consumer,
                 destination.device_id,
@@ -2954,6 +2962,11 @@ async fn handle_peer_ingress_inner(
                 crate::HTTP_FORWARD_OPERATION,
             )
             .await?;
+            // The owner selects the profile from its own catalog read, never
+            // from the forwarding relay's choice.
+            let export = http_forward
+                .as_ref()
+                .and_then(|exports| exports.select(&capabilities));
             crate::http::forward::handle_peer_http_stream(
                 request,
                 handle.clone(),
@@ -2963,7 +2976,7 @@ async fn handle_peer_ingress_inner(
                 grant,
                 access.expires_at,
                 fault,
-                http_forward,
+                export,
             )
             .await
         }
@@ -3045,6 +3058,7 @@ async fn owner_stream_grant(
         crate::ECHO_OPERATION,
     )
     .await
+    .map(|(grant, _)| grant)
 }
 
 async fn owner_stream_grant_of_type(
@@ -3055,7 +3069,7 @@ async fn owner_stream_grant_of_type(
     expires_at: chrono::DateTime<Utc>,
     service_type: &str,
     operation: &str,
-) -> Result<tunnel_catalog::GrantSnapshot, PeerRuntimeError> {
+) -> Result<(tunnel_catalog::GrantSnapshot, serde_json::Value), PeerRuntimeError> {
     let devices = catalog
         .list_devices_filtered(consumer, &DeviceListFilter::default(), Utc::now())
         .await
@@ -3078,6 +3092,13 @@ async fn owner_stream_grant_of_type(
         service_type,
     )
     .map_err(|error| PeerRuntimeError::Membership(error.to_string()))?;
+    let capabilities = device
+        .services
+        .iter()
+        .find(|candidate| candidate.service_id == service_id)
+        .map_or(serde_json::Value::Null, |candidate| {
+            candidate.capabilities.clone()
+        });
     let grant = catalog
         .authorize(consumer, device_id, service_id, Utc::now(), Utc::now())
         .await
@@ -3090,7 +3111,7 @@ async fn owner_stream_grant_of_type(
     }
     let mut grant = grant;
     grant.valid_until = grant.valid_until.min(expires_at);
-    Ok(grant)
+    Ok((grant, capabilities))
 }
 
 async fn handle_peer_device_control(

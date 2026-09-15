@@ -7,7 +7,9 @@ mod common;
 
 use std::time::Duration;
 
-use common::{connect, count_lines, gateway, http_export, rmcp_http_backend, wait_for_file, within};
+use common::{
+    connect, count_lines, gateway, http_export, rmcp_http_backend, wait_for_file, within,
+};
 use rmcp::model::{CallToolRequestParams, ClientRequest, Request, RequestMetaObject};
 use rmcp::service::PeerRequestOptions;
 
@@ -46,16 +48,20 @@ async fn http_export_round_trip(profile: &str, legacy: bool) {
         serde_json::json!({"k": [true, null, 7]})
     );
 
-    let handle = within(client.send_cancellable_request(
-        ClientRequest::CallToolRequest(Request::new(
-            CallToolRequestParams::new("progress")
-                .with_arguments(arguments(serde_json::json!({"steps": 3}))),
-        )),
-        PeerRequestOptions::no_options(),
-    ))
+    let handle = within(
+        client.send_cancellable_request(
+            ClientRequest::CallToolRequest(Request::new(
+                CallToolRequestParams::new("progress")
+                    .with_arguments(arguments(serde_json::json!({"steps": 3}))),
+            )),
+            PeerRequestOptions::no_options(),
+        ),
+    )
     .await
     .expect("progress");
-    within(handle.await_response()).await.expect("progress result");
+    within(handle.await_response())
+        .await
+        .expect("progress result");
     assert_eq!(
         handler.progress.lock().expect("lock").clone(),
         vec![1.0, 2.0, 3.0]
@@ -63,13 +69,15 @@ async fn http_export_round_trip(profile: &str, legacy: bool) {
 
     // Cancellation: 2026 closes the request's response stream (the export
     // drops the backend connection); 2025 POSTs notifications/cancelled.
-    let handle = within(client.send_cancellable_request(
-        ClientRequest::CallToolRequest(Request::new(
-            CallToolRequestParams::new("sleep")
-                .with_arguments(arguments(serde_json::json!({"label": "h1"}))),
-        )),
-        PeerRequestOptions::no_options(),
-    ))
+    let handle = within(
+        client.send_cancellable_request(
+            ClientRequest::CallToolRequest(Request::new(
+                CallToolRequestParams::new("sleep")
+                    .with_arguments(arguments(serde_json::json!({"label": "h1"}))),
+            )),
+            PeerRequestOptions::no_options(),
+        ),
+    )
     .await
     .expect("sleep");
     let log = dir.path().join("invocations.log");

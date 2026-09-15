@@ -37,15 +37,11 @@ tunnel-catalog = { path = "../tunnel-catalog" }
 tunnel-cluster = { path = "../tunnel-cluster" }
 tunnel-http-bridge = { path = "../tunnel-http-bridge" }
 tunnel-http-forward = { path = "../tunnel-http-forward" }
+tunnel-mcp = { path = "../tunnel-mcp" }
 tunnel-protocol = { path = "../tunnel-protocol" }
 tunnel-transport = { path = "../tunnel-transport" }
 serde.workspace = true
 toml.workspace = true
-
-[features]
-# Test infrastructure only (the `http-forward/1` fixture hold).  Enabled by
-# `tunnel-test-harness`; a relay built without it refuses a fixture hold.
-test-fixtures = []
 
 [dev-dependencies]
 async-trait = "0.1.89"

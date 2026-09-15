@@ -202,12 +202,7 @@ impl HttpHandlers {
             let handler_export = mcp_export.clone();
             let handler = move |request: Request<ChannelBody>| -> HttpHandlerFuture {
                 let export = handler_export.clone();
-                Box::pin(async move {
-                    export
-                        .handle(request)
-                        .await
-                        .map_err(|_| HttpHandlerError)
-                })
+                Box::pin(async move { export.handle(request).await.map_err(|_| HttpHandlerError) })
             };
             self.exports.insert(
                 service_id.clone(),
