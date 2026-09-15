@@ -265,15 +265,30 @@ const REDIS_PARTITION_AUTHORIZATION_WAIT: Duration = Duration::from_secs(6);
 /// or slow publish cannot expire a record, and it matches how a real control
 /// plane re-issues membership well before expiry.
 const MEMBERSHIP_RESIGN_INTERVAL: Duration = Duration::from_secs(15);
-/// How many consecutive publish rounds may fail before the re-signer is
-/// treated as broken rather than as riding out a deliberate outage.
+/// How long publishing may keep failing before the re-signer is treated as
+/// broken rather than as riding out a deliberate outage.
 ///
 /// A scenario that pauses Redis on purpose makes the publish fail for as long
-/// as the pause lasts, so a re-signer that gave up on the first error would
-/// die in exactly the gate that needs it.  It retries instead.  The threshold
-/// spans a full record lifetime: past that, membership trust has genuinely
-/// lapsed and the run should say so rather than carry on with stale records.
-const MEMBERSHIP_RESIGN_MAX_CONSECUTIVE_FAILURES: u32 = 4;
+/// as the pause lasts, so a re-signer that gave up on the first error would die
+/// in exactly the gate that needs it.  It retries instead, and gives up only
+/// once the failures have spanned a full record lifetime, because past that the
+/// record it would refresh has expired anyway and membership trust really has
+/// lapsed.
+///
+/// This is measured as elapsed time rather than as a count of failed rounds.
+/// A count at the normal interval is the same rule only while every retry is
+/// exactly one interval apart: four failures at fifteen seconds is sixty
+/// seconds precisely, so any slowness pushes an outage that is well inside the
+/// lifetime over the threshold.  That is what happened on a loaded machine,
+/// where a deliberate six-second pause was reported as a re-signer that had
+/// failed for five consecutive rounds.
+const MEMBERSHIP_RESIGN_FAILURE_GRACE: Duration =
+    Duration::from_secs(M7_MEMBERSHIP_LIFETIME.num_seconds().unsigned_abs());
+/// Retry interval while a publish is failing.
+///
+/// Much shorter than the ordinary interval so a brief outage is ridden out
+/// within it rather than consuming whole scheduled rounds.
+const MEMBERSHIP_RESIGN_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const REDIS_PARTITION_POLL: Duration = Duration::from_millis(25);
 const REDIS_RECOVERY_TIMEOUT: Duration = Duration::from_secs(15);
 const PUBLIC_HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -5650,7 +5665,7 @@ async fn membership_resign_loop(
     // published, so skip it and re-sign one interval later.
     ticker.tick().await;
     let mut record_version = inputs.next_record_version;
-    let mut consecutive_failures: u32 = 0;
+    let mut failing_since: Option<Instant> = None;
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => break,
@@ -5699,17 +5714,26 @@ async fn membership_resign_loop(
                     }
                 }
                 if round_failed {
-                    consecutive_failures = consecutive_failures.saturating_add(1);
-                    if consecutive_failures > MEMBERSHIP_RESIGN_MAX_CONSECUTIVE_FAILURES {
+                    let since = *failing_since.get_or_insert_with(Instant::now);
+                    let failing_for = since.elapsed();
+                    if failing_for > MEMBERSHIP_RESIGN_FAILURE_GRACE {
                         record_failure(format!(
-                            "membership republish failed {consecutive_failures} consecutive rounds, \
-                             which is longer than one record lifetime"
+                            "membership republish kept failing for {} seconds, which is longer \
+                             than one record lifetime",
+                            failing_for.as_secs()
                         ));
                         return;
                     }
+                    // Retry sooner than the ordinary interval so a brief
+                    // deliberate outage is ridden out inside the grace rather
+                    // than consuming whole scheduled rounds.
+                    tokio::select! {
+                        _ = shutdown.cancelled() => break,
+                        () = sleep(MEMBERSHIP_RESIGN_RETRY_INTERVAL) => {}
+                    }
                     continue;
                 }
-                consecutive_failures = 0;
+                failing_since = None;
                 record_version = record_version.saturating_add(1);
             }
         }
