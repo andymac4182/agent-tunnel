@@ -635,6 +635,12 @@ env = { SYNTHETIC_SECRET = "synthetic-env-value" }
             .with_mcp_exports(&config)
             .expect("handlers");
         assert!(handlers.contains("22222222-2222-4222-8222-222222222222"));
+        let counters = handlers
+            .mcp_diagnostics_source()
+            .get("22222222-2222-4222-8222-222222222222")
+            .expect("mcp export counters");
+        assert_eq!(counters.children_spawned, 0);
+        assert!(handlers.mcp_diagnostics_source().get("echo").is_none());
 
         // An mcp table on an echo export, an unknown profile, a relative
         // command and a non-loopback backend are configuration errors.

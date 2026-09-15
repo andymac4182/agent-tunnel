@@ -32,7 +32,7 @@ pub use actor::{
     ListenerSocketOptions, PeerListenerConfig, Relay, RelayError, RelayHandle, RunningRelay,
 };
 pub use config::{
-    ClusterConfig, DEFAULT_MAX_PENDING_OPERATIONS_PER_OWNER,
+    ClusterConfig, DEFAULT_MAX_PENDING_OPERATIONS_PER_OWNER, HttpForwardServeConfig,
     MAX_PENDING_OPERATIONS_PER_OWNER_CEILING, PrivateEndpointPolicyConfig, RecoveryConfig,
     RelayLimits, RelayOptions, ServeConfig,
 };
