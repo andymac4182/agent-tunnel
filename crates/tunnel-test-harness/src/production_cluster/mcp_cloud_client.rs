@@ -346,7 +346,10 @@ fn expected_stream_messages(label: &str) -> Vec<String> {
 /// A `HarnessError::Process` naming the violated rule.
 #[allow(clippy::too_many_lines)]
 pub fn validate_mcp_cloud_client_evidence(evidence: &McpCloudClientEvidence) -> Result<()> {
-    let mut checks: Vec<(String, bool)> = vec![
+    // Per-case rules come first, so a run restricted with M3_MCP_COMBOS or
+    // M3_MCP_CASES names the case rule it broke before the global
+    // completeness rules reject the partial run.
+    let mut global: Vec<(String, bool)> = vec![
         ("three relays".into(), evidence.relay_count == 3),
         (
             "non-owner ingress".into(),
@@ -387,13 +390,14 @@ pub fn validate_mcp_cloud_client_evidence(evidence: &McpCloudClientEvidence) -> 
             evidence.not_covered.len() == NOT_COVERED.len(),
         ),
     ];
+    let mut checks: Vec<(String, bool)> = Vec::new();
     let mut combos = evidence
         .combos
         .iter()
         .map(|combo| (combo.kind.as_str(), combo.profile.as_str()))
         .collect::<Vec<_>>();
     combos.sort_unstable();
-    checks.push((
+    global.push((
         "all four export kind x profile combinations".into(),
         combos
             == [
@@ -661,7 +665,7 @@ pub fn validate_mcp_cloud_client_evidence(evidence: &McpCloudClientEvidence) -> 
             ),
         ]);
     }
-    checks.push((
+    global.push((
         "rotations completed across the sessions".into(),
         evidence.rotations_completed
             == evidence
@@ -671,6 +675,7 @@ pub fn validate_mcp_cloud_client_evidence(evidence: &McpCloudClientEvidence) -> 
                 .sum::<u64>()
             && evidence.rotations_completed >= 4 * (2 + STREAM_MIN_ROTATIONS) as u64,
     ));
+    checks.extend(global);
     for (rule, passed) in checks {
         if !passed {
             return Err(HarnessError::Process(format!(
