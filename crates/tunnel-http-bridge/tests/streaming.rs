@@ -1039,7 +1039,7 @@ async fn post_fin_device_reset_does_not_truncate_a_completed_response_being_deli
 async fn owner_deadline_reaches_a_busy_device_as_an_ordered_reset() {
     const CREDIT: usize = 64 * 1024;
     let owner_config = BridgeConfig::default()
-        .with_deadline(Duration::from_millis(300))
+        .with_deadline(Duration::from_secs(1))
         .unwrap();
     let Link {
         to_device,
