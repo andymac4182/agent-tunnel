@@ -5087,6 +5087,28 @@ impl RelayActor {
                 return false;
             };
             let queued = self.session_for(key).is_some_and(|session| {
+                // The connector validates FORGET against its own sender state,
+                // which needs this relay's ACK of its terminal.  That ACK went
+                // out on the carrier the terminal arrived on; when that was a
+                // retiring carrier closed right after, the ACK can be lost and
+                // the proof could never converge.  Re-advertise the final
+                // cumulative ACK on the current carrier first: ACKs are
+                // unsequenced and a duplicate cannot decrease progress.
+                if let Some(data_tx) = session.data_tx.as_ref()
+                    && let Some(stream) = session.streams.get(&stream_id)
+                    && let Ok(ack) = Frame::ack(
+                        key.epoch,
+                        session.generation,
+                        stream_id,
+                        stream
+                            .sequence
+                            .direction(Direction::ConnectorToRelay)
+                            .recv_contiguous(),
+                    )
+                    .encode()
+                {
+                    let _ = queue_data(data_tx, &session.queue_budget, ack);
+                }
                 queue_control(&session.control_tx, &session.queue_budget, encoded).is_ok()
             });
             if !queued {
@@ -5831,8 +5853,11 @@ impl RelayActor {
                 }
                 if stream.terminal {
                     // A connector RESET already ended an HTTP stream; its
-                    // bounded high-water record is still taken once here.
-                    Self::record_http_owner_stream(stream, &http_diagnostics);
+                    // bounded high-water record is still taken once here
+                    // (or at reclamation while a terminal is deferred).
+                    if stream.pending_terminal.is_none() {
+                        Self::record_http_owner_stream(stream, &http_diagnostics);
+                    }
                     return true;
                 }
                 // The public ingress also enforces the verified token deadline
@@ -5964,7 +5989,12 @@ impl RelayActor {
                     stream.terminal_fin_failure = true;
                 }
                 Self::release_echo_stream_state(stream, &queue_budget, false);
-                Self::record_http_owner_stream(stream, &http_diagnostics);
+                // A terminal still deferred behind a rotation freeze is
+                // recorded when it is reclaimed, so the record carries the
+                // sequence and carrier the terminal actually used.
+                if stream.pending_terminal.is_none() {
+                    Self::record_http_owner_stream(stream, &http_diagnostics);
+                }
             }
         }
         if let Some(event) = pending_unregister {
@@ -7365,6 +7395,7 @@ impl RelayActor {
         {
             return Ok(());
         }
+        let http_diagnostics = self.http_forward_diagnostics.clone();
         self.with_rotation_mut(key, |session, rotation| {
             let status = rotation.state.status();
             if status.phase == RotationPhase::Draining && rotation.frozen_message_id.is_empty() {
@@ -7467,6 +7498,16 @@ impl RelayActor {
                     rotation,
                     &status_after_commit,
                     Some(&drain_set),
+                );
+                // Both drain proofs are complete and the roster is still
+                // frozen, so every HTTP stream captured at QUIESCE is still
+                // present: record its position with the attempt's fences and
+                // acknowledgement cursors at this commit decision.
+                Self::record_http_rotation_observations(
+                    session,
+                    rotation.completed_rotation_diagnostics.as_ref(),
+                    session.rotations_completed.saturating_add(1),
+                    &http_diagnostics,
                 );
                 let refs = vec![
                     DrainProofRef {
@@ -8071,7 +8112,6 @@ impl RelayActor {
     }
 
     fn finish_rotation_if_ready(&mut self, key: &SessionKey) {
-        let http_diagnostics = self.http_forward_diagnostics.clone();
         let _ = self.with_rotation_mut(key, |session, rotation| {
             if rotation.state.phase() != RotationPhase::Active {
                 return Ok::<(), tunnel_protocol::rotation::RotationError>(());
@@ -8137,12 +8177,6 @@ impl RelayActor {
             Self::clear_phase_message_ids(rotation);
             rotation.remote_fences = [None, None];
             rotation.own_fence = None;
-            Self::record_http_rotation_observations(
-                session,
-                completed_diagnostics.as_ref(),
-                session.rotations_completed.saturating_add(1),
-                &http_diagnostics,
-            );
             rotation.completed_rotation_diagnostics = completed_diagnostics;
             session.rotations_completed = session.rotations_completed.saturating_add(1);
             session.last_rotation = Instant::now();

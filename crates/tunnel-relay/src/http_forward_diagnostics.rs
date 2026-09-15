@@ -63,13 +63,13 @@ impl From<TrackerSnapshot> for HttpRecordPosition {
 /// The record positions and parked/buffered bytes are captured when the
 /// owner froze its writer at QUIESCE (so the request position is exactly
 /// what was sequenced below the relay fence); the fences and acknowledgement
-/// cursors are the attempt's drain proof, read when the attempt completed.
+/// cursors are the attempt's drain proof, read at its commit decision.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct HttpRotationObservation {
     pub stream_id: u64,
     pub operation_id: String,
     pub request_id: Option<String>,
-    /// The session's completed-rotation count including this attempt.
+    /// The completed-rotation count this attempt reaches when it completes.
     pub rotation: u64,
     pub rotation_id: String,
     pub old_generation: u64,

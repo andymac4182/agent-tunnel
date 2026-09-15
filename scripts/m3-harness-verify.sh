@@ -26,5 +26,7 @@ gate "build locked workspace binaries" \
 
 gate "M3 http-forward/1 gate 3 over non-owner ingress, peer HTTP/3 and the device WebSocket" \
   cargo run --locked -p tunnel-test-harness -- verify-m3-http-forward-real-path
+gate "M3 http-forward/1 gate 4 rotation points, CANCEL/RESET race and outcome_unknown" \
+  cargo run --locked -p tunnel-test-harness -- verify-m3-http-forward-rotation
 
 echo "m3-harness-verify: implemented M3 harness suite passed" >&2

@@ -735,8 +735,8 @@ impl RelayActor {
         }
     }
 
-    /// Turn the captured positions into rotation observations once the
-    /// attempt completed, adding its fences and acknowledgement cursors.
+    /// Turn the captured positions into rotation observations at the
+    /// commit decision, adding the fences and acknowledgement cursors.
     pub(super) fn record_http_rotation_observations(
         session: &mut DeviceSession,
         completed: Option<&RelayRotationSnapshot>,
