@@ -57,6 +57,7 @@ pub struct HttpRelayHold {
     state: Arc<State>,
 }
 
+#[cfg(any(test, feature = "test-fixtures"))]
 impl Default for HttpRelayHold {
     fn default() -> Self {
         Self {

@@ -13953,6 +13953,10 @@ impl Relay {
         options
             .validate()
             .map_err(|error| RelayError::Config(error.to_string()))?;
+        if let Some(export) = listener_options.http_forward.as_ref() {
+            crate::http::forward::validate_export(export)
+                .map_err(|error| RelayError::Config(error.to_owned()))?;
+        }
         let handle = RelayHandle::spawn(options.clone(), catalog.clone());
         let cancel = options.shutdown.clone();
         let consumer_addr = consumer_listener.local_addr().map_err(|error| {

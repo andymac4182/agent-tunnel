@@ -98,8 +98,32 @@ pub struct HttpForwardExport {
     pub profile: Arc<Profile>,
     pub config: BridgeConfig,
     /// A fixture hold for the owner's peer relay (implementation gate 4).
-    /// Production exports carry none.
+    /// Test infrastructure only: an [`HttpRelayHold`] can be constructed
+    /// only with the `test-fixtures` cargo feature, and a relay built without
+    /// that feature refuses to start with a hold ([`validate_export`]).
+    #[doc(hidden)]
     pub fixture_hold: Option<HttpRelayHold>,
+}
+
+/// Refuse an export a production relay must not serve: a fixture hold
+/// without the `test-fixtures` feature.
+///
+/// # Errors
+/// A static description of the refused setting.
+pub(crate) fn validate_export(export: &HttpForwardExport) -> Result<(), &'static str> {
+    check_fixture_hold(export.fixture_hold.is_some(), fixture_holds_enabled())
+}
+
+const fn check_fixture_hold(has_hold: bool, enabled: bool) -> Result<(), &'static str> {
+    if has_hold && !enabled {
+        return Err("http-forward fixture hold requires the test-fixtures feature");
+    }
+    Ok(())
+}
+
+/// Whether this build may honour a fixture hold.
+pub(crate) const fn fixture_holds_enabled() -> bool {
+    cfg!(any(test, feature = "test-fixtures"))
 }
 
 impl core::fmt::Debug for HttpForwardExport {
@@ -1597,7 +1621,10 @@ pub(crate) async fn handle_peer_http_stream(
         actor_writer,
         export.profile.request.clone(),
         method_tx,
-        export.fixture_hold.clone(),
+        export
+            .fixture_hold
+            .clone()
+            .filter(|_| fixture_holds_enabled()),
         Arc::clone(&verdict),
         down_tx.clone(),
     );
@@ -1701,6 +1728,19 @@ pub(crate) async fn handle_peer_http_stream(
 mod tests {
     use super::*;
     use tunnel_cluster::peer_frame::StreamBudget;
+
+    /// Review item 6: a fixture hold is refused unless the build enables
+    /// fixture holds.
+    #[test]
+    fn a_fixture_hold_is_refused_without_the_test_fixtures_feature() {
+        assert!(check_fixture_hold(true, false).is_err());
+        assert!(check_fixture_hold(false, false).is_ok());
+        assert!(check_fixture_hold(true, true).is_ok());
+        assert_eq!(
+            fixture_holds_enabled(),
+            cfg!(any(test, feature = "test-fixtures"))
+        );
+    }
 
     /// An in-memory peer request direction.  The "network" is unbounded:
     /// only the hop credit and the per-peer aggregate may bound it.
