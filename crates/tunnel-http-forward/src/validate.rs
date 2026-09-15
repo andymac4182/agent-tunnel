@@ -14,6 +14,9 @@ pub const MAX_HEADER_NAME_LEN: usize = 128;
 pub const MAX_HEADER_VALUE_LEN: usize = 4 * 1024;
 pub const MAX_HEADER_FIELDS: usize = 32;
 pub const MAX_HEADER_TOTAL_BYTES: usize = 8 * 1024;
+/// The hard ceiling on any configured cumulative body limit (1 TiB).  There
+/// is no unlimited sentinel: a policy above this ceiling cannot be built.
+pub const MAX_BODY_LIMIT: u64 = 1 << 40;
 
 /// Header names that never cross this array, in either direction, regardless
 /// of policy: routing, framing, credentials, forwarded identity, and internal
@@ -110,8 +113,10 @@ impl HeaderPolicy {
         if validate_header_name(name).is_err() {
             return Err(PolicyError::InvalidHeaderName);
         }
-        if header_forbidden(name).is_some() {
-            return Err(PolicyError::ForbiddenHeader);
+        match header_forbidden(name) {
+            Some(HeaderRule::Unsupported) => return Err(PolicyError::UnsupportedHeader),
+            Some(_) => return Err(PolicyError::ForbiddenHeader),
+            None => {}
         }
         if self.rules.iter().any(|rule| rule.name == name) {
             return Err(PolicyError::DuplicateEntry);
@@ -186,15 +191,20 @@ pub struct RequestPolicy {
 impl RequestPolicy {
     /// A policy with no routes, no versions, no query keys, no headers, and
     /// the given finite cumulative request body limit.
-    #[must_use]
-    pub const fn new(body_limit: u64) -> Self {
-        Self {
+    ///
+    /// # Errors
+    /// [`PolicyError::BodyLimitAboveCeiling`] above [`MAX_BODY_LIMIT`].
+    pub const fn new(body_limit: u64) -> Result<Self, PolicyError> {
+        if body_limit > MAX_BODY_LIMIT {
+            return Err(PolicyError::BodyLimitAboveCeiling);
+        }
+        Ok(Self {
             routes: Vec::new(),
             http_versions: Vec::new(),
             query: QueryPolicy::new(),
             headers: HeaderPolicy::new(),
             body_limit,
-        }
+        })
     }
 
     /// Advertise a method/path pair.
@@ -248,12 +258,18 @@ pub struct ResponsePolicy {
 }
 
 impl ResponsePolicy {
-    #[must_use]
-    pub const fn new(body_limit: u64) -> Self {
-        Self {
+    /// A policy with no headers and the given finite cumulative body limit.
+    ///
+    /// # Errors
+    /// [`PolicyError::BodyLimitAboveCeiling`] above [`MAX_BODY_LIMIT`].
+    pub const fn new(body_limit: u64) -> Result<Self, PolicyError> {
+        if body_limit > MAX_BODY_LIMIT {
+            return Err(PolicyError::BodyLimitAboveCeiling);
+        }
+        Ok(Self {
             headers: HeaderPolicy::new(),
             body_limit,
-        }
+        })
     }
 
     #[must_use]
@@ -335,9 +351,6 @@ pub fn validate_query(
             Some((key, value)) => (key, value),
             None => (pair, ""),
         };
-        if raw_value.contains('=') {
-            return Err(QueryRule::AmbiguousSeparator);
-        }
         if raw_key.is_empty() {
             return Err(QueryRule::EmptyKey);
         }
@@ -504,4 +517,53 @@ pub fn validate_headers(headers: &[HeaderField], policy: &HeaderPolicy) -> Resul
 
 pub(crate) fn header_error(rule: HeaderRule) -> CodecError {
     CodecError::InvalidHeader(rule)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a policy that bypasses `HeaderPolicy::allow`, so the runtime
+    /// guard in `validate_headers` is the only thing that can reject.
+    fn permissive(names: &[&str]) -> HeaderPolicy {
+        HeaderPolicy {
+            rules: names
+                .iter()
+                .map(|name| NameRule {
+                    name: (*name).to_owned(),
+                    occurrence: Occurrence::Repeatable,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn runtime_guard_rejects_forbidden_headers_even_when_allowlisted() {
+        let mut names: Vec<&str> = FORBIDDEN_HEADERS.to_vec();
+        names.extend(["x-forwarded-for", "x-agent-tunnel-tenant"]);
+        let policy = permissive(&names);
+        for name in &names {
+            let fields = [HeaderField::new(*name, "x")];
+            assert_eq!(
+                validate_headers(&fields, &policy),
+                Err(HeaderRule::Forbidden),
+                "{name}"
+            );
+        }
+        let policy = permissive(UNSUPPORTED_HEADERS);
+        for name in UNSUPPORTED_HEADERS {
+            let fields = [HeaderField::new(*name, "x")];
+            assert_eq!(
+                validate_headers(&fields, &policy),
+                Err(HeaderRule::Unsupported),
+                "{name}"
+            );
+        }
+        // Control: an ordinary allowlisted name passes the same path.
+        let policy = permissive(&["accept"]);
+        assert_eq!(
+            validate_headers(&[HeaderField::new("accept", "x")], &policy),
+            Ok(())
+        );
+    }
 }

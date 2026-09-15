@@ -5,9 +5,10 @@ mod common;
 
 use common::*;
 use tunnel_http_forward::{
-    CodecError, END_RECORD, HttpErrorCode, Method, Phase, RecordDeadline, RecordKind,
-    RequestPolicy, RequestReader, ResetOutcome, ResponseHead, ResponseReader, encode_record,
-    encode_request_head, encode_response_head, request_head_json, response_head_json,
+    CodecError, END_RECORD, HttpErrorCode, MAX_BODY_LIMIT, Method, Phase, PolicyError,
+    RecordDeadline, RecordKind, RequestPolicy, RequestReader, ResetOutcome, ResponseHead,
+    ResponsePolicy, ResponseReader, encode_record, encode_request_head, encode_response_head,
+    request_head_json, response_head_json,
 };
 
 fn req_head_record(body_length: Option<u64>) -> Vec<u8> {
@@ -21,7 +22,7 @@ fn req_head_record(body_length: Option<u64>) -> Vec<u8> {
     out
 }
 
-fn resp_head_record(status: u16, body_length: Option<u64>, method: Method) -> Vec<u8> {
+fn resp_head_record(status: u16, body_length: Option<u64>) -> Vec<u8> {
     // Encode without the zero-body check so tests can build invalid heads.
     let head = response_head(status, body_length);
     let mut out = Vec::new();
@@ -31,7 +32,6 @@ fn resp_head_record(status: u16, body_length: Option<u64>, method: Method) -> Ve
         &mut out,
     )
     .unwrap();
-    let _ = method;
     out
 }
 
@@ -115,10 +115,7 @@ fn grammar_errors_before_head() {
     let cases: [(Vec<u8>, CodecError); 3] = [
         (body(b"x"), CodecError::BodyBeforeHead),
         (END_RECORD.to_vec(), CodecError::EndBeforeHead),
-        (
-            resp_head_record(200, None, Method::Post),
-            CodecError::WrongDirectionHead,
-        ),
+        (resp_head_record(200, None), CodecError::WrongDirectionHead),
     ];
     for (bytes, expected) in cases {
         let (flow, error, phase) = request_result(&bytes, false);
@@ -135,7 +132,7 @@ fn grammar_errors_before_head() {
 #[test]
 fn wrong_head_is_rejected_before_its_payload_arrives() {
     // Only the eight header bytes of a wrong-direction head are supplied.
-    let wrong = resp_head_record(200, None, Method::Post);
+    let wrong = resp_head_record(200, None);
     let mut reader = RequestReader::new(request_policy());
     let mut input = &wrong[..8];
     assert_eq!(reader.read(&mut input), Err(CodecError::WrongDirectionHead));
@@ -156,10 +153,7 @@ fn second_head_during_body() {
         request_result(&bytes, false).1,
         Some(CodecError::SecondHead)
     );
-    let bytes = cat(&[
-        &req_head_record(None),
-        &resp_head_record(200, None, Method::Post),
-    ]);
+    let bytes = cat(&[&req_head_record(None), &resp_head_record(200, None)]);
     assert_eq!(
         request_result(&bytes, false).1,
         Some(CodecError::WrongDirectionHead)
@@ -173,10 +167,7 @@ fn records_after_end() {
         (END_RECORD.to_vec(), CodecError::RepeatedEnd),
         (body(b"x"), CodecError::BodyAfterEnd),
         (req_head_record(None), CodecError::SecondHead),
-        (
-            resp_head_record(200, None, Method::Post),
-            CodecError::WrongDirectionHead,
-        ),
+        (resp_head_record(200, None), CodecError::WrongDirectionHead),
         (vec![0x00], CodecError::DataAfterEnd),
     ];
     for (extra, expected) in cases {
@@ -279,16 +270,12 @@ fn declared_length_mismatch_both_directions() {
     ]);
     assert_eq!(request_result(&bytes, true).1, None);
     // Response direction.
-    let bytes = cat(&[
-        &resp_head_record(200, Some(2), Method::Post),
-        &body(b"a"),
-        &END_RECORD,
-    ]);
+    let bytes = cat(&[&resp_head_record(200, Some(2)), &body(b"a"), &END_RECORD]);
     assert_eq!(
         response_result(&bytes, Method::Post, true).1,
         Some(CodecError::BodyShorterThanDeclared)
     );
-    let bytes = cat(&[&resp_head_record(200, Some(2), Method::Post), &body(b"abc")]);
+    let bytes = cat(&[&resp_head_record(200, Some(2)), &body(b"abc")]);
     assert_eq!(
         response_result(&bytes, Method::Post, true).1,
         Some(CodecError::BodyLongerThanDeclared)
@@ -297,7 +284,7 @@ fn declared_length_mismatch_both_directions() {
 
 #[test]
 fn unknown_length_is_bounded_by_the_body_limit() {
-    let mut policy = RequestPolicy::new(10);
+    let mut policy = RequestPolicy::new(10).unwrap();
     policy.allow_route(Method::Post, "/acp").unwrap();
     policy.allow_http_version(tunnel_http_forward::HttpVersion::Http2);
     policy
@@ -331,27 +318,55 @@ fn unknown_length_is_bounded_by_the_body_limit() {
     assert!(flow.is_empty());
     assert_eq!(error, Some(CodecError::DeclaredLengthExceedsLimit));
 
-    // u64::MAX declared never overflows the counters.
-    let mut max = Vec::new();
-    encode_record(
-        RecordKind::RequestHead,
-        request_head_json(&request_head(Method::Post, Some(u64::MAX))).as_bytes(),
-        &mut max,
-    )
-    .unwrap();
-    let mut unlimited = RequestPolicy::new(u64::MAX);
-    unlimited.allow_route(Method::Post, "/acp").unwrap();
-    unlimited.allow_http_version(tunnel_http_forward::HttpVersion::Http2);
-    unlimited
+    // The largest finite limit: counters stay exact near it, and a declared
+    // length one past it is rejected at the head.
+    let mut ceiling = RequestPolicy::new(MAX_BODY_LIMIT).unwrap();
+    ceiling.allow_route(Method::Post, "/acp").unwrap();
+    ceiling.allow_http_version(tunnel_http_forward::HttpVersion::Http2);
+    ceiling
         .headers
         .allow("content-type", tunnel_http_forward::Occurrence::Singleton)
         .unwrap();
-    let bytes = cat(&[&max, &body(b"x"), &END_RECORD]);
-    let mut reader = RequestReader::new(unlimited);
+    let head_with = |declared: u64| {
+        let mut out = Vec::new();
+        encode_record(
+            RecordKind::RequestHead,
+            request_head_json(&request_head(Method::Post, Some(declared))).as_bytes(),
+            &mut out,
+        )
+        .unwrap();
+        out
+    };
+    let bytes = cat(&[&head_with(MAX_BODY_LIMIT), &body(b"x"), &END_RECORD]);
+    let mut reader = RequestReader::new(ceiling.clone());
     assert_eq!(
         run_request(&mut reader, &[&bytes], true).1,
         Some(CodecError::BodyShorterThanDeclared)
     );
+    for declared in [MAX_BODY_LIMIT + 1, u64::MAX] {
+        let mut reader = RequestReader::new(ceiling.clone());
+        assert_eq!(
+            run_request(&mut reader, &[&head_with(declared)], false).1,
+            Some(CodecError::DeclaredLengthExceedsLimit)
+        );
+    }
+}
+
+#[test]
+fn body_limits_have_a_finite_ceiling() {
+    assert_eq!(MAX_BODY_LIMIT, 1 << 40);
+    assert!(RequestPolicy::new(MAX_BODY_LIMIT).is_ok());
+    assert!(ResponsePolicy::new(MAX_BODY_LIMIT).is_ok());
+    for limit in [MAX_BODY_LIMIT + 1, u64::MAX] {
+        assert_eq!(
+            RequestPolicy::new(limit),
+            Err(PolicyError::BodyLimitAboveCeiling)
+        );
+        assert_eq!(
+            ResponsePolicy::new(limit),
+            Err(PolicyError::BodyLimitAboveCeiling)
+        );
+    }
 }
 
 #[test]
@@ -364,7 +379,7 @@ fn zero_body_responses() {
         (Method::Get, 304),
     ] {
         // "0", no BODY, END: accepted.
-        let ok = cat(&[&resp_head_record(status, Some(0), method), &END_RECORD]);
+        let ok = cat(&[&resp_head_record(status, Some(0)), &END_RECORD]);
         let (flow, error, phase) = response_result(&ok, method, true);
         assert_eq!(error, None, "{method:?} {status}");
         assert_eq!(phase, Phase::Complete);
@@ -372,18 +387,14 @@ fn zero_body_responses() {
 
         // null or nonzero declared length: rejected at the head.
         for declared in [None, Some(1), Some(10)] {
-            let bad = resp_head_record(status, declared, method);
+            let bad = resp_head_record(status, declared);
             let (flow, error, _) = response_result(&bad, method, false);
             assert!(flow.is_empty());
             assert_eq!(error, Some(CodecError::ZeroBodyRequired), "{declared:?}");
         }
 
         // Any BODY record: rejected before its bytes are emitted.
-        let with_body = cat(&[
-            &resp_head_record(status, Some(0), method),
-            &body(b"x"),
-            &END_RECORD,
-        ]);
+        let with_body = cat(&[&resp_head_record(status, Some(0)), &body(b"x"), &END_RECORD]);
         let (flow, error, _) = response_result(&with_body, method, true);
         assert_eq!(error, Some(CodecError::BodyForbidden));
         assert!(!flow.iter().any(|item| matches!(item, Flow::Body(_))));
@@ -401,16 +412,12 @@ fn zero_body_responses() {
         );
     }
     // The same statuses allow bodies only where the rule does not apply.
-    let normal = cat(&[
-        &resp_head_record(200, None, Method::Get),
-        &body(b"data"),
-        &END_RECORD,
-    ]);
+    let normal = cat(&[&resp_head_record(200, None), &body(b"data"), &END_RECORD]);
     assert_eq!(response_result(&normal, Method::Get, true).1, None);
     // The rule depends on the request method: 200 to GET with a body is fine,
     // the same bytes answering HEAD are not.
     let (_, error, _) = response_result(
-        &cat(&[&resp_head_record(200, None, Method::Head), &END_RECORD]),
+        &cat(&[&resp_head_record(200, None), &END_RECORD]),
         Method::Head,
         true,
     );

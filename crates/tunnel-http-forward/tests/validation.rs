@@ -113,6 +113,23 @@ fn valid_queries_decode_once() {
             ("cursor".into(), String::new()),
         ])
     );
+    // Only the first '=' separates key and value; later '=' is value data
+    // (RFC 3986 permits it), so base64 padding is accepted verbatim.
+    assert_eq!(
+        validate_query("cursor=a=b", &policy),
+        Ok(vec![("cursor".into(), "a=b".into())])
+    );
+    assert_eq!(
+        validate_query("cursor=YWJjZA==&tag=YQ%3D%3D", &policy),
+        Ok(vec![
+            ("cursor".into(), "YWJjZA==".into()),
+            ("tag".into(), "YQ==".into()),
+        ])
+    );
+    assert_eq!(
+        validate_query("cursor=", &policy),
+        Ok(vec![("cursor".into(), String::new())])
+    );
     assert_eq!(
         validate_query("cursor", &policy),
         Ok(vec![("cursor".into(), String::new())])
@@ -143,7 +160,6 @@ fn ambiguous_queries_rejected() {
         ("&cursor=1", QueryRule::EmptyPair),
         ("cursor=1&&tag=2", QueryRule::EmptyPair),
         ("=1", QueryRule::EmptyKey),
-        ("cursor=a=b", QueryRule::AmbiguousSeparator),
         ("cursor=a+b", QueryRule::DisallowedCharacter),
         ("cursor=a;tag=b", QueryRule::DisallowedCharacter),
         ("cursor=a b", QueryRule::DisallowedCharacter),
@@ -335,7 +351,9 @@ fn singleton_and_repeatable_fields() {
 }
 
 #[test]
-fn forbidden_headers_rejected_even_if_policy_would_allow() {
+fn forbidden_headers_are_classified_before_the_allowlist_and_refused_by_policy() {
+    // The runtime guard with an allowlist that names these headers is covered
+    // by the unit test in src/validate.rs, which can bypass `allow`.
     let everything = headers_policy();
     let mut names: Vec<String> = FORBIDDEN_HEADERS.iter().map(|s| (*s).to_owned()).collect();
     names.extend(
@@ -372,7 +390,9 @@ fn forbidden_headers_rejected_even_if_policy_would_allow() {
             "{name}"
         );
     }
-    for name in ["transfer-encoding", "te", "trailer", "upgrade", "expect"] {
+    assert_eq!(UNSUPPORTED_HEADERS.len(), 5);
+    for name in UNSUPPORTED_HEADERS.iter().copied() {
+        assert!(["transfer-encoding", "te", "trailer", "upgrade", "expect"].contains(&name));
         assert!(UNSUPPORTED_HEADERS.contains(&name));
         assert_eq!(
             validate_headers(&fields(&[(name, "x")]), &everything),
@@ -382,6 +402,12 @@ fn forbidden_headers_rejected_even_if_policy_would_allow() {
         assert_eq!(
             CodecError::InvalidHeader(HeaderRule::Unsupported).code(),
             HttpErrorCode::UnsupportedFeature
+        );
+        let mut policy = HeaderPolicy::new();
+        assert_eq!(
+            policy.allow(name, Occurrence::Repeatable),
+            Err(PolicyError::UnsupportedHeader),
+            "{name}"
         );
     }
     // A connection-nominated field cannot ride along: connection itself fails.
@@ -417,7 +443,7 @@ fn response_direction_uses_its_own_allowlist() {
 
 #[test]
 fn route_policy_construction() {
-    let mut policy = RequestPolicy::new(10);
+    let mut policy = RequestPolicy::new(10).unwrap();
     assert_eq!(
         policy.allow_route(Method::Get, "/a/../b"),
         Err(PolicyError::InvalidRoutePath(PathRule::DotSegment))

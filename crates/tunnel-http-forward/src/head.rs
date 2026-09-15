@@ -70,7 +70,7 @@ impl HttpVersion {
     }
 }
 
-/// One header entry.  `Debug` omits the value.
+/// One header entry.  `Debug` prints only lengths.
 #[derive(Clone, Eq, PartialEq)]
 pub struct HeaderField {
     pub name: String,
@@ -91,13 +91,13 @@ impl fmt::Debug for HeaderField {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("HeaderField")
-            .field("name", &self.name)
+            .field("name_len", &self.name.len())
             .field("value_len", &self.value.len())
             .finish()
     }
 }
 
-/// A validated `REQUEST_HEAD`.  `Debug` omits path, query, and values.
+/// A validated `REQUEST_HEAD`.  `Debug` omits path, query, and headers.
 #[derive(Clone, Eq, PartialEq)]
 pub struct RequestHead {
     pub method: Method,
@@ -118,18 +118,29 @@ impl fmt::Debug for RequestHead {
             .field("path_len", &self.path.len())
             .field("query_len", &self.query.len())
             .field("http_version", &self.http_version)
-            .field("headers", &self.headers)
+            .field("headers_len", &self.headers.len())
             .field("body_length", &self.body_length)
             .finish()
     }
 }
 
-/// A validated `RESPONSE_HEAD`.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// A validated `RESPONSE_HEAD`.  `Debug` omits headers.
+#[derive(Clone, Eq, PartialEq)]
 pub struct ResponseHead {
     pub status: u16,
     pub headers: Vec<HeaderField>,
     pub body_length: Option<u64>,
+}
+
+impl fmt::Debug for ResponseHead {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ResponseHead")
+            .field("status", &self.status)
+            .field("headers_len", &self.headers.len())
+            .field("body_length", &self.body_length)
+            .finish()
+    }
 }
 
 const REQUEST_KEYS: [&str; 6] = [
@@ -379,7 +390,7 @@ pub fn encode_request_head(
     }
     let reparsed = parse_request_head(text.as_bytes(), policy)?;
     if reparsed != *head {
-        return Err(CodecError::JsonSyntax);
+        return Err(CodecError::EncoderRoundTrip);
     }
     encode_record(RecordKind::RequestHead, text.as_bytes(), out)
 }
@@ -400,7 +411,7 @@ pub fn encode_response_head(
     }
     let reparsed = parse_response_head(text.as_bytes(), policy, request_method)?;
     if reparsed != *head {
-        return Err(CodecError::JsonSyntax);
+        return Err(CodecError::EncoderRoundTrip);
     }
     encode_record(RecordKind::ResponseHead, text.as_bytes(), out)
 }

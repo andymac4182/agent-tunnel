@@ -23,20 +23,21 @@ fn all_bytes_body() -> Vec<u8> {
     (0..=255u8).collect()
 }
 
+type Run<H> = (Vec<Flow<H>>, Option<CodecError>);
+
 /// Assert decoder and reader output is identical for whole, one-byte, and
-/// every single split point.
-fn assert_split_independent(bytes: &[u8]) {
+/// every single split point.  `run` feeds chunks to a fresh reader of either
+/// direction and applies FIN.
+fn assert_split_independent_with<H: Clone + std::fmt::Debug + PartialEq>(
+    bytes: &[u8],
+    run: impl Fn(&[&[u8]]) -> Run<H>,
+) -> Run<H> {
     let (whole_events, whole_error) = decode_chunks(&[bytes]);
-    let mut reader = RequestReader::new(request_policy());
-    let (whole_flow, whole_flow_error) = run_request(&mut reader, &[bytes], true);
+    let whole = run(&[bytes]);
 
     let ones = one_byte_chunks(bytes);
     assert_eq!(decode_chunks(&ones), (whole_events.clone(), whole_error));
-    let mut reader = RequestReader::new(request_policy());
-    assert_eq!(
-        run_request(&mut reader, &ones, true),
-        (whole_flow.clone(), whole_flow_error)
-    );
+    assert_eq!(run(&ones), whole);
 
     for split in 0..=bytes.len() {
         let (a, b) = bytes.split_at(split);
@@ -45,13 +46,80 @@ fn assert_split_independent(bytes: &[u8]) {
             (whole_events.clone(), whole_error),
             "decoder split at {split}"
         );
-        let mut reader = RequestReader::new(request_policy());
-        assert_eq!(
-            run_request(&mut reader, &[a, b], true),
-            (whole_flow.clone(), whole_flow_error),
-            "reader split at {split}"
-        );
+        assert_eq!(run(&[a, b]), whole, "reader split at {split}");
     }
+    whole
+}
+
+fn assert_split_independent(bytes: &[u8]) {
+    assert_split_independent_with(bytes, |chunks| {
+        let mut reader = RequestReader::new(request_policy());
+        run_request(&mut reader, chunks, true)
+    });
+}
+
+fn assert_response_split_independent(
+    bytes: &[u8],
+    method: Method,
+) -> Run<tunnel_http_forward::ResponseHead> {
+    assert_split_independent_with(bytes, |chunks| {
+        let mut reader = ResponseReader::new(response_policy(), method);
+        run_response(&mut reader, chunks, true)
+    })
+}
+
+fn response_head_record(body_length: Option<u64>) -> Vec<u8> {
+    let mut head = doc_response_head();
+    head.body_length = body_length;
+    let mut out = Vec::new();
+    encode_response_head(&head, &response_policy(), Method::Get, &mut out).unwrap();
+    out
+}
+
+#[test]
+fn every_split_of_a_binary_response_is_identical() {
+    let body = all_bytes_body();
+    let mut bytes = response_head_record(Some(256));
+    encode_body(&body, &mut bytes);
+    bytes.extend_from_slice(&END_RECORD);
+    let (flow, error) = assert_response_split_independent(&bytes, Method::Get);
+    assert_eq!(error, None);
+    assert_eq!(flow[1], Flow::Body(body));
+    assert_eq!(flow.last(), Some(&Flow::Fin));
+}
+
+#[test]
+fn every_split_of_malformed_response_streams_reports_the_same_error() {
+    // Declared 2, BODY "abc": rejected at the BODY header, nothing emitted.
+    let mut longer = response_head_record(Some(2));
+    encode_record(RecordKind::Body, b"abc", &mut longer).unwrap();
+    longer.extend_from_slice(&END_RECORD);
+    let (flow, error) = assert_response_split_independent(&longer, Method::Get);
+    assert_eq!(error, Some(CodecError::BodyLongerThanDeclared));
+    assert_eq!(flow.len(), 1);
+
+    // Declared 2, BODY "ab", END, then a stray byte after END.
+    let mut stray = response_head_record(Some(2));
+    encode_record(RecordKind::Body, b"ab", &mut stray).unwrap();
+    stray.extend_from_slice(&END_RECORD);
+    stray.push(0x7f);
+    let (flow, error) = assert_response_split_independent(&stray, Method::Get);
+    assert_eq!(error, Some(CodecError::DataAfterEnd));
+    assert_eq!(flow.last(), Some(&Flow::End));
+
+    // Declared 3, BODY "ab", END: shorter at END.
+    let mut shorter = response_head_record(Some(3));
+    encode_record(RecordKind::Body, b"ab", &mut shorter).unwrap();
+    shorter.extend_from_slice(&END_RECORD);
+    let (_, error) = assert_response_split_independent(&shorter, Method::Get);
+    assert_eq!(error, Some(CodecError::BodyShorterThanDeclared));
+
+    // Truncated inside END: FIN reports EOF inside a record at every split.
+    let mut truncated = response_head_record(Some(2));
+    encode_record(RecordKind::Body, b"ab", &mut truncated).unwrap();
+    truncated.extend_from_slice(&END_RECORD[..5]);
+    let (_, error) = assert_response_split_independent(&truncated, Method::Get);
+    assert_eq!(error, Some(CodecError::EofInsideRecord));
 }
 
 #[test]

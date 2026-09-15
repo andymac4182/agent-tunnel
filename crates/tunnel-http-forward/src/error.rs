@@ -65,7 +65,6 @@ pub enum QueryRule {
     TooManyPairs,
     EmptyPair,
     EmptyKey,
-    AmbiguousSeparator,
     DisallowedCharacter,
     InvalidPercentEscape,
     EncodedKey,
@@ -153,6 +152,9 @@ pub enum CodecError {
 
     // Caller-observed progress.
     RecordDeadlineExceeded,
+
+    // The encoder's serialized head did not re-parse to the same value.
+    EncoderRoundTrip,
 }
 
 impl CodecError {
@@ -199,7 +201,8 @@ impl CodecError {
             | Self::ZeroBodyRequired
             | Self::InvalidPath(_)
             | Self::InvalidQuery(_)
-            | Self::InvalidHeader(_) => HttpErrorCode::InvalidHead,
+            | Self::InvalidHeader(_)
+            | Self::EncoderRoundTrip => HttpErrorCode::InvalidHead,
             Self::DeclaredLengthExceedsLimit | Self::BodyLimitExceeded => HttpErrorCode::BodyLimit,
             Self::BodyShorterThanDeclared | Self::BodyLongerThanDeclared | Self::BodyForbidden => {
                 HttpErrorCode::LengthMismatch
@@ -225,6 +228,11 @@ pub enum PolicyError {
     InvalidRoutePath(PathRule),
     InvalidHeaderName,
     ForbiddenHeader,
+    /// A hop-by-hop feature header (`transfer-encoding`, `te`, `trailer`,
+    /// `upgrade`, `expect`) that the runtime classifies as unsupported.
+    UnsupportedHeader,
+    /// A body limit above [`crate::MAX_BODY_LIMIT`].
+    BodyLimitAboveCeiling,
     InvalidQueryKey,
     CredentialQueryParameter,
     DuplicateEntry,

@@ -404,7 +404,7 @@ fn method_and_version_sets_are_exact() {
             "{raw}"
         );
     }
-    let mut only_h2 = tunnel_http_forward::RequestPolicy::new(1024);
+    let mut only_h2 = tunnel_http_forward::RequestPolicy::new(1024).unwrap();
     only_h2.allow_route(Method::Post, "/acp").unwrap();
     only_h2.allow_http_version(HttpVersion::Http2);
     only_h2

@@ -33,7 +33,8 @@ pub use record::{
 };
 pub use validate::{
     CREDENTIAL_QUERY_PARAMETERS, FORBIDDEN_HEADER_PREFIXES, FORBIDDEN_HEADERS, HeaderPolicy,
-    MAX_HEADER_FIELDS, MAX_HEADER_NAME_LEN, MAX_HEADER_TOTAL_BYTES, MAX_HEADER_VALUE_LEN,
-    MAX_PATH_LEN, MAX_QUERY_LEN, MAX_QUERY_PAIRS, Occurrence, QueryPolicy, RequestPolicy,
-    ResponsePolicy, Route, UNSUPPORTED_HEADERS, validate_headers, validate_path, validate_query,
+    MAX_BODY_LIMIT, MAX_HEADER_FIELDS, MAX_HEADER_NAME_LEN, MAX_HEADER_TOTAL_BYTES,
+    MAX_HEADER_VALUE_LEN, MAX_PATH_LEN, MAX_QUERY_LEN, MAX_QUERY_PAIRS, Occurrence, QueryPolicy,
+    RequestPolicy, ResponsePolicy, Route, UNSUPPORTED_HEADERS, validate_headers, validate_path,
+    validate_query,
 };

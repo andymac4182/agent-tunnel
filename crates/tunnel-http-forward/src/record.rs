@@ -162,12 +162,13 @@ pub fn encode_record(
 /// appends nothing, since BODY records are never empty.
 pub fn encode_body(body: &[u8], out: &mut Vec<u8>) {
     for chunk in body.chunks(MAX_BODY_PAYLOAD_LEN) {
-        // Chunks are 1..=MAX_BODY_PAYLOAD_LEN by construction.
-        if let Ok(len) = u32::try_from(chunk.len())
-            && let Ok(header) = RecordHeader::new(RecordKind::Body, len)
-        {
-            out.extend_from_slice(&header.encode());
-            out.extend_from_slice(chunk);
-        }
+        // Invariant: `chunks` yields 1..=MAX_BODY_PAYLOAD_LEN bytes, which
+        // always fits u32 and is always a valid BODY length.  The input is
+        // the local sender's body, never decoded peer data.
+        let len = u32::try_from(chunk.len()).expect("BODY chunk length fits u32");
+        let header =
+            RecordHeader::new(RecordKind::Body, len).expect("BODY chunk length is within bounds");
+        out.extend_from_slice(&header.encode());
+        out.extend_from_slice(chunk);
     }
 }

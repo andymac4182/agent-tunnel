@@ -19,7 +19,7 @@ pub const REQUEST_BODY_LIMIT: u64 = 1024 * 1024;
 pub const RESPONSE_BODY_LIMIT: u64 = 4 * 1024 * 1024;
 
 pub fn request_policy() -> RequestPolicy {
-    let mut policy = RequestPolicy::new(REQUEST_BODY_LIMIT);
+    let mut policy = RequestPolicy::new(REQUEST_BODY_LIMIT).unwrap();
     for (method, path) in [
         (Method::Post, "/acp"),
         (Method::Get, "/acp"),
@@ -49,7 +49,7 @@ pub fn request_policy() -> RequestPolicy {
 }
 
 pub fn response_policy() -> ResponsePolicy {
-    let mut policy = ResponsePolicy::new(RESPONSE_BODY_LIMIT);
+    let mut policy = ResponsePolicy::new(RESPONSE_BODY_LIMIT).unwrap();
     policy
         .headers
         .allow("content-type", Occurrence::Singleton)
