@@ -21,6 +21,19 @@
 //! reserved control capacity is *usable* and that frame ordering still holds
 //! while the data path is genuinely saturated.
 //!
+//! # Phase order, and why the GOAWAY comes before the fence
+//!
+//! M7-I07's row also asks for a *sibling* stream that survives across the
+//! owner's planned peer GOAWAY.  The phases therefore run: revocation close,
+//! reordered pair, duplicate, **planned GOAWAY**, sibling round trip,
+//! post-FIN fence.  The sibling answers its outstanding record after the owner
+//! has written `GOAWAY(0)` and is already refusing fresh peer streams, and the
+//! fence is still the session's own last event -- `session_terminal_events`
+//! must be exactly one, carrying the typed `INVALID_SEQUENCE` reason a drain
+//! never produces.  `GOAWAY(0)` closes admission; it does not end an already
+//! admitted session, which `session_alive_after_goaway` records from the
+//! owner's own snapshot rather than inferring.
+//!
 //! # Why this is a separate gate rather than an extension of
 //! `verify-m7-queue-saturation`
 //!
@@ -170,6 +183,14 @@ const QUIET_INTERVAL: Duration = Duration::from_millis(60);
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(8);
 const PHASE_TIMEOUT: Duration = Duration::from_secs(25);
 const GATE_TIMEOUT: Duration = Duration::from_secs(180);
+/// Bound on the window from the owner writing the planned GOAWAY to the
+/// post-FIN fence closing the session.  The whole post-GOAWAY sequence --
+/// sibling round trip, fence, terminal re-sampling -- measures about 80 ms,
+/// and the fixture has been measured completing it with a deliberate extra
+/// second inserted after the GOAWAY, so this bound is a generous ceiling that
+/// keeps the ordering claim honest rather than a tight race.
+const GOAWAY_TO_FENCE_BOUND_MS: u64 = 5_000;
+
 /// Re-samples used to prove the first terminal identity never changes.
 const TERMINAL_SAMPLES: usize = 8;
 const TERMINAL_SAMPLE_INTERVAL: Duration = Duration::from_millis(25);
@@ -314,6 +335,10 @@ pub struct SaturatedFrameEvidence {
     /// injections, completed its own outstanding round trip byte exact while
     /// the carrier was still saturated.
     pub sibling_survived_terminals: bool,
+    /// That round trip ran after the owner had written the planned peer
+    /// GOAWAY and was already refusing fresh peer streams: the sibling
+    /// survived *across* the drain, not merely under saturation.
+    pub sibling_round_trip_across_goaway: bool,
     /// Physical occupancy observed across that sibling round trip.
     pub sibling_resident_frames: usize,
     /// Neither the duplicate nor the post-FIN frame produced a second
@@ -342,12 +367,23 @@ pub struct SaturatedFrameEvidence {
     /// class, which is the ingress-observable proof the GOAWAY landed.
     pub goaway_refused_new_peer_stream: bool,
     pub goaway_refusal_class: String,
-    /// The GOAWAY was requested only after the post-FIN fence had already
-    /// closed the session.  Recorded rather than implied: the owner's planned
-    /// drain is a listener-wide `GOAWAY(0)` that ends the session within tens
-    /// of milliseconds, and the fence has to be the session's own last event,
-    /// so the two cannot be ordered the other way round.
-    pub goaway_requested_after_fence: bool,
+    /// The device session was still present in the owner's own snapshot after
+    /// the planned GOAWAY was written and fresh peer streams were already
+    /// being refused: `GOAWAY(0)` closes admission, it does not end an
+    /// admitted session.
+    pub session_alive_after_goaway: bool,
+    /// The post-FIN fence landed after the GOAWAY, so the typed
+    /// `INVALID_SEQUENCE` close is the session's own reaction to the injected
+    /// frame while the drain was already in progress.
+    pub fence_after_goaway: bool,
+    /// Session terminal events the owner recorded for this session.  Exactly
+    /// one: the fence is the session's last event, so `INVALID_SEQUENCE` is
+    /// attributable to the injected frame and not to the drain.
+    pub session_terminal_events: usize,
+    /// Milliseconds from the owner writing the planned GOAWAY to the fence
+    /// closing the session, and the bound that window had to stay inside.
+    pub goaway_to_fence_ms: u64,
+    pub goaway_to_fence_bound_ms: u64,
     /// The owner's peer listener reported that it actually wrote the planned
     /// HTTP/3 GOAWAY on a peer connection.
     pub goaway_sent_by_owner: bool,
@@ -576,6 +612,12 @@ impl SaturatedFrameEvidence {
         if !self.sibling_survived_terminals {
             failures.push("sibling_survived_terminals");
         }
+        if !self.sibling_round_trip_across_goaway
+            || self.sibling_round_trip_across_goaway
+                != (self.sibling_survived_terminals && self.session_alive_after_goaway)
+        {
+            failures.push("sibling_round_trip_across_goaway");
+        }
         if self.sibling_resident_frames < self.resident_frames_floor {
             failures.push("sibling_resident_frames");
         }
@@ -618,11 +660,26 @@ impl SaturatedFrameEvidence {
         if self.goaway_refusal_class != GOAWAY_CLASS {
             failures.push("goaway_refusal_class");
         }
-        if !self.goaway_requested_after_fence {
-            failures.push("goaway_requested_after_fence");
-        }
         if !self.goaway_sent_by_owner {
             failures.push("goaway_sent_by_owner");
+        }
+        if !self.session_alive_after_goaway {
+            failures.push("session_alive_after_goaway");
+        }
+        if !self.fence_after_goaway {
+            failures.push("fence_after_goaway");
+        }
+        // Exactly one session terminal event keeps the fence the session's own
+        // last event: a drain-induced close would be a second one, or would
+        // have replaced the typed reason above.
+        if self.session_terminal_events != 1 {
+            failures.push("session_terminal_events");
+        }
+        if self.goaway_to_fence_bound_ms != GOAWAY_TO_FENCE_BOUND_MS {
+            failures.push("goaway_to_fence_bound_ms");
+        }
+        if self.goaway_to_fence_ms == 0 || self.goaway_to_fence_ms > self.goaway_to_fence_bound_ms {
+            failures.push("goaway_to_fence_ms");
         }
 
         if !self.cleanup_joined {
@@ -643,7 +700,7 @@ impl SaturatedFrameEvidence {
     #[must_use]
     pub fn evidence_line(&self) -> String {
         format!(
-            "M7 saturated peer frames passed: non_owner_ingress={} carrier_connection_isolated={} profile={} streams_admitted={} stream_cap_refused_one_more={} record_bytes={} charge_per_record={} data_queue_depth_high_water={} physically_resident_frames={} resident_floor={} min_resident_during_injection={} reserved_free_data_slots_at_peak={} queue_bytes_high_water={} data_bytes_high_water={} control_bytes_available_at_data_peak={} carrier_drain_records_consumed={}/{} saturation_window_ms={}/{} revocation_close_delivered={} revocation_close_reason={} revocation_failure_code={} revocation_stream_terminal={} revocation_dispatch_delta={} data_queue_depth_at_revocation={} control_enqueues_during_saturation={} control_queue_refusals_during_saturation={} reorder_recv_after_gap={} reorder_delivered_after_gap={} reorder_recv_after_fill={} reorder_delivered_after_fill={} reorder_order_restored={} reorder_resident_frames={} duplicate_delivered_before={} duplicate_delivered_after={} duplicate_adapter_records={} duplicate_resident_frames={} no_double_delivery={} late_fin_cursor={} late_stream_terminals={} late_adapter_bytes_after_fin={} late_session_reason={} late_resident_frames={} terminal_identity_immutable={} terminal_identity_samples={} goaway_refused_new_peer_stream={} goaway_refusal_class={} goaway_sent_by_owner={} goaway_requested_after_fence={} sibling_survived_terminals={} sibling_resident_frames={} cleanup_joined={} elapsed_ms={}",
+            "M7 saturated peer frames passed: non_owner_ingress={} carrier_connection_isolated={} profile={} streams_admitted={} stream_cap_refused_one_more={} record_bytes={} charge_per_record={} data_queue_depth_high_water={} physically_resident_frames={} resident_floor={} min_resident_during_injection={} reserved_free_data_slots_at_peak={} queue_bytes_high_water={} data_bytes_high_water={} control_bytes_available_at_data_peak={} carrier_drain_records_consumed={}/{} saturation_window_ms={}/{} revocation_close_delivered={} revocation_close_reason={} revocation_failure_code={} revocation_stream_terminal={} revocation_dispatch_delta={} data_queue_depth_at_revocation={} control_enqueues_during_saturation={} control_queue_refusals_during_saturation={} reorder_recv_after_gap={} reorder_delivered_after_gap={} reorder_recv_after_fill={} reorder_delivered_after_fill={} reorder_order_restored={} reorder_resident_frames={} duplicate_delivered_before={} duplicate_delivered_after={} duplicate_adapter_records={} duplicate_resident_frames={} no_double_delivery={} late_fin_cursor={} late_stream_terminals={} late_adapter_bytes_after_fin={} late_session_reason={} late_resident_frames={} terminal_identity_immutable={} terminal_identity_samples={} goaway_refused_new_peer_stream={} goaway_refusal_class={} goaway_sent_by_owner={} session_alive_after_goaway={} fence_after_goaway={} session_terminal_events={} goaway_to_fence_ms={}/{} sibling_survived_terminals={} sibling_round_trip_across_goaway={} sibling_resident_frames={} cleanup_joined={} elapsed_ms={}",
             self.non_owner_ingress,
             self.carrier_connection_isolated,
             self.session_profile,
@@ -692,8 +749,13 @@ impl SaturatedFrameEvidence {
             self.goaway_refused_new_peer_stream,
             self.goaway_refusal_class,
             self.goaway_sent_by_owner,
-            self.goaway_requested_after_fence,
+            self.session_alive_after_goaway,
+            self.fence_after_goaway,
+            self.session_terminal_events,
+            self.goaway_to_fence_ms,
+            self.goaway_to_fence_bound_ms,
             self.sibling_survived_terminals,
+            self.sibling_round_trip_across_goaway,
             self.sibling_resident_frames,
             self.cleanup_joined,
             self.elapsed_ms,
@@ -789,6 +851,7 @@ async fn run_gate(running: &RunningFixture) -> Result<SaturatedFrameEvidence> {
         carrier_drain_budget: CARRIER_DRAIN_BUDGET,
         operation_timeout_ms: OPERATION_TIMEOUT_MS,
         saturation_window_bound_ms: SATURATION_WINDOW_BOUND_MS,
+        goaway_to_fence_bound_ms: GOAWAY_TO_FENCE_BOUND_MS,
         ..SaturatedFrameEvidence::default()
     };
 
@@ -956,7 +1019,20 @@ async fn run_gate(running: &RunningFixture) -> Result<SaturatedFrameEvidence> {
         HarnessError::Timeout("saturated duplicate phase exceeded its bound".to_owned())
     })??;
 
-    // Phase 5: a sibling stream, still saturated, survives the terminals.
+    // Phase 5 (item 3): the owner's planned peer GOAWAY on the same peer
+    // connection, taken *before* the sibling round trip and before the fence
+    // so both of those are observed across it.
+    tracing::info!(phase = "saturated_phase_goaway", "phase start");
+    let goaway_written = timeout(
+        PHASE_TIMEOUT,
+        phase_goaway(running, &ingress_connection, &mut evidence),
+    )
+    .await
+    .map_err(|_| HarnessError::Timeout("saturated GOAWAY phase exceeded its bound".to_owned()))??;
+
+    // Phase 6: the sibling stream, still saturated, survives the terminals and
+    // the drain: its own outstanding round trip completes byte exact after the
+    // owner has already written the planned GOAWAY.
     tracing::info!(phase = "saturated_phase_sibling", "phase start");
     timeout(
         PHASE_TIMEOUT,
@@ -974,8 +1050,10 @@ async fn run_gate(running: &RunningFixture) -> Result<SaturatedFrameEvidence> {
         HarnessError::Timeout("saturated sibling phase exceeded its bound".to_owned())
     })??;
 
-    // Phase 6 (item 2, terminal half): the late frame fences the session, so it
-    // is the session's own last event.
+    // Phase 7 (item 2, terminal half): the late frame fences the session, so it
+    // is the session's own last event -- still true with the drain already in
+    // progress, which is what makes `INVALID_SEQUENCE` attributable to the
+    // injected frame rather than to the GOAWAY.
     tracing::info!(phase = "saturated_phase_late", "phase start");
     timeout(
         PHASE_TIMEOUT,
@@ -991,15 +1069,15 @@ async fn run_gate(running: &RunningFixture) -> Result<SaturatedFrameEvidence> {
     .await
     .map_err(|_| HarnessError::Timeout("saturated late phase exceeded its bound".to_owned()))??;
 
-    // Phase 7 (item 3): the peer GOAWAY on the same peer connection.  See
-    // `phase_goaway` for why it follows the fence.
-    tracing::info!(phase = "saturated_phase_goaway", "phase start");
-    timeout(
-        PHASE_TIMEOUT,
-        phase_goaway(running, &ingress_connection, &mut evidence),
-    )
-    .await
-    .map_err(|_| HarnessError::Timeout("saturated GOAWAY phase exceeded its bound".to_owned()))??;
+    evidence.fence_after_goaway = !evidence.late_session_reason.is_empty();
+    evidence.goaway_to_fence_ms =
+        u64::try_from(goaway_written.elapsed().as_millis()).unwrap_or(u64::MAX);
+    evidence.session_terminal_events = snapshot(running)
+        .await?
+        .session_terminal_events
+        .iter()
+        .filter(|event| event.session_id == context.session_id)
+        .count();
 
     let live = owner_session(running, &context.session_id).await.ok();
     evidence.control_enqueues_during_saturation =
@@ -1622,13 +1700,18 @@ async fn phase_duplicate(
     Ok(())
 }
 
-/// A sibling stream survives the terminals and the injections.
+/// A sibling stream survives the terminals, the injections and the GOAWAY.
 ///
 /// The sibling was admitted with the rest of the workload and still owes the
-/// response to the record it holds.  Answering it after the revocation close
-/// and both injections, while the carrier is still saturated, is the survival
-/// proof: a terminal on one stream and a refused frame on another leave an
-/// untouched stream able to complete its own round trip byte exact.
+/// response to the record it holds.  Answering it after the revocation close,
+/// both injections and the owner's planned peer GOAWAY, while the carrier is
+/// still saturated, is the survival proof: a terminal on one stream, a refused
+/// frame on another and a listener that has closed admission leave an already
+/// admitted stream able to complete its own round trip byte exact.
+///
+/// The session is sampled for liveness first, so "across the GOAWAY" is a
+/// measured precondition of the round trip rather than an inference from its
+/// success.
 async fn phase_sibling(
     running: &RunningFixture,
     data: &mut RawStream,
@@ -1638,6 +1721,13 @@ async fn phase_sibling(
     evidence: &mut SaturatedFrameEvidence,
 ) -> Result<()> {
     let stream_id = sibling.stream_id;
+    // The owner already wrote the planned GOAWAY and already refuses fresh
+    // peer streams; this session is nonetheless still live, which is the
+    // precondition the round trip below is measured against.
+    evidence.session_alive_after_goaway = evidence.goaway_sent_by_owner
+        && evidence.goaway_refused_new_peer_stream
+        && session_of(&snapshot(running).await?, &context.session_id).is_some();
+
     let response = Frame::data(
         context.epoch,
         context.generation,
@@ -1649,6 +1739,8 @@ async fn phase_sibling(
     forward_expecting_recv(running, data, context, stream_id, 1, &response, state).await?;
     let delivered = next_consumer_record(&mut sibling.stream).await?;
     evidence.sibling_survived_terminals = delivered == SIBLING_BODY;
+    evidence.sibling_round_trip_across_goaway =
+        evidence.sibling_survived_terminals && evidence.session_alive_after_goaway;
     evidence.sibling_resident_frames =
         sample_residency(running, &context.session_id, state).await?;
 
@@ -1776,27 +1868,36 @@ async fn phase_late(
 /// carried this run's consumer ingress is refused with the typed pre-dispatch
 /// GOAWAY class rather than admitted.
 ///
-/// **Recorded ordering limit.** That drain sends a listener-wide `GOAWAY(0)`,
-/// which ends this device session within tens of milliseconds -- measured at
-/// roughly 70 ms.  The post-FIN fence has to be the session's own last event
-/// for `INVALID_SEQUENCE` to be attributable to the injected frame rather than
-/// to the drain, so the GOAWAY is requested only after that fence has already
-/// closed the session.  The consequence is that the surviving sibling is
-/// asserted against the stream terminals under saturation (`phase_sibling`)
-/// and not across the GOAWAY itself.
+/// **Measured ordering.** The drain sends a listener-wide `GOAWAY(0)`, and an
+/// earlier revision of this gate recorded that as ending the device session
+/// "within tens of milliseconds", which is why it used to request the GOAWAY
+/// only after the post-FIN fence had already closed the session.  That is not
+/// what the owner does.  `GOAWAY(0)` closes *admission*: already admitted peer
+/// streams -- the device control and data carriers among them -- keep serving,
+/// so the session outlives the GOAWAY by seconds, not milliseconds.  Measured
+/// in this fixture: with a deliberate one-second pause inserted after the
+/// GOAWAY, the sibling round trip and the post-FIN fence both still completed
+/// and the session still closed with `INVALID_SEQUENCE`; the whole post-GOAWAY
+/// sequence takes about 80 ms, and `goaway_to_fence_ms` records it every run.
+///
+/// The GOAWAY is therefore taken *before* the sibling round trip and before
+/// the fence.  The fence stays the session's own last event -- asserted, not
+/// assumed, by `session_terminal_events == 1` with the typed
+/// `INVALID_SEQUENCE` reason, which the drain never produces.
+///
+/// Returns the instant at which the owner reported the planned GOAWAY written.
 async fn phase_goaway(
     running: &RunningFixture,
     ingress: &tunnel_transport::PeerConnectionHandle,
     evidence: &mut SaturatedFrameEvidence,
-) -> Result<()> {
+) -> Result<Instant> {
     running.request_planned_goaway()?;
     evidence.goaway_requested = true;
-    evidence.goaway_requested_after_fence = !evidence.late_session_reason.is_empty();
 
     // The owner's own listener diagnostics: the planned HTTP/3 GOAWAY was
     // actually written on a peer connection, not merely requested.
     let deadline = Instant::now() + SETTLE_TIMEOUT;
-    loop {
+    let written = loop {
         let stats = running.server_diagnostics.snapshot();
         if stats
             .connections
@@ -1804,7 +1905,7 @@ async fn phase_goaway(
             .any(|connection| connection.planned_goaway_sent)
         {
             evidence.goaway_sent_by_owner = true;
-            break;
+            break Instant::now();
         }
         if Instant::now() >= deadline {
             return Err(HarnessError::Timeout(
@@ -1813,7 +1914,7 @@ async fn phase_goaway(
             ));
         }
         sleep(POLL).await;
-    }
+    };
 
     // The ingress-observable consequence, taken on the very connection that
     // carried this run's consumer ingress.  The handle is held from before the
@@ -1838,7 +1939,7 @@ async fn phase_goaway(
             Err(PeerTransportError::GoAway) => {
                 evidence.goaway_refused_new_peer_stream = true;
                 evidence.goaway_refusal_class = GOAWAY_CLASS.to_owned();
-                return Ok(());
+                return Ok(written);
             }
             Err(other) => {
                 return Err(HarnessError::Http(format!(
@@ -1926,8 +2027,9 @@ async fn cursors(
 #[cfg(test)]
 mod c17_validator_tests {
     use super::{
-        CARRIER_DRAIN_BUDGET, GOAWAY_CLASS, GRANT_UNAVAILABLE, MIN_RESIDENT_FRAMES, NAMED_STREAMS,
-        SATURATION_STREAMS, SATURATION_WINDOW_BOUND_MS, SaturatedFrameEvidence, charge_per_record,
+        CARRIER_DRAIN_BUDGET, GOAWAY_CLASS, GOAWAY_TO_FENCE_BOUND_MS, GRANT_UNAVAILABLE,
+        MIN_RESIDENT_FRAMES, NAMED_STREAMS, SATURATION_STREAMS, SATURATION_WINDOW_BOUND_MS,
+        SaturatedFrameEvidence, charge_per_record,
     };
     use crate::acceptance_test_support::assert_rejected;
 
@@ -1984,6 +2086,7 @@ mod c17_validator_tests {
             duplicate_adapter_records: 1,
             duplicate_resident_frames: 44,
             sibling_survived_terminals: true,
+            sibling_round_trip_across_goaway: true,
             sibling_resident_frames: 42,
             no_double_delivery: true,
             late_fin_cursor: 2,
@@ -1997,7 +2100,11 @@ mod c17_validator_tests {
             goaway_refused_new_peer_stream: true,
             goaway_refusal_class: GOAWAY_CLASS.to_owned(),
             goaway_sent_by_owner: true,
-            goaway_requested_after_fence: true,
+            session_alive_after_goaway: true,
+            fence_after_goaway: true,
+            session_terminal_events: 1,
+            goaway_to_fence_ms: 84,
+            goaway_to_fence_bound_ms: GOAWAY_TO_FENCE_BOUND_MS,
             cleanup_joined: true,
             elapsed_ms: 9_000,
         }
@@ -2162,7 +2269,7 @@ mod c17_validator_tests {
     #[test]
     fn every_saturated_terminal_and_goaway_bound_reaches_the_shared_exit_path() {
         type Mutate = (&'static str, fn(&mut SaturatedFrameEvidence));
-        let cases: [Mutate; 13] = [
+        let cases: [Mutate; 18] = [
             ("no_double_delivery", |e| e.no_double_delivery = false),
             ("late_fin_cursor", |e| e.late_fin_cursor = 0),
             ("late_stream_terminals", |e| e.late_stream_terminals = 2),
@@ -2183,8 +2290,20 @@ mod c17_validator_tests {
             ("goaway_refused_new_peer_stream", |e| {
                 e.goaway_refused_new_peer_stream = false
             }),
-            ("goaway_requested_after_fence", |e| {
-                e.goaway_requested_after_fence = false
+            ("session_alive_after_goaway", |e| {
+                e.session_alive_after_goaway = false;
+                e.sibling_round_trip_across_goaway = false;
+            }),
+            ("fence_after_goaway", |e| e.fence_after_goaway = false),
+            ("session_terminal_events", |e| e.session_terminal_events = 2),
+            ("goaway_to_fence_bound_ms", |e| {
+                e.goaway_to_fence_bound_ms = 60_000
+            }),
+            ("goaway_to_fence_ms", |e| {
+                e.goaway_to_fence_ms = GOAWAY_TO_FENCE_BOUND_MS + 1
+            }),
+            ("sibling_round_trip_across_goaway", |e| {
+                e.sibling_round_trip_across_goaway = false
             }),
             ("goaway_sent_by_owner", |e| e.goaway_sent_by_owner = false),
             ("cleanup_joined", |e| e.cleanup_joined = false),
