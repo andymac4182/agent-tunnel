@@ -1,0 +1,26 @@
+[package]
+name = "tunnel-http-bridge"
+description = "In-process streaming HTTP bridge over the http-forward/1 codec (implementation gate 2)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Deliberately free of Axum, Hyper servers and sockets: the owner adapter takes
+# an `http::Request` and the device adapter calls an in-process handler.  Only
+# crates already in Cargo.lock are used.  `tokio` omits the `net` feature.
+[dependencies]
+bytes = "1"
+http = "1"
+http-body = "1"
+http-body-util = "0.1"
+tokio = { version = "1.48", features = ["macros", "rt", "sync", "time"] }
+tokio-util = { version = "0.7", default-features = false }
+tunnel-http-forward = { path = "../tunnel-http-forward" }
+
+[dev-dependencies]
+tokio = { version = "1.48", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
+
+[lints]
+workspace = true
