@@ -26,7 +26,7 @@ use tokio::{
     sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot},
     time::{timeout, timeout_at},
 };
-use tunnel_catalog::{DeviceListFilter, OidcVerifier, SharedCatalog};
+use tunnel_catalog::{DeviceListFilter, OidcError, OidcVerifier, SharedCatalog};
 use tunnel_protocol::{CONTROL_OWNER_BUSY_CLOSE_CODE, CONTROL_OWNER_BUSY_CLOSE_REASON};
 use tunnel_transport::{PeerTransportError, TlsIdentity};
 use uuid::Uuid;
@@ -1044,13 +1044,8 @@ async fn echo(
         .await
     {
         Ok(value) => value,
-        Err(_) => {
-            return error_response(
-                StatusCode::UNAUTHORIZED,
-                "UNAUTHORIZED",
-                "consumer authentication failed",
-                "not_dispatched",
-            );
+        Err(error) => {
+            return consumer_authentication_response(&error);
         }
     };
     let device_id = match parse_uuid(&device) {
@@ -1408,13 +1403,8 @@ async fn echo_stream(
         .await
     {
         Ok(value) => value,
-        Err(_) => {
-            return error_response(
-                StatusCode::UNAUTHORIZED,
-                "UNAUTHORIZED",
-                "consumer authentication failed",
-                "not_dispatched",
-            );
+        Err(error) => {
+            return consumer_authentication_response(&error);
         }
     };
     let device_id = match parse_uuid(&device) {
@@ -2259,14 +2249,35 @@ async fn authenticate(
             .map(|value| value.consumer),
         None => oidc.authenticate(&**catalog, authorization, None).await,
     }
-    .map_err(|_| {
-        error_response(
-            StatusCode::UNAUTHORIZED,
-            "UNAUTHORIZED",
-            "consumer authentication failed",
+    .map_err(|error| consumer_authentication_response(&error))
+}
+
+/// Map a consumer authentication failure onto its public response.
+///
+/// A credential the relay evaluated and rejected is `401 UNAUTHORIZED`.  A
+/// failure to reach the catalog is not: the credential was never evaluated, so
+/// reporting it as a rejection tells a consumer holding perfectly good
+/// credentials that they were refused, and is indistinguishable at the HTTP
+/// boundary from a real refusal.  That case takes the
+/// `AUTHORIZATION_UNAVAILABLE` boundary this module already defines for an
+/// absent catalog, which is the same condition reached a moment later.
+///
+/// Both remain `not_dispatched`: neither reaches an owner.
+fn consumer_authentication_response(error: &OidcError) -> Response {
+    if matches!(error, OidcError::Catalog(_)) {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "AUTHORIZATION_UNAVAILABLE",
+            "consumer authorization is unavailable",
             "not_dispatched",
-        )
-    })
+        );
+    }
+    error_response(
+        StatusCode::UNAUTHORIZED,
+        "UNAUTHORIZED",
+        "consumer authentication failed",
+        "not_dispatched",
+    )
 }
 
 fn bearer(headers: &HeaderMap) -> &str {
@@ -4766,6 +4777,56 @@ mod pending_open_abandon_tests;
 
 #[cfg(test)]
 mod task_closure_tests;
+
+#[cfg(test)]
+mod consumer_authentication_status_tests {
+    use super::{StatusCode, consumer_authentication_response};
+    use tunnel_catalog::{CatalogError, OidcError};
+
+    #[tokio::test]
+    async fn a_catalog_failure_is_unavailable_not_a_credential_rejection() {
+        // The credential was never evaluated, so calling it rejected tells a
+        // consumer holding good credentials that they were refused, and is
+        // indistinguishable at the HTTP boundary from a real refusal.
+        let response = consumer_authentication_response(&OidcError::Catalog(
+            CatalogError::Conflict("catalog unreachable"),
+        ));
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .expect("bounded body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("response JSON");
+        assert_eq!(body["code"], "AUTHORIZATION_UNAVAILABLE");
+        assert_eq!(body["execution"], "not_dispatched");
+    }
+
+    #[tokio::test]
+    async fn an_evaluated_credential_is_still_rejected_as_unauthorized() {
+        // The other direction matters just as much: an availability status
+        // must not start swallowing genuine credential rejections.
+        for error in [
+            OidcError::InvalidToken,
+            OidcError::DisallowedAlgorithm,
+            OidcError::MissingKeyId,
+            OidcError::UnknownKey,
+            OidcError::InsufficientScope,
+            OidcError::UnknownConsumer,
+        ] {
+            let response = consumer_authentication_response(&error);
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "an evaluated credential failure must stay a rejection"
+            );
+            let body = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .expect("bounded body");
+            let body: serde_json::Value = serde_json::from_slice(&body).expect("response JSON");
+            assert_eq!(body["code"], "UNAUTHORIZED");
+            assert_eq!(body["execution"], "not_dispatched");
+        }
+    }
+}
 
 #[cfg(test)]
 mod tenant_admission_tests;
