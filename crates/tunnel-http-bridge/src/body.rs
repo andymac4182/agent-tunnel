@@ -230,7 +230,8 @@ impl Drop for ChannelBody {
     /// reader already took every octet of a declared length: an HTTP server
     /// stops polling at the declared length, before END and FIN arrive, and
     /// that is not the consumer going away.  The exchange then completes (or
-    /// fails) on its own END and FIN.
+    /// fails) on its own END and FIN, which the owner's response pump bounds
+    /// with the FIN-after-END budget from the last declared byte.
     fn drop(&mut self) {
         let fully_delivered = self.length == Some(self.delivered);
         if self.shared.terminal.get().is_none()

@@ -349,6 +349,7 @@ async fn response_pump(
     let mut record = BudgetClock::new(ProgressKind::Record, &exchange.budgets);
     let mut fin = BudgetClock::new(ProgressKind::FinAfterEnd, &exchange.budgets);
     let mut record_ordinal = None;
+    let mut declared_remaining: Option<u64> = None;
     'frames: loop {
         let listen_only = exchange.is_complete(Dir::Response);
         let mark = WaitMark::now(&pause);
@@ -404,6 +405,10 @@ async fn response_pump(
                     };
                     match event {
                         ResponseEvent::Head(head) => {
+                            declared_remaining = head.body_length;
+                            if declared_remaining == Some(0) {
+                                fin.arm();
+                            }
                             match build_response(head, method, queue, &owner.consumer) {
                                 Ok((response, sender)) => {
                                     // A response head is only sent after the
@@ -425,6 +430,17 @@ async fn response_pump(
                                 continue;
                             };
                             let chunk = bytes.slice_ref(slice);
+                            // After the last declared byte only END and FIN
+                            // may follow, so the FIN-after-END budget covers
+                            // them from here.  The consumer may already have
+                            // released the body at its declared length,
+                            // which is not a cancellation (see `ChannelBody`).
+                            if let Some(remaining) = declared_remaining.as_mut() {
+                                *remaining = remaining.saturating_sub(chunk.len() as u64);
+                                if *remaining == 0 {
+                                    fin.arm();
+                                }
+                            }
                             tokio::select! {
                                 biased;
                                 () = exchange.stop.cancelled() => break 'frames,

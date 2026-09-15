@@ -311,3 +311,61 @@ async fn a_partial_response_record_expires_at_the_ingress_after_headers() {
     let report = handle.report().await;
     assert_eq!(report.progress_expired, Some(ProgressKind::Record));
 }
+
+/// Review item 8: a consumer that reads every declared response byte and
+/// then goes away is not a cancellation, so the ingress must still bound
+/// how long it waits for the device's END and FIN.
+#[tokio::test(start_paused = true)]
+async fn end_and_fin_after_the_last_declared_byte_are_bounded_after_the_consumer_leaves() {
+    let (to_device, mut from_owner, _) = channel(STREAM_CREDIT);
+    let (to_owner, from_device, _) = channel(STREAM_CREDIT);
+    let request = Request::builder()
+        .method("GET")
+        .uri("/status")
+        .body(common::empty_body())
+        .expect("request");
+    let exchange = tokio::spawn(async move {
+        forward_paused(
+            request,
+            profile(),
+            config(),
+            to_device,
+            from_device,
+            PauseSignal::never(),
+        )
+        .await
+    });
+    loop {
+        if matches!(from_owner.recv().await, Some(Frame::Fin) | None) {
+            break;
+        }
+    }
+    let head = ResponseHead {
+        status: 200,
+        headers: vec![HeaderField::new("content-type", "application/octet-stream")],
+        body_length: Some(40),
+    };
+    let mut bytes = Vec::new();
+    encode_response_head(&head, &profile().response, Method::Get, &mut bytes).expect("head");
+    bytes.extend_from_slice(&body_record(40));
+    to_owner.send_data(Bytes::from(bytes)).await.expect("send");
+    let (response, handle) = exchange.await.expect("join");
+    assert_eq!(response.status(), 200);
+    let mut body = response.into_body();
+    let frame = body.frame().await.expect("frame").expect("data");
+    assert_eq!(frame.into_data().expect("data").len(), 40);
+    // The consumer stops at the declared length, before END and FIN.
+    drop(body);
+    let started = Instant::now();
+    loop {
+        match from_owner.recv().await {
+            Some(Frame::Reset(_)) | None => break,
+            Some(_) => {}
+        }
+    }
+    assert_eq!(started.elapsed(), Duration::from_secs(10));
+    drop(to_owner);
+    let report = handle.report().await;
+    assert_eq!(report.progress_expired, Some(ProgressKind::FinAfterEnd));
+    assert_ne!(report.error, Some(HttpErrorCode::Cancelled));
+}

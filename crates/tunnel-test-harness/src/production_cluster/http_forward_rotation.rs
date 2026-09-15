@@ -507,16 +507,23 @@ fn profile() -> Result<Arc<Profile>> {
     Ok(Arc::new(Profile { request, response }))
 }
 
-/// The gate holds a record open until the next scheduled rotation (up to one
-/// interval plus a possibly aborted attempt), so the partial-record and
-/// FIN-after-END budgets are raised from their 10-second starting values;
-/// the budgets themselves are proven by the bridge's progress tests.
-pub const GATE_RECORD_BUDGET: Duration = Duration::from_secs(30);
+/// The gate holds a record open, a credit stall or a FIN until the next
+/// observed rotation, and waits up to [`OBSERVATION_BOUND`] for it, so every
+/// transport budget it can hit is raised above that bound (the budgets
+/// themselves are proven by the bridge's progress tests).  A case can
+/// therefore never fail on its own budget before its observation.
+pub const GATE_PROGRESS_BUDGET: Duration = Duration::from_secs(60);
+/// The longest `wait_observation` waits for one case's rotation.
+pub const OBSERVATION_BOUND: Duration = Duration::from_secs(
+    (GATE_ROTATION.interval_seconds + GATE_ROTATION.overlap_seconds) * MAX_ROTATIONS_PER_CASE,
+);
+const _: () = assert!(GATE_PROGRESS_BUDGET.as_secs() > OBSERVATION_BOUND.as_secs());
 
 fn bridge_config() -> Result<BridgeConfig> {
     let progress = tunnel_http_bridge::ProgressBudgets::default()
-        .with_record(GATE_RECORD_BUDGET)
-        .and_then(|budgets| budgets.with_fin_after_end(GATE_RECORD_BUDGET))
+        .with_record(GATE_PROGRESS_BUDGET)
+        .and_then(|budgets| budgets.with_fin_after_end(GATE_PROGRESS_BUDGET))
+        .and_then(|budgets| budgets.with_credit_stall(GATE_PROGRESS_BUDGET))
         .map_err(|error| HarnessError::InvalidInput(format!("progress budgets: {error}")))?;
     BridgeConfig::default()
         .with_deadline(Duration::from_secs(180))
@@ -853,11 +860,7 @@ impl Gate<'_> {
         stream_id: u64,
         after: u64,
     ) -> Result<HttpRotationObservation> {
-        let deadline = Instant::now()
-            + Duration::from_secs(
-                (GATE_ROTATION.interval_seconds + GATE_ROTATION.overlap_seconds)
-                    * MAX_ROTATIONS_PER_CASE,
-            );
+        let deadline = Instant::now() + OBSERVATION_BOUND;
         loop {
             let snapshot = self.owner_snapshot().await?;
             let observations = snapshot
