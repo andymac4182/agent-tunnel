@@ -4,6 +4,7 @@ members = [
     "crates/tunnel-client",
     "crates/tunnel-cluster",
     "crates/tunnel-core",
+    "crates/tunnel-http-forward",
     "crates/tunnel-protocol",
     "crates/tunnel-relay",
     "crates/tunnel-test-harness",

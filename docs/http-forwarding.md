@@ -1,6 +1,6 @@
 # Bounded HTTP forwarding over a logical tunnel stream
 
-Status: proposed implementation contract, 2026-09-09. The codec and bridge are not implemented. This document defines **`http-forward/1`**, an internal Agent Tunnel encoding; it is not a new public HTTP or ACP standard.
+Status: implementation contract, 2026-09-09; amended 2026-09-15. The pure codec (implementation gate 1) is implemented in `crates/tunnel-http-forward`, with the choices it pins listed under [Pinned in code (gate 1)](#pinned-in-code-gate-1). The bridge and gates 2–5 are not implemented. This document defines **`http-forward/1`**, an internal Agent Tunnel encoding; it is not a new public HTTP or ACP standard.
 
 The intended route is **cloud agent → Agent Tunnel's Axum API → optional owner HTTP/3 hop → existing device data WebSocket → desktop adapter**. Responses follow the reverse route. The desktop adapter can be an in-process ACP HTTP-to-stdio service, an MCP bridge, or a typed CUA HTTP facade. The client CLI opens the device connections; no public inbound desktop port is required.
 
@@ -177,5 +177,25 @@ Recoverable loss with retained outer sequence/parser state replays only missing 
 3. Put the handler behind the real Axum→owner HTTP/3→device WebSocket path. Saturate one stream while another cancels/answers permission, measure bounded queues at every hop, and verify bytes with checksums. Confirm no private credentials/addresses cross the public/device headers.
 4. Rotate through HEAD, partial BODY/header, END-before-FIN, early response, credit stalls, and long-lived SSE. Race control CANCEL with queued RESET during freeze and prove prompt local cancellation, no out-of-order RESET, preserved fence accounting, and eventual STREAM_FORGET. No duplicate dispatch, repeated HEAD, event rewriting, ordering loss, fabricated END, or extra steady-state device sockets is permitted. Inject owner loss and lost acknowledgments after a synthetic side effect and assert `outcome_unknown` without retry.
 5. Run the selected official ACP and MCP client/server fixtures plus a synthetic CUA HTTP facade through the shared bridge. Advertise only application profiles that pass their own lifecycle gates. The common codec passing its tests does not establish application compatibility.
+
+### Pinned in code (gate 1)
+
+`crates/tunnel-http-forward` resolves the following points that the prose above leaves open. Each is peer-observable, so changing one is a protocol change.
+
+- **Record payload limits.** A HEAD payload is 1–16,384 bytes; an empty HEAD is rejected. A BODY payload is 1–65,528 bytes. An END payload is exactly zero bytes.
+- **Forbidden headers → `HTTP_INVALID_HEAD`.** These are rejected in both directions, and no policy can allow them: `host`, `connection`, `keep-alive`, `proxy-connection`, `content-length`, `authorization`, `proxy-authorization`, `proxy-authenticate`, `cookie`, `set-cookie`, and the `x-agent-tunnel-*` prefix.
+- **Forwarded identity headers.** These are forbidden in the same way. The enumerated set is `forwarded`, `via`, `x-real-ip`, `x-client-ip`, `true-client-ip`, `cf-connecting-ip`, and the `x-forwarded-*` prefix.
+- **Unsupported headers → `HTTP_UNSUPPORTED_FEATURE`.** These are also rejected unconditionally and cannot be allowed: `transfer-encoding`, `te`, `trailer`, `upgrade`, and `expect`. A consumer HTTP version that the selected policy does not accept also maps to `HTTP_UNSUPPORTED_FEATURE`.
+- **Header values.** The codec rejects a value with leading or trailing space or tab; it does not trim. Ingress trims boundary optional whitespace once, as required above, before it encodes the head.
+- **Header ordering.** The 32-field count is checked first. Then, per field in order: the name (lowercase token characters), the value (printable ASCII or tab), the running 8 KiB total, the forbidden and unsupported classification, the allowlist lookup, and the singleton repeat check.
+- **Query alphabet.** Raw query bytes are RFC 3986 query characters, excluding `+` (form-decoding ambiguity) and `;` (legacy separator ambiguity).
+- **Query pairs.** Pairs are split on `&`, and an empty pair is rejected. Only the first `=` separates key from value. A later `=` is value data, so base64 padding such as `cursor=YWJjZA==` is accepted.
+- **Query keys.** Keys must be literal: a percent-encoded key is rejected even if it decodes to an allowed name. The decoded key is compared ASCII-case-insensitively against a credential list that no policy can allow: `access_token`, `id_token`, `refresh_token`, `token`, `api_key`, `apikey`, `api-key`, `key`, `password`, `passwd`, `secret`, `client_secret`, `auth`, `authorization`, `session_token`, `x-amz-security-token`, `x-amz-signature`, `sig`, and `signature`.
+- **Query values.** Values are percent-decoded exactly once for the policy decision. The result must be valid UTF-8 with no Unicode control characters. The original query bytes are what is forwarded.
+- **Paths.** A trailing slash (`/acp/`) is rejected as an empty segment. `/` alone passes syntax but must still match an advertised route.
+- **Status.** `status` must be a JSON integer lexeme of exactly three digits in 200–599. Fractions and exponents are rejected, so `200.0` and `2e2` are invalid even though they equal 200.
+- **Grammar errors.** An END or BODY record before HEAD is a protocol error (`HTTP_BAD_RECORD`), decided from the fixed header alone. Any byte after END fails on arrival and is classified by its kind byte, so the error does not depend on how the stream was split.
+- **Per-record progress budget.** When a partly received record misses its completion budget, the caller reports `HTTP_DEADLINE_EXCEEDED`. That code is shared with the absolute application deadline. The codec is clock-free: the caller supplies progress-clock observations and pauses its clock during a freeze or withheld credit.
+- **Body limit ceiling.** A configured cumulative body limit is finite and at most 1 TiB (2^40 bytes). A policy above the ceiling cannot be constructed, so no unlimited sentinel exists.
 
 The implementation PR pins codec fixtures, all limits, per-profile header/path allowlists, HTTP library features, and the supported errors in code. Keep this codec independent of Axum extractors, ACP JSON-RPC types, and child supervision so its behavior can be reasoned about and tested without a running server.
