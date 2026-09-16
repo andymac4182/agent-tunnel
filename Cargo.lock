@@ -2826,6 +2826,7 @@ dependencies = [
  "tunnel-core",
  "tunnel-http-bridge",
  "tunnel-http-forward",
+ "tunnel-mcp",
  "tunnel-mcp-export",
  "tunnel-mcp-fixture",
  "tunnel-protocol",
