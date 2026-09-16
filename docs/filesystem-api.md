@@ -1,6 +1,8 @@
 # Filesystem endpoint contract
 
-Status: implementation specification, 2026-09-09. **No endpoint, TypeScript client, or adapter described here exists yet.** The Rust configuration starter remains the only runnable product code. This document defines M4; it takes precedence over earlier filesystem-specific sketches in other documents. The device tunnel invariants in [protocol.md](protocol.md) still apply.
+Status: implementation specification, 2026-09-09; amended 2026-09-17 with the [confinement and capability model](#confinement-and-capability-model) and a numbered list of [implementation gates](#implementation-gates). **No endpoint, TypeScript client, or adapter exists yet.** Implementation gate 1 — the confined virtual path namespace, the capability and primitive authorization model, the negotiated limits, the payload-free error vocabulary and the descriptor — is implemented in `crates/tunnel-fs-core`, with the choices it pins listed under [Pinned in code (gate 1)](#pinned-in-code-gate-1); it is **implemented awaiting verification** (task row M4-07). Gates 2 to 6 are not started. This document defines M4; it takes precedence over earlier filesystem-specific sketches in other documents. The device tunnel invariants in [protocol.md](protocol.md) still apply.
+
+Gate 1 is pure and performs no I/O, so it proves the **lexical** half of confinement only. It does not prove confinement against an operating system: symlinks, hard links, mount points and every TOCTOU race between resolving a path and acting on it are invisible to a crate that never opens a file, and are gate 2's obligation.
 
 ## Outcome and layers
 
@@ -146,6 +148,78 @@ Conditional mutation (`expectedMtime`, if-match, if-none-match except exclusive 
 
 Mastra has an explicitly selected adapter-only `mtimePolicy: 'check-before-write'` compatibility profile, described in [filesystem-adapters.md](filesystem-adapters.md). It reproduces Mastra's advisory timestamp preflight using ordinary stat and write, with an acknowledged race. It does not send a conditional-write operation, change `conditionalWrites: false`, or provide atomic compare-and-swap. The default adapter policy rejects timestamp conditions until the application deliberately selects that weaker upstream-compatible behavior.
 
+## Confinement and capability model
+
+This section is normative and settles what earlier sections gestured at. It governs the device-side provider; the adapters and the shared client inherit it and may not widen it.
+
+### The virtual path namespace
+
+A **virtual path** is an absolute POSIX-style path inside one export's root. Validation **rejects; it never rewrites.** No implementation may normalise, fold, percent-decode, Unicode-normalise, case-fold, or otherwise repair an attacker-supplied path. Anything a resolver would have to fix is refused instead. These are refused, each with its own diagnostic rule:
+
+| Refused | Reason |
+| --- | --- |
+| The empty string, or any path not beginning with `/` | Relative paths cannot be resolved against a caller-chosen base |
+| A `..` component, in any position | Parent traversal is refused, never resolved |
+| A `.` component | A normaliser would fold it away; refusing keeps one path per file |
+| An empty component, from a repeated or trailing `/` | Two spellings must not name one file |
+| A NUL byte | Truncates the path in every C-string host API |
+| A C0 control character or `DEL` | Terminal and log injection, and host ambiguity |
+| A backslash | A separator on Windows hosts |
+| A colon | Drive-letter syntax and NTFS alternate data streams |
+| A component whose stem matches `CON`, `PRN`, `AUX`, `NUL`, `CONIN$`, `CONOUT$`, `COM0`–`COM9` or `LPT0`–`LPT9`, ASCII-case-insensitively | Reserved Windows devices, refused on **every** host so an export's namespace does not change meaning when the serving device changes operating system |
+| A component ending in `.` or a space | Windows silently trims both, so two virtual paths would alias one host file |
+| A path above the negotiated `maxPathBytes`, or a component above 255 UTF-8 bytes | Bounded before allocation |
+| More components than the negotiated `maxPathComponents` | Bounded before allocation |
+
+Deliberate narrowings, recorded as named limits rather than left implicit: the colon is legal in a POSIX filename and is refused anyway; `...` and any other trailing-dot name is refused although POSIX permits it. `<`, `>`, `"`, `|`, `?` and `*` are **accepted** at this layer — they are legal POSIX filenames — and a host that cannot represent one must produce an explicit documented error from the resolver rather than a silent substitution.
+
+Containment is decided component-wise, never by string prefix: `/ab` is not inside `/a`.
+
+### Case-insensitive collisions
+
+The provider reports the host's observed case behaviour in `root.caseSensitivity` and never assumes it. The collision key defined for gate 1 is an **ASCII** case fold. It does not implement Unicode simple or full case folding and does not apply NFC or NFD normalisation, so it does not detect every collision an APFS or HFS+ volume can produce. That residue is real and is the resolver's obligation in gate 2, which must decide collisions by asking the host — by anchored `openat`-style resolution and file identity — rather than by comparing strings.
+
+### TOCTOU, symlinks and hard links
+
+Lexical validation is **not** confinement. A validated virtual path means "this text cannot itself express an escape", never "this path is safe to open". The resolver must therefore:
+
+1. Resolve every path component by anchored traversal from a retained root descriptor (`openat2` with `RESOLVE_BENEATH`/`RESOLVE_NO_SYMLINKS` where available, otherwise `openat` with `O_NOFOLLOW` per component), never by concatenating text and calling a path-taking syscall. A path-taking syscall re-resolves the whole path and reintroduces every race.
+2. Act on the descriptor it resolved, not on the path it resolved from. Checking a path and then opening it by name is a TOCTOU bug regardless of how carefully the path was checked.
+3. Treat symbolic links as denied unless the `symlinks` feature is advertised, and resolve an absolute link target against the **exported virtual root**, never host `/`.
+4. Treat hard links as denied unless the `hardLinks` feature is advertised. A writable exported inode that is also linked outside the root is an escape that no path check can see; write support requires a tested hard-link policy.
+5. Refuse special files, sockets, FIFOs and device nodes.
+6. Recheck the grant after every asynchronous queue wait and immediately before each primitive side effect, per the [cluster contract](cluster.md).
+
+Both rename endpoints, both link endpoints and every traversal are confined independently. There is no implicit cross-export move; a cross-export or cross-device operation is `EXDEV` and is never emulated by copy-and-delete.
+
+### Capabilities
+
+An operator grants exactly four capabilities: **read**, **write**, **list**, **delete**. The default is deny. There is no wildcard, no "all" value and no implicit grant; every capability a session holds was named individually. An export granting nothing admits no session at all, rather than admitting a session that can do nothing.
+
+| Capability | Governs |
+| --- | --- |
+| `read` | File content and symbolic-link targets |
+| `write` | Create, modify, truncate, and set metadata |
+| `list` | Traverse for metadata, and enumerate directories |
+| `delete` | Remove a name from a directory |
+
+The server enforces **primitives**, not labels. Each 9P opcode family — with its `.L` flags decoded, so that `Tlopen` for reading, for writing, for truncation and on a directory are four separate decisions — requires a conjunction of capabilities. Notable consequences, each a deliberate decision:
+
+* Enumerating a directory needs `list`, not `read`, so a grant that may list names cannot thereby read content; and `read` alone does not permit enumeration.
+* `Trenameat` requires **both** `write` and `delete`: renaming away removes a name, and a grant that may create but not remove must not remove one by renaming it.
+* Session lifecycle primitives (`Tversion`, `Tattach`, `Tflush`, `Tclunk`) and `Twalk` require no capability, because a session exists only for a non-empty grant.
+* `Tsymlink` and `Treadlink` additionally require the `symlinks` feature, `Tlink` the `hardLinks` feature and `Trenameat` the `atomicRename` feature. All are absent by default.
+
+There is **no append-only or create-only capability**. `write` permits overwriting and truncating existing content. An export that must never destroy data cannot be expressed in this model and must not claim to be.
+
+The descriptor's `operations` are **derived**, never configured: an operation is advertised only when every primitive composing it is independently permitted. A grant allowing `copy` therefore necessarily allows plain reads and writes, and this profile cannot promise copy-only, grep-only or framework-only access. `root.readOnly` is likewise derived from the grant, so the advertised flag cannot disagree with what is enforced.
+
+### Payload-free diagnostics
+
+No path, file name, file content, host path, host identity or credential may appear in a log line, a `Debug` rendering, an error message, a close reason or a descriptor. This is a construction rule, not a review rule: error types carry only static codes and field-free enums, and a validated path type has a redacting `Debug` and no `Display`, so its text leaves only through an explicit accessor. A caller already knows the path it asked for and correlates by request tag; repeating it in the error would put it into every rendering that touches it.
+
+The errno vocabulary is closed. An unmapped host errno becomes `EINVAL` rather than being passed through, so a consumer's handling stays exhaustive and a host cannot disclose which of its own failure modes occurred.
+
 ## Errors, retries, and cancellation
 
 Shared errors carry `code`, `operation`, virtual `path` when safe, `outcome`, `retryable`, and optional `bytesAcknowledged`. Outcomes are `not_started`, `failed`, `partial`, or `unknown`; a rejection after a previously confirmed partial chunk cannot become `not_started`. `bytesAcknowledged` is a lower bound confirmed by replies, not proof of final content or durable bytes.
@@ -176,6 +250,27 @@ Budget encoded bytes, pending promises, fids, traversal state, and adapter pagin
 
 The 32 MiB limit covers concurrent client/adapter-owned materialization buffers, conversion copies and retained caches. Release a reservation when the result's ownership transfers to the caller; if an adapter keeps a copy, that copy remains charged. Returned ordinary Uint8Array/Buffer/string values have no release API, so caller-retained results are outside this enforceable internal limit. Applications must bound their own result history. Sequential completed reads must not permanently consume the internal quota, and concurrent reads cannot each reserve the full limit independently. The descriptor field `maxTotalBufferedBytes` has this internal ownership meaning.
 
-## Implementation boundary and acceptance
+## Implementation gates
 
-Implement in this order: descriptor/auth admission → Rust confined 9P read provider → shared client/lifecycle/bytes/errors → framework read adapters → explicit writes/partial failures → cross-framework and cross-platform conformance. [The adapter plan](filesystem-adapters.md) gives per-framework delivery gates; [testing.md](testing.md) covers wire and failure fixtures. A framework is supported only after its pinned published package passes against actual relay/device sockets. Compilation against a source interface or a fake in-memory adapter is insufficient to claim remote compatibility.
+Six gates, in order. Each names what it must prove; a gate is not closed by code existing, and a later gate does not close an earlier one's residue. [The adapter plan](filesystem-adapters.md) gives per-framework delivery gates; [testing.md](testing.md) covers wire and failure fixtures.
+
+1. **Contract and pure core.** The virtual path namespace, the capability/primitive/derived-operation model, the negotiated limits, the payload-free error vocabulary and the descriptor — with no I/O, no clock, no socket and no dependency. *Must prove:* every refused path class above is refused by its own rule and no accepted path can express an escape; every limit is exact at its boundary and refused one beyond, with no unlimited sentinel; capabilities default to deny and no advertised operation exceeds its primitive grant, exhaustively over every grant and feature set; no error rendering contains a path or content; the emitted descriptor reproduces the checked-in example byte for byte. *Cannot prove:* anything about a real filesystem.
+2. **OS-confined resolver.** Anchored traversal on each supported host, symlink and hard-link policy, file identity, case-collision decisions taken from the host, and the special-file refusal. *Must prove:* escape attempts through symlinks, hard links, link cycles, mount points, cross-root rename and links changed concurrently with access all fail, against a real temporary filesystem, including a writer racing the resolver between resolution and use. This is where TOCTOU is proven; gate 1 cannot.
+3. **9P2000.L codec and session state.** Bounded incremental encode/decode, `msize` negotiation, tags, fids, directory cookies, `Tflush`. *Must prove:* byte-exact golden fixtures shared with the TypeScript client, messages exactly at and one byte above `msize`, fuzzed incremental decoding that never over-allocates, and exhausted tag/fid quotas.
+4. **Descriptor endpoint, upgrade and read provider over the real path.** The authenticated `GET`, the WSS upgrade at the same URL, grant-revision recheck, and a confined read-only provider reached through the relay and the device data socket. *Must prove:* the authorization matrix at descriptor, upgrade, attach and open-fid use; a cached descriptor never authorizes access; and a forged `Tattach` cannot exceed the grant.
+5. **Write grants and partial failure.** Creates, truncation, append, rename, composite operations, and structured partial/unknown outcomes. *Must prove:* a read-only grant denies every mutating opcode and flag before backend dispatch; a failure injected after truncation, after a short write and after rename-before-reply reports its outcome accurately; and no ambiguous mutation is ever replayed.
+6. **Shared client and native adapters.** `@agent-tunnel/client` plus the Files SDK, Mastra, just-bash and AI SDK Files adapters, end to end through the real endpoint and a rotating device tunnel. *Must prove:* each pinned published package passes against actual relay/device sockets. Compilation against a source interface or a fake in-memory adapter is insufficient to claim remote compatibility.
+
+### Pinned in code (gate 1)
+
+`crates/tunnel-fs-core` is dependency-free and performs no I/O. It pins these choices, each of which is a decision this document did not previously settle:
+
+* The refused path classes and their per-class diagnostic rules, exactly as tabulated above, checked in a fixed order so the rule reported for a given input is deterministic.
+* A 255-byte maximum path component. This is a fixed property of the namespace, matching the `NAME_MAX` every supported host provides, so it is not a negotiated limit and does not appear in the descriptor.
+* The four capabilities, the 24 enforced primitives and their required capabilities, and the composition of all 17 derived client operations. `Tlopen` is split into read, directory, write and truncate decisions; directory enumeration needs `list`; rename needs `write` and `delete`.
+* Identifiers (`deviceId`, `serviceId`, `grantRevision`) are restricted to ASCII alphanumerics, `-`, `_` and `.`, which is narrower than the schema's length-only rule. That makes JSON escaping unnecessary, so the emitter cannot be the place a quote or control character escapes into the document.
+* The three consistency rules the descriptor schema's `$comment` defers to runtime are made structurally impossible rather than checked: `availability`/`capabilityStatus` are one enum, `root.readOnly` is derived from the grant, and `operations` is derived from the primitives.
+* Limit negotiation reduces only. Zero and `u64::MAX` are both refused for every field, so neither can be read as "no limit". Five cross-field rules are enforced: `msize` has a 256-byte floor, the consumer queue may not be smaller than one maximum-size message, one materialized file may not exceed the concurrent materialization budget, the default operation deadline may not exceed the maximum, and the single-request deadline may not exceed the operation default.
+* `Outcome` is ordered and merges monotonically, so an operation observed as `partial` or `unknown` can never later be reported `not_started`.
+
+**Residue, not covered by gate 1 and open:** every item in gate 2, plus Unicode case folding and NFC/NFD collisions; the `msize` framing itself and all 9P encoding; deadlines and clocks; quota accounting for queued, buffered and traversal state; and the `maxTotalBufferedBytes` ownership-transfer accounting, which is a client-side property with no representation here.

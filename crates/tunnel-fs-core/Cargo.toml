@@ -1,0 +1,16 @@
+[package]
+name = "tunnel-fs-core"
+description = "Pure filesystem-export core: virtual paths, capabilities, limits, error vocabulary and the agent-tunnel.fs.v1 descriptor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Deliberately dependency-free, like tunnel-http-forward.  The descriptor JSON
+# is hand-emitted so field order, escaping and the closed field set are pinned
+# by construction rather than by a serializer's configuration.  Nothing here
+# touches a real filesystem, a clock, a socket or an allocator budget.
+
+[lints]
+workspace = true
