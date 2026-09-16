@@ -253,13 +253,7 @@ async fn admit(
         crate::FS_SERVICE_TYPE,
     )
     .await
-    .map_err(|_| {
-        fs_error(
-            StatusCode::NOT_FOUND,
-            "EXPORT_NOT_FOUND",
-            "no such filesystem export",
-        )
-    })?;
+    .map_err(translate_resolution)?;
 
     // The host declaration.  Gate 2 declares filesystem exports unsupported on
     // Windows in one function so discovery can answer 403; this is how that
@@ -323,6 +317,47 @@ async fn admit(
         capabilities: derived,
         case_sensitivity,
     })
+}
+
+/// Re-render the shared resolver's refusal in this endpoint's vocabulary.
+///
+/// The resolver answers in the relay's own shape and codes, and this URL
+/// answers in the contract's. Mapping by **status** rather than by code keeps
+/// the two vocabularies from leaking into one another while preserving the
+/// distinction that matters to a caller: a catalog this relay could not read is
+/// not the same answer as an export that does not exist, and collapsing both to
+/// 404 would tell a consumer its export was gone when the relay simply could not
+/// look.
+///
+/// `409 SERVICE_AMBIGUOUS` becomes `404 EXPORT_NOT_FOUND`, deliberately: the
+/// contract reserves 409 at this URL for `CAPABILITIES_CHANGED`, and a label
+/// matching several live services names no single export, which is what
+/// undiscoverable means here.
+fn translate_resolution(response: Response) -> Response {
+    match response.status() {
+        StatusCode::SERVICE_UNAVAILABLE => fs_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "BACKEND_UNAVAILABLE",
+            "authorization unavailable",
+        ),
+        StatusCode::FORBIDDEN => fs_error(
+            StatusCode::FORBIDDEN,
+            "ACCESS_DENIED",
+            "the grant does not admit a filesystem session",
+        ),
+        StatusCode::TOO_MANY_REQUESTS => fs_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "RESOURCE_EXHAUSTED",
+            "admission capacity exhausted",
+        ),
+        // A nonexistent and an undiscoverable export get the same external
+        // answer, so a 404 discloses nothing about which it was.
+        _ => fs_error(
+            StatusCode::NOT_FOUND,
+            "EXPORT_NOT_FOUND",
+            "no such filesystem export",
+        ),
+    }
 }
 
 fn parse_case_sensitivity(text: &str) -> Option<CaseSensitivity> {
