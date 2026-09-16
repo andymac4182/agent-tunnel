@@ -56,18 +56,26 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// The longest accepted bearer token file.
 pub const MAX_TOKEN_BYTES: usize = 8192;
 /// Backend-issued `mcp-2025-11-25` sessions whose principal binding this
-/// export remembers.  The oldest binding is dropped once the bound is
-/// reached; a request on a forgotten session is answered 404 and the client
-/// re-initializes, so the bound fails closed rather than open.
+/// export tracks at once.
 pub const MAX_TRACKED_SESSIONS: usize = 256;
+/// Sessions one principal may hold at once.  One principal therefore cannot
+/// fill the table, and a new `initialize` is refused before the backend is
+/// dialled instead of evicting somebody else's live session.
+pub const MAX_SESSIONS_PER_BINDING: usize = MAX_TRACKED_SESSIONS / 8;
 
 /// Principal bindings for the sessions a Streamable HTTP backend issued
 /// through this export (M3-04).  The backend owns the session identifiers;
 /// the device owns which principal may use them.
+///
+/// Nothing here ever evicts another principal's entry.  An earlier revision
+/// dropped the oldest binding when the table filled, which let any authorized
+/// principal evict every other principal's live session — a cross-principal
+/// denial channel — by opening 257 sessions.  Capacity is now refused at the
+/// door, and entries leave only when their own session does: a successful
+/// DELETE, or a backend that answers 404 for it.
 #[derive(Debug, Default)]
 struct SessionBindings {
     bindings: std::collections::HashMap<String, Option<String>>,
-    order: std::collections::VecDeque<String>,
 }
 
 impl SessionBindings {
@@ -78,22 +86,36 @@ impl SessionBindings {
             .is_some_and(|known| known.as_ref() == binding)
     }
 
+    fn held_by(&self, binding: Option<&String>) -> usize {
+        self.bindings
+            .values()
+            .filter(|known| known.as_ref() == binding)
+            .count()
+    }
+
+    /// Whether one more session may be opened for `binding`.
+    fn has_room_for(&self, binding: Option<&String>) -> bool {
+        self.bindings.len() < MAX_TRACKED_SESSIONS
+            && self.held_by(binding) < MAX_SESSIONS_PER_BINDING
+    }
+
+    /// Record a session the backend issued.  Refuses silently when the table
+    /// or the principal's share is full, which fails closed: the session is
+    /// unusable through this export and the client re-initializes.
     fn remember(&mut self, session: String, binding: Option<String>) {
-        if self.bindings.contains_key(&session) {
+        if self.bindings.contains_key(&session) || !self.has_room_for(binding.as_ref()) {
             return;
         }
-        while self.order.len() >= MAX_TRACKED_SESSIONS {
-            if let Some(evicted) = self.order.pop_front() {
-                self.bindings.remove(&evicted);
-            }
-        }
-        self.order.push_back(session.clone());
         self.bindings.insert(session, binding);
     }
 
     fn forget(&mut self, session: &str) {
         self.bindings.remove(session);
-        self.order.retain(|known| known != session);
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.bindings.len()
     }
 }
 
@@ -293,17 +315,33 @@ impl HttpBackendExport {
             .get(tunnel_mcp::headers::MCP_SESSION_ID)
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
-        if self.profile.is_legacy()
-            && let Some(session) = &named_session
-            && !self.sessions().permits(session, binding.as_ref())
-        {
-            return Ok(self.reject(&McpRejection {
-                status: 404,
-                code: codes::INVALID_REQUEST,
-                message: "session not found",
-                id: None,
-                supported: None,
-            }));
+        if self.profile.is_legacy() {
+            match &named_session {
+                Some(session) if !self.sessions().permits(session, binding.as_ref()) => {
+                    return Ok(self.reject(&McpRejection {
+                        status: 404,
+                        code: codes::INVALID_REQUEST,
+                        message: "session not found",
+                        id: None,
+                        supported: None,
+                    }));
+                }
+                // A POST naming no session opens one.  Capacity is decided
+                // here, before the backend is dialled, so a full table
+                // refuses the newcomer instead of evicting somebody else's
+                // live session, and so the backend never creates a session
+                // this export could not track.
+                None if parts.method == Method::POST
+                    && !self.sessions().has_room_for(binding.as_ref()) =>
+                {
+                    return Ok(local_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "the export is at its session limit",
+                        None,
+                    ));
+                }
+                _ => {}
+            }
         }
 
         let mut upstream = Request::builder()
@@ -426,15 +464,26 @@ impl HttpBackendExport {
                 .get(tunnel_mcp::headers::MCP_SESSION_ID)
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_owned);
-            if status.is_success() {
-                match (&named_session, parts.method == Method::DELETE) {
-                    (Some(session), true) => self.sessions().forget(session),
-                    _ => {
-                        if let Some(session) = issued {
-                            self.sessions().remember(session, binding.clone());
-                        }
+            match (&named_session, status) {
+                // Only the exchange that opened a session binds it.  A
+                // backend that echoes some other identifier on a later
+                // request cannot bind it to this caller.
+                (None, status) if status.is_success() => {
+                    if let Some(session) = issued {
+                        self.sessions().remember(session, binding.clone());
                     }
                 }
+                // The session this request named is gone: a successful
+                // DELETE ended it, and a 404 says the backend expired it.
+                // Forgetting it is what keeps the table from filling with
+                // sessions no one can use.
+                (Some(session), status)
+                    if (status.is_success() && parts.method == Method::DELETE)
+                        || status == StatusCode::NOT_FOUND =>
+                {
+                    self.sessions().forget(session);
+                }
+                _ => {}
             }
         }
         let mut out = Response::builder().status(status);
@@ -480,5 +529,83 @@ impl HttpBackendExport {
             .boxed()
         };
         out.body(body).map_err(|_| ExportError)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn binding(label: &str) -> Option<String> {
+        Some(label.to_owned())
+    }
+
+    /// M3-04 review: opening sessions must never cost another principal its
+    /// own.  An earlier revision evicted the oldest entry when the table
+    /// filled, so any authorized principal could drop every other
+    /// principal's live session by opening `MAX_TRACKED_SESSIONS + 1`.
+    #[test]
+    fn one_principal_cannot_evict_another_by_opening_sessions() {
+        let mut sessions = SessionBindings::default();
+        let victim = binding("victim");
+        sessions.remember("victim-session".into(), victim.clone());
+        assert!(sessions.permits("victim-session", victim.as_ref()));
+
+        // The attacker exhausts its own share, then the whole table.
+        let attacker = binding("attacker");
+        for index in 0..MAX_TRACKED_SESSIONS * 2 {
+            sessions.remember(format!("attacker-{index}"), attacker.clone());
+        }
+        assert_eq!(
+            sessions.held_by(attacker.as_ref()),
+            MAX_SESSIONS_PER_BINDING
+        );
+        assert!(!sessions.has_room_for(attacker.as_ref()));
+        // The victim's session is untouched, and the victim can still open
+        // one: a principal's own share is not consumed by anybody else.
+        assert!(sessions.permits("victim-session", victim.as_ref()));
+        assert!(sessions.has_room_for(victim.as_ref()));
+        assert!(sessions.len() <= MAX_TRACKED_SESSIONS);
+    }
+
+    /// The table is bounded, and a full table refuses the newcomer.
+    #[test]
+    fn a_full_table_refuses_instead_of_evicting() {
+        let mut sessions = SessionBindings::default();
+        let principals = MAX_TRACKED_SESSIONS / MAX_SESSIONS_PER_BINDING;
+        for principal in 0..principals {
+            let holder = binding(&format!("principal-{principal}"));
+            for index in 0..MAX_SESSIONS_PER_BINDING {
+                sessions.remember(format!("s-{principal}-{index}"), holder.clone());
+            }
+        }
+        assert_eq!(sessions.len(), MAX_TRACKED_SESSIONS);
+        let newcomer = binding("newcomer");
+        assert!(!sessions.has_room_for(newcomer.as_ref()));
+        sessions.remember("newcomer-session".into(), newcomer.clone());
+        assert!(!sessions.permits("newcomer-session", newcomer.as_ref()));
+        assert_eq!(sessions.len(), MAX_TRACKED_SESSIONS);
+        // The first principal's sessions all survived.
+        let first = binding("principal-0");
+        assert_eq!(sessions.held_by(first.as_ref()), MAX_SESSIONS_PER_BINDING);
+        // Ending one frees exactly one slot, for its own holder.
+        sessions.forget("s-0-0");
+        assert!(sessions.has_room_for(first.as_ref()));
+        assert!(sessions.has_room_for(newcomer.as_ref()));
+    }
+
+    /// A binding is compared exactly: no principal inherits another's
+    /// session, and "no principal" is its own holder.
+    #[test]
+    fn a_session_permits_only_its_own_binding() {
+        let mut sessions = SessionBindings::default();
+        sessions.remember("bound".into(), binding("alice"));
+        sessions.remember("unbound".into(), None);
+        assert!(sessions.permits("bound", binding("alice").as_ref()));
+        assert!(!sessions.permits("bound", binding("bob").as_ref()));
+        assert!(!sessions.permits("bound", None));
+        assert!(sessions.permits("unbound", None));
+        assert!(!sessions.permits("unbound", binding("alice").as_ref()));
+        assert!(!sessions.permits("never-issued", binding("alice").as_ref()));
     }
 }

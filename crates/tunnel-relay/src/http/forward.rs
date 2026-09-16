@@ -1187,6 +1187,38 @@ pub(crate) fn principal_binding_header() -> http::HeaderName {
     http::HeaderName::from_static(tunnel_mcp::headers::TUNNEL_PRINCIPAL_BINDING)
 }
 
+/// The refusal for a consumer request that presents the relay-only principal
+/// binding itself, or `None` when it presents none.
+///
+/// This is the whole basis of the unkeyed design (M3-04): because a consumer
+/// can never supply the header, the value's integrity does not depend on the
+/// digest being secret.  It is refused, not stripped and overwritten, so a
+/// forged binding can never be confused with a derived one, and the refusal
+/// is a plain `400 HTTP_INVALID_HEAD` `not_dispatched` that says nothing
+/// about the header, the profile or the session.
+///
+/// Header names are already lowercased by the HTTP parser, so one predicate
+/// covers every spelling, and `HeaderMap::contains_key` covers repeats.
+pub(crate) fn refuse_consumer_principal_binding(headers: &http::HeaderMap) -> Option<Response> {
+    headers.contains_key(principal_binding_header()).then(|| {
+        error_response(
+            StatusCode::BAD_REQUEST,
+            "HTTP_INVALID_HEAD",
+            "invalid request head",
+            "not_dispatched",
+        )
+    })
+}
+
+/// The derived binding as a header value.  The digest is lowercase hex, which
+/// is always a valid visible-ASCII header value, so this cannot fail; the
+/// `expect` documents the invariant rather than hiding a fallible conversion
+/// behind a consumer-visible 500.
+fn principal_binding_value(binding: &str) -> http::HeaderValue {
+    debug_assert!(binding.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    http::HeaderValue::from_str(binding).expect("a hex digest is a valid header value")
+}
+
 /// The domain separator of the principal binding digest.  Changing it
 /// invalidates every live protocol session, which is why it is versioned.
 const PRINCIPAL_BINDING_DOMAIN: &[u8] = b"agent-tunnel/mcp-principal-binding/1";
@@ -1363,18 +1395,12 @@ pub(crate) async fn http_forward_route(
     // header itself is refused here: the value is never taken from the
     // request, and never merely overwritten, so a forged binding can neither
     // reach the device nor be confused with a derived one.
-    let binding_header = principal_binding_header();
-    if parts.headers.contains_key(&binding_header) {
+    if let Some(refusal) = refuse_consumer_principal_binding(&parts.headers) {
         state
             .handle
             .http_forward_diagnostics()
             .record_ingress_rejection();
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "HTTP_INVALID_HEAD",
-            "invalid request head",
-            "not_dispatched",
-        );
+        return refusal;
     }
     if export
         .profile
@@ -1388,14 +1414,10 @@ pub(crate) async fn http_forward_route(
             device_id,
             service_id,
         );
-        let Ok(value) = http::HeaderValue::from_str(&binding) else {
-            return gateway_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "HTTP_INVALID_HEAD",
-                "not_dispatched",
-            );
-        };
-        parts.headers.insert(binding_header, value);
+        parts.headers.insert(
+            principal_binding_header(),
+            principal_binding_value(&binding),
+        );
     }
     // A head the bridge would refuse is refused here, before any owner
     // route, peer stream or tunnel stream exists: a malformed or forbidden
@@ -1757,6 +1779,25 @@ pub(crate) async fn handle_peer_http_stream(
         tracing::debug!(phase = "http_forward_owner_without_profile");
         return Err(PeerRuntimeError::Closed);
     };
+    // M3-04: derived here, from the identifiers this owner authorized for
+    // itself, before `consumer` is handed to the registration.  A binding
+    // relayed by an ingress is never adopted, only compared.
+    let owner_principal_binding = export
+        .profile
+        .request
+        .headers
+        .allows(tunnel_mcp::headers::TUNNEL_PRINCIPAL_BINDING)
+        .then(|| {
+            (
+                tunnel_mcp::headers::TUNNEL_PRINCIPAL_BINDING,
+                principal_binding(
+                    grant.tenant_id,
+                    consumer.principal_id,
+                    device_id,
+                    service_id,
+                ),
+            )
+        });
     let request_id = request.envelope().request_id.clone();
     let source_node = request.envelope().source.node_id.clone();
     let admission_context = request.admission_cancellation_context();
@@ -1830,6 +1871,7 @@ pub(crate) async fn handle_peer_http_stream(
         method_tx,
         export.interposer.clone(),
         Arc::clone(&verdict),
+        owner_principal_binding,
         down_tx.clone(),
     );
     let response_writer = OwnerResponseWriter::new(
@@ -1991,6 +2033,45 @@ mod tests {
             .unwrap();
         assert!(legacy.request.headers.allows(name));
         assert!(!export().profile.request.headers.allows(name));
+    }
+
+    /// M3-04.  A consumer can never supply the binding: every spelling and a
+    /// repeat are refused with the same opaque `400`, whatever the profile.
+    /// The gate case `binding-forgery` is the regression for the handler
+    /// actually calling this; this test pins what it answers.
+    #[test]
+    fn a_consumer_supplied_principal_binding_is_refused() {
+        let name = tunnel_mcp::headers::TUNNEL_PRINCIPAL_BINDING;
+        let forged = "0a1b2c3d4e5f60718a7f2c9a1b4d6e8f";
+        // The HTTP parser lowercases names, so every spelling a consumer can
+        // put on the wire arrives as the same key.
+        for spelling in [name, "Tunnel-Principal-Binding", "TUNNEL-PRINCIPAL-BINDING"] {
+            let mut headers = http::HeaderMap::new();
+            headers.append(
+                http::HeaderName::from_bytes(spelling.as_bytes()).unwrap(),
+                http::HeaderValue::from_static("0a1b2c3d4e5f60718a7f2c9a1b4d6e8f"),
+            );
+            let refusal = refuse_consumer_principal_binding(&headers)
+                .unwrap_or_else(|| panic!("{spelling} was admitted"));
+            assert_eq!(refusal.status(), StatusCode::BAD_REQUEST, "{spelling}");
+        }
+        // A repeat is refused too, and so is a repeat of an empty value.
+        let mut headers = http::HeaderMap::new();
+        for value in [forged, ""] {
+            headers.append(
+                principal_binding_header(),
+                http::HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        assert!(refuse_consumer_principal_binding(&headers).is_some());
+        // Control: an ordinary MCP request presents none and is admitted.
+        let mut headers = http::HeaderMap::new();
+        headers.append("mcp-session-id", http::HeaderValue::from_static("0123abcd"));
+        assert!(refuse_consumer_principal_binding(&headers).is_none());
+        // The value the ingress inserts is the derived digest, verbatim.
+        let ids = [Uuid::nil(), Uuid::max(), Uuid::nil(), Uuid::max()];
+        let derived = principal_binding(ids[0], ids[1], ids[2], ids[3]);
+        assert_eq!(principal_binding_value(&derived).to_str().unwrap(), derived);
     }
 
     /// Gate 5: a service selects its profile only through the catalog

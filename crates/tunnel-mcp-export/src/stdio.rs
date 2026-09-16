@@ -133,6 +133,18 @@ pub struct StdioExport {
     counters: Arc<ExportCounters>,
     slots: Arc<Semaphore>,
     sessions: Arc<Mutex<HashMap<String, Arc<Session>>>>,
+    /// Cancelled when the export is dropped or [`StdioExport::shutdown`] is
+    /// called.  A legacy session's pump is a detached task that owns the
+    /// child and its `max_children` permit, so without this the children of
+    /// sessions nobody ended would outlive the export, the connector and the
+    /// device session they were opened on.
+    shutdown: CancellationToken,
+}
+
+impl Drop for StdioExport {
+    fn drop(&mut self) {
+        self.shutdown_sessions();
+    }
 }
 
 impl std::fmt::Debug for StdioExport {
@@ -167,6 +179,28 @@ impl StdioExport {
             counters,
             slots,
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            shutdown: CancellationToken::new(),
+        }
+    }
+
+    /// End every open legacy session and kill its child's process group.
+    ///
+    /// Idempotent, and safe to call from `Drop`: the session pumps observe
+    /// the cancellation and their children are killed here as well, so a
+    /// child cannot survive the export whatever the task scheduler does
+    /// afterwards.
+    pub fn shutdown_sessions(&self) {
+        self.shutdown.cancel();
+        let sessions: Vec<Arc<Session>> = self
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .drain()
+            .map(|(_, session)| session)
+            .collect();
+        for session in sessions {
+            session.router().ended = true;
+            session.child.kill();
         }
     }
 
@@ -559,6 +593,7 @@ impl StdioExport {
             events,
             Arc::clone(&self.sessions),
             Arc::clone(&self.counters),
+            self.shutdown.child_token(),
         ));
         if session.child.send(&message.compact).await.is_err() {
             self.remove_session(&session_id);
@@ -917,9 +952,11 @@ async fn run_session(
     mut events: mpsc::Receiver<ChildEvent>,
     sessions: Arc<Mutex<HashMap<String, Arc<Session>>>>,
     counters: Arc<ExportCounters>,
+    shutdown: CancellationToken,
 ) {
     loop {
         let event = tokio::select! {
+            () = shutdown.cancelled() => break,
             event = events.recv() => event,
             () = tokio::time::sleep_until(session.idle_deadline()) => {
                 if tokio::time::Instant::now() < session.idle_deadline() {

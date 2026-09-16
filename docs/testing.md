@@ -970,11 +970,22 @@ All five cases run on **one device session** (defect M7-C82 is fixed), up to
 the owner loss that necessarily ends it, and membership is re-signed at case
 boundaries at most every 15 s (defect M7-C80).
 
+* **binding-forgery.** The consumer sends `tunnel-principal-binding` itself,
+  on both profiles and all three routes, once with a single value and once
+  with the header repeated with two different values: twelve attempts, each
+  refused `400 HTTP_INVALID_HEAD` `not_dispatched`, each counted as an ingress
+  rejection by relay-c, and zero device dispatches. This is the whole basis of
+  the unkeyed design — because a consumer can never put the header on the
+  wire, the digest does not have to be secret — so it is a gate case and not
+  only a unit test. (Header names are lowercased by the HTTP parser, so every
+  spelling a consumer can send arrives as the same key; the relay unit test
+  `a_consumer_supplied_principal_binding_is_refused` pins that.)
 * **session-isolation.** Each principal opens its own `mcp-2025-11-25`
   session. Consumer B then presents consumer A's session ID on POST, GET and
-  DELETE: all three must answer 404, and the POST answer must be *byte
-  identical* to the same request naming a session that never existed, so a
-  leaked ID neither works nor reveals that the session exists. Both sessions
+  DELETE: all three must answer 404, and each answer must be indistinguishable
+  — status, every response header except `date`, and the body bytes — from the
+  same route's answer for a session that never existed, so a leaked ID neither
+  works nor reveals that the session exists. Both sessions
   must still answer exactly afterwards. Each principal then opens its
   standalone GET stream and calls `log` with its own label, concurrently and
   with the same JSON-RPC ID: each stream must carry exactly its own four
@@ -1004,7 +1015,8 @@ boundaries at most every 15 s (defect M7-C80).
   is exactly that: the other principals' sessions still answer and the device
   session survives. The revoked principal's own device-side session is *not*
   ended; it simply becomes unreachable, and its child holds a `max_children`
-  slot until `session_idle_seconds` (M3-16).
+  slot for as long as the device session lives, or until
+  `session_idle_seconds` (M3-16).
 * **rotation-span.** One call is held open until the owner has completed three
   scheduled rotations, then released: it must answer 200 exactly once with the
   fixture's exact text, on the same device session, with one dispatch. This
@@ -1017,23 +1029,51 @@ boundaries at most every 15 s (defect M7-C80).
   path, and in a second round shuts relay-a down. Either way the consumer must
   get a 5xx whose `{code, execution}` maps to `outcome_unknown`, the side
   effect must still be recorded exactly once at the outcome, and nothing may
-  be retried or replayed.
+  be retried or replayed. The side effect is counted at an observed event, not
+  after a sleep: the lost-acknowledgement round settles when the device has
+  finished and recorded that exchange (a replay would be a second record,
+  matched by stream ID because the connector's log is bounded), and the
+  owner-loss round settles when the connector leaves readiness, because the
+  device session a replay would need is gone with it. Each round records which
+  event it settled on, and the validator requires the expected one.
 
 Evidence is validated by `validate_mcp_isolation_evidence`
 (`production_cluster/mcp_isolation.rs`), re-run at the command boundary; its
 unit test rejects every listed single-rule mutation of passing evidence.
-Correctness comes from HTTP statuses and bodies, MCP export counters, fixture
-marker files, owner session snapshots and the connector's OPEN journal
-occupancy; no fixed sleep is a correctness signal. The OPEN journal peak is
+Correctness comes from HTTP statuses, response headers and bodies, MCP export
+counters, fixture marker files, device exchange records, connector readiness,
+owner session snapshots and the connector's OPEN journal occupancy. No sleep
+is a correctness signal: the standalone GET streams are opened and their heads
+answered before either call starts (the answered head is the device's own
+signal that the session's standalone stream is registered), and each unknown
+outcome is counted at the settle event above. Sleeps appear only as the poll
+interval of bounded waits on those signals. The OPEN journal peak is
 sampled continuously from the connector's status watch and must stay within a
-bound derived from the case concurrency (16), not from the roughly sixty
+bound derived from the case concurrency (20), not from the roughly seventy
 streams the run serves on that one session; observed 13 to 15. The gate ends
-every session it can with DELETE and requires exactly the two it cannot end —
-the revoked principal's and the one whose owner relay was killed — to be the
-only export children left running.
+every session it can with DELETE; exactly two cannot be ended (the revoked
+principal's, whose DELETE the relay refuses along with everything else it
+sends, and the one whose owner relay was killed), and **no** export child may
+be left running once the connector stops, because dropping the connector's
+handler registry ends every session its exports still hold.
 
 **Red-then-green.**
 
+* Removing the owner's re-derivation and comparison
+  (`OwnerRequestWriter::validate`): a head carrying another principal's
+  binding, and a head carrying none, both reached the device. The owner test
+  `the_owner_verifies_the_principal_binding_it_derived_itself` fails on both.
+* Removing the ingress refusal (`refuse_consumer_principal_binding`'s guard):
+  the relay unit test fails, and with the handler's call site removed the
+  `binding-forgery` gate case reports admitted attempts and a nonzero device
+  dispatch.
+* Removing the export's session shutdown (`StdioExport`'s `Drop` and
+  `shutdown_sessions`): `an_unended_legacy_session_dies_with_its_export` and
+  `shutdown_ends_every_open_legacy_session` fail with the wrapper's grandchild
+  outliving its process group, and the gate reports `children_after_stop=2`.
+* Restoring the Streamable HTTP export's oldest-first eviction:
+  `one_principal_cannot_evict_another_by_opening_sessions` fails — one
+  principal's 257 `initialize` calls drop another principal's live session.
 * Removing the device's principal-binding check on legacy sessions
   (`tunnel-mcp-export/src/stdio.rs`): consumer B's POST, GET and DELETE on
   consumer A's session ID were accepted with 200, 200 and 204 — B could read

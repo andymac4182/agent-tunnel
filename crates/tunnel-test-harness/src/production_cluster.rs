@@ -140,9 +140,10 @@ pub use mcp_cloud_client::{
 };
 mod mcp_isolation;
 pub use mcp_isolation::{
-    CorrelationEvidence as McpCorrelationEvidence, ISOLATION_ROTATION,
-    IsolationEvidence as McpIsolationCaseEvidence, MCP_ISOLATION_CASES, McpIsolationEvidence,
-    RevocationEvidence as McpRevocationEvidence, RotationSpanEvidence as McpRotationSpanEvidence,
+    CorrelationEvidence as McpCorrelationEvidence, ForgeryEvidence as McpForgeryEvidence,
+    ISOLATION_ROTATION, IsolationEvidence as McpIsolationCaseEvidence, MCP_ISOLATION_CASES,
+    McpIsolationEvidence, RevocationEvidence as McpRevocationEvidence,
+    RotationSpanEvidence as McpRotationSpanEvidence,
     UnknownOutcomeEvidence as McpUnknownOutcomeEvidence, validate_mcp_isolation_evidence,
     verify as verify_mcp_isolation,
 };

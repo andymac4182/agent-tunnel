@@ -169,6 +169,22 @@ pub struct HttpHandlers {
     mcp: BTreeMap<String, tunnel_mcp_export::McpExport>,
 }
 
+/// Ending the registry ends the protocol sessions it served.
+///
+/// A registered MCP export is also held by [`McpExportDiagnostics`], so the
+/// export's own `Drop` cannot be relied on to run when the connector stops.
+/// This is the connector's explicit teardown: every MCP export ends its open
+/// protocol sessions and kills each session child's process group, so a
+/// session nobody ended cannot outlive the device session it was served on
+/// (M3-04).
+impl Drop for HttpHandlers {
+    fn drop(&mut self) {
+        for export in self.mcp.values() {
+            export.shutdown();
+        }
+    }
+}
+
 impl HttpHandlers {
     #[must_use]
     pub fn new() -> Self {

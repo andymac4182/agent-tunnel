@@ -53,7 +53,7 @@ use hyper::body::Frame;
 use serde_json::{Value, json};
 use tokio::time::{sleep, timeout};
 use tunnel_client::ConnectOptions;
-use tunnel_client::http_forward::{HttpHandlers, McpExportDiagnostics};
+use tunnel_client::http_forward::{DeviceHttpDiagnostics, HttpHandlers, McpExportDiagnostics};
 use tunnel_core::RotationConfig;
 use tunnel_mcp_export::ExportDiagnostics;
 
@@ -79,7 +79,8 @@ pub const PROFILE_2025: &str = "mcp-2025-11-25";
 const SERVICE_2025: &str = "stdio-2025";
 const SERVICE_2026: &str = "stdio-2026";
 /// The cases, in order.
-pub const MCP_ISOLATION_CASES: [&str; 5] = [
+pub const MCP_ISOLATION_CASES: [&str; 6] = [
+    "binding-forgery",
     "session-isolation",
     "correlation",
     "revocation",
@@ -100,6 +101,9 @@ pub const COLLIDING_IDS: [&str; CORRELATION_CALLS] = [
     "\"shared-b\"",
     "0",
 ];
+/// Consumer attempts to supply the relay-only principal binding: two
+/// profiles × three routes × (one value, then a repeated one).
+pub const FORGERY_ATTEMPTS: usize = 2 * 3 * 2;
 /// Server notifications each principal asks for in the isolation case.
 pub const ISOLATION_LOG_COUNT: u64 = 4;
 /// Completed scheduled rotations one held call must span.
@@ -110,7 +114,7 @@ pub const ROTATION_SPAN: u64 = 3;
 /// reclamation has not completed; the point of the rule is that the bound is
 /// a function of concurrency and not of the roughly sixty streams the run
 /// serves on one session.
-pub const JOURNAL_ENTRY_BOUND: usize = CORRELATION_CALLS * 2 + 4;
+pub const JOURNAL_ENTRY_BOUND: usize = CORRELATION_CALLS * 2 + 8;
 const JOURNAL_TRACKED_ENTRIES: usize = tunnel_protocol::control_journal::MAX_JOURNAL_ENTRIES;
 
 const SCENARIO_TIMEOUT: Duration = Duration::from_secs(1_200);
@@ -136,15 +140,30 @@ pub const REVOCATION_WITHDRAWAL_BOUND: Duration = Duration::from_secs(5);
 const MEMBERSHIP_RESIGN_SPACING: Duration = Duration::from_secs(15);
 
 /// What this gate does not prove.  Recorded rather than faked.
-pub const NOT_COVERED: [&str; 5] = [
+pub const NOT_COVERED: [&str; 6] = [
     "server-to-client JSON-RPC requests (sampling/createMessage, elicitation/create, MRTR input): the pinned fixture issues none, so colliding server-to-client request IDs are unproven (M3-13)",
     "Origin validation and the MCP authorization profile, including token audience checks at the export (M3-11)",
     "Last-Event-ID resume of an interrupted legacy stream (M3-10)",
     "principal binding for a Streamable HTTP backend over the real cluster: proven in tunnel-mcp-fixture's principal_binding tests through the in-process bridge, not here",
     "cross-tenant consumers: both correlation principals are of one tenant, and tenant separation is M7 admission evidence",
+    "correlation through one shared backend process: the 2025-11-25 stdio export gives each session its own child, so its correlation is process-isolated by construction; the Streamable HTTP export, where every session shares one backend, is not driven here (M3-13)",
 ];
 
 // ---- evidence ---------------------------------------------------------------
+
+/// `binding-forgery`.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ForgeryEvidence {
+    /// Consumer requests that presented the relay-only principal binding.
+    pub attempts: usize,
+    /// How many were refused `400 HTTP_INVALID_HEAD` `not_dispatched`.
+    pub refused: usize,
+    /// Ingress rejections the relay counted while they were sent.
+    pub ingress_rejections: u64,
+    /// Device dispatches while they were sent.  None of them is admitted, so
+    /// this must be zero.
+    pub dispatched: u64,
+}
 
 /// `session-isolation`.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -246,10 +265,38 @@ pub struct RotationSpanEvidence {
     pub session_stable: bool,
 }
 
+/// The observed event a fault's replay check settles on.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Settle {
+    /// The device finished and recorded the exchange.
+    DeviceRecord,
+    /// The device session the call was dispatched on is gone.
+    SessionEnded,
+}
+
+impl Settle {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::DeviceRecord => "device_exchange_record",
+            Self::SessionEnded => "device_session_ended",
+        }
+    }
+}
+
 /// One explicit unknown outcome after a synthetic side effect.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct UnknownOutcomeEvidence {
     pub fault: String,
+    /// The event the gate waited for before counting the side effect again,
+    /// so the replay check is tied to something observable rather than to a
+    /// sleep: `device_exchange_record` when the device finished and recorded
+    /// the exchange, `device_session_ended` when the session the call was
+    /// dispatched on is gone and nothing can be re-dispatched on it.
+    pub settled_on: String,
+    /// Device exchange records that appeared for this call.  Meaningful only
+    /// for `device_exchange_record`; the connector keeps a bounded log, so it
+    /// is matched by stream ID, not by length.
+    pub device_exchanges: usize,
     /// Side-effect records before the fault and after the outcome.
     pub side_effects_before_fault: u64,
     pub side_effects_after_outcome: u64,
@@ -274,6 +321,7 @@ pub struct McpIsolationEvidence {
     pub device_sessions: usize,
     /// The reused session's highest OPEN journal occupancy (M7-C82).
     pub journal_entries_peak: usize,
+    pub forgery: ForgeryEvidence,
     pub isolation: IsolationEvidence,
     pub correlation: CorrelationEvidence,
     pub revocation: RevocationEvidence,
@@ -288,6 +336,9 @@ pub struct McpIsolationEvidence {
     pub sessions_opened: usize,
     pub sessions_deleted: usize,
     /// Export child processes still running after the connector stopped.
+    /// Zero: dropping an export ends every session it still holds and kills
+    /// each session child's process group, whether or not anyone ended the
+    /// session first.
     pub children_after_stop: u64,
     pub not_covered: Vec<String>,
 }
@@ -306,16 +357,20 @@ pub fn validate_mcp_isolation_evidence(evidence: &McpIsolationEvidence) -> Resul
     let rotation = &evidence.rotation_span;
     let mut profiles = evidence.relay_profiles.clone();
     profiles.sort();
-    let unknown = |outcome: &UnknownOutcomeEvidence, fault: &str| {
+    let unknown = |outcome: &UnknownOutcomeEvidence, fault: &str, settle: &str| {
         outcome.fault == fault
             && outcome.side_effects_before_fault == 1
             && outcome.side_effects_after_outcome == 1
+            // Counted at an observed event, not after a sleep.
+            && outcome.settled_on == settle
+            && (settle != "device_exchange_record" || outcome.device_exchanges == 1)
             && outcome.result_outcome == "outcome_unknown"
             && outcome.body_execution == "unknown"
             && !outcome.body_code.is_empty()
             && (500..=599).contains(&outcome.status)
     };
-    let checks: [(&str, bool); 32] = [
+    let forgery = &evidence.forgery;
+    let checks: [(&str, bool); 34] = [
         ("three relays ran", evidence.relay_count == 3),
         (
             "the ingress was not the owner",
@@ -339,6 +394,16 @@ pub fn validate_mcp_isolation_evidence(evidence: &McpIsolationEvidence) -> Resul
             "the reused session's OPEN journal stayed bounded",
             evidence.journal_entries_peak <= JOURNAL_ENTRY_BOUND
                 && JOURNAL_ENTRY_BOUND < JOURNAL_TRACKED_ENTRIES,
+        ),
+        (
+            "every consumer-supplied principal binding was refused",
+            forgery.attempts == FORGERY_ATTEMPTS
+                && forgery.refused == FORGERY_ATTEMPTS
+                && forgery.ingress_rejections == FORGERY_ATTEMPTS as u64,
+        ),
+        (
+            "a forged principal binding never reached the device",
+            forgery.dispatched == 0,
         ),
         (
             "each principal opened its own distinct session",
@@ -409,9 +474,12 @@ pub fn validate_mcp_isolation_evidence(evidence: &McpIsolationEvidence) -> Resul
             "the admitted exchange was withdrawn with a typed error, not a result",
             revocation.in_flight_withdrawn
                 && revocation.withdrawn_within_ms <= REVOCATION_WITHDRAWAL_BOUND.as_millis()
-                && revocation.in_flight_status != 200
-                && !revocation.in_flight_code.is_empty()
-                && !revocation.in_flight_execution.is_empty(),
+                // A bare connection close is not a typed outcome: the answer
+                // must be a 5xx whose code and execution the product's own
+                // parsers accept.
+                && (500..=599).contains(&revocation.in_flight_status)
+                && tunnel_http_forward::HttpErrorCode::parse(&revocation.in_flight_code).is_some()
+                && tunnel_http_bridge::Execution::parse(&revocation.in_flight_execution).is_some(),
         ),
         (
             // The control for the rule above: an identical held call that was
@@ -463,11 +531,19 @@ pub fn validate_mcp_isolation_evidence(evidence: &McpIsolationEvidence) -> Resul
         ),
         (
             "a lost acknowledgement is an explicit unknown outcome with no replay",
-            unknown(&evidence.lost_ack, "owner_to_ingress_path_blackholed"),
+            unknown(
+                &evidence.lost_ack,
+                "owner_to_ingress_path_blackholed",
+                "device_exchange_record",
+            ),
         ),
         (
             "owner loss is an explicit unknown outcome with no replay",
-            unknown(&evidence.owner_loss, "owner_process_loss"),
+            unknown(
+                &evidence.owner_loss,
+                "owner_process_loss",
+                "device_session_ended",
+            ),
         ),
     ];
     for (rule, passed) in checks {
@@ -477,17 +553,15 @@ pub fn validate_mcp_isolation_evidence(evidence: &McpIsolationEvidence) -> Resul
             )));
         }
     }
-    // Every session the gate could end was ended, and exactly one child
-    // survived per session it could not end: the revoked principal's (whose
-    // DELETE the relay refuses along with everything else) and the one whose
-    // owner relay was killed.  A larger residue would mean a session leaked.
+    // Two sessions cannot be ended by the gate: the revoked principal's
+    // (the relay refuses its DELETE along with everything else it sends) and
+    // the one whose owner relay was killed.  Their children must still be
+    // gone once the connector stops, because the export ends every session it
+    // holds when it is dropped.
     let unendable = evidence
         .sessions_opened
         .saturating_sub(evidence.sessions_deleted);
-    if evidence.sessions_opened == 0
-        || unendable != 2
-        || evidence.children_after_stop != unendable as u64
-    {
+    if evidence.sessions_opened == 0 || unendable != 2 || evidence.children_after_stop != 0 {
         return Err(HarnessError::Process(format!(
             "MCP isolation gate failed: {} of {} sessions were ended and {} export children survived",
             evidence.sessions_deleted, evidence.sessions_opened, evidence.children_after_stop
@@ -524,7 +598,18 @@ fn empty() -> StreamBody<ConsumerStream> {
 struct Answer {
     status: u16,
     session: Option<String>,
+    /// Every response header except `date`, sorted, so two answers can be
+    /// compared field for field and not only by status and body.
+    headers: Vec<(String, String)>,
     body: Vec<u8>,
+}
+
+impl Answer {
+    /// Whether two answers are indistinguishable to a consumer: the same
+    /// status, the same header fields and the same body bytes.
+    fn indistinguishable_from(&self, other: &Self) -> bool {
+        self.status == other.status && self.headers == other.headers && self.body == other.body
+    }
 }
 
 impl Answer {
@@ -618,6 +703,18 @@ impl Consumer {
             .get(tunnel_mcp::headers::MCP_SESSION_ID)
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
+        let mut headers: Vec<(String, String)> = response
+            .headers()
+            .iter()
+            .filter(|(name, _)| name.as_str() != "date")
+            .map(|(name, value)| {
+                (
+                    name.as_str().to_owned(),
+                    String::from_utf8_lossy(value.as_bytes()).into_owned(),
+                )
+            })
+            .collect();
+        headers.sort();
         let body = response
             .into_body()
             .collect()
@@ -628,60 +725,78 @@ impl Consumer {
         Ok(Answer {
             status,
             session,
+            headers,
             body,
         })
     }
 
-    /// Read a standalone GET stream until `want` `notifications/message`
-    /// events have arrived or the bound expires, then close it.
-    async fn standalone(
-        &self,
-        uri: &str,
-        session: &str,
-        want: usize,
-        bound: Duration,
-    ) -> Vec<Value> {
+    /// Open a standalone GET stream and return it only once the device has
+    /// answered its head.  That answer is the deterministic signal that the
+    /// session's standalone stream is registered, so the caller can start a
+    /// call that produces server notifications without sleeping first.
+    async fn open_standalone(&self, uri: &str, session: &str) -> Result<StandaloneStream> {
         let headers = [
             ("accept", "text/event-stream"),
             ("mcp-protocol-version", "2025-11-25"),
             (tunnel_mcp::headers::MCP_SESSION_ID, session),
         ];
-        let Ok((mut sender, connection)) = connect_consumer(self.ingress, &self.ca).await else {
-            return Vec::new();
-        };
+        let (mut sender, connection) = connect_consumer(self.ingress, &self.ca).await?;
         let connection = tokio::spawn(async move {
             let _ = connection.await;
         });
-        let built = request("GET", uri, Some(&self.token), &headers, empty());
-        let Ok(built) = built else {
+        let built = request("GET", uri, Some(&self.token), &headers, empty())?;
+        let response = timeout(WAIT, sender.send_request(built))
+            .await
+            .map_err(|_| HarnessError::Timeout(format!("{}: standalone stream head", self.label)))?
+            .map_err(|error| {
+                HarnessError::Http(format!("{}: standalone stream: {error}", self.label))
+            })?;
+        let status = response.status().as_u16();
+        if status != 200 {
             connection.abort();
-            return Vec::new();
-        };
-        let Ok(Ok(response)) = timeout(WAIT, sender.send_request(built)).await else {
-            connection.abort();
-            return Vec::new();
-        };
-        let mut body = response.into_body();
-        let mut text = String::new();
-        let mut events = Vec::new();
+            return Err(HarnessError::Process(format!(
+                "{}: standalone stream answered {status}",
+                self.label
+            )));
+        }
+        Ok(StandaloneStream {
+            body: response.into_body(),
+            connection,
+            text: String::new(),
+        })
+    }
+}
+
+/// An open standalone GET stream.
+struct StandaloneStream {
+    body: hyper::body::Incoming,
+    connection: tokio::task::JoinHandle<()>,
+    text: String,
+}
+
+impl StandaloneStream {
+    /// Collect `want` `notifications/message` events, or as many as arrive
+    /// within `bound`, then close the stream.
+    async fn collect(mut self, want: usize, bound: Duration) -> Vec<Value> {
         let deadline = Instant::now() + bound;
+        let mut events = Vec::new();
         while events.len() < want && Instant::now() < deadline {
-            let Ok(Some(Ok(frame))) = timeout(bound, body.frame()).await else {
+            let Ok(Some(Ok(frame))) = timeout(bound, self.body.frame()).await else {
                 break;
             };
             let Ok(data) = frame.into_data() else {
                 continue;
             };
-            text.push_str(&String::from_utf8_lossy(&data));
-            events = text
+            self.text.push_str(&String::from_utf8_lossy(&data));
+            events = self
+                .text
                 .split("\n\n")
                 .filter_map(|event| event.strip_prefix("data: "))
                 .filter_map(|data| serde_json::from_str::<Value>(data).ok())
                 .filter(|message| message["method"] == "notifications/message")
                 .collect();
         }
-        drop(body);
-        connection.abort();
+        self.connection.abort();
         events
     }
 }
@@ -773,6 +888,7 @@ struct Gate<'a> {
     cluster: &'a mut ProductionCluster,
     config: tunnel_client::ConnectConfig,
     client: Option<tunnel_client::ConnectionHandle>,
+    device_diagnostics: DeviceHttpDiagnostics,
     mcp_diagnostics: McpExportDiagnostics,
     session_id: String,
     tenant_id: uuid::Uuid,
@@ -813,6 +929,7 @@ impl Gate<'_> {
         let handlers = HttpHandlers::new()
             .with_mcp_exports(&self.config)
             .map_err(|error| HarnessError::InvalidInput(format!("MCP exports: {error}")))?;
+        self.device_diagnostics = handlers.diagnostics();
         self.mcp_diagnostics = handlers.mcp_diagnostics_source();
         let client = timeout(
             STARTUP_TIMEOUT,
@@ -995,6 +1112,105 @@ impl Gate<'_> {
         Ok(answer.status == 204)
     }
 
+    // ---- case: binding forgery ---------------------------------------------
+
+    /// Every consumer attempt to supply the relay-only principal binding,
+    /// on both profiles and every route the profile serves.
+    ///
+    /// This is the whole basis of the unkeyed design: because a consumer can
+    /// never put the header on the wire, the digest does not have to be
+    /// secret.  A forgery must be refused before admission — not stripped,
+    /// not overwritten — with an answer that says nothing about the header.
+    async fn binding_forgery(&mut self, consumer: &Consumer) -> Result<ForgeryEvidence> {
+        let name = tunnel_mcp::headers::TUNNEL_PRINCIPAL_BINDING;
+        let forged = "0a1b2c3d4e5f60718a7f2c9a1b4d6e8f";
+        let other = "7f2c9a1b4d6e8f0a1b2c3d4e5f60718a";
+        let rejections_before = self.ingress_rejections().await?;
+        let dispatched_before =
+            self.export(SERVICE_2025).dispatched + self.export(SERVICE_2026).dispatched;
+        let mut evidence = ForgeryEvidence::default();
+        let list =
+            Bytes::from(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).to_string());
+        for label in [SERVICE_2025, SERVICE_2026] {
+            let uri = self.uri(label);
+            let version = if label == SERVICE_2025 {
+                "2025-11-25"
+            } else {
+                "2026-07-28"
+            };
+            for method in ["POST", "GET", "DELETE"] {
+                // One value, then the same header twice with different
+                // values: neither may be admitted, and a repeat must not be
+                // collapsed into an accepted singleton.
+                for repeated in [false, true] {
+                    let mut headers = vec![
+                        ("content-type", "application/json"),
+                        ("accept", "application/json, text/event-stream"),
+                        ("mcp-protocol-version", version),
+                        (name, forged),
+                    ];
+                    if repeated {
+                        headers.push((name, other));
+                    }
+                    if method != "POST" {
+                        headers.retain(|(header, _)| *header != "content-type");
+                    }
+                    let body = if method == "POST" {
+                        body_stream(list.clone())
+                    } else {
+                        empty()
+                    };
+                    let answer = consumer.send(method, &uri, &headers, body).await?;
+                    evidence.attempts += 1;
+                    let (code, execution) = answer.error();
+                    if answer.status == 400
+                        && code == "HTTP_INVALID_HEAD"
+                        && execution == "not_dispatched"
+                    {
+                        evidence.refused += 1;
+                    } else {
+                        eprintln!(
+                            "MCP isolation gate: forged binding on {label} {method} (repeated={repeated}) answered {} {code} {execution}",
+                            answer.status
+                        );
+                    }
+                }
+            }
+        }
+        evidence.ingress_rejections = self
+            .ingress_rejections()
+            .await?
+            .saturating_sub(rejections_before);
+        evidence.dispatched = (self.export(SERVICE_2025).dispatched
+            + self.export(SERVICE_2026).dispatched)
+            .saturating_sub(dispatched_before);
+        Ok(evidence)
+    }
+
+    /// The highest device exchange stream ID recorded for `service`.  The
+    /// connector keeps a bounded log, so a new exchange is identified by its
+    /// stream ID rather than by the log growing.
+    fn highest_device_stream(&self, service: &str) -> u64 {
+        self.device_diagnostics
+            .snapshot()
+            .iter()
+            .filter(|record| record.service_id == service)
+            .map(|record| record.stream_id)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Requests relay-c refused before admission.
+    async fn ingress_rejections(&self) -> Result<u64> {
+        Ok(self
+            .cluster
+            .relay("relay-c")?
+            .snapshot()
+            .await?
+            .http_forward
+            .ingress_rejected_before_admission)
+    }
+
     // ---- case: session isolation -------------------------------------------
 
     async fn session_isolation(
@@ -1021,7 +1237,8 @@ impl Gate<'_> {
             )
             .await?;
         evidence.foreign_post_status = foreign.status;
-        // The same request naming a session that never existed.
+        // The same request naming a session that never existed: the control
+        // for every route below.
         let absent_id = "ffffffffffffffffffffffffffffffff";
         let absent = bob
             .send(
@@ -1031,33 +1248,38 @@ impl Gate<'_> {
                 body_stream(list.clone()),
             )
             .await?;
-        evidence.foreign_matches_unknown =
-            foreign.status == absent.status && foreign.body == absent.body;
+        fn get_headers(session: &str) -> Vec<(&str, &str)> {
+            vec![
+                ("accept", "text/event-stream"),
+                ("mcp-protocol-version", "2025-11-25"),
+                (tunnel_mcp::headers::MCP_SESSION_ID, session),
+            ]
+        }
+        fn delete_headers(session: &str) -> Vec<(&str, &str)> {
+            vec![
+                ("mcp-protocol-version", "2025-11-25"),
+                (tunnel_mcp::headers::MCP_SESSION_ID, session),
+            ]
+        }
         let foreign_get = bob
-            .send(
-                "GET",
-                &uri,
-                &[
-                    ("accept", "text/event-stream"),
-                    ("mcp-protocol-version", "2025-11-25"),
-                    (tunnel_mcp::headers::MCP_SESSION_ID, &alice_session),
-                ],
-                empty(),
-            )
+            .send("GET", &uri, &get_headers(&alice_session), empty())
+            .await?;
+        let absent_get = bob
+            .send("GET", &uri, &get_headers(absent_id), empty())
             .await?;
         evidence.foreign_get_status = foreign_get.status;
         let foreign_delete = bob
-            .send(
-                "DELETE",
-                &uri,
-                &[
-                    ("mcp-protocol-version", "2025-11-25"),
-                    (tunnel_mcp::headers::MCP_SESSION_ID, &alice_session),
-                ],
-                empty(),
-            )
+            .send("DELETE", &uri, &delete_headers(&alice_session), empty())
+            .await?;
+        let absent_delete = bob
+            .send("DELETE", &uri, &delete_headers(absent_id), empty())
             .await?;
         evidence.foreign_delete_status = foreign_delete.status;
+        // Indistinguishable on every route, field for field: status, every
+        // response header except `date`, and the body bytes.
+        evidence.foreign_matches_unknown = foreign.indistinguishable_from(&absent)
+            && foreign_get.indistinguishable_from(&absent_get)
+            && foreign_delete.indistinguishable_from(&absent_delete);
 
         // Both sessions still work.
         let alice_answer = alice
@@ -1116,38 +1338,17 @@ impl Gate<'_> {
             )
             .await
         };
-        // The streams are opened first, then both calls run concurrently
-        // with the same JSON-RPC ID on two sessions of two principals.
+        // Both standalone streams are opened, and the device has answered
+        // both heads, before either call starts: the answered head is the
+        // signal that the session's standalone stream is registered, so the
+        // ordering here is a real event and not a sleep.
+        let alice_stream = alice.open_standalone(&uri, &alice_session).await?;
+        let bob_stream = bob.open_standalone(&uri, &bob_session).await?;
         let (alice_events, bob_events, alice_result, bob_result) = tokio::join!(
-            async {
-                sleep(Duration::from_millis(150)).await;
-                alice
-                    .standalone(
-                        &uri,
-                        &alice_session,
-                        ISOLATION_LOG_COUNT as usize,
-                        Duration::from_secs(10),
-                    )
-                    .await
-            },
-            async {
-                sleep(Duration::from_millis(150)).await;
-                bob.standalone(
-                    &uri,
-                    &bob_session,
-                    ISOLATION_LOG_COUNT as usize,
-                    Duration::from_secs(10),
-                )
-                .await
-            },
-            async {
-                sleep(Duration::from_millis(600)).await;
-                alice_call.await
-            },
-            async {
-                sleep(Duration::from_millis(600)).await;
-                bob_call.await
-            },
+            alice_stream.collect(ISOLATION_LOG_COUNT as usize, Duration::from_secs(10)),
+            bob_stream.collect(ISOLATION_LOG_COUNT as usize, Duration::from_secs(10)),
+            alice_call,
+            bob_call,
         );
         let alice_result = alice_result?;
         let bob_result = bob_result?;
@@ -1523,11 +1724,10 @@ impl Gate<'_> {
                 evidence.in_flight_execution = execution;
             }
             Some(Ok(Err(error))) => {
-                // A transport-level end is itself a terminal; the consumer
-                // never saw a result.
-                evidence.in_flight_status = 0;
-                evidence.in_flight_code = "TRANSPORT_CLOSED".into();
-                evidence.in_flight_execution = "unknown".into();
+                // The consumer's transport ended with no answer at all.
+                // Nothing is invented here: the evidence stays empty and the
+                // validator refuses it, because a bare close is not the typed
+                // interruption the documentation claims.
                 eprintln!("MCP isolation gate: revoked call ended in transport: {error}");
             }
             Some(Err(error)) => {
@@ -1648,6 +1848,7 @@ impl Gate<'_> {
         session: &str,
         label: &'static str,
         fault_name: &str,
+        settle: Settle,
         fault: F,
     ) -> Result<UnknownOutcomeEvidence>
     where
@@ -1671,6 +1872,12 @@ impl Gate<'_> {
                     .await
             })
         };
+        let service = self
+            .services
+            .get(SERVICE_2025)
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        let highest_before = self.highest_device_stream(&service);
         let waiting = self
             .markers(SERVICE_2025)
             .join(format!("waiting-gate{label}"));
@@ -1696,10 +1903,40 @@ impl Gate<'_> {
             .map_err(|_| HarnessError::Timeout(format!("{fault_name} outcome timed out")))?
             .map_err(|error| HarnessError::Process(format!("{fault_name} join: {error}")))?;
         let answer = answer.unwrap_or_default();
-        // Give any (forbidden) retry time to land before counting.
-        sleep(Duration::from_secs(2)).await;
+        // Settle on an observed event, never on a sleep.  A fault the session
+        // survives settles when the device has finished and recorded the
+        // exchange, because a replay would be a second record; a fault that
+        // ends the session settles when the connector leaves readiness,
+        // because the stream a replay would need is gone with it.
+        let deadline = Instant::now() + OUTCOME_WAIT;
+        loop {
+            let ended = self
+                .client
+                .as_ref()
+                .is_none_or(|client| !client.readiness().borrow().is_ready());
+            let recorded = self.highest_device_stream(&service) > highest_before;
+            if settle == Settle::SessionEnded && ended {
+                break;
+            }
+            if settle == Settle::DeviceRecord && recorded {
+                break;
+            }
+            if Instant::now() >= deadline {
+                return Err(HarnessError::Timeout(format!(
+                    "the {fault_name} exchange never settled (recorded={recorded} session_ended={ended})"
+                )));
+            }
+            sleep(POLL).await;
+        }
         let (code, execution) = answer.error();
         Ok(UnknownOutcomeEvidence {
+            settled_on: settle.as_str().to_owned(),
+            device_exchanges: self
+                .device_diagnostics
+                .snapshot()
+                .iter()
+                .filter(|record| record.service_id == service && record.stream_id > highest_before)
+                .count(),
             fault: fault_name.to_owned(),
             side_effects_before_fault,
             side_effects_after_outcome: self
@@ -1923,6 +2160,7 @@ async fn run(
         cluster,
         config,
         client: None,
+        device_diagnostics: DeviceHttpDiagnostics::default(),
         mcp_diagnostics: McpExportDiagnostics::default(),
         session_id: String::new(),
         tenant_id: device.tenant_id,
@@ -1941,6 +2179,13 @@ async fn run(
         evidence.owner_node = gate.connect_device().await?;
         evidence.non_owner_ingress = evidence.owner_node == "relay-a";
         evidence.device_sessions += 1;
+
+        eprintln!(
+            "MCP isolation gate: binding-forgery at {} ms",
+            started.elapsed().as_millis()
+        );
+        gate.boundary().await?;
+        evidence.forgery = gate.binding_forgery(&alice).await?;
 
         eprintln!(
             "MCP isolation gate: session-isolation at {} ms",
@@ -1990,6 +2235,7 @@ async fn run(
                 &alice_session,
                 "lostack",
                 "owner_to_ingress_path_blackholed",
+                Settle::DeviceRecord,
                 async |gate: &mut Gate<'_>| {
                     gate.cluster
                         .set_peer_path_drop_from("relay-a", "relay-c", true)
@@ -2026,6 +2272,7 @@ async fn run(
                 &owner_session,
                 "ownerloss",
                 "owner_process_loss",
+                Settle::SessionEnded,
                 async |gate: &mut Gate<'_>| gate.cluster.shutdown_node("relay-a").await,
             )
             .await?;
@@ -2060,9 +2307,11 @@ async fn run(
 mod tests {
     use super::*;
 
-    fn outcome(fault: &str) -> UnknownOutcomeEvidence {
+    fn outcome(fault: &str, settle: Settle) -> UnknownOutcomeEvidence {
         UnknownOutcomeEvidence {
             fault: fault.to_owned(),
+            settled_on: settle.as_str().to_owned(),
+            device_exchanges: usize::from(settle == Settle::DeviceRecord),
             side_effects_before_fault: 1,
             side_effects_after_outcome: 1,
             status: 504,
@@ -2082,6 +2331,12 @@ mod tests {
             principals: 2,
             device_sessions: 1,
             journal_entries_peak: 1,
+            forgery: ForgeryEvidence {
+                attempts: FORGERY_ATTEMPTS,
+                refused: FORGERY_ATTEMPTS,
+                ingress_rejections: FORGERY_ATTEMPTS as u64,
+                dispatched: 0,
+            },
             isolation: IsolationEvidence {
                 sessions_distinct: true,
                 foreign_post_status: 404,
@@ -2129,12 +2384,12 @@ mod tests {
                 invocations: 1,
                 session_stable: true,
             },
-            lost_ack: outcome("owner_to_ingress_path_blackholed"),
-            owner_loss: outcome("owner_process_loss"),
+            lost_ack: outcome("owner_to_ingress_path_blackholed", Settle::DeviceRecord),
+            owner_loss: outcome("owner_process_loss", Settle::SessionEnded),
             resign_spacing_ms: MEMBERSHIP_RESIGN_SPACING.as_millis(),
             sessions_opened: 5,
             sessions_deleted: 3,
-            children_after_stop: 2,
+            children_after_stop: 0,
             not_covered: NOT_COVERED.iter().map(|item| (*item).to_owned()).collect(),
         }
     }
@@ -2157,6 +2412,12 @@ mod tests {
             ("journal", |e| {
                 e.journal_entries_peak = JOURNAL_ENTRY_BOUND + 1;
             }),
+            ("a forgery was admitted", |e| e.forgery.refused -= 1),
+            ("a forgery was not counted", |e| {
+                e.forgery.ingress_rejections -= 1
+            }),
+            ("fewer forgeries were tried", |e| e.forgery.attempts -= 1),
+            ("a forgery reached the device", |e| e.forgery.dispatched = 1),
             ("sessions distinct", |e| {
                 e.isolation.sessions_distinct = false;
             }),
@@ -2261,6 +2522,15 @@ mod tests {
             ("lost ack replayed", |e| {
                 e.lost_ack.side_effects_after_outcome = 2;
             }),
+            ("lost ack second device exchange", |e| {
+                e.lost_ack.device_exchanges = 2;
+            }),
+            ("lost ack settled on nothing", |e| {
+                e.lost_ack.settled_on.clear();
+            }),
+            ("owner loss settled on the wrong event", |e| {
+                e.owner_loss.settled_on = Settle::DeviceRecord.as_str().to_owned();
+            }),
             ("lost ack outcome", |e| {
                 e.lost_ack.result_outcome = "failed".into();
             }),
@@ -2276,7 +2546,7 @@ mod tests {
             ("owner loss outcome", |e| {
                 e.owner_loss.result_outcome = "failed".into();
             }),
-            ("an extra child survived", |e| e.children_after_stop += 1),
+            ("a child survived the export", |e| e.children_after_stop = 1),
             ("a session leaked", |e| e.sessions_opened += 1),
             ("no session was ended", |e| e.sessions_deleted = 0),
             ("not covered dropped", |e| e.not_covered.clear()),

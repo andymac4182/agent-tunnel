@@ -93,51 +93,124 @@ async fn open_session(export: &McpExport, binding: &str) -> String {
     session
 }
 
+/// A response reduced to what a consumer can distinguish.
+#[derive(Debug, Eq, PartialEq)]
+struct Seen {
+    status: StatusCode,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+async fn seen(response: http::Response<tunnel_http_bridge::ChannelBody>) -> Seen {
+    let status = response.status();
+    let mut headers: Vec<(String, String)> = response
+        .headers()
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_owned(),
+                String::from_utf8_lossy(value.as_bytes()).into_owned(),
+            )
+        })
+        .collect();
+    headers.sort();
+    let body = body_bytes(response).await.unwrap_or_default().to_vec();
+    Seen {
+        status,
+        headers,
+        body,
+    }
+}
+
 /// Every legacy route refuses another principal's binding, and the absence of
-/// a binding is itself a distinct principal rather than a wildcard.
+/// a binding is itself a distinct principal rather than a wildcard.  Each
+/// refusal is compared field for field with the same route's answer for a
+/// session that never existed, so nothing at all distinguishes them.
 async fn refuses_every_other_binding(export: &McpExport, session: &str) {
+    const ABSENT: &str = "ffffffffffffffffffffffffffffffff";
     for foreign in [Some(CONSUMER_B), None] {
-        let headers = session_post(session, foreign);
-        let response = within(exchange(export, post(&refs(&headers), LIST))).await;
+        let foreign_post = seen(
+            within(exchange(
+                export,
+                post(&refs(&session_post(session, foreign)), LIST),
+            ))
+            .await,
+        )
+        .await;
+        let absent_post = seen(
+            within(exchange(
+                export,
+                post(&refs(&session_post(ABSENT, foreign)), LIST),
+            ))
+            .await,
+        )
+        .await;
         assert_eq!(
-            response.status(),
+            foreign_post.status,
             StatusCode::NOT_FOUND,
             "POST with binding {foreign:?}"
         );
-        let body = body_bytes(response).await.expect("body");
-        let value: serde_json::Value = serde_json::from_slice(&body).expect("json");
-        // Byte-identical to an unknown session: nothing says the session
-        // exists.
-        assert_eq!(value["error"]["message"], "session not found");
+        assert_eq!(foreign_post, absent_post, "POST with binding {foreign:?}");
 
-        let mut get_headers = session_post(session, foreign);
-        get_headers.retain(|(name, _)| *name != "content-type" && *name != "accept");
-        get_headers.push(("accept", "text/event-stream".to_owned()));
-        let response = within(exchange(
-            export,
-            request("GET", &refs(&get_headers), Bytes::new()),
-        ))
+        let get_headers = |id: &str| {
+            let mut headers = session_post(id, foreign);
+            headers.retain(|(name, _)| *name != "content-type" && *name != "accept");
+            headers.push(("accept", "text/event-stream".to_owned()));
+            headers
+        };
+        let foreign_get = seen(
+            within(exchange(
+                export,
+                request("GET", &refs(&get_headers(session)), Bytes::new()),
+            ))
+            .await,
+        )
+        .await;
+        let absent_get = seen(
+            within(exchange(
+                export,
+                request("GET", &refs(&get_headers(ABSENT)), Bytes::new()),
+            ))
+            .await,
+        )
         .await;
         assert_eq!(
-            response.status(),
+            foreign_get.status,
             StatusCode::NOT_FOUND,
             "GET with binding {foreign:?}"
         );
-        let _ = body_bytes(response).await;
+        assert_eq!(foreign_get, absent_get, "GET with binding {foreign:?}");
 
-        let mut delete_headers = session_post(session, foreign);
-        delete_headers.retain(|(name, _)| *name != "content-type" && *name != "accept");
-        let response = within(exchange(
-            export,
-            request("DELETE", &refs(&delete_headers), Bytes::new()),
-        ))
+        let delete_headers = |id: &str| {
+            let mut headers = session_post(id, foreign);
+            headers.retain(|(name, _)| *name != "content-type" && *name != "accept");
+            headers
+        };
+        let foreign_delete = seen(
+            within(exchange(
+                export,
+                request("DELETE", &refs(&delete_headers(session)), Bytes::new()),
+            ))
+            .await,
+        )
+        .await;
+        let absent_delete = seen(
+            within(exchange(
+                export,
+                request("DELETE", &refs(&delete_headers(ABSENT)), Bytes::new()),
+            ))
+            .await,
+        )
         .await;
         assert_eq!(
-            response.status(),
+            foreign_delete.status,
             StatusCode::NOT_FOUND,
             "DELETE with binding {foreign:?}"
         );
-        let _ = body_bytes(response).await;
+        assert_eq!(
+            foreign_delete, absent_delete,
+            "DELETE with binding {foreign:?}"
+        );
     }
 }
 

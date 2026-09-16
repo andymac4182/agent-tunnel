@@ -237,13 +237,25 @@ therefore unguessable but not scoped — any authorized consumer of the same
 export who learned one could use it. The binding closes that without telling
 the device who anyone is.
 
-- **The ingress derives it.** The relay ingress is the only endpoint that
-  verified the consumer credential. After it strips the public credentials and
-  before it normalizes anything, it derives
+- **The ingress derives it.** After it strips the public credentials and
+  before it normalizes anything, the relay ingress derives
   `tunnel-principal-binding`: a SHA-256 digest over a versioned domain
   separator and the tenant, principal, device and service identifiers,
   truncated to 128 bits and hex encoded
   (`tunnel_relay::http::forward::principal_binding`).
+- **The owner re-derives it and never adopts it.** The ingress is not trusted
+  with it. The owner re-authenticates the consumer's forwarded token and
+  authorizes the grant for itself, so it holds the same four identifiers
+  independently; it derives the binding from *those* and compares it with the
+  relayed head, resetting the exchange with `HTTP_INVALID_HEAD`
+  `not_dispatched` on a mismatch or on an absent binding, before a byte
+  reaches the device (`OwnerRequestWriter`, `http/forward/owner_relay.rs`).
+  This matters precisely because the digest is unkeyed over catalog
+  identifiers: a compromised or buggy ingress holding one principal's token
+  could otherwise compute another principal's binding and land its requests on
+  that principal's session. The ingress is the only endpoint that *derives the
+  value a consumer's request will carry*; it is not the only endpoint that
+  checks it.
 - **It carries no identity.** The value is one way, and it is scoped to one
   device and one service, so the same principal presents unrelated values on
   unrelated exports and the device learns only "the same consumer as before".
@@ -253,10 +265,14 @@ the device who anyone is.
   add a distribution problem without adding security, because the value's
   integrity comes from the next point, not from secrecy.
 - **A consumer can never supply it.** An ingress request that carries the
-  header at all is refused with `400 HTTP_INVALID_HEAD` before anything is
-  forwarded, and counted as an ingress rejection. The value is never taken
-  from the request and never merely overwritten, so a forged binding can
-  neither reach a device nor be confused with a derived one.
+  header at all is refused with `400 HTTP_INVALID_HEAD` `not_dispatched`
+  before anything is forwarded, and counted as an ingress rejection. The
+  value is never taken from the request and never merely overwritten, so a
+  forged binding can neither reach a device nor be confused with a derived
+  one. Header names are lowercased by the HTTP parser, so one predicate
+  (`refuse_consumer_principal_binding`) covers every spelling, and a repeated
+  header is refused like a single one. The gate case `binding-forgery` drives
+  this through the real route on both profiles and all three methods.
 - **Only the session profile carries it.** It is in the `mcp-2025-11-25`
   request allowlist and nowhere else: the sessionless `mcp-2026-07-28` profile
   refuses it like any other unlisted header, and no profile allows it on a
@@ -266,9 +282,19 @@ the device who anyone is.
   Streamable HTTP export does not own the backend's session identifiers, so it
   records which binding each backend-issued session was handed to and refuses
   every other principal — and every session it did not see issued — before the
-  backend is dialled; that table is bounded to 256 sessions and evicts oldest
-  first, which fails closed (a forgotten session gets 404 and the client
-  re-initializes). The binding is never forwarded upstream.
+  backend is dialled. Only the exchange that opened a session binds it, so a
+  backend that echoes a different identifier on a later request cannot bind
+  that identifier to the caller. The binding is never forwarded upstream.
+  - **Capacity is refused, never taken from somebody else.** The table holds
+    `MAX_TRACKED_SESSIONS` (256) sessions and at most `MAX_SESSIONS_PER_BINDING`
+    (32) per principal. A principal at either bound is refused a new
+    `initialize` with `503` *before the backend is dialled*, so the backend
+    never creates a session this export could not track. An earlier revision
+    evicted the oldest entry instead, which was a cross-principal denial
+    channel: any authorized principal could drop every other principal's live
+    session — forcing a re-initialization and losing its subscription state —
+    by opening 257 sessions. Entries leave only when their own session does: a
+    successful DELETE, or a backend that answers 404 for it.
 - **A mismatch is an unknown session.** The same status, code and message,
   byte for byte, so a leaked ID proves nothing about whether the session
   exists.
@@ -276,6 +302,13 @@ the device who anyone is.
   the export tests supplies no binding, so sessions there are bound to "no
   principal" and still refuse any other value. That is the only configuration
   in which the binding is absent.
+- **A session does not outlive the export that served it.** A legacy session
+  is pumped by a detached task that owns the child process and its
+  `max_children` permit, so ending the export has to end the sessions
+  explicitly. Dropping an `McpExport`, calling `McpExport::shutdown`, or
+  dropping the connector's `HttpHandlers` registry ends every open session and
+  kills each session child's process group, whether or not anyone sent a
+  DELETE.
 
 ### What the gate pins
 
@@ -314,6 +347,14 @@ the device who anyone is.
 - `Last-Event-ID` resume of an interrupted legacy stream (M3-10).
 - **Cross-tenant consumers.** Both correlation principals belong to one
   tenant; tenant separation is M7 admission evidence, not this gate's.
+- **Correlation through one shared backend process.** The 2025-11-25 stdio
+  export gives every session its own child, so its correlation is
+  process-isolated by construction and the gate's colliding IDs prove routing,
+  not shared-process separation. The Streamable HTTP export, where every
+  session shares one backend, is not driven here (M3-13).
 - **Ending a device-side session on revocation.** Revocation makes the session
   unreachable but does not end it, so its child holds a `max_children` slot
-  until `session_idle_seconds` (M3-16 in [tasks.md](tasks.md)).
+  for as long as the device session lives, or until `session_idle_seconds`
+  (M3-16 in [tasks.md](tasks.md)). It no longer outlives the device session:
+  the export ends every session it holds when the connector's handler registry
+  goes away.

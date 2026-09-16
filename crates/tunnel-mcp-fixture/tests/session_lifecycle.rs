@@ -306,6 +306,44 @@ async fn wrapper_descendants_die_when_the_server_crashes() {
     grandchild_is_reaped(workspace.path()).await;
 }
 
+/// M3-04 review: a legacy session's pump is a detached task that owns the
+/// child and its `max_children` permit, so a session nobody ended used to
+/// keep its child alive after the export, the connector's handler registry
+/// and the device session were gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unended_legacy_session_dies_with_its_export() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let script = wrapper_script(workspace.path());
+    let export = stdio_export_with(LEGACY, workspace.path(), 2, &script, "");
+    let _session = open_session(&export).await;
+    assert_eq!(export.diagnostics().children_running, 1);
+    // No DELETE, no idle expiry: just the export going away, as it does when
+    // the connector drops its handlers.
+    drop(export);
+    grandchild_is_reaped(workspace.path()).await;
+}
+
+/// The explicit form a connector can call before dropping its handlers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_ends_every_open_legacy_session() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let script = wrapper_script(workspace.path());
+    let export = stdio_export_with(LEGACY, workspace.path(), 2, &script, "");
+    let _session = open_session(&export).await;
+    export.shutdown();
+    // Idempotent, and the counters settle without dropping the export.
+    export.shutdown();
+    grandchild_is_reaped(workspace.path()).await;
+    for _ in 0..500 {
+        if export.diagnostics().children_running == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(export.diagnostics().children_running, 0);
+    assert!(export.diagnostics().child_group_kills >= 1);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn wrapper_descendants_die_when_a_legacy_session_is_deleted() {
     let workspace = tempfile::tempdir().expect("workspace");

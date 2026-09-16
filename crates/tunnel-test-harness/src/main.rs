@@ -1842,6 +1842,13 @@ async fn main() -> ExitCode {
                     )?;
                     // Payload-free: statuses, counts and typed codes.
                     println!(
+                        "M3 MCP isolation binding-forgery: attempts={} refused={} ingress_rejections={} dispatched={}",
+                        evidence.forgery.attempts,
+                        evidence.forgery.refused,
+                        evidence.forgery.ingress_rejections,
+                        evidence.forgery.dispatched,
+                    );
+                    println!(
                         "M3 MCP isolation session-isolation: distinct={} foreign(post={} get={} delete={}) indistinguishable={} own_served={} sibling_served={} notifications({}/{}) no_cross_delivery={} sessions_opened={} children={}",
                         evidence.isolation.sessions_distinct,
                         evidence.isolation.foreign_post_status,
@@ -1893,7 +1900,7 @@ async fn main() -> ExitCode {
                     );
                     for outcome in [&evidence.lost_ack, &evidence.owner_loss] {
                         println!(
-                            "M3 MCP isolation unknown-outcome {}: status={} code={} execution={} outcome={} side_effects({} -> {})",
+                            "M3 MCP isolation unknown-outcome {}: status={} code={} execution={} outcome={} side_effects({} -> {}) settled_on={} device_exchanges={}",
                             outcome.fault,
                             outcome.status,
                             outcome.body_code,
@@ -1901,6 +1908,8 @@ async fn main() -> ExitCode {
                             outcome.result_outcome,
                             outcome.side_effects_before_fault,
                             outcome.side_effects_after_outcome,
+                            outcome.settled_on,
+                            outcome.device_exchanges,
                         );
                     }
                     println!(

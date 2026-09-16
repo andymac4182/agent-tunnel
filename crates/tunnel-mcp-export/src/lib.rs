@@ -205,6 +205,21 @@ impl McpExport {
         self.counters.snapshot()
     }
 
+    /// End every open protocol session this export holds and kill each
+    /// session child's process group.
+    ///
+    /// Dropping the export does the same; this is the explicit form for a
+    /// connector that stops its handlers before dropping them.  Idempotent.
+    pub fn shutdown(&self) {
+        match &*self.kind {
+            Kind::Stdio(export) => export.shutdown_sessions(),
+            // A Streamable HTTP export owns no process: its sessions belong
+            // to the operator's backend, and forgetting its bindings is what
+            // dropping it already does.
+            Kind::Http(_) => {}
+        }
+    }
+
     /// Serve one exchange in process.
     ///
     /// # Errors
