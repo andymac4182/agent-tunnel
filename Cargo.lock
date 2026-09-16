@@ -2859,6 +2859,8 @@ dependencies = [
  "tunnel-client",
  "tunnel-cluster",
  "tunnel-core",
+ "tunnel-fs-core",
+ "tunnel-fs-ninep",
  "tunnel-http-bridge",
  "tunnel-http-forward",
  "tunnel-mcp",
