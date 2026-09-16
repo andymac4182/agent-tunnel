@@ -60,46 +60,35 @@ function checkNegotiatedMsize(msize: number): void {
   }
 }
 
-function checkTlopenFlags(flags: number): void {
-  if ((flags & ~C.TLOPEN_FLAG_MASK) !== 0) {
-    fail('FlagNotInProfile', 'flags');
-  }
-  const access = flags & C.O_ACCMODE;
-  if (access === 3) {
-    fail('FlagNotInProfile', 'flags.accmode');
-  }
-  const writable = access === C.O_WRONLY || access === C.O_RDWR;
-  if (!writable && (flags & (C.O_TRUNC | C.O_APPEND)) !== 0) {
-    fail('FlagNotInProfile', 'flags.readonly-mutating');
-  }
-  if ((flags & C.O_DIRECTORY) !== 0 && (writable || (flags & C.O_TRUNC) !== 0)) {
-    fail('FlagNotInProfile', 'flags.directory-mutating');
-  }
-}
-
-function checkTsetattrMask(valid: number): void {
-  if (valid === 0) {
-    // A `Tsetattr` that changes nothing would be answered `Rsetattr`,
-    // reporting a mutation that did not happen.
-    fail('EmptyMask', 'valid');
-  }
-  if ((valid & ~C.TSETATTR_VALID_MASK) !== 0) {
-    fail('MaskNotInProfile', 'valid');
-  }
-}
-
-function checkTgetattrMask(requestMask: bigint): void {
-  if (requestMask === 0n) {
-    fail('EmptyMask', 'request_mask');
-  }
-  if ((requestMask & ~BigInt(C.GETATTR_ALL)) !== 0n) {
-    fail('MaskNotInProfile', 'request_mask');
-  }
-}
-
-function checkUnlinkatFlags(flags: number): void {
-  if ((flags & ~C.AT_REMOVEDIR) !== 0) {
-    fail('FlagNotInProfile', 'flags');
+/**
+ * A requested or returned `count[4]` must leave room for its own framing.
+ *
+ * A `Tread` or `Treaddir` asking for exactly `msize` bytes cannot be answered:
+ * the reply carrying them would be `msize + 11`. An `Rwrite` may not
+ * acknowledge more bytes than a `Twrite` could have carried, which is
+ * `msize - 23`. Silently shortening a reply instead would be
+ * indistinguishable to the caller from a short read at end of file.
+ *
+ * This is framing, not a profile refusal: the count is a property of the frame
+ * the peer sent, and there is nothing to negotiate about it.
+ */
+function checkCounts(message: Message, msize: number): void {
+  const replyLimit = Math.max(0, msize - C.COUNTED_REPLY_OVERHEAD);
+  const writeLimit = Math.max(0, msize - C.WRITE_REQUEST_OVERHEAD);
+  switch (message.kind) {
+    case 'Tread':
+    case 'Treaddir':
+      if (message.count > replyLimit) {
+        fail('CountAboveMsize', 'count');
+      }
+      return;
+    case 'Rwrite':
+      if (message.count > writeLimit) {
+        fail('CountAboveMsize', 'count');
+      }
+      return;
+    default:
+      return;
   }
 }
 
@@ -127,9 +116,9 @@ function readQid(reader: Reader, field: string): Qid {
 
 function writeQid(writer: Writer, qid: Qid, field: string): void {
   checkQid(qid, field);
-  writer.u8(qid.type);
-  writer.u32(qid.version);
-  writer.u64(qid.path);
+  writer.u8(qid.type, `${field}.type`);
+  writer.u32(qid.version, `${field}.version`);
+  writer.u64(qid.path, `${field}.path`);
 }
 
 /**
@@ -172,8 +161,8 @@ export function encodeDirEntries(entries: DirEntry[]): Uint8Array {
       fail('DirentTypeDisagreesWithQid', 'entry.type');
     }
     writeQid(writer, entry.qid, 'entry.qid');
-    writer.u64(entry.offset);
-    writer.u8(entry.type);
+    writer.u64(entry.offset, 'entry.offset');
+    writer.u8(entry.type, 'entry.type');
     writer.string(entry.name, 'entry.name');
   }
   return writer.finish();
@@ -243,7 +232,6 @@ function decodeBody(kind: C.MessageName, tag: number, reader: Reader): Message {
     case 'Tlopen': {
       const fid = reader.u32('fid');
       const flags = reader.u32('flags');
-      checkTlopenFlags(flags);
       return { kind, tag, fid, flags };
     }
     case 'Rlopen':
@@ -280,7 +268,6 @@ function decodeBody(kind: C.MessageName, tag: number, reader: Reader): Message {
     case 'Tgetattr': {
       const fid = reader.u32('fid');
       const requestMask = reader.u64('request_mask');
-      checkTgetattrMask(requestMask);
       return { kind, tag, fid, requestMask };
     }
     case 'Rgetattr':
@@ -311,7 +298,6 @@ function decodeBody(kind: C.MessageName, tag: number, reader: Reader): Message {
     case 'Tsetattr': {
       const fid = reader.u32('fid');
       const valid = reader.u32('valid');
-      checkTsetattrMask(valid);
       return {
         kind,
         tag,
@@ -379,7 +365,6 @@ function decodeBody(kind: C.MessageName, tag: number, reader: Reader): Message {
       const dirfid = reader.u32('dirfid');
       const entryName = reader.string('name');
       const flags = reader.u32('flags');
-      checkUnlinkatFlags(flags);
       return { kind, tag, dirfid, name: entryName, flags };
     }
     case 'Rread': {
@@ -417,15 +402,15 @@ function encodeBody(message: Message, writer: Writer): void {
     case 'Rversion':
       checkVersion(message.version);
       checkNegotiatedMsize(message.msize);
-      writer.u32(message.msize);
+      writer.u32(message.msize, 'msize');
       writer.string(message.version, 'version');
       return;
     case 'Tattach':
-      writer.u32(message.fid);
-      writer.u32(message.afid);
+      writer.u32(message.fid, 'fid');
+      writer.u32(message.afid, 'afid');
       writer.string(message.uname, 'uname');
       writer.string(message.aname, 'aname');
-      writer.u32(message.nUname);
+      writer.u32(message.nUname, 'nUname');
       return;
     case 'Rattach':
     case 'Rsymlink':
@@ -434,150 +419,146 @@ function encodeBody(message: Message, writer: Writer): void {
       return;
     case 'Rlerror':
       checkErrno(message.ecode);
-      writer.u32(message.ecode);
+      writer.u32(message.ecode, 'ecode');
       return;
     case 'Tflush':
-      writer.u16(message.oldtag);
+      writer.u16(message.oldtag, 'oldtag');
       return;
     case 'Twalk':
       if (message.wnames.length > C.MAXWELEM) {
         fail('TooManyWalkElements', 'nwname');
       }
-      writer.u32(message.fid);
-      writer.u32(message.newfid);
-      writer.u16(message.wnames.length);
+      writer.u32(message.fid, 'fid');
+      writer.u32(message.newfid, 'newfid');
+      writer.u16(message.wnames.length, 'nwname');
       message.wnames.forEach((wname, index) => writer.string(wname, `wname[${index}]`));
       return;
     case 'Rwalk':
       if (message.wqids.length > C.MAXWELEM) {
         fail('TooManyWalkElements', 'nwqid');
       }
-      writer.u16(message.wqids.length);
+      writer.u16(message.wqids.length, 'nwqid');
       message.wqids.forEach((qid, index) => writeQid(writer, qid, `wqid[${index}]`));
       return;
     case 'Tlopen':
-      checkTlopenFlags(message.flags);
-      writer.u32(message.fid);
-      writer.u32(message.flags);
+      writer.u32(message.fid, 'fid');
+      writer.u32(message.flags, 'flags');
       return;
     case 'Rlopen':
     case 'Rlcreate':
       writeQid(writer, message.qid, 'qid');
-      writer.u32(message.iounit);
+      writer.u32(message.iounit, 'iounit');
       return;
     case 'Tlcreate':
-      writer.u32(message.fid);
+      writer.u32(message.fid, 'fid');
       writer.string(message.name, 'name');
-      writer.u32(message.flags);
-      writer.u32(message.mode);
-      writer.u32(message.gid);
+      writer.u32(message.flags, 'flags');
+      writer.u32(message.mode, 'mode');
+      writer.u32(message.gid, 'gid');
       return;
     case 'Tsymlink':
-      writer.u32(message.fid);
+      writer.u32(message.fid, 'fid');
       writer.string(message.name, 'name');
       writer.string(message.symtgt, 'symtgt');
-      writer.u32(message.gid);
+      writer.u32(message.gid, 'gid');
       return;
     case 'Treadlink':
     case 'Tclunk':
     case 'Tremove':
-      writer.u32(message.fid);
+      writer.u32(message.fid, 'fid');
       return;
     case 'Rreadlink':
       writer.string(message.target, 'target');
       return;
     case 'Tgetattr':
-      checkTgetattrMask(message.requestMask);
-      writer.u32(message.fid);
-      writer.u64(message.requestMask);
+      writer.u32(message.fid, 'fid');
+      writer.u64(message.requestMask, 'requestMask');
       return;
     case 'Rgetattr':
-      writer.u64(message.valid);
+      writer.u64(message.valid, 'valid');
       writeQid(writer, message.qid, 'qid');
-      writer.u32(message.mode);
-      writer.u32(message.uid);
-      writer.u32(message.gid);
-      writer.u64(message.nlink);
-      writer.u64(message.rdev);
-      writer.u64(message.size);
-      writer.u64(message.blksize);
-      writer.u64(message.blocks);
-      writer.u64(message.atimeSec);
-      writer.u64(message.atimeNsec);
-      writer.u64(message.mtimeSec);
-      writer.u64(message.mtimeNsec);
-      writer.u64(message.ctimeSec);
-      writer.u64(message.ctimeNsec);
-      writer.u64(message.btimeSec);
-      writer.u64(message.btimeNsec);
-      writer.u64(message.gen);
-      writer.u64(message.dataVersion);
+      writer.u32(message.mode, 'mode');
+      writer.u32(message.uid, 'uid');
+      writer.u32(message.gid, 'gid');
+      writer.u64(message.nlink, 'nlink');
+      writer.u64(message.rdev, 'rdev');
+      writer.u64(message.size, 'size');
+      writer.u64(message.blksize, 'blksize');
+      writer.u64(message.blocks, 'blocks');
+      writer.u64(message.atimeSec, 'atimeSec');
+      writer.u64(message.atimeNsec, 'atimeNsec');
+      writer.u64(message.mtimeSec, 'mtimeSec');
+      writer.u64(message.mtimeNsec, 'mtimeNsec');
+      writer.u64(message.ctimeSec, 'ctimeSec');
+      writer.u64(message.ctimeNsec, 'ctimeNsec');
+      writer.u64(message.btimeSec, 'btimeSec');
+      writer.u64(message.btimeNsec, 'btimeNsec');
+      writer.u64(message.gen, 'gen');
+      writer.u64(message.dataVersion, 'dataVersion');
       return;
     case 'Tsetattr':
-      checkTsetattrMask(message.valid);
-      writer.u32(message.fid);
-      writer.u32(message.valid);
-      writer.u32(message.mode);
-      writer.u32(message.uid);
-      writer.u32(message.gid);
-      writer.u64(message.size);
-      writer.u64(message.atimeSec);
-      writer.u64(message.atimeNsec);
-      writer.u64(message.mtimeSec);
-      writer.u64(message.mtimeNsec);
+      writer.u32(message.fid, 'fid');
+      writer.u32(message.valid, 'valid');
+      writer.u32(message.mode, 'mode');
+      writer.u32(message.uid, 'uid');
+      writer.u32(message.gid, 'gid');
+      writer.u64(message.size, 'size');
+      writer.u64(message.atimeSec, 'atimeSec');
+      writer.u64(message.atimeNsec, 'atimeNsec');
+      writer.u64(message.mtimeSec, 'mtimeSec');
+      writer.u64(message.mtimeNsec, 'mtimeNsec');
       return;
     case 'Treaddir':
     case 'Tread':
-      writer.u32(message.fid);
-      writer.u64(message.offset);
-      writer.u32(message.count);
+      writer.u32(message.fid, 'fid');
+      writer.u64(message.offset, 'offset');
+      writer.u32(message.count, 'count');
       return;
     case 'Rreaddir': {
       const block = encodeDirEntries(message.entries);
-      writer.u32(block.byteLength);
+      writer.u32(block.byteLength, 'count');
       writer.raw(block);
       return;
     }
     case 'Tlink':
-      writer.u32(message.dfid);
-      writer.u32(message.fid);
+      writer.u32(message.dfid, 'dfid');
+      writer.u32(message.fid, 'fid');
       writer.string(message.name, 'name');
       return;
     case 'Tmkdir':
-      writer.u32(message.dfid);
+      writer.u32(message.dfid, 'dfid');
       writer.string(message.name, 'name');
-      writer.u32(message.mode);
-      writer.u32(message.gid);
+      writer.u32(message.mode, 'mode');
+      writer.u32(message.gid, 'gid');
       return;
     case 'Trename':
-      writer.u32(message.fid);
-      writer.u32(message.dfid);
+      writer.u32(message.fid, 'fid');
+      writer.u32(message.dfid, 'dfid');
       writer.string(message.name, 'name');
       return;
     case 'Trenameat':
-      writer.u32(message.olddirfid);
+      writer.u32(message.olddirfid, 'olddirfid');
       writer.string(message.oldname, 'oldname');
-      writer.u32(message.newdirfid);
+      writer.u32(message.newdirfid, 'newdirfid');
       writer.string(message.newname, 'newname');
       return;
     case 'Tunlinkat':
-      checkUnlinkatFlags(message.flags);
-      writer.u32(message.dirfid);
+      writer.u32(message.dirfid, 'dirfid');
       writer.string(message.name, 'name');
-      writer.u32(message.flags);
+      writer.u32(message.flags, 'flags');
       return;
     case 'Rread':
-      writer.u32(message.data.byteLength);
+      writer.u32(message.data.byteLength, 'count');
       writer.raw(message.data);
       return;
     case 'Twrite':
-      writer.u32(message.fid);
-      writer.u64(message.offset);
-      writer.u32(message.data.byteLength);
+      writer.u32(message.fid, 'fid');
+      writer.u64(message.offset, 'offset');
+      writer.u32(message.data.byteLength, 'count');
       writer.raw(message.data);
       return;
     case 'Rwrite':
-      writer.u32(message.count);
+      writer.u32(message.count, 'count');
       return;
     case 'Rflush':
     case 'Rsetattr':
@@ -647,6 +628,7 @@ function decodeFrame(bytes: Uint8Array, msize: number): Message {
   checkTag(kind, tag);
   const message = decodeBody(kind, tag, reader);
   reader.end('body');
+  checkCounts(message, msize);
   return message;
 }
 
@@ -657,11 +639,16 @@ function decodeFrame(bytes: Uint8Array, msize: number): Message {
  */
 export function decodeExact(bytes: Uint8Array, options: DecodeOptions = {}): Message {
   const msize = options.msize ?? C.MSIZE_CEILING;
-  if (bytes.byteLength < C.HEADER_BYTES) {
-    // Not enough bytes even to read the declared size. On this transport there
-    // is no "wait for more": the binary message is the whole frame.
-    fail('TruncatedBody', 'header');
+  if (bytes.byteLength < 4) {
+    // Not even a `size[4]`. On this transport there is no "wait for more": the
+    // binary message is the whole frame.
+    fail('TruncatedBody', 'size');
   }
+  // A 4-to-6-byte buffer still carries a declared size, so read it and let the
+  // size checks speak first: a buffer declaring `size < 7` is below the header
+  // floor, which is a more precise answer than "truncated" and is the answer
+  // the Rust codec gives. Only a buffer whose declared size is sound but whose
+  // bytes ran out is `TruncatedBody`.
   const reader = new Reader(bytes);
   const size = reader.u32('size');
   checkDeclaredSize(size, msize);
@@ -677,6 +664,7 @@ export function decodeExact(bytes: Uint8Array, options: DecodeOptions = {}): Mes
 export function encode(message: Message, options: DecodeOptions = {}): Uint8Array {
   const msize = options.msize ?? C.MSIZE_CEILING;
   checkTag(message.kind, message.tag);
+  checkCounts(message, msize);
   const body = new Writer();
   encodeBody(message, body);
   const bodyBytes = body.finish();
@@ -685,7 +673,7 @@ export function encode(message: Message, options: DecodeOptions = {}): Uint8Arra
   const writer = new Writer();
   writer.u32(size);
   writer.u8(C.MESSAGE_TYPES[message.kind]);
-  writer.u16(message.tag);
+  writer.u16(message.tag, 'tag');
   writer.raw(bodyBytes);
   return writer.finish();
 }
@@ -709,7 +697,17 @@ export class FrameDecoder {
     this.msize = options.msize ?? C.MSIZE_CEILING;
   }
 
-  /** Bytes held pending a complete frame. Never exceeds `msize`. */
+  /**
+   * Bytes held pending a complete frame, **between** pushes. It is bounded by
+   * `msize`, because anything that could complete a frame is decoded and
+   * dropped before `push` returns, and a declared size above `msize` latches
+   * an error rather than accumulating.
+   *
+   * It is *not* a bound on peak memory during one `push`: a caller handing over
+   * a 10 MiB chunk has already allocated it, and this class concatenates that
+   * chunk onto the retained bytes before it can read the next declared size.
+   * Bounding the peak is the transport's job, above this decoder.
+   */
   get retainedBytes(): number {
     return this.retained.byteLength;
   }
@@ -766,14 +764,3 @@ export function negotiateMsize(offered: number, maximum: number = C.MSIZE_CEILIN
   return Math.min(offered, maximum);
 }
 
-/**
- * A `count[4]` must leave room for its own framing: a `Tread` asking for
- * exactly `msize` bytes is refused, because the `Rread` carrying them would be
- * `msize + 11`. Silently shortening the reply would be indistinguishable to the
- * caller from a short read at end of file.
- */
-export function checkReadCount(count: number, msize: number): void {
-  if (count + C.READ_REPLY_OVERHEAD > msize) {
-    fail('CountLeavesNoRoomForFraming', 'count');
-  }
-}

@@ -1,13 +1,39 @@
 /**
- * What each checked-in fixture is *supposed to say*, written by hand from
- * `crates/tunnel-fs-ninep/fixtures/README.md`, the fixture headers and
- * `docs/filesystem-api.md` — one entry per fixture, as a decoded message.
+ * What each checked-in fixture is *supposed to say* — one entry per fixture, as
+ * a decoded message.
+ *
+ * ## Where these values came from, precisely
+ *
+ * They were transcribed **by hand from the fixtures' own hex bytes**, laid out
+ * against the field order in the 9P2000.L definition, with the fixture headers
+ * and `fixtures/README.md` supplying the message type, tag, length and the
+ * properties the bytes are meant to pin. They were **not** read from
+ * `crates/tunnel-fs-ninep/tests/common/mod.rs`, which was never opened, and not
+ * dumped from this decoder's own output. That is why they necessarily coincide
+ * with the Rust fixture source: the bytes are the same bytes.
+ *
+ * It is a hand transcription, and four of the entries were wrong on the first
+ * run — `Tsetattr`'s `size` was read as 4 where the bytes say 1024, and the
+ * wide name's UTF-16 and code-point counts were both off by one. Those are
+ * recorded rather than quietly fixed, because they bound what this table
+ * proves: it is a careful reading of the bytes, not a source independent of
+ * them.
+ *
+ * ## What it therefore can and cannot catch
  *
  * This table is the half of the cross-check that a round trip cannot do. A
  * decode-then-re-encode agrees with the fixture even when two field offsets are
- * swapped, as long as the widths match; only naming the intended values catches
- * that. The round trip then catches the opposite failure, a decoder that reads
+ * swapped, as long as the widths match; naming the intended values catches
+ * that. The round trip catches the opposite failure, a decoder that reads
  * fields the encoder does not write back identically.
+ *
+ * **It cannot catch a transposition between two fields that hold the same
+ * value in the fixture** — `Rgetattr`'s `uid` and `gid` are both 1000,
+ * `Tsetattr`'s are both 0, its `atimeNsec` and `mtimeNsec` are both 0, and
+ * `Tattach`'s `uname` and `aname` are both empty. A swap of any such pair is
+ * invisible here *and* in the Rust's own fixture comparison. The
+ * fixture-independent layout tests in `boundaries.test.ts` cover exactly those
+ * pairs with distinct sentinels.
  */
 
 import type { Message } from '../src/ninep/codec.ts';

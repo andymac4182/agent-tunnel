@@ -215,17 +215,34 @@ describe('the whole corpus over a tunnel byte stream', () => {
     });
   });
 
-  it('decodes identically at every single split point, and never retains above msize', () => {
+  it('decodes identically at every single split point, content included', () => {
+    // This compared only `messages.length` before. A subarray or byteOffset bug
+    // producing wrong-but-complete frames would have passed it, while the docs
+    // claimed the corpus "decodes identically" at every cut. Compare content.
+    const expected = fixtures.map((fixture) => EXPECTED[fixture.id]);
     for (let cut = 0; cut <= stream.byteLength; cut += 1) {
       const decoder = new FrameDecoder();
-      const messages = [
-        ...decoder.push(stream.subarray(0, cut)),
-        ...decoder.push(stream.subarray(cut)),
-      ];
-      assert.equal(messages.length, fixtures.length, `cut at ${cut}`);
-      assert.ok(decoder.retainedBytes <= C.MSIZE_CEILING);
-      assert.equal(decoder.retainedBytes, 0);
+      const first = decoder.push(stream.subarray(0, cut));
+      // Asserted after the FIRST push, where it is not vacuous: the decoder is
+      // mid-frame for most cuts and is genuinely holding a partial frame.
+      assert.ok(
+        decoder.retainedBytes <= C.MSIZE_CEILING,
+        `retained ${decoder.retainedBytes} at cut ${cut}`,
+      );
+      const messages = [...first, ...decoder.push(stream.subarray(cut))];
+      assert.deepEqual(messages, expected, `cut at ${cut}`);
+      assert.equal(decoder.retainedBytes, 0, `nothing retained after cut ${cut}`);
     }
+  });
+
+  it('holds a genuinely partial frame at a mid-frame cut, so the bound above is not vacuous', () => {
+    // The largest fixture is `twrite` at 279 bytes; cutting inside it leaves
+    // real retained bytes rather than zero.
+    const cut = stream.byteLength - 100;
+    const decoder = new FrameDecoder();
+    decoder.push(stream.subarray(0, cut));
+    assert.ok(decoder.retainedBytes > 0, 'expected the decoder to be mid-frame');
+    assert.ok(decoder.retainedBytes <= C.MSIZE_CEILING);
   });
 
   it('decodes identically one byte at a time', () => {

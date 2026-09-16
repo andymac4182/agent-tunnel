@@ -30,10 +30,18 @@ export const VERSION = '9P2000.L';
 export const MAXWELEM = 16;
 
 /**
- * `Rread`'s own framing cost beyond the data: `size[4] type[1] tag[2] count[4]`.
- * A `Tread` asking for `count` bytes implies a reply of `count + 11`.
+ * A counted reply's framing cost beyond its data: `size[4] type[1] tag[2]
+ * count[4]`. A `Tread` or `Treaddir` asking for `count` bytes implies a reply
+ * of `count + 11`.
  */
-export const READ_REPLY_OVERHEAD = HEADER_BYTES + 4;
+export const COUNTED_REPLY_OVERHEAD = HEADER_BYTES + 4;
+
+/**
+ * A `Twrite`'s framing cost beyond its data: the header plus `fid[4]
+ * offset[8] count[4]`. An `Rwrite` may not acknowledge more bytes than a
+ * `Twrite` could have carried in the first place.
+ */
+export const WRITE_REQUEST_OVERHEAD = HEADER_BYTES + 16;
 
 /** The 41 message types of the profile, name to opcode. */
 export const MESSAGE_TYPES = {

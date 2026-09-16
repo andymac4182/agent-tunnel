@@ -66,45 +66,129 @@ socket: `msize` negotiation at 255/256/65,536/65,537; the three size checks in
 their fixed order, including the consequence that at `msize` 65,536 a frame one
 byte above reports the *ceiling* rather than the negotiated bound; a frame
 exactly at `msize` and one byte above at four `msize` values in both directions;
-`count[4]` leaving room for its own framing; `MAXWELEM` at 16 and 17 with the
-declared count checked before anything is reserved; the `NOTAG` rules on encode
-and decode; all 215 non-profile opcodes; the closed fourteen-code `Rlerror`
-vocabulary; all 256 qid type bytes; the `.L` flag and mask sets; and
-malformed-frame rejection — truncation at every cut, trailing bytes, two messages
-in one binary message, a declared size disagreeing with the buffer, and the
-stream decoder latching its first framing error.
+`count[4]` leaving room for its own framing, at the limit and one beyond, for
+`Tread`, `Treaddir` and `Rwrite` at three `msize` values, through `encode` and
+`decodeExact` rather than a helper; `MAXWELEM` at 16 and 17 with the declared
+count checked before anything is reserved; the `NOTAG` rules on encode and
+decode; all 215 non-profile opcodes; the closed fourteen-code `Rlerror`
+vocabulary; all 256 qid type bytes; and malformed-frame rejection — truncation at
+every cut, trailing bytes, two messages in one binary message, a declared size
+disagreeing with the buffer, a short buffer judged by its own declared size, and
+the stream decoder latching its first framing error.
+
+**The `.L` flag and mask sets**, in `src/ninep/profile.ts` rather than in the
+codec, because they are answered with an `Rlerror` on the request's own tag and
+not with a close. See the Result section.
+
+**Writer range checks**: every integer refused above its field's width rather
+than silently truncated, and every field accepted at its exact width.
+
+**Field layout, independent of the fixtures**: `Rgetattr`, `Tsetattr` and
+`Tattach` encoded with all-distinct sentinels and asserted byte by byte at the
+offsets the 9P2000.L definition gives, covering the same-valued field pairs no
+fixture comparison on either side can distinguish.
 
 **The UTF-8 refusal**, by field and never by substitution: five invalid
 sequences (lone continuation, unfinished sequence, overlong, surrogate half, a
 byte never valid in UTF-8) against a request name, an `Rreadlink` target and a
-name inside an `Rreaddir` block, with an assertion that U+FFFD never appears,
-and a check that `Rread` data is left alone because it is content, not text.
+name inside an `Rreaddir` block, asserting that no string is returned at all —
+and, separately, that a legitimately encoded U+FFFD *does* decode, so the
+refusal is not an unreachable path. Plus a check that `Rread` data is left alone
+because it is content, not text.
 
 **The whole corpus as a tunnel byte stream**, decoded whole, at every single
-split point, and one byte at a time, with the retained-byte bound asserted.
+split point and one byte at a time, with every message deep-compared against the
+expectation table at every cut, and the retained-byte bound asserted after the
+first push, where the decoder is genuinely holding a partial frame.
 
 ## Result
 
 The two implementations agree on all 43 fixtures, in both directions, field for
 field and byte for byte.
 
-One difference was found, and it is a difference of *diagnostic*, not of wire
-format. This implementation first classified `Tlerror` (6) and `Terror` (106) as
-known-but-not-in-profile opcodes; the Rust's `KNOWN_OUTSIDE_PROFILE` holds 25
-entries and omits both. The Rust is right — 6 and 106 are reserved numbering
-slots beside `Rlerror` (7) and `Rerror` (107), not messages any peer can send,
-so answering "you reached for a real opcode the profile denies" would name a
-message that does not exist. Both codecs refuse such a frame and both close with
-1002. This side was aligned and the reasoning kept on the constant rather than
-the difference erased.
+**Two differences were found. One is a diagnostic; the other was wire-visible
+and is fixed.**
 
-Four defects were found in **this** implementation while the cross-check was
-being brought up, all before any fixture was trusted: `name` was used as both
-the message-type discriminator and the 9P `name[s]` field, which silently
-overwrote the discriminator on the eight messages carrying both (the
-discriminator is now `kind`), and three hand-transcription errors in
-`test/expected.ts` and the boundary expectations. None were defects in the Rust
-codec or in the fixtures.
+**Wire-visible: where a denied `.L` flag is refused.** This client first checked
+the `Tlopen` flag set and the `Tsetattr`/`Tgetattr`/`Tunlinkat` masks *inside*
+the codec, where every failure is a `NinepError` — which this client's own
+taxonomy defines as a framing failure answered by closing with 1002. In
+`crates/tunnel-fs-ninep` those checks live in `session.rs`, not the codec: a
+`Tlopen` carrying `O_CREAT` decodes cleanly and the session answers
+`Rlerror(ENOTSUP)` on its own tag and **stays open**. The contract names "a flag
+the profile denies" among the refusals a correct client can recover from, so the
+Rust is right and this side would have torn down a session carrying other
+outstanding tags. Fixed by layering: the codec now decodes `flags[4]` and the
+mask words as opaque integers, and the rules moved to `src/ninep/profile.ts`
+behind a separate `ProfileRefusal` type that carries the errno an `Rlerror`
+would. A test asserts a denied flag decodes cleanly and that its refusal is not
+a `NinepError`.
+
+**Diagnostic only: two reserved opcode slots.** This implementation first
+classified `Tlerror` (6) and `Terror` (106) as known-but-not-in-profile opcodes;
+the Rust's `KNOWN_OUTSIDE_PROFILE` holds 25 entries and omits both. The Rust is
+right — 6 and 106 are reserved numbering slots beside `Rlerror` (7) and `Rerror`
+(107), not messages any peer can send, so answering "you reached for a real
+opcode the profile denies" would name a message that does not exist. Both codecs
+refuse such a frame and both close with 1002. This side was aligned and the
+reasoning kept on the constant rather than the difference erased.
+
+### Defects found in this implementation
+
+All were in the TypeScript; none in the Rust codec or in the fixtures.
+
+* **The `count[4]` framing rule was documented and unenforced.** `checkReadCount`
+  existed, was exported, was described in this README and in the task row — and
+  was never called from the codec. A `Tread` with `count` 0xffffffff decoded at
+  `msize` 4096, a `Treaddir` with `count` 4096 was accepted at `msize` 4096, and
+  an `Rwrite` acknowledging 0xffffffff bytes was accepted at `msize` 256. The
+  Rust refuses all three at both ends. It is now applied in `encode` and in
+  `decodeExact`/`FrameDecoder` with `msize` threaded through, for `Tread` and
+  `Treaddir` at overhead 11 and `Rwrite` at overhead 23, and tested at the limit
+  and one beyond through the real entry points rather than a helper.
+* **`Writer` truncated out-of-range integers silently.** `u32(2 ** 32)`,
+  `u32(-1)`, `u16(70000)`, `u64(-1n)` and a qid version of `2 ** 32` all
+  encoded, so `encode(x)` could decode to something other than `x` and a
+  `Tclunk` with `fid: -1` quietly became `NOFID`. That also hollowed out the
+  "encoded from the expectation table alone" argument, since a table entry wrong
+  *above* a field's width would still match the fixture. Every integer write is
+  now range-checked and throws a typed `FieldOutOfRange` naming the field.
+* **The split-point test compared only message counts.** It asserted
+  `messages.length` per cut and never content, so a subarray or byteOffset bug
+  yielding wrong-but-complete frames would have passed while this README claimed
+  the corpus "decodes identically at every single split point". It now deep-equals
+  every message against the expectation table at every cut, and asserts the
+  retained-byte bound after the *first* push, where the decoder is genuinely
+  mid-frame rather than empty.
+* **`name` was used as both the message-type discriminator and the 9P `name[s]`
+  field**, silently overwriting the discriminator on the eight messages carrying
+  both. The discriminator is now `kind`.
+* Three hand-transcription errors in `test/expected.ts` and the boundary
+  expectations, described under "How the expectation table was built" below.
+
+### How the expectation table was built
+
+`test/expected.ts` was transcribed **by hand from the fixtures' own hex bytes**,
+laid out against the field order in the 9P2000.L definition, with the fixture
+headers and `fixtures/README.md` supplying the type, tag, length and the
+properties the bytes pin. It was **not** read from
+`crates/tunnel-fs-ninep/tests/common/mod.rs`, which was never opened, and not
+dumped from this decoder's output. It coincides with the Rust fixture source
+because the bytes are the same bytes.
+
+It is a hand transcription and four entries were wrong on the first run
+(`Tsetattr`'s `size` read as 4 where the bytes say 1024; the wide name's UTF-16
+and code-point counts each off by one; and a flag-check ordering expectation).
+That bounds what the table proves: a careful reading of the bytes, not a source
+independent of them.
+
+**It cannot catch a transposition between two fields holding the same value in
+the fixture** — `Rgetattr`'s `uid` and `gid` are both 1000, `Tsetattr`'s are both
+0, its `atimeNsec` and `mtimeNsec` are both 0, `Tattach`'s `uname` and `aname`
+are both empty. Such a swap is invisible here *and* in the Rust's own fixture
+comparison. `boundaries.test.ts` therefore carries fixture-independent layout
+tests that encode `Rgetattr`, `Tsetattr` and `Tattach` with all-distinct
+sentinels and assert the bytes at the offsets the spec gives.
 
 ## What is not proven here
 

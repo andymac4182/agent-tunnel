@@ -76,7 +76,17 @@ export class Reader {
   }
 }
 
-/** A growing little-endian writer. */
+/**
+ * A growing little-endian writer.
+ *
+ * Every integer is range-checked before it is written. `DataView` truncates
+ * silently — `setUint32(0, 2 ** 32)` stores zero and `setUint32(0, -1)` stores
+ * `0xffffffff` — so without these checks `encode(message)` could produce bytes
+ * that decode to something *other than* `message`, and a `Tclunk` with
+ * `fid: -1` would quietly become `NOFID`. That would also hollow out the
+ * "encoded from the expectation table alone" half of the fixture cross-check:
+ * a table entry wrong above the field's width would still match the fixture.
+ */
 export class Writer {
   private chunks: Uint8Array[] = [];
   private length = 0;
@@ -90,25 +100,37 @@ export class Writer {
     return this.length;
   }
 
-  u8(value: number): void {
+  private checkUnsigned(value: number, bits: number, field: string): void {
+    if (!Number.isInteger(value) || value < 0 || value > 2 ** bits - 1) {
+      fail('FieldOutOfRange', field);
+    }
+  }
+
+  u8(value: number, field = 'u8'): void {
+    this.checkUnsigned(value, 8, field);
     const out = new Uint8Array(1);
     new DataView(out.buffer).setUint8(0, value);
     this.push(out);
   }
 
-  u16(value: number): void {
+  u16(value: number, field = 'u16'): void {
+    this.checkUnsigned(value, 16, field);
     const out = new Uint8Array(2);
     new DataView(out.buffer).setUint16(0, value, true);
     this.push(out);
   }
 
-  u32(value: number): void {
+  u32(value: number, field = 'u32'): void {
+    this.checkUnsigned(value, 32, field);
     const out = new Uint8Array(4);
     new DataView(out.buffer).setUint32(0, value, true);
     this.push(out);
   }
 
-  u64(value: bigint): void {
+  u64(value: bigint, field = 'u64'): void {
+    if (typeof value !== 'bigint' || value < 0n || value > 0xffff_ffff_ffff_ffffn) {
+      fail('FieldOutOfRange', field);
+    }
     const out = new Uint8Array(8);
     new DataView(out.buffer).setBigUint64(0, value, true);
     this.push(out);
