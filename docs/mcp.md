@@ -1,6 +1,6 @@
 # MCP adapter plan
 
-Status: M3-01 (pins), M3-02 (device exports over `http-forward/1`) and M3-03 (a real cloud-side client across relays and rotations) are **verified local at `db1da30`, 2026-09-16**, each through `verify-m3-mcp-cloud-client`, which passed 7 of 7 runs at that revision — 3 inside `scripts/m3-harness-verify.sh` and 4 standalone. M3-01 and M3-02 have no gate of their own and rest on that gate plus their unit tests. M3-04 (isolation, correlation, unknown outcomes and revocation) remains **implemented, awaiting verification**: its gate `verify-m3-mcp-isolation` failed 2 of 17 runs at `db1da30` and 2 of 10 at the follow-up commit that gave it a timeout diagnostic; see the M3-04 row in [tasks.md](tasks.md) for what those failures do and do not establish. Gate 5 of the forwarding contract is verified local for MCP only; no ACP or CUA profile exists, and those stay in M8 and M5. Both profiles are proven only against the pinned rmcp 3.4.0 client and the deterministic fixture server — no conformance suite or non-Rust SDK is pinned (M3-17). See [Pinned in code](#pinned-in-code-m3-01-and-m3-02), [Pinned in code (M3-03)](#pinned-in-code-m3-03) and [Pinned in code (M3-04)](#pinned-in-code-m3-04). MCP compatibility is separate from the tunnel wire protocol. The tunnel's control and data WebSockets do not require an external MCP client to support a custom transport.
+Status: M3-01 (pins), M3-02 (device exports over `http-forward/1`) and M3-03 (a real cloud-side client across relays and rotations) are **verified local at `db1da30`, 2026-09-16**, each through `verify-m3-mcp-cloud-client`, which passed 7 of 7 runs at that revision — 3 inside `scripts/m3-harness-verify.sh` and 4 standalone. M3-01 and M3-02 have no gate of their own and rest on that gate plus their unit tests. M3-04 (isolation, correlation, unknown outcomes and revocation) remains **implemented, awaiting verification**. Its gate `verify-m3-mcp-isolation` failed 2 of 17 runs at `db1da30`; owner-side correlation traced that to a product defect in the relay's peer-trust handling rather than to test noise, and the two gaps the row itself named — the Streamable HTTP export's binding over the real cluster, and cross-tenant consumers — are now driven by two new gate cases. The fix for the underlying defect is held back as **M7-C86**, M3-04's named blocker, because it regresses `verify-m7-trust-expiry`. Measured interleaved on one machine with pre-built binaries, `verify-m7-trust-expiry` is **10 of 10 with the retention held back and 6 of 10 with it applied**, and `verify-m3-mcp-isolation` is **10 of 12 without the retention and 12 of 12 with it**. See the M3-04 row in [tasks.md](tasks.md) for the mechanism, what is fixed and what is still open. Gate 5 of the forwarding contract is verified local for MCP only; no ACP or CUA profile exists, and those stay in M8 and M5. Both profiles are proven only against the pinned rmcp 3.4.0 client and the deterministic fixture server — no conformance suite or non-Rust SDK is pinned (M3-17). See [Pinned in code](#pinned-in-code-m3-01-and-m3-02), [Pinned in code (M3-03)](#pinned-in-code-m3-03) and [Pinned in code (M3-04)](#pinned-in-code-m3-04). MCP compatibility is separate from the tunnel wire protocol. The tunnel's control and data WebSockets do not require an external MCP client to support a custom transport.
 
 ## Two explicit compatibility profiles
 
@@ -342,6 +342,18 @@ the device who anyone is.
   recorded its synthetic side effect: `outcome_unknown` at the consumer, the
   side effect recorded exactly once, nothing replayed.
 
+### Proven by M3-04 over the real cluster
+
+The cluster gate `verify-m3-mcp-isolation` drives **both** export kinds. The
+stdio exports carry the `session-isolation` case; the Streamable HTTP export
+carries `streamable-binding`, which is what separates the binding from process
+isolation — one backend process and one session table serve every principal
+there, so a foreign session ID that is refused is refused by the binding and
+by nothing else. A consumer authorized in **another tenant** is driven by the
+`cross-tenant` case against this tenant's device, session and service, and is
+refused before dispatch on every route, indistinguishably from one naming a
+session that never existed.
+
 ### Not proven by M3-04
 
 - **Server→client JSON-RPC requests.** The pinned fixture issues none, so
@@ -349,19 +361,15 @@ the device who anyone is.
   direction is colliding progress tokens and server notifications (M3-13).
   Sampling (`sampling/createMessage`), elicitation, MRTR input requests and
   `subscriptions/listen` are likewise unexercised.
-- **The Streamable HTTP backend's binding over the real cluster.** It is
-  proven through the in-process bridge by `tunnel-mcp-fixture`'s
-  `principal_binding` tests; the cluster gate drives the stdio exports only.
 - Browser `Origin` handling, OAuth protected-resource discovery and audience
   checks at the export (M3-11).
 - `Last-Event-ID` resume of an interrupted legacy stream (M3-10).
-- **Cross-tenant consumers.** Both correlation principals belong to one
-  tenant; tenant separation is M7 admission evidence, not this gate's.
-- **Correlation through one shared backend process.** The 2025-11-25 stdio
-  export gives every session its own child, so its correlation is
-  process-isolated by construction and the gate's colliding IDs prove routing,
-  not shared-process separation. The Streamable HTTP export, where every
-  session shares one backend, is not driven here (M3-13).
+- **Concurrent colliding request IDs through one shared backend process.** The
+  cluster gate's `streamable-binding` case now drives the Streamable HTTP
+  export, where every session shares one backend, for *session* separation;
+  but the colliding JSON-RPC IDs and progress tokens of the `correlation` case
+  still run on the stdio exports only, where each session has its own child.
+  So shared-process *correlation* remains unproven here (M3-13).
 - **Ending a device-side session on revocation.** Revocation makes the session
   unreachable but does not end it, so its child holds a `max_children` slot
   for as long as the device session lives, or until `session_idle_seconds`

@@ -700,6 +700,16 @@ pub enum PeerTransportError {
     /// The authenticated peer failed the role or SPKI check.
     #[error("peer authentication failed: {0}")]
     Authentication(String),
+    /// No approved peer SPKI pins are published, so no peer can be dialled.
+    ///
+    /// This is a pre-dispatch outcome and is deliberately distinct from
+    /// [`Self::Authentication`]: no peer certificate was examined, no socket
+    /// was opened and nothing was written, because the caller's own
+    /// membership coordinator currently publishes no trust evidence at all.
+    /// A caller can therefore report it as `not_dispatched` and, since the
+    /// coordinator republishes on its own bounded schedule, as retryable.
+    #[error("no approved peer SPKI pins are published")]
+    PinsUnavailable,
     /// A request was rejected by the caller-supplied policy.
     #[error("peer request rejected by caller policy")]
     PolicyRejected,
@@ -2251,9 +2261,7 @@ impl PeerClient {
         }
         let current_pins = self.pin_provider.snapshot();
         if current_pins.is_empty() {
-            return Err(PeerTransportError::Authentication(
-                "no approved peer SPKI pins".to_owned(),
-            ));
+            return Err(PeerTransportError::PinsUnavailable);
         }
         let deadline = Instant::now() + self.limits.handshake_timeout;
         let entry = {
@@ -3832,6 +3840,30 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn dialling_with_no_published_pins_is_its_own_typed_refusal() {
+        // M7-C83.  An empty pin snapshot means the caller's membership
+        // coordinator currently publishes no trust evidence at all.  The dial
+        // is refused before a socket is opened or a certificate examined, so
+        // it must not share a variant with a peer that *was* dialled and
+        // failed its SPKI check: a caller that cannot tell them apart has to
+        // report the first as `unknown` too, and deny a safe request the
+        // retry it is entitled to.
+        let endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap())
+            .expect("bind a client endpoint");
+        let client = PeerClient::new_with_pin_provider(
+            endpoint,
+            SharedPeerPins::empty(),
+            PeerTransportLimits::default(),
+        )
+        .expect("client with fail-closed pins");
+        let destination = PeerDestination::new("127.0.0.1:1".parse().unwrap(), "peer.test");
+        assert!(matches!(
+            client.connect(destination).await,
+            Err(PeerTransportError::PinsUnavailable)
+        ));
+    }
 
     #[test]
     fn limits_are_explicit_and_bounded() {

@@ -1096,12 +1096,30 @@ impl MembershipRuntime {
                     return Ok(());
                 }
                 _ = interval.tick() => {
-                    let _ = self.reconcile_once().await;
+                    Self::observe_reconcile(self.reconcile_once().await);
                 }
                 _ = self.wake.notified() => {
-                    let _ = self.reconcile_once().await;
+                    Self::observe_reconcile(self.reconcile_once().await);
                 }
             }
+        }
+    }
+
+    /// Name a failed periodic reconcile once, at warning level.
+    ///
+    /// A reconcile that fails takes this runtime out of `Ready` and
+    /// invalidates every peer admission, which withdraws the transport pin
+    /// set with it. Discarding the result left that transition with no
+    /// operator-visible cause at all, so a peer path that failed closed for a
+    /// few seconds could not be attributed (M7-C83). The typed error names
+    /// signed-membership evidence only: no consumer request, body or
+    /// credential passes through it.
+    fn observe_reconcile(result: Result<MembershipSnapshot, MembershipRuntimeError>) {
+        if let Err(error) = result {
+            tracing::warn!(
+                ?error,
+                "membership reconcile failed; peer admissions and pins fail closed until it recovers"
+            );
         }
     }
 

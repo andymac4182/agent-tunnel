@@ -186,6 +186,9 @@ pub enum PeerFaultCause {
     TransportQuic,
     /// The transport pool or permit budget was exhausted.
     TransportCapacity,
+    /// This relay publishes no approved peer trust evidence, so no peer could
+    /// be dialled.  Nothing was written to any owner.
+    TransportPinsUnavailable,
     /// A bounded body or chunk limit was exceeded.
     TransportBodyLimit,
     /// Any other typed transport failure.
@@ -217,6 +220,43 @@ pub enum PeerFaultCause {
 }
 
 impl PeerFaultCause {
+    /// Every cause, for tables that must enumerate the closed vocabulary.
+    ///
+    /// The C11 capture scanner keeps its own copy of these labels and refuses
+    /// any snapshot carrying one outside it, so the two lists must not drift:
+    /// `harness_peer_fault_causes_match_the_relay_vocabulary` in
+    /// `tunnel-test-harness` compares them, and the exhaustive match in
+    /// `every_cause_is_enumerated` below fails to compile if a variant is
+    /// added without being listed here.
+    pub const ALL: [Self; 26] = [
+        Self::NoLiveOwner,
+        Self::Catalog,
+        Self::Membership,
+        Self::InvalidEndpoint,
+        Self::IdentityMismatch,
+        Self::TransportTimeout,
+        Self::TransportGoAway,
+        Self::TransportCancelled,
+        Self::TransportH3,
+        Self::TransportQuic,
+        Self::TransportCapacity,
+        Self::TransportPinsUnavailable,
+        Self::TransportBodyLimit,
+        Self::TransportOther,
+        Self::Envelope,
+        Self::Frame,
+        Self::RemoteUnauthorized,
+        Self::RemoteForbidden,
+        Self::RemoteStatus,
+        Self::InvalidRoute,
+        Self::UnexpectedRecord,
+        Self::OwnerNotReady,
+        Self::Capacity,
+        Self::MembershipExpired,
+        Self::Closed,
+        Self::Deadline,
+    ];
+
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -231,6 +271,7 @@ impl PeerFaultCause {
             Self::TransportH3 => "transport_h3",
             Self::TransportQuic => "transport_quic",
             Self::TransportCapacity => "transport_capacity",
+            Self::TransportPinsUnavailable => "transport_pins_unavailable",
             Self::TransportBodyLimit => "transport_body_limit",
             Self::TransportOther => "transport_other",
             Self::Envelope => "envelope",
@@ -266,6 +307,7 @@ impl PeerFaultCause {
                 PeerTransportError::H3(_) => Self::TransportH3,
                 PeerTransportError::Quic(_) => Self::TransportQuic,
                 PeerTransportError::Capacity => Self::TransportCapacity,
+                PeerTransportError::PinsUnavailable => Self::TransportPinsUnavailable,
                 PeerTransportError::ChunkTooLarge { .. }
                 | PeerTransportError::BodyTooLarge { .. } => Self::TransportBodyLimit,
                 _ => Self::TransportOther,
@@ -705,6 +747,52 @@ fn diagnostic_now_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    /// Adding a `PeerFaultCause` variant must also add it to
+    /// [`PeerFaultCause::ALL`] and to the C11 scanner's copy of the
+    /// vocabulary in `tunnel-test-harness`; otherwise a relay snapshot
+    /// carrying the new cause is rejected as outside the closed vocabulary
+    /// and `verify-m7-c11-diagnostics` fails at capture time rather than at
+    /// compile time.  The exhaustive match below is the compile-time half.
+    #[test]
+    fn every_cause_is_enumerated() {
+        use super::PeerFaultCause;
+        for cause in PeerFaultCause::ALL {
+            match cause {
+                PeerFaultCause::NoLiveOwner
+                | PeerFaultCause::Catalog
+                | PeerFaultCause::Membership
+                | PeerFaultCause::InvalidEndpoint
+                | PeerFaultCause::IdentityMismatch
+                | PeerFaultCause::TransportTimeout
+                | PeerFaultCause::TransportGoAway
+                | PeerFaultCause::TransportCancelled
+                | PeerFaultCause::TransportH3
+                | PeerFaultCause::TransportQuic
+                | PeerFaultCause::TransportCapacity
+                | PeerFaultCause::TransportPinsUnavailable
+                | PeerFaultCause::TransportBodyLimit
+                | PeerFaultCause::TransportOther
+                | PeerFaultCause::Envelope
+                | PeerFaultCause::Frame
+                | PeerFaultCause::RemoteUnauthorized
+                | PeerFaultCause::RemoteForbidden
+                | PeerFaultCause::RemoteStatus
+                | PeerFaultCause::InvalidRoute
+                | PeerFaultCause::UnexpectedRecord
+                | PeerFaultCause::OwnerNotReady
+                | PeerFaultCause::Capacity
+                | PeerFaultCause::MembershipExpired
+                | PeerFaultCause::Closed
+                | PeerFaultCause::Deadline => {}
+            }
+        }
+        let mut labels: Vec<&str> = PeerFaultCause::ALL.iter().map(|c| c.as_str()).collect();
+        let total = labels.len();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(labels.len(), total, "cause labels must be distinct");
+    }
+
     use super::*;
     use crate::routing::OwnerRoutingError;
     use crate::routing::OwnerScope;

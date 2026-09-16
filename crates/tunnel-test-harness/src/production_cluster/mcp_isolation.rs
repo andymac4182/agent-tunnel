@@ -58,7 +58,7 @@ use tunnel_core::RotationConfig;
 use tunnel_mcp_export::ExportDiagnostics;
 
 use super::http_forward_real_path::{ConsumerStream, connect_consumer, request};
-use super::mcp_cloud_client::wire::{count_lines, fixture_binary_path, wait_file};
+use super::mcp_cloud_client::wire::{HttpBackend, count_lines, fixture_binary_path, wait_file};
 use super::{
     CLEANUP_TIMEOUT, ProductionCluster, RunningHarness, STARTUP_TIMEOUT,
     finish_scenario_with_cleanup, push_cleanup_error,
@@ -78,10 +78,20 @@ pub const PROFILE_2025: &str = "mcp-2025-11-25";
 /// The harness fixture labels of the two stdio services this gate drives.
 const SERVICE_2025: &str = "stdio-2025";
 const SERVICE_2026: &str = "stdio-2026";
+/// The legacy-profile service this gate exports through a **Streamable HTTP**
+/// backend rather than a stdio child.
+///
+/// The stdio export gives every session its own child process, so its session
+/// isolation is partly process isolation.  This backend is one shared process
+/// for every session and every principal, so a session ID presented by the
+/// wrong principal is separated by the principal binding alone.
+const SERVICE_HTTP_2025: &str = "http-2025";
 /// The cases, in order.
-pub const MCP_ISOLATION_CASES: [&str; 6] = [
+pub const MCP_ISOLATION_CASES: [&str; 8] = [
     "binding-forgery",
     "session-isolation",
+    "streamable-binding",
+    "cross-tenant",
     "correlation",
     "revocation",
     "rotation-span",
@@ -149,13 +159,11 @@ pub const REVOCATION_WITHDRAWAL_BOUND: Duration = Duration::from_secs(5);
 const MEMBERSHIP_RESIGN_SPACING: Duration = Duration::from_secs(15);
 
 /// What this gate does not prove.  Recorded rather than faked.
-pub const NOT_COVERED: [&str; 6] = [
+pub const NOT_COVERED: [&str; 4] = [
     "server-to-client JSON-RPC requests (sampling/createMessage, elicitation/create, MRTR input): the pinned fixture issues none, so colliding server-to-client request IDs are unproven (M3-13)",
     "Origin validation and the MCP authorization profile, including token audience checks at the export (M3-11)",
     "Last-Event-ID resume of an interrupted legacy stream (M3-10)",
-    "principal binding for a Streamable HTTP backend over the real cluster: proven in tunnel-mcp-fixture's principal_binding tests through the in-process bridge, not here",
-    "cross-tenant consumers: both correlation principals are of one tenant, and tenant separation is M7 admission evidence",
-    "correlation through one shared backend process: the 2025-11-25 stdio export gives each session its own child, so its correlation is process-isolated by construction; the Streamable HTTP export, where every session shares one backend, is not driven here (M3-13)",
+    "concurrent colliding request IDs through one shared backend process: the streamable-binding case drives the shared Streamable HTTP backend for session separation, but the correlation case's colliding IDs and progress tokens are driven on the stdio exports only (M3-13)",
 ];
 
 // ---- evidence ---------------------------------------------------------------
@@ -200,6 +208,86 @@ pub struct IsolationEvidence {
     /// Child processes the device spawned during the case: one per session,
     /// never one for a refused request.
     pub children_spawned: u64,
+}
+
+/// `streamable-binding`.
+///
+/// The same principal-binding rule as `session-isolation`, driven over the
+/// real cluster against a **Streamable HTTP** backend instead of a stdio
+/// child.  This is the case that separates the binding from *process*
+/// isolation: one backend process serves every session here, so a foreign
+/// session ID cannot be refused by a process boundary.  What refuses it is
+/// the export's own principal-binding table (`SessionBindings::permits`),
+/// before the backend is dialled.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct StreamableBindingEvidence {
+    /// The backend really was the shared Streamable HTTP one: the export
+    /// started **no per-session child process**, because a Streamable HTTP
+    /// backend is an address the export forwards to.
+    ///
+    /// The export does keep a per-session table of its own — the principal
+    /// bindings it refuses a foreign principal from — and that table is the
+    /// point of the case, not something it rules out.  What is ruled out is a
+    /// process boundary, and the backend itself doing the refusing.  The
+    /// counter below reads zero for a different reason: it counts stdio
+    /// sessions and is never incremented for this backend kind.
+    pub shared_backend: bool,
+    /// Both principals' sessions came from that one backend and differ.
+    pub sessions_distinct: bool,
+    /// A's session ID presented by B: POST, GET and DELETE statuses.
+    pub foreign_post_status: u16,
+    pub foreign_get_status: u16,
+    pub foreign_delete_status: u16,
+    /// B's answer for A's session is indistinguishable from its answer for a
+    /// session that never existed, field for field.
+    pub foreign_matches_unknown: bool,
+    /// Both principals' own sessions still answered exactly afterwards.
+    pub owner_still_served: bool,
+    pub sibling_still_served: bool,
+    /// The export's stdio session counter during the case.  Zero: it counts
+    /// stdio sessions only and is never incremented for a Streamable HTTP
+    /// backend.  It is *not* evidence that the export tracks no session
+    /// state — it tracks principal bindings, which is what refuses the
+    /// foreign principal.
+    pub sessions_opened: u64,
+    /// How many of those two each owning principal ended itself, counted by
+    /// the session becoming unusable afterwards rather than by a status.
+    pub sessions_ended: usize,
+}
+
+/// `cross-tenant`.
+///
+/// A consumer authenticated and authorized in another tenant drives this
+/// tenant's device and service.  Nothing it sends may reach the device, this
+/// tenant's MCP session, or any answer that distinguishes an existing session
+/// from an absent one.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CrossTenantEvidence {
+    /// The foreign principal really is of the other tenant.
+    pub foreign_tenant: bool,
+    /// Opening a fresh session on this tenant's export: status and typed
+    /// outcome.
+    pub initialize_status: u16,
+    pub initialize_code: String,
+    pub initialize_execution: String,
+    /// Presenting this tenant's live session ID on POST, GET and DELETE.
+    pub session_post_status: u16,
+    pub session_get_status: u16,
+    pub session_delete_status: u16,
+    /// Every one of those was refused, and every refusal was the same typed
+    /// answer as the request that named no session at all: a foreign tenant
+    /// learns nothing about whether the session exists.
+    pub refused: usize,
+    pub attempts: usize,
+    pub uniform_refusal: bool,
+    /// Device dispatches and export sessions gained while the foreign tenant
+    /// was driving: zero of each.
+    pub dispatched: u64,
+    pub sessions_opened: u64,
+    /// The device exchange log did not grow, so nothing reached the device.
+    pub device_exchanges: u64,
+    /// This tenant's own session still answered exactly afterwards.
+    pub tenant_session_served: bool,
 }
 
 /// `correlation`.
@@ -330,8 +418,12 @@ pub struct McpIsolationEvidence {
     pub device_sessions: usize,
     /// The reused session's highest OPEN journal occupancy (M7-C82).
     pub journal_entries_peak: usize,
+    /// Principals of another tenant the gate drove against this tenant.
+    pub foreign_tenant_principals: usize,
     pub forgery: ForgeryEvidence,
     pub isolation: IsolationEvidence,
+    pub streamable_binding: StreamableBindingEvidence,
+    pub cross_tenant: CrossTenantEvidence,
     pub correlation: CorrelationEvidence,
     pub revocation: RevocationEvidence,
     pub rotation_span: RotationSpanEvidence,
@@ -361,6 +453,8 @@ pub struct McpIsolationEvidence {
 #[allow(clippy::too_many_lines)]
 pub fn validate_mcp_isolation_evidence(evidence: &McpIsolationEvidence) -> Result<()> {
     let isolation = &evidence.isolation;
+    let streamable = &evidence.streamable_binding;
+    let cross_tenant = &evidence.cross_tenant;
     let correlation = &evidence.correlation;
     let revocation = &evidence.revocation;
     let rotation = &evidence.rotation_span;
@@ -379,7 +473,7 @@ pub fn validate_mcp_isolation_evidence(evidence: &McpIsolationEvidence) -> Resul
             && (500..=599).contains(&outcome.status)
     };
     let forgery = &evidence.forgery;
-    let checks: [(&str, bool); 34] = [
+    let checks: [(&str, bool); 45] = [
         ("three relays ran", evidence.relay_count == 3),
         (
             "the ingress was not the owner",
@@ -444,6 +538,56 @@ pub fn validate_mcp_isolation_evidence(evidence: &McpIsolationEvidence) -> Resul
         (
             "exactly one session and one child per principal, and none for a refusal",
             isolation.sessions_opened == 2 && isolation.children_spawned == 2,
+        ),
+        (
+            "the Streamable HTTP binding case ran against one shared backend, not a child per session",
+            streamable.shared_backend && streamable.sessions_distinct,
+        ),
+        (
+            "a Streamable HTTP session ID is refused for another principal on every route",
+            streamable.foreign_post_status == 404
+                && streamable.foreign_get_status == 404
+                && streamable.foreign_delete_status == 404,
+        ),
+        (
+            "that refusal is indistinguishable from an unknown Streamable HTTP session",
+            streamable.foreign_matches_unknown,
+        ),
+        (
+            "both Streamable HTTP sessions were still served exactly afterwards",
+            streamable.owner_still_served && streamable.sibling_still_served,
+        ),
+        (
+            "each principal ended its own Streamable HTTP session, and it was then unusable",
+            streamable.sessions_ended == 2,
+        ),
+        (
+            "the cross-tenant case was driven by a principal of another tenant",
+            evidence.foreign_tenant_principals == 1 && cross_tenant.foreign_tenant,
+        ),
+        (
+            "a cross-tenant consumer could not open a session on this tenant's export",
+            (400..500).contains(&cross_tenant.initialize_status)
+                && cross_tenant.initialize_execution == "not_dispatched"
+                && !cross_tenant.initialize_code.is_empty(),
+        ),
+        (
+            "a cross-tenant consumer was refused, before dispatch, on every route it tried",
+            cross_tenant.attempts == 7 && cross_tenant.refused == cross_tenant.attempts,
+        ),
+        (
+            "a cross-tenant refusal never reveals whether the named session exists",
+            cross_tenant.uniform_refusal,
+        ),
+        (
+            "nothing a cross-tenant consumer sent reached the device or opened a session",
+            cross_tenant.dispatched == 0
+                && cross_tenant.sessions_opened == 0
+                && cross_tenant.device_exchanges == 0,
+        ),
+        (
+            "this tenant's own session was untouched by the cross-tenant attempts",
+            cross_tenant.tenant_session_served,
         ),
         (
             "both principals ran the full set of colliding calls",
@@ -631,9 +775,30 @@ impl Answer {
         if text.trim_start().starts_with('{') {
             return serde_json::from_str(text).into_iter().collect();
         }
+        // One SSE event is a block of fields, and `data:` is only one of
+        // them.
+        //
+        // Events are split on a blank line written as `\n\n`.  A server that
+        // terminated events with `\r\n\r\n` would collapse into one block
+        // here; the pinned rmcp server and the fixture both use `\n\n`, and
+        // no gate drives a `\r\n` server, so this is recorded rather than
+        // handled.  The stdio export happens to put `data:` last, but a
+        // Streamable HTTP backend follows it with `id:` and `retry:`, so
+        // treating the whole block after `data: ` as the payload dropped
+        // every message the shared backend sent.  Join this event's `data:`
+        // lines, as the SSE grammar says to, and ignore the rest.
         text.split("\n\n")
-            .filter_map(|event| event.strip_prefix("data: "))
-            .filter_map(|data| serde_json::from_str(data).ok())
+            .filter_map(|event| {
+                let data = event
+                    .lines()
+                    .filter_map(|line| {
+                        line.strip_prefix("data:")
+                            .map(|value| value.strip_prefix(' ').unwrap_or(value))
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                serde_json::from_str(&data).ok()
+            })
             .collect()
     }
 
@@ -1403,6 +1568,319 @@ impl Gate<'_> {
         Ok((evidence, alice_session, bob_session))
     }
 
+    // ---- case: Streamable HTTP principal binding ---------------------------
+
+    /// The same binding rule as `session_isolation`, over the real cluster
+    /// against the Streamable HTTP export.
+    ///
+    /// M3-04 previously proved this export's binding only through
+    /// `tunnel-mcp-fixture`'s in-process bridge.  Driving it here puts the
+    /// whole path under it — non-owner ingress, the peer HTTP/3 hop, the
+    /// owner actor, the rotating device WebSocket and the device's export —
+    /// and, because one backend process serves every session on this export,
+    /// removes the stdio case's per-session child as an alternative
+    /// explanation for a foreign session ID being refused.
+    async fn streamable_binding(
+        &mut self,
+        alice: &Consumer,
+        bob: &Consumer,
+    ) -> Result<StreamableBindingEvidence> {
+        let uri = self.uri(SERVICE_HTTP_2025);
+        let before = self.export(SERVICE_HTTP_2025);
+        let mut evidence = StreamableBindingEvidence::default();
+        let alice_session = self.open_session(alice, &uri).await?;
+        let bob_session = self.open_session(bob, &uri).await?;
+        evidence.sessions_distinct = alice_session != bob_session;
+
+        let list =
+            Bytes::from(json!({"jsonrpc": "2.0", "id": 21, "method": "tools/list"}).to_string());
+        let absent_id = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        fn get_headers(session: &str) -> Vec<(&str, &str)> {
+            vec![
+                ("accept", "text/event-stream"),
+                ("mcp-protocol-version", "2025-11-25"),
+                (tunnel_mcp::headers::MCP_SESSION_ID, session),
+            ]
+        }
+        fn delete_headers(session: &str) -> Vec<(&str, &str)> {
+            vec![
+                ("mcp-protocol-version", "2025-11-25"),
+                (tunnel_mcp::headers::MCP_SESSION_ID, session),
+            ]
+        }
+
+        let foreign = bob
+            .send(
+                "POST",
+                &uri,
+                &legacy_headers(Some(&alice_session)),
+                body_stream(list.clone()),
+            )
+            .await?;
+        let absent = bob
+            .send(
+                "POST",
+                &uri,
+                &legacy_headers(Some(absent_id)),
+                body_stream(list.clone()),
+            )
+            .await?;
+        evidence.foreign_post_status = foreign.status;
+
+        let foreign_get = bob
+            .send("GET", &uri, &get_headers(&alice_session), empty())
+            .await?;
+        let absent_get = bob
+            .send("GET", &uri, &get_headers(absent_id), empty())
+            .await?;
+        evidence.foreign_get_status = foreign_get.status;
+
+        let foreign_delete = bob
+            .send("DELETE", &uri, &delete_headers(&alice_session), empty())
+            .await?;
+        let absent_delete = bob
+            .send("DELETE", &uri, &delete_headers(absent_id), empty())
+            .await?;
+        evidence.foreign_delete_status = foreign_delete.status;
+        evidence.foreign_matches_unknown = foreign.indistinguishable_from(&absent)
+            && foreign_get.indistinguishable_from(&absent_get)
+            && foreign_delete.indistinguishable_from(&absent_delete);
+
+        let exact = |answer: &Answer| {
+            answer.status == 200
+                && answer.final_message().is_some_and(|message| {
+                    id_matches(&message, "21") && message["result"].is_object()
+                })
+        };
+        let alice_answer = alice
+            .send(
+                "POST",
+                &uri,
+                &legacy_headers(Some(&alice_session)),
+                body_stream(list.clone()),
+            )
+            .await?;
+        evidence.owner_still_served = exact(&alice_answer);
+        let bob_answer = bob
+            .send(
+                "POST",
+                &uri,
+                &legacy_headers(Some(&bob_session)),
+                body_stream(list),
+            )
+            .await?;
+        evidence.sibling_still_served = exact(&bob_answer);
+
+        let after = self.export(SERVICE_HTTP_2025);
+        evidence.sessions_opened = after.sessions_opened - before.sessions_opened;
+        // A Streamable HTTP backend is an address the export forwards to, not
+        // a process it starts.  If the export had spawned a child here it
+        // would be a stdio backend and this case would prove nothing the
+        // stdio case does not.
+        evidence.shared_backend =
+            after.children_spawned == before.children_spawned && evidence.sessions_opened == 0;
+
+        // Each principal ends its own session, and the end is checked by the
+        // session becoming unusable rather than by a status code: the shared
+        // backend acknowledges a DELETE with 202, not the stdio export's 204,
+        // and an acknowledgement is not evidence that the session is gone.
+        for (consumer, session) in [(alice, &alice_session), (bob, &bob_session)] {
+            let deleted = consumer
+                .send("DELETE", &uri, &delete_headers(session), empty())
+                .await?;
+            let after = consumer
+                .send(
+                    "POST",
+                    &uri,
+                    &legacy_headers(Some(session)),
+                    body_stream(Bytes::from(
+                        json!({"jsonrpc": "2.0", "id": 22, "method": "tools/list"}).to_string(),
+                    )),
+                )
+                .await?;
+            if (200..300).contains(&deleted.status) && after.status == 404 {
+                evidence.sessions_ended += 1;
+            } else {
+                eprintln!(
+                    "MCP isolation gate: {} could not end its Streamable HTTP session: delete {} reuse {}",
+                    consumer.label, deleted.status, after.status
+                );
+            }
+        }
+
+        if evidence.foreign_post_status != 404
+            || evidence.foreign_get_status != 404
+            || evidence.foreign_delete_status != 404
+        {
+            return Err(HarnessError::Process(format!(
+                "a Streamable HTTP session ID was accepted for another principal: post {} get {} delete {}",
+                evidence.foreign_post_status,
+                evidence.foreign_get_status,
+                evidence.foreign_delete_status
+            )));
+        }
+        Ok(evidence)
+    }
+
+    // ---- case: cross-tenant consumers --------------------------------------
+
+    /// A consumer authenticated and authorized in another tenant drives this
+    /// tenant's device and MCP session.
+    ///
+    /// Tenant separation is proven for the echo path by the M7 admission
+    /// gates, but M3-04 never drove it for an MCP export, where a session ID
+    /// is an extra handle a foreign tenant could try.  Nothing here may reach
+    /// the device, and every refusal must be the same typed answer whether or
+    /// not the session named actually exists — otherwise the refusal itself
+    /// tells a foreign tenant which of this tenant's sessions are live.
+    async fn cross_tenant(
+        &mut self,
+        foreign: &Consumer,
+        tenant: &Consumer,
+        tenant_session: &str,
+        foreign_tenant_id: uuid::Uuid,
+    ) -> Result<CrossTenantEvidence> {
+        let uri = self.uri(SERVICE_2025);
+        let service = self
+            .services
+            .get(SERVICE_2025)
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        let before = self.export(SERVICE_2025);
+        let dispatched_before = before.dispatched;
+        let exchanges_before = self.highest_device_stream(&service);
+        let mut evidence = CrossTenantEvidence {
+            foreign_tenant: foreign_tenant_id != self.tenant_id,
+            ..CrossTenantEvidence::default()
+        };
+
+        let list =
+            Bytes::from(json!({"jsonrpc": "2.0", "id": 31, "method": "tools/list"}).to_string());
+        let absent_id = "dddddddddddddddddddddddddddddddd";
+        let mut answers = Vec::new();
+
+        // Opening a fresh session: the foreign tenant has no grant for this
+        // device at all, so this is refused before any session exists.
+        let initialize = foreign
+            .send(
+                "POST",
+                &uri,
+                &legacy_headers(None),
+                body_stream(initialize_body()),
+            )
+            .await?;
+        evidence.initialize_status = initialize.status;
+        let (code, execution) = initialize.error();
+        evidence.initialize_code = code;
+        evidence.initialize_execution = execution;
+        answers.push(initialize);
+
+        // This tenant's live session ID, then one that never existed, on
+        // every legacy route.  The pairs must be indistinguishable.
+        let post_live = foreign
+            .send(
+                "POST",
+                &uri,
+                &legacy_headers(Some(tenant_session)),
+                body_stream(list.clone()),
+            )
+            .await?;
+        let post_absent = foreign
+            .send(
+                "POST",
+                &uri,
+                &legacy_headers(Some(absent_id)),
+                body_stream(list.clone()),
+            )
+            .await?;
+        evidence.session_post_status = post_live.status;
+        fn get_headers(session: &str) -> Vec<(&str, &str)> {
+            vec![
+                ("accept", "text/event-stream"),
+                ("mcp-protocol-version", "2025-11-25"),
+                (tunnel_mcp::headers::MCP_SESSION_ID, session),
+            ]
+        }
+        fn delete_headers(session: &str) -> Vec<(&str, &str)> {
+            vec![
+                ("mcp-protocol-version", "2025-11-25"),
+                (tunnel_mcp::headers::MCP_SESSION_ID, session),
+            ]
+        }
+        let get_live = foreign
+            .send("GET", &uri, &get_headers(tenant_session), empty())
+            .await?;
+        let get_absent = foreign
+            .send("GET", &uri, &get_headers(absent_id), empty())
+            .await?;
+        evidence.session_get_status = get_live.status;
+        let delete_live = foreign
+            .send("DELETE", &uri, &delete_headers(tenant_session), empty())
+            .await?;
+        let delete_absent = foreign
+            .send("DELETE", &uri, &delete_headers(absent_id), empty())
+            .await?;
+        evidence.session_delete_status = delete_live.status;
+
+        evidence.uniform_refusal = post_live.indistinguishable_from(&post_absent)
+            && get_live.indistinguishable_from(&get_absent)
+            && delete_live.indistinguishable_from(&delete_absent);
+        answers.extend([
+            post_live,
+            post_absent,
+            get_live,
+            get_absent,
+            delete_live,
+            delete_absent,
+        ]);
+
+        evidence.attempts = answers.len();
+        evidence.refused = answers
+            .iter()
+            .filter(|answer| {
+                let (_, execution) = answer.error();
+                // Refused, and refused before anything was dispatched: a
+                // foreign tenant must never receive an `unknown` outcome,
+                // because that would mean the relay could not rule out that
+                // its request reached this tenant's device.
+                (400..500).contains(&answer.status) && execution == "not_dispatched"
+            })
+            .count();
+
+        let after = self.export(SERVICE_2025);
+        evidence.dispatched = after.dispatched.saturating_sub(dispatched_before);
+        evidence.sessions_opened = after.sessions_opened - before.sessions_opened;
+        evidence.device_exchanges = self
+            .highest_device_stream(&service)
+            .saturating_sub(exchanges_before);
+
+        // This tenant's own session is untouched by all of it.
+        let served = tenant
+            .send(
+                "POST",
+                &uri,
+                &legacy_headers(Some(tenant_session)),
+                body_stream(list),
+            )
+            .await?;
+        evidence.tenant_session_served = served.status == 200
+            && served
+                .final_message()
+                .is_some_and(|message| id_matches(&message, "31") && message["result"].is_object());
+
+        if evidence.refused != evidence.attempts {
+            return Err(HarnessError::Process(format!(
+                "a cross-tenant consumer was not refused before dispatch on every route: {} of {} refused, initialize {} {} {}",
+                evidence.refused,
+                evidence.attempts,
+                evidence.initialize_status,
+                evidence.initialize_code,
+                evidence.initialize_execution
+            )));
+        }
+        Ok(evidence)
+    }
+
     // ---- case: correlation --------------------------------------------------
 
     async fn correlation(
@@ -1866,19 +2344,24 @@ impl Gate<'_> {
         let uri = self.uri(SERVICE_2025);
         let before = self.invocations(SERVICE_2025, "gate");
         let body = call_body("6", "gate", &json!({"label": label}), None);
+        // How long the consumer's POST stayed outstanding is itself evidence:
+        // it separates an immediate pin-watcher close from a handshake or
+        // idle deadline.  Diagnostics only, on the failure path.
+        let issued = Instant::now();
         let call = {
             let consumer = consumer.clone();
             let uri = uri.clone();
             let session = session.to_owned();
             tokio::spawn(async move {
-                consumer
+                let answered = consumer
                     .send(
                         "POST",
                         &uri,
                         &legacy_headers(Some(&session)),
                         body_stream(body),
                     )
-                    .await
+                    .await;
+                (answered, issued.elapsed())
             })
         };
         let service = self
@@ -1900,14 +2383,18 @@ impl Gate<'_> {
             // turn a failing run green.
             let mut call = call;
             let observed = match timeout(OUTCOME_STATUS_GRACE, &mut call).await {
-                Ok(Ok(Ok(answer))) => {
+                Ok(Ok((Ok(answer), latency))) => {
                     let (code, execution) = answer.error();
                     format!(
-                        "consumer status {} code={code:?} execution={execution:?}",
-                        answer.status
+                        "consumer status {} code={code:?} execution={execution:?} answered {} ms after it was issued",
+                        answer.status,
+                        latency.as_millis(),
                     )
                 }
-                Ok(Ok(Err(error))) => format!("consumer request failed: {error}"),
+                Ok(Ok((Err(error), latency))) => format!(
+                    "consumer request failed after {} ms: {error}",
+                    latency.as_millis()
+                ),
                 Ok(Err(error)) => format!("consumer task did not join: {error}"),
                 Err(_) => {
                     // Keep the pre-diagnostic cleanup: a call still running
@@ -1917,8 +2404,14 @@ impl Gate<'_> {
                     "consumer request still outstanding".to_owned()
                 }
             };
+            // The consumer's status alone cannot say whether the request ever
+            // left the ingress.  Join it with the relays' own bounded
+            // `role/stage/cause` tuples and their transport pin state, which
+            // together separate a fresh dial refused on an empty pin set from
+            // a hop closed under a request the owner had already seen.
+            let forensics = self.cluster.peer_path_forensics().await;
             return Err(HarnessError::Timeout(format!(
-                "the {fault_name} side effect never ran ({observed})"
+                "the {fault_name} side effect never ran ({observed}); peer path: {forensics}"
             )));
         }
         // The side effect has run exactly once at this point.
@@ -1936,7 +2429,7 @@ impl Gate<'_> {
             .await
             .map_err(|_| HarnessError::Timeout(format!("{fault_name} outcome timed out")))?
             .map_err(|error| HarnessError::Process(format!("{fault_name} join: {error}")))?;
-        let answer = answer.unwrap_or_default();
+        let answer = answer.0.unwrap_or_default();
         // Settle on an observed event, never on a sleep.  A fault the session
         // survives settles when the device has finished and recorded the
         // exchange, because a replay would be a second record; a fault that
@@ -1992,6 +2485,7 @@ fn device_config_text(
     services: &[(&'static str, uuid::Uuid, &'static str)],
     fixture: &Path,
     marker_dirs: &std::collections::BTreeMap<&'static str, PathBuf>,
+    http_backend: &HttpBackend,
 ) -> Result<String> {
     let quote = |value: &str| serde_json::to_string(value).unwrap_or_default();
     let mut text = base.to_owned();
@@ -2000,11 +2494,21 @@ fn device_config_text(
             .get(label)
             .ok_or_else(|| HarnessError::InvalidInput("marker directory missing".into()))?;
         text.push_str(&format!(
-            "\n[exports.\"{service_id}\"]\ntype = \"http-forward\"\n\n[exports.\"{service_id}\".mcp]\nprofile = {}\n\n[exports.\"{service_id}\".mcp.backend]\nkind = \"stdio\"\ncommand = {}\nargs = [\"stdio\"]\nworkspace = {}\nmax_children = 16\nsession_idle_seconds = 600\n",
+            "\n[exports.\"{service_id}\"]\ntype = \"http-forward\"\n\n[exports.\"{service_id}\".mcp]\nprofile = {}\n\n[exports.\"{service_id}\".mcp.backend]\n",
             quote(profile),
-            quote(&fixture.to_string_lossy()),
-            quote(&workspace.to_string_lossy()),
         ));
+        if *label == SERVICE_HTTP_2025 {
+            text.push_str(&format!(
+                "kind = \"streamable-http\"\nurl = {}\n",
+                quote(&format!("http://{}/mcp", http_backend.address))
+            ));
+        } else {
+            text.push_str(&format!(
+                "kind = \"stdio\"\ncommand = {}\nargs = [\"stdio\"]\nworkspace = {}\nmax_children = 16\nsession_idle_seconds = 600\n",
+                quote(&fixture.to_string_lossy()),
+                quote(&workspace.to_string_lossy()),
+            ));
+        }
     }
     Ok(text)
 }
@@ -2104,14 +2608,17 @@ async fn run(
     let mut services = std::collections::BTreeMap::new();
     let mut wanted = Vec::new();
     for service in &harness.mcp_services {
-        if service.label == SERVICE_2025 || service.label == SERVICE_2026 {
+        if service.label == SERVICE_2025
+            || service.label == SERVICE_2026
+            || service.label == SERVICE_HTTP_2025
+        {
             services.insert(service.label, service.service_id);
             wanted.push((service.label, service.service_id, service.profile));
         }
     }
-    if wanted.len() != 2 {
+    if wanted.len() != 3 {
         return Err(HarnessError::InvalidInput(
-            "the two stdio MCP services were not seeded".into(),
+            "the two stdio and one Streamable HTTP MCP services were not seeded".into(),
         ));
     }
     let fixture = fixture_binary_path()?;
@@ -2140,8 +2647,16 @@ async fn run(
         &device.certificate.private_key_pem,
         &harness.pki.server_ca.certificate_pem,
     )?;
+    // One shared Streamable HTTP backend process for the legacy HTTP export.
+    // The device forwards to its address; it starts no child per session, so
+    // the binding case over it cannot be explained by process isolation.
+    let http_marker_dir = marker_dirs
+        .get(SERVICE_HTTP_2025)
+        .cloned()
+        .ok_or_else(|| HarnessError::InvalidInput("HTTP marker directory missing".into()))?;
+    let mut http_backend = HttpBackend::start(&fixture, &http_marker_dir, true).await?;
     let base = std::fs::read_to_string(&device_profile.config_path).map_err(HarnessError::Io)?;
-    let text = device_config_text(&base, &wanted, &fixture, &marker_dirs)?;
+    let text = device_config_text(&base, &wanted, &fixture, &marker_dirs, &http_backend)?;
     let mut config = tunnel_client::ConnectConfig::parse(&text)
         .map_err(|error| HarnessError::InvalidInput(format!("device config: {error}")))?;
     config.rotation = ISOLATION_ROTATION;
@@ -2184,11 +2699,26 @@ async fn run(
         label: "owner-a",
         token: harness
             .oidc
-            .issue_with(&harness.topology.owner_a.name, scope)?,
+            .issue_with(&harness.topology.owner_a.name, scope.clone())?,
         ingress,
         ca: ca.clone(),
     };
     let victim_id = harness.topology.owner_a.id;
+    // A fully authenticated consumer of the *other* tenant, holding the same
+    // scopes against its own tenant's devices.  Its token is valid; what it
+    // lacks is any grant in this tenant.
+    let foreign_principal = harness
+        .topology
+        .consumers_b
+        .first()
+        .ok_or_else(|| HarnessError::InvalidInput("a tenant-B consumer is missing".into()))?;
+    let carol = Consumer {
+        label: "consumer-b-1",
+        token: harness.oidc.issue_with(&foreign_principal.name, scope)?,
+        ingress,
+        ca: ca.clone(),
+    };
+    let foreign_tenant_id = harness.topology.tenant_b.id;
 
     let mut gate = Gate {
         cluster,
@@ -2229,6 +2759,43 @@ async fn run(
         let (isolation, alice_session, bob_session) = gate.session_isolation(&alice, &bob).await?;
         evidence.isolation = isolation;
         evidence.sessions_opened += 2;
+
+        eprintln!(
+            "MCP isolation gate: streamable-binding at {} ms",
+            started.elapsed().as_millis()
+        );
+        gate.boundary().await?;
+        evidence.streamable_binding = gate.streamable_binding(&alice, &bob).await?;
+        eprintln!(
+            "MCP isolation gate: streamable-binding foreign post/get/delete {}/{}/{} indistinguishable={} shared_backend={} sessions_ended={}",
+            evidence.streamable_binding.foreign_post_status,
+            evidence.streamable_binding.foreign_get_status,
+            evidence.streamable_binding.foreign_delete_status,
+            evidence.streamable_binding.foreign_matches_unknown,
+            evidence.streamable_binding.shared_backend,
+            evidence.streamable_binding.sessions_ended,
+        );
+
+        eprintln!(
+            "MCP isolation gate: cross-tenant at {} ms",
+            started.elapsed().as_millis()
+        );
+        gate.boundary().await?;
+        evidence.cross_tenant = gate
+            .cross_tenant(&carol, &alice, &alice_session, foreign_tenant_id)
+            .await?;
+        eprintln!(
+            "MCP isolation gate: cross-tenant {} of {} refused, initialize {} {} {}, uniform={} dispatched={} device_exchanges={}",
+            evidence.cross_tenant.refused,
+            evidence.cross_tenant.attempts,
+            evidence.cross_tenant.initialize_status,
+            evidence.cross_tenant.initialize_code,
+            evidence.cross_tenant.initialize_execution,
+            evidence.cross_tenant.uniform_refusal,
+            evidence.cross_tenant.dispatched,
+            evidence.cross_tenant.device_exchanges,
+        );
+        evidence.foreign_tenant_principals = 1;
 
         eprintln!(
             "MCP isolation gate: correlation at {} ms",
@@ -2333,6 +2900,9 @@ async fn run(
     evidence.children_after_stop =
         gate.export(SERVICE_2025).children_running + gate.export(SERVICE_2026).children_running;
     drop(gate);
+    // The Streamable HTTP backend is the gate's own process, not the
+    // connector's, so the gate ends it whatever the run did.
+    http_backend.stop().await;
     run_result?;
     Ok(evidence)
 }
@@ -2384,6 +2954,35 @@ mod tests {
                 no_cross_delivery: true,
                 sessions_opened: 2,
                 children_spawned: 2,
+            },
+            foreign_tenant_principals: 1,
+            streamable_binding: StreamableBindingEvidence {
+                shared_backend: true,
+                sessions_distinct: true,
+                foreign_post_status: 404,
+                foreign_get_status: 404,
+                foreign_delete_status: 404,
+                foreign_matches_unknown: true,
+                owner_still_served: true,
+                sibling_still_served: true,
+                sessions_opened: 0,
+                sessions_ended: 2,
+            },
+            cross_tenant: CrossTenantEvidence {
+                foreign_tenant: true,
+                initialize_status: 404,
+                initialize_code: "DEVICE_NOT_FOUND".into(),
+                initialize_execution: "not_dispatched".into(),
+                session_post_status: 404,
+                session_get_status: 404,
+                session_delete_status: 404,
+                refused: 7,
+                attempts: 7,
+                uniform_refusal: true,
+                dispatched: 0,
+                sessions_opened: 0,
+                device_exchanges: 0,
+                tenant_session_served: true,
             },
             correlation: CorrelationEvidence {
                 calls_per_principal: CORRELATION_CALLS,
@@ -2475,6 +3074,70 @@ mod tests {
             }),
             ("cross delivery", |e| {
                 e.isolation.no_cross_delivery = false;
+            }),
+            ("the Streamable HTTP backend was not shared", |e| {
+                e.streamable_binding.shared_backend = false;
+            }),
+            ("Streamable HTTP sessions not distinct", |e| {
+                e.streamable_binding.sessions_distinct = false;
+            }),
+            ("Streamable HTTP foreign POST", |e| {
+                e.streamable_binding.foreign_post_status = 200;
+            }),
+            ("Streamable HTTP foreign GET", |e| {
+                e.streamable_binding.foreign_get_status = 200;
+            }),
+            ("Streamable HTTP foreign DELETE", |e| {
+                e.streamable_binding.foreign_delete_status = 202;
+            }),
+            ("Streamable HTTP refusal distinguishable", |e| {
+                e.streamable_binding.foreign_matches_unknown = false;
+            }),
+            ("Streamable HTTP owner session broken", |e| {
+                e.streamable_binding.owner_still_served = false;
+            }),
+            ("Streamable HTTP sibling session broken", |e| {
+                e.streamable_binding.sibling_still_served = false;
+            }),
+            ("a Streamable HTTP session outlived its DELETE", |e| {
+                e.streamable_binding.sessions_ended = 1;
+            }),
+            ("no foreign tenant was driven", |e| {
+                e.foreign_tenant_principals = 0;
+            }),
+            ("the cross-tenant principal was of this tenant", |e| {
+                e.cross_tenant.foreign_tenant = false;
+            }),
+            ("a cross-tenant consumer opened a session", |e| {
+                e.cross_tenant.initialize_status = 200;
+            }),
+            ("a cross-tenant refusal claimed uncertainty", |e| {
+                e.cross_tenant.initialize_execution = "unknown".into();
+            }),
+            ("a cross-tenant refusal carried no code", |e| {
+                e.cross_tenant.initialize_code = String::new();
+            }),
+            ("a cross-tenant request was not refused", |e| {
+                e.cross_tenant.refused -= 1;
+            }),
+            ("fewer cross-tenant routes were tried", |e| {
+                e.cross_tenant.attempts -= 1;
+                e.cross_tenant.refused -= 1;
+            }),
+            ("a cross-tenant refusal revealed the session", |e| {
+                e.cross_tenant.uniform_refusal = false;
+            }),
+            ("a cross-tenant request reached the device", |e| {
+                e.cross_tenant.dispatched = 1;
+            }),
+            ("a cross-tenant request opened an export session", |e| {
+                e.cross_tenant.sessions_opened = 1;
+            }),
+            ("a cross-tenant request produced a device exchange", |e| {
+                e.cross_tenant.device_exchanges = 1;
+            }),
+            ("the tenant's own session was disturbed", |e| {
+                e.cross_tenant.tenant_session_served = false;
             }),
             ("sessions opened", |e| e.isolation.sessions_opened = 3),
             ("children spawned", |e| e.isolation.children_spawned = 3),

@@ -5044,6 +5044,77 @@ impl ProductionCluster {
         Ok(stages)
     }
 
+    /// Render a payload-free forensic line per relay for a failing exchange.
+    ///
+    /// This joins the three things the consumer's own status cannot separate:
+    /// whether the relay's transport pin set was momentarily empty (and
+    /// whether a failed-closed publication is still pending a retry), whether
+    /// the peer runtime still considered itself ready, and the bounded
+    /// `role/stage/cause` fault tuples the relay recorded, oldest first, with
+    /// their shared monotonic clock.  A tuple with `role=owner` proves the
+    /// owner saw the stream; an `ingress` tuple at a pre-envelope stage
+    /// (`pool_connect`, `stream_permit_checkout`, `sender_lock`,
+    /// `h3_dispatch`) proves it never left this relay.
+    ///
+    /// Every field is an identifier, a counter or a boolean: no endpoint, no
+    /// error text, no body and no credential. Diagnostics only — nothing here
+    /// influences admission, and it is read on failure paths.
+    async fn peer_path_forensics(&self) -> String {
+        let mut lines = Vec::new();
+        for relay in &self.relays {
+            if relay.running.is_none() {
+                lines.push(format!("{}: stopped", relay.node_id));
+                continue;
+            }
+            let pins = relay.pins.snapshot();
+            let ready = relay.peer_runtime.is_ready();
+            let faults = match relay.snapshot().await {
+                Ok(snapshot) => {
+                    let diagnostics = snapshot.peer_fault_diagnostics;
+                    let recent = diagnostics
+                        .recent
+                        .iter()
+                        .map(|event| {
+                            format!(
+                                "#{}@{}ms:{}/{}/{}{}",
+                                event.sequence,
+                                event.observed_at_ms,
+                                event.role.as_str(),
+                                event.stage.as_str(),
+                                event.cause.as_str(),
+                                if event.request_id.is_some() {
+                                    "+rid"
+                                } else {
+                                    ""
+                                },
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    format!(
+                        "now={}ms faults={} ingress={} owner={} recent=[{}]",
+                        snapshot.monotonic_now_ms,
+                        diagnostics.fault_count,
+                        diagnostics.ingress_count,
+                        diagnostics.owner_count,
+                        if recent.is_empty() { "none" } else { &recent },
+                    )
+                }
+                Err(error) => format!("snapshot unavailable: {error}"),
+            };
+            lines.push(format!(
+                "{}: pins_len={} pins_empty={} pins_revision={} peer_ready={} {}",
+                relay.node_id,
+                pins.len(),
+                pins.is_empty(),
+                pins.revision(),
+                ready,
+                faults,
+            ));
+        }
+        lines.join(" | ")
+    }
+
     fn set_peer_path_drop(&self, node_id: &str, drop_packets: bool) -> Result<()> {
         let proxy = self.peer_proxies.get(node_id).ok_or_else(|| {
             HarnessError::InvalidInput(format!("production relay {node_id} has no UDP proxy"))

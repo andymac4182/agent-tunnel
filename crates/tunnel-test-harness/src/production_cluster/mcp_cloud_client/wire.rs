@@ -941,7 +941,7 @@ pub(crate) fn count_lines(path: &Path, needle: &str) -> u64 {
 }
 
 /// The synthetic rmcp Streamable HTTP server process.
-pub(super) struct HttpBackend {
+pub(crate) struct HttpBackend {
     binary: PathBuf,
     pub marker_dir: PathBuf,
     legacy: bool,

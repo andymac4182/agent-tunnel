@@ -1388,7 +1388,17 @@ impl PeerRuntime {
         let connection = match self.client.connect(destination.clone()).await {
             Ok(connection) => connection,
             Err(error) => {
-                if let Some(readiness) = &self.readiness {
+                // A dial refused because *this* relay publishes no approved
+                // peer trust evidence says nothing about the route: no packet
+                // was sent and the peer was never contacted.  Recording it as
+                // unreachability would drop route readiness for a condition
+                // entirely local to this process, and the readiness probe
+                // that would clear it again needs the same missing evidence.
+                // Every other transport error did reach, or fail to reach,
+                // the peer, and still marks the route.
+                if let Some(readiness) = &self.readiness
+                    && !matches!(error, PeerTransportError::PinsUnavailable)
+                {
                     readiness.mark_route_unreachable(&readiness_target);
                 }
                 return Err(error.into());

@@ -29,7 +29,7 @@ pub const PEER_FAULT_STAGES: [&str; 11] = [
     "owner",
 ];
 /// The relay's closed peer fault cause vocabulary.
-pub const PEER_FAULT_CAUSES: [&str; 25] = [
+pub const PEER_FAULT_CAUSES: [&str; 26] = [
     "no_live_owner",
     "catalog",
     "membership",
@@ -41,6 +41,7 @@ pub const PEER_FAULT_CAUSES: [&str; 25] = [
     "transport_h3",
     "transport_quic",
     "transport_capacity",
+    "transport_pins_unavailable",
     "transport_body_limit",
     "transport_other",
     "envelope",
@@ -1728,6 +1729,38 @@ mod c17_validator_tests {
         }
     }
 
+    /// A dial that races an empty pin set is the normal shape of the
+    /// `verify-m3-mcp-isolation` flake recorded on M7-C86, so the scanner must
+    /// accept that cause on a real capture, not merely agree with the relay's
+    /// list.  Nobody has observed it inside a capture window, so this drives
+    /// the acceptance path directly.
+    #[test]
+    fn a_snapshot_carrying_an_unavailable_pin_dial_is_accepted() {
+        let spec = spec_with_roles(&["snapshot-relay-relay-a"])
+            .expect("spec")
+            .with_required_fields(std::iter::empty::<SafeField>())
+            .with_required_peer_faults(&[("ingress", "pool_connect", "transport_pins_unavailable")])
+            .expect("tuples");
+        let mut window = C11Window::new(spec);
+        window
+            .append(
+                "snapshot-relay-relay-a",
+                peer_fault_snapshot(&[("ingress", "pool_connect", "transport_pins_unavailable")])
+                    .as_bytes(),
+            )
+            .expect("the scanner accepts a pins-unavailable dial");
+        window.close("snapshot-relay-relay-a").expect("close");
+        window.mark_joined("snapshot-relay-relay-a").expect("join");
+        let report = window.finish(101).expect("finish");
+        assert!(
+            report.peer_faults_present.contains(
+                &PeerFaultTuple::new("ingress", "pool_connect", "transport_pins_unavailable")
+                    .unwrap()
+            ),
+            "the cause is counted, not merely tolerated"
+        );
+    }
+
     #[test]
     fn relay_snapshot_tuples_satisfy_exact_requirements_and_are_reported() {
         let spec = spec_with_roles(&["snapshot-relay-relay-a", "snapshot-relay-relay-b"])
@@ -2172,5 +2205,28 @@ mod c17_validator_tests {
             );
             assert_rejected(result, fragment);
         }
+    }
+}
+
+#[cfg(test)]
+mod peer_fault_vocabulary_tests {
+    use super::PEER_FAULT_CAUSES;
+    use tunnel_relay::peer_fault_diagnostics::PeerFaultCause;
+
+    /// The scanner refuses any snapshot carrying a cause outside its copy of
+    /// the vocabulary, so a relay that gains a cause without this list gaining
+    /// it makes `verify-m7-c11-diagnostics` and `verify-m7-og02-correlation`
+    /// fail on a perfectly valid capture.  That is exactly what happened when
+    /// `transport_pins_unavailable` was added on the relay side only.
+    #[test]
+    fn harness_peer_fault_causes_match_the_relay_vocabulary() {
+        let mut relay: Vec<&str> = PeerFaultCause::ALL.iter().map(|c| c.as_str()).collect();
+        let mut scanner: Vec<&str> = PEER_FAULT_CAUSES.to_vec();
+        relay.sort_unstable();
+        scanner.sort_unstable();
+        assert_eq!(
+            relay, scanner,
+            "the C11 scanner's cause vocabulary has drifted from the relay's"
+        );
     }
 }
