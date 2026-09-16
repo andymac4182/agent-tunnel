@@ -2665,6 +2665,14 @@ name = "tunnel-fs-core"
 version = "0.1.0"
 
 [[package]]
+name = "tunnel-fs-host"
+version = "0.1.0"
+dependencies = [
+ "rustix",
+ "tunnel-fs-core",
+]
+
+[[package]]
 name = "tunnel-http-bridge"
 version = "0.1.0"
 dependencies = [

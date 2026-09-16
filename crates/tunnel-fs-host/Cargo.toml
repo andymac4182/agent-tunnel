@@ -1,0 +1,25 @@
+[package]
+name = "tunnel-fs-host"
+description = "OS-confined filesystem resolver: anchored traversal, symlink and hard-link policy, file identity and special-file refusal"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Implementation gate 2 of docs/filesystem-api.md.  The only dependencies are
+# the pure gate-1 core and `rustix`, which is already in this workspace for the
+# M3 process-group work; its `fs` feature is the safe wrapper the no-unsafe rule
+# requires for `openat`, `openat2`, `statat`, `readlinkat` and `fstat`.  No new
+# third-party crate is introduced.  There is no async runtime, no clock and no
+# network here.
+
+[dependencies]
+rustix = { version = "1.1", default-features = false, features = ["fs", "std"] }
+tunnel-fs-core = { path = "../tunnel-fs-core" }
+
+[dev-dependencies]
+rustix = { version = "1.1", default-features = false, features = ["fs", "std"] }
+
+[lints]
+workspace = true
