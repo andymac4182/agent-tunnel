@@ -145,6 +145,45 @@ impl RuntimeConfig {
                 mcp.validate()
                     .map_err(|error| RuntimeConfigError::Invalid(error.0))?;
             }
+            match (export.kind, export.fs.as_ref()) {
+                (ExportKind::Fs, None) => {
+                    return Err(RuntimeConfigError::Invalid(
+                        "an fs export requires an [exports.<service>.fs] table naming its root",
+                    ));
+                }
+                (kind, Some(_)) if kind != ExportKind::Fs => {
+                    return Err(RuntimeConfigError::Invalid(
+                        "an fs table is only valid on an fs export",
+                    ));
+                }
+                (ExportKind::Fs, Some(fs)) => {
+                    if fs.root.as_os_str().is_empty() {
+                        return Err(RuntimeConfigError::Invalid(
+                            "an fs export must name a root directory",
+                        ));
+                    }
+                    if fs.capabilities.is_empty() {
+                        // Default deny: an export granting nothing admits no
+                        // session at all, rather than one that can do nothing.
+                        return Err(RuntimeConfigError::Invalid(
+                            "an fs export must name at least one capability",
+                        ));
+                    }
+                    for capability in &fs.capabilities {
+                        if tunnel_fs_core::Capability::parse(capability).is_none() {
+                            return Err(RuntimeConfigError::Invalid(
+                                "fs capabilities are read, write, list and delete",
+                            ));
+                        }
+                    }
+                }
+                _ => {}
+            }
+            if export.kind == ExportKind::Fs && export.device_canary.is_some() {
+                return Err(RuntimeConfigError::Invalid(
+                    "an fs export has no device_canary",
+                ));
+            }
             if let Some(canary) = &export.device_canary
                 && canary.len() > 256
             {
@@ -255,6 +294,33 @@ pub struct ExportConfig {
     /// An MCP export served by the connector itself (M3-02): only valid on
     /// an `http-forward` export.  See `tunnel_mcp_export::config`.
     pub mcp: Option<tunnel_mcp_export::McpExportConfig>,
+    /// A filesystem export served by the connector itself (M4 gate 4): only
+    /// valid on an `fs` export, and required on one.  The root is operator
+    /// configuration and is the one path this profile opens by name.
+    pub fs: Option<FsExportSettings>,
+}
+
+/// The operator configuration of one filesystem export.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FsExportSettings {
+    /// The host directory the export is rooted at.
+    pub root: PathBuf,
+    /// The capabilities this device will serve **at most**.
+    ///
+    /// The session's effective grant is this intersected with what the relay's
+    /// OPEN named, so a relay can only ever narrow it. Default deny: an export
+    /// that names nothing admits no session, which is gate 1's own rule.
+    pub capabilities: Vec<String>,
+}
+
+impl Default for FsExportSettings {
+    fn default() -> Self {
+        Self {
+            root: PathBuf::new(),
+            capabilities: Vec::new(),
+        }
+    }
 }
 
 impl Default for ExportConfig {
@@ -263,6 +329,7 @@ impl Default for ExportConfig {
             kind: ExportKind::Echo,
             device_canary: None,
             mcp: None,
+            fs: None,
         }
     }
 }
@@ -277,6 +344,11 @@ pub enum ExportKind {
     /// never admits it.
     #[serde(rename = "http-forward")]
     HttpForward,
+    /// A filesystem export serving 9P2000.L over one logical stream (M4 gate
+    /// 4).  It is admitted only when an `[exports.<service>.fs]` table names a
+    /// root this connector can open; the M1 profile never admits it.
+    #[serde(rename = "fs")]
+    Fs,
 }
 
 /// Resource limits enforced before work enters a client queue.

@@ -600,6 +600,8 @@ use crate::{
 };
 
 pub(crate) mod forward;
+/// The filesystem endpoint: descriptor, WSS upgrade and byte pump.
+pub(crate) mod fs;
 
 /// Per-owner-scope consumer admission permits.
 ///
@@ -885,6 +887,14 @@ pub(crate) fn consumer_router_with_peer_and_barriers(
         .route(
             "/v1/devices/{device}/services/{service}/http/{*path}",
             axum::routing::any(crate::http::forward::http_forward_route),
+        )
+        // One URL for the descriptor and the upgrade, registered for every
+        // method so the 405 is this route's own typed answer rather than the
+        // router's fallback: the contract requires the filesystem error body
+        // there too.
+        .route(
+            "/v1/devices/{device}/services/{service}/fs",
+            axum::routing::any(crate::http::fs::fs_route),
         )
         // A known path with an unserved method is a typed not-dispatched
         // rejection, so a GET/HEAD/OPTIONS shape at the POST-only echo route

@@ -66,9 +66,16 @@
 
 #[cfg(unix)]
 mod provider;
+// Deliberately **not** `cfg(unix)`: the relay decodes this framing too, and a
+// relay is not required to be a host that can serve a filesystem export.
+pub mod record;
 
 #[cfg(unix)]
 pub use provider::{Authority, Authorization, Outbound, Provider, ProviderStats};
+pub use record::{
+    KIND_CLOSE, KIND_MESSAGE, MAX_RECORD_BYTES, RECORD_HEADER_LEN, Record, RecordDecoder,
+    RecordError, encode_close, encode_message,
+};
 
 use tunnel_fs_core::{Limits, SessionErrorCode};
 

@@ -104,3 +104,34 @@ pub const HTTP_FORWARD_SERVICE_TYPE: &str = "http-forward";
 /// The grant operation (and consumer token scope) for an `http-forward/1`
 /// export.
 pub const HTTP_FORWARD_OPERATION: &str = "http:invoke";
+/// The catalog service type of a filesystem export.
+pub const FS_SERVICE_TYPE: &str = "fs";
+/// The grant operation (and consumer token scope) a filesystem **read**
+/// session requires.
+///
+/// One scope admits the session; the four capabilities inside it — read, write,
+/// list and delete — are carried separately and enforced by the device's own
+/// provider on every 9P primitive. A token scope cannot stand in for them: the
+/// contract's model is that every capability a session holds was named
+/// individually, and a scope is one name.
+pub const FS_READ_OPERATION: &str = "fs:read";
+/// The grant operation a filesystem **write** session requires. Gate 5's; the
+/// name is pinned here so a grant seeded for it cannot mean something else
+/// later.
+pub const FS_WRITE_OPERATION: &str = "fs:write";
+/// The service capability naming the export's observed case behaviour.
+///
+/// Required on a filesystem service record. The contract says the provider
+/// **reports** the host's case behaviour and never assumes it, so a relay that
+/// had to guess would be inventing it; an export without this capability is one
+/// this relay does not serve, and discovery answers 404 for it exactly as it
+/// does for an `http-forward` service naming no profile.
+pub const FS_CASE_SENSITIVITY_CAPABILITY: &str = "fs_case_sensitivity";
+/// The service capability by which a device declares that its host cannot serve
+/// filesystem exports at all.
+///
+/// `false` answers `403 ACCESS_DENIED`. Gate 2 declares filesystem exports
+/// unsupported on Windows, in one function, so that discovery can answer 403
+/// for such a host; this is how that declaration reaches the relay, which does
+/// not know the device's operating system.
+pub const FS_HOST_SUPPORTED_CAPABILITY: &str = "fs_host_supported";

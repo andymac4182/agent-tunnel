@@ -54,7 +54,7 @@ use url::Url;
 #[path = "m2_http.rs"]
 mod m2_http;
 use crate::http_forward::{HttpActorRequest, HttpHandlers};
-use m2_http::{DeviceHttpState, HTTP_FORWARD_OPERATION};
+use m2_http::{DeviceHttpState, FS_STREAM_OPERATION, HTTP_FORWARD_OPERATION};
 
 const M2_FEATURE: &str = "ordered-rotation-v1";
 const OWNER_FENCING_FEATURE: &str = "owner-fencing-v1";
@@ -1386,8 +1386,17 @@ struct M2Stream {
     /// This makes repeated CANCEL/auth-expiry paths idempotent before the
     /// terminal frame reaches the active carrier.
     reset_queued: bool,
-    /// Present only for an `http-forward/1` stream; see `m2_http`.
+    /// Present for a raw bidirectional stream — `http-forward/1` or a
+    /// filesystem 9P session; see `m2_http`.
     http: Option<DeviceHttpState>,
+    /// Present only for a filesystem stream: the live authorization the
+    /// provider reads before every host call.
+    ///
+    /// The connector confirms and invalidates it from the same places it moves
+    /// `auth` below, so the provider's recheck after a queue wait sees exactly
+    /// what the actor sees, without the provider ever holding the actor's lock
+    /// or caching a decision.
+    fs_authority: Option<std::sync::Arc<crate::fs_export::StreamAuthority>>,
 }
 
 /// Consume as many complete length-prefixed echo records as are available.
@@ -4056,9 +4065,39 @@ impl M2Actor {
             && open.operation == HTTP_FORWARD_OPERATION)
             .then(|| self.http_handlers.export(&open.service_id).cloned())
             .flatten();
+        // A filesystem export needs the local allowlist entry, the operator's
+        // own `[exports.<service>.fs]` root, and an OPEN naming the filesystem
+        // adapter.  The capabilities the OPEN carries are intersected with the
+        // configured ones when the exchange starts, so the relay can narrow
+        // this export but never widen it.
+        let fs_export = (export.kind == super::ExportKind::Fs
+            && open.operation == FS_STREAM_OPERATION)
+            .then(|| export.fs.clone())
+            .flatten()
+            .map(|settings| {
+                (
+                    crate::fs_export::FsExport {
+                        root: settings.root,
+                        allowed: tunnel_fs_core::CapabilitySet::from_slice(
+                            &settings
+                                .capabilities
+                                .iter()
+                                .filter_map(|name| tunnel_fs_core::Capability::parse(name))
+                                .collect::<Vec<_>>(),
+                        ),
+                        features: tunnel_fs_core::FeatureSet::NONE,
+                        limits: tunnel_fs_provider::default_limits(),
+                    },
+                    crate::fs_export::parse_capabilities(
+                        open.metadata
+                            .get("fs_capabilities")
+                            .map_or("", String::as_str),
+                    ),
+                )
+            });
         let echo = export.kind == super::ExportKind::Echo
             && matches!(open.operation.as_str(), "echo" | "echo_stream");
-        if !echo && http_export.is_none() {
+        if !echo && http_export.is_none() && fs_export.is_none() {
             return self.send_open_rejected_journaled(
                 open,
                 "OPERATION_DENIED",
@@ -4195,7 +4234,7 @@ impl M2Actor {
         // An HTTP response is written independently of the request, so its
         // replay and reorder capacity must cover the whole window (the owner
         // acknowledges on receipt); credit alone then parks a write.
-        let (replay_bytes, replay_frames) = if http_export.is_some() {
+        let (replay_bytes, replay_frames) = if http_export.is_some() || fs_export.is_some() {
             let window = usize::try_from(initial_credit.max(receive_credit)).unwrap_or(usize::MAX);
             (
                 replay_bytes.max(window),
@@ -4244,6 +4283,7 @@ impl M2Actor {
             output_reset: false,
             reset_queued: false,
             http: None,
+            fs_authority: None,
         };
         let mut stream = stream;
         if let Some(http_export) = http_export {
@@ -4251,6 +4291,23 @@ impl M2Actor {
                 open.stream_id,
                 &open.service_id,
                 http_export,
+                receive_credit,
+            ));
+        } else if let Some((settings, granted)) = fs_export {
+            // The authority the provider reads before every host call.  It is
+            // created confirmed, because the OPEN only reaches here after the
+            // stream's authorization context was admitted; every later
+            // confirmation and every invalidation moves it.
+            let authority = std::sync::Arc::new(crate::fs_export::StreamAuthority::new(
+                authorization.grant_revision,
+                granted,
+            ));
+            stream.fs_authority = Some(std::sync::Arc::clone(&authority));
+            stream.http = Some(self.start_fs_exchange(
+                open.stream_id,
+                settings,
+                granted,
+                authority,
                 receive_credit,
             ));
         }
@@ -4476,6 +4533,13 @@ impl M2Actor {
                         stream.auth.confirmed = true;
                         stream.auth.refresh_in_flight = false;
                         stream.auth.nonce.clear();
+                        // The provider reads this before every host call, so a
+                        // renewed confirmation reaches it at the same instant
+                        // the actor takes it.
+                        if let Some(authority) = stream.fs_authority.as_ref() {
+                            authority
+                                .confirm(stream.auth.grant_revision, authority.current_grant());
+                        }
                         (std::mem::take(&mut stream.pending), stream.pending_bytes)
                     }
                     None => (VecDeque::new(), 0),
@@ -4531,7 +4595,7 @@ impl M2Actor {
             .filter_map(|(&stream_id, stream)| {
                 if !matches!(
                     stream.operation.as_str(),
-                    "echo_stream" | HTTP_FORWARD_OPERATION
+                    "echo_stream" | HTTP_FORWARD_OPERATION | FS_STREAM_OPERATION
                 ) || !stream.auth.confirmed
                     || stream.auth.refresh_in_flight
                     || stream.auth.invalidated
@@ -4797,6 +4861,9 @@ impl M2Actor {
                     .expect("operation match checked above");
                 stream.input_reset = true;
                 stream.auth.invalidated = true;
+                if let Some(authority) = stream.fs_authority.as_ref() {
+                    authority.invalidate();
+                }
                 stream.record_buffer.clear();
                 stream.record_expected = None;
                 stream.pending.clear();
@@ -8124,6 +8191,11 @@ impl M2Actor {
         self.http_abort(stream_id, M2_RESET_AUTH_EXPIRED);
         if let Some(stream) = self.streams.get_mut(&stream_id) {
             stream.auth.invalidated = true;
+            // An expired authorization deadline stops filesystem dispatch at
+            // the provider too: its next host call closes the session instead.
+            if let Some(authority) = stream.fs_authority.as_ref() {
+                authority.invalidate();
+            }
             let pending_bytes = stream.pending_bytes;
             stream.pending.clear();
             stream.pending_bytes = 0;
@@ -9796,6 +9868,7 @@ mod tests {
             output_reset: false,
             reset_queued: false,
             http: None,
+            fs_authority: None,
         }
     }
 

@@ -76,7 +76,8 @@ use crate::{
 #[path = "actor_http_stream.rs"]
 mod http_stream;
 pub(crate) use http_stream::{
-    HTTP_FORWARD_STREAM_OPERATION, HttpPeerReset, HttpRead, HttpStreamRegistration,
+    FS_STREAM_OPERATION, HTTP_FORWARD_STREAM_OPERATION, HttpPeerReset, HttpRead,
+    HttpStreamRegistration,
 };
 use http_stream::{HttpMaintenance, HttpStreamState};
 
@@ -1453,11 +1454,37 @@ struct M2Stream {
 enum StreamAdmissionReply {
     Echo(oneshot::Sender<Result<ConsumerStreamRegistration, RelayError>>),
     Http(oneshot::Sender<Result<HttpStreamRegistration, RelayError>>),
+    /// A filesystem 9P stream.
+    ///
+    /// It uses the same raw bidirectional machinery as `http-forward/1` — which
+    /// is what `is_http` below names, and why it answers true for this variant
+    /// too — and differs in exactly three things: the grant operation it
+    /// requires, the operation it names in the OPEN, and the bounded capability
+    /// list it hands the connector. That list is how the device learns which of
+    /// read, write, list and delete the grant carries, because the device never
+    /// reads the catalog and a permission digest cannot be reversed into a set.
+    Fs {
+        response: oneshot::Sender<Result<HttpStreamRegistration, RelayError>>,
+        capabilities: String,
+    },
 }
 
 impl StreamAdmissionReply {
+    /// Whether this admission is a raw bidirectional stream rather than the
+    /// record-framed echo one.
     const fn is_http(&self) -> bool {
-        matches!(self, Self::Http(_))
+        !matches!(self, Self::Echo(_))
+    }
+
+    const fn is_fs(&self) -> bool {
+        matches!(self, Self::Fs { .. })
+    }
+
+    fn fs_capabilities(&self) -> Option<&str> {
+        match self {
+            Self::Fs { capabilities, .. } => Some(capabilities.as_str()),
+            _ => None,
+        }
     }
 
     /// Report a refused admission.  Successful admissions are sent by the
@@ -1468,7 +1495,9 @@ impl StreamAdmissionReply {
         };
         match self {
             Self::Echo(response) => response.send(Err(error)).map_err(drop),
-            Self::Http(response) => response.send(Err(error)).map_err(drop),
+            Self::Http(response) | Self::Fs { response, .. } => {
+                response.send(Err(error)).map_err(drop)
+            }
         }
     }
 }
@@ -1810,6 +1839,16 @@ enum Command {
         request_id: Option<String>,
         response: oneshot::Sender<Result<HttpStreamRegistration, RelayError>>,
     },
+    OpenFsStream {
+        consumer: AuthenticatedConsumer,
+        device_id: Uuid,
+        service_id: Uuid,
+        grant: GrantSnapshot,
+        consumer_expires_at: chrono::DateTime<Utc>,
+        request_id: Option<String>,
+        capabilities: String,
+        response: oneshot::Sender<Result<HttpStreamRegistration, RelayError>>,
+    },
     ReadHttpStream {
         key: SessionKey,
         stream_id: u64,
@@ -1882,7 +1921,8 @@ impl Command {
             | Self::AttachResolved { .. }
             | Self::AttachForwardedData { .. }
             | Self::OpenEchoStream { .. }
-            | Self::OpenHttpStream { .. } => HttpMaintenanceScope::All,
+            | Self::OpenHttpStream { .. }
+            | Self::OpenFsStream { .. } => HttpMaintenanceScope::All,
         }
     }
 }
@@ -2297,6 +2337,46 @@ impl RelayHandle {
                 grant,
                 consumer_expires_at,
                 request_id,
+                response,
+            })
+            .await
+            .map_err(|_| RelayError::Shutdown)?;
+        receiver.await.map_err(|_| RelayError::Shutdown)?
+    }
+
+    /// Admit one filesystem 9P logical stream.
+    ///
+    /// The same carrier as `open_http_stream`, and every later operation on the
+    /// stream — write, read, finish, reset, close — is shared with it. What
+    /// differs is that the OPEN requires the filesystem grant operation, names
+    /// the filesystem adapter, and carries the bounded capability list the
+    /// device's provider enforces primitives against.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the filesystem admission carries exactly the http-forward one's arguments plus \
+                  the capability list the device's provider enforces primitives against; grouping \
+                  them into a struct would hide which of them the actor re-validates"
+    )]
+    pub(crate) async fn open_fs_stream(
+        &self,
+        consumer: AuthenticatedConsumer,
+        device_id: Uuid,
+        service_id: Uuid,
+        grant: GrantSnapshot,
+        consumer_expires_at: chrono::DateTime<Utc>,
+        request_id: Option<String>,
+        capabilities: String,
+    ) -> Result<HttpStreamRegistration, RelayError> {
+        let (response, receiver) = oneshot::channel();
+        self.tx
+            .send(Command::OpenFsStream {
+                consumer,
+                device_id,
+                service_id,
+                grant,
+                consumer_expires_at,
+                request_id,
+                capabilities,
                 response,
             })
             .await
@@ -3047,6 +3127,29 @@ impl RelayActor {
                     consumer_expires_at,
                     request_id,
                     StreamAdmissionReply::Http(response),
+                );
+            }
+            Command::OpenFsStream {
+                consumer,
+                device_id,
+                service_id,
+                grant,
+                consumer_expires_at,
+                request_id,
+                capabilities,
+                response,
+            } => {
+                self.open_consumer_stream(
+                    consumer,
+                    device_id,
+                    service_id,
+                    grant,
+                    consumer_expires_at,
+                    request_id,
+                    StreamAdmissionReply::Fs {
+                        response,
+                        capabilities,
+                    },
                 );
             }
             Command::ReadHttpStream {
@@ -4435,6 +4538,7 @@ impl RelayActor {
             grant_revision: grant.revision,
             digest: &digest,
             operation: "echo",
+            fs_capabilities: None,
         })) {
             Ok(value) => value,
             Err(_) => {
@@ -4559,7 +4663,11 @@ impl RelayActor {
         response: StreamAdmissionReply,
     ) {
         let http = response.is_http();
-        let required_operation = if http {
+        let fs = response.is_fs();
+        let fs_capabilities = response.fs_capabilities().map(str::to_owned);
+        let required_operation = if fs {
+            crate::FS_READ_OPERATION
+        } else if http {
             crate::HTTP_FORWARD_OPERATION
         } else {
             crate::ECHO_OPERATION
@@ -4644,11 +4752,14 @@ impl RelayActor {
             body_len: 0,
             grant_revision: grant.revision,
             digest: &digest,
-            operation: if http {
+            operation: if fs {
+                FS_STREAM_OPERATION
+            } else if http {
                 HTTP_FORWARD_STREAM_OPERATION
             } else {
                 "echo_stream"
             },
+            fs_capabilities: fs_capabilities.as_deref(),
         });
         let open_message_id = match &open_message {
             ControlMessage::Open(open) => open.message_id.clone(),
@@ -4765,7 +4876,10 @@ impl RelayActor {
             admission_lease,
         };
         match (response, http_watchers) {
-            (StreamAdmissionReply::Http(response), Some(watchers)) => {
+            (
+                StreamAdmissionReply::Http(response) | StreamAdmissionReply::Fs { response, .. },
+                Some(watchers),
+            ) => {
                 // The HTTP ingress has no upgrade callback: it owns the
                 // registration from this reply onwards.
                 registration.claim_admission();
@@ -4788,8 +4902,8 @@ impl RelayActor {
             (StreamAdmissionReply::Echo(response), _) => {
                 self.send_echo_registration(response, registration);
             }
-            (StreamAdmissionReply::Http(_), None) => {
-                unreachable!("an HTTP admission always creates HTTP stream state")
+            (StreamAdmissionReply::Http(_) | StreamAdmissionReply::Fs { .. }, None) => {
+                unreachable!("a raw-stream admission always creates HTTP stream state")
             }
         }
     }

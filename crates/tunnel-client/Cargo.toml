@@ -28,6 +28,16 @@ tokio-util = { version = "0.7", features = ["rt"] }
 toml.workspace = true
 url = "2.5"
 uuid = { version = "1.18", features = ["v4"] }
+# M4 gate 4: the device half of the filesystem endpoint.
+tunnel-fs-core = { path = "../tunnel-fs-core" }
+tunnel-fs-ninep = { path = "../tunnel-fs-ninep" }
+tunnel-fs-provider = { path = "../tunnel-fs-provider" }
+
+# The resolver is Unix-only, for the reason gate 2 records: filesystem
+# exports are declared unsupported on Windows, where `tunnel-fs-host`
+# compiles to that declaration alone and this connector serves no session.
+[target.'cfg(unix)'.dependencies]
+tunnel-fs-host = { path = "../tunnel-fs-host" }
 
 [dev-dependencies]
 tempfile = "3.21"

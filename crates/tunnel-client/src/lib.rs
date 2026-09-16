@@ -11,9 +11,12 @@
 
 mod config;
 pub mod credentials;
+/// The device half of the filesystem endpoint (M4 gate 4).
+pub mod fs_export;
 pub mod http_forward;
 mod m2_runtime;
 
+pub use config::FsExportSettings;
 use config::{ExportConfig, ExportKind, RuntimeConfig};
 use credentials::{CredentialError, load_client_config};
 use futures_util::{SinkExt, StreamExt};
@@ -520,6 +523,7 @@ fn configured_services(config: &RuntimeConfig) -> Vec<ServiceAdvertisement> {
                 match export.kind {
                     ExportKind::Echo => "echo",
                     ExportKind::HttpForward => "http-forward",
+                    ExportKind::Fs => "fs",
                 },
                 "1",
                 ["echo", "data", "fin", "ack"],
