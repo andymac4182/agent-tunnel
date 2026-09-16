@@ -111,10 +111,102 @@ separately obey the negotiated active limit. Retained terminal streams cannot
 consume a free active slot, and each journal entry reserves its future tombstone slot.
 Authenticated, operation-matched `STREAM_FORGET` releases retained reply bytes
 after the carrier barriers, including for refused requests with no stream.
-Canonical tombstones remain bounded for the session lifetime. The journal
+Canonical tombstones remain bounded, and are released at the OPEN retry
+horizon defined below. The journal
 never evicts a known ID to admit a new one; exhaustion requires an explicit
 resource-exhausted/fresh-session outcome. A permanent retention failure must
 not wait indefinitely as if it were temporary writer backpressure.
+
+### OPEN retry horizon and journal reclamation
+
+The owner may retry an `OPEN` message ID only while the connector still
+retains that request's entry. The horizon is the owner's own authenticated
+`STREAM_FORGET` for the stream and operation that message ID named. Issuing it
+is the owner's irrevocable assertion that the entry is reclaimed: it carries
+final cursor/terminal evidence, the owner holds no drain or replay reference
+to the entry, it is serialized with QUIESCE, and the entry is excluded from
+every later snapshot. An owner that could still retry the `OPEN` has not
+finished with the stream and must not have sent the `STREAM_FORGET`. Epoch
+change, owner change and session loss end every message ID's retry window with
+the session that scopes the journal. A connector may therefore release a
+journal entry — canonical request, retained reply bytes and tombstone — once
+the `STREAM_FORGET` naming its stream and operation has completed its carrier
+barriers. A session's journal is then bounded by its unreclaimed entries
+rather than by the number of streams it has ever admitted, which is what makes
+"idempotent for an identical `message_id` within a bounded retention period"
+an explicit period for `OPEN` rather than the whole session lifetime.
+
+Releasing the entry does not weaken the guarantees the journal exists for:
+
+- **No duplicate dispatch.** The predicate is a monotonic per-session
+  watermark: the highest stream ID whose reclamation has completed. An `OPEN`
+  naming a stream ID at or below that watermark, for which the connector holds
+  no live stream and no retained entry, is refused `STREAM_EXISTS` before
+  admission and before journaling, whatever message ID it carries. A retry
+  after the horizon is therefore refused rather than dispatched a second time.
+  The refusal is deliberately **not** journaled: the owner has already
+  forgotten that stream and will never forget it again, so a retained entry
+  for it could never be released, and a rule-violating owner could otherwise
+  leak one entry per refusal until the session wedged at `RESOURCE_EXHAUSTED`.
+  A stream ID the session still retains keeps its journaled refusal, which its
+  own `STREAM_FORGET` releases.
+- **No resurrection.** A new message ID still cannot reuse a forgotten stream
+  ID at or below the reclamation watermark, and the owner never reuses a stream
+  ID within a session.  An ID refused before it was journaled stays above the
+  watermark and is admissible to a later `OPEN`: it was never dispatched, so
+  that is a first dispatch rather than a resurrection.
+- **No fabricated result.** The refusal is the connector's own typed
+  `REJECTED`. The connector never replays or invents an `OPENED` for an entry
+  it no longer holds. After the horizon it can no longer distinguish a retry
+  from a reused message ID carrying different contents, so it refuses such a
+  request instead of reporting a conflict; the owner must not reuse a message
+  ID within a session.
+- **Reclamation stays owner-ordered.** The connector releases nothing on its
+  own timer, and nothing before the barriers that already authorize
+  compaction.
+
+A `STREAM_FORGET` is authenticated before anything else is decided about it,
+including whether it is benign: a message naming another session or a stale
+epoch is a protocol error whatever stream ID it carries. An authenticated
+`STREAM_FORGET` is benign and idempotent, with no state change, when it names
+a stream the connector has already reclaimed, one it refused without
+journaling because its retention was exhausted, or any ID at or below the
+reclamation watermark. The watermark is a benign condition in its own right
+because the owner allocates stream IDs monotonically within a session and can
+consume one without ever naming it in an `OPEN` — a control encode or a full
+control queue can discard the message — so an ID below the watermark was
+allocated by this owner in this session even when the connector never saw it.
+A `STREAM_FORGET` naming an ID **above** the watermark that this session never
+retained remains the protocol error it is.
+
+The connector also keeps a bounded monotonic record of reclaimed stream IDs,
+which covers the IDs it refused before journaling them: those can be above the
+watermark, since nothing was ever forgotten for them. That record is held as
+disjoint ranges. Its range count is **not** bounded by the tracked-entry cap:
+a gap can be a stream the session still retains, but it can equally be an ID
+the owner allocated and never named in either an `OPEN` or a `STREAM_FORGET`,
+so sustained control-queue pressure can open arbitrarily many gaps. The bound
+is enforced rather than derived: an implementation that would exceed its range
+limit coalesces its lowest gap and counts the coalescence in payload-free
+diagnostics. Coalescing can only make the record more permissive about an ID
+it never saw, never less, and never permissive about admitting one; every ID
+it absorbs is below the watermark and therefore already benign, so the counter
+is an observability signal about control-queue pressure and not a safety
+condition.
+
+**Known limitation.** Because the refusal predicate is a watermark rather than
+an exact set, an `OPEN` that is still waiting in the connector's bounded
+admission queue when a *later* stream ID is forgotten is refused
+`STREAM_EXISTS` if it reaches admission afterwards, even though it was never
+dispatched. The owner sees a typed refusal and no dispatch, so no operation is
+duplicated or lost ambiguously; the request is simply refused where it could
+have been admitted. This predates journal reclamation and is unchanged by it.
+
+Exhaustion keeps its meaning for genuinely concurrent work. A session whose
+live entries reach the tracked-entry cap still refuses admission with
+`RESOURCE_EXHAUSTED` and the fresh-session outcome. What no longer exists is a
+lifetime ceiling: an unattended long-lived session serves an unbounded number
+of sequential streams.
 
 Decoded pending OPEN requests use a separate bounded pool. Each retained
 request reserves its parsed strings, metadata tree, authorization clones and
@@ -431,6 +523,7 @@ Structured logs identify tenant, connector, owner, session, epoch, generation, c
 16. Commit requires both complete immutable fence sets and cumulative receipt through every fence, including pending-OPEN, half-closed and cancelled/reset entries; a control marker alone is insufficient.
 17. Old transport retirement and its WebSocket close acknowledgement do not close logical streams or claim application completion. Drain does not wait for long-lived operations to finish.
 18. An uncertain/accepted commit cannot roll back to old. Timeout either coordinates safe abort, retires an already-drained old socket, or enters explicit bounded recovery/failure.
+19. The OPEN journal is bounded by its unreclaimed entries, not by the streams a session has ever admitted: sequential open/forget cycles far beyond the tracked-entry cap stay bounded, a retry for a live entry is still deduplicated, a retry after the OPEN retry horizon is refused without a second dispatch and without journaling the refusal, repeated post-horizon retries cannot fill the journal, a `STREAM_FORGET` for a reclaimed stream ID or one at or below the reclamation watermark is benign once it authenticates, and one for an unretained ID above the watermark is still a protocol error.
 
 Validate these with pure state-machine/property tests, parser fuzzing, deterministic clocks, real-WebSocket integration tests and fault injection before/after every state transition. Race OPEN/OPENED, FIN, RESET/CANCEL, duplicate drain messages, ACK loss, candidate failure and control loss against freeze/commit. Delay control and data independently to prove that a FROZEN marker cannot hide a data gap. Test abort after quiesce followed by a new attempt with greater fences, all 128 tracked entries, exhausted queue credit, missing replay buffers, stale connection IDs and lost close acknowledgements.
 
