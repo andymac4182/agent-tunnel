@@ -410,7 +410,14 @@ impl<A: Authority> Provider<A> {
         // obligation is about the case where it does not: a reply produced for
         // a tag whose `Rflush` has gone out.  `Provider::step` is where it is
         // dropped, before any host work, so nothing is performed either way.
-        if self.session.has_tag(oldtag) || self.queue.iter().any(|queued| queued.tag == oldtag) {
+        //
+        // **Only a request still in the queue is marked.** A victim this
+        // dispatcher has already answered has no reply left to drop, and
+        // marking its tag anyway would be a defect rather than caution: gate
+        // 3's session releases a flushed tag when its `Rflush` is answered, so
+        // the client may immediately re-issue that number, and a stale mark
+        // would silently drop the *new* request's reply.
+        if self.queue.iter().any(|queued| queued.tag == oldtag) {
             self.flushed.insert(oldtag);
         }
         let reply = Frame::new(tag, Message::Rflush);

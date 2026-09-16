@@ -664,6 +664,17 @@ fn a_flush_of_a_tag_that_was_already_answered_still_answers_rflush() {
     let reply = one_frame(exchange(&mut provider, tflush(10, 9)));
     assert!(matches!(reply.message, Message::Rflush));
     assert_eq!(provider.stats().dropped_after_flush, 0);
+
+    // And the number is immediately re-usable.  Gate 3's session releases a
+    // flushed tag when its `Rflush` is answered, so a dispatcher that had
+    // marked this victim anyway would now silently drop the **new** request's
+    // reply — which is the defect this assertion exists to catch.
+    let reply = one_frame(exchange(&mut provider, tgetattr(9, 1, GETATTR_BASIC)));
+    match reply.message {
+        Message::Rgetattr(attributes) => assert_eq!(attributes.size, 9),
+        other => panic!("a re-issued tag must be answered, got {other:?}"),
+    }
+    assert_eq!(provider.stats().dropped_after_flush, 0);
 }
 
 // -------------------------------------------------- the fid-generation rule
