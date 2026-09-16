@@ -824,7 +824,7 @@ mod tests {
     use super::{
         capability_metadata, derive_capabilities, parse_case_sensitivity, revision_matches,
     };
-    use axum::http::HeaderMap;
+    use axum::http::{HeaderMap, StatusCode};
     use tunnel_fs_core::{Capability, CapabilitySet, CaseSensitivity};
 
     fn grant_with(operations: &[&str]) -> tunnel_catalog::GrantSnapshot {
@@ -890,6 +890,53 @@ mod tests {
         for unknown in ["", "SENSITIVE", "insensitive", "true", "case-folding"] {
             assert_eq!(parse_case_sensitivity(unknown), None, "{unknown}");
         }
+    }
+
+    #[test]
+    fn a_resolver_refusal_keeps_its_distinction_in_the_contracts_vocabulary() {
+        use axum::body::Body;
+        use axum::http::Response as HttpResponse;
+
+        let cases = [
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (StatusCode::FORBIDDEN, StatusCode::FORBIDDEN),
+            (StatusCode::TOO_MANY_REQUESTS, StatusCode::TOO_MANY_REQUESTS),
+            (StatusCode::NOT_FOUND, StatusCode::NOT_FOUND),
+            // The contract reserves 409 at this URL for CAPABILITIES_CHANGED, so
+            // an ambiguous service label is undiscoverable rather than a
+            // conflict.
+            (StatusCode::CONFLICT, StatusCode::NOT_FOUND),
+        ];
+        for (from, expected) in cases {
+            let refusal = HttpResponse::builder()
+                .status(from)
+                .body(Body::empty())
+                .expect("response");
+            assert_eq!(
+                super::translate_resolution(refusal).status(),
+                expected,
+                "{from}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_websocket_upgrade_request_is_read_as_one() {
+        let mut headers = HeaderMap::new();
+        assert!(
+            !super::is_upgrade(&headers),
+            "a plain GET is the descriptor"
+        );
+        headers.insert(axum::http::header::UPGRADE, "h2c".parse().expect("value"));
+        assert!(!super::is_upgrade(&headers));
+        headers.insert(
+            axum::http::header::UPGRADE,
+            "WebSocket".parse().expect("value"),
+        );
+        assert!(super::is_upgrade(&headers), "the token is case-insensitive");
     }
 
     #[test]
