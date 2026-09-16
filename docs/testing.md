@@ -1050,7 +1050,7 @@ outcome is counted at the settle event above. Sleeps appear only as the poll
 interval of bounded waits on those signals. The OPEN journal peak is
 sampled continuously from the connector's status watch and must stay within a
 bound derived from the case concurrency (20), not from the roughly seventy
-streams the run serves on that one session; observed 13 to 15. The gate ends
+streams the run serves on that one session; observed 13 to 18. The gate ends
 every session it can with DELETE; exactly two cannot be ended (the revoked
 principal's, whose DELETE the relay refuses along with everything else it
 sends, and the one whose owner relay was killed), and **no** export child may
