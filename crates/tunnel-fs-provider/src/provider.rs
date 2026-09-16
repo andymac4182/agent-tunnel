@@ -93,12 +93,21 @@ pub struct ProviderStats {
     pub revision_closures: u64,
     /// Sessions closed because the authorization snapshot had expired.
     pub freshness_closures: u64,
-    /// `Tlopen`s whose classification the resolver's kind changed.
+    /// `Tlopen`s the resolver's kind classified differently from the flags.
     ///
-    /// The gate-3 obligation: a directory opened read-only classifies from the
-    /// flags as `OpenRead`, and must become `OpenDir`.
+    /// The comparison is against the **flags alone**, which is the only
+    /// classification available without asking something about the node: a
+    /// directory opened read-only without `O_DIRECTORY` reads as `OpenRead`
+    /// there and must become `OpenDir`. Gate 3's session reaches the same
+    /// answer for a fid whose *qid* already says directory, so this counter is
+    /// larger than the number of decisions the session would have got wrong —
+    /// it measures the re-classification happening, not the session being
+    /// mistaken, and those are different claims.
     pub reclassified_opens: u64,
     /// `Tlopen`s the re-classification refused that the flags alone permitted.
+    ///
+    /// This one *is* the gate-3 obligation's own measure: an open the flag-level
+    /// decision would have admitted and the resolver's kind refuses.
     pub reclassification_refusals: u64,
     /// Mutating requests refused because writes are gate 5's.
     pub mutations_refused: u64,
