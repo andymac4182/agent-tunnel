@@ -78,6 +78,21 @@ const CANCEL_REASON: u16 = tunnel_protocol::reset_reason::CANCELLED;
 const COOKIE_SECRET: &str = "synthetic-session-cookie-0a1b2c";
 const INTERNAL_HEADER: &str = "x-agent-tunnel-owner";
 const DIAGNOSTIC_WAIT: Duration = Duration::from_secs(15);
+/// M7-C82: one device session used to admit at most this many streams in its
+/// whole lifetime, because its OPEN journal never released a tombstone.
+pub const OPEN_JOURNAL_TRACKED_ENTRIES: usize =
+    tunnel_protocol::control_journal::MAX_JOURNAL_ENTRIES;
+/// Sequential small requests driven through one device session, comfortably
+/// past that former ceiling.
+pub const SEQUENTIAL_REQUESTS: usize = 160;
+/// A fresh consumer connection every this many sequential requests, so the
+/// loop does not depend on one HTTP/1.1 connection surviving all of them.
+const SEQUENTIAL_CONNECTION_REQUESTS: usize = 32;
+/// A typed `not_dispatched` refusal (an owner-not-ready condition) may be
+/// retried this many times in total.  It never reached the device, so it
+/// cannot account for a second dispatch.
+const SEQUENTIAL_RETRY_CAP: usize = 12;
+const SEQUENTIAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// The bounded evidence one gate run produces.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -146,6 +161,18 @@ pub struct HttpForwardRealPathEvidence {
     pub internal_header_probe_status: u16,
     pub unauthenticated_status: u16,
     pub rejected_probes_dispatched: bool,
+    // (f) M7-C82: one long-lived session past the former 128-stream ceiling.
+    pub sequential_requests: usize,
+    pub sequential_ok: usize,
+    pub sequential_dispatches: u64,
+    pub sequential_not_dispatched_retries: usize,
+    pub sequential_highest_stream_id: u64,
+    pub sequential_session_id_stable: bool,
+    pub sequential_phase_after: String,
+    pub sequential_ready_after: bool,
+    pub open_journal_entries_peak: usize,
+    pub open_streams_retired: u64,
+    pub open_retired_ranges_coalesced: u64,
 }
 
 /// The documented bound every hop must respect.  Returns the first violated
@@ -157,7 +184,7 @@ pub fn validate_http_forward_real_path_evidence(
     evidence: &HttpForwardRealPathEvidence,
 ) -> Result<()> {
     let body_queue_bound = BODY_QUEUE_CHUNKS * MAX_BODY_PAYLOAD_LEN;
-    let checks: [(&str, bool); 46] = [
+    let checks: [(&str, bool); 54] = [
         (
             "owner-local ingress answers the permission request",
             evidence.owner_local_permission_exact,
@@ -328,6 +355,44 @@ pub fn validate_http_forward_real_path_evidence(
             evidence.internal_header_probe_status == 400
                 && evidence.unauthenticated_status == 401
                 && !evidence.rejected_probes_dispatched,
+        ),
+        (
+            "one session served every sequential request",
+            evidence.sequential_requests == SEQUENTIAL_REQUESTS
+                && evidence.sequential_ok == SEQUENTIAL_REQUESTS,
+        ),
+        (
+            "sequential streams passed the former 128-stream session ceiling",
+            evidence.sequential_highest_stream_id > OPEN_JOURNAL_TRACKED_ENTRIES as u64,
+        ),
+        (
+            "one dispatch per sequential request",
+            evidence.sequential_dispatches == SEQUENTIAL_REQUESTS as u64,
+        ),
+        (
+            "typed not_dispatched refusals stayed bounded",
+            evidence.sequential_not_dispatched_retries <= SEQUENTIAL_RETRY_CAP,
+        ),
+        (
+            "the device session survived every sequential stream",
+            evidence.sequential_session_id_stable
+                && evidence.sequential_ready_after
+                && matches!(
+                    evidence.sequential_phase_after.as_str(),
+                    "active" | "preparing" | "quiescing" | "draining" | "committing" | "retiring"
+                ),
+        ),
+        (
+            "the OPEN journal stayed bounded while serving them",
+            evidence.open_journal_entries_peak <= OPEN_JOURNAL_TRACKED_ENTRIES,
+        ),
+        (
+            "every served stream was reclaimed at the OPEN retry horizon",
+            evidence.open_streams_retired >= SEQUENTIAL_REQUESTS as u64,
+        ),
+        (
+            "the bounded retired-stream record never coalesced a gap",
+            evidence.open_retired_ranges_coalesced == 0,
         ),
     ];
     for (rule, passed) in checks {
@@ -788,6 +853,7 @@ async fn run(
             harness,
             &state,
             &device_diagnostics,
+            &client,
             device.tenant_id,
             device.id,
             http_service,
@@ -836,6 +902,7 @@ async fn exercise(
     harness: &RunningHarness,
     state: &Arc<HandlerState>,
     device_diagnostics: &tunnel_client::http_forward::DeviceHttpDiagnostics,
+    client: &tunnel_client::ConnectionHandle,
     tenant_id: uuid::Uuid,
     device_id: uuid::Uuid,
     service_id: uuid::Uuid,
@@ -1313,6 +1380,130 @@ async fn exercise(
             .max_device_request_body
             .max(record.request_body_high_water);
     }
+
+    // (f) M7-C82: one long-lived session serves an unbounded number of
+    // sequential streams.  Before the OPEN retry horizon this session died at
+    // its 128th stream: the connector's journal refused admission and the
+    // owner's next STREAM_FORGET for that unjournaled stream failed the
+    // session.  Every request here is small, so the loop measures the
+    // per-session stream ceiling rather than throughput.  It runs last,
+    // because it evicts the bounded device exchange records read above.
+    sequential_streams(
+        ingress_addr,
+        &ca,
+        &token,
+        &base,
+        state,
+        device_diagnostics,
+        client,
+        session_id,
+        evidence,
+    )
+    .await
+}
+
+/// Drive `SEQUENTIAL_REQUESTS` small requests through one device session, one
+/// at a time, and record what the session and its OPEN journal did.
+#[allow(clippy::too_many_arguments)]
+async fn sequential_streams(
+    ingress_addr: SocketAddr,
+    ca: &[u8],
+    token: &str,
+    base: &str,
+    state: &Arc<HandlerState>,
+    device_diagnostics: &tunnel_client::http_forward::DeviceHttpDiagnostics,
+    client: &tunnel_client::ConnectionHandle,
+    session_id: &str,
+    evidence: &mut HttpForwardRealPathEvidence,
+) -> Result<()> {
+    let dispatches_before = state.invocations.load(Ordering::SeqCst) as u64;
+    evidence.sequential_requests = SEQUENTIAL_REQUESTS;
+    let mut connection: Option<(Sender, tokio::task::JoinHandle<()>)> = None;
+    let mut on_connection = 0;
+    let mut index = 0;
+    while index < SEQUENTIAL_REQUESTS {
+        if connection.is_none() || on_connection >= SEQUENTIAL_CONNECTION_REQUESTS {
+            if let Some((sender, task)) = connection.take() {
+                drop(sender);
+                task.abort();
+            }
+            connection = Some(connect_consumer(ingress_addr, ca).await?);
+            on_connection = 0;
+        }
+        let (sender, _task) = connection
+            .as_mut()
+            .ok_or_else(|| HarnessError::Process("sequential consumer connection".into()))?;
+        let response = timeout(
+            SEQUENTIAL_REQUEST_TIMEOUT,
+            sender.send_request(request(
+                "POST",
+                &format!("{base}/permission"),
+                Some(token),
+                &[("content-type", "application/json")],
+                once_stream(br#"{"permission":"allow_once"}"#),
+            )?),
+        )
+        .await
+        .map_err(|_| HarnessError::Timeout(format!("sequential request {index} head timed out")))?
+        .map_err(|error| HarnessError::Http(format!("sequential request {index}: {error}")))?;
+        let status = response.status().as_u16();
+        let body = timeout(SEQUENTIAL_REQUEST_TIMEOUT, response.into_body().collect())
+            .await
+            .map_err(|_| HarnessError::Timeout(format!("sequential body {index} timed out")))?
+            .map_err(|error| HarnessError::Http(format!("sequential body {index}: {error}")))?
+            .to_bytes();
+        on_connection += 1;
+        if status == 200 && body.as_ref() == b"permission-granted" {
+            evidence.sequential_ok += 1;
+            index += 1;
+        } else if body.windows(14).any(|window| window == b"not_dispatched")
+            && evidence.sequential_not_dispatched_retries < SEQUENTIAL_RETRY_CAP
+        {
+            // A typed owner-not-ready refusal never reached the device, so it
+            // cannot account for a second dispatch.  Retry the same request.
+            evidence.sequential_not_dispatched_retries += 1;
+            sleep(Duration::from_millis(100)).await;
+        } else {
+            return Err(HarnessError::Process(format!(
+                "sequential request {index} failed with status {status} after {} typed retries",
+                evidence.sequential_not_dispatched_retries
+            )));
+        }
+        let status_snapshot = client.status_snapshot();
+        evidence.open_journal_entries_peak = evidence
+            .open_journal_entries_peak
+            .max(status_snapshot.open_journal_entries);
+    }
+    if let Some((sender, task)) = connection.take() {
+        drop(sender);
+        task.abort();
+    }
+    evidence.sequential_dispatches =
+        (state.invocations.load(Ordering::SeqCst) as u64).saturating_sub(dispatches_before);
+    evidence.sequential_highest_stream_id = device_diagnostics
+        .snapshot()
+        .iter()
+        .map(|record| record.stream_id)
+        .max()
+        .unwrap_or_default();
+    // The journal releases an entry only after the owner's STREAM_FORGET has
+    // completed its carrier barriers, which can trail the consumer response.
+    let final_status = wait_for_records("open journal", async || {
+        let snapshot = client.status_snapshot();
+        Ok((snapshot.open_streams_retired >= SEQUENTIAL_REQUESTS as u64).then_some(snapshot))
+    })
+    .await?;
+    evidence.open_journal_entries_peak = evidence
+        .open_journal_entries_peak
+        .max(final_status.open_journal_entries);
+    evidence.open_streams_retired = final_status.open_streams_retired;
+    evidence.open_retired_ranges_coalesced = final_status.open_retired_ranges_coalesced;
+    evidence.sequential_session_id_stable = final_status.session_id.as_deref() == Some(session_id);
+    evidence.sequential_phase_after = final_status.phase.clone();
+    evidence.sequential_ready_after = matches!(
+        &*client.readiness().borrow(),
+        tunnel_client::Readiness::Ready(session) if session.session_id == session_id
+    );
     Ok(())
 }
 
@@ -1378,6 +1569,17 @@ mod tests {
             internal_header_probe_status: 400,
             unauthenticated_status: 401,
             rejected_probes_dispatched: false,
+            sequential_requests: SEQUENTIAL_REQUESTS,
+            sequential_ok: SEQUENTIAL_REQUESTS,
+            sequential_dispatches: SEQUENTIAL_REQUESTS as u64,
+            sequential_not_dispatched_retries: 0,
+            sequential_highest_stream_id: OPEN_JOURNAL_TRACKED_ENTRIES as u64 + 1,
+            sequential_session_id_stable: true,
+            sequential_phase_after: "active".into(),
+            sequential_ready_after: true,
+            open_journal_entries_peak: OPEN_JOURNAL_TRACKED_ENTRIES,
+            open_streams_retired: SEQUENTIAL_REQUESTS as u64,
+            open_retired_ranges_coalesced: 0,
         }
     }
 
@@ -1485,6 +1687,31 @@ mod tests {
             ("response leak", |e| e.consumer_response_header_leak = true),
             ("probe status", |e| e.internal_header_probe_status = 200),
             ("probe dispatched", |e| e.rejected_probes_dispatched = true),
+            ("sequential count", |e| e.sequential_requests -= 1),
+            ("sequential success", |e| e.sequential_ok -= 1),
+            ("sequential ceiling", |e| {
+                e.sequential_highest_stream_id = OPEN_JOURNAL_TRACKED_ENTRIES as u64;
+            }),
+            ("sequential double dispatch", |e| {
+                e.sequential_dispatches += 1
+            }),
+            ("sequential retries", |e| {
+                e.sequential_not_dispatched_retries = SEQUENTIAL_RETRY_CAP + 1;
+            }),
+            ("sequential session", |e| {
+                e.sequential_session_id_stable = false
+            }),
+            ("sequential phase", |e| {
+                e.sequential_phase_after = "failed".into()
+            }),
+            ("sequential readiness", |e| e.sequential_ready_after = false),
+            ("journal bound", |e| {
+                e.open_journal_entries_peak = OPEN_JOURNAL_TRACKED_ENTRIES + 1;
+            }),
+            ("journal reclamation", |e| e.open_streams_retired -= 1),
+            ("retired record coalesced", |e| {
+                e.open_retired_ranges_coalesced = 1
+            }),
         ];
         for (name, mutate) in mutations {
             let mut evidence = passing();
