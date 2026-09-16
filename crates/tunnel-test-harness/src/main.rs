@@ -1868,11 +1868,12 @@ async fn main() -> ExitCode {
                         evidence.correlation.misrouted,
                     );
                     println!(
-                        "M3 MCP isolation revocation: baseline={} in_flight({} {} {}) after({} {} {}) within={}ms dispatched_after={} sibling_served={} device_session_survived={} revoked_session_unreachable={}",
+                        "M3 MCP isolation revocation: baseline={} in_flight({} {} {} withdrawn_in={}ms) after({} {} {}) within={}ms dispatched_after={} sibling_served={} device_session_survived={} revoked_session_unreachable={}",
                         evidence.revocation.baseline_status,
                         evidence.revocation.in_flight_status,
                         evidence.revocation.in_flight_code,
                         evidence.revocation.in_flight_execution,
+                        evidence.revocation.withdrawn_within_ms,
                         evidence.revocation.after_status,
                         evidence.revocation.after_code,
                         evidence.revocation.after_execution,

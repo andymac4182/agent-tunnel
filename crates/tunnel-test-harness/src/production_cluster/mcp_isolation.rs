@@ -127,6 +127,12 @@ const ROTATION_BOUND: Duration = Duration::from_secs(
 const OUTCOME_WAIT: Duration = Duration::from_secs(90);
 /// A revoked grant must stop dispatch within this bound.
 pub const REVOCATION_BOUND: Duration = Duration::from_secs(30);
+/// An admitted exchange must be withdrawn this soon after the revocation.
+/// The bound separates the revocation from the exchange's own progress
+/// deadline: with the revocation skipped, the identical held call runs to
+/// that deadline at about 30 s, and with it the call ends in well under a
+/// second.
+pub const REVOCATION_WITHDRAWAL_BOUND: Duration = Duration::from_secs(5);
 const MEMBERSHIP_RESIGN_SPACING: Duration = Duration::from_secs(15);
 
 /// What this gate does not prove.  Recorded rather than faked.
@@ -198,6 +204,12 @@ pub struct RevocationEvidence {
     /// inside [`REVOCATION_BOUND`], rather than only ending when the gate
     /// released the fixture afterwards.
     pub in_flight_withdrawn: bool,
+    /// How long after the revocation the admitted exchange ended.  The
+    /// `rotation-span` case holds an identical call, unrevoked, for longer
+    /// than [`REVOCATION_BOUND`] and it completes with a result, so a
+    /// withdrawal inside the bound is the revocation's doing and not a
+    /// deadline every held call would hit.
+    pub withdrawn_within_ms: u128,
     /// The in-flight exchange's terminal status and typed code.  A status of
     /// zero means the consumer's transport ended with no response at all.
     pub in_flight_status: u16,
@@ -303,7 +315,7 @@ pub fn validate_mcp_isolation_evidence(evidence: &McpIsolationEvidence) -> Resul
             && !outcome.body_code.is_empty()
             && (500..=599).contains(&outcome.status)
     };
-    let checks: [(&str, bool); 31] = [
+    let checks: [(&str, bool); 32] = [
         ("three relays ran", evidence.relay_count == 3),
         (
             "the ingress was not the owner",
@@ -396,9 +408,24 @@ pub fn validate_mcp_isolation_evidence(evidence: &McpIsolationEvidence) -> Resul
             // claim that nothing ran, would both be wrong.
             "the admitted exchange was withdrawn with a typed error, not a result",
             revocation.in_flight_withdrawn
+                && revocation.withdrawn_within_ms <= REVOCATION_WITHDRAWAL_BOUND.as_millis()
                 && revocation.in_flight_status != 200
                 && !revocation.in_flight_code.is_empty()
                 && !revocation.in_flight_execution.is_empty(),
+        ),
+        (
+            // The control for the rule above: an identical held call that was
+            // never revoked stays open longer than the revocation bound and
+            // is answered, so the withdrawal is the revocation's doing.
+            "an unrevoked call outlives the withdrawal bound and is answered",
+            rotation.status == 200
+                && ROTATION_BOUND.as_millis() > REVOCATION_BOUND.as_millis()
+                && u128::from(
+                    rotation.rotations_spanned
+                        * (ISOLATION_ROTATION.interval_seconds
+                            + ISOLATION_ROTATION.overlap_seconds)
+                        * 1_000,
+                ) > REVOCATION_WITHDRAWAL_BOUND.as_millis(),
         ),
         (
             "a fresh request after revocation is refused, not dispatched",
@@ -1149,6 +1176,20 @@ impl Gate<'_> {
         let after = self.export(SERVICE_2025);
         evidence.sessions_opened = after.sessions_opened - before.sessions_opened;
         evidence.children_spawned = after.children_spawned - before.children_spawned;
+        // Fail here rather than letting a later case fail for an unrelated
+        // reason: every case after this one uses these two sessions, so a
+        // binding that did not hold would first show up as a missing session.
+        if evidence.foreign_post_status != 404
+            || evidence.foreign_get_status != 404
+            || evidence.foreign_delete_status != 404
+        {
+            return Err(HarnessError::Process(format!(
+                "another principal's session ID was accepted: post {} get {} delete {}",
+                evidence.foreign_post_status,
+                evidence.foreign_get_status,
+                evidence.foreign_delete_status
+            )));
+        }
         Ok((evidence, alice_session, bob_session))
     }
 
@@ -1436,7 +1477,12 @@ impl Gate<'_> {
                     body_stream(call_body("3", "echo", &json!({"phase": "after"}), None)),
                 )
                 .await?;
-            if attempt.status != 200 || Instant::now() >= deadline {
+            // Only the revocation's own typed refusal ends the wait; a
+            // transient owner-not-ready 503 is retried, so this loop cannot
+            // mistake a rotation freeze for a revocation.
+            let (code, _) = attempt.error();
+            if (attempt.status == 404 && code == "SERVICE_NOT_FOUND") || Instant::now() >= deadline
+            {
                 break attempt;
             }
             sleep(POLL).await;
@@ -1456,6 +1502,7 @@ impl Gate<'_> {
         let mut in_flight = in_flight;
         let withdrawn = timeout(REVOCATION_BOUND, &mut in_flight).await;
         evidence.in_flight_withdrawn = withdrawn.is_ok();
+        evidence.withdrawn_within_ms = revoked_at.elapsed().as_millis();
         let terminal =
             match withdrawn {
                 Ok(joined) => Some(joined),
@@ -2062,6 +2109,7 @@ mod tests {
             revocation: RevocationEvidence {
                 baseline_status: 200,
                 in_flight_withdrawn: true,
+                withdrawn_within_ms: 500,
                 in_flight_status: 502,
                 in_flight_code: "HTTP_STREAM_INTERRUPTED".into(),
                 in_flight_execution: "unknown".into(),
@@ -2160,6 +2208,9 @@ mod tests {
             }),
             ("the exchange was not withdrawn", |e| {
                 e.revocation.in_flight_withdrawn = false;
+            }),
+            ("the withdrawal was slower than the bound", |e| {
+                e.revocation.withdrawn_within_ms = REVOCATION_WITHDRAWAL_BOUND.as_millis() + 1;
             }),
             ("the withdrawn exchange returned a result", |e| {
                 e.revocation.in_flight_status = 200;
