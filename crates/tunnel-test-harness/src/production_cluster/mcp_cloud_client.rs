@@ -37,7 +37,7 @@
 //!
 //! All payloads, credentials and processes are synthetic.
 
-mod wire;
+pub(super) mod wire;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -129,7 +129,7 @@ pub const NOT_COVERED: [&str; 6] = [
     "resources and prompts (M3-13)",
     "Last-Event-ID resume of an interrupted stream (M3-10)",
     "process-group kill for a Streamable HTTP backend, which the device does not own",
-    "session isolation, concurrent correlation, lost acknowledgements and revocation (M3-04)",
+    "session isolation, concurrent correlation, lost acknowledgements and revocation: covered by verify-m3-mcp-isolation (M3-04), not by this gate",
 ];
 
 fn protocol_of(profile: &str) -> &'static str {

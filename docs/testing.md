@@ -941,17 +941,174 @@ Because the relay pauses new stream admission during a rotation freeze, a POST c
 
 See "Not proven by M3-03" in [mcp.md](mcp.md#pinned-in-code-m3-03) for what this gate does not cover.
 
+## MCP isolation, correlation and unknown outcomes (`verify-m3-mcp-isolation`)
+
+```sh
+TEST_REDIS_URL=redis://127.0.0.1:63790/ scripts/m3-harness-verify.sh
+cargo run -p tunnel-test-harness --locked -- verify-m3-mcp-isolation
+```
+
+M3-04. The gate runs on the same three-relay production cluster and the same
+short rotation policy as the M3-03 gate (interval 6 s, handshake 2 s, overlap
+5 s), against the same `tunnel-mcp-fixture` stdio server, but with **two
+distinct authenticated principals of one tenant** — `consumer-a-1` and
+`consumer-a-2`, each with its own bearer token and its own grant on the same
+device and services — and a **third principal** (`owner-a`) that exists only
+to have its grant revoked, so revocation cannot disturb the other cases. A run
+takes about 60 s.
+
+Its client is raw HTTP, deliberately. M3-03 already pins the official rmcp
+client end to end; this gate has to send what a conforming client never sends:
+another principal's session ID, deliberately colliding JSON-RPC IDs and
+progress tokens in both directions, and a request whose acknowledgement is
+lost. It therefore builds every message itself and reads every answer as
+bytes. Everything else on the path is production: relay-c's public route, the
+peer HTTP/3 hop, relay-a's owner actor, the rotating device data WebSocket and
+`tunnel-client`'s configured `[exports.<service>.mcp]` stdio exports.
+
+All five cases run on **one device session** (defect M7-C82 is fixed), up to
+the owner loss that necessarily ends it, and membership is re-signed at case
+boundaries at most every 15 s (defect M7-C80).
+
+* **binding-forgery.** The consumer sends `tunnel-principal-binding` itself,
+  on both profiles and all three routes, once with a single value and once
+  with the header repeated with two different values: twelve attempts, each
+  refused `400 HTTP_INVALID_HEAD` `not_dispatched`, each counted as an ingress
+  rejection by relay-c, and zero device dispatches. This is the whole basis of
+  the unkeyed design — because a consumer can never put the header on the
+  wire, the digest does not have to be secret — so it is a gate case and not
+  only a unit test. (Header names are lowercased by the HTTP parser, so every
+  spelling a consumer can send arrives as the same key; the relay unit test
+  `a_consumer_supplied_principal_binding_is_refused` pins that.)
+* **session-isolation.** Each principal opens its own `mcp-2025-11-25`
+  session. Consumer B then presents consumer A's session ID on POST, GET and
+  DELETE: all three must answer 404, and each answer must be indistinguishable
+  — status, every response header except `date`, and the body bytes — from the
+  same route's answer for a session that never existed, so a leaked ID neither
+  works nor reveals that the session exists. Both sessions
+  must still answer exactly afterwards. Each principal then opens its
+  standalone GET stream and calls `log` with its own label, concurrently and
+  with the same JSON-RPC ID: each stream must carry exactly its own four
+  `notifications/message` and none of the other's. Exactly two sessions and
+  two children were opened, so a refused request never spawned one.
+* **correlation.** Both principals issue the six colliding JSON-RPC IDs of
+  `COLLIDING_IDS` at once — including `9007199254740993` and
+  `9007199254740994`, which a JSON implementation reading IDs as doubles would
+  collapse into one — first against the sessionless `mcp-2026-07-28` export
+  and then on their own `mcp-2025-11-25` sessions, where they also reuse the
+  same progress-token values across sessions and principals. All 24 answers
+  must carry their own caller's ID and echo their own caller's arguments; none
+  may be misrouted. A `progress` call on each session with one shared token
+  must see its own 1, 2, 3. A genuine duplicate — the same ID, and separately
+  the same progress token, while the first is still in flight on one session —
+  must be refused with 400.
+* **revocation.** The third principal opens a session, is answered once, and
+  holds a call in the fixture. Its grant is then revoked in Redis. A fresh
+  request must be refused with `404 SERVICE_NOT_FOUND` and `not_dispatched`
+  (a transient `503 PEER_UNAVAILABLE` is retried, so a rotation freeze cannot
+  be mistaken for a revocation), nothing may be dispatched to the device
+  afterwards, and the *admitted* exchange must be withdrawn within five
+  seconds with a typed interruption rather than a result. Observed: refused in
+  about 10 ms, withdrawn in about 500 ms, `502 HTTP_STREAM_INTERRUPTED` with
+  `execution: unknown` — the tool had already been dispatched, so neither a
+  result nor a claim that nothing ran would be true. The recorded blast radius
+  is exactly that: the other principals' sessions still answer and the device
+  session survives. The revoked principal's own device-side session is *not*
+  ended; it simply becomes unreachable, and its child holds a `max_children`
+  slot for as long as the device session lives, or until
+  `session_idle_seconds` (M3-16). The Streamable HTTP export has the same
+  setting for its own session table, so an abandoned session there is
+  forgotten rather than held for ever.
+* **rotation-span.** One call is held open until the owner has completed three
+  scheduled rotations, then released: it must answer 200 exactly once with the
+  fixture's exact text, on the same device session, with one dispatch. This
+  case is also the validator's control for the revocation withdrawal above: an
+  identical held call that is never revoked stays open far longer than the
+  five-second withdrawal bound and is answered.
+* **unknown-outcome.** A call is held until the fixture has appended its
+  invocation to `invocations.log` — the synthetic side effect, which has then
+  provably run exactly once. The gate then blackholes the owner→ingress peer
+  path, and in a second round shuts relay-a down. Either way the consumer must
+  get a 5xx whose `{code, execution}` maps to `outcome_unknown`, the side
+  effect must still be recorded exactly once at the outcome, and nothing may
+  be retried or replayed. The side effect is counted at an observed event, not
+  after a sleep: the lost-acknowledgement round settles when the device has
+  finished and recorded that exchange (a replay would be a second record,
+  matched by stream ID because the connector's log is bounded), and the
+  owner-loss round settles when the connector leaves readiness, because the
+  device session a replay would need is gone with it. Each round records which
+  event it settled on, and the validator requires the expected one.
+
+Evidence is validated by `validate_mcp_isolation_evidence`
+(`production_cluster/mcp_isolation.rs`), re-run at the command boundary; its
+unit test rejects every listed single-rule mutation of passing evidence.
+Correctness comes from HTTP statuses, response headers and bodies, MCP export
+counters, fixture marker files, device exchange records, connector readiness,
+owner session snapshots and the connector's OPEN journal occupancy. No sleep
+is a correctness signal: the standalone GET streams are opened and their heads
+answered before either call starts (the answered head is the device's own
+signal that the session's standalone stream is registered), and each unknown
+outcome is counted at the settle event above. Sleeps appear only as the poll
+interval of bounded waits on those signals. The OPEN journal peak is
+sampled continuously from the connector's status watch and must stay within a
+bound derived from the case concurrency — the correlation case issues two
+adjacent bursts of `CORRELATION_CALLS * 2` streams and the second can begin
+while the first's `STREAM_FORGET`s are still in flight, so both may be
+unreclaimed at once: `CORRELATION_CALLS * 4` = 24 — not from the roughly
+seventy streams the run serves on that one session; observed 12 to 18 across
+six runs. The gate ends
+every session it can with DELETE; exactly two cannot be ended (the revoked
+principal's, whose DELETE the relay refuses along with everything else it
+sends, and the one whose owner relay was killed), and **no** export child may
+be left running once the connector stops, because dropping the connector's
+handler registry ends every session its exports still hold.
+
+**Red-then-green.**
+
+* Removing the owner's re-derivation and comparison
+  (`OwnerRequestWriter::validate`): a head carrying another principal's
+  binding, and a head carrying none, both reached the device. The owner test
+  `the_owner_verifies_the_principal_binding_it_derived_itself` fails on both.
+* Removing the ingress refusal (`refuse_consumer_principal_binding`'s guard):
+  the relay unit test fails, and with the handler's call site removed the
+  `binding-forgery` gate case reports admitted attempts and a nonzero device
+  dispatch.
+* Removing the export's session shutdown (`StdioExport`'s `Drop` and
+  `shutdown_sessions`): `an_unended_legacy_session_dies_with_its_export` and
+  `shutdown_ends_every_open_legacy_session` fail with the wrapper's grandchild
+  outliving its process group, and the gate reports `children_after_stop=2`.
+* Restoring the Streamable HTTP export's oldest-first eviction:
+  `one_principal_cannot_evict_another_by_opening_sessions` fails — one
+  principal's 257 `initialize` calls drop another principal's live session.
+* Removing the device's principal-binding check on legacy sessions
+  (`tunnel-mcp-export/src/stdio.rs`): consumer B's POST, GET and DELETE on
+  consumer A's session ID were accepted with 200, 200 and 204 — B could read
+  A's session and end it — and the gate failed with
+  `another principal's session ID was accepted: post 200 get 200 delete 204`.
+  The same removal fails the `tunnel-mcp-fixture` `principal_binding` tests
+  for both export kinds.
+* Skipping the `revoke_grant` call in the revocation case: the fresh request
+  was still served, the case ended on an unrelated transient
+  `503 PEER_UNAVAILABLE`, and the gate failed with
+  `a fresh request after revocation is refused, not dispatched`. That run also
+  showed the held call ending anyway at about 30 s on the exchange's own
+  progress deadline, which is why the withdrawal now has its own five-second
+  bound and the rotation-span control.
+
+See "Not proven by M3-04" in [mcp.md](mcp.md#pinned-in-code-m3-04) for what
+this gate does not cover.
+
 ## MCP and computer-use integration
 
 For MCP, test against a pinned SDK/server fixture with initialization, negotiated capabilities, request/response correlation, notifications, cancellation, concurrent calls, structured errors, and streaming behavior for each supported transport profile. Exercise a long-running request across rotation. Confirm that MCP session state and its lifecycle follow the adapter contract instead of being inferred from the lifetime of one data WebSocket. Keep other exposed capabilities functional while MCP work is active.
 
-The M3-01/M3-02 suite runs with the ordinary workspace test command. It is not a harness gate and needs no Redis or network, only loopback and a temporary Unix socket:
+The M3-01/M3-02/M3-04 suite runs with the ordinary workspace test command. It is not a harness gate and needs no Redis or network, only loopback and a temporary Unix socket:
 
 ```sh
 cargo test --locked -p tunnel-mcp -p tunnel-mcp-export -p tunnel-mcp-fixture
 ```
 
-`tunnel-mcp-fixture` builds the synthetic rmcp 3.4.0 server binary. Its `rmcp_stdio`, `rmcp_http` and `export_guards` tests run the pinned rmcp client through the in-process gate-2 bridge against the stdio export and the Streamable HTTP export, for both `mcp-2026-07-28` and `mcp-2025-11-25`. [mcp.md](mcp.md#pinned-in-code-m3-01-and-m3-02) lists what they cover and what they do not: isolation and unknown outcomes are M3-04. The end-to-end tests are `cfg(unix)`. The same fixture binary is the desktop server of the real-path gate above.
+`tunnel-mcp-fixture` builds the synthetic rmcp 3.4.0 server binary. Its `rmcp_stdio`, `rmcp_http`, `export_guards` and `principal_binding` tests run the pinned rmcp client through the in-process gate-2 bridge against the stdio export and the Streamable HTTP export, for both `mcp-2026-07-28` and `mcp-2025-11-25`. [mcp.md](mcp.md#pinned-in-code-m3-01-and-m3-02) lists what they cover and what they do not. `principal_binding` covers the M3-04 session binding for both export kinds through that bridge; isolation over the real cluster is `verify-m3-mcp-isolation`. The end-to-end tests are `cfg(unix)`. The same fixture binary is the desktop server of the real-path gate above.
 
 For CUA, pin each supported backend profile separately. Use recorded synthetic contract fixtures or fake local servers in ordinary CI. The Python computer-server profile requires tests for its `/cmd` response format and its sequential `/ws` request behavior without correlation IDs. If a Rust `cua-driver` profile is selected, validate its own protocol and capability discovery independently. Tunnel credentials must not be forwarded as CUA cloud credentials.
 

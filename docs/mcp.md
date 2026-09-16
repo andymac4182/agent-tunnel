@@ -1,6 +1,6 @@
 # MCP adapter plan
 
-Status: M3-01 (pins), M3-02 (device exports over `http-forward/1`) and M3-03 (a real cloud-side client across relays and rotations) are implemented, awaiting verification, 2026-09-16; see [Pinned in code](#pinned-in-code-m3-01-and-m3-02) and [Pinned in code (M3-03)](#pinned-in-code-m3-03). M3-04 (isolation, correlation and unknown outcomes) is not implemented. MCP compatibility is separate from the tunnel wire protocol. The tunnel's control and data WebSockets do not require an external MCP client to support a custom transport.
+Status: M3-01 (pins), M3-02 (device exports over `http-forward/1`), M3-03 (a real cloud-side client across relays and rotations) and M3-04 (isolation, correlation, unknown outcomes and revocation) are implemented, awaiting verification, 2026-09-16; see [Pinned in code](#pinned-in-code-m3-01-and-m3-02), [Pinned in code (M3-03)](#pinned-in-code-m3-03) and [Pinned in code (M3-04)](#pinned-in-code-m3-04). MCP compatibility is separate from the tunnel wire protocol. The tunnel's control and data WebSockets do not require an external MCP client to support a custom transport.
 
 ## Two explicit compatibility profiles
 
@@ -10,7 +10,7 @@ The current upstream specification is **2026-07-28**. It changes HTTP transport 
 | --- | --- | --- |
 | Startup | Discovery/negotiation with per-request metadata | `initialize` and `notifications/initialized` lifecycle |
 | HTTP | POST with JSON or request-scoped SSE response | POST plus optional GET SSE stream |
-| Protocol sessions | No protocol-level session IDs | Scope MCP session IDs to authenticated principal/device/service |
+| Protocol sessions | No protocol-level session IDs | MCP session IDs are scoped to the authenticated principal, device and service (M3-04) |
 | Resume | No Last-Event-ID transport resume | Resume only where the backend profile supports it |
 | Cancellation | Response-stream disconnect cancels that request | Version-specific cancellation behavior |
 
@@ -140,7 +140,7 @@ Rejections are local JSON-RPC errors with fixed messages. They never echo header
 
 **2025-11-25 over stdio.**
 
-- **Sessions.** An `initialize` without `Mcp-Session-Id` starts one child and one session. Its random 128-bit ID is returned in `Mcp-Session-Id` only when the result succeeds. A request without the header gets 400; an unknown session gets 404.
+- **Sessions.** An `initialize` without `Mcp-Session-Id` starts one child and one session. Its random 128-bit ID is returned in `Mcp-Session-Id` only when the result succeeds. A request without the header gets 400; an unknown session gets 404. The session also records the principal binding it was opened with, and every later POST, GET and DELETE must present exactly that value; any other gets the unknown-session 404, byte for byte (M3-04, below).
 - **Routing.** A response is routed to its POST by ID. A notification carrying that request's `progressToken` follows the request. Every other server message, including server requests, goes to the one standalone GET stream (a second one gets 409). With no GET stream, such messages wait in a backlog bounded to 64 messages and the JSON limit; an overflow ends the session.
 - **Disconnects.** A disconnect is not cancellation. The client's POSTed `notifications/cancelled` is forwarded unchanged.
 - **Duplicates.** A request whose ID, or whose `progressToken`, is already in flight on the session gets 400. A reused token is never rebound to another request.
@@ -173,8 +173,7 @@ Rejections are local JSON-RPC errors with fixed messages. They never echo header
 ### Not proven by M3-01/M3-02
 
 - A real cloud-side client through non-owner ingress, the HTTP/3 hop and the rotating tunnel: these end-to-end tests use the in-process gate-2 bridge. That path is covered by the M3-03 gate below.
-- Session or consumer isolation bound to the authenticated principal (M3-04 acceptance). The device cannot see the principal, so legacy session IDs are unguessable but not principal-scoped (M3-04).
-- Concurrent consumers through the relay, revocation, lost acknowledgements and unknown tool outcomes across relays (M3-04).
+- Session or consumer isolation bound to the authenticated principal, concurrent consumers through the relay, revocation, lost acknowledgements and unknown tool outcomes across relays. These are now implemented and covered by `verify-m3-mcp-isolation`; see [Pinned in code (M3-04)](#pinned-in-code-m3-04). The M3-01/M3-02 tests themselves run through the in-process bridge with no ingress, so every request there carries no principal binding at all.
 - Resources, prompts, subscriptions (`subscriptions/listen`), MRTR input requests, sampling and elicitation. The bridge forwards them as raw messages, but no test exercises them (M3-13).
 - Server→client log notifications (`notifications/message`) and per-request cancellation over the real cluster; both are covered by M3-03 below.
 - `Last-Event-ID` resume. The stdio bridge emits no event IDs, so a legacy stream cannot resume; an HTTP backend's own resume is forwarded but untested (M3-10).
@@ -212,10 +211,160 @@ Every cell was observed in three consecutive standalone runs.
 
 ### Not proven by M3-03
 
-- Session or consumer isolation bound to the authenticated principal, concurrent consumers with colliding JSON-RPC IDs, lost acknowledgements and revocation (M3-04).
+- Session or consumer isolation bound to the authenticated principal, concurrent consumers with colliding JSON-RPC IDs, lost acknowledgements and revocation: covered by `verify-m3-mcp-isolation`, not by this gate. See [Pinned in code (M3-04)](#pinned-in-code-m3-04).
 - Sampling (`sampling/createMessage`), elicitation, MRTR input requests and `subscriptions/listen`; resources and prompts (M3-13). The bridge forwards them as raw messages and rmcp can express some of them, but no case exercises them.
 - `Last-Event-ID` resume of an interrupted stream (M3-10). The 2025 Streamable HTTP backend's own event IDs make rmcp attempt a resume after a crash; the gate bounds those attempts rather than proving resume.
 - A process-group kill for a Streamable HTTP backend: the device does not own that process. The gate restarts it as an operator's supervisor would.
 - HTTP/2 consumers, browser `Origin` handling and the MCP authorization profile (M3-11, M3-12).
 - An ingress exchange record for a consumer that disconnects before any response head (M3-14): the owner records the cancellation, the ingress records nothing.
 
+
+## Pinned in code (M3-04)
+
+Recorded 2026-09-16. The harness gate `verify-m3-mcp-isolation` (see
+[testing.md](testing.md#mcp-isolation-correlation-and-unknown-outcomes-verify-m3-mcp-isolation))
+runs two distinct authenticated principals of one tenant, plus a third whose
+grant is revoked, as raw-HTTP cloud consumers through non-owner ingress
+(relay-c), the peer HTTP/3 hop, the owner actor (relay-a), the rotating device
+data WebSocket and `tunnel-client`'s configured MCP exports, against the
+deterministic `tunnel-mcp-fixture` desktop server.
+
+### The principal binding
+
+The device sees no principal, and it never will: nothing about the consumer's
+identity belongs in a device-visible header. A 2025-11-25 session ID was
+therefore unguessable but not scoped — any authorized consumer of the same
+export who learned one could use it. The binding closes that without telling
+the device who anyone is.
+
+- **The ingress derives it.** After it strips the public credentials and
+  before it normalizes anything, the relay ingress derives
+  `tunnel-principal-binding`: a SHA-256 digest over a versioned domain
+  separator and the tenant, principal, device and service identifiers,
+  truncated to 128 bits and hex encoded
+  (`tunnel_relay::http::forward::principal_binding`).
+- **The owner re-derives it and never adopts it.** The ingress is not trusted
+  with it. The owner re-authenticates the consumer's forwarded token and
+  authorizes the grant for itself, so it holds the same four identifiers
+  independently; it derives the binding from *those* and compares it with the
+  relayed head, resetting the exchange with `HTTP_INVALID_HEAD`
+  `not_dispatched` on a mismatch or on an absent binding, before a byte
+  reaches the device (`OwnerRequestWriter`, `http/forward/owner_relay.rs`).
+  This matters precisely because the digest is unkeyed over catalog
+  identifiers: a compromised or buggy ingress holding one principal's token
+  could otherwise compute another principal's binding and land its requests on
+  that principal's session. The ingress is the only endpoint that *derives the
+  value a consumer's request will carry*; it is not the only endpoint that
+  checks it.
+- **It carries no identity.** The value is one way, and it is scoped to one
+  device and one service, so the same principal presents unrelated values on
+  unrelated exports and the device learns only "the same consumer as before".
+- **It is stable across relays.** Every relay derives the same value from the
+  same catalog facts, so a session opened through one ingress is usable
+  through another. It is deliberately not keyed: a shared cluster secret would
+  add a distribution problem without adding security, because the value's
+  integrity comes from the next point, not from secrecy.
+- **A consumer can never supply it.** An ingress request that carries the
+  header at all is refused with `400 HTTP_INVALID_HEAD` `not_dispatched`
+  before anything is forwarded, and counted as an ingress rejection. The
+  value is never taken from the request and never merely overwritten, so a
+  forged binding can neither reach a device nor be confused with a derived
+  one. Header names are lowercased by the HTTP parser, so one predicate
+  (`refuse_consumer_principal_binding`) covers every spelling, and a repeated
+  header is refused like a single one. The gate case `binding-forgery` drives
+  this through the real route on both profiles and all three methods.
+- **Only the session profile carries it.** It is in the `mcp-2025-11-25`
+  request allowlist and nowhere else: the sessionless `mcp-2026-07-28` profile
+  refuses it like any other unlisted header, and no profile allows it on a
+  response. It is a singleton, like every other header in these profiles.
+- **Both export kinds enforce it.** A stdio session records the binding it was
+  opened with; POST, GET and DELETE all require exactly that value. The
+  Streamable HTTP export does not own the backend's session identifiers, so it
+  records which binding each backend-issued session was handed to and refuses
+  every other principal — and every session it did not see issued — before the
+  backend is dialled. Only the exchange that opened a session binds it, so a
+  backend that echoes a different identifier on a later request cannot bind
+  that identifier to the caller. The binding is never forwarded upstream.
+  - **Capacity is refused, never taken from somebody else.** The table holds
+    `MAX_TRACKED_SESSIONS` (256) sessions and at most `MAX_SESSIONS_PER_BINDING`
+    (32) per principal. A principal at either bound is refused a new
+    `initialize` with `503` *before the backend is dialled* (and the refusal is
+    counted in the export's `rejected`), so the backend never creates a
+    session this export could not track. An earlier revision evicted the
+    oldest entry instead, which was a cross-principal denial channel: any
+    authorized principal could drop every other principal's live session —
+    forcing a re-initialization and losing its subscription state — by opening
+    257 sessions.
+  - **Entries expire.** An entry leaves when its own session does — a
+    successful DELETE, or a backend that answers 404 for it — or when it has
+    gone unused for the export's `session_idle_seconds` (default 600, the same
+    setting and bounds the stdio backend has). Without the expiry a client
+    that crashed and restarted without a DELETE leaked one slot per restart:
+    after 32 restarts that principal was refused every `initialize` until the
+    device process restarted, and 256 abandoned sessions would have locked the
+    export for everyone. Expiry fails closed — a forgotten session is answered
+    404 and its own holder re-initializes; no other principal is affected —
+    and it is per entry, so a session in use is never forgotten.
+- **A mismatch is an unknown session.** The same status, code and message,
+  byte for byte, so a leaked ID proves nothing about whether the session
+  exists.
+- **Without an ingress there is no principal.** The in-process bridge used by
+  the export tests supplies no binding, so sessions there are bound to "no
+  principal" and still refuse any other value. That is the only configuration
+  in which the binding is absent.
+- **A session does not outlive the export that served it.** A legacy session
+  is pumped by a detached task that owns the child process and its
+  `max_children` permit, so ending the export has to end the sessions
+  explicitly. Dropping an `McpExport`, calling `McpExport::shutdown`, or
+  dropping the connector's `HttpHandlers` registry ends every open session and
+  kills each session child's process group, whether or not anyone sent a
+  DELETE.
+
+### What the gate pins
+
+- Two principals, each with its own token and grant on the same device and
+  service: one's session ID is refused for the other on POST, GET and DELETE
+  with byte-identical answers to an unknown session; both sessions keep
+  working; and each principal's standalone GET stream carries only its own
+  server notifications.
+- Twenty-four concurrent calls whose JSON-RPC IDs and progress tokens collide
+  deliberately across sessions and principals, in both profiles, each answered
+  to its own caller with exact results; a genuine duplicate on one session is
+  refused with 400.
+- Revocation of a consumer grant: refused in about 10 ms with
+  `404 SERVICE_NOT_FOUND` `not_dispatched`, the admitted exchange withdrawn in
+  about 500 ms with `502 HTTP_STREAM_INTERRUPTED` and `execution: unknown`,
+  nothing dispatched afterwards, and the other principals and the device
+  session untouched.
+- One call held across three completed scheduled rotations, answered exactly
+  once with exact bytes and one dispatch.
+- A lost acknowledgement and owner process loss, each after the fixture has
+  recorded its synthetic side effect: `outcome_unknown` at the consumer, the
+  side effect recorded exactly once, nothing replayed.
+
+### Not proven by M3-04
+
+- **Server→client JSON-RPC requests.** The pinned fixture issues none, so
+  colliding *server→client* request IDs are unproven. What is proven in that
+  direction is colliding progress tokens and server notifications (M3-13).
+  Sampling (`sampling/createMessage`), elicitation, MRTR input requests and
+  `subscriptions/listen` are likewise unexercised.
+- **The Streamable HTTP backend's binding over the real cluster.** It is
+  proven through the in-process bridge by `tunnel-mcp-fixture`'s
+  `principal_binding` tests; the cluster gate drives the stdio exports only.
+- Browser `Origin` handling, OAuth protected-resource discovery and audience
+  checks at the export (M3-11).
+- `Last-Event-ID` resume of an interrupted legacy stream (M3-10).
+- **Cross-tenant consumers.** Both correlation principals belong to one
+  tenant; tenant separation is M7 admission evidence, not this gate's.
+- **Correlation through one shared backend process.** The 2025-11-25 stdio
+  export gives every session its own child, so its correlation is
+  process-isolated by construction and the gate's colliding IDs prove routing,
+  not shared-process separation. The Streamable HTTP export, where every
+  session shares one backend, is not driven here (M3-13).
+- **Ending a device-side session on revocation.** Revocation makes the session
+  unreachable but does not end it, so its child holds a `max_children` slot
+  for as long as the device session lives, or until `session_idle_seconds`
+  (M3-16 in [tasks.md](tasks.md)). It no longer outlives the device session:
+  the export ends every session it holds when the connector's handler registry
+  goes away.

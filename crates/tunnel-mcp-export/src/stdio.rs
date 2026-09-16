@@ -32,6 +32,14 @@
 //! alone does not count) ends the same way, and a request whose consumer
 //! lets its stream queue fill has only that stream interrupted.  A child crash ends the session: open streams are
 //! interrupted and later requests get 404.
+//!
+//! **Principal binding (M3-04).**  A session also remembers the opaque
+//! `tunnel-principal-binding` the relay ingress derived for the consumer that
+//! opened it, and POST, GET and DELETE all require exactly that value.  A
+//! different value — including none, when this export is reached without an
+//! ingress — is answered as an unknown session, byte for byte, so a session
+//! ID learned by another authorized consumer neither works nor reveals that
+//! the session exists.  The device never derives or interprets the value.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::Ordering;
@@ -125,6 +133,18 @@ pub struct StdioExport {
     counters: Arc<ExportCounters>,
     slots: Arc<Semaphore>,
     sessions: Arc<Mutex<HashMap<String, Arc<Session>>>>,
+    /// Cancelled when the export is dropped or [`StdioExport::shutdown`] is
+    /// called.  A legacy session's pump is a detached task that owns the
+    /// child and its `max_children` permit, so without this the children of
+    /// sessions nobody ended would outlive the export, the connector and the
+    /// device session they were opened on.
+    shutdown: CancellationToken,
+}
+
+impl Drop for StdioExport {
+    fn drop(&mut self) {
+        self.shutdown_sessions();
+    }
 }
 
 impl std::fmt::Debug for StdioExport {
@@ -159,6 +179,28 @@ impl StdioExport {
             counters,
             slots,
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            shutdown: CancellationToken::new(),
+        }
+    }
+
+    /// End every open legacy session and kill its child's process group.
+    ///
+    /// Idempotent, and safe to call from `Drop`: the session pumps observe
+    /// the cancellation and their children are killed here as well, so a
+    /// child cannot survive the export whatever the task scheduler does
+    /// afterwards.
+    pub fn shutdown_sessions(&self) {
+        self.shutdown.cancel();
+        let sessions: Vec<Arc<Session>> = self
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .drain()
+            .map(|(_, session)| session)
+            .collect();
+        for session in sessions {
+            session.router().ended = true;
+            session.child.kill();
         }
     }
 
@@ -408,6 +450,7 @@ impl StdioExport {
         message: McpMessage,
         cancel: CancellationToken,
     ) -> Result<Response<ExportBody>, ExportError> {
+        let binding = crate::request_principal_binding(headers_map);
         let session_header = headers_map
             .get(headers::MCP_SESSION_ID)
             .and_then(|value| value.to_str().ok());
@@ -421,7 +464,7 @@ impl StdioExport {
                     supported: None,
                 }));
             }
-            return self.initialize_legacy(message, cancel).await;
+            return self.initialize_legacy(binding, message, cancel).await;
         }
         let Some(session_id) = session_header else {
             return Ok(self.reject(&McpRejection {
@@ -432,7 +475,13 @@ impl StdioExport {
                 supported: None,
             }));
         };
-        let Some(session) = self.session(session_id) else {
+        // An unknown session and a session bound to another principal are the
+        // same answer, so a valid session ID leaked to another consumer
+        // proves nothing about whether it exists.
+        let Some(session) = self
+            .session(session_id)
+            .filter(|session| session.binding == binding)
+        else {
             return Ok(self.reject(&McpRejection {
                 status: 404,
                 code: codes::INVALID_REQUEST,
@@ -495,6 +544,7 @@ impl StdioExport {
 
     async fn initialize_legacy(
         self: &Arc<Self>,
+        binding: Option<String>,
         message: McpMessage,
         cancel: CancellationToken,
     ) -> Result<Response<ExportBody>, ExportError> {
@@ -520,6 +570,7 @@ impl StdioExport {
         let session_id = uuid::Uuid::new_v4().simple().to_string();
         let session = Arc::new(Session {
             id: session_id.clone(),
+            binding,
             child,
             router: Mutex::new(Router::default()),
             _slot: permit,
@@ -542,6 +593,7 @@ impl StdioExport {
             events,
             Arc::clone(&self.sessions),
             Arc::clone(&self.counters),
+            self.shutdown.child_token(),
         ));
         if session.child.send(&message.compact).await.is_err() {
             self.remove_session(&session_id);
@@ -581,10 +633,12 @@ impl StdioExport {
         headers_map: &HeaderMap,
         cancel: CancellationToken,
     ) -> Result<Response<ExportBody>, ExportError> {
+        let binding = crate::request_principal_binding(headers_map);
         let Some(session) = headers_map
             .get(headers::MCP_SESSION_ID)
             .and_then(|value| value.to_str().ok())
             .and_then(|id| self.session(id))
+            .filter(|session| session.binding == binding)
         else {
             return Ok(self.reject(&McpRejection {
                 status: 404,
@@ -644,9 +698,16 @@ impl StdioExport {
     }
 
     fn delete_legacy(&self, headers_map: &HeaderMap) -> Response<ExportBody> {
+        let binding = crate::request_principal_binding(headers_map);
+        // The binding is checked before the session is removed, so another
+        // principal's DELETE cannot end a session it could not use.
         let removed = headers_map
             .get(headers::MCP_SESSION_ID)
             .and_then(|value| value.to_str().ok())
+            .filter(|id| {
+                self.session(id)
+                    .is_some_and(|session| session.binding == binding)
+            })
             .and_then(|id| self.remove_session(id));
         match removed {
             Some(session) => {
@@ -767,6 +828,11 @@ struct Router {
 
 struct Session {
     id: String,
+    /// The principal binding the session was opened with (M3-04).  Every
+    /// later request on the session must present exactly this value; any
+    /// other one is answered as an unknown session, so a consumer who learns
+    /// a session ID cannot tell a bound session from a nonexistent one.
+    binding: Option<String>,
     child: ChildHandle,
     router: Mutex<Router>,
     _slot: OwnedSemaphorePermit,
@@ -886,9 +952,11 @@ async fn run_session(
     mut events: mpsc::Receiver<ChildEvent>,
     sessions: Arc<Mutex<HashMap<String, Arc<Session>>>>,
     counters: Arc<ExportCounters>,
+    shutdown: CancellationToken,
 ) {
     loop {
         let event = tokio::select! {
+            () = shutdown.cancelled() => break,
             event = events.recv() => event,
             () = tokio::time::sleep_until(session.idle_deadline()) => {
                 if tokio::time::Instant::now() < session.idle_deadline() {

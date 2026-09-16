@@ -98,6 +98,14 @@ pub enum McpBackendConfig {
         /// backend `Authorization` header.
         #[serde(default)]
         bearer_token_file: Option<PathBuf>,
+        /// How long the device remembers which principal a backend-issued
+        /// legacy (2025-11-25) session belongs to after that session's last
+        /// use (default 600, 1..=86400).  The backend owns the session; this
+        /// bounds the device's own table, so a client that vanishes without
+        /// a DELETE cannot hold a slot for ever.  Ignored by the 2026
+        /// profile, which has no sessions.
+        #[serde(default = "default_session_idle_seconds")]
+        session_idle_seconds: u64,
     },
 }
 
@@ -118,10 +126,13 @@ impl std::fmt::Debug for McpBackendConfig {
                 .field("max_children", max_children)
                 .finish_non_exhaustive(),
             Self::StreamableHttp {
-                bearer_token_file, ..
+                bearer_token_file,
+                session_idle_seconds,
+                ..
             } => formatter
                 .debug_struct("StreamableHttp")
                 .field("credential", &bearer_token_file.is_some())
+                .field("session_idle_seconds", session_idle_seconds)
                 .finish_non_exhaustive(),
         }
     }
@@ -194,6 +205,9 @@ pub struct HttpBackend {
     /// The backend's MCP endpoint path.
     pub path: String,
     pub bearer_token_file: Option<PathBuf>,
+    /// How long a backend-issued legacy session's principal binding is
+    /// remembered after its last use.
+    pub session_idle: std::time::Duration,
 }
 
 /// A validated export.
@@ -316,6 +330,7 @@ impl McpExportConfig {
             McpBackendConfig::StreamableHttp {
                 url,
                 bearer_token_file,
+                session_idle_seconds,
             } => {
                 let backend = parse_backend_url(url)?;
                 if let Some(path) = bearer_token_file
@@ -325,8 +340,14 @@ impl McpExportConfig {
                         "mcp.backend.bearer_token_file must be an absolute path",
                     ));
                 }
+                if *session_idle_seconds == 0 || *session_idle_seconds > MAX_SESSION_IDLE_SECONDS {
+                    return Err(McpConfigError(
+                        "mcp.backend.session_idle_seconds must be between 1 and 86400",
+                    ));
+                }
                 ValidatedBackend::Http(HttpBackend {
                     bearer_token_file: bearer_token_file.clone(),
+                    session_idle: std::time::Duration::from_secs(*session_idle_seconds),
                     ..backend
                 })
             }
@@ -372,6 +393,9 @@ fn parse_backend_url(text: &str) -> Result<HttpBackend, McpConfigError> {
         authority,
         path: path.to_owned(),
         bearer_token_file: None,
+        // Replaced by the validated configuration value; the URL parser has
+        // no opinion about it.
+        session_idle: std::time::Duration::from_secs(DEFAULT_SESSION_IDLE_SECONDS),
     })
 }
 
@@ -431,6 +455,25 @@ request_body_bytes = 4096
         };
         assert_eq!(backend.authority, "127.0.0.1:8931");
         assert_eq!(backend.path, "/v1/mcp");
+        // The session table's idle deadline defaults like the stdio one.
+        assert_eq!(
+            backend.session_idle,
+            std::time::Duration::from_secs(DEFAULT_SESSION_IDLE_SECONDS)
+        );
+        let explicit = parse(
+            r#"
+profile = "mcp-2025-11-25"
+[backend]
+kind = "streamable-http"
+url = "http://127.0.0.1:8931/v1/mcp"
+session_idle_seconds = 30
+"#,
+        )
+        .unwrap();
+        let ValidatedBackend::Http(backend) = explicit.backend else {
+            panic!("http");
+        };
+        assert_eq!(backend.session_idle, std::time::Duration::from_secs(30));
         let v6 = parse(
             r#"
 profile = "mcp-2026-07-28"
@@ -468,6 +511,12 @@ url = "http://[::1]:9/mcp"
             "unix:///tmp/socket",
         ] {
             assert!(parse(&http(url)).is_err(), "{url}");
+        }
+        for seconds in ["0", "86401"] {
+            let text = format!(
+                "profile = \"mcp-2025-11-25\"\n[backend]\nkind = \"streamable-http\"\nurl = \"http://127.0.0.1:1/mcp\"\nsession_idle_seconds = {seconds}\n"
+            );
+            assert!(parse(&text).is_err(), "{seconds}");
         }
         let replace = |from: &str, to: &str| STDIO.replace(from, to);
         for text in [

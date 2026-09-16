@@ -50,6 +50,7 @@ tunnel-cluster = { path = "../tunnel-cluster" }
 tunnel-client = { path = "../tunnel-client" }
 tunnel-http-bridge = { path = "../tunnel-http-bridge" }
 tunnel-http-forward = { path = "../tunnel-http-forward" }
+tunnel-mcp = { path = "../tunnel-mcp" }
 tunnel-mcp-export = { path = "../tunnel-mcp-export" }
 tunnel-mcp-fixture = { path = "../tunnel-mcp-fixture" }
 tunnel-core = { path = "../tunnel-core" }

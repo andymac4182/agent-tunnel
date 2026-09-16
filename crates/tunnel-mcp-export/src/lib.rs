@@ -28,6 +28,23 @@ use tunnel_mcp::{McpLimits, McpProfile};
 pub use body::ExportBody;
 pub use config::{McpBackendConfig, McpConfigError, McpExportConfig, McpLimitsConfig};
 
+/// The opaque per-principal binding the relay ingress derived for this
+/// request, or `None` when no ingress supplied one.
+///
+/// The device never interprets the value and never derives one: it only
+/// compares it for equality with the value a protocol session was opened
+/// with (M3-04).  A deployment with no relay ingress in front of the export —
+/// the in-process gate-2 bridge used by the export tests — has no
+/// authenticated principal at all, and every request then carries `None`,
+/// which binds a session to "no principal" and still refuses any other value.
+#[must_use]
+pub fn request_principal_binding(headers: &http::HeaderMap) -> Option<String> {
+    headers
+        .get(tunnel_mcp::headers::TUNNEL_PRINCIPAL_BINDING)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+}
+
 /// An exchange the export interrupts instead of answering.  It carries no
 /// message; the peer learns only the bridge's sanitized code.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -186,6 +203,21 @@ impl McpExport {
     #[must_use]
     pub fn diagnostics(&self) -> ExportDiagnostics {
         self.counters.snapshot()
+    }
+
+    /// End every open protocol session this export holds and kill each
+    /// session child's process group.
+    ///
+    /// Dropping the export does the same; this is the explicit form for a
+    /// connector that stops its handlers before dropping them.  Idempotent.
+    pub fn shutdown(&self) {
+        match &*self.kind {
+            Kind::Stdio(export) => export.shutdown_sessions(),
+            // A Streamable HTTP export owns no process: its sessions belong
+            // to the operator's backend, and forgetting its bindings is what
+            // dropping it already does.
+            Kind::Http(_) => {}
+        }
     }
 
     /// Serve one exchange in process.

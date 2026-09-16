@@ -138,6 +138,15 @@ pub use mcp_cloud_client::{
     WireCounts as McpWireCounts, validate_mcp_cloud_client_evidence,
     verify as verify_mcp_cloud_client,
 };
+mod mcp_isolation;
+pub use mcp_isolation::{
+    CorrelationEvidence as McpCorrelationEvidence, ForgeryEvidence as McpForgeryEvidence,
+    ISOLATION_ROTATION, IsolationEvidence as McpIsolationCaseEvidence, MCP_ISOLATION_CASES,
+    McpIsolationEvidence, RevocationEvidence as McpRevocationEvidence,
+    RotationSpanEvidence as McpRotationSpanEvidence,
+    UnknownOutcomeEvidence as McpUnknownOutcomeEvidence, validate_mcp_isolation_evidence,
+    verify as verify_mcp_isolation,
+};
 mod lifecycle;
 pub use lifecycle::{LifecycleEvidence, validate_lifecycle_evidence, verify as verify_lifecycle};
 mod key_rotation;

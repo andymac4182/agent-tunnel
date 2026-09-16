@@ -161,12 +161,36 @@ impl McpExportDiagnostics {
 }
 
 /// The handler registry passed to [`crate::connect_with_http_handlers`].
-#[derive(Clone, Debug, Default)]
+///
+/// Deliberately **not** `Clone`.  Its `Drop` ends the protocol sessions its
+/// MCP exports still hold, which is a process-wide effect; a second copy
+/// would end every live session as soon as the first one went away.  A
+/// caller that needs the registry's observations after handing it over takes
+/// [`HttpHandlers::diagnostics`] or
+/// [`HttpHandlers::mcp_diagnostics_source`], which are cheap read-only
+/// handles and carry no teardown.
+#[derive(Debug, Default)]
 pub struct HttpHandlers {
     exports: BTreeMap<String, HttpExport>,
     diagnostics: DeviceHttpDiagnostics,
     /// The registered MCP exports, kept only for their payload-free counters.
     mcp: BTreeMap<String, tunnel_mcp_export::McpExport>,
+}
+
+/// Ending the registry ends the protocol sessions it served.
+///
+/// A registered MCP export is also held by [`McpExportDiagnostics`], so the
+/// export's own `Drop` cannot be relied on to run when the connector stops.
+/// This is the connector's explicit teardown: every MCP export ends its open
+/// protocol sessions and kills each session child's process group, so a
+/// session nobody ended cannot outlive the device session it was served on
+/// (M3-04).
+impl Drop for HttpHandlers {
+    fn drop(&mut self) {
+        for export in self.mcp.values() {
+            export.shutdown();
+        }
+    }
 }
 
 impl HttpHandlers {

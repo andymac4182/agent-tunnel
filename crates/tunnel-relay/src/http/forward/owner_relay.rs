@@ -26,8 +26,8 @@ use bytes::Bytes;
 use tokio::sync::watch;
 use tunnel_http_bridge::{CarrierClosed, CarrierWriter, Execution, FrameSender, ResetDetail};
 use tunnel_http_forward::{
-    CodecError, HttpErrorCode, Method, RecordKind, RecordPosition, RecordTracker, RequestEvent,
-    RequestPolicy, RequestReader, ResponsePolicy, ResponseReader,
+    CodecError, HeaderRule, HttpErrorCode, Method, RecordKind, RecordPosition, RecordTracker,
+    RequestEvent, RequestPolicy, RequestReader, ResponsePolicy, ResponseReader,
 };
 
 use super::hold::{HttpRelayHoldPoint, HttpRelayInterposer};
@@ -68,6 +68,13 @@ pub(crate) struct OwnerRequestWriter<W> {
     tracker: RecordTracker,
     hold: Option<Arc<dyn HttpRelayInterposer>>,
     verdict: Arc<OwnerVerdict>,
+    /// The principal binding this owner derived from its **own** verified
+    /// identifiers, when the selected profile carries one.  The ingress
+    /// derives the same value, but the owner never trusts it: the digest is
+    /// unkeyed over catalog identifiers, so an ingress holding one
+    /// principal's token could otherwise compute another principal's binding
+    /// and land its requests on that principal's session.
+    binding: Option<(&'static str, String)>,
     /// The owner→ingress direction, reset with the owner's detail.
     other: FrameSender,
 }
@@ -79,6 +86,7 @@ impl<W: CarrierWriter> OwnerRequestWriter<W> {
         method: watch::Sender<Option<Method>>,
         hold: Option<Arc<dyn HttpRelayInterposer>>,
         verdict: Arc<OwnerVerdict>,
+        binding: Option<(&'static str, String)>,
         other: FrameSender,
     ) -> Self {
         Self {
@@ -88,6 +96,7 @@ impl<W: CarrierWriter> OwnerRequestWriter<W> {
             tracker: RecordTracker::new(),
             hold,
             verdict,
+            binding,
             other,
         }
     }
@@ -97,6 +106,24 @@ impl<W: CarrierWriter> OwnerRequestWriter<W> {
         loop {
             match self.reader.read(&mut input)? {
                 Some(RequestEvent::Head(head)) => {
+                    // The codec has already reduced the head to the profile
+                    // allowlist, so an absent binding here means the ingress
+                    // sent none and a present one is a single value.  Both
+                    // are compared against the owner's own derivation.
+                    if let Some((name, expected)) = &self.binding {
+                        // The codec compares header names
+                        // ASCII-case-insensitively, so this must too: an
+                        // uppercase spelling the allowlist admitted would
+                        // otherwise read as absent here.
+                        let presented = head
+                            .headers
+                            .iter()
+                            .find(|field| field.name.eq_ignore_ascii_case(name))
+                            .map(|field| field.value.as_str());
+                        if presented != Some(expected.as_str()) {
+                            return Err(CodecError::InvalidHeader(HeaderRule::NotAllowed));
+                        }
+                    }
                     self.method.send_replace(Some(head.method));
                 }
                 Some(_) => {}
@@ -394,6 +421,7 @@ mod tests {
             method_tx,
             None,
             Arc::clone(&verdict),
+            None,
             to_ingress,
         );
         let result = writer.data(Bytes::from(forged_head())).await;
@@ -421,6 +449,144 @@ mod tests {
         );
     }
 
+    /// M3-04.  The owner derives the principal binding from the identifiers
+    /// it authorized for itself, so a relayed head carrying another
+    /// principal's binding — which an ingress holding one principal's token
+    /// could compute, because the digest is unkeyed over catalog identifiers
+    /// — never reaches the device, and neither does one carrying none.
+    #[tokio::test]
+    async fn the_owner_verifies_the_principal_binding_it_derived_itself() {
+        let name = tunnel_mcp::headers::TUNNEL_PRINCIPAL_BINDING;
+        let binding_policy = || {
+            let mut policy = RequestPolicy::new(1 << 20).unwrap();
+            policy.allow_route(Method::Post, "/mcp").unwrap();
+            policy.allow_http_version(HttpVersion::Http11);
+            policy.headers.allow(name, Occurrence::Singleton).unwrap();
+            policy
+        };
+        let head = |value: Option<&str>| {
+            let policy = binding_policy();
+            let head = RequestHead {
+                method: Method::Post,
+                path: "/mcp".into(),
+                query: String::new(),
+                http_version: HttpVersion::Http11,
+                headers: value
+                    .map(|value| vec![HeaderField::new(name, value)])
+                    .unwrap_or_default(),
+                body_length: None,
+            };
+            let mut out = Vec::new();
+            encode_request_head(&head, &policy, &mut out).unwrap();
+            out
+        };
+        let owned = "7f2c9a1b4d6e8f0a1b2c3d4e5f60718a";
+        let forged = "0a1b2c3d4e5f60718a7f2c9a1b4d6e8f";
+        // Another principal's binding, and no binding at all, are both
+        // refused before a byte is forwarded.
+        for value in [Some(forged), None] {
+            let actor = Recorder::default();
+            let (to_ingress, _rx, _) = channel(1 << 16);
+            let verdict = Arc::new(OwnerVerdict::default());
+            let mut writer = OwnerRequestWriter::new(
+                actor.clone(),
+                binding_policy(),
+                watch::channel(None).0,
+                None,
+                Arc::clone(&verdict),
+                Some((name, owned.to_owned())),
+                to_ingress,
+            );
+            assert_eq!(
+                writer.data(Bytes::from(head(value))).await,
+                Err(CarrierClosed),
+                "{value:?}"
+            );
+            assert!(actor.bytes().is_empty(), "{value:?}");
+            assert_eq!(
+                verdict.get(),
+                Some(ResetDetail {
+                    code: HttpErrorCode::InvalidHead,
+                    execution: Execution::NotDispatched
+                }),
+                "{value:?}"
+            );
+        }
+        // A name in any other ASCII case cannot reach the comparison at all:
+        // `http-forward/1` header names are lowercase
+        // (`validate_header_name` / `is_tchar_lower`), so the codec refuses
+        // the head outright.  The comparison below is nevertheless
+        // case-insensitive, so it can never read a differently-spelled name
+        // as an absent one if that rule ever changes.
+        let upper_head = {
+            let json = format!(
+                r#"{{"method":"POST","path":"/mcp","query":"","http_version":"1.1","headers":[["{}","{owned}"]],"body_length":null}}"#,
+                name.to_ascii_uppercase()
+            );
+            let mut out = Vec::new();
+            encode_record(RecordKind::RequestHead, json.as_bytes(), &mut out).unwrap();
+            out
+        };
+        let actor = Recorder::default();
+        let (to_ingress, _rx, _) = channel(1 << 16);
+        let verdict = Arc::new(OwnerVerdict::default());
+        let mut writer = OwnerRequestWriter::new(
+            actor.clone(),
+            binding_policy(),
+            watch::channel(None).0,
+            None,
+            Arc::clone(&verdict),
+            Some((name, owned.to_owned())),
+            to_ingress,
+        );
+        assert_eq!(
+            writer.data(Bytes::from(upper_head)).await,
+            Err(CarrierClosed)
+        );
+        assert!(actor.bytes().is_empty());
+        assert_eq!(
+            verdict.get(),
+            Some(ResetDetail {
+                code: HttpErrorCode::InvalidHead,
+                execution: Execution::NotDispatched
+            })
+        );
+
+        // The owner's own value passes, so the rule is not vacuous.
+        let actor = Recorder::default();
+        let (to_ingress, _rx, _) = channel(1 << 16);
+        let mut writer = OwnerRequestWriter::new(
+            actor.clone(),
+            binding_policy(),
+            watch::channel(None).0,
+            None,
+            Arc::new(OwnerVerdict::default()),
+            Some((name, owned.to_owned())),
+            to_ingress,
+        );
+        assert_eq!(writer.data(Bytes::from(head(Some(owned)))).await, Ok(()));
+        assert!(!actor.bytes().is_empty());
+        // A profile without the header carries no binding to check, and a
+        // head that names it is refused by the allowlist anyway.
+        let (request_policy, _) = policies();
+        let actor = Recorder::default();
+        let (to_ingress, _rx, _) = channel(1 << 16);
+        let mut writer = OwnerRequestWriter::new(
+            actor.clone(),
+            request_policy.clone(),
+            watch::channel(None).0,
+            None,
+            Arc::new(OwnerVerdict::default()),
+            None,
+            to_ingress,
+        );
+        assert_eq!(
+            writer.data(Bytes::from(valid_head(&request_policy))).await,
+            Ok(())
+        );
+        assert!(!actor.bytes().is_empty());
+    }
+
     #[tokio::test]
     async fn grammar_and_fin_violations_are_rejected_at_the_owner() {
         let (request_policy, _) = policies();
@@ -433,6 +599,7 @@ mod tests {
             watch::channel(None).0,
             None,
             Arc::new(OwnerVerdict::default()),
+            None,
             to_ingress,
         );
         let mut body = Vec::new();
@@ -449,6 +616,7 @@ mod tests {
             watch::channel(None).0,
             None,
             Arc::clone(&verdict),
+            None,
             to_ingress,
         );
         assert!(
@@ -478,6 +646,7 @@ mod tests {
             method_tx,
             None,
             Arc::clone(&verdict),
+            None,
             to_ingress,
         );
         let mut stream = valid_head(&request_policy);
@@ -641,6 +810,7 @@ mod tests {
             watch::channel(None).0,
             Some(Arc::clone(&hold) as Arc<dyn HttpRelayInterposer>),
             Arc::new(OwnerVerdict::default()),
+            None,
             to_ingress,
         );
         writer

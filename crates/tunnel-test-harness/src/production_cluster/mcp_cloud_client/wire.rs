@@ -857,7 +857,7 @@ impl ClientHandler for GateClient {
 
 /// The built `tunnel-mcp-fixture` binary: `TUNNEL_MCP_FIXTURE_BIN`, or next
 /// to this executable.
-pub(super) fn fixture_binary_path() -> Result<PathBuf> {
+pub(crate) fn fixture_binary_path() -> Result<PathBuf> {
     if let Some(path) = std::env::var_os("TUNNEL_MCP_FIXTURE_BIN") {
         let path = PathBuf::from(path);
         if path.is_file() {
@@ -888,7 +888,7 @@ pub(super) fn fixture_binary_path() -> Result<PathBuf> {
 }
 
 /// Whether a process with `pid` still exists (a zombie counts).
-pub(super) fn process_exists(pid: u32) -> bool {
+pub(crate) fn process_exists(pid: u32) -> bool {
     i32::try_from(pid)
         .ok()
         .and_then(rustix::process::Pid::from_raw)
@@ -910,7 +910,7 @@ pub(super) async fn wait_process_gone(pid: u32, bound: Duration) -> bool {
 }
 
 /// Wait, bounded, for a file to exist.
-pub(super) async fn wait_file(path: &Path, bound: Duration) -> bool {
+pub(crate) async fn wait_file(path: &Path, bound: Duration) -> bool {
     let deadline = Instant::now() + bound;
     loop {
         if path.exists() {
@@ -932,7 +932,7 @@ pub(super) async fn wait_pid_file(path: &Path, bound: Duration) -> Option<u32> {
 }
 
 /// Count lines equal to `needle`.
-pub(super) fn count_lines(path: &Path, needle: &str) -> u64 {
+pub(crate) fn count_lines(path: &Path, needle: &str) -> u64 {
     std::fs::read_to_string(path)
         .unwrap_or_default()
         .lines()
