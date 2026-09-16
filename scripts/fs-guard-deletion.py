@@ -705,7 +705,7 @@ GATE3_CASES: list[tuple[str, list[Edit]]] = [
             (
                 NINEP_SESSION,
                 """        if let Some(existing) = self.tags.get(&frame.tag) {
-            return Err(if existing.flushed_by.is_some() || existing.answered {
+            return Err(if !existing.flushed_by.is_empty() || existing.answered {
                 SessionError::TagReservedByFlush
             } else {
                 SessionError::TagInUse
@@ -713,21 +713,6 @@ GATE3_CASES: list[tuple[str, list[Edit]]] = [
         }
 """,
                 "",
-            )
-        ],
-    ),
-    (
-        "the flush reservation on an answered tag",
-        [
-            (
-                NINEP_SESSION,
-                """        if let Some(flush_tag) = state.flushed_by
-            && self.tags.contains_key(&flush_tag)
-        {""",
-                """        if let Some(flush_tag) = state.flushed_by
-            && self.tags.contains_key(&flush_tag)
-            && false
-        {""",
             )
         ],
     ),
@@ -956,17 +941,125 @@ GATE3_CASES: list[tuple[str, list[Edit]]] = [
             )
         ],
     ),
-    # --- guards added by the review round -------------------------------
+    # --- guards added by review round 2 ---------------------------------
+    (
+        "an Rflush matching only a flush its target actually carries",
+        [
+            (
+                NINEP_SESSION,
+                """        if !target.flushed_by.contains(&flush_tag) {
+            return;
+        }
+""",
+                "",
+            )
+        ],
+    ),
+    (
+        "the last outstanding flush being the one that releases the tag",
+        [
+            (
+                NINEP_SESSION,
+                """            .filter(|candidate| *candidate != flush_tag && self.tags.contains_key(candidate))""",
+                """            .filter(|candidate| *candidate != flush_tag && false)""",
+            )
+        ],
+    ),
+    (
+        "every outstanding flush holding its target reserved",
+        [
+            (
+                NINEP_SESSION,
+                """        if state
+            .flushed_by
+            .iter()
+            .any(|flush_tag| self.tags.contains_key(flush_tag))
+        {""",
+                """        if state
+            .flushed_by
+            .iter()
+            .take(0)
+            .any(|flush_tag| self.tags.contains_key(flush_tag))
+        {""",
+            )
+        ],
+    ),
+    (
+        "the fid generation on a late in-place walk",
+        [
+            (
+                NINEP_SESSION,
+                """                } else if !matches!(
+                    self.fids.get(newfid),
+                    Some(state) if state.generation == *origin_generation
+                ) {""",
+                """                } else if !self.fids.contains_key(newfid) {""",
+            )
+        ],
+    ),
+    (
+        "the fid generation on a zero-element clone's origin",
+        [
+            (
+                NINEP_SESSION,
+                """                        Some(state) if state.generation == *origin_generation => state.qid,""",
+                """                        Some(state) => state.qid,""",
+            )
+        ],
+    ),
+    (
+        "the fid generation on a late Rlopen",
+        [
+            (
+                NINEP_SESSION,
+                """                let Some(state) = self
+                    .fids
+                    .get_mut(fid)
+                    .filter(|state| state.generation == *generation)
+                else {
+                    return Ok(());
+                };
+                let mut mode = *mode;""",
+                """                let Some(state) = self.fids.get_mut(fid) else {
+                    return Ok(());
+                };
+                let _ = generation;
+                let mut mode = *mode;""",
+            )
+        ],
+    ),
+    (
+        "the fid generation on a late Rlcreate",
+        [
+            (
+                NINEP_SESSION,
+                """                let Some(state) = self
+                    .fids
+                    .get_mut(fid)
+                    .filter(|state| state.generation == *generation)
+                else {
+                    return Ok(());
+                };""",
+                """                let Some(state) = self.fids.get_mut(fid) else {
+                    return Ok(());
+                };
+                let _ = generation;""",
+            )
+        ],
+    ),
+    # --- guards added by review round 1 ----------------------------------
     (
         "the flushed request's reservation released with its tag",
         [
             (
                 NINEP_SESSION,
-                """            if !target.answered {
-                self.undo_reservation(&target.effect);
-            }
-""",
-                "",
+                """        if let Some(target) = self.tags.remove(&flushed)
+            && !target.answered
+        {""",
+                """        if let Some(target) = self.tags.remove(&flushed)
+            && !target.answered
+            && false
+        {""",
             )
         ],
     ),
@@ -988,13 +1081,18 @@ GATE3_CASES: list[tuple[str, list[Edit]]] = [
         [
             (
                 NINEP_SESSION,
-                """                } else if !self.fids.contains_key(newfid) {
-                    // A walk in place reserves nothing, so it may bind only a
-                    // fid that is **still** bound.  Re-creating one clunked
-                    // while the walk was outstanding would put a number back
-                    // into the table that the quota had already released, and
-                    // `live_fids()` could then exceed `maxFids` — the bound
-                    // gate 4 relies on to cap open descriptors.
+                """                } else if !matches!(
+                    self.fids.get(newfid),
+                    Some(state) if state.generation == *origin_generation
+                ) {
+                    // A walk in place reserves nothing, so it may bind only the
+                    // **binding** it was admitted against.  Re-creating a fid
+                    // clunked while the walk was outstanding would put a number
+                    // back into the table that the quota had already released,
+                    // and `live_fids()` could then exceed `maxFids`; moving a
+                    // number the client has since re-bound to something else
+                    // would leave this session's path and gate 4's descriptor
+                    // for that fid disagreeing.
                     return Ok(());
                 }""",
                 "                }",
@@ -1026,8 +1124,10 @@ GATE3_CASES: list[tuple[str, list[Edit]]] = [
             (
                 NINEP_SESSION,
                 """                    match self.fids.get(origin) {
-                        Some(state) => state.qid,
-                        None => return Ok(()),
+                        Some(state) if state.generation == *origin_generation => state.qid,
+                        // Gone, or the number carries a different binding now:
+                        // either way there is nothing left to clone.
+                        _ => return Ok(()),
                     }""",
                 "                    self.require_fid(*origin)?.qid",
             )
@@ -1038,11 +1138,19 @@ GATE3_CASES: list[tuple[str, list[Edit]]] = [
         [
             (
                 NINEP_SESSION,
-                """                let Some(state) = self.fids.get_mut(fid) else {
+                """                let Some(state) = self
+                    .fids
+                    .get_mut(fid)
+                    .filter(|state| state.generation == *generation)
+                else {
                     return Ok(());
                 };
                 let mut mode = *mode;""",
-                """                let state = self.fids.get_mut(fid).ok_or(SessionError::UnknownFid)?;
+                """                let state = self
+                    .fids
+                    .get_mut(fid)
+                    .filter(|state| state.generation == *generation)
+                    .ok_or(SessionError::UnknownFid)?;
                 let mut mode = *mode;""",
             )
         ],
@@ -1052,12 +1160,20 @@ GATE3_CASES: list[tuple[str, list[Edit]]] = [
         [
             (
                 NINEP_SESSION,
-                """                let Some(state) = self.fids.get_mut(fid) else {
+                """                let Some(state) = self
+                    .fids
+                    .get_mut(fid)
+                    .filter(|state| state.generation == *generation)
+                else {
                     return Ok(());
                 };
-                if qid.kind != QidKind::File {""",
-                """                let state = self.fids.get_mut(fid).ok_or(SessionError::UnknownFid)?;
-                if qid.kind != QidKind::File {""",
+                // A create rebinds the fid to the child it made, so the number
+                // now carries a new binding.""",
+                """                let state = self
+                    .fids
+                    .get_mut(fid)
+                    .filter(|state| state.generation == *generation)
+                    .ok_or(SessionError::UnknownFid)?;""",
             )
         ],
     ),
