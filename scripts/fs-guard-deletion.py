@@ -141,6 +141,27 @@ FILE_PRE_DEVICE: Edit = (
 PRE_OPEN_KIND: Edit = (RESOLVER, "                    check_exportable(kind)?;\n", "")
 POST_OPEN_KIND: Edit = (RESOLVER, "                    check_exportable(identity.kind())?;\n", "")
 
+PAIR_IDENTITY: Edit = (
+    NINEP_SESSION,
+    """        self.tags
+            .get(&flush_tag)
+            .is_some_and(|state| state.flushing == Some(victim))""",
+    """        let _ = victim;
+        self.tags.contains_key(&flush_tag)""",
+)
+CANCEL_FLUSH: Edit = (
+    NINEP_SESSION,
+    """            if let Some(victim) = target.flushing {
+                // The tag just removed was itself a `Tflush`, so removing it
+                // **cancels** that flush and it must leave its own victim's
+                // set — otherwise the victim keeps a member no reply will ever
+                // answer.
+                self.cancel_flush(victim, flushed);
+            }
+""",
+    "",
+)
+
 GATE2_CASES: list[tuple[str, list[Edit]]] = [
     (
         "symlink feature refusal (rule 3)",
@@ -941,6 +962,54 @@ GATE3_CASES: list[tuple[str, list[Edit]]] = [
             )
         ],
     ),
+    # --- guards added by review round 3 ---------------------------------
+    (
+        # Masked by the set staying accurate: with a cancelled flush removed
+        # from its victim's set there is no stale number left for a reused tag
+        # to be mistaken for.  Proven as a pair below, and listed singly so the
+        # masking is measured rather than asserted.
+        "a flush identified by its pair, not by its tag number",
+        [PAIR_IDENTITY],
+    ),
+    (
+        "a cancelled flush leaving its own victim's set",
+        [CANCEL_FLUSH],
+    ),
+    (
+        "the pair identity and the cancelled-flush removal together",
+        [PAIR_IDENTITY, CANCEL_FLUSH],
+    ),
+    (
+        "collecting an answered tag whose only flush was cancelled",
+        [
+            (
+                NINEP_SESSION,
+                """        if !target.flushed_by.is_empty() || !answered {
+            return;
+        }""",
+                """        if true || !target.flushed_by.is_empty() || !answered {
+            return;
+        }""",
+            )
+        ],
+    ),
+    (
+        "the fid generation on a late Rclunk or Rremove",
+        [
+            (
+                NINEP_SESSION,
+                """        if self
+            .fids
+            .get(&fid)
+            .is_some_and(|state| state.generation == generation)
+        {
+            self.fids.remove(&fid);
+        }""",
+                """        let _ = generation;
+        self.fids.remove(&fid);""",
+            )
+        ],
+    ),
     # --- guards added by review round 2 ---------------------------------
     (
         "an Rflush matching only a flush its target actually carries",
@@ -960,8 +1029,10 @@ GATE3_CASES: list[tuple[str, list[Edit]]] = [
         [
             (
                 NINEP_SESSION,
-                """            .filter(|candidate| *candidate != flush_tag && self.tags.contains_key(candidate))""",
-                """            .filter(|candidate| *candidate != flush_tag && false)""",
+                """                .filter(|candidate| {
+                    *candidate != excluded && self.is_live_flush_of(*candidate, victim)
+                })""",
+                """                .filter(|candidate| *candidate != excluded && false)""",
             )
         ],
     ),
@@ -973,13 +1044,13 @@ GATE3_CASES: list[tuple[str, list[Edit]]] = [
                 """        if state
             .flushed_by
             .iter()
-            .any(|flush_tag| self.tags.contains_key(flush_tag))
+            .any(|flush_tag| self.is_live_flush_of(*flush_tag, tag))
         {""",
                 """        if state
             .flushed_by
             .iter()
             .take(0)
-            .any(|flush_tag| self.tags.contains_key(flush_tag))
+            .any(|flush_tag| self.is_live_flush_of(*flush_tag, tag))
         {""",
             )
         ],
@@ -1053,13 +1124,10 @@ GATE3_CASES: list[tuple[str, list[Edit]]] = [
         [
             (
                 NINEP_SESSION,
-                """        if let Some(target) = self.tags.remove(&flushed)
-            && !target.answered
-        {""",
-                """        if let Some(target) = self.tags.remove(&flushed)
-            && !target.answered
-            && false
-        {""",
+                """            if !target.answered {
+                // An `Rflush` releases the tag it flushed""",
+                """            if false && !target.answered {
+                // An `Rflush` releases the tag it flushed""",
             )
         ],
     ),
