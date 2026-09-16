@@ -3,7 +3,7 @@
 //! One [`Provider`] is one 9P session on one consumer connection, against one
 //! export root and one grant context.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 
 use tunnel_fs_core::{
     CapabilitySet, FeatureSet, FsError, FsErrorCode, Limits, Primitive, SessionErrorCode,
@@ -148,6 +148,17 @@ struct Queued {
     accepted: Accepted,
     /// The binding the request's primary fid carried when it was admitted.
     generation: u64,
+    /// A `Tflush` named this request's tag while it was waiting here.
+    ///
+    /// **The mark belongs to the entry, not to the tag number.** A number is
+    /// not a request: gate 3's session releases a flushed tag when its `Rflush`
+    /// is answered, so a client may re-issue that number while the original is
+    /// still queued, and then flush the new one too. Both are legitimately
+    /// flushed, and a mark held per *number* can only be spent once — the first
+    /// entry popped would clear it and the second would be performed, its reply
+    /// handed to `Session::complete` for a tag nothing is waiting on, closing a
+    /// well-behaved client's session with 1002.
+    flushed: bool,
 }
 
 /// One 9P session over one export.
@@ -174,12 +185,6 @@ pub struct Provider<A: Authority> {
     open: BTreeMap<u32, OpenFid>,
     /// Requests admitted and not yet performed.
     queue: VecDeque<Queued>,
-    /// Tags whose `Rflush` has already been sent.
-    ///
-    /// A queued request whose tag is in here is dropped rather than performed:
-    /// its tag is gone from the session, so its reply has nothing to correlate
-    /// against and `Session::complete` would read it as an invented tag.
-    flushed: BTreeSet<u16>,
     stats: ProviderStats,
 }
 
@@ -202,7 +207,6 @@ impl<A: Authority> Provider<A> {
             authority,
             open: BTreeMap::new(),
             queue: VecDeque::new(),
-            flushed: BTreeSet::new(),
             stats: ProviderStats::default(),
         })
     }
@@ -229,7 +233,6 @@ impl<A: Authority> Provider<A> {
     pub fn close(&mut self) {
         self.session.close();
         self.queue.clear();
-        self.flushed.clear();
         // Dropping the map is what closes the descriptors.  Gate 3's `Session`
         // forgets its fids; this is the half that returns the host's resources.
         self.open.clear();
@@ -263,6 +266,7 @@ impl<A: Authority> Provider<A> {
                     frame: frame.clone(),
                     accepted,
                     generation,
+                    flushed: false,
                 });
                 Vec::new()
             }
@@ -284,7 +288,7 @@ impl<A: Authority> Provider<A> {
         // answer for a peer inventing a tag and a 1002 close for an ordinary
         // flush race.  The machine cannot tell the two apart; this dispatcher
         // can, because it is the thing that sent the `Rflush`.
-        if self.flushed.remove(&queued.tag) {
+        if queued.flushed {
             self.stats.dropped_after_flush += 1;
             return Vec::new();
         }
@@ -420,14 +424,19 @@ impl<A: Authority> Provider<A> {
         // a tag whose `Rflush` has gone out.  `Provider::step` is where it is
         // dropped, before any host work, so nothing is performed either way.
         //
-        // **Only a request still in the queue is marked.** A victim this
-        // dispatcher has already answered has no reply left to drop, and
-        // marking its tag anyway would be a defect rather than caution: gate
-        // 3's session releases a flushed tag when its `Rflush` is answered, so
-        // the client may immediately re-issue that number, and a stale mark
-        // would silently drop the *new* request's reply.
-        if self.queue.iter().any(|queued| queued.tag == oldtag) {
-            self.flushed.insert(oldtag);
+        // **Only a request still in the queue is marked, and the mark is per
+        // entry rather than per tag number.** A victim this dispatcher has
+        // already answered has no reply left to drop, and marking it anyway
+        // would silently drop the reply of whatever the client re-issued on
+        // that number. Marking *every* queued entry carrying `oldtag` is what
+        // makes a re-issued-and-re-flushed number work: at this moment the
+        // queue can hold both the original — already marked by its own flush —
+        // and the re-issue this flush names, and both were legitimately
+        // flushed. A single mark on the number could only be spent once.
+        for queued in &mut self.queue {
+            if queued.tag == oldtag {
+                queued.flushed = true;
+            }
         }
         let reply = Frame::new(tag, Message::Rflush);
         if let Err(error) = self.session.complete(&reply) {

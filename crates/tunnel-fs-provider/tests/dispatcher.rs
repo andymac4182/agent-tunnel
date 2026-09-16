@@ -651,6 +651,61 @@ fn a_reply_whose_tag_was_flushed_is_dropped_and_never_completed() {
 }
 
 #[test]
+fn a_tag_re_issued_and_flushed_again_drops_both_and_keeps_the_session() {
+    // A number is not a request. The client here does nothing wrong: it flushes
+    // tag 9, the `Rflush` releases the number, it re-issues on 9 — which 9P
+    // permits as soon as the flush is answered — and flushes that too. Both
+    // requests are legitimately flushed and both must be dropped.
+    //
+    // A mark held per tag *number* can only be spent once: the first entry
+    // popped would clear it and the second would be performed, its reply handed
+    // to `Session::complete` for a tag nothing is waiting on, closing a
+    // well-behaved client's session with 1002. The mark is therefore on the
+    // queue entry.
+    //
+    // Reachable from a real client precisely because the device admits every
+    // frame already available before performing any of them, so both reads and
+    // both flushes can be queued together.
+    let fixture = Fixture::new();
+    fixture.file("/notes.txt", b"synthetic");
+    let (mut provider, _authority) = fixture.provider(read_and_list());
+    handshake(&mut provider, ROOT);
+    let _ = exchange(&mut provider, twalk(2, ROOT, 1, &["notes.txt"]));
+    let _ = exchange(&mut provider, tlopen(3, 1, O_RDONLY));
+
+    // The original, queued and then flushed.
+    assert!(provider.accept(&tread(9, 1, 0, 64)).is_empty());
+    assert!(matches!(
+        one_frame(provider.accept(&tflush(10, 9))).message,
+        Message::Rflush
+    ));
+    // The number is free again, so the client re-issues on it — and flushes
+    // that one too, while the original is still waiting to be performed.
+    assert!(provider.accept(&tread(9, 1, 0, 64)).is_empty());
+    assert!(matches!(
+        one_frame(provider.accept(&tflush(11, 9))).message,
+        Message::Rflush
+    ));
+
+    // Both are dropped, and neither closes the session.
+    let first = provider.step();
+    assert!(first.is_empty(), "the original must be dropped: {first:?}");
+    let second = provider.step();
+    assert!(
+        second.is_empty(),
+        "the re-issue must be dropped too: {second:?}"
+    );
+    assert_eq!(provider.stats().dropped_after_flush, 2);
+
+    // The session survives and answers the next request normally.
+    let reply = one_frame(exchange(&mut provider, tread(12, 1, 0, 64)));
+    match reply.message {
+        Message::Rread { data } => assert_eq!(data, b"synthetic"),
+        other => panic!("the session must survive, got {other:?}"),
+    }
+}
+
+#[test]
 fn a_flush_of_a_tag_that_was_already_answered_still_answers_rflush() {
     let fixture = Fixture::new();
     fixture.file("/notes.txt", b"synthetic");

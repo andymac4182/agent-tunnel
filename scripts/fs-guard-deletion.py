@@ -1401,12 +1401,38 @@ GATE4_CASES: list[tuple[str, list[Edit]]] = [
         [
             (
                 PROVIDER_SRC,
-                """        if self.flushed.remove(&queued.tag) {
+                """        if queued.flushed {
             self.stats.dropped_after_flush += 1;
             return Vec::new();
         }
 """,
                 "",
+            )
+        ],
+    ),
+    (
+        # The mark lives on the queue **entry**, not on the tag number.  This
+        # case restores the per-number set the first round shipped: a client
+        # that flushes a tag, re-issues on the released number and flushes that
+        # too has both requests legitimately flushed, and a mark held per number
+        # can only be spent once — the second is performed and its reply closes
+        # a well-behaved client's session with 1002.
+        "the flush mark is per queue entry, not per tag number",
+        [
+            (
+                PROVIDER_SRC,
+                """        for queued in &mut self.queue {
+            if queued.tag == oldtag {
+                queued.flushed = true;
+            }
+        }""",
+                """        if let Some(queued) = self
+            .queue
+            .iter_mut()
+            .find(|queued| queued.tag == oldtag)
+        {
+            queued.flushed = true;
+        }""",
             )
         ],
     ),
