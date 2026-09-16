@@ -144,11 +144,29 @@ impl DeviceHttpDiagnostics {
     }
 }
 
+/// Read access to the payload-free counters of registered MCP exports.
+#[derive(Clone, Debug, Default)]
+pub struct McpExportDiagnostics {
+    exports: BTreeMap<String, tunnel_mcp_export::McpExport>,
+}
+
+impl McpExportDiagnostics {
+    /// The counters of the export registered for `service_id`.
+    #[must_use]
+    pub fn get(&self, service_id: &str) -> Option<tunnel_mcp_export::ExportDiagnostics> {
+        self.exports
+            .get(service_id)
+            .map(tunnel_mcp_export::McpExport::diagnostics)
+    }
+}
+
 /// The handler registry passed to [`crate::connect_with_http_handlers`].
 #[derive(Clone, Debug, Default)]
 pub struct HttpHandlers {
     exports: BTreeMap<String, HttpExport>,
     diagnostics: DeviceHttpDiagnostics,
+    /// The registered MCP exports, kept only for their payload-free counters.
+    mcp: BTreeMap<String, tunnel_mcp_export::McpExport>,
 }
 
 impl HttpHandlers {
@@ -199,6 +217,7 @@ impl HttpHandlers {
             let profile = mcp_export.profile_policies().map_err(|_| {
                 tunnel_mcp_export::McpConfigError("the pinned MCP profile tables are inconsistent")
             })?;
+            self.mcp.insert(service_id.clone(), mcp_export.clone());
             let handler_export = mcp_export.clone();
             let handler = move |request: Request<ChannelBody>| -> HttpHandlerFuture {
                 let export = handler_export.clone();
@@ -214,6 +233,18 @@ impl HttpHandlers {
             );
         }
         Ok(self)
+    }
+
+    /// A shareable view of every registered MCP export's payload-free
+    /// counters (children, sessions, interruptions, cancellation
+    /// notifications; never arguments, environment or bodies).  It stays
+    /// valid after the handlers move into
+    /// [`crate::connect_with_http_handlers`].
+    #[must_use]
+    pub fn mcp_diagnostics_source(&self) -> McpExportDiagnostics {
+        McpExportDiagnostics {
+            exports: self.mcp.clone(),
+        }
     }
 
     /// The bounded device-side exchange records.

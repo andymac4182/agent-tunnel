@@ -1,21 +1,71 @@
 #![forbid(unsafe_code)]
-//! `tunnel-mcp-fixture stdio` serves [`tunnel_mcp_fixture::FixtureServer`]
-//! over stdio, recording markers in its working directory (the export's
-//! configured synthetic workspace).
+//! The synthetic fixture server binary.
+//!
+//! * `tunnel-mcp-fixture stdio` serves [`tunnel_mcp_fixture::FixtureServer`]
+//!   over stdio, recording markers in its working directory (the export's
+//!   configured synthetic workspace).
+//! * `tunnel-mcp-fixture http <marker-dir> <port> <stateless|legacy>
+//!   <address-file>` serves it with the official rmcp Streamable HTTP server
+//!   on `127.0.0.1:<port>` (0 picks a free port) and writes the bound address
+//!   to `<address-file>`.  `legacy` enables rmcp's 2025-11-25 sessions.
+//! * `tunnel-mcp-fixture descendant <pid-file>` is the synthetic descendant
+//!   the `sleep` and `crash` tools can start.
+
+use std::path::PathBuf;
 
 use rmcp::ServiceExt;
-use tunnel_mcp_fixture::FixtureServer;
+use tunnel_mcp_fixture::{DESCENDANT_MODE, FixtureServer};
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> std::process::ExitCode {
-    let mode = std::env::args().nth(1);
-    if mode.as_deref() != Some("stdio") {
-        return std::process::ExitCode::from(2);
+    let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+    match arguments.first().map(String::as_str) {
+        Some("stdio") if arguments.len() == 1 => {
+            let server = FixtureServer::new(std::env::current_dir().ok());
+            let Ok(running) = server.serve(rmcp::transport::stdio()).await else {
+                return std::process::ExitCode::from(1);
+            };
+            let _ = running.waiting().await;
+            std::process::ExitCode::SUCCESS
+        }
+        Some("http") if arguments.len() == 5 => {
+            let marker_dir = PathBuf::from(&arguments[1]);
+            let Ok(port) = arguments[2].parse::<u16>() else {
+                return std::process::ExitCode::from(2);
+            };
+            let legacy = match arguments[3].as_str() {
+                "legacy" => true,
+                "stateless" => false,
+                _ => return std::process::ExitCode::from(2),
+            };
+            let Ok(listener) = tokio::net::TcpListener::bind(("127.0.0.1", port)).await else {
+                return std::process::ExitCode::from(1);
+            };
+            let Ok(address) = listener.local_addr() else {
+                return std::process::ExitCode::from(1);
+            };
+            let address_file = PathBuf::from(&arguments[4]);
+            let temporary = address_file.with_extension("tmp");
+            if tokio::fs::write(&temporary, address.to_string())
+                .await
+                .is_err()
+                || tokio::fs::rename(&temporary, &address_file).await.is_err()
+            {
+                return std::process::ExitCode::from(1);
+            }
+            tunnel_mcp_fixture::serve_http(
+                listener,
+                legacy,
+                marker_dir,
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await;
+            std::process::ExitCode::SUCCESS
+        }
+        Some(mode) if mode == DESCENDANT_MODE && arguments.len() == 2 => {
+            tunnel_mcp_fixture::run_descendant(&PathBuf::from(&arguments[1])).await;
+            std::process::ExitCode::SUCCESS
+        }
+        _ => std::process::ExitCode::from(2),
     }
-    let server = FixtureServer::new(std::env::current_dir().ok());
-    let Ok(running) = server.serve(rmcp::transport::stdio()).await else {
-        return std::process::ExitCode::from(1);
-    };
-    let _ = running.waiting().await;
-    std::process::ExitCode::SUCCESS
 }

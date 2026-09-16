@@ -1,6 +1,6 @@
 # MCP adapter plan
 
-Status: M3-01 (pins) and M3-02 (device exports over `http-forward/1`) implemented, awaiting verification, 2026-09-16; see [Pinned in code](#pinned-in-code-m3-01-and-m3-02). M3-03 (a real cloud-side client across relays and rotations) and M3-04 (isolation, correlation and unknown outcomes) are not implemented. MCP compatibility is separate from the tunnel wire protocol. The tunnel's control and data WebSockets do not require an external MCP client to support a custom transport.
+Status: M3-01 (pins), M3-02 (device exports over `http-forward/1`) and M3-03 (a real cloud-side client across relays and rotations) are implemented, awaiting verification, 2026-09-16; see [Pinned in code](#pinned-in-code-m3-01-and-m3-02) and [Pinned in code (M3-03)](#pinned-in-code-m3-03). M3-04 (isolation, correlation and unknown outcomes) is not implemented. MCP compatibility is separate from the tunnel wire protocol. The tunnel's control and data WebSockets do not require an external MCP client to support a custom transport.
 
 ## Two explicit compatibility profiles
 
@@ -172,12 +172,50 @@ Rejections are local JSON-RPC errors with fixed messages. They never echo header
 
 ### Not proven by M3-01/M3-02
 
-- A real cloud-side client through non-owner ingress, the HTTP/3 hop and the rotating tunnel. The end-to-end tests use the in-process gate-2 bridge (M3-03).
-- Rotation during MCP streams, and a streaming call across three rotations (M3-03).
+- A real cloud-side client through non-owner ingress, the HTTP/3 hop and the rotating tunnel: these end-to-end tests use the in-process gate-2 bridge. That path is covered by the M3-03 gate below.
 - Session or consumer isolation bound to the authenticated principal (M3-04 acceptance). The device cannot see the principal, so legacy session IDs are unguessable but not principal-scoped (M3-04).
 - Concurrent consumers through the relay, revocation, lost acknowledgements and unknown tool outcomes across relays (M3-04).
 - Resources, prompts, subscriptions (`subscriptions/listen`), MRTR input requests, sampling and elicitation. The bridge forwards them as raw messages, but no test exercises them (M3-13).
+- Server→client log notifications (`notifications/message`) and per-request cancellation over the real cluster; both are covered by M3-03 below.
 - `Last-Event-ID` resume. The stdio bridge emits no event IDs, so a legacy stream cannot resume; an HTTP backend's own resume is forwarded but untested (M3-10).
 - Browser `Origin` handling, OAuth protected-resource discovery and audience checks (M3-11). HTTP/2 consumers (M3-12).
 - Descendants that leave the child's process group (M3-09). Non-Unix hosts, where the group kill is absent and the end-to-end tests are `cfg(unix)` (M3-12).
 - Throughput and cost of one child per 2026 request with real servers.
+
+## Pinned in code (M3-03)
+
+Recorded 2026-09-16. The harness gate `verify-m3-mcp-cloud-client` (see [testing.md](testing.md#mcp-through-the-real-cluster-verify-m3-mcp-cloud-client)) runs the pinned rmcp 3.4.0 client as a cloud consumer through non-owner ingress (relay-c), the peer HTTP/3 hop, the owner actor (relay-a), the rotating device data WebSocket and `tunnel-client`'s configured MCP exports, against the deterministic `tunnel-mcp-fixture` desktop server.
+
+### Coverage matrix
+
+Every cell was observed in three consecutive standalone runs.
+
+| Behaviour | stdio / 2026-07-28 | stdio / 2025-11-25 | Streamable HTTP / 2026-07-28 | Streamable HTTP / 2025-11-25 |
+| --- | --- | --- | --- | --- |
+| Discovery | `server/discover` once, no session header | `initialize` once, `Mcp-Session-Id` returned | `server/discover` once | `initialize` once |
+| Tool call | `tools/list` once; `echo` arguments, `_meta` and image exact, one invocation | same | same | same |
+| Progress notifications | 1..6 in wire order during the call | same | same | same |
+| Server→client messages | five `notifications/message` on the call's response stream | five on the standalone GET stream | five on the response stream | five on the standalone GET stream |
+| Streaming | 48 × 4 KiB progress events across three rotations, byte-exact, one child | same, one session child | same | same |
+| Cancellation | stream close → one bridge `notifications/cancelled`, child group killed, owner `RESET(4005)` | client `notifications/cancelled` forwarded, child group killed at session end | backend connection dropped, backend observed the cancellation, owner `RESET(4005)` or device FIN | client `notifications/cancelled` forwarded |
+| Backend crash mid-call | interruption, one invocation, fresh child for the next call | interruption, session ended, 404 then one re-initialization | interruption, restarted backend serves the next call | interruption, 404 then one re-initialization |
+| Rotation during discovery and invocation | held `tools/list` and held call each observed dispatched-and-unanswered at a rotation, one dispatch | same | same | same |
+
+### What the gate pins
+
+- **The client is the official SDK.** rmcp 3.4.0's `StreamableHttpClientTransport` drives the lifecycle; the harness only decorates rmcp's own Unix-socket HTTP client with a payload-free ledger (POSTs by method, responses by call, session headers, standalone streams, log and progress order) and puts a byte-copying TLS sidecar in front of it, because rmcp has no TLS client without `reqwest` and the workspace pins none.
+- **The device is configured as production configures it.** The gate writes `[exports.<service>.mcp]` tables into the connector's runtime file, parses them with `RuntimeConfig`, and registers them with `HttpHandlers::with_mcp_exports`, as `tunnel-client connect` does. The relays build their profile set from a `ServeConfig [http_forward]` table, and each catalog service selects one through `http_forward_profile`.
+- **Ordering evidence is the wire, not the client handler.** rmcp may run a client's notification handlers concurrently; one run delivered log seq 4 before 3 to the handler while the wire order was intact. Progress and log ordering are therefore compared on the transport (a SHA-256 over the messages in arrival order for the 48-event stream), and the handler proves only the multiset.
+- **One device session per combination.** Stream IDs restart with a session and the owner's bounded diagnostics outlive one, so every record is matched by operation ID as well. A session is also limited to 128 streams for its lifetime (M7-C82 in [tasks.md](tasks.md)).
+- **Rotation freezes refuse new requests.** The relay pauses stream admission from QUIESCE to COMMIT, so a POST can be refused with a retryable `503 PEER_UNAVAILABLE` `not_dispatched`, and rmcp does not retry it. That body is the relay's answer to every owner-not-ready condition, not only a freeze, so the gate resends a refusal only while its own watch on the connector's rotation phase says a rotation is frozen (or within 750 ms of one). The cap is derived from the rotation policy (the handshake budget at the relay's 250 ms hint, plus four; 12 here), so a slow drain cannot fail a call. A refusal outside a freeze fails the call and records the connector's phase and rotation count as its cause, because the owner freezes before the connector sees `ROTATE_QUIESCE`. Each case's POST and standalone-GET refusals and retries are printed and must be equal and bounded, with no unexplained refusal (M3-15).
+- **A device session is limited.** Each combination runs on its own session and the validator requires its highest call stream ID to stay under 128 and no export child to survive the session's stop (M7-C82).
+
+### Not proven by M3-03
+
+- Session or consumer isolation bound to the authenticated principal, concurrent consumers with colliding JSON-RPC IDs, lost acknowledgements and revocation (M3-04).
+- Sampling (`sampling/createMessage`), elicitation, MRTR input requests and `subscriptions/listen`; resources and prompts (M3-13). The bridge forwards them as raw messages and rmcp can express some of them, but no case exercises them.
+- `Last-Event-ID` resume of an interrupted stream (M3-10). The 2025 Streamable HTTP backend's own event IDs make rmcp attempt a resume after a crash; the gate bounds those attempts rather than proving resume.
+- A process-group kill for a Streamable HTTP backend: the device does not own that process. The gate restarts it as an operator's supervisor would.
+- HTTP/2 consumers, browser `Origin` handling and the MCP authorization profile (M3-11, M3-12).
+- An ingress exchange record for a consumer that disconnects before any response head (M3-14): the owner records the cancellation, the ingress records nothing.
+
