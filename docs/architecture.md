@@ -41,7 +41,7 @@ The two-socket requirement applies to each device-to-relay tunnel. Consumers, a 
 | `tunnel-vfs` | 9P2000.L server, directory-handle-confined mount operations and bytes | Future Rust crate |
 | `tunnel-cua` | Typed, authorized local CUA operations and desktop leases | Future Rust crate |
 | `tunnel-http` / `tunnel-acp` | Bounded HTTP forwarding and CLI ACP HTTP-to-stdio lifecycle bridge | Future Rust modules/crates |
-| `packages/client` | Shared filesystem endpoint/9P client with scoped lifecycle and errors | Future TypeScript package |
+| `packages/client` | Shared filesystem endpoint/9P client with scoped lifecycle and errors | TypeScript package; **the 9P2000.L codec exists** (task row M4-10), the endpoint, lifecycle and errors do not |
 | `packages/files-sdk`, `packages/mastra`, `packages/just-bash`, `packages/ai-sdk` | Native framework adapters over one client API | Future TypeScript packages |
 
 Start with a small workspace and split crates only when their milestone starts. Axum is the selected public HTTP/WebSocket server. Tokio, tokio-tungstenite, rustls and tracing are planned supporting libraries; HTTP/3 peers use a dedicated QUIC/H3 integration sharing typed services with Axum, not an assumption that Axum natively serves H3. See [runtime.md](runtime.md) for listener roles, TLS identity propagation, CLI commands, actor ownership and debugging. Pin and test the actual dependency combination before claiming support.
