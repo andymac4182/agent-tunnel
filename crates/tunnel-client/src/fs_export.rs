@@ -42,8 +42,8 @@ use bytes::Bytes;
 use tunnel_fs_core::{Capability, CapabilitySet, FeatureSet, Limits, SessionErrorCode};
 use tunnel_fs_ninep::{FrameDecoder, MAX_MESSAGE_BYTES};
 use tunnel_fs_provider::{
-    Authority, Authorization, Outbound, Provider, ProviderStats, default_limits, encode_close,
-    encode_message,
+    Authority, Authorization, Outbound, Provider, ProviderStats, RECORD_HEADER_LEN, default_limits,
+    encode_close, encode_message,
 };
 use tunnel_http_bridge::{Frame, FrameReceiver, FrameSender};
 
@@ -280,15 +280,47 @@ async fn serve_unix(
 
     let mut decoder = FrameDecoder::new();
     let mut applied_msize = MAX_MESSAGE_BYTES;
+    // Admitting **every request already available** takes priority over
+    // performing a queued one.
+    //
+    // This is not an optimisation, and getting it wrong makes a rule
+    // unenforceable rather than slow. A loop that drained the queue after each
+    // decoded frame would perform a pipelined `Tread` before it had even
+    // decoded the `Tflush` that follows it, so the flush could never win the
+    // race and `Provider`'s drop path would be unreachable from a client — the
+    // contract permits the flush to lose, but a dispatcher that makes it
+    // *always* lose has not implemented cancellation, it has implemented
+    // nothing. So each turn of this loop prefers input that is ready now and
+    // performs exactly one queued request when none is.
+    //
+    // `FrameReceiver::recv` awaits only its channel and does its bookkeeping
+    // after, so dropping it in the `select!` below loses nothing; that is what
+    // makes "read what is ready, otherwise make progress" expressible at all.
     'stream: loop {
-        let Some(frame) = inbound.recv().await else {
-            break;
+        let ready = if provider.has_work() {
+            tokio::select! {
+                biased;
+                frame = inbound.recv() => Some(frame),
+                () = std::future::ready(()) => None,
+            }
+        } else {
+            Some(inbound.recv().await)
         };
-        let bytes = match frame {
-            Frame::Data(bytes) => bytes,
+
+        let bytes = match ready {
+            // Nothing is waiting to be read: perform one queued request.
+            None => {
+                if emit(&outbound, provider.step(), &mut provider, &mut report).await {
+                    break 'stream;
+                }
+                continue;
+            }
+            Some(None) => break,
+            Some(Some(Frame::Data(bytes))) => bytes,
             // Either terminal ends the session; a 9P session has no half-close.
-            Frame::Fin | Frame::Reset(_) => break,
+            Some(Some(Frame::Fin | Frame::Reset(_))) => break,
         };
+
         let mut input: &[u8] = &bytes;
         loop {
             let decoded = match decoder.decode(&mut input) {
@@ -304,31 +336,11 @@ async fn serve_unix(
                     break 'stream;
                 }
             };
-            let mut outbounds = provider.accept(&decoded);
-            while provider.has_work() {
-                outbounds.extend(provider.step());
-            }
-            for out in outbounds {
-                match out {
-                    Outbound::Frame(frame) => {
-                        let mut encoded = Vec::new();
-                        if frame.encode(provider.msize(), &mut encoded).is_err() {
-                            report.closed_with = Some(SessionErrorCode::ProtocolViolation);
-                            emit_close(&outbound, SessionErrorCode::ProtocolViolation).await;
-                            break 'stream;
-                        }
-                        let mut record = Vec::with_capacity(encoded.len() + 5);
-                        encode_message(&encoded, &mut record);
-                        if outbound.send_data(Bytes::from(record)).await.is_err() {
-                            break 'stream;
-                        }
-                    }
-                    Outbound::Close(code) => {
-                        report.closed_with = Some(code);
-                        emit_close(&outbound, code).await;
-                        break 'stream;
-                    }
-                }
+            // Only the answers that need no host work — the version handshake
+            // and `Tflush` — come back here; everything else is queued.
+            let admitted = provider.accept(&decoded);
+            if emit(&outbound, admitted, &mut provider, &mut report).await {
+                break 'stream;
             }
             // The decoder's bound follows the negotiation, reduction only and
             // only at a frame boundary.
@@ -341,6 +353,43 @@ async fn serve_unix(
     provider.close();
     let _ = outbound.finish();
     report
+}
+
+/// Write one batch of the provider's answers. Returns whether the session ended.
+///
+/// A reply is encoded and sent one at a time rather than collected first, so the
+/// bytes this task holds outside the carrier are bounded by one `msize` however
+/// many requests a client pipelined.
+#[cfg(unix)]
+async fn emit(
+    outbound: &FrameSender,
+    outbounds: Vec<Outbound>,
+    provider: &mut Provider<SharedAuthority>,
+    report: &mut FsExchangeReport,
+) -> bool {
+    for out in outbounds {
+        match out {
+            Outbound::Frame(frame) => {
+                let mut encoded = Vec::new();
+                if frame.encode(provider.msize(), &mut encoded).is_err() {
+                    report.closed_with = Some(SessionErrorCode::ProtocolViolation);
+                    emit_close(outbound, SessionErrorCode::ProtocolViolation).await;
+                    return true;
+                }
+                let mut record = Vec::with_capacity(encoded.len() + RECORD_HEADER_LEN);
+                encode_message(&encoded, &mut record);
+                if outbound.send_data(Bytes::from(record)).await.is_err() {
+                    return true;
+                }
+            }
+            Outbound::Close(code) => {
+                report.closed_with = Some(code);
+                emit_close(outbound, code).await;
+                return true;
+            }
+        }
+    }
+    false
 }
 
 async fn emit_close(outbound: &FrameSender, code: SessionErrorCode) {
