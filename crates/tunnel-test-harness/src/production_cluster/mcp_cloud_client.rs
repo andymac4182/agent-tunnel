@@ -32,8 +32,8 @@
 //!   a held call are each observed dispatched and unanswered by the owner at
 //!   a completed rotation, then answered exactly with one dispatch;
 //! * `streaming`: 48 progress events of 4 KiB each, gated so the owner
-//!   observes the open response at two distinct rotations, byte-exact and in
-//!   order, with one dispatch.
+//!   observes the open response at three distinct rotations, byte-exact and
+//!   in order, with one dispatch.
 //!
 //! All payloads, credentials and processes are synthetic.
 
@@ -62,8 +62,9 @@ use tunnel_relay::{RelaySessionSnapshot, RelaySnapshot};
 
 pub use self::wire::WireCounts;
 use self::wire::{
-    CountingHttpClient, GateClient, HttpBackend, Sidecar, WireLedger, count_lines,
-    fixture_binary_path, process_exists, wait_file, wait_pid_file, wait_process_gone,
+    CountingHttpClient, FreezeWatch, GateClient, HttpBackend, NOT_DISPATCHED_RETRIES, Sidecar,
+    WireLedger, count_lines, fixture_binary_path, process_exists, wait_file, wait_pid_file,
+    wait_process_gone,
 };
 use super::http_forward_real_path::{connect_consumer, empty_stream, request};
 use super::{
@@ -115,6 +116,9 @@ const SCENARIO_TIMEOUT: Duration = Duration::from_secs(1_200);
 const WAIT: Duration = Duration::from_secs(30);
 const POLL: Duration = Duration::from_millis(20);
 const CANCELLED: u16 = tunnel_protocol::reset_reason::CANCELLED;
+/// The connector's rotation phases in which the owner pauses new stream
+/// admission (docs/protocol.md, "Quiesce admission").
+const FROZEN_PHASES: [&str; 3] = ["quiescing", "draining", "committing"];
 const MEMBERSHIP_RESIGN_SPACING: Duration = Duration::from_secs(15);
 /// The fixture's signed membership record lifetime (the product maximum).
 const MEMBERSHIP_RECORD_LIFETIME: Duration = Duration::from_secs(60);
@@ -261,6 +265,9 @@ pub struct McpComboEvidence {
     /// The highest owner stream ID a call used (a session admits at most
     /// 128 streams in its lifetime, M7-C82).
     pub highest_call_stream_id: u64,
+    /// MCP export children still running after this combination's device
+    /// session stopped.
+    pub children_running_after_stop: u64,
     pub discovery: DiscoveryEvidence,
     pub notifications: NotificationEvidence,
     pub cancellation: CancellationEvidence,
@@ -294,6 +301,22 @@ pub struct McpCloudClientEvidence {
     /// every case must end inside the records' 60 s lifetime.
     pub max_membership_age_at_case_end_ms: u128,
     pub not_covered: Vec<String>,
+}
+
+impl McpComboEvidence {
+    /// Every case's transport counts, in case order.
+    #[must_use]
+    pub fn case_wires(&self) -> Vec<(&'static str, &WireCounts)> {
+        vec![
+            ("discovery", &self.discovery.wire),
+            ("notifications", &self.notifications.wire),
+            ("cancellation", &self.cancellation.wire),
+            ("crash", &self.crash.wire),
+            ("rotation-discovery", &self.rotation_discovery.wire),
+            ("rotation-invocation", &self.rotation_invocation.wire),
+            ("streaming", &self.streaming.wire),
+        ]
+    }
 }
 
 fn fence_accounted(observation: &HttpRotationObservation) -> bool {
@@ -642,7 +665,7 @@ pub fn validate_mcp_cloud_client_evidence(evidence: &McpCloudClientEvidence) -> 
                 s.events_received == STREAM_EVENTS && s.events_exact_in_order && s.result_exact,
             ),
             (
-                format!("{name} streaming: the open stream spanned two rotations"),
+                format!("{name} streaming: the open stream spanned three rotations"),
                 rotations.len() >= STREAM_MIN_ROTATIONS
                     && !s.operation_id.is_empty()
                     && s.observations.iter().all(|observation| {
@@ -664,7 +687,24 @@ pub fn validate_mcp_cloud_client_evidence(evidence: &McpCloudClientEvidence) -> 
                 s.device_error.is_none() && s.ingress_error.is_none(),
             ),
             (
-                format!("{name}: four distinct rotations observed on one stable session"),
+                format!(
+                    "{name}: every not_dispatched refusal coincided with a rotation freeze and was bounded"
+                ),
+                combo.case_wires().iter().all(|(_, wire)| {
+                    wire.not_dispatched_refusals == wire.not_dispatched_retries
+                        && wire.not_dispatched_retries <= NOT_DISPATCHED_RETRIES
+                }),
+            ),
+            (
+                format!("{name}: one device session stayed under the 128-stream limit (M7-C82)"),
+                combo.highest_call_stream_id > 0 && combo.highest_call_stream_id < 128,
+            ),
+            (
+                format!("{name}: no export child outlived its device session"),
+                combo.children_running_after_stop == 0,
+            ),
+            (
+                format!("{name}: five distinct rotations observed on one stable session"),
                 combo.session_stable
                     && observed_rotations.len() >= 2 + STREAM_MIN_ROTATIONS
                     && combo.session_rotations >= observed_rotations.len() as u64,
@@ -799,12 +839,18 @@ struct Gate<'a> {
     sidecar: Sidecar,
     backends: BTreeMap<&'static str, HttpBackend>,
     device_id: uuid::Uuid,
+    /// Catalog service identifiers by combination label.
+    service_ids: BTreeMap<&'static str, String>,
     token: String,
     ca: Vec<u8>,
     membership_signed_at: Instant,
     session_id: String,
     last_stream_id: u64,
     descendant_pids: Vec<u32>,
+    /// Whether the connector is in a rotation freeze, watched for the
+    /// current device session.
+    freeze: Arc<FreezeWatch>,
+    freeze_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Gate<'_> {
@@ -843,6 +889,23 @@ impl Gate<'_> {
         .map_err(|_| HarnessError::Timeout("MCP gate device startup timed out".into()))?
         .map_err(|error| HarnessError::Process(format!("MCP gate device: {error}")))?;
         let client = self.client.insert(client);
+        // Watch this session's rotation phase: the relay refuses new stream
+        // admission from QUIESCE to COMMIT with the same body it uses for
+        // every other owner-not-ready condition, so only a refusal that
+        // coincides with an observed freeze may be resent.
+        self.freeze = Arc::new(FreezeWatch::default());
+        let freeze = Arc::clone(&self.freeze);
+        let mut status = client.status();
+        freeze.record(FROZEN_PHASES.contains(&status.borrow().phase.as_str()));
+        self.freeze_task = Some(tokio::spawn(async move {
+            while status.changed().await.is_ok() {
+                let frozen = {
+                    let status = status.borrow_and_update();
+                    FROZEN_PHASES.contains(&status.phase.as_str())
+                };
+                freeze.record(frozen);
+            }
+        }));
         let session = timeout(STARTUP_TIMEOUT, client.wait_ready())
             .await
             .map_err(|_| HarnessError::Timeout("MCP gate device readiness timed out".into()))?
@@ -874,7 +937,23 @@ impl Gate<'_> {
         }
     }
 
+    /// Export children still running, summed over every MCP export.
+    fn children_running(&self) -> u64 {
+        crate::MCP_GATE_SERVICES
+            .iter()
+            .filter_map(|(label, _)| {
+                self.service_ids
+                    .get(label)
+                    .and_then(|service_id| self.mcp_diagnostics.get(service_id))
+            })
+            .map(|diagnostics| diagnostics.children_running)
+            .sum()
+    }
+
     async fn stop_device(&mut self) -> Result<()> {
+        if let Some(task) = self.freeze_task.take() {
+            task.abort();
+        }
         let Some(client) = self.client.take() else {
             return Ok(());
         };
@@ -949,8 +1028,11 @@ impl Gate<'_> {
             .to_str()
             .ok_or_else(|| HarnessError::InvalidInput("sidecar socket path".into()))?;
         let ledger = Arc::new(WireLedger::default());
-        let http =
-            CountingHttpClient::new(UnixSocketHttpClient::new(socket, &uri), Arc::clone(&ledger));
+        let http = CountingHttpClient::new(
+            UnixSocketHttpClient::new(socket, &uri),
+            Arc::clone(&ledger),
+            Arc::clone(&self.freeze),
+        );
         let mut config =
             StreamableHttpClientTransportConfig::with_uri(uri).auth_header(self.token.clone());
         // rmcp retries a broken event stream forever by default; a cloud
@@ -1129,7 +1211,10 @@ impl Gate<'_> {
                 self.last_stream_id = *stream_id;
                 return Ok((*stream_id, operation_id.clone()));
             }
-            if candidates.len() > 1 || Instant::now() >= deadline {
+            // More than one open call stream is usually a transient overlap
+            // (a previous case's stream is still settling), so wait for the
+            // same bound rather than failing on the first sample.
+            if Instant::now() >= deadline {
                 return Err(HarnessError::Process(format!(
                     "{label}: expected one open call stream, found {candidates:?}"
                 )));
@@ -2006,6 +2091,10 @@ async fn run(
         sidecar,
         backends,
         device_id: device.id,
+        service_ids: combos
+            .iter()
+            .map(|combo| (combo.service.label, combo.service.service_id.to_string()))
+            .collect(),
         token,
         ca,
         // The bootstrap records were signed when the cluster started, so
@@ -2016,6 +2105,8 @@ async fn run(
         session_id: String::new(),
         last_stream_id: 0,
         descendant_pids: Vec::new(),
+        freeze: Arc::new(FreezeWatch::default()),
+        freeze_task: None,
     };
     let only_cases = std::env::var("M3_MCP_CASES").ok();
     let only_combos = std::env::var("M3_MCP_COMBOS").ok();
@@ -2124,6 +2215,7 @@ async fn run(
             combo_evidence.highest_call_stream_id = highest_stream;
             evidence.rotations_completed += rotations;
             gate.stop_device().await?;
+            last_combo(&mut evidence)?.children_running_after_stop = gate.children_running();
         }
         evidence.device_session_stable =
             !evidence.combos.is_empty() && evidence.combos.iter().all(|combo| combo.session_stable);
@@ -2243,6 +2335,7 @@ mod tests {
             session_stable: true,
             session_rotations: 5,
             highest_call_stream_id: 40,
+            children_running_after_stop: 0,
             discovery: DiscoveryEvidence {
                 negotiated_version: protocol_of(profile).to_owned(),
                 lifecycle_dispatches: 1,
@@ -2408,6 +2501,62 @@ mod tests {
             ("resign spacing", |e| e.resign_spacing_ms = 1),
             ("membership age", |e| {
                 e.max_membership_age_at_case_end_ms = 60_000
+            }),
+            ("refusal outside a freeze", |e| {
+                e.combos[0].discovery.wire.not_dispatched_refusals = 1;
+            }),
+            ("unbounded freeze retries", |e| {
+                e.combos[1].streaming.wire.not_dispatched_refusals = NOT_DISPATCHED_RETRIES + 1;
+                e.combos[1].streaming.wire.not_dispatched_retries = NOT_DISPATCHED_RETRIES + 1;
+            }),
+            ("session stream limit", |e| {
+                e.combos[2].highest_call_stream_id = 128;
+            }),
+            ("no call stream", |e| e.combos[2].highest_call_stream_id = 0),
+            ("child outlived its session", |e| {
+                e.combos[3].children_running_after_stop = 1;
+            }),
+            ("2026 standalone stream", |e| {
+                e.combos[0].notifications.wire.standalone_opened = 1;
+            }),
+            ("cancel stream missing", |e| {
+                e.combos[1].cancellation.stream_id = 0
+            }),
+            ("http cancel descendant", |e| {
+                e.combos[2].cancellation.descendant_killed = Some(true);
+            }),
+            ("http crash descendant", |e| {
+                e.combos[3].crash.descendant_killed = Some(true);
+            }),
+            ("2025 bridge cancel notification", |e| {
+                e.combos[1].cancellation.bridge_cancel_notifications = 1;
+            }),
+            ("2026 session expired", |e| {
+                e.combos[2].crash.wire.session_expired = 1;
+            }),
+            ("2026 stdio re-initialized", |e| {
+                e.combos[0].crash.lifecycle_dispatches_after_crash = 1;
+            }),
+            ("2026 http re-initialized", |e| {
+                e.combos[2].crash.lifecycle_dispatches_after_crash = 1;
+            }),
+            ("2025 stdio interrupted", |e| {
+                e.combos[1].crash.export_interrupted = 0;
+            }),
+            ("stdio backend exit", |e| {
+                e.combos[0].crash.backend_exited = Some(true);
+            }),
+            ("stream post missing", |e| {
+                e.combos[2].streaming.wire.posts.clear();
+            }),
+            ("stream result missing", |e| {
+                e.combos[2].streaming.wire.results.clear();
+            }),
+            ("cancel operation missing", |e| {
+                e.combos[0].rotation_invocation.operation_id = String::new();
+            }),
+            ("stream operation missing", |e| {
+                e.combos[3].streaming.operation_id = String::new();
             }),
             ("not covered", |e| {
                 e.not_covered.pop();

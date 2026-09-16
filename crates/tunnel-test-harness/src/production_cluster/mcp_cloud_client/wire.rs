@@ -22,7 +22,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -46,10 +46,74 @@ use tokio_util::sync::CancellationToken;
 use crate::{HarnessError, Result};
 
 /// How many times one POST or standalone GET is sent again after a
-/// retryable `not_dispatched` refusal.
-const NOT_DISPATCHED_RETRIES: u64 = 20;
+/// retryable `not_dispatched` refusal that coincided with a rotation
+/// freeze.  The freeze lasts at most the rotation overlap, so a handful of
+/// hint-sized waits covers it; the evidence validator bounds it again.
+pub(super) const NOT_DISPATCHED_RETRIES: u64 = 8;
 /// The longest retry hint honoured.
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(1);
+/// How long after the last observed frozen owner sample a refusal still
+/// counts as coinciding with that freeze.
+const FREEZE_COINCIDENCE: Duration = Duration::from_millis(750);
+
+/// Whether the owner session is, or has just been, in a rotation freeze.
+///
+/// The relay answers every owner-not-ready condition with the same
+/// retryable `503 PEER_UNAVAILABLE` `not_dispatched` body (`http.rs`
+/// `retryable_peer_failure_response`), so the body alone cannot say whether
+/// the refusal came from the documented quiesce-admission pause or from a
+/// fault state.  The gate samples the owner's session phase instead and
+/// resends only while that says a rotation is frozen.
+#[derive(Debug, Default)]
+pub(super) struct FreezeWatch {
+    frozen: AtomicBool,
+    /// Whether any frozen sample was ever recorded.
+    seen_frozen: AtomicBool,
+    /// Milliseconds since the watch started, at the last frozen sample.
+    last_frozen_ms: AtomicU64,
+    started: Mutex<Option<Instant>>,
+}
+
+impl FreezeWatch {
+    pub fn record(&self, frozen: bool) {
+        let mut started = self
+            .started
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let started = *started.get_or_insert_with(Instant::now);
+        self.frozen.store(frozen, Ordering::SeqCst);
+        if frozen {
+            self.seen_frozen.store(true, Ordering::SeqCst);
+            self.last_frozen_ms.store(
+                u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                Ordering::SeqCst,
+            );
+        }
+    }
+
+    /// Whether a refusal observed now coincides with a rotation freeze.
+    fn coincides(&self) -> bool {
+        if self.frozen.load(Ordering::SeqCst) {
+            return true;
+        }
+        let started = {
+            let started = self
+                .started
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *started
+        };
+        let Some(started) = started else {
+            return false;
+        };
+        if !self.seen_frozen.load(Ordering::SeqCst) {
+            return false;
+        }
+        let last = self.last_frozen_ms.load(Ordering::SeqCst);
+        u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+            <= last + FREEZE_COINCIDENCE.as_millis() as u64
+    }
+}
 
 /// The retry hint of a retryable `not_dispatched` 503 relay refusal, or
 /// `None` for any other failure.  Only such a refusal may be resent: the
@@ -190,8 +254,11 @@ pub struct WireCounts {
     /// POSTs that failed at the transport (other than an expired session).
     pub post_failures: u64,
     /// POSTs the relay refused with a retryable `503 PEER_UNAVAILABLE`
-    /// `not_dispatched` answer (a rotation freeze pauses new admissions)
-    /// and this client sent again after the hint.
+    /// `not_dispatched` answer.
+    pub not_dispatched_refusals: u64,
+    /// Those refusals that coincided with an observed owner rotation freeze
+    /// and were therefore sent again after the hint.  A refusal outside a
+    /// freeze is never resent, so it fails its call.
     pub not_dispatched_retries: u64,
     /// Standalone GETs refused with 503 and sent again.
     pub standalone_retries: u64,
@@ -373,11 +440,20 @@ impl WireLedger {
 pub(super) struct CountingHttpClient {
     inner: UnixSocketHttpClient,
     ledger: Arc<WireLedger>,
+    freeze: Arc<FreezeWatch>,
 }
 
 impl CountingHttpClient {
-    pub fn new(inner: UnixSocketHttpClient, ledger: Arc<WireLedger>) -> Self {
-        Self { inner, ledger }
+    pub fn new(
+        inner: UnixSocketHttpClient,
+        ledger: Arc<WireLedger>,
+        freeze: Arc<FreezeWatch>,
+    ) -> Self {
+        Self {
+            inner,
+            ledger,
+            freeze,
+        }
     }
 
     fn observe_post(
@@ -472,14 +548,20 @@ impl StreamableHttpClient for CountingHttpClient {
                 )
                 .await;
             if let Err(error) = &result
-                && retries < NOT_DISPATCHED_RETRIES
                 && let Some(delay) = not_dispatched_retry_after(error)
             {
-                retries += 1;
-                self.ledger
-                    .with(|inner| inner.counts.not_dispatched_retries += 1);
-                sleep(delay).await;
-                continue;
+                let coincides = self.freeze.coincides();
+                self.ledger.with(|inner| {
+                    inner.counts.not_dispatched_refusals += 1;
+                    if coincides {
+                        inner.counts.not_dispatched_retries += 1;
+                    }
+                });
+                if coincides && retries < NOT_DISPATCHED_RETRIES {
+                    retries += 1;
+                    sleep(delay).await;
+                    continue;
+                }
             }
             return self.observe_post(result);
         }
@@ -550,9 +632,11 @@ impl StreamableHttpClient for CountingHttpClient {
                 )
                 .await;
             // A GET refusal carries no body to inspect; a standalone stream
-            // dispatches nothing, so a 503 is resent within the same bound.
+            // dispatches nothing, so a 503 is resent within the same bound
+            // while the owner is frozen.
             if standalone
                 && retries < NOT_DISPATCHED_RETRIES
+                && self.freeze.coincides()
                 && matches!(
                     &result,
                     Err(StreamableHttpError::UnexpectedServerResponse(text))
@@ -860,5 +944,61 @@ impl HttpBackend {
             let _ = child.start_kill();
             let _ = timeout(Duration::from_secs(10), child.wait()).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_refusal_coincides_only_with_a_recent_or_current_freeze() {
+        let watch = FreezeWatch::default();
+        // Nothing observed yet: a refusal cannot be attributed to a freeze.
+        assert!(!watch.coincides());
+        watch.record(false);
+        assert!(!watch.coincides());
+        watch.record(true);
+        assert!(watch.coincides());
+        // Still inside the coincidence window after the freeze ends.
+        watch.record(false);
+        assert!(watch.coincides());
+    }
+
+    #[test]
+    fn only_a_retryable_not_dispatched_503_carries_a_retry_hint() {
+        let refusal = |body: &str| {
+            StreamableHttpError::UnexpectedServerResponse(std::borrow::Cow::Owned(format!(
+                "HTTP 503 Service Unavailable: {body}"
+            )))
+        };
+        let frozen = refusal(
+            r#"{"code":"PEER_UNAVAILABLE","execution":"not_dispatched","retryable":true,"retry_after_ms":250}"#,
+        );
+        assert_eq!(
+            not_dispatched_retry_after(&frozen),
+            Some(Duration::from_millis(250))
+        );
+        // An unknown outcome, a non-retryable refusal and another status are
+        // never resent: only the relay's "nothing was dispatched" answer is.
+        for body in [
+            r#"{"code":"PEER_UNAVAILABLE","execution":"unknown","retryable":true,"retry_after_ms":250}"#,
+            r#"{"code":"PEER_UNAVAILABLE","execution":"not_dispatched","retryable":false}"#,
+        ] {
+            assert_eq!(not_dispatched_retry_after(&refusal(body)), None);
+        }
+        assert_eq!(
+            not_dispatched_retry_after(&StreamableHttpError::UnexpectedServerResponse(
+                std::borrow::Cow::Borrowed("HTTP 502 Bad Gateway: {}")
+            )),
+            None
+        );
+        // A hint longer than the ceiling is clamped.
+        assert_eq!(
+            not_dispatched_retry_after(&refusal(
+                r#"{"execution":"not_dispatched","retryable":true,"retry_after_ms":60000}"#
+            )),
+            Some(MAX_RETRY_AFTER)
+        );
     }
 }
