@@ -399,6 +399,32 @@ impl Handle {
         let stat = rustix::fs::fstat(self.as_fd()).map_err(host_error)?;
         Ok(Metadata::from_stat(&stat))
     }
+
+    /// Read from this descriptor at an absolute offset.
+    ///
+    /// **Positioned, never seek-then-read.** A 9P `Tread` carries its own
+    /// offset and several may be outstanding at once on one fid, so a shared
+    /// file position would let two concurrent reads of one fid each move the
+    /// other's offset and return bytes neither asked for.
+    ///
+    /// A short read is an ordinary result and is not an error: it is what the
+    /// end of a file looks like, and the 9P profile says so too.
+    ///
+    /// # Errors
+    ///
+    /// A translated host failure. `EINTR` is retried rather than
+    /// surfaced, exactly as everywhere else in this crate.
+    pub fn read_at(&self, offset: u64, out: &mut [u8]) -> Result<usize, FsError> {
+        // `pread` takes the buffer by value, so the closure cannot capture it:
+        // a reborrow inside the loop is what makes the `EINTR` retry expressible
+        // without a second buffer.
+        loop {
+            match rustix::io::pread(self.as_fd(), &mut *out, offset) {
+                Err(errno) if errno == rustix::io::Errno::INTR => {}
+                other => return other.map_err(host_error),
+            }
+        }
+    }
 }
 
 impl ExportRoot {
