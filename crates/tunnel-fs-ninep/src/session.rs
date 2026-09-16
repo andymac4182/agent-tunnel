@@ -251,6 +251,16 @@ struct TagState {
     flushing: Option<u16>,
 }
 
+/// How a retiring `Tflush` ended, which decides what happens to its victim.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FlushOutcome {
+    /// An `Rflush` arrived: the flush happened, so its victim is released.
+    Answered,
+    /// The flush ended without happening — an `Rlerror`, or the flush was
+    /// itself flushed — so its victim is **not** released.
+    Cancelled,
+}
+
 /// The pure 9P session state machine.
 #[derive(Clone, Debug)]
 pub struct Session {
@@ -444,7 +454,7 @@ impl Session {
         // walked to).  After a successful bind this is a no-op, because
         // `apply_effect` consumed the reservation itself.
         self.undo_reservation(&state.effect);
-        self.retire_tag(frame.tag, &state);
+        self.retire_tag(frame.tag, &state, FlushOutcome::Answered);
         applied
     }
 
@@ -452,6 +462,18 @@ impl Session {
     ///
     /// The request's state changes are **not** applied, except the `Tclunk` and
     /// `Tremove` fid release, which happens either way.
+    ///
+    /// # A failed `Tflush` is a cancelled flush, not an answered one
+    ///
+    /// 9P answers `Tflush` only with `Rflush`, so gate 4 will never reach this
+    /// with a flush's tag and the case is unreachable in practice.  It is
+    /// still worth getting right rather than documenting as impossible: the
+    /// two answers differ in what they do to the **victim**, and an `Rlerror`
+    /// says the flush did not happen.  Treating it as answered would release
+    /// the victim and undo its reservation — cancelling a request on the
+    /// strength of a cancellation that failed.  So a failed flush takes the
+    /// same path as one that was itself flushed: it leaves its victim's set
+    /// without releasing it.
     ///
     /// # Errors
     /// [`SessionError::TagNotInUse`].
@@ -471,7 +493,9 @@ impl Session {
             Effect::Release { fid, generation } => self.release_fid(*fid, *generation),
             other => self.undo_reservation(other),
         }
-        self.retire_tag(tag, &state);
+        // An `Rlerror` means the request did not happen, so a failed `Tflush`
+        // is a **cancelled** flush rather than an answered one.
+        self.retire_tag(tag, &state, FlushOutcome::Cancelled);
         Ok(())
     }
 
@@ -536,7 +560,7 @@ impl Session {
     }
 
     /// Release a tag, honouring the flush reservation.
-    fn retire_tag(&mut self, tag: u16, state: &TagState) {
+    fn retire_tag(&mut self, tag: u16, state: &TagState, outcome: FlushOutcome) {
         if state
             .flushed_by
             .iter()
@@ -554,7 +578,12 @@ impl Session {
         }
         self.tags.remove(&tag);
         if let Some(flushed) = state.flushing {
-            self.release_flushed(flushed, tag);
+            match outcome {
+                FlushOutcome::Answered => self.release_flushed(flushed, tag),
+                // A flush that ended without happening leaves its victim's set
+                // but does not release it — see `Session::fail`.
+                FlushOutcome::Cancelled => self.cancel_flush(flushed, tag),
+            }
         }
     }
 

@@ -713,6 +713,41 @@ fn an_answered_tag_held_only_by_a_cancelled_flush_is_collected() {
     assert!(session.request(&twalk(3, 0, 2, &["b"])).is_ok());
 }
 
+#[test]
+fn a_failed_flush_does_not_release_its_victim() {
+    // Unreachable in practice — 9P answers `Tflush` only with `Rflush` — but
+    // the two answers differ in what they do to the victim, and an `Rlerror`
+    // says the flush did not happen.  Releasing the victim on it would cancel
+    // a request on the strength of a cancellation that failed.
+    let mut session = attached_session();
+    session.request(&twalk(3, 0, 1, &["a"])).expect("Twalk");
+    session
+        .request(&Frame::new(4, Message::Tflush { oldtag: 3 }))
+        .expect("Tflush");
+    assert_eq!(session.live_fids(), 2, "the walk reserved fid 1");
+
+    session.fail(4).expect("Rlerror to the flush");
+    assert!(!session.has_tag(4), "the flush's own tag is released");
+    assert!(session.has_tag(3), "its victim is not");
+    assert_eq!(
+        session.live_fids(),
+        2,
+        "and neither is the victim's reservation"
+    );
+
+    // The walk is still an ordinary outstanding request and its reply lands.
+    session
+        .complete(&Frame::new(
+            3,
+            Message::Rwalk {
+                qids: vec![Qid::new(QidKind::Directory, 1)],
+            },
+        ))
+        .expect("Rwalk");
+    assert_eq!(session.fid(1).unwrap().path().as_str(), "/a");
+    assert_eq!(session.outstanding_tags(), 0);
+}
+
 // ------------------------------------------------------------------ fids
 
 #[test]
