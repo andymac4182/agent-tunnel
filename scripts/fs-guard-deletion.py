@@ -534,8 +534,11 @@ GATE3_CASES: list[tuple[str, list[Edit]]] = [
         [
             (
                 NINEP_CODEC,
-                "        if msize < MIN_MSIZE || msize > self.msize {",
-                "        if msize < MIN_MSIZE {",
+                """        if msize > self.msize {
+            return Err(SessionError::MsizeNotAReduction);
+        }
+""",
+                "",
             )
         ],
     ),
@@ -747,7 +750,7 @@ GATE3_CASES: list[tuple[str, list[Edit]]] = [
         [
             (
                 NINEP_SESSION,
-                """                if self.phase != Phase::AwaitingVersion {
+                """                if self.phase != Phase::AwaitingVersion || self.pending_msize.is_some() {
                     return Err(SessionError::RepeatedVersion);
                 }
                 let negotiated = negotiate(*msize, version, self.msize)?;""",
@@ -950,6 +953,170 @@ GATE3_CASES: list[tuple[str, list[Edit]]] = [
                 NINEP_SESSION,
                 "            other => self.undo_reservation(other),",
                 "            other => {\n                let _ = other;\n            }",
+            )
+        ],
+    ),
+    # --- guards added by the review round -------------------------------
+    (
+        "the flushed request's reservation released with its tag",
+        [
+            (
+                NINEP_SESSION,
+                """            if !target.answered {
+                self.undo_reservation(&target.effect);
+            }
+""",
+                "",
+            )
+        ],
+    ),
+    (
+        "the reservation released on every reply path",
+        [
+            (
+                NINEP_SESSION,
+                """        self.undo_reservation(&state.effect);
+        self.retire_tag(frame.tag, &state);
+        applied""",
+                """        self.retire_tag(frame.tag, &state);
+        applied""",
+            )
+        ],
+    ),
+    (
+        "an in-place walk binding only a still-bound fid",
+        [
+            (
+                NINEP_SESSION,
+                """                } else if !self.fids.contains_key(newfid) {
+                    // A walk in place reserves nothing, so it may bind only a
+                    // fid that is **still** bound.  Re-creating one clunked
+                    // while the walk was outstanding would put a number back
+                    // into the table that the quota had already released, and
+                    // `live_fids()` could then exceed `maxFids` — the bound
+                    // gate 4 relies on to cap open descriptors.
+                    return Ok(());
+                }""",
+                "                }",
+            )
+        ],
+    ),
+    (
+        # Defensive, and deliberately kept though no test reaches it: every
+        # path that releases a reservation releases its tag in the same step,
+        # so a reservation cannot vanish while its request is outstanding.
+        # Listed so that fact is measured rather than assumed — the same
+        # treatment gate 2's `EINTR` retry gets.
+        "a reserved walk binding only a live reservation",
+        [
+            (
+                NINEP_SESSION,
+                """                    if self.reserved_fids.remove(newfid).is_none() {
+                        // The reservation was released — flushed, or the
+                        // request already failed — so there is nothing to bind.
+                        return Ok(());
+                    }""",
+                "                    self.reserved_fids.remove(newfid);",
+            )
+        ],
+    ),
+    (
+        "a zero-element walk whose origin is gone applying nothing",
+        [
+            (
+                NINEP_SESSION,
+                """                    match self.fids.get(origin) {
+                        Some(state) => state.qid,
+                        None => return Ok(()),
+                    }""",
+                "                    self.require_fid(*origin)?.qid",
+            )
+        ],
+    ),
+    (
+        "an Rlopen for a clunked fid applying nothing",
+        [
+            (
+                NINEP_SESSION,
+                """                let Some(state) = self.fids.get_mut(fid) else {
+                    return Ok(());
+                };
+                let mut mode = *mode;""",
+                """                let state = self.fids.get_mut(fid).ok_or(SessionError::UnknownFid)?;
+                let mut mode = *mode;""",
+            )
+        ],
+    ),
+    (
+        "an Rlcreate for a clunked fid applying nothing",
+        [
+            (
+                NINEP_SESSION,
+                """                let Some(state) = self.fids.get_mut(fid) else {
+                    return Ok(());
+                };
+                if qid.kind != QidKind::File {""",
+                """                let state = self.fids.get_mut(fid).ok_or(SessionError::UnknownFid)?;
+                if qid.kind != QidKind::File {""",
+            )
+        ],
+    ),
+    (
+        "refusing a pipelined second Tversion",
+        [
+            (
+                NINEP_SESSION,
+                "                if self.phase != Phase::AwaitingVersion || self.pending_msize.is_some() {",
+                "                if self.phase != Phase::AwaitingVersion {",
+            )
+        ],
+    ),
+    (
+        "refusing a pipelined second Tattach",
+        [
+            (
+                NINEP_SESSION,
+                """                if self.attach_outstanding() {
+                    return Err(SessionError::RepeatedAttach);
+                }
+""",
+                "",
+            )
+        ],
+    ),
+    (
+        "the reply byte bound on Rread and Rreaddir",
+        [
+            (
+                NINEP_SESSION,
+                """                if data.len() > *limit as usize {
+                    return Err(SessionError::MalformedReply);
+                }
+""",
+                "                let _ = limit;\n",
+            )
+        ],
+    ),
+    (
+        "the reply byte bound on Rwrite",
+        [
+            (
+                NINEP_SESSION,
+                """                if count > limit {
+                    return Err(SessionError::MalformedReply);
+                }
+""",
+                "                let _ = limit;\n",
+            )
+        ],
+    ),
+    (
+        "refusing an Rwalk with no qids for a nonempty Twalk",
+        [
+            (
+                NINEP_SESSION,
+                """                if qids.is_empty() && *names > 0 {""",
+                """                if false && qids.is_empty() && *names > 0 {""",
             )
         ],
     ),
