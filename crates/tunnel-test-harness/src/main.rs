@@ -1739,7 +1739,7 @@ async fn main() -> ExitCode {
                             combo.streaming.children_spawned,
                         );
                         println!(
-                            "M3 MCP cloud client {}/{}: session(stable={} rotations={} highest_stream={} children_after_stop={}) not_dispatched(refusals={:?} freeze_retries={:?})",
+                            "M3 MCP cloud client {}/{}: session(stable={} rotations={} highest_stream={} children_after_stop={}) not_dispatched(refusals={:?} freeze_retries={:?} standalone_refusals={:?} standalone_retries={:?} unexplained={:?})",
                             combo.kind,
                             combo.profile,
                             combo.session_stable,
@@ -1755,6 +1755,27 @@ async fn main() -> ExitCode {
                                 .case_wires()
                                 .iter()
                                 .map(|(case, wire)| (*case, wire.not_dispatched_retries))
+                                .collect::<Vec<_>>(),
+                            combo
+                                .case_wires()
+                                .iter()
+                                .map(|(case, wire)| {
+                                    (*case, wire.standalone_not_dispatched_refusals)
+                                })
+                                .collect::<Vec<_>>(),
+                            combo
+                                .case_wires()
+                                .iter()
+                                .map(|(case, wire)| (*case, wire.standalone_retries))
+                                .collect::<Vec<_>>(),
+                            combo
+                                .case_wires()
+                                .iter()
+                                .filter_map(|(case, wire)| {
+                                    wire.unexplained_refusal
+                                        .as_ref()
+                                        .map(|cause| (*case, cause.clone()))
+                                })
                                 .collect::<Vec<_>>(),
                         );
                     }

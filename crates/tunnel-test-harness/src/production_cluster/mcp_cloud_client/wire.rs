@@ -45,11 +45,25 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{HarnessError, Result};
 
+/// The smallest retry hint the relay sends with a retryable refusal
+/// (`OWNER_NOT_READY_RETRY_AFTER_MS`), and so the shortest wait between two
+/// resends of one request.
+pub(super) const MIN_RETRY_HINT_MS: u64 = 250;
+/// Margin over the derived cap: a drain can be slower than its budget on a
+/// loaded machine, and a refusal may land just before the freeze starts.
+pub(super) const RETRY_MARGIN: u64 = 4;
 /// How many times one POST or standalone GET is sent again after a
 /// retryable `not_dispatched` refusal that coincided with a rotation
-/// freeze.  The freeze lasts at most the rotation overlap, so a handful of
-/// hint-sized waits covers it; the evidence validator bounds it again.
-pub(super) const NOT_DISPATCHED_RETRIES: u64 = 8;
+/// freeze.
+///
+/// A freeze ends when the attempt commits or its handshake budget expires,
+/// so the cap covers that budget at the smallest hint, plus the margin.
+/// Deriving it from the gate's own rotation policy keeps a slow-but-legal
+/// drain from failing a call; the evidence validator bounds it again with
+/// the same expression.
+pub(super) const NOT_DISPATCHED_RETRIES: u64 =
+    (super::MCP_GATE_ROTATION.handshake_timeout_seconds * 1_000).div_ceil(MIN_RETRY_HINT_MS)
+        + RETRY_MARGIN;
 /// The longest retry hint honoured.
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(1);
 /// How long after the last observed frozen owner sample a refusal still
@@ -72,16 +86,31 @@ pub(super) struct FreezeWatch {
     /// Milliseconds since the watch started, at the last frozen sample.
     last_frozen_ms: AtomicU64,
     started: Mutex<Option<Instant>>,
+    /// The connector's last observed rotation phase and completed rotation
+    /// count, for a refusal that did not coincide with a freeze.
+    phase: Mutex<String>,
+    rotations_completed: AtomicU64,
 }
 
 impl FreezeWatch {
-    pub fn record(&self, frozen: bool) {
+    /// Record one connector status sample: its rotation phase and completed
+    /// rotation count.
+    pub fn record(&self, phase: &str, rotations_completed: u64) {
+        let frozen = FROZEN_PHASES.contains(&phase);
         let mut started = self
             .started
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let started = *started.get_or_insert_with(Instant::now);
         self.frozen.store(frozen, Ordering::SeqCst);
+        self.rotations_completed
+            .store(rotations_completed, Ordering::SeqCst);
+        phase.clone_into(
+            &mut self
+                .phase
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
         if frozen {
             self.seen_frozen.store(true, Ordering::SeqCst);
             self.last_frozen_ms.store(
@@ -89,6 +118,37 @@ impl FreezeWatch {
                 Ordering::SeqCst,
             );
         }
+    }
+
+    /// Why a refusal was not attributed to a freeze: the connector state at
+    /// the moment it was observed.  The owner freezes before the connector
+    /// sees `ROTATE_QUIESCE`, so a refusal can land in that head gap.
+    fn unexplained(&self) -> String {
+        let phase = self
+            .phase
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let since_frozen = {
+            let started = self
+                .started
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            started.map(|started| {
+                u64::try_from(started.elapsed().as_millis())
+                    .unwrap_or(u64::MAX)
+                    .saturating_sub(self.last_frozen_ms.load(Ordering::SeqCst))
+            })
+        };
+        let since_frozen = if self.seen_frozen.load(Ordering::SeqCst) {
+            since_frozen
+        } else {
+            None
+        };
+        format!(
+            "not_dispatched refusal outside a rotation freeze: connector phase={phase:?} rotations_completed={} ms_since_last_freeze={since_frozen:?}",
+            self.rotations_completed.load(Ordering::SeqCst),
+        )
     }
 
     /// Whether a refusal observed now coincides with a rotation freeze.
@@ -130,6 +190,10 @@ fn not_dispatched_retry_after(
         Duration::from_millis(value["retry_after_ms"].as_u64().unwrap_or(250)).min(MAX_RETRY_AFTER)
     })
 }
+
+/// The connector rotation phases in which the owner pauses new stream
+/// admission (docs/protocol.md, "Quiesce admission").
+pub(super) const FROZEN_PHASES: [&str; 3] = ["quiescing", "draining", "committing"];
 
 /// rmcp's default SSE event bound, restated because its constant is private.
 const MAX_SSE_EVENT_BYTES: usize = 16 * 1024 * 1024;
@@ -260,6 +324,9 @@ pub struct WireCounts {
     /// and were therefore sent again after the hint.  A refusal outside a
     /// freeze is never resent, so it fails its call.
     pub not_dispatched_retries: u64,
+    /// The connector state at the first refusal that did not coincide with
+    /// a freeze, so a failure names its cause.
+    pub unexplained_refusal: Option<String>,
     /// Standalone GETs refused with 503 and sent again.
     pub standalone_retries: u64,
     /// POSTs answered 404 for an attached legacy session.
@@ -268,8 +335,10 @@ pub struct WireCounts {
     pub session_headers: u64,
     /// Standalone GET streams opened for a legacy session.
     pub standalone_opened: u64,
-    /// Standalone GET attempts refused.
+    /// Standalone GET attempts refused for any reason.
     pub standalone_refused: u64,
+    /// Standalone GET attempts the relay refused with 503.
+    pub standalone_not_dispatched_refusals: u64,
     /// GET attempts without a session (stateless response resumption).
     pub resume_attempts: u64,
     /// The `seq` field of each `notifications/message` log in wire arrival
@@ -551,10 +620,13 @@ impl StreamableHttpClient for CountingHttpClient {
                 && let Some(delay) = not_dispatched_retry_after(error)
             {
                 let coincides = self.freeze.coincides();
+                let cause = (!coincides).then(|| self.freeze.unexplained());
                 self.ledger.with(|inner| {
                     inner.counts.not_dispatched_refusals += 1;
                     if coincides {
                         inner.counts.not_dispatched_retries += 1;
+                    } else if let Some(cause) = cause {
+                        inner.counts.unexplained_refusal.get_or_insert(cause);
                     }
                 });
                 if coincides && retries < NOT_DISPATCHED_RETRIES {
@@ -634,20 +706,28 @@ impl StreamableHttpClient for CountingHttpClient {
             // A GET refusal carries no body to inspect; a standalone stream
             // dispatches nothing, so a 503 is resent within the same bound
             // while the owner is frozen.
-            if standalone
-                && retries < NOT_DISPATCHED_RETRIES
-                && self.freeze.coincides()
+            let refused = standalone
                 && matches!(
                     &result,
                     Err(StreamableHttpError::UnexpectedServerResponse(text))
                         if text.as_ref() == "get_stream returned 503 Service Unavailable"
-                )
-            {
-                retries += 1;
-                self.ledger
-                    .with(|inner| inner.counts.standalone_retries += 1);
-                sleep(Duration::from_millis(250)).await;
-                continue;
+                );
+            if refused {
+                let coincides = self.freeze.coincides();
+                let cause = (!coincides).then(|| self.freeze.unexplained());
+                self.ledger.with(|inner| {
+                    inner.counts.standalone_not_dispatched_refusals += 1;
+                    if coincides {
+                        inner.counts.standalone_retries += 1;
+                    } else if let Some(cause) = cause {
+                        inner.counts.unexplained_refusal.get_or_insert(cause);
+                    }
+                });
+                if coincides && retries < NOT_DISPATCHED_RETRIES {
+                    retries += 1;
+                    sleep(Duration::from_millis(MIN_RETRY_HINT_MS)).await;
+                    continue;
+                }
             }
             break result;
         };
@@ -956,13 +1036,49 @@ mod tests {
         let watch = FreezeWatch::default();
         // Nothing observed yet: a refusal cannot be attributed to a freeze.
         assert!(!watch.coincides());
-        watch.record(false);
+        watch.record("active", 3);
         assert!(!watch.coincides());
-        watch.record(true);
+        for phase in FROZEN_PHASES {
+            let watch = FreezeWatch::default();
+            watch.record(phase, 3);
+            assert!(watch.coincides(), "{phase}");
+        }
+        let watch = FreezeWatch::default();
+        watch.record("quiescing", 3);
         assert!(watch.coincides());
         // Still inside the coincidence window after the freeze ends.
-        watch.record(false);
+        watch.record("active", 4);
         assert!(watch.coincides());
+    }
+
+    #[test]
+    fn an_unexplained_refusal_names_the_connector_state() {
+        let watch = FreezeWatch::default();
+        watch.record("active", 7);
+        let unexplained = watch.unexplained();
+        assert!(unexplained.contains("phase=\"active\""), "{unexplained}");
+        assert!(
+            unexplained.contains("rotations_completed=7"),
+            "{unexplained}"
+        );
+        // No freeze has been seen at all, so there is no age to report.
+        assert!(
+            unexplained.contains("ms_since_last_freeze=None"),
+            "{unexplained}"
+        );
+    }
+
+    #[test]
+    fn the_resend_cap_covers_the_rotation_handshake_budget() {
+        let handshake_ms = super::super::MCP_GATE_ROTATION.handshake_timeout_seconds * 1_000;
+        assert_eq!(
+            NOT_DISPATCHED_RETRIES,
+            handshake_ms.div_ceil(MIN_RETRY_HINT_MS) + RETRY_MARGIN
+        );
+        // Every resend waits at least the smallest hint, so the cap spans
+        // the whole handshake budget with the margin to spare.
+        assert!(NOT_DISPATCHED_RETRIES * MIN_RETRY_HINT_MS > handshake_ms);
+        assert_eq!(NOT_DISPATCHED_RETRIES, 12);
     }
 
     #[test]

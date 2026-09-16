@@ -116,9 +116,6 @@ const SCENARIO_TIMEOUT: Duration = Duration::from_secs(1_200);
 const WAIT: Duration = Duration::from_secs(30);
 const POLL: Duration = Duration::from_millis(20);
 const CANCELLED: u16 = tunnel_protocol::reset_reason::CANCELLED;
-/// The connector's rotation phases in which the owner pauses new stream
-/// admission (docs/protocol.md, "Quiesce admission").
-const FROZEN_PHASES: [&str; 3] = ["quiescing", "draining", "committing"];
 const MEMBERSHIP_RESIGN_SPACING: Duration = Duration::from_secs(15);
 /// The fixture's signed membership record lifetime (the product maximum).
 const MEMBERSHIP_RECORD_LIFETIME: Duration = Duration::from_secs(60);
@@ -692,7 +689,10 @@ pub fn validate_mcp_cloud_client_evidence(evidence: &McpCloudClientEvidence) -> 
                 ),
                 combo.case_wires().iter().all(|(_, wire)| {
                     wire.not_dispatched_refusals == wire.not_dispatched_retries
+                        && wire.standalone_not_dispatched_refusals == wire.standalone_retries
                         && wire.not_dispatched_retries <= NOT_DISPATCHED_RETRIES
+                        && wire.standalone_retries <= NOT_DISPATCHED_RETRIES
+                        && wire.unexplained_refusal.is_none()
                 }),
             ),
             (
@@ -896,14 +896,17 @@ impl Gate<'_> {
         self.freeze = Arc::new(FreezeWatch::default());
         let freeze = Arc::clone(&self.freeze);
         let mut status = client.status();
-        freeze.record(FROZEN_PHASES.contains(&status.borrow().phase.as_str()));
+        {
+            let status = status.borrow_and_update();
+            freeze.record(&status.phase, status.rotations_completed);
+        }
         self.freeze_task = Some(tokio::spawn(async move {
             while status.changed().await.is_ok() {
-                let frozen = {
+                let (phase, rotations) = {
                     let status = status.borrow_and_update();
-                    FROZEN_PHASES.contains(&status.phase.as_str())
+                    (status.phase.clone(), status.rotations_completed)
                 };
-                freeze.record(frozen);
+                freeze.record(&phase, rotations);
             }
         }));
         let session = timeout(STARTUP_TIMEOUT, client.wait_ready())
@@ -2508,6 +2511,23 @@ mod tests {
             ("unbounded freeze retries", |e| {
                 e.combos[1].streaming.wire.not_dispatched_refusals = NOT_DISPATCHED_RETRIES + 1;
                 e.combos[1].streaming.wire.not_dispatched_retries = NOT_DISPATCHED_RETRIES + 1;
+            }),
+            ("standalone refusal outside a freeze", |e| {
+                e.combos[1]
+                    .notifications
+                    .wire
+                    .standalone_not_dispatched_refusals = 1;
+            }),
+            ("unbounded standalone retries", |e| {
+                e.combos[3]
+                    .notifications
+                    .wire
+                    .standalone_not_dispatched_refusals = NOT_DISPATCHED_RETRIES + 1;
+                e.combos[3].notifications.wire.standalone_retries = NOT_DISPATCHED_RETRIES + 1;
+            }),
+            ("unexplained refusal recorded", |e| {
+                e.combos[0].crash.wire.unexplained_refusal =
+                    Some("not_dispatched refusal outside a rotation freeze".to_owned());
             }),
             ("session stream limit", |e| {
                 e.combos[2].highest_call_stream_id = 128;
