@@ -214,18 +214,23 @@ pub struct IsolationEvidence {
 ///
 /// The same principal-binding rule as `session-isolation`, driven over the
 /// real cluster against a **Streamable HTTP** backend instead of a stdio
-/// child.  This is the case that separates the binding from process
+/// child.  This is the case that separates the binding from *process*
 /// isolation: one backend process serves every session here, so a foreign
-/// session ID that is refused is refused by the binding and by nothing else.
+/// session ID cannot be refused by a process boundary.  What refuses it is
+/// the export's own principal-binding table (`SessionBindings::permits`),
+/// before the backend is dialled.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct StreamableBindingEvidence {
     /// The backend really was the shared Streamable HTTP one: the export
-    /// started no child process and opened no session table entry of its own
-    /// for this case, because a Streamable HTTP backend is an address the
-    /// export forwards to and the backend itself owns the session table.
-    /// That is exactly what makes this case evidence for the binding: there
-    /// is no per-session process and no export-side session object to explain
-    /// a foreign session ID being refused.
+    /// started **no per-session child process**, because a Streamable HTTP
+    /// backend is an address the export forwards to.
+    ///
+    /// The export does keep a per-session table of its own — the principal
+    /// bindings it refuses a foreign principal from — and that table is the
+    /// point of the case, not something it rules out.  What is ruled out is a
+    /// process boundary, and the backend itself doing the refusing.  The
+    /// counter below reads zero for a different reason: it counts stdio
+    /// sessions and is never incremented for this backend kind.
     pub shared_backend: bool,
     /// Both principals' sessions came from that one backend and differ.
     pub sessions_distinct: bool,
@@ -239,8 +244,11 @@ pub struct StreamableBindingEvidence {
     /// Both principals' own sessions still answered exactly afterwards.
     pub owner_still_served: bool,
     pub sibling_still_served: bool,
-    /// Sessions the export's own table opened during the case.  Zero: the
-    /// sessions live in the shared backend, not in the export.
+    /// The export's stdio session counter during the case.  Zero: it counts
+    /// stdio sessions only and is never incremented for a Streamable HTTP
+    /// backend.  It is *not* evidence that the export tracks no session
+    /// state — it tracks principal bindings, which is what refuses the
+    /// foreign principal.
     pub sessions_opened: u64,
     /// How many of those two each owning principal ended itself, counted by
     /// the session becoming unusable afterwards rather than by a status.
@@ -768,7 +776,13 @@ impl Answer {
             return serde_json::from_str(text).into_iter().collect();
         }
         // One SSE event is a block of fields, and `data:` is only one of
-        // them.  The stdio export happens to put `data:` last, but a
+        // them.
+        //
+        // Events are split on a blank line written as `\n\n`.  A server that
+        // terminated events with `\r\n\r\n` would collapse into one block
+        // here; the pinned rmcp server and the fixture both use `\n\n`, and
+        // no gate drives a `\r\n` server, so this is recorded rather than
+        // handled.  The stdio export happens to put `data:` last, but a
         // Streamable HTTP backend follows it with `id:` and `retry:`, so
         // treating the whole block after `data: ` as the payload dropped
         // every message the shared backend sent.  Join this event's `data:`

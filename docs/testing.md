@@ -451,17 +451,19 @@ in both directions at the fix revision: with the retention widened back the gate
 fails at this phase in 65 s, and with the split in place it passes in 68 s.
 
 The retention split has a second consequence that is **not** yet resolved, and
-is why that work is not landable: `verify-m7-trust-expiry` fails intermittently
-on the branch carrying it (6 of 6 pass at the branch base, 3 of 6 on the branch)
+is why that work is held back as M7-C86: `verify-m7-trust-expiry` regresses on
+the branch carrying it (interleaved on one machine with pre-built binaries,
+10 of 10 without the retention and 6 of 10 with it)
 with `expired target pooled stream was not observed with its exact owner
 session/cursor before reclamation`. The stream *is* closed by the expiry in
 every run - the owner records `PeerMembershipExpired` and one terminal event
 either way - and exactly one of the gate's seventeen joined conditions differs:
 the ingress's receive-side outcome, `TrustExpired` when it passes and `Closed`
-when it fails. The ingress reclassifies a close as trust expiry only once its
-own invalidation dispatcher has recorded that reason, and at the base the pin
-set is emptied five times per run, which latches it promptly. It is tracked on
-M7-C83.
+when it fails. **Why that differs is not established**: three hypotheses were
+tested and refuted, including that the ingress reclassifies only once its own
+dispatcher has recorded the reason - instrumenting `dispatch_invalidations` on
+both revisions produced identical traces in passing and failing runs. What
+remains is an unconfirmed ordering hypothesis, recorded on M7-C86.
 
 The retention work that fixes the isolation blackout is **not landed**; it is
 held on M7-C86 because it regresses this gate. At the landed revision this gate
@@ -1042,8 +1044,12 @@ boundaries at most every 15 s (defect M7-C80).
   backend is an address the export forwards to — one process, one session
   table, shared by every principal — so the binding is the only thing that can
   refuse it. The gate asserts that shape rather than assuming it: the export
-  must spawn no child and open no session-table entry of its own for the case,
-  because the sessions live in the backend. Each principal opens a session
+  must spawn no per-session child. It does keep a per-session binding table —
+  `SessionBindings::permits` is exactly what refuses the foreign principal,
+  before the backend is dialled — so what the case rules out is a *process*
+  boundary and the backend itself doing the refusing, not an export-side
+  session object. The stdio session counter reads zero here only because it
+  is never incremented for this backend kind Each principal opens a session
   through the cluster, consumer B presents consumer A's session ID on POST,
   GET and DELETE, all three must answer 404 indistinguishably from an unknown
   session, and both principals' own sessions must still answer exactly
@@ -1114,6 +1120,20 @@ boundaries at most every 15 s (defect M7-C80).
   owner-loss round settles when the connector leaves readiness, because the
   device session a replay would need is gone with it. Each round records which
   event it settled on, and the validator requires the expected one.
+
+**Known failure, about 1 in 6 runs on `main`.** This gate is not reliably green
+and must not be read as a pass/fail signal for an unrelated change. The failure
+is always the `unknown-outcome` case: the consumer's POST is answered
+`503 PEER_UNAVAILABLE` with `execution="not_dispatched"` about 14 ms after it
+was issued, the ingress relay carries exactly one
+`ingress/pool_connect/transport_pins_unavailable` fault tuple, **no** relay
+carries an owner-role tuple, and the run carries exactly one
+`membership pin publication failed closed` warning. That is a membership
+re-sign racing the periodic reconcile, which leaves the runtime briefly unready
+and withdraws the whole transport pin set, so a fresh dial to the owner is
+refused before any I/O. The fix is known and is held back as **M7-C86** because
+it regresses `verify-m7-trust-expiry`; with it applied this gate is 12 of 12,
+without it 10 of 12. See the M3-04 and M7-C86 rows in [tasks.md](tasks.md).
 
 Evidence is validated by `validate_mcp_isolation_evidence`
 (`production_cluster/mcp_isolation.rs`), re-run at the command boundary; its
