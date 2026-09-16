@@ -1055,7 +1055,8 @@ bound derived from the case concurrency — the correlation case issues two
 adjacent bursts of `CORRELATION_CALLS * 2` streams and the second can begin
 while the first's `STREAM_FORGET`s are still in flight, so both may be
 unreclaimed at once: `CORRELATION_CALLS * 4` = 24 — not from the roughly
-seventy streams the run serves on that one session; observed 12 to 18. The gate ends
+seventy streams the run serves on that one session; observed 12 to 18 across
+six runs. The gate ends
 every session it can with DELETE; exactly two cannot be ended (the revoked
 principal's, whose DELETE the relay refuses along with everything else it
 sends, and the one whose owner relay was killed), and **no** export child may
