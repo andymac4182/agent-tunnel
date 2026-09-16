@@ -49,6 +49,8 @@
 //! from an untested path would be worse than naming it. It is recorded as
 //! gate-4 residue.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -67,6 +69,8 @@ use tunnel_fs_core::{
 };
 use tunnel_fs_ninep::{MAX_MESSAGE_BYTES, decode_exact};
 use tunnel_fs_provider::{Record, RecordDecoder, default_limits};
+
+use tokio_util::sync::CancellationToken;
 
 use crate::http::forward::actor_carriers;
 use crate::routing::{OwnerRoute, OwnerScope};
@@ -591,6 +595,29 @@ async fn upgrade_session(
         .into_response()
 }
 
+/// No verdict published yet.
+///
+/// `u8::MAX` rather than a sentinel of its own, because a published verdict is
+/// an index into gate 1's `SessionErrorCode::ALL` and that array is far shorter
+/// than 255.
+const NO_VERDICT: u8 = u8::MAX;
+
+/// Publish the inbound task's verdict. The first one wins.
+fn publish(slot: &AtomicU8, code: SessionErrorCode) {
+    let _ = slot.compare_exchange(
+        NO_VERDICT,
+        tunnel_fs_provider::record::close_byte(code),
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    );
+}
+
+/// The verdict the inbound task published, if it published one.
+fn collect(slot: &AtomicU8) -> Option<SessionErrorCode> {
+    let byte = slot.load(Ordering::Acquire);
+    (byte != NO_VERDICT).then(|| tunnel_fs_provider::record::close_code(byte))?
+}
+
 /// Why the consumer socket was closed, as a bounded sanitized identifier.
 fn close_frame(code: SessionErrorCode) -> Option<axum::extract::ws::CloseFrame> {
     code.close_code()
@@ -617,13 +644,25 @@ async fn pump(
 
     let (mut sink, mut stream) = socket.split();
     let inbound_closed = closed.clone();
+    // The inbound task's verdict, published rather than returned.
+    //
+    // It cannot be a `JoinHandle`'s value: the outbound loop below has to stop
+    // as soon as the consumer's side ends, and aborting the task to make that
+    // happen discards whatever it was about to return — including a framing
+    // violation, which is the one thing that must not be lost. So the task
+    // publishes its verdict before it ends and cancels the token; the outbound
+    // loop reads the verdict after it stops.
+    let verdict: Arc<AtomicU8> = Arc::new(AtomicU8::new(NO_VERDICT));
+    let inbound_verdict = Arc::clone(&verdict);
+    let inbound_done = CancellationToken::new();
+    let inbound_ended = inbound_done.clone();
 
     // Consumer → device.  A separate task, because the device direction must
     // keep being serviced while a write is parked for send credit: the two
     // directions of a 9P session are independent, and a client that pipelines
     // sixty-four tags would otherwise deadlock against its own replies.
     let inbound = tokio::spawn(async move {
-        let mut violation = None;
+        let _guard = inbound_ended.drop_guard();
         loop {
             let message = tokio::select! {
                 biased;
@@ -639,7 +678,7 @@ async fn pump(
                     // framing violations, and a framing violation is a 1002
                     // close and never an `Rlerror`.
                     if decode_exact(&bytes, MAX_MESSAGE_BYTES).is_err() {
-                        violation = Some(SessionErrorCode::ProtocolViolation);
+                        publish(&inbound_verdict, SessionErrorCode::ProtocolViolation);
                         break;
                     }
                     if writer.data(bytes).await.is_err() {
@@ -649,7 +688,7 @@ async fn pump(
                 // "Reject text" — the profile is binary, and a text frame is a
                 // peer that did not read the contract.
                 Message::Text(_) => {
-                    violation = Some(SessionErrorCode::ProtocolViolation);
+                    publish(&inbound_verdict, SessionErrorCode::ProtocolViolation);
                     break;
                 }
                 Message::Close(_) => break,
@@ -657,7 +696,6 @@ async fn pump(
             }
         }
         let _ = writer.finish().await;
-        violation
     });
 
     // Device → consumer.
@@ -672,6 +710,11 @@ async fn pump(
         let event = tokio::select! {
             biased;
             () = closed.cancelled() => break,
+            // The consumer's side ended — cleanly, or on a framing violation
+            // this loop must report. Either way there is nothing left to
+            // forward, so the session ends here rather than waiting for the
+            // device to notice.
+            () = inbound_done.cancelled() => break,
             () = &mut expires => {
                 close_with = Some(SessionErrorCode::AuthExpired);
                 break;
@@ -719,8 +762,11 @@ async fn pump(
     }
 
     inbound.abort();
-    if let Ok(Some(violation)) = inbound.await {
-        close_with = close_with.or(Some(violation));
+    // A framing violation the consumer committed wins over every other reason
+    // this loop stopped: the close code is what tells the peer its own frame was
+    // refused, and reporting 1011 for it would name the relay as the failure.
+    if let Some(violation) = collect(&verdict) {
+        close_with = Some(violation);
     }
     signal_task.abort();
     let frame = close_with.and_then(close_frame);
