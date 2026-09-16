@@ -529,6 +529,79 @@ fn multiple_flushes_of_one_tag_are_accepted() {
         .complete(&Frame::new(4, Message::Rflush))
         .expect("Rflush 4");
     assert_eq!(session.outstanding_tags(), 0);
+    assert_eq!(session.live_fids(), 1, "the walk's reservation went too");
+}
+
+#[test]
+fn the_last_outstanding_flush_is_what_releases_a_flushed_tag() {
+    // Answering the flushes in **forward** order is what the reverse-order
+    // test above cannot see.  With one slot per tag the second `Tflush`
+    // overwrote the first, and removal keyed on the flush's own `flushing`
+    // field alone: the first `Rflush` freed the tag, the client could re-issue
+    // on it, and the second `Rflush` then silently cancelled that new request
+    // and undid its reservation — leaving its eventual `Rwalk` to close the
+    // session with a fatal unknown tag.
+    let mut session = attached_session();
+    session.request(&twalk(3, 0, 1, &["a"])).expect("Twalk");
+    session
+        .request(&Frame::new(4, Message::Tflush { oldtag: 3 }))
+        .expect("first flush");
+    session
+        .request(&Frame::new(5, Message::Tflush { oldtag: 3 }))
+        .expect("second flush");
+
+    session
+        .complete(&Frame::new(4, Message::Rflush))
+        .expect("Rflush 4");
+    assert!(
+        session.has_tag(3),
+        "one flush answered is not the last: tag 3 stays reserved"
+    );
+    assert_eq!(
+        session.request(&twalk(3, 0, 2, &["b"])),
+        Err(SessionError::TagReservedByFlush),
+        "the tag cannot be re-issued while a flush is still outstanding"
+    );
+
+    session
+        .complete(&Frame::new(5, Message::Rflush))
+        .expect("Rflush 5");
+    assert!(!session.has_tag(3), "the last flush released it");
+    assert_eq!(session.outstanding_tags(), 0);
+    assert_eq!(session.live_fids(), 1, "and its reservation");
+}
+
+#[test]
+fn a_request_a_flush_never_named_survives_that_flushs_reply() {
+    // The narrow form of the same bug, and the one that isolates the
+    // membership check: a `Tflush` of a tag that is **not** outstanding is a
+    // no-op, so it joins no set.  A request issued on that tag afterwards
+    // therefore carries no flushes at all, and the flush's own reply must not
+    // touch it — keying the release on the flush's `flushing` field alone
+    // would cancel it and undo its reservation.
+    let mut session = attached_session();
+    session
+        .request(&Frame::new(4, Message::Tflush { oldtag: 3 }))
+        .expect("a flush of a tag that is not outstanding");
+    assert!(!session.has_tag(3));
+
+    session.request(&twalk(3, 0, 2, &["b"])).expect("re-issued");
+    assert_eq!(session.live_fids(), 2, "fid 2 is reserved");
+
+    session
+        .complete(&Frame::new(4, Message::Rflush))
+        .expect("Rflush");
+    assert!(session.has_tag(3), "the unrelated request is still live");
+    assert_eq!(session.live_fids(), 2, "and so is its reservation");
+    session
+        .complete(&Frame::new(
+            3,
+            Message::Rwalk {
+                qids: vec![Qid::new(QidKind::Directory, 2)],
+            },
+        ))
+        .expect("its reply is not a fatal unknown tag");
+    assert_eq!(session.fid(2).unwrap().path().as_str(), "/b");
 }
 
 // ------------------------------------------------------------------ fids
@@ -1491,6 +1564,175 @@ fn an_open_or_create_reply_for_a_clunked_fid_applies_nothing() {
         assert!(session.fid(1).is_none(), "created={created}");
         assert_eq!(session.live_fids(), 1, "created={created}");
         assert_eq!(session.outstanding_tags(), 0, "created={created}");
+    }
+}
+
+#[test]
+fn a_late_open_reply_cannot_land_on_a_rebound_fid_of_the_same_number() {
+    // The client caused this by reusing a fid number while a request naming it
+    // was outstanding, and no authority is gained — every `Tread`/`Twrite` is
+    // re-checked by primitive, and both paths were validated.  But the
+    // session's path and gate 4's descriptor for that fid would disagree, so
+    // the binding is stamped with a generation and a late reply that does not
+    // match applies nothing.
+    let mut session = attached_session();
+    walk(&mut session, 2, 0, 1, &["a"], QidKind::File);
+    let first = session.fid(1).unwrap().generation();
+    session
+        .request(&Frame::new(
+            3,
+            Message::Tlopen {
+                fid: 1,
+                flags: tunnel_fs_ninep::flags::O_WRONLY,
+            },
+        ))
+        .expect("Tlopen");
+
+    // Clunk fid 1 and walk a different file to the same number.
+    session
+        .request(&Frame::new(4, Message::Tclunk { fid: 1 }))
+        .expect("Tclunk");
+    session
+        .complete(&Frame::new(4, Message::Rclunk))
+        .expect("Rclunk");
+    walk(&mut session, 5, 0, 1, &["b"], QidKind::File);
+    let second = session.fid(1).unwrap().generation();
+    assert_ne!(first, second, "a rebound number is a new binding");
+
+    // The late reply names fid 1, which now means /b.
+    session
+        .complete(&Frame::new(
+            3,
+            Message::Rlopen {
+                qid: Qid::new(QidKind::File, 7),
+                iounit: 0,
+            },
+        ))
+        .expect("applies nothing rather than failing");
+    let state = session.fid(1).unwrap();
+    assert_eq!(state.path().as_str(), "/b");
+    assert!(
+        state.open().is_none(),
+        "/b was never opened and must not be marked open"
+    );
+    assert_eq!(state.generation(), second);
+}
+
+#[test]
+fn a_late_in_place_walk_cannot_move_a_rebound_fid_of_the_same_number() {
+    let mut session = attached_session();
+    walk(&mut session, 2, 0, 1, &["a"], QidKind::Directory);
+    session.request(&twalk(3, 1, 1, &["x"])).expect("Twalk");
+
+    session
+        .request(&Frame::new(4, Message::Tclunk { fid: 1 }))
+        .expect("Tclunk");
+    session
+        .complete(&Frame::new(4, Message::Rclunk))
+        .expect("Rclunk");
+    walk(&mut session, 5, 0, 1, &["b"], QidKind::Directory);
+
+    session
+        .complete(&Frame::new(
+            3,
+            Message::Rwalk {
+                qids: vec![Qid::new(QidKind::Directory, 9)],
+            },
+        ))
+        .expect("applies nothing rather than failing");
+    assert_eq!(
+        session.fid(1).unwrap().path().as_str(),
+        "/b",
+        "the rebound fid did not move to /a/x"
+    );
+    assert_eq!(session.live_fids(), 2);
+}
+
+#[test]
+fn a_late_create_reply_cannot_rebind_a_reused_fid_number() {
+    let mut session = attached_session();
+    walk(&mut session, 2, 0, 1, &["dir"], QidKind::Directory);
+    session
+        .request(&Frame::new(
+            3,
+            Message::Tlcreate {
+                fid: 1,
+                name: "new.txt".to_owned(),
+                flags: tunnel_fs_ninep::flags::O_WRONLY,
+                mode: 0o644,
+                gid: 0,
+            },
+        ))
+        .expect("Tlcreate");
+    session
+        .request(&Frame::new(4, Message::Tclunk { fid: 1 }))
+        .expect("Tclunk");
+    session
+        .complete(&Frame::new(4, Message::Rclunk))
+        .expect("Rclunk");
+    walk(&mut session, 5, 0, 1, &["other"], QidKind::Directory);
+
+    session
+        .complete(&Frame::new(
+            3,
+            Message::Rlcreate {
+                qid: Qid::new(QidKind::File, 7),
+                iounit: 0,
+            },
+        ))
+        .expect("applies nothing rather than failing");
+    let state = session.fid(1).unwrap();
+    assert_eq!(state.path().as_str(), "/other");
+    assert!(state.open().is_none());
+}
+
+#[test]
+fn a_late_zero_element_clone_cannot_take_a_rebound_origins_qid() {
+    // A zero-element walk reads its qid from the origin at **apply** time, so
+    // a re-bound origin would hand the clone the wrong file's qid.
+    let mut session = attached_session();
+    walk(&mut session, 2, 0, 1, &["a"], QidKind::File);
+    session.request(&twalk(3, 1, 2, &[])).expect("Twalk clone");
+
+    session
+        .request(&Frame::new(4, Message::Tclunk { fid: 1 }))
+        .expect("Tclunk");
+    session
+        .complete(&Frame::new(4, Message::Rclunk))
+        .expect("Rclunk");
+    walk(&mut session, 5, 0, 1, &["b"], QidKind::Directory);
+
+    session
+        .complete(&Frame::new(3, Message::Rwalk { qids: Vec::new() }))
+        .expect("applies nothing rather than failing");
+    assert!(
+        session.fid(2).is_none(),
+        "the clone did not take the rebound origin's qid"
+    );
+    assert_eq!(session.live_fids(), 2, "its reservation was released");
+}
+
+#[test]
+fn a_generation_is_monotonic_and_never_reused_within_a_session() {
+    let mut session = attached_session();
+    let root = session.fid(0).unwrap().generation();
+    assert_ne!(root, 0, "zero is never a live binding");
+    let mut seen = vec![root];
+    for step in 0..8u16 {
+        walk(&mut session, step, 0, 1, &["a"], QidKind::File);
+        let generation = session.fid(1).unwrap().generation();
+        assert!(
+            generation > *seen.last().unwrap(),
+            "generations only increase"
+        );
+        assert!(!seen.contains(&generation), "and are never reused");
+        seen.push(generation);
+        session
+            .request(&Frame::new(100 + step, Message::Tclunk { fid: 1 }))
+            .expect("Tclunk");
+        session
+            .complete(&Frame::new(100 + step, Message::Rclunk))
+            .expect("Rclunk");
     }
 }
 

@@ -31,7 +31,7 @@
 //! with no clock and no queue has neither event to hook.  Gate 4 owns that
 //! recheck; this is the static half of it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use tunnel_fs_core::{
     CapabilitySet, FeatureSet, Limits, PathBounds, Primitive, VirtualPath, admits_session,
@@ -76,6 +76,7 @@ pub struct FidState {
     path: VirtualPath,
     qid: Qid,
     open: Option<OpenMode>,
+    generation: u64,
 }
 
 impl FidState {
@@ -101,6 +102,22 @@ impl FidState {
     #[must_use]
     pub fn is_directory(&self) -> bool {
         self.qid.kind == QidKind::Directory
+    }
+
+    /// Which **binding** of this fid number this is.
+    ///
+    /// A fid number says nothing on its own: a client may clunk one and walk a
+    /// new file to the same number while a request naming the old binding is
+    /// still outstanding.  The generation distinguishes the two, and it is what
+    /// this machine checks before a late reply is allowed to touch a fid.  It
+    /// is exported because gate 4 holds a resolved descriptor per fid and needs
+    /// the same distinction: a descriptor cached against generation *n* must
+    /// not be reused once the number carries generation *n + 1*.
+    ///
+    /// Monotonic within a session, never reused, and never zero for a live fid.
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
     }
 }
 
@@ -167,16 +184,25 @@ enum Effect {
     /// Bind `newfid` to `destination`, but only for a complete walk.
     Walk {
         origin: u32,
+        /// The binding `origin` carried when the walk was admitted.
+        origin_generation: u64,
         newfid: u32,
         destination: VirtualPath,
         names: usize,
         reserved: bool,
     },
     /// Mark `fid` open.
-    Open { fid: u32, mode: OpenMode },
+    Open {
+        fid: u32,
+        /// The binding `fid` carried when the open was admitted.
+        generation: u64,
+        mode: OpenMode,
+    },
     /// Rebind `fid` to the created child and mark it open.
     Create {
         fid: u32,
+        /// The binding `fid` carried when the create was admitted.
+        generation: u64,
         child: VirtualPath,
         mode: OpenMode,
     },
@@ -197,8 +223,16 @@ enum Effect {
 struct TagState {
     message_type: MessageType,
     effect: Effect,
-    /// The tag of a `Tflush` waiting on this one.
-    flushed_by: Option<u16>,
+    /// Every `Tflush` currently outstanding against this tag.
+    ///
+    /// A **set**, not one tag: 9P allows several flushes of one request, and a
+    /// single slot meant the second flush overwrote the first.  Releasing then
+    /// keyed on the flush's own `flushing` field alone, so the first `Rflush`
+    /// freed the tag, the client could re-issue on it — and the second
+    /// `Rflush` then cancelled that new request and undid its reservation.
+    /// Membership is what makes a re-issued request safe: it carries an empty
+    /// set, so no stale `Rflush` can ever match it.
+    flushed_by: BTreeSet<u16>,
     /// The original reply arrived while a flush was still pending.
     ///
     /// `docs/filesystem-api.md`: "Respect a normal reply arriving before
@@ -225,6 +259,9 @@ pub struct Session {
     /// Reserved at request time so two concurrent `Twalk`s cannot both claim
     /// one `newfid`, and so the fid quota counts work already in flight.
     reserved_fids: BTreeMap<u32, VirtualPath>,
+    /// Hands out the stamp on [`FidState::generation`].  Monotonic, never
+    /// reused, and never zero, so a stale effect can be told from a live one.
+    next_generation: u64,
 }
 
 impl Session {
@@ -250,6 +287,7 @@ impl Session {
             tags: BTreeMap::new(),
             fids: BTreeMap::new(),
             reserved_fids: BTreeMap::new(),
+            next_generation: 0,
         })
     }
 
@@ -458,7 +496,7 @@ impl Session {
             return Ok(());
         }
         if let Some(existing) = self.tags.get(&frame.tag) {
-            return Err(if existing.flushed_by.is_some() || existing.answered {
+            return Err(if !existing.flushed_by.is_empty() || existing.answered {
                 SessionError::TagReservedByFlush
             } else {
                 SessionError::TagInUse
@@ -475,14 +513,14 @@ impl Session {
         if let Some(oldtag) = flushing
             && let Some(target) = self.tags.get_mut(&oldtag)
         {
-            target.flushed_by = Some(frame.tag);
+            target.flushed_by.insert(frame.tag);
         }
         self.tags.insert(
             frame.tag,
             TagState {
                 message_type: frame.message_type(),
                 effect,
-                flushed_by: None,
+                flushed_by: BTreeSet::new(),
                 answered: false,
                 flushing,
             },
@@ -492,12 +530,15 @@ impl Session {
 
     /// Release a tag, honouring the flush reservation.
     fn retire_tag(&mut self, tag: u16, state: &TagState) {
-        if let Some(flush_tag) = state.flushed_by
-            && self.tags.contains_key(&flush_tag)
+        if state
+            .flushed_by
+            .iter()
+            .any(|flush_tag| self.tags.contains_key(flush_tag))
         {
             // The original reply arrived before its `Rflush`.  It is honoured —
             // the effect above has already been applied — but the tag stays
-            // reserved, and unusable, until the flush is answered.
+            // reserved, and unusable, until **every** flush outstanding
+            // against it has been answered.
             if let Some(entry) = self.tags.get_mut(&tag) {
                 entry.answered = true;
                 entry.effect = Effect::None;
@@ -505,21 +546,57 @@ impl Session {
             return;
         }
         self.tags.remove(&tag);
-        if let Some(flushed) = state.flushing
-            && let Some(target) = self.tags.remove(&flushed)
+        if let Some(flushed) = state.flushing {
+            self.release_flushed(flushed, tag);
+        }
+    }
+
+    /// Answer one `Tflush`: drop it from its target's set, and release the
+    /// target once it is the **last** flush outstanding against it.
+    ///
+    /// Keyed on membership rather than on the flush's own `flushing` field.
+    /// That is what makes a re-issued request safe: with two flushes for one
+    /// tag, the first `Rflush` must not free the tag — and if it did, the
+    /// client could re-issue on it and the second `Rflush` would silently
+    /// cancel that new request and undo its reservation, leaving its eventual
+    /// reply to close the session with a fatal unknown tag.  A re-issued
+    /// request carries an empty set, so no stale `Rflush` can match it.
+    fn release_flushed(&mut self, flushed: u16, flush_tag: u16) {
+        let Some(target) = self.tags.get(&flushed) else {
+            return;
+        };
+        if !target.flushed_by.contains(&flush_tag) {
+            return;
+        }
+        // Keep only the flushes that are still outstanding, this one excluded.
+        let remaining: BTreeSet<u16> = target
+            .flushed_by
+            .iter()
+            .copied()
+            .filter(|candidate| *candidate != flush_tag && self.tags.contains_key(candidate))
+            .collect();
+        if let Some(target) = self.tags.get_mut(&flushed) {
+            target.flushed_by = remaining;
+            if !target.flushed_by.is_empty() {
+                // The contract's "reserve the flushed tag until the flush
+                // response" means the **last** response when there are
+                // several.
+                return;
+            }
+        }
+        if let Some(target) = self.tags.remove(&flushed)
+            && !target.answered
         {
             // An `Rflush` releases the tag it flushed, whether or not the
-            // original reply ever arrived.  Only after this may the client
-            // reuse that tag — and the flushed request's **reservation** goes
-            // with it.  Without that, a flushed `Twalk` or `Tattach` strands
-            // its target fid for the life of the session: no reply will ever
-            // bind it and no `Tclunk` can release it, because it is not bound,
-            // and a client that flushes walks exhausts its own fid quota with
-            // nothing to clunk.  A tag already marked `answered` bound its fid
-            // and had its effect cleared, so it has nothing left to undo.
-            if !target.answered {
-                self.undo_reservation(&target.effect);
-            }
+            // original reply ever arrived — and the flushed request's
+            // **reservation** goes with it.  Without that, a flushed `Twalk`
+            // or `Tattach` strands its target fid for the life of the session:
+            // no reply will ever bind it and no `Tclunk` can release it,
+            // because it is not bound, and a client that flushes walks
+            // exhausts its own fid quota with nothing to clunk.  A tag already
+            // marked `answered` bound its fid and had its effect cleared, so it
+            // has nothing left to undo.
+            self.undo_reservation(&target.effect);
         }
     }
 
@@ -533,6 +610,7 @@ impl Session {
             }
             Effect::Walk {
                 origin,
+                origin_generation,
                 newfid,
                 destination,
                 names,
@@ -544,6 +622,7 @@ impl Session {
                 }
                 Ok(Effect::Walk {
                     origin,
+                    origin_generation,
                     newfid,
                     destination,
                     names,
@@ -583,6 +662,12 @@ impl Session {
         }
         self.reserved_fids.insert(fid, path);
         Ok(())
+    }
+
+    /// Hand out the next fid binding stamp.
+    fn fresh_generation(&mut self) -> u64 {
+        self.next_generation = self.next_generation.wrapping_add(1);
+        self.next_generation
     }
 
     /// Whether a `Tattach` is outstanding with no reply yet.
@@ -729,6 +814,7 @@ impl Session {
                     },
                     Effect::Walk {
                         origin: *fid,
+                        origin_generation: origin.generation,
                         newfid: *newfid,
                         destination,
                         names: names.len(),
@@ -747,6 +833,7 @@ impl Session {
                     node(primitives, &state.path),
                     Effect::Open {
                         fid: *fid,
+                        generation: state.generation,
                         mode: open_mode(*flags, directory),
                     },
                 ))
@@ -766,6 +853,7 @@ impl Session {
                     child(create_primitives(*flags)?, &parent.path, created.clone()),
                     Effect::Create {
                         fid: *fid,
+                        generation: parent.generation,
                         child: created,
                         mode: open_mode(*flags, false),
                     },
@@ -962,12 +1050,14 @@ impl Session {
                     // cannot serve.
                     return Err(SessionError::MalformedReply);
                 }
+                let generation = self.fresh_generation();
                 self.fids.insert(
                     *fid,
                     FidState {
                         path,
                         qid: *qid,
                         open: None,
+                        generation,
                     },
                 );
                 self.phase = Phase::Attached;
@@ -995,6 +1085,7 @@ impl Session {
             (
                 Effect::Walk {
                     origin,
+                    origin_generation,
                     newfid,
                     destination,
                     names,
@@ -1029,8 +1120,10 @@ impl Session {
                     // while this walk was outstanding there is nothing left to
                     // clone, so the reply applies nothing.
                     match self.fids.get(origin) {
-                        Some(state) => state.qid,
-                        None => return Ok(()),
+                        Some(state) if state.generation == *origin_generation => state.qid,
+                        // Gone, or the number carries a different binding now:
+                        // either way there is nothing left to clone.
+                        _ => return Ok(()),
                     }
                 };
                 if *reserved {
@@ -1039,30 +1132,50 @@ impl Session {
                         // request already failed — so there is nothing to bind.
                         return Ok(());
                     }
-                } else if !self.fids.contains_key(newfid) {
-                    // A walk in place reserves nothing, so it may bind only a
-                    // fid that is **still** bound.  Re-creating one clunked
-                    // while the walk was outstanding would put a number back
-                    // into the table that the quota had already released, and
-                    // `live_fids()` could then exceed `maxFids` — the bound
-                    // gate 4 relies on to cap open descriptors.
+                } else if !matches!(
+                    self.fids.get(newfid),
+                    Some(state) if state.generation == *origin_generation
+                ) {
+                    // A walk in place reserves nothing, so it may bind only the
+                    // **binding** it was admitted against.  Re-creating a fid
+                    // clunked while the walk was outstanding would put a number
+                    // back into the table that the quota had already released,
+                    // and `live_fids()` could then exceed `maxFids`; moving a
+                    // number the client has since re-bound to something else
+                    // would leave this session's path and gate 4's descriptor
+                    // for that fid disagreeing.
                     return Ok(());
                 }
+                let generation = self.fresh_generation();
                 self.fids.insert(
                     *newfid,
                     FidState {
                         path: destination.clone(),
                         qid,
                         open: None,
+                        generation,
                     },
                 );
                 Ok(())
             }
-            (Effect::Open { fid, mode }, Message::Rlopen { qid, .. }) => {
-                // A fid clunked while its open was outstanding is gone; the
-                // reply applies nothing rather than failing, because a reply
-                // is not a request and gate 4 has no `Rlerror` to send for it.
-                let Some(state) = self.fids.get_mut(fid) else {
+            (
+                Effect::Open {
+                    fid,
+                    generation,
+                    mode,
+                },
+                Message::Rlopen { qid, .. },
+            ) => {
+                // A fid clunked while its open was outstanding is gone, and a
+                // number the client has since re-bound carries a different
+                // generation; either way the reply applies nothing rather than
+                // failing, because a reply is not a request and gate 4 has no
+                // `Rlerror` to send for it.
+                let Some(state) = self
+                    .fids
+                    .get_mut(fid)
+                    .filter(|state| state.generation == *generation)
+                else {
                     return Ok(());
                 };
                 let mut mode = *mode;
@@ -1078,16 +1191,32 @@ impl Session {
                 state.open = Some(mode);
                 Ok(())
             }
-            (Effect::Create { fid, child, mode }, Message::Rlcreate { qid, .. }) => {
-                let Some(state) = self.fids.get_mut(fid) else {
-                    return Ok(());
-                };
+            (
+                Effect::Create {
+                    fid,
+                    generation,
+                    child,
+                    mode,
+                },
+                Message::Rlcreate { qid, .. },
+            ) => {
                 if qid.kind != QidKind::File {
                     return Err(SessionError::MalformedReply);
                 }
+                let fresh = self.fresh_generation();
+                let Some(state) = self
+                    .fids
+                    .get_mut(fid)
+                    .filter(|state| state.generation == *generation)
+                else {
+                    return Ok(());
+                };
+                // A create rebinds the fid to the child it made, so the number
+                // now carries a new binding.
                 state.path = child.clone();
                 state.qid = *qid;
                 state.open = Some(*mode);
+                state.generation = fresh;
                 Ok(())
             }
             (Effect::Release { fid }, _) => {
