@@ -1534,14 +1534,14 @@ GATE4_CASES: list[tuple[str, list[Edit]]] = [
         ],
     ),
     (
-        # The three above mask one another and are load-bearing only together.
-        # The cache's own generation filter is masked by the prune, which
-        # removes a stale entry as soon as the clunk's reply lands; the prune is
-        # masked by the filter, which would refuse a stale entry anyway; and the
-        # release's generation check is masked by the prune for the same reason.
-        # Measured as a triple rather than counted as three singles, which is
-        # the same honesty gate 2 applies to its mount-boundary checks.
-        "the three fid-generation guards, together",
+        # The lookup's generation filter and the prune mask one another, and
+        # are load-bearing only together: the prune removes a stale entry, and
+        # the filter refuses one that survived.  Measured as a pair rather than
+        # counted as two singles, which is the honesty gate 2 applies to its
+        # mount-boundary checks.  The scenario that reaches either is a refused
+        # `Tremove`, which releases its fid through the session's **error**
+        # path, where nothing calls the cache's own release.
+        "the cache's generation filter and the prune, together",
         [
             (
                 PROVIDER_SRC,
@@ -1565,18 +1565,6 @@ GATE4_CASES: list[tuple[str, list[Edit]]] = [
             self.open.remove(&fid);
         }""",
                 "        let _ = live;",
-            ),
-            (
-                PROVIDER_SRC,
-                """        if self
-            .open
-            .get(&fid)
-            .is_some_and(|entry| entry.generation == generation)
-        {
-            self.open.remove(&fid);
-        }""",
-                """        let _ = generation;
-        self.open.remove(&fid);""",
             ),
         ],
     ),

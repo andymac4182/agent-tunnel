@@ -720,6 +720,57 @@ fn a_descriptor_is_keyed_by_fid_generation_and_never_by_fid_number() {
     }
 }
 
+#[test]
+fn a_refused_remove_releases_its_fid_and_the_descriptor_with_it() {
+    // The scenario that reaches the descriptor cache's staleness guards, which
+    // the ordinary clunk cannot: `Tclunk` and `Tremove` release their fid on
+    // **either** answer, so a refused `Tremove` frees the number through the
+    // session's error path — where nothing calls the cache's release. If the
+    // entry is not pruned there, and the lookup does not check the generation,
+    // a fid the client re-walks to that number answers from the **previous**
+    // file's descriptor.
+    let fixture = Fixture::new();
+    fixture.file("/first.txt", b"first-body");
+    fixture.file("/second.txt", b"second-body-which-is-longer");
+
+    let (mut provider, _authority) = fixture.provider(full_grant());
+    handshake(&mut provider, ROOT);
+    let _ = exchange(&mut provider, twalk(2, ROOT, 1, &["first.txt"]));
+    let _ = exchange(&mut provider, tlopen(3, 1, O_RDONLY));
+    let reply = one_frame(exchange(&mut provider, tread(4, 1, 0, 64)));
+    match reply.message {
+        Message::Rread { data } => assert_eq!(data, b"first-body"),
+        other => panic!("expected Rread, got {other:?}"),
+    }
+
+    // Refused — writes are gate 5's — and the fid is released anyway.
+    let reply = one_frame(exchange(
+        &mut provider,
+        tunnel_fs_ninep::Frame::new(5, Message::Tremove { fid: 1 }),
+    ));
+    assert_eq!(error_code(&reply), FsErrorCode::Enotsup);
+
+    // The number is free, so the client may bind it to a different file.
+    let reply = one_frame(exchange(&mut provider, twalk(6, ROOT, 1, &["second.txt"])));
+    assert!(matches!(reply.message, Message::Rwalk { .. }));
+
+    // The new binding is not open. A read must be refused rather than answered
+    // from the descriptor the previous binding left behind.
+    let reply = one_frame(exchange(&mut provider, tread(7, 1, 0, 64)));
+    assert_eq!(
+        error_code(&reply),
+        FsErrorCode::Einval,
+        "the previous binding's descriptor must not answer for a re-bound number"
+    );
+
+    let _ = exchange(&mut provider, tlopen(8, 1, O_RDONLY));
+    let reply = one_frame(exchange(&mut provider, tread(9, 1, 0, 64)));
+    match reply.message {
+        Message::Rread { data } => assert_eq!(data, b"second-body-which-is-longer"),
+        other => panic!("expected Rread, got {other:?}"),
+    }
+}
+
 // ------------------------------------------- the recheck after a queue wait
 
 #[test]

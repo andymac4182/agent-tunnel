@@ -485,6 +485,15 @@ impl<A: Authority> Provider<A> {
         // Keyed on the generation, not the number: two `Tclunk`s of one fid can
         // be outstanding, and without this the second would close the descriptor
         // of whatever the client had since walked to that number.
+        //
+        // **Defensive, and unreachable in this dispatcher**, recorded rather
+        // than counted among the load-bearing guards: the queue is FIFO, and
+        // gate 3's session refuses a `Twalk` to a fid that is still bound, so a
+        // number cannot be re-bound until its clunk's *reply* has landed — which
+        // happens before any request queued behind it is performed. A dispatcher
+        // that performed requests out of order, which is the shape gate 5 needs
+        // for a blocking pool, would reach it. It has no test for the same
+        // reason gate 3's reserved-walk check has none.
         if self
             .open
             .get(&fid)
