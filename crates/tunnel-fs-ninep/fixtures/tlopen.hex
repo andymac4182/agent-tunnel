@@ -1,0 +1,7 @@
+# agent-tunnel 9P2000.L golden fixture
+# name: tlopen
+# type: Tlopen (12)
+# tag: 4
+# size: 15 bytes, msize 65536
+# Little-endian; string[s] is a 16-bit BYTE count of UTF-8.
+0f0000000c04000100000000000000

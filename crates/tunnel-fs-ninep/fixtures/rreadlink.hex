@@ -1,0 +1,7 @@
+# agent-tunnel 9P2000.L golden fixture
+# name: rreadlink
+# type: Rreadlink (23)
+# tag: 7
+# size: 27 bytes, msize 65536
+# Little-endian; string[s] is a 16-bit BYTE count of UTF-8.
+1b000000170700120070726f6a656374732f64726166742e747874

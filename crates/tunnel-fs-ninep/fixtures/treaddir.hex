@@ -1,0 +1,7 @@
+# agent-tunnel 9P2000.L golden fixture
+# name: treaddir
+# type: Treaddir (40)
+# tag: 10
+# size: 23 bytes, msize 65536
+# Little-endian; string[s] is a 16-bit BYTE count of UTF-8.
+17000000280a0002000000000000000000000000100000

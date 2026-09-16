@@ -1,0 +1,21 @@
+[package]
+name = "tunnel-fs-ninep"
+description = "Pure 9P2000.L codec and session state machine for the filesystem export profile"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Implementation gate 3 of docs/filesystem-api.md.  Dependency-light in the
+# shape of `tunnel-http-forward`: the only dependency is the pure gate-1 core,
+# whose capability, limit, path and error vocabularies this crate speaks.  There
+# is no serializer, no async runtime, no clock, no socket and no filesystem
+# here; every byte of the wire format is written and read by hand so the layout,
+# the strictness and the refusals are pinned by construction.
+
+[dependencies]
+tunnel-fs-core = { path = "../tunnel-fs-core" }
+
+[lints]
+workspace = true

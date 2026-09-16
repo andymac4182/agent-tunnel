@@ -1,0 +1,7 @@
+# agent-tunnel 9P2000.L golden fixture
+# name: rmkdir
+# type: Rmkdir (73)
+# tag: 12
+# size: 20 bytes, msize 65536
+# Little-endian; string[s] is a 16-bit BYTE count of UTF-8.
+14000000490c0080010000008877665544332211

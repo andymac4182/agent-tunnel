@@ -1,0 +1,7 @@
+# agent-tunnel 9P2000.L golden fixture
+# name: tread
+# type: Tread (116)
+# tag: 17
+# size: 23 bytes, msize 65536
+# Little-endian; string[s] is a 16-bit BYTE count of UTF-8.
+1700000074110001000000000000000100000000100000

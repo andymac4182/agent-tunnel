@@ -1,0 +1,7 @@
+# agent-tunnel 9P2000.L golden fixture
+# name: tversion
+# type: Tversion (100)
+# tag: 65535
+# size: 21 bytes, msize 65536
+# Little-endian; string[s] is a 16-bit BYTE count of UTF-8.
+1500000064ffff0000010008003950323030302e4c

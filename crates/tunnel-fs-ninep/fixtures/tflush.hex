@@ -1,0 +1,7 @@
+# agent-tunnel 9P2000.L golden fixture
+# name: tflush
+# type: Tflush (108)
+# tag: 2
+# size: 9 bytes, msize 65536
+# Little-endian; string[s] is a 16-bit BYTE count of UTF-8.
+090000006c02000100

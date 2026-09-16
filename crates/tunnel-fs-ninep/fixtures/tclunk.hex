@@ -1,0 +1,7 @@
+# agent-tunnel 9P2000.L golden fixture
+# name: tclunk
+# type: Tclunk (120)
+# tag: 19
+# size: 11 bytes, msize 65536
+# Little-endian; string[s] is a 16-bit BYTE count of UTF-8.
+0b00000078130001000000

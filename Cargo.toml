@@ -6,6 +6,7 @@ members = [
     "crates/tunnel-core",
     "crates/tunnel-fs-core",
     "crates/tunnel-fs-host",
+    "crates/tunnel-fs-ninep",
     "crates/tunnel-http-bridge",
     "crates/tunnel-http-forward",
     "crates/tunnel-mcp",

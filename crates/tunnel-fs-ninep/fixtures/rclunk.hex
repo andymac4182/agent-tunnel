@@ -1,0 +1,7 @@
+# agent-tunnel 9P2000.L golden fixture
+# name: rclunk
+# type: Rclunk (121)
+# tag: 19
+# size: 7 bytes, msize 65536
+# Little-endian; string[s] is a 16-bit BYTE count of UTF-8.
+07000000791300

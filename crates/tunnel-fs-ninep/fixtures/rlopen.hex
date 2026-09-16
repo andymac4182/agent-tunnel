@@ -1,0 +1,7 @@
+# agent-tunnel 9P2000.L golden fixture
+# name: rlopen
+# type: Rlopen (13)
+# tag: 4
+# size: 24 bytes, msize 65536
+# Little-endian; string[s] is a 16-bit BYTE count of UTF-8.
+180000000d04000007000000efcdab896745230100200000
