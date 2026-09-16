@@ -13,8 +13,12 @@
 //!
 //! Act on the descriptor you resolved, never on the path you resolved it from.
 //! No function here passes caller-derived text to a path-taking syscall.  The
-//! sole path opened by name is the operator-configured export root, once, at
-//! construction.
+//! only **caller-independent** path opened by name is the operator-configured
+//! export root, once, at construction — plus, on Linux, two fixed procfs
+//! spellings: `/proc/self/fd`, probed once to decide whether the `openat2` path
+//! is usable at all, and `/proc/self/fd/N`, which reopens a descriptor the
+//! resolver already holds and re-checks its identity afterwards.  Neither
+//! contains a byte a caller supplied.
 //!
 //! # Hosts
 //!

@@ -10,7 +10,10 @@
 //!
 //! Run with `cargo test -p tunnel-fs-host --features race-window-hook`.
 
-#![cfg(feature = "race-window-hook")]
+// Both halves matter: the hook exists only under the feature, and the resolver
+// it hooks exists only on a Unix host, so a Windows build **with** the feature
+// must compile to nothing here rather than to unresolved imports.
+#![cfg(all(unix, feature = "race-window-hook"))]
 
 mod support;
 
