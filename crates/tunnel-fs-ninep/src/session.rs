@@ -207,7 +207,16 @@ enum Effect {
         mode: OpenMode,
     },
     /// Release `fid` whatever the answer is.
-    Release { fid: u32 },
+    Release {
+        fid: u32,
+        /// The binding `fid` carried when the clunk or remove was admitted.
+        ///
+        /// Two `Tclunk`s of one fid can be outstanding at once, and the first
+        /// reply frees the number for a fresh walk.  Without this stamp the
+        /// second reply deleted whatever now held that number: the client's
+        /// live fid vanished while gate 4 still held a descriptor for it.
+        generation: u64,
+    },
     /// The reply carries a byte count the request bounded.
     ///
     /// `Tread` and `Treaddir` bound their reply's `data`; `Twrite` bounds the
@@ -459,9 +468,7 @@ impl Session {
             return Err(SessionError::TagNotInUse);
         }
         match &state.effect {
-            Effect::Release { fid } => {
-                self.fids.remove(fid);
-            }
+            Effect::Release { fid, generation } => self.release_fid(*fid, *generation),
             other => self.undo_reservation(other),
         }
         self.retire_tag(tag, &state);
@@ -533,7 +540,7 @@ impl Session {
         if state
             .flushed_by
             .iter()
-            .any(|flush_tag| self.tags.contains_key(flush_tag))
+            .any(|flush_tag| self.is_live_flush_of(*flush_tag, tag))
         {
             // The original reply arrived before its `Rflush`.  It is honoured —
             // the effect above has already been applied — but the tag stays
@@ -549,6 +556,35 @@ impl Session {
         if let Some(flushed) = state.flushing {
             self.release_flushed(flushed, tag);
         }
+    }
+
+    /// Whether `flush_tag` is a **live** tag that is a `Tflush` of `victim`.
+    ///
+    /// The identity of a flush is that pair, not the number.  Testing only
+    /// whether the number is outstanding let a *reused* tag count as a flush of
+    /// something it had nothing to do with: with a stale entry left in a
+    /// target's set and the client re-issuing that number as a flush of some
+    /// other tag, the target read as "still flushed" forever — reserved,
+    /// un-reissuable, and releasable by nothing. Repeated, that pins the
+    /// session's own `maxInflightRequests` one slot at a time.
+    fn is_live_flush_of(&self, flush_tag: u16, victim: u16) -> bool {
+        self.tags
+            .get(&flush_tag)
+            .is_some_and(|state| state.flushing == Some(victim))
+    }
+
+    /// The flushes still outstanding against `victim`, `excluded` aside.
+    fn live_flushes_of(&self, victim: u16, excluded: u16) -> BTreeSet<u16> {
+        self.tags.get(&victim).map_or_else(BTreeSet::new, |target| {
+            target
+                .flushed_by
+                .iter()
+                .copied()
+                .filter(|candidate| {
+                    *candidate != excluded && self.is_live_flush_of(*candidate, victim)
+                })
+                .collect()
+        })
     }
 
     /// Answer one `Tflush`: drop it from its target's set, and release the
@@ -568,13 +604,7 @@ impl Session {
         if !target.flushed_by.contains(&flush_tag) {
             return;
         }
-        // Keep only the flushes that are still outstanding, this one excluded.
-        let remaining: BTreeSet<u16> = target
-            .flushed_by
-            .iter()
-            .copied()
-            .filter(|candidate| *candidate != flush_tag && self.tags.contains_key(candidate))
-            .collect();
+        let remaining = self.live_flushes_of(flushed, flush_tag);
         if let Some(target) = self.tags.get_mut(&flushed) {
             target.flushed_by = remaining;
             if !target.flushed_by.is_empty() {
@@ -584,19 +614,63 @@ impl Session {
                 return;
             }
         }
-        if let Some(target) = self.tags.remove(&flushed)
-            && !target.answered
+        if let Some(target) = self.tags.remove(&flushed) {
+            if !target.answered {
+                // An `Rflush` releases the tag it flushed, whether or not the
+                // original reply ever arrived — and the flushed request's
+                // **reservation** goes with it.  Without that, a flushed
+                // `Twalk` or `Tattach` strands its target fid for the life of
+                // the session: no reply will ever bind it and no `Tclunk` can
+                // release it, because it is not bound, and a client that
+                // flushes walks exhausts its own fid quota with nothing to
+                // clunk.  A tag already marked `answered` bound its fid and had
+                // its effect cleared, so it has nothing left to undo.
+                self.undo_reservation(&target.effect);
+            }
+            if let Some(victim) = target.flushing {
+                // The tag just removed was itself a `Tflush`, so removing it
+                // **cancels** that flush and it must leave its own victim's
+                // set — otherwise the victim keeps a member no reply will ever
+                // answer.
+                self.cancel_flush(victim, flushed);
+            }
+        }
+    }
+
+    /// Remove a cancelled flush from its victim's set.
+    ///
+    /// A cancelled flush is not an answered one, so this does **not** release
+    /// the victim the way [`Session::release_flushed`] does: the victim's own
+    /// request may still be outstanding, and undoing its reservation would
+    /// cancel a request nobody asked to cancel.  The one case that must still
+    /// be collected is a victim held *only* for this flush whose own reply has
+    /// already arrived: with the flush gone there is nothing left for it to
+    /// wait on, and leaving it would be the same permanent reservation this
+    /// method exists to prevent.
+    fn cancel_flush(&mut self, victim: u16, flush_tag: u16) {
+        let Some(target) = self.tags.get(&victim) else {
+            return;
+        };
+        if !target.flushed_by.contains(&flush_tag) {
+            return;
+        }
+        let answered = target.answered;
+        let remaining = self.live_flushes_of(victim, flush_tag);
+        let Some(target) = self.tags.get_mut(&victim) else {
+            return;
+        };
+        target.flushed_by = remaining;
+        if !target.flushed_by.is_empty() || !answered {
+            return;
+        }
+        // Held only for a flush that has now been cancelled, and already
+        // answered, so its effect was cleared and there is nothing to undo.
+        if let Some(target) = self.tags.remove(&victim)
+            && let Some(next) = target.flushing
         {
-            // An `Rflush` releases the tag it flushed, whether or not the
-            // original reply ever arrived — and the flushed request's
-            // **reservation** goes with it.  Without that, a flushed `Twalk`
-            // or `Tattach` strands its target fid for the life of the session:
-            // no reply will ever bind it and no `Tclunk` can release it,
-            // because it is not bound, and a client that flushes walks
-            // exhausts its own fid quota with nothing to clunk.  A tag already
-            // marked `answered` bound its fid and had its effect cleared, so it
-            // has nothing left to undo.
-            self.undo_reservation(&target.effect);
+            // It was a flush itself, so cancel it against its own victim too.
+            // The chain is finite: every step removes one tag.
+            self.cancel_flush(next, victim);
         }
     }
 
@@ -665,8 +739,18 @@ impl Session {
     }
 
     /// Hand out the next fid binding stamp.
+    ///
+    /// `checked_add` rather than `wrapping_add`, so "monotonic, never reused,
+    /// never zero" is true without qualification.  Wrapping would have made it
+    /// true only up to 2^64 bindings, which is unreachable — a session would
+    /// have to bind a fid every nanosecond for five centuries — but a stated
+    /// invariant that quietly stops holding at some ceiling is worse than one
+    /// that says where it ends.
     fn fresh_generation(&mut self) -> u64 {
-        self.next_generation = self.next_generation.wrapping_add(1);
+        self.next_generation = self
+            .next_generation
+            .checked_add(1)
+            .expect("a session cannot bind 2^64 fids");
         self.next_generation
     }
 
@@ -675,6 +759,23 @@ impl Session {
         self.tags
             .values()
             .any(|tag| matches!(tag.effect, Effect::Attach { .. }))
+    }
+
+    /// Release `fid`, but only if it still carries the binding the request
+    /// was admitted against.
+    ///
+    /// `Tclunk` and `Tremove` release their fid on **either** answer, so this
+    /// is reached from both [`Session::complete`] and [`Session::fail`]; it is
+    /// the one apply path that deletes rather than writes, and it needs the
+    /// generation for exactly the same reason the others do.
+    fn release_fid(&mut self, fid: u32, generation: u64) {
+        if self
+            .fids
+            .get(&fid)
+            .is_some_and(|state| state.generation == generation)
+        {
+            self.fids.remove(&fid);
+        }
     }
 
     fn require_fid(&self, fid: u32) -> Result<&FidState, SessionError> {
@@ -994,7 +1095,10 @@ impl Session {
                 let state = self.require_fid(*fid)?;
                 Ok((
                     node(Primitives::one(Primitive::Clunk), &state.path),
-                    Effect::Release { fid: *fid },
+                    Effect::Release {
+                        fid: *fid,
+                        generation: state.generation,
+                    },
                 ))
             }
             Message::Tremove { fid } => {
@@ -1008,7 +1112,10 @@ impl Session {
                 };
                 Ok((
                     node(Primitives::one(primitive), &state.path),
-                    Effect::Release { fid: *fid },
+                    Effect::Release {
+                        fid: *fid,
+                        generation: state.generation,
+                    },
                 ))
             }
             // `Tversion`, `Tattach` and `Tflush` are handled by `classify`, and
@@ -1219,8 +1326,8 @@ impl Session {
                 state.generation = fresh;
                 Ok(())
             }
-            (Effect::Release { fid }, _) => {
-                self.fids.remove(fid);
+            (Effect::Release { fid, generation }, _) => {
+                self.release_fid(*fid, *generation);
                 Ok(())
             }
             (Effect::None, _) => Ok(()),

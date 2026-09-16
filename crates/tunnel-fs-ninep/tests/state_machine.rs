@@ -604,6 +604,115 @@ fn a_request_a_flush_never_named_survives_that_flushs_reply() {
     assert_eq!(session.fid(2).unwrap().path().as_str(), "/b");
 }
 
+#[test]
+fn a_flush_cancelled_by_its_own_flush_cannot_pin_a_tag_forever() {
+    // The reviewer's probe.  Two bugs met here: a cancelled flush left a stale
+    // entry in its target's set, and the liveness test asked only whether that
+    // tag *number* was outstanding — so the client could re-issue the number as
+    // a flush of something else and the original read as "still flushed"
+    // forever: reserved, un-reissuable, releasable by nothing. Repeated, that
+    // pins `maxInflightRequests` one slot at a time.
+    let mut session = attached_session();
+    session.request(&twalk(3, 0, 1, &["a"])).expect("Twalk");
+    session
+        .request(&Frame::new(10, Message::Tflush { oldtag: 3 }))
+        .expect("flush of the walk");
+    session
+        .request(&Frame::new(11, Message::Tflush { oldtag: 10 }))
+        .expect("flush of that flush");
+
+    // Answering 11 cancels flush 10, which must leave tag 3's set.
+    session
+        .complete(&Frame::new(11, Message::Rflush))
+        .expect("Rflush 11");
+    assert!(!session.has_tag(10), "the cancelled flush is gone");
+    assert!(session.has_tag(3), "the original walk is untouched");
+
+    // The client reuses tag 10 as a flush of something else entirely.
+    session
+        .request(&Frame::new(10, Message::Tflush { oldtag: 99 }))
+        .expect("tag 10 reused");
+
+    // The walk's own reply must release it: tag 10 is not a flush of 3.
+    session
+        .complete(&Frame::new(
+            3,
+            Message::Rwalk {
+                qids: vec![Qid::new(QidKind::Directory, 1)],
+            },
+        ))
+        .expect("Rwalk");
+    assert!(!session.has_tag(3), "tag 3 is released, not pinned");
+    assert_eq!(session.fid(1).unwrap().path().as_str(), "/a");
+
+    session
+        .complete(&Frame::new(10, Message::Rflush))
+        .expect("Rflush 10");
+    assert_eq!(session.outstanding_tags(), 0, "nothing is stranded");
+    assert!(session.request(&twalk(3, 0, 2, &["b"])).is_ok());
+}
+
+#[test]
+fn a_reused_tag_number_is_never_mistaken_for_a_flush_of_another_tag() {
+    // The narrow half: tag 3 is answered while a flush of it is outstanding,
+    // so it is held.  That flush is then answered, releasing 3 — and a reused
+    // number flushing something else must not have kept it alive in between.
+    let mut session = attached_session();
+    session.request(&twalk(3, 0, 1, &["a"])).expect("Twalk");
+    session
+        .request(&Frame::new(10, Message::Tflush { oldtag: 3 }))
+        .expect("flush");
+    session
+        .complete(&Frame::new(
+            3,
+            Message::Rwalk {
+                qids: vec![Qid::new(QidKind::Directory, 1)],
+            },
+        ))
+        .expect("the original reply arrives first");
+    assert!(session.has_tag(3), "held by its outstanding flush");
+    session
+        .complete(&Frame::new(10, Message::Rflush))
+        .expect("Rflush");
+    assert!(!session.has_tag(3));
+    assert_eq!(session.outstanding_tags(), 0);
+}
+
+#[test]
+fn an_answered_tag_held_only_by_a_cancelled_flush_is_collected() {
+    // The case `cancel_flush` exists for: tag 3 has already been answered and
+    // is held *only* by flush 10; flush 10 is then cancelled by flush 11.
+    // Nothing is left for tag 3 to wait on, so it must not stay reserved.
+    let mut session = attached_session();
+    session.request(&twalk(3, 0, 1, &["a"])).expect("Twalk");
+    session
+        .request(&Frame::new(10, Message::Tflush { oldtag: 3 }))
+        .expect("flush of the walk");
+    session
+        .complete(&Frame::new(
+            3,
+            Message::Rwalk {
+                qids: vec![Qid::new(QidKind::Directory, 1)],
+            },
+        ))
+        .expect("the original reply arrives first");
+    assert!(session.has_tag(3), "held by flush 10");
+
+    session
+        .request(&Frame::new(11, Message::Tflush { oldtag: 10 }))
+        .expect("flush of that flush");
+    session
+        .complete(&Frame::new(11, Message::Rflush))
+        .expect("Rflush 11");
+    assert!(!session.has_tag(10));
+    assert!(
+        !session.has_tag(3),
+        "nothing is left holding tag 3, so it is collected"
+    );
+    assert_eq!(session.outstanding_tags(), 0);
+    assert!(session.request(&twalk(3, 0, 2, &["b"])).is_ok());
+}
+
 // ------------------------------------------------------------------ fids
 
 #[test]
@@ -1710,6 +1819,80 @@ fn a_late_zero_element_clone_cannot_take_a_rebound_origins_qid() {
         "the clone did not take the rebound origin's qid"
     );
     assert_eq!(session.live_fids(), 2, "its reservation was released");
+}
+
+#[test]
+fn a_late_clunk_reply_cannot_delete_a_rebound_fid_of_the_same_number() {
+    // `Effect::Release` is the one apply path that deletes rather than writes,
+    // and it needs the generation for the same reason the others do: two
+    // clunks of one fid can be outstanding, the first frees the number for a
+    // fresh walk, and the second would otherwise delete the new binding — the
+    // client's live fid vanishing while gate 4 still holds its descriptor.
+    for remove in [false, true] {
+        let mut session = attached_session();
+        walk(&mut session, 2, 0, 1, &["a"], QidKind::File);
+        let request = |fid| {
+            if remove {
+                Message::Tremove { fid }
+            } else {
+                Message::Tclunk { fid }
+            }
+        };
+        session.request(&Frame::new(3, request(1))).expect("first");
+        session.request(&Frame::new(4, request(1))).expect("second");
+
+        let reply = if remove {
+            Message::Rremove
+        } else {
+            Message::Rclunk
+        };
+        session
+            .complete(&Frame::new(3, reply.clone()))
+            .expect("first reply");
+        assert!(session.fid(1).is_none(), "remove={remove}");
+
+        // The number is free; the client walks a different file to it.
+        walk(&mut session, 5, 0, 1, &["b"], QidKind::File);
+        assert_eq!(session.live_fids(), 2, "remove={remove}");
+
+        session
+            .complete(&Frame::new(4, reply))
+            .expect("the late reply applies nothing");
+        let state = session
+            .fid(1)
+            .unwrap_or_else(|| panic!("remove={remove}: the new binding was deleted"));
+        assert_eq!(state.path().as_str(), "/b");
+        assert_eq!(session.live_fids(), 2, "remove={remove}");
+    }
+}
+
+#[test]
+fn a_failed_late_clunk_cannot_delete_a_rebound_fid_either() {
+    // `Tclunk` releases its fid on either answer, so the `Rlerror` path needs
+    // the same comparison.
+    let mut session = attached_session();
+    walk(&mut session, 2, 0, 1, &["a"], QidKind::File);
+    session
+        .request(&Frame::new(3, Message::Tclunk { fid: 1 }))
+        .expect("first");
+    session
+        .request(&Frame::new(4, Message::Tclunk { fid: 1 }))
+        .expect("second");
+    session
+        .complete(&Frame::new(3, Message::Rclunk))
+        .expect("Rclunk");
+    walk(&mut session, 5, 0, 1, &["b"], QidKind::File);
+
+    session.fail(4).expect("Rlerror to the late clunk");
+    assert_eq!(
+        session
+            .fid(1)
+            .expect("the new binding survives")
+            .path()
+            .as_str(),
+        "/b"
+    );
+    assert_eq!(session.live_fids(), 2);
 }
 
 #[test]
