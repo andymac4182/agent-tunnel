@@ -463,6 +463,11 @@ own invalidation dispatcher has recorded that reason, and at the base the pin
 set is emptied five times per run, which latches it promptly. It is tracked on
 M7-C83.
 
+The retention work that fixes the isolation blackout is **not landed**; it is
+held on M7-C86 because it regresses this gate. At the landed revision this gate
+is unaffected: interleaved against `origin/main` with both binaries pre-built,
+8 of 8 on each arm.
+
 An attribution change keyed on `VerifiedPeerBinding::valid_until` was written
 and then reverted: instrumentation showed the trust/checkpoint window, already
 carried monotonically, is *earlier*, so that arm could only fire later than the
