@@ -1694,6 +1694,7 @@ GATE4_CASES: list[tuple[str, list[Edit]]] = [
             (
                 METADATA,
                 """            if check_exportable(identity.kind()).is_err() {
+                skipped += 1;
                 continue;
             }
 """,
