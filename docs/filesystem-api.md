@@ -73,7 +73,9 @@ The descriptor's high-level `operations` are **derived client capabilities**, no
 | Primitive family | Required server policy checks |
 | --- | --- |
 | `Tversion`, `Tattach`, `Tflush`, `Tclunk` | Authenticated session, fixed export, quotas and lifecycle; cleanup cannot broaden authority |
-| `Twalk`, `Tgetattr`, `Treaddir`, `Treadlink` | Confined traversal and granted metadata/list/read-link permissions; every resolved fid retains export and permission context |
+| `Twalk` | Confined traversal; requires no capability, per the [recorded decision below](#twalk-and-its-disclosure). Every resolved fid retains export and permission context |
+| `Tgetattr`, `Treaddir` | Granted `list`; a fid reached by walking does not carry metadata rights |
+| `Treadlink` | Granted `read` **and** the `symlinks` feature |
 | `Tlopen`, `Tlcreate`, `Tread`, `Twrite` | Decode `.L` flags explicitly: check read vs write access, create/exclusive/truncate/append permissions and node type before opening or changing anything; recheck fid rights and fresh authorization on each I/O |
 | `Tmkdir`, `Tunlinkat`, `Tremove`, `Trenameat`, `Trename` | Granted create/remove/rename on relevant parent/source/destination; root confinement on both sides and no implicit cross-export move |
 | `Tsetattr` | Validate the mask field by field; size changes require write/truncate authority, mode/time changes require their explicit permissions; reject unsupported ownership fields |
@@ -166,27 +168,54 @@ A **virtual path** is an absolute POSIX-style path inside one export's root. Val
 | A C0 control character or `DEL` | Terminal and log injection, and host ambiguity |
 | A backslash | A separator on Windows hosts |
 | A colon | Drive-letter syntax and NTFS alternate data streams |
-| A component whose stem matches `CON`, `PRN`, `AUX`, `NUL`, `CONIN$`, `CONOUT$`, `COM0`–`COM9` or `LPT0`–`LPT9`, ASCII-case-insensitively | Reserved Windows devices, refused on **every** host so an export's namespace does not change meaning when the serving device changes operating system |
+| A component whose stem matches `CON`, `PRN`, `AUX`, `NUL`, `CONIN$`, `CONOUT$`, `COM0`–`COM9`, `COM¹`, `COM²`, `COM³`, `LPT0`–`LPT9`, `LPT¹`, `LPT²` or `LPT³`, ASCII-case-insensitively, **after trailing ASCII spaces are removed from the stem** | Reserved Windows devices, refused on **every** host so an export's namespace does not change meaning when the serving device changes operating system. The trim is load-bearing: `ntdll` strips trailing spaces from the stem before comparing, so `CON .txt` opens the console device. The superscript spellings are reserved by Microsoft alongside the ASCII-digit forms |
 | A component ending in `.` or a space | Windows silently trims both, so two virtual paths would alias one host file |
 | A path above the negotiated `maxPathBytes`, or a component above 255 UTF-8 bytes | Bounded before allocation |
 | More components than the negotiated `maxPathComponents` | Bounded before allocation |
 
-Deliberate narrowings, recorded as named limits rather than left implicit: the colon is legal in a POSIX filename and is refused anyway; `...` and any other trailing-dot name is refused although POSIX permits it. `<`, `>`, `"`, `|`, `?` and `*` are **accepted** at this layer — they are legal POSIX filenames — and a host that cannot represent one must produce an explicit documented error from the resolver rather than a silent substitution.
+A component supplied to a path-building helper that itself contains a `/` is refused under its own rule, not reported as an empty component: it is several components, and calling it empty would misdescribe the input.
+
+**Non-UTF-8 input is not this layer's gate.** A virtual path is a UTF-8 string by construction, so a byte sequence that is not valid UTF-8 cannot reach path validation at all. Rejecting it is the **codec's** obligation (implementation gate 3), which must refuse a 9P string that is not valid UTF-8 before it is ever decoded into a path, rather than replacing invalid bytes. A host filename that cannot be represented in UTF-8 produces the documented explicit result from the resolver; it is never transliterated.
+
+Deliberate narrowings and acceptances, recorded as named limits rather than left implicit:
+
+* The colon is legal in a POSIX filename and is refused anyway, for drive and alternate-data-stream syntax.
+* `...`, and any other name ending in a dot or a space, is refused although POSIX permits it, because Windows trims both.
+* `<`, `>`, `"`, `|`, `?` and `*` are **accepted** — they are legal POSIX filenames. A host that cannot represent one must produce an explicit documented error from the resolver rather than a silent substitution.
+* Only C0 controls and `DEL` are refused. **C1 controls (U+0080–U+009F), the bidirectional overrides U+202A–U+202E and U+2066–U+2069, U+2028 and U+2029, and zero-width characters are accepted.** This is a deliberate narrowing of the injection rationale to the byte range that is hazardous in a C-string host API and a terminal escape. It means a filename can be constructed that renders misleadingly in a terminal or a UI; consumers that display filenames are responsible for their own rendering, and this is not treated as a confinement property.
 
 Containment is decided component-wise, never by string prefix: `/ab` is not inside `/a`.
 
-### Case-insensitive collisions
+### Two spellings, one file
 
-The provider reports the host's observed case behaviour in `root.caseSensitivity` and never assumes it. The collision key defined for gate 1 is an **ASCII** case fold. It does not implement Unicode simple or full case folding and does not apply NFC or NFD normalisation, so it does not detect every collision an APFS or HFS+ volume can produce. That residue is real and is the resolver's obligation in gate 2, which must decide collisions by asking the host — by anchored `openat`-style resolution and file identity — rather than by comparing strings.
+The provider reports the host's observed case behaviour in `root.caseSensitivity` and never assumes it.
+
+**Gate 1 provides no collision key, deliberately.** An earlier draft exposed an ASCII case fold; it was removed, because no string comparison can decide these collisions and a key that is right most of the time reads as though the problem were solved. At least four distinct classes map two accepted virtual paths onto one host file, and gate 1 accepts both members of every pair:
+
+| Class | Example pair | Where |
+| --- | --- | --- |
+| ASCII case | `/Dir/File.TXT`, `/dir/file.txt` | Case-insensitive volumes |
+| Unicode case pairs | `/σ`, `/Σ`; `/straße`, `/STRASSE` | Case-insensitive volumes |
+| NFC versus NFD | `/café`, `/cafe` + U+0301 | APFS, HFS+ |
+| NTFS 8.3 short names | `/LONGFI~1.TXT`, `/longfilename.txt` | NTFS with 8.3 generation enabled |
+
+The last is the same two-spellings-one-file hazard the refusal table exists to prevent, and it cannot be refused lexically: a short name is well-formed and indistinguishable from an ordinary name. All four are the resolver's obligation in gate 2, which must decide them by asking the host — anchored resolution plus file identity — rather than by comparing strings. On NTFS a provider may alternatively require 8.3 generation to be disabled on the exported volume and state that as a precondition.
 
 ### TOCTOU, symlinks and hard links
 
 Lexical validation is **not** confinement. A validated virtual path means "this text cannot itself express an escape", never "this path is safe to open". The resolver must therefore:
 
-1. Resolve every path component by anchored traversal from a retained root descriptor (`openat2` with `RESOLVE_BENEATH`/`RESOLVE_NO_SYMLINKS` where available, otherwise `openat` with `O_NOFOLLOW` per component), never by concatenating text and calling a path-taking syscall. A path-taking syscall re-resolves the whole path and reintroduces every race.
+1. Resolve every path component by anchored traversal from a retained root descriptor, never by concatenating text and calling a path-taking syscall. A path-taking syscall re-resolves the whole path and reintroduces every race. The anchoring mechanism is per host:
+   * **Linux:** `openat2`. The `resolve` flag follows the `symlinks` feature and the two are mutually exclusive: `RESOLVE_NO_SYMLINKS` when `symlinks` is **off**, `RESOLVE_IN_ROOT` when it is **on**. `RESOLVE_BENEATH` is *not* usable with links enabled — it rejects an absolute symlink target with `EXDEV` rather than re-rooting it, so it cannot satisfy rule 3. Fall back to per-component `openat` with `O_NOFOLLOW` on kernels without `openat2`, re-checking the parent's identity after each step.
+   * **macOS and other BSDs:** per-component `openat` with `O_NOFOLLOW`, with link targets re-rooted by the provider rather than by the kernel.
+   * **Windows:** `NtCreateFile` with a `RootDirectory` handle and `FILE_OPEN_REPARSE_POINT`, which is the only anchoring primitive that does not re-resolve from a drive root. Windows device hosts are in scope for the product ([architecture.md](architecture.md)), so a gate-2 implementation that omits this must state that filesystem exports are unsupported on Windows rather than leaving the mechanism unnamed.
 2. Act on the descriptor it resolved, not on the path it resolved from. Checking a path and then opening it by name is a TOCTOU bug regardless of how carefully the path was checked.
-3. Treat symbolic links as denied unless the `symlinks` feature is advertised, and resolve an absolute link target against the **exported virtual root**, never host `/`.
-4. Treat hard links as denied unless the `hardLinks` feature is advertised. A writable exported inode that is also linked outside the root is an escape that no path check can see; write support requires a tested hard-link policy.
+3. Deny symbolic links unless the `symlinks` feature is advertised: with the feature off, `Tsymlink` and `Treadlink` are refused and a link encountered during traversal fails the walk with `ELOOP` rather than being followed. With it on, resolve an absolute link target against the **exported virtual root**, never host `/`.
+4. **Hard links.** "Deny hard links" is not directly implementable — a hard link is not observable during a path walk, since every directory entry is a link and the second one is indistinguishable from the first. The testable rule is therefore stated in terms of what *is* observable, `st_nlink` and file identity:
+   * `Tlink` is refused unless the `hardLinks` feature is advertised. This is the only part that is a simple capability check.
+   * With a write grant and `hardLinks` **off**, `OpenWrite`, `OpenTruncate` and size-changing `Tsetattr` are refused with `EPERM` on any inode whose `st_nlink` is greater than 1, because such an inode may also be linked outside the root and writing through it would be an escape no path check can see.
+   * Reads of a multiply-linked inode are unaffected: the link count discloses nothing the grant does not already permit.
+   * This is the "tested hard-link policy" that write support is conditional on. It is deliberately conservative — it refuses writes to legitimately multiply-linked files inside the root — and a provider that needs those writes must advertise `hardLinks` and prove containment by file identity instead.
 5. Refuse special files, sockets, FIFOs and device nodes.
 6. Recheck the grant after every asynchronous queue wait and immediately before each primitive side effect, per the [cluster contract](cluster.md).
 
@@ -207,12 +236,25 @@ The server enforces **primitives**, not labels. Each 9P opcode family — with i
 
 * Enumerating a directory needs `list`, not `read`, so a grant that may list names cannot thereby read content; and `read` alone does not permit enumeration.
 * `Trenameat` requires **both** `write` and `delete`: renaming away removes a name, and a grant that may create but not remove must not remove one by renaming it.
-* Session lifecycle primitives (`Tversion`, `Tattach`, `Tflush`, `Tclunk`) and `Twalk` require no capability, because a session exists only for a non-empty grant.
+* The recursive operations `copy` and `remove` traverse directories, so both additionally require `list`. `remove` is therefore not available under `delete` alone, and `copy` is not available under read+write alone.
+* Session lifecycle primitives (`Tversion`, `Tattach`, `Tflush`, `Tclunk`) require no capability, because a session exists only for a non-empty grant.
 * `Tsymlink` and `Treadlink` additionally require the `symlinks` feature, `Tlink` the `hardLinks` feature and `Trenameat` the `atomicRename` feature. All are absent by default.
 
 There is **no append-only or create-only capability**. `write` permits overwriting and truncating existing content. An export that must never destroy data cannot be expressed in this model and must not claim to be.
 
+The **read-only profile is `read` + `list` together**, and that pair is what an integrator should configure. `read` alone is a valid grant — read-by-name, for a caller that knows its paths and must not enumerate — but it has no `stat`, so a Files SDK `head` or `exists` call has nothing to call. Do not reach for `read` alone expecting an ordinary read-only mount.
+
+#### `Twalk` and its disclosure
+
+`Twalk` requires no capability. This is a recorded decision with a named cost, not an oversight.
+
+Requiring `list` to walk would make read-by-name impossible, because every open begins with a walk: a `read`-without-`list` grant could not reach any file at all, and the grant shape would be useless. The cost is that `Rwalk` returns qids, so a grant holding only `write` or only `delete` can probe whether a name exists and whether it is a file or a directory.
+
+Those qids are the **only** metadata such a grant may observe. `Tgetattr` and `Treaddir` both require `list`, so size, times, mode, link count and directory contents remain unreachable, and a fid reached by walking carries no metadata rights. An export for which name-existence probing by a write-only or delete-only consumer is itself unacceptable must not issue such a grant.
+
 The descriptor's `operations` are **derived**, never configured: an operation is advertised only when every primitive composing it is independently permitted. A grant allowing `copy` therefore necessarily allows plain reads and writes, and this profile cannot promise copy-only, grep-only or framework-only access. `root.readOnly` is likewise derived from the grant, so the advertised flag cannot disagree with what is enforced.
+
+An empty grant derives an empty operation list. Discovery must answer `403 ACCESS_DENIED` for such an export rather than serving a descriptor that advertises nothing: an empty `operations` array must never reach a consumer as though it described a usable export.
 
 ### Payload-free diagnostics
 
@@ -255,7 +297,7 @@ The 32 MiB limit covers concurrent client/adapter-owned materialization buffers,
 Six gates, in order. Each names what it must prove; a gate is not closed by code existing, and a later gate does not close an earlier one's residue. [The adapter plan](filesystem-adapters.md) gives per-framework delivery gates; [testing.md](testing.md) covers wire and failure fixtures.
 
 1. **Contract and pure core.** The virtual path namespace, the capability/primitive/derived-operation model, the negotiated limits, the payload-free error vocabulary and the descriptor — with no I/O, no clock, no socket and no dependency. *Must prove:* every refused path class above is refused by its own rule and no accepted path can express an escape; every limit is exact at its boundary and refused one beyond, with no unlimited sentinel; capabilities default to deny and no advertised operation exceeds its primitive grant, exhaustively over every grant and feature set; no error rendering contains a path or content; the emitted descriptor reproduces the checked-in example byte for byte. *Cannot prove:* anything about a real filesystem.
-2. **OS-confined resolver.** Anchored traversal on each supported host, symlink and hard-link policy, file identity, case-collision decisions taken from the host, and the special-file refusal. *Must prove:* escape attempts through symlinks, hard links, link cycles, mount points, cross-root rename and links changed concurrently with access all fail, against a real temporary filesystem, including a writer racing the resolver between resolution and use. This is where TOCTOU is proven; gate 1 cannot.
+2. **OS-confined resolver.** Anchored traversal on each supported host, symlink and hard-link policy, file identity, case-collision decisions taken from the host, and the special-file refusal. *Must prove:* escape attempts through symlinks, hard links, link cycles, mount points, cross-root rename and links changed concurrently with access all fail, against a real temporary filesystem, including a writer racing the resolver between resolution and use; the `st_nlink` write refusal of rule 4 above; and that each of the four two-spellings-one-file classes — ASCII case, Unicode case pairs, NFC/NFD and **NTFS 8.3 short names** — is decided by file identity rather than by string comparison, or that its precondition is enforced. This is where TOCTOU is proven; gate 1 cannot.
 3. **9P2000.L codec and session state.** Bounded incremental encode/decode, `msize` negotiation, tags, fids, directory cookies, `Tflush`. *Must prove:* byte-exact golden fixtures shared with the TypeScript client, messages exactly at and one byte above `msize`, fuzzed incremental decoding that never over-allocates, and exhausted tag/fid quotas.
 4. **Descriptor endpoint, upgrade and read provider over the real path.** The authenticated `GET`, the WSS upgrade at the same URL, grant-revision recheck, and a confined read-only provider reached through the relay and the device data socket. *Must prove:* the authorization matrix at descriptor, upgrade, attach and open-fid use; a cached descriptor never authorizes access; and a forged `Tattach` cannot exceed the grant.
 5. **Write grants and partial failure.** Creates, truncation, append, rename, composite operations, and structured partial/unknown outcomes. *Must prove:* a read-only grant denies every mutating opcode and flag before backend dispatch; a failure injected after truncation, after a short write and after rename-before-reply reports its outcome accurately; and no ambiguous mutation is ever replayed.
@@ -265,12 +307,20 @@ Six gates, in order. Each names what it must prove; a gate is not closed by code
 
 `crates/tunnel-fs-core` is dependency-free and performs no I/O. It pins these choices, each of which is a decision this document did not previously settle:
 
-* The refused path classes and their per-class diagnostic rules, exactly as tabulated above, checked in a fixed order so the rule reported for a given input is deterministic.
+* The refused path classes and their per-class diagnostic rules. The table above is **unordered**; the checking order is fixed but different, and it is what determines which rule a path violating several of them reports. That order is: empty, then total byte length, then the leading separator, then a whole-path byte scan for NUL, backslash, colon and control characters, then per component — empty, component length, `.`, `..`, a contained separator, the component byte scan, trailing space or dot, reserved device stem — with the component count checked as components are consumed. So `\a` reports `PATH_NOT_ABSOLUTE` rather than `PATH_BACKSLASH`, and a 5,000-byte path containing `..` reports `PATH_TOO_LONG`.
 * A 255-byte maximum path component. This is a fixed property of the namespace, matching the `NAME_MAX` every supported host provides, so it is not a negotiated limit and does not appear in the descriptor.
-* The four capabilities, the 24 enforced primitives and their required capabilities, and the composition of all 17 derived client operations. `Tlopen` is split into read, directory, write and truncate decisions; directory enumeration needs `list`; rename needs `write` and `delete`.
+* The four capabilities, the 24 enforced primitives and their required capabilities, and the composition of all 17 derived client operations. `Tlopen` is split into read, directory, write and truncate decisions; directory enumeration needs `list`; rename needs `write` and `delete`; the recursive `copy` and `remove` compose their traversal primitives and so need `list` too.
+* `Twalk` requiring no capability, with the qid disclosure that follows from it bounded and stated above.
+* Close-code mapping. `DEVICE_OFFLINE` is 1012, because the export's backend is what went away; `ABORTED` maps to **no** close code, because cancelling one operation must not close a session carrying other outstanding tags. `maxMessageBytes` is deliberately not an `EFBIG` filesystem error: an over-`msize` frame is a framing violation answered with a 1002 close, never an `Rlerror`.
 * Identifiers (`deviceId`, `serviceId`, `grantRevision`) are restricted to ASCII alphanumerics, `-`, `_` and `.`, which is narrower than the schema's length-only rule. That makes JSON escaping unnecessary, so the emitter cannot be the place a quote or control character escapes into the document.
 * The three consistency rules the descriptor schema's `$comment` defers to runtime are made structurally impossible rather than checked: `availability`/`capabilityStatus` are one enum, `root.readOnly` is derived from the grant, and `operations` is derived from the primitives.
 * Limit negotiation reduces only. Zero and `u64::MAX` are both refused for every field, so neither can be read as "no limit". Five cross-field rules are enforced: `msize` has a 256-byte floor, the consumer queue may not be smaller than one maximum-size message, one materialized file may not exceed the concurrent materialization budget, the default operation deadline may not exceed the maximum, and the single-request deadline may not exceed the operation default.
 * `Outcome` is ordered and merges monotonically, so an operation observed as `partial` or `unknown` can never later be reported `not_started`.
 
-**Residue, not covered by gate 1 and open:** every item in gate 2, plus Unicode case folding and NFC/NFD collisions; the `msize` framing itself and all 9P encoding; deadlines and clocks; quota accounting for queued, buffered and traversal state; and the `maxTotalBufferedBytes` ownership-transfer accounting, which is a client-side property with no representation here.
+**Residue, not covered by gate 1 and open:** every item in gate 2. Specifically, and each accepted by gate 1 rather than refused:
+
+* All four two-spellings-one-file classes — ASCII case, Unicode case pairs, NFC/NFD, and **NTFS 8.3 short names** — which need file identity from the host.
+* Symlinks, hard links, `st_nlink`, mount points, special files and every TOCTOU race.
+* Non-UTF-8 input, which is the codec's gate (3), not this one's.
+* C1 controls, bidirectional overrides, U+2028/U+2029 and zero-width characters, accepted deliberately; a filename can therefore render misleadingly in a terminal or UI.
+* The `msize` framing itself and all 9P encoding; deadlines and clocks; quota accounting for queued, buffered and traversal state; and the `maxTotalBufferedBytes` ownership-transfer accounting, which is a client-side property with no representation here.
