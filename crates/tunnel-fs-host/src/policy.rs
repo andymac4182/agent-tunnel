@@ -97,11 +97,18 @@ pub const fn check_exportable(kind: FileKind) -> Result<(), FsError> {
 
 /// Whether an entry on `entry` may be crossed from a root on `root`.
 ///
-/// A mount point, a bind mount and a macOS firmlink all present as a directory
-/// whose device differs from its parent's.  The exported root is one host
-/// filesystem, so crossing out of it is `EXDEV` — the same answer the contract
-/// fixes for a cross-export operation, and for the same reason: the target is
-/// not in this export.
+/// What this compares is the entry's device against the **export root's**, not
+/// against its parent's: an export is one host filesystem, and anything on
+/// another one is outside it. That catches an ordinary mount point, a macOS
+/// firmlink, and a cross-filesystem bind mount. It does **not** catch a
+/// same-filesystem bind mount, whose device is the root's by definition; on
+/// Linux that case is the kernel's to refuse, through `RESOLVE_NO_XDEV` on the
+/// `openat2` path, and this comparison is the coarser check that remains on a
+/// host without it.
+///
+/// Crossing out is `EXDEV` — the same answer the contract fixes for a
+/// cross-export operation, and for the same reason: the target is not in this
+/// export.
 ///
 /// # Errors
 ///
