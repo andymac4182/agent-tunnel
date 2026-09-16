@@ -169,6 +169,10 @@ fn the_2025_profile_accepts_post_get_delete_and_session_headers() {
         ("mcp-protocol-version", "2025-11-25"),
         ("mcp-session-id", "0123abcd"),
         ("last-event-id", "7"),
+        (
+            "tunnel-principal-binding",
+            "7f2c9a1b4d6e8f0a1b2c3d4e5f60718a",
+        ),
     ];
     for method in [Method::Post, Method::Get, Method::Delete] {
         assert_eq!(
@@ -204,6 +208,37 @@ fn the_2025_profile_accepts_post_get_delete_and_session_headers() {
             "{response}"
         );
     }
+}
+
+/// M3-04.  The relay-derived principal binding belongs to the session
+/// profile only: the sessionless 2026 profile refuses it, and it is a
+/// singleton there as everywhere, so no request can present two bindings.
+#[test]
+fn the_principal_binding_header_belongs_to_the_session_profile_only() {
+    let name = headers::TUNNEL_PRINCIPAL_BINDING;
+    let legacy = McpProfile::V2025_11_25
+        .policies(McpLimits::default())
+        .unwrap();
+    assert!(legacy.request.headers.allows(name));
+    // It is request-only: a device can never answer with one.
+    assert!(!legacy.response.headers.allows(name));
+    assert_eq!(
+        check_request(
+            &legacy,
+            &request(Method::Post, "/mcp", &[(name, "a"), (name, "b")]),
+        ),
+        Err(CodecError::InvalidHeader(HeaderRule::RepeatedSingleton))
+    );
+
+    let current = McpProfile::V2026_07_28
+        .policies(McpLimits::default())
+        .unwrap();
+    assert!(!current.request.headers.allows(name));
+    assert!(!current.response.headers.allows(name));
+    assert_eq!(
+        check_request(&current, &request(Method::Post, "/mcp", &[(name, "a")])),
+        Err(CodecError::InvalidHeader(HeaderRule::NotAllowed))
+    );
 }
 
 #[test]

@@ -20,6 +20,12 @@
 //! * A failure before the request is written is a sanitized 502 JSON-RPC
 //!   error (the backend was not invoked); a failure after it was written is
 //!   an interruption with no fabricated JSON-RPC result.
+//! * M3-04: the backend owns `mcp-2025-11-25` session identifiers, but the
+//!   device owns who may use one.  This export remembers the opaque
+//!   `tunnel-principal-binding` each session was issued to and refuses any
+//!   other principal — and any session it did not see issued — as an unknown
+//!   session, before the backend is dialled.  The binding itself is
+//!   relay-to-device metadata and is never forwarded upstream.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -49,6 +55,47 @@ use crate::{ExportCounters, ExportError};
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// The longest accepted bearer token file.
 pub const MAX_TOKEN_BYTES: usize = 8192;
+/// Backend-issued `mcp-2025-11-25` sessions whose principal binding this
+/// export remembers.  The oldest binding is dropped once the bound is
+/// reached; a request on a forgotten session is answered 404 and the client
+/// re-initializes, so the bound fails closed rather than open.
+pub const MAX_TRACKED_SESSIONS: usize = 256;
+
+/// Principal bindings for the sessions a Streamable HTTP backend issued
+/// through this export (M3-04).  The backend owns the session identifiers;
+/// the device owns which principal may use them.
+#[derive(Debug, Default)]
+struct SessionBindings {
+    bindings: std::collections::HashMap<String, Option<String>>,
+    order: std::collections::VecDeque<String>,
+}
+
+impl SessionBindings {
+    /// Whether `binding` may use `session`.  An unknown session is refused.
+    fn permits(&self, session: &str, binding: Option<&String>) -> bool {
+        self.bindings
+            .get(session)
+            .is_some_and(|known| known.as_ref() == binding)
+    }
+
+    fn remember(&mut self, session: String, binding: Option<String>) {
+        if self.bindings.contains_key(&session) {
+            return;
+        }
+        while self.order.len() >= MAX_TRACKED_SESSIONS {
+            if let Some(evicted) = self.order.pop_front() {
+                self.bindings.remove(&evicted);
+            }
+        }
+        self.order.push_back(session.clone());
+        self.bindings.insert(session, binding);
+    }
+
+    fn forget(&mut self, session: &str) {
+        self.bindings.remove(session);
+        self.order.retain(|known| known != session);
+    }
+}
 
 /// A validated Streamable HTTP export.
 pub struct HttpBackendExport {
@@ -57,6 +104,7 @@ pub struct HttpBackendExport {
     backend: HttpBackend,
     authorization: Option<HeaderValue>,
     counters: Arc<ExportCounters>,
+    sessions: std::sync::Mutex<SessionBindings>,
 }
 
 impl std::fmt::Debug for HttpBackendExport {
@@ -164,7 +212,14 @@ impl HttpBackendExport {
             backend,
             authorization,
             counters,
+            sessions: std::sync::Mutex::new(SessionBindings::default()),
         })
+    }
+
+    fn sessions(&self) -> std::sync::MutexGuard<'_, SessionBindings> {
+        self.sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn reject(&self, value: &McpRejection) -> Response<ExportBody> {
@@ -226,13 +281,41 @@ impl HttpBackendExport {
             return Ok(self.reject(&error));
         }
 
+        // M3-04.  This revision's sessions belong to the backend, but which
+        // principal may use one is the device's decision: a request naming a
+        // session this export did not see opened for exactly this principal
+        // binding is answered as an unknown session, before the backend is
+        // dialled, so nothing is dispatched and nothing distinguishes a
+        // foreign session from a nonexistent one.
+        let binding = crate::request_principal_binding(&parts.headers);
+        let named_session = parts
+            .headers
+            .get(tunnel_mcp::headers::MCP_SESSION_ID)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        if self.profile.is_legacy()
+            && let Some(session) = &named_session
+            && !self.sessions().permits(session, binding.as_ref())
+        {
+            return Ok(self.reject(&McpRejection {
+                status: 404,
+                code: codes::INVALID_REQUEST,
+                message: "session not found",
+                id: None,
+                supported: None,
+            }));
+        }
+
         let mut upstream = Request::builder()
             .method(parts.method.clone())
             .uri(self.backend.path.as_str());
         for (name, value) in &parts.headers {
             // The codec already reduced the head to the profile allowlist;
             // copy exactly those fields and nothing the export sets itself.
-            if name == http::header::HOST
+            // The principal binding is relay-to-device metadata and is never
+            // forwarded: the backend authenticates nobody.
+            if name.as_str() == tunnel_mcp::headers::TUNNEL_PRINCIPAL_BINDING
+                || name == http::header::HOST
                 || name == http::header::ACCEPT_ENCODING
                 || name == http::header::AUTHORIZATION
                 || name == http::header::CONTENT_LENGTH
@@ -334,6 +417,25 @@ impl HttpBackendExport {
                 StatusCode::BAD_GATEWAY,
                 "the MCP backend response exceeds the export limit",
             ));
+        }
+        if self.profile.is_legacy() {
+            // A session the backend issues on a successful exchange belongs
+            // to the principal that opened it, and a successful DELETE ends
+            // it.  Nothing is recorded for a failed exchange.
+            let issued = upstream_headers
+                .get(tunnel_mcp::headers::MCP_SESSION_ID)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            if status.is_success() {
+                match (&named_session, parts.method == Method::DELETE) {
+                    (Some(session), true) => self.sessions().forget(session),
+                    _ => {
+                        if let Some(session) = issued {
+                            self.sessions().remember(session, binding.clone());
+                        }
+                    }
+                }
+            }
         }
         let mut out = Response::builder().status(status);
         for (name, _) in self.profile.response_headers() {

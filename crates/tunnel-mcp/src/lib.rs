@@ -45,6 +45,14 @@ pub mod headers {
     pub const MCP_PARAM_PREFIX: &str = "mcp-param-";
     pub const MCP_SESSION_ID: &str = "mcp-session-id";
     pub const LAST_EVENT_ID: &str = "last-event-id";
+    /// Not an MCP header.  The relay ingress, which is the only endpoint that
+    /// authenticates the consumer, derives this opaque per-principal value and
+    /// sets it on every `mcp-2025-11-25` request so the device can bind a
+    /// protocol session to the principal it was opened for (M3-04).  It
+    /// carries no identity: it is a one-way digest over the tenant,
+    /// principal, device and service identifiers.  A consumer that sends it
+    /// itself is refused by the ingress before anything is forwarded.
+    pub const TUNNEL_PRINCIPAL_BINDING: &str = "tunnel-principal-binding";
 }
 
 /// The two selectable MCP profiles.
@@ -77,6 +85,7 @@ const REQUEST_2025: HeaderRules = &[
     (headers::MCP_PROTOCOL_VERSION, Occurrence::Singleton),
     (headers::MCP_SESSION_ID, Occurrence::Singleton),
     (headers::LAST_EVENT_ID, Occurrence::Singleton),
+    (headers::TUNNEL_PRINCIPAL_BINDING, Occurrence::Singleton),
 ];
 const RESPONSE_2025: HeaderRules = &[
     (headers::CONTENT_TYPE, Occurrence::Singleton),

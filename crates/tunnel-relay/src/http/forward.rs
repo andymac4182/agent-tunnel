@@ -1180,6 +1180,58 @@ fn strip_public_credentials(headers: &mut http::HeaderMap) {
     headers.remove(header::COOKIE);
 }
 
+/// The typed name of the relay-only principal binding header.  The literal
+/// is a valid lowercase HTTP token, which `tunnel_mcp`'s profile tables also
+/// prove by building their policies from it.
+pub(crate) fn principal_binding_header() -> http::HeaderName {
+    http::HeaderName::from_static(tunnel_mcp::headers::TUNNEL_PRINCIPAL_BINDING)
+}
+
+/// The domain separator of the principal binding digest.  Changing it
+/// invalidates every live protocol session, which is why it is versioned.
+const PRINCIPAL_BINDING_DOMAIN: &[u8] = b"agent-tunnel/mcp-principal-binding/1";
+/// Digest bytes carried in the binding value (128 bits, hex encoded).
+const PRINCIPAL_BINDING_BYTES: usize = 16;
+
+/// Derive the opaque per-principal binding an ingress sets on a request whose
+/// profile allowlists [`tunnel_mcp::headers::TUNNEL_PRINCIPAL_BINDING`].
+///
+/// The value is a one-way SHA-256 digest over a domain separator and the
+/// tenant, principal, device and service identifiers, truncated to 128 bits.
+/// It is therefore:
+///
+/// * **stable** — every relay in the cluster derives the same value for the
+///   same authenticated consumer on the same export, so a session opened
+///   through one ingress is usable through another;
+/// * **non-identifying to the device** — it carries no issuer, subject, name
+///   or identifier, and it is scoped to one device and service, so the same
+///   principal presents unrelated values on unrelated exports;
+/// * **unforgeable in practice** — not because the digest is keyed, but
+///   because a consumer can never supply the header: the ingress refuses any
+///   request that carries it (see [`http_forward_handler`]).
+pub(crate) fn principal_binding(
+    tenant_id: Uuid,
+    principal_id: Uuid,
+    device_id: Uuid,
+    service_id: Uuid,
+) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(PRINCIPAL_BINDING_DOMAIN);
+    for id in [tenant_id, principal_id, device_id, service_id] {
+        hasher.update(id.as_bytes());
+    }
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(PRINCIPAL_BINDING_BYTES * 2);
+    for byte in &digest[..PRINCIPAL_BINDING_BYTES] {
+        use std::fmt::Write as _;
+        // Infallible: writing into a String cannot fail.
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
 fn gateway_error(status: StatusCode, code: &'static str, execution: &'static str) -> Response {
     error_response(status, code, "http forwarding is unavailable", execution)
 }
@@ -1305,6 +1357,46 @@ pub(crate) async fn http_forward_route(
     };
     parts.uri = uri;
     strip_public_credentials(&mut parts.headers);
+    // M3-04: the device cannot see the authenticated principal, so the
+    // ingress — the only endpoint that verified the consumer credential —
+    // hands it an opaque per-principal binding.  A consumer that presents the
+    // header itself is refused here: the value is never taken from the
+    // request, and never merely overwritten, so a forged binding can neither
+    // reach the device nor be confused with a derived one.
+    let binding_header = principal_binding_header();
+    if parts.headers.contains_key(&binding_header) {
+        state
+            .handle
+            .http_forward_diagnostics()
+            .record_ingress_rejection();
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "HTTP_INVALID_HEAD",
+            "invalid request head",
+            "not_dispatched",
+        );
+    }
+    if export
+        .profile
+        .request
+        .headers
+        .allows(tunnel_mcp::headers::TUNNEL_PRINCIPAL_BINDING)
+    {
+        let binding = principal_binding(
+            grant.tenant_id,
+            validated.consumer.principal_id,
+            device_id,
+            service_id,
+        );
+        let Ok(value) = http::HeaderValue::from_str(&binding) else {
+            return gateway_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "HTTP_INVALID_HEAD",
+                "not_dispatched",
+            );
+        };
+        parts.headers.insert(binding_header, value);
+    }
     // A head the bridge would refuse is refused here, before any owner
     // route, peer stream or tunnel stream exists: a malformed or forbidden
     // head must not amplify into peer→owner→device admission work.
@@ -1846,6 +1938,59 @@ mod tests {
             .policies(tunnel_mcp::McpLimits::default())
             .unwrap();
         HttpForwardExport::new(Arc::new(profile), BridgeConfig::default())
+    }
+
+    /// M3-04.  The binding an ingress derives is a stable, opaque function of
+    /// exactly the tenant, principal, device and service; every other
+    /// consumer, device or service gets a different value, and the value
+    /// reveals none of its inputs.
+    #[test]
+    fn the_principal_binding_is_stable_scoped_and_opaque() {
+        let ids: [Uuid; 4] = [
+            Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap(),
+            Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap(),
+            Uuid::parse_str("33333333-3333-4333-8333-333333333333").unwrap(),
+            Uuid::parse_str("44444444-4444-4444-8444-444444444444").unwrap(),
+        ];
+        let other = Uuid::parse_str("55555555-5555-4555-8555-555555555555").unwrap();
+        let base = principal_binding(ids[0], ids[1], ids[2], ids[3]);
+        // Stable: a second ingress, or the same one later, derives it again.
+        assert_eq!(base, principal_binding(ids[0], ids[1], ids[2], ids[3]));
+        assert_eq!(base.len(), PRINCIPAL_BINDING_BYTES * 2);
+        assert!(base.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        // Scoped: changing any single input changes the value, so one
+        // principal's binding on one export is useless anywhere else.
+        let mut seen = std::collections::BTreeSet::from([base.clone()]);
+        for position in 0..ids.len() {
+            let mut inputs = ids;
+            inputs[position] = other;
+            let derived = principal_binding(inputs[0], inputs[1], inputs[2], inputs[3]);
+            assert!(seen.insert(derived), "input {position} changed nothing");
+        }
+        // Opaque: no identifier, in any spelling, survives into the value.
+        for id in ids {
+            assert!(!base.contains(&id.simple().to_string()));
+            assert!(!base.contains(&id.hyphenated().to_string()));
+        }
+        // The header the value travels in is exactly the profile's, and it is
+        // never confused with a swapped argument order.
+        assert_eq!(
+            principal_binding_header().as_str(),
+            tunnel_mcp::headers::TUNNEL_PRINCIPAL_BINDING
+        );
+        assert_ne!(base, principal_binding(ids[1], ids[0], ids[2], ids[3]));
+    }
+
+    /// M3-04.  Only the session profile carries the binding, so the ingress
+    /// adds it to a 2025 request and to nothing else.
+    #[test]
+    fn only_the_session_profile_admits_the_principal_binding() {
+        let name = tunnel_mcp::headers::TUNNEL_PRINCIPAL_BINDING;
+        let legacy = tunnel_mcp::McpProfile::V2025_11_25
+            .policies(tunnel_mcp::McpLimits::default())
+            .unwrap();
+        assert!(legacy.request.headers.allows(name));
+        assert!(!export().profile.request.headers.allows(name));
     }
 
     /// Gate 5: a service selects its profile only through the catalog
