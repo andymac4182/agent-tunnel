@@ -692,7 +692,9 @@ impl<A: Authority> Provider<A> {
 
         let (handle, reader, mode) = if metadata.kind() == FileKind::Directory {
             let handle = self.root.open_directory(&path)?;
-            let reader = self.root.reader_for(&handle)?;
+            let reader = self
+                .root
+                .reader_for(&handle, self.limits.max_traversal_entries())?;
             (handle, Some(reader), OpenKind::Directory)
         } else {
             let handle = self.root.open_read(&path)?;

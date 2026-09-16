@@ -159,9 +159,22 @@ impl RecordDecoder {
         if let Some(error) = self.latched {
             return Err(error);
         }
-        // Bounded before the copy: the buffer never holds more than one
-        // maximum-size record plus its header.
-        if self.buffer.len() + bytes.len() > MAX_RECORD_BYTES + RECORD_HEADER_LEN {
+        // Bounded before the copy, at **two** maximum records rather than one.
+        //
+        // One is the wrong bound and was a latent defect rather than a tight
+        // one: a carrier chunk may legitimately carry the tail of a full-`msize`
+        // record and the head of the next, so a decoder bounded at one record
+        // would latch `TooLong` on a well-formed stream. It has not happened
+        // because the device frames one record per `send_data` and the owner
+        // delivers one chunk per DATA frame, but that is a property of today's
+        // emitter, not of this decoder, and a decoder that is safe only because
+        // of what its peer happens to do is not bounded.
+        //
+        // Two is still a bound: the caller drains complete records between
+        // pushes, so what is retained on entry is at most one incomplete record,
+        // and one chunk can add at most one more. The **length** a record may
+        // declare is checked separately, against one record, in `next_record`.
+        if self.buffer.len() + bytes.len() > 2 * (MAX_RECORD_BYTES + RECORD_HEADER_LEN) {
             return Err(self.latch(RecordError::TooLong));
         }
         self.buffer.extend_from_slice(bytes);
@@ -304,6 +317,38 @@ mod tests {
             .push(&[super::KIND_CLOSE, 0, 0, 0, 1, u8::MAX])
             .expect("push");
         assert_eq!(decoder.next_record(), Err(RecordError::MalformedClose));
+    }
+
+    #[test]
+    fn a_chunk_carrying_the_tail_of_one_record_and_the_head_of_the_next_is_accepted() {
+        // The bound this asserts is the decoder's own, not its peer's. Today's
+        // device frames one record per carrier send and the owner delivers one
+        // chunk per DATA frame, so a straddling chunk does not arise — but a
+        // decoder that is safe only because of what its emitter happens to do is
+        // not bounded, and a bound of one record would latch `TooLong` here.
+        let first = vec![3_u8; MAX_RECORD_BYTES];
+        let second = b"second".to_vec();
+        let mut stream = Vec::new();
+        encode_message(&first, &mut stream);
+        encode_message(&second, &mut stream);
+
+        let mut decoder = RecordDecoder::new();
+        // One byte short of the first record, then everything else: the second
+        // push carries the tail of one full-size record and the whole of the
+        // next.
+        let split = MAX_RECORD_BYTES + RECORD_HEADER_LEN - 1;
+        decoder.push(&stream[..split]).expect("head");
+        assert_eq!(decoder.next_record().expect("incomplete"), None);
+        decoder.push(&stream[split..]).expect("straddling tail");
+        assert_eq!(
+            decoder.next_record().expect("decode"),
+            Some(Record::Message(first))
+        );
+        assert_eq!(
+            decoder.next_record().expect("decode"),
+            Some(Record::Message(second))
+        );
+        assert_eq!(decoder.retained(), 0);
     }
 
     #[test]

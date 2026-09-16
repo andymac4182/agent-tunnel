@@ -44,7 +44,7 @@
 
 use rustix::fs::{AtFlags, Dir, Stat};
 
-use tunnel_fs_core::{FsError, FsErrorCode, Primitive, VirtualPath};
+use tunnel_fs_core::{FsError, FsErrorCode, LimitField, Primitive, VirtualPath};
 
 use crate::identity::{FileIdentity, FileKind};
 use crate::policy::{check_exportable, check_same_device, host_error};
@@ -230,8 +230,13 @@ impl HostEntry {
 
     /// The opaque cookie a later `Treaddir` resumes from.
     ///
-    /// This is the host's own directory offset. Nothing in this profile
-    /// interprets it, orders by it, or assumes it counts anything.
+    /// A position in the [`DirReader`] that produced it — the number of servable
+    /// entries returned since its last rewind — and **not** the host's own
+    /// `d_off`, for the reason recorded on `DirReader`: `rustix` exposes
+    /// `DirEntry::offset` on Linux and not on Apple, and a cookie that existed
+    /// on one host and not another would make the wire protocol's behaviour
+    /// depend on the serving operating system. Nothing in this profile
+    /// interprets it or orders by it; it is carried back unchanged.
     #[must_use]
     pub const fn cookie(&self) -> u64 {
         self.cookie
@@ -274,6 +279,17 @@ pub struct DirReader {
     position: u64,
     /// The export root's identity, for the mount-boundary check on each entry.
     root: FileIdentity,
+    /// How many unservable entries one call may pass over before refusing.
+    ///
+    /// The block a `Treaddir` fills bounds the entries it *returns*, and bounds
+    /// nothing about the entries it skips: `.`, `..`, a special file, an entry
+    /// on another filesystem and one removed between `readdir` and `statat` all
+    /// cost a `statat` and take no space in the reply. A directory of ten
+    /// thousand FIFOs would therefore make one `Treaddir` perform ten thousand
+    /// host calls for an empty block, which is unbounded work behind a bounded
+    /// answer. This is the contract's recursive-traversal entry limit applied
+    /// to that work.
+    skip_budget: u64,
 }
 
 impl core::fmt::Debug for DirReader {
@@ -344,7 +360,15 @@ impl DirReader {
     /// fails the **whole** enumeration — see this module's own documentation for
     /// why it is not skipped — and any translated host failure.
     pub fn next_entry(&mut self) -> Result<Option<HostEntry>, FsError> {
+        let mut skipped = 0_u64;
         loop {
+            if skipped > self.skip_budget {
+                // A bound on work, not a statement about the directory: the
+                // caller asked for one entry and this call has already passed
+                // over more unservable ones than the negotiated traversal-entry
+                // limit permits.
+                return Err(FsError::Limit(LimitField::MaxTraversalEntries));
+            }
             let Some(entry) = self.dir.read() else {
                 return Ok(None);
             };
@@ -352,6 +376,7 @@ impl DirReader {
             let raw = entry.file_name();
             let name = entry_name(raw)?;
             if name == "." || name == ".." {
+                skipped += 1;
                 continue;
             }
             // The kind and the identity are asked of the host by name relative
@@ -364,7 +389,10 @@ impl DirReader {
                 // The entry was removed between `readdir` and `statat`.  A live
                 // filesystem is what the contract says enumeration observes, so
                 // this is an ordinary outcome and not a failure of the listing.
-                Err(rustix::io::Errno::NOENT) => continue,
+                Err(rustix::io::Errno::NOENT) => {
+                    skipped += 1;
+                    continue;
+                }
                 Err(errno) => return Err(host_error(errno)),
             };
             let identity = FileIdentity::from_stat(&stat);
@@ -372,12 +400,14 @@ impl DirReader {
             // denies it everywhere else too, so its absence agrees with every
             // other answer a caller could get about it.
             if check_exportable(identity.kind()).is_err() {
+                skipped += 1;
                 continue;
             }
             // An entry on another filesystem is a mount point.  Walking into it
             // is `EXDEV`, so naming it in a listing would advertise a node no
             // operation can reach.
             if check_same_device(self.root, identity).is_err() {
+                skipped += 1;
                 continue;
             }
             self.position = self.position.saturating_add(1);
@@ -513,9 +543,13 @@ impl ExportRoot {
     ///
     /// As [`ExportRoot::open_directory`], plus a translated host failure from
     /// taking the directory stream.
-    pub fn read_directory(&self, path: &VirtualPath) -> Result<DirReader, FsError> {
+    pub fn read_directory(
+        &self,
+        path: &VirtualPath,
+        skip_budget: u64,
+    ) -> Result<DirReader, FsError> {
         let handle = self.open_directory(path)?;
-        self.reader_for(&handle)
+        self.reader_for(&handle, skip_budget)
     }
 
     /// The directory stream for an already-resolved directory descriptor.
@@ -523,11 +557,15 @@ impl ExportRoot {
     /// Used by the endpoint, which resolves a directory once when a fid is
     /// opened and enumerates it across many `Treaddir` requests.
     ///
+    /// `skip_budget` bounds how many unservable entries one `next_entry` may
+    /// pass over; the contract's recursive-traversal entry limit is what a
+    /// caller passes.
+    ///
     /// # Errors
     ///
     /// [`FsErrorCode::Enotdir`] when the handle is not a directory, or a
     /// translated host failure.
-    pub fn reader_for(&self, handle: &Handle) -> Result<DirReader, FsError> {
+    pub fn reader_for(&self, handle: &Handle, skip_budget: u64) -> Result<DirReader, FsError> {
         if handle.kind() != FileKind::Directory {
             return Err(FsError::refused(FsErrorCode::Enotdir));
         }
@@ -539,6 +577,7 @@ impl ExportRoot {
             dir,
             position: 0,
             root: self.identity(),
+            skip_budget,
         })
     }
 }

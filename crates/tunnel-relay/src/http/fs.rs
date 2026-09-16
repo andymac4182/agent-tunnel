@@ -77,8 +77,7 @@ use crate::routing::{OwnerRoute, OwnerScope};
 use tunnel_http_bridge::{CarrierEvent, CarrierReader as _, CarrierWriter as _};
 
 use super::{
-    HttpState, bearer, cluster_is_ready, forwarded_bearer_token, parse_uuid,
-    service_and_grant_of_type, subprotocol_offered,
+    HttpState, bearer, cluster_is_ready, parse_uuid, service_and_grant_of_type, subprotocol_offered,
 };
 
 /// The header a Node client sends the descriptor's `grantRevision` in.
@@ -577,7 +576,6 @@ async fn upgrade_session(
             "admission capacity exhausted for this device",
         );
     };
-    let _ = forwarded_bearer_token(&headers);
 
     let handle = state.handle.clone();
     let capabilities = capability_metadata(admitted.capabilities);
@@ -630,6 +628,29 @@ async fn upgrade_session(
         .into_response()
 }
 
+/// The session close a reset reason names.
+///
+/// **`AUTHORIZATION_EXPIRED` is 1008 and everything else is 1011.** The
+/// contract requires an authorization invalidation to close the session with
+/// 1008, and that decision is taken on the **device** — by the connector, which
+/// holds the authorization context and the clock — or by the owner when a grant
+/// moves under a live stream. Neither can reach the consumer's socket except
+/// through this reset code, because the connector aborts the exchange task
+/// before it invalidates, so the provider never runs again and never emits its
+/// own close record.
+///
+/// The wire has **one** code for the whole class: `AUTHORIZATION_EXPIRED`
+/// covers an expired snapshot, a revoked grant and a moved revision alike. So
+/// this maps to `AuthExpired` rather than `CapabilitiesChanged` — both close
+/// 1008, which is what a consumer branches on, and claiming to distinguish them
+/// here would be inventing a distinction the reason code does not carry.
+fn session_close_for_reset(reason: Option<u16>) -> SessionErrorCode {
+    match reason {
+        Some(tunnel_protocol::reset_reason::AUTHORIZATION_EXPIRED) => SessionErrorCode::AuthExpired,
+        _ => SessionErrorCode::SessionLost,
+    }
+}
+
 /// No verdict published yet.
 ///
 /// `u8::MAX` rather than a sentinel of its own, because a published verdict is
@@ -675,6 +696,13 @@ async fn pump(
     let closed = registration.base.closed.clone();
     registration.base.claim_admission();
     let mut cleanup = handle.echo_cleanup_guard(key.clone(), stream_id, operation_id.clone(), None);
+    // Cloned before the carriers consume the registration: the connector's
+    // RESET is observed here out of band, ahead of its ordered delivery, and a
+    // stream the actor closes for a revocation ends this loop through
+    // `closed.cancelled()` without ever delivering that RESET in order. Without
+    // this the consumer would see a close with no code where the contract
+    // requires 1008.
+    let mut peer_reset = registration.peer_reset.clone();
     let (mut writer, mut reader, signal_task, _freeze) = actor_carriers(&handle, registration);
 
     let (mut sink, mut stream) = socket.split();
@@ -790,13 +818,21 @@ async fn pump(
             }
             CarrierEvent::Fin | CarrierEvent::Closed => break,
             CarrierEvent::Reset(_) => {
-                close_with = Some(SessionErrorCode::SessionLost);
+                close_with = Some(session_close_for_reset(reader.last_reset_reason()));
                 break;
             }
         }
     }
 
     inbound.abort();
+    // A RESET the connector raised out of band but never delivered in order —
+    // the shape an authorization invalidation takes, because the connector
+    // aborts its exchange before it resets — still decides the close code.
+    if close_with.is_none()
+        && let Some(observed) = peer_reset.borrow_and_update().as_ref()
+    {
+        close_with = Some(session_close_for_reset(Some(observed.reason)));
+    }
     // A framing violation the consumer committed wins over every other reason
     // this loop stopped: the close code is what tells the peer its own frame was
     // refused, and reporting 1011 for it would name the relay as the failure.

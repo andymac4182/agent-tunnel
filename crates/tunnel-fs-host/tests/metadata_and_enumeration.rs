@@ -200,7 +200,7 @@ fn enumeration_lists_children_and_never_dot_or_dotdot() {
 
     let export = fixture.open(read_only(), FeatureSet::NONE, bounds());
     let mut reader = export
-        .read_directory(&vpath("/"))
+        .read_directory(&vpath("/"), ENTRY_BUDGET)
         .expect("enumerate the root");
     let mut names = Vec::new();
     while let Some(entry) = reader.next_entry().expect("entry") {
@@ -218,7 +218,7 @@ fn enumeration_needs_list_and_not_read() {
     let reading = fixture.open(read_only_no_list(), FeatureSet::NONE, bounds());
     assert_eq!(
         reading
-            .read_directory(&vpath("/"))
+            .read_directory(&vpath("/"), ENTRY_BUDGET)
             .expect_err("read alone cannot enumerate")
             .code(),
         FsErrorCode::Eperm
@@ -226,7 +226,7 @@ fn enumeration_needs_list_and_not_read() {
 
     let listing = fixture.open(list_only(), FeatureSet::NONE, bounds());
     listing
-        .read_directory(&vpath("/"))
+        .read_directory(&vpath("/"), ENTRY_BUDGET)
         .expect("list alone enumerates");
 }
 
@@ -244,7 +244,9 @@ fn enumeration_leaves_out_a_special_file() {
     );
 
     let export = fixture.open(read_only(), FeatureSet::NONE, bounds());
-    let mut reader = export.read_directory(&vpath("/")).expect("enumerate");
+    let mut reader = export
+        .read_directory(&vpath("/"), ENTRY_BUDGET)
+        .expect("enumerate");
     let mut names = Vec::new();
     while let Some(entry) = reader.next_entry().expect("entry") {
         names.push(entry.name().to_owned());
@@ -273,7 +275,9 @@ fn an_entry_name_that_is_not_utf8_fails_the_whole_enumeration() {
         .expect("the host must accept a non-UTF-8 file name for this test to mean anything");
 
     let export = fixture.open(read_only(), FeatureSet::NONE, bounds());
-    let mut reader = export.read_directory(&vpath("/")).expect("enumerate");
+    let mut reader = export
+        .read_directory(&vpath("/"), ENTRY_BUDGET)
+        .expect("enumerate");
 
     // The whole listing fails.  Which entry the host returns first is not
     // determined, so the assertion is that the enumeration cannot complete
@@ -304,7 +308,9 @@ fn a_cookie_resumes_where_it_was_taken() {
     }
 
     let export = fixture.open(read_only(), FeatureSet::NONE, bounds());
-    let mut reader = export.read_directory(&vpath("/")).expect("enumerate");
+    let mut reader = export
+        .read_directory(&vpath("/"), ENTRY_BUDGET)
+        .expect("enumerate");
 
     let mut first = Vec::new();
     let mut cookie = 0;
@@ -339,11 +345,67 @@ fn a_cookie_resumes_where_it_was_taken() {
 }
 
 #[test]
+fn a_run_of_unservable_entries_is_bounded_rather_than_walked() {
+    // The block a `Treaddir` fills bounds the entries it returns and bounds
+    // nothing about the entries it skips: each special file costs a `statat`
+    // and takes no space in the reply. A directory of them would otherwise make
+    // one call perform arbitrarily many host calls for an empty block.
+    let fixture = Fixture::new();
+    for index in 0..6 {
+        let pipe = fixture.inside(&format!("p{index}"));
+        assert!(
+            Command::new("mkfifo")
+                .args([pipe.as_os_str()])
+                .output()
+                .is_ok_and(|output| output.status.success()),
+            "mkfifo must create a FIFO inside the temporary export"
+        );
+    }
+    fixture.file("/z-ordinary.txt", b"synthetic");
+
+    let export = fixture.open(read_only(), FeatureSet::NONE, bounds());
+    // A budget of three cannot cross six FIFOs, whatever order the host
+    // returns them in, so the refusal is the answer rather than a race.
+    let mut reader = export
+        .read_directory(&vpath("/"), 3)
+        .expect("enumerate the root");
+    let mut refused = false;
+    loop {
+        match reader.next_entry() {
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(error) => {
+                assert_eq!(error.code(), FsErrorCode::Einval);
+                refused = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        refused,
+        "a run of unservable entries longer than the budget must be refused"
+    );
+
+    // The same directory under the contract's own traversal-entry limit lists
+    // normally: the budget bounds work, and is not a claim about the directory.
+    let mut reader = export
+        .read_directory(&vpath("/"), ENTRY_BUDGET)
+        .expect("enumerate the root");
+    let mut names = Vec::new();
+    while let Some(entry) = reader.next_entry().expect("entry") {
+        names.push(entry.name().to_owned());
+    }
+    assert_eq!(names, vec!["z-ordinary.txt"]);
+}
+
+#[test]
 fn a_cookie_past_the_end_is_refused() {
     let fixture = Fixture::new();
     fixture.file("/only.txt", b"synthetic");
     let export = fixture.open(read_only(), FeatureSet::NONE, bounds());
-    let mut reader = export.read_directory(&vpath("/")).expect("enumerate");
+    let mut reader = export
+        .read_directory(&vpath("/"), ENTRY_BUDGET)
+        .expect("enumerate");
     assert_eq!(
         reader
             .seek(5, ENTRY_BUDGET)
@@ -358,7 +420,9 @@ fn a_cookie_beyond_the_budget_is_refused_without_reading() {
     let fixture = Fixture::new();
     fixture.file("/only.txt", b"synthetic");
     let export = fixture.open(read_only(), FeatureSet::NONE, bounds());
-    let mut reader = export.read_directory(&vpath("/")).expect("enumerate");
+    let mut reader = export
+        .read_directory(&vpath("/"), ENTRY_BUDGET)
+        .expect("enumerate");
     assert_eq!(
         reader
             .seek(ENTRY_BUDGET + 1, ENTRY_BUDGET)
@@ -375,7 +439,7 @@ fn enumerating_a_file_is_not_a_directory() {
     let export = fixture.open(full_grant(), FeatureSet::NONE, bounds());
     assert_eq!(
         export
-            .read_directory(&vpath("/a.txt"))
+            .read_directory(&vpath("/a.txt"), ENTRY_BUDGET)
             .expect_err("a file is not enumerable")
             .code(),
         FsErrorCode::Enotdir
@@ -387,7 +451,9 @@ fn an_entry_renders_without_its_name() {
     let fixture = Fixture::new();
     fixture.file("/secret-name.txt", b"synthetic");
     let export = fixture.open(read_only(), FeatureSet::NONE, bounds());
-    let mut reader = export.read_directory(&vpath("/")).expect("enumerate");
+    let mut reader = export
+        .read_directory(&vpath("/"), ENTRY_BUDGET)
+        .expect("enumerate");
     let entry = reader.next_entry().expect("entry").expect("one entry");
     let rendered = format!("{entry:?}");
     assert!(!rendered.contains("secret-name"), "{rendered}");

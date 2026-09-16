@@ -303,6 +303,23 @@ pub(crate) struct ActorReader {
     signal: ResetSignal,
     pending: Option<tokio::sync::oneshot::Receiver<HttpRead>>,
     pending_reset: Option<u16>,
+    /// The protocol reason code of the most recent RESET this reader produced.
+    ///
+    /// `CarrierEvent::Reset` carries a `ResetDetail`, which is HTTP-shaped and
+    /// deliberately narrow: `detail_with_status` folds every reason that is not
+    /// cancellation into one `StreamInterrupted`. That is the right vocabulary
+    /// for `http-forward/1` and the wrong one for a filesystem session, where
+    /// `AUTHORIZATION_EXPIRED` has to become a 1008 close and everything else a
+    /// 1011. Keeping the raw code lets the filesystem endpoint make that
+    /// distinction without widening `ResetDetail` for a reason only it needs.
+    last_reset_reason: Option<u16>,
+}
+
+impl ActorReader {
+    /// The protocol reason code of the most recent RESET, if there was one.
+    pub(crate) const fn last_reset_reason(&self) -> Option<u16> {
+        self.last_reset_reason
+    }
 }
 
 async fn detail_with_status(
@@ -335,6 +352,7 @@ impl CarrierReader for ActorReader {
                 if let Some(reason) = self.pending_reset {
                     let detail = detail_with_status(reason, &mut self.status).await;
                     self.pending_reset = None;
+                    self.last_reset_reason = Some(reason);
                     return CarrierEvent::Reset(detail);
                 }
                 if self.pending.is_none() {
@@ -421,6 +439,7 @@ pub(crate) fn actor_carriers(
             signal,
             pending: None,
             pending_reset: None,
+            last_reset_reason: None,
         },
         task,
         freeze,
