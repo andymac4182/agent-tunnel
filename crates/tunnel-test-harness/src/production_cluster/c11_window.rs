@@ -1729,6 +1729,38 @@ mod c17_validator_tests {
         }
     }
 
+    /// A dial that races an empty pin set is the normal shape of the
+    /// `verify-m3-mcp-isolation` flake recorded on M7-C86, so the scanner must
+    /// accept that cause on a real capture, not merely agree with the relay's
+    /// list.  Nobody has observed it inside a capture window, so this drives
+    /// the acceptance path directly.
+    #[test]
+    fn a_snapshot_carrying_an_unavailable_pin_dial_is_accepted() {
+        let spec = spec_with_roles(&["snapshot-relay-relay-a"])
+            .expect("spec")
+            .with_required_fields(std::iter::empty::<SafeField>())
+            .with_required_peer_faults(&[("ingress", "pool_connect", "transport_pins_unavailable")])
+            .expect("tuples");
+        let mut window = C11Window::new(spec);
+        window
+            .append(
+                "snapshot-relay-relay-a",
+                peer_fault_snapshot(&[("ingress", "pool_connect", "transport_pins_unavailable")])
+                    .as_bytes(),
+            )
+            .expect("the scanner accepts a pins-unavailable dial");
+        window.close("snapshot-relay-relay-a").expect("close");
+        window.mark_joined("snapshot-relay-relay-a").expect("join");
+        let report = window.finish(101).expect("finish");
+        assert!(
+            report.peer_faults_present.contains(
+                &PeerFaultTuple::new("ingress", "pool_connect", "transport_pins_unavailable")
+                    .unwrap()
+            ),
+            "the cause is counted, not merely tolerated"
+        );
+    }
+
     #[test]
     fn relay_snapshot_tuples_satisfy_exact_requirements_and_are_reported() {
         let spec = spec_with_roles(&["snapshot-relay-relay-a", "snapshot-relay-relay-b"])

@@ -466,7 +466,8 @@ both revisions produced identical traces in passing and failing runs. What
 remains is an unconfirmed ordering hypothesis, recorded on M7-C86.
 
 The retention work that fixes the isolation blackout is **not landed**; it is
-held on M7-C86 because it regresses this gate. At the landed revision this gate
+held on M7-C86 because it regresses this gate. At `85cdd24` on
+`m3c10-gate-only` this gate
 is unaffected: interleaved against `origin/main` with both binaries pre-built,
 8 of 8 on each arm.
 
@@ -1049,7 +1050,7 @@ boundaries at most every 15 s (defect M7-C80).
   before the backend is dialled — so what the case rules out is a *process*
   boundary and the backend itself doing the refusing, not an export-side
   session object. The stdio session counter reads zero here only because it
-  is never incremented for this backend kind Each principal opens a session
+  is never incremented for this backend kind.  Each principal opens a session
   through the cluster, consumer B presents consumer A's session ID on POST,
   GET and DELETE, all three must answer 404 indistinguishably from an unknown
   session, and both principals' own sessions must still answer exactly
