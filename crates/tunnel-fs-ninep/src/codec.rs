@@ -177,6 +177,11 @@ impl Frame {
 /// This is the consumer WebSocket rule.  Use [`FrameDecoder`] for a byte
 /// stream.
 ///
+/// `msize` is the bound in force.  **Before negotiation there is none, so pass
+/// [`MAX_MESSAGE_BYTES`]** — the same value [`FrameDecoder::new`] starts with,
+/// and what keeps a `Tversion` claiming a gigabyte impossible to send before
+/// any limit has been agreed.
+///
 /// # Errors
 ///
 /// [`CodecError::TruncatedBody`] when `bytes` is shorter than the declared
@@ -319,14 +324,18 @@ impl FrameDecoder {
     ///
     /// # Errors
     ///
-    /// [`SessionError::MsizeBelowFloor`] below [`MIN_MSIZE`], and
-    /// [`SessionError::BeforeVersion`] if a frame is partly received.
+    /// [`SessionError::MsizeBelowFloor`] below [`MIN_MSIZE`],
+    /// [`SessionError::MsizeNotAReduction`] above the bound already in force,
+    /// and [`SessionError::MidFrame`] if a frame is partly received.
     pub fn apply_msize(&mut self, msize: u32) -> Result<(), SessionError> {
-        if msize < MIN_MSIZE || msize > self.msize {
+        if msize < MIN_MSIZE {
             return Err(SessionError::MsizeBelowFloor);
         }
+        if msize > self.msize {
+            return Err(SessionError::MsizeNotAReduction);
+        }
         if !self.is_idle() {
-            return Err(SessionError::BeforeVersion);
+            return Err(SessionError::MidFrame);
         }
         self.msize = msize;
         Ok(())

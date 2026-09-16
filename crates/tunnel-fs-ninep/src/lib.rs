@@ -41,15 +41,22 @@
 //! The contract assigns non-UTF-8 input to this gate, because gate 1's
 //! `VirtualPath` is a `&str` by construction and a byte sequence that is not
 //! UTF-8 cannot reach path validation at all.  [`wire::Reader::string`] is the
-//! answer: **every** `string[s]` field in the profile, in both directions, is
-//! required to be valid UTF-8 and is otherwise refused with
+//! answer: **every** `string[s]` field in the profile is required to be valid
+//! UTF-8 on the way **in** and is otherwise refused with
 //! [`CodecError::StringNotUtf8`] naming the field.  There is no
 //! `from_utf8_lossy` in this crate — a U+FFFD substitution would turn one host
 //! name into a different one, and hand gate 2 a path naming a file the caller
-//! never asked for.  The rule covers `Rreadlink`'s target and the names inside
-//! an `Rreaddir` block as well as request names, so a host filename that cannot
-//! be represented produces an explicit refusal on the way *out* too, never a
-//! transliteration.
+//! never asked for.  The rule applies to `Rreadlink`'s target and the names
+//! inside an `Rreaddir` block as well as to request names, so a reply stream
+//! carrying a name that is not UTF-8 is refused rather than repaired.
+//!
+//! **On the way out this crate makes a lossy conversion inexpressible; it does
+//! not itself perform the refusal.** [`Message::Rreadlink`] and
+//! [`readdir::DirEntry`] take a `String`, so there is no API here through which
+//! a non-UTF-8 host name could be encoded at all — but the conversion from the
+//! host's bytes happens in gate 4, where an `OsStr` becomes a `String`, and
+//! that is where the refusal is taken.  See [`readdir::parse_entries`] for the
+//! policy gate 4 must implement when it meets one.
 //!
 //! # Payload-free by construction
 //!

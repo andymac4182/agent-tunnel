@@ -420,6 +420,84 @@ fn an_rflush_releases_a_tag_whose_original_reply_never_arrived() {
         session.fid(1).is_none(),
         "a flushed walk that never replied binds nothing"
     );
+    // `fid(1).is_none()` is also true of a fid that is merely *reserved*, so it
+    // cannot tell a released reservation from a stranded one.  `live_fids()`
+    // counts reservations, which is what the quota counts.
+    assert_eq!(
+        session.live_fids(),
+        1,
+        "the flush released the walk's reservation, not only its tag"
+    );
+}
+
+#[test]
+fn an_rflush_releases_the_flushed_requests_reservation_not_only_its_tag() {
+    // A reservation outlives only an outstanding request.  If the `Rflush`
+    // released the tag but not the reservation, the target fid would be
+    // stranded for the life of the session: no reply can ever bind it, and no
+    // `Tclunk` can release it because it is not bound.  A client that flushes
+    // walks would exhaust its own fid quota with nothing to clunk.
+    let mut session = attached_session();
+    session.request(&twalk(3, 0, 1, &["a"])).expect("Twalk");
+    assert_eq!(session.live_fids(), 2, "the walk reserved fid 1");
+    session
+        .request(&Frame::new(4, Message::Tflush { oldtag: 3 }))
+        .expect("Tflush");
+    session
+        .complete(&Frame::new(4, Message::Rflush))
+        .expect("Rflush");
+    assert_eq!(session.outstanding_tags(), 0);
+    assert_eq!(session.live_fids(), 1, "fid 1 is free again");
+    // ...and provably free: it can be walked to.
+    walk(&mut session, 5, 0, 1, &["a"], QidKind::Directory);
+    assert_eq!(session.fid(1).unwrap().path().as_str(), "/a");
+}
+
+#[test]
+fn a_flushed_attach_leaves_the_session_able_to_attach_again() {
+    let mut session = session();
+    version_handshake(&mut session);
+    session.request(&tattach(0, 1)).expect("Tattach");
+    assert_eq!(session.live_fids(), 1, "the attach reserved fid 0");
+    session
+        .request(&Frame::new(2, Message::Tflush { oldtag: 1 }))
+        .expect("Tflush");
+    session
+        .complete(&Frame::new(2, Message::Rflush))
+        .expect("Rflush");
+    assert_eq!(session.phase(), Phase::Versioned);
+    assert_eq!(session.live_fids(), 0, "the root fid is free again");
+    // A second attempt on the same fid is admitted, where a stranded
+    // reservation would have answered FidInUse for the life of the session.
+    attach(&mut session, 0, 3);
+    assert_eq!(session.phase(), Phase::Attached);
+    assert_eq!(session.fid(0).unwrap().path().as_str(), "/");
+}
+
+#[test]
+fn a_late_rattach_after_its_flush_binds_nothing() {
+    let mut session = session();
+    version_handshake(&mut session);
+    session.request(&tattach(0, 1)).expect("Tattach");
+    session
+        .request(&Frame::new(2, Message::Tflush { oldtag: 1 }))
+        .expect("Tflush");
+    session
+        .complete(&Frame::new(2, Message::Rflush))
+        .expect("Rflush");
+    // The tag is gone, so a dispatcher that fed this reply here would get a
+    // 1002 close — which is why dropping late replies is gate 4's obligation.
+    assert_eq!(
+        session.complete(&Frame::new(
+            1,
+            Message::Rattach {
+                qid: Qid::new(QidKind::Directory, 1),
+            }
+        )),
+        Err(SessionError::TagNotInUse)
+    );
+    assert_eq!(session.phase(), Phase::Versioned);
+    assert_eq!(session.live_fids(), 0);
 }
 
 #[test]
@@ -1310,6 +1388,273 @@ fn walk_needs_no_capability_but_discloses_only_qids() {
         session.request(&Frame::new(3, Message::Tlopen { fid: 1, flags: 0 })),
         Err(SessionError::NotPermitted)
     );
+}
+
+// --------------------------------------------- replies after a clunk
+
+#[test]
+fn an_in_place_walk_whose_fid_was_clunked_binds_nothing() {
+    // Re-creating a clunked fid here would put a number back into the table
+    // that the quota had already released, so `live_fids()` could exceed
+    // `maxFids` — the bound gate 4 relies on to cap open descriptors.
+    let mut session = attached_session();
+    walk(&mut session, 2, 0, 1, &["f"], QidKind::Directory);
+    session.request(&twalk(3, 1, 1, &["x"])).expect("Twalk");
+    session
+        .request(&Frame::new(4, Message::Tclunk { fid: 1 }))
+        .expect("Tclunk");
+    session
+        .complete(&Frame::new(4, Message::Rclunk))
+        .expect("Rclunk");
+    assert_eq!(session.live_fids(), 1);
+
+    session
+        .complete(&Frame::new(
+            3,
+            Message::Rwalk {
+                qids: vec![Qid::new(QidKind::Directory, 9)],
+            },
+        ))
+        .expect("a reply for a clunked fid applies nothing rather than failing");
+    assert!(session.fid(1).is_none());
+    assert_eq!(session.live_fids(), 1, "the quota did not gain a fid");
+    assert_eq!(session.outstanding_tags(), 0, "the tag was released");
+}
+
+#[test]
+fn a_clone_walk_whose_origin_was_clunked_releases_its_reservation() {
+    let mut session = attached_session();
+    walk(&mut session, 2, 0, 1, &["f"], QidKind::Directory);
+    // A zero-element clone takes its qid from the origin, which is about to go.
+    session.request(&twalk(3, 1, 2, &[])).expect("Twalk");
+    assert_eq!(session.live_fids(), 3, "fid 2 is reserved");
+    session
+        .request(&Frame::new(4, Message::Tclunk { fid: 1 }))
+        .expect("Tclunk");
+    session
+        .complete(&Frame::new(4, Message::Rclunk))
+        .expect("Rclunk");
+
+    session
+        .complete(&Frame::new(3, Message::Rwalk { qids: Vec::new() }))
+        .expect("applies nothing rather than failing");
+    assert!(session.fid(2).is_none());
+    assert_eq!(
+        session.live_fids(),
+        1,
+        "the reservation went with the tag, not stranded"
+    );
+    assert_eq!(session.outstanding_tags(), 0);
+}
+
+#[test]
+fn an_open_or_create_reply_for_a_clunked_fid_applies_nothing() {
+    for created in [false, true] {
+        let mut session = attached_session();
+        walk(&mut session, 2, 0, 1, &["d"], QidKind::Directory);
+        let request = if created {
+            Message::Tlcreate {
+                fid: 1,
+                name: "new.txt".to_owned(),
+                flags: tunnel_fs_ninep::flags::O_WRONLY,
+                mode: 0o644,
+                gid: 0,
+            }
+        } else {
+            Message::Tlopen {
+                fid: 1,
+                flags: tunnel_fs_ninep::flags::O_DIRECTORY,
+            }
+        };
+        session.request(&Frame::new(3, request)).expect("request");
+        session
+            .request(&Frame::new(4, Message::Tclunk { fid: 1 }))
+            .expect("Tclunk");
+        session
+            .complete(&Frame::new(4, Message::Rclunk))
+            .expect("Rclunk");
+
+        let reply = if created {
+            Message::Rlcreate {
+                qid: Qid::new(QidKind::File, 5),
+                iounit: 0,
+            }
+        } else {
+            Message::Rlopen {
+                qid: Qid::new(QidKind::Directory, 5),
+                iounit: 0,
+            }
+        };
+        session
+            .complete(&Frame::new(3, reply))
+            .expect("a reply is not a request: there is no Rlerror to send for it");
+        assert!(session.fid(1).is_none(), "created={created}");
+        assert_eq!(session.live_fids(), 1, "created={created}");
+        assert_eq!(session.outstanding_tags(), 0, "created={created}");
+    }
+}
+
+// ------------------------------------------------------ pipelined handshake
+
+#[test]
+fn two_tversions_before_any_rversion_are_refused() {
+    // The phase moves only when the `Rversion` arrives, so without the
+    // pending-negotiation check a pipelined client could land two `Tversion`s
+    // and the second would silently overwrite what the first settled.
+    let mut session = session();
+    session.request(&tversion(65_536)).expect("first Tversion");
+    let error = session.request(&tversion(256)).unwrap_err();
+    assert_eq!(error, SessionError::RepeatedVersion);
+    assert!(error.is_fatal());
+    // The first negotiation is intact.
+    let Message::Rversion { msize, .. } = session.version_reply().unwrap().message else {
+        panic!("wrong reply");
+    };
+    assert_eq!(msize, 65_536, "the second Tversion did not overwrite it");
+}
+
+#[test]
+fn two_tattachs_before_any_rattach_are_refused() {
+    let mut session = session();
+    version_handshake(&mut session);
+    session.request(&tattach(0, 1)).expect("first Tattach");
+    let error = session.request(&tattach(7, 2)).unwrap_err();
+    assert_eq!(error, SessionError::RepeatedAttach);
+    assert!(error.is_fatal());
+    assert_eq!(session.live_fids(), 1, "only one root fid was ever claimed");
+}
+
+// -------------------------------------------------------- reply bounds
+
+#[test]
+fn a_reply_carrying_more_bytes_than_its_request_asked_for_is_refused() {
+    let mut session = attached_session();
+    walk(&mut session, 2, 0, 1, &["f"], QidKind::File);
+    open(
+        &mut session,
+        3,
+        1,
+        tunnel_fs_ninep::flags::O_RDWR,
+        QidKind::File,
+    );
+
+    // Tread count 2: two bytes back is fine, three is not.
+    for (data, ok) in [(vec![1u8, 2], true), (vec![1u8, 2, 3], false)] {
+        let mut session = session.clone();
+        session
+            .request(&Frame::new(
+                4,
+                Message::Tread {
+                    fid: 1,
+                    offset: 0,
+                    count: 2,
+                },
+            ))
+            .expect("Tread");
+        let result = session.complete(&Frame::new(4, Message::Rread { data }));
+        assert_eq!(result.is_ok(), ok);
+        if !ok {
+            assert_eq!(result, Err(SessionError::MalformedReply));
+        }
+    }
+
+    // Twrite of three bytes: acknowledging three is fine, four is not.
+    for (count, ok) in [(3u32, true), (4u32, false)] {
+        let mut session = session.clone();
+        session
+            .request(&Frame::new(
+                5,
+                Message::Twrite {
+                    fid: 1,
+                    offset: 0,
+                    data: vec![9, 9, 9],
+                },
+            ))
+            .expect("Twrite");
+        let result = session.complete(&Frame::new(5, Message::Rwrite { count }));
+        assert_eq!(result.is_ok(), ok, "count {count}");
+    }
+}
+
+#[test]
+fn an_rreaddir_larger_than_its_treaddir_asked_for_is_refused() {
+    let mut session = attached_session();
+    walk(&mut session, 2, 0, 1, &["d"], QidKind::Directory);
+    open(
+        &mut session,
+        3,
+        1,
+        tunnel_fs_ninep::flags::O_DIRECTORY,
+        QidKind::Directory,
+    );
+    session
+        .request(&Frame::new(
+            4,
+            Message::Treaddir {
+                fid: 1,
+                offset: 0,
+                count: 32,
+            },
+        ))
+        .expect("Treaddir");
+    assert_eq!(
+        session.complete(&Frame::new(
+            4,
+            Message::Rreaddir {
+                data: vec![0u8; 33]
+            }
+        )),
+        Err(SessionError::MalformedReply)
+    );
+}
+
+#[test]
+fn an_rwalk_with_no_qids_for_a_nonempty_twalk_is_refused() {
+    // 9P answers an error reply when the first element cannot be walked, not
+    // an `Rwalk` carrying no qids, which the client is supposed to read as a
+    // successful zero-element clone.
+    let mut session = attached_session();
+    session.request(&twalk(3, 0, 1, &["a"])).expect("Twalk");
+    assert_eq!(
+        session.complete(&Frame::new(3, Message::Rwalk { qids: Vec::new() })),
+        Err(SessionError::MalformedReply)
+    );
+}
+
+#[test]
+fn the_getattr_mask_bits_are_the_values_9p2000l_defines() {
+    use tunnel_fs_ninep::flags::{
+        GETATTR_ATIME, GETATTR_BLOCKS, GETATTR_BTIME, GETATTR_CTIME, GETATTR_DATA_VERSION,
+        GETATTR_GEN, GETATTR_GID, GETATTR_INO, GETATTR_MODE, GETATTR_MTIME, GETATTR_NLINK,
+        GETATTR_RDEV, GETATTR_SIZE, GETATTR_UID,
+    };
+
+    // Each is one bit, in the reference's order, with no two sharing one.
+    let basic = [
+        GETATTR_MODE,
+        GETATTR_NLINK,
+        GETATTR_UID,
+        GETATTR_GID,
+        GETATTR_RDEV,
+        GETATTR_ATIME,
+        GETATTR_MTIME,
+        GETATTR_CTIME,
+        GETATTR_INO,
+        GETATTR_SIZE,
+        GETATTR_BLOCKS,
+    ];
+    for (index, bit) in basic.iter().enumerate() {
+        assert_eq!(*bit, 1u64 << index, "bit {index}");
+    }
+    assert_eq!(basic.iter().fold(0, |all, bit| all | bit), GETATTR_BASIC);
+    assert_eq!(
+        GETATTR_BASIC | GETATTR_BTIME | GETATTR_GEN | GETATTR_DATA_VERSION,
+        tunnel_fs_ninep::GETATTR_ALL
+    );
+    // The two the review caught: `nlink` is not `uid`, and `size` is not
+    // `atime`.
+    assert_eq!(GETATTR_NLINK, 0x2);
+    assert_eq!(GETATTR_SIZE, 0x200);
 }
 
 #[test]

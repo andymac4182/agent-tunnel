@@ -182,6 +182,15 @@ enum Effect {
     },
     /// Release `fid` whatever the answer is.
     Release { fid: u32 },
+    /// The reply carries a byte count the request bounded.
+    ///
+    /// `Tread` and `Treaddir` bound their reply's `data`; `Twrite` bounds the
+    /// `count` an `Rwrite` may acknowledge, because a provider cannot have
+    /// written more bytes than the request carried.  Without this the session
+    /// would accept an `Rread` of a hundred bytes for a two-byte `Tread`, which
+    /// is the same class of unchecked reply as an `Rwalk` longer than its
+    /// `Twalk`.
+    CountedReply { limit: u32 },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -344,6 +353,19 @@ impl Session {
     /// [`SessionError::UnexpectedReply`] for a reply of the wrong type, and
     /// [`SessionError::MalformedReply`] for one whose fields contradict the
     /// request it answers.
+    ///
+    /// # Gate 4 must not feed a late reply to this
+    ///
+    /// A provider reply that arrives **after** its `Rflush` names a tag this
+    /// machine has already released, so it answers [`SessionError::TagNotInUse`]
+    /// — which is a 1002 close.  That is the right answer for a peer inventing
+    /// a tag and the wrong one for an ordinary flush race, and the machine
+    /// cannot tell them apart: both look like a reply on a released tag.  **The
+    /// dispatcher owns the distinction and must drop a reply whose tag it
+    /// flushed rather than passing it here.** The contract already says a
+    /// normal reply arriving before `Rflush` is honoured and the tag stays
+    /// reserved until the flush response; this is the other side of that
+    /// window.
     pub fn complete(&mut self, frame: &Frame) -> Result<(), SessionError> {
         if self.phase == Phase::Closed {
             return Err(SessionError::Closed);
@@ -366,9 +388,17 @@ impl Session {
         if reply_for(state.message_type) != frame.message_type() {
             return Err(SessionError::UnexpectedReply);
         }
-        self.apply_effect(&state.effect, &frame.message)?;
+        let applied = self.apply_effect(&state.effect, &frame.message);
+        // Whatever the effect did or refused to do, the request is over: its
+        // tag is released and any fid it had reserved but not bound goes with
+        // it.  A reservation exists only for an outstanding request, so
+        // leaving one behind on an error path would strand a fid number that
+        // is neither bound (so it cannot be clunked) nor free (so it cannot be
+        // walked to).  After a successful bind this is a no-op, because
+        // `apply_effect` consumed the reservation itself.
+        self.undo_reservation(&state.effect);
         self.retire_tag(frame.tag, &state);
-        Ok(())
+        applied
     }
 
     /// Apply an `Rlerror` and release its tag.
@@ -475,11 +505,21 @@ impl Session {
             return;
         }
         self.tags.remove(&tag);
-        if let Some(flushed) = state.flushing {
+        if let Some(flushed) = state.flushing
+            && let Some(target) = self.tags.remove(&flushed)
+        {
             // An `Rflush` releases the tag it flushed, whether or not the
             // original reply ever arrived.  Only after this may the client
-            // reuse that tag.
-            self.tags.remove(&flushed);
+            // reuse that tag — and the flushed request's **reservation** goes
+            // with it.  Without that, a flushed `Twalk` or `Tattach` strands
+            // its target fid for the life of the session: no reply will ever
+            // bind it and no `Tclunk` can release it, because it is not bound,
+            // and a client that flushes walks exhausts its own fid quota with
+            // nothing to clunk.  A tag already marked `answered` bound its fid
+            // and had its effect cleared, so it has nothing left to undo.
+            if !target.answered {
+                self.undo_reservation(&target.effect);
+            }
         }
     }
 
@@ -545,6 +585,13 @@ impl Session {
         Ok(())
     }
 
+    /// Whether a `Tattach` is outstanding with no reply yet.
+    fn attach_outstanding(&self) -> bool {
+        self.tags
+            .values()
+            .any(|tag| matches!(tag.effect, Effect::Attach { .. }))
+    }
+
     fn require_fid(&self, fid: u32) -> Result<&FidState, SessionError> {
         if fid == NOFID {
             return Err(SessionError::UnknownFid);
@@ -557,7 +604,12 @@ impl Session {
     fn classify(&self, frame: &Frame) -> Result<(Accepted, Effect), SessionError> {
         match &frame.message {
             Message::Tversion { msize, version } => {
-                if self.phase != Phase::AwaitingVersion {
+                // `pending_msize` is the second half of "one `Tversion` per
+                // session": the phase alone only moves when the `Rversion`
+                // arrives, so a **pipelined** client could otherwise land two
+                // `Tversion`s before either was answered, and the second would
+                // silently overwrite what the first negotiated.
+                if self.phase != Phase::AwaitingVersion || self.pending_msize.is_some() {
                     return Err(SessionError::RepeatedVersion);
                 }
                 let negotiated = negotiate(*msize, version, self.msize)?;
@@ -581,6 +633,12 @@ impl Session {
                     Phase::AwaitingVersion => return Err(SessionError::BeforeVersion),
                     Phase::Attached => return Err(SessionError::RepeatedAttach),
                     Phase::Versioned | Phase::Closed => {}
+                }
+                // The phase moves only when the `Rattach` arrives, so the
+                // outstanding-attach check is what stops a pipelined client
+                // binding two root fids before either was answered.
+                if self.attach_outstanding() {
+                    return Err(SessionError::RepeatedAttach);
                 }
                 if *afid != NOFID || !uname.is_empty() || !aname.is_empty() || *n_uname != NONUNAME
                 {
@@ -800,7 +858,7 @@ impl Session {
                     Effect::None,
                 ))
             }
-            Message::Tread { fid, .. } => {
+            Message::Tread { fid, count, .. } => {
                 let state = self.require_fid(*fid)?;
                 let open = state.open.ok_or(SessionError::FidNotOpen)?;
                 if open.directory {
@@ -814,10 +872,10 @@ impl Session {
                 }
                 Ok((
                     node(Primitives::one(Primitive::Read), &state.path),
-                    Effect::None,
+                    Effect::CountedReply { limit: *count },
                 ))
             }
-            Message::Twrite { fid, .. } => {
+            Message::Twrite { fid, data, .. } => {
                 let state = self.require_fid(*fid)?;
                 let open = state.open.ok_or(SessionError::FidNotOpen)?;
                 if open.directory {
@@ -828,10 +886,12 @@ impl Session {
                 }
                 Ok((
                     node(Primitives::one(Primitive::Write), &state.path),
-                    Effect::None,
+                    Effect::CountedReply {
+                        limit: u32::try_from(data.len()).unwrap_or(u32::MAX),
+                    },
                 ))
             }
-            Message::Treaddir { fid, .. } => {
+            Message::Treaddir { fid, count, .. } => {
                 let state = self.require_fid(*fid)?;
                 let open = state.open.ok_or(SessionError::FidNotOpen)?;
                 if !open.directory {
@@ -839,7 +899,7 @@ impl Session {
                 }
                 Ok((
                     node(Primitives::one(Primitive::Readdir), &state.path),
-                    Effect::None,
+                    Effect::CountedReply { limit: *count },
                 ))
             }
             Message::Tclunk { fid } => {
@@ -891,10 +951,11 @@ impl Session {
     fn apply_effect(&mut self, effect: &Effect, reply: &Message) -> Result<(), SessionError> {
         match (effect, reply) {
             (Effect::Attach { fid }, Message::Rattach { qid }) => {
-                let path = self
-                    .reserved_fids
-                    .remove(fid)
-                    .ok_or(SessionError::MalformedReply)?;
+                // A flushed attach released its reservation, so a late
+                // `Rattach` binds nothing and leaves the session unattached.
+                let Some(path) = self.reserved_fids.remove(fid) else {
+                    return Ok(());
+                };
                 if qid.kind != QidKind::Directory {
                     // The export root is a directory.  A provider claiming
                     // otherwise has bound the session to something this profile
@@ -912,6 +973,25 @@ impl Session {
                 self.phase = Phase::Attached;
                 Ok(())
             }
+            (Effect::CountedReply { limit }, Message::Rread { data })
+            | (Effect::CountedReply { limit }, Message::Rreaddir { data }) => {
+                // A short read is normal; a reply longer than the request asked
+                // for is not, and accepting it would let a provider return
+                // bytes the caller never made room for.
+                if data.len() > *limit as usize {
+                    return Err(SessionError::MalformedReply);
+                }
+                Ok(())
+            }
+            (Effect::CountedReply { limit }, Message::Rwrite { count }) => {
+                // A short write is normal; acknowledging more bytes than the
+                // `Twrite` carried is not, and `bytesAcknowledged` is built
+                // from these.
+                if count > limit {
+                    return Err(SessionError::MalformedReply);
+                }
+                Ok(())
+            }
             (
                 Effect::Walk {
                     origin,
@@ -925,6 +1005,14 @@ impl Session {
                 if qids.len() > *names {
                     return Err(SessionError::MalformedReply);
                 }
+                if qids.is_empty() && *names > 0 {
+                    // 9P: when the **first** element cannot be walked the
+                    // server answers an error reply, not an `Rwalk` carrying
+                    // no qids.  Accepting the latter would let a provider
+                    // report "nothing found" in a shape the client is supposed
+                    // to read as a successful zero-element clone.
+                    return Err(SessionError::MalformedReply);
+                }
                 if qids.len() < *names {
                     // A partial walk binds nothing.  The reservation is
                     // released, and `newfid` is as unused as before.
@@ -933,14 +1021,32 @@ impl Session {
                     }
                     return Ok(());
                 }
-                let qid = match qids.last() {
-                    Some(qid) => *qid,
+                let qid = if let Some(qid) = qids.last() {
+                    *qid
+                } else {
                     // A zero-element walk clones the fid, so the destination's
-                    // qid is the origin's.
-                    None => self.require_fid(*origin)?.qid,
+                    // qid is the origin's — and if the origin was clunked
+                    // while this walk was outstanding there is nothing left to
+                    // clone, so the reply applies nothing.
+                    match self.fids.get(origin) {
+                        Some(state) => state.qid,
+                        None => return Ok(()),
+                    }
                 };
                 if *reserved {
-                    self.reserved_fids.remove(newfid);
+                    if self.reserved_fids.remove(newfid).is_none() {
+                        // The reservation was released — flushed, or the
+                        // request already failed — so there is nothing to bind.
+                        return Ok(());
+                    }
+                } else if !self.fids.contains_key(newfid) {
+                    // A walk in place reserves nothing, so it may bind only a
+                    // fid that is **still** bound.  Re-creating one clunked
+                    // while the walk was outstanding would put a number back
+                    // into the table that the quota had already released, and
+                    // `live_fids()` could then exceed `maxFids` — the bound
+                    // gate 4 relies on to cap open descriptors.
+                    return Ok(());
                 }
                 self.fids.insert(
                     *newfid,
@@ -953,7 +1059,12 @@ impl Session {
                 Ok(())
             }
             (Effect::Open { fid, mode }, Message::Rlopen { qid, .. }) => {
-                let state = self.fids.get_mut(fid).ok_or(SessionError::UnknownFid)?;
+                // A fid clunked while its open was outstanding is gone; the
+                // reply applies nothing rather than failing, because a reply
+                // is not a request and gate 4 has no `Rlerror` to send for it.
+                let Some(state) = self.fids.get_mut(fid) else {
+                    return Ok(());
+                };
                 let mut mode = *mode;
                 // The provider's qid is the authority on the node's kind, so an
                 // open that the flags called a file and the host calls a
@@ -968,7 +1079,9 @@ impl Session {
                 Ok(())
             }
             (Effect::Create { fid, child, mode }, Message::Rlcreate { qid, .. }) => {
-                let state = self.fids.get_mut(fid).ok_or(SessionError::UnknownFid)?;
+                let Some(state) = self.fids.get_mut(fid) else {
+                    return Ok(());
+                };
                 if qid.kind != QidKind::File {
                     return Err(SessionError::MalformedReply);
                 }

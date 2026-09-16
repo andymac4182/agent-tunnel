@@ -244,6 +244,14 @@ pub enum SessionError {
     UnsupportedDialect,
     /// The offered `msize` was below [`tunnel_fs_core::MIN_MESSAGE_BYTES`].
     MsizeBelowFloor,
+    /// An `msize` above the bound already in force.
+    ///
+    /// Distinct from [`SessionError::MsizeBelowFloor`]: negotiation reduces
+    /// only, and raising the bound after bytes have been accepted under a
+    /// smaller one would let a peer re-frame what it already sent.
+    MsizeNotAReduction,
+    /// A bound change was attempted part-way through a frame.
+    MidFrame,
     /// `Tattach` carried an `afid` other than `NOFID`, a non-empty `uname` or
     /// `aname`, or an `n_uname` other than `NONUNAME`.
     ///
@@ -330,6 +338,8 @@ impl SessionError {
             | Self::RepeatedAttach
             | Self::UnsupportedDialect
             | Self::MsizeBelowFloor
+            | Self::MsizeNotAReduction
+            | Self::MidFrame
             | Self::AttachFieldNotPermitted
             | Self::TagInUse
             | Self::TagNotInUse

@@ -116,7 +116,7 @@ pub enum MessageType {
 ///
 /// Listed so a peer using one is told it reached for a real opcode the profile
 /// denies, rather than being told its byte means nothing.
-pub const KNOWN_OUTSIDE_PROFILE: [u8; 21] = [
+pub const KNOWN_OUTSIDE_PROFILE: [u8; 25] = [
     8, 9, // Tstatfs / Rstatfs
     18, 19, // Tmknod / Rmknod
     30, 31, // Txattrwalk / Rxattrwalk
@@ -125,11 +125,14 @@ pub const KNOWN_OUTSIDE_PROFILE: [u8; 21] = [
     52, 53, // Tlock / Rlock
     54, 55, // Tgetlock / Rgetlock
     102, 103, // Tauth / Rauth — no custom bearer-token scheme
-    107, // Rerror — plain 9P2000 only
-    112, // Topen — plain 9P2000 only
-    114, // Tcreate — plain 9P2000 only
-    124, // Tstat — plain 9P2000 only
-    126, // Twstat — plain 9P2000 only
+    // The plain-9P2000 opcodes, **both** directions of each: a peer that
+    // negotiated the wrong dialect sends the request, and a client reading a
+    // wrongly-configured server's stream sees the reply.
+    107, // Rerror
+    112, 113, // Topen / Ropen
+    114, 115, // Tcreate / Rcreate
+    124, 125, // Tstat / Rstat
+    126, 127, // Twstat / Rwstat
 ];
 
 impl MessageType {

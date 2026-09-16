@@ -93,18 +93,43 @@ pub const SETATTR_ALLOWED: u32 = SETATTR_MODE
 /// `AT_REMOVEDIR`, the only `Tunlinkat` flag this profile accepts.
 pub const AT_REMOVEDIR: u32 = 0x200;
 
-/// `Tgetattr` `request_mask` bits, `P9_GETATTR_*`.
+// `Tgetattr` `request_mask` bits, `P9_GETATTR_*`.  The complete set is spelled
+// out rather than the handful this crate happens to reference: these are
+// exported, a TypeScript client will read them, and a partial list invites a
+// caller to guess the gaps.  Each is one bit, in the order the 9P2000.L
+// reference defines them.
+/// `mode`.
 pub const GETATTR_MODE: u64 = 0x0000_0001;
 /// `nlink`.
-pub const GETATTR_NLINK: u64 = 0x0000_0004;
+pub const GETATTR_NLINK: u64 = 0x0000_0002;
+/// `uid`.
+pub const GETATTR_UID: u64 = 0x0000_0004;
+/// `gid`.
+pub const GETATTR_GID: u64 = 0x0000_0008;
 /// `rdev`.
 pub const GETATTR_RDEV: u64 = 0x0000_0010;
+/// `atime`.
+pub const GETATTR_ATIME: u64 = 0x0000_0020;
+/// `mtime`.
+pub const GETATTR_MTIME: u64 = 0x0000_0040;
+/// `ctime`.
+pub const GETATTR_CTIME: u64 = 0x0000_0080;
+/// `ino`, which this profile answers from the qid path rather than a host
+/// inode number.
+pub const GETATTR_INO: u64 = 0x0000_0100;
 /// `size`.
-pub const GETATTR_SIZE: u64 = 0x0000_0020;
-/// The `P9_GETATTR_BASIC` set: mode, nlink, uid, gid, rdev, size, blocks and
-/// the three timestamps.
+pub const GETATTR_SIZE: u64 = 0x0000_0200;
+/// `blocks`, which carries `blksize` with it.
+pub const GETATTR_BLOCKS: u64 = 0x0000_0400;
+/// The `P9_GETATTR_BASIC` set: every bit above.
 pub const GETATTR_BASIC: u64 = 0x0000_07FF;
-/// `btime`, `gen` and `data_version` on top of the basic set.
+/// `btime`.
+pub const GETATTR_BTIME: u64 = 0x0000_0800;
+/// `gen`.
+pub const GETATTR_GEN: u64 = 0x0000_1000;
+/// `data_version`.
+pub const GETATTR_DATA_VERSION: u64 = 0x0000_2000;
+/// `P9_GETATTR_ALL`: the basic set plus `btime`, `gen` and `data_version`.
 pub const GETATTR_ALL: u64 = 0x0000_3FFF;
 
 /// Up to four primitives one request requires, as a conjunction.

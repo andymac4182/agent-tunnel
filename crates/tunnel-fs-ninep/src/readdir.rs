@@ -12,8 +12,22 @@
 //! somewhere:
 //!
 //! * Entry names are **UTF-8 or refused**, the same rule every other
-//!   `string[s]` in this profile follows.  A host name that is not UTF-8
-//!   produces an explicit refusal, never a mangled name.
+//!   `string[s]` in this profile follows.  A block carrying one that is not
+//!   UTF-8 is refused, never mangled.
+//!
+//!   On the **encoding** side [`DirEntry`] takes a `String`, so a non-UTF-8
+//!   name cannot be expressed here at all; the conversion from the host's
+//!   bytes happens in gate 4.  **Gate 4's obligation, pinned here because this
+//!   is where a reader will look for it:** when an entry's host name is not
+//!   representable in UTF-8, fail the whole `Treaddir` with `EINVAL` — do
+//!   **not** skip the entry.  The two are not equivalent and the choice is not
+//!   free: skipping hides a file from a caller that believes it received the
+//!   whole listing, which is exactly the silent-substitution failure the
+//!   refuse-never-repair rule exists to prevent, while refusing makes one
+//!   unrepresentable name render its directory unlistable.  `docs/testing.md`
+//!   requires "the documented explicit result", and the explicit result is the
+//!   error — the same answer gate 2 already gives for a symbolic-link target
+//!   that is not valid UTF-8.
 //! * The `type[1]` byte is restricted to directory, regular file and symbolic
 //!   link.  Gate 2 refuses special files, sockets, FIFOs and device nodes, so a
 //!   provider cannot enumerate one, and a client cannot be told one exists.
@@ -101,7 +115,14 @@ pub fn parse_entries(data: &[u8]) -> Result<Vec<DirEntry>, CodecError> {
     let mut reader = Reader::new(data);
     let mut entries = Vec::new();
     while reader.remaining() > 0 {
-        let qid = reader.qid()?;
+        // A block that runs out mid-record is malformed wherever it runs out,
+        // so truncation is reported the same way in every field.  A qid whose
+        // *type byte* is outside the profile keeps its own refusal, because
+        // that is a different failure: the bytes were all there.
+        let qid = reader.qid().map_err(|error| match error {
+            CodecError::TruncatedBody => CodecError::MalformedDirEntry,
+            other => other,
+        })?;
         let offset = reader.u64().map_err(|_| CodecError::MalformedDirEntry)?;
         let dirent_type = reader.u8().map_err(|_| CodecError::MalformedDirEntry)?;
         kind_from_dirent(dirent_type, qid)?;
