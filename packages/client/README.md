@@ -163,8 +163,9 @@ All were in the TypeScript; none in the Rust codec or in the fixtures.
 * **`name` was used as both the message-type discriminator and the 9P `name[s]`
   field**, silently overwriting the discriminator on the eight messages carrying
   both. The discriminator is now `kind`.
-* Three hand-transcription errors in `test/expected.ts` and the boundary
-  expectations, described under "How the expectation table was built" below.
+* Four hand-transcription errors: three in `test/expected.ts` and one in the
+  boundary expectations, described under "How the expectation table was built"
+  below.
 
 ### How the expectation table was built
 
