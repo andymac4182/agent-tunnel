@@ -151,7 +151,10 @@ Releasing the entry does not weaken the guarantees the journal exists for:
   A stream ID the session still retains keeps its journaled refusal, which its
   own `STREAM_FORGET` releases.
 - **No resurrection.** A new message ID still cannot reuse a forgotten stream
-  ID, and the owner never reuses a stream ID within a session.
+  ID at or below the reclamation watermark, and the owner never reuses a stream
+  ID within a session.  An ID refused before it was journaled stays above the
+  watermark and is admissible to a later `OPEN`: it was never dispatched, so
+  that is a first dispatch rather than a resurrection.
 - **No fabricated result.** The refusal is the connector's own typed
   `REJECTED`. The connector never replays or invents an `OPENED` for an entry
   it no longer holds. After the horizon it can no longer distinguish a retry
