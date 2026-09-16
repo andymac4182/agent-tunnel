@@ -962,8 +962,9 @@ impl Gate<'_> {
         };
         // Stop between rotations: a stop that lands inside an attempt can
         // fail its stream-forget barrier with "data writer stopped before
-        // barrier completion" (seen once in fifteen runs).  Waiting for a
-        // settled carrier is bounded and does not hide a stop failure.
+        // barrier completion" (defect M7-C84, seen once in fifteen runs).
+        // The wait narrows that window; it is bounded and does not hide a
+        // stop failure, and a failure names the phase it stopped in.
         let settled = Instant::now() + WAIT;
         loop {
             let status = client.status_snapshot();
@@ -974,10 +975,17 @@ impl Gate<'_> {
             }
             sleep(POLL).await;
         }
+        let stopping = client.status_snapshot();
         match timeout(CLEANUP_TIMEOUT, client.stop()).await {
             Ok(Ok(())) => Ok(()),
-            Ok(Err(error)) => Err(HarnessError::Process(format!("device stop: {error}"))),
-            Err(_) => Err(HarnessError::Timeout("device stop timed out".into())),
+            Ok(Err(error)) => Err(HarnessError::Process(format!(
+                "device stop in phase={} candidate_generation={:?} rotations={}: {error}",
+                stopping.phase, stopping.candidate_generation, stopping.rotations_completed
+            ))),
+            Err(_) => Err(HarnessError::Timeout(format!(
+                "device stop timed out in phase={} candidate_generation={:?}",
+                stopping.phase, stopping.candidate_generation
+            ))),
         }
     }
 
