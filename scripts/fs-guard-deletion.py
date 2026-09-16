@@ -733,10 +733,7 @@ GATE3_CASES: list[tuple[str, list[Edit]]] = [
         [
             (
                 NINEP_SESSION,
-                """                if *afid != NOFID
-                    || !uname.is_empty()
-                    || !aname.is_empty()
-                    || *n_uname != NONUNAME
+                """                if *afid != NOFID || !uname.is_empty() || !aname.is_empty() || *n_uname != NONUNAME
                 {
                     return Err(SessionError::AttachFieldNotPermitted);
                 }
@@ -908,6 +905,29 @@ GATE3_CASES: list[tuple[str, list[Edit]]] = [
 """,
                 "",
             )
+        ],
+    ),
+    (
+        # The reply-type match and `apply_effect`'s catch-all mask one another:
+        # with the match gone, a mismatched reply still falls through to the
+        # catch-all.  Proven as a pair, and said so rather than claimed singly.
+        "the reply-type match and the effect pairing together",
+        [
+            (
+                NINEP_SESSION,
+                """        if reply_for(state.message_type) != frame.message_type() {
+            return Err(SessionError::UnexpectedReply);
+        }
+""",
+                "",
+            ),
+            (
+                NINEP_SESSION,
+                """            // Every other pairing means the reply's type did not match its
+            // request's, which `complete` already refused.
+            _ => Err(SessionError::UnexpectedReply),""",
+                """            _ => Ok(()),""",
+            ),
         ],
     ),
     (
