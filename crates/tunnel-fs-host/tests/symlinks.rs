@@ -1,6 +1,11 @@
 //! The symbolic-link policy of `docs/filesystem-api.md` rule 3, against a real
 //! temporary filesystem.
 
+// The resolver exists only on a Unix host; on Windows this crate is the
+// declaration that filesystem exports are unsupported, and there is nothing
+// here to test.
+#![cfg(unix)]
+
 mod support;
 
 use support::{Fixture, bounds, full_grant, vpath};
@@ -236,6 +241,29 @@ fn a_link_target_with_more_components_than_the_bound_is_refused() {
         .resolve(&vpath("/deep"), Intent::Inspect)
         .expect_err("a six-component target exceeds a four-component bound");
     assert_eq!(error.code(), FsErrorCode::Enametoolong);
+}
+
+#[test]
+fn a_link_target_ending_in_a_separator_must_name_a_directory() {
+    let fixture = Fixture::new();
+    fixture.file("plain.txt", b"synthetic");
+    fixture.dir("real-dir");
+    fixture.link("to-file", "plain.txt/");
+    fixture.link("to-dir", "real-dir/");
+
+    let export = fixture.open_with_symlinks();
+    // POSIX resolves `link -> file/` to ENOTDIR; dropping the trailing
+    // separator would silently make it succeed on a regular file.
+    assert_eq!(
+        export
+            .resolve(&vpath("/to-file"), Intent::Inspect)
+            .expect_err("a trailing separator requires a directory")
+            .code(),
+        FsErrorCode::Enotdir
+    );
+    export
+        .resolve(&vpath("/to-dir"), Intent::Inspect)
+        .expect("a trailing separator on a directory target is fine");
 }
 
 #[test]

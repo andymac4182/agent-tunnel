@@ -15,17 +15,19 @@ publish.workspace = true
 # network here.
 
 [dependencies]
-rustix = { version = "1.1", default-features = false, features = ["fs", "std"] }
 tunnel-fs-core = { path = "../tunnel-fs-core" }
+
+# `rustix::fs` is `cfg(not(windows))` upstream, and filesystem exports are
+# declared unsupported on Windows, so the dependency itself is Unix-only: a
+# Windows build of this crate is the declaration and nothing else.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1", default-features = false, features = ["fs", "std"] }
 
 [features]
 # Off by default and never enabled by a shipped build.  It compiles in a
 # thread-local hook the crate's own race tests use to hold open the window
 # between inspecting a name and opening it; see `resolver::race_window`.
 race-window-hook = []
-
-[dev-dependencies]
-rustix = { version = "1.1", default-features = false, features = ["fs", "std"] }
 
 [lints]
 workspace = true

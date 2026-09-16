@@ -1,9 +1,14 @@
 //! Rule 5 of `docs/filesystem-api.md` — special files, sockets, FIFOs and
 //! device nodes — and the mount-point boundary gate 2 owes.
 //!
-//! Where the host refuses to let a test create the node it needs, the test
-//! records precisely what could not be demonstrated instead of passing
-//! silently.
+//! A node this host cannot create is an `#[ignore]` with a reason, never a
+//! test that prints a skip and passes: `cargo test` hides stderr for a passing
+//! test, so a printed skip would leave the same green count whether the case
+//! ran or not.  Everything that can be created here — a FIFO, a unix socket,
+//! and a real mount point from an unprivileged disk image — is a hard failure
+//! if it cannot be.
+
+#![cfg(unix)]
 
 mod support;
 
@@ -47,14 +52,12 @@ fn a_fifo_is_refused_rather_than_opened() {
 fn a_unix_socket_is_refused() {
     let fixture = Fixture::new();
     let socket_path = fixture.inside("s");
-    let Ok(listener) = std::os::unix::net::UnixListener::bind(&socket_path) else {
-        eprintln!(
-            "RECORDED SKIP: this host refused to bind a unix-domain socket inside the temporary \
-             export (the sun_path limit is about 104 bytes and the temporary directory is \
-             already long); the socket refusal is therefore not demonstrated here."
-        );
-        return;
-    };
+    // A hard failure, not a skip.  The fixture name is deliberately short
+    // because `sun_path` is about 104 bytes on macOS and the temporary
+    // directory is already long; if that ever stops being enough, this test
+    // must say so rather than quietly stop covering the socket case.
+    let listener = std::os::unix::net::UnixListener::bind(&socket_path)
+        .expect("bind a unix-domain socket inside the temporary export");
 
     let export = fixture.open_default();
     let error = export
@@ -65,41 +68,41 @@ fn a_unix_socket_is_refused() {
 }
 
 #[test]
-fn a_device_node_is_refused_where_one_can_be_created() {
-    let fixture = Fixture::new();
-    // Creating a device node needs privilege on every host this runs on.  The
-    // attempt is made rather than assumed to fail, so the skip below reports
-    // what the host actually did.
-    let node = fixture.inside("device");
-    let made = run(
-        "mknod",
-        &[
-            node.as_os_str(),
-            std::ffi::OsStr::new("c"),
-            std::ffi::OsStr::new("3"),
-            std::ffi::OsStr::new("2"),
-        ],
-    );
-    if !made {
-        eprintln!(
-            "RECORDED SKIP: this host refused to create a character device node inside the \
-             temporary export (mknod needs privilege); the device-node refusal is proven only \
-             through the shared kind decision below, not against a real device node."
+fn the_exportable_kinds_are_exactly_directories_and_regular_files() {
+    // This is what stands in for a real device node on a host where one cannot
+    // be created: the decision is exhaustive over the kind enum, and the FIFO
+    // and socket cases above prove the same decision against real nodes.
+    for kind in FileKind::ALL {
+        assert_eq!(
+            kind.is_exportable(),
+            matches!(kind, FileKind::Directory | FileKind::RegularFile),
+            "only directories and regular files are exportable"
         );
-        // The decision itself is still exhaustive over the kind enum.
-        for kind in FileKind::ALL {
-            assert_eq!(
-                kind.is_exportable(),
-                matches!(kind, FileKind::Directory | FileKind::RegularFile),
-                "only directories and regular files are exportable"
-            );
-            assert_eq!(
-                tunnel_fs_host::policy::check_exportable(kind).is_ok(),
-                kind.is_exportable()
-            );
-        }
-        return;
+        assert_eq!(
+            tunnel_fs_host::policy::check_exportable(kind).is_ok(),
+            kind.is_exportable()
+        );
     }
+}
+
+#[test]
+#[ignore = "creating a character device node needs privilege; run as root with \
+            `cargo test -p tunnel-fs-host -- --ignored` to exercise it"]
+fn a_real_device_node_is_refused() {
+    let fixture = Fixture::new();
+    let node = fixture.inside("device");
+    assert!(
+        run(
+            "mknod",
+            &[
+                node.as_os_str(),
+                std::ffi::OsStr::new("c"),
+                std::ffi::OsStr::new("3"),
+                std::ffi::OsStr::new("2"),
+            ],
+        ),
+        "mknod must create a character device node inside the temporary export"
+    );
 
     let export = fixture.open_default();
     let error = export
@@ -109,10 +112,12 @@ fn a_device_node_is_refused_where_one_can_be_created() {
 }
 
 /// Detaches a mounted disk image however the test ends.
+#[cfg(target_os = "macos")]
 struct Mounted {
     mountpoint: String,
 }
 
+#[cfg(target_os = "macos")]
 impl Drop for Mounted {
     fn drop(&mut self) {
         let _ = Command::new("hdiutil")
@@ -133,31 +138,27 @@ fn a_mount_point_inside_the_export_is_not_crossed() {
         .expect("utf-8 fixture path")
         .to_owned();
 
+    // `hdiutil` ships with macOS and attaching an image the test just created
+    // needs no privilege, so a failure here is a failure of the test, not a
+    // property of the host to be skipped past: this is the only place the
+    // mount boundary meets a real mount.
     let created = Command::new("hdiutil")
         .args(["create", "-size", "10m", "-fs", "HFS+", "-volname", "probe"])
         .arg(&image)
         .output();
-    let created = matches!(&created, Ok(output) if output.status.success());
-    if !created {
-        eprintln!(
-            "RECORDED SKIP: this host could not create a disk image with hdiutil, so the \
-             mount-point boundary is not demonstrated against a real mount."
-        );
-        return;
-    }
+    assert!(
+        matches!(&created, Ok(output) if output.status.success()),
+        "hdiutil must create a disk image inside the temporary tree"
+    );
 
     let attached = Command::new("hdiutil")
         .args(["attach", "-nobrowse", "-mountpoint", &mountpoint])
         .arg(&image)
         .output();
-    let attached = matches!(&attached, Ok(output) if output.status.success());
-    if !attached {
-        eprintln!(
-            "RECORDED SKIP: this host refused to attach a disk image without privilege, so the \
-             mount-point boundary is not demonstrated against a real mount."
-        );
-        return;
-    }
+    assert!(
+        matches!(&attached, Ok(output) if output.status.success()),
+        "hdiutil must attach that image at a mount point inside the export"
+    );
     let _guard = Mounted {
         mountpoint: mountpoint.clone(),
     };

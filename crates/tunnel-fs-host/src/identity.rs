@@ -115,6 +115,12 @@ pub struct FileIdentity {
 impl FileIdentity {
     /// Read the identity of an already-opened descriptor's `Stat`.
     #[must_use]
+    #[allow(
+        clippy::useless_conversion,
+        reason = "st_nlink is u16 on macOS and already u64 on Linux; the conversion is a \
+                  no-op on one host and load-bearing on the other, and writing it as a cast \
+                  would trade this lint for `unnecessary_cast` on the other host"
+    )]
     pub(crate) fn from_stat(stat: &Stat) -> Self {
         Self {
             device: i128::from(stat.st_dev),

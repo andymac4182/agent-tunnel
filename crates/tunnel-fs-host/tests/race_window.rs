@@ -83,7 +83,12 @@ fn a_directory_swapped_for_a_link_inside_the_window_does_not_escape() {
             !handle.identity().is_same_file(forbidden),
             "the resolver followed a link that replaced a directory mid-walk"
         ),
-        Err(error) => eprintln!("RECORDED: refused inside the window with {error}"),
+        Err(error) => assert_eq!(
+            error.code(),
+            tunnel_fs_core::FsErrorCode::Enoent,
+            "a component that changed under the resolver takes one uniform answer, so a \
+             racer cannot learn which kind of swap it performed"
+        ),
     }
 }
 
@@ -109,7 +114,12 @@ fn a_file_swapped_for_a_link_inside_the_window_does_not_escape() {
             !handle.identity().is_same_file(forbidden),
             "the resolver opened a link that replaced a file mid-walk"
         ),
-        Err(error) => eprintln!("RECORDED: refused inside the window with {error}"),
+        Err(error) => assert_eq!(
+            error.code(),
+            tunnel_fs_core::FsErrorCode::Enoent,
+            "a component that changed under the resolver takes one uniform answer, so a \
+             racer cannot learn which kind of swap it performed"
+        ),
     }
 }
 
@@ -137,6 +147,11 @@ fn a_file_replaced_by_another_inode_inside_the_window_is_not_handed_back() {
             !handle.identity().is_same_file(usurper),
             "the resolver handed back an inode it had not inspected"
         ),
-        Err(error) => eprintln!("RECORDED: refused inside the window with {error}"),
+        Err(error) => assert_eq!(
+            error.code(),
+            tunnel_fs_core::FsErrorCode::Enoent,
+            "a component that changed under the resolver takes one uniform answer, so a \
+             racer cannot learn which kind of swap it performed"
+        ),
     }
 }

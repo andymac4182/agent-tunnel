@@ -142,6 +142,17 @@ pub struct ExportRoot {
     grant: CapabilitySet,
     features: FeatureSet,
     bounds: PathBounds,
+    /// Whether the `openat2` path may be used at all.
+    ///
+    /// It needs `/proc/self/fd` to turn its `O_PATH` result into a usable
+    /// descriptor, and a Linux host can be running without `/proc` mounted.
+    /// Rather than let every read and write report `ENOENT` — file-absent —
+    /// because a reopen could not find a procfs path, this is probed once at
+    /// construction and the per-component walk is used when it is unavailable.
+    /// That walk needs no procfs and is the same mechanism macOS uses, so the
+    /// export stays confined either way.
+    #[cfg(target_os = "linux")]
+    anchored_open: bool,
 }
 
 impl ExportRoot {
@@ -162,11 +173,13 @@ impl ExportRoot {
         features: FeatureSet,
         bounds: PathBounds,
     ) -> Result<Self, FsError> {
-        let root = rustix::fs::open(
-            host_root,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
+        let root = retry(|| {
+            rustix::fs::open(
+                host_root,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+        })
         .map_err(host_error)?;
         let identity = identity_of(&root)?;
         if identity.kind() != FileKind::Directory {
@@ -178,6 +191,8 @@ impl ExportRoot {
             grant,
             features,
             bounds,
+            #[cfg(target_os = "linux")]
+            anchored_open: procfs_available(),
         })
     }
 
@@ -391,13 +406,27 @@ impl ExportRoot {
     /// walk everywhere else.
     #[cfg(target_os = "linux")]
     fn walk(&self, path: &VirtualPath, intent: Intent) -> Result<Handle, FsError> {
+        if !self.anchored_open {
+            return self.walk_components(path, intent);
+        }
         match self.walk_openat2(path, intent) {
             // `openat2` arrived in Linux 5.6, and a seccomp filter can refuse
             // it on a kernel that has it. Both are the contract's named
-            // fallback case, not a failure of the request.
+            // fallback case, not a failure of the request, and the fallback is
+            // not a weaker mechanism: it is the same per-component walk macOS
+            // and the BSDs use as their only mechanism, with the same
+            // anchoring, the same re-rooting and the same guards. What the
+            // fallback loses is the kernel taking the decisions in one
+            // syscall, not any part of the confinement.
             Err(errno) if errno == rustix::io::Errno::NOSYS || errno == rustix::io::Errno::PERM => {
                 self.walk_components(path, intent)
             }
+            // `RESOLVE_IN_ROOT` answers `EAGAIN` when a rename or a mount moved
+            // part of the path while the kernel was walking it. That is the
+            // race, not a malformed request, so it takes the same uniform
+            // answer as a component that changed under the per-component walk
+            // rather than falling through to `EINVAL`.
+            Err(errno) if errno == rustix::io::Errno::AGAIN => Err(lost_race()),
             Err(errno) => Err(host_error(errno)),
             Ok(handle) => handle,
         }
@@ -431,11 +460,22 @@ impl ExportRoot {
     ) -> Result<Result<Handle, FsError>, rustix::io::Errno> {
         use rustix::fs::ResolveFlags;
 
-        let resolve = if self.features.has(Feature::Symlinks) {
-            ResolveFlags::IN_ROOT
-        } else {
-            ResolveFlags::NO_SYMLINKS
-        };
+        // `NO_XDEV` is what makes the mount-point refusal a property of the
+        // whole walk rather than of its last component: without it, a bind
+        // mount of an outside directory underneath a mount inside the root
+        // would be refused by the per-component walk and handed back here,
+        // because comparing the final `st_dev` with the root's cannot see a
+        // boundary that was crossed and then crossed back. `NO_MAGICLINKS`
+        // refuses the `/proc` links that are re-openings of an existing
+        // descriptor rather than names, which `RESOLVE_IN_ROOT` would
+        // otherwise follow.
+        let boundaries = ResolveFlags::NO_XDEV | ResolveFlags::NO_MAGICLINKS;
+        let resolve = boundaries
+            | if self.features.has(Feature::Symlinks) {
+                ResolveFlags::IN_ROOT
+            } else {
+                ResolveFlags::NO_SYMLINKS
+            };
         let relative = relative_spelling(path);
         // `O_PATH` first: it opens no device, blocks on no FIFO and starts no
         // driver, so the node kind is decided before anything is really
@@ -457,23 +497,22 @@ impl ExportRoot {
         let identity = identity_of(&located)?;
         check_exportable(identity.kind())?;
         check_same_device(self.identity, identity)?;
-        if intent == Intent::Inspect || identity.kind() == FileKind::Directory {
-            return Ok(Handle {
-                descriptor: located,
-                identity,
-            });
-        }
-        // Upgrade the `O_PATH` descriptor to a usable one. This reopens the
-        // **descriptor**, through the kernel's own name for it, not the
-        // caller's path, so no component is re-resolved; the identity check
-        // below is what makes that claim testable rather than assumed.
+        // Upgrade the `O_PATH` descriptor to a usable one, for a directory as
+        // well as a file: an `O_PATH` directory descriptor answers `EBADF` to
+        // `getdents`, so returning one would leave `open_directory` unable to
+        // do the one thing it exists for. This reopens the **descriptor**,
+        // through the kernel's own name for it, not the caller's path, so no
+        // component is re-resolved; the identity check below is what makes
+        // that claim testable rather than assumed.
+        let flags = if identity.kind() == FileKind::Directory {
+            OFlags::RDONLY | OFlags::DIRECTORY
+        } else {
+            intent.flags() | OFlags::NONBLOCK
+        };
         let procfs = format!("/proc/self/fd/{}", located.as_raw_fd());
-        let opened = rustix::fs::open(
-            procfs.as_str(),
-            intent.flags() | OFlags::CLOEXEC | OFlags::NONBLOCK,
-            Mode::empty(),
-        )
-        .map_err(host_error)?;
+        let opened =
+            retry(|| rustix::fs::open(procfs.as_str(), flags | OFlags::CLOEXEC, Mode::empty()))
+                .map_err(host_error)?;
         let reopened = identity_of(&opened)?;
         if !reopened.is_same_file(identity) {
             return Err(lost_race());
@@ -506,6 +545,11 @@ impl ExportRoot {
 
         let mut hops: u32 = 0;
         let mut steps: usize = 0;
+        // Set when a symbolic link's target ends in `/`. POSIX requires such a
+        // target to name a directory, and dropping the separator would let
+        // `link -> file/` resolve to a regular file where the host itself
+        // answers `ENOTDIR`.
+        let mut require_directory = false;
         let step_budget = self
             .bounds
             .max_components()
@@ -535,8 +579,9 @@ impl ExportRoot {
             // device node opened at all can have a side effect. The open
             // below is still what decides, and the identity comparison after
             // it is what makes this look safe rather than authoritative.
-            let seen = rustix::fs::statat(parent, name.as_str(), AtFlags::SYMLINK_NOFOLLOW)
-                .map_err(host_error)?;
+            let seen =
+                retry(|| rustix::fs::statat(parent, name.as_str(), AtFlags::SYMLINK_NOFOLLOW))
+                    .map_err(host_error)?;
             let seen = FileIdentity::from_stat(&seen);
             // The TOCTOU window itself, held open on demand.  Compiled out
             // entirely unless the `race-window-hook` feature is on, which only
@@ -559,14 +604,18 @@ impl ExportRoot {
                     if hops > MAX_LINK_HOPS {
                         return Err(FsError::refused(FsErrorCode::Eloop));
                     }
-                    let target = rustix::fs::readlinkat(parent, name.as_str(), Vec::new())
-                        .map_err(host_error)?;
+                    let target =
+                        retry(|| rustix::fs::readlinkat(parent, name.as_str(), Vec::new()))
+                            .map_err(host_error)?;
                     let target = target
                         .to_str()
                         .map_err(|_| FsError::refused(FsErrorCode::Einval))?
                         .to_owned();
                     if target.is_empty() {
                         return Err(FsError::refused(FsErrorCode::Enoent));
+                    }
+                    if last && target.ends_with('/') {
+                        require_directory = true;
                     }
                     if target.starts_with('/') {
                         // An absolute target is resolved against the exported
@@ -583,13 +632,20 @@ impl ExportRoot {
                     }
                 }
                 FileKind::Directory => {
-                    let opened = rustix::fs::openat(
-                        parent,
-                        name.as_str(),
-                        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                        Mode::empty(),
-                    )
-                    .map_err(host_error)?;
+                    // Before the open, for the same reason as in the other
+                    // arm: a mount point crossed even momentarily is a
+                    // directory on another filesystem, whose own driver would
+                    // see the open.
+                    check_same_device(self.identity, seen)?;
+                    let opened = retry(|| {
+                        rustix::fs::openat(
+                            parent,
+                            name.as_str(),
+                            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                            Mode::empty(),
+                        )
+                    })
+                    .map_err(component_open_error)?;
                     let identity = identity_of(&opened)?;
                     if !identity.is_same_file(seen) {
                         return Err(lost_race());
@@ -607,19 +663,27 @@ impl ExportRoot {
                     ancestors.push(opened);
                 }
                 kind => {
-                    if !last {
+                    if !last || require_directory {
                         return Err(FsError::refused(FsErrorCode::Enotdir));
                     }
                     // Refuse a FIFO, a socket or a device node without opening
                     // it at all.
                     check_exportable(kind)?;
-                    let opened = rustix::fs::openat(
-                        parent,
-                        name.as_str(),
-                        intent.flags() | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
-                        Mode::empty(),
-                    )
-                    .map_err(host_error)?;
+                    // Decide the device boundary before the open too, not only
+                    // after it: opening a file on a FUSE or network filesystem
+                    // runs that filesystem's own open handler, and an export
+                    // must not reach into another device even for the instant
+                    // it takes to refuse.
+                    check_same_device(self.identity, seen)?;
+                    let opened = retry(|| {
+                        rustix::fs::openat(
+                            parent,
+                            name.as_str(),
+                            intent.flags() | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+                            Mode::empty(),
+                        )
+                    })
+                    .map_err(component_open_error)?;
                     let identity = identity_of(&opened)?;
                     if !identity.is_same_file(seen) {
                         return Err(lost_race());
@@ -648,14 +712,62 @@ impl ExportRoot {
 }
 
 fn identity_of<Fd: AsFd>(descriptor: Fd) -> Result<FileIdentity, FsError> {
-    let stat = rustix::fs::fstat(descriptor).map_err(host_error)?;
+    let stat = retry(|| rustix::fs::fstat(&descriptor)).map_err(host_error)?;
     Ok(FileIdentity::from_stat(&stat))
+}
+
+/// Repeat a host call that a signal interrupted.
+///
+/// `EINTR` is not a filesystem answer, and the closed vocabulary has no code
+/// for it: mapping it to `EINVAL` would report a delivered signal as a
+/// malformed request. Every host call in this crate is short and restartable,
+/// so the only correct response is to make it again.
+fn retry<T>(mut call: impl FnMut() -> rustix::io::Result<T>) -> rustix::io::Result<T> {
+    loop {
+        match call() {
+            Err(errno) if errno == rustix::io::Errno::INTR => {}
+            outcome => return outcome,
+        }
+    }
+}
+
+/// A component open that failed, with the two errnos that can only mean "the
+/// name changed under us" folded into the uniform race answer.
+///
+/// The open is reached only after `statat` said the entry was a directory (with
+/// `O_DIRECTORY | O_NOFOLLOW`) or an exportable non-directory (with
+/// `O_NOFOLLOW`). `ELOOP` therefore means a symbolic link appeared where one had
+/// not been, and `ENOTDIR` that a directory stopped being one — both are the
+/// race, not a property of what the caller asked for. Folding them keeps the
+/// contract's claim that a component changing under the resolver answers
+/// `ENOENT` true for every component kind, rather than leaking which kind of
+/// swap a concurrent writer performed.
+fn component_open_error(errno: rustix::io::Errno) -> FsError {
+    if errno == rustix::io::Errno::LOOP || errno == rustix::io::Errno::NOTDIR {
+        lost_race()
+    } else {
+        host_error(errno)
+    }
 }
 
 fn io_error(_: std::io::Error) -> FsError {
     // Deliberately field-free: a `std::io::Error` can carry an OS message, and
     // that message is a host detail.
     FsError::refused(FsErrorCode::Einval)
+}
+
+/// Whether `/proc/self/fd` can be opened, which the `openat2` path needs to
+/// upgrade its `O_PATH` result.
+#[cfg(target_os = "linux")]
+fn procfs_available() -> bool {
+    retry(|| {
+        rustix::fs::open(
+            "/proc/self/fd",
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+    })
+    .is_ok()
 }
 
 /// The export-relative spelling of a virtual path, for `openat2`.

@@ -7,6 +7,11 @@
 //! is the inode inside the export.  A single handle on the outside inode fails
 //! the test.
 
+// The resolver exists only on a Unix host; on Windows this crate is the
+// declaration that filesystem exports are unsupported, and there is nothing
+// here to test.
+#![cfg(unix)]
+
 mod support;
 
 use std::sync::Arc;

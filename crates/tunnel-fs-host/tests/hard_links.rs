@@ -2,6 +2,11 @@
 //! what is observable — `st_nlink` and file identity — because a hard link is
 //! not observable during a path walk.
 
+// The resolver exists only on a Unix host; on Windows this crate is the
+// declaration that filesystem exports are unsupported, and there is nothing
+// here to test.
+#![cfg(unix)]
+
 mod support;
 
 use support::{Fixture, bounds, full_grant, vpath};

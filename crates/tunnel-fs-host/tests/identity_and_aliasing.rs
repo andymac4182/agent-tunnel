@@ -7,6 +7,11 @@
 //! either, and it therefore passes unchanged on a case-sensitive and a
 //! case-insensitive volume while reporting which one it met.
 
+// The resolver exists only on a Unix host; on Windows this crate is the
+// declaration that filesystem exports are unsupported, and there is nothing
+// here to test.
+#![cfg(unix)]
+
 mod support;
 
 use support::{Fixture, bounds, full_grant, vpath};
@@ -25,20 +30,19 @@ enum Verdict {
 }
 
 /// Create `created`, then ask the host what `other` names.
+///
+/// The question is put through [`ExportRoot::same_file`] — the API a provider
+/// would use — rather than re-implemented here, so this test exercises the
+/// decision that ships instead of a copy of it that cannot disagree with it.
 fn verdict(fixture: &Fixture, created: &str, other: &str) -> Verdict {
     fixture.file(created, b"synthetic");
     let export = fixture.open_default();
-    let first = export
+    export
         .resolve(&vpath(created), Intent::Inspect)
         .expect("the created spelling resolves");
-    match export.resolve(&vpath(other), Intent::Inspect) {
-        Ok(second) => {
-            if first.identity().is_same_file(second.identity()) {
-                Verdict::OneFile
-            } else {
-                Verdict::TwoFiles
-            }
-        }
+    match export.same_file(&vpath(created), &vpath(other)) {
+        Ok(true) => Verdict::OneFile,
+        Ok(false) => Verdict::TwoFiles,
         Err(error) => {
             assert_eq!(
                 error.code(),

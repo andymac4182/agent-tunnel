@@ -7,6 +7,7 @@
 //! resolver failed to refuse would reach a file this test wrote, not a file of
 //! the user's.
 
+#![cfg(unix)]
 #![allow(dead_code)]
 
 use std::fs;
