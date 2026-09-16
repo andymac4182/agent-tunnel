@@ -729,11 +729,10 @@ fn no_error_rendering_can_contain_a_name_or_a_path() {
         rendered.push(format!("{error:?}"));
         rendered.push(format!("{:?}", error.answer()));
     }
-    assert!(
-        rendered.len() > 600,
-        "the sweep shrank to {} values",
-        rendered.len()
-    );
+    // Pinned exactly, so the sweep cannot quietly shrink: 10 string fields x 2,
+    // 256 opcode bytes x 2, 41 message types, 13 codec errors x 2, and 37
+    // session errors x 3.
+    assert_eq!(rendered.len(), 710, "the payload-free sweep changed size");
     for text in &rendered {
         for forbidden in [
             "caf",
