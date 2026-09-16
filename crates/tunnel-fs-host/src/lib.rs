@@ -67,6 +67,12 @@
 // the declaration below a runtime refusal rather than a build failure.
 #[cfg(unix)]
 pub mod identity;
+// Gate 2's crate discharging two named gate-4 obligations: the metadata-only
+// open a `list`-without-`read` grant needs, and the outward `OsStr` refusal at
+// the one place a host name becomes a `String`.  Both are decisions about the
+// host, so neither may live anywhere the anchoring does not already hold.
+#[cfg(unix)]
+pub mod metadata;
 #[cfg(unix)]
 pub mod policy;
 #[cfg(unix)]
@@ -74,6 +80,8 @@ pub mod resolver;
 
 #[cfg(unix)]
 pub use identity::{FileIdentity, FileKind};
+#[cfg(unix)]
+pub use metadata::{DirReader, HostEntry, Metadata};
 #[cfg(unix)]
 pub use policy::{MAX_LINK_HOPS, code_from_errno};
 #[cfg(unix)]
