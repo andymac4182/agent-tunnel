@@ -213,7 +213,12 @@ async fn admit(
         ));
     };
     let validated = oidc
-        .authenticate_for_scope(&**catalog, bearer(headers), None, crate::FS_READ_OPERATION)
+        .authenticate_for_scope(
+            &**catalog,
+            bearer(headers),
+            None,
+            crate::FS_SESSION_OPERATION,
+        )
         .await
         .map_err(|error| match error {
             tunnel_catalog::OidcError::Catalog(_) => fs_error(
@@ -282,7 +287,7 @@ async fn admit(
     };
 
     let now = Utc::now();
-    if !grant.permissions.allows(crate::FS_READ_OPERATION)
+    if !grant.permissions.allows(crate::FS_SESSION_OPERATION)
         || grant.valid_until <= now
         || validated.expires_at <= now
     {
@@ -331,10 +336,10 @@ fn parse_case_sensitivity(text: &str) -> Option<CaseSensitivity> {
 fn derive_capabilities(grant: &tunnel_catalog::GrantSnapshot) -> CapabilitySet {
     let mut set = CapabilitySet::DENY;
     for (operation, capability) in [
-        ("fs:read", Capability::Read),
-        ("fs:write", Capability::Write),
-        ("fs:list", Capability::List),
-        ("fs:delete", Capability::Delete),
+        (crate::FS_READ_OPERATION, Capability::Read),
+        (crate::FS_WRITE_OPERATION, Capability::Write),
+        (crate::FS_LIST_OPERATION, Capability::List),
+        (crate::FS_DELETE_OPERATION, Capability::Delete),
     ] {
         if grant.permissions.allows(operation) {
             set = set.with(capability);

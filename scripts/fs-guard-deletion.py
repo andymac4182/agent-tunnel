@@ -8,6 +8,9 @@ of `docs/filesystem-api.md`.  Two suites live here:
 * `gate2` — the OS-confined resolver in `crates/tunnel-fs-host`.
 * `gate3` — the 9P2000.L codec and session state machine in
   `crates/tunnel-fs-ninep`.
+* `gate4` — the endpoint, the dispatcher and the read path, which spans four
+  crates: the resolver's metadata and enumeration additions, the provider, the
+  relay route and the connector's export.
 
 A guard whose deletion leaves every test green is **not** load-bearing on its
 own, and this script prints that outcome rather than hiding it: several of the
@@ -56,6 +59,15 @@ CRATE = REPO / "crates" / "tunnel-fs-host"
 RESOLVER = CRATE / "src" / "resolver.rs"
 POLICY = CRATE / "src" / "policy.rs"
 IDENTITY = CRATE / "src" / "identity.rs"
+
+PROVIDER = REPO / "crates" / "tunnel-fs-provider"
+PROVIDER_SRC = PROVIDER / "src" / "provider.rs"
+PROVIDER_RECORD = PROVIDER / "src" / "record.rs"
+METADATA = CRATE / "src" / "metadata.rs"
+RELAY = REPO / "crates" / "tunnel-relay"
+RELAY_FS = RELAY / "src" / "http" / "fs.rs"
+CLIENT = REPO / "crates" / "tunnel-client"
+CLIENT_FS = CLIENT / "src" / "fs_export.rs"
 
 NINEP = REPO / "crates" / "tunnel-fs-ninep"
 NINEP_WIRE = NINEP / "src" / "wire.rs"
@@ -1363,24 +1375,366 @@ GATE3_CASES: list[tuple[str, list[Edit]]] = [
 ]
 
 
+# The gate-4 suite spans four crates, so it runs their tests together.  The
+# relay and the connector are large crates and each case rebuilds one of them;
+# that is the cost of measuring a guard where it lives rather than asserting it
+# from a distance.
+GATE4_TEST = [
+    "cargo",
+    "test",
+    "--offline",
+    "-p",
+    "tunnel-fs-host",
+    "-p",
+    "tunnel-fs-provider",
+    "-p",
+    "tunnel-relay",
+    "-p",
+    "tunnel-client",
+    "--lib",
+    "--tests",
+]
+
+GATE4_CASES: list[tuple[str, list[Edit]]] = [
+    (
+        "drop a reply whose tag was flushed",
+        [
+            (
+                PROVIDER_SRC,
+                """        if self.flushed.remove(&queued.tag) {
+            self.stats.dropped_after_flush += 1;
+            return Vec::new();
+        }
+""",
+                "",
+            )
+        ],
+    ),
+    (
+        "close on a moved grant revision",
+        [
+            (
+                PROVIDER_SRC,
+                """        if live.revision != self.admitted_revision {
+            self.stats.revision_closures += 1;
+            self.close();
+            return vec![Outbound::Close(SessionErrorCode::CapabilitiesChanged)];
+        }
+""",
+                "",
+            )
+        ],
+    ),
+    (
+        "close on an expired authorization snapshot",
+        [
+            (
+                PROVIDER_SRC,
+                """        if !live.fresh {
+            self.stats.freshness_closures += 1;
+            self.close();
+            return vec![Outbound::Close(SessionErrorCode::AuthExpired)];
+        }
+""",
+                "",
+            )
+        ],
+    ),
+    (
+        "recheck each primitive against the live grant",
+        [
+            (
+                PROVIDER_SRC,
+                """        for primitive in queued.accepted.primitives.iter() {
+            if !primitive.is_permitted(live.grant, self.features) {""",
+                """        for primitive in queued.accepted.primitives.iter() {
+            if false && !primitive.is_permitted(live.grant, self.features) {""",
+            )
+        ],
+    ),
+    (
+        "re-classify Tlopen with the resolver's kind",
+        [
+            (
+                PROVIDER_SRC,
+                "        let required = open_primitives(flags, kind == FileKind::Directory)\n"
+                "            .map_err(|_| FsError::refused(FsErrorCode::Enotsup))?;",
+                "        let _ = kind;\n"
+                "        let required = admitted;",
+            )
+        ],
+    ),
+    (
+        "refuse a writing open before the host is touched",
+        [
+            (
+                PROVIDER_SRC,
+                """        if required.iter().any(|primitive| {
+            matches!(
+                primitive,
+                Primitive::OpenWrite | Primitive::OpenTruncate | Primitive::Create
+            )
+        }) {
+            self.stats.mutations_refused += 1;
+            return Err(FsError::refused(FsErrorCode::Enotsup));
+        }
+""",
+                "",
+            )
+        ],
+    ),
+    (
+        "key the descriptor cache by fid generation",
+        [
+            (
+                PROVIDER_SRC,
+                """    fn cached(&self, fid: u32) -> Option<&OpenFid> {
+        let generation = self.session.fid(fid)?.generation();
+        self.open
+            .get(&fid)
+            .filter(|entry| entry.generation == generation)
+    }""",
+                """    fn cached(&self, fid: u32) -> Option<&OpenFid> {
+        self.open.get(&fid)
+    }""",
+            )
+        ],
+    ),
+    (
+        "prune a descriptor whose binding has gone",
+        [
+            (
+                PROVIDER_SRC,
+                """        if self
+            .open
+            .get(&fid)
+            .is_some_and(|entry| Some(entry.generation) != live)
+        {
+            self.open.remove(&fid);
+        }""",
+                "        let _ = live;",
+            )
+        ],
+    ),
+    (
+        "release a descriptor only for its own generation",
+        [
+            (
+                PROVIDER_SRC,
+                """        if self
+            .open
+            .get(&fid)
+            .is_some_and(|entry| entry.generation == generation)
+        {
+            self.open.remove(&fid);
+        }""",
+                """        let _ = generation;
+        self.open.remove(&fid);""",
+            )
+        ],
+    ),
+    (
+        "the record decoder latches its first violation",
+        [
+            (
+                PROVIDER_RECORD,
+                """    fn latch(&mut self, error: RecordError) -> RecordError {
+        self.latched = Some(error);
+        self.buffer.clear();
+        error
+    }""",
+                """    fn latch(&mut self, error: RecordError) -> RecordError {
+        self.buffer.clear();
+        error
+    }""",
+            )
+        ],
+    ),
+    (
+        "the record decoder bounds a declared length before allocating",
+        [
+            (
+                PROVIDER_RECORD,
+                """        if length > MAX_RECORD_BYTES {
+            return Err(self.latch(RecordError::TooLong));
+        }
+""",
+                "",
+            )
+        ],
+    ),
+    (
+        "a close record must name a code in the vocabulary",
+        [
+            (
+                PROVIDER_RECORD,
+                """                let Some(code) = payload.first().copied().and_then(close_code) else {
+                    return Err(self.latch(RecordError::MalformedClose));
+                };""",
+                """                let code = payload
+                    .first()
+                    .copied()
+                    .and_then(close_code)
+                    .unwrap_or(SessionErrorCode::SessionLost);""",
+            )
+        ],
+    ),
+    (
+        "metadata is governed by list",
+        [
+            (
+                METADATA,
+                """    pub fn metadata(&self, path: &VirtualPath) -> Result<Metadata, FsError> {
+        self.authorize(Primitive::Getattr)?;""",
+                """    pub fn metadata(&self, path: &VirtualPath) -> Result<Metadata, FsError> {""",
+            )
+        ],
+    ),
+    (
+        "a link is decided before the exportable-kind check",
+        [
+            (
+                METADATA,
+                """        if identity.kind() == FileKind::Symlink {""",
+                """        check_exportable(identity.kind())?;
+        if identity.kind() == FileKind::Symlink {""",
+            )
+        ],
+    ),
+    (
+        "an unrepresentable entry name is refused, never repaired",
+        [
+            (
+                METADATA,
+                "    core::str::from_utf8(raw.to_bytes()).map_err(|_| FsError::refused(FsErrorCode::Einval))",
+                r'    Ok(core::str::from_utf8(raw.to_bytes()).unwrap_or("\u{fffd}"))',
+            )
+        ],
+    ),
+    (
+        "a special file is left out of a listing",
+        [
+            (
+                METADATA,
+                """            if check_exportable(identity.kind()).is_err() {
+                continue;
+            }
+""",
+                "",
+            )
+        ],
+    ),
+    (
+        "a resume cookie is bounded by the traversal budget",
+        [
+            (
+                METADATA,
+                """        if cookie > budget {
+            return Err(FsError::refused(FsErrorCode::Einval));
+        }
+""",
+                "",
+            )
+        ],
+    ),
+    (
+        "a cookie past the end of a directory is refused",
+        [
+            (
+                METADATA,
+                """            if self.next_entry()?.is_none() {""",
+                """            if false && self.next_entry()?.is_none() {""",
+            )
+        ],
+    ),
+    (
+        "the relay derives each capability from its own operation",
+        [
+            (
+                RELAY_FS,
+                "        (crate::FS_LIST_OPERATION, Capability::List),\n",
+                "",
+            )
+        ],
+    ),
+    (
+        "a stale grant revision does not match",
+        [
+            (
+                RELAY_FS,
+                "        .is_none_or(|value| value.trim() == revision.to_string())",
+                "        .is_none_or(|_| true)",
+            )
+        ],
+    ),
+    (
+        "the case behaviour is parsed and never guessed",
+        [
+            (
+                RELAY_FS,
+                """        _ => None,
+    }
+}""",
+                """        _ => Some(CaseSensitivity::Sensitive),
+    }
+}""",
+            )
+        ],
+    ),
+    (
+        "the connector's allowlist narrows the relay's capabilities",
+        [
+            (
+                CLIENT_FS,
+                """        if left.allows(capability) && right.allows(capability) {""",
+                """        if left.allows(capability) {""",
+            )
+        ],
+    ),
+    (
+        "an unknown capability name is ignored, not admitted",
+        [
+            (
+                CLIENT_FS,
+                """        if let Some(capability) = Capability::parse(name.trim()) {
+            set = set.with(capability);
+        }""",
+                """        if let Some(capability) = Capability::parse(name.trim()) {
+            set = set.with(capability);
+        } else if !name.trim().is_empty() {
+            set = set.with(Capability::Read);
+        }""",
+            )
+        ],
+    ),
+]
+
+
 @dataclass
 class Suite:
-    """One crate's guards and the command that measures them."""
+    """One suite's guards and the command that measures them.
+
+    `crates` is a list because gate 4 is not one crate: it spans the resolver's
+    additions, the provider, the relay route and the connector's export, and a
+    guard in one of them is measured by tests in another.  Restoring after each
+    case therefore checks out every crate the suite can edit.
+    """
 
     name: str
-    crate: Path
+    crates: list[Path]
     cargo_test: list[str]
     cases: list[tuple[str, list[Edit]]] = field(default_factory=list)
 
 
 SUITES: list[Suite] = [
-    Suite("gate2", CRATE, CARGO_TEST, GATE2_CASES),
+    Suite("gate2", [CRATE], CARGO_TEST, GATE2_CASES),
     Suite(
         "gate3",
-        NINEP,
+        [NINEP],
         ["cargo", "test", "-p", "tunnel-fs-ninep", "--locked"],
         GATE3_CASES,
     ),
+    Suite("gate4", [CRATE, PROVIDER, RELAY, CLIENT], GATE4_TEST, GATE4_CASES),
 ]
 
 
@@ -1428,7 +1782,8 @@ def run_tests(suite: Suite) -> tuple[str, list[str]]:
 
 def restore(suite: Suite) -> None:
     subprocess.run(
-        ["git", "checkout", "--", str(suite.crate.relative_to(REPO))],
+        ["git", "checkout", "--"]
+        + [str(crate.relative_to(REPO)) for crate in suite.crates],
         cwd=REPO,
         check=True,
     )
@@ -1436,20 +1791,21 @@ def restore(suite: Suite) -> None:
 
 def require_clean_tree(suites: list[Suite]) -> None:
     for suite in suites:
-        relative = str(suite.crate.relative_to(REPO))
-        changed = subprocess.run(
-            ["git", "status", "--porcelain", "--", relative],
-            cwd=REPO,
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-        if changed:
-            sys.exit(
-                "fs-guard-deletion: refusing to run with uncommitted changes "
-                f"under {relative}; each case is restored by checking the crate "
-                "out again, which would discard them."
-            )
+        for crate in suite.crates:
+            relative = str(crate.relative_to(REPO))
+            changed = subprocess.run(
+                ["git", "status", "--porcelain", "--", relative],
+                cwd=REPO,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            if changed:
+                sys.exit(
+                    "fs-guard-deletion: refusing to run with uncommitted changes "
+                    f"under {relative}; each case is restored by checking the "
+                    "crate out again, which would discard them."
+                )
 
 
 def main() -> int:
@@ -1458,7 +1814,7 @@ def main() -> int:
     parser.add_argument("--case", help="run only cases whose name contains this text")
     parser.add_argument(
         "--suite",
-        help="run only this suite (gate2 or gate3); default is both",
+        help="run only this suite (gate2, gate3 or gate4); default is all",
     )
     arguments = parser.parse_args()
 

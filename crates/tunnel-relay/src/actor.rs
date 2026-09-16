@@ -4666,7 +4666,7 @@ impl RelayActor {
         let fs = response.is_fs();
         let fs_capabilities = response.fs_capabilities().map(str::to_owned);
         let required_operation = if fs {
-            crate::FS_READ_OPERATION
+            crate::FS_SESSION_OPERATION
         } else if http {
             crate::HTTP_FORWARD_OPERATION
         } else {

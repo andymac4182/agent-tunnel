@@ -106,19 +106,25 @@ pub const HTTP_FORWARD_SERVICE_TYPE: &str = "http-forward";
 pub const HTTP_FORWARD_OPERATION: &str = "http:invoke";
 /// The catalog service type of a filesystem export.
 pub const FS_SERVICE_TYPE: &str = "fs";
-/// The grant operation (and consumer token scope) a filesystem **read**
-/// session requires.
+/// The grant operation and consumer token scope that admit a filesystem
+/// session at all.
 ///
-/// One scope admits the session; the four capabilities inside it — read, write,
-/// list and delete — are carried separately and enforced by the device's own
-/// provider on every 9P primitive. A token scope cannot stand in for them: the
-/// contract's model is that every capability a session holds was named
-/// individually, and a scope is one name.
+/// Deliberately **not** one of the four capabilities. A scope is one name, and
+/// the contract's model is that every capability a session holds was named
+/// individually: a session-admitting scope that also meant `read` would make a
+/// `list`-without-`read` grant unable to open a session, which is one of the
+/// grant shapes the contract requires to work.
+pub const FS_SESSION_OPERATION: &str = "fs:connect";
+/// The grant operation naming the `read` capability.
 pub const FS_READ_OPERATION: &str = "fs:read";
-/// The grant operation a filesystem **write** session requires. Gate 5's; the
-/// name is pinned here so a grant seeded for it cannot mean something else
-/// later.
+/// The grant operation naming the `write` capability. Gate 5 is where it
+/// becomes usable; the name is pinned here so a grant seeded for it cannot mean
+/// something else later.
 pub const FS_WRITE_OPERATION: &str = "fs:write";
+/// The grant operation naming the `list` capability.
+pub const FS_LIST_OPERATION: &str = "fs:list";
+/// The grant operation naming the `delete` capability. Gate 5's.
+pub const FS_DELETE_OPERATION: &str = "fs:delete";
 /// The service capability naming the export's observed case behaviour.
 ///
 /// Required on a filesystem service record. The contract says the provider
