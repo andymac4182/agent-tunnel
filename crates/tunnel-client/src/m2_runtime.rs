@@ -911,10 +911,13 @@ fn pending_open_retained_bytes(open: &Open) -> Option<usize> {
 }
 
 const M2_OPEN_JOURNAL_MAX_ENTRIES: usize = MAX_JOURNAL_ENTRIES;
-/// Retired stream IDs are kept as disjoint inclusive ranges.  A gap between
-/// two ranges can only be a stream the session still retains, so the range
-/// count is bounded by the retained-entry cap; the extra headroom keeps the
-/// coalescing path below an unreachable defence rather than a working limit.
+/// Retired stream IDs are kept as disjoint inclusive ranges.  The range count
+/// is not derived from the retained-entry cap: a gap can be a stream the
+/// session still retains, but it can equally be an ID the owner allocated and
+/// never named in an OPEN or a STREAM_FORGET, so sustained control-queue
+/// pressure can open arbitrarily many.  The bound is enforced by coalescing
+/// instead, which is safe because every absorbed ID is below the reclamation
+/// watermark and therefore already benign.
 const M2_RETIRED_STREAM_RANGES: usize = M2_OPEN_JOURNAL_MAX_ENTRIES + 64;
 // The journal retains encoded wire messages and deadline metadata rather than
 // parsed response trees. Keep a conservative fixed charge for the enclosing
@@ -1198,15 +1201,21 @@ impl OpenJournal {
 /// The session's monotonic record of stream IDs whose OPEN state has been
 /// reclaimed: either the owner's `STREAM_FORGET` completed its barriers, or
 /// the connector refused the request without journaling it because retention
-/// was exhausted.  A later `STREAM_FORGET` naming one of these is benign; a
-/// `STREAM_FORGET` naming an ID that was never here and is not retained
-/// stays the protocol error it is.
+/// was exhausted.  Its job is the second case, which the `forgotten_stream_through`
+/// watermark cannot cover: nothing was ever forgotten for those IDs, so they
+/// can sit above the watermark.  A later `STREAM_FORGET` naming one of them,
+/// or naming anything at or below the watermark, is benign; one naming an
+/// unretained ID above the watermark stays the protocol error it is.
 ///
-/// IDs are kept as sorted, disjoint, non-adjacent inclusive ranges.  A gap
-/// between ranges can only be a stream the session still retains, so the
-/// range count is bounded by the retained-entry cap.  If that reasoning is
-/// ever violated the lowest gap is coalesced and counted, which can only make
-/// the record more permissive about a never-seen ID, never less.
+/// IDs are kept as sorted, disjoint, non-adjacent inclusive ranges.  The
+/// range count is bounded by coalescing the lowest gap, not by an invariant:
+/// a gap can be an ID the owner allocated but never named in an OPEN or a
+/// STREAM_FORGET (a failed control encode, or a full control queue), so
+/// sustained control-queue pressure can open more gaps than retained entries.
+/// Coalescing is counted, and is safe in both directions: it can only make
+/// the record more permissive about an ID it never saw, never less, it never
+/// makes an ID admissible, and every ID it absorbs lies below the watermark
+/// and is therefore already benign for reclamation.
 #[derive(Debug, Default)]
 struct RetiredStreamIds {
     ranges: Vec<(u64, u64)>,
@@ -3869,6 +3878,20 @@ impl M2Actor {
         self.complete_open_journal(&open.message_id, vec![response], vec![None])
     }
 
+    /// Whether this OPEN names a stream ID whose state the session has
+    /// already reclaimed and holds nothing for.  The predicate is the
+    /// monotonic forgotten-stream watermark, not the retired-stream record:
+    /// a stream ID refused before it could be journaled was never forgotten,
+    /// and its OPEN stays retryable with its own typed refusal.
+    fn open_is_past_retry_horizon(&self, open: &Open) -> bool {
+        open.stream_id <= self.forgotten_stream_through
+            && !self.streams.contains_key(&open.stream_id)
+            && self
+                .open_journal
+                .retained_operation_matches(open.stream_id, &open.operation_id)
+                .is_none()
+    }
+
     fn active_stream_count(&self) -> usize {
         self.streams
             .values()
@@ -3878,6 +3901,21 @@ impl M2Actor {
 
     fn handle_open(&mut self, open: Open) -> Result<(), ClientError> {
         self.validate_open_context(&open)?;
+        // Past the OPEN retry horizon this connector holds no entry for the
+        // request, so journaling the refusal would retain a fresh entry for a
+        // stream the owner has already forgotten and will never forget again:
+        // the owner ignores a REJECTED naming a stream it no longer tracks,
+        // so nothing would ever release it.  Refuse without journaling, the
+        // same shape as the retention-exhausted refusal below.  The journaled
+        // STREAM_EXISTS path in `try_admit_open` stays for a stream ID this
+        // session still retains, whose own STREAM_FORGET releases it.
+        if self.open_is_past_retry_horizon(&open) {
+            return self.send_rejected(
+                &open,
+                "STREAM_EXISTS",
+                "stream ID was already forgotten; start a fresh session",
+            );
+        }
         let canonical = encode_control(&ControlMessage::Open(open.clone()))
             .map_err(|error| ClientError::Protocol(error.to_string()))?;
         let observation = match self.open_journal.observe(
@@ -4663,10 +4701,11 @@ impl M2Actor {
     }
 
     /// Remove deferred OPENs for the operation being forgotten before its
-    /// journal entries become tombstones.  A pending OPEN has no stream to
-    /// validate after the carrier barrier, so leaving it queued would make
-    /// the later retry observe a tombstone and fail the whole session.  Keep
-    /// all other operations in their original FIFO order and deadlines.
+    /// journal entries are released at the OPEN retry horizon.  A pending
+    /// OPEN has no stream to validate after the carrier barrier, so leaving
+    /// it queued would admit a request for a stream the owner has already
+    /// forgotten.  Keep all other operations in their original FIFO order
+    /// and deadlines.
     fn remove_pending_open_for_forget(&mut self, stream_id: u64, operation_id: &str) {
         let matches = |pending: &PendingOpen| {
             pending.open.stream_id == stream_id && pending.open.operation_id == operation_id
@@ -4781,11 +4820,25 @@ impl M2Actor {
         &mut self,
         forget: tunnel_protocol::rotation_control::StreamForget,
     ) -> Result<(), ClientError> {
-        // A STREAM_FORGET for a stream this session has already reclaimed, or
-        // refused without journaling because its retention was exhausted, is
-        // benign and idempotent.  An ID that was never retained and is not
-        // recorded as retired stays the protocol error it is.
-        if self.retired_streams.contains(forget.stream_id)
+        // Authenticate before deciding anything, including benignity: a
+        // message from another session or a stale epoch is a protocol error
+        // whatever stream ID it names.
+        if forget.session_id != self.session.session_id || forget.epoch != self.session.epoch {
+            return Err(ClientError::Protocol(
+                "STREAM_FORGET context mismatch".to_owned(),
+            ));
+        }
+        // A STREAM_FORGET for a stream this session has already reclaimed, for
+        // one refused without journaling because its retention was exhausted,
+        // or for any ID at or below the forgotten-stream watermark, is benign
+        // and idempotent.  The watermark is kept as its own condition because
+        // the owner allocates stream IDs monotonically and can consume one
+        // without ever naming it in an OPEN, so an ID below the watermark was
+        // allocated by this owner in this session even when the connector
+        // never saw it.  An ID above the watermark that this session never
+        // retained stays the protocol error it is.
+        if (self.retired_streams.contains(forget.stream_id)
+            || forget.stream_id <= self.forgotten_stream_through)
             && !self.streams.contains_key(&forget.stream_id)
             && self
                 .open_journal
@@ -14104,6 +14157,12 @@ mod tests {
                     && rejected.reply_to == open.message_id
         ));
         assert!(actor.streams.is_empty());
+        // The refusal is not journaled.  Journaling it would retain a fresh
+        // entry for a stream the owner has already forgotten and will never
+        // forget again, so a rule-violating owner could leak one entry per
+        // refusal until the session wedged at RESOURCE_EXHAUSTED.
+        assert_eq!(actor.open_journal.entry_count(), 0);
+        assert_eq!(actor.open_journal.used_bytes(), 0);
 
         // The connector can no longer tell that retry apart from a reused
         // message ID carrying different contents.  Both are refused before
@@ -14124,6 +14183,99 @@ mod tests {
                     && rejected.reply_to == changed.message_id
         ));
         assert!(actor.streams.is_empty());
+        assert_eq!(actor.open_journal.entry_count(), 0);
+        assert_eq!(actor.open_journal.used_bytes(), 0);
+    }
+
+    /// A refusal past the horizon must not be able to fill the journal, even
+    /// from an owner that breaks the rule and retries forever.
+    #[tokio::test]
+    async fn repeated_post_horizon_retries_cannot_fill_the_open_journal() {
+        let (mut actor, active_key, mut carrier_receiver, mut control_receiver) =
+            test_actor_with_control_capacity(M2_CARRIER_QUEUE_FRAMES, 16);
+        let (_responses, _entries) = open_forget_cycle(
+            &mut actor,
+            &active_key,
+            &mut carrier_receiver,
+            &mut control_receiver,
+            1,
+        )
+        .await;
+        for index in 0..(4 * M2_OPEN_JOURNAL_MAX_ENTRIES) {
+            let mut retry = test_open(1);
+            retry.message_id = format!("post-horizon-{index}");
+            actor
+                .handle_control(ControlMessage::Open(retry.clone()))
+                .await
+                .expect("a post-horizon retry is refused, never a session failure");
+            assert!(matches!(
+                drain_control_messages(&mut control_receiver).last(),
+                Some(ControlMessage::Rejected(rejected))
+                    if rejected.code == "STREAM_EXISTS" && rejected.reply_to == retry.message_id
+            ));
+            assert_eq!(actor.open_journal.entry_count(), 0);
+        }
+        assert_eq!(actor.open_journal.used_bytes(), 0);
+        // A fresh stream ID is still admitted afterwards.
+        let (responses, _entries) = open_forget_cycle(
+            &mut actor,
+            &active_key,
+            &mut carrier_receiver,
+            &mut control_receiver,
+            2,
+        )
+        .await;
+        assert!(responses.iter().all(|message| !matches!(
+            message,
+            ControlMessage::Rejected(rejected) if rejected.stream_id == 2
+        )));
+    }
+
+    #[test]
+    fn stream_forget_for_a_retired_stream_still_authenticates_its_context() {
+        let (mut actor, _key, mut carrier_receiver, _control_receiver) =
+            test_actor_with_carrier(M2_CARRIER_QUEUE_FRAMES);
+        actor.forgotten_stream_through = 4;
+        actor.retired_streams.insert(4);
+        let benign = tunnel_protocol::rotation_control::StreamForget {
+            message_id: "retired-forget".to_owned(),
+            reply_to: String::new(),
+            session_id: "session".to_owned(),
+            epoch: 1,
+            stream_id: 4,
+            operation_id: "operation-4".to_owned(),
+            direction: Direction::RelayToConnector,
+            final_state: no_stream_forget_state(4),
+        };
+        actor
+            .handle_stream_forget(benign.clone())
+            .expect("a retired stream ID in this session is benign");
+        // An ID the owner allocated but never named in an OPEN sits below the
+        // watermark and is benign for the same reason.
+        let mut never_seen = benign.clone();
+        never_seen.stream_id = 3;
+        never_seen.final_state = no_stream_forget_state(3);
+        actor
+            .handle_stream_forget(never_seen)
+            .expect("an ID below the watermark was allocated by this owner");
+        // Benignity is decided only after the message authenticates.
+        let mut stale_epoch = benign.clone();
+        stale_epoch.epoch = 2;
+        assert!(matches!(
+            actor
+                .handle_stream_forget(stale_epoch)
+                .expect_err("a stale epoch must not be accepted for a retired ID"),
+            ClientError::Protocol(message) if message == "STREAM_FORGET context mismatch"
+        ));
+        let mut other_session = benign;
+        other_session.session_id = "other-session".to_owned();
+        assert!(matches!(
+            actor
+                .handle_stream_forget(other_session)
+                .expect_err("another session's message must not be accepted"),
+            ClientError::Protocol(message) if message == "STREAM_FORGET context mismatch"
+        ));
+        assert!(carrier_receiver.try_recv().is_err());
     }
 
     #[test]
@@ -14154,15 +14306,16 @@ mod tests {
             test_actor_with_control_capacity(M2_CARRIER_QUEUE_FRAMES, 16);
         let mut rejected_open = test_open(1);
         rejected_open.service_id = "not-exported".to_owned();
-        // Exercise the stale stream-ID fence as well: a retained REJECTED
-        // entry still needs its authenticated FORGET to reach reclamation
-        // even when the retired-stream record would otherwise return early.
-        actor.forgotten_stream_through = rejected_open.stream_id;
-        actor.retired_streams.insert(rejected_open.stream_id);
         actor
             .handle_control(ControlMessage::Open(rejected_open.clone()))
             .await
             .expect("a locally denied OPEN should emit a typed rejection");
+        // Exercise the stale stream-ID fence as well: a retained REJECTED
+        // entry still needs its authenticated FORGET to reach reclamation
+        // even when the watermark and the retired-stream record would
+        // otherwise make a message for this ID benign.
+        actor.forgotten_stream_through = rejected_open.stream_id;
+        actor.retired_streams.insert(rejected_open.stream_id);
         let rejection = drain_control_messages(&mut control_receiver);
         assert!(matches!(
             rejection.last(),

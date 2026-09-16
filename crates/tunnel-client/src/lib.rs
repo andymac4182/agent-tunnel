@@ -167,10 +167,13 @@ pub struct ConnectionStatus {
     /// Stream IDs whose OPEN state has been reclaimed at that horizon, or
     /// refused before it could be journaled.  Monotonic for the session.
     pub open_streams_retired: u64,
-    /// How often the bounded retired-stream record coalesced a gap.  Its
-    /// range count is bounded by the retained-entry cap, so this is expected
-    /// to stay zero; a nonzero value means the record became more permissive
-    /// about a never-seen ID.
+    /// How often the bounded retired-stream record coalesced its lowest gap
+    /// to stay within its range limit.  A gap can be a stream ID the owner
+    /// allocated and never named in an OPEN or a STREAM_FORGET, so this can
+    /// increment legitimately under sustained control-queue pressure; it is
+    /// an observability signal about that pressure, not a safety condition.
+    /// Every absorbed ID lies below the reclamation watermark and is already
+    /// benign, and coalescing never makes an ID admissible.
     pub open_retired_ranges_coalesced: u64,
     pub emitted_sequences: u64,
     pub received_sequences: u64,

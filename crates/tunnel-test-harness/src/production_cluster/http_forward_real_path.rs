@@ -90,8 +90,14 @@ pub const SEQUENTIAL_REQUESTS: usize = 160;
 const SEQUENTIAL_CONNECTION_REQUESTS: usize = 32;
 /// A typed `not_dispatched` refusal (an owner-not-ready condition) may be
 /// retried this many times in total.  It never reached the device, so it
-/// cannot account for a second dispatch.
+/// cannot account for a second dispatch.  Exceeding the cap fails the run
+/// inside the loop; it is deliberately not also a validator rule, which
+/// could only restate the cap the loop already enforces.
 const SEQUENTIAL_RETRY_CAP: usize = 12;
+/// The sequential loop runs one request at a time, so the connector can hold
+/// the in-flight request's entry plus at most one whose reclamation has not
+/// completed.  Observed: 1.
+const SEQUENTIAL_JOURNAL_ENTRY_BOUND: usize = 2;
 const SEQUENTIAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// The bounded evidence one gate run produces.
@@ -171,6 +177,7 @@ pub struct HttpForwardRealPathEvidence {
     pub sequential_phase_after: String,
     pub sequential_ready_after: bool,
     pub open_journal_entries_peak: usize,
+    pub open_streams_retired_before_sequential: u64,
     pub open_streams_retired: u64,
     pub open_retired_ranges_coalesced: u64,
 }
@@ -184,7 +191,7 @@ pub fn validate_http_forward_real_path_evidence(
     evidence: &HttpForwardRealPathEvidence,
 ) -> Result<()> {
     let body_queue_bound = BODY_QUEUE_CHUNKS * MAX_BODY_PAYLOAD_LEN;
-    let checks: [(&str, bool); 54] = [
+    let checks: [(&str, bool); 52] = [
         (
             "owner-local ingress answers the permission request",
             evidence.owner_local_permission_exact,
@@ -370,10 +377,6 @@ pub fn validate_http_forward_real_path_evidence(
             evidence.sequential_dispatches == SEQUENTIAL_REQUESTS as u64,
         ),
         (
-            "typed not_dispatched refusals stayed bounded",
-            evidence.sequential_not_dispatched_retries <= SEQUENTIAL_RETRY_CAP,
-        ),
-        (
             "the device session survived every sequential stream",
             evidence.sequential_session_id_stable
                 && evidence.sequential_ready_after
@@ -383,16 +386,22 @@ pub fn validate_http_forward_real_path_evidence(
                 ),
         ),
         (
-            "the OPEN journal stayed bounded while serving them",
-            evidence.open_journal_entries_peak <= OPEN_JOURNAL_TRACKED_ENTRIES,
+            // One request at a time, so at most the in-flight request's own
+            // entry and one whose reclamation has not finished.  The cap
+            // itself would be vacuous: the journal refuses at the cap by
+            // construction.
+            "the OPEN journal held at most two entries while serving them",
+            evidence.open_journal_entries_peak <= SEQUENTIAL_JOURNAL_ENTRY_BOUND
+                && SEQUENTIAL_JOURNAL_ENTRY_BOUND < OPEN_JOURNAL_TRACKED_ENTRIES,
         ),
         (
-            "every served stream was reclaimed at the OPEN retry horizon",
-            evidence.open_streams_retired >= SEQUENTIAL_REQUESTS as u64,
-        ),
-        (
-            "the bounded retired-stream record never coalesced a gap",
-            evidence.open_retired_ranges_coalesced == 0,
+            // Exactly, not at least: every stream this phase opened was
+            // reclaimed at the horizon, and nothing else was.
+            "every sequential stream was reclaimed at the OPEN retry horizon",
+            evidence.open_streams_retired
+                == evidence
+                    .open_streams_retired_before_sequential
+                    .saturating_add(SEQUENTIAL_REQUESTS as u64),
         ),
     ];
     for (rule, passed) in checks {
@@ -1418,6 +1427,7 @@ async fn sequential_streams(
 ) -> Result<()> {
     let dispatches_before = state.invocations.load(Ordering::SeqCst) as u64;
     evidence.sequential_requests = SEQUENTIAL_REQUESTS;
+    evidence.open_streams_retired_before_sequential = client.status_snapshot().open_streams_retired;
     let mut connection: Option<(Sender, tokio::task::JoinHandle<()>)> = None;
     let mut on_connection = 0;
     let mut index = 0;
@@ -1488,9 +1498,12 @@ async fn sequential_streams(
         .unwrap_or_default();
     // The journal releases an entry only after the owner's STREAM_FORGET has
     // completed its carrier barriers, which can trail the consumer response.
+    let target_retired = evidence
+        .open_streams_retired_before_sequential
+        .saturating_add(SEQUENTIAL_REQUESTS as u64);
     let final_status = wait_for_records("open journal", async || {
         let snapshot = client.status_snapshot();
-        Ok((snapshot.open_streams_retired >= SEQUENTIAL_REQUESTS as u64).then_some(snapshot))
+        Ok((snapshot.open_streams_retired >= target_retired).then_some(snapshot))
     })
     .await?;
     evidence.open_journal_entries_peak = evidence
@@ -1577,8 +1590,9 @@ mod tests {
             sequential_session_id_stable: true,
             sequential_phase_after: "active".into(),
             sequential_ready_after: true,
-            open_journal_entries_peak: OPEN_JOURNAL_TRACKED_ENTRIES,
-            open_streams_retired: SEQUENTIAL_REQUESTS as u64,
+            open_journal_entries_peak: SEQUENTIAL_JOURNAL_ENTRY_BOUND,
+            open_streams_retired_before_sequential: 3,
+            open_streams_retired: SEQUENTIAL_REQUESTS as u64 + 3,
             open_retired_ranges_coalesced: 0,
         }
     }
@@ -1695,9 +1709,6 @@ mod tests {
             ("sequential double dispatch", |e| {
                 e.sequential_dispatches += 1
             }),
-            ("sequential retries", |e| {
-                e.sequential_not_dispatched_retries = SEQUENTIAL_RETRY_CAP + 1;
-            }),
             ("sequential session", |e| {
                 e.sequential_session_id_stable = false
             }),
@@ -1706,11 +1717,12 @@ mod tests {
             }),
             ("sequential readiness", |e| e.sequential_ready_after = false),
             ("journal bound", |e| {
-                e.open_journal_entries_peak = OPEN_JOURNAL_TRACKED_ENTRIES + 1;
+                e.open_journal_entries_peak = SEQUENTIAL_JOURNAL_ENTRY_BOUND + 1;
             }),
-            ("journal reclamation", |e| e.open_streams_retired -= 1),
-            ("retired record coalesced", |e| {
-                e.open_retired_ranges_coalesced = 1
+            ("journal reclamation short", |e| e.open_streams_retired -= 1),
+            ("journal reclamation extra", |e| e.open_streams_retired += 1),
+            ("reclamation baseline", |e| {
+                e.open_streams_retired_before_sequential += 1
             }),
         ];
         for (name, mutate) in mutations {
