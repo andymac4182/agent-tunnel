@@ -21,13 +21,22 @@ honesty applies to gate 3's.
     python3 scripts/fs-guard-deletion.py --case "32-hop" # substring filter
 
 Exit status is 0 when every case produced a usable result, and 1 when any case
-could not be applied or did not build — see `run_tests` below, which refuses to
-call a failed build a red test.  An earlier round of this evidence was wrong in
-exactly that way: the harness restored the crate with a checkout between runs,
-which also reverted an uncommitted cargo feature the tests needed, so three
-cases reported "RED" for a build that never compiled.  That refusal is the
-reason the numbers in task rows M4-08 and M4-09 can be trusted, so do not remove
-it.
+could not be applied or did not build.  **Two refusals keep the numbers honest
+and neither may be removed.** Both were added after a round of this evidence
+turned out to be wrong in exactly the way the refusal now prevents, and the
+numbers in task rows M4-08 and M4-09 rest on them:
+
+1. `run_tests` will not call a failed build a red test.  An early harness
+   restored the crate with a checkout between runs, which also reverted an
+   uncommitted cargo feature the tests needed, so three cases reported "RED"
+   for a build that never compiled.
+2. A case whose `old` text is **not unique** in its file is refused outright
+   rather than applied to the first match.  `str.replace(old, new, 1)` edits
+   whichever match comes first, so an ambiguous case deletes some *other*
+   guard and reports a red for it under the wrong name.  That happened twice:
+   the `Rlcreate` generation case's text was also the opening of the `Rlopen`
+   arm, and the `Rflush` membership case's text appears in `cancel_flush` too.
+   Both are anchored now, and the check caught the second one itself.
 
 The working tree must be clean before running: every case is restored by
 checking the crate out again, which would discard uncommitted work there.
@@ -976,6 +985,16 @@ GATE3_CASES: list[tuple[str, list[Edit]]] = [
         [CANCEL_FLUSH],
     ),
     (
+        "a failed flush cancelling rather than releasing its victim",
+        [
+            (
+                NINEP_SESSION,
+                """                FlushOutcome::Cancelled => self.cancel_flush(flushed, tag),""",
+                """                FlushOutcome::Cancelled => self.release_flushed(flushed, tag),""",
+            )
+        ],
+    ),
+    (
         "the pair identity and the cancelled-flush removal together",
         [PAIR_IDENTITY, CANCEL_FLUSH],
     ),
@@ -1016,11 +1035,14 @@ GATE3_CASES: list[tuple[str, list[Edit]]] = [
         [
             (
                 NINEP_SESSION,
+                # Anchored on the following line: the membership check itself
+                # appears in `cancel_flush` too, and `require_unique` refuses
+                # an ambiguous case rather than editing whichever comes first.
                 """        if !target.flushed_by.contains(&flush_tag) {
             return;
         }
-""",
-                "",
+        let remaining = self.live_flushes_of(flushed, flush_tag);""",
+                """        let remaining = self.live_flushes_of(flushed, flush_tag);""",
             )
         ],
     ),
@@ -1104,14 +1126,21 @@ GATE3_CASES: list[tuple[str, list[Edit]]] = [
         [
             (
                 NINEP_SESSION,
-                """                let Some(state) = self
+                # Anchored on the preceding line: without it this text is also
+                # the opening of the `Rlopen` arm, so the edit landed there
+                # instead and this case silently measured that guard twice.
+                # `require_unique` now refuses such a case outright; the anchor
+                # is what makes this one measure what it names.
+                """                let fresh = self.fresh_generation();
+                let Some(state) = self
                     .fids
                     .get_mut(fid)
                     .filter(|state| state.generation == *generation)
                 else {
                     return Ok(());
                 };""",
-                """                let Some(state) = self.fids.get_mut(fid) else {
+                """                let fresh = self.fresh_generation();
+                let Some(state) = self.fids.get_mut(fid) else {
                     return Ok(());
                 };
                 let _ = generation;""",
@@ -1137,9 +1166,9 @@ GATE3_CASES: list[tuple[str, list[Edit]]] = [
             (
                 NINEP_SESSION,
                 """        self.undo_reservation(&state.effect);
-        self.retire_tag(frame.tag, &state);
+        self.retire_tag(frame.tag, &state, FlushOutcome::Answered);
         applied""",
-                """        self.retire_tag(frame.tag, &state);
+                """        self.retire_tag(frame.tag, &state, FlushOutcome::Answered);
         applied""",
             )
         ],
@@ -1458,17 +1487,30 @@ def main() -> int:
 
     results: list[tuple[str, str, str, list[str]]] = []
     for suite, name, edits in selected:
-        applied = True
+        problem = None
         for path, old, new in edits:
             text = path.read_text()
-            if old not in text:
-                applied = False
+            occurrences = text.count(old)
+            if occurrences == 0:
+                problem = "guard text not found"
+                break
+            if occurrences > 1:
+                # Refusing is the whole point: `str.replace(old, new, 1)` would
+                # silently edit the FIRST match, so a case whose text is not
+                # unique measures some other guard — and reports a red for it
+                # under this case's name.  That happened: the `Rlcreate`
+                # generation case's text was also the opening of the `Rlopen`
+                # arm, so it deleted the `Rlopen` guard a second time and the
+                # real `Rlcreate` guard had never been deleted at all.  A count
+                # inflated that way is false evidence, and false evidence is
+                # worse than a missing case.
+                problem = f"guard text is ambiguous: {occurrences} occurrences"
                 break
             path.write_text(text.replace(old, new, 1))
-        if not applied:
+        if problem is not None:
             restore(suite)
-            results.append((suite.name, name, "COULD NOT DELETE: guard text not found", []))
-            print(f"[{suite.name}] {name}: guard text not found", flush=True)
+            results.append((suite.name, name, f"COULD NOT DELETE: {problem}", []))
+            print(f"[{suite.name}] {name}: {problem}", flush=True)
             continue
         outcome, failures = run_tests(suite)
         restore(suite)
