@@ -161,7 +161,15 @@ impl McpExportDiagnostics {
 }
 
 /// The handler registry passed to [`crate::connect_with_http_handlers`].
-#[derive(Clone, Debug, Default)]
+///
+/// Deliberately **not** `Clone`.  Its `Drop` ends the protocol sessions its
+/// MCP exports still hold, which is a process-wide effect; a second copy
+/// would end every live session as soon as the first one went away.  A
+/// caller that needs the registry's observations after handing it over takes
+/// [`HttpHandlers::diagnostics`] or
+/// [`HttpHandlers::mcp_diagnostics_source`], which are cheap read-only
+/// handles and carry no teardown.
+#[derive(Debug, Default)]
 pub struct HttpHandlers {
     exports: BTreeMap<String, HttpExport>,
     diagnostics: DeviceHttpDiagnostics,

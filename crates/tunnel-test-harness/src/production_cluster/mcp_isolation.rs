@@ -108,13 +108,17 @@ pub const FORGERY_ATTEMPTS: usize = 2 * 3 * 2;
 pub const ISOLATION_LOG_COUNT: u64 = 4;
 /// Completed scheduled rotations one held call must span.
 pub const ROTATION_SPAN: u64 = 3;
-/// The OPEN journal bound on the reused device session (M7-C82).  The
-/// correlation case puts `CORRELATION_CALLS` streams per principal in flight
-/// at once, so the journal may hold that many plus the entries whose
-/// reclamation has not completed; the point of the rule is that the bound is
-/// a function of concurrency and not of the roughly sixty streams the run
-/// serves on one session.
-pub const JOURNAL_ENTRY_BOUND: usize = CORRELATION_CALLS * 2 + 8;
+/// The OPEN journal bound on the reused device session (M7-C82).
+///
+/// Derived, not tuned.  The correlation case issues two adjacent bursts of
+/// `CORRELATION_CALLS` calls per principal — `CORRELATION_CALLS * 2` streams
+/// each — and the second burst can begin while the first burst's
+/// `STREAM_FORGET`s are still in flight, so both bursts may be unreclaimed at
+/// once: `CORRELATION_CALLS * 4`.  Nothing in the run can exceed that, and it
+/// is far under `MAX_JOURNAL_ENTRIES`, so the rule still says what it is meant
+/// to say — the journal is a function of concurrency, not of the roughly
+/// seventy streams the run serves on one session.
+pub const JOURNAL_ENTRY_BOUND: usize = CORRELATION_CALLS * 4;
 const JOURNAL_TRACKED_ENTRIES: usize = tunnel_protocol::control_journal::MAX_JOURNAL_ENTRIES;
 
 const SCENARIO_TIMEOUT: Duration = Duration::from_secs(1_200);

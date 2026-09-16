@@ -111,10 +111,14 @@ impl<W: CarrierWriter> OwnerRequestWriter<W> {
                     // sent none and a present one is a single value.  Both
                     // are compared against the owner's own derivation.
                     if let Some((name, expected)) = &self.binding {
+                        // The codec compares header names
+                        // ASCII-case-insensitively, so this must too: an
+                        // uppercase spelling the allowlist admitted would
+                        // otherwise read as absent here.
                         let presented = head
                             .headers
                             .iter()
-                            .find(|field| field.name == *name)
+                            .find(|field| field.name.eq_ignore_ascii_case(name))
                             .map(|field| field.value.as_str());
                         if presented != Some(expected.as_str()) {
                             return Err(CodecError::InvalidHeader(HeaderRule::NotAllowed));
@@ -508,6 +512,46 @@ mod tests {
                 "{value:?}"
             );
         }
+        // A name in any other ASCII case cannot reach the comparison at all:
+        // `http-forward/1` header names are lowercase
+        // (`validate_header_name` / `is_tchar_lower`), so the codec refuses
+        // the head outright.  The comparison below is nevertheless
+        // case-insensitive, so it can never read a differently-spelled name
+        // as an absent one if that rule ever changes.
+        let upper_head = {
+            let json = format!(
+                r#"{{"method":"POST","path":"/mcp","query":"","http_version":"1.1","headers":[["{}","{owned}"]],"body_length":null}}"#,
+                name.to_ascii_uppercase()
+            );
+            let mut out = Vec::new();
+            encode_record(RecordKind::RequestHead, json.as_bytes(), &mut out).unwrap();
+            out
+        };
+        let actor = Recorder::default();
+        let (to_ingress, _rx, _) = channel(1 << 16);
+        let verdict = Arc::new(OwnerVerdict::default());
+        let mut writer = OwnerRequestWriter::new(
+            actor.clone(),
+            binding_policy(),
+            watch::channel(None).0,
+            None,
+            Arc::clone(&verdict),
+            Some((name, owned.to_owned())),
+            to_ingress,
+        );
+        assert_eq!(
+            writer.data(Bytes::from(upper_head)).await,
+            Err(CarrierClosed)
+        );
+        assert!(actor.bytes().is_empty());
+        assert_eq!(
+            verdict.get(),
+            Some(ResetDetail {
+                code: HttpErrorCode::InvalidHead,
+                execution: Execution::NotDispatched
+            })
+        );
+
         // The owner's own value passes, so the rule is not vacuous.
         let actor = Recorder::default();
         let (to_ingress, _rx, _) = channel(1 << 16);

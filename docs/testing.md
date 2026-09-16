@@ -1016,7 +1016,9 @@ boundaries at most every 15 s (defect M7-C80).
   session survives. The revoked principal's own device-side session is *not*
   ended; it simply becomes unreachable, and its child holds a `max_children`
   slot for as long as the device session lives, or until
-  `session_idle_seconds` (M3-16).
+  `session_idle_seconds` (M3-16). The Streamable HTTP export has the same
+  setting for its own session table, so an abandoned session there is
+  forgotten rather than held for ever.
 * **rotation-span.** One call is held open until the owner has completed three
   scheduled rotations, then released: it must answer 200 exactly once with the
   fixture's exact text, on the same device session, with one dispatch. This
@@ -1049,8 +1051,11 @@ signal that the session's standalone stream is registered), and each unknown
 outcome is counted at the settle event above. Sleeps appear only as the poll
 interval of bounded waits on those signals. The OPEN journal peak is
 sampled continuously from the connector's status watch and must stay within a
-bound derived from the case concurrency (20), not from the roughly seventy
-streams the run serves on that one session; observed 13 to 18. The gate ends
+bound derived from the case concurrency — the correlation case issues two
+adjacent bursts of `CORRELATION_CALLS * 2` streams and the second can begin
+while the first's `STREAM_FORGET`s are still in flight, so both may be
+unreclaimed at once: `CORRELATION_CALLS * 4` = 24 — not from the roughly
+seventy streams the run serves on that one session; observed 12 to 18. The gate ends
 every session it can with DELETE; exactly two cannot be ended (the revoked
 principal's, whose DELETE the relay refuses along with everything else it
 sends, and the one whose owner relay was killed), and **no** export child may

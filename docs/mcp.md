@@ -288,13 +288,23 @@ the device who anyone is.
   - **Capacity is refused, never taken from somebody else.** The table holds
     `MAX_TRACKED_SESSIONS` (256) sessions and at most `MAX_SESSIONS_PER_BINDING`
     (32) per principal. A principal at either bound is refused a new
-    `initialize` with `503` *before the backend is dialled*, so the backend
-    never creates a session this export could not track. An earlier revision
-    evicted the oldest entry instead, which was a cross-principal denial
-    channel: any authorized principal could drop every other principal's live
-    session — forcing a re-initialization and losing its subscription state —
-    by opening 257 sessions. Entries leave only when their own session does: a
-    successful DELETE, or a backend that answers 404 for it.
+    `initialize` with `503` *before the backend is dialled* (and the refusal is
+    counted in the export's `rejected`), so the backend never creates a
+    session this export could not track. An earlier revision evicted the
+    oldest entry instead, which was a cross-principal denial channel: any
+    authorized principal could drop every other principal's live session —
+    forcing a re-initialization and losing its subscription state — by opening
+    257 sessions.
+  - **Entries expire.** An entry leaves when its own session does — a
+    successful DELETE, or a backend that answers 404 for it — or when it has
+    gone unused for the export's `session_idle_seconds` (default 600, the same
+    setting and bounds the stdio backend has). Without the expiry a client
+    that crashed and restarted without a DELETE leaked one slot per restart:
+    after 32 restarts that principal was refused every `initialize` until the
+    device process restarted, and 256 abandoned sessions would have locked the
+    export for everyone. Expiry fails closed — a forgotten session is answered
+    404 and its own holder re-initializes; no other principal is affected —
+    and it is per entry, so a session in use is never forgotten.
 - **A mismatch is an unknown session.** The same status, code and message,
   byte for byte, so a leaked ID proves nothing about whether the session
   exists.
