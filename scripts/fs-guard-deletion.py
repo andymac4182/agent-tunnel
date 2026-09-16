@@ -1534,6 +1534,53 @@ GATE4_CASES: list[tuple[str, list[Edit]]] = [
         ],
     ),
     (
+        # The three above mask one another and are load-bearing only together.
+        # The cache's own generation filter is masked by the prune, which
+        # removes a stale entry as soon as the clunk's reply lands; the prune is
+        # masked by the filter, which would refuse a stale entry anyway; and the
+        # release's generation check is masked by the prune for the same reason.
+        # Measured as a triple rather than counted as three singles, which is
+        # the same honesty gate 2 applies to its mount-boundary checks.
+        "the three fid-generation guards, together",
+        [
+            (
+                PROVIDER_SRC,
+                """    fn cached(&self, fid: u32) -> Option<&OpenFid> {
+        let generation = self.session.fid(fid)?.generation();
+        self.open
+            .get(&fid)
+            .filter(|entry| entry.generation == generation)
+    }""",
+                """    fn cached(&self, fid: u32) -> Option<&OpenFid> {
+        self.open.get(&fid)
+    }""",
+            ),
+            (
+                PROVIDER_SRC,
+                """        if self
+            .open
+            .get(&fid)
+            .is_some_and(|entry| Some(entry.generation) != live)
+        {
+            self.open.remove(&fid);
+        }""",
+                "        let _ = live;",
+            ),
+            (
+                PROVIDER_SRC,
+                """        if self
+            .open
+            .get(&fid)
+            .is_some_and(|entry| entry.generation == generation)
+        {
+            self.open.remove(&fid);
+        }""",
+                """        let _ = generation;
+        self.open.remove(&fid);""",
+            ),
+        ],
+    ),
+    (
         "the record decoder latches its first violation",
         [
             (
