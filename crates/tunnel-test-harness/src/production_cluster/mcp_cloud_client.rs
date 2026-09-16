@@ -960,6 +960,20 @@ impl Gate<'_> {
         let Some(client) = self.client.take() else {
             return Ok(());
         };
+        // Stop between rotations: a stop that lands inside an attempt can
+        // fail its stream-forget barrier with "data writer stopped before
+        // barrier completion" (seen once in fifteen runs).  Waiting for a
+        // settled carrier is bounded and does not hide a stop failure.
+        let settled = Instant::now() + WAIT;
+        loop {
+            let status = client.status_snapshot();
+            if (status.phase == "active" && status.candidate_generation.is_none())
+                || Instant::now() >= settled
+            {
+                break;
+            }
+            sleep(POLL).await;
+        }
         match timeout(CLEANUP_TIMEOUT, client.stop()).await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(error)) => Err(HarnessError::Process(format!("device stop: {error}"))),
