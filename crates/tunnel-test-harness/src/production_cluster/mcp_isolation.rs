@@ -133,6 +133,11 @@ const ROTATION_BOUND: Duration = Duration::from_secs(
 /// How long an explicit outcome may take to reach the consumer after a
 /// fault.
 const OUTCOME_WAIT: Duration = Duration::from_secs(90);
+/// How long the consumer's own call is given to finish after its side effect
+/// failed to appear, so the failure can name what the consumer saw.  This is
+/// a diagnostic grace on the failure path only: it asserts nothing, and a
+/// call still outstanding when it expires is reported as such.
+const OUTCOME_STATUS_GRACE: Duration = Duration::from_secs(15);
 /// A revoked grant must stop dispatch within this bound.
 pub const REVOCATION_BOUND: Duration = Duration::from_secs(30);
 /// An admitted exchange must be withdrawn this soon after the revocation.
@@ -1886,9 +1891,34 @@ impl Gate<'_> {
             .markers(SERVICE_2025)
             .join(format!("waiting-gate{label}"));
         if !wait_file(&waiting, WAIT).await {
-            call.abort();
+            // The side effect never ran.  Reporting only that fact cannot
+            // distinguish a request lost or refused before dispatch from one
+            // dispatched but never recorded, which is exactly the ambiguity
+            // that left the cause of this gate's observed timeouts open (see
+            // M7-C83).  Give the consumer's own call a bounded grace and name
+            // what it saw.  Failure path only: it asserts nothing and cannot
+            // turn a failing run green.
+            let mut call = call;
+            let observed = match timeout(OUTCOME_STATUS_GRACE, &mut call).await {
+                Ok(Ok(Ok(answer))) => {
+                    let (code, execution) = answer.error();
+                    format!(
+                        "consumer status {} code={code:?} execution={execution:?}",
+                        answer.status
+                    )
+                }
+                Ok(Ok(Err(error))) => format!("consumer request failed: {error}"),
+                Ok(Err(error)) => format!("consumer task did not join: {error}"),
+                Err(_) => {
+                    // Keep the pre-diagnostic cleanup: a call still running
+                    // when the grace expires is stopped, not left to the
+                    // process.
+                    call.abort();
+                    "consumer request still outstanding".to_owned()
+                }
+            };
             return Err(HarnessError::Timeout(format!(
-                "the {fault_name} side effect never ran"
+                "the {fault_name} side effect never ran ({observed})"
             )));
         }
         // The side effect has run exactly once at this point.
