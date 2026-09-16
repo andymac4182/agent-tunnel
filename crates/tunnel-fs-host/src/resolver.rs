@@ -22,6 +22,43 @@ use crate::policy::{
     lost_race,
 };
 
+/// The test-only hook that occupies the window between inspecting a name and
+/// opening it.
+///
+/// This module exists **only** under the `race-window-hook` feature, which no
+/// shipped build enables: with the feature off there is no hook, no
+/// thread-local and no call site.  It is here because the guards that survive a
+/// component being swapped mid-walk — `O_NOFOLLOW` and the post-open identity
+/// comparison — protect a window a few microseconds wide, and a test that
+/// merely races threads cannot be relied on to land inside it.  Rather than
+/// claim those guards are load-bearing without evidence, this lets a test step
+/// into the window deliberately.
+#[cfg(feature = "race-window-hook")]
+pub mod race_window {
+    use std::cell::Cell;
+
+    thread_local! {
+        static HOOK: Cell<Option<fn()>> = const { Cell::new(None) };
+    }
+
+    /// Run `hook` on this thread between each component's inspection and its
+    /// open.
+    pub fn set(hook: fn()) {
+        HOOK.with(|slot| slot.set(Some(hook)));
+    }
+
+    /// Stop running any hook on this thread.
+    pub fn clear() {
+        HOOK.with(|slot| slot.set(None));
+    }
+
+    pub(crate) fn fire() {
+        if let Some(hook) = HOOK.with(Cell::get) {
+            hook();
+        }
+    }
+}
+
 /// What a caller intends to do with the descriptor it is resolving.
 ///
 /// The intent is applied **in** the resolving open, not by reopening the name
@@ -501,6 +538,14 @@ impl ExportRoot {
             let seen = rustix::fs::statat(parent, name.as_str(), AtFlags::SYMLINK_NOFOLLOW)
                 .map_err(host_error)?;
             let seen = FileIdentity::from_stat(&seen);
+            // The TOCTOU window itself, held open on demand.  Compiled out
+            // entirely unless the `race-window-hook` feature is on, which only
+            // this crate's own race tests turn on: they need to occupy the
+            // instant between the name being inspected and the descriptor
+            // being opened, and a nanosecond-wide window cannot be hit
+            // reliably by racing threads alone.
+            #[cfg(feature = "race-window-hook")]
+            race_window::fire();
             let last = pending.is_empty();
 
             match seen.kind() {

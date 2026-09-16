@@ -18,6 +18,12 @@ publish.workspace = true
 rustix = { version = "1.1", default-features = false, features = ["fs", "std"] }
 tunnel-fs-core = { path = "../tunnel-fs-core" }
 
+[features]
+# Off by default and never enabled by a shipped build.  It compiles in a
+# thread-local hook the crate's own race tests use to hold open the window
+# between inspecting a name and opening it; see `resolver::race_window`.
+race-window-hook = []
+
 [dev-dependencies]
 rustix = { version = "1.1", default-features = false, features = ["fs", "std"] }
 
