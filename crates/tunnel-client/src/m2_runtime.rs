@@ -4088,10 +4088,23 @@ impl M2Actor {
                         features: tunnel_fs_core::FeatureSet::NONE,
                         limits: tunnel_fs_provider::default_limits(),
                     },
-                    crate::fs_export::parse_capabilities(
-                        open.metadata
-                            .get("fs_capabilities")
-                            .map_or("", String::as_str),
+                    // Narrowed here, not later: the stream's authority holds
+                    // this set and the provider rechecks every queued request
+                    // against it, so it has to be the **effective** grant and
+                    // not the wider one the relay named.
+                    crate::fs_export::intersect(
+                        crate::fs_export::parse_capabilities(
+                            open.metadata
+                                .get("fs_capabilities")
+                                .map_or("", String::as_str),
+                        ),
+                        tunnel_fs_core::CapabilitySet::from_slice(
+                            &settings
+                                .capabilities
+                                .iter()
+                                .filter_map(|name| tunnel_fs_core::Capability::parse(name))
+                                .collect::<Vec<_>>(),
+                        ),
                     ),
                 )
             });

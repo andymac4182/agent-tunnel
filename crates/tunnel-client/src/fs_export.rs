@@ -350,7 +350,15 @@ async fn emit_close(outbound: &FrameSender, code: SessionErrorCode) {
 }
 
 /// The capabilities both the relay's OPEN and the local allowlist name.
-fn intersect(left: CapabilitySet, right: CapabilitySet) -> CapabilitySet {
+///
+/// Public because the connector applies it **before** building the stream's
+/// [`StreamAuthority`]: the authority is what the provider rechecks a queued
+/// request against, so it must hold the effective grant rather than the wider
+/// one the relay named. Applying it twice is harmless — the operation is
+/// idempotent — and [`serve`] applies it again so the narrowing is a property of
+/// this module rather than of its caller.
+#[must_use]
+pub fn intersect(left: CapabilitySet, right: CapabilitySet) -> CapabilitySet {
     let mut set = CapabilitySet::DENY;
     for capability in Capability::ALL {
         if left.allows(capability) && right.allows(capability) {
