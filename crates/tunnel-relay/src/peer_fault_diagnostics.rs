@@ -186,6 +186,9 @@ pub enum PeerFaultCause {
     TransportQuic,
     /// The transport pool or permit budget was exhausted.
     TransportCapacity,
+    /// This relay publishes no approved peer trust evidence, so no peer could
+    /// be dialled.  Nothing was written to any owner.
+    TransportPinsUnavailable,
     /// A bounded body or chunk limit was exceeded.
     TransportBodyLimit,
     /// Any other typed transport failure.
@@ -231,6 +234,7 @@ impl PeerFaultCause {
             Self::TransportH3 => "transport_h3",
             Self::TransportQuic => "transport_quic",
             Self::TransportCapacity => "transport_capacity",
+            Self::TransportPinsUnavailable => "transport_pins_unavailable",
             Self::TransportBodyLimit => "transport_body_limit",
             Self::TransportOther => "transport_other",
             Self::Envelope => "envelope",
@@ -266,6 +270,7 @@ impl PeerFaultCause {
                 PeerTransportError::H3(_) => Self::TransportH3,
                 PeerTransportError::Quic(_) => Self::TransportQuic,
                 PeerTransportError::Capacity => Self::TransportCapacity,
+                PeerTransportError::PinsUnavailable => Self::TransportPinsUnavailable,
                 PeerTransportError::ChunkTooLarge { .. }
                 | PeerTransportError::BodyTooLarge { .. } => Self::TransportBodyLimit,
                 _ => Self::TransportOther,

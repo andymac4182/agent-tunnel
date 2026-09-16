@@ -4150,6 +4150,19 @@ fn peer_failure_response(error: PeerRuntimeError) -> Response {
             "PEER_UNAVAILABLE",
             "not_dispatched",
         ),
+        // This relay currently publishes no approved peer trust evidence, so
+        // the dial was refused by its own verifier before a socket was opened
+        // or a certificate examined: nothing reached any owner, which makes
+        // this `not_dispatched` rather than the `unknown` the generic
+        // transport arm below gives.  Reporting it as `unknown` denied a
+        // consumer the retry it is entitled to make for a safe request, which
+        // is what `verify-m3-mcp-isolation` saw a request issued just after a
+        // membership re-sign receive (M7-C83).  The condition is this relay's
+        // own transient state and its membership coordinator republishes on a
+        // bounded schedule, so the answer carries the retry hint too.
+        PeerRuntimeError::Transport(PeerTransportError::PinsUnavailable) => {
+            return peer_trust_unavailable_response();
+        }
         PeerRuntimeError::OwnerNotReady { retry_after_ms } => {
             return retryable_peer_failure_response(retry_after_ms);
         }
@@ -4198,6 +4211,41 @@ fn local_consumer_admission_response(error: RelayError) -> Response {
             "unknown",
         ),
     }
+}
+
+/// How long a consumer should wait before retrying a request refused because
+/// this relay publishes no approved peer trust evidence.
+///
+/// The membership coordinator republishes the pin set on its own bounded
+/// refresh tick, which the cluster configuration caps at five seconds, so this
+/// is that cap rather than the much shorter owner-readiness hint: a consumer
+/// that retried in 250 ms would simply be refused again.
+const PEER_TRUST_UNAVAILABLE_RETRY_AFTER_MS: u64 = 5_000;
+
+/// The typed answer for a dial refused before it left this relay because no
+/// approved peer trust evidence is currently published.
+///
+/// Distinct from [`retryable_peer_failure_response`] in its hint and its
+/// message only: both are `PEER_UNAVAILABLE` / `not_dispatched` / retryable,
+/// because in both cases nothing reached the owner and the condition clears
+/// on its own.
+fn peer_trust_unavailable_response() -> Response {
+    let mut response = (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ErrorBody {
+            code: "PEER_UNAVAILABLE",
+            execution: "not_dispatched",
+            message: "no approved peer trust evidence is published; retry after the bounded hint",
+            retryable: Some(true),
+            retry_after_ms: Some(PEER_TRUST_UNAVAILABLE_RETRY_AFTER_MS),
+        }),
+    )
+        .into_response();
+    let retry_after_seconds = PEER_TRUST_UNAVAILABLE_RETRY_AFTER_MS.div_ceil(1_000);
+    if let Ok(value) = HeaderValue::from_str(&retry_after_seconds.to_string()) {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    response
 }
 
 fn retryable_peer_failure_response(retry_after_ms: u64) -> Response {
@@ -4657,6 +4705,53 @@ mod tests {
                 .expect("transport capacity response JSON");
         assert_eq!(transport_capacity_body["code"], "PEER_UNAVAILABLE");
         assert_eq!(transport_capacity_body["execution"], "not_dispatched");
+    }
+
+    #[tokio::test]
+    async fn unpublished_peer_trust_is_not_dispatched_and_retryable() {
+        // M7-C83.  A dial refused because this relay publishes no approved
+        // peer trust evidence never opened a socket, never examined a peer
+        // certificate and never wrote anything, so it is `not_dispatched`.
+        // It used to fall into the generic transport arm below and answer
+        // `unknown`, which is what a request issued just after a membership
+        // re-sign received: certainty the relay did not have, and no retry a
+        // safe request could act on.  The condition is this relay's own
+        // transient state and clears on the bounded membership refresh tick,
+        // so the answer also carries the hint.
+        let response = peer_failure_response(PeerRuntimeError::Transport(
+            tunnel_transport::PeerTransportError::PinsUnavailable,
+        ));
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("5")
+        );
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .expect("bounded trust-unavailable body");
+        let body: serde_json::Value =
+            serde_json::from_slice(&body).expect("trust-unavailable response JSON");
+        assert_eq!(body["code"], "PEER_UNAVAILABLE");
+        assert_eq!(body["execution"], "not_dispatched");
+        assert_eq!(body["retryable"], true);
+        assert_eq!(body["retry_after_ms"], 5_000);
+
+        // An authentication failure against a peer that *was* dialled stays
+        // `unknown`: a certificate was examined, so the relay cannot claim
+        // nothing happened.  The two must not collapse into one arm.
+        let authentication = peer_failure_response(PeerRuntimeError::Transport(
+            tunnel_transport::PeerTransportError::Authentication("peer".to_owned()),
+        ));
+        let authentication_body = axum::body::to_bytes(authentication.into_body(), 1024)
+            .await
+            .expect("bounded authentication body");
+        let authentication_body: serde_json::Value =
+            serde_json::from_slice(&authentication_body).expect("authentication response JSON");
+        assert_eq!(authentication_body["execution"], "unknown");
+        assert!(authentication_body.get("retryable").is_none());
     }
 
     #[tokio::test]

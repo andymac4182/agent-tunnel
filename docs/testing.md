@@ -437,7 +437,41 @@ session; a public request across the retired route returns
 `503 CLUSTER_UNREADY` / `not_dispatched` and the impostor receives a connection
 from A but never a request stream; an untrusted signer naming a rogue SPKI
 leaves A unready with both the rogue and the replacement certificate refused;
-and a trusted record restores the replacement-only key set. Every transition
+and a trusted record restores the replacement-only key set.
+
+That rogue-signer phase is also **the regression for which unready states may
+keep a relay's peer pins** ([cluster.md](cluster.md#implementation-and-acceptance-gates)).
+An earlier attempt at the M7-C83 fix retained pins for *every* unready state and
+broke this gate: relay A completed mTLS and answered the probe `accepted` where
+this phase requires `rejected`, failing with `relay A did not reach the expected
+rejected outcome for the relay-b-replacement certificate before the bounded
+deadline (last=accepted)`. Rejected trust evidence therefore still withdraws the
+pin set, and only a local or transient unready state retains it. Red-then-green
+in both directions at the fix revision: with the retention widened back the gate
+fails at this phase in 65 s, and with the split in place it passes in 68 s.
+
+The retention split has a second consequence that is **not** yet resolved, and
+is why that work is not landable: `verify-m7-trust-expiry` fails intermittently
+on the branch carrying it (6 of 6 pass at the branch base, 3 of 6 on the branch)
+with `expired target pooled stream was not observed with its exact owner
+session/cursor before reclamation`. The stream *is* closed by the expiry in
+every run - the owner records `PeerMembershipExpired` and one terminal event
+either way - and exactly one of the gate's seventeen joined conditions differs:
+the ingress's receive-side outcome, `TrustExpired` when it passes and `Closed`
+when it fails. The ingress reclassifies a close as trust expiry only once its
+own invalidation dispatcher has recorded that reason, and at the base the pin
+set is emptied five times per run, which latches it promptly. It is tracked on
+M7-C83.
+
+An attribution change keyed on `VerifiedPeerBinding::valid_until` was written
+and then reverted: instrumentation showed the trust/checkpoint window, already
+carried monotonically, is *earlier*, so that arm could only fire later than the
+one that exists. The dispatcher was then instrumented on both revisions and
+latches `TrustExpired` identically in every run, passing or failing, so this is
+not a missed latch either. Measured interleaved on one machine with both
+binaries pre-built, the gate is **10 of 10 at the branch base and 6 of 10 on
+the branch**. The remaining difference is an ordering race whose mechanism is
+recorded as an unconfirmed hypothesis on M7-C83. Every transition
 asserts payload-free, credential-free process diagnostics, and cleanup joins
 both relay processes, the impostor, the checkpoint authority, both Redis
 forwarders and the catalog namespace. The deterministic statement of the same
@@ -953,9 +987,13 @@ short rotation policy as the M3-03 gate (interval 6 s, handshake 2 s, overlap
 5 s), against the same `tunnel-mcp-fixture` stdio server, but with **two
 distinct authenticated principals of one tenant** — `consumer-a-1` and
 `consumer-a-2`, each with its own bearer token and its own grant on the same
-device and services — and a **third principal** (`owner-a`) that exists only
-to have its grant revoked, so revocation cannot disturb the other cases. A run
-takes about 60 s.
+device and services — a **third principal** (`owner-a`) that exists only
+to have its grant revoked, so revocation cannot disturb the other cases, and a
+**fourth of another tenant entirely** (`consumer-b-1`), whose token is valid
+and whose grants are real but hold in tenant B only. The device also exports a
+**Streamable HTTP** service (`http-2025`) alongside the two stdio ones, backed
+by a single shared `tunnel-mcp-fixture` HTTP process the gate starts itself. A
+run takes about 40 s.
 
 Its client is raw HTTP, deliberately. M3-03 already pins the official rmcp
 client end to end; this gate has to send what a conforming client never sends:
@@ -966,7 +1004,7 @@ bytes. Everything else on the path is production: relay-c's public route, the
 peer HTTP/3 hop, relay-a's owner actor, the rotating device data WebSocket and
 `tunnel-client`'s configured `[exports.<service>.mcp]` stdio exports.
 
-All five cases run on **one device session** (defect M7-C82 is fixed), up to
+All eight cases run on **one device session** (defect M7-C82 is fixed), up to
 the owner loss that necessarily ends it, and membership is re-signed at case
 boundaries at most every 15 s (defect M7-C80).
 
@@ -991,6 +1029,39 @@ boundaries at most every 15 s (defect M7-C80).
   with the same JSON-RPC ID: each stream must carry exactly its own four
   `notifications/message` and none of the other's. Exactly two sessions and
   two children were opened, so a refused request never spawned one.
+* **streamable-binding.** The same rule as `session-isolation`, over the same
+  real cluster, but against the **Streamable HTTP** export instead of a stdio
+  one. This is the case that separates the binding from process isolation: the
+  stdio export gives every session its own child process, so a foreign session
+  ID failing there has two possible explanations, while a Streamable HTTP
+  backend is an address the export forwards to — one process, one session
+  table, shared by every principal — so the binding is the only thing that can
+  refuse it. The gate asserts that shape rather than assuming it: the export
+  must spawn no child and open no session-table entry of its own for the case,
+  because the sessions live in the backend. Each principal opens a session
+  through the cluster, consumer B presents consumer A's session ID on POST,
+  GET and DELETE, all three must answer 404 indistinguishably from an unknown
+  session, and both principals' own sessions must still answer exactly
+  afterwards. Each principal then ends its own session, and the end is checked
+  by the session becoming unusable — a reused ID answering 404 — rather than
+  by a status code, because this backend acknowledges a DELETE with 202 where
+  the stdio export answers 204, and an acknowledgement is not evidence. Before
+  this case, M3-04 proved the Streamable HTTP binding only through
+  `tunnel-mcp-fixture`'s in-process bridge.
+* **cross-tenant.** `consumer-b-1`, fully authenticated and genuinely
+  authorized in tenant B, drives tenant A's device and MCP service: one
+  `initialize`, and then tenant A's *live* session ID on POST, GET and DELETE,
+  each paired with the same route naming a session that never existed. All
+  seven must be refused with a 4xx and `not_dispatched` — never `unknown`,
+  which would mean the relay could not rule out that a foreign tenant's
+  request reached this tenant's device — and each live/absent pair must be
+  indistinguishable, so a refusal never tells a foreign tenant which of this
+  tenant's sessions are live. Observed: `404 DEVICE_NOT_FOUND`
+  `not_dispatched` on all seven. Nothing may be dispatched, no export session
+  may be opened, the device exchange log may not grow, and tenant A's own
+  session must still answer exactly afterwards. Tenant separation for the echo
+  path is M7 admission evidence; this drives it for an MCP export, where a
+  session ID is an extra handle a foreign tenant could try.
 * **correlation.** Both principals issue the six colliding JSON-RPC IDs of
   `COLLIDING_IDS` at once — including `9007199254740993` and
   `9007199254740994`, which a JSON implementation reading IDs as doubles would
@@ -1087,6 +1158,21 @@ handler registry ends every session its exports still hold.
   `another principal's session ID was accepted: post 200 get 200 delete 204`.
   The same removal fails the `tunnel-mcp-fixture` `principal_binding` tests
   for both export kinds.
+* Disabling the Streamable HTTP export's binding comparison
+  (`SessionBindings::permits` accepting any binding for a known session):
+  consumer B's POST, GET and DELETE on consumer A's Streamable HTTP session
+  were accepted with 200, 200 and 202, and the gate failed with
+  `a Streamable HTTP session ID was accepted for another principal: post 200
+  get 200 delete 202`.
+* Driving the `cross-tenant` case with `consumer-a-2` — a principal of *this*
+  tenant holding a real grant — instead of `consumer-b-1`: the gate failed
+  with `a cross-tenant consumer was not refused before dispatch on every
+  route: 0 of 7 refused, initialize 200`. The case therefore detects an
+  admitted consumer rather than passing because every request happens to fail;
+  its green result is the tenant boundary doing the work. A defect injected
+  into tenant scoping itself would be the stronger red, but the catalog's
+  grants are tenant-scoped by construction and cannot be seeded across
+  tenants, so this is the red the fixture can express.
 * Skipping the `revoke_grant` call in the revocation case: the fresh request
   was still served, the case ended on an unrelated transient
   `503 PEER_UNAVAILABLE`, and the gate failed with
@@ -1108,7 +1194,7 @@ The M3-01/M3-02/M3-04 suite runs with the ordinary workspace test command. It is
 cargo test --locked -p tunnel-mcp -p tunnel-mcp-export -p tunnel-mcp-fixture
 ```
 
-`tunnel-mcp-fixture` builds the synthetic rmcp 3.4.0 server binary. Its `rmcp_stdio`, `rmcp_http`, `export_guards` and `principal_binding` tests run the pinned rmcp client through the in-process gate-2 bridge against the stdio export and the Streamable HTTP export, for both `mcp-2026-07-28` and `mcp-2025-11-25`. [mcp.md](mcp.md#pinned-in-code-m3-01-and-m3-02) lists what they cover and what they do not. `principal_binding` covers the M3-04 session binding for both export kinds through that bridge; isolation over the real cluster is `verify-m3-mcp-isolation`. The end-to-end tests are `cfg(unix)`. The same fixture binary is the desktop server of the real-path gate above.
+`tunnel-mcp-fixture` builds the synthetic rmcp 3.4.0 server binary. Its `rmcp_stdio`, `rmcp_http`, `export_guards` and `principal_binding` tests run the pinned rmcp client through the in-process gate-2 bridge against the stdio export and the Streamable HTTP export, for both `mcp-2026-07-28` and `mcp-2025-11-25`. [mcp.md](mcp.md#pinned-in-code-m3-01-and-m3-02) lists what they cover and what they do not. `principal_binding` covers the M3-04 session binding for both export kinds through that bridge; over the real cluster, `verify-m3-mcp-isolation` now drives both kinds too — the stdio exports in `session-isolation` and the Streamable HTTP export in `streamable-binding`. The end-to-end tests are `cfg(unix)`. The same fixture binary is the desktop server of the real-path gate above.
 
 For CUA, pin each supported backend profile separately. Use recorded synthetic contract fixtures or fake local servers in ordinary CI. The Python computer-server profile requires tests for its `/cmd` response format and its sequential `/ws` request behavior without correlation IDs. If a Rust `cua-driver` profile is selected, validate its own protocol and capability discovery independently. Tunnel credentials must not be forwarded as CUA cloud credentials.
 
