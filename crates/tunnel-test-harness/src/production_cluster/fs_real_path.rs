@@ -1,7 +1,7 @@
 //! Implementation gate 4 of `docs/filesystem-api.md` over the real cluster:
 //! a consumer HTTPS descriptor read and a real WSS 9P2000.L session through
 //! the owning relay's public route, the owner actor, the device data
-//! WebSocket and `tunnel-client`'s filesystem export, against five filesystem
+//! WebSocket and `tunnel-client`'s filesystem export, against six filesystem
 //! exports seeded side by side on one device.
 //!
 //! What one run proves, in the order [`run`] takes it:
@@ -20,6 +20,12 @@
 //!   each on its own export.
 //! * A pipelined `Tflush`, a fid-generation collision, a non-owner relay's
 //!   refusal, and every mutation refused with the host file unchanged.
+//! * A **real** grant revision advanced in the catalog between discovery and
+//!   upgrade: the superseded revision is refused at both the descriptor and
+//!   the upgrade, and the current one is admitted.
+//! * A **real** revocation under a live 9P session on its own export: the
+//!   session closes, nothing further is answered, and the close code is
+//!   recorded.
 //!
 //! Every byte of fixture content is synthetic and generated here; no evidence
 //! field, log line or error message carries a path, a name or file content.
@@ -78,6 +84,10 @@ const EPERM: u32 = FsErrorCode::Eperm.errno();
 const EINVAL: u32 = FsErrorCode::Einval.errno();
 /// A framing or lifecycle violation closes the consumer socket with this code.
 const PROTOCOL_VIOLATION_CLOSE: u16 = 1002;
+/// An authorization invalidation closes the consumer socket with this code.
+/// The contract has one close for the whole class — an expired snapshot, a
+/// moved revision and a revoked grant alike — and it is 1008.
+const AUTHORIZATION_CLOSE: u16 = 1008;
 
 /// The `msize` the gate offers, which is also the profile ceiling.
 const OFFERED_MSIZE: u32 = tunnel_fs_ninep::MAX_MESSAGE_BYTES;
@@ -116,6 +126,19 @@ const COLLISION_FILE_BYTES: usize = 1_024;
 const FLUSH_PIPELINE_DEPTH: usize = 8;
 /// How long the owner claim may take to land in the catalog.
 const OWNER_WAIT: Duration = Duration::from_secs(30);
+/// The file the revoked session reads before its grant goes away.
+const REVOCABLE_FILE_BYTES: usize = 512;
+/// How long an authorization change may take to become observable.
+///
+/// A relay may hold an authorization snapshot for up to five seconds and a
+/// live stream re-challenges on the same ceiling, so a change is not visible
+/// instantly.  This is the bound on the wait, not the wait itself: every loop
+/// below polls or blocks on the real signal and stops the moment it arrives,
+/// so a run that is merely slow still passes and a run where the change never
+/// becomes observable fails by name rather than by a sleep that was too short.
+const AUTHORIZATION_WAIT: Duration = Duration::from_secs(60);
+/// How long to wait between polls of an authorization change.
+const AUTHORIZATION_POLL: Duration = Duration::from_millis(100);
 
 /// The bounded evidence one gate run produces.
 ///
@@ -215,6 +238,36 @@ pub struct FsRealPathEvidence {
     pub mutation_create_errno: Option<u32>,
     pub mutation_mkdir_errno: Option<u32>,
     pub mutation_host_unchanged: bool,
+    // (q) a real grant revision advanced between discovery and upgrade.
+    /// Whether `upsert_grant` moved the revision the catalog holds off the one
+    /// the descriptor had just published.  Without this the rest of the case
+    /// would prove only that the relay refuses a number it never issued.
+    pub revision_advanced_in_catalog: bool,
+    /// The status of the descriptor read that first reported the new revision.
+    pub revised_descriptor_status: u16,
+    /// Whether that descriptor's `grantRevision` differs from the one a
+    /// consumer would have cached before the change.
+    pub revised_revision_differs: bool,
+    /// A descriptor read carrying the superseded revision.
+    pub superseded_descriptor_status: u16,
+    pub superseded_descriptor_code: String,
+    /// The WSS upgrade carrying the superseded revision.
+    pub superseded_upgrade_status: u16,
+    pub superseded_upgrade_code: String,
+    /// Whether the upgrade carrying the *current* revision was admitted and
+    /// reached an attached root, so the refusal above is the revision's doing
+    /// and not the export becoming unusable.
+    pub current_revision_upgrade_admitted: bool,
+    // (r) a real revocation under a live 9P session.
+    /// Whether the session read its file before anything was revoked.
+    pub revoked_session_served_before: bool,
+    /// Whether the consumer's socket ended at all within the bound.
+    pub revoked_session_closed: bool,
+    /// The close code the consumer observed, or `None` for a socket that ended
+    /// without one.
+    pub revoked_session_close_code: Option<u16>,
+    /// 9P replies that arrived after the revocation.  Must be zero.
+    pub revoked_session_replies_after: usize,
 }
 
 /// Every rule gate 4 must satisfy.  Returns the first violated one, so a
@@ -224,7 +277,7 @@ pub struct FsRealPathEvidence {
 /// A `HarnessError::Process` naming the violated rule.
 #[allow(clippy::too_many_lines)]
 pub fn validate_fs_real_path_evidence(evidence: &FsRealPathEvidence) -> Result<()> {
-    let checks: [(&str, bool); 45] = [
+    let checks: [(&str, bool); 54] = [
         ("three relays", evidence.relay_count == 3),
         (
             "the upgrade ran against the owning relay and the refusal against another",
@@ -415,6 +468,44 @@ pub fn validate_fs_real_path_evidence(evidence: &FsRealPathEvidence) -> Result<(
             "the host file is unchanged after the refused mutations",
             evidence.mutation_host_unchanged,
         ),
+        (
+            "a real grant revision moved in the catalog",
+            evidence.revision_advanced_in_catalog,
+        ),
+        (
+            "a fresh descriptor reports the moved revision",
+            evidence.revised_descriptor_status == 200 && evidence.revised_revision_differs,
+        ),
+        (
+            "a descriptor read carrying the superseded revision is refused",
+            evidence.superseded_descriptor_status == 409
+                && evidence.superseded_descriptor_code == CAPABILITIES_CHANGED,
+        ),
+        (
+            "an upgrade carrying the superseded revision is refused",
+            evidence.superseded_upgrade_status == 409
+                && evidence.superseded_upgrade_code == CAPABILITIES_CHANGED,
+        ),
+        (
+            "the upgrade carrying the current revision is admitted",
+            evidence.current_revision_upgrade_admitted,
+        ),
+        (
+            "the session served its file before the revocation",
+            evidence.revoked_session_served_before,
+        ),
+        (
+            "a revoked grant ends the live session",
+            evidence.revoked_session_closed,
+        ),
+        (
+            "the revoked session closed for an authorization invalidation",
+            evidence.revoked_session_close_code == Some(AUTHORIZATION_CLOSE),
+        ),
+        (
+            "nothing was answered after the revocation",
+            evidence.revoked_session_replies_after == 0,
+        ),
     ];
     for (rule, passed) in checks {
         if !passed {
@@ -492,13 +583,14 @@ struct Fixture {
     directory: TempDir,
 }
 
-/// Build the five export roots, each with only the content its own cases need.
+/// Build the six export roots, each with only the content its own cases need.
 fn build_fixtures(harness: &RunningHarness) -> Result<Vec<Fixture>> {
     let mut fixtures = Vec::new();
     for label in [
         "read-list",
         "list-only",
         "read-only",
+        "revocable",
         "empty-grant",
         "unsupported-host",
     ] {
@@ -544,6 +636,10 @@ fn build_fixtures(harness: &RunningHarness) -> Result<Vec<Fixture>> {
                 std::fs::write(root.join("only.bin"), synthetic_bytes(READ_ONLY_FILE_BYTES))
                     .map_err(HarnessError::Io)?;
                 std::fs::create_dir(root.join("sub")).map_err(HarnessError::Io)?;
+            }
+            "revocable" => {
+                std::fs::write(root.join("live.bin"), synthetic_bytes(REVOCABLE_FILE_BYTES))
+                    .map_err(HarnessError::Io)?;
             }
             // No session is ever admitted for these two, so their trees exist
             // only so the connector can open the root the operator configured.
@@ -1003,6 +1099,301 @@ async fn exercise(
         evidence,
     )
     .await?;
+
+    let principal_id = harness
+        .topology
+        .consumers_a
+        .first()
+        .map(|consumer| consumer.id)
+        .ok_or_else(|| HarnessError::InvalidInput("the consumer principal is missing".into()))?;
+
+    // (q) A real grant revision moved between discovery and upgrade.  Last
+    // among the `read-list` cases, because it changes that export's grant and
+    // every case above reads the revision the fixture seeded.
+    revision_change_case(
+        cluster,
+        &Grant {
+            tenant_id,
+            principal_id,
+            device_id,
+            service_id: read_list.service_id,
+        },
+        harness
+            .fs_service("read-list")
+            .ok_or_else(|| HarnessError::InvalidInput("the read-list export is missing".into()))?
+            .operations,
+        owner_addr,
+        &ca,
+        &token,
+        evidence,
+    )
+    .await?;
+
+    // (r) A real revocation under a live session, on an export nothing else
+    // in this run has touched.
+    let revocable = fixture("revocable")?;
+    revocation_case(
+        cluster,
+        &Grant {
+            tenant_id,
+            principal_id,
+            device_id,
+            service_id: revocable.service_id,
+        },
+        &target(owner_addr, revocable.service_id),
+        &ca,
+        &token,
+        evidence,
+    )
+    .await?;
+    Ok(())
+}
+
+/// The catalog coordinates of one grant, so the two authorization cases take a
+/// name rather than four bare `Uuid`s in a row.
+struct Grant {
+    tenant_id: Uuid,
+    principal_id: Uuid,
+    device_id: Uuid,
+    service_id: Uuid,
+}
+
+/// The descriptor's `grantRevision`, or the empty string.
+fn grant_revision(body: &[u8]) -> String {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .pointer("/grantRevision")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_default()
+}
+
+/// (q) A grant whose revision really moves between discovery and upgrade.
+///
+/// The gate's other revision case sends a number the catalog never issued,
+/// which proves only that the relay compares. This one changes the grant in
+/// the authoritative catalog and then holds the descriptor a consumer would
+/// have cached against the change: a cached descriptor is informative and is
+/// never itself an authorization credential, so the superseded revision has to
+/// be refused at the descriptor *and* at the upgrade, while the current one is
+/// still admitted.
+///
+/// The re-grant names the same operations as the seed. The point being proven
+/// is the revision, so a capability difference here would let a refusal be
+/// credited to a lost permission instead.
+async fn revision_change_case(
+    cluster: &ProductionCluster,
+    grant: &Grant,
+    operations: &[&str],
+    owner_addr: std::net::SocketAddr,
+    ca: &[u8],
+    token: &str,
+    evidence: &mut FsRealPathEvidence,
+) -> Result<()> {
+    let path = format!(
+        "/v1/devices/{}/services/{}/fs",
+        grant.device_id, grant.service_id
+    );
+    // What a consumer that discovered the export a moment ago would hold.
+    let (status, _, body) = http_get(owner_addr, ca, "GET", &path, Some(token), &[]).await?;
+    if status != 200 {
+        return Err(HarnessError::Process(format!(
+            "the descriptor before the revision change answered {status}"
+        )));
+    }
+    let cached = grant_revision(&body);
+    if cached.is_empty() {
+        return Err(HarnessError::Process(
+            "the descriptor carried no grant revision to supersede".into(),
+        ));
+    }
+
+    let snapshot = cluster
+        .catalog
+        .upsert_grant(&tunnel_catalog::GrantSpec {
+            tenant_id: grant.tenant_id,
+            principal_id: grant.principal_id,
+            device_id: grant.device_id,
+            service_id: grant.service_id,
+            permissions: tunnel_catalog::PermissionSet {
+                operations: operations
+                    .iter()
+                    .map(|operation| (*operation).to_owned())
+                    .collect(),
+            },
+            constraints: serde_json::Value::Object(serde_json::Map::new()),
+            expires_at: None,
+            active: true,
+        })
+        .await
+        .map_err(|error| HarnessError::Redis(format!("revising the grant: {error}")))?;
+    evidence.revision_advanced_in_catalog = snapshot.revision.to_string() != cached;
+
+    // A relay may serve an authorization snapshot for up to five seconds, so
+    // the change is not visible the instant the catalog takes it.  Poll the
+    // real signal — a descriptor reporting a different revision — under a
+    // bounded deadline rather than sleeping for the ceiling and assuming.
+    let deadline = Instant::now() + AUTHORIZATION_WAIT;
+    let current = loop {
+        let (status, _, body) = http_get(owner_addr, ca, "GET", &path, Some(token), &[]).await?;
+        let revision = grant_revision(&body);
+        if status == 200 && !revision.is_empty() && revision != cached {
+            evidence.revised_descriptor_status = status;
+            break revision;
+        }
+        if Instant::now() >= deadline {
+            return Err(HarnessError::Timeout(
+                "the revised grant revision never reached the descriptor".into(),
+            ));
+        }
+        sleep(AUTHORIZATION_POLL).await;
+    };
+    evidence.revised_revision_differs = current != cached;
+    // The cached revision at the descriptor.
+    let (status, _, body) = http_get(
+        owner_addr,
+        ca,
+        "GET",
+        &path,
+        Some(token),
+        &[(wire::GRANT_REVISION_HEADER, cached.as_str())],
+    )
+    .await?;
+    evidence.superseded_descriptor_status = status;
+    evidence.superseded_descriptor_code = error_code(&body);
+
+    let target = Target {
+        consumer_addr: owner_addr,
+        device_id: grant.device_id,
+        service: grant.service_id.to_string(),
+    };
+    // The cached revision at the upgrade.  This is the gate's own must-prove:
+    // a descriptor a consumer already holds authorizes nothing.
+    match NinepClient::connect_with(
+        &target,
+        ca,
+        token,
+        Some(SUBPROTOCOL),
+        &[(wire::GRANT_REVISION_HEADER, cached.as_str())],
+    )
+    .await
+    {
+        Ok(client) => {
+            client.close().await;
+            return Err(HarnessError::Process(
+                "an upgrade carrying a superseded grant revision was admitted".into(),
+            ));
+        }
+        Err(failure) => {
+            let (status, body) = failure.into_status()?;
+            evidence.superseded_upgrade_status = status;
+            evidence.superseded_upgrade_code = error_code(&body.unwrap_or_default());
+        }
+    }
+
+    // The current revision, so the refusal above is the revision's doing and
+    // not the export having become unusable.  Carried all the way to an
+    // attached root: a `101` alone would not show the session working.
+    let mut client = match NinepClient::connect_with(
+        &target,
+        ca,
+        token,
+        Some(SUBPROTOCOL),
+        &[(wire::GRANT_REVISION_HEADER, current.as_str())],
+    )
+    .await
+    {
+        Ok(client) => client,
+        Err(failure) => {
+            let (status, _) = failure.into_status()?;
+            return Err(HarnessError::Http(format!(
+                "the upgrade carrying the current grant revision was refused with {status}"
+            )));
+        }
+    };
+    client.version(OFFERED_MSIZE).await?;
+    let qid = client.attach(0).await?;
+    evidence.current_revision_upgrade_admitted = qid.kind == QidKind::Directory;
+    client.close().await;
+    Ok(())
+}
+
+/// (r) A grant revoked while a 9P session on it is live.
+///
+/// The session is opened on an export nothing else in this run touches, so the
+/// only authorization change under it is this revocation.  After the revoke
+/// the consumer only *reads*: what is being proven is what a consumer observes
+/// without asking for anything, which is the honest form of "the session was
+/// closed for it" — a reply that arrived because the gate poked the socket
+/// would prove nothing about the relay noticing on its own.
+async fn revocation_case(
+    cluster: &ProductionCluster,
+    grant: &Grant,
+    target: &Target,
+    ca: &[u8],
+    token: &str,
+    evidence: &mut FsRealPathEvidence,
+) -> Result<()> {
+    let mut client = open_session(target, ca, token).await?;
+    client.version(OFFERED_MSIZE).await?;
+    let root_fid = 0_u32;
+    client.attach(root_fid).await?;
+    let fid = 1_u32;
+    expect_walk(client.walk(root_fid, fid, &["live.bin"]).await?, 1)?;
+    expect_open(client.lopen(fid, O_RDONLY).await?)?;
+    let (bytes, _) = read_whole(&mut client, fid, READ_COUNT).await?;
+    evidence.revoked_session_served_before = bytes == synthetic_bytes(REVOCABLE_FILE_BYTES);
+
+    cluster
+        .catalog
+        .revoke_grant(
+            grant.tenant_id,
+            grant.principal_id,
+            grant.device_id,
+            grant.service_id,
+            chrono::Utc::now(),
+        )
+        .await
+        .map_err(|error| HarnessError::Redis(format!("revoking the grant: {error}")))?;
+
+    // Bounded by a deadline, not by a fixed wait: the loop ends the moment the
+    // socket does, and a socket that never ends fails by name.
+    let deadline = Instant::now() + AUTHORIZATION_WAIT;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match timeout(remaining, client.recv_event()).await {
+            Ok(Ok(Event::Frame(_))) => {
+                // A reply after the grant went away.  Counted rather than
+                // refused here, so the validator names the rule it broke.
+                evidence.revoked_session_replies_after += 1;
+            }
+            Ok(Ok(Event::Close(code))) => {
+                evidence.revoked_session_closed = true;
+                evidence.revoked_session_close_code = code;
+                break;
+            }
+            Ok(Ok(Event::Ended)) => {
+                // The socket ended with no close frame at all, which is a
+                // distinct observation from a close carrying a code.
+                evidence.revoked_session_closed = true;
+                break;
+            }
+            Ok(Err(error)) => {
+                // Transport-level, so it carries no payload: the socket failed
+                // before or instead of a close frame.
+                eprintln!("fs revocation: the consumer socket failed: {error}");
+                evidence.revoked_session_closed = true;
+                break;
+            }
+            Err(_) => break,
+        }
+    }
     Ok(())
 }
 
@@ -1463,6 +1854,18 @@ mod tests {
             mutation_create_errno: Some(EPERM),
             mutation_mkdir_errno: Some(EPERM),
             mutation_host_unchanged: true,
+            revision_advanced_in_catalog: true,
+            revised_descriptor_status: 200,
+            revised_revision_differs: true,
+            superseded_descriptor_status: 409,
+            superseded_descriptor_code: CAPABILITIES_CHANGED.into(),
+            superseded_upgrade_status: 409,
+            superseded_upgrade_code: CAPABILITIES_CHANGED.into(),
+            current_revision_upgrade_admitted: true,
+            revoked_session_served_before: true,
+            revoked_session_closed: true,
+            revoked_session_close_code: Some(AUTHORIZATION_CLOSE),
+            revoked_session_replies_after: 0,
         }
     }
 
@@ -1573,6 +1976,45 @@ mod tests {
             }),
             ("mutation create", |e| e.mutation_create_errno = None),
             ("host changed", |e| e.mutation_host_unchanged = false),
+            ("the catalog revision never moved", |e| {
+                e.revision_advanced_in_catalog = false;
+            }),
+            ("the revised descriptor was refused", |e| {
+                e.revised_descriptor_status = 409;
+            }),
+            ("the descriptor reported the same revision", |e| {
+                e.revised_revision_differs = false;
+            }),
+            ("a superseded revision was served a descriptor", |e| {
+                e.superseded_descriptor_status = 200;
+            }),
+            ("a superseded descriptor refusal named another code", |e| {
+                e.superseded_descriptor_code = ACCESS_DENIED.into();
+            }),
+            ("a superseded revision was admitted an upgrade", |e| {
+                e.superseded_upgrade_status = 101;
+            }),
+            ("a superseded upgrade refusal named another code", |e| {
+                e.superseded_upgrade_code = BACKEND_UNAVAILABLE.into();
+            }),
+            ("the current revision was refused an upgrade", |e| {
+                e.current_revision_upgrade_admitted = false;
+            }),
+            ("the revoked session never served anything", |e| {
+                e.revoked_session_served_before = false;
+            }),
+            ("the revoked session stayed open", |e| {
+                e.revoked_session_closed = false;
+            }),
+            ("the revoked session closed without a code", |e| {
+                e.revoked_session_close_code = None;
+            }),
+            ("the revoked session closed as a protocol violation", |e| {
+                e.revoked_session_close_code = Some(PROTOCOL_VIOLATION_CLOSE);
+            }),
+            ("a reply arrived after the revocation", |e| {
+                e.revoked_session_replies_after = 1;
+            }),
         ];
         for (name, mutate) in mutations {
             let mut evidence = passing();

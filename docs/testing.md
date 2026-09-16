@@ -837,11 +837,11 @@ requires every one of those rules to notice a field weakened on its own.
 **What the gate must observe, and where each rule comes from.** The
 authorization matrix of
 [filesystem-api.md](filesystem-api.md#confinement-and-capability-model) is
-proven by seeding five filesystem exports side by side on one device — a
-`read`+`list` grant, a `list`-only grant, a `read`-only grant, a grant naming
-only the session scope, and an export whose host declares filesystem exports
-unsupported — so a session's answer cannot be credited to a different export's
-configuration. Against them: the descriptor from the grant; `403 ACCESS_DENIED`
+proven by seeding six filesystem exports side by side on one device — a
+`read`+`list` grant, a `list`-only grant, a `read`-only grant, a grant revoked
+under a live session, a grant naming only the session scope, and an export
+whose host declares filesystem exports unsupported — so a session's answer
+cannot be credited to a different export's configuration. Against them: the descriptor from the grant; `403 ACCESS_DENIED`
 for the empty grant and for the unsupported host; `401` with no token, `404` for
 an unknown device, `405` for a method this URL does not serve, `409
 CAPABILITIES_CHANGED` for a stale `X-Agent-Tunnel-Grant-Revision`, and `426`
@@ -853,6 +853,20 @@ be admitted; a checksummed read of a file large enough to span many messages; a
 without closing the session; a fid number re-bound while a descriptor for its
 previous binding is held; every mutating opcode refused with the export
 unchanged; and a non-owner relay refusing the upgrade.
+
+**A cached descriptor never authorizes access.** A stale header value proves
+only that the relay compares numbers, so the gate also moves a grant for real.
+It reads the descriptor, advances that grant's revision in the authoritative
+catalog with `upsert_grant` naming the same operations — so only the revision
+moves — and polls a fresh descriptor under a bounded deadline until it reports
+a different `grantRevision`. The revision a consumer would have cached is then
+refused `409 CAPABILITIES_CHANGED` at the descriptor *and* at the WSS upgrade,
+while the current revision is still admitted through to an attached root.
+Separately, on an export nothing else in the run touches, a grant is revoked
+with a 9P session live on it after that session has read a file: the consumer
+then only reads its socket, and observes the session closed with **1008** with
+no further 9P reply. Both changes are made through the same production catalog
+the relays read, not through a harness shortcut.
 
 **A descriptor must carry no host detail.** The gate scans the raw response body
 for the export root's own host path and for owner identity fields, rather than

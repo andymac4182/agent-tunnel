@@ -1613,7 +1613,7 @@ async fn main() -> ExitCode {
                         &evidence,
                     )?;
                     println!(
-                        "M4 filesystem real path passed: relays={} owner={} non_owner={} descriptor_status={} content_type={} cache_control={} schema={} subprotocol={} dialect={} root_read_only={} operations={:?} device_matches={} service_matches={} grant_revision_present={} host_path_leak={} identity_field_leak={} empty_grant={}/{} unsupported_host={}/{} unauthenticated={}/{} unknown_device={}/{} method_not_allowed={} stale_revision={}/{} missing_subprotocol={} non_owner_upgrade={}/{} selected_subprotocol={} negotiated_msize={} negotiated_dialect={} attach_qid_is_directory={} forged_uname_close={:?} forged_uname_admitted={} forged_afid_close={:?} forged_afid_admitted={} read_file_bytes={} read_observed_bytes={} read_checksum_matches={} read_messages={} readdir_expected={} readdir_observed={} readdir_pages={} readdir_every_name_once={} list_only_stat_size_matches={} list_only_open_errno={:?} read_only_read_matches={} read_only_getattr_errno={:?} read_only_directory_open_errno={:?} flush_rflush_observed={} flush_victim_reply_observed={} flush_replies_after_rflush={} flush_session_survived={} fid_reuse_first_read_matches={} fid_reuse_stale_read_errno={:?} fid_reuse_second_read_matches={} mutation_write_open_errno={:?} mutation_write_errno={:?} mutation_create_errno={:?} mutation_mkdir_errno={:?} mutation_host_unchanged={}",
+                        "M4 filesystem real path passed: relays={} owner={} non_owner={} descriptor_status={} content_type={} cache_control={} schema={} subprotocol={} dialect={} root_read_only={} operations={:?} device_matches={} service_matches={} grant_revision_present={} host_path_leak={} identity_field_leak={} empty_grant={}/{} unsupported_host={}/{} unauthenticated={}/{} unknown_device={}/{} method_not_allowed={} stale_revision={}/{} missing_subprotocol={} non_owner_upgrade={}/{} selected_subprotocol={} negotiated_msize={} negotiated_dialect={} attach_qid_is_directory={} forged_uname_close={:?} forged_uname_admitted={} forged_afid_close={:?} forged_afid_admitted={} read_file_bytes={} read_observed_bytes={} read_checksum_matches={} read_messages={} readdir_expected={} readdir_observed={} readdir_pages={} readdir_every_name_once={} list_only_stat_size_matches={} list_only_open_errno={:?} read_only_read_matches={} read_only_getattr_errno={:?} read_only_directory_open_errno={:?} flush_rflush_observed={} flush_victim_reply_observed={} flush_replies_after_rflush={} flush_session_survived={} fid_reuse_first_read_matches={} fid_reuse_stale_read_errno={:?} fid_reuse_second_read_matches={} mutation_write_open_errno={:?} mutation_write_errno={:?} mutation_create_errno={:?} mutation_mkdir_errno={:?} mutation_host_unchanged={} revision_advanced_in_catalog={} revised_descriptor_status={} revised_revision_differs={} superseded_descriptor={}/{} superseded_upgrade={}/{} current_revision_upgrade_admitted={} revoked_session_served_before={} revoked_session_closed={} revoked_session_close_code={:?} revoked_session_replies_after={}",
                         evidence.relay_count,
                         evidence.owner_node,
                         evidence.non_owner_node,
@@ -1677,6 +1677,18 @@ async fn main() -> ExitCode {
                         evidence.mutation_create_errno,
                         evidence.mutation_mkdir_errno,
                         evidence.mutation_host_unchanged,
+                        evidence.revision_advanced_in_catalog,
+                        evidence.revised_descriptor_status,
+                        evidence.revised_revision_differs,
+                        evidence.superseded_descriptor_status,
+                        evidence.superseded_descriptor_code,
+                        evidence.superseded_upgrade_status,
+                        evidence.superseded_upgrade_code,
+                        evidence.current_revision_upgrade_admitted,
+                        evidence.revoked_session_served_before,
+                        evidence.revoked_session_closed,
+                        evidence.revoked_session_close_code,
+                        evidence.revoked_session_replies_after,
                     );
                     Ok(())
                 }),

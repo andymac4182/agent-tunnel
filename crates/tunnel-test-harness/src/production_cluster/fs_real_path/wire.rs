@@ -23,7 +23,7 @@ use futures_util::{SinkExt as _, StreamExt as _};
 use rustls::pki_types::CertificateDer;
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::http::HeaderValue;
+use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
 use tokio_tungstenite::{
     Connector, MaybeTlsStream, WebSocketStream, connect_async_tls_with_config,
     tungstenite::Message as WsMessage,
@@ -106,6 +106,22 @@ impl NinepClient {
         token: &str,
         subprotocol: Option<&str>,
     ) -> std::result::Result<Self, UpgradeFailure> {
+        Self::connect_with(target, server_ca_der, token, subprotocol, &[]).await
+    }
+
+    /// The same upgrade with caller-supplied extra request headers.
+    ///
+    /// The grant-revision cases need this: what the contract calls a cached
+    /// descriptor is a revision a consumer carries into its upgrade, so the
+    /// header has to be settable on the upgrade and not only on the
+    /// descriptor read.
+    pub(super) async fn connect_with(
+        target: &Target,
+        server_ca_der: &[u8],
+        token: &str,
+        subprotocol: Option<&str>,
+        extra: &[(&str, &str)],
+    ) -> std::result::Result<Self, UpgradeFailure> {
         let tls = tls_config(server_ca_der).map_err(UpgradeFailure::Harness)?;
         let url = format!(
             "wss://localhost:{}/v1/devices/{}/services/{}/fs",
@@ -131,6 +147,15 @@ impl NinepClient {
                     )))
                 })?,
             );
+        }
+        for (name, value) in extra {
+            let name = HeaderName::from_bytes(name.as_bytes()).map_err(|error| {
+                UpgradeFailure::Harness(HarnessError::Http(format!("fs upgrade header: {error}")))
+            })?;
+            let value = HeaderValue::from_str(value).map_err(|error| {
+                UpgradeFailure::Harness(HarnessError::Http(format!("fs upgrade header: {error}")))
+            })?;
+            request.headers_mut().insert(name, value);
         }
         let connected = timeout(
             IO_TIMEOUT,

@@ -52,7 +52,7 @@ pub struct HarnessOptions {
     /// gate ([`MCP_GATE_SERVICES`]) on the first tenant-A device, each with
     /// mirrored `http:invoke` grants.  Only that gate enables it.
     pub mcp_services: bool,
-    /// Seed the five filesystem services of the M4 gate-4 authorization matrix
+    /// Seed the six filesystem services of the M4 gate-4 authorization matrix
     /// ([`FS_GATE_SERVICES`]) on the first tenant-A device.  Only that gate
     /// enables it.
     pub fs_services: bool,
@@ -443,10 +443,10 @@ pub struct FsGateService {
     pub host_supported: bool,
 }
 
-/// The five filesystem exports gate 4's authorization matrix needs.
+/// The six filesystem exports gate 4's authorization matrix needs.
 ///
 /// Seeded side by side on one device so the matrix is a property of the grants
-/// rather than of five separate runs: a session's answer cannot be credited to
+/// rather than of six separate runs: a session's answer cannot be credited to
 /// a different export's configuration when every export is live at once.
 pub const FS_GATE_SERVICES: &[FsGateService] = &[
     FsGateService {
@@ -478,6 +478,18 @@ pub const FS_GATE_SERVICES: &[FsGateService] = &[
         // contract requires 403 for it rather than a descriptor advertising an
         // empty operation list.
         operations: &["fs:connect"],
+        case_sensitivity: Some("insensitive-preserving"),
+        host_supported: true,
+    },
+    FsGateService {
+        // The export whose grant is revoked under a live 9P session.  It is
+        // its own export so that the revocation cannot be confused with the
+        // revision change the discovery-to-upgrade case performs on
+        // `read-list`: nothing else in the gate disturbs this grant, so the
+        // only thing that can end a session held on it is the revocation.
+        label: "revocable",
+        display_name: "Synthetic filesystem export revoked under a live session",
+        operations: &["fs:connect", "fs:read", "fs:list"],
         case_sensitivity: Some("insensitive-preserving"),
         host_supported: true,
     },
