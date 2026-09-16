@@ -310,6 +310,12 @@ impl DirReader {
         if cookie == self.position {
             return Ok(());
         }
+        // The budget refusal and the end-of-directory refusal below answer the
+        // same code, so no test can tell them apart and this one is green when
+        // deleted on its own. It is kept because it bounds the *work* a single
+        // `Treaddir` can demand — a client naming a large cookie would otherwise
+        // walk the whole directory before being refused — and that is a bound,
+        // not an answer.
         if cookie > budget {
             return Err(FsError::refused(FsErrorCode::Einval));
         }

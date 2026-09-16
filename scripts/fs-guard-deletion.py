@@ -1689,12 +1689,28 @@ GATE4_CASES: list[tuple[str, list[Edit]]] = [
         ],
     ),
     (
+        # Deleted by turning the refusal into a `break` rather than by removing
+        # the test: removing it leaves `while self.position < cookie` spinning
+        # on a reader that will never advance, and the harness reports that as
+        # `RED (hung)` after a ten-minute timeout.  A hang *is* evidence the
+        # guard is load-bearing, but it is expensive evidence and it names the
+        # wrong failure; breaking out reaches the same conclusion in a second,
+        # by letting `seek` claim success at a position the directory does not
+        # have.
         "a cookie past the end of a directory is refused",
         [
             (
                 METADATA,
-                """            if self.next_entry()?.is_none() {""",
-                """            if false && self.next_entry()?.is_none() {""",
+                """                return Err(FsError::refused(FsErrorCode::Einval));
+            }
+        }
+        Ok(())
+    }""",
+                """                break;
+            }
+        }
+        Ok(())
+    }""",
             )
         ],
     ),
