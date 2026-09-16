@@ -722,13 +722,18 @@ fn a_descriptor_is_keyed_by_fid_generation_and_never_by_fid_number() {
 
 #[test]
 fn a_refused_remove_releases_its_fid_and_the_descriptor_with_it() {
-    // The scenario that reaches the descriptor cache's staleness guards, which
-    // the ordinary clunk cannot: `Tclunk` and `Tremove` release their fid on
-    // **either** answer, so a refused `Tremove` frees the number through the
-    // session's error path — where nothing calls the cache's release. If the
-    // entry is not pruned there, and the lookup does not check the generation,
-    // a fid the client re-walks to that number answers from the **previous**
-    // file's descriptor.
+    // 9P releases a fid on **either** answer to `Tclunk` and `Tremove`, so a
+    // refused `Tremove` frees the number through the session's error path — and
+    // this gate's dispatcher has to release what it holds for that fid there
+    // too, or a refused `Tremove` on an open fid would leak a descriptor for
+    // the life of the session.
+    //
+    // It is also the closest a client can get to the descriptor cache's
+    // staleness guards, and it does not reach them: gate 3's session refuses
+    // the read below because the re-bound fid is not open at its current
+    // binding, before this dispatcher is asked anything. That is recorded on
+    // `Provider::cached` rather than hidden, and it is why those guards are
+    // measured as defence in depth instead of counted as load-bearing.
     let fixture = Fixture::new();
     fixture.file("/first.txt", b"first-body");
     fixture.file("/second.txt", b"second-body-which-is-longer");

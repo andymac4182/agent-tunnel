@@ -1534,14 +1534,18 @@ GATE4_CASES: list[tuple[str, list[Edit]]] = [
         ],
     ),
     (
-        # The lookup's generation filter and the prune mask one another, and
-        # are load-bearing only together: the prune removes a stale entry, and
-        # the filter refuses one that survived.  Measured as a pair rather than
-        # counted as two singles, which is the honesty gate 2 applies to its
-        # mount-boundary checks.  The scenario that reaches either is a refused
-        # `Tremove`, which releases its fid through the session's **error**
-        # path, where nothing calls the cache's own release.
-        "the cache's generation filter and the prune, together",
+        # All three of the descriptor cache's generation guards at once, and
+        # **still green** — measured, not assumed, and the reason is worth more
+        # than a red would have been.  Gate 3's session is what makes them
+        # unreachable: it records a fid's open state per *binding*, refuses a
+        # `Tread` on a fid it does not hold open at the current one, and applies
+        # a reply only to the binding it was admitted against.  So no path can
+        # consult a stale entry: the session refuses first, and an `Rlopen` for
+        # a re-bound number overwrites the entry rather than reading it.  The
+        # cache's keying is therefore **defence in depth behind gate 3's own
+        # stamp**, which is what the obligation asked for and is not the same
+        # claim as "load-bearing".
+        "all three descriptor-cache generation guards, together",
         [
             (
                 PROVIDER_SRC,
@@ -1565,6 +1569,18 @@ GATE4_CASES: list[tuple[str, list[Edit]]] = [
             self.open.remove(&fid);
         }""",
                 "        let _ = live;",
+            ),
+            (
+                PROVIDER_SRC,
+                """        if self
+            .open
+            .get(&fid)
+            .is_some_and(|entry| entry.generation == generation)
+        {
+            self.open.remove(&fid);
+        }""",
+                """        let _ = generation;
+        self.open.remove(&fid);""",
             ),
         ],
     ),

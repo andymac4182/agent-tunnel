@@ -444,6 +444,17 @@ impl<A: Authority> Provider<A> {
     /// Obligation 3. The generation is asked of the session, so a number the
     /// client re-bound answers `None` rather than the previous binding's
     /// descriptor.
+    ///
+    /// **Defence in depth, and measured as such.** Deleting this filter, the
+    /// prune and the release's own generation check — all three at once — turns
+    /// no test red, because gate 3's session is already authoritative about a
+    /// fid's open state *per binding*: it refuses a `Tread` on a fid it does not
+    /// hold open at the current one, and applies a reply only to the binding it
+    /// was admitted against, so nothing can reach a stale entry and an `Rlopen`
+    /// for a re-bound number overwrites it rather than reading it. The
+    /// obligation asked for the cache to be keyed on the generation and it is;
+    /// that is not the same claim as the keying being load-bearing, and the
+    /// difference is recorded rather than counted.
     fn cached(&self, fid: u32) -> Option<&OpenFid> {
         let generation = self.session.fid(fid)?.generation();
         self.open
@@ -486,14 +497,12 @@ impl<A: Authority> Provider<A> {
         // be outstanding, and without this the second would close the descriptor
         // of whatever the client had since walked to that number.
         //
-        // **Defensive, and unreachable in this dispatcher**, recorded rather
-        // than counted among the load-bearing guards: the queue is FIFO, and
-        // gate 3's session refuses a `Twalk` to a fid that is still bound, so a
-        // number cannot be re-bound until its clunk's *reply* has landed — which
-        // happens before any request queued behind it is performed. A dispatcher
-        // that performed requests out of order, which is the shape gate 5 needs
-        // for a blocking pool, would reach it. It has no test for the same
-        // reason gate 3's reserved-walk check has none.
+        // **Defensive**, like the lookup's own filter above: the queue is FIFO
+        // and gate 3's session refuses a `Twalk` to a fid that is still bound,
+        // so a number cannot be re-bound until its clunk's *reply* has landed,
+        // which happens before any request queued behind it is performed. A
+        // dispatcher that performed requests out of order — the shape gate 5
+        // needs for a blocking pool — would reach it.
         if self
             .open
             .get(&fid)
