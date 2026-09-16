@@ -1898,7 +1898,8 @@ impl Gate<'_> {
             // M7-C83).  Give the consumer's own call a bounded grace and name
             // what it saw.  Failure path only: it asserts nothing and cannot
             // turn a failing run green.
-            let observed = match timeout(OUTCOME_STATUS_GRACE, call).await {
+            let mut call = call;
+            let observed = match timeout(OUTCOME_STATUS_GRACE, &mut call).await {
                 Ok(Ok(Ok(answer))) => {
                     let (code, execution) = answer.error();
                     format!(
@@ -1908,7 +1909,13 @@ impl Gate<'_> {
                 }
                 Ok(Ok(Err(error))) => format!("consumer request failed: {error}"),
                 Ok(Err(error)) => format!("consumer task did not join: {error}"),
-                Err(_) => "consumer request still outstanding".to_owned(),
+                Err(_) => {
+                    // Keep the pre-diagnostic cleanup: a call still running
+                    // when the grace expires is stopped, not left to the
+                    // process.
+                    call.abort();
+                    "consumer request still outstanding".to_owned()
+                }
             };
             return Err(HarnessError::Timeout(format!(
                 "the {fault_name} side effect never ran ({observed})"
