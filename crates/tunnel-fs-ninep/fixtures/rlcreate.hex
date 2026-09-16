@@ -1,0 +1,7 @@
+# agent-tunnel 9P2000.L golden fixture
+# name: rlcreate
+# type: Rlcreate (15)
+# tag: 5
+# size: 24 bytes, msize 65536
+# Little-endian; string[s] is a 16-bit BYTE count of UTF-8.
+180000000f05000007000000efcdab896745230100200000

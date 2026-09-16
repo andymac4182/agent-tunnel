@@ -1,0 +1,8 @@
+# agent-tunnel 9P2000.L golden fixture
+# name: tsymlink
+# type: Tsymlink (16)
+# tag: 6
+# size: 45 bytes, msize 65536
+# Little-endian; string[s] is a 16-bit BYTE count of UTF-8.
+2d00000010060000000000080073686f7274637574120070726f6a656374732f
+64726166742e747874e8030000

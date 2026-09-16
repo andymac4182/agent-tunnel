@@ -1,0 +1,7 @@
+# agent-tunnel 9P2000.L golden fixture
+# name: tmkdir
+# type: Tmkdir (72)
+# tag: 12
+# size: 28 bytes, msize 65536
+# Little-endian; string[s] is a 16-bit BYTE count of UTF-8.
+1c000000480c0000000000070061726368697665ed010000e8030000

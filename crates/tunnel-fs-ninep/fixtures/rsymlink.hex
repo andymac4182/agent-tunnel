@@ -1,0 +1,7 @@
+# agent-tunnel 9P2000.L golden fixture
+# name: rsymlink
+# type: Rsymlink (17)
+# tag: 6
+# size: 20 bytes, msize 65536
+# Little-endian; string[s] is a 16-bit BYTE count of UTF-8.
+140000001106000200000000ff00ff00ff00ff00

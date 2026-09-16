@@ -1,0 +1,8 @@
+# agent-tunnel 9P2000.L golden fixture
+# name: rwalk
+# type: Rwalk (111)
+# tag: 3
+# size: 35 bytes, msize 65536
+# Little-endian; string[s] is a 16-bit BYTE count of UTF-8.
+230000006f03000200800100000088776655443322110007000000efcdab8967
+452301

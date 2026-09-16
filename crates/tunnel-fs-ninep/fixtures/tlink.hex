@@ -1,0 +1,7 @@
+# agent-tunnel 9P2000.L golden fixture
+# name: tlink
+# type: Tlink (70)
+# tag: 11
+# size: 29 bytes, msize 65536
+# Little-endian; string[s] is a 16-bit BYTE count of UTF-8.
+1d000000460b0000000000010000000c00686172646c696e6b2e747874

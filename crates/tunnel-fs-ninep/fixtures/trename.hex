@@ -1,0 +1,7 @@
+# agent-tunnel 9P2000.L golden fixture
+# name: trename
+# type: Trename (20)
+# tag: 13
+# size: 28 bytes, msize 65536
+# Little-endian; string[s] is a 16-bit BYTE count of UTF-8.
+1c000000140d0001000000000000000b0072656e616d65642e747874

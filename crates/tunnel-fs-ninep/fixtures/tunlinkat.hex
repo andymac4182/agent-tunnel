@@ -1,0 +1,7 @@
+# agent-tunnel 9P2000.L golden fixture
+# name: tunlinkat
+# type: Tunlinkat (76)
+# tag: 15
+# size: 26 bytes, msize 65536
+# Little-endian; string[s] is a 16-bit BYTE count of UTF-8.
+1a0000004c0f0000000000090064726166742e74787400000000

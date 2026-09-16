@@ -1,0 +1,7 @@
+# agent-tunnel 9P2000.L golden fixture
+# name: rattach
+# type: Rattach (105)
+# tag: 1
+# size: 20 bytes, msize 65536
+# Little-endian; string[s] is a 16-bit BYTE count of UTF-8.
+1400000069010080010000008877665544332211

@@ -1,0 +1,9 @@
+# agent-tunnel 9P2000.L golden fixture
+# name: tsetattr
+# type: Tsetattr (26)
+# tag: 9
+# size: 67 bytes, msize 65536
+# Little-endian; string[s] is a 16-bit BYTE count of UTF-8.
+430000001a090001000000b90100008001000000000000000000000004000000
+000000800e8069000000000000000000000000810e8069000000000000000000
+000000

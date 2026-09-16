@@ -1,0 +1,7 @@
+# agent-tunnel 9P2000.L golden fixture
+# name: tremove
+# type: Tremove (122)
+# tag: 20
+# size: 11 bytes, msize 65536
+# Little-endian; string[s] is a 16-bit BYTE count of UTF-8.
+0b0000007a140002000000
