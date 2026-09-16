@@ -381,6 +381,17 @@ impl Primitive {
     /// `Rename` requires both `Write` and `Delete`: it creates a name at the
     /// destination and removes one at the source, and a grant that may create
     /// but not remove must not be able to remove a name by renaming it away.
+    ///
+    /// `Walk` requires **no** capability, which is a recorded decision rather
+    /// than an oversight, and it has a disclosure cost.  Requiring `List` to
+    /// walk would make a read-by-name grant — `read` without `list`, the shape
+    /// a caller wants when it knows its paths and must not enumerate — unable
+    /// to reach any file at all, since every open begins with a walk.  The cost
+    /// is that `Rwalk` returns qids, so a grant holding only `write` or only
+    /// `delete` can probe whether a name exists and whether it is a file or a
+    /// directory.  Those qids are the **only** metadata such a grant may
+    /// observe: `Tgetattr` and `Treaddir` both require `List`, so size, times,
+    /// mode, link count and directory contents stay unreachable.
     #[must_use]
     pub fn required_capabilities(self) -> CapabilitySet {
         use Capability::{Delete, List, Read, Write};
@@ -558,11 +569,27 @@ impl ClientOperation {
             Self::Stat => &[P::Walk, P::Getattr, P::Clunk],
             Self::ReadDirectory => &[P::Walk, P::OpenDir, P::Readdir, P::Clunk],
             Self::Mkdir => &[P::Walk, P::Mkdir, P::Clunk],
-            Self::Remove => &[P::Walk, P::Unlink, P::RemoveDir, P::Clunk],
+            // `remove` and `copy` are recursive in the shared-client contract,
+            // so both traverse directories and both need `list` as well.  An
+            // earlier composition omitted the traversal primitives, which
+            // advertised `remove` under `delete` alone and `copy` under
+            // read+write with no `list` — operations the provider would then
+            // have refused part-way through a directory.
+            Self::Remove => &[
+                P::Walk,
+                P::OpenDir,
+                P::Readdir,
+                P::Unlink,
+                P::RemoveDir,
+                P::Clunk,
+            ],
             Self::Copy => &[
                 P::Walk,
+                P::OpenDir,
+                P::Readdir,
                 P::OpenRead,
                 P::Read,
+                P::Mkdir,
                 P::Create,
                 P::OpenWrite,
                 P::Write,

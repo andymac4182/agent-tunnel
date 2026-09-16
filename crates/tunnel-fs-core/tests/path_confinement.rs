@@ -61,6 +61,16 @@ const ESCAPES: &[(&str, PathRule)] = &[
     ("/CONIN$", PathRule::WindowsDeviceName),
     ("/CONOUT$.dat", PathRule::WindowsDeviceName),
     ("/dir/con/file", PathRule::WindowsDeviceName),
+    // `ntdll` trims trailing spaces from the stem before comparing, so these
+    // open the console device on Windows despite the space.
+    ("/CON .txt", PathRule::WindowsDeviceName),
+    ("/con   .log", PathRule::WindowsDeviceName),
+    ("/dir/aux  .dat", PathRule::WindowsDeviceName),
+    // Microsoft reserves the superscript spellings alongside the ASCII digits.
+    ("/COM\u{b9}", PathRule::WindowsDeviceName),
+    ("/COM\u{b2}.txt", PathRule::WindowsDeviceName),
+    ("/LPT\u{b9}", PathRule::WindowsDeviceName),
+    ("/lpt\u{b3}.log", PathRule::WindowsDeviceName),
     // Endings a Windows host silently trims, which would alias two paths.
     ("/trailing.", PathRule::TrailingSpaceOrDot),
     ("/trailing ", PathRule::TrailingSpaceOrDot),
@@ -75,6 +85,11 @@ const ESCAPES: &[(&str, PathRule)] = &[
 #[test]
 fn every_named_escape_class_is_refused_by_its_own_rule() {
     let bounds = default_bounds();
+    assert_eq!(
+        ESCAPES.len(),
+        57,
+        "the escape corpus changed; update the evidence count in docs/tasks.md"
+    );
     for (candidate, expected) in ESCAPES {
         match VirtualPath::parse(candidate, bounds) {
             Ok(accepted) => panic!(
@@ -89,6 +104,27 @@ fn every_named_escape_class_is_refused_by_its_own_rule() {
                 expected.as_str()
             ),
         }
+    }
+
+    // Every rule must be exercised somewhere, so a rule added without a case
+    // cannot ship untested.  Four are covered by their own tests rather than by
+    // this corpus, because each needs a constructed input rather than a
+    // literal: the three length rules are driven at their exact boundaries by
+    // the limit tests below, and `Separator` is reachable only through `join`.
+    let covered_elsewhere = [
+        PathRule::TooLongBytes,      // path_byte_limit_is_exact_...
+        PathRule::TooManyComponents, // component_count_limit_is_exact_...
+        PathRule::ComponentTooLong,  // component_byte_limit_is_exact_...
+        PathRule::Separator,         // parent_and_join_stay_within_the_root
+    ];
+    for rule in PathRule::ALL {
+        if covered_elsewhere.contains(&rule) {
+            continue;
+        }
+        assert!(
+            ESCAPES.iter().any(|(_, expected)| *expected == rule),
+            "{rule} has no case in the escape corpus"
+        );
     }
 }
 
@@ -257,7 +293,10 @@ fn parent_and_join_stay_within_the_root() {
     assert_eq!(nested.join("..", bounds), Err(PathRule::DotDotComponent));
     assert_eq!(nested.join(".", bounds), Err(PathRule::DotComponent));
     assert_eq!(nested.join("", bounds), Err(PathRule::EmptyComponent));
-    assert_eq!(nested.join("a/b", bounds), Err(PathRule::EmptyComponent));
+    // A separator in a joined component is its own rule: the component is not
+    // empty, it is several components, and calling it empty would misreport it.
+    assert_eq!(nested.join("a/b", bounds), Err(PathRule::Separator));
+    assert_eq!(nested.join("/", bounds), Err(PathRule::Separator));
     assert_eq!(nested.join("a\\b", bounds), Err(PathRule::Backslash));
 
     let joined = nested.join("d", bounds).expect("ordinary component");
@@ -282,25 +321,34 @@ fn containment_is_component_wise_not_a_string_prefix() {
 }
 
 #[test]
-fn ascii_case_fold_key_collides_exactly_for_ascii_case_variants() {
+fn distinct_paths_that_a_host_may_alias_are_all_accepted_here() {
+    // This module offers no collision key, deliberately.  These pairs are each
+    // two distinct virtual paths that some host resolves to one file, and every
+    // one of them is accepted, because deciding them needs file identity from
+    // the host rather than a string comparison.  The test exists so the residue
+    // is visible and counted rather than assumed away; gate 2 owns it.
     let bounds = default_bounds();
-    let lower = VirtualPath::parse("/Dir/File.TXT", bounds).expect("valid");
-    let upper = VirtualPath::parse("/DIR/file.txt", bounds).expect("valid");
-    let other = VirtualPath::parse("/dir/file2.txt", bounds).expect("valid");
-
-    assert_eq!(lower.ascii_case_fold_key(), upper.ascii_case_fold_key());
-    assert_ne!(lower.ascii_case_fold_key(), other.ascii_case_fold_key());
-
-    // Named limit: the fold is ASCII only, so a non-ASCII case pair does NOT
-    // collide here.  Detecting it is the resolver's obligation, and this
-    // assertion exists so the residue is visible rather than assumed away.
-    let sigma_lower = VirtualPath::parse("/\u{3c3}", bounds).expect("valid");
-    let sigma_upper = VirtualPath::parse("/\u{3a3}", bounds).expect("valid");
-    assert_ne!(
-        sigma_lower.ascii_case_fold_key(),
-        sigma_upper.ascii_case_fold_key(),
-        "the ASCII fold deliberately does not cover Unicode case pairs"
-    );
+    let aliasing_pairs = [
+        // ASCII case, on a case-insensitive volume.
+        ("/Dir/File.TXT", "/dir/file.txt"),
+        // Unicode case pairs, which an ASCII fold would have missed.
+        ("/\u{3c3}", "/\u{3a3}"),
+        ("/stra\u{df}e", "/STRASSE"),
+        // NFC and NFD spellings of the same name on APFS or HFS+.
+        ("/caf\u{e9}", "/cafe\u{301}"),
+        // An NTFS 8.3 short name and its long form.
+        ("/LONGFI~1.TXT", "/longfilename.txt"),
+    ];
+    for (left, right) in aliasing_pairs {
+        let first = VirtualPath::parse(left, bounds)
+            .unwrap_or_else(|rule| panic!("{} refused {left:?}", rule.as_str()));
+        let second = VirtualPath::parse(right, bounds)
+            .unwrap_or_else(|rule| panic!("{} refused {right:?}", rule.as_str()));
+        assert_ne!(
+            first, second,
+            "{left:?} and {right:?} are distinct virtual paths here"
+        );
+    }
 }
 
 #[test]
@@ -437,10 +485,19 @@ fn every_parent_chain_of_a_generated_path_terminates_at_the_root() {
 #[test]
 fn arbitrary_bytes_never_panic_and_are_classified() {
     let bounds = default_bounds();
+    let mut accepted = 0u32;
+    let mut rejected = 0u32;
+
     for seed in 0..20_000u64 {
         let mut rng = Rng::new(seed ^ 0xDEAD_BEEF_CAFE_F00D);
         let length = rng.below(48);
-        let mut candidate = String::with_capacity(length);
+        let mut candidate = String::with_capacity(length + 1);
+        // Half the seeds get a leading separator.  Without it a random first
+        // scalar is `/` with probability 1 in 0x110000, so every candidate is
+        // refused as non-absolute and the acceptance arm below never runs.
+        if seed % 2 == 0 {
+            candidate.push('/');
+        }
         for _ in 0..length {
             // Draw from the whole scalar range, including astral planes.
             let raw = rng.below(0x11_0000) as u32;
@@ -450,18 +507,31 @@ fn arbitrary_bytes_never_panic_and_are_classified() {
         }
         match VirtualPath::parse(&candidate, bounds) {
             Ok(path) => {
+                accepted += 1;
                 assert_eq!(path.as_str(), candidate, "seed {seed}");
                 assert!(path.is_within(&VirtualPath::root()), "seed {seed}");
                 for component in path.components() {
                     assert_ne!(component, "..", "seed {seed}");
                     assert_ne!(component, ".", "seed {seed}");
+                    assert!(!component.is_empty(), "seed {seed}");
                 }
             }
             Err(rule) => {
+                rejected += 1;
                 // The rule must be one this crate defines; `parse` on the token
                 // round-trips, which catches a rule added without a token.
                 assert_eq!(PathRule::parse(rule.as_str()), Some(rule), "seed {seed}");
             }
         }
     }
+
+    // Both arms must genuinely run, or the invariants above are vacuous.
+    assert!(
+        accepted >= 1_000,
+        "only {accepted} candidates were accepted"
+    );
+    assert!(
+        rejected >= 1_000,
+        "only {rejected} candidates were rejected"
+    );
 }

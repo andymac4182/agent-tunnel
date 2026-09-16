@@ -224,6 +224,13 @@ impl Descriptor {
     ///
     /// `operations` and `root.readOnly` are derived, not supplied, so the
     /// result always agrees with `grant` and `features`.
+    ///
+    /// An empty `grant` is accepted here and emits `"operations": []`, because
+    /// this type describes a grant rather than deciding admission. Such an
+    /// export admits no session ([`crate::admits_session`]), and discovery
+    /// answers `403 ACCESS_DENIED` for it rather than serving a descriptor
+    /// advertising nothing — an empty operation list must never be presented to
+    /// a consumer as a usable export.
     #[must_use]
     pub const fn new(
         identity: ExportIdentity,

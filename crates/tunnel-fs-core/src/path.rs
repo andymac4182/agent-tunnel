@@ -69,6 +69,13 @@ pub enum PathRule {
     /// A component ending in `.` or a space, which Windows silently trims, so
     /// two distinct virtual paths would name one host file.
     TrailingSpaceOrDot,
+    /// A component supplied to [`VirtualPath::join`] contained a `/`.
+    ///
+    /// Distinct from [`PathRule::EmptyComponent`]: such a component is not
+    /// empty, it is several components, and calling it empty would misdescribe
+    /// the input.  `parse` splits on `/` before checking components, so only
+    /// `join` can reach this rule.
+    Separator,
 }
 
 impl PathRule {
@@ -90,11 +97,12 @@ impl PathRule {
             Self::Colon => "PATH_COLON",
             Self::WindowsDeviceName => "PATH_RESERVED_DEVICE_NAME",
             Self::TrailingSpaceOrDot => "PATH_TRAILING_SPACE_OR_DOT",
+            Self::Separator => "PATH_COMPONENT_SEPARATOR",
         }
     }
 
     /// Every rule, for exhaustive tests and diagnostics tables.
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 15] = [
         Self::Empty,
         Self::MissingLeadingSlash,
         Self::TooLongBytes,
@@ -109,6 +117,7 @@ impl PathRule {
         Self::Colon,
         Self::WindowsDeviceName,
         Self::TrailingSpaceOrDot,
+        Self::Separator,
     ];
 
     /// Parse the exact diagnostic token; anything else is `None`.
@@ -126,14 +135,51 @@ impl fmt::Display for PathRule {
 
 /// Reserved Windows device stems, upper case.
 ///
-/// A component whose stem — the text before its first `.` — equals one of
-/// these ASCII-case-insensitively is refused on every host, not only Windows,
-/// so one export's namespace does not change meaning when the device that
-/// serves it changes operating system.
-pub const RESERVED_DEVICE_STEMS: [&str; 26] = [
-    "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$", "COM0", "COM1", "COM2", "COM3", "COM4",
-    "COM5", "COM6", "COM7", "COM8", "COM9", "LPT0", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6",
-    "LPT7", "LPT8", "LPT9",
+/// A component whose stem — the text before its first `.`, with trailing ASCII
+/// spaces removed — equals one of these ASCII-case-insensitively is refused on
+/// every host, not only Windows, so one export's namespace does not change
+/// meaning when the device that serves it changes operating system.
+///
+/// Two details this list and [`is_reserved_device_stem`] exist to get right:
+///
+/// * `ntdll` strips trailing spaces from the stem before its own comparison,
+///   so `CON .txt` and `con   .log` open the console device even though their
+///   stems are not literally `CON`.
+/// * Microsoft reserves the superscript spellings `COM¹`, `COM²`, `COM³`,
+///   `LPT¹`, `LPT²` and `LPT³` alongside the ASCII-digit forms.
+pub const RESERVED_DEVICE_STEMS: [&str; 32] = [
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    "CONIN$",
+    "CONOUT$",
+    "COM0",
+    "COM1",
+    "COM2",
+    "COM3",
+    "COM4",
+    "COM5",
+    "COM6",
+    "COM7",
+    "COM8",
+    "COM9",
+    "COM\u{b9}",
+    "COM\u{b2}",
+    "COM\u{b3}",
+    "LPT0",
+    "LPT1",
+    "LPT2",
+    "LPT3",
+    "LPT4",
+    "LPT5",
+    "LPT6",
+    "LPT7",
+    "LPT8",
+    "LPT9",
+    "LPT\u{b9}",
+    "LPT\u{b2}",
+    "LPT\u{b3}",
 ];
 
 /// The bounds a path is checked against.
@@ -336,20 +382,17 @@ impl VirtualPath {
         }
         true
     }
-
-    /// A collision key for an ASCII-case-insensitive host.
-    ///
-    /// Two paths that a case-insensitive host would resolve to one file share a
-    /// key.  The fold is **ASCII only**: it does not implement Unicode simple
-    /// or full case folding, and it does not apply NFC or NFD normalisation, so
-    /// it does not detect every collision an HFS+ or APFS volume can produce.
-    /// That residue is named in `docs/filesystem-api.md` and is the resolver's
-    /// obligation, not this key's.
-    #[must_use]
-    pub fn ascii_case_fold_key(&self) -> String {
-        self.text.to_ascii_lowercase()
-    }
 }
+
+// Deliberately absent: a case-folding collision key.  An earlier draft of this
+// module exposed an ASCII fold, which an author of the gate-2 resolver would
+// reasonably have reached for — and it would have been wrong.  No string
+// comparison can decide collisions on a case-insensitive host: an ASCII fold
+// misses Unicode case pairs, NFC/NFD pairs and NTFS 8.3 short names, each of
+// which maps two distinct virtual paths onto one host file.  Collisions are
+// decided by asking the host for file identity, as the confinement model in
+// `docs/filesystem-api.md` requires.  A key that is right most of the time is
+// worse than no key, because it reads as if the problem were solved.
 
 /// Redacting `Debug`: shape only, never path text.
 impl fmt::Debug for VirtualPath {
@@ -382,7 +425,7 @@ fn check_component(component: &str) -> Result<(), PathRule> {
             0 => return Err(PathRule::Nul),
             b'\\' => return Err(PathRule::Backslash),
             b':' => return Err(PathRule::Colon),
-            b'/' => return Err(PathRule::EmptyComponent),
+            b'/' => return Err(PathRule::Separator),
             0x01..=0x1F | 0x7F => return Err(PathRule::ControlCharacter),
             _ => {}
         }
@@ -397,8 +440,17 @@ fn check_component(component: &str) -> Result<(), PathRule> {
 }
 
 /// Whether a component's stem is a reserved Windows device name.
+///
+/// The stem is the text before the first `.` with trailing ASCII spaces
+/// removed, matching what `ntdll` compares rather than what the name looks
+/// like.  Without the trim, `CON .txt` is accepted here and opens the console
+/// device on a Windows host.
 fn is_reserved_device_stem(component: &str) -> bool {
-    let stem = component.split('.').next().unwrap_or(component);
+    let stem = component
+        .split('.')
+        .next()
+        .unwrap_or(component)
+        .trim_end_matches(' ');
     RESERVED_DEVICE_STEMS
         .iter()
         .any(|reserved| stem.eq_ignore_ascii_case(reserved))

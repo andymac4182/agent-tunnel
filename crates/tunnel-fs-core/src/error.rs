@@ -262,16 +262,28 @@ impl SessionErrorCode {
         Self::ALL.into_iter().find(|value| value.as_str() == text)
     }
 
-    /// The WebSocket close code this failure closes a consumer socket with.
+    /// The WebSocket close code this failure closes a consumer socket with, or
+    /// `None` when the failure does not close the socket.
+    ///
+    /// [`SessionErrorCode::Aborted`] is the `None` case: a caller cancelling
+    /// one operation ends that operation, not the session, and the other
+    /// outstanding tags on the same connection continue.  A cancellation that
+    /// did close the socket would make `AbortSignal` a session-wide weapon.
+    ///
+    /// [`SessionErrorCode::DeviceOffline`] is 1012 (service restart), the code
+    /// the contract reserves for shutdown, because the export's backend is the
+    /// thing that went away; 1011 would report it as an unexpected relay
+    /// failure. That leaves 1011 for genuine internal failure and for a
+    /// deadline that elapsed with the stream in an unknown state.
     #[must_use]
-    pub const fn close_code(self) -> u16 {
+    pub const fn close_code(self) -> Option<u16> {
         match self {
-            Self::ProtocolViolation => 1002,
-            Self::AuthExpired | Self::CapabilitiesChanged => 1008,
-            Self::ResourceExhausted => 1013,
-            Self::SessionLost | Self::DeviceOffline | Self::DeadlineExceeded | Self::Aborted => {
-                1011
-            }
+            Self::ProtocolViolation => Some(1002),
+            Self::AuthExpired | Self::CapabilitiesChanged => Some(1008),
+            Self::ResourceExhausted => Some(1013),
+            Self::DeviceOffline => Some(1012),
+            Self::SessionLost | Self::DeadlineExceeded => Some(1011),
+            Self::Aborted => None,
         }
     }
 }
@@ -332,10 +344,15 @@ impl FsError {
                 _ => FsErrorCode::Einval,
             },
             Self::Limit(field) => match field {
+                // `MaxMessageBytes` is deliberately absent from this arm.  A
+                // frame larger than the negotiated `msize` is a framing
+                // violation, not a file that is too big: it is answered by
+                // closing the socket with 1002, never surfaced as an `Rlerror`.
+                // Mapping it to EFBIG would invite a provider to reply to a
+                // malformed frame instead of terminating the session.
                 LimitField::MaxBufferedFileBytes
                 | LimitField::MaxTotalBufferedBytes
-                | LimitField::MaxQueuedBytes
-                | LimitField::MaxMessageBytes => FsErrorCode::Efbig,
+                | LimitField::MaxQueuedBytes => FsErrorCode::Efbig,
                 LimitField::MaxPathBytes | LimitField::MaxPathComponents => {
                     FsErrorCode::Enametoolong
                 }
@@ -377,7 +394,11 @@ impl fmt::Display for FsError {
             Self::Filesystem { code, outcome } => {
                 write!(formatter, "{} ({})", code.as_str(), outcome.as_str())
             }
-            Self::Path(rule) => write!(formatter, "EINVAL ({})", rule.as_str()),
+            // Derived from `code()` rather than hardcoded, so a path rule that
+            // translates to ENAMETOOLONG does not display as EINVAL.
+            Self::Path(rule) => {
+                write!(formatter, "{} ({})", self.code().as_str(), rule.as_str())
+            }
             Self::Limit(field) => {
                 write!(formatter, "{} ({})", self.code().as_str(), field.as_str())
             }

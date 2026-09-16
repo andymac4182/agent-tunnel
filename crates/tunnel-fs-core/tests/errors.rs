@@ -184,22 +184,53 @@ fn path_and_limit_failures_translate_to_a_stable_errno() {
         FsError::Limit(LimitField::SessionIdleSeconds).code(),
         FsErrorCode::Einval
     );
+
+    // A frame over the negotiated msize is a framing violation answered by
+    // closing the socket with 1002, not a file that is too big, so it must not
+    // present as EFBIG and invite a reply to a malformed frame.
+    assert_eq!(
+        FsError::Limit(LimitField::MaxMessageBytes).code(),
+        FsErrorCode::Einval,
+        "an over-msize frame is a protocol violation, never an Rlerror EFBIG"
+    );
+    assert_eq!(
+        SessionErrorCode::ProtocolViolation.close_code(),
+        Some(1002),
+        "which is the answer it does get"
+    );
 }
 
 #[test]
 fn session_failures_carry_the_documented_close_codes() {
-    assert_eq!(SessionErrorCode::ProtocolViolation.close_code(), 1002);
-    assert_eq!(SessionErrorCode::AuthExpired.close_code(), 1008);
-    assert_eq!(SessionErrorCode::CapabilitiesChanged.close_code(), 1008);
-    assert_eq!(SessionErrorCode::ResourceExhausted.close_code(), 1013);
-    assert_eq!(SessionErrorCode::SessionLost.close_code(), 1011);
+    assert_eq!(SessionErrorCode::ProtocolViolation.close_code(), Some(1002));
+    assert_eq!(SessionErrorCode::AuthExpired.close_code(), Some(1008));
+    assert_eq!(
+        SessionErrorCode::CapabilitiesChanged.close_code(),
+        Some(1008)
+    );
+    assert_eq!(SessionErrorCode::ResourceExhausted.close_code(), Some(1013));
+    assert_eq!(SessionErrorCode::SessionLost.close_code(), Some(1011));
+    assert_eq!(SessionErrorCode::DeadlineExceeded.close_code(), Some(1011));
+
+    // The backend going away is a service restart, not an unexpected relay
+    // failure, so 1012 is used rather than being left unmapped.
+    assert_eq!(SessionErrorCode::DeviceOffline.close_code(), Some(1012));
+
+    // Cancelling one operation must not close the session out from under the
+    // other outstanding tags on the same connection.
+    assert_eq!(
+        SessionErrorCode::Aborted.close_code(),
+        None,
+        "a caller's cancellation is not a session-closing failure"
+    );
 
     for code in SessionErrorCode::ALL {
-        let close = code.close_code();
-        assert!(
-            (1002..=1013).contains(&close),
-            "{code} used an out-of-range close code {close}"
-        );
+        if let Some(close) = code.close_code() {
+            assert!(
+                (1002..=1013).contains(&close),
+                "{code} used an out-of-range close code {close}"
+            );
+        }
     }
 }
 
@@ -251,8 +282,11 @@ fn no_error_rendering_can_contain_a_path_or_content() {
     }
 
     assert!(
-        errors.len() > 80,
-        "the sweep must cover the whole vocabulary"
+        errors.len() == 118,
+        "the sweep must render every error this crate can build: 15 path rules \
+         + 14 limit fields + NotPermitted + 14 codes x 4 outcomes + 8 session \
+         codes x 4 outcomes; got {}",
+        errors.len()
     );
     for error in errors {
         for rendered in [format!("{error:?}"), format!("{error}")] {
@@ -291,6 +325,23 @@ fn display_is_a_code_and_an_outcome_or_rule() {
         format!("{}", FsError::Path(PathRule::DotDotComponent)),
         "EINVAL (PATH_DOTDOT_COMPONENT)"
     );
+    // Display is derived from `code()`, so the two length rules that translate
+    // to ENAMETOOLONG display as ENAMETOOLONG rather than as a hardcoded EINVAL.
+    assert_eq!(
+        format!("{}", FsError::Path(PathRule::TooLongBytes)),
+        "ENAMETOOLONG (PATH_TOO_LONG)"
+    );
+    assert_eq!(
+        format!("{}", FsError::Path(PathRule::ComponentTooLong)),
+        "ENAMETOOLONG (PATH_COMPONENT_TOO_LONG)"
+    );
+    for rule in PathRule::ALL {
+        let error = FsError::Path(rule);
+        assert!(
+            format!("{error}").starts_with(error.code().as_str()),
+            "{rule} displayed a code other than its own"
+        );
+    }
     assert_eq!(
         format!("{}", FsError::Limit(LimitField::MaxBufferedFileBytes)),
         "EFBIG (maxBufferedFileBytes)"

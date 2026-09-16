@@ -179,10 +179,60 @@ fn copy_cannot_be_granted_without_its_underlying_read_and_write() {
     assert!(!ClientOperation::Copy.is_available(write_only, FeatureSet::NONE));
 
     // Granting copy necessarily grants plain reads and writes.
-    let copy_grant = CapabilitySet::from_slice(&[Capability::Read, Capability::Write]);
+    let copy_grant =
+        CapabilitySet::from_slice(&[Capability::Read, Capability::Write, Capability::List]);
     assert!(ClientOperation::Copy.is_available(copy_grant, FeatureSet::NONE));
     assert!(ClientOperation::ReadFile.is_available(copy_grant, FeatureSet::NONE));
     assert!(ClientOperation::WriteFile.is_available(copy_grant, FeatureSet::NONE));
+}
+
+#[test]
+fn the_recursive_operations_compose_their_traversal_primitives() {
+    // `copy` and `remove` are recursive in the shared-client contract, so both
+    // enumerate directories and both need `list`.  Omitting the traversal
+    // primitives advertised `remove` under `delete` alone and `copy` under
+    // read+write, which the provider would then have refused part-way through
+    // a directory — exactly the partial advertisement the model forbids.
+    for (operation, expected) in [
+        (
+            ClientOperation::Remove,
+            CapabilitySet::from_slice(&[Capability::Delete, Capability::List]),
+        ),
+        (
+            ClientOperation::Copy,
+            CapabilitySet::from_slice(&[Capability::Read, Capability::Write, Capability::List]),
+        ),
+    ] {
+        assert_eq!(
+            operation.required_capabilities(),
+            expected,
+            "{operation} requires the wrong capabilities"
+        );
+        assert!(
+            operation.primitives().contains(&Primitive::Readdir),
+            "{operation} must enumerate"
+        );
+        assert!(
+            operation.primitives().contains(&Primitive::OpenDir),
+            "{operation} must open a directory to enumerate it"
+        );
+        assert!(
+            !operation.is_available(expected.without(Capability::List), FeatureSet::NONE),
+            "{operation} stayed advertised without list"
+        );
+    }
+
+    // `copy` also creates directories when it recurses into one.
+    assert!(
+        ClientOperation::Copy
+            .primitives()
+            .contains(&Primitive::Mkdir),
+        "a recursive copy creates directories"
+    );
+
+    // Delete alone no longer advertises remove.
+    let delete_only = CapabilitySet::from_slice(&[Capability::Delete]);
+    assert!(!ClientOperation::Remove.is_available(delete_only, FeatureSet::NONE));
 }
 
 #[test]
@@ -252,6 +302,68 @@ fn read_only_is_derived_from_the_grant_and_denies_every_mutating_primitive() {
         assert!(
             !CapabilitySet::DENY.with(capability).is_read_only(),
             "{capability} makes a grant writable"
+        );
+    }
+}
+
+#[test]
+fn walking_without_list_discloses_qids_and_nothing_further() {
+    // A recorded decision: `Twalk` requires no capability, so a read-by-name
+    // grant (`read` without `list`) can reach a file it already knows the path
+    // of.  The cost is that a write-only or delete-only grant can probe name
+    // existence and node type through `Rwalk` qids.  This test pins the extent
+    // of that disclosure: qids only, never attributes or directory contents.
+    for capability in [Capability::Write, Capability::Delete] {
+        let grant = CapabilitySet::DENY.with(capability);
+        assert!(
+            Primitive::Walk.is_permitted(grant, FeatureSet::NONE),
+            "{capability} alone may walk"
+        );
+        for denied in [Primitive::Getattr, Primitive::Readdir, Primitive::OpenDir] {
+            assert!(
+                !denied.is_permitted(grant, FeatureSet::NONE),
+                "{capability} alone must not reach {denied}"
+            );
+        }
+        assert!(
+            !Primitive::Read.is_permitted(grant, FeatureSet::NONE),
+            "{capability} alone must not read content"
+        );
+        // And no metadata operation is advertised to such a grant.
+        for operation in ClientOperation::derive_all(grant, FeatureSet::NONE) {
+            assert_ne!(operation, ClientOperation::Stat);
+            assert_ne!(operation, ClientOperation::ReadDirectory);
+        }
+    }
+
+    // The point of the decision: read-by-name works without list.
+    let read_by_name = CapabilitySet::DENY.with(Capability::Read);
+    assert!(ClientOperation::ReadFile.is_available(read_by_name, FeatureSet::NONE));
+}
+
+#[test]
+fn the_read_only_profile_is_read_and_list_together() {
+    // Named so integrators do not configure `read` alone: without `list` there
+    // is no `stat`, and a Files SDK head or exists call has nothing to call.
+    let read_alone = CapabilitySet::DENY.with(Capability::Read);
+    assert!(!ClientOperation::Stat.is_available(read_alone, FeatureSet::NONE));
+
+    let profile = example_grant();
+    assert_eq!(
+        profile,
+        CapabilitySet::from_slice(&[Capability::Read, Capability::List])
+    );
+    assert!(profile.is_read_only());
+    for operation in [
+        ClientOperation::ReadFile,
+        ClientOperation::ReadStream,
+        ClientOperation::Stat,
+        ClientOperation::ReadDirectory,
+        ClientOperation::Realpath,
+    ] {
+        assert!(
+            operation.is_available(profile, FeatureSet::NONE),
+            "{operation} belongs to the read-only profile"
         );
     }
 }

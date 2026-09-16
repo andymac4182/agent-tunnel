@@ -120,12 +120,18 @@ fn advertised_operations_never_exceed_the_grant() {
 }
 
 #[test]
-fn an_empty_grant_advertises_nothing_at_all() {
+fn an_empty_grant_advertises_nothing_and_admits_no_session() {
     let descriptor = descriptor_with(Availability::Online, CapabilitySet::DENY, FeatureSet::NONE);
     assert!(descriptor.operations().is_empty());
     let json = descriptor.to_json();
     assert!(json.contains("\"operations\": [],"), "{json}");
     assert!(json.contains("\"readOnly\": true"));
+
+    // The descriptor type describes a grant; it does not decide admission.
+    // Such an export admits no session, and discovery answers 403 rather than
+    // serving this document, so an empty operation list never reaches a
+    // consumer as if it were a usable export.
+    assert!(!tunnel_fs_core::admits_session(descriptor.grant()));
 }
 
 #[test]
