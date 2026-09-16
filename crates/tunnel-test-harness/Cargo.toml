@@ -60,5 +60,10 @@ tunnel-protocol = { path = "../tunnel-protocol" }
 futures-util = { version = "0.3", features = ["sink", "std"] }
 uuid = { version = "1.10", features = ["v4", "serde"] }
 
+[dev-dependencies]
+# `#[tokio::test(start_paused = true)]` in this crate's own tests; workspace
+# feature unification otherwise hid it from `cargo test -p`.
+tokio = { version = "1.40", features = ["test-util"] }
+
 [lints]
 workspace = true

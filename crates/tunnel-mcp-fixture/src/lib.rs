@@ -576,7 +576,15 @@ pub async fn serve_http(
             () = shutdown.cancelled() => return,
             accepted = listener.accept() => accepted,
         };
-        let Ok((stream, _)) = accepted else { return };
+        let stream = match accepted {
+            Ok((stream, _)) => stream,
+            // A per-connection accept error (a peer that vanished, a
+            // momentary descriptor limit) is not the end of the listener.
+            Err(error) => {
+                eprintln!("tunnel-mcp-fixture: accept failed: {}", error.kind());
+                continue;
+            }
+        };
         let service = hyper_util::service::TowerToHyperService::new(service.clone());
         tokio::spawn(async move {
             let _ = hyper::server::conn::http1::Builder::new()
