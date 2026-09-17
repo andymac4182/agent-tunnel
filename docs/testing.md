@@ -1095,6 +1095,17 @@ recorded with their reasoning in
 [filesystem-api.md](filesystem-api.md#pinned-in-code-gate-3)'s gate-3 residue,
 which that fuzzing closes. The two verdict files are byte-identical.
 
+The corpus weights `NOTAG` for the two version opcodes and draws `Rlerror` from
+an errno pool, because a uniform tag pool spent almost every version frame on
+the one refusal that guards it: 41 of 41 message types are now decoded, where
+`Tversion` was reached once and `Rlerror` three times in 4,096 cases. Nothing new
+surfaced, and **that is a weaker result than it may look**: both codecs decode an
+`Rversion`'s `msize` without judging it, so agreement shows the rule is in
+neither codec rather than that it belongs in a session — and the Rust side has no
+consumer-side `Rversion` rule to compare against at all, being the server end.
+The differences that remain between the two implementations are session-layer
+rules a corpus of frames does not reach.
+
 **What the client's own suite covers.** The namespace, with every refused class
 refused by its own rule and the checking **order** that decides which rule a path
 violating several of them reports. The descriptor: the schema's rules, the HTTP

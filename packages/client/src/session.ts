@@ -616,8 +616,15 @@ export class ConsumerSession {
     if (record.tag === C.NOTAG) {
       // The version handshake cannot be flushed — `Tflush` names a tag, and
       // `NOTAG` is not one — and a peer that will not answer `Tversion` has no
-      // session to preserve. `DEADLINE_EXCEEDED` closes 1011.
-      this.failSession('DEADLINE_EXCEEDED', 1011, 'version-deadline');
+      // session to preserve.
+      //
+      // **1002, not 1011.** 1011 is the contract's *server* code for an
+      // unexpected failure, and this close is taken by the client, for its own
+      // deadline, against a peer that did not complete the handshake this
+      // profile requires before any other traffic. The error the caller
+      // receives is still `DEADLINE_EXCEEDED`; the close code says what the
+      // peer did.
+      this.failSession('DEADLINE_EXCEEDED', 1002, 'version-deadline');
       return;
     }
     this.retire(record);

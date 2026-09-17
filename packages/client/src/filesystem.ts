@@ -556,7 +556,12 @@ export class RemoteFilesystem {
         // destination already created, and an abort between the `Rlcreate` and
         // the first `Twrite` does the same. That is the class gate 5 spent a
         // round removing on the device side, and a client must not put it back.
-        outcome = mergeOutcome(outcome, 'failed');
+        //
+        // The floor is **`partial`**, not `failed`. A composite that provably
+        // applied one of its steps and not the rest is what `partial` names;
+        // `failed` is the single request whose effecting call was refused, and
+        // using it here would spell those two situations the same way.
+        outcome = mergeOutcome(outcome, 'partial');
       } catch (error) {
         const failed = error as FilesystemError;
         if (!overwrite || failed.code !== 'EEXIST') {
@@ -574,9 +579,10 @@ export class RemoteFilesystem {
         if (opened.kind !== 'Rlopen') {
           throw this.unexpected(operation, path);
         }
-        // A truncating open **carries an effect**: from here nothing can be
-        // reported `not_started`.
-        outcome = mergeOutcome(outcome, 'failed');
+        // A truncating open **carries an effect** — the file is now empty — so
+        // from here nothing can be reported `not_started`, and for the same
+        // reason as the create above the floor is `partial`.
+        outcome = mergeOutcome(outcome, 'partial');
       }
       const target = fid;
       if (target === undefined) {
@@ -615,7 +621,14 @@ export class RemoteFilesystem {
         }
       }
     } catch (error) {
-      const failed = error as FilesystemError;
+      if (!(error instanceof FilesystemError)) {
+        // A refused path is a `PathRefusal` and carries no outcome, so there is
+        // nothing to merge into and nothing to learn by rewriting it. `copy`
+        // validates both of its paths before it creates anything, so this
+        // cannot be a refusal that happened after an effect.
+        throw error;
+      }
+      const failed = error;
       // The composite's own outcome is merged with the failing step's, and the
       // merge only ever strengthens: a write that acknowledged bytes and then
       // lost its session is `partial`-or-worse and can never be reported
@@ -665,33 +678,79 @@ export class RemoteFilesystem {
     });
   }
 
+  /**
+   * Create a directory, and its parents when asked.
+   *
+   * A recursive `mkdir` is a **composite**, so it carries the same floor
+   * `writeFile` does: once any `Rmkdir` has arrived, a directory exists that did
+   * not before, and no later failure may be reported `not_started`. Without it,
+   * `mkdir('/a/b', { recursive: true })` interrupted after `/a` was made told
+   * the caller nothing had happened, with `/a` standing in the export.
+   */
   async mkdir(path: string, options: { recursive?: boolean | undefined; signal?: AbortSignal | undefined } = {}): Promise<void> {
     this.require('mkdir', path);
     const components = validatePath(path, this.bounds);
     const recursive = options.recursive === true;
     const targets = recursive ? components.map((_, index) => index + 1) : [components.length];
+    let made = 0;
     for (const depth of targets) {
       const at = `/${components.slice(0, depth).join('/')}`;
       const { parent, name } = splitParent(at, this.bounds);
-      const parentFid = await this.walk(parent, options.signal);
+      let parentFid: number;
+      try {
+        parentFid = await this.walk(parent, options.signal);
+      } catch (error) {
+        throw this.withCompositeFloor(error, 'mkdir', path, made > 0);
+      }
       try {
         await this.session.request(
           { kind: 'Tmkdir', tag: 0, dfid: parentFid, name, mode: 0o755, gid: 0 },
           { signal: options.signal },
         );
+        made += 1;
       } catch (error) {
         const failed = error as FilesystemError;
         // Only `recursive` may ignore an existing directory, and it ignores
         // nothing else: a permission failure is still a failure. A plain
         // `mkdir` of a name that exists is `EEXIST`, which is what a caller
         // that did not ask for the chain needs to be told.
+        //
+        // An ignored `EEXIST` made nothing, so it does not move the floor.
         if (!(recursive && failed.code === 'EEXIST')) {
-          throw failed;
+          throw this.withCompositeFloor(failed, 'mkdir', path, made > 0);
         }
       } finally {
         await this.clunkQuietly(parentFid);
       }
     }
+  }
+
+  /**
+   * Re-report a composite's failure with the floor its own progress sets.
+   *
+   * `applied` means this operation has provably changed the export already, so
+   * the result cannot be `not_started` however the step that failed describes
+   * itself. The merge is gate 1's and only ever strengthens, so a step that was
+   * `unknown` stays `unknown`.
+   */
+  private withCompositeFloor(
+    error: unknown,
+    operation: string,
+    path: string,
+    applied: boolean,
+  ): unknown {
+    if (!(error instanceof FilesystemError) || !applied) {
+      return error;
+    }
+    return new FilesystemError({
+      code: error.code,
+      operation,
+      path: error.path ?? path,
+      outcome: mergeOutcome(error.outcome, 'partial'),
+      retryable: false,
+      bytesAcknowledged: error.bytesAcknowledged,
+      closeCode: error.closeCode,
+    });
   }
 
   /**
@@ -705,7 +764,25 @@ export class RemoteFilesystem {
     path: string,
     options: { recursive?: boolean | undefined; force?: boolean | undefined; signal?: AbortSignal | undefined } = {},
     depth = 0,
-    budget: { entries: number } = { entries: 0 },
+    progress: { entries: number; removed: number } = { entries: 0, removed: 0 },
+  ): Promise<void> {
+    try {
+      await this.removeInner(path, options, depth, progress);
+    } catch (error) {
+      // A recursive removal is a composite, and its outcome is the
+      // **composite's**, not the last request's. Removing two of three children
+      // and then meeting an `EACCES` is not `not_started`: two names are gone.
+      // The counter is shared by reference down the recursion, so the floor is
+      // the same fact at every level.
+      throw this.withCompositeFloor(error, 'remove', path, progress.removed > 0);
+    }
+  }
+
+  private async removeInner(
+    path: string,
+    options: { recursive?: boolean | undefined; force?: boolean | undefined; signal?: AbortSignal | undefined },
+    depth: number,
+    progress: { entries: number; removed: number },
   ): Promise<void> {
     this.require('remove', path);
     if (depth > this.descriptor.limits.maxTraversalDepth) {
@@ -737,23 +814,27 @@ export class RemoteFilesystem {
         // one directory's pages: a tree of ten thousand single-entry
         // directories is ten thousand entries however they are spread. The
         // counter is threaded through the recursion for that reason.
-        budget.entries += 1;
-        if (budget.entries > this.descriptor.limits.maxTraversalEntries) {
+        progress.entries += 1;
+        if (progress.entries > this.descriptor.limits.maxTraversalEntries) {
           throw new FilesystemError({
             code: 'EFBIG',
             operation: 'remove',
             path,
-            // Children may already be gone: a bounded traversal that stops is
-            // not a traversal that did nothing.
-            outcome: depth > 0 || budget.entries > 1 ? 'partial' : 'not_started',
+            // Decided by what has actually been removed, not by how deep the
+            // traversal is. Removal is **post-order**, so a budget that fires
+            // during the descent has sent no `Tunlinkat` at all: reporting
+            // `partial` there — as an earlier round did, keyed on depth —
+            // claimed an effect that had not happened. The wrapper above
+            // supplies the floor once one has.
+            outcome: 'not_started',
             retryable: false,
           });
         }
-        await this.remove(
+        await this.removeInner(
           `${path === '/' ? '' : path}/${child.name}`,
           options,
           depth + 1,
-          budget,
+          progress,
         );
       }
     }
@@ -770,6 +851,7 @@ export class RemoteFilesystem {
         },
         { signal: options.signal },
       );
+      progress.removed += 1;
     } catch (error) {
       const failed = error as FilesystemError;
       if (options.force === true && failed.code === 'ENOENT') {
@@ -794,7 +876,18 @@ export class RemoteFilesystem {
     if (this.descriptor.features.atomicRename) {
       const from = splitParent(source, this.bounds);
       const oldParent = await this.walk(from.parent, options.signal);
-      const newParent = await this.walk(target.parent, options.signal);
+      // The second walk is inside its own guard: a fid bound before a `try` and
+      // released only inside it leaks on both sides when the step between them
+      // throws — the same shape as the `writeInto` fallback, one operation
+      // later. A rename to a directory that does not exist used to leak the
+      // source parent's fid, permanently, once per attempt.
+      let newParent: number;
+      try {
+        newParent = await this.walk(target.parent, options.signal);
+      } catch (error) {
+        await this.clunkQuietly(oldParent);
+        throw error;
+      }
       try {
         await this.session.request(
           {
@@ -814,7 +907,13 @@ export class RemoteFilesystem {
       return;
     }
     const fid = await this.walk(source, options.signal);
-    const newParent = await this.walk(target.parent, options.signal);
+    let newParent: number;
+    try {
+      newParent = await this.walk(target.parent, options.signal);
+    } catch (error) {
+      await this.clunkQuietly(fid);
+      throw error;
+    }
     try {
       await this.session.request(
         { kind: 'Trename', tag: 0, fid, dfid: newParent, name: target.name },
@@ -834,6 +933,12 @@ export class RemoteFilesystem {
    */
   async copy(source: string, destination: string, options: WriteOptions = {}): Promise<void> {
     this.require('copy', source);
+    // **Both** paths are validated here, before anything is created. The read
+    // is lazy, so a source the namespace refuses would otherwise be refused
+    // *after* the destination existed — an effect this operation would then
+    // report with a `PathRefusal` that has no outcome field to carry it.
+    validatePath(source, this.bounds);
+    validatePath(destination, this.bounds);
     await this.writeInto('copy', destination, this.readStream(source, { signal: options.signal }), options);
   }
 
@@ -960,6 +1065,18 @@ export class RemoteFilesystem {
   }
 }
 
+/** Refuse before acting when the caller has already cancelled. */
+function throwIfAborted(signal: AbortSignal | undefined, operation: string): void {
+  if (signal?.aborted === true) {
+    throw new FilesystemError({
+      code: 'ABORTED',
+      operation,
+      outcome: 'not_started',
+      retryable: false,
+    });
+  }
+}
+
 function msFrom(seconds: bigint, nanoseconds: bigint): number {
   // A 64-bit second count does not fit a `number`, so the conversion is
   // checked rather than rounded: "numeric size/time conversion must fail on
@@ -994,7 +1111,12 @@ async function* asAsync(
 export async function fetchDescriptor(options: ConnectOptions): Promise<Descriptor> {
   const url = new URL(options.endpoint);
   requireSecureEndpoint(url, options.allowInsecureLoopback ?? false);
+  throwIfAborted(options.signal, 'descriptor');
   const token = await options.token();
+  // A token supplier can await anything — a network call to an identity
+  // provider, most often — so the signal is checked on both sides of it rather
+  // than only before.
+  throwIfAborted(options.signal, 'descriptor');
   let response: Response;
   try {
     response = await fetch(url, {
@@ -1073,7 +1195,9 @@ export async function connectFilesystem(options: ConnectOptions): Promise<Remote
     });
   }
   const url = new URL(options.endpoint);
+  throwIfAborted(options.signal, 'connect');
   const token = await options.token();
+  throwIfAborted(options.signal, 'connect');
   const msize = Math.min(
     descriptor.limits.maxMessageBytes,
     options.maxMessageBytes ?? LIMIT_CEILINGS.maxMessageBytes,

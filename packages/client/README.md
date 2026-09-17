@@ -231,6 +231,13 @@ produce a verdict on every one: they must accept and agree, or both refuse.
 verdicts; `npm test` regenerates the corpus from the seed, recomputes this
 side's verdicts and compares. The two verdict files are byte-identical.
 
+The corpus weights `NOTAG` for the version opcodes and draws `Rlerror` from an
+errno pool, so all 41 message types are decoded. Agreement there is a weaker
+result than it looks: both codecs decode an `Rversion`'s `msize` without judging
+it, so it shows the rule is in **neither** codec, not that it belongs in a
+session — and the Rust is the server end, with no consumer-side `Rversion` rule
+to compare against.
+
 ```sh
 node fuzz/generate.ts --seed 0x1 --cases 1024   # explore another seed
 cargo test -p tunnel-fs-ninep --test shared_fuzz # re-derive the Rust verdicts

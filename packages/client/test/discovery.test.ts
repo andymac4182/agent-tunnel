@@ -8,7 +8,10 @@
  */
 
 import { strict as assert } from 'node:assert';
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { after, describe, it } from 'node:test';
+import { fileURLToPath } from 'node:url';
 
 import { connectFilesystem, fetchDescriptor } from '../src/filesystem.ts';
 import { validateDescriptor, GRANT_REVISION_HEADER } from '../src/descriptor.ts';
@@ -169,7 +172,21 @@ describe('the descriptor', () => {
       });
     }
 
-    it('accepts the checked-in example’s shape', () => {
+    it('accepts the checked-in example itself, not merely a fixture shaped like it', () => {
+      // Read from `docs/contracts/filesystem-capabilities.example.json`, so the
+      // rules this validator enforces — `additionalProperties: false` above
+      // all — cannot drift away from the document they claim to implement. A
+      // fixture written beside the validator would agree with it by
+      // construction.
+      const example: unknown = JSON.parse(
+        readFileSync(
+          join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..', 'docs', 'contracts', 'filesystem-capabilities.example.json'),
+          'utf8',
+        ),
+      );
+      const parsed = validateDescriptor(example);
+      assert.equal(parsed.schemaVersion, 'agent-tunnel.fs.v1');
+      assert.equal(parsed.root.readOnly, true);
       assert.doesNotThrow(() => validateDescriptor(descriptorFixture()));
     });
   });
