@@ -70,6 +70,9 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from guard_outcomes import unusable as unusable_outcomes  # noqa: E402
+
 REPO = Path(__file__).resolve().parent.parent
 CRATE = REPO / "crates" / "tunnel-fs-host"
 RESOLVER = CRATE / "src" / "resolver.rs"
@@ -2453,6 +2456,101 @@ GATE6_E2E_CASES: list[tuple[str, list[Edit]]] = [
     ),
 ]
 
+#: Cases whose **green result is the documented finding**, not a lost guard.
+#:
+#: This is the exact analogue of `scripts/acp-guard-deletion.py`'s
+#: `expect_build_failure`: a third kind of evidence that is reported on its own
+#: line and never counted in a red total, because it is not a red test and must
+#: not inflate one.
+#:
+#: A case belongs here only when the suite already argues, in the case's own
+#: comment, *why* nothing can go red -- that the rule is defence in depth
+#: behind a guard that refuses first.  "It did not go red and I am not sure
+#: why" is a stale case (M4-18), which is a different thing and must not be
+#: hidden here.
+#:
+#: A case in this set that **does** go red is an unusable outcome, not a
+#: success: it would mean the rule became load-bearing and the comment
+#: explaining the green is now wrong.
+#: Every entry here must be traceable to a written reason.  The gate-4 five are
+#: the five that task row **M4-11** already records and explains, in those
+#: words: "the descriptor cache's three generation guards are green
+#: individually **and as a triple**, because gate 3's session is already
+#: authoritative about a fid's open state per binding and refuses every path
+#: that could reach a stale entry ... and the `Treaddir` resume budget answers
+#: the same code as the end-of-directory refusal beside it, so no test can tell
+#: them apart".
+#:
+#: They are listed here, rather than left to the row, so the harness's exit
+#: status agrees with the row: before this, five documented findings and one
+#: real defect all produced the same non-zero exit for different reasons.
+EXPECT_GREEN: frozenset[str] = frozenset(
+    {
+        # The descriptor cache's generation keying, individually and as a
+        # triple.  Gate 3's session refuses a `Tread` on a fid it does not hold
+        # open at the current binding, so no path can reach a stale entry; the
+        # keying is defence in depth behind that stamp.  The combined case
+        # carries the full argument in its own comment in GATE4_CASES.
+        "key the descriptor cache by fid generation",
+        "prune a descriptor whose binding has gone",
+        "release a descriptor only for its own generation",
+        "all three descriptor-cache generation guards, together",
+        # The `Treaddir` resume budget answers the same error code as the
+        # end-of-directory refusal beside it, so no test can distinguish them;
+        # what it bounds is the *work* a resume may demand, not the answer.
+        "a resume cookie is bounded by the traversal budget",
+        # gate2.  Task row **M4-08** explains all nine in those words: "each
+        # `O_NOFOLLOW` and its sibling identity check mask one another and are
+        # proven in pairs, and the three mount-boundary checks mask one another
+        # and are proven as a triple", the two special-file checks likewise
+        # being proven "as a pair", and "`EINTR` retry has no test at all".
+        # The row also says which single window guard *is* load-bearing — the
+        # **file** post-open identity comparison — and that one is red, which
+        # is the check that this set is not simply swallowing the group.
+        "mount boundary after the directory open",
+        "mount boundary before the directory open",
+        "mount boundary before the file open",
+        "special-file refusal before the open",
+        "special-file refusal on the descriptor",
+        "O_NOFOLLOW on a directory component",
+        "O_NOFOLLOW on the final file open",
+        "post-open identity check on a directory",
+        # No test reaches it at all, stated plainly in M4-08 and listed here so
+        # that fact is measured rather than assumed -- the treatment gate3's
+        # reserved-walk case explicitly cites as "the same treatment gate 2's
+        # `EINTR` retry gets".
+        "EINTR retried rather than reported",
+        # gate3.  Both already carry their reason in their own case comment
+        # above: the flush guard is masked by the set staying accurate and is
+        # proven as a pair, and the reserved-walk guard is defensive and
+        # deliberately kept though no test reaches it, "listed so that fact is
+        # measured rather than assumed".
+        "a flush identified by its pair, not by its tag number",
+        "a reserved walk binding only a live reservation",
+        # gate3.  These two were first left out of this set on the grounds that
+        # they "carry no written explanation anywhere".  That was wrong about
+        # the first and incomplete about the second, and review caught it.
+        #
+        # The reply-type match is explained four lines below its own case, by
+        # the pair case that follows it: "The reply-type match and
+        # `apply_effect`'s catch-all mask one another: with the match gone, a
+        # mismatched reply still falls through to the catch-all.  Proven as a
+        # pair."  That is the same shape the flush case above is marked on, so
+        # refusing this one was an inconsistency, not caution.
+        "the reply-type match in complete",
+        # The count check has no prose reason, but the fact is one read away and
+        # was verified rather than inferred: `read_counted`
+        # (`crates/tunnel-fs-ninep/src/message.rs:1033-1039`) pre-checks
+        # `count > reader.remaining()` and then calls `reader.raw(count)`, which
+        # delegates to `Reader::take` (`wire.rs:161-168`) -- and `take` returns
+        # the identical `CodecError::TruncatedBody` on a short body.  The
+        # pre-check is provably defence in depth, so its green is a documented
+        # green like the others; the citation is the code rather than a row.
+        "the count check before a counted payload is copied",
+    }
+)
+
+
 @dataclass
 class Suite:
     """One suite's guards and the command that measures them.
@@ -2529,7 +2627,13 @@ def run_node_tests(suite: Suite) -> tuple[str, list[str]]:
             timeout=600,
         )
     except subprocess.TimeoutExpired:
-        return "RED (hung)", []
+        # M8-C06, finished here: a run that timed out names no failing test,
+        # which is the same observation as the no-named-failure case.  The old
+        # "RED (hung)" spelling was counted in neither the red tally nor the
+        # unusable list.  A guard whose deletion genuinely hangs is still
+        # evidence, but expensive and unnamed -- see the `break`-rather-than-
+        # delete note on the readdir cookie case.
+        return "NOT EVIDENCE (timed out)", []
     combined = done.stdout + done.stderr
     # A load failure is diagnosed from node's own machinery, not from the word
     # appearing anywhere in the run: a genuinely red test whose failure message
@@ -2577,7 +2681,13 @@ def run_tests(suite: Suite) -> tuple[str, list[str]]:
             timeout=600,
         )
     except subprocess.TimeoutExpired:
-        return "RED (hung)", []
+        # M8-C06, finished here: a run that timed out names no failing test,
+        # which is the same observation as the no-named-failure case.  The old
+        # "RED (hung)" spelling was counted in neither the red tally nor the
+        # unusable list.  A guard whose deletion genuinely hangs is still
+        # evidence, but expensive and unnamed -- see the `break`-rather-than-
+        # delete note on the readdir cookie case.
+        return "NOT EVIDENCE (timed out)", []
     combined = done.stdout + done.stderr
     if "error[" in combined or "error: could not compile" in combined:
         return "BUILD FAILED (not evidence)", []
@@ -2686,6 +2796,12 @@ def main() -> int:
             continue
         outcome, failures = run_tests(suite)
         restore(suite)
+        if name in EXPECT_GREEN:
+            outcome = (
+                "DOCUMENTED GREEN"
+                if outcome == "still green"
+                else f"EXPECTED A DOCUMENTED GREEN, GOT: {outcome}"
+            )
         results.append((suite.name, name, outcome, failures))
         print(
             f"[{suite.name}] {name}: {outcome} {failures if failures else ''}".rstrip(),
@@ -2701,17 +2817,26 @@ def main() -> int:
         if not rows:
             continue
         red = sum(1 for row in rows if row[2] == "RED")
-        print(f"\n{suite.name}: {red} of {len(rows)} deletions turned a test red")
+        documented = sum(1 for row in rows if row[2] == "DOCUMENTED GREEN")
+        measurable = len(rows) - documented
+        print(f"\n{suite.name}: {red} of {measurable} deletions turned a test red")
+        if documented:
+            print(
+                f"{suite.name}: {documented} further case(s) are DOCUMENTED GREEN -- "
+                "defence in depth behind a guard that refuses first, reported "
+                "separately and never counted as a red test"
+            )
 
-    # Every "not evidence" outcome must reach this list, or a suite whose cases
-    # all failed to build would exit 0 and read as a clean run.  The node
-    # runner's two spellings are here for that reason: an earlier version left
-    # them out and a deliberately broken case exited 0.
-    unusable = [
-        f"[{suite_name}] {name}"
-        for suite_name, name, outcome, _ in results
-        if outcome.startswith(("BUILD", "COULD", "MODULE", "NO TEST"))
-    ]
+    # Shared with scripts/acp-guard-deletion.py, and an allow list rather than
+    # the deny list of prefixes this used to carry (task row M8-C08).  That
+    # list -- BUILD, COULD, MODULE, NO TEST -- failed open: "still green",
+    # which this file returns in two places and which means the guard was
+    # defeated and NOTHING went red, matched none of them, so a run in which
+    # every guard stayed green printed "0 of N" and exited 0.  Now anything
+    # that is not RED or REFUSED BY COMPILER fails closed and is named.
+    unusable = unusable_outcomes(
+        (suite_name, name, outcome) for suite_name, name, outcome, _ in results
+    )
     if unusable:
         print("\nno usable result for: " + ", ".join(unusable))
         return 1

@@ -2,12 +2,17 @@
 """Defeat one ACP profile guard at a time, run the tests it should protect, and
 restore it.
 
-This is the red-then-green evidence behind M8 chunk 1: the pinned `tunnel-acp`
-profile, its message validation and its pin assertions.  One suite lives here:
+This is the red-then-green evidence behind the M8 ACP chunks.  Two suites live
+here:
 
 * `m8c1` — `crates/tunnel-acp`: the `http-forward/1` profile tables, the strict
   JSON scanner, the JSON-RPC message rules, the version negotiation, the v1
   turn-completion rule, and the two draft features that must stay off.
+* `m8c2` — the pure lifecycle in `crates/tunnel-acp/src/lifecycle.rs`, the
+  supervisor in `crates/tunnel-acp-export` and the synthetic agent in
+  `crates/tunnel-acp-fixture`: id scoping, resolve-exactly-once, the bounds,
+  the permission deadline, the child's stdout rules, the stderr sink and the
+  process-group kill.
 
 It follows `scripts/fs-guard-deletion.py`, **including both of that script's
 refusals, which are what keep the numbers honest and neither of which may be
@@ -22,7 +27,19 @@ removed**:
    whichever match comes first, so an ambiguous case defeats some *other* guard
    and reports a red for it under the wrong name.
 
-A third outcome exists here that the filesystem suite has no use for.  One
+A **third refusal**, added by chunk 2: a run that *timed out* returns
+`NOT EVIDENCE (timed out)`, not `RED (hung)`.  A timed-out run names no failing
+test, which is the same observation refusal 2's sibling makes below.  Recorded
+as M8-C06.
+
+The classification of those outcomes is **not in this file**.  It lives in
+`scripts/guard_outcomes.py`, shared with `scripts/fs-guard-deletion.py`, and it
+is an **allow list**: `RED` and `REFUSED BY COMPILER` are usable and everything
+else fails closed.  The deny-list-of-prefixes each harness used to carry failed
+open, which is how `RED (hung)` and `still green` both went uncounted (M8-C08).
+A new outcome spelling added here therefore needs no change there.
+
+A fourth outcome exists here that the filesystem suite has no use for.  One
 guard — `unstable_protocol_v2` staying off — is enforced by the compiler
 rather than by a test: the pinned schema removes `ProtocolVersion::LATEST`
 when that feature is enabled, so `src/pin.rs` stops compiling.  Turning the
@@ -60,6 +77,9 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from guard_outcomes import unusable as unusable_outcomes  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
 CRATE = REPO / "crates" / "tunnel-acp"
@@ -569,7 +589,368 @@ class Suite:
     cwd: Path = REPO
 
 
-SUITES: list[Suite] = [Suite("m8c1", [CRATE], CARGO_TEST, CASES)]
+# ------------------------------------------------------------- m8c2: chunk 2
+#
+# The pure lifecycle (`crates/tunnel-acp/src/lifecycle.rs`), the supervisor
+# (`crates/tunnel-acp-export`) and the synthetic agent fixture
+# (`crates/tunnel-acp-fixture`).
+#
+# Two kinds of case are deliberately absent rather than faked:
+#
+# * **A string id and a number id are different requests** is enforced by the
+#   type (`RequestId::Text` / `RequestId::Number`), not by a branch.  There is
+#   nothing to delete that leaves the crate compiling, so it is in the same
+#   class as `unstable_protocol_v2` in the m8c1 suite -- except that it has no
+#   `expect_build_failure` shape either, so it is simply not claimed here.
+# * **The reader is a separate task** is a structural property of
+#   `tokio::spawn(read_agent(..))`.  Defeating it means rewriting the
+#   supervisor, not deleting a guard, and a rewrite is not a deletion result.
+
+EXPORT = REPO / "crates" / "tunnel-acp-export"
+FIXTURE = REPO / "crates" / "tunnel-acp-fixture"
+LIFECYCLE = CRATE / "src" / "lifecycle.rs"
+CHILD = EXPORT / "src" / "child.rs"
+SUPERVISOR = EXPORT / "src" / "supervisor.rs"
+
+C2_CARGO_TEST = [
+    "cargo",
+    "test",
+    "-p",
+    "tunnel-acp",
+    "-p",
+    "tunnel-acp-export",
+    "-p",
+    "tunnel-acp-fixture",
+    "--locked",
+    "--no-fail-fast",
+]
+
+C2_CASES: list[tuple[str, list[Edit], bool]] = [
+    # ------------------------------------------------ the permission deadline
+    (
+        "a permission deadline cancels, and never approves",
+        [
+            (
+                LIFECYCLE,
+                """                outcome: PermissionOutcome::Cancelled,
+            });""",
+                """                outcome: PermissionOutcome::Selected("permit-one".to_owned()),
+            });""",
+            )
+        ],
+        False,
+    ),
+    (
+        "the deadline must be exceeded, not merely reached",
+        [
+            (
+                LIFECYCLE,
+                "&& entry.deadline.is_some_and(|deadline| now > deadline)",
+                "&& entry.deadline.is_some_and(|deadline| now >= deadline)",
+            )
+        ],
+        False,
+    ),
+    (
+        # Two edits, because this one rule is written in two places: only a
+        # permission is *given* a deadline, and only a permission is *checked*
+        # against one.  Defeating either alone leaves the other standing and
+        # the suite green, which would report the guard as not load-bearing
+        # when it is -- so the case defeats the rule, not half of it.
+        "only a permission expires on a permission deadline",
+        [
+            (
+                LIFECYCLE,
+                """        let deadline = match kind {
+            PendingKind::Permission => Some(now.saturating_add(timeout)),
+            PendingKind::Prompt | PendingKind::Call => None,
+        };""",
+                "        let deadline = Some(now.saturating_add(timeout));",
+            ),
+            (
+                LIFECYCLE,
+                """                entry.kind == PendingKind::Permission
+                    && entry.deadline.is_some_and(|deadline| now > deadline)""",
+                "                entry.deadline.is_some_and(|deadline| now > deadline)",
+            ),
+        ],
+        False,
+    ),
+    (
+        "the cancellation reaches the agent on the wire",
+        [
+            (
+                SUPERVISOR,
+                'PermissionOutcome::Cancelled => json!({"outcome": "cancelled"}),',
+                'PermissionOutcome::Cancelled => json!({"outcome": "selected", "optionId": "permit-one"}),',
+            )
+        ],
+        False,
+    ),
+    # ----------------------------------------------------------- id scoping
+    (
+        "a JSON-RPC id is scoped by its direction",
+        [
+            (
+                LIFECYCLE,
+                """            connection: connection.to_owned(),
+            direction,
+        }""",
+                """            connection: connection.to_owned(),
+            direction: Direction::HostToAgent,
+        }""",
+            )
+        ],
+        False,
+    ),
+    (
+        "a duplicate pending id conflicts before dispatch",
+        [
+            (
+                LIFECYCLE,
+                """        if self.pending.contains_key(&key) {
+            return Err(LifecycleRejection::new(
+                LifecycleRule::DuplicatePendingId,
+                "that request id is already outstanding in this scope",
+            ));
+        }
+""",
+                "",
+            )
+        ],
+        False,
+    ),
+    (
+        "a callback resolves exactly once",
+        [
+            (
+                LIFECYCLE,
+                "        let entry = self.pending.remove(&key).unwrap_or_else(|| unreachable!());",
+                "        let entry = self.pending.get(&key).cloned().unwrap_or_else(|| unreachable!());",
+            )
+        ],
+        False,
+    ),
+    (
+        "a response must answer the kind of request outstanding",
+        [
+            (
+                LIFECYCLE,
+                "            (PendingKind::Permission, _) | (PendingKind::Prompt | PendingKind::Call, _) => false,",
+                "            (PendingKind::Permission, _) | (PendingKind::Prompt | PendingKind::Call, _) => true,",
+            )
+        ],
+        False,
+    ),
+    # -------------------------------------------------------------- the bounds
+    (
+        "the pending bound is reached at the bound, not one past it",
+        [
+            (
+                LIFECYCLE,
+                "        if self.pending_in(scope) >= self.limit {",
+                "        if self.pending_in(scope) > self.limit {",
+            )
+        ],
+        False,
+    ),
+    (
+        "the session bound is reached at the bound, not one past it",
+        [
+            (
+                LIFECYCLE,
+                "        if self.sessions.len() >= self.session_limit {",
+                "        if self.sessions.len() > self.session_limit {",
+            )
+        ],
+        False,
+    ),
+    (
+        "a second concurrent prompt on one session is refused",
+        [
+            (
+                LIFECYCLE,
+                """            SessionPhase::Prompting => Err(LifecycleRejection::new(
+                LifecycleRule::PromptAlreadyActive,
+                "this session already has an active prompt",
+            )),""",
+                "            SessionPhase::Prompting => Ok(()),",
+            )
+        ],
+        False,
+    ),
+    (
+        "a new session has no subscriber until one arrives",
+        [
+            (
+                LIFECYCLE,
+                "                phase: SessionPhase::AwaitingSubscriber,",
+                "                phase: SessionPhase::Ready,",
+            )
+        ],
+        False,
+    ),
+    # ---------------------------------------------------------- the lifecycle
+    (
+        "a child that vanished while admitting work failed, it did not stop",
+        [
+            (
+                LIFECYCLE,
+                "            (Self::Starting | Self::Ready, LifecycleEvent::Reaped) => Ok(Self::Failed),",
+                "            (Self::Starting | Self::Ready, LifecycleEvent::Reaped) => Ok(Self::Stopped),",
+            )
+        ],
+        False,
+    ),
+    (
+        "draining stops admission",
+        [(LIFECYCLE, "matches!(self, Self::Ready)", "matches!(self, Self::Ready | Self::Draining)")],
+        False,
+    ),
+    (
+        "draining closes every session",
+        [
+            (
+                LIFECYCLE,
+                """            for session in self.sessions.values_mut() {
+                session.phase = SessionPhase::Closed;
+            }
+""",
+                "",
+            )
+        ],
+        False,
+    ),
+    # ------------------------------------------------------ the child's stdout
+    (
+        "an oversized line is refused before it is reassembled",
+        [
+            (
+                CHILD,
+                "        if line.len().saturating_add(take) > limit {",
+                "        if line.len().saturating_add(take) > usize::MAX {",
+            )
+        ],
+        False,
+    ),
+    (
+        "a refused stdout line is counted",
+        [
+            (
+                CHILD,
+                """        ChildEnd::InvalidLine(rule) => {
+            if rule == AcpRule::BatchNotSupported {
+                counters.batch_output.fetch_add(1, Ordering::Relaxed);
+            }
+            counters.invalid_output.fetch_add(1, Ordering::Relaxed);
+            kill.cancel();
+        }""",
+                """        ChildEnd::InvalidLine(_) => {
+            kill.cancel();
+        }""",
+            )
+        ],
+        False,
+    ),
+    (
+        "every end of a child's life signals its process group",
+        [
+            (
+                CHILD,
+                """        if kill_group(group) {
+            supervisor_counters
+                .group_kills
+                .fetch_add(1, Ordering::Relaxed);
+        }
+""",
+                "",
+            )
+        ],
+        False,
+    ),
+    # ----------------------------------------------------------- the stderr sink
+    # ------------------------------------------------------------- cleanup
+    #
+    # Added after the M8-C07 review found three processes alive at the end of a
+    # guard run.  Each of these defeats one of the three places cleanup has to
+    # happen, and each is witnessed by a **surviving process in the process
+    # table**, not by a counter.
+    (
+        "a supervisor that is dropped rather than drained ends its child",
+        [
+            (
+                SUPERVISOR,
+                """    fn drop(&mut self) {
+        self.child.kill();
+    }""",
+                "    fn drop(&mut self) {}",
+            )
+        ],
+        False,
+    ),
+    (
+        "the child handle kills the group synchronously, not only from a task",
+        [
+            (
+                CHILD,
+                """        self.kill.cancel();
+        if !*self.exited.borrow() {
+            let _ = kill_group(self.pid);
+        }""",
+                "        self.kill.cancel();",
+            )
+        ],
+        False,
+    ),
+    (
+        "the deadline ticker ends when the child does",
+        [
+            (
+                SUPERVISOR,
+                """        tokio::select! {
+            () = child.wait_exited() => return,
+            _ = ticker.tick() => {}
+        }""",
+                "        ticker.tick().await;",
+            )
+        ],
+        False,
+    ),
+    (
+        "a stderr flood is counted",
+        [
+            (
+                CHILD,
+                """                counters
+                    .stderr_bytes
+                    .fetch_add(read as u64, Ordering::Relaxed);
+""",
+                "",
+            )
+        ],
+        False,
+    ),
+    (
+        "the stderr sink reports passing its cap",
+        [
+            (
+                CHILD,
+                """                if total > cap && !reported {
+                    reported = true;
+                    counters.stderr_over_cap.fetch_add(1, Ordering::Relaxed);
+                }
+""",
+                "",
+            )
+        ],
+        False,
+    ),
+]
+
+SUITES: list[Suite] = [
+    Suite("m8c1", [CRATE], CARGO_TEST, CASES),
+    Suite("m8c2", [CRATE, EXPORT, FIXTURE], C2_CARGO_TEST, C2_CASES),
+]
 
 
 def cargo_env() -> dict[str, str]:
@@ -595,7 +976,13 @@ def run_tests(suite: Suite) -> tuple[str, list[str]]:
             timeout=600,
         )
     except subprocess.TimeoutExpired:
-        return "RED (hung)", []
+        # Refusal 3.  This used to return "RED (hung)", which was counted as
+        # neither red (the tally matches the exact string "RED") nor unusable
+        # (the filter below is matched by prefix), so a suite whose every case
+        # hung printed a 0-of-N summary and still exited 0.  A run that timed
+        # out names no failing test, which is the same observation as the
+        # no-named-failure case: not evidence.  Recorded as defect M8-C06.
+        return "NOT EVIDENCE (timed out)", []
     combined = done.stdout + done.stderr
     if "error[" in combined or "error: could not compile" in combined:
         return "BUILD FAILED", []
@@ -650,9 +1037,14 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--list", action="store_true", help="print case names and exit")
     parser.add_argument("--case", help="run only cases whose name contains this text")
+    parser.add_argument("--suite", help="run only this suite (m8c1, m8c2)")
     arguments = parser.parse_args()
 
     suites = SUITES
+    if arguments.suite:
+        suites = [suite for suite in SUITES if suite.name == arguments.suite]
+        if not suites:
+            sys.exit(f"acp-guard-deletion: no suite named {arguments.suite!r}")
     selected = [
         (suite, name, edits, expect_build_failure)
         for suite in suites
@@ -726,17 +1118,14 @@ def main() -> int:
                 "compiler and are reported separately, never counted as a red test"
             )
 
-    # Every "not evidence" outcome must reach this list, or a suite whose cases
-    # all failed to build would exit 0 and read as a clean run.
-    unusable = [
-        f"[{suite_name}] {name}"
-        for suite_name, name, outcome, _ in results
-        # "NOT" covers NOT EVIDENCE (no named failure).  This filter is matched
-        # by prefix, so every new unusable spelling has to be added here as
-        # well as returned -- a status the filter does not know about is
-        # silently absent from the tally and the run still exits 0.
-        if outcome.startswith(("BUILD", "COULD", "EXPECTED", "NOT"))
-    ]
+    # Shared, and an allow list rather than a deny list: see
+    # scripts/guard_outcomes.py and task row M8-C08.  Anything that is not RED
+    # or REFUSED BY COMPILER fails closed and is named, including "still green"
+    # -- a guard that was defeated with nothing going red is not load-bearing,
+    # and a run of nothing but those must not exit 0.
+    unusable = unusable_outcomes(
+        (suite_name, name, outcome) for suite_name, name, outcome, _ in results
+    )
     if unusable:
         print("\nno usable result for: " + ", ".join(unusable))
         return 1
