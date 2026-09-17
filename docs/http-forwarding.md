@@ -318,4 +318,10 @@ Gate 5 for MCP is recorded in [mcp.md](mcp.md#pinned-in-code-m3-01-and-m3-02). T
 - **Buffer before dispatch.** For both MCP profiles the device collects the complete bounded body and validates it before invoking a backend. The relay still streams request bodies; only the device dispatch waits. A request rejected there never reaches the backend, and its local JSON-RPC error is an ordinary completed HTTP response.
 - **Fixture hold.** The hold moved to the harness; see gate 4.
 - **Proven over the real path.** `verify-m3-mcp-cloud-client` (M3-03) runs both MCP profiles over the real Axum → HTTP/3 → owner actor → device WebSocket path with relay profile selection from `[http_forward]` and the catalog capability, across scheduled rotations; see [mcp.md](mcp.md#pinned-in-code-m3-03).
-- **Not proven.** Consumer isolation, concurrent correlation and unknown outcomes for MCP (M3-04). ACP and CUA allowlists remain open.
+- **Not proven.** Consumer isolation, concurrent correlation and unknown outcomes for MCP (M3-04). The CUA allowlist remains open.
+
+### Pinned in code (gate 5, ACP)
+
+`crates/tunnel-acp` adds the `acp-http-v1` profile: `POST`/`GET`/`DELETE` at `/acp`, **HTTP/2 only**, an empty query, the request headers `content-type`, `accept`, `acp-connection-id`, `acp-session-id` and `tunnel-principal-binding`, and the response headers `content-type`, `cache-control`, `x-accel-buffering` and `acp-connection-id` — every one a singleton, and no prefix rule. Buffer-before-dispatch applies as it does for MCP: the device validates one complete bounded JSON-RPC message before anything is invoked. The enumerated table and its refusals are in [acp.md](acp.md#pinned-in-code-m8-01); the artifacts it is pinned against are in [sources.md](sources.md#acp).
+
+This is gate 5's **profile table only**. It has not been served: no relay serves `acp-http-v1`, no device export exists, and no ACP fixture has been run through the bridge. The codec passing its tests does not establish application compatibility, and neither does a profile table passing its own.

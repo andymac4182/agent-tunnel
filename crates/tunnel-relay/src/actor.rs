@@ -1794,7 +1794,10 @@ enum Command {
     ChallengeAuthorized {
         key: SessionKey,
         challenge: DeviceChallenge,
-        result: ChallengeAuthorizationResult,
+        // Boxed for the same reason `AttachResolved` boxes its result: this
+        // is the largest variant, and carrying it inline makes every command
+        // in the queue as big as the widest authorization outcome.
+        result: Box<ChallengeAuthorizationResult>,
     },
     MaintenanceResult {
         key: SessionKey,
@@ -3056,7 +3059,7 @@ impl RelayActor {
                 challenge,
                 result,
             } => {
-                self.finish_device_challenge(key, challenge, result);
+                self.finish_device_challenge(key, challenge, *result);
             }
             Command::MaintenanceResult {
                 key,
@@ -10508,7 +10511,7 @@ impl RelayActor {
                 Command::ChallengeAuthorized {
                     key,
                     challenge,
-                    result,
+                    result: Box::new(result),
                 },
             )
             .await;
