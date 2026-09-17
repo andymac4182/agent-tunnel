@@ -333,3 +333,7 @@ impl Scanner<'_> {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "json_tests.rs"]
+mod tests;
