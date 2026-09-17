@@ -2,10 +2,42 @@
 
 The shared TypeScript filesystem client named in
 [`docs/architecture.md`](../../docs/architecture.md) (`packages/client`) and in
-[`docs/filesystem-adapters.md`](../../docs/filesystem-adapters.md). **Only the
-9P2000.L codec exists so far.** There is no descriptor fetch, no WebSocket, no
-`connectFilesystem`, no lifecycle and no adapter: those are the rest of
-implementation gate 6 of [`docs/filesystem-api.md`](../../docs/filesystem-api.md).
+[`docs/filesystem-adapters.md`](../../docs/filesystem-adapters.md).
+
+It is now a client, not only a codec: `connectFilesystem`, the descriptor fetch
+with its `grantRevision` header, an authenticated WebSocket upgrade written out
+so it can set `Authorization`, the consumer-side 9P session with its tags, fids,
+flush and close codes, and the bytes and limits of the [shared client
+API](../../docs/filesystem-api.md#shared-client-api). **The four native
+adapters are not here** — `@agent-tunnel/files-sdk`, `@agent-tunnel/mastra`,
+`@agent-tunnel/just-bash` and `@agent-tunnel/ai-sdk` are separate packages, none
+of which exists, and they are the rest of implementation gate 6.
+
+**What has never run against a relay or a device.** Every socket in this
+package's tests is a loopback socket to a harness in `test/harness/`, which
+speaks the wire and is not the Rust provider. Nothing here is evidence of
+interoperability with `crates/tunnel-relay` or `crates/tunnel-fs-provider`, and
+the gate is explicit that it cannot be: "compilation against a source interface
+or a fake in-memory adapter is insufficient to claim remote compatibility".
+
+## What is in it
+
+| Module | What it owns |
+| --- | --- |
+| `src/ninep/` | The independent 9P2000.L codec (below) |
+| `src/descriptor.ts` | The `agent-tunnel.fs.v1` descriptor, its validation and the HTTP failure vocabulary |
+| `src/websocket.ts` | RFC 6455's client half, written out: no dependency can set `Authorization` |
+| `src/session.ts` | The consumer session: lifecycle, tags, fids, flush, close codes, **outcome classification** |
+| `src/paths.ts` | The virtual path namespace, refusing exactly what gate 1 refuses |
+| `src/filesystem.ts` | `connectFilesystem`, the API methods, the composite operations and the budgets |
+
+The outcome classification is the obligation gate 5 named for this side: there
+is no wire field for an outcome, so a client derives one from its own dispatch
+and reply history. A request whose bytes never reached the transport is
+`not_started`; a dispatched read that never answered is `failed`; a dispatched
+**mutation** that never answered is `unknown`, whatever close code ended the
+session, because the device may have performed it and no code on the wire says
+which.
 
 ## What this is for
 
@@ -191,15 +223,36 @@ comparison. `boundaries.test.ts` therefore carries fixture-independent layout
 tests that encode `Rgetattr`, `Tsetattr` and `Tattach` with all-distinct
 sentinels and assert the bytes at the offsets the spec gives.
 
+## Shared fuzzing
+
+`fuzz/` generates 4,096 cases deterministically from one seed and both codecs
+produce a verdict on every one: they must accept and agree, or both refuse.
+`crates/tunnel-fs-ninep/tests/shared_fuzz.rs` is the Rust half and checks in its
+verdicts; `npm test` regenerates the corpus from the seed, recomputes this
+side's verdicts and compares. The two verdict files are byte-identical.
+
+```sh
+node fuzz/generate.ts --seed 0x1 --cases 1024   # explore another seed
+cargo test -p tunnel-fs-ninep --test shared_fuzz # re-derive the Rust verdicts
+```
+
+It found four disagreements, all in this implementation, all fixed and all
+recorded in `docs/filesystem-api.md`'s gate-3 residue: frames discarded when a
+later frame in the same push failed, a declared size checked at seven bytes
+where the Rust checks at four, `Tversion`'s negotiation values judged inside the
+codec, and two checks taken after a later field had been read.
+
 ## What is not proven here
 
-Everything gate 3 already listed as needing a socket or a clock, plus the rest of
-gate 6: `connectFilesystem`, the descriptor fetch, the authenticated WSS upgrade,
-the session state machine on this side, and the four native adapters
-(`@agent-tunnel/files-sdk`, `@agent-tunnel/mastra`, `@agent-tunnel/just-bash`,
-`@agent-tunnel/ai-sdk`) against their pinned published packages and real relay
-and device sockets. Shared *fuzzing* of one corpus against both codecs, with
-accepted values compared, is also still open: this suite fuzzes neither codec, it
-compares them on a fixed corpus and on the contract's named boundaries.
+* **Any relay and any device.** No test in this package has spoken to one. The
+  transport is exercised against a loopback harness, which is a peer and not the
+  product.
+* **TLS.** Every test endpoint is `http://127.0.0.1`, through the contract's own
+  loopback development harness, which this client requires to be asked for
+  explicitly and refuses for any non-loopback host.
+* **A rotating device tunnel**, a cross-relay hop, a real grant, a real
+  revocation, and every clock the contract names: this client enforces its own
+  request deadline, and the device enforces none.
+* **The four native adapters** against their pinned published packages.
 
 All fixture values are synthetic, as `fixtures/README.md` records.
