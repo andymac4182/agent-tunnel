@@ -48,12 +48,21 @@ fn get() -> http::request::Builder {
         .header("accept", "text/event-stream")
 }
 
+/// Drive one exchange against the export, **bounded**.
+///
+/// The bound is not decoration.  `exchange` awaits a response that a broken
+/// export may never produce, and an unbounded wait here turns a guard-deletion
+/// case from evidence into a hang: a mutation that stops `initialize` ever
+/// resolving made every test that opens a connection wait forever, so the
+/// case's `cargo test` hit the harness's 600 s ceiling and was reported
+/// `NOT EVIDENCE (timed out)` rather than `RED` (task row M8-C13).  A bounded
+/// wait makes the same mutation fail by name, which is what the case is for.
 async fn send(
     export: &AcpExport,
     profile: &Arc<Profile>,
     request: Request<Full<Bytes>>,
 ) -> http::Response<ChannelBody> {
-    exchange(export, Arc::clone(profile), request).await
+    within(exchange(export, Arc::clone(profile), request)).await
 }
 
 fn json_body(value: &Value) -> Full<Bytes> {

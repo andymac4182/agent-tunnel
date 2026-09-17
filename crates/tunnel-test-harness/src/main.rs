@@ -1623,7 +1623,7 @@ async fn main() -> ExitCode {
                         &evidence,
                     )?;
                     println!(
-                        "M8 ACP real path passed: relays={} owner={} ingress={} non_owner={} cases={:?} connection_opened={} session_from_stream={} prompt_202={} stop_reason={} permission_on_wire={} offered={:?} allow_at_agent={} reject_at_agent={} allow_stop={} reject_stop={} unoffered_refused={} unknown_id_refused={} wrong_connection_refused={} resign_spacing_ms={} max_membership_age_ms={} resigns={} refusals={} retries={} unexplained={:?} rotations={} device_sessions={} leftover_processes={} not_covered={}",
+                        "M8 ACP real path passed: relays={} owner={} ingress={} non_owner={} cases={:?} connection_opened={} session_from_stream={} prompt_202={} stop_reason={} permission_on_wire={} offered={:?} allow_at_agent={} reject_at_agent={} allow_stop={} reject_stop={} unoffered_rule={} unknown_id_rule={} wrong_connection_status={} resign_spacing_ms={} max_membership_age_ms={} resigns={} refusals={} retries={} unexplained={:?} rotations={} device_sessions={} leftover_processes={} not_covered={} terminals(s/c/u)={}/{}/{} unknown_error_ms={} stream_ended_cleanly={}",
                         evidence.relay_count,
                         evidence.owner_node,
                         evidence.ingress_node,
@@ -1639,9 +1639,9 @@ async fn main() -> ExitCode {
                         evidence.reject_outcome_at_agent,
                         evidence.allow_stop_reason,
                         evidence.reject_stop_reason,
-                        evidence.unoffered_option_refused,
-                        evidence.unknown_request_id_refused,
-                        evidence.wrong_connection_refused,
+                        evidence.unoffered_option_rule,
+                        evidence.unknown_request_id_rule,
+                        evidence.wrong_connection_status,
                         evidence.resign_spacing_ms,
                         evidence.max_membership_age_at_case_end_ms,
                         evidence.membership_resigns,
@@ -1652,6 +1652,11 @@ async fn main() -> ExitCode {
                         evidence.device_sessions,
                         evidence.leftover_processes,
                         evidence.not_covered.len(),
+                        evidence.export_terminal_succeeded_delta,
+                        evidence.export_terminal_cancelled_delta,
+                        evidence.export_terminal_unknown_delta,
+                        evidence.unknown_error_latency_ms,
+                        evidence.unknown_stream_ended_cleanly,
                     );
                     Ok(())
                 }),

@@ -205,6 +205,36 @@ struct Counters {
     /// same reason the subscription deadlines are.
     last_stall_elapsed_us: AtomicU64,
     last_stall_bound_us: AtomicU64,
+    /// Operations this export classified through
+    /// [`tunnel_acp::terminal::AcpTerminal`], counted by the outcome that rule
+    /// produced.
+    ///
+    /// **This is what makes the mapping a rule the product applies.**  Without
+    /// it `terminal.rs` would be a table only its own unit tests read, and a
+    /// gate asserting `AcpTerminal::LostAfterDispatch.result_status()` would be
+    /// evaluating a pure function rather than observing a decision.  These are
+    /// incremented where the export decides, and read back from
+    /// [`AcpDiagnostics`].
+    terminals_succeeded: AtomicU64,
+    terminals_cancelled: AtomicU64,
+    terminals_failed: AtomicU64,
+    terminals_unknown: AtomicU64,
+}
+
+/// Classify one ended operation and count it by the outcome the rule gave.
+///
+/// The `match` is on the rule's own output, so a change to
+/// [`tunnel_acp::terminal`] changes what this export reports.  An outcome the
+/// protocol vocabulary does not contain is impossible by that module's own
+/// test, and is counted as unknown here rather than silently dropped.
+fn record_terminal(counters: &Counters, terminal: tunnel_acp::terminal::AcpTerminal) {
+    let counter = match terminal.result_status() {
+        "succeeded" => &counters.terminals_succeeded,
+        "cancelled" => &counters.terminals_cancelled,
+        "failed" => &counters.terminals_failed,
+        _ => &counters.terminals_unknown,
+    };
+    counter.fetch_add(1, Ordering::Release);
 }
 
 /// A snapshot of an export's counters.  Identifiers, phases and counters
@@ -237,6 +267,10 @@ pub struct AcpDiagnostics {
     pub output_stalls: u64,
     pub last_stall_elapsed_us: u64,
     pub last_stall_bound_us: u64,
+    pub terminals_succeeded: u64,
+    pub terminals_cancelled: u64,
+    pub terminals_failed: u64,
+    pub terminals_unknown: u64,
     pub live_connections: u64,
 }
 
@@ -519,6 +553,10 @@ impl AcpExport {
             output_stalls: counters.output_stalls.load(Ordering::Acquire),
             last_stall_elapsed_us: load(&counters.last_stall_elapsed_us),
             last_stall_bound_us: load(&counters.last_stall_bound_us),
+            terminals_succeeded: counters.terminals_succeeded.load(Ordering::Acquire),
+            terminals_cancelled: counters.terminals_cancelled.load(Ordering::Acquire),
+            terminals_failed: counters.terminals_failed.load(Ordering::Acquire),
+            terminals_unknown: counters.terminals_unknown.load(Ordering::Acquire),
             live_connections: self
                 .inner
                 .connections
@@ -942,17 +980,31 @@ impl AcpExport {
             // `stop_reason` runs the pinned crate's own v1 turn-completion
             // reader: a v2 acknowledgement with no `stopReason` is refused by
             // its own rule rather than delivered as a finished turn.
-            let body = match ticket.stop_reason().await {
-                Ok(stop) => serde_json::to_vec(&json!({
-                    "jsonrpc": "2.0",
-                    "id": host_id,
-                    "result": {"stopReason": stop},
-                })),
-                Err(error) => serde_json::to_vec(&json!({
-                    "jsonrpc": "2.0",
-                    "id": host_id,
-                    "error": {"code": -32603, "message": error.to_string()},
-                })),
+            let body = match ticket.completion().await {
+                Ok((terminal, stop)) => {
+                    // The export classifies the turn it just finished, through
+                    // the one rule that decides terminals.
+                    record_terminal(&connection.counters, terminal);
+                    serde_json::to_vec(&json!({
+                        "jsonrpc": "2.0",
+                        "id": host_id,
+                        "result": {"stopReason": stop},
+                    }))
+                }
+                Err(error) => {
+                    // The child is gone, or its answer was refused, with the
+                    // prompt already dispatched: `docs/acp.md` marks dispatched
+                    // unresolved work `outcome_unknown`.
+                    record_terminal(
+                        &connection.counters,
+                        tunnel_acp::terminal::AcpTerminal::LostAfterDispatch,
+                    );
+                    serde_json::to_vec(&json!({
+                        "jsonrpc": "2.0",
+                        "id": host_id,
+                        "error": {"code": -32603, "message": error.to_string()},
+                    }))
+                }
             }
             .unwrap_or_default();
             let _ = target.tx.send(Bytes::from(body)).await;

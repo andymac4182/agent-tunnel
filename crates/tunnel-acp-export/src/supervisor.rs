@@ -29,6 +29,7 @@ use tunnel_acp::lifecycle::{
     Outcome, PendingKind, PermissionOutcome, RequestId,
 };
 use tunnel_acp::message::{AcpRule, MessageKind, read_turn_completion};
+use tunnel_acp::terminal::AcpTerminal;
 
 use crate::child::{ChildConfig, ChildCounters, ChildEnd, ChildEvent, ChildHandle, SpawnError};
 
@@ -215,15 +216,27 @@ impl PromptTicket {
     /// the pinned profile refuses by its own rule. [`SupervisorError::ChildGone`]
     /// when the child ended first.
     pub async fn stop_reason(self) -> Result<String, SupervisorError> {
+        Ok(self.completion().await?.1)
+    }
+
+    /// The turn's terminal **and** its wire spelling.
+    ///
+    /// The [`AcpTerminal`] is built here, where the pinned `StopReason` is
+    /// already in scope, so the classification runs on the schema's own type
+    /// rather than on a string anybody could have retyped.  The bridge records
+    /// it; that is what makes `tunnel_acp::terminal` a rule the product
+    /// applies rather than a table only a test reads.
+    pub async fn completion(self) -> Result<(AcpTerminal, String), SupervisorError> {
         let value = self.reply.await.map_err(|_| SupervisorError::ChildGone)??;
         let stop = read_turn_completion(&value)
             .map_err(|rejection| SupervisorError::Protocol(rejection.rule))?;
         // The pinned crate's own serialization, so the vocabulary is the
         // schema's rather than a string retyped here.
-        serde_json::to_value(stop)
+        let spelling = serde_json::to_value(stop)
             .ok()
             .and_then(|value| value.as_str().map(ToOwned::to_owned))
-            .ok_or(SupervisorError::Protocol(AcpRule::UnknownStopReason))
+            .ok_or(SupervisorError::Protocol(AcpRule::UnknownStopReason))?;
+        Ok((AcpTerminal::Turn(stop), spelling))
     }
 }
 

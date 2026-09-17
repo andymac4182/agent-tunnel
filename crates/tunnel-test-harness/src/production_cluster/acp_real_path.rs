@@ -86,10 +86,15 @@ use super::{
 
 /// The rotation policy this gate runs the device under.
 ///
-/// Short enough that rotations really happen while ACP connections are open —
-/// `docs/acp.md` says ordinary data-socket rotation must leave connections,
-/// sessions, callbacks and GET streams intact, and a gate that never rotated
-/// would not be testing that.
+/// **This does not make the gate a rotation test, and the earlier comment here
+/// claimed it did.** `docs/acp.md` says ordinary data-socket rotation must
+/// leave connections, sessions, callbacks and GET streams intact; proving that
+/// needs a case that holds a connection open across a completed rotation and
+/// asserts it survived, and there is no such case. Runs have been observed at
+/// `rotations_completed` of both 0 and 4 — the count is incidental to how long
+/// the cases happen to take, and nothing asserts it either way. The interval is
+/// short so the device behaves like a real one rather than a static fixture.
+/// The gate's `not_covered` carries the observed count.
 pub const ACP_GATE_ROTATION: RotationConfig = RotationConfig {
     interval_seconds: 6,
     handshake_timeout_seconds: 2,
@@ -141,18 +146,36 @@ pub const ACP_CASES: [&str; 7] = [
 /// not a measurement.  The validator requires the evidence to carry exactly as
 /// many of them as are listed here, so a case that quietly stops recording one
 /// fails the run.
-pub const NOT_COVERED: [&str; 10] = [
+pub const NOT_COVERED: [&str; 9] = [
     "an ACP connection surviving a membership re-sign: M7-C80 is open, and this gate re-signs only at case boundaries and at most every 15 s, which is a harness accommodation rather than a product property",
-    "no retry beyond the moment of observation: a handler counter is read when the consumer sees its answer, and a retry issued later would not be observed",
+    "no retry beyond the moment of observation: the agent's ledger is read when the consumer's stream has failed and again after a settle window, and a replay issued after that would not be observed",
     "two users, cross-tenant isolation, grant revocation, owner loss and peer-key rotation: M8 chunk 5",
     "any host but macOS",
     "any ACP agent but this repository's own synthetic fixture, and any ACP server at all",
     "the connection-capacity table at its real bounds: 256 tracked and 32 per principal are proven as arithmetic in tunnel-acp-export, not by opening 257 connections with 257 child processes here",
-    "an ACP connection carried across a completed scheduled rotation: this run observed rotations_completed = 0, because every case finishes well inside the rotation interval, so nothing here says what a rotation does to a live ACP connection",
+    // The rotation sentence is NOT here: it carries a measurement, and a
+    // measurement written into a constant is a claim about a run that has not
+    // happened yet.  An earlier version of this list said "this run observed
+    // rotations_completed = 0" unconditionally, and emitted that sentence
+    // verbatim in a run that observed four.  It is formatted from the field in
+    // [`not_covered`] instead.
     "the output-credit stall over the real route: the 30 s bound and its never-drop-and-continue half are measured against the export's own queue in tunnel-acp-export, and the carrier in front of it has flow control of its own that this gate does not drive to saturation",
     "the permission deadline over the real route: it is observed elapsing in tunnel-acp-export against a shortened bound, not here",
     "bounded per-hop queues at the ingress, owner and device hops: no case here saturates a hop, so no hop bound is asserted rather than asserted vacuously",
 ];
+
+/// The limits of this gate's claim, with the ones that carry a measurement
+/// formatted from what was actually observed.
+///
+/// **A disclosure that hard-codes a number is a claim, not a disclosure.**
+#[must_use]
+pub fn not_covered(rotations_observed: u64) -> Vec<String> {
+    let mut all: Vec<String> = NOT_COVERED.iter().map(|text| (*text).to_owned()).collect();
+    all.push(format!(
+        "an ACP connection carried across a completed scheduled rotation: this run observed rotations_completed = {rotations_observed}, and no case asserts anything about a connection spanning one, so nothing here says what a rotation does to a live ACP connection"
+    ));
+    all
+}
 
 /// Everything this gate measured.  Primitives only: identifiers, counters,
 /// statuses and typed labels, never a payload or a credential.
@@ -191,12 +214,18 @@ pub struct AcpRealPathEvidence {
     pub reject_outcome_at_agent: String,
     pub allow_stop_reason: String,
     pub reject_stop_reason: String,
-    /// A permission response naming an option the agent never offered.
-    pub unoffered_option_refused: bool,
-    /// A permission response on the wrong connection.
-    pub wrong_connection_refused: bool,
-    /// A permission response whose id answers nothing outstanding.
-    pub unknown_request_id_refused: bool,
+    /// The **rule** each refused permission response named, read from the
+    /// response body.
+    ///
+    /// A status alone would not do: a 404 from a mistyped route and a 503 from
+    /// a rotation freeze are both "not 202", and neither is the rule firing.
+    /// These carry the lifecycle rule's own code.
+    pub unoffered_option_rule: String,
+    pub unknown_request_id_rule: String,
+    /// The wrong-connection case is a **404 with no rule**, deliberately: a
+    /// foreign connection is indistinguishable from one that never existed, so
+    /// there is no rule to name and the status is the whole answer.
+    pub wrong_connection_status: u16,
 
     // --- cancellation ---
     /// `session/cancel` produced this `stopReason`, read off the wire.
@@ -229,11 +258,42 @@ pub struct AcpRealPathEvidence {
     /// The consumer's stream **errored** rather than ending cleanly or
     /// carrying a result: the turn has no terminal on the wire.
     pub unknown_stream_errored: bool,
+    /// The stream **ended cleanly** instead.
+    ///
+    /// Recorded separately because "not errored" is three different outcomes
+    /// wearing one name: a clean end, a stream still open, and a stream that
+    /// errored after the gate stopped looking. A run that failed this case
+    /// could previously say only "not errored", which is exactly the
+    /// distinction the case exists to make.
+    pub unknown_stream_ended_cleanly: bool,
+    /// Milliseconds from the crashing prompt being accepted to the stream
+    /// failing.  0 when it never failed.
+    pub unknown_error_latency_ms: u128,
+    /// How long the gate waited before giving up on the stream failing.
+    pub unknown_error_wait_ms: u128,
+    /// Whether the **export** ended the connection when its child died.
+    ///
+    /// This separates "the device never noticed the crash" from "the device
+    /// noticed and the termination did not reach the consumer", which are
+    /// different defects in different components, and the earlier evidence
+    /// could not tell them apart.
+    pub unknown_export_ended_connection: bool,
+    /// Live ACP connections the export still held after the crash.
+    pub unknown_export_live_connections: u64,
     /// No `stopReason` ever arrived for the crashed turn.
     pub unknown_no_stop_reason: bool,
-    /// The terminal this maps to through `tunnel_acp::terminal`, which is the
-    /// same rule the connector uses for `RESULT_STATUS`.
-    pub unknown_result_status: String,
+    /// How many operations the **export** classified through
+    /// `tunnel_acp::terminal` during each case, by the outcome that rule gave.
+    ///
+    /// **Read from the export's own diagnostics, never computed here.** An
+    /// earlier version of this gate set a field to
+    /// `AcpTerminal::LostAfterDispatch.result_status()` — the gate choosing the
+    /// variant and evaluating a pure function, which observes nothing. These
+    /// are deltas across the case, so what is asserted is that the export
+    /// reached that classification for work that really ran.
+    pub export_terminal_succeeded_delta: u64,
+    pub export_terminal_cancelled_delta: u64,
+    pub export_terminal_unknown_delta: u64,
 
     // --- the M7-C80 accommodation, made visible in the evidence ---
     pub resign_spacing_ms: u128,
@@ -570,6 +630,29 @@ fn sse_payloads(bytes: &[u8]) -> Vec<Vec<u8>> {
         rest = &stripped[(end + 2).min(stripped.len())..];
     }
     payloads
+}
+
+/// The lifecycle rule a refusal named, read from the response body.
+///
+/// `LifecycleRejection` displays as `<RULE_CODE>: <detail>`, and
+/// `supervisor_refusal` puts that in `error.message`, so the rule really is on
+/// the wire.  An answer that was accepted, or one carrying no rule, yields an
+/// empty string rather than a guess — the validator then names it.
+fn refusal_rule(status: http::StatusCode, body: &str) -> String {
+    if status == http::StatusCode::ACCEPTED {
+        return String::new();
+    }
+    serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .and_then(|message| message.split(':').next())
+                .map(str::trim)
+                .map(ToOwned::to_owned)
+        })
+        .unwrap_or_default()
 }
 
 fn stop_reason(value: &Value) -> Option<String> {
@@ -1017,6 +1100,7 @@ impl Gate<'_> {
 
     /// Case `conversation`: a whole v1 turn over the real three-relay route.
     async fn case_conversation(&mut self, evidence: &mut AcpRealPathEvidence) -> Result<()> {
+        let before = self.export();
         let conversation = self.open_conversation(evidence).await?;
         let status = self.prompt(&conversation, "prompt-1", "ok").await?;
         if status != http::StatusCode::ACCEPTED {
@@ -1030,6 +1114,9 @@ impl Gate<'_> {
             .session_stream
             .wait_for("the prompt result", stop_reason)
             .await?;
+        // What the **export** made of that turn, through the terminal rule.
+        evidence.export_terminal_succeeded_delta =
+            self.export().terminals_succeeded - before.terminals_succeeded;
         self.close_conversation(conversation).await;
         Ok(())
     }
@@ -1174,7 +1261,7 @@ impl Gate<'_> {
         let headers = self.session_headers(conversation);
 
         // An option the agent never offered.
-        let (status, _h, _b) = self
+        let (status, _h, body) = self
             .post(
                 &conversation.consumer,
                 &headers,
@@ -1185,10 +1272,10 @@ impl Gate<'_> {
                 }),
             )
             .await?;
-        evidence.unoffered_option_refused = status != http::StatusCode::ACCEPTED;
+        evidence.unoffered_option_rule = refusal_rule(status, &body);
 
         // An id that answers nothing outstanding.
-        let (status, _h, _b) = self
+        let (status, _h, body) = self
             .post(
                 &conversation.consumer,
                 &headers,
@@ -1199,7 +1286,7 @@ impl Gate<'_> {
                 }),
             )
             .await?;
-        evidence.unknown_request_id_refused = status != http::StatusCode::ACCEPTED;
+        evidence.unknown_request_id_rule = refusal_rule(status, &body);
 
         // The right answer on the wrong connection: a second connection, whose
         // callback table has never heard of this id.
@@ -1218,7 +1305,7 @@ impl Gate<'_> {
                 }),
             )
             .await?;
-        evidence.wrong_connection_refused = status != http::StatusCode::ACCEPTED;
+        evidence.wrong_connection_status = status.as_u16();
         self.close_conversation(other).await;
         Ok(())
     }
@@ -1264,6 +1351,7 @@ impl Gate<'_> {
             .join(tunnel_acp_fixture::PERMISSION_OUTCOME_FILE);
         let _ = std::fs::remove_file(&marker);
 
+        let before = self.export();
         let conversation = self.open_conversation(evidence).await?;
         let status = self
             .prompt(&conversation, "prompt-cancel", "permission")
@@ -1339,6 +1427,9 @@ impl Gate<'_> {
             }
             sleep(Duration::from_millis(50)).await;
         };
+        // The export classified the cancelled turn through the same rule.
+        evidence.export_terminal_cancelled_delta =
+            self.export().terminals_cancelled - before.terminals_cancelled;
         self.close_conversation(conversation).await;
         Ok(())
     }
@@ -1515,6 +1606,7 @@ impl Gate<'_> {
         let _ = std::fs::remove_file(&ledger);
         let effect = "acp-gate-effect";
 
+        let before = self.export();
         let conversation = self.open_conversation(evidence).await?;
         let status = self
             .prompt(
@@ -1531,10 +1623,28 @@ impl Gate<'_> {
 
         // The child dies after recording the effect, so its transport ends and
         // the consumer's stream fails.  Nothing answers the prompt.
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let waited = Instant::now();
+        // **70 s, and the number comes from the product rather than from what
+        // made a run green.** The consumer-visible end of this exchange is
+        // bimodal: normally ~52 ms, and otherwise ~58.7 s, which is the
+        // forwarding layer's own 60 s record / FIN-after-END budget expiring
+        // instead of the RESET arriving. An earlier version waited 30 s, which
+        // is simply below that fallback, so it recorded "never terminated" for
+        // an exchange that terminates at 58.7 s. The slow path is a defect
+        // (M8-C14) and is recorded by `unknown_error_latency_ms` rather than
+        // tolerated silently.
+        let bound = Duration::from_secs(70);
+        let deadline = waited + bound;
         loop {
             if conversation.session_stream.has_errored() {
                 evidence.unknown_stream_errored = true;
+                evidence.unknown_error_latency_ms = waited.elapsed().as_millis();
+                break;
+            }
+            // A clean end is **not** the same failure as a stream that stayed
+            // open, and the evidence has to be able to say which.
+            if conversation.session_stream.has_ended() {
+                evidence.unknown_stream_ended_cleanly = true;
                 break;
             }
             if Instant::now() >= deadline {
@@ -1542,6 +1652,11 @@ impl Gate<'_> {
             }
             sleep(Duration::from_millis(50)).await;
         }
+        evidence.unknown_error_wait_ms = bound.as_millis();
+        let after = self.export();
+        evidence.unknown_export_ended_connection =
+            after.connections_ended_by_child > before.connections_ended_by_child;
+        evidence.unknown_export_live_connections = after.live_connections;
         evidence.unknown_no_stop_reason = conversation
             .session_stream
             .seen()
@@ -1553,10 +1668,11 @@ impl Gate<'_> {
         sleep(Duration::from_secs(2)).await;
         evidence.side_effects_after_settle = count_effect(&ledger, effect);
 
-        // The terminal this is, through the one rule that decides it.
-        evidence.unknown_result_status = tunnel_acp::terminal::AcpTerminal::LostAfterDispatch
-            .result_status()
-            .to_owned();
+        // **What the export decided**, not what this gate can compute. The
+        // dispatched prompt never resolved, so the export classifies it
+        // `outcome_unknown` through `tunnel_acp::terminal` and counts it there.
+        evidence.export_terminal_unknown_delta =
+            self.export().terminals_unknown - before.terminals_unknown;
 
         conversation.connection_stream.break_now();
         conversation.session_stream.break_now();
@@ -1583,7 +1699,6 @@ async fn run(
     let mut evidence = AcpRealPathEvidence {
         relay_count: cluster.relays.len(),
         resign_spacing_ms: MEMBERSHIP_RESIGN_SPACING.as_millis(),
-        not_covered: NOT_COVERED.iter().map(|text| (*text).to_owned()).collect(),
         ..AcpRealPathEvidence::default()
     };
     let device = harness
@@ -1726,6 +1841,8 @@ async fn run(
     if let Some(client) = &gate.client {
         evidence.rotations_observed = client.status().borrow().rotations_completed;
     }
+    // Built last, from what was observed rather than from a constant.
+    evidence.not_covered = not_covered(evidence.rotations_observed);
 
     // Every child this export ever started must be gone.  Read from the
     // process table after teardown, not from a counter.
@@ -1755,7 +1872,7 @@ async fn run(
 /// The first rule that did not hold.
 pub fn validate_acp_real_path_evidence(evidence: &AcpRealPathEvidence) -> Result<()> {
     let executed: Vec<&str> = evidence.cases_executed.iter().map(String::as_str).collect();
-    let checks: [(&str, bool); 28] = [
+    let checks: [(&str, bool); 32] = [
         ("three relays", evidence.relay_count == 3),
         (
             "the device is owned by relay-a and the consumer entered at relay-c",
@@ -1765,8 +1882,18 @@ pub fn validate_acp_real_path_evidence(evidence: &AcpRealPathEvidence) -> Result
         ),
         ("every case executed", executed == ACP_CASES.to_vec()),
         (
-            "the limits of the claim are recorded",
-            evidence.not_covered.len() == NOT_COVERED.len(),
+            // **Not `len() == NOT_COVERED.len()`**, which compared the evidence
+            // against the constant it was built from and could not fail. This
+            // checks the one entry that carries a measurement really carries
+            // *this run's* measurement.
+            "the limits of the claim are recorded, and the rotation disclosure states the observed count",
+            evidence.not_covered.len() == NOT_COVERED.len() + 1
+                && evidence.not_covered.iter().any(|text| {
+                    text.contains(&format!(
+                        "rotations_completed = {}",
+                        evidence.rotations_observed
+                    ))
+                }),
         ),
         // --- the conversation, off the wire ---
         ("initialize opened a connection", evidence.connection_opened),
@@ -1814,16 +1941,18 @@ pub fn validate_acp_real_path_evidence(evidence: &AcpRealPathEvidence) -> Result
             evidence.reject_stop_reason == "refusal",
         ),
         (
-            "a response naming an option the agent never offered is refused",
-            evidence.unoffered_option_refused,
+            "an unoffered option is refused by its own rule, read off the wire",
+            evidence.unoffered_option_rule == "ACP_OPTION_NOT_OFFERED",
         ),
         (
-            "a response answering nothing outstanding is refused",
-            evidence.unknown_request_id_refused,
+            "a response answering nothing outstanding is refused by its own rule",
+            evidence.unknown_request_id_rule == "ACP_UNKNOWN_REQUEST_ID",
         ),
         (
-            "a response on the wrong connection is refused",
-            evidence.wrong_connection_refused,
+            // No rule here on purpose: a foreign connection must be
+            // indistinguishable from one that never existed.
+            "a response on the wrong connection is answered 404, as a nonexistent one is",
+            evidence.wrong_connection_status == 404,
         ),
         // --- cancellation ---
         (
@@ -1841,7 +1970,19 @@ pub fn validate_acp_real_path_evidence(evidence: &AcpRealPathEvidence) -> Result
         // --- the explicit unknown outcome ---
         (
             "the crashed turn's stream errored rather than ending cleanly",
-            evidence.unknown_stream_errored,
+            evidence.unknown_stream_errored && !evidence.unknown_stream_ended_cleanly,
+        ),
+        (
+            "the stream failed inside the forwarding layer's own terminal budget",
+            evidence.unknown_error_latency_ms > 0
+                && evidence.unknown_error_latency_ms < evidence.unknown_error_wait_ms,
+        ),
+        (
+            // The device noticed; whether that reached the consumer promptly
+            // is the separate, recorded question above.
+            "the export ended the connection when its child died",
+            evidence.unknown_export_ended_connection
+                && evidence.unknown_export_live_connections == 0,
         ),
         (
             "no stopReason ever arrived for the crashed turn",
@@ -1856,13 +1997,29 @@ pub fn validate_acp_real_path_evidence(evidence: &AcpRealPathEvidence) -> Result
             evidence.side_effects_after_settle == 1,
         ),
         (
-            "a lost process after dispatch is outcome_unknown",
-            evidence.unknown_result_status == "outcome_unknown",
+            "the export classified the crashed turn outcome_unknown through the terminal rule",
+            evidence.export_terminal_unknown_delta == 1,
+        ),
+        (
+            "the export classified the completed turn succeeded through the terminal rule",
+            evidence.export_terminal_succeeded_delta == 1,
+        ),
+        (
+            "the export classified the cancelled turn cancelled through the terminal rule",
+            evidence.export_terminal_cancelled_delta == 1,
         ),
         // --- the M7-C80 accommodation ---
         (
-            "membership was re-signed no more often than the accommodation allows",
-            evidence.resign_spacing_ms >= MEMBERSHIP_RESIGN_SPACING.as_millis(),
+            // **Not `resign_spacing_ms >= MEMBERSHIP_RESIGN_SPACING`**, which
+            // compared a constant to the constant it was copied from. What
+            // matters is that re-signing really was rare: the accommodation is
+            // "at most every 15 s", so a run of this length admits very few.
+            "membership was re-signed only at case boundaries, and rarely",
+            evidence.membership_resigns >= 1
+                && u128::from(evidence.membership_resigns)
+                    <= (evidence.max_membership_age_at_case_end_ms
+                        / MEMBERSHIP_RESIGN_SPACING.as_millis())
+                        + 1,
         ),
         (
             "every case ended inside the membership records' lifetime",
