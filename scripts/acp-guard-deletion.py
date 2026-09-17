@@ -1001,7 +1001,7 @@ C3_CASES: list[tuple[str, list[Edit], bool]] = [
     # ------------------------------------------------------ the SSE encoding
     (
         "an SSE event ends with a blank line, not one newline",
-        [(SSE, 'event.extend_from_slice(b"\n\n");', 'event.extend_from_slice(b"\n");')],
+        [(SSE, r'event.extend_from_slice(b"\n\n");', r'event.extend_from_slice(b"\n");')],
         False,
     ),
     (
@@ -1130,8 +1130,8 @@ C3_RELAY_CASES: list[tuple[str, list[Edit], bool]] = [
         [
             (
                 RELAY_CONFIG,
-                "                } else if let Some(profile) = tunnel_acp::AcpProfile::parse_id(id) {",
-                "                } else if let Some(profile) = None.or(tunnel_acp::AcpProfile::parse_id(id)).filter(|_| false) {",
+                "            } else if let Some(profile) = tunnel_acp::AcpProfile::parse_id(id) {",
+                "            } else if let Some(profile) = tunnel_acp::AcpProfile::parse_id(id).filter(|_| false) {",
             )
         ],
         False,
@@ -1141,21 +1141,21 @@ C3_RELAY_CASES: list[tuple[str, list[Edit], bool]] = [
         [
             (
                 RELAY_CONFIG,
-                """                } else {
-                    return Err(ConfigError::Invalid(
-                        "http_forward.profiles may name only mcp-2026-07-28, mcp-2025-11-25 and acp-http-v1",
-                    ));
-                };""",
-                """                } else {
-                    (
-                        tunnel_acp::AcpProfile::HttpV1.id(),
-                        tunnel_acp::AcpProfile::HttpV1
-                            .policies(tunnel_acp::AcpLimits::default())
-                            .map_err(|_| {
-                                ConfigError::Invalid("pinned http_forward profile is inconsistent")
-                            })?,
-                    )
-                };""",
+                """            } else {
+                return Err(ConfigError::Invalid(
+                    "http_forward.profiles may name only mcp-2026-07-28, mcp-2025-11-25 and acp-http-v1",
+                ));
+            };""",
+                """            } else {
+                (
+                    tunnel_acp::AcpProfile::HttpV1.id(),
+                    tunnel_acp::AcpProfile::HttpV1
+                        .policies(tunnel_acp::AcpLimits::default())
+                        .map_err(|_| {
+                            ConfigError::Invalid("pinned http_forward profile is inconsistent")
+                        })?,
+                )
+            };""",
             )
         ],
         False,
