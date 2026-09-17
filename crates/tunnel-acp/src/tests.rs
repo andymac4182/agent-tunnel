@@ -76,8 +76,11 @@ const NEIGHBOUR_REQUEST_HEADERS: &[&str] = &[
 
 const NEIGHBOUR_RESPONSE_HEADERS: &[&str] = &[
     // The RFD returns a new session's identifier in the `session/new`
-    // response **body**; no response carries it as a header, so allowing one
-    // would create a second, unvalidated source of session identity.
+    // response **body** and names only `Acp-Connection-Id` on responses, so
+    // allowing one here would create a second, unvalidated source of session
+    // identity.  This is a deliberate divergence from the pinned SDK, which
+    // does send it -- see `the_session_header_refusal_is_a_disclosed_divergence`
+    // below and the task row it names.
     "acp-session-id",
     "acp-connection",
     "www-authenticate",
@@ -216,6 +219,44 @@ fn neighbouring_header_spellings_are_refused_in_both_directions() {
             "{name}"
         );
     }
+}
+
+#[test]
+fn the_session_header_refusal_is_a_disclosed_divergence_from_the_pinned_sdk() {
+    // `agent-client-protocol-http` 2.1.0 `http_server.rs:410-413` inserts
+    // `HEADER_SESSION_ID` on every session-scoped SSE response `handle_get`
+    // serves.  This profile follows the RFD instead and refuses it.
+    //
+    // The refusal is asserted here under its own name so the divergence is a
+    // decision with a test attached rather than a side effect of a list: a
+    // later chunk that fronts or mirrors that server has to come here, read the
+    // row, and choose.  An earlier draft of this crate asserted as fact that the
+    // pinned server sends no such header, which review refuted against the
+    // published source.
+    let profile = profile();
+    assert_eq!(
+        check_response(&profile, &[("acp-session-id", "sess-1")]),
+        Err(CodecError::InvalidHeader(HeaderRule::NotAllowed)),
+        "the session header must be refused on responses, by rule and not by omission",
+    );
+    // ...while the request direction accepts it, so the refusal above is about
+    // direction and not about the header being unknown to this profile.
+    assert!(
+        check_request(
+            &profile,
+            &request(
+                Method::Post,
+                "/acp",
+                &[
+                    ("content-type", "application/json"),
+                    ("acp-connection-id", "conn-1"),
+                    ("acp-session-id", "sess-1"),
+                ],
+            ),
+        )
+        .is_ok(),
+        "the same header is legal on a request",
+    );
 }
 
 #[test]

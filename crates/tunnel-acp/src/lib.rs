@@ -96,9 +96,23 @@ const REQUEST_HEADERS: HeaderRules = &[
     (headers::TUNNEL_PRINCIPAL_BINDING, Occurrence::Singleton),
 ];
 
-/// The response direction carries no `acp-session-id`: the RFD returns a new
-/// session's identifier in the `session/new` **response body**, and the
-/// pinned server sets only the connection header on a response.
+/// The response direction carries no `acp-session-id`, and this is a
+/// **deliberate divergence from the pinned SDK**, not a reading of it.
+///
+/// The RFD returns a new session's identifier in the `session/new`
+/// **response body**, and names only `Acp-Connection-Id` on responses, so
+/// this allowlist follows the RFD. The pinned server does **not** agree:
+/// `agent-client-protocol-http` 2.1.0 `http_server.rs:410-413` (`handle_get`)
+/// inserts `HEADER_SESSION_ID` on every session-scoped SSE response it
+/// serves. An earlier draft of this comment asserted the opposite as fact,
+/// and review caught it against the published source.
+///
+/// The consequence is real and is **deferred, not resolved**: a later chunk
+/// that fronts or mirrors that server would have every session-scoped stream
+/// refused by this allowlist. Whether to widen it or to strip the header at
+/// the bridge is a decision for the chunk that has a live stream to decide
+/// it against; it is recorded as a task row rather than settled here by a
+/// constant nobody revisits.
 const RESPONSE_HEADERS: HeaderRules = &[
     (headers::CONTENT_TYPE, Occurrence::Singleton),
     (headers::CACHE_CONTROL, Occurrence::Singleton),

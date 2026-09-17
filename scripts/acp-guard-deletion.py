@@ -69,7 +69,11 @@ MESSAGE = CRATE / "src" / "message.rs"
 PIN = CRATE / "src" / "pin.rs"
 MANIFEST = CRATE / "Cargo.toml"
 
-CARGO_TEST = ["cargo", "test", "-p", "tunnel-acp", "--locked"]
+# --no-fail-fast so every red test is named.  Without it cargo stops after the
+# first failing binary, and a case whose guard is witnessed by tests in two
+# binaries reports only the first -- which understates the evidence and, worse,
+# makes a claim about the second witness that the run never checked.
+CARGO_TEST = ["cargo", "test", "-p", "tunnel-acp", "--locked", "--no-fail-fast"]
 
 # An edit is (file, exact text to remove or replace, replacement).
 Edit = tuple[Path, str, str]
@@ -604,6 +608,13 @@ def run_tests(suite: Suite) -> tuple[str, list[str]]:
     )
     if done.returncode == 0:
         return "still green", []
+    if not failures:
+        # Non-zero, but no test said it failed: a --locked lockfile refusal, a
+        # doctest failure, a binary killed by a signal.  Something went wrong,
+        # and "something went wrong" is not the same observation as "the test
+        # that guards this rule went red".  Counting it as RED would let a
+        # suite report a guard as load-bearing without a single test naming it.
+        return "NOT EVIDENCE (no named failure)", []
     return "RED", failures
 
 
@@ -720,7 +731,11 @@ def main() -> int:
     unusable = [
         f"[{suite_name}] {name}"
         for suite_name, name, outcome, _ in results
-        if outcome.startswith(("BUILD", "COULD", "EXPECTED"))
+        # "NOT" covers NOT EVIDENCE (no named failure).  This filter is matched
+        # by prefix, so every new unusable spelling has to be added here as
+        # well as returned -- a status the filter does not know about is
+        # silently absent from the tally and the run still exits 0.
+        if outcome.startswith(("BUILD", "COULD", "EXPECTED", "NOT"))
     ]
     if unusable:
         print("\nno usable result for: " + ", ".join(unusable))
