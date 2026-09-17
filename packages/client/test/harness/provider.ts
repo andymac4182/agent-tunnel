@@ -45,6 +45,16 @@ export class FakeProvider {
   swallow: Set<Message['kind']> = new Set();
   /** Replies with fewer bytes than asked, once, for the short-write case. */
   shortWriteTo: number | undefined;
+  /**
+   * Answer `Rlerror` to a message kind once this many of it have succeeded.
+   *
+   * For the composites: a recursive `mkdir` that made one directory and was
+   * then refused has **applied** something, and the client's floor must say so.
+   * Constructing that needs a peer that fails the second request and not the
+   * first, which no seeding arrangement produces on its own.
+   */
+  failAfter = new Map<Message['kind'], { after: number; ecode: number }>();
+  private succeeded = new Map<Message['kind'], number>();
 
   constructor(seed: Record<string, string | Uint8Array> = {}) {
     for (const [name, content] of Object.entries(seed)) {
@@ -106,6 +116,15 @@ export class FakeProvider {
     const error = (ecode: number): void => {
       connection.send({ kind: 'Rlerror', tag: message.tag, ecode });
     };
+    const scheduled = this.failAfter.get(message.kind);
+    if (scheduled !== undefined) {
+      const done = this.succeeded.get(message.kind) ?? 0;
+      if (done >= scheduled.after) {
+        error(scheduled.ecode);
+        return;
+      }
+      this.succeeded.set(message.kind, done + 1);
+    }
     switch (message.kind) {
       case 'Tversion':
         connection.send({
