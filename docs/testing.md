@@ -974,11 +974,23 @@ holds scalars, closed labels and identifier-free strings only.
   learn which: that is the contract's `unknown`, and the only honest thing to
   assert is what must be true either way. Every **acknowledged** byte is on the
   host and correct, which is `bytesAcknowledged` as a lower bound confirmed by
-  replies; the whole file is a **prefix of the source**, so nothing was applied
-  twice or at the wrong offset; the host holds no more than was sent; and
-  nothing is re-sent, which is recorded as a field rather than left to the
-  reader. Observed landing points across runs have ranged from six blocks to
-  fourteen, which is the case being genuinely partial rather than arranged.
+  replies; the whole file is a **prefix of the source**, so nothing landed at
+  the wrong offset or out of order; and the host holds no more than was sent.
+  Observed landing points have ranged across runs from six blocks to
+  twenty-two, which is the case being genuinely partial rather than arranged.
+
+  **Non-replay is claimed structurally here, not measured, and the distinction
+  matters.** A `Twrite` is positioned, so a block re-applied at its own offset
+  is byte-identical and leaves the file a perfect prefix either way — no
+  comparison of the result can tell a replay from its absence. What the prefix
+  check does catch is a block applied at the **wrong** offset, which is a
+  different defect. The non-replay claim rests on the gate re-sending nothing
+  after the interruption and on `Provider::step` popping each queued entry
+  exactly once. The device-side counter that would measure it,
+  `mutations_applied`, is now published in the connector's status snapshot, but
+  a *consumer* cannot read it — there is no wire field for an outcome — and
+  correlating it across a session this gate deliberately abandoned is not
+  something the gate attempts.
 * **A host failure surfacing the right errno without a name.** A directory the
   export may traverse and may not write to — mode `0o500` — answers `EACCES` to
   a create inside it. The rendering of what came back is scanned for the refused
@@ -997,22 +1009,39 @@ check rather than by a wait that was too short.
 outcome, so a consumer cannot read the device's own ledger. The ledger is
 asserted directly in `crates/tunnel-fs-provider/tests/mutations.rs`, where
 driving `accept` and `step` by hand lets a test perform a mutation and decline
-to confirm delivery — the shape a dropped consumer has. Classifying an in-flight
-mutation from a client's own dispatch and reply history is the shared client's
-job and is gate 6's.
+to confirm delivery — the shape a dropped consumer has — and it is **published**
+on the device in `ConnectionStatus::fs`, so an operator can read what a consumer
+cannot. Classifying an in-flight mutation from a client's own dispatch and reply
+history is the shared client's job and is gate 6's.
 
-**Red-then-green.** Twelve cases in a `gate5` suite of
+**Red-then-green.** Nineteen cases in a `gate5` suite of
 [`scripts/fs-guard-deletion.py`](../scripts/fs-guard-deletion.py), spanning the
-resolver's write module and the dispatcher; **twelve of twelve turn a test
-red**. One of them reaches two pinned claims and says so rather than being split
-into a case that cannot be written: deleting the hard-link check makes a
-multiply-linked file writable *and* lets the truncating open in the same test
-truncate it, and that content-intact assertion is the only form in which
+resolver's write module and the dispatcher; **nineteen of nineteen turn a test
+red**. The suite runs with `--no-fail-fast`, which is not a detail: `cargo test
+-p a -p b` otherwise stops at the first failing binary, so a deletion that
+breaks tests in both crates was reported against only one of them and the
+attribution in an earlier round was wrong.
+
+One case reaches two pinned claims and both are now reported. Deleting the
+hard-link check makes a multiply-linked file writable *and* lets a truncating
+open truncate it, and that content-intact assertion is the only form in which
 "truncation happens through the descriptor after the rule permitted it" is
 measurable by deletion — the alternative ordering is a different implementation,
-not a deletion. The connector's settling of the mutation ledger has **no unit
-test** and is deliberately absent from the suite rather than listed there with a
-green it did not earn; it is exercised only through the harness gate.
+not a deletion. **The truncating case lives in its own test for exactly that
+reason:** it was once the last iteration of a refusal loop, where the first
+iteration's panic meant it was never reached and the red belonged to a different
+assertion entirely.
+
+Two cases need the `post-effect-hook` feature, which no shipped build enables
+and which follows gate 2's `race-window-hook` precedent: the window between a
+creating syscall and the identity read that gives its reply a qid is
+microseconds wide, so a test steps into it deliberately rather than racing for
+it. Without that hook the rule it protects — after the effect, a failure is
+`unknown` and never `not_started` — could only be asserted.
+
+The connector's settling of the mutation ledger has **no unit test** and is
+deliberately absent from the suite rather than listed there with a green it did
+not earn; it is exercised only through the harness gate.
 
 ### Shared dataset and native semantics
 
