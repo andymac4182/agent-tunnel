@@ -844,7 +844,7 @@ here rather than a surprise at a consumer's call site.
 | Mastra | `new Workspace({ filesystem: new TunnelMastraFilesystem({ remote, errors }) })`, `workspace.init()`, then `readFile`, `writeFile`, `exists`, `stat`, `readdir` through `workspace.filesystem`, then `workspace.destroy()`. | Pass. `workspace.sandbox` is `undefined`: filesystem access implies no host command-execution sandbox. `destroy()` leaves the borrowed client `ready`. |
 | Mastra errors | The real `FileNotFoundError`, `FileExistsError` and `StaleFileError` raised through the adapter. | Pass, by `instanceof` against the installed classes. |
 | just-bash | `new Bash({ fs: new TunnelJustBashFilesystem({ remote }), cwd: '/', defenseInDepth: { excludeViolationTypes: ['setTimeout'] } })`, then `cat`, `ls`, a `wc -l` pipeline, `echo > file`, `cp && mv && ls`, `find -name`, and a 256-byte binary round trip through `wc -c`. Network, Python and JavaScript execution all off. | Pass. **The `setTimeout` exclusion is required**: just-bash 3.4.2 blocks the global for the duration of a script and the shared client arms a timer for every request deadline, so without it the first `cat` fails before a byte reaches the socket. One exclusion is enough. |
-| just-bash failures | Shell `>>`, and a dispatched write that never answers. | Pass. `>>` **rejects out of `exec`** rather than becoming an exit status, and the file is untouched. The interrupted write leaves `exec` with a nonzero status that carries nothing, while `drainOperationFailures()` holds one record with `outcome: 'unknown'`. |
+| just-bash failures | Shell `>>`, and a dispatched write that never answers. | Pass. **Both reject out of `exec`** rather than becoming an exit status — a redirect-target failure is not turned into a shell status in just-bash 3.4.2 — so `>>` leaves the file untouched, and the interrupted write gives a wrapper reading `ExecResult` nothing at all, not even a nonzero status. `drainOperationFailures()` holds one record with `outcome: 'unknown'`, which is the only place the outcome exists. |
 | AI SDK FilesV4 | `ai.uploadFile({ api, … })` with a counting wrapper; then `getFileMetadata`, `downloadFile` and `deleteFile` invoked on the instance itself. | Pass. **One provider call**, matching the inspected helper: it calls once and rethrows, with no `maxRetries` to disable. An ambiguous upload rethrows with `outcome: 'unknown'`, mints no reference, sends one `Twrite`, and leaves its path in `incompleteUploads()`. |
 | AI SDK live tools | — | **Not satisfied.** No tool factories are implemented: no native filesystem `tool()` definitions, no filtered `files-sdk/ai-sdk` factories, no `bash-tool` wrapper. Input schemas, abort propagation, bounded output and model-visible outcome fields are all untested. This row remains open. |
 
@@ -854,9 +854,15 @@ here rather than a surprise at a consumer's call site.
 confinement and no filesystem behind it. This document's own rule applies
 without qualification, so no row above is evidence of endpoint interoperability
 or authorization. The read-only-mount and writable-profile pairing below is
-exercised only where the descriptor fixture can express it — a read-only export
-is proven to refuse `createFilesApi` at construction — and a real read-only
-*grant*, enforced by a device, is untested here.
+run for all four: `createFilesApi` refuses construction over a read-only export,
+and the Files SDK, Mastra and just-bash adapters each refuse their whole write
+surface — `upload`/`delete`/`copy`/`move`, `writeFile`/`appendFile`/`deleteFile`/
+`copyFile`/`moveFile`/`mkdir`/`rmdir`, and `writeFile`/`appendFile`/`rm`/`mkdir`/
+`cp`/`mv`/`chmod`/`utimes` — with **no mutating opcode reaching the socket**,
+while reads keep working. What that does *not* establish: a real read-only
+**grant**, enforced by a device. These refusals are the client's, taken from a
+descriptor it was handed, and the descriptor "is informative, never an
+authorization credential".
 
 Run each supported adapter against a read-only mount and the documented writable profile. Where a framework expects an operation the endpoint cannot provide, prove the published adapter behavior: reject construction if that capability is mandatory, or expose an explicit unsupported-operation error if the framework permits it. An absent capability must never become fabricated metadata, a silently ignored option, or a successful no-op. Compile-time interface coverage and runtime capability coverage are separate results.
 
@@ -1233,8 +1239,8 @@ package, so they run under the same one command:
 cd packages/client && npm test
 ```
 
-**508 tests, 508 pass, 0 fail**, offline with `node_modules` deleted — 88 of them
-the adapter suites. The contract-compilation evidence, which needs an install, is
+**525 tests, 525 pass, 0 fail**, offline with `node_modules` deleted — 105 of
+them the adapter suites. The contract-compilation evidence, which needs an install, is
 tabulated under [Contract compilation and capability
 profiles](#the-table-as-satisfied-2026-09-17-task-row-m4-14) above; this section
 is the behaviour.
@@ -1275,6 +1281,39 @@ evicted; foreign provider keys, unknown ids, closed-adapter ids and nonempty
 header overrides all refused; a reference proven to be an alias for a path by
 having another writer replace what it resolves to.
 
+**The composites the adapters own, which are not the client's.** `upload`,
+`copy` and `move` create the key's parent directories first, and so do Mastra's
+`writeFile` and `copyFile` — so each is a composite **at the adapter layer**, and
+a directory made there followed by a failure is the same class of defect the
+shared client spent three rounds removing from `writeInto`, `mkdir` and `remove`.
+`RemoteFilesystem.mkdir` now returns how many directories it created, which is
+what decides the floor: a chain that found every component present sets none, and
+a chain that made one puts the failure at `partial` however the failing step
+describes itself. Five sites are covered, each measured by deleting its floor and
+requiring the case to fail: a Files SDK `move` onto a made parent, an `upload` and
+a `copy` whose `Tlcreate` is refused, and the two Mastra ones — where the
+assertion is also that the result is **not** `PermissionError`, which a tool
+reads as "nothing happened". A sixth case is the inverse: an `upload` whose write
+is **confirmed** and whose trailing courtesy `stat` then fails must still
+succeed, without `lastModified`, because reporting a completed write as a failure
+that never started is worse than losing an optional field.
+
+**A page the adapter can actually produce.** Each listed key is a `stat`, and the
+session refuses a request past `maxInflightRequests` locally — the profile pins
+that at 64. A page fanned out at once therefore could not be produced at all for
+a directory with more keys than the quota, which made `DEFAULT_PAGE` of 100 a
+number this adapter could never fulfil. The fan-out is bounded at a quarter of
+the quota, leaving room for another borrower of the same client, and the case
+lists strictly more keys than the quota in one page.
+
+**Mastra's `readdir` follows the pinned `LocalFilesystem` in three places** that a
+tool depends on and that are not obvious: a nested entry's name carries its
+subpath, so `/a/x.txt` and `/b/x.txt` are distinguishable and addressable; an
+extension filter applies to files only, so directories survive it and the
+structure the names are relative to survives with them; and an extension is
+matched by **equality** against `extname`, with or without its leading dot, so
+`.ts` and `ts` select `x.ts` and a bare `s` selects nothing.
+
 **The outcome rows, which are the point of the whole section.** For each adapter,
 a dispatched mutation with no reply and a 1011 close, and a composite that
 applied one step and then failed. Files SDK: a permanent `Provider` error with
@@ -1287,6 +1326,12 @@ ambiguous mutations should not fill with unambiguous ones. FilesV4: a throw, wit
 `incompleteUploads()` holding the path, and a delete that rejects rather than
 answering `deleted: false`. Every adapter is also asserted to put no path, name
 or content into the message it hands its framework.
+
+**Read-only, for all four.** A read-only descriptor refuses `createFilesApi` at
+construction, and the other three refuse their whole write surface with no
+mutating opcode reaching the socket while reads keep working. These are the
+client's own refusals, taken from a descriptor it was handed; no device has
+enforced one.
 
 **What these suites do not prove.** The same loopback harness, with the same
 consequence: not a relay, not a device, no TLS, no grant, no confinement. And the

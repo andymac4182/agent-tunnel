@@ -33,7 +33,7 @@ These records contain inspected immutable source references and distinguish sour
 - [`@mastra/core` 1.65.0](https://www.npmjs.com/package/@mastra/core/v/1.65.0) — `WorkspaceFilesystem` and `Workspace` from its `./workspace` export. Latest is 1.67.0.
 - [`just-bash` 3.4.2](https://www.npmjs.com/package/just-bash/v/3.4.2) — `IFileSystem` for `new Bash({ fs })`. It is the current latest.
 - [`ai` 7.0.94](https://www.npmjs.com/package/ai/v/7.0.94) — the `uploadFile` helper. Latest is 7.0.105.
-- [`@ai-sdk/provider` 4.0.11](https://www.npmjs.com/package/@ai-sdk/provider/v/4.0.11) — `FilesV4`. **Exact rather than a range**, because it is the version `ai` 7.0.94 itself depends on and any other would put two copies of the interface in a consumer's tree.
+- [`@ai-sdk/provider` 4.0.11](https://www.npmjs.com/package/@ai-sdk/provider/v/4.0.11) — `FilesV4`. **Exact rather than a range**, because it is the version `ai` 7.0.94 itself depends on: the pin makes the `FilesV4` `ai.uploadFile` reaches the same one the adapter was compiled against. It does not make the tree single-copy — `@mastra/core` brings two more nested copies of its own.
 
 What the installed artifacts actually declare, where they differ from the source notes, and the three upstream behaviours only running them revealed are recorded in [filesystem-adapters.md](filesystem-adapters.md#pinned-packages-as-installed). No adapter has been run against a relay or a device.
 
