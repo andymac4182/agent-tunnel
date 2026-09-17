@@ -1373,11 +1373,33 @@ driver that decided for itself what passing meant could not smuggle a verdict
 past the validator.
 
 **TLS is proven by a pair, because a connect that resolved proves nothing.**
-The fixture's server leaf now carries `127.0.0.1` as an IP subject alternative
-name — `rcgen` turns a name that parses as an address into one — so the endpoint
-can be the loopback address the relay binds with no name to resolve. `node`
-trusts the fixture CA through `NODE_EXTRA_CA_CERTS` and verifies the chain the
-ordinary way, and the client's own `allowInsecureLoopback` is never passed.
+The **cluster relay's** server leaf carries `127.0.0.1` as an IP subject
+alternative name — `rcgen` turns a name that parses as an address into one — so
+the endpoint can be the loopback address the relay binds with no name to
+resolve. `node` trusts the fixture CA through `NODE_EXTRA_CA_CERTS` and verifies
+the chain the ordinary way, and the client's own `allowInsecureLoopback` is
+never passed.
+
+The leaf that carries the address is **only** that one, and the distinction is
+load-bearing rather than tidy. It was first written into the shared
+`CertificateProfile::server`, which every fixture listener in the harness uses,
+and `verify-m7-redis-tls` builds `wrong_server_name_rejected` by dialling its
+forwarder at `rediss://127.0.0.1` and requiring refusal. A name granted to every
+listener made the wrong name a right name, so that negative case could no longer
+fail and the gate went red 3 of 3 — task row M4-17. The widening is now an
+opt-in, `CertificateProfile::server_with_loopback_ip`, asked for at the cluster
+relay leaf that gate 6's driver actually dials; the Redis TLS forwarder issues
+from `server_without_ip_sans` at its own site; and a unit test asserts the
+forwarder's leaf is refused for `127.0.0.1` and accepted for `localhost`.
+State precisely what that test guards: because `server_without_ip_sans` is a
+subtraction, a re-widening of the shared default is **neutralised** at this
+site rather than caught, and the test stays green because the leaf stays
+narrow. The test reddens when this leaf itself changes — the site pointed back
+at `issue_server`, the subtraction broken, or an IP SAN introduced below the
+profile — and it does so in milliseconds instead of through a gate run. The
+companion assertion that the opt-in leaf *is* accepted for `127.0.0.1` is what
+keeps the refusal a real observation rather than an artefact of a verifier
+that never checks IP SANs at all.
 
 That much was true of the first round of this gate too, and it was **not
 enough**: the driver set `tlsVerified = true` once `connectFilesystem` returned,
