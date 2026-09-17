@@ -14,6 +14,13 @@ of `docs/filesystem-api.md`.  Two suites live here:
 * `gate5` — write grants and partial failure: the resolver's mutating
   primitives, the hard-link write rule on a real write, and the dispatcher's
   outcome ledger.
+* `gate6-e2e` — the validator of the end-to-end gate that drives the real
+  TypeScript client against real relay and device sockets.  The gate itself is
+  a cluster run and cannot be repeated once per case, so what is measured is
+  its **rule list**, against the mutation table that claims every rule of it is
+  load-bearing.  Its edits replace a condition with `true` rather than remove
+  it: the rules are a fixed-length array, and removing one stops the crate
+  compiling, which this script refuses to call a red test.
 * `gate6-adapters` — the four native SDK adapters in `packages/client`.  This
   one is **TypeScript**, so its runner is `node --test` rather than `cargo`
   and its not-evidence check is a module that failed to load rather than a
@@ -2268,6 +2275,184 @@ GATE6_CASES: list[tuple[str, list[Edit]]] = [
 ]
 
 
+HARNESS = REPO / "crates" / "tunnel-test-harness"
+HARNESS_E2E = HARNESS / "src" / "production_cluster" / "fs_client_e2e.rs"
+
+# Gate 6's end-to-end half is a **cluster** gate: it needs Redis, three relays,
+# a device connector and `node`, and it takes minutes.  That is not a shape this
+# script can run once per case, so what it measures here is the other half of
+# what makes that gate a gate — its **validator**, and the mutation table in the
+# same file that asserts every rule of it is load-bearing.  Deleting a rule must
+# turn that table red, because the table's whole claim is that no rule is
+# decorative; a rule whose deletion leaves it green is a rule the evidence never
+# needed.
+#
+# The edits **replace a condition with `true`** rather than remove the tuple.
+# The rule list is a fixed-length array, so removing an entry changes its length
+# and the crate stops compiling — and this script refuses to call a failed build
+# a red test, so such a case would measure nothing at all.
+GATE6_E2E_TEST = [
+    "cargo",
+    "test",
+    "--offline",
+    "-p",
+    "tunnel-test-harness",
+    "--lib",
+    "--locked",
+    "production_cluster::fs_client_e2e",
+]
+
+GATE6_E2E_CASES: list[tuple[str, list[Edit]]] = [
+    (
+        "a case the driver could not run is not a case that passed",
+        [(HARNESS_E2E, "            evidence.driver_failures.is_empty(),", "            true,")],
+    ),
+    (
+        "node could not have skipped certificate verification",
+        [
+            (
+                HARNESS_E2E,
+                '            evidence.node_tls_reject_unauthorized == "unset"\n'
+                '                && evidence.probe_tls_reject_unauthorized == "unset",',
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "an unverifiable certificate is refused by the same client",
+        [
+            (
+                HARNESS_E2E,
+                '            evidence.probe_extra_ca == "unset"\n'
+                '                && evidence.probe_code == "INSECURE_ENDPOINT"\n'
+                "                && !evidence.probe_retryable,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "a superseded grant revision is refused at the upgrade",
+        [
+            (
+                HARNESS_E2E,
+                "            evidence.revision_upgrade_status == 409\n"
+                '                && evidence.revision_upgrade_code == "CAPABILITIES_CHANGED",',
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the read spanned more than four messages",
+        [
+            (
+                HARNESS_E2E,
+                "            evidence.read_messages >= MIN_MESSAGES,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the write spanned more than four messages, each acknowledged",
+        [
+            (
+                HARNESS_E2E,
+                "            evidence.write_messages >= MIN_MESSAGES\n"
+                "                && evidence.write_acknowledgements == evidence.write_messages,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "a refused mutation is reported at the wire's floor and no lower",
+        [
+            (
+                HARNESS_E2E,
+                '            evidence.read_only_device_outcomes == ["failed", "failed", "failed", "not_started"],',
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the device applied nothing under a read-only grant",
+        [
+            (
+                HARNESS_E2E,
+                "            !evidence.read_only_device_applied_anything\n"
+                "                && evidence.read_only_ledger_after.bytes_written\n"
+                "                    == evidence.read_only_ledger_before.bytes_written\n"
+                "                && evidence.read_only_ledger_after.mutations_dispatched\n"
+                "                    == evidence.read_only_ledger_before.mutations_dispatched,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "every dispatched unanswered mutation is unknown",
+        [
+            (
+                HARNESS_E2E,
+                "            evidence.unknown_requests == UNKNOWN_WRITES\n"
+                "                && evidence.unknown_classified_unknown == UNKNOWN_WRITES,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the ledger reading covers exactly one exchange",
+        [
+            (
+                HARNESS_E2E,
+                "            evidence.ledger_before == DeviceLedger::default() && ledger.exchanges == 1,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the host holds exactly what the device's ledger says it wrote",
+        [
+            (
+                HARNESS_E2E,
+                "            evidence.unknown_host_matches_ledger\n"
+                "                && evidence.unknown_host_pattern_matches\n"
+                "                && evidence.ledger_identity_holds\n"
+                "                && ledger.mutations_dispatched >= ledger.mutations_applied,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the adapter's write reached the host",
+        [
+            (
+                HARNESS_E2E,
+                "                && evidence.adapter_host_write_matches\n"
+                "                && evidence.adapter_listing_names == 2",
+                "                && evidence.adapter_listing_names == 2",
+            )
+        ],
+    ),
+    (
+        "the driver loaded this repository's own client module",
+        [
+            (
+                HARNESS_E2E,
+                "            evidence.client_module_is_the_package && !evidence.client_module_path.is_empty(),",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the session ran against the relay this gate arranged",
+        [
+            (
+                HARNESS_E2E,
+                "            !evidence.owner_node.is_empty() && evidence.owner_node == evidence.expected_owner_node,",
+                "            true,",
+            )
+        ],
+    ),
+]
+
 @dataclass
 class Suite:
     """One suite's guards and the command that measures them.
@@ -2311,6 +2496,7 @@ SUITES: list[Suite] = [
         runner="node",
         cwd=CLIENT_PKG,
     ),
+    Suite("gate6-e2e", [HARNESS / "src"], GATE6_E2E_TEST, GATE6_E2E_CASES),
 ]
 
 

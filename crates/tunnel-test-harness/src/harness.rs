@@ -520,6 +520,54 @@ pub const FS_GATE_SERVICES: &[FsGateService] = &[
         case_sensitivity: Some("insensitive-preserving"),
         host_supported: true,
     },
+    // Gate 6's five exports.  The shared TypeScript client drives all of them
+    // in one run, so they are held apart for the same reason every row above
+    // is: a session's answer must not be creditable to another case's grant.
+    FsGateService {
+        // The client's own read, write and listing cases.
+        label: "client-rw",
+        display_name: "Synthetic writable filesystem export for the shared client",
+        operations: &["fs:connect", "fs:read", "fs:write", "fs:list", "fs:delete"],
+        case_sensitivity: Some("insensitive-preserving"),
+        host_supported: true,
+    },
+    FsGateService {
+        // The read-only grant the client's mutations are refused against, at
+        // the client's own entry points and through a raw 9P session.
+        label: "client-ro",
+        display_name: "Synthetic read-only filesystem export for the shared client",
+        operations: &["fs:connect", "fs:read", "fs:list"],
+        case_sensitivity: Some("insensitive-preserving"),
+        host_supported: true,
+    },
+    FsGateService {
+        // The export whose grant revision is advanced between the client's
+        // descriptor read and its upgrade.  Its own export, so the move cannot
+        // disturb a case that holds a session.
+        label: "client-revision",
+        display_name: "Synthetic filesystem export whose grant revision moves under a client",
+        operations: &["fs:connect", "fs:read", "fs:list"],
+        case_sensitivity: Some("insensitive-preserving"),
+        host_supported: true,
+    },
+    FsGateService {
+        // The export the client dispatches unanswered writes to.  Its own
+        // export, because the device's ledger for that case is read as a delta
+        // from zero and another case's writes would be folded into it.
+        label: "client-unknown",
+        display_name: "Synthetic writable filesystem export for an unanswered write",
+        operations: &["fs:connect", "fs:read", "fs:write", "fs:list", "fs:delete"],
+        case_sensitivity: Some("insensitive-preserving"),
+        host_supported: true,
+    },
+    FsGateService {
+        // The export one native adapter drives end to end.
+        label: "client-adapter",
+        display_name: "Synthetic writable filesystem export for a native adapter",
+        operations: &["fs:connect", "fs:read", "fs:write", "fs:list", "fs:delete"],
+        case_sensitivity: Some("insensitive-preserving"),
+        host_supported: true,
+    },
     FsGateService {
         label: "unsupported-host",
         display_name: "Synthetic filesystem export on an unsupported host",

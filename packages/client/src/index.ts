@@ -11,6 +11,7 @@ export {
   attachSession,
   MaterializationBudget,
   RemoteFilesystem,
+  upgradeRejectionError,
   type ConnectOptions,
   type DirectoryEntry,
   type ReadOptions,

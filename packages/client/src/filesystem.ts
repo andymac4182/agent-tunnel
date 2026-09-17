@@ -1253,6 +1253,36 @@ export async function fetchDescriptor(options: ConnectOptions): Promise<Descript
 }
 
 /**
+ * The refused upgrade, in this client's own error vocabulary.
+ *
+ * Extracted from `connectFilesystem` and exported so that a caller which drives
+ * the upgrade itself — this package's own end-to-end gate does, because
+ * `connectFilesystem` always fetches a fresh descriptor and so could never
+ * carry a superseded grant revision — reports the same code, the same outcome
+ * and the same retryability as the composed entry point. Two copies of this
+ * mapping would be two things that could disagree, and the one that mattered
+ * would be the one no test drove.
+ *
+ * `outcome` is `not_started` for every status: an upgrade the server refused
+ * with an HTTP response never became a session, so nothing can have happened
+ * behind it. Only a busy relay and an unavailable backend are retryable.
+ */
+export function upgradeRejectionError(rejected: UpgradeRejected): FilesystemError {
+  let body: unknown;
+  try {
+    body = JSON.parse(rejected.body);
+  } catch {
+    body = undefined;
+  }
+  return new FilesystemError({
+    code: discoveryCode(rejected.status, body),
+    operation: 'upgrade',
+    outcome: 'not_started',
+    retryable: rejected.status === 429 || rejected.status === 503,
+  });
+}
+
+/**
  * Connect: descriptor, then upgrade at the **same** URL with that descriptor's
  * grant revision, then version and attach.
  *
@@ -1309,18 +1339,7 @@ export async function connectFilesystem(options: ConnectOptions): Promise<Remote
     });
   } catch (error) {
     if (error instanceof UpgradeRejected) {
-      let body: unknown;
-      try {
-        body = JSON.parse(error.body);
-      } catch {
-        body = undefined;
-      }
-      throw new FilesystemError({
-        code: discoveryCode(error.status, body),
-        operation: 'upgrade',
-        outcome: 'not_started',
-        retryable: error.status === 429 || error.status === 503,
-      });
+      throw upgradeRejectionError(error);
     }
     throw error;
   }
