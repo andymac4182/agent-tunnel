@@ -962,19 +962,30 @@ C2_CASES: list[tuple[str, list[Edit], bool]] = [
 #
 # Two kinds of case are deliberately absent rather than faked:
 #
-# * **"There is no inbound device listener"** cannot be defeated by deleting a
-#   guard, because there is no guard: `tunnel_http_bridge::serve` takes no
-#   address. Adding a listener to prove the detector works is what
-#   `no_listener.rs`'s own positive control already does, inside the test.
-# * **The `202` rule** is the shape of the handler, not a branch. Returning 200
-#   from a POST that dispatches would not make any assertion in this chunk go
-#   red, because no assertion in this chunk terminates on a status -- which is
-#   the point. A case that measured nothing would be worse than no case.
+# **Two earlier exemptions were wrong and are now cases.**  Both were claimed
+# here as "cannot be measured", and review measured them:
+#
+# * **The 202 rule.**  The claim was that nothing could be defeated because no
+#   assertion terminates on a status.  The mutation that matters is not
+#   `202 -> 200`; it is a **lying 202** -- answer 202 and then never deliver the
+#   result.  That is constructible, it reddens four tests, and it is exactly the
+#   rule "no claim terminates on a status" exists to protect.  It has no
+#   business being the one rule exempted from the standard everything else here
+#   is held to.
+# * **The inbound listener.**  A listener bound inside `AcpExport::from_config`
+#   is a perfectly good deletion case and reddens `no_listener.rs`.  The
+#   positive control inside that test checks the *detector*; it says nothing
+#   about the export path, which is what a guard case has to defeat.
 
 BRIDGE = EXPORT / "src" / "bridge.rs"
 SSE = EXPORT / "src" / "sse.rs"
 RELAY_CONFIG = REPO / "crates" / "tunnel-relay" / "src" / "config.rs"
 
+# `--features tunnel-acp-fixture/interop` so the **pinned client's** own tests
+# are part of this suite's evidence.  They are off by default -- the client
+# drags a second `rustls` crypto provider into whatever build it is in
+# (M8-C09) -- but a guard-deletion run is exactly where they belong: several of
+# these rules are witnessed by the real client and by nothing else.
 C3_CARGO_TEST = [
     "cargo",
     "test",
@@ -982,6 +993,8 @@ C3_CARGO_TEST = [
     "tunnel-acp-export",
     "-p",
     "tunnel-acp-fixture",
+    "--features",
+    "tunnel-acp-fixture/interop",
     "--locked",
     "--no-fail-fast",
 ]
@@ -998,6 +1011,123 @@ C3_RELAY_TEST = [
 ]
 
 C3_CASES: list[tuple[str, list[Edit], bool]] = [
+    # --------------------------------------------------------- the 202 rule
+    (
+        # A **lying 202**: the POST is still accepted, and the result the host
+        # is waiting for on its session stream never arrives.  If any claim in
+        # this chunk terminated on the status, this would stay green.
+        "a 202 is followed by the result on the stream (prompt)",
+        [
+            (
+                BRIDGE,
+                """            }
+            .unwrap_or_default();
+            let _ = target.tx.send(Bytes::from(body)).await;
+        });
+        no_body(StatusCode::ACCEPTED)
+    }
+
+    async fn answer_permission(""",
+                """            }
+            .unwrap_or_default();
+            let _ = body;
+        });
+        no_body(StatusCode::ACCEPTED)
+    }
+
+    async fn answer_permission(""",
+            )
+        ],
+        False,
+    ),
+    (
+        "a 202 is followed by the result on the stream (session/new)",
+        [
+            (
+                BRIDGE,
+                """                "result": {"sessionId": session},
+            }))
+            .unwrap_or_default();
+            let _ = target.tx.send(Bytes::from(body)).await;""",
+                """                "result": {"sessionId": session},
+            }))
+            .unwrap_or_default();
+            let _ = (target, body);""",
+            )
+        ],
+        False,
+    ),
+    # ----------------------------------------------------- one lost subscriber
+    (
+        # Restores the destructive behaviour review found: the connection's one
+        # router returning on the first failed send, which silently stopped
+        # every other stream on the connection.
+        "one lost subscriber closes one stream and nothing else",
+        [
+            (
+                BRIDGE,
+                """        if target.tx.send(Bytes::from(message.compact)).await.is_err() {
+            target.close();
+            connection
+                .counters
+                .streams_lost
+                .fetch_add(1, Ordering::Relaxed);
+        }""",
+                """        if target.tx.send(Bytes::from(message.compact)).await.is_err() {
+            return;
+        }""",
+            )
+        ],
+        False,
+    ),
+    # -------------------------------------------------- a child ends its transport
+    (
+        "a child that is gone ends its transport",
+        [
+            (
+                BRIDGE,
+                """            () = connection.supervisor.wait_exited() => {
+                end_with_child(&export, &connection).await;
+                return;
+            }""",
+                "            () = connection.supervisor.wait_exited() => return,",
+            )
+        ],
+        False,
+    ),
+    (
+        "a broken stream errors its body rather than ending cleanly",
+        [
+            (
+                BRIDGE,
+                """            if shutdown.is_cancelled() {
+                sender.fail(StreamFailure::Interrupted).await;
+            }
+            return;""",
+                "            return;",
+            )
+        ],
+        False,
+    ),
+    # ------------------------------------------------------ the inbound listener
+    (
+        # "No listener" has no branch to delete, so the case *adds* one, in the
+        # export's own constructor.  That is the path `no_listener.rs` is about;
+        # its in-test positive control only checks the detector.
+        "the ACP export opens no listener of its own",
+        [
+            (
+                BRIDGE,
+                """    pub fn from_config(config: &AcpExportConfig) -> Result<Self, AcpConfigError> {
+        let validated = config.validate()?;""",
+                """    pub fn from_config(config: &AcpExportConfig) -> Result<Self, AcpConfigError> {
+        let validated = config.validate()?;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("guard-deletion listener");
+        std::mem::forget(listener);""",
+            )
+        ],
+        False,
+    ),
     # ------------------------------------------------------ the SSE encoding
     (
         "an SSE event ends with a blank line, not one newline",

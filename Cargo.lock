@@ -3474,7 +3474,6 @@ dependencies = [
  "agent-client-protocol",
  "agent-client-protocol-http",
  "bytes",
- "futures",
  "http",
  "http-body",
  "http-body-util",

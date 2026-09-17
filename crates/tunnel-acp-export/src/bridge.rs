@@ -122,6 +122,17 @@ struct Counters {
     /// anything.
     last_expiry_elapsed_us: AtomicU64,
     last_expiry_bound_us: AtomicU64,
+    /// SSE streams whose subscriber went away while messages were still being
+    /// routed to them.
+    streams_lost: AtomicU64,
+    /// Messages dropped because their stream was already over.
+    messages_dropped_on_closed_stream: AtomicU64,
+    /// Connections ended because their child did.
+    connections_ended_by_child: AtomicU64,
+    /// The child's own refused-batch and refused-line counts, folded in when a
+    /// connection ends, so they survive the connection they belonged to.
+    child_batch_output: AtomicU64,
+    child_invalid_output: AtomicU64,
 }
 
 /// A snapshot of an export's counters.  Identifiers, phases and counters
@@ -143,6 +154,11 @@ pub struct AcpDiagnostics {
     pub sse_bytes: u64,
     pub last_expiry_elapsed_us: u64,
     pub last_expiry_bound_us: u64,
+    pub streams_lost: u64,
+    pub messages_dropped_on_closed_stream: u64,
+    pub connections_ended_by_child: u64,
+    pub child_batch_output: u64,
+    pub child_invalid_output: u64,
     pub live_connections: u64,
 }
 
@@ -157,6 +173,18 @@ struct Target {
     rx: Mutex<Option<mpsc::Receiver<Bytes>>>,
     created: Instant,
     subscribed: Mutex<bool>,
+    /// This stream is over: its subscriber went away, or its window expired.
+    ///
+    /// **It is per target, and that is the whole point.** A dropped SSE body
+    /// is an ordinary event — a client closing one session's stream, or this
+    /// bridge expiring a session whose GET never arrived — and before review
+    /// found it, the first such failure returned the connection's one
+    /// dispatcher task, which dropped the supervisor's forward channel, which
+    /// ended the supervisor's reader, which meant **every other session and
+    /// the connection stream itself stopped receiving and every outstanding
+    /// prompt hung until DELETE**. Marking one target closed and carrying on is
+    /// what stops one lost subscriber from silently disabling a connection.
+    closed: Mutex<bool>,
 }
 
 impl Target {
@@ -167,10 +195,30 @@ impl Target {
             rx: Mutex::new(Some(rx)),
             created: Instant::now(),
             subscribed: Mutex::new(false),
+            closed: Mutex::new(false),
         }
     }
 
+    fn close(&self) {
+        *self.closed.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        // Nothing may subscribe to a stream that is over, so the receiving
+        // half is taken away as well: a later GET is refused 409 by the same
+        // mechanism that refuses a second subscriber.
+        let _ = self
+            .rx
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+    }
+
+    fn is_closed(&self) -> bool {
+        *self.closed.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     fn take(&self) -> Option<mpsc::Receiver<Bytes>> {
+        if self.is_closed() {
+            return None;
+        }
         let taken = self
             .rx
             .lock()
@@ -234,6 +282,9 @@ impl Connection {
             if state.closed {
                 return None;
             }
+            // A closed session stays closed: the entry is kept so a target
+            // that was expired or lost cannot be resurrected by the next
+            // message that mentions its identifier.
             Some(Arc::clone(
                 state
                     .sessions
@@ -334,6 +385,11 @@ impl AcpExport {
             sse_bytes: load(&counters.sse_bytes),
             last_expiry_elapsed_us: load(&counters.last_expiry_elapsed_us),
             last_expiry_bound_us: load(&counters.last_expiry_bound_us),
+            streams_lost: load(&counters.streams_lost),
+            messages_dropped_on_closed_stream: load(&counters.messages_dropped_on_closed_stream),
+            connections_ended_by_child: counters.connections_ended_by_child.load(Ordering::Acquire),
+            child_batch_output: load(&counters.child_batch_output),
+            child_invalid_output: load(&counters.child_invalid_output),
             live_connections: self
                 .inner
                 .connections
@@ -842,6 +898,20 @@ impl AcpExport {
 
 /// Route one agent→host message to the stream it belongs on, in the order the
 /// agent wrote it.
+///
+/// **One lost subscriber closes one stream, and nothing else.** This task is
+/// the connection's only reader of the supervisor's forward channel, so
+/// returning from it stops every stream on the connection at once and hangs
+/// every outstanding prompt — which is what it used to do on the first failed
+/// send. A target whose body has gone away is marked closed and its messages
+/// are dropped; the loop carries on.
+///
+/// **What this is not.** `docs/acp.md` says an established required SSE stream
+/// breaking should terminate the whole ACP transport in v0. That is *subscriber
+/// loss*, it is M8-03's open half, and it is not implemented: this bridge keeps
+/// the connection and its other sessions running. The change here is narrower
+/// and only removes a silent, destructive failure — it is not the documented
+/// policy.
 async fn dispatch_outbound(
     connection: Arc<Connection>,
     mut inbox: mpsc::Receiver<OutboundMessage>,
@@ -851,9 +921,22 @@ async fn dispatch_outbound(
             Some(session) => connection.session_target(session),
             None => Some(connection.with(|state| Arc::clone(&state.connection))),
         };
+        // `None` means the connection itself is closed; there is nothing left
+        // to route to and the child is on its way out.
         let Some(target) = target else { return };
+        if target.is_closed() {
+            connection
+                .counters
+                .messages_dropped_on_closed_stream
+                .fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
         if target.tx.send(Bytes::from(message.compact)).await.is_err() {
-            return;
+            target.close();
+            connection
+                .counters
+                .streams_lost
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -876,7 +959,18 @@ async fn pump_stream(
             }
             message = queue.recv() => message,
         };
-        let Some(compact) = compact else { return };
+        let Some(compact) = compact else {
+            // The queue ended.  **Which ending that is depends on why**, and
+            // the two must not be confused: a connection that was closed ends
+            // its targets and then drops them, so the queue running dry *after*
+            // the shutdown signal is a broken stream, not an orderly one. A
+            // `select!` that happened to pick this branch first would otherwise
+            // deliver a clean end of stream for a transport that failed.
+            if shutdown.is_cancelled() {
+                sender.fail(StreamFailure::Interrupted).await;
+            }
+            return;
+        };
         let event = sse_event(&compact);
         counters.sse_events.fetch_add(1, Ordering::Relaxed);
         counters
@@ -901,7 +995,19 @@ async fn watch_deadlines(export: AcpExport, connection: Arc<Connection>) {
     loop {
         tokio::select! {
             () = connection.shutdown.cancelled() => return,
-            () = connection.supervisor.wait_exited() => return,
+            // **A child that is gone ends its transport.** `docs/acp.md`: "A
+            // child crash closes the transport and invalidates live sessions."
+            // This task used to simply return here, which left the connection
+            // in the export's map with a dead child behind it until someone
+            // sent a DELETE, and left every open stream hanging without an
+            // ending. A child can end for reasons that are the profile's own —
+            // a batch, a malformed line, an oversized line, each of which kills
+            // it by its own `AcpRule` — so this is the path those refusals
+            // reach the host on.
+            () = connection.supervisor.wait_exited() => {
+                end_with_child(&export, &connection).await;
+                return;
+            }
             _ = ticker.tick() => {}
         }
         let target = connection.with(|state| Arc::clone(&state.connection));
@@ -950,17 +1056,48 @@ async fn watch_deadlines(export: AcpExport, connection: Arc<Connection>) {
                 .counters
                 .session_subscribe_expired
                 .fetch_add(1, Ordering::Release);
-            // Taking the queue is what stops a later GET from subscribing to a
-            // session whose window has closed: the same mechanism as the
+            // Closing the target is what stops a later GET from subscribing to
+            // a session whose window has closed: the same mechanism as the
             // one-subscriber rule, so an expired session answers 409 and never
             // silently reopens.
-            let _ = target.take();
+            target.close();
         }
     }
 }
 
+/// End a connection because its child did, folding the child's own refusal
+/// counters in first so they outlive the connection that carried them.
+async fn end_with_child(export: &AcpExport, connection: &Arc<Connection>) {
+    let child = connection.supervisor.diagnostics();
+    connection
+        .counters
+        .child_batch_output
+        .fetch_add(child.batch_output, Ordering::Relaxed);
+    connection
+        .counters
+        .child_invalid_output
+        .fetch_add(child.invalid_output, Ordering::Relaxed);
+    // Published before the counter a reader waits on, for the same reason the
+    // deadline measurements are.
+    connection
+        .counters
+        .connections_ended_by_child
+        .fetch_add(1, Ordering::Release);
+    export.remove(&connection.id);
+    close_connection(connection).await;
+}
+
 async fn close_connection(connection: &Arc<Connection>) {
-    connection.with(|state| state.closed = true);
+    connection.with(|state| {
+        state.closed = true;
+        state.connection.close();
+        for target in state.sessions.values() {
+            target.close();
+        }
+    });
+    // Every open body is failed rather than ended cleanly: `docs/acp.md`
+    // refuses to let a broken ACP stream look like an orderly one, so a
+    // consumer sees an error and not an end of stream.
     connection.shutdown.cancel();
     connection.supervisor.drain().await;
 }

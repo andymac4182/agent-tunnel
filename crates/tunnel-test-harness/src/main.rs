@@ -9,9 +9,14 @@ use tunnel_test_harness::{
 async fn main() -> ExitCode {
     // The process-wide `rustls` provider is chosen here, explicitly, rather
     // than inferred from which provider features happen to be enabled across
-    // the whole dependency graph. See
-    // `tunnel_transport::install_process_crypto_provider`.
-    let _ = tunnel_transport::install_process_crypto_provider();
+    // the whole dependency graph (task row M8-C09). An error means something
+    // installed one before this line, which is fatal: whatever that is has
+    // decided this process's cryptography.
+    if let Err(error) = tunnel_transport::install_process_crypto_provider() {
+        eprintln!("tunnel: {error}");
+        return ExitCode::FAILURE;
+    }
+    debug_assert!(tunnel_transport::process_provider_is_ring());
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
     let _ = tracing_subscriber::fmt()

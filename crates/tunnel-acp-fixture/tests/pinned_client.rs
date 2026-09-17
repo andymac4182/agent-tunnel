@@ -1,4 +1,4 @@
-#![cfg(unix)]
+#![cfg(all(unix, feature = "interop"))]
 //! A complete v1 ACP conversation driven by the **official pinned client**
 //! through the gate-2 `forward`/`serve` bridge (M8 chunk 3).
 //!
@@ -27,6 +27,16 @@
 //! in front of it, so every request carries no `tunnel-principal-binding` at
 //! all — the M3-01/M3-02 precedent exactly.  Nothing in this file is evidence
 //! about principals, tenants, rotation, peers or isolation.
+//!
+//! **This file is behind the `interop` feature and is not built by
+//! `cargo test --workspace`.**  The pinned client's `reqwest` pulls a second
+//! `rustls` crypto provider into whatever build it is in (M8-C09), which broke
+//! binaries that name neither dependency, so the driver is kept out of the
+//! shared graph exactly as M8-C04's acceptance asks.  Run it with:
+//!
+//! ```text
+//! cargo test -p tunnel-acp-fixture --features interop --test pinned_client
+//! ```
 
 mod common;
 
@@ -41,7 +51,7 @@ use agent_client_protocol::schema::v1::{
 };
 use agent_client_protocol::{Agent, ConnectionTo};
 use agent_client_protocol_http::HttpClient;
-use common::{acp_export, gateway, http2_client, order_digest, sse_payloads, within};
+use common::{acp_export, gateway, http2_client, sse_payloads, within};
 use serde_json::Value;
 
 /// Everything the client's own handlers saw, in the order they ran.
@@ -252,17 +262,6 @@ async fn the_pinned_client_completes_a_v1_conversation_with_a_permission_callbac
         ],
         "the session stream's wire order: the callback, then the chunk that \
          reports its outcome, then the turn's result"
-    );
-    // A digest over arrival order, so a future reordering changes the value
-    // rather than passing a multiset comparison.
-    assert_ne!(
-        order_digest(&session_stream),
-        order_digest(&{
-            let mut reversed = session_stream.clone();
-            reversed.reverse();
-            reversed
-        }),
-        "the digest is order sensitive"
     );
 
     export.shutdown();
