@@ -376,6 +376,37 @@ impl Primitive {
         )
     }
 
+    /// Whether performing this primitive can change the host.
+    ///
+    /// This is what decides whether a refusal needs an [`crate::Outcome`] at
+    /// all, and it is deliberately narrower than "needs `write` or `delete`".
+    /// [`Primitive::OpenWrite`] is **not** here: opening a file for writing
+    /// changes nothing, so a failure after it is still `not_started`, where a
+    /// failure after [`Primitive::OpenTruncate`] is not — the truncation has
+    /// already discarded the content. That difference is the reason the two are
+    /// separate primitives rather than one with a flag.
+    ///
+    /// `Tread`, `Treaddir`, `Tgetattr`, `Treadlink` and the session lifecycle
+    /// primitives are all observation and are all absent.
+    #[must_use]
+    pub const fn is_mutating(self) -> bool {
+        matches!(
+            self,
+            Self::OpenTruncate
+                | Self::Create
+                | Self::Write
+                | Self::Mkdir
+                | Self::Unlink
+                | Self::RemoveDir
+                | Self::Rename
+                | Self::SetattrSize
+                | Self::SetattrMode
+                | Self::SetattrTimes
+                | Self::Symlink
+                | Self::Link
+        )
+    }
+
     /// Every capability this primitive requires, as a conjunction.
     ///
     /// `Rename` requires both `Write` and `Delete`: it creates a name at the

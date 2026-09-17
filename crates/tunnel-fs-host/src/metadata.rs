@@ -535,6 +535,42 @@ impl ExportRoot {
         Ok(Metadata::from_stat(&stat))
     }
 
+    /// Read a symbolic link's target, without following it.
+    ///
+    /// The parent is resolved by the ordinary anchored walk and the final
+    /// component is read relative to that descriptor with `readlinkat`, which
+    /// never follows. The target is the host's own bytes and is **not**
+    /// resolved, re-rooted or validated as a virtual path here: it is text a
+    /// caller asked to see, and the re-rooting that makes an absolute target
+    /// mean the exported root happens on the next traversal, in the resolver.
+    ///
+    /// A target that is not valid UTF-8 is [`FsErrorCode::Einval`] and an empty
+    /// one [`FsErrorCode::Enoent`] — gate 2's own boundary, unchanged, and the
+    /// outward half of the refuse-never-substitute rule: no `from_utf8_lossy`
+    /// is reachable from here.
+    ///
+    /// # Errors
+    ///
+    /// [`FsError::NotPermitted`] without `read` or without the `symlinks`
+    /// feature; [`FsErrorCode::Einval`] for the export root or a target that is
+    /// not UTF-8; [`FsErrorCode::Enoent`] for an empty target; or any
+    /// confinement refusal.
+    pub fn read_link(&self, path: &VirtualPath) -> Result<String, FsError> {
+        self.authorize(Primitive::Readlink)?;
+        let name = path
+            .file_name()
+            .ok_or(FsError::refused(FsErrorCode::Einval))?;
+        let parent = self.resolve_parent(path)?;
+        let target = rustix::fs::readlinkat(parent.as_fd(), name, Vec::new()).map_err(host_error)?;
+        let bytes = target.to_bytes();
+        if bytes.is_empty() {
+            return Err(FsError::refused(FsErrorCode::Enoent));
+        }
+        core::str::from_utf8(bytes)
+            .map(str::to_owned)
+            .map_err(|_| FsError::refused(FsErrorCode::Einval))
+    }
+
     /// Open a directory for enumeration and take its host directory stream.
     ///
     /// The descriptor is resolved by [`ExportRoot::open_directory`], so the

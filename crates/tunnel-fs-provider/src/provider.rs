@@ -6,12 +6,16 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use tunnel_fs_core::{
-    CapabilitySet, FeatureSet, FsError, FsErrorCode, Limits, Primitive, SessionErrorCode,
+    CapabilitySet, FeatureSet, FsError, FsErrorCode, Limits, Outcome, Primitive, SessionErrorCode,
 };
-use tunnel_fs_host::{DirReader, ExportRoot, FileKind, Handle, HostEntry, Metadata};
+use tunnel_fs_host::{DirReader, ExportRoot, FileKind, Handle, HostEntry, Intent, Metadata};
 use tunnel_fs_ninep::{
     Accepted, Attributes, COUNTED_REPLY_OVERHEAD, DirEntry, ENTRY_OVERHEAD, Frame, GETATTR_ALL,
     GETATTR_BASIC, Message, Primitives, Qid, QidKind, RequestPaths, Session, SessionError,
+    flags::{
+        AT_REMOVEDIR, O_ACCMODE, O_APPEND, O_RDONLY, O_RDWR, O_TRUNC, SETATTR_ATIME,
+        SETATTR_ATIME_SET, SETATTR_MODE, SETATTR_MTIME, SETATTR_MTIME_SET, SETATTR_SIZE,
+    },
     open_primitives, pack_entries,
 };
 
@@ -109,8 +113,48 @@ pub struct ProviderStats {
     /// This one *is* the gate-3 obligation's own measure: an open the flag-level
     /// decision would have admitted and the resolver's kind refuses.
     pub reclassification_refusals: u64,
-    /// Mutating requests refused because writes are gate 5's.
+    /// Mutating requests refused before the host was touched.
+    ///
+    /// Every one of these is [`Outcome::NotStarted`], which is the claim gate 4
+    /// could make about *every* refusal it produced and gate 5 can no longer.
     pub mutations_refused: u64,
+    /// Mutating requests this dispatcher handed to the host.
+    ///
+    /// The denominator of the outcome ledger below: a request counted here had
+    /// its effecting syscall made, so it is one whose outcome is a fact about
+    /// the host rather than about this dispatcher.
+    pub mutations_dispatched: u64,
+    /// Dispatched mutations the host reported it applied, whole or in part.
+    pub mutations_applied: u64,
+    /// Applied mutations whose reply this dispatcher produced.
+    ///
+    /// `mutations_applied - mutations_acknowledged` is the number whose effect
+    /// happened and whose reply the consumer has not been given, which is
+    /// exactly [`Outcome::Unknown`].
+    pub mutations_acknowledged: u64,
+    /// Dispatched mutations the host reported changed nothing.
+    ///
+    /// [`Outcome::Failed`], and **not** `not_started`: the request reached the
+    /// host, which is a different fact from a refusal taken before it.
+    pub mutation_failed: u64,
+    /// Mutations that applied part of what they were asked for.
+    ///
+    /// A short `Twrite`, and a multi-field `Tsetattr` whose later field failed
+    /// after an earlier one had already been applied. [`Outcome::Partial`].
+    pub mutation_partial: u64,
+    /// Applied mutations whose reply never reached the consumer.
+    ///
+    /// [`Outcome::Unknown`]. Counted when the connector reports a send it could
+    /// not complete, and at [`Provider::close`] for an effect still
+    /// outstanding. A session that ends mid-mutation is the case the contract
+    /// names: "Session loss during a potentially dispatched mutation carries
+    /// `outcome: unknown`."
+    pub mutation_unknown: u64,
+    /// Bytes the host acknowledged writing.
+    ///
+    /// The contract's `bytesAcknowledged` on this side of the wire: a lower
+    /// bound confirmed by replies, never a claim about durable content.
+    pub bytes_written: u64,
     /// Bytes answered to `Tread`.
     pub bytes_read: u64,
     /// `Rreaddir` blocks packed.
@@ -185,6 +229,21 @@ pub struct Provider<A: Authority> {
     open: BTreeMap<u32, OpenFid>,
     /// Requests admitted and not yet performed.
     queue: VecDeque<Queued>,
+    /// An effect that happened on the host and whose reply the connector has
+    /// not confirmed sending.
+    ///
+    /// **This is the whole of the `unknown` outcome on this side.** A
+    /// dispatcher cannot observe delivery — the socket is the connector's — so
+    /// the honest model is a one-entry ledger the connector settles: it calls
+    /// [`Provider::confirm_effect_delivered`] once the record is on the
+    /// carrier, and anything still outstanding when the session ends is
+    /// reported `unknown` rather than guessed either way. It is one entry and
+    /// not a set because [`Provider::step`] performs one request and the
+    /// connector writes its reply before the next `step`, so two effects can
+    /// never be outstanding at once; a dispatcher that performed requests
+    /// concurrently would need a map here, and that is recorded rather than
+    /// pre-built.
+    undelivered_effect: bool,
     stats: ProviderStats,
 }
 
@@ -207,6 +266,7 @@ impl<A: Authority> Provider<A> {
             authority,
             open: BTreeMap::new(),
             queue: VecDeque::new(),
+            undelivered_effect: false,
             stats: ProviderStats::default(),
         })
     }
@@ -229,8 +289,48 @@ impl<A: Authority> Provider<A> {
         !self.queue.is_empty()
     }
 
+    /// Whether the reply this dispatcher just produced reports an effect that
+    /// has already happened on the host.
+    ///
+    /// The connector reads this to decide whether a failed send is an
+    /// `unknown` outcome or merely a lost read.
+    #[must_use]
+    pub const fn reply_carries_effect(&self) -> bool {
+        self.undelivered_effect
+    }
+
+    /// Record that the reply carrying the outstanding effect reached the
+    /// carrier.
+    ///
+    /// Delivery to the *carrier*, which is all a device can ever confirm: the
+    /// contract is explicit that a transport acknowledgement proves neither a
+    /// filesystem side effect nor its arrival, and this settles the ledger
+    /// rather than claiming either.
+    pub fn confirm_effect_delivered(&mut self) {
+        self.undelivered_effect = false;
+    }
+
+    /// Record that the reply carrying the outstanding effect could not be sent.
+    ///
+    /// The effect happened and the consumer will never be told what it was, so
+    /// the operation's outcome is [`Outcome::Unknown`] and is counted as such.
+    /// It is never downgraded afterwards, which is gate 1's monotonic
+    /// [`Outcome::merge`] applied to a counter.
+    pub fn note_effect_undelivered(&mut self) {
+        if self.undelivered_effect {
+            self.undelivered_effect = false;
+            self.stats.mutation_unknown += 1;
+        }
+    }
+
     /// End the session, releasing every descriptor it holds.
     pub fn close(&mut self) {
+        // An effect that happened and whose reply never went out is `unknown`,
+        // and the session ending is the last moment it can be recorded. A
+        // queued request that was never performed is **not** counted here: it
+        // was never dispatched, so it is `not_started` and there is nothing
+        // ambiguous about it.
+        self.note_effect_undelivered();
         self.session.close();
         self.queue.clear();
         // Dropping the map is what closes the descriptors.  Gate 3's `Session`
@@ -326,6 +426,21 @@ impl<A: Authority> Provider<A> {
         }
     }
 
+    /// Whether a request's admitted primitives include one that can change the
+    /// host.
+    ///
+    /// Taken from the primitives gate 3 decoded, not from the opcode: a
+    /// `Tlopen` is a mutation when its flags decoded to `OpenTruncate` and is
+    /// not when they decoded to `OpenWrite`, and only the flag word can tell
+    /// those apart.
+    fn is_mutation(queued: &Queued) -> bool {
+        queued
+            .accepted
+            .primitives
+            .iter()
+            .any(Primitive::is_mutating)
+    }
+
     // ------------------------------------------------------------- answering
 
     /// Answer a refusal the session took before anything was performed.
@@ -371,6 +486,31 @@ impl<A: Authority> Provider<A> {
     /// refused `Tremove` on an open fid would leak one for the life of the
     /// session.
     fn fail_queued(&mut self, queued: &Queued, error: FsError) -> Vec<Outbound> {
+        if Self::is_mutation(queued) {
+            // The outcome the host reported, recorded as the host reported it.
+            // `Outcome::Failed` means the effecting syscall was made and
+            // changed nothing; `Outcome::NotStarted` means the refusal came
+            // before it — from the grant, from the flags, from the namespace or
+            // from resolving the parent. Gate 4 could only ever produce the
+            // second, and conflating them here would give that claim back.
+            match error.outcome() {
+                Outcome::NotStarted => self.stats.mutations_refused += 1,
+                Outcome::Failed => {
+                    self.stats.mutations_dispatched += 1;
+                    self.stats.mutation_failed += 1;
+                }
+                // A partial or unknown effect is never reported by an
+                // `Rlerror`: it has a reply carrying what was applied, and it
+                // is settled rather than failed. Counting it here would report
+                // an effect twice.
+                Outcome::Partial | Outcome::Unknown => {
+                    self.stats.mutations_dispatched += 1;
+                    self.stats.mutations_applied += 1;
+                    self.undelivered_effect = true;
+                    self.note_effect_undelivered();
+                }
+            }
+        }
         let answer = self.fail(queued.tag, error);
         if let Some(fid) = self.primary_fid(&queued.frame.message) {
             self.prune(fid);
@@ -380,13 +520,40 @@ impl<A: Authority> Provider<A> {
 
     /// Apply a successful reply to the session and emit it.
     fn settle(&mut self, queued: Queued, reply: Reply) -> Vec<Outbound> {
+        if let Some(effect) = reply.effect {
+            self.stats.mutations_dispatched += 1;
+            self.stats.mutations_applied += 1;
+            if effect == Applied::Partial {
+                self.stats.mutation_partial += 1;
+            }
+            // The ledger opens here and is settled by the connector. Between
+            // these two points the effect has happened and the consumer has not
+            // been told, which is the only window in which `unknown` is the
+            // truthful answer.
+            self.undelivered_effect = true;
+        }
         let frame = Frame::new(queued.tag, reply.message);
         if let Err(error) = self.session.complete(&frame) {
             return self.refuse(queued.tag, error);
         }
+        if reply.effect.is_some() {
+            self.stats.mutations_acknowledged += 1;
+        }
         if let Some(fid) = self.primary_fid(&queued.frame.message) {
             match reply.cache {
                 CacheEffect::Insert(entry) => self.insert(fid, queued.generation, entry),
+                // A create rebinds its fid to the file it made, so the session
+                // stamped a *fresh* generation when the reply above was
+                // applied. Keying the descriptor on the generation the request
+                // was admitted against would leave the created file's
+                // descriptor immediately unusable.
+                CacheEffect::InsertCreated(entry) => {
+                    let generation = self
+                        .session
+                        .fid(fid)
+                        .map_or(queued.generation, tunnel_fs_ninep::FidState::generation);
+                    self.insert(fid, generation, entry);
+                }
                 CacheEffect::Release => self.release(fid, queued.generation),
                 CacheEffect::None => {}
             }
@@ -547,8 +714,17 @@ impl<A: Authority> Provider<A> {
             | Message::Tgetattr { fid, .. }
             | Message::Tclunk { fid }
             | Message::Tremove { fid }
-            | Message::Treadlink { fid } => Some(*fid),
+            | Message::Treadlink { fid }
+            // `Tlcreate` rebinds its parent fid to the file it made, so the
+            // cache effect belongs to that same number.
+            | Message::Tlcreate { fid, .. }
+            | Message::Twrite { fid, .. }
+            | Message::Tsetattr { fid, .. } => Some(*fid),
             Message::Twalk { newfid, .. } => Some(*newfid),
+            // `Tmkdir`, `Tsymlink`, `Tunlinkat`, `Tlink` and both renames name
+            // a *directory* fid whose own binding they do not change, so none
+            // of them has a cache effect and pruning on one would drop a
+            // descriptor the client still holds.
             _ => None,
         }
     }
@@ -564,14 +740,46 @@ impl<A: Authority> Provider<A> {
             Message::Treaddir { fid, offset, count } => self.perform_readdir(*fid, *offset, *count),
             Message::Tgetattr { fid, request_mask } => self.perform_getattr(*fid, *request_mask),
             Message::Tclunk { .. } => Ok(Reply::releasing(Message::Rclunk)),
-            // Every mutation, and `Treadlink`, which needs a feature this
-            // profile does not advertise and an implementation gate 4 does not
-            // have.  `Tremove` releases its fid on either answer, which is 9P's
-            // own rule and gate 3's session applies it to an `Rlerror` too.
-            _ => {
-                self.stats.mutations_refused += 1;
-                Err(FsError::refused(FsErrorCode::Enotsup))
+            Message::Treadlink { fid } => self.perform_readlink(*fid),
+            Message::Tlcreate {
+                name: _,
+                flags,
+                mode,
+                ..
+            } => self.perform_create(&queued.accepted, *flags, *mode),
+            Message::Twrite { fid, offset, data } => self.perform_write(*fid, *offset, data),
+            Message::Tmkdir { mode, .. } => self.perform_mkdir(&queued.accepted, *mode),
+            Message::Tsymlink { target, .. } => self.perform_symlink(&queued.accepted, target),
+            Message::Tunlinkat { flags, .. } => {
+                self.perform_unlink(&queued.accepted, *flags & AT_REMOVEDIR != 0)
             }
+            Message::Tremove { fid } => self.perform_remove(*fid, grant),
+            Message::Trename { .. } => self.perform_rename(&queued.accepted, Message::Rrename),
+            Message::Trenameat { .. } => self.perform_rename(&queued.accepted, Message::Rrenameat),
+            Message::Tlink { .. } => self.perform_link(&queued.accepted),
+            Message::Tsetattr {
+                fid,
+                valid,
+                mode,
+                size,
+                atime_sec,
+                atime_nsec,
+                mtime_sec,
+                mtime_nsec,
+                ..
+            } => self.perform_setattr(
+                *fid,
+                SetattrRequest {
+                    valid: *valid,
+                    mode: *mode,
+                    size: *size,
+                    atime: (*atime_sec, *atime_nsec),
+                    mtime: (*mtime_sec, *mtime_nsec),
+                },
+            ),
+            // `Tversion`, `Tattach` and `Tflush` never reach the queue, and a
+            // reply was refused before classification began.
+            _ => Err(FsError::refused(FsErrorCode::Einval)),
         }
     }
 
@@ -679,16 +887,11 @@ impl<A: Authority> Provider<A> {
             open_primitives(flags, false).map_err(|_| FsError::refused(FsErrorCode::Enotsup))?;
         let required = self.open_primitives_now(flags, metadata.kind(), admitted, grant)?;
 
-        // Writes are gate 5's, whatever the grant says.
-        if required.iter().any(|primitive| {
-            matches!(
-                primitive,
-                Primitive::OpenWrite | Primitive::OpenTruncate | Primitive::Create
-            )
-        }) {
-            self.stats.mutations_refused += 1;
-            return Err(FsError::refused(FsErrorCode::Enotsup));
-        }
+        check_append_unsupported(flags)?;
+        let writable = required
+            .iter()
+            .any(|primitive| matches!(primitive, Primitive::OpenWrite | Primitive::OpenTruncate));
+        let truncating = flags & O_TRUNC != 0;
 
         let (handle, reader, mode) = if metadata.kind() == FileKind::Directory {
             let handle = self.root.open_directory(&path)?;
@@ -696,6 +899,16 @@ impl<A: Authority> Provider<A> {
                 .root
                 .reader_for(&handle, self.limits.max_traversal_entries())?;
             (handle, Some(reader), OpenKind::Directory)
+        } else if writable {
+            // The truncation happens **through the descriptor**, inside
+            // `open_writable`, after the hard-link rule has permitted it. The
+            // resolving open never carries `O_TRUNC`, which is gate 2's pinned
+            // choice and is what keeps a refused write from following a
+            // truncation that already destroyed the file.
+            let handle =
+                self.root
+                    .open_writable(&path, truncating, flags & O_ACCMODE == O_RDWR)?;
+            (handle, None, OpenKind::File)
         } else {
             let handle = self.root.open_read(&path)?;
             (handle, None, OpenKind::File)
@@ -708,13 +921,22 @@ impl<A: Authority> Provider<A> {
             return Err(FsError::refused(FsErrorCode::Einval));
         }
         let iounit = self.session.msize().saturating_sub(COUNTED_REPLY_OVERHEAD);
-        Ok(Reply::opening(
+        let reply = Reply::opening(
             Message::Rlopen {
                 qid: qid_of(opened),
                 iounit,
             },
             OpenState { handle, reader },
-        ))
+        );
+        // A truncating open **changed the file**, so its reply carries an
+        // effect and its loss is `unknown`. A plain writable open changed
+        // nothing and does not: the distinction is exactly why `OpenWrite` and
+        // `OpenTruncate` are two primitives.
+        Ok(if truncating {
+            reply.with_effect(Applied::Whole)
+        } else {
+            reply
+        })
     }
 
     fn perform_read(&mut self, fid: u32, offset: u64, count: u32) -> Result<Reply, FsError> {
@@ -831,6 +1053,326 @@ impl<A: Authority> Provider<A> {
             request_mask,
         ))))
     }
+
+    // ------------------------------------------------------------ mutations
+    //
+    // Everything below this line is implementation gate 5. Each one takes the
+    // same shape and the shape is the point: the primitive was authorized
+    // against the **live** grant in `step` before any of this ran, the paths
+    // were validated by gate 1 and handed over by gate 3, the resolver anchors
+    // the parent, and exactly one host syscall can change anything. A failure
+    // before that syscall is `not_started` and a failure of it is `failed`; a
+    // reply that reports an effect opens the ledger `settle` hands to the
+    // connector, and that ledger is the whole of `unknown`.
+
+    /// The virtual path a fid currently names.
+    fn path_of(&self, fid: u32) -> Result<tunnel_fs_core::VirtualPath, FsError> {
+        Ok(self
+            .session
+            .fid(fid)
+            .ok_or_else(|| FsError::refused(FsErrorCode::Einval))?
+            .path()
+            .clone())
+    }
+
+    /// The `child` half of a create-or-remove request's paths.
+    fn child_path(accepted: &Accepted) -> Result<&tunnel_fs_core::VirtualPath, FsError> {
+        match &accepted.paths {
+            RequestPaths::Child { child, .. } => Ok(child),
+            _ => Err(FsError::refused(FsErrorCode::Einval)),
+        }
+    }
+
+    /// The independently confined endpoints of a rename or a link.
+    fn pair_paths(
+        accepted: &Accepted,
+    ) -> Result<(&tunnel_fs_core::VirtualPath, &tunnel_fs_core::VirtualPath), FsError> {
+        match &accepted.paths {
+            RequestPaths::Pair {
+                source,
+                destination,
+            } => Ok((source, destination)),
+            _ => Err(FsError::refused(FsErrorCode::Einval)),
+        }
+    }
+
+    fn perform_readlink(&mut self, fid: u32) -> Result<Reply, FsError> {
+        let path = self.path_of(fid)?;
+        let target = self.root.read_link(&path)?;
+        Ok(Reply::plain(Message::Rreadlink { target }))
+    }
+
+    /// `Tlcreate`: make a new regular file and rebind the parent fid to it.
+    fn perform_create(
+        &mut self,
+        accepted: &Accepted,
+        flags: u32,
+        mode: u32,
+    ) -> Result<Reply, FsError> {
+        check_append_unsupported(flags)?;
+        let access = flags & O_ACCMODE;
+        if access == O_RDONLY {
+            // A create whose fid is not writable is refused rather than
+            // served, because gate 3's session would record the fid read-only
+            // while the host descriptor this call makes is not, and a fid whose
+            // two descriptions disagree is the defect the generation stamp
+            // exists to prevent in the other direction. Creating a file one
+            // cannot then write also has no use the profile names.
+            return Err(FsError::refused(FsErrorCode::Einval));
+        }
+        let path = Self::child_path(accepted)?.clone();
+        let handle = self
+            .root
+            .create(&path, mode, flags & O_TRUNC != 0, access == O_RDWR)?;
+        let created = handle.metadata()?;
+        let iounit = self.session.msize().saturating_sub(COUNTED_REPLY_OVERHEAD);
+        Ok(Reply::creating(
+            Message::Rlcreate {
+                qid: qid_of(created),
+                iounit,
+            },
+            OpenState {
+                handle,
+                reader: None,
+            },
+        )
+        .with_effect(Applied::Whole))
+    }
+
+    /// `Twrite`: a positioned write through the fid's own descriptor.
+    ///
+    /// **A short write is an ordinary 9P answer and is the only partial outcome
+    /// this profile can express on the wire.** The `Rwrite` carries what the
+    /// host acknowledged, the contract's `bytesAcknowledged` is built from
+    /// exactly that, and nothing here retries the remainder: a retry is a
+    /// second dispatch, and this profile never replays a mutation on a caller's
+    /// behalf.
+    fn perform_write(&mut self, fid: u32, offset: u64, data: &[u8]) -> Result<Reply, FsError> {
+        let entry = self
+            .cached(fid)
+            .ok_or_else(|| FsError::refused(FsErrorCode::Einval))?;
+        if entry.reader.is_some() {
+            // A directory is enumerated, never written.
+            return Err(FsError::refused(FsErrorCode::Eisdir));
+        }
+        let written = entry.handle.write_at(offset, data)?;
+        self.stats.bytes_written += written as u64;
+        let count = u32::try_from(written).unwrap_or(u32::MAX);
+        // Gate 3's session refuses an `Rwrite` acknowledging more than its
+        // `Twrite` carried, so this cannot over-report even if the host did.
+        Ok(
+            Reply::plain(Message::Rwrite { count }).with_effect(if written == data.len() {
+                Applied::Whole
+            } else {
+                Applied::Partial
+            }),
+        )
+    }
+
+    fn perform_mkdir(&mut self, accepted: &Accepted, mode: u32) -> Result<Reply, FsError> {
+        let path = Self::child_path(accepted)?.clone();
+        let identity = self.root.make_directory(&path, mode)?;
+        Ok(
+            Reply::plain(Message::Rmkdir {
+                qid: Qid::new(QidKind::Directory, identity.qid_path()),
+            })
+            .with_effect(Applied::Whole),
+        )
+    }
+
+    fn perform_symlink(&mut self, accepted: &Accepted, target: &str) -> Result<Reply, FsError> {
+        let path = Self::child_path(accepted)?.clone();
+        let identity = self.root.symlink(&path, target)?;
+        Ok(
+            Reply::plain(Message::Rsymlink {
+                qid: Qid::new(QidKind::Symlink, identity.qid_path()),
+            })
+            .with_effect(Applied::Whole),
+        )
+    }
+
+    fn perform_unlink(&mut self, accepted: &Accepted, directory: bool) -> Result<Reply, FsError> {
+        let path = Self::child_path(accepted)?.clone();
+        self.root.remove(&path, directory)?;
+        Ok(Reply::plain(Message::Runlinkat).with_effect(Applied::Whole))
+    }
+
+    /// `Tremove`: unlink the name a fid names, and release the fid either way.
+    ///
+    /// The kind is re-decided with the **resolver's** answer rather than with
+    /// the qid gate 3's session recorded at walk time, for the same reason
+    /// `Tlopen` is: the node can have changed kind since the walk, and removing
+    /// a directory is a different authority from removing a file. The
+    /// re-decided primitive is re-checked against the live grant.
+    ///
+    /// **That re-check is belt and braces and is recorded as such rather than
+    /// counted**, because `Unlink` and `RemoveDir` require the same capability
+    /// — `delete` — so no grant can permit one and refuse the other. What the
+    /// re-decision *is* load-bearing for is the syscall: `unlinkat` without
+    /// `AT_REMOVEDIR` refuses a directory and with it refuses a file, so a kind
+    /// taken from the walk rather than from now would answer `EISDIR` or
+    /// `ENOTDIR` for a node that had changed kind, where the profile should
+    /// simply remove it.
+    fn perform_remove(&mut self, fid: u32, grant: CapabilitySet) -> Result<Reply, FsError> {
+        let path = self.path_of(fid)?;
+        let metadata = self.root.metadata_unchecked(&path)?;
+        let directory = metadata.kind() == FileKind::Directory;
+        let primitive = if directory {
+            Primitive::RemoveDir
+        } else {
+            Primitive::Unlink
+        };
+        if !primitive.is_permitted(grant, self.features) {
+            return Err(FsError::NotPermitted);
+        }
+        self.root.remove(&path, directory)?;
+        Ok(Reply::releasing(Message::Rremove).with_effect(Applied::Whole))
+    }
+
+    fn perform_rename(&mut self, accepted: &Accepted, reply: Message) -> Result<Reply, FsError> {
+        let (source, destination) = Self::pair_paths(accepted)?;
+        let (source, destination) = (source.clone(), destination.clone());
+        self.root.rename_checked(&source, &destination)?;
+        Ok(Reply::plain(reply).with_effect(Applied::Whole))
+    }
+
+    fn perform_link(&mut self, accepted: &Accepted) -> Result<Reply, FsError> {
+        let (source, destination) = Self::pair_paths(accepted)?;
+        let (source, destination) = (source.clone(), destination.clone());
+        // The source is resolved to a descriptor rather than named again at the
+        // link syscall: the inode the new name refers to has to be the one the
+        // anchored walk verified is inside the export.
+        let handle = self.root.resolve(&source, Intent::Inspect)?;
+        self.root.link(&handle, &destination)?;
+        Ok(Reply::plain(Message::Rlink).with_effect(Applied::Whole))
+    }
+
+    /// `Tsetattr`: apply each named field, in a fixed order, and report how far
+    /// it got.
+    ///
+    /// **This is the one composite mutation in the profile**, and it is where a
+    /// genuine partial outcome arises without the wire's help: the mask can
+    /// name a size, a mode and two timestamps, and the second of them can fail
+    /// after the first has been applied. The order is fixed — size, then mode,
+    /// then times — so one request has one answer, and a failure after any
+    /// earlier field succeeded is reported [`Outcome::Partial`], never
+    /// `not_started` and never `failed`. Gate 1's monotonic merge is what makes
+    /// that expressible: once an effect is observed the outcome can only
+    /// strengthen.
+    fn perform_setattr(&mut self, fid: u32, request: SetattrRequest) -> Result<Reply, FsError> {
+        let path = self.path_of(fid)?;
+        let mut applied = false;
+        // The hard-link rule and the size change both want the fid's own
+        // descriptor when it has one, because that descriptor is the file the
+        // session opened rather than whatever the name reaches now.
+        if request.valid & SETATTR_SIZE != 0 {
+            let result = match self.cached(fid) {
+                Some(entry) => {
+                    // Borrowed and finished with before `self.root` is touched
+                    // again; the handle is cloned by reference, not by value.
+                    let handle = &entry.handle;
+                    self.root.set_size_through(handle, request.size)
+                }
+                None => self.root.set_size(&path, request.size),
+            };
+            result.map_err(|error| Self::escalate(error, applied))?;
+            applied = true;
+        }
+        if request.valid & SETATTR_MODE != 0 {
+            let result = match self.cached(fid) {
+                Some(entry) => entry.handle.set_mode(request.mode),
+                None => self
+                    .root
+                    .resolve(&path, Intent::Inspect)
+                    .and_then(|handle| handle.set_mode(request.mode)),
+            };
+            result.map_err(|error| Self::escalate(error, applied))?;
+            applied = true;
+        }
+        let atime = times_of(request.valid, SETATTR_ATIME, SETATTR_ATIME_SET, request.atime);
+        let mtime = times_of(request.valid, SETATTR_MTIME, SETATTR_MTIME_SET, request.mtime);
+        if atime.is_some() || mtime.is_some() {
+            let result = match self.cached(fid) {
+                Some(entry) => entry.handle.set_times(atime, mtime),
+                None => self
+                    .root
+                    .resolve(&path, Intent::Inspect)
+                    .and_then(|handle| handle.set_times(atime, mtime)),
+            };
+            result.map_err(|error| Self::escalate(error, applied))?;
+            applied = true;
+        }
+        if !applied {
+            // Gate 3 refuses an empty mask, and gate 1's mask excludes uid, gid
+            // and ctime, so a `Tsetattr` that reached here naming nothing this
+            // provider applies would answer `Rsetattr` for a mutation that did
+            // not happen.
+            return Err(FsError::refused(FsErrorCode::Enotsup));
+        }
+        Ok(Reply::plain(Message::Rsetattr).with_effect(Applied::Whole))
+    }
+
+    /// Strengthen a failure that arrived after something was already applied.
+    ///
+    /// The contract: "a rejection after a previously confirmed partial chunk
+    /// cannot become `not_started`". This is that rule at the one place a
+    /// composite mutation can violate it.
+    fn escalate(error: FsError, applied: bool) -> FsError {
+        if !applied {
+            return error;
+        }
+        FsError::Filesystem {
+            code: error.code(),
+            outcome: error.outcome().merge(Outcome::Partial),
+        }
+    }
+}
+
+/// `Tsetattr`'s fields, gathered so the dispatch arm is not nine arguments.
+#[derive(Clone, Copy, Debug)]
+struct SetattrRequest {
+    valid: u32,
+    mode: u32,
+    size: u64,
+    atime: (u64, u64),
+    mtime: (u64, u64),
+}
+
+/// Whether one `Tsetattr` timestamp is to be set, and to what.
+///
+/// `.L` gives each timestamp two bits: one saying "change this field" and one
+/// saying "use the value I supplied rather than the current time". This profile
+/// has **no clock**, so the "current time" spelling — the field bit without its
+/// `_SET` companion — is answered by the host's own `UTIME_NOW`… which this
+/// implementation does not use either. It returns `None` for that combination,
+/// so such a request changes nothing and is refused as an empty effect rather
+/// than silently applying a time this provider made up.
+const fn times_of(valid: u32, field: u32, explicit: u32, value: (u64, u64)) -> Option<(u64, u64)> {
+    if valid & field != 0 && valid & explicit != 0 {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+/// Refuse `O_APPEND`, which this profile does not implement.
+///
+/// **A decision with a named reason, not an omission.** The contract's
+/// `appendFile` requires atomic append positioning per write, and the two hosts
+/// this profile serves disagree about whether `pwrite` honours its offset on a
+/// descriptor opened `O_APPEND`: POSIX says the offset wins, Linux says the
+/// append does. A provider that accepted the flag would be writing to one of
+/// two different places depending on the serving operating system, which is the
+/// class of host-dependent behaviour the namespace rules exist to prevent. So
+/// the flag is `ENOTSUP` and the `nativeAppend` feature is not advertised,
+/// which is the contract's own instruction: "If a platform cannot provide
+/// required flags/semantics, advertise them unsupported."
+fn check_append_unsupported(flags: u32) -> Result<(), FsError> {
+    if flags & O_APPEND == 0 {
+        Ok(())
+    } else {
+        Err(FsError::refused(FsErrorCode::Enotsup))
+    }
 }
 
 /// Which of the two shapes an open produced.
@@ -849,12 +1391,45 @@ struct OpenState {
 enum CacheEffect {
     None,
     Insert(OpenState),
+    /// As [`CacheEffect::Insert`], but for a reply that **rebound** its fid.
+    ///
+    /// Only `Rlcreate` does: the fid named the parent directory on the way in
+    /// and names the created file on the way out, so gate 3's session stamped a
+    /// fresh generation when it applied the reply. Keying the descriptor on the
+    /// generation the request was admitted against would file it under a
+    /// binding that no longer exists, and the created file would be unwritable
+    /// through the very fid that made it.
+    InsertCreated(OpenState),
     Release,
+}
+
+/// How much of a mutation the host applied before its reply was built.
+///
+/// Deliberately **not** [`Outcome`]. An outcome describes a *failure*'s extent
+/// and gate 1's vocabulary has no spelling for "it all worked", so reusing it
+/// here would need a fifth variant whose only purpose is to be filtered out
+/// again. This says what happened; [`Provider::settle`] and
+/// [`Provider::note_effect_undelivered`] are what turn it into the outcome a
+/// consumer is told.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Applied {
+    /// Everything the request asked for.
+    Whole,
+    /// Some of it. A short `Twrite` is the only shape the wire can carry.
+    Partial,
 }
 
 struct Reply {
     message: Message,
     cache: CacheEffect,
+    /// Present when this reply reports something that has already happened on
+    /// the host, and absent for every observation.
+    ///
+    /// This is what decides whether losing the reply is `unknown` or merely a
+    /// lost read, and it is attached per reply rather than derived from the
+    /// opcode because a `Tlopen` is both: truncating it changed the file and
+    /// opening it for writing did not.
+    effect: Option<Applied>,
 }
 
 impl Reply {
@@ -862,6 +1437,7 @@ impl Reply {
         Self {
             message,
             cache: CacheEffect::None,
+            effect: None,
         }
     }
 
@@ -869,6 +1445,7 @@ impl Reply {
         Self {
             message,
             cache: CacheEffect::Release,
+            effect: None,
         }
     }
 
@@ -876,7 +1453,21 @@ impl Reply {
         Self {
             message,
             cache: CacheEffect::Insert(state),
+            effect: None,
         }
+    }
+
+    const fn creating(message: Message, state: OpenState) -> Self {
+        Self {
+            message,
+            cache: CacheEffect::InsertCreated(state),
+            effect: None,
+        }
+    }
+
+    const fn with_effect(mut self, applied: Applied) -> Self {
+        self.effect = Some(applied);
+        self
     }
 }
 

@@ -68,6 +68,33 @@ pub fn host_error(errno: Errno) -> FsError {
     FsError::refused(code_from_errno(errno))
 }
 
+/// A host failure from the one syscall that could have changed the host.
+///
+/// The difference from [`host_error`] is the **outcome**, and it is the whole
+/// of what implementation gate 5 adds to this vocabulary. Gate 4 could only
+/// ever produce [`Outcome::NotStarted`], because nothing it dispatched could
+/// change anything; a mutation is dispatched, so its failure is a report from
+/// the host that it applied nothing — [`Outcome::Failed`] — rather than a
+/// refusal taken before the host was asked.
+///
+/// Everything a mutation does *before* that syscall — authorizing the
+/// primitive, resolving the parent, inspecting the final component — keeps
+/// [`host_error`] and stays `NotStarted`. That split is what makes the outcome
+/// a fact about the host rather than a label attached to a whole operation.
+///
+/// **This is never used for a partial effect.** A `pwrite` that transferred
+/// some bytes returns the count rather than an error, so the partial case
+/// reaches the wire as a short `Rwrite` and never through here. A syscall that
+/// failed and a syscall that half-succeeded are different observations and this
+/// function only ever describes the first.
+#[must_use]
+pub fn mutation_error(errno: Errno) -> FsError {
+    FsError::Filesystem {
+        code: code_from_errno(errno),
+        outcome: Outcome::Failed,
+    }
+}
+
 /// A resolution that observed the filesystem change underneath it.
 ///
 /// Reported as `ENOENT`: the entry this resolution had identified is not there
