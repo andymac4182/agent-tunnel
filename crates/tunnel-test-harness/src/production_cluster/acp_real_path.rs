@@ -1870,6 +1870,43 @@ async fn run(
 ///
 /// # Errors
 /// The first rule that did not hold.
+/// Name M8-C14 on a failure, and **only** when this run carries its signature.
+///
+/// M8-C14 is the open defect that makes this gate fail about one run in ten:
+/// the consumer learns of a crashed turn either in ~50 ms or in ~58.7 s, and
+/// the slow mode trips the accommodation's own lifetime invariant.  The
+/// invariant is deliberately not relaxed — it is what found the defect.
+///
+/// The point of checking a signature rather than printing the row on every red
+/// run is that a *different* failure must not be able to borrow M8-C14's
+/// explanation.  A known flake that absorbs unrelated failures stops being a
+/// filed defect and becomes a blanket excuse, which is how a gate quietly
+/// stops meaning anything.  So: slow-mode latency, the export side sound, and
+/// the connection actually gone.  Anything else is a new finding and says so.
+fn m8c14_attribution(evidence: &AcpRealPathEvidence) -> String {
+    let slow = evidence.unknown_error_latency_ms > 55_000;
+    let export_side_sound =
+        evidence.unknown_export_ended_connection && evidence.unknown_export_live_connections == 0;
+    if slow && export_side_sound {
+        format!(
+            " -- signature matches the open defect M8-C14 \
+             (unknown_error_latency_ms={}, export_ended_connection=true, live_connections=0): \
+             the export side is sound and the lost RESET is in the shared forwarding teardown \
+             path, not in ACP.  This does not make the run a pass.",
+            evidence.unknown_error_latency_ms
+        )
+    } else {
+        format!(
+            " -- this is NOT M8-C14's signature \
+             (unknown_error_latency_ms={}, export_ended_connection={}, live_connections={}), \
+             so it is a new finding and must be investigated rather than attributed to it.",
+            evidence.unknown_error_latency_ms,
+            evidence.unknown_export_ended_connection,
+            evidence.unknown_export_live_connections
+        )
+    }
+}
+
 pub fn validate_acp_real_path_evidence(evidence: &AcpRealPathEvidence) -> Result<()> {
     let executed: Vec<&str> = evidence.cases_executed.iter().map(String::as_str).collect();
     let checks: [(&str, bool); 32] = [
@@ -2036,7 +2073,8 @@ pub fn validate_acp_real_path_evidence(evidence: &AcpRealPathEvidence) -> Result
     for (rule, passed) in checks {
         if !passed {
             return Err(HarnessError::Process(format!(
-                "ACP real-path gate failed: {rule}"
+                "ACP real-path gate failed: {rule}{}",
+                m8c14_attribution(evidence)
             )));
         }
     }

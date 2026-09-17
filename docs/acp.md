@@ -555,7 +555,7 @@ failures. In the recorded runs there were **no refusals at all**.
 
 ### Evidence
 
-`python3 scripts/acp-guard-deletion.py --suite m8c4`: **12 of 12** defeated
+`python3 scripts/acp-guard-deletion.py --suite m8c4`: **14 of 14** defeated
 guards turned a test red, plus **one documented green** reported separately. The
 documented green is the `StopReason` wildcard: no test can construct the future
 variant it protects against, because every variant the pinned schema defines is
@@ -582,9 +582,13 @@ was still too tight under a full five-suite guard run.
 
 Two users, cross-tenant isolation, grant revocation, owner loss and peer-key
 rotation (chunk 5). **An ACP connection carried across a completed scheduled
-rotation**: the recorded runs observed `rotations_completed = 0`, because every
-case finishes well inside the rotation interval, so nothing here says what a
-rotation does to a live ACP connection. The output-credit stall and the
+rotation**: `rotations_completed` is recorded per run and
+disclosed from the field, never asserted in prose.  An earlier draft said the
+runs observed 0 *because* every case finishes well inside the rotation
+interval; M8-C14's characterisation disproves that — failing runs observe **8**,
+and the count is incidental to case duration rather than determined by it.  The
+true statement is the narrow one: **no run here carries an ACP connection across
+a completed rotation**, whatever number a given run recorded. The output-credit stall and the
 permission deadline over the **real route** — both are measured in
 `tunnel-acp-export` against the export's own queue and clock, and the carrier in
 front of the export has flow control of its own that this gate does not drive to

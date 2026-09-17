@@ -37,6 +37,18 @@ gate "build locked workspace binaries" \
 # admission and every stream riding it, and ACP is a long-lived SSE response
 # through a non-owner ingress.  Nothing here shows an ACP connection surviving
 # normal cluster operation.  The gate's own NOT_COVERED carries this too.
+# **This gate is known to fail about one run in ten, and the failure is filed.**
+# M8-C14: the consumer learns of a crashed turn either in ~50 ms or in ~58.7 s,
+# bimodally, and the slow mode trips the gate's own hygiene invariant "every
+# case ended inside the membership records' lifetime".  A red run showing
+# `unknown_error_latency_ms` near 58700 with `export_ended_connection=true` and
+# `live_connections=0` is that defect -- the export side is sound and the lost
+# RESET is in the shared forwarding teardown path, not in ACP.
+#
+# A failure WITHOUT that signature is a NEW finding and must not borrow
+# M8-C14's explanation.  The validator names M8-C14 only when the signature
+# matches, so the two cannot be confused.  The invariant is deliberately NOT
+# relaxed to make this gate green: it is what caught the defect.
 gate "M8 ACP over three relays: a v1 conversation, permissions, cancellation, subscriber loss and an unknown outcome through a non-owner ingress" \
   cargo run --locked -p tunnel-test-harness -- verify-m8-acp-real-path
 
