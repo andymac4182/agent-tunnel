@@ -791,14 +791,21 @@ async fn a_session_whose_subscriber_never_arrives_closes_its_window() {
     // at random across a whole guard-deletion suite, which is how it was
     // found. The deadline is still observed and still elapses; only the
     // fragility is gone.
-    let export = acp_export_with(workspace.path(), "[deadlines]\nsubscribe_ms = 1500\n");
+    //
+    // **1500 ms was not enough either.** Running all five ACP guard suites back
+    // to back keeps this machine compiling and running the workspace for half
+    // an hour, and the connection GET still missed a 1500 ms window under it.
+    // 5000 ms is chosen against that load rather than against an idle machine.
+    // The underlying coupling — one configuration value bounding two different
+    // windows — is what M8-C12 records as not fixed.
+    let export = acp_export_with(workspace.path(), "[deadlines]\nsubscribe_ms = 5000\n");
     let profile = Arc::new(export.profile_policies().expect("profile"));
     let connection = initialize(&export, &profile).await;
     let stream = send(&export, &profile, get_connection(&connection)).await;
     let session = open_session(&export, &profile, &connection, workspace.path(), stream).await;
 
     let mut diagnostics = export.diagnostics();
-    for _ in 0..600 {
+    for _ in 0..1500 {
         if diagnostics.session_subscribe_expired == 1 {
             break;
         }
