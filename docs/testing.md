@@ -901,6 +901,119 @@ loss or a control-epoch change. Any write, and therefore any partial or unknown
 mutation outcome. Any adapter, any TypeScript client, and any second
 implementation reading gate 3's golden fixtures.
 
+### Implementation gate 5: write grants and partial failure
+
+The gate is `verify-m4-fs-write-path`, registered in
+[`scripts/m4-harness-verify.sh`](../scripts/m4-harness-verify.sh) beside gate 4's
+and implemented in
+`crates/tunnel-test-harness/src/production_cluster/fs_write_path.rs`. It runs on
+the same real three-relay production cluster, the same authoritative Redis
+catalog, the same device connector and the same consumer WSS sockets, and it
+speaks the wire with the same 9P client — which moved up a level so that one
+copy of it serves both gates rather than two that could drift apart.
+
+It is a **sibling** of the gate-4 gate rather than an extension of it. The two
+prove different things and share one device: gate 4's exports are read-only and
+gate 5 seeds two writable ones beside them, so a refusal in one can never be
+credited to the other's configuration. The device's own `[exports.<service>.fs]`
+allowlist is the **same and the widest** for every export gate 5 configures,
+which is deliberate: the narrowing the read-only case turns on is the relay's
+OPEN, derived from the grant, and a difference configured on the device would
+let a refusal be credited to the connector's allowlist instead.
+
+**What one run proves, in the order it takes it.** Every byte of fixture content
+is synthetic and generated in the gate; no evidence field, log line or error
+message can carry a path, a name or file content, because the evidence struct
+holds scalars, closed labels and identifier-free strings only.
+
+* **The descriptor a write grant produces.** `root.readOnly` is *derived* from
+  the grant by gate 1, so a writable export reporting it false — with nothing
+  having configured the flag — is what makes the advertised flag and the
+  enforced grant provably the same thing. Gate 4's export reports it true in the
+  same run.
+* **A checksummed write spanning many messages.** A 393,216-byte synthetic file
+  is created with `Tlcreate` and written across more than four maximum-size
+  `Twrite` messages, then read back **on a fresh fid** — so the bytes come from
+  a descriptor the session resolved again rather than from the one that wrote
+  them — and compared on the host at exactly the length that was sent. A
+  replayed chunk changes the length, the checksum, or both.
+* **Every name-changing primitive, observed on the host.** `Tlcreate`,
+  `Tmkdir`, `Trenameat`, `Tunlinkat` without `AT_REMOVEDIR` and with it. The
+  directory is emptied first, which is the profile's own non-recursive default.
+* **A truncating open and a size-changing `Tsetattr`.** The truncation happens
+  through the descriptor after the hard-link rule has permitted it; the
+  resolving open carries no `O_TRUNC`, which is gate 2's pinned choice and is
+  what keeps a refused write from following a truncation that already happened.
+* **The hard-link write refusal, on a genuinely multiply-linked file.** The
+  second link is made **out of band**, because the profile refuses to create one
+  without the `hardLinks` feature and a fixture built through the wire would be
+  proving something else. The run records the observed `st_nlink` as well as the
+  four refusals, so the rest of the case cannot be credited to a write simply
+  being denied. A write open, a read-write open, a truncating open and a
+  size-changing `Tsetattr` are each `EPERM`; the content is verified **intact**;
+  and an ordinary read of the same file is still served, because the link count
+  discloses nothing the grant does not already permit.
+* **A read-only grant refusing every mutating primitive before dispatch.** All
+  eleven of them — the two mutating `Tlopen` flag shapes on an ordinary
+  unopened file, `Tlcreate`, `Twrite`, `Tmkdir`, `Tunlinkat`, `Trenameat`,
+  `Tsetattr`, `Tsymlink`, `Tlink` and `Tremove` — on its own export, with the
+  export byte-for-byte unchanged afterwards and every name the mutations would
+  have created checked absent. The validator requires each errno to be one of
+  the three a **pre-dispatch** refusal can carry: `EPERM` from gate 1's
+  capability table, `EINVAL` from gate 3's session for a fid used in a way its
+  state forbids, and `ENOTSUP` from gate 3's flag decoding. `EACCES` can only be
+  the host's answer, so a refusal carrying it would mean a mutation was
+  dispatched under a read-only grant, and a single-mutation case covers exactly
+  that. The two flag shapes are additionally required to be `EPERM`
+  specifically: the contract denies every mutating **flag**, and a refusal taken
+  for the node's kind would have happened under a write grant too.
+* **A write interrupted mid-stream.** The consumer pipelines twenty-four
+  full-`msize` writes back to back, reads only the first four replies, and then
+  **abandons the transport** — no close frame, no drain. Some of the remaining
+  writes will have been performed and some will not, and the consumer can never
+  learn which: that is the contract's `unknown`, and the only honest thing to
+  assert is what must be true either way. Every **acknowledged** byte is on the
+  host and correct, which is `bytesAcknowledged` as a lower bound confirmed by
+  replies; the whole file is a **prefix of the source**, so nothing was applied
+  twice or at the wrong offset; the host holds no more than was sent; and
+  nothing is re-sent, which is recorded as a field rather than left to the
+  reader. Observed landing points across runs have ranged from six blocks to
+  fourteen, which is the case being genuinely partial rather than arranged.
+* **A host failure surfacing the right errno without a name.** A directory the
+  export may traverse and may not write to — mode `0o500` — answers `EACCES` to
+  a create inside it. The rendering of what came back is scanned for the refused
+  name, the directory's name and the export's host path, and the session is
+  required to survive and answer afterwards, which is gate 3's three-way split
+  of refusals: an `Rlerror` a correct client can recover from keeps the session.
+
+**Waiting for the host to settle is polled, never slept.** The interrupted case
+reads the file until its length stops changing and stops the moment it is
+stable, bounded at twenty seconds. A fixed sleep would be either flaky or a
+correctness signal, and this is neither: a slow run still passes, and a run
+where the device kept writing after its consumer vanished fails by the length
+check rather than by a wait that was too short.
+
+**What the gate cannot see, and says so.** There is no wire field for an
+outcome, so a consumer cannot read the device's own ledger. The ledger is
+asserted directly in `crates/tunnel-fs-provider/tests/mutations.rs`, where
+driving `accept` and `step` by hand lets a test perform a mutation and decline
+to confirm delivery — the shape a dropped consumer has. Classifying an in-flight
+mutation from a client's own dispatch and reply history is the shared client's
+job and is gate 6's.
+
+**Red-then-green.** Twelve cases in a `gate5` suite of
+[`scripts/fs-guard-deletion.py`](../scripts/fs-guard-deletion.py), spanning the
+resolver's write module and the dispatcher; **twelve of twelve turn a test
+red**. One of them reaches two pinned claims and says so rather than being split
+into a case that cannot be written: deleting the hard-link check makes a
+multiply-linked file writable *and* lets the truncating open in the same test
+truncate it, and that content-intact assertion is the only form in which
+"truncation happens through the descriptor after the rule permitted it" is
+measurable by deletion — the alternative ordering is a different implementation,
+not a deletion. The connector's settling of the mutation ledger has **no unit
+test** and is deliberately absent from the suite rather than listed there with a
+green it did not earn; it is exercised only through the harness gate.
+
 ### Shared dataset and native semantics
 
 Build one synthetic mount dataset and access that same authorized mount through Files SDK, Mastra, just-bash, and AI SDK tools concurrently. A file created through one writable view must be readable byte-for-byte through every other view; rename/remove must be visible without undocumented persistent caching. Compare native directory and metadata results after normalizing only documented differences. AI SDK FilesV4 uploads are also visible as ordinary files in their configured upload directory, while its native methods accept only its own references. Use real relay/device processes and sockets; preserve a separate fast mocked suite for error translation and upstream contract fixtures.
