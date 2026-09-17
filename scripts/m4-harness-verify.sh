@@ -27,4 +27,7 @@ gate "build locked workspace binaries" \
 gate "M4 filesystem gate 4: descriptor, refusal matrix, 9P session, capability matrix and refused mutations" \
   cargo run --locked -p tunnel-test-harness -- verify-m4-fs-real-path
 
+gate "M4 filesystem gate 5: write grants, the hard-link write rule, an interrupted write and partial failure" \
+  cargo run --locked -p tunnel-test-harness -- verify-m4-fs-write-path
+
 echo "m4-harness-verify: implemented M4 harness suite passed" >&2
