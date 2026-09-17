@@ -1504,6 +1504,35 @@ C4_CASES: list[tuple[str, list[Edit], bool]] = [
         ],
         False,
     ),
+    # --------------------------------------- the export applies the mapping
+    (
+        # Without this the mapping has no consumer and could drift freely.
+        "the export classifies a completed turn through the terminal rule",
+        [
+            (
+                BRIDGE,
+                """    let counter = match terminal.result_status() {
+        "succeeded" => &counters.terminals_succeeded,""",
+                """    let counter = match "succeeded" {
+        "succeeded" => &counters.terminals_succeeded,""",
+            )
+        ],
+        False,
+    ),
+    (
+        "a prompt whose child died is classified outcome_unknown by the export",
+        [
+            (
+                BRIDGE,
+                """                    record_terminal(
+                        &connection.counters,
+                        tunnel_acp::terminal::AcpTerminal::LostAfterDispatch,
+                    );""",
+                "",
+            )
+        ],
+        False,
+    ),
     # ------------------------------------------- the RESULT_STATUS mapping
     (
         "a lost process after dispatch is outcome_unknown, not a success",

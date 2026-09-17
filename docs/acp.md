@@ -427,7 +427,12 @@ owner loss and peer-key rotation remain chunk 5.
   outside it, and the refusal **leaves the callback outstanding** so an invented
   option cannot consume the host's real decision. A response for the wrong
   connection, and one answering nothing outstanding, are each refused while a
-  genuine callback is pending — and the genuine answer then succeeds, so the
+  genuine callback is pending — and the refusals are read as **rules off the
+  wire**, `ACP_OPTION_NOT_OFFERED` and `ACP_UNKNOWN_REQUEST_ID`, not as "not a
+  202", because a 404 from a bad route and a 503 from a rotation freeze are both
+  "not a 202" and neither is the rule firing. The wrong-connection case is
+  deliberately a bare **404 with no rule**: a foreign connection must be
+  indistinguishable from one that never existed — and the genuine answer then succeeds, so the
   refusals are not passing because the callback had already gone. Each outcome
   is read from the marker the **agent itself** wrote.
 - **`session/cancel` reaches `stopReason: "cancelled"`**, read off the wire,
@@ -444,7 +449,10 @@ owner loss and peer-key rotation remain chunk 5.
   asserted **separately**, for a broken session stream and again for a broken
   connection stream: the transport ends **by the subscriber-loss rule** and not
   by a child ending or a deadline; the pending permission resolves `cancelled`
-  and none is approved; a new prompt is refused; the *other* required stream is
+  and none is approved — read from the **bridge's** counter rather than the
+  agent's marker, the one place this chunk rests on a parent's report, and
+  defensible only because the child is killed moments later and cannot be
+  asked; a new prompt is refused; the *other* required stream is
   closed and **errors** rather than ending cleanly; a reconnect must initialize
   anew; and the child is gone **from the process table**. A stream that never
   arrived is still the subscription deadline, which is a different rule.
@@ -455,12 +463,31 @@ owner loss and peer-key rotation remain chunk 5.
   `fsync`ed by the agent process at the moment the effect happens — not from a
   harness counter that increments where the harness *believes* it dispatched,
   which could not tell one effect from two with one unrecorded attempt. It reads
-  exactly one, and one again after a settle window. `tunnel_acp::terminal` maps
-  a lost process after dispatch to `outcome_unknown`. **The no-replay claim is
+  exactly one, and one again after a settle window, and the export classifies
+  the unresolved prompt `outcome_unknown` through `tunnel_acp::terminal`.
+  **This case is demonstrated but not reliable, and the claim is limited
+  accordingly.** The consumer-visible end of that stream is bimodal: 50-53 ms in
+  22 of 25 runs, and ~58.7 s in the other 3 — membership records expiring rather
+  than the device's RESET arriving. The device side is sound in every observed
+  run; what is unreliable is the consumer learning promptly. Because a 58.7 s
+  case cannot finish inside the accommodation's 60 s records, the gate fails
+  about **12%** of runs, and it is **not yet suitable for unattended use**. That
+  is **M8-C14**, filed rather than tuned around: the gate's wait was corrected
+  from 30 s to 70 s only so the evidence can tell "terminated slowly" from
+  "never terminated", and the measured latency is recorded. **The no-replay claim is
   bounded at the moment of observation**, exactly as `http-forwarding.md` gate 4
   bounds its own: a replay issued later would not be observed.
 - **`RESULT_STATUS` for ACP terminals** is `crates/tunnel-acp/src/terminal.rs`,
   reading the closed vocabulary from `tunnel_protocol` rather than retyping it.
+  **The export applies the rule**, which is what makes it a rule rather than a
+  table: `PromptTicket::completion` builds the terminal from the pinned
+  `StopReason` where that type is already in scope, and the bridge counts the
+  outcome the rule gives. The gate reads those counters — one `succeeded`, one
+  `cancelled`, one `outcome_unknown` across its cases — instead of evaluating
+  the function itself, which is what an earlier draft of the gate did and which
+  observed nothing at all. **The connector's own `RESULT_STATUS` path does not
+  consume this mapping**, so nothing here reconciles the connector's status with
+  the export's classification; that is not done and is not claimed.
   A completed turn is `succeeded` whatever its stop reason — `docs/acp.md` says
   `succeeded` is about the request completing — a confirmed cancellation is
   `cancelled`, a refusal before dispatch is `failed`, and a lost process after
@@ -547,8 +574,9 @@ kept, both are commented, and neither is claimed as guarded.
 subscribe bound applies to the connection GET as well as the session GET, and on
 a loaded machine the connection's own window closed first, so the session's
 window never expired and the test failed for a reason unrelated to what it
-measures. The bound is now 1500 ms and the test asserts the connection's window
-did not close, so a recurrence fails by name.
+measures. The bound is now 5000 ms and the test asserts the connection's window
+did not close, so a recurrence fails by name. 1500 ms was tried first and
+was still too tight under a full five-suite guard run.
 
 ### Not proven
 

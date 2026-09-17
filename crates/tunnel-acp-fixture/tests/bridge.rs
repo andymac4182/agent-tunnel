@@ -688,6 +688,108 @@ fn the_documented_output_stall_default_is_thirty_seconds() {
     );
 }
 
+/// **The export applies `tunnel_acp::terminal`**, rather than the rule being a
+/// table only its own unit tests read (M8 chunk 4).
+///
+/// A completed turn is classified `succeeded` and a turn whose child died
+/// before answering is classified `outcome_unknown`, and both are counted where
+/// the export decides. Without this the mapping would have no consumer at all,
+/// and a gate asserting `AcpTerminal::LostAfterDispatch.result_status()` would
+/// be evaluating a pure function rather than observing a decision.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_export_classifies_its_terminals_through_the_terminal_rule() {
+    let workspace = workspace();
+    let export = acp_export(workspace.path());
+    let profile = Arc::new(export.profile_policies().expect("profile"));
+
+    // A turn that completes.
+    let connection = initialize(&export, &profile).await;
+    let stream = send(&export, &profile, get_connection(&connection)).await;
+    let session = open_session(&export, &profile, &connection, workspace.path(), stream).await;
+    let session_stream = send(&export, &profile, get_session(&connection, &session.id)).await;
+    let held = HeldStream::hold(session_stream);
+    let request = post()
+        .header(headers::ACP_CONNECTION_ID, &connection)
+        .header(headers::ACP_SESSION_ID, &session.id)
+        .body(json_body(&json!({
+            "jsonrpc": "2.0",
+            "id": "prompt-ok",
+            "method": "session/prompt",
+            "params": {"sessionId": session.id, "prompt": [{"type": "text", "text": "ok"}]},
+        })))
+        .expect("request");
+    assert_eq!(
+        send(&export, &profile, request).await.status(),
+        StatusCode::ACCEPTED
+    );
+    let stop = within(held.wait_for_pointer("/result/stopReason")).await;
+    assert_eq!(stop, "end_turn");
+    let mut diagnostics = export.diagnostics();
+    for _ in 0..200 {
+        if diagnostics.terminals_succeeded == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        diagnostics = export.diagnostics();
+    }
+    assert_eq!(
+        diagnostics.terminals_succeeded, 1,
+        "the export classified the completed turn: {diagnostics:?}"
+    );
+    assert_eq!(diagnostics.terminals_unknown, 0, "{diagnostics:?}");
+
+    // A turn whose child dies before answering.
+    let connection = initialize(&export, &profile).await;
+    let stream = send(&export, &profile, get_connection(&connection)).await;
+    let session = open_session(&export, &profile, &connection, workspace.path(), stream).await;
+    let crashed = send(&export, &profile, get_session(&connection, &session.id)).await;
+    let crashed = HeldStream::hold(crashed);
+    let request = post()
+        .header(headers::ACP_CONNECTION_ID, &connection)
+        .header(headers::ACP_SESSION_ID, &session.id)
+        .body(json_body(&json!({
+            "jsonrpc": "2.0",
+            "id": "prompt-crash",
+            "method": "session/prompt",
+            "params": {
+                "sessionId": session.id,
+                "prompt": [{"type": "text", "text": "effect-crash:unit"}],
+            },
+        })))
+        .expect("request");
+    assert_eq!(
+        send(&export, &profile, request).await.status(),
+        StatusCode::ACCEPTED
+    );
+    let mut diagnostics = export.diagnostics();
+    for _ in 0..400 {
+        if diagnostics.terminals_unknown >= 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        diagnostics = export.diagnostics();
+    }
+    assert_eq!(
+        diagnostics.terminals_unknown, 1,
+        "the export classified the lost turn outcome_unknown: {diagnostics:?}"
+    );
+    // The agent recorded its side effect exactly once, on disk, before dying.
+    let ledger = workspace
+        .path()
+        .join(tunnel_acp_fixture::SIDE_EFFECT_LEDGER);
+    let recorded = std::fs::read_to_string(&ledger).unwrap_or_default();
+    assert_eq!(
+        recorded
+            .lines()
+            .filter(|line| line.trim() == "unit")
+            .count(),
+        1,
+        "the agent's own ledger holds the effect exactly once: {recorded:?}"
+    );
+    drop(crashed);
+    export.shutdown();
+}
+
 // ------------------------------------------------------------- deadlines
 
 /// The subscription deadline is **observed and elapsed**, at a shortened
