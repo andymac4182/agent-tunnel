@@ -335,6 +335,100 @@ impl FixtureTopology {
         Ok(service_id)
     }
 
+    /// Append an active `fs` service to `device_id`, with the capabilities a
+    /// filesystem export must declare and grants naming `operations`.
+    ///
+    /// The grant operations are a parameter rather than a constant, because the
+    /// authorization matrix gate 4 has to prove is exactly the difference
+    /// between them: `read`+`list`, `list` alone, `read` alone and the empty
+    /// grant are four separate exports here, seeded side by side on one device,
+    /// so one session's answers cannot be credited to another's configuration.
+    ///
+    /// `case_sensitivity` and `host_supported` are the two capabilities the
+    /// relay reads from the service record: the first because the contract says
+    /// case behaviour is reported and never assumed, the second because it is
+    /// how gate 2's declaration that filesystem exports are unsupported on some
+    /// hosts reaches a relay that does not know the device's operating system.
+    ///
+    /// Apply before the harness's single catalog seed.
+    ///
+    /// # Errors
+    /// An unknown device, or a device with no primary grant to mirror.
+    pub fn push_fs_service(
+        &self,
+        fixture: &mut CatalogFixture,
+        device_id: Uuid,
+        display_name: &str,
+        operations: &[&str],
+        case_sensitivity: Option<&str>,
+        host_supported: bool,
+    ) -> Result<Uuid> {
+        let device = self
+            .all_devices()
+            .find(|device| device.id == device_id)
+            .ok_or_else(|| {
+                HarnessError::InvalidInput(format!(
+                    "fs service references unknown device {device_id}"
+                ))
+            })?;
+        let primary = self.service_ids.get(&device_id).copied().ok_or_else(|| {
+            HarnessError::InvalidInput(format!("device {device_id} has no service id"))
+        })?;
+        let service_id = Uuid::new_v4();
+        let mut capabilities = serde_json::Map::new();
+        capabilities.insert(
+            "operations".to_owned(),
+            serde_json::Value::Array(
+                operations
+                    .iter()
+                    .map(|operation| serde_json::Value::String((*operation).to_owned()))
+                    .collect(),
+            ),
+        );
+        if let Some(case_sensitivity) = case_sensitivity {
+            capabilities.insert(
+                tunnel_relay::FS_CASE_SENSITIVITY_CAPABILITY.to_owned(),
+                serde_json::Value::String(case_sensitivity.to_owned()),
+            );
+        }
+        capabilities.insert(
+            tunnel_relay::FS_HOST_SUPPORTED_CAPABILITY.to_owned(),
+            serde_json::Value::Bool(host_supported),
+        );
+        fixture.services.push(ServiceSpec {
+            tenant_id: device.tenant_id,
+            device_id,
+            service_id,
+            service_type: tunnel_relay::FS_SERVICE_TYPE.to_owned(),
+            display_name: display_name.to_owned(),
+            capabilities: serde_json::Value::Object(capabilities),
+            version: 1,
+            active: true,
+        });
+        let mirrored = fixture
+            .grants
+            .iter()
+            .filter(|grant| grant.device_id == device_id && grant.service_id == primary)
+            .map(|grant| GrantSpec {
+                service_id,
+                permissions: PermissionSet {
+                    operations: operations
+                        .iter()
+                        .map(|operation| (*operation).to_owned())
+                        .collect(),
+                },
+                ..grant.clone()
+            })
+            .collect::<Vec<_>>();
+        if mirrored.is_empty() {
+            return Err(HarnessError::InvalidInput(format!(
+                "device {device_id} has no primary grant to mirror"
+            )));
+        }
+        fixture.grants.extend(mirrored);
+        Ok(service_id)
+    }
+
     /// Append a second active `echo` service to `device_id` so the public
     /// service-type label resolves to more than one live target.
     ///

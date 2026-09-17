@@ -1,0 +1,27 @@
+[package]
+name = "tunnel-fs-provider"
+description = "Confined read-only 9P2000.L provider: the gate-4 dispatcher between the session state machine and the OS-confined resolver"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Implementation gate 4 of docs/filesystem-api.md, device side.  It depends on
+# the three filesystem crates and on nothing else: no async runtime, no socket,
+# no HTTP and no serializer.  The clock and the live authorization both arrive
+# through the `Authority` trait, so this crate stays deterministic and its tests
+# need neither a Redis nor a relay.  **No new third-party crate is introduced.**
+
+[dependencies]
+tunnel-fs-core = { path = "../tunnel-fs-core" }
+tunnel-fs-ninep = { path = "../tunnel-fs-ninep" }
+
+# The resolver is Unix-only for the same reason gate 2 is: filesystem exports
+# are declared unsupported on Windows, and `tunnel-fs-host` compiles there to
+# its declaration alone.
+[target.'cfg(unix)'.dependencies]
+tunnel-fs-host = { path = "../tunnel-fs-host" }
+
+[lints]
+workspace = true

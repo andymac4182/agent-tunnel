@@ -41,6 +41,14 @@ use crate::http_forward_diagnostics::{
 /// The OPEN operation name for an HTTP forwarding stream.
 pub(crate) const HTTP_FORWARD_STREAM_OPERATION: &str = "http_forward";
 
+/// The OPEN operation name for a filesystem 9P stream.
+///
+/// A separate name from `http_forward` although the two share every byte of the
+/// carrier machinery: the OPEN names the adapter the connector will run, and a
+/// 9P stream announced as an HTTP one would be a lie the connector's own
+/// allowlist could not check.
+pub(crate) const FS_STREAM_OPERATION: &str = "fs_9p";
+
 /// A connector RESET observed by the owner, ahead of ordered delivery.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct HttpPeerReset {

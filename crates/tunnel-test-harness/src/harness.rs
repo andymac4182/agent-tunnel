@@ -52,6 +52,10 @@ pub struct HarnessOptions {
     /// gate ([`MCP_GATE_SERVICES`]) on the first tenant-A device, each with
     /// mirrored `http:invoke` grants.  Only that gate enables it.
     pub mcp_services: bool,
+    /// Seed the six filesystem services of the M4 gate-4 authorization matrix
+    /// ([`FS_GATE_SERVICES`]) on the first tenant-A device.  Only that gate
+    /// enables it.
+    pub fs_services: bool,
 }
 
 /// The MCP services the M3-03 gate seeds: `(label, profile)`.  The label
@@ -84,6 +88,7 @@ impl Default for HarnessOptions {
             ambiguous_echo_service: false,
             http_forward_service: false,
             mcp_services: false,
+            fs_services: false,
         }
     }
 }
@@ -147,6 +152,13 @@ impl HarnessOptions {
     }
 
     /// Opt into the `http-forward` service used by the HTTP forwarding gate.
+    /// Seed the M4 gate-4 filesystem services.
+    #[must_use]
+    pub fn fs_services(mut self, value: bool) -> Self {
+        self.fs_services = value;
+        self
+    }
+
     pub fn http_forward_service(mut self, value: bool) -> Self {
         self.http_forward_service = value;
         self
@@ -313,6 +325,32 @@ impl Harness {
                 }
             }
         }
+        let mut fs_services = Vec::new();
+        if options.fs_services {
+            let Some(device_id) = topology.devices_a.first().map(|device| device.id) else {
+                let error = HarnessError::InvalidInput(
+                    "filesystem services require a tenant-A device".to_owned(),
+                );
+                return Err(with_redis_cleanup(error, redis.close().await));
+            };
+            for entry in FS_GATE_SERVICES {
+                match topology.push_fs_service(
+                    &mut fixture,
+                    device_id,
+                    entry.display_name,
+                    entry.operations,
+                    entry.case_sensitivity,
+                    entry.host_supported,
+                ) {
+                    Ok(service_id) => fs_services.push(FsServiceFixture {
+                        label: entry.label,
+                        service_id,
+                        operations: entry.operations,
+                    }),
+                    Err(error) => return Err(with_redis_cleanup(error, redis.close().await)),
+                }
+            }
+        }
         if let Err(error) = catalog.seed_fixture(&fixture).await {
             let error = HarnessError::Redis(format!("seeding production Redis catalog: {error}"));
             // A seed is one-shot. Discard a failed fixture, including partial
@@ -337,6 +375,7 @@ impl Harness {
             http_forward: None,
             http_forward_service,
             mcp_services,
+            fs_services,
         })
     }
 }
@@ -365,7 +404,103 @@ pub struct RunningHarness {
     pub http_forward_service: Option<uuid::Uuid>,
     /// The seeded MCP services, when requested.
     pub mcp_services: Vec<McpServiceFixture>,
+    /// The seeded filesystem services, when requested.
+    pub fs_services: Vec<FsServiceFixture>,
 }
+
+/// One seeded filesystem service and the grant operations it carries.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FsServiceFixture {
+    /// The gate's own name for this export.
+    pub label: &'static str,
+    /// The catalog service identifier.
+    pub service_id: uuid::Uuid,
+    /// The grant operations seeded for it.
+    pub operations: &'static [&'static str],
+}
+
+impl RunningHarness {
+    /// The seeded filesystem service with this label.
+    #[must_use]
+    pub fn fs_service(&self, label: &str) -> Option<&FsServiceFixture> {
+        self.fs_services
+            .iter()
+            .find(|service| service.label == label)
+    }
+}
+
+/// One entry of the filesystem service table seeded for the gate-4 gate.
+pub struct FsGateService {
+    /// The gate's own name for the export.
+    pub label: &'static str,
+    /// The catalog display name.
+    pub display_name: &'static str,
+    /// The grant operations.
+    pub operations: &'static [&'static str],
+    /// The `fs_case_sensitivity` capability, or `None` to omit it entirely.
+    pub case_sensitivity: Option<&'static str>,
+    /// The `fs_host_supported` capability.
+    pub host_supported: bool,
+}
+
+/// The six filesystem exports gate 4's authorization matrix needs.
+///
+/// Seeded side by side on one device so the matrix is a property of the grants
+/// rather than of six separate runs: a session's answer cannot be credited to
+/// a different export's configuration when every export is live at once.
+pub const FS_GATE_SERVICES: &[FsGateService] = &[
+    FsGateService {
+        label: "read-list",
+        display_name: "Synthetic read-only filesystem export",
+        operations: &["fs:connect", "fs:read", "fs:list"],
+        case_sensitivity: Some("insensitive-preserving"),
+        host_supported: true,
+    },
+    FsGateService {
+        label: "list-only",
+        display_name: "Synthetic list-without-read filesystem export",
+        operations: &["fs:connect", "fs:list"],
+        case_sensitivity: Some("insensitive-preserving"),
+        host_supported: true,
+    },
+    FsGateService {
+        label: "read-only",
+        display_name: "Synthetic read-without-list filesystem export",
+        operations: &["fs:connect", "fs:read"],
+        case_sensitivity: Some("insensitive-preserving"),
+        host_supported: true,
+    },
+    FsGateService {
+        label: "empty-grant",
+        display_name: "Synthetic filesystem export with no capability",
+        // The session-admitting scope and nothing else: the export is
+        // discoverable and authorized, and names no capability at all. The
+        // contract requires 403 for it rather than a descriptor advertising an
+        // empty operation list.
+        operations: &["fs:connect"],
+        case_sensitivity: Some("insensitive-preserving"),
+        host_supported: true,
+    },
+    FsGateService {
+        // The export whose grant is revoked under a live 9P session.  It is
+        // its own export so that the revocation cannot be confused with the
+        // revision change the discovery-to-upgrade case performs on
+        // `read-list`: nothing else in the gate disturbs this grant, so the
+        // only thing that can end a session held on it is the revocation.
+        label: "revocable",
+        display_name: "Synthetic filesystem export revoked under a live session",
+        operations: &["fs:connect", "fs:read", "fs:list"],
+        case_sensitivity: Some("insensitive-preserving"),
+        host_supported: true,
+    },
+    FsGateService {
+        label: "unsupported-host",
+        display_name: "Synthetic filesystem export on an unsupported host",
+        operations: &["fs:connect", "fs:read", "fs:list"],
+        case_sensitivity: Some("insensitive-preserving"),
+        host_supported: false,
+    },
+];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PublicConsumerEvidence {

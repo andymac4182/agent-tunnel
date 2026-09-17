@@ -35,6 +35,13 @@ use crate::http_forward::{
 /// The OPEN operation name for an HTTP forwarding stream.
 pub(super) const HTTP_FORWARD_OPERATION: &str = "http_forward";
 
+/// The OPEN operation name for a filesystem 9P stream (M4 gate 4).
+///
+/// It must match the relay's `FS_STREAM_OPERATION` exactly: the connector's
+/// own allowlist check is what makes an OPEN naming an adapter this device
+/// does not serve a refusal rather than a surprise.
+pub(super) const FS_STREAM_OPERATION: &str = "fs_9p";
+
 /// Per-stream HTTP state held by the connector actor.
 pub(super) struct DeviceHttpState {
     chunks: VecDeque<Vec<u8>>,
@@ -377,6 +384,56 @@ impl M2Actor {
                 response_handoff_high_water: response_handoff.high_water(),
                 request_body_high_water,
                 report: Some(report),
+                ..DeviceHttpExchangeRecord::default()
+            };
+            let _ = sink.send(HttpActorRequest::Done { record }).await;
+        });
+        DeviceHttpState::new(notifier, receive_window, freeze, Some(task))
+    }
+
+    /// Build the state for an admitted filesystem stream and start its 9P
+    /// exchange task.
+    ///
+    /// Deliberately the **same** carrier state as an HTTP exchange: the
+    /// connector's buffering, credit release, parked writes, independent
+    /// half-closes and terminal handling are properties of a raw bidirectional
+    /// logical stream, not of HTTP, and duplicating them for 9P would mean two
+    /// implementations of the rules `docs/protocol.md` states once. What differs
+    /// is only the task: `tunnel_fs_provider` replaces the HTTP bridge.
+    pub(super) fn start_fs_exchange(
+        &self,
+        stream_id: u64,
+        export: crate::fs_export::FsExport,
+        grant: tunnel_fs_core::CapabilitySet,
+        authority: std::sync::Arc<crate::fs_export::StreamAuthority>,
+        receive_window: u64,
+    ) -> DeviceHttpState {
+        let (notifier, signal) = reset_signal_pair();
+        let (request_tx, request_rx, _request_handoff) = channel(HANDOFF_CAPACITY);
+        let (response_tx, response_rx, _response_handoff) = channel(HANDOFF_CAPACITY);
+        let sink = self.http_requests.clone();
+        let reader = DeviceReader {
+            sink: sink.clone(),
+            stream_id,
+            signal,
+            pending: None,
+        };
+        let writer = DeviceWriter {
+            sink: sink.clone(),
+            stream_id,
+        };
+        let freeze = PauseController::new(self.writes_frozen);
+        let task = tokio::spawn(async move {
+            let (_report, _, _) = tokio::join!(
+                crate::fs_export::serve(export, grant, authority, request_rx, response_tx),
+                pump_outbound(response_rx, writer),
+                pump_inbound(reader, request_tx),
+            );
+            // The filesystem exchange keeps no bounded record of its own: the
+            // provider's counters live on the device's diagnostics, and an
+            // exchange record shaped for HTTP heads would have nothing to hold.
+            let record = DeviceHttpExchangeRecord {
+                stream_id,
                 ..DeviceHttpExchangeRecord::default()
             };
             let _ = sink.send(HttpActorRequest::Done { record }).await;
@@ -977,6 +1034,7 @@ mod tests {
             output_reset: false,
             reset_queued: false,
             http: state,
+            fs_authority: None,
         }
     }
 

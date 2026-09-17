@@ -48,6 +48,10 @@ tokio-tungstenite = { version = "0.30", default-features = false, features = ["c
 tunnel-catalog = { path = "../tunnel-catalog" }
 tunnel-cluster = { path = "../tunnel-cluster" }
 tunnel-client = { path = "../tunnel-client" }
+# The M4 gate-4 gate speaks 9P2000.L on the wire itself, because the contract's
+# first certified consumer runtime is Node and there is no Rust client to reuse.
+tunnel-fs-core = { path = "../tunnel-fs-core" }
+tunnel-fs-ninep = { path = "../tunnel-fs-ninep" }
 tunnel-http-bridge = { path = "../tunnel-http-bridge" }
 tunnel-http-forward = { path = "../tunnel-http-forward" }
 tunnel-mcp = { path = "../tunnel-mcp" }

@@ -123,6 +123,10 @@ pub use http_forward_real_path::{
     HttpForwardRealPathEvidence, validate_http_forward_real_path_evidence,
     verify as verify_http_forward_real_path,
 };
+mod fs_real_path;
+pub use fs_real_path::{
+    FsRealPathEvidence, validate_fs_real_path_evidence, verify as verify_fs_real_path,
+};
 mod http_forward_rotation;
 pub use http_forward_rotation::{
     AdmissionProbeEvidence, CancelRaceEvidence, GATE_ROTATION, HttpForwardRotationEvidence,

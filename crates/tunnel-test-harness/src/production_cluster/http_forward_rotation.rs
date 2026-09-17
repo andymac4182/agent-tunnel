@@ -2199,6 +2199,7 @@ async fn run(
             kind: LocalExportKind::HttpForward,
             device_canary: None,
             mcp: None,
+            fs: None,
         },
     );
     device_profile

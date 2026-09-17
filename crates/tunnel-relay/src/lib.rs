@@ -104,3 +104,40 @@ pub const HTTP_FORWARD_SERVICE_TYPE: &str = "http-forward";
 /// The grant operation (and consumer token scope) for an `http-forward/1`
 /// export.
 pub const HTTP_FORWARD_OPERATION: &str = "http:invoke";
+/// The catalog service type of a filesystem export.
+pub const FS_SERVICE_TYPE: &str = "fs";
+/// The grant operation and consumer token scope that admit a filesystem
+/// session at all.
+///
+/// Deliberately **not** one of the four capabilities. A scope is one name, and
+/// the contract's model is that every capability a session holds was named
+/// individually: a session-admitting scope that also meant `read` would make a
+/// `list`-without-`read` grant unable to open a session, which is one of the
+/// grant shapes the contract requires to work.
+pub const FS_SESSION_OPERATION: &str = "fs:connect";
+/// The grant operation naming the `read` capability.
+pub const FS_READ_OPERATION: &str = "fs:read";
+/// The grant operation naming the `write` capability. Gate 5 is where it
+/// becomes usable; the name is pinned here so a grant seeded for it cannot mean
+/// something else later.
+pub const FS_WRITE_OPERATION: &str = "fs:write";
+/// The grant operation naming the `list` capability.
+pub const FS_LIST_OPERATION: &str = "fs:list";
+/// The grant operation naming the `delete` capability. Gate 5's.
+pub const FS_DELETE_OPERATION: &str = "fs:delete";
+/// The service capability naming the export's observed case behaviour.
+///
+/// Required on a filesystem service record. The contract says the provider
+/// **reports** the host's case behaviour and never assumes it, so a relay that
+/// had to guess would be inventing it; an export without this capability is one
+/// this relay does not serve, and discovery answers 404 for it exactly as it
+/// does for an `http-forward` service naming no profile.
+pub const FS_CASE_SENSITIVITY_CAPABILITY: &str = "fs_case_sensitivity";
+/// The service capability by which a device declares that its host cannot serve
+/// filesystem exports at all.
+///
+/// `false` answers `403 ACCESS_DENIED`. Gate 2 declares filesystem exports
+/// unsupported on Windows, in one function, so that discovery can answer 403
+/// for such a host; this is how that declaration reaches the relay, which does
+/// not know the device's operating system.
+pub const FS_HOST_SUPPORTED_CAPABILITY: &str = "fs_host_supported";

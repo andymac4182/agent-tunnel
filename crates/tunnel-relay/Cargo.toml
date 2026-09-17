@@ -42,6 +42,12 @@ tunnel-protocol = { path = "../tunnel-protocol" }
 tunnel-transport = { path = "../tunnel-transport" }
 serde.workspace = true
 toml.workspace = true
+# Gate 4 needs the shared filesystem vocabulary at the relay: the descriptor
+# and its capability model (gate 1), the consumer WebSocket decode rule (gate
+# 3), and the device-to-relay record framing that carries a close code.
+tunnel-fs-core = { path = "../tunnel-fs-core" }
+tunnel-fs-ninep = { path = "../tunnel-fs-ninep" }
+tunnel-fs-provider = { path = "../tunnel-fs-provider" }
 
 [dev-dependencies]
 async-trait = "0.1.89"

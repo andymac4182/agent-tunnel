@@ -823,6 +823,84 @@ Repeat the authorization matrix for descriptor retrieval, WebSocket upgrade, 9P 
 
 Node is the initial adapter runtime; verify its supported credential transport, TLS validation, cleanup, deadlines, and cancellation. Browser support gets separate Origin, CORS, credential-transport, and buffering tests before it is advertised. Credentials cannot appear in URL queries, exception messages, or snapshots. If short-lived attachment tickets are introduced, test expiry, intended audience, single-use/binding rules, and concurrent redemption independently of the long-lived device data-ticket tests.
 
+### Implementation gate 4: the endpoint, the upgrade and the read path
+
+The gate is `verify-m4-fs-real-path`, registered in
+[`scripts/m4-harness-verify.sh`](../scripts/m4-harness-verify.sh) and
+implemented in
+`crates/tunnel-test-harness/src/production_cluster/fs_real_path.rs`. It runs on
+the real three-relay production cluster against the authoritative Redis catalog,
+a real device connector and real sockets. Its evidence struct is payload-free,
+its validator is one array of named rules, and a single-mutation unit test
+requires every one of those rules to notice a field weakened on its own.
+
+**What the gate must observe, and where each rule comes from.** The
+authorization matrix of
+[filesystem-api.md](filesystem-api.md#confinement-and-capability-model) is
+proven by seeding six filesystem exports side by side on one device — a
+`read`+`list` grant, a `list`-only grant, a `read`-only grant, a grant revoked
+under a live session, a grant naming only the session scope, and an export
+whose host declares filesystem exports unsupported — so a session's answer
+cannot be credited to a different export's configuration. Against them: the descriptor from the grant; `403 ACCESS_DENIED`
+for the empty grant and for the unsupported host; `401` with no token, `404` for
+an unknown device, `405` for a method this URL does not serve, `409
+CAPABILITIES_CHANGED` for a stale `X-Agent-Tunnel-Grant-Revision`, and `426`
+for an upgrade offering no `agent-tunnel.9p.v1`; the upgrade itself with the
+subprotocol selected and `9P2000.L` negotiated; a forged `Tattach` that cannot
+be admitted; a checksummed read of a file large enough to span many messages; a
+`Treaddir` paged by opaque cookie; the `list`-without-`read` and
+`read`-without-`list` cases; a flushed request whose late reply is dropped
+without closing the session; a fid number re-bound while a descriptor for its
+previous binding is held; every mutating opcode refused with the export
+unchanged; and a non-owner relay refusing the upgrade.
+
+**A cached descriptor never authorizes access.** A stale header value proves
+only that the relay compares numbers, so the gate also moves a grant for real.
+It reads the descriptor, advances that grant's revision in the authoritative
+catalog with `upsert_grant` naming the same operations — so only the revision
+moves — and polls a fresh descriptor under a bounded deadline until it reports
+a different `grantRevision`. The revision a consumer would have cached is then
+refused `409 CAPABILITIES_CHANGED` at the descriptor *and* at the WSS upgrade,
+while the current revision is still admitted through to an attached root.
+Separately, on an export nothing else in the run touches, a grant is revoked
+with a 9P session live on it after that session has read a file: the consumer
+then only reads its socket, and observes the session closed with **1008** with
+no further 9P reply. Both changes are made through the same production catalog
+the relays read, not through a harness shortcut.
+
+**A descriptor must carry no host detail.** The gate scans the raw response body
+for the export root's own host path and for owner identity fields, rather than
+asserting only on the parsed fields it expects: an assertion that checks what is
+present cannot notice what else came with it.
+
+**The bounds that are structural and the bounds that are not.** Gate 4 enforces
+`msize` on every frame, the tag and fid quotas, the carrier's credit and replay
+limits, the traversal-entry budget on a `Treaddir` resume, and the consumer
+token's expiry. It enforces **no clock**: the 30-second request deadline, the
+composite operation deadlines, the 300-second idle-session timeout and the
+queued- and buffered-byte budgets of
+[filesystem-api.md](filesystem-api.md#initial-enforced-limits) are not
+implemented, so no gate may report them as covered. Exercising each limit
+exactly at and one unit beyond its advertised value, with paused clocks for the
+deadline boundaries, remains required and remains unmet for the clock half.
+
+**Red-then-green.** The guards gate 4 adds are measured by deleting them one at
+a time with [`scripts/fs-guard-deletion.py`](../scripts/fs-guard-deletion.py)
+`--suite gate4`, which restores the crate by checkout between cases, refuses to
+run against a dirty working tree, refuses to call a failed build a red test, and
+refuses a case whose text is not unique in its file. A guard whose deletion
+leaves every test green is **printed as such** rather than counted among the
+load-bearing ones; several of gate 4's mask one another and are red only in
+combination, and the honest form of that claim is the combination, not the
+single.
+
+**What this gate does not prove, and must not be read as proving.** A filesystem
+session across the relay-to-relay peer hop, because gate 4 admits one only at
+the owning relay. Anything across a scheduled data-socket rotation, a consumer
+loss or a control-epoch change. Any write, and therefore any partial or unknown
+mutation outcome. Any adapter, any TypeScript client, and any second
+implementation reading gate 3's golden fixtures.
+
 ### Shared dataset and native semantics
 
 Build one synthetic mount dataset and access that same authorized mount through Files SDK, Mastra, just-bash, and AI SDK tools concurrently. A file created through one writable view must be readable byte-for-byte through every other view; rename/remove must be visible without undocumented persistent caching. Compare native directory and metadata results after normalizing only documented differences. AI SDK FilesV4 uploads are also visible as ordinary files in their configured upload directory, while its native methods accept only its own references. Use real relay/device processes and sockets; preserve a separate fast mocked suite for error translation and upstream contract fixtures.

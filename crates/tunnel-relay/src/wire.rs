@@ -206,11 +206,20 @@ pub(crate) struct OpenRequest<'a> {
     pub(crate) grant_revision: u64,
     pub(crate) digest: &'a str,
     pub(crate) operation: &'a str,
+    /// The comma-separated capability names a filesystem session carries.
+    ///
+    /// Bounded, and neither a path nor a credential: the four names are
+    /// `read`, `write`, `list` and `delete`. The device needs them because its
+    /// provider enforces primitives, and the grant's own permission set lives
+    /// in the catalog, which the device never reads.
+    pub(crate) fs_capabilities: Option<&'a str>,
 }
 
 pub(crate) fn open(request: OpenRequest<'_>) -> ControlMessage {
     let (initial_send_window, initial_receive_window) = match request.operation {
-        "echo_stream" | crate::actor::HTTP_FORWARD_STREAM_OPERATION => (
+        "echo_stream"
+        | crate::actor::HTTP_FORWARD_STREAM_OPERATION
+        | crate::actor::FS_STREAM_OPERATION => (
             M2_INITIAL_WINDOW_BYTES as u64,
             M2_INITIAL_WINDOW_BYTES as u64,
         ),
@@ -234,6 +243,10 @@ pub(crate) fn open(request: OpenRequest<'_>) -> ControlMessage {
         .insert("grant_revision".into(), request.grant_revision.to_string());
     open.metadata
         .insert("permission_digest".into(), request.digest.to_owned());
+    if let Some(capabilities) = request.fs_capabilities {
+        open.metadata
+            .insert("fs_capabilities".into(), capabilities.to_owned());
+    }
     ControlMessage::Open(open)
 }
 
@@ -256,6 +269,7 @@ mod tests {
             grant_revision: 1,
             digest: "digest",
             operation,
+            fs_capabilities: None,
         }) else {
             panic!("wire::open must return an OPEN control message");
         };
