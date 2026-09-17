@@ -345,6 +345,21 @@ pub struct AcpClusterEvidence {
     /// A second, live SSE stream still delivered while both hops were full.
     pub live_stream_served_while_saturated: bool,
 
+    // --- M7-C85, disclosed rather than asserted ---
+    /// Retained OPEN journal entries on the device connector at the end of the
+    /// run, and the streams it retired.
+    ///
+    /// **Disclosed, never asserted.** M7-C85 is the open wedge where a
+    /// consumer-cancelled exchange never releases its journal entry, 128 per
+    /// session. Chunk 4 recorded that its seven cases produced far too few
+    /// cancellations to reach it. This gate produces more — every held stream
+    /// it breaks is one — but still roughly twenty, an order of magnitude
+    /// short, so it cannot settle the question either way and says so with the
+    /// number rather than with an adjective. A rule here would either be
+    /// vacuous or would fail the run for an open defect it did not reach.
+    pub open_journal_entries: usize,
+    pub open_streams_retired: u64,
+
     /// Agent processes that outlived the gate, read from the process table.
     pub leftover_processes: usize,
 }
@@ -1388,7 +1403,7 @@ impl Gate<'_> {
         }
         stream
             .wait_for("the revocation callback", |value| {
-                (method_of(value) == Some("session/request_permission")).then(|| true)
+                (method_of(value) == Some("session/request_permission")).then_some(true)
             })
             .await?;
 
@@ -1484,7 +1499,7 @@ impl Gate<'_> {
         }
         stream
             .wait_for(&format!("the {label} callback"), |value| {
-                (method_of(value) == Some("session/request_permission")).then(|| true)
+                (method_of(value) == Some("session/request_permission")).then_some(true)
             })
             .await?;
 
@@ -2254,6 +2269,11 @@ async fn run(
         .unwrap_or_else(|e| e.into_inner())
         .clone();
     evidence.not_covered = not_covered(evidence.rotation_span_ms, evidence.rotations_across_span);
+    if let Some(client) = &gate.client {
+        let status = client.status_snapshot();
+        evidence.open_journal_entries = status.open_journal_entries;
+        evidence.open_streams_retired = status.open_streams_retired;
+    }
 
     let pids = gate
         .client
@@ -2714,6 +2734,8 @@ mod tests {
             peer_window: 196_608,
             both_segments_saturated: true,
             live_stream_served_while_saturated: true,
+            open_journal_entries: 0,
+            open_streams_retired: 0,
             leftover_processes: 0,
         };
         evidence.not_covered =
@@ -2734,9 +2756,12 @@ mod tests {
     /// meaningful: a rule that has been deleted or neutered stops rejecting
     /// its own falsification, and this test names it.  Without it, a deleted
     /// rule would simply stop being checked and nothing would go red.
+    /// One falsification: a name, and the single field it spoils.
+    type Falsification = (&'static str, fn(&mut AcpClusterEvidence));
+
     #[test]
     fn every_claim_can_fail_on_its_own() {
-        let mutations: Vec<(&str, fn(&mut AcpClusterEvidence))> = vec![
+        let mutations: Vec<Falsification> = vec![
             ("relay_count", |e| e.relay_count = 2),
             ("non_owner_ingress", |e| e.non_owner_ingress = false),
             ("owner_node", |e| e.owner_node = "relay-c".to_owned()),
