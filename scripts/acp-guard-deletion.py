@@ -1096,8 +1096,26 @@ C3_CASES: list[tuple[str, list[Edit], bool]] = [
         False,
     ),
     (
+        # **Two edits, because the rule is written in two places**, and the
+        # first run of this case proved why: a pump blocked on its queue is
+        # woken by the shutdown signal, and a pump whose queue ran dry checks
+        # the signal itself. Which one fires is a race, so defeating either
+        # alone leaves the other standing and reports the rule as not
+        # load-bearing when it is. The same shape as the m8c2 suite's "only a
+        # permission expires on a permission deadline".
         "a broken stream errors its body rather than ending cleanly",
         [
+            (
+                BRIDGE,
+                """            () = shutdown.cancelled() => {
+                // A connection that ended while a stream was open fails the
+                // body rather than ending it cleanly: `docs/acp.md` refuses to
+                // let a broken ACP stream look like an orderly one.
+                sender.fail(StreamFailure::Interrupted).await;
+                return;
+            }""",
+                "            () = shutdown.cancelled() => return,",
+            ),
             (
                 BRIDGE,
                 """            if shutdown.is_cancelled() {
@@ -1105,7 +1123,7 @@ C3_CASES: list[tuple[str, list[Edit], bool]] = [
             }
             return;""",
                 "            return;",
-            )
+            ),
         ],
         False,
     ),
@@ -1180,7 +1198,7 @@ C3_CASES: list[tuple[str, list[Edit], bool]] = [
     ),
     (
         "an expired session's window stays closed",
-        [(BRIDGE, "            let _ = target.take();", "")],
+        [(BRIDGE, "            target.close();", "")],
         False,
     ),
     # ------------------------------------------------------------- readiness

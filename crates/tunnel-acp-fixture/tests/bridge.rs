@@ -383,6 +383,34 @@ async fn dropping_one_session_stream_leaves_the_others_delivering() {
     // The client goes away on the first session only.
     drop(first_stream);
 
+    // **A message must actually be routed to the lost stream**, or the router
+    // never meets the failure this test exists for and the destructive version
+    // stays green.  A turn on the first session is what does it: the agent's
+    // update is sent to a target whose body is gone.
+    let mut diagnostics = export.diagnostics();
+    for round in 0..20 {
+        if diagnostics.streams_lost >= 1 {
+            break;
+        }
+        let request = post()
+            .header(headers::ACP_CONNECTION_ID, &connection)
+            .header(headers::ACP_SESSION_ID, &first.id)
+            .body(json_body(&json!({
+                "jsonrpc": "2.0",
+                "id": format!("prompt-1-{round}"),
+                "method": "session/prompt",
+                "params": {"sessionId": first.id, "prompt": [{"type": "text", "text": "ok"}]},
+            })))
+            .expect("request");
+        let _ = send(&export, &profile, request).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        diagnostics = export.diagnostics();
+    }
+    assert_eq!(
+        diagnostics.streams_lost, 1,
+        "the lost stream was noticed and counted: {diagnostics:?}"
+    );
+
     // A turn on the surviving session still completes, read off the wire.
     let request = post()
         .header(headers::ACP_CONNECTION_ID, &connection)
@@ -414,10 +442,7 @@ async fn dropping_one_session_stream_leaves_the_others_delivering() {
         "the surviving session's turn completed on the wire: {payloads:?}"
     );
 
-    // The connection is still live, and the loss was counted rather than
-    // silent.  `streams_lost` may be 0 if nothing was routed to the dropped
-    // stream after it went away, so the load-bearing assertion is the one
-    // above; this is the diagnostic that names what happened when it does.
+    // The connection is still live: one lost stream did not end it.
     let diagnostics = export.diagnostics();
     assert_eq!(diagnostics.live_connections, 1, "{diagnostics:?}");
     assert_eq!(diagnostics.connections_ended_by_child, 0, "{diagnostics:?}");
