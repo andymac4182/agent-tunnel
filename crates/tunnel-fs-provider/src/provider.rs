@@ -128,12 +128,19 @@ pub struct ProviderStats {
     pub mutations_dispatched: u64,
     /// Dispatched mutations the host reported it applied, whole or in part.
     pub mutations_applied: u64,
-    /// Applied mutations whose reply reached the carrier.
+    /// Applied mutations whose reply reached the carrier **and described the
+    /// effect**.
     ///
     /// `mutations_applied - mutations_acknowledged == mutation_unknown` is an
     /// identity, which is why this is counted where delivery is confirmed
     /// rather than where the reply is built: a reply that was produced and
     /// could not be sent is not an acknowledgement of anything.
+    ///
+    /// The second half of that sentence is what keeps the identity true for
+    /// [`ProviderStats::mutation_unknown`]'s *other* source. A post-effect
+    /// read that failed produces an `Rlerror` which does go out — but it names
+    /// a code, not the effect, so nothing is acknowledged and the ledger is
+    /// closed as `unknown` before the send rather than settled by it.
     pub mutations_acknowledged: u64,
     /// Dispatched mutations the host reported changed nothing.
     ///
@@ -145,13 +152,27 @@ pub struct ProviderStats {
     /// A short `Twrite`, and a multi-field `Tsetattr` whose later field failed
     /// after an earlier one had already been applied. [`Outcome::Partial`].
     pub mutation_partial: u64,
-    /// Applied mutations whose reply never reached the consumer.
+    /// Applied mutations whose effect the consumer cannot learn.
     ///
-    /// [`Outcome::Unknown`]. Counted when the connector reports a send it could
-    /// not complete, and at [`Provider::close`] for an effect still
-    /// outstanding. A session that ends mid-mutation is the case the contract
-    /// names: "Session loss during a potentially dispatched mutation carries
-    /// `outcome: unknown`."
+    /// [`Outcome::Unknown`], and it has **two** sources rather than one.
+    ///
+    /// The first is a reply that never left: counted when the connector reports
+    /// a send it could not complete, and at [`Provider::close`] for an effect
+    /// still outstanding. A session that ends mid-mutation is the case the
+    /// contract names: "Session loss during a potentially dispatched mutation
+    /// carries `outcome: unknown`."
+    ///
+    /// The second is a **post-effect read that failed**, and there the
+    /// `Rlerror` *is* delivered — which is why this field is worded about what
+    /// the consumer can learn rather than about what arrived. `mkdirat` and
+    /// `symlinkat` create a node and return nothing, so the qid the reply must
+    /// carry costs a second syscall; when that syscall loses a race the node
+    /// still exists, and no code in the closed vocabulary can say what was
+    /// made. The caller is told something failed and cannot tell that anything
+    /// applied, so the ledger is closed `unknown` at that point and the reply
+    /// is never counted acknowledged — which is what keeps
+    /// `mutations_applied - mutations_acknowledged == mutation_unknown` an
+    /// identity across both sources.
     pub mutation_unknown: u64,
     /// Bytes the host acknowledged writing.
     ///

@@ -38,11 +38,14 @@
 //!   `O_EXCL` is therefore redundant here rather than meaningful, and the
 //!   `exclusiveCreate` feature describes a property this implementation always
 //!   has.
-//! * **A mode carrying anything outside `0o777` is refused, never masked.**
+//! * **A mode carrying anything outside `0o777` is refused, never masked —
+//!   once a `Tsetattr` mode's file-type bits have been discarded.**
 //!   Set-user-ID, set-group-ID and the sticky bit are not bits this profile
 //!   grants, and quietly dropping them would report a mode that was not
 //!   applied. The namespace rule is refuse, never repair, and a mode is no
-//!   different from a path.
+//!   different from a path. The file-type bits are the one exception, for the
+//!   reason [`MODE_TYPE_BITS`] gives, and they are named here rather than left
+//!   to contradict this sentence from further down the file.
 //! * **A special file cannot be removed or renamed.** The profile refuses a
 //!   FIFO, a socket and a device node at every other operation and leaves them
 //!   out of a listing, so a `delete` grant that could nonetheless unlink one
@@ -111,7 +114,9 @@ fn fire_post_effect_hook() {
 /// The permission bits a caller may set.
 ///
 /// `0o777` exactly: no set-user-ID, no set-group-ID and no sticky bit. A mode
-/// outside it is refused rather than masked.
+/// outside it is refused rather than masked — **once a `Tsetattr` mode's
+/// file-type bits have been discarded**, which is the one exception and is
+/// [`MODE_TYPE_BITS`]'s own business rather than this constant's.
 pub const MODE_BITS_ALLOWED: u32 = 0o777;
 
 /// `S_IFMT`: the file-type bits of a mode word.
@@ -379,10 +384,18 @@ impl ExportRoot {
             )
         })
         .map_err(mutation_error)?;
+        // **Past this point the file exists**, so this read reports `unknown`
+        // like every other post-effect read in this module — the `fstat`, the
+        // exportable-kind check and the device check alike. Unreachable in
+        // practice, because the descriptor `openat` just returned is a regular
+        // file on the parent's own device by construction; kept and wrapped
+        // anyway, because the pinned section says *every* post-effect read is
+        // `unknown` and one that was not would make that sentence false.
+        //
         // The identity is taken from the descriptor `openat` returned, not from
         // a `statat` on the name: the two can already disagree, and only the
         // first is the file this call created.
-        self.adopt(descriptor)
+        self.adopt(descriptor).map_err(after_effect)
     }
 
     /// Create a directory.
