@@ -1317,13 +1317,272 @@ C3_RELAY_CASES: list[tuple[str, list[Edit], bool]] = [
     ),
 ]
 
+
+# --------------------------------------------------------------- M8 chunk 4
+#
+# The policies chunk 4 implemented: the offered-option check, subscriber loss
+# terminating an ACP transport, the connection-capacity discipline, the
+# output-credit stall, and the `RESULT_STATUS` mapping.
+#
+# `TERMINAL` and `LIFECYCLE` are pure; the rest need a real child, so the suite
+# runs the same three crates chunk 2 does.
+
+TERMINAL = CRATE / "src" / "terminal.rs"
+
+C4_CARGO_TEST = [
+    "cargo",
+    "test",
+    "-p",
+    "tunnel-acp",
+    "-p",
+    "tunnel-acp-export",
+    "-p",
+    "tunnel-acp-fixture",
+    "--locked",
+    "--no-fail-fast",
+]
+
+C4_CASES: list[tuple[str, list[Edit], bool]] = [
+    # ------------------------------------------------ the offered-option rule
+    (
+        "a permission response must name an offered option (M8-C11)",
+        [
+            (
+                LIFECYCLE,
+                """        if let Outcome::Permission(PermissionOutcome::Selected(option)) = &outcome
+            && let Some(offered) = entry.offered.as_ref()
+            && !offered.iter().any(|candidate| candidate == option)
+        {""",
+                """        if let Outcome::Permission(PermissionOutcome::Selected(option)) = &outcome
+            && let Some(offered) = entry.offered.as_ref()
+            && !offered.iter().any(|candidate| candidate == option)
+            && false
+        {""",
+            )
+        ],
+        False,
+    ),
+    (
+        # The refusal must leave the callback outstanding, or an invented
+        # option consumes the host's real decision and the genuine answer that
+        # follows is refused as unknown.
+        "an unoffered option does not consume the outstanding callback",
+        [
+            (
+                LIFECYCLE,
+                """            return Err(LifecycleRejection::new(
+                LifecycleRule::OptionNotOffered,
+                "that optionId was not offered by the request it answers",
+            ));""",
+                """            self.pending.remove(&key);
+            return Err(LifecycleRejection::new(
+                LifecycleRule::OptionNotOffered,
+                "that optionId was not offered by the request it answers",
+            ));""",
+            )
+        ],
+        False,
+    ),
+    (
+        # The supervisor must record what the agent offered.  An empty list
+        # admits no selection at all, so every permission turn fails.
+        "the supervisor records the options the agent offered",
+        [
+            (
+                SUPERVISOR,
+                """    message
+        .pointer("/params/options")
+        .and_then(serde_json::Value::as_array)""",
+                """    message
+        .pointer("/params/options/never")
+        .and_then(serde_json::Value::as_array)""",
+            )
+        ],
+        False,
+    ),
+    # --------------------------------------------------- subscriber loss (v0)
+    (
+        "an established required stream that broke is noticed by the watchdog",
+        [
+            (
+                BRIDGE,
+                """        self.body
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(StreamSender::is_closed)""",
+                """        self.body
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(StreamSender::is_closed)
+            && false""",
+            )
+        ],
+        False,
+    ),
+    (
+        # Without the parked sender the watchdog has nothing to ask, so a
+        # broken stream on a quiet connection is invisible.
+        "the live body's sender is parked so a quiet connection still notices",
+        [
+            (
+                BRIDGE,
+                """        target.watch_body(sender.clone());""",
+                """        let _ = &sender;""",
+            )
+        ],
+        False,
+    ),
+    (
+        # `docs/acp.md` names five consequences; this is the one a counter
+        # would not notice going missing.
+        "subscriber loss resolves pending permissions as cancelled",
+        [
+            (
+                BRIDGE,
+                """    let cancelled = connection.supervisor.cancel_all_permissions().await;""",
+                """    let cancelled = 0usize;""",
+            )
+        ],
+        False,
+    ),
+    # ------------------------------------------------- the capacity discipline
+    (
+        "the export refuses a connection beyond its global cap",
+        [
+            (
+                BRIDGE,
+                """    live < MAX_TRACKED_CONNECTIONS && held < MAX_CONNECTIONS_PER_BINDING""",
+                """    held < MAX_CONNECTIONS_PER_BINDING""",
+            )
+        ],
+        False,
+    ),
+    (
+        # Without the per-principal share one authorized principal fills the
+        # table and denies everybody else: the cross-principal denial channel.
+        "one principal cannot fill the table and deny the rest",
+        [
+            (
+                BRIDGE,
+                """    live < MAX_TRACKED_CONNECTIONS && held < MAX_CONNECTIONS_PER_BINDING""",
+                """    live < MAX_TRACKED_CONNECTIONS""",
+            )
+        ],
+        False,
+    ),
+    # ------------------------------------------------ the output-credit stall
+    (
+        "an output-credit stall is bounded",
+        [
+            (
+                BRIDGE,
+                """        match tokio::time::timeout(stall_deadline, target.tx.send(Bytes::from(message.compact)))
+            .await
+        {""",
+                """        match tokio::time::timeout(
+            Duration::from_secs(86_400),
+            target.tx.send(Bytes::from(message.compact)),
+        )
+        .await
+        {""",
+            )
+        ],
+        False,
+    ),
+    (
+        # `docs/acp.md`: "never drop an event and continue".  Continuing past
+        # the stalled message is the failure this rule exists to forbid.
+        "a stalled event is never dropped and continued past",
+        [
+            (
+                BRIDGE,
+                """                end_with_subscriber_loss(&export, &connection).await;
+                return;
+            }
+        }
+    }
+}""",
+                """                continue;
+            }
+        }
+    }
+}""",
+            )
+        ],
+        False,
+    ),
+    # ------------------------------------------- the RESULT_STATUS mapping
+    (
+        "a lost process after dispatch is outcome_unknown, not a success",
+        [
+            (
+                TERMINAL,
+                """            Self::LostAfterDispatch => "outcome_unknown",""",
+                """            Self::LostAfterDispatch => "succeeded",""",
+            )
+        ],
+        False,
+    ),
+    (
+        "a confirmed cancelled turn is cancelled",
+        [
+            (
+                TERMINAL,
+                """            Self::Turn(StopReason::Cancelled) => "cancelled",""",
+                """            Self::Turn(StopReason::Cancelled) => "succeeded",""",
+            )
+        ],
+        False,
+    ),
+    (
+        # `StopReason` is `#[non_exhaustive]`, so a future variant lands in the
+        # wildcard.  Reporting success there is how a protocol upgrade starts
+        # claiming completions nobody verified.
+        #
+        # **This one cannot be reddened today, and that is the finding**, so it
+        # is in `EXPECT_GREEN` rather than counted.  No test can construct the
+        # variant it protects against: every variant the pinned schema defines
+        # is matched by name above, and a future one does not exist to be
+        # written down.  The guard is for the upgrade that adds one, and it
+        # becomes measurable on the day the pin moves.
+        "an unread stop reason is not silently a success",
+        [
+            (
+                TERMINAL,
+                """            Self::Turn(_) => "outcome_unknown",""",
+                """            Self::Turn(_) => "succeeded",""",
+            )
+        ],
+        False,
+    ),
+]
+
 RELAY_CRATE = REPO / "crates" / "tunnel-relay"
+
+# Cases whose **green result is the documented finding**.
+#
+# The mechanism is `scripts/fs-guard-deletion.py`'s, added there when failing
+# closed changed that harness's exit contract (M8-C08).  An entry here is
+# reported on its own line, never counted in a red total, and turns into the
+# unusable `EXPECTED A DOCUMENTED GREEN, GOT: ...` if it ever goes red --
+# because that would mean the rule became load-bearing and the comment
+# explaining the green is now wrong.
+#
+# Every entry must carry a written reason at the case itself.
+EXPECT_GREEN: frozenset[str] = frozenset(
+    {
+        "an unread stop reason is not silently a success",
+    }
+)
 
 SUITES: list[Suite] = [
     Suite("m8c1", [CRATE], CARGO_TEST, CASES),
     Suite("m8c2", [CRATE, EXPORT, FIXTURE], C2_CARGO_TEST, C2_CASES),
     Suite("m8c3", [EXPORT, FIXTURE], C3_CARGO_TEST, C3_CASES),
     Suite("m8c3-relay", [RELAY_CRATE], C3_RELAY_TEST, C3_RELAY_CASES),
+    Suite("m8c4", [CRATE, EXPORT, FIXTURE], C4_CARGO_TEST, C4_CASES),
 ]
 
 
@@ -1412,7 +1671,7 @@ def main() -> int:
     parser.add_argument("--list", action="store_true", help="print case names and exit")
     parser.add_argument("--case", help="run only cases whose name contains this text")
     parser.add_argument(
-        "--suite", help="run only this suite (m8c1, m8c2, m8c3, m8c3-relay)"
+        "--suite", help="run only this suite (m8c1, m8c2, m8c3, m8c3-relay, m8c4)"
     )
     arguments = parser.parse_args()
 
@@ -1460,7 +1719,13 @@ def main() -> int:
             continue
         outcome, failures = run_tests(suite)
         restore(suite)
-        if expect_build_failure:
+        if name in EXPECT_GREEN:
+            outcome = (
+                "DOCUMENTED GREEN"
+                if outcome == "still green"
+                else f"EXPECTED A DOCUMENTED GREEN, GOT: {outcome}"
+            )
+        elif expect_build_failure:
             outcome = (
                 "REFUSED BY COMPILER"
                 if outcome == "BUILD FAILED"
@@ -1484,10 +1749,15 @@ def main() -> int:
             continue
         red = sum(1 for row in rows if row[2] == "RED")
         compiler = sum(1 for row in rows if row[2] == "REFUSED BY COMPILER")
-        measurable = len(rows) - compiler
+        documented = sum(1 for row in rows if row[2] == "DOCUMENTED GREEN")
+        measurable = len(rows) - compiler - documented
         print(
             f"\n{suite.name}: {red} of {measurable} defeated guards turned a test red"
         )
+        if documented:
+            print(
+                f"{suite.name}: {documented} guard(s) reported separately as a documented green"
+            )
         if compiler:
             print(
                 f"{suite.name}: {compiler} further guard(s) are enforced by the "

@@ -298,6 +298,13 @@ impl Target {
     /// that is a subscription deadline, which is a different rule with a
     /// different consequence, and conflating them would let a slow consumer's
     /// missing GET masquerade as a lost one.
+    /// **No guard case defeats the `is_subscribed` half, deliberately.**  It
+    /// is implied by the body test rather than load-bearing beside it: `body`
+    /// is parked only when a subscriber takes the queue, so a target that
+    /// never had one reads `None` here and is not broken either way.  A
+    /// guard-deletion run reported exactly that — removing it reddened
+    /// nothing — so it stays as a statement of the rule and is not claimed as
+    /// a guarded one.
     fn established_and_broken(&self) -> bool {
         if !self.is_subscribed() || self.is_closed() {
             return false;
@@ -1124,6 +1131,12 @@ async fn dispatch_outbound(
                     .counters
                     .streams_lost
                     .fetch_add(1, Ordering::Relaxed);
+                // **A latency path, not a separate rule.** The connection's
+                // watchdog notices the same break within a tick, and a
+                // guard-deletion run confirmed that removing this branch
+                // reddens nothing. It is kept because ending at the moment a
+                // message could not be delivered is better than ending up to
+                // a tick later, not because anything depends on it.
                 if target.is_subscribed() {
                     end_with_subscriber_loss(&export, &connection).await;
                     return;
