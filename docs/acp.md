@@ -330,14 +330,29 @@ claim is still unclaimed.
   to the pinned server's.** What the chunk proves is that they do not need to
   be — the pinned *client* reads that header on no response, and completed a
   whole v1 conversation without it. The half that remains open is a bridge that
-  **fronts or mirrors** the SDK's own server, which this chunk does not do.
-- **The batch disagreement is half closed.** A host that POSTs a JSON-RPC array
-  is refused **501** by the batch rule's own code, and nothing is dispatched.
-  The other half **cannot be proven without a product change**: a batch
-  arriving on the *device's* SSE stream is discovered after the response head
-  is already on the wire, so no status can carry the refusal — the stream can
-  only break. That is recorded on M8-C02 rather than tested into a shape that
-  passes by accident.
+  **fronts or mirrors** the SDK's own server, which this chunk does not do; that
+  is a different direction — the header arrives on the request-parsing side and
+  needs its own decision — and it is tracked as **M8-C10** rather than left
+  implicit in this one.
+- **The batch disagreement is closed in both directions.** A host that POSTs a
+  JSON-RPC array is refused **501** by the batch rule's own code, and nothing is
+  dispatched. A batch arriving on the *device's* SSE stream is refused by that
+  same rule at the child boundary — the child's own `batch_output` and
+  `invalid_output` counters each read 1, so the refusal is observed where it
+  happens rather than inferred — and because a connection has exactly one child,
+  a child that dies this way **closes its transport**: the connection is removed,
+  every target is closed, and a later GET is answered 404. That is `acp.md`'s own
+  policy below, now implemented rather than merely stated.
+
+  An earlier draft of this bullet recorded the device half as **"cannot be proven
+  without a product change"**, reasoning that the response head is already on the
+  wire so no status can carry the refusal. That reasoning was about the wrong
+  question: M8-C02's acceptance never asked for a mid-stream 501, it asked the
+  bridge to *guarantee the stream never carries a batch and prove it with a child
+  that deliberately emits one*, which is provable and now proved. The correction
+  is recorded rather than silently applied, because "cannot be proven" is a claim
+  like any other and this one was wrong. What stays open is narrower and is on
+  M8-C02: whether the profile should refuse such a child at admission instead.
 - **Evidence.** `scripts/acp-guard-deletion.py --suite m8c3` defeats each of
   this chunk's rules in turn: **17 of 17 turned a test red**. Its sibling
   `--suite m8c3-relay`, which needs a different crate and a different test

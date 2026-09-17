@@ -564,13 +564,19 @@ pub fn process_provider_is_ring() -> bool {
     let Some(installed) = CryptoProvider::get_default() else {
         return false;
     };
-    let ring = crypto::ring::default_provider();
-    installed.cipher_suites.len() == ring.cipher_suites.len()
-        && installed
-            .cipher_suites
-            .iter()
-            .zip(ring.cipher_suites.iter())
-            .all(|(left, right)| left.suite() == right.suite())
+    // Discriminate on the secure-random implementation's own type name, not on
+    // the cipher-suite list.
+    //
+    // An earlier version of this compared `cipher_suites` against ring's, which
+    // could not fail for the reason it claimed: rustls 0.23's `ring` and
+    // `aws_lc_rs` default providers offer the same suites in the same order
+    // (non-FIPS, tls12), so this returned `true` for *precisely* the provider
+    // M8-C09 exists to exclude.  Review caught it.
+    //
+    // `SecureRandom` is `Debug` and each provider's implementing type is a
+    // distinct named struct -- ring's is `Ring` -- so the rendered type name
+    // separates them where the suite list cannot.
+    format!("{:?}", installed.secure_random).starts_with("Ring")
 }
 
 fn require_client_ca_with_provider(
