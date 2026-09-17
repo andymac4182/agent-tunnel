@@ -645,7 +645,12 @@ C2_CASES: list[tuple[str, list[Edit], bool]] = [
         False,
     ),
     (
-        "only a permission carries a deadline",
+        # Two edits, because this one rule is written in two places: only a
+        # permission is *given* a deadline, and only a permission is *checked*
+        # against one.  Defeating either alone leaves the other standing and
+        # the suite green, which would report the guard as not load-bearing
+        # when it is -- so the case defeats the rule, not half of it.
+        "only a permission expires on a permission deadline",
         [
             (
                 LIFECYCLE,
@@ -654,7 +659,13 @@ C2_CASES: list[tuple[str, list[Edit], bool]] = [
             PendingKind::Prompt | PendingKind::Call => None,
         };""",
                 "        let deadline = Some(now.saturating_add(timeout));",
-            )
+            ),
+            (
+                LIFECYCLE,
+                """                entry.kind == PendingKind::Permission
+                    && entry.deadline.is_some_and(|deadline| now > deadline)""",
+                "                entry.deadline.is_some_and(|deadline| now > deadline)",
+            ),
         ],
         False,
     ),
