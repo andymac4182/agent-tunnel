@@ -5512,9 +5512,18 @@ async fn start_relay(
         }
     })));
 
+    // These are the listeners the gate-6 driver of `verify-m4-fs-client-e2e`
+    // dials, and it dials them by loopback address: every endpoint in its plan
+    // file is `https://127.0.0.1:<consumer port>/...`, and its descriptor
+    // fetch and its stream upgrade both use that same URL. `node` verifies the
+    // chain against the fixture CA the ordinary way, so the leaf must carry
+    // the address as an IP SAN. The widening is asked for here, at the only
+    // listeners that need it, rather than in the shared server profile — where
+    // it would also reach fixtures whose negative cases depend on its absence
+    // (M4-17).
     let mut server = harness
         .pki
-        .issue_server(format!("{}-server", node.node_id))
+        .issue_server_with_loopback_ip(format!("{}-server", node.node_id))
         .map_err(|error| HarnessError::Pki(error.to_string()))?;
     let server_chain = format!(
         "{}{}",

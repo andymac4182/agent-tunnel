@@ -45,9 +45,7 @@ pub struct RedisTlsEvidence {
 pub async fn verify(redis_url: &str) -> Result<RedisTlsEvidence> {
     let upstream = parse_plaintext_upstream(redis_url)?;
     let pki = FixturePki::new()?;
-    let server = pki
-        .issue_server("redis-tls-forwarder")
-        .map_err(|error| HarnessError::Pki(error.to_string()))?;
+    let server = issue_forwarder_leaf(&pki)?;
     let client = pki
         .issue_peer("redis-tls-client")
         .map_err(|error| HarnessError::Pki(error.to_string()))?;
@@ -71,6 +69,24 @@ pub async fn verify(redis_url: &str) -> Result<RedisTlsEvidence> {
         (Ok(_), Err(error)) => Err(error),
         (Ok(evidence), Ok(())) => Ok(evidence),
     }
+}
+
+/// The forwarder's own server leaf.
+///
+/// Explicitly narrow, and the explicitness is the point. The
+/// `wrong_server_name_rejected` case dials this forwarder as
+/// `rediss://127.0.0.1` and requires refusal, so that case is a check at all
+/// only while this leaf carries no loopback IP subject alternative name. That
+/// the shared default happens to agree is not something this gate should
+/// depend on: it did depend on it, and M4-17 is what happened when the default
+/// was widened elsewhere for an unrelated consumer.
+///
+/// `forwarder_leaf_is_refused_for_the_loopback_address` asserts the property
+/// directly against the issued certificate, so a re-widening reddens a unit
+/// test rather than only this gate.
+fn issue_forwarder_leaf(pki: &FixturePki) -> Result<crate::CertificateMaterial> {
+    pki.issue_server_without_ip_sans("redis-tls-forwarder")
+        .map_err(|error| HarnessError::Pki(error.to_string()))
 }
 
 async fn run_cases(
@@ -375,7 +391,86 @@ async fn forward_connection(
 
 #[cfg(test)]
 mod tests {
-    use super::verify;
+    use super::{FixturePki, issue_forwarder_leaf, verify};
+    use rustls::{
+        RootCertStore,
+        client::{WebPkiServerVerifier, danger::ServerCertVerifier},
+        crypto::ring::default_provider,
+        pki_types::{CertificateDer, ServerName, UnixTime},
+    };
+    use std::sync::Arc;
+
+    /// Verify `leaf` against the fixture server CA for `name`, the way an
+    /// ordinary TLS client would, and say whether it was accepted.
+    fn chain_verifies_for(pki: &FixturePki, leaf: &[u8], name: &str) -> bool {
+        let mut roots = RootCertStore::empty();
+        roots
+            .add(CertificateDer::from(pki.server_ca.certificate_der.clone()))
+            .expect("the fixture server CA is a usable root");
+        let verifier = WebPkiServerVerifier::builder_with_provider(
+            Arc::new(roots),
+            Arc::new(default_provider()),
+        )
+        .build()
+        .expect("building a webpki server verifier");
+        let server_name = ServerName::try_from(name)
+            .expect("a literal server name")
+            .to_owned();
+        verifier
+            .verify_server_cert(
+                &CertificateDer::from(leaf.to_vec()),
+                &[],
+                &server_name,
+                &[],
+                UnixTime::now(),
+            )
+            .is_ok()
+    }
+
+    /// The regression guard for M4-17.
+    ///
+    /// `wrong_server_name_rejected` dials the forwarder at
+    /// `rediss://127.0.0.1` and requires the handshake to fail on the name. If
+    /// the forwarder's leaf ever carries the loopback address as an IP subject
+    /// alternative name, that connection succeeds, the negative case can no
+    /// longer fail, and it stops being a check. This asserts the property on
+    /// the certificate the gate actually issues, and does so in milliseconds
+    /// with no Redis and no sockets.
+    ///
+    /// Both directions are asserted: refused for the address, and *accepted*
+    /// for `localhost`, so the test cannot pass because the leaf is simply
+    /// unusable.
+    #[test]
+    fn forwarder_leaf_is_refused_for_the_loopback_address() {
+        let pki = FixturePki::new().expect("fixture PKI");
+        let leaf = issue_forwarder_leaf(&pki).expect("forwarder leaf");
+        assert!(
+            chain_verifies_for(&pki, &leaf.certificate_der, "localhost"),
+            "the forwarder leaf must still verify for the name the gate's \
+             positive case dials"
+        );
+        assert!(
+            !chain_verifies_for(&pki, &leaf.certificate_der, "127.0.0.1"),
+            "the forwarder leaf must not verify for 127.0.0.1: \
+             verify-m7-redis-tls's wrong_server_name_rejected case dials that \
+             address and requires refusal, so an IP SAN here disarms it (M4-17)"
+        );
+    }
+
+    /// The other direction of the same trade, at the profile the gate-6 driver
+    /// depends on: `verify-m4-fs-client-e2e` spawns `node` against
+    /// `https://127.0.0.1:<port>`, and that leaf must verify for the address.
+    /// Narrowing it would break gate 6 exactly as widening the shared default
+    /// broke `verify-m7-redis-tls`.
+    #[test]
+    fn the_loopback_opt_in_leaf_verifies_for_the_address_and_the_name() {
+        let pki = FixturePki::new().expect("fixture PKI");
+        let leaf = pki
+            .issue_server_with_loopback_ip("loopback-opt-in")
+            .expect("loopback leaf");
+        assert!(chain_verifies_for(&pki, &leaf.certificate_der, "localhost"));
+        assert!(chain_verifies_for(&pki, &leaf.certificate_der, "127.0.0.1"));
+    }
 
     /// Run explicitly with the dedicated plaintext Redis service. The test is
     /// ignored by the ordinary workspace suite because Redis is external.
