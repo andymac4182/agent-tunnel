@@ -615,6 +615,23 @@ pub fn validate_fs_client_e2e_evidence(evidence: &FsClientE2eEvidence) -> Result
 /// # Errors
 /// Any setup, scenario, validation or cleanup failure.
 pub async fn verify() -> Result<FsClientE2eEvidence> {
+    // **First, before anything is started.** Removing the variable from the
+    // child's environment is not enough on its own: an operator who set it
+    // meant something by it, and a gate that silently ignored it would be
+    // reporting a verified chain in an environment configured not to verify.
+    // The check belongs here rather than beside the spawn it protects, because
+    // by then three relays, a Redis catalog and a device connector are already
+    // running and the refusal arrives buried under their diagnostics — an
+    // environment this gate will not run in should cost nothing to discover.
+    // The child's environment is scrubbed as well, and the driver reports what
+    // it saw.
+    if std::env::var_os("NODE_TLS_REJECT_UNAUTHORIZED").is_some() {
+        return Err(HarnessError::InvalidInput(
+            "NODE_TLS_REJECT_UNAUTHORIZED is set in this environment; this gate proves \
+             certificate verification and will not run where it can be skipped"
+                .into(),
+        ));
+    }
     let options = HarnessOptions::from_env()?.fs_services(true);
     let mut harness = timeout(STARTUP_TIMEOUT, Harness::start(options))
         .await
@@ -671,15 +688,6 @@ fn fnv1a(bytes: &[u8]) -> u64 {
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     hash
-}
-
-/// The filesystem path inside a `file:` URL, or `None` for anything else.
-///
-/// `import.meta.resolve` answers a URL, and comparing a URL to a path would
-/// compare two spellings of the same thing; this takes the path out so the
-/// comparison can be made on canonicalised files.
-fn url_path(url: &str) -> Option<PathBuf> {
-    url.strip_prefix("file://").map(PathBuf::from)
 }
 
 /// The repository root, from this crate's own manifest directory.
@@ -1046,20 +1054,6 @@ async fn exercise(
         })
     });
 
-    // **Refuse to run at all if this process could hand the driver a way to skip
-    // certificate verification.** Removing the variable from the child's
-    // environment is not enough on its own: an operator who set it meant
-    // something by it, and a gate that silently ignored it would be reporting a
-    // verified chain in an environment configured not to verify. The child's
-    // environment is scrubbed as well, and the driver reports what it saw.
-    if std::env::var_os("NODE_TLS_REJECT_UNAUTHORIZED").is_some() {
-        return Err(HarnessError::InvalidInput(
-            "NODE_TLS_REJECT_UNAUTHORIZED is set in this environment; this gate proves \
-             certificate verification and will not run where it can be skipped"
-                .into(),
-        ));
-    }
-
     let work = tempfile::tempdir().map_err(HarnessError::Io)?;
     let plan_path = work.path().join("plan.json");
     write_private(
@@ -1257,9 +1251,13 @@ async fn exercise(
     // repository's own file. A file-exists check would have said only that a
     // package is present somewhere; this says the module the driver loaded is
     // that file.
+    // The driver reports a decoded filesystem path, not a URL: a URL
+    // percent-encodes a space and every non-ASCII byte, and stripping `file://`
+    // here would have failed a checkout under such a path for a reason that has
+    // nothing to do with which module was loaded. Both sides are canonicalised,
+    // so a symlinked checkout compares equal too.
     let expected_module = std::fs::canonicalize(root.join("packages/client/src/index.ts")).ok();
-    let resolved_module =
-        url_path(&evidence.client_module_path).and_then(|path| std::fs::canonicalize(path).ok());
+    let resolved_module = std::fs::canonicalize(&evidence.client_module_path).ok();
     evidence.client_module_is_the_package =
         expected_module.is_some() && expected_module == resolved_module;
 

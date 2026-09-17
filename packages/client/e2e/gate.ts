@@ -35,6 +35,7 @@
  */
 
 import { createInterface } from 'node:readline';
+import { fileURLToPath } from 'node:url';
 
 import {
   ConsumerSession,
@@ -134,7 +135,7 @@ interface Report {
    * that it was.
    */
   nodeTlsRejectUnauthorized: string;
-  /** The module specifier this driver resolved for the client under test. */
+  /** The filesystem path this driver resolved for the client under test. */
   clientModulePath: string;
   /** Whether the composed public entry point was driven, not only its pieces. */
   publicEntryPointUsed: boolean;
@@ -318,8 +319,21 @@ async function bracket(
   try {
     await body();
   } finally {
+    // The closing rendezvous must not be able to *replace* the body's error.
+    // A `finally` that throws discards whatever was propagating through it, so
+    // a harness that had closed stdin would turn "the read-only case failed
+    // with EPERM" into "stdin closed" — the same class of burying the `finally`
+    // itself was added to prevent. Today the harness never closes stdin early,
+    // and a rule that is only true because of what the peer happens to do is
+    // not a rule.
     emit({ event: `${name}-done` });
-    await awaitGo(lines);
+    try {
+      await awaitGo(lines);
+    } catch (error) {
+      process.stderr.write(
+        `gate6-e2e: the ${name} rendezvous did not close: ${(error as Error)?.name ?? 'unknown'}\n`,
+      );
+    }
   }
 }
 
@@ -1015,10 +1029,16 @@ async function main(): Promise<void> {
   }
   const report = blankReport();
   report.nodeTlsRejectUnauthorized = process.env['NODE_TLS_REJECT_UNAUTHORIZED'] ?? 'unset';
-  // The specifier this driver actually resolved for the client under test, so
-  // the harness compares a path node produced against the path it expects
-  // rather than asking whether a file exists somewhere.
-  report.clientModulePath = import.meta.resolve('../src/index.ts');
+  // The path this driver actually resolved for the client under test, so the
+  // harness compares a path node produced against the path it expects rather
+  // than asking whether a file exists somewhere.
+  //
+  // `fileURLToPath` rather than stripping `file://` on the other side: a URL
+  // percent-encodes a space and every non-ASCII byte, so a checkout under a
+  // path containing either would have failed the comparison for a reason that
+  // has nothing to do with which module was loaded. Decoding belongs where the
+  // URL is, and node has the function for it.
+  report.clientModulePath = fileURLToPath(import.meta.resolve('../src/index.ts'));
   const lines = createInterface({ input: process.stdin })[Symbol.asyncIterator]();
 
   // The order is load-bearing in one place and stated rather than left to be
