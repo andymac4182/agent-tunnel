@@ -1905,7 +1905,10 @@ C5_CASES: list[tuple[str, list[Edit], bool]] = [
         [
             (
                 ACP_CLUSTER,
-                '            evidence.revocation_in_flight_execution == "unknown",',
+                """            evidence
+                .revocation_in_flight_execution
+                .split('+')
+                .any(|execution| execution == "unknown"),""",
                 "            true,",
             )
         ],

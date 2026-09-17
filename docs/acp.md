@@ -753,6 +753,17 @@ connection and started a child.
   victim is a **third** principal, M3-04's precedent: an earlier draft revoked
   the principal every other case drives, and every case after it met
   `404 SERVICE_NOT_FOUND`.
+
+  **A revocation withdraws more than one exchange, and they are not classified
+  alike.** The held session GET, whose turn was dispatched and whose result
+  will never arrive, is `unknown`; the connection GET, which the device
+  demonstrably received, is `dispatched`. Both are correct. The gate diffs the
+  relay's aborted-exchange set across the revocation, so only exchanges *this
+  revocation* withdrew are considered — reading "the most recent aborted
+  record" is not correlation, because the saturation case has left aborted
+  records of its own by then — and asserts the withdrawal **contains** an
+  `unknown`. An earlier version demanded a single value and failed about one
+  run in two on a classification the product was getting right.
 - **Peer-key rotation** (the ingress relay's peer pins withdrawn, and the
   ingress→owner path dropped so a pooled connection cannot carry the stream on
   regardless of the pin set) and **owner loss** (the owner relay stopped) each
@@ -780,8 +791,15 @@ more freezes than chunk 4 does. Chunk 4's gate applies the refusal discipline
 to **POSTs only**, and a session GET that lands in a QUIESCE→COMMIT freeze
 fails the run as though the route were broken, counted in neither refusal
 tally. That is **M8-C15**, filed rather than worked around; this gate counts
-and correlates refusals in both directions. In the recorded runs there were
-**no refusals at all**.
+and correlates refusals in both directions. Its resend budget is derived from
+**its own** rotation policy rather than imported from chunk 4's: the freeze
+spans the handshake window *and* the candidate's overlap, and at a 3-second
+interval chunk 4's budget ran out inside a genuine freeze. A refusal that
+exhausts its budget, or never correlates, now **fails by name with the freeze
+correlation attached** rather than being handed back as a bare 503 for the
+caller to describe as a broken route. In the recorded runs there were **no
+refusals at all**: `not_dispatched_refusals` and `not_dispatched_retries` both
+zero across six consecutive green runs.
 
 ### Evidence
 
