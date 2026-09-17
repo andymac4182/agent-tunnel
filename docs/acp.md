@@ -343,11 +343,19 @@ claim is still unclaimed.
   `--suite m8c3-relay`, which needs a different crate and a different test
   command, is **2 of 2**. Both classify their outcomes with the shared
   `scripts/guard_outcomes.py` allow list, so anything but `RED`, `REFUSED BY
-  COMPILER` or `DOCUMENTED GREEN` fails closed. Two rules are deliberately
-  **not** claimed as cases rather than faked: "no inbound listener" has no
-  guard to delete, and the 202 rule is the shape of the handler rather than a
-  branch — defeating it would turn nothing red, because nothing in this chunk
-  asserts a status for a dispatched operation, which is the point.
+  COMPILER` or `DOCUMENTED GREEN` fails closed.
+
+  **Two rules were exempted from that in the first draft, and both exemptions
+  were wrong.** The 202 rule was called unmeasurable "because nothing here
+  terminates on a status"; the mutation that matters is not `202 → 200` but a
+  **lying 202** — accept the POST and never deliver the result — which is
+  constructible, reddens several tests, and is precisely the rule "no claim
+  terminates on a status" exists to protect. "No inbound listener" was called
+  unguardable; a listener bound inside the export's own constructor is a
+  perfectly good case, and the positive control inside `no_listener.rs` checks
+  the *detector*, not the export path. Both are cases now. The one rule exempted
+  from the standard everything else was held to turned out not to need the
+  exemption.
 - **There is no principal in this chunk.** `docs/acp.md` derives a principal at
   the relay ingress, and the in-process gate-2 bridge has no ingress in front of
   it: every request carries no `tunnel-principal-binding` at all. That is the
