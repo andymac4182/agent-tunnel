@@ -1058,28 +1058,19 @@ C3_CASES: list[tuple[str, list[Edit], bool]] = [
         False,
     ),
     # ----------------------------------------------------- one lost subscriber
-    (
-        # Restores the destructive behaviour review found: the connection's one
-        # router returning on the first failed send, which silently stopped
-        # every other stream on the connection.
-        "one lost subscriber closes one stream and nothing else",
-        [
-            (
-                BRIDGE,
-                """        if target.tx.send(Bytes::from(message.compact)).await.is_err() {
-            target.close();
-            connection
-                .counters
-                .streams_lost
-                .fetch_add(1, Ordering::Relaxed);
-        }""",
-                """        if target.tx.send(Bytes::from(message.compact)).await.is_err() {
-            return;
-        }""",
-            )
-        ],
-        False,
-    ),
+    #
+    # **Removed in M8 chunk 4, because the behaviour it guarded was
+    # deliberately replaced rather than because the guard stopped mattering.**
+    # The case restored chunk 3's destructive router — returning on the first
+    # failed send, silently stopping every other stream on the connection — to
+    # prove chunk 3's narrow fix was load-bearing. Chunk 3 said in terms that
+    # its fix "is not the documented policy"; chunk 4 implemented the documented
+    # policy, so an established stream that breaks now terminates the whole ACP
+    # transport and the code this case mutated no longer exists. The `m8c4`
+    # suite guards the policy that replaced it, including the consequence this
+    # one existed for: the other streams no longer go quiet, they are closed and
+    # errored. Deleting it silently would have left `COULD NOT APPLY` in a run
+    # nobody read, which is how a suite rots.
     # -------------------------------------------------- a child ends its transport
     (
         "a child that is gone ends its transport",
