@@ -782,7 +782,16 @@ async fn the_documented_ten_second_deadline_is_the_one_that_elapses() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_session_whose_subscriber_never_arrives_closes_its_window() {
     let workspace = workspace();
-    let export = acp_export_with(workspace.path(), "[deadlines]\nsubscribe_ms = 300\n");
+    // **1500 ms, not 300.** The bound applies to the *connection* GET as well
+    // as the session GET, and 300 ms is the wall time between `initialize`
+    // returning and this test getting round to sending the connection GET on a
+    // loaded machine. When that window closed first the connection ended, the
+    // session's window never expired, and this test failed for a reason that
+    // had nothing to do with what it measures. It surfaced as a test reddening
+    // at random across a whole guard-deletion suite, which is how it was
+    // found. The deadline is still observed and still elapses; only the
+    // fragility is gone.
+    let export = acp_export_with(workspace.path(), "[deadlines]\nsubscribe_ms = 1500\n");
     let profile = Arc::new(export.profile_policies().expect("profile"));
     let connection = initialize(&export, &profile).await;
     let stream = send(&export, &profile, get_connection(&connection)).await;
@@ -796,6 +805,10 @@ async fn a_session_whose_subscriber_never_arrives_closes_its_window() {
         tokio::time::sleep(Duration::from_millis(20)).await;
         diagnostics = export.diagnostics();
     }
+    assert_eq!(
+        diagnostics.connection_subscribe_expired, 0,
+        "the connection's own window must not be what closed: {diagnostics:?}"
+    );
     assert_eq!(diagnostics.session_subscribe_expired, 1);
     assert!(
         diagnostics.last_expiry_elapsed_us > diagnostics.last_expiry_bound_us,
