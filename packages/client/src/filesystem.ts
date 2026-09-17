@@ -24,7 +24,12 @@ import {
   type Operation,
 } from './descriptor.ts';
 import { FilesystemError, mergeOutcome, type Outcome } from './errors.ts';
-import { splitParent, validatePath, type PathBounds } from './paths.ts';
+import {
+  splitParent,
+  validateComponentForJoin,
+  validatePath,
+  type PathBounds,
+} from './paths.ts';
 import { ConsumerSession, ROOT_FID, type Lifecycle } from './session.ts';
 import {
   isTlsVerificationFailure,
@@ -622,11 +627,28 @@ export class RemoteFilesystem {
       }
     } catch (error) {
       if (!(error instanceof FilesystemError)) {
-        // A refused path is a `PathRefusal` and carries no outcome, so there is
-        // nothing to merge into and nothing to learn by rewriting it. `copy`
-        // validates both of its paths before it creates anything, so this
-        // cannot be a refusal that happened after an effect.
-        throw error;
+        // Not one of ours: a `PathRefusal`, or — the case that matters here —
+        // an exception thrown by the caller's **own** chunk source, which
+        // `writeStream` and `copy` both iterate inside this `try`.
+        //
+        // If nothing has been applied it is passed through untouched: it is the
+        // caller's error and none of this client's business. If something has,
+        // it is wrapped, because a created file plus an error carrying no
+        // `outcome` is exactly the ambiguity a retry wrapper misreads as "safe
+        // to try again".
+        const floor = mergeOutcome(outcome, acknowledged > 0 ? 'partial' : 'not_started');
+        if (floor === 'not_started') {
+          throw error;
+        }
+        throw new FilesystemError({
+          code: 'EINVAL',
+          operation,
+          path,
+          outcome: floor,
+          retryable: false,
+          bytesAcknowledged: acknowledged,
+          cause: error,
+        });
       }
       const failed = error;
       // The composite's own outcome is merged with the failing step's, and the
@@ -739,8 +761,27 @@ export class RemoteFilesystem {
     path: string,
     applied: boolean,
   ): unknown {
-    if (!(error instanceof FilesystemError) || !applied) {
+    if (!applied) {
+      // Nothing has been applied, so there is no floor to impose and nothing
+      // is gained by rewriting whatever this is.
       return error;
+    }
+    if (!(error instanceof FilesystemError)) {
+      // Something that carries no outcome at all — a `PathRefusal`, or an
+      // exception out of a caller's own chunk source — escaping an operation
+      // that **has** changed the export. A retry wrapper reading `outcome`
+      // would see `undefined` and be free to try again over an applied
+      // mutation, which is the failure this whole class of fix exists to
+      // prevent. It is wrapped so the outcome exists, with the original kept as
+      // `cause` so nothing is lost by wrapping it.
+      return new FilesystemError({
+        code: 'EINVAL',
+        operation,
+        path,
+        outcome: 'partial',
+        retryable: false,
+        cause: error,
+      });
     }
     return new FilesystemError({
       code: error.code,
@@ -750,6 +791,7 @@ export class RemoteFilesystem {
       retryable: false,
       bytesAcknowledged: error.bytesAcknowledged,
       closeCode: error.closeCode,
+      cause: error.cause,
     });
   }
 
@@ -830,12 +872,33 @@ export class RemoteFilesystem {
             retryable: false,
           });
         }
-        await this.removeInner(
-          `${path === '/' ? '' : path}/${child.name}`,
-          options,
-          depth + 1,
-          progress,
-        );
+        const childPath = `${path === '/' ? '' : path}/${child.name}`;
+        // **The name came from the device, not from the caller.** A `Treaddir`
+        // lists whatever the host holds, and the provider skips only `.`, `..`,
+        // special files and foreign mounts — so an ordinary host file named
+        // `notes.` or `CON` is listed and is then refused by this namespace's
+        // own rules on the way back. Left alone, that refusal is a
+        // `PathRefusal` with no outcome, thrown after earlier siblings were
+        // already unlinked.
+        //
+        // It is converted here, at the name, rather than being caught further
+        // out: the failure is that this export holds a name this profile cannot
+        // address, which is `EINVAL` and is `not_started` **for this child**,
+        // and the composite's own floor is then applied above by whatever has
+        // been removed already.
+        try {
+          validateComponentForJoin(child.name);
+        } catch (error) {
+          throw new FilesystemError({
+            code: 'EINVAL',
+            operation: 'remove',
+            path: childPath,
+            outcome: 'not_started',
+            retryable: false,
+            cause: error,
+          });
+        }
+        await this.removeInner(childPath, options, depth + 1, progress);
       }
     }
     const { parent, name } = splitParent(path, this.bounds);

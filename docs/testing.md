@@ -1140,7 +1140,21 @@ right offset" comparison true by construction.
 A composite that made something and then failed is covered on its own, because
 it is the client's version of the defect gate 5 removed on the device side: a
 `copy` whose source turns out to be absent has already created its destination,
-and a caller told `not_started` would believe the export untouched.
+and a caller told `not_started` would believe the export untouched. The same
+floor is exercised for a recursive `mkdir` interrupted after one `Rmkdir` and a
+recursive `remove` that unlinked a child before failing, and in the other
+direction for the traversal budget, which fires during a post-order descent and
+must therefore report `not_started` with zero `Tunlinkat` on the wire.
+
+Two of those cases are about the **type** of the failure rather than its floor,
+and they are the ones an outcome can escape through: a directory entry the device
+listed but this namespace refuses — an ordinary host file called `bad.` — and an
+exception from the caller's own chunk source, which `writeStream` iterates inside
+the composite. Both are `PathRefusal` or a plain `Error`, neither carries an
+`outcome`, and both are reachable **after** the composite has applied something.
+Each is asserted to arrive as a `FilesystemError` carrying the floor with the
+original as `cause`, and — when nothing has applied — to be passed through
+unchanged.
 
 **What this suite does not prove, and must not be read as proving.** Every socket
 in it is a loopback socket to a harness in `packages/client/test/harness/`. That

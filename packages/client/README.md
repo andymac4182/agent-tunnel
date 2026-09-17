@@ -264,6 +264,11 @@ this client's own socket path would not be.
 * **A graceful close.** `close()` rejects what is pending and closes the socket;
   it sends no `Tflush` and clunks no fid. The session ends either way, but an
   orderly shutdown is a different thing.
+* **Addressing a host name this namespace refuses.** A POSIX host may hold a file
+  called `notes.` or `CON`; the device lists it, gate 1 refuses it on every host
+  so an export does not change meaning with the serving OS, and no path this
+  client will send can name it. A recursive `remove` of the directory holding one
+  therefore removes what it can and reports `EINVAL` naming that child.
 * **TLS.** Every test endpoint is `http://127.0.0.1`, through the contract's own
   loopback development harness, which this client requires to be asked for
   explicitly and refuses for any non-loopback host.

@@ -91,6 +91,13 @@ export interface FilesystemErrorFields {
   bytesAcknowledged?: number | undefined;
   /** For a session that closed: the WebSocket close code, when one arrived. */
   closeCode?: number | undefined;
+  /**
+   * The error this one was built from, when it wraps something that carries no
+   * outcome of its own — a refused path, or an exception out of a caller's own
+   * chunk source. The wrapper exists so an applied composite always reports an
+   * outcome; the cause exists so nothing is lost in doing so.
+   */
+  cause?: unknown;
 }
 
 /**
@@ -115,7 +122,10 @@ export class FilesystemError extends Error {
     // path is a *field*, deliberately, so that a caller logging `error.message`
     // cannot put a name into a log line that was never meant to hold one; a
     // caller already knows the path it asked for.
-    super(`${fields.code} (${fields.operation})`);
+    super(
+      `${fields.code} (${fields.operation})`,
+      fields.cause === undefined ? undefined : { cause: fields.cause },
+    );
     this.name = 'FilesystemError';
     this.code = fields.code;
     this.operation = fields.operation;
