@@ -1304,7 +1304,15 @@ that at 64. A page fanned out at once therefore could not be produced at all for
 a directory with more keys than the quota, which made `DEFAULT_PAGE` of 100 a
 number this adapter could never fulfil. The fan-out is bounded at a quarter of
 the quota, leaving room for another borrower of the same client, and the case
-lists strictly more keys than the quota in one page.
+lists strictly more keys than the quota in one page. A second case covers the
+failure path, which is where an unbounded pool does its real damage:
+`Promise.all` rejects at the first failure, so without a shared flag the
+survivors drain the rest of the page *after* the caller already holds an error,
+spending the quota the bound exists to protect and swallowing their own
+failures. The peer fails exactly one stat — a peer that failed every stat would
+kill every worker at once and a pool that had kept going would still have looked
+bounded — and the run is required to settle strictly below the page and to stay
+settled.
 
 **Mastra's `readdir` follows the pinned `LocalFilesystem` in three places** that a
 tool depends on and that are not obvious: a nested entry's name carries its
