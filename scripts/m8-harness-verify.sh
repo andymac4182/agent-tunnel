@@ -52,4 +52,24 @@ gate "build locked workspace binaries" \
 gate "M8 ACP over three relays: a v1 conversation, permissions, cancellation, subscriber loss and an unknown outcome through a non-owner ingress" \
   cargo run --locked -p tunnel-test-harness -- verify-m8-acp-real-path
 
+# **What this gate does and does not claim.**  Unlike the gate above, this one
+# *does* carry two ACP sessions across three completed scheduled rotations, and
+# asserts it.  That is possible because a scheduled **device data-socket**
+# rotation and a cluster **membership re-sign** are different mechanisms and
+# only the second is M7-C80: the consumer still enters at the non-owner
+# relay-c, the peer hop is still crossed, and membership is simply not
+# re-signed while the streams are live.  What it does not claim is a connection
+# that outlives its membership record: a peer admission's deadline is never
+# extended, so one record is the ceiling on a non-owner ingress either way, and
+# the rotation case is bounded to finish inside it rather than escaping it.
+#
+# It also does not claim per-OS process-tree cleanup (macOS is the only host,
+# and M8-C07's escaping descendant is not reached at all), any OS sandbox
+# guarantee (the export is trusted-agent execution until a tested sandbox
+# profile exists), or real-agent interoperability (the agent is this
+# repository's own synthetic fixture).  The gate's own NOT_COVERED carries all
+# of this, and the validator requires the evidence to carry it.
+gate "M8 ACP across three relays: three completed rotations with two sessions live, two tenants reusing identical ids, forged heads, revocation, peer-key rotation, owner loss and both forwarding segments saturated" \
+  cargo run --locked -p tunnel-test-harness -- verify-m8-acp-cluster
+
 echo "m8-harness-verify: implemented M8 harness suite passed" >&2

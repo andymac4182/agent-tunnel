@@ -30,6 +30,8 @@
 //! | `silent` | never answer the prompt |
 //! | `updates:<n>` | emit `n` `session/update` chunks as fast as it can, then finish — enough of them fills a stream's bounded queue, so an unread subscriber stalls output credit |
 //! | `effect-crash:<name>` | append one line to the workspace's own side-effect ledger, flush it to disk, then **die without answering the prompt** |
+//! | `effect:<name>` | append one line to that same ledger, then finish `end_turn` — the non-crashing sibling, so a turn that must survive can still record a durable effect |
+//! | `effect-permission:<name>` | record one effect, then behave as `permission`: the turn stays open on a pending callback and the effect is already on disk |
 //!
 //! The echoed permission outcome is what makes a timeout observable **on the
 //! wire**: the supervisor's belief about what it sent is not evidence that the
@@ -197,11 +199,19 @@ async fn run_directive(
         // `permission` asks once; `permission:<n>` asks `n` times at once, so
         // the pending-callback bound is reachable from a single session and a
         // single turn.
-        "permission" => {
-            let count = argument
-                .and_then(|value| value.parse::<usize>().ok())
-                .unwrap_or(1)
-                .max(1);
+        // `effect-permission:<name>` is `permission` with one durable side
+        // effect recorded first, for a turn that must be held open across a
+        // carrier drain and then shown to have run its effect exactly once.
+        "permission" | "effect-permission" => {
+            let count = if verb == "effect-permission" {
+                record_side_effect(&argument.clone().unwrap_or_else(|| "effect".to_owned()));
+                1
+            } else {
+                argument
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(1)
+                    .max(1)
+            };
             let mut waiting = Vec::with_capacity(count);
             for index in 0..count {
                 let permission_id = format!("permission-{session}-{index}");
@@ -360,6 +370,20 @@ async fn run_directive(
             // crash this directive is for, and it is why the ledger is
             // flushed to disk *before* this line rather than at exit.
             std::process::abort();
+        }
+        // The same durable record as `effect-crash`, without the crash.
+        //
+        // It exists because "no repeated side effects across a rotation"
+        // cannot otherwise be read from the **agent's own** ledger: every
+        // other ledger-writing directive kills the agent, so a turn that must
+        // survive three rotations and then finish had no way to record that it
+        // ran exactly once.  Counting SSE messages instead would measure the
+        // stream rather than the effect.
+        "effect" => {
+            let name = argument.unwrap_or_else(|| "effect".to_owned());
+            record_side_effect(&name);
+            update(&out, &session, "synthetic effect recorded").await;
+            finish(&out, &id, "end_turn").await;
         }
         "silent" => {}
         _ => {

@@ -61,6 +61,20 @@ pub struct HarnessOptions {
     /// ([`ACP_GATE_SERVICE`]) on the first tenant-A device, with mirrored
     /// `http:invoke` grants.  Only `verify-m8-acp-real-path` enables it.
     pub acp_services: bool,
+    /// Also seed an ACP export on the first **tenant-B** device
+    /// ([`ACP_GATE_SERVICE_B`]), for the M8 chunk-5 cluster gate.
+    ///
+    /// The second row is appended after tenant A's, so a gate reading
+    /// `acp_services.first()` still gets tenant A and
+    /// `verify-m8-acp-real-path` is untouched by this option existing.
+    ///
+    /// Two tenants need two catalog services because
+    /// `push_http_forward_service_with_profile` mirrors the device's own
+    /// primary grants: on a tenant-B device it mirrors the
+    /// `consumers_b × devices_b` grants, so tenant-B principals get
+    /// `http:invoke` here and tenant-A principals get nothing.  That is the
+    /// isolation the chunk-5 gate measures, seeded rather than asserted.
+    pub acp_services_tenant_b: bool,
 }
 
 /// The MCP services the M3-03 gate seeds: `(label, profile)`.  The label
@@ -78,6 +92,14 @@ pub const MCP_GATE_SERVICES: [(&str, &str); 4] = [
 /// and there is one export kind for it.  The shape follows
 /// [`MCP_GATE_SERVICES`] so the two read the same way.
 pub const ACP_GATE_SERVICE: (&str, &str) = ("acp", "acp-http-v1");
+
+/// The second ACP service, on a **tenant-B** device, for the chunk-5 cluster
+/// gate: `(label, profile)`.
+///
+/// The profile is the same one — there is only one pinned ACP profile — and
+/// the label is what distinguishes the two rows, exactly as the filesystem
+/// fixtures are looked up by label rather than by position.
+pub const ACP_GATE_SERVICE_B: (&str, &str) = ("acp-b", "acp-http-v1");
 
 /// One seeded ACP service.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -110,6 +132,7 @@ impl Default for HarnessOptions {
             mcp_services: false,
             fs_services: false,
             acp_services: false,
+            acp_services_tenant_b: false,
         }
     }
 }
@@ -185,10 +208,22 @@ impl HarnessOptions {
         self
     }
 
-    /// Opt into the four MCP services used by the M3-03 cloud-client gate.
+    /// Opt into the ACP export used by the M8 ACP gates.
+    ///
+    /// The comment here used to describe the four MCP services, copied from
+    /// the builder above; it named the wrong milestone, the wrong protocol
+    /// and the wrong count.
     #[must_use]
     pub fn acp_services(mut self, value: bool) -> Self {
         self.acp_services = value;
+        self
+    }
+
+    /// Also seed an ACP export on a tenant-B device, for the chunk-5 cluster
+    /// gate's two-tenant cases.
+    #[must_use]
+    pub fn acp_services_tenant_b(mut self, value: bool) -> Self {
+        self.acp_services_tenant_b = value;
         self
     }
 
@@ -374,6 +409,31 @@ impl Harness {
                 Err(error) => return Err(with_redis_cleanup(error, redis.close().await)),
             }
         }
+        if options.acp_services_tenant_b {
+            // Appended after tenant A's row, never before it: the chunk-4 gate
+            // reads `acp_services.first()`, so prepending here would silently
+            // hand that gate the other tenant's export.
+            let Some(device_id) = topology.devices_b.first().map(|device| device.id) else {
+                let error = HarnessError::InvalidInput(
+                    "the tenant-B ACP service requires a tenant-B device".to_owned(),
+                );
+                return Err(with_redis_cleanup(error, redis.close().await));
+            };
+            let (label, profile) = ACP_GATE_SERVICE_B;
+            match topology.push_http_forward_service_with_profile(
+                &mut fixture,
+                device_id,
+                profile,
+                "Synthetic ACP export (tenant B)",
+            ) {
+                Ok(service_id) => acp_services.push(AcpServiceFixture {
+                    label,
+                    profile,
+                    service_id,
+                }),
+                Err(error) => return Err(with_redis_cleanup(error, redis.close().await)),
+            }
+        }
         let mut fs_services = Vec::new();
         if options.fs_services {
             let Some(device_id) = topology.devices_a.first().map(|device| device.id) else {
@@ -475,6 +535,18 @@ impl RunningHarness {
     #[must_use]
     pub fn fs_service(&self, label: &str) -> Option<&FsServiceFixture> {
         self.fs_services
+            .iter()
+            .find(|service| service.label == label)
+    }
+
+    /// The seeded ACP service with this label.
+    ///
+    /// Looked up by label rather than by position, because the chunk-5 gate
+    /// needs both tenants' exports and position would make which is which a
+    /// property of seeding order.
+    #[must_use]
+    pub fn acp_service(&self, label: &str) -> Option<&AcpServiceFixture> {
+        self.acp_services
             .iter()
             .find(|service| service.label == label)
     }

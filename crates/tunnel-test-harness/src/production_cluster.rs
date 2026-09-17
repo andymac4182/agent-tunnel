@@ -123,6 +123,11 @@ pub use acp_real_path::{
     ACP_CASES, AcpRealPathEvidence, validate_acp_real_path_evidence, verify as verify_acp_real_path,
 };
 
+mod acp_cluster;
+pub use acp_cluster::{
+    AcpClusterEvidence, CLUSTER_CASES, validate_acp_cluster_evidence, verify as verify_acp_cluster,
+};
+
 mod http_forward_real_path;
 pub use http_forward_real_path::{
     HttpForwardRealPathEvidence, validate_http_forward_real_path_evidence,

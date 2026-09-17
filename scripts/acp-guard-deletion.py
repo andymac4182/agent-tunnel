@@ -14,6 +14,13 @@ here:
   sibling suite `m8c3-relay` holds the relay's `[http_forward]` profile
   allowlist, which lives in a different crate and needs a different test
   command.
+* `m8c5` — the cluster gate's own validator in
+  `crates/tunnel-test-harness/src/production_cluster/acp_cluster.rs`: the three
+  completed rotations, the socket bounds, the byte-identical isolation
+  refusals, the forgery refusals, the revocation classification, the two
+  explicit interruptions and the saturation threshold.  Its guards are
+  validator rules, so defeating one stops that rule rejecting its own
+  falsification and the gate's `every_claim_can_fail_on_its_own` names it.
 * `m8c2` — the pure lifecycle in `crates/tunnel-acp/src/lifecycle.rs`, the
   supervisor in `crates/tunnel-acp-export` and the synthetic agent in
   `crates/tunnel-acp-fixture`: id scoping, resolve-exactly-once, the bounds,
@@ -1597,12 +1604,428 @@ EXPECT_GREEN: frozenset[str] = frozenset(
     }
 )
 
+# --------------------------------------------------------------- M8 chunk 5
+#
+# Chunk 5's guards are not codec rules; they are the cluster gate's own
+# validator rules.  That is why this suite's test command is the harness's own
+# library tests rather than the ACP crates': `every_claim_can_fail_on_its_own`
+# asserts that each claim can fail on its own, so a rule that has been deleted
+# or neutered stops rejecting its falsification and that test goes red by name.
+#
+# **This suite does not run the gate itself.**  The gate needs Redis, three
+# relays and about fifty seconds; running it once per case would exceed the
+# 600 s per-case ceiling on a cold build and would make every figure here a
+# measure of the fixture's flakiness rather than of the guard.  What is
+# measured is the validator, which is where every one of these rules lives.
+HARNESS_CRATE = REPO / "crates" / "tunnel-test-harness"
+ACP_CLUSTER = (
+    HARNESS_CRATE / "src" / "production_cluster" / "acp_cluster.rs"
+)
+
+C5_CARGO_TEST = [
+    "cargo",
+    "test",
+    "-p",
+    "tunnel-test-harness",
+    "--lib",
+    "--locked",
+    "--no-fail-fast",
+    "acp_cluster",
+]
+
+C5_CASES: list[tuple[str, list[Edit], bool]] = [
+    # ------------------------------------------------- the three rotations
+    (
+        "three completed rotations are required, not recorded",
+        [
+            (
+                ACP_CLUSTER,
+                "            evidence.rotations_across_span >= REQUIRED_ROTATIONS,",
+                "            true,",
+            )
+        ],
+        False,
+    ),
+    (
+        "the owner must have counted the rotations independently",
+        [
+            (
+                ACP_CLUSTER,
+                "            evidence.owner_rotations_across_span >= REQUIRED_ROTATIONS,",
+                "            true,",
+            )
+        ],
+        False,
+    ),
+    (
+        "a window shorter than the schedule counted recovery, not rotations",
+        [
+            (
+                ACP_CLUSTER,
+                "            evidence.rotation_span_met_schedule,",
+                "            true,",
+            )
+        ],
+        False,
+    ),
+    (
+        "the rotation window must finish inside one membership record",
+        [
+            (
+                ACP_CLUSTER,
+                "            evidence.rotation_span_ms < ROTATION_CEILING.as_millis(),",
+                "            true,",
+            )
+        ],
+        False,
+    ),
+    (
+        "the device must move to a new data socket per rotation",
+        [
+            (
+                ACP_CLUSTER,
+                """            evidence.distinct_device_sockets
+                >= usize::try_from(REQUIRED_ROTATIONS).unwrap_or(usize::MAX),""",
+                "            true,",
+            )
+        ],
+        False,
+    ),
+    (
+        "two device sockets at every settled steady state",
+        [
+            (
+                ACP_CLUSTER,
+                """            !evidence.steady_state_sockets.is_empty()
+                && evidence.steady_state_sockets.iter().all(|open| *open == 2),""",
+                "            true,",
+            )
+        ],
+        False,
+    ),
+    (
+        "at most one candidate data socket",
+        [
+            (
+                ACP_CLUSTER,
+                "            evidence.device_socket_peak <= 3,",
+                "            true,",
+            )
+        ],
+        False,
+    ),
+    (
+        "these must be rotations rather than a reconnect",
+        [
+            (
+                ACP_CLUSTER,
+                "            evidence.device_session_stable && evidence.device_epoch_stable,",
+                "            true,",
+            )
+        ],
+        False,
+    ),
+    (
+        "each held turn's side effect is recorded exactly once and never replayed",
+        [
+            (
+                ACP_CLUSTER,
+                """            evidence.side_effects_in_ledger == ROTATION_SESSIONS as u64
+                && evidence.side_effects_after_settle == ROTATION_SESSIONS as u64,""",
+                "            true,",
+            )
+        ],
+        False,
+    ),
+    (
+        "a permission callback arriving twice across the window is a duplicate",
+        [
+            (
+                ACP_CLUSTER,
+                """                "the permission callback arrived exactly once across the window",
+                span.callbacks == 1,""",
+                """                "the permission callback arrived exactly once across the window",
+                true,""",
+            )
+        ],
+        False,
+    ),
+    (
+        "the held turn must complete end_turn, read off the wire",
+        [
+            (
+                ACP_CLUSTER,
+                """                "the held turn completed end_turn, read off the wire",
+                span.stop_reason == "end_turn",""",
+                """                "the held turn completed end_turn, read off the wire",
+                true,""",
+            )
+        ],
+        False,
+    ),
+    # --------------------------------------------- the M7-C80 accommodation
+    (
+        "every case must end inside the membership records' lifetime",
+        [
+            (
+                ACP_CLUSTER,
+                "            evidence.max_membership_age_at_case_end_ms < MEMBERSHIP_RECORD_LIFETIME.as_millis(),",
+                "            true,",
+            )
+        ],
+        False,
+    ),
+    (
+        "an uncorrelated rotation-freeze refusal must fail the run (M3-15)",
+        [
+            (
+                ACP_CLUSTER,
+                """            evidence.not_dispatched_refusals == evidence.not_dispatched_retries
+                && evidence.unexplained_refusal.is_none(),""",
+                "            true,",
+            )
+        ],
+        False,
+    ),
+    # ------------------------------------------------------- two tenants
+    (
+        "a live connection id must be inert in the other tenant",
+        [
+            (
+                ACP_CLUSTER,
+                "            evidence.connection_id_inert_in_other_tenant,",
+                "            true,",
+            )
+        ],
+        False,
+    ),
+    (
+        "the two tenants must really have reused one session id",
+        [
+            (
+                ACP_CLUSTER,
+                "            evidence.session_ids_collide,",
+                "            true,",
+            )
+        ],
+        False,
+    ),
+    (
+        "every reply must be routed to the principal that asked",
+        [
+            (
+                ACP_CLUSTER,
+                "            evidence.replies_routed_per_principal,",
+                "            true,",
+            )
+        ],
+        False,
+    ),
+    (
+        "a same-tenant foreign id must be refused byte-identically",
+        [
+            (
+                ACP_CLUSTER,
+                "            evidence.same_tenant_foreign_matches_unknown,",
+                "            true,",
+            )
+        ],
+        False,
+    ),
+    (
+        "a cross-tenant foreign id must be refused byte-identically",
+        [
+            (
+                ACP_CLUSTER,
+                "            evidence.cross_tenant_foreign_matches_unknown,",
+                "            true,",
+            )
+        ],
+        False,
+    ),
+    (
+        "the refusal must be the profile's not-found, not some other error",
+        [
+            (
+                ACP_CLUSTER,
+                "            evidence.foreign_refusal_status == 404,",
+                "            true,",
+            )
+        ],
+        False,
+    ),
+    (
+        "the probes must not have opened anything on the other tenant's export",
+        [
+            (
+                ACP_CLUSTER,
+                "            evidence.tenant_b_sessions_opened == 1,",
+                "            true,",
+            )
+        ],
+        False,
+    ),
+    # ---------------------------------------------------------- forgeries
+    (
+        "every forged head must be refused before dispatch",
+        [
+            (
+                ACP_CLUSTER,
+                "            evidence.forgery_attempts == 3 && evidence.forgeries_refused == 3,",
+                "            true,",
+            )
+        ],
+        False,
+    ),
+    (
+        "not one forged head may reach the device",
+        [
+            (
+                ACP_CLUSTER,
+                "            evidence.forgery_dispatched == 0,",
+                "            true,",
+            )
+        ],
+        False,
+    ),
+    # --------------------------------------------------------- revocation
+    (
+        "revocation must withdraw the admitted exchange",
+        [
+            (
+                ACP_CLUSTER,
+                "            evidence.revocation_in_flight_withdrawn,",
+                "            true,",
+            )
+        ],
+        False,
+    ),
+    (
+        "the withdrawn exchange must be classified execution: unknown",
+        [
+            (
+                ACP_CLUSTER,
+                '            evidence.revocation_in_flight_execution == "unknown",',
+                "            true,",
+            )
+        ],
+        False,
+    ),
+    (
+        "nothing may be dispatched after revocation",
+        [
+            (
+                ACP_CLUSTER,
+                "            evidence.revocation_dispatched_after == 0,",
+                "            true,",
+            )
+        ],
+        False,
+    ),
+    (
+        "a withdrawn turn must never acquire a stop reason",
+        [
+            (
+                ACP_CLUSTER,
+                "            evidence.revocation_no_stop_reason,",
+                "            true,",
+            )
+        ],
+        False,
+    ),
+    # ------------------------------------------- explicit interruptions
+    (
+        "an interruption must be explicit, and a fabricated stopReason must fail",
+        [
+            (
+                ACP_CLUSTER,
+                """        if !interrupted {
+            return Err(HarnessError::Process(format!(
+                "ACP cluster gate failed: {label} did not produce an explicit interruption"
+            )));
+        }""",
+                "        let _ = interrupted;",
+            )
+        ],
+        False,
+    ),
+    (
+        "a stopReason for a turn that never finished must fail the run",
+        [
+            (
+                ACP_CLUSTER,
+                """        if !no_stop_reason {
+            return Err(HarnessError::Process(format!(
+                "ACP cluster gate failed: {label} produced a stopReason for a turn that never finished, which is a fabricated terminal"
+            )));
+        }""",
+                "        let _ = no_stop_reason;",
+            )
+        ],
+        False,
+    ),
+    # --------------------------------------------------------- saturation
+    (
+        "both segments must be saturated with a live stream still served",
+        [
+            (
+                ACP_CLUSTER,
+                "            evidence.both_segments_saturated && evidence.live_stream_served_while_saturated,",
+                "            true,",
+            )
+        ],
+        False,
+    ),
+    # ------------------------------------------------------------ hygiene
+    (
+        "an agent process outliving the gate must fail the run",
+        [
+            (
+                ACP_CLUSTER,
+                "    if evidence.leftover_processes != 0 {",
+                "    if false {",
+            )
+        ],
+        False,
+    ),
+    (
+        "a case that did not execute must name itself",
+        [
+            (
+                ACP_CLUSTER,
+                '        ("every case executed", executed == CLUSTER_CASES.to_vec()),',
+                '        ("every case executed", true),',
+            )
+        ],
+        False,
+    ),
+    (
+        "the rotation disclosure must carry this run's own measurement",
+        [
+            (
+                ACP_CLUSTER,
+                """            evidence.not_covered.len() == NOT_COVERED.len() + 1
+                && evidence.not_covered.iter().any(|text| {
+                    text.contains(&format!(
+                        "across {} completed rotations in {} ms",
+                        evidence.rotations_across_span, evidence.rotation_span_ms
+                    ))
+                }),""",
+                "            true,",
+            )
+        ],
+        False,
+    ),
+]
+
+
 SUITES: list[Suite] = [
     Suite("m8c1", [CRATE], CARGO_TEST, CASES),
     Suite("m8c2", [CRATE, EXPORT, FIXTURE], C2_CARGO_TEST, C2_CASES),
     Suite("m8c3", [EXPORT, FIXTURE], C3_CARGO_TEST, C3_CASES),
     Suite("m8c3-relay", [RELAY_CRATE], C3_RELAY_TEST, C3_RELAY_CASES),
     Suite("m8c4", [CRATE, EXPORT, FIXTURE], C4_CARGO_TEST, C4_CASES),
+    Suite("m8c5", [HARNESS_CRATE], C5_CARGO_TEST, C5_CASES),
 ]
 
 
@@ -1691,7 +2114,7 @@ def main() -> int:
     parser.add_argument("--list", action="store_true", help="print case names and exit")
     parser.add_argument("--case", help="run only cases whose name contains this text")
     parser.add_argument(
-        "--suite", help="run only this suite (m8c1, m8c2, m8c3, m8c3-relay, m8c4)"
+        "--suite", help="run only this suite (m8c1, m8c2, m8c3, m8c3-relay, m8c4, m8c5)"
     )
     arguments = parser.parse_args()
 
