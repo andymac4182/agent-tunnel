@@ -1,0 +1,1534 @@
+//! `verify-m8-acp-real-path`: ACP over the real three-relay production
+//! cluster (task rows M8-03 and M8-04, M8 chunk 4).
+//!
+//! The device is owned by **relay-a** and the consumer enters at **relay-c**,
+//! a non-owner ingress, so every exchange crosses the private mTLS HTTP/3 peer
+//! hop to the owner actor and then the device's own data WebSocket. Chunks 1
+//! to 3 had no tunnel, no relay and no principal; this gate is where those
+//! arrive.
+//!
+//! # No claim terminates on an HTTP status
+//!
+//! `docs/acp.md`: "HTTP 202 means accepted by the bridge, not that an agent
+//! finished or committed an action." Every claim here about a prompt, a
+//! session or a permission anchors to a message **observed on an SSE stream**,
+//! and `stopReason` is read off the wire. A status is asserted only where the
+//! relay or the bridge *refused*, and each of those also shows that nothing
+//! reached the agent.
+//!
+//! # The M7-C80 accommodation, and what it costs this gate's claims
+//!
+//! **A same-key membership re-sign at a higher record version invalidates
+//! every peer admission and every in-flight stream riding it**
+//! (`membership_runtime.rs`, the `current_version != Some(peer.record_version)`
+//! invalidation). `docs/http-forwarding.md` gate 4 records the consequence: "A
+//! long-lived SSE response through a non-owner ingress therefore does not
+//! survive a membership re-sign."
+//!
+//! **ACP is nothing but a long-lived SSE response through a non-owner
+//! ingress.** Every connection here holds a connection GET open for its whole
+//! life, and a session GET beside it.
+//!
+//! So this gate does what `verify-m3-http-forward-rotation` does: it re-signs
+//! the fixture's 60-second membership records **only at case boundaries, and
+//! at most every [`MEMBERSHIP_RESIGN_SPACING`]**, never while a stream is in
+//! flight, and waits for the relay-c route to answer again before the next
+//! case starts. [`Gate::boundary`] is that code, and it is deliberately the
+//! only place in this file that re-signs.
+//!
+//! **That is a harness accommodation, not a property of the product, and this
+//! gate must not be read as one.** Nothing here shows that an ACP connection
+//! survives normal cluster operation; a membership refresh in production would
+//! break every ACP connection on a non-owner ingress, and M7-C80 is open for
+//! exactly that reason. What the gate shows is ACP's own behaviour over the
+//! real route *between* re-signs. [`NOT_COVERED`] says so in the evidence
+//! itself rather than only in this comment.
+//!
+//! # Rotation-freeze refusals are never silently counted as passes
+//!
+//! M3-15 is open: a POST landing in a QUIESCE→COMMIT freeze is answered `503
+//! PEER_UNAVAILABLE` with `not_dispatched`, which is the same body the relay
+//! returns for every owner-not-ready condition. ACP is worse off than MCP here
+//! because its subscription deadlines are ten seconds.
+//!
+//! This gate copies `verify-m3-mcp-cloud-client`'s discipline exactly: every
+//! refusal is counted, correlated against an **observed** connector rotation
+//! phase, resent only while it coincides with a freeze and only up to
+//! [`NOT_DISPATCHED_RETRIES`], and the first refusal that does **not** coincide
+//! is recorded in `unexplained_refusal` and fails the run by name. A case that
+//! did not execute is reported as not executed; it is never folded into a pass
+//! count.
+
+use std::collections::BTreeMap;
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+use bytes::Bytes;
+use http_body_util::{BodyExt, StreamBody};
+use hyper::body::Frame;
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use rustls::pki_types::{CertificateDer, ServerName};
+use serde_json::{Value, json};
+use tokio::time::{sleep, timeout};
+use tokio_rustls::TlsConnector;
+use tunnel_client::http_forward::{AcpExportDiagnostics, HttpHandlers};
+use tunnel_client::{ConnectOptions, ConnectionHandle};
+use tunnel_core::RotationConfig;
+
+use super::http_forward_real_path::{ConsumerStream, empty_stream};
+use super::{
+    CLEANUP_TIMEOUT, Harness, HarnessError, HarnessOptions, ProductionCluster, Result,
+    RunningHarness, SCENARIO_TIMEOUT, STARTUP_TIMEOUT, finish_scenario_with_cleanup,
+    push_cleanup_error,
+};
+
+/// The rotation policy this gate runs the device under.
+///
+/// Short enough that rotations really happen while ACP connections are open —
+/// `docs/acp.md` says ordinary data-socket rotation must leave connections,
+/// sessions, callbacks and GET streams intact, and a gate that never rotated
+/// would not be testing that.
+pub const ACP_GATE_ROTATION: RotationConfig = RotationConfig {
+    interval_seconds: 6,
+    handshake_timeout_seconds: 2,
+    overlap_seconds: 5,
+};
+
+/// How rarely membership may be re-signed: the M7-C80 accommodation.
+///
+/// `docs/http-forwarding.md` gate 4 uses the same 15 seconds against the same
+/// defect. It is a harness accommodation; see the module comment.
+pub const MEMBERSHIP_RESIGN_SPACING: Duration = Duration::from_secs(15);
+
+/// The lifetime of the membership records the fixture signs.  Every case must
+/// finish inside it, or the gate was relying on records that had expired.
+pub const MEMBERSHIP_RECORD_LIFETIME: Duration = Duration::from_secs(60);
+
+/// The relay's own retry hint for an owner-not-ready refusal.
+const MIN_RETRY_HINT_MS: u64 = 250;
+/// Margin above the handshake window, so a resend budget derived from the
+/// rotation policy is not tight against it.
+const RETRY_MARGIN: u64 = 4;
+/// How many times a `not_dispatched` refusal that **coincides with an observed
+/// freeze** may be resent.  Derived from this gate's own rotation policy
+/// rather than tuned until the run passed.
+pub const NOT_DISPATCHED_RETRIES: u64 = (ACP_GATE_ROTATION.handshake_timeout_seconds * 1_000)
+    .div_ceil(MIN_RETRY_HINT_MS)
+    + RETRY_MARGIN;
+
+/// How close to an observed frozen sample a refusal must be to count as
+/// coinciding with it.
+const FREEZE_COINCIDENCE: Duration = Duration::from_millis(750);
+/// The connector phases in which the owner refuses new stream admission.
+const FROZEN_PHASES: [&str; 3] = ["quiescing", "draining", "committing"];
+
+/// The cases this gate runs, in order.
+pub const ACP_CASES: [&str; 3] = ["conversation", "permission-allow", "permission-reject"];
+
+/// What this gate deliberately does not establish.
+///
+/// These are prose rather than fields because each is a limit on the claim,
+/// not a measurement.  The validator requires the evidence to carry exactly as
+/// many of them as are listed here, so a case that quietly stops recording one
+/// fails the run.
+pub const NOT_COVERED: [&str; 6] = [
+    "an ACP connection surviving a membership re-sign: M7-C80 is open, and this gate re-signs only at case boundaries and at most every 15 s, which is a harness accommodation rather than a product property",
+    "no retry beyond the moment of observation: a handler counter is read when the consumer sees its answer, and a retry issued later would not be observed",
+    "two users, cross-tenant isolation, grant revocation, owner loss and peer-key rotation: M8 chunk 5",
+    "any host but macOS",
+    "any ACP agent but this repository's own synthetic fixture, and any ACP server at all",
+    "the connection-capacity table at its real bounds: 256 tracked and 32 per principal are proven as arithmetic in tunnel-acp-export, not by opening 257 connections with 257 child processes here",
+];
+
+/// Everything this gate measured.  Primitives only: identifiers, counters,
+/// statuses and typed labels, never a payload or a credential.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AcpRealPathEvidence {
+    pub relay_count: usize,
+    pub owner_node: String,
+    pub ingress_node: String,
+    pub non_owner_ingress: bool,
+    /// The cases that actually ran, in order.  A case that did not execute is
+    /// absent here and the validator rejects the run; it is never folded into
+    /// a pass count.
+    pub cases_executed: Vec<String>,
+    pub not_covered: Vec<String>,
+
+    // --- the conversation, every claim read off an SSE stream ---
+    /// `initialize` was answered 200 and returned a connection identifier.
+    pub connection_opened: bool,
+    /// The `session/new` result arrived **on the connection GET**.
+    pub session_id_from_connection_stream: bool,
+    /// The prompt's own result arrived on the session GET, with this
+    /// `stopReason` read from the message itself.
+    pub conversation_stop_reason: String,
+    /// `session/prompt` was answered 202 and the result arrived separately.
+    pub prompt_accepted_202: bool,
+
+    // --- permissions ---
+    /// The permission callback was observed on the session stream.
+    pub permission_requested_on_wire: bool,
+    /// The option identifiers the agent actually offered, read from the
+    /// callback on the wire.
+    pub offered_options: Vec<String>,
+    /// The outcome the **agent itself** recorded receiving, read from its
+    /// workspace marker rather than from anything the bridge believes.
+    pub allow_outcome_at_agent: String,
+    pub reject_outcome_at_agent: String,
+    pub allow_stop_reason: String,
+    pub reject_stop_reason: String,
+    /// A permission response naming an option the agent never offered.
+    pub unoffered_option_refused: bool,
+    /// A permission response on the wrong connection.
+    pub wrong_connection_refused: bool,
+    /// A permission response whose id answers nothing outstanding.
+    pub unknown_request_id_refused: bool,
+
+    // --- the M7-C80 accommodation, made visible in the evidence ---
+    pub resign_spacing_ms: u128,
+    /// How old the membership records in force were when a case ended.  Every
+    /// case must end inside their lifetime.
+    pub max_membership_age_at_case_end_ms: u128,
+    pub membership_resigns: u64,
+
+    // --- rotation-freeze refusal discipline (M3-15) ---
+    pub not_dispatched_refusals: u64,
+    pub not_dispatched_retries: u64,
+    /// The first refusal that did not coincide with an observed rotation
+    /// freeze.  Any value here fails the run **by name**.
+    pub unexplained_refusal: Option<String>,
+
+    // --- the device and its child ---
+    pub rotations_observed: u64,
+    pub device_sessions: u64,
+    /// Child processes still alive after the gate tore everything down, read
+    /// from the process table.
+    pub leftover_processes: usize,
+}
+
+/// A refusal the relay answered that this gate resent, and why it was allowed
+/// to.
+#[derive(Debug, Default)]
+struct RefusalLedger {
+    refusals: AtomicU64,
+    retries: AtomicU64,
+    unexplained: std::sync::Mutex<Option<String>>,
+}
+
+/// The connector's rotation phase, sampled from its own status watch.
+///
+/// A refusal is only resendable if it coincides with a phase **this observed**
+/// — never because a refusal looked like one a rotation would produce.
+#[derive(Debug, Default)]
+struct FreezeWatch {
+    frozen: std::sync::atomic::AtomicBool,
+    seen_frozen: std::sync::atomic::AtomicBool,
+    last_frozen_ms: AtomicU64,
+    started: std::sync::Mutex<Option<Instant>>,
+    phase: std::sync::Mutex<String>,
+    rotations_completed: AtomicU64,
+}
+
+impl FreezeWatch {
+    fn record(&self, phase: &str, rotations_completed: u64) {
+        let mut started = self.started.lock().unwrap_or_else(|e| e.into_inner());
+        if started.is_none() {
+            *started = Some(Instant::now());
+        }
+        let origin = started.expect("set above");
+        drop(started);
+        *self.phase.lock().unwrap_or_else(|e| e.into_inner()) = phase.to_owned();
+        self.rotations_completed
+            .store(rotations_completed, Ordering::SeqCst);
+        let frozen = FROZEN_PHASES.contains(&phase);
+        self.frozen.store(frozen, Ordering::SeqCst);
+        if frozen {
+            self.seen_frozen.store(true, Ordering::SeqCst);
+            self.last_frozen_ms.store(
+                u64::try_from(origin.elapsed().as_millis()).unwrap_or(u64::MAX),
+                Ordering::SeqCst,
+            );
+        }
+    }
+
+    fn coincides(&self) -> bool {
+        if self.frozen.load(Ordering::SeqCst) {
+            return true;
+        }
+        if !self.seen_frozen.load(Ordering::SeqCst) {
+            return false;
+        }
+        let started = self.started.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(origin) = *started else {
+            return false;
+        };
+        drop(started);
+        let now = u64::try_from(origin.elapsed().as_millis()).unwrap_or(u64::MAX);
+        now.saturating_sub(self.last_frozen_ms.load(Ordering::SeqCst))
+            <= u64::try_from(FREEZE_COINCIDENCE.as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// The sentence a refusal outside a freeze is reported with.  It names the
+    /// connector state, so the failure is diagnosable without a rerun.
+    fn unexplained(&self) -> String {
+        let phase = self.phase.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        format!(
+            "not_dispatched refusal outside a rotation freeze: connector phase={phase:?} rotations_completed={}",
+            self.rotations_completed.load(Ordering::SeqCst)
+        )
+    }
+}
+
+/// The consumer's HTTP/2 connection to a relay's public listener.
+///
+/// **HTTP/2, because `acp-http-v1` is an HTTP/2-only profile** (M8-01): an
+/// HTTP/1.1 consumer is refused `HTTP_UNSUPPORTED_FEATURE` by the codec before
+/// anything is routed. The other `http-forward` gates share an HTTP/1.1
+/// consumer helper, which is why this one is here rather than there.
+///
+/// One connection carries the long-lived GET streams and the POSTs beside
+/// them, which is what h2 multiplexing is for and what the profile assumes.
+struct AcpConsumer {
+    sender: hyper::client::conn::http2::SendRequest<StreamBody<ConsumerStream>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl AcpConsumer {
+    async fn connect(addr: SocketAddr, ca_der: &[u8]) -> Result<Self> {
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(CertificateDer::from(ca_der.to_vec()))
+            .map_err(|error| HarnessError::Http(format!("consumer CA: {error}")))?;
+        let mut config = rustls::ClientConfig::builder_with_provider(
+            rustls::crypto::ring::default_provider().into(),
+        )
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|error| HarnessError::Http(format!("consumer TLS: {error}")))?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        // ALPN `h2` only: the profile admits nothing else, so a silent
+        // downgrade to HTTP/1.1 must fail the handshake here rather than
+        // surface later as a puzzling codec refusal.
+        config.alpn_protocols = vec![b"h2".to_vec()];
+        let tcp = tokio::net::TcpStream::connect(addr)
+            .await
+            .map_err(HarnessError::Io)?;
+        let name = ServerName::try_from("localhost".to_owned())
+            .map_err(|error| HarnessError::Http(format!("server name: {error}")))?;
+        let tls = TlsConnector::from(Arc::new(config))
+            .connect(name, tcp)
+            .await
+            .map_err(|error| HarnessError::Http(format!("consumer TLS handshake: {error}")))?;
+        let (sender, connection) =
+            hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tls))
+                .await
+                .map_err(|error| HarnessError::Http(format!("consumer h2 handshake: {error}")))?;
+        let task = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        Ok(Self { sender, task })
+    }
+
+    fn shutdown(self) {
+        self.task.abort();
+    }
+}
+
+/// One ACP exchange's request, built for the public route.
+fn acp_request(
+    method: &str,
+    uri: &str,
+    token: &str,
+    extra: &[(&str, &str)],
+    body: StreamBody<ConsumerStream>,
+) -> Result<http::Request<StreamBody<ConsumerStream>>> {
+    let mut builder = http::Request::builder()
+        .method(method)
+        .uri(uri)
+        .version(http::Version::HTTP_2)
+        .header(http::header::AUTHORIZATION, format!("Bearer {token}"));
+    for (name, value) in extra {
+        builder = builder.header(*name, *value);
+    }
+    builder
+        .body(body)
+        .map_err(|error| HarnessError::Http(format!("building an ACP request: {error}")))
+}
+
+fn json_stream(value: &Value) -> StreamBody<ConsumerStream> {
+    let bytes = Bytes::from(serde_json::to_vec(value).unwrap_or_default());
+    StreamBody::new(Box::pin(futures_util::stream::once(async move {
+        Ok(Frame::data(bytes))
+    })))
+}
+
+/// A subscribed SSE stream, drained in the background for the life of the
+/// case.
+///
+/// **Holding it open is load-bearing**, and not only because the consumer
+/// wants the messages: under `docs/acp.md`'s subscriber-loss policy an
+/// established required stream whose body is dropped terminates the whole ACP
+/// transport. A reader that took one message and let the response go would
+/// destroy the connection it was reading.
+struct HeldStream {
+    payloads: Arc<std::sync::Mutex<Vec<Value>>>,
+    errored: Arc<std::sync::atomic::AtomicBool>,
+    ended: Arc<std::sync::atomic::AtomicBool>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl HeldStream {
+    fn hold(response: http::Response<hyper::body::Incoming>) -> Self {
+        let payloads = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let errored = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sink = Arc::clone(&payloads);
+        let failed = Arc::clone(&errored);
+        let done = Arc::clone(&ended);
+        let task = tokio::spawn(async move {
+            let mut body = std::pin::pin!(response.into_body());
+            let mut buffer: Vec<u8> = Vec::new();
+            let mut taken = 0usize;
+            while let Some(frame) = body.frame().await {
+                match frame {
+                    Ok(frame) => {
+                        if let Ok(data) = frame.into_data() {
+                            buffer.extend_from_slice(&data);
+                        }
+                    }
+                    Err(_) => {
+                        // A broken ACP stream errors its body; an orderly one
+                        // ends.  The two must not be confused.
+                        failed.store(true, Ordering::SeqCst);
+                        return;
+                    }
+                }
+                let all = sse_payloads(&buffer);
+                if all.len() > taken {
+                    let mut guard = sink.lock().unwrap_or_else(|e| e.into_inner());
+                    for payload in &all[taken..] {
+                        if let Ok(value) = serde_json::from_slice::<Value>(payload) {
+                            guard.push(value);
+                        }
+                    }
+                    taken = all.len();
+                }
+            }
+            done.store(true, Ordering::SeqCst);
+        });
+        Self {
+            payloads,
+            errored,
+            ended,
+            task,
+        }
+    }
+
+    fn seen(&self) -> Vec<Value> {
+        self.payloads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Wait for a message this stream carried that `pick` accepts.
+    ///
+    /// Bounded: a stream that never carries it is a failure with a name, not a
+    /// hang.
+    async fn wait_for<T>(&self, what: &str, pick: impl Fn(&Value) -> Option<T>) -> Result<T> {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            for value in self.seen() {
+                if let Some(found) = pick(&value) {
+                    return Ok(found);
+                }
+            }
+            if self.errored.load(Ordering::SeqCst) {
+                return Err(HarnessError::Process(format!(
+                    "the stream errored before {what} arrived"
+                )));
+            }
+            if Instant::now() >= deadline {
+                return Err(HarnessError::Timeout(format!(
+                    "{what} never arrived on the stream"
+                )));
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// Break this established stream the way a consumer going away breaks it.
+    fn break_now(&self) {
+        self.task.abort();
+    }
+
+    fn has_errored(&self) -> bool {
+        self.errored.load(Ordering::SeqCst)
+    }
+
+    fn has_ended(&self) -> bool {
+        self.ended.load(Ordering::SeqCst)
+    }
+}
+
+/// Split an SSE byte buffer into its `data:` payloads.
+///
+/// The encoding is this profile's own and is asserted byte for byte in
+/// `tunnel-acp-export`; this is only the reader.
+fn sse_payloads(bytes: &[u8]) -> Vec<Vec<u8>> {
+    let mut payloads = Vec::new();
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        let Some(stripped) = rest.strip_prefix(b"data: ") else {
+            break;
+        };
+        let Some(end) = stripped
+            .windows(2)
+            .position(|window| window == b"\n\n")
+            .or_else(|| stripped.iter().position(|byte| *byte == b'\n'))
+        else {
+            break;
+        };
+        payloads.push(stripped[..end].to_vec());
+        rest = &stripped[(end + 2).min(stripped.len())..];
+    }
+    payloads
+}
+
+fn stop_reason(value: &Value) -> Option<String> {
+    value
+        .pointer("/result/stopReason")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
+fn session_id(value: &Value) -> Option<String> {
+    value
+        .pointer("/result/sessionId")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
+/// Whether a process is in the process table and not a reaped corpse.
+///
+/// `kill -0` alone succeeds on a zombie, so a cleanup claim resting on it
+/// would stay green for the wrong reason.
+fn process_alive(pid: u32) -> bool {
+    let Ok(output) = std::process::Command::new("ps")
+        .args(["-o", "state=", "-p", &pid.to_string()])
+        .output()
+    else {
+        return false;
+    };
+    let state = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    !state.is_empty() && !state.starts_with('Z')
+}
+
+/// The device runtime configuration: the harness device profile plus one
+/// `[exports.<service>.acp]` table, parsed and validated by `tunnel-client`
+/// exactly as `tunnel-client connect` loads it.
+fn device_config_text(base: &str, service: &str, fixture: &Path, workspace: &Path) -> String {
+    let quote = |value: &str| serde_json::to_string(value).unwrap_or_default();
+    format!(
+        "{base}\n[exports.\"{service}\"]\ntype = \"http-forward\"\n\n[exports.\"{service}\".acp]\nprofile = \"acp-http-v1\"\n\n[exports.\"{service}\".acp.agent]\ncommand = {}\nargs = [\"agent\"]\nworkspace = {}\n",
+        quote(&fixture.to_string_lossy()),
+        quote(&workspace.to_string_lossy()),
+    )
+}
+
+/// Where the ACP fixture binary is.
+fn fixture_binary_path() -> Result<PathBuf> {
+    if let Ok(path) = std::env::var("TUNNEL_ACP_FIXTURE_BIN") {
+        return Ok(PathBuf::from(path));
+    }
+    let exe = std::env::current_exe().map_err(HarnessError::Io)?;
+    let directory = exe
+        .parent()
+        .ok_or_else(|| HarnessError::InvalidInput("the harness has no directory".into()))?;
+    let candidate = directory.join("tunnel-acp-fixture");
+    if candidate.exists() {
+        return Ok(candidate);
+    }
+    let sibling = directory
+        .parent()
+        .map(|parent| parent.join("tunnel-acp-fixture"));
+    match sibling {
+        Some(path) if path.exists() => Ok(path),
+        _ => Err(HarnessError::InvalidInput(
+            "the tunnel-acp-fixture binary was not found; set TUNNEL_ACP_FIXTURE_BIN".into(),
+        )),
+    }
+}
+
+/// The gate's live state: the cluster, the device session, the consumer and
+/// the accommodation's clock.
+struct Gate<'h> {
+    cluster: &'h mut ProductionCluster,
+    harness: &'h RunningHarness,
+    tenant_id: uuid::Uuid,
+    device_id: uuid::Uuid,
+    service_id: uuid::Uuid,
+    config: tunnel_client::ConnectConfig,
+    client: Option<ConnectionHandle>,
+    session_id: String,
+    acp_diagnostics: AcpExportDiagnostics,
+    freeze: Arc<FreezeWatch>,
+    freeze_task: Option<tokio::task::JoinHandle<()>>,
+    ledger: Arc<RefusalLedger>,
+    /// When membership was last re-signed.  The M7-C80 accommodation's clock,
+    /// and the only one.
+    membership_signed_at: Instant,
+    membership_resigns: u64,
+    ingress_addr: SocketAddr,
+    ca: Vec<u8>,
+    token: String,
+    base_uri: String,
+    workspace: PathBuf,
+}
+
+impl Gate<'_> {
+    fn export(&self) -> tunnel_acp_export::AcpDiagnostics {
+        self.acp_diagnostics
+            .get(&self.service_id.to_string())
+            .unwrap_or_default()
+    }
+
+    /// Start a `tunnel-client` session with the ACP export registered exactly
+    /// as `tunnel-client connect` registers it, and wait for its owner claim.
+    async fn connect_device(&mut self) -> Result<String> {
+        let handlers = HttpHandlers::new()
+            .with_acp_exports(&self.config)
+            .map_err(|error| HarnessError::InvalidInput(format!("ACP exports: {error}")))?;
+        self.acp_diagnostics = handlers.acp_diagnostics_source();
+        let client = timeout(
+            STARTUP_TIMEOUT,
+            tunnel_client::connect_with_http_handlers(
+                ConnectOptions::new(self.config.clone()),
+                handlers,
+            ),
+        )
+        .await
+        .map_err(|_| HarnessError::Timeout("ACP gate device startup timed out".into()))?
+        .map_err(|error| HarnessError::Process(format!("ACP gate device: {error}")))?;
+        let client = self.client.insert(client);
+        // Watch this session's rotation phase.  A refusal may only be resent
+        // if it coincides with a phase observed here.
+        self.freeze = Arc::new(FreezeWatch::default());
+        let freeze = Arc::clone(&self.freeze);
+        let mut status = client.status();
+        {
+            let status = status.borrow_and_update();
+            freeze.record(&status.phase, status.rotations_completed);
+        }
+        self.freeze_task = Some(tokio::spawn(async move {
+            while status.changed().await.is_ok() {
+                let (phase, rotations) = {
+                    let status = status.borrow_and_update();
+                    (status.phase.clone(), status.rotations_completed)
+                };
+                freeze.record(&phase, rotations);
+            }
+        }));
+        let session = timeout(STARTUP_TIMEOUT, client.wait_ready())
+            .await
+            .map_err(|_| HarnessError::Timeout("ACP gate device readiness timed out".into()))?
+            .map_err(|error| HarnessError::Process(format!("device not ready: {error}")))?;
+        self.session_id = session.session_id.clone();
+        let deadline = Instant::now() + STARTUP_TIMEOUT;
+        loop {
+            let owner = self
+                .cluster
+                .catalog
+                .current_owner(self.tenant_id, self.device_id, chrono::Utc::now())
+                .await
+                .map_err(|error| HarnessError::Redis(format!("reading owner: {error}")))?;
+            if let Some(owner) = owner
+                && owner.token.session_id == self.session_id
+            {
+                return Ok(owner.token.node_id);
+            }
+            if Instant::now() >= deadline {
+                return Err(HarnessError::Timeout(
+                    "the device owner claim was not observed".into(),
+                ));
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// POST one ACP message, resending **only** a `not_dispatched` refusal
+    /// that coincides with an observed rotation freeze (M3-15).
+    ///
+    /// Every refusal is counted.  The first one that does not coincide is
+    /// recorded and fails the run by name; it is never retried and never
+    /// folded into a pass.
+    async fn post(
+        &self,
+        consumer: &AcpConsumer,
+        extra: &[(&str, &str)],
+        message: &Value,
+    ) -> Result<(http::StatusCode, http::HeaderMap, String)> {
+        let mut retries = 0u64;
+        loop {
+            let request = acp_request(
+                "POST",
+                &self.base_uri,
+                &self.token,
+                &[
+                    &[
+                        ("content-type", "application/json"),
+                        ("accept", "application/json"),
+                    ][..],
+                    extra,
+                ]
+                .concat(),
+                json_stream(message),
+            )?;
+            let response = consumer
+                .sender
+                .clone()
+                .send_request(request)
+                .await
+                .map_err(|error| HarnessError::Http(format!("ACP POST: {error}")))?;
+            let status = response.status();
+            let headers = response.headers().clone();
+            let body = response
+                .into_body()
+                .collect()
+                .await
+                .map(|collected| String::from_utf8_lossy(&collected.to_bytes()).into_owned())
+                .unwrap_or_default();
+            if status == http::StatusCode::SERVICE_UNAVAILABLE && body.contains("not_dispatched") {
+                let coincides = self.freeze.coincides();
+                self.ledger.refusals.fetch_add(1, Ordering::SeqCst);
+                if coincides {
+                    self.ledger.retries.fetch_add(1, Ordering::SeqCst);
+                } else {
+                    let mut slot = self
+                        .ledger
+                        .unexplained
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    if slot.is_none() {
+                        *slot = Some(self.freeze.unexplained());
+                    }
+                }
+                if coincides && retries < NOT_DISPATCHED_RETRIES {
+                    retries += 1;
+                    sleep(Duration::from_millis(MIN_RETRY_HINT_MS)).await;
+                    continue;
+                }
+            }
+            return Ok((status, headers, body));
+        }
+    }
+
+    /// Open an SSE stream and hold it.
+    async fn open_stream(
+        &self,
+        consumer: &AcpConsumer,
+        extra: &[(&str, &str)],
+    ) -> Result<(http::StatusCode, http::HeaderMap, Option<HeldStream>)> {
+        let request = acp_request(
+            "GET",
+            &self.base_uri,
+            &self.token,
+            &[&[("accept", "text/event-stream")][..], extra].concat(),
+            empty_stream(),
+        )?;
+        let response = consumer
+            .sender
+            .clone()
+            .send_request(request)
+            .await
+            .map_err(|error| HarnessError::Http(format!("ACP GET: {error}")))?;
+        let status = response.status();
+        let headers = response.headers().clone();
+        if status != http::StatusCode::OK {
+            return Ok((status, headers, None));
+        }
+        Ok((status, headers, Some(HeldStream::hold(response))))
+    }
+
+    /// The case boundary, and the **only** place membership is re-signed.
+    ///
+    /// The M7-C80 accommodation lives here and nowhere else: see the module
+    /// comment for why it exists and what it costs this gate's claims.  It
+    /// never runs while a stream is in flight, because the caller has closed
+    /// its connection before reaching it.
+    async fn boundary(&mut self) -> Result<()> {
+        if self.membership_signed_at.elapsed() < MEMBERSHIP_RESIGN_SPACING {
+            return Ok(());
+        }
+        self.cluster.resign_membership_now().await?;
+        self.membership_signed_at = Instant::now();
+        self.membership_resigns += 1;
+        self.wait_peers_ready().await?;
+        Ok(())
+    }
+
+    async fn wait_peers_ready(&self) -> Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(45);
+        loop {
+            if self
+                .cluster
+                .relays
+                .iter()
+                .filter(|relay| relay.running.is_some())
+                .all(|relay| relay.peer_runtime.is_ready())
+            {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(HarnessError::Timeout(
+                    "peer readiness did not return after a membership re-sign".into(),
+                ));
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    }
+}
+
+/// One ACP connection over the real route: initialize, the connection GET, a
+/// session, and its session GET.
+struct Conversation {
+    consumer: AcpConsumer,
+    connection: String,
+    connection_stream: HeldStream,
+    session: String,
+    session_stream: HeldStream,
+}
+
+impl Gate<'_> {
+    /// Open a connection and a session over the real route.
+    ///
+    /// Every identifier is read from where the profile puts it: the connection
+    /// id from the `initialize` **response header**, the session id from the
+    /// `session/new` result **on the connection GET** — not from the 202 that
+    /// accepted the POST, which `docs/acp.md` says means only that the bridge
+    /// accepted it.
+    async fn open_conversation(&self, evidence: &mut AcpRealPathEvidence) -> Result<Conversation> {
+        let consumer = AcpConsumer::connect(self.ingress_addr, &self.ca).await?;
+        let (status, headers, _body) = self
+            .post(
+                &consumer,
+                &[],
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": "init-1",
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": 1,
+                        "clientCapabilities": {},
+                        "clientInfo": {"name": "tunnel-acp-gate", "version": "0.1.0"},
+                    },
+                }),
+            )
+            .await?;
+        if status != http::StatusCode::OK {
+            return Err(HarnessError::Http(format!(
+                "initialize over the real route answered {status}"
+            )));
+        }
+        let connection = headers
+            .get(tunnel_acp::headers::ACP_CONNECTION_ID)
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| {
+                HarnessError::Http("initialize returned no Acp-Connection-Id".to_owned())
+            })?;
+        evidence.connection_opened = true;
+
+        let (status, _headers, stream) = self
+            .open_stream(&consumer, &[("acp-connection-id", connection.as_str())])
+            .await?;
+        let connection_stream = stream
+            .ok_or_else(|| HarnessError::Http(format!("the connection GET answered {status}")))?;
+
+        let (status, _headers, _body) = self
+            .post(
+                &consumer,
+                &[("acp-connection-id", connection.as_str())],
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": "new-1",
+                    "method": "session/new",
+                    "params": {
+                        "cwd": self.workspace.to_string_lossy(),
+                        "mcpServers": [],
+                    },
+                }),
+            )
+            .await?;
+        if status != http::StatusCode::ACCEPTED {
+            return Err(HarnessError::Http(format!(
+                "session/new answered {status}, not 202"
+            )));
+        }
+        // The session identifier comes off the **connection stream**, which is
+        // where the RFD puts it, not from the status above.
+        let session = connection_stream
+            .wait_for("the session/new result", session_id)
+            .await?;
+        evidence.session_id_from_connection_stream = true;
+
+        let (status, headers, stream) = self
+            .open_stream(
+                &consumer,
+                &[
+                    ("acp-connection-id", connection.as_str()),
+                    ("acp-session-id", session.as_str()),
+                ],
+            )
+            .await?;
+        let session_stream = stream
+            .ok_or_else(|| HarnessError::Http(format!("the session GET answered {status}")))?;
+        // M8-C05: this profile puts no session header on a response, and the
+        // decision is re-observed here over the real route rather than only in
+        // the in-process bridge.
+        if headers.contains_key(tunnel_acp::headers::ACP_SESSION_ID) {
+            return Err(HarnessError::Http(
+                "a session-scoped SSE response carried Acp-Session-Id (M8-C05)".to_owned(),
+            ));
+        }
+
+        Ok(Conversation {
+            consumer,
+            connection,
+            connection_stream,
+            session,
+            session_stream,
+        })
+    }
+
+    fn connection_headers<'a>(&self, conversation: &'a Conversation) -> [(&'a str, &'a str); 1] {
+        [("acp-connection-id", conversation.connection.as_str())]
+    }
+
+    fn session_headers<'a>(&self, conversation: &'a Conversation) -> [(&'a str, &'a str); 2] {
+        [
+            ("acp-connection-id", conversation.connection.as_str()),
+            ("acp-session-id", conversation.session.as_str()),
+        ]
+    }
+
+    /// POST a prompt and return the status; the result is read off the wire by
+    /// the caller.
+    async fn prompt(
+        &self,
+        conversation: &Conversation,
+        id: &str,
+        text: &str,
+    ) -> Result<http::StatusCode> {
+        let headers = self.session_headers(conversation);
+        let (status, _headers, _body) = self
+            .post(
+                &conversation.consumer,
+                &headers,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "method": "session/prompt",
+                    "params": {
+                        "sessionId": conversation.session,
+                        "prompt": [{"type": "text", "text": text}],
+                    },
+                }),
+            )
+            .await?;
+        Ok(status)
+    }
+
+    /// Case `conversation`: a whole v1 turn over the real three-relay route.
+    async fn case_conversation(&mut self, evidence: &mut AcpRealPathEvidence) -> Result<()> {
+        let conversation = self.open_conversation(evidence).await?;
+        let status = self.prompt(&conversation, "prompt-1", "ok").await?;
+        if status != http::StatusCode::ACCEPTED {
+            return Err(HarnessError::Http(format!(
+                "session/prompt answered {status}, not 202"
+            )));
+        }
+        evidence.prompt_accepted_202 = true;
+        // The turn's own result, read from the message the consumer received.
+        evidence.conversation_stop_reason = conversation
+            .session_stream
+            .wait_for("the prompt result", stop_reason)
+            .await?;
+        self.close_conversation(conversation).await;
+        Ok(())
+    }
+
+    /// Case `permission-allow` / `permission-reject`: a permission callback
+    /// over the real route, answered with an offered option.
+    ///
+    /// The outcome is read from the marker the **agent itself** wrote, so what
+    /// is proven is what the agent received rather than what the bridge
+    /// believes it forwarded.
+    async fn case_permission(
+        &mut self,
+        evidence: &mut AcpRealPathEvidence,
+        allow: bool,
+    ) -> Result<()> {
+        let marker = self
+            .workspace
+            .join(tunnel_acp_fixture::PERMISSION_OUTCOME_FILE);
+        let _ = std::fs::remove_file(&marker);
+
+        let conversation = self.open_conversation(evidence).await?;
+        let status = self
+            .prompt(&conversation, "prompt-permission", "permission")
+            .await?;
+        if status != http::StatusCode::ACCEPTED {
+            return Err(HarnessError::Http(format!(
+                "the permission prompt answered {status}, not 202"
+            )));
+        }
+        // The callback is observed **on the wire**.
+        let callback = conversation
+            .session_stream
+            .wait_for("the permission callback", |value| {
+                (value.get("method").and_then(Value::as_str) == Some("session/request_permission"))
+                    .then(|| value.clone())
+            })
+            .await?;
+        evidence.permission_requested_on_wire = true;
+        let request_id = callback
+            .get("id")
+            .cloned()
+            .ok_or_else(|| HarnessError::Http("the permission callback carried no id".into()))?;
+        let offered: Vec<String> = callback
+            .pointer("/params/options")
+            .and_then(Value::as_array)
+            .map(|options| {
+                options
+                    .iter()
+                    .filter_map(|option| {
+                        option
+                            .get("optionId")
+                            .and_then(Value::as_str)
+                            .map(ToOwned::to_owned)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        evidence.offered_options = offered.clone();
+
+        let chosen = if allow {
+            tunnel_acp_fixture::PERMIT_OPTION
+        } else {
+            tunnel_acp_fixture::REJECT_OPTION
+        };
+        if !offered.iter().any(|option| option == chosen) {
+            return Err(HarnessError::Process(format!(
+                "the agent never offered {chosen}; it offered {offered:?}"
+            )));
+        }
+
+        // Only on the allow pass, and only once: the three refusals below are
+        // about *this* outstanding callback, so they must run while it is
+        // still outstanding.
+        if allow {
+            self.check_permission_refusals(&conversation, &request_id, evidence)
+                .await?;
+        }
+
+        let headers = self.session_headers(&conversation);
+        let (status, _headers, _body) = self
+            .post(
+                &conversation.consumer,
+                &headers,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "result": {"outcome": {"outcome": "selected", "optionId": chosen}},
+                }),
+            )
+            .await?;
+        if status != http::StatusCode::ACCEPTED {
+            return Err(HarnessError::Http(format!(
+                "the permission response answered {status}, not 202"
+            )));
+        }
+
+        let stop = conversation
+            .session_stream
+            .wait_for("the permission turn result", stop_reason)
+            .await?;
+
+        // What the **agent** recorded receiving, from its own marker file.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let recorded = loop {
+            if let Ok(text) = std::fs::read_to_string(&marker) {
+                let text = text.trim().to_owned();
+                if !text.is_empty() {
+                    break text;
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(HarnessError::Timeout(
+                    "the agent never recorded the permission outcome it received".into(),
+                ));
+            }
+            sleep(Duration::from_millis(50)).await;
+        };
+
+        if allow {
+            evidence.allow_stop_reason = stop;
+            evidence.allow_outcome_at_agent = recorded;
+        } else {
+            evidence.reject_stop_reason = stop;
+            evidence.reject_outcome_at_agent = recorded;
+        }
+        self.close_conversation(conversation).await;
+        Ok(())
+    }
+
+    /// Three permission responses that must each be refused, while a real
+    /// callback is outstanding.
+    ///
+    /// Each is checked while the genuine callback is still pending, and the
+    /// genuine response succeeds afterwards — so a refusal cannot be passing
+    /// because the callback had already gone.
+    async fn check_permission_refusals(
+        &self,
+        conversation: &Conversation,
+        request_id: &Value,
+        evidence: &mut AcpRealPathEvidence,
+    ) -> Result<()> {
+        let headers = self.session_headers(conversation);
+
+        // An option the agent never offered.
+        let (status, _h, _b) = self
+            .post(
+                &conversation.consumer,
+                &headers,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "result": {"outcome": {"outcome": "selected", "optionId": "not-offered"}},
+                }),
+            )
+            .await?;
+        evidence.unoffered_option_refused = status != http::StatusCode::ACCEPTED;
+
+        // An id that answers nothing outstanding.
+        let (status, _h, _b) = self
+            .post(
+                &conversation.consumer,
+                &headers,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": "no-such-request",
+                    "result": {"outcome": {"outcome": "selected", "optionId": tunnel_acp_fixture::PERMIT_OPTION}},
+                }),
+            )
+            .await?;
+        evidence.unknown_request_id_refused = status != http::StatusCode::ACCEPTED;
+
+        // The right answer on the wrong connection: a second connection, whose
+        // callback table has never heard of this id.
+        let other = self
+            .open_conversation(&mut AcpRealPathEvidence::default())
+            .await?;
+        let other_headers = self.session_headers(&other);
+        let (status, _h, _b) = self
+            .post(
+                &other.consumer,
+                &other_headers,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "result": {"outcome": {"outcome": "selected", "optionId": tunnel_acp_fixture::PERMIT_OPTION}},
+                }),
+            )
+            .await?;
+        evidence.wrong_connection_refused = status != http::StatusCode::ACCEPTED;
+        self.close_conversation(other).await;
+        Ok(())
+    }
+
+    /// End a conversation the way a well-behaved consumer does: DELETE, then
+    /// let its streams go.
+    async fn close_conversation(&self, conversation: Conversation) {
+        let headers = self.connection_headers(&conversation);
+        if let Ok(request) = acp_request(
+            "DELETE",
+            &self.base_uri,
+            &self.token,
+            &headers,
+            empty_stream(),
+        ) {
+            let _ = conversation
+                .consumer
+                .sender
+                .clone()
+                .send_request(request)
+                .await;
+        }
+        conversation.connection_stream.break_now();
+        conversation.session_stream.break_now();
+        conversation.consumer.shutdown();
+    }
+}
+
+/// Run every case in order, with the M7-C80 accommodation between them.
+async fn run(
+    cluster: &mut ProductionCluster,
+    harness: &RunningHarness,
+    workspace: PathBuf,
+) -> Result<AcpRealPathEvidence> {
+    let mut evidence = AcpRealPathEvidence {
+        relay_count: cluster.relays.len(),
+        resign_spacing_ms: MEMBERSHIP_RESIGN_SPACING.as_millis(),
+        not_covered: NOT_COVERED.iter().map(|text| (*text).to_owned()).collect(),
+        ..AcpRealPathEvidence::default()
+    };
+    let device = harness
+        .topology
+        .devices_a
+        .first()
+        .ok_or_else(|| HarnessError::InvalidInput("the ACP gate device is missing".into()))?;
+    let echo_service = *harness
+        .topology
+        .service_ids
+        .get(&device.id)
+        .ok_or_else(|| HarnessError::InvalidInput("the echo service is missing".into()))?;
+    let acp_service = harness
+        .acp_services
+        .first()
+        .ok_or_else(|| HarnessError::InvalidInput("the ACP service was not seeded".into()))?
+        .service_id;
+
+    // The device attaches to relay-a, which becomes the owner.
+    let owner_device_addr = cluster
+        .relay("relay-a")?
+        .running
+        .as_ref()
+        .map(|running| running.device_addr)
+        .ok_or_else(|| HarnessError::Process("relay-a is not running".into()))?;
+    let profile_directory = tempfile::tempdir().map_err(HarnessError::Io)?;
+    let device_profile = crate::acceptance::helpers::write_device_profile(
+        profile_directory.path(),
+        device.id,
+        echo_service,
+        "m8-acp-canary",
+        owner_device_addr,
+        &device.certificate.certificate_pem,
+        &device.certificate.private_key_pem,
+        &harness.pki.server_ca.certificate_pem,
+    )?;
+    let base = std::fs::read_to_string(&device_profile.config_path).map_err(HarnessError::Io)?;
+    let fixture = fixture_binary_path()?;
+    let text = device_config_text(&base, &acp_service.to_string(), &fixture, &workspace);
+    let mut config = tunnel_client::ConnectConfig::parse(&text)
+        .map_err(|error| HarnessError::InvalidInput(format!("device config: {error}")))?;
+    config.rotation = ACP_GATE_ROTATION;
+    config
+        .validate()
+        .map_err(|error| HarnessError::InvalidInput(format!("device config: {error}")))?;
+
+    let ingress = cluster.relay("relay-c")?;
+    evidence.ingress_node = ingress.node_id.clone();
+    let ingress_addr = ingress.consumer_addr()?;
+    let ca = harness.pki.server_ca.certificate_der.clone();
+    let token = harness.oidc.issue_with(
+        &harness.topology.consumers_a[0].name,
+        crate::OidcTokenOptions {
+            scope: Some("echo:invoke http:invoke".to_owned()),
+            ..crate::OidcTokenOptions::default()
+        },
+    )?;
+    let base_uri = format!(
+        "https://localhost:{}/v1/devices/{}/services/{acp_service}/http/acp",
+        ingress_addr.port(),
+        device.id
+    );
+
+    let mut gate = Gate {
+        cluster,
+        harness,
+        tenant_id: device.tenant_id,
+        device_id: device.id,
+        service_id: acp_service,
+        config,
+        client: None,
+        session_id: String::new(),
+        acp_diagnostics: AcpExportDiagnostics::default(),
+        freeze: Arc::new(FreezeWatch::default()),
+        freeze_task: None,
+        ledger: Arc::new(RefusalLedger::default()),
+        // Pre-aged so the first case boundary re-signs: the bootstrap records
+        // were signed when the cluster started.
+        membership_signed_at: Instant::now()
+            .checked_sub(MEMBERSHIP_RESIGN_SPACING)
+            .unwrap_or_else(Instant::now),
+        membership_resigns: 0,
+        ingress_addr,
+        ca,
+        token,
+        base_uri,
+        workspace: workspace.clone(),
+    };
+
+    let owner_node = gate.connect_device().await?;
+    evidence.owner_node = owner_node.clone();
+    evidence.non_owner_ingress = owner_node == "relay-a" && evidence.ingress_node == "relay-c";
+
+    let outcome = async {
+        for case in ACP_CASES {
+            gate.boundary().await?;
+            let started = Instant::now();
+            eprintln!("ACP real-path gate: {case}");
+            match case {
+                "conversation" => gate.case_conversation(&mut evidence).await?,
+                "permission-allow" => gate.case_permission(&mut evidence, true).await?,
+                "permission-reject" => gate.case_permission(&mut evidence, false).await?,
+                other => {
+                    return Err(HarnessError::InvalidInput(format!(
+                        "unknown ACP gate case {other}"
+                    )));
+                }
+            }
+            // A case is recorded as executed only after it returned, so a case
+            // that failed is absent rather than counted.
+            evidence.cases_executed.push(case.to_owned());
+            evidence.max_membership_age_at_case_end_ms = evidence
+                .max_membership_age_at_case_end_ms
+                .max(gate.membership_signed_at.elapsed().as_millis());
+            eprintln!(
+                "ACP real-path case {case} at {} ms: {evidence:?}",
+                started.elapsed().as_millis()
+            );
+        }
+        Ok::<(), HarnessError>(())
+    }
+    .await;
+
+    // The accommodation and the refusal ledger are recorded whether or not the
+    // run succeeded, so a failure still reports them.
+    evidence.membership_resigns = gate.membership_resigns;
+    evidence.not_dispatched_refusals = gate.ledger.refusals.load(Ordering::SeqCst);
+    evidence.not_dispatched_retries = gate.ledger.retries.load(Ordering::SeqCst);
+    evidence.unexplained_refusal = gate
+        .ledger
+        .unexplained
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let export = gate.export();
+    evidence.device_sessions = export.connections_opened;
+    if let Some(client) = &gate.client {
+        evidence.rotations_observed = client.status().borrow().rotations_completed;
+    }
+
+    // Every child this export ever started must be gone.  Read from the
+    // process table after teardown, not from a counter.
+    let pids = gate
+        .client
+        .as_ref()
+        .map(|_| {
+            gate.acp_diagnostics
+                .child_pids(&gate.service_id.to_string())
+        })
+        .unwrap_or_default();
+    if let Some(task) = gate.freeze_task.take() {
+        task.abort();
+    }
+    if let Some(client) = gate.client.take() {
+        let _ = timeout(CLEANUP_TIMEOUT, client.stop()).await;
+    }
+    evidence.leftover_processes = pids.into_iter().filter(|pid| process_alive(*pid)).count();
+
+    outcome?;
+    Ok(evidence)
+}
+
+/// Every rule this gate holds.  The first violated one names itself.
+///
+/// # Errors
+/// The first rule that did not hold.
+pub fn validate_acp_real_path_evidence(evidence: &AcpRealPathEvidence) -> Result<()> {
+    let executed: Vec<&str> = evidence.cases_executed.iter().map(String::as_str).collect();
+    let checks: [(&str, bool); 20] = [
+        ("three relays", evidence.relay_count == 3),
+        (
+            "the device is owned by relay-a and the consumer entered at relay-c",
+            evidence.non_owner_ingress
+                && evidence.owner_node == "relay-a"
+                && evidence.ingress_node == "relay-c",
+        ),
+        (
+            "every case executed",
+            executed == ACP_CASES.iter().copied().collect::<Vec<_>>(),
+        ),
+        (
+            "the limits of the claim are recorded",
+            evidence.not_covered.len() == NOT_COVERED.len(),
+        ),
+        // --- the conversation, off the wire ---
+        ("initialize opened a connection", evidence.connection_opened),
+        (
+            "the session identifier arrived on the connection stream",
+            evidence.session_id_from_connection_stream,
+        ),
+        (
+            "session/prompt was accepted 202 and answered separately",
+            evidence.prompt_accepted_202,
+        ),
+        (
+            "the turn completed with end_turn, read off the wire",
+            evidence.conversation_stop_reason == "end_turn",
+        ),
+        // --- permissions ---
+        (
+            "the permission callback was observed on the session stream",
+            evidence.permission_requested_on_wire,
+        ),
+        (
+            "the agent offered exactly the two options this profile expects",
+            evidence.offered_options
+                == vec![
+                    tunnel_acp_fixture::PERMIT_OPTION.to_owned(),
+                    tunnel_acp_fixture::REJECT_OPTION.to_owned(),
+                ],
+        ),
+        (
+            "the agent itself recorded receiving the allowed option",
+            evidence.allow_outcome_at_agent
+                == format!("selected:{}", tunnel_acp_fixture::PERMIT_OPTION),
+        ),
+        (
+            "the agent itself recorded receiving the rejected option",
+            evidence.reject_outcome_at_agent
+                == format!("selected:{}", tunnel_acp_fixture::REJECT_OPTION),
+        ),
+        (
+            "an allowed permission ends the turn end_turn",
+            evidence.allow_stop_reason == "end_turn",
+        ),
+        (
+            "a rejected permission ends the turn refusal",
+            evidence.reject_stop_reason == "refusal",
+        ),
+        (
+            "a response naming an option the agent never offered is refused",
+            evidence.unoffered_option_refused,
+        ),
+        (
+            "a response answering nothing outstanding is refused",
+            evidence.unknown_request_id_refused,
+        ),
+        (
+            "a response on the wrong connection is refused",
+            evidence.wrong_connection_refused,
+        ),
+        // --- the M7-C80 accommodation ---
+        (
+            "membership was re-signed no more often than the accommodation allows",
+            evidence.resign_spacing_ms >= MEMBERSHIP_RESIGN_SPACING.as_millis(),
+        ),
+        (
+            "every case ended inside the membership records' lifetime",
+            evidence.max_membership_age_at_case_end_ms < MEMBERSHIP_RECORD_LIFETIME.as_millis(),
+        ),
+        // --- refusals, and the process table ---
+        (
+            "every not_dispatched refusal coincided with an observed rotation freeze and was bounded",
+            evidence.not_dispatched_refusals == evidence.not_dispatched_retries
+                && evidence.not_dispatched_retries <= NOT_DISPATCHED_RETRIES
+                && evidence.unexplained_refusal.is_none(),
+        ),
+    ];
+    for (rule, passed) in checks {
+        if !passed {
+            return Err(HarnessError::Process(format!(
+                "ACP real-path gate failed: {rule}"
+            )));
+        }
+    }
+    if evidence.leftover_processes != 0 {
+        return Err(HarnessError::Process(format!(
+            "ACP real-path gate failed: {} agent processes outlived the gate",
+            evidence.leftover_processes
+        )));
+    }
+    Ok(())
+}
+
+/// Run the gate on a fresh harness and production cluster.
+///
+/// # Errors
+/// Any setup, scenario, validation or cleanup failure.
+pub async fn verify() -> Result<AcpRealPathEvidence> {
+    let options = HarnessOptions::from_env()?
+        .acp_services(true)
+        .rotation(ACP_GATE_ROTATION);
+    let mut harness = timeout(STARTUP_TIMEOUT, Harness::start(options))
+        .await
+        .map_err(|_| HarnessError::Timeout("ACP gate harness startup timed out".into()))??;
+    // The relays serve the pinned ACP profile exactly as `serve` builds it
+    // from `[http_forward] profiles`.
+    let serve = tunnel_relay::HttpForwardServeConfig {
+        profiles: vec![tunnel_acp::PROFILE_ID.to_owned()],
+        request_body_bytes: None,
+        response_body_bytes: None,
+        deadline_seconds: None,
+    };
+    let exports = match serve.exports() {
+        Ok(exports) => exports,
+        Err(error) => {
+            let _ = harness.shutdown().await;
+            return Err(HarnessError::InvalidInput(format!(
+                "[http_forward] profiles: {error}"
+            )));
+        }
+    };
+    harness.http_forward = Some(exports);
+    let workspace = match tempfile::tempdir() {
+        Ok(directory) => directory,
+        Err(error) => {
+            let _ = harness.shutdown().await;
+            return Err(HarnessError::Io(error));
+        }
+    };
+    let mut cluster = match ProductionCluster::start(&mut harness).await {
+        Ok(cluster) => cluster,
+        Err(error) => {
+            let _ = harness.shutdown().await;
+            return Err(error);
+        }
+    };
+    let scenario = match timeout(
+        SCENARIO_TIMEOUT,
+        run(&mut cluster, &harness, workspace.path().to_path_buf()),
+    )
+    .await
+    {
+        Ok(result) => result.and_then(|evidence| {
+            if let Err(error) = validate_acp_real_path_evidence(&evidence) {
+                // Payload-free: identifiers, counters and labels.
+                eprintln!("ACP real-path evidence: {evidence:?}");
+                return Err(error);
+            }
+            Ok(evidence)
+        }),
+        Err(_) => Err(HarnessError::Timeout(
+            "the ACP real-path scenario exceeded its bounded deadline".into(),
+        )),
+    };
+    let mut cleanup_errors = Vec::new();
+    push_cleanup_error(
+        &mut cleanup_errors,
+        "relay cleanup",
+        cluster.shutdown().await,
+    );
+    push_cleanup_error(
+        &mut cleanup_errors,
+        "catalog cleanup",
+        harness.shutdown().await,
+    );
+    finish_scenario_with_cleanup(scenario, cleanup_errors)
+}

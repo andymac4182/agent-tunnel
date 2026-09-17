@@ -57,6 +57,10 @@ pub struct HarnessOptions {
     /// and both seed the whole table: a gate looks its exports up by label, so
     /// a row one gate does not use costs it a catalog record and nothing else.
     pub fs_services: bool,
+    /// Seed the ACP `http-forward` service of the M8-04 gate
+    /// ([`ACP_GATE_SERVICE`]) on the first tenant-A device, with mirrored
+    /// `http:invoke` grants.  Only `verify-m8-acp-real-path` enables it.
+    pub acp_services: bool,
 }
 
 /// The MCP services the M3-03 gate seeds: `(label, profile)`.  The label
@@ -67,6 +71,21 @@ pub const MCP_GATE_SERVICES: [(&str, &str); 4] = [
     ("http-2026", "mcp-2026-07-28"),
     ("http-2025", "mcp-2025-11-25"),
 ];
+
+/// The ACP service the M8-04 gate seeds: `(label, profile)`.
+///
+/// One row, not four: `acp-http-v1` is the only pinned ACP profile (M8-01),
+/// and there is one export kind for it.  The shape follows
+/// [`MCP_GATE_SERVICES`] so the two read the same way.
+pub const ACP_GATE_SERVICE: (&str, &str) = ("acp", "acp-http-v1");
+
+/// One seeded ACP service.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AcpServiceFixture {
+    pub label: &'static str,
+    pub profile: &'static str,
+    pub service_id: uuid::Uuid,
+}
 
 /// One seeded MCP service.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -90,6 +109,7 @@ impl Default for HarnessOptions {
             http_forward_service: false,
             mcp_services: false,
             fs_services: false,
+            acp_services: false,
         }
     }
 }
@@ -166,6 +186,12 @@ impl HarnessOptions {
     }
 
     /// Opt into the four MCP services used by the M3-03 cloud-client gate.
+    #[must_use]
+    pub fn acp_services(mut self, value: bool) -> Self {
+        self.acp_services = value;
+        self
+    }
+
     pub fn mcp_services(mut self, value: bool) -> Self {
         self.mcp_services = value;
         self
@@ -326,6 +352,28 @@ impl Harness {
                 }
             }
         }
+        let mut acp_services = Vec::new();
+        if options.acp_services {
+            let Some(device_id) = topology.devices_a.first().map(|device| device.id) else {
+                let error =
+                    HarnessError::InvalidInput("ACP services require a tenant-A device".to_owned());
+                return Err(with_redis_cleanup(error, redis.close().await));
+            };
+            let (label, profile) = ACP_GATE_SERVICE;
+            match topology.push_http_forward_service_with_profile(
+                &mut fixture,
+                device_id,
+                profile,
+                "Synthetic ACP export",
+            ) {
+                Ok(service_id) => acp_services.push(AcpServiceFixture {
+                    label,
+                    profile,
+                    service_id,
+                }),
+                Err(error) => return Err(with_redis_cleanup(error, redis.close().await)),
+            }
+        }
         let mut fs_services = Vec::new();
         if options.fs_services {
             let Some(device_id) = topology.devices_a.first().map(|device| device.id) else {
@@ -376,6 +424,7 @@ impl Harness {
             http_forward: None,
             http_forward_service,
             mcp_services,
+            acp_services,
             fs_services,
         })
     }
@@ -405,6 +454,7 @@ pub struct RunningHarness {
     pub http_forward_service: Option<uuid::Uuid>,
     /// The seeded MCP services, when requested.
     pub mcp_services: Vec<McpServiceFixture>,
+    pub acp_services: Vec<AcpServiceFixture>,
     /// The seeded filesystem services, when requested.
     pub fs_services: Vec<FsServiceFixture>,
 }

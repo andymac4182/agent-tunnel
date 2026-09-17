@@ -821,6 +821,29 @@ fn id_value(id: &RequestId) -> Value {
     }
 }
 
+/// The `optionId`s a `session/request_permission` offered, in the order the
+/// agent listed them.
+///
+/// An agent that offers none yields an empty list, which admits no selection
+/// at all — which is right: there was nothing to select.
+fn offered_options(message: &serde_json::Value) -> Vec<String> {
+    message
+        .pointer("/params/options")
+        .and_then(serde_json::Value::as_array)
+        .map(|options| {
+            options
+                .iter()
+                .filter_map(|option| {
+                    option
+                        .get("optionId")
+                        .and_then(serde_json::Value::as_str)
+                        .map(ToOwned::to_owned)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn id_from_value(value: &Value) -> Option<RequestId> {
     match value {
         Value::String(text) => Some(RequestId::Text(text.clone())),
@@ -908,13 +931,17 @@ async fn read_agent(mut events: mpsc::Receiver<ChildEvent>, context: ReaderConte
                         let session = message.session_id().unwrap_or_default().to_owned();
                         let registered = {
                             let mut guard = shared.lock().unwrap_or_else(PoisonError::into_inner);
-                            guard.callbacks.register(
+                            // The options the agent offered are recorded with
+                            // the callback, so the host's answer can be
+                            // checked against them (`docs/acp.md`: "Validate
+                            // the response against ... the offered option").
+                            guard.callbacks.register_permission(
                                 &agent_scope,
                                 id.clone(),
-                                PendingKind::Permission,
                                 Some(&session),
                                 now,
                                 permission_timeout_ms,
+                                offered_options(&message.value),
                             )
                         };
                         let event = match registered {

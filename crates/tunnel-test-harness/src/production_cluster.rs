@@ -118,6 +118,11 @@ mod pressure;
 pub use pressure::PressureEvidence;
 mod queue_saturation;
 pub use queue_saturation::{QueueSaturationEvidence, validate_queue_saturation_evidence};
+mod acp_real_path;
+pub use acp_real_path::{
+    ACP_CASES, AcpRealPathEvidence, validate_acp_real_path_evidence, verify as verify_acp_real_path,
+};
+
 mod http_forward_real_path;
 pub use http_forward_real_path::{
     HttpForwardRealPathEvidence, validate_http_forward_real_path_evidence,

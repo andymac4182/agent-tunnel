@@ -121,6 +121,14 @@ pub enum LifecycleRule {
     /// A response whose shape does not match what was outstanding (a
     /// permission answer to a prompt, say).
     CallbackKindMismatch,
+    /// A permission response naming an `optionId` the agent did not offer.
+    ///
+    /// `docs/acp.md`: "Validate the response against the outstanding callback,
+    /// principal, session, direction, and **offered option**."  A host that
+    /// answers with an option nobody offered has not answered the question
+    /// that was asked, and letting it through would let a host invent
+    /// decisions the agent has no branch for.
+    OptionNotOffered,
     /// A second session with an identifier already in use.
     DuplicateSession,
     /// No such session on this connection.
@@ -145,6 +153,7 @@ impl LifecycleRule {
             Self::DuplicatePendingId => "ACP_DUPLICATE_PENDING_ID",
             Self::UnknownRequestId => "ACP_UNKNOWN_REQUEST_ID",
             Self::CallbackKindMismatch => "ACP_CALLBACK_KIND_MISMATCH",
+            Self::OptionNotOffered => "ACP_OPTION_NOT_OFFERED",
             Self::DuplicateSession => "ACP_DUPLICATE_SESSION",
             Self::UnknownSession => "ACP_UNKNOWN_SESSION",
             Self::PromptAlreadyActive => "ACP_PROMPT_ALREADY_ACTIVE",
@@ -307,6 +316,15 @@ struct Pending {
     kind: PendingKind,
     session: Option<String>,
     registered_at: u64,
+    /// The `optionId`s the agent offered, for a [`PendingKind::Permission`].
+    ///
+    /// `None` means they were **not recorded**, and no option check is then
+    /// possible.  Every production path registers a permission through
+    /// [`CallbackTable::register_permission`], which always records them; the
+    /// plain [`CallbackTable::register`] leaves this `None` and is used for
+    /// prompts and calls, which have no options.  `Some(list)` is checked on
+    /// resolution, and an empty list admits no selection at all.
+    offered: Option<Vec<String>>,
     /// Only a [`PendingKind::Permission`] carries one.
     deadline: Option<u64>,
 }
@@ -431,9 +449,42 @@ impl CallbackTable {
                 kind,
                 session: session.map(ToOwned::to_owned),
                 registered_at: now,
+                offered: None,
                 deadline,
             },
         );
+        Ok(())
+    }
+
+    /// Register an agent `session/request_permission`, recording the options
+    /// it offered so the host's answer can be checked against them.
+    ///
+    /// This is the only way a permission should be registered: the plain
+    /// [`CallbackTable::register`] records no options, and a permission
+    /// registered through it can never have its `optionId` validated.
+    ///
+    /// # Errors
+    /// As [`CallbackTable::register`].
+    pub fn register_permission(
+        &mut self,
+        scope: &IdScope,
+        id: RequestId,
+        session: Option<&str>,
+        now: u64,
+        timeout: u64,
+        offered: Vec<String>,
+    ) -> Result<(), LifecycleRejection> {
+        self.register(
+            scope,
+            id.clone(),
+            PendingKind::Permission,
+            session,
+            now,
+            timeout,
+        )?;
+        if let Some(entry) = self.pending.get_mut(&(scope.clone(), id)) {
+            entry.offered = Some(offered);
+        }
         Ok(())
     }
 
@@ -470,6 +521,20 @@ impl CallbackTable {
             return Err(LifecycleRejection::new(
                 LifecycleRule::CallbackKindMismatch,
                 "that response does not answer the kind of request outstanding",
+            ));
+        }
+        // `docs/acp.md`: validate the response against the **offered option**.
+        // The entry is still in the table at this point, so a refusal here
+        // leaves the callback outstanding and the genuine answer can still
+        // arrive -- which is the whole point: an invented option must not
+        // consume the decision.
+        if let Outcome::Permission(PermissionOutcome::Selected(option)) = &outcome
+            && let Some(offered) = entry.offered.as_ref()
+            && !offered.iter().any(|candidate| candidate == option)
+        {
+            return Err(LifecycleRejection::new(
+                LifecycleRule::OptionNotOffered,
+                "that optionId was not offered by the request it answers",
             ));
         }
         // Remove before returning: the decision leaves this table once.
