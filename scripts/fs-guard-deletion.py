@@ -2345,9 +2345,18 @@ def run_node_tests(suite: Suite) -> tuple[str, list[str]]:
     except subprocess.TimeoutExpired:
         return "RED (hung)", []
     combined = done.stdout + done.stderr
-    for marker in ("SyntaxError", "ERR_MODULE_NOT_FOUND", "Cannot find module", "ERR_UNSUPPORTED"):
-        if marker in combined:
-            return "MODULE FAILED TO LOAD (not evidence)", []
+    # A load failure is diagnosed from node's own machinery, not from the word
+    # appearing anywhere in the run: a genuinely red test whose failure message
+    # happens to quote `SyntaxError` would otherwise be withheld credit it
+    # earned.  `ERR_*` codes are node's own and never appear in a passing run;
+    # `SyntaxError` counts only when node names it as the failing construct.
+    load_markers = ("ERR_MODULE_NOT_FOUND", "Cannot find module", "ERR_UNSUPPORTED")
+    failed_to_load = any(marker in combined for marker in load_markers) or any(
+        line.lstrip().startswith(("SyntaxError:", "[SyntaxError", "throw new SyntaxError"))
+        for line in combined.splitlines()
+    )
+    if failed_to_load:
+        return "MODULE FAILED TO LOAD (not evidence)", []
     if "# pass 0" in done.stdout or "# tests 0" in done.stdout:
         return "NO TEST RAN (not evidence)", []
     failures = sorted(
