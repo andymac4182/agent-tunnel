@@ -234,9 +234,17 @@ fn is_integer(value: &Value) -> bool {
     value.as_i64().is_some() || value.as_u64().is_some()
 }
 
-/// Read one header.  A repeated field is reported as unreadable rather than
-/// silently picking one; the codec's singleton rule already refuses it, and
-/// this keeps the two from disagreeing if that rule were ever relaxed.
+/// Read one header.  A repeated or non-UTF-8 field yields a `\0` sentinel
+/// rather than silently picking one value.
+///
+/// Be exact about what that buys, because an earlier comment here claimed
+/// more: the sentinel is **non-empty**, so a caller that only asks whether a
+/// header is present -- `require_connection`, `validate_get`, `validate_delete`
+/// -- still treats a repeated header as present.  What actually refuses a
+/// repeated header is the codec's singleton rule, upstream of here, and this
+/// function does not stand in for it.  The sentinel's real job is narrower:
+/// it keeps an unreadable value from being mistaken for a readable one by
+/// anything that goes on to compare it.
 fn header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     let mut values = headers.get_all(name).iter();
     let first = values.next()?;
