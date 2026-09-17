@@ -389,6 +389,184 @@ claim is still unclaimed.
   authorized stored session mapping first. The idle, prompt-wall-time and
   output-stall bounds of the limits table are not implemented.
 
+## Implemented in code (M8 chunk 4)
+
+Chunk 4 puts ACP on the **real three-relay production cluster**: the device is
+owned by relay-a and the consumer enters at **relay-c**, a non-owner ingress, so
+every exchange crosses the private mTLS HTTP/3 peer hop and the device's own
+data WebSocket. The gate is `verify-m8-acp-real-path`, registered in the new
+`scripts/m8-harness-verify.sh`. Chunks 1 to 3 had no tunnel, no relay and no
+principal; those arrive here. Two users, cross-tenant isolation, revocation,
+owner loss and peer-key rotation remain chunk 5.
+
+- **A whole v1 conversation over the real route, with no claim terminating on a
+  status.** The consumer speaks **HTTP/2**, because `acp-http-v1` admits nothing
+  else. `initialize` answers 200 with `Acp-Connection-Id`; the session
+  identifier is read from the `session/new` result **on the connection GET**,
+  which is where the RFD puts it, not from the 202 that accepted the POST;
+  `session/prompt` answers 202 and its `stopReason` is read off the session GET.
+  M8-C05's decision is re-observed against a live session-scoped stream through
+  a real relay: the response carries no `Acp-Session-Id`.
+- **The principal binding needed no new mechanism, and that is the finding.**
+  The relay ingress derives the binding and the owner **re-derives it
+  independently** and refuses a mismatch with `HTTP_INVALID_HEAD` /
+  `not_dispatched`; the gate is
+  `export.profile.request.headers.allows("tunnel-principal-binding")`, and
+  `acp-http-v1`'s `REQUEST_HEADERS` already carried that header from chunk 1.
+  So M3-04's landed mechanism extends to ACP with **no relay change at all**,
+  and the export compares the value for equality exactly as
+  `tunnel_mcp_export` does. What chunk 3 recorded as "a mechanism, not a
+  principal-binding claim" is now a real authenticated principal.
+- **Permission allow, reject and cancel over the real route — and the offered
+  option was never validated.** `docs/acp.md` has always said "Validate the
+  response against the outstanding callback, principal, session, direction, and
+  **offered option**", and the offered-option half did not exist: any
+  `optionId` at all resolved a callback, so a host could answer with an option
+  the agent had no branch for. That is **M8-C11**, found by this gate. The
+  callback table now records what the agent offered and refuses a selection
+  outside it, and the refusal **leaves the callback outstanding** so an invented
+  option cannot consume the host's real decision. A response for the wrong
+  connection, and one answering nothing outstanding, are each refused while a
+  genuine callback is pending — and the genuine answer then succeeds, so the
+  refusals are not passing because the callback had already gone. Each outcome
+  is read from the marker the **agent itself** wrote.
+- **`session/cancel` reaches `stopReason: "cancelled"`**, read off the wire,
+  with the agent's own marker recording that it received `cancelled`, and an
+  update accepted **after** the cancellation and **before** the original
+  prompt's result — `docs/acp.md`'s "Accept remaining updates until that
+  response".
+- **Subscriber loss terminates the ACP transport, and each required stream is
+  broken independently.** This is `docs/acp.md`'s v0 policy and was M8-03's open
+  half. It **replaces a chunk-3 behaviour that did the opposite**, and the
+  replacement is a deliberate change rather than a correction: chunk 3 kept the
+  connection alive on a lost subscriber and said in terms that "the fix is not
+  the documented policy". `docs/acp.md` names five consequences and all five are
+  asserted **separately**, for a broken session stream and again for a broken
+  connection stream: the transport ends **by the subscriber-loss rule** and not
+  by a child ending or a deadline; the pending permission resolves `cancelled`
+  and none is approved; a new prompt is refused; the *other* required stream is
+  closed and **errors** rather than ending cleanly; a reconnect must initialize
+  anew; and the child is gone **from the process table**. A stream that never
+  arrived is still the subscription deadline, which is a different rule.
+- **An explicit unknown outcome, read from the agent's own ledger.** A child
+  that crashes after an instrumented synthetic side effect leaves the consumer's
+  stream errored with no `stopReason` ever arriving. The effect is counted from
+  `crates/tunnel-acp-fixture`'s **append-only on-disk ledger**, written and
+  `fsync`ed by the agent process at the moment the effect happens — not from a
+  harness counter that increments where the harness *believes* it dispatched,
+  which could not tell one effect from two with one unrecorded attempt. It reads
+  exactly one, and one again after a settle window. `tunnel_acp::terminal` maps
+  a lost process after dispatch to `outcome_unknown`. **The no-replay claim is
+  bounded at the moment of observation**, exactly as `http-forwarding.md` gate 4
+  bounds its own: a replay issued later would not be observed.
+- **`RESULT_STATUS` for ACP terminals** is `crates/tunnel-acp/src/terminal.rs`,
+  reading the closed vocabulary from `tunnel_protocol` rather than retyping it.
+  A completed turn is `succeeded` whatever its stop reason — `docs/acp.md` says
+  `succeeded` is about the request completing — a confirmed cancellation is
+  `cancelled`, a refusal before dispatch is `failed`, and a lost process after
+  dispatch is `outcome_unknown`. `StopReason` is `#[non_exhaustive]` upstream,
+  so the wildcard arm maps to **`outcome_unknown`, not `succeeded`**: a variant
+  nobody here has read is not a completion anybody verified.
+- **Connection capacity copies M3-04's session table rather than re-deriving
+  it**: `MAX_TRACKED_CONNECTIONS` 256, `MAX_CONNECTIONS_PER_BINDING` 32,
+  refuse-never-evict, and the decision taken **before the child is spawned** so
+  the export never starts an agent it could not track. Evict-oldest is a
+  cross-principal denial channel — eviction picks by age, not by owner — and the
+  per-principal share is what stops one principal filling the table. The rule is
+  the free function `admits`, so the denial property is tested as arithmetic
+  rather than by spawning 257 child processes.
+- **The output-credit stall is bounded, measured and terminal.** 30 s by
+  default; against a bound shortened to 400 ms the measured elapsed exceeded it,
+  read from the dispatcher's own measurement rather than from the constant it
+  was configured with. `docs/acp.md`'s "never drop an event and continue" is the
+  half with teeth: the connection ends with the message unsent rather than the
+  event being skipped, because this profile has no `Last-Event-ID` replay to
+  fill the hole and the consumer could not learn of it.
+
+### The M7-C80 accommodation, and what it costs these claims
+
+**In-flight peer streams die at a membership re-sign.** A same-key membership
+version bump invalidates every peer admission and every stream riding it, and
+`http-forwarding.md` gate 4 records that a long-lived SSE response through a
+non-owner ingress therefore **does not survive a membership re-sign**. ACP is
+nothing but a long-lived SSE response through a non-owner ingress: every
+connection here holds a connection GET open for its whole life.
+
+M3 worked around this by re-signing only at case boundaries, at most every 15 s,
+and **this gate does the same**. The accommodation is visible in the gate's own
+code — `Gate::boundary` is the only place in the file that re-signs — and it is
+named in the gate's `NOT_COVERED`, which the validator requires the evidence to
+carry.
+
+**It is a harness accommodation, not a property of the product.** This gate does
+**not** claim that an ACP connection survives normal cluster operation. A
+membership refresh in production would break every ACP connection on a non-owner
+ingress, and **M7-C80 is open for exactly that reason**. The accommodation was
+sufficient: no case saw a re-sign land mid-case, `max_membership_age_at_case_end`
+stayed far inside the records' 60 s lifetime, and the window was never widened
+to make a run pass.
+
+**M7-C85 was not reached.** That wedge — a consumer-cancelled exchange never
+releasing its OPEN journal entry, 128 per session — needs 128 cancellations on
+one device session, and this gate's seven cases produce far fewer. It is a
+plausible thing for a longer ACP gate to hit, and it stays open.
+
+### Rotation-freeze refusals
+
+M3-15 is open and undecided: a POST landing in a QUIESCE→COMMIT freeze is
+answered `503 PEER_UNAVAILABLE` with `not_dispatched`, the same body the relay
+returns for every owner-not-ready condition, and ACP is worse off than MCP
+because its subscription deadlines are ten seconds. The gate copies
+`verify-m3-mcp-cloud-client`'s discipline: every refusal is counted, correlated
+against an **observed** connector rotation phase, resent only while it coincides
+with a freeze and only up to a budget derived from the gate's own rotation
+policy, and the first refusal that does not coincide is recorded and **fails the
+run by name**. A case that did not execute is reported as not executed and never
+folded into a pass count — the completeness rule runs before the per-case rules
+so that a case which never ran names itself rather than producing six unrelated
+failures. In the recorded runs there were **no refusals at all**.
+
+### Evidence
+
+`python3 scripts/acp-guard-deletion.py --suite m8c4`: **12 of 12** defeated
+guards turned a test red, plus **one documented green** reported separately. The
+documented green is the `StopReason` wildcard: no test can construct the future
+variant it protects against, because every variant the pinned schema defines is
+matched by name and a future one does not exist to be written down. It becomes
+measurable the day the pin moves. The ACP harness gained the `EXPECT_GREEN`
+mechanism `scripts/fs-guard-deletion.py` already had (M8-C08) rather than
+counting it or exempting it.
+
+**Two rules turned out not to be load-bearing, and are recorded as such rather
+than left as guards nobody checks:** the subscription half of
+`established_and_broken` is implied by the parked body, and the dispatcher's own
+loss branch is a latency path the connection watchdog already covers. Both are
+kept, both are commented, and neither is claimed as guarded.
+
+**A chunk-3 test was found reddening at random** across the suite: its 300 ms
+subscribe bound applies to the connection GET as well as the session GET, and on
+a loaded machine the connection's own window closed first, so the session's
+window never expired and the test failed for a reason unrelated to what it
+measures. The bound is now 1500 ms and the test asserts the connection's window
+did not close, so a recurrence fails by name.
+
+### Not proven
+
+Two users, cross-tenant isolation, grant revocation, owner loss and peer-key
+rotation (chunk 5). **An ACP connection carried across a completed scheduled
+rotation**: the recorded runs observed `rotations_completed = 0`, because every
+case finishes well inside the rotation interval, so nothing here says what a
+rotation does to a live ACP connection. The output-credit stall and the
+permission deadline over the **real route** — both are measured in
+`tunnel-acp-export` against the export's own queue and clock, and the carrier in
+front of the export has flow control of its own that this gate does not drive to
+saturation. **Bounded per-hop queues at the ingress, owner and device hops**: no
+case here saturates a hop, so no hop bound is asserted rather than asserted
+vacuously. The connection-capacity table at its real bounds. The
+`X-Agent-Tunnel-Operation-Id` header and the operation facility. `session/load`,
+still refused 501. macOS is the only host, and the only agent is this
+repository's own synthetic fixture; no ACP **server** has been run.
+
 ## Research provenance
 
 The linked official pages were read on 2026-09-09. Source history exposed protocol commit `b4eddcd86937c972e65240e5199403f6d8a8cc2c` and SDK commit `7d8291d42236023c683bfc52f13d27746cda59ea`. The SDK commit explicitly distinguishes stable v1 builders from draft v2 APIs. These are observed source references, not a dependency lock or a claim that every immutable transport file was fetched. The first slice must pin and verify exact crate/schema/transport contents before implementation advertises compatibility. [Protocol history](https://github.com/agentclientprotocol/agent-client-protocol/commits/main), [SDK reference](https://github.com/agentclientprotocol/rust-sdk/commit/7d8291d42236023c683bfc52f13d27746cda59ea)

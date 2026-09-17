@@ -1510,7 +1510,7 @@ mod capacity_tests {
     fn the_per_principal_cap_is_a_share_of_the_table() {
         assert_eq!(MAX_TRACKED_CONNECTIONS, 256);
         assert_eq!(MAX_CONNECTIONS_PER_BINDING, 32);
-        assert!(MAX_CONNECTIONS_PER_BINDING < MAX_TRACKED_CONNECTIONS);
+        const { assert!(MAX_CONNECTIONS_PER_BINDING < MAX_TRACKED_CONNECTIONS) };
     }
 
     #[test]
@@ -1544,11 +1544,16 @@ mod capacity_tests {
             admits(mine, 0),
             "another principal is unaffected by the first one's share"
         );
-        assert!(
-            MAX_TRACKED_CONNECTIONS - MAX_CONNECTIONS_PER_BINDING
-                >= MAX_TRACKED_CONNECTIONS * 7 / 8,
-            "seven eighths of the table survive one principal's maximum"
-        );
+        // A `const` block: the compiler refuses the build if one principal's
+        // share ever grows past an eighth of the table, which is stronger than
+        // a test that has to be run.
+        const {
+            assert!(
+                MAX_TRACKED_CONNECTIONS - MAX_CONNECTIONS_PER_BINDING
+                    >= MAX_TRACKED_CONNECTIONS * 7 / 8,
+                "seven eighths of the table survive one principal's maximum"
+            )
+        };
     }
 
     /// A full table refuses rather than evicting: there is no input to

@@ -59,7 +59,6 @@
 //! did not execute is reported as not executed; it is never folded into a pass
 //! count.
 
-use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -142,13 +141,17 @@ pub const ACP_CASES: [&str; 7] = [
 /// not a measurement.  The validator requires the evidence to carry exactly as
 /// many of them as are listed here, so a case that quietly stops recording one
 /// fails the run.
-pub const NOT_COVERED: [&str; 6] = [
+pub const NOT_COVERED: [&str; 10] = [
     "an ACP connection surviving a membership re-sign: M7-C80 is open, and this gate re-signs only at case boundaries and at most every 15 s, which is a harness accommodation rather than a product property",
     "no retry beyond the moment of observation: a handler counter is read when the consumer sees its answer, and a retry issued later would not be observed",
     "two users, cross-tenant isolation, grant revocation, owner loss and peer-key rotation: M8 chunk 5",
     "any host but macOS",
     "any ACP agent but this repository's own synthetic fixture, and any ACP server at all",
     "the connection-capacity table at its real bounds: 256 tracked and 32 per principal are proven as arithmetic in tunnel-acp-export, not by opening 257 connections with 257 child processes here",
+    "an ACP connection carried across a completed scheduled rotation: this run observed rotations_completed = 0, because every case finishes well inside the rotation interval, so nothing here says what a rotation does to a live ACP connection",
+    "the output-credit stall over the real route: the 30 s bound and its never-drop-and-continue half are measured against the export's own queue in tunnel-acp-export, and the carrier in front of it has flow control of its own that this gate does not drive to saturation",
+    "the permission deadline over the real route: it is observed elapsing in tunnel-acp-export against a shortened bound, not here",
+    "bounded per-hop queues at the ingress, owner and device hops: no case here saturates a hop, so no hop bound is asserted rather than asserted vacuously",
 ];
 
 /// Everything this gate measured.  Primitives only: identifiers, counters,
@@ -638,7 +641,6 @@ fn fixture_binary_path() -> Result<PathBuf> {
 /// the accommodation's clock.
 struct Gate<'h> {
     cluster: &'h mut ProductionCluster,
-    harness: &'h RunningHarness,
     tenant_id: uuid::Uuid,
     device_id: uuid::Uuid,
     service_id: uuid::Uuid,
@@ -1277,7 +1279,7 @@ impl Gate<'_> {
             .session_stream
             .wait_for("the permission callback", |value| {
                 (value.get("method").and_then(Value::as_str) == Some("session/request_permission"))
-                    .then(|| ())
+                    .then_some(())
             })
             .await?;
         let seen_before_cancel = conversation.session_stream.seen().len();
@@ -1385,7 +1387,7 @@ impl Gate<'_> {
             .session_stream
             .wait_for("the permission callback", |value| {
                 (value.get("method").and_then(Value::as_str) == Some("session/request_permission"))
-                    .then(|| ())
+                    .then_some(())
             })
             .await?;
 
@@ -1647,7 +1649,6 @@ async fn run(
 
     let mut gate = Gate {
         cluster,
-        harness,
         tenant_id: device.tenant_id,
         device_id: device.id,
         service_id: acp_service,
@@ -1762,10 +1763,7 @@ pub fn validate_acp_real_path_evidence(evidence: &AcpRealPathEvidence) -> Result
                 && evidence.owner_node == "relay-a"
                 && evidence.ingress_node == "relay-c",
         ),
-        (
-            "every case executed",
-            executed == ACP_CASES.iter().copied().collect::<Vec<_>>(),
-        ),
+        ("every case executed", executed == ACP_CASES.to_vec()),
         (
             "the limits of the claim are recorded",
             evidence.not_covered.len() == NOT_COVERED.len(),
