@@ -2527,14 +2527,26 @@ EXPECT_GREEN: frozenset[str] = frozenset(
         # measured rather than assumed".
         "a flush identified by its pair, not by its tag number",
         "a reserved walk binding only a live reservation",
+        # gate3.  These two were first left out of this set on the grounds that
+        # they "carry no written explanation anywhere".  That was wrong about
+        # the first and incomplete about the second, and review caught it.
         #
-        # **Deliberately NOT here**, and the reason is the point of this set:
-        # gate3's other two green cases — "the count check before a counted
-        # payload is copied" and "the reply-type match in complete" — carry no
-        # written explanation anywhere. Whether they are masked by design or
-        # stale is **not established**, and guessing would turn an open
-        # question into a documented finding. They keep gate3's exit at 1 until
-        # an M4 owner says which; task row M4-18 records it.
+        # The reply-type match is explained four lines below its own case, by
+        # the pair case that follows it: "The reply-type match and
+        # `apply_effect`'s catch-all mask one another: with the match gone, a
+        # mismatched reply still falls through to the catch-all.  Proven as a
+        # pair."  That is the same shape the flush case above is marked on, so
+        # refusing this one was an inconsistency, not caution.
+        "the reply-type match in complete",
+        # The count check has no prose reason, but the fact is one read away and
+        # was verified rather than inferred: `read_counted`
+        # (`crates/tunnel-fs-ninep/src/message.rs:1033-1039`) pre-checks
+        # `count > reader.remaining()` and then calls `reader.raw(count)`, which
+        # delegates to `Reader::take` (`wire.rs:161-168`) -- and `take` returns
+        # the identical `CodecError::TruncatedBody` on a short body.  The
+        # pre-check is provably defence in depth, so its green is a documented
+        # green like the others; the citation is the code rather than a row.
+        "the count check before a counted payload is copied",
     }
 )
 

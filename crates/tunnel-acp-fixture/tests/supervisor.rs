@@ -676,7 +676,15 @@ async fn nothing_holds_the_child_handle_once_the_child_is_gone() {
         "the reader and the deadline ticker are both running"
     );
     assert_eq!(
-        before.child_handle_holders, 2,
+        // Exactly two: the reader and the deadline ticker.  This is read after
+        // `stop_reason()` has returned, which matters -- `dispatch` spawns
+        // short-lived send tasks that also clone the handle, so taken earlier
+        // this count is timing-dependent.  If it ever fails at 3, the fix is to
+        // find the task still holding the handle, not to loosen this to `>= 2`:
+        // a task holding the handle without ending with the child is the exact
+        // defect this test exists to catch.
+        before.child_handle_holders,
+        2,
         "and both of them hold the child handle"
     );
 
