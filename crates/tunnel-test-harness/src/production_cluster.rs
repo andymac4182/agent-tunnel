@@ -138,6 +138,13 @@ pub use fs_real_path::{
 pub use fs_write_path::{
     FsWritePathEvidence, validate_fs_write_path_evidence, verify as verify_fs_write_path,
 };
+/// Gate 6's end-to-end half: the real `@agent-tunnel/client`, run by `node`,
+/// against this cluster's real relay and device sockets.
+mod fs_client_e2e;
+pub use fs_client_e2e::{
+    DeviceLedger, FsClientE2eEvidence, validate_fs_client_e2e_evidence as validate_fs_client_e2e,
+    verify as verify_fs_client_e2e,
+};
 mod http_forward_rotation;
 pub use http_forward_rotation::{
     AdmissionProbeEvidence, CancelRaceEvidence, GATE_ROTATION, HttpForwardRotationEvidence,

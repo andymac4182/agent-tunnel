@@ -129,11 +129,23 @@ pub struct CertificateProfile {
 }
 
 impl CertificateProfile {
+    /// A server leaf for the fixture's own listeners.
+    ///
+    /// Two names, and the second is load-bearing rather than decorative.
+    /// `localhost` is what every in-process consumer in this crate sends as
+    /// SNI; `127.0.0.1` becomes an **IP** subject alternative name — `rcgen`
+    /// parses a name that is an address into one — and exists so a consumer
+    /// outside this process can verify the chain against the loopback address
+    /// the relay actually binds, with no name to resolve. The gate-6 driver is
+    /// that consumer: `node` trusts this CA through `NODE_EXTRA_CA_CERTS` and
+    /// verifies the certificate the ordinary way, which is the point. The
+    /// alternative was to have that client skip verification, and TLS
+    /// verification is one of the things under test.
     pub fn server(subject: impl Into<String>) -> Self {
         Self {
             role: CertificateRole::Server,
             subject: subject.into(),
-            dns_names: vec!["localhost".to_owned()],
+            dns_names: vec!["localhost".to_owned(), "127.0.0.1".to_owned()],
             uri_san: None,
             validity: Validity::one_day(),
         }

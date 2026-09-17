@@ -30,4 +30,7 @@ gate "M4 filesystem gate 4: descriptor, refusal matrix, 9P session, capability m
 gate "M4 filesystem gate 5: write grants, the hard-link write rule, an interrupted write and partial failure" \
   cargo run --locked -p tunnel-test-harness -- verify-m4-fs-write-path
 
+gate "M4 filesystem gate 6: the real TypeScript client against real relay and device sockets" \
+  cargo run --locked -p tunnel-test-harness -- verify-m4-fs-client-e2e
+
 echo "m4-harness-verify: implemented M4 harness suite passed" >&2
