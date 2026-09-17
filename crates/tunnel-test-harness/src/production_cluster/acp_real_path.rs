@@ -126,13 +126,14 @@ const FREEZE_COINCIDENCE: Duration = Duration::from_millis(750);
 const FROZEN_PHASES: [&str; 3] = ["quiescing", "draining", "committing"];
 
 /// The cases this gate runs, in order.
-pub const ACP_CASES: [&str; 6] = [
+pub const ACP_CASES: [&str; 7] = [
     "conversation",
     "permission-allow",
     "permission-reject",
     "cancel",
     "sse-loss-session",
     "sse-loss-connection",
+    "outcome-unknown",
 ];
 
 /// What this gate deliberately does not establish.
@@ -209,6 +210,27 @@ pub struct AcpRealPathEvidence {
     /// Per broken stream: the five consequences, each observed separately.
     pub session_loss: LossEvidence,
     pub connection_loss: LossEvidence,
+
+    // --- an explicit unknown outcome after a crash ---
+    /// How many times the agent's **own on-disk ledger** records the synthetic
+    /// side effect, read after the fault.
+    ///
+    /// Read from the fixture's file rather than from a harness counter: a
+    /// counter that increments where the harness believes it dispatched cannot
+    /// tell "the effect happened once" from "it happened twice and one attempt
+    /// was not recorded", which is the whole question.
+    pub side_effects_in_ledger: u64,
+    /// The same ledger re-read after a settle window, to show nothing replayed
+    /// it.
+    pub side_effects_after_settle: u64,
+    /// The consumer's stream **errored** rather than ending cleanly or
+    /// carrying a result: the turn has no terminal on the wire.
+    pub unknown_stream_errored: bool,
+    /// No `stopReason` ever arrived for the crashed turn.
+    pub unknown_no_stop_reason: bool,
+    /// The terminal this maps to through `tunnel_acp::terminal`, which is the
+    /// same rule the connector uses for `RESULT_STATUS`.
+    pub unknown_result_status: String,
 
     // --- the M7-C80 accommodation, made visible in the evidence ---
     pub resign_spacing_ms: u128,
@@ -1467,6 +1489,89 @@ impl Gate<'_> {
     }
 }
 
+impl Gate<'_> {
+    /// Case `outcome-unknown`: a child crash **after** an instrumented
+    /// synthetic side effect.
+    ///
+    /// `docs/acp.md`: "a reset connection or lost process marks dispatched
+    /// unresolved work `outcome_unknown`", and "never automatically replay its
+    /// input into a replacement child".
+    ///
+    /// The side effect is counted from the **fixture's own append-only ledger
+    /// on disk**, written and `fsync`ed by the agent process at the moment the
+    /// effect happens and read back after the fault. A harness counter that
+    /// incremented where the harness *thought* it dispatched would not be able
+    /// to distinguish one effect from two with one unrecorded attempt.
+    ///
+    /// **The no-replay claim is bounded at the moment of observation**, the
+    /// same way `docs/http-forwarding.md` gate 4 bounds its own: the ledger is
+    /// read when the consumer's stream has failed and again after a settle
+    /// window, and a replay issued after that would not be observed. That
+    /// limit is in [`NOT_COVERED`].
+    async fn case_outcome_unknown(&mut self, evidence: &mut AcpRealPathEvidence) -> Result<()> {
+        let ledger = self.workspace.join(tunnel_acp_fixture::SIDE_EFFECT_LEDGER);
+        let _ = std::fs::remove_file(&ledger);
+        let effect = "acp-gate-effect";
+
+        let conversation = self.open_conversation(evidence).await?;
+        let status = self
+            .prompt(
+                &conversation,
+                "prompt-crash",
+                &format!("effect-crash:{effect}"),
+            )
+            .await?;
+        if status != http::StatusCode::ACCEPTED {
+            return Err(HarnessError::Http(format!(
+                "the crashing prompt answered {status}, not 202"
+            )));
+        }
+
+        // The child dies after recording the effect, so its transport ends and
+        // the consumer's stream fails.  Nothing answers the prompt.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if conversation.session_stream.has_errored() {
+                evidence.unknown_stream_errored = true;
+                break;
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+        evidence.unknown_no_stop_reason = conversation
+            .session_stream
+            .seen()
+            .iter()
+            .all(|value| stop_reason(value).is_none());
+
+        evidence.side_effects_in_ledger = count_effect(&ledger, effect);
+        // A settle window, then read again: nothing re-ran it.
+        sleep(Duration::from_secs(2)).await;
+        evidence.side_effects_after_settle = count_effect(&ledger, effect);
+
+        // The terminal this is, through the one rule that decides it.
+        evidence.unknown_result_status = tunnel_acp::terminal::AcpTerminal::LostAfterDispatch
+            .result_status()
+            .to_owned();
+
+        conversation.connection_stream.break_now();
+        conversation.session_stream.break_now();
+        conversation.consumer.shutdown();
+        Ok(())
+    }
+}
+
+/// How many times the ledger records exactly this effect name.
+fn count_effect(ledger: &Path, effect: &str) -> u64 {
+    std::fs::read_to_string(ledger)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| line.trim() == effect)
+        .count() as u64
+}
+
 /// Run every case in order, with the M7-C80 accommodation between them.
 async fn run(
     cluster: &mut ProductionCluster,
@@ -1582,6 +1687,7 @@ async fn run(
                 "cancel" => gate.case_cancel(&mut evidence).await?,
                 "sse-loss-session" => gate.case_sse_loss(&mut evidence, true).await?,
                 "sse-loss-connection" => gate.case_sse_loss(&mut evidence, false).await?,
+                "outcome-unknown" => gate.case_outcome_unknown(&mut evidence).await?,
                 other => {
                     return Err(HarnessError::InvalidInput(format!(
                         "unknown ACP gate case {other}"
@@ -1648,7 +1754,7 @@ async fn run(
 /// The first rule that did not hold.
 pub fn validate_acp_real_path_evidence(evidence: &AcpRealPathEvidence) -> Result<()> {
     let executed: Vec<&str> = evidence.cases_executed.iter().map(String::as_str).collect();
-    let checks: [(&str, bool); 23] = [
+    let checks: [(&str, bool); 28] = [
         ("three relays", evidence.relay_count == 3),
         (
             "the device is owned by relay-a and the consumer entered at relay-c",
@@ -1733,6 +1839,27 @@ pub fn validate_acp_real_path_evidence(evidence: &AcpRealPathEvidence) -> Result
         (
             "an update was accepted after the cancellation and before the prompt result",
             evidence.update_after_cancel_before_result,
+        ),
+        // --- the explicit unknown outcome ---
+        (
+            "the crashed turn's stream errored rather than ending cleanly",
+            evidence.unknown_stream_errored,
+        ),
+        (
+            "no stopReason ever arrived for the crashed turn",
+            evidence.unknown_no_stop_reason,
+        ),
+        (
+            "the side effect is recorded exactly once in the agent's own ledger",
+            evidence.side_effects_in_ledger == 1,
+        ),
+        (
+            "nothing replayed the side effect within the observation window",
+            evidence.side_effects_after_settle == 1,
+        ),
+        (
+            "a lost process after dispatch is outcome_unknown",
+            evidence.unknown_result_status == "outcome_unknown",
         ),
         // --- the M7-C80 accommodation ---
         (
