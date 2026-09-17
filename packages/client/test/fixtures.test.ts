@@ -207,7 +207,8 @@ describe('the whole corpus over a tunnel byte stream', () => {
 
   it('decodes as one ordered stream, whole', () => {
     const decoder = new FrameDecoder();
-    const messages = decoder.push(stream);
+    const { messages, error } = decoder.push(stream);
+    assert.equal(error, undefined);
     assert.equal(messages.length, fixtures.length);
     assert.equal(decoder.retainedBytes, 0);
     messages.forEach((message, index) => {
@@ -222,14 +223,14 @@ describe('the whole corpus over a tunnel byte stream', () => {
     const expected = fixtures.map((fixture) => EXPECTED[fixture.id]);
     for (let cut = 0; cut <= stream.byteLength; cut += 1) {
       const decoder = new FrameDecoder();
-      const first = decoder.push(stream.subarray(0, cut));
+      const first = decoder.push(stream.subarray(0, cut)).messages;
       // Asserted after the FIRST push, where it is not vacuous: the decoder is
       // mid-frame for most cuts and is genuinely holding a partial frame.
       assert.ok(
         decoder.retainedBytes <= C.MSIZE_CEILING,
         `retained ${decoder.retainedBytes} at cut ${cut}`,
       );
-      const messages = [...first, ...decoder.push(stream.subarray(cut))];
+      const messages = [...first, ...decoder.push(stream.subarray(cut)).messages];
       assert.deepEqual(messages, expected, `cut at ${cut}`);
       assert.equal(decoder.retainedBytes, 0, `nothing retained after cut ${cut}`);
     }
@@ -249,7 +250,7 @@ describe('the whole corpus over a tunnel byte stream', () => {
     const decoder = new FrameDecoder();
     const messages: unknown[] = [];
     for (const byte of stream) {
-      messages.push(...decoder.push(Uint8Array.of(byte)));
+      messages.push(...decoder.push(Uint8Array.of(byte)).messages);
     }
     assert.equal(messages.length, fixtures.length);
     messages.forEach((message, index) => {
