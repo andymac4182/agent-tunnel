@@ -111,6 +111,16 @@ const U64_POOL = [
 
 const TAG_POOL = [0, 1, 2, 63, 64, 0x1234, 0xfffe, 0xffff];
 
+/**
+ * The closed `Rlerror` vocabulary, and values just outside it.
+ *
+ * Drawn separately because the generic integer pool almost never lands on a
+ * valid errno, so the fourteen-code rule was being exercised in one direction
+ * only: three accepted `Rlerror`s in 4,096 cases is not a comparison of the
+ * vocabulary, it is a comparison of its rejection.
+ */
+const ERRNO_POOL = [1, 2, 13, 17, 18, 20, 21, 22, 27, 30, 36, 39, 40, 95, 0, 3, 19, 94, 96, 0xffffffff];
+
 const QID_TYPE_POOL = [0x00, 0x02, 0x80, 0x01, 0x03, 0x08, 0x40, 0x81, 0x82, 0xff];
 
 /**
@@ -340,8 +350,13 @@ function buildFrame(rng: Prng): Uint8Array {
   const opcode = inProfile ? rng.pick(PROFILE_OPCODES) : rng.pick(OTHER_OPCODES);
   const shape = SHAPES.get(opcode) ?? [];
   const body = new Raw();
-  for (const field of shape) {
-    writeField(rng, field, body);
+  if (opcode === 7) {
+    // `Rlerror`'s one field, from the errno pool rather than the integer pool.
+    body.u32(rng.pick(ERRNO_POOL));
+  } else {
+    for (const field of shape) {
+      writeField(rng, field, body);
+    }
   }
   const bodyBytes = body.finish();
   const out = new Raw();
@@ -353,7 +368,15 @@ function buildFrame(rng: Prng): Uint8Array {
     : honest;
   out.u32(size);
   out.u8(opcode);
-  out.u16(rng.pick(TAG_POOL));
+  // `Tversion`/`Rversion` **require** `NOTAG` and everything else forbids it,
+  // so a uniform tag pool spent almost every version frame on that one refusal
+  // and almost none on the negotiation values behind it. Weighted here, in the
+  // generator, rather than by special-casing either codec.
+  const versionHandshake = opcode === 100 || opcode === 101;
+  const tag = versionHandshake
+    ? (rng.chance(3, 4) ? 0xffff : rng.pick(TAG_POOL))
+    : rng.pick(TAG_POOL);
+  out.u16(tag);
   out.raw(bodyBytes);
   return out.finish();
 }

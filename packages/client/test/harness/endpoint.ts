@@ -3,10 +3,17 @@
  *
  * **What this is and what it is not.** It is a real `node:http` server on
  * 127.0.0.1: a real TCP connection, a real HTTP request, a real RFC 6455
- * handshake and real WebSocket frames, with the server's half of the framing
- * written here rather than borrowed from the client under test. So the client's
- * transport is exercised end to end against another implementation of the same
- * wire.
+ * handshake and real WebSocket frames, with the **WebSocket** half of the
+ * framing written here rather than borrowed from the client under test — so
+ * that layer is exercised against another implementation of it.
+ *
+ * Its **9P** layer is deliberately not independent: it encodes and decodes with
+ * `src/ninep/`, the codec under test. Writing a third 9P implementation to
+ * drive these tests would be a third thing to keep correct, and the second
+ * opinion about 9P bytes already exists and is a better one — the shared corpus
+ * in `fuzz/`, where the other implementation is `crates/tunnel-fs-ninep`.
+ * Nothing this harness asserts should be read as independent evidence about the
+ * wire format.
  *
  * It is **not** a relay and not a device. There is no TLS, no tunnel, no
  * logical stream, no grant, no provider and no filesystem: the 9P replies are

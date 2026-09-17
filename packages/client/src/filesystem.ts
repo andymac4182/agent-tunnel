@@ -27,6 +27,7 @@ import { FilesystemError, mergeOutcome, type Outcome } from './errors.ts';
 import { splitParent, validatePath, type PathBounds } from './paths.ts';
 import { ConsumerSession, ROOT_FID, type Lifecycle } from './session.ts';
 import {
+  isTlsVerificationFailure,
   requireSecureEndpoint,
   upgrade,
   UpgradeRejected,
@@ -521,7 +522,14 @@ export class RemoteFilesystem {
     const overwrite = options.overwrite ?? true;
     const { parent, name } = splitParent(path, this.bounds);
     const parentFid = await this.walk(parent, options.signal);
-    let fid = parentFid;
+    // `undefined` means "nothing is bound to clunk". It is not `parentFid`
+    // between the clunk below and the re-walk that replaces it: if that walk
+    // throws, the `finally` would otherwise clunk and release a fid this side
+    // has already given back — two `Tclunk`s for one fid on the wire, the
+    // number free twice in the pool, and the next two operations handed the
+    // same fid, which the device answers `EINVAL` for one of them while this
+    // side's fid quota silently stops counting.
+    let fid: number | undefined = parentFid;
     let acknowledged = 0;
     let outcome: Outcome = 'not_started';
     try {
@@ -541,13 +549,23 @@ export class RemoteFilesystem {
         if (created.kind !== 'Rlcreate') {
           throw this.unexpected(operation, path);
         }
-        // `Tlcreate` rebinds the parent fid to the file it made.
+        // `Tlcreate` rebinds the parent fid to the file it made — and **the
+        // file now exists**, so from here nothing this composite does can be
+        // reported `not_started`. Without this floor, a `copy` whose source
+        // turns out to be absent reports `not_started` with an empty
+        // destination already created, and an abort between the `Rlcreate` and
+        // the first `Twrite` does the same. That is the class gate 5 spent a
+        // round removing on the device side, and a client must not put it back.
+        outcome = mergeOutcome(outcome, 'failed');
       } catch (error) {
         const failed = error as FilesystemError;
         if (!overwrite || failed.code !== 'EEXIST') {
           throw failed;
         }
+        // An `Rlerror(EEXIST)` means the create was refused and made nothing,
+        // so the floor above was never reached on this path.
         await this.clunkQuietly(parentFid);
+        fid = undefined;
         fid = await this.walk(path, options.signal);
         const opened = await this.session.request(
           { kind: 'Tlopen', tag: 0, fid, flags: C.O_WRONLY | C.O_TRUNC },
@@ -560,6 +578,10 @@ export class RemoteFilesystem {
         // reported `not_started`.
         outcome = mergeOutcome(outcome, 'failed');
       }
+      const target = fid;
+      if (target === undefined) {
+        throw this.unexpected(operation, path);
+      }
       const limit = this.session.msize - C.WRITE_REQUEST_OVERHEAD;
       let offset = 0n;
       for await (const chunk of asAsync(chunks)) {
@@ -567,7 +589,7 @@ export class RemoteFilesystem {
         while (at < chunk.byteLength) {
           const slice = chunk.subarray(at, at + limit);
           const reply = await this.session.request(
-            { kind: 'Twrite', tag: 0, fid, offset, data: slice },
+            { kind: 'Twrite', tag: 0, fid: target, offset, data: slice },
             { signal: options.signal },
           );
           if (reply.kind !== 'Rwrite') {
@@ -611,7 +633,9 @@ export class RemoteFilesystem {
         closeCode: failed.closeCode,
       });
     } finally {
-      await this.clunkQuietly(fid);
+      if (fid !== undefined) {
+        await this.clunkQuietly(fid);
+      }
     }
   }
 
@@ -681,6 +705,7 @@ export class RemoteFilesystem {
     path: string,
     options: { recursive?: boolean | undefined; force?: boolean | undefined; signal?: AbortSignal | undefined } = {},
     depth = 0,
+    budget: { entries: number } = { entries: 0 },
   ): Promise<void> {
     this.require('remove', path);
     if (depth > this.descriptor.limits.maxTraversalDepth) {
@@ -708,7 +733,28 @@ export class RemoteFilesystem {
         children.push(entry);
       }
       for (const child of children) {
-        await this.remove(`${path === '/' ? '' : path}/${child.name}`, options, depth + 1);
+        // The traversal-entry limit bounds the **whole** recursive removal, not
+        // one directory's pages: a tree of ten thousand single-entry
+        // directories is ten thousand entries however they are spread. The
+        // counter is threaded through the recursion for that reason.
+        budget.entries += 1;
+        if (budget.entries > this.descriptor.limits.maxTraversalEntries) {
+          throw new FilesystemError({
+            code: 'EFBIG',
+            operation: 'remove',
+            path,
+            // Children may already be gone: a bounded traversal that stops is
+            // not a traversal that did nothing.
+            outcome: depth > 0 || budget.entries > 1 ? 'partial' : 'not_started',
+            retryable: false,
+          });
+        }
+        await this.remove(
+          `${path === '/' ? '' : path}/${child.name}`,
+          options,
+          depth + 1,
+          budget,
+        );
       }
     }
     const { parent, name } = splitParent(path, this.bounds);
@@ -892,10 +938,18 @@ export class RemoteFilesystem {
   /**
    * Close.
    *
-   * Cancels what is pending, closes the socket, and leaves an object that
-   * cannot be reused: there is no reconnect behind the caller's back, so a
-   * later call fails rather than quietly opening a second session under a
-   * token this object no longer holds.
+   * It rejects every pending operation **locally** and closes the socket. It
+   * does **not** send `Tflush` for what is outstanding, and it does not clunk
+   * the fids it still holds within a deadline, which is what item 6 of the
+   * contract's 9P binding asks of a graceful close. That is a named gap rather
+   * than a claim: the session ends either way, the device releases every fid
+   * with the stream, and a client that flushed and clunked on the way out would
+   * be describing an orderly shutdown this one does not perform. See the gate-6
+   * residue in `docs/filesystem-api.md`.
+   *
+   * What it does guarantee: the object cannot be reused, and there is no
+   * reconnect behind the caller's back, so a later call fails rather than
+   * quietly opening a second session under a token this object no longer holds.
    */
   async close(): Promise<void> {
     this.session.close();
@@ -941,15 +995,41 @@ export async function fetchDescriptor(options: ConnectOptions): Promise<Descript
   const url = new URL(options.endpoint);
   requireSecureEndpoint(url, options.allowInsecureLoopback ?? false);
   const token = await options.token();
-  const response = await fetch(url, {
-    method: 'GET',
-    headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
-    // "Do not follow cross-origin redirects or trust an arbitrary WS URL
-    // returned in JSON": no redirect is followed at all, which is the simpler
-    // rule and the one that cannot be got around by a same-origin hop.
-    redirect: 'manual',
-    signal: options.signal ?? null,
-  });
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method: 'GET',
+      headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+      // "Do not follow cross-origin redirects or trust an arbitrary WS URL
+      // returned in JSON": no redirect is followed at all, which is the simpler
+      // rule and the one that cannot be got around by a same-origin hop.
+      redirect: 'manual',
+      signal: options.signal ?? null,
+    });
+  } catch (error) {
+    // A transport failure reached callers as whatever `fetch` threw — a bare
+    // `TypeError` — so a caller branching on `error.code` saw nothing. Every
+    // failure out of this function is a `FilesystemError`, and a certificate
+    // this side could not verify is **not** an outage: it is reported
+    // `INSECURE_ENDPOINT` and is never retryable, because retrying reaches the
+    // same untrusted peer.
+    if ((error as { name?: unknown }).name === 'AbortError') {
+      throw new FilesystemError({
+        code: 'ABORTED',
+        operation: 'descriptor',
+        outcome: 'not_started',
+        retryable: false,
+      });
+    }
+    const cause = (error as { cause?: unknown }).cause ?? error;
+    const tls = isTlsVerificationFailure(cause);
+    throw new FilesystemError({
+      code: tls ? 'INSECURE_ENDPOINT' : 'BACKEND_UNAVAILABLE',
+      operation: tls ? 'descriptor:tls' : 'descriptor:connect',
+      outcome: 'not_started',
+      retryable: !tls,
+    });
+  }
   if (response.status !== 200) {
     const body: unknown = await response.json().catch(() => undefined);
     throw new FilesystemError({
@@ -998,6 +1078,12 @@ export async function connectFilesystem(options: ConnectOptions): Promise<Remote
     descriptor.limits.maxMessageBytes,
     options.maxMessageBytes ?? LIMIT_CEILINGS.maxMessageBytes,
   );
+  // The descriptor's own single-request deadline bounds the handshake as well.
+  // Every step of this function is now bounded and cancellable: the fetch by
+  // the caller's signal, the upgrade by both, and the `Tversion` by the
+  // session's request timer. A peer that answers the 101 and then says nothing
+  // used to hold this call open for ever.
+  const handshakeTimeoutMs = descriptor.limits.requestTimeoutSeconds * 1000;
 
   let session: ConsumerSession | undefined;
   let transport: BinaryTransport;
@@ -1011,6 +1097,8 @@ export async function connectFilesystem(options: ConnectOptions): Promise<Remote
       },
       maxMessageBytes: msize,
       allowInsecureLoopback: options.allowInsecureLoopback ?? false,
+      timeoutMs: handshakeTimeoutMs,
+      signal: options.signal,
       handlers: {
         onMessage: (bytes) => session?.onMessage(bytes),
         onClose: (info) => session?.onClose(info),
@@ -1038,9 +1126,18 @@ export async function connectFilesystem(options: ConnectOptions): Promise<Remote
     msize,
     maxInflightRequests: descriptor.limits.maxInflightRequests,
     maxFids: descriptor.limits.maxFids,
-    requestTimeoutMs: descriptor.limits.requestTimeoutSeconds * 1000,
+    requestTimeoutMs: handshakeTimeoutMs,
   });
-  await session.open();
+  try {
+    await session.open({ signal: options.signal });
+  } catch (error) {
+    // A handshake that did not complete leaves no client, so the socket is not
+    // left open behind the rejection.
+    if (transport.isOpen) {
+      transport.close(1002, 'handshake');
+    }
+    throw error;
+  }
   return new RemoteFilesystem(descriptor, session, transport);
 }
 

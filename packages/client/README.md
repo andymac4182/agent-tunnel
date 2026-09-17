@@ -242,11 +242,21 @@ later frame in the same push failed, a declared size checked at seven bytes
 where the Rust checks at four, `Tversion`'s negotiation values judged inside the
 codec, and two checks taken after a later field had been read.
 
+The first two are in `FrameDecoder`, which is the **stream** rule — and this
+client does not use it: a consumer decodes one message per WebSocket binary
+message with `decodeExact`. They would be visible to a stream consumer this
+package does not have. The fixes are right; the claim that they were visible on
+this client's own socket path would not be.
+
 ## What is not proven here
 
 * **Any relay and any device.** No test in this package has spoken to one. The
   transport is exercised against a loopback harness, which is a peer and not the
-  product.
+  product — and whose 9P layer is this package's own codec, so it is a second
+  opinion about WebSocket framing only.
+* **A graceful close.** `close()` rejects what is pending and closes the socket;
+  it sends no `Tflush` and clunks no fid. The session ends either way, but an
+  orderly shutdown is a different thing.
 * **TLS.** Every test endpoint is `http://127.0.0.1`, through the contract's own
   loopback development harness, which this client requires to be asked for
   explicitly and refuses for any non-loopback host.

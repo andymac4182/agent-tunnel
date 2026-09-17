@@ -408,6 +408,69 @@ describe('the session state machine', () => {
     session.close();
   });
 
+  it('refuses an Rversion whose msize is above this side’s offer', async () => {
+    // 9P requires the server's value to be at most the client's. Clamping it
+    // silently would leave the two disagreeing about the frame bound until the
+    // first over-size message closed the session in the middle of a read.
+    const provider = new FakeProvider({ 'notes.txt': 'hello' });
+    const endpoint = await startEndpoint({
+      descriptor: descriptorFixture({
+        limits: { ...descriptorFixture().limits, maxMessageBytes: 256 },
+      }),
+      onRequest: (message, connection) => {
+        if (message.kind === 'Tversion') {
+          connection.send({ kind: 'Rversion', tag: message.tag, msize: 65536, version: '9P2000.L' });
+          return;
+        }
+        provider.handle(message, connection);
+      },
+    });
+    open.push(endpoint);
+    await assert.rejects(
+      connectFilesystem({ endpoint: endpoint.url, token, allowInsecureLoopback: true }),
+      (error: FilesystemError) => {
+        assert.equal(error.code, 'PROTOCOL_VIOLATION');
+        return true;
+      },
+    );
+  });
+
+  it('releases a held tag when the flush it could not send is answered by the original', async () => {
+    // Under a full tag quota `flush` has no tag to cancel with, so the victim's
+    // number stays held rather than being reused. An earlier round held it for
+    // ever — one slot lost per deadline — because the late reply was dropped
+    // without releasing it. The reply is the last word on that tag, so it is
+    // released there.
+    const provider = new FakeProvider({ 'notes.txt': 'hello' });
+    let held: { message: import('../src/ninep/messages.ts').Message; connection: ServerConnection } | undefined;
+    const endpoint = await startEndpoint({
+      descriptor: descriptorFixture(),
+      onRequest: (message, connection) => {
+        if (message.kind === 'Twalk' && message.wnames.length > 0 && held === undefined) {
+          held = { message, connection };
+          return;
+        }
+        provider.handle(message, connection);
+      },
+    });
+    open.push(endpoint);
+    const session = await openSession(endpoint, { maxInflightRequests: 1, requestTimeoutMs: 30 });
+    const walk = session.request({ kind: 'Twalk', tag: 0, fid: 0, newfid: 5, wnames: ['notes.txt'] });
+    await assert.rejects(walk, (error: FilesystemError) => {
+      assert.equal(error.code, 'DEADLINE_EXCEEDED');
+      return true;
+    });
+    assert.equal(session.tagsHeld, 1, 'the tag is held, not reused');
+    // Now the original reply arrives: nothing is waiting to flush it, so the
+    // number is free again and the session is usable.
+    await waitFor(() => held !== undefined);
+    provider.handle(held!.message, held!.connection);
+    await waitFor(() => session.tagsHeld === 0);
+    const again = await session.request({ kind: 'Tclunk', tag: 0, fid: 5 });
+    assert.equal(again.kind, 'Rclunk');
+    session.close();
+  });
+
   it('an already-aborted signal refuses before anything is sent', async () => {
     const wired = await connect({ seed: { 'notes.txt': 'hello' } });
     const controller = new AbortController();
@@ -425,7 +488,10 @@ describe('the session state machine', () => {
 });
 
 /** Open a bare session over the endpoint, for the rules a composite hides. */
-async function openSession(endpoint: Endpoint): Promise<ConsumerSession> {
+async function openSession(
+  endpoint: Endpoint,
+  limits: { maxInflightRequests?: number; requestTimeoutMs?: number } = {},
+): Promise<ConsumerSession> {
   let session: ConsumerSession | undefined;
   const transport = await upgrade({
     url: new URL(endpoint.url),
@@ -440,9 +506,9 @@ async function openSession(endpoint: Endpoint): Promise<ConsumerSession> {
   });
   session = new ConsumerSession(transport, {
     msize: 65536,
-    maxInflightRequests: 64,
+    maxInflightRequests: limits.maxInflightRequests ?? 64,
     maxFids: 256,
-    requestTimeoutMs: 0,
+    requestTimeoutMs: limits.requestTimeoutMs ?? 0,
   });
   await session.open();
   return session;

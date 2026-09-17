@@ -1119,16 +1119,28 @@ own dispatch and reply history. It is tested as a pure function and over a real
 socket that goes away mid-write: a dispatched mutation with no reply is
 `unknown` at **every** close code the contract pins, an error carrying `partial`
 or `unknown` is never retryable, and a truncating open that fails afterwards is
-never reported `not_started` — with the peer's copy of the file checked to show
-that the truncation really did happen, so `not_started` would have been a lie
-rather than a conservative answer.
+never reported `not_started`. What makes that last floor correct is asserted as a
+fact about the **client** — the open it sent carried `O_TRUNC`, so it asked for
+an effect — and not by checking that the harness then truncated, which would be
+asserting the harness's own handler. For the same reason the interrupted write
+uses content whose bytes all differ: an all-zero source makes the "landed at the
+right offset" comparison true by construction.
+
+A composite that made something and then failed is covered on its own, because
+it is the client's version of the defect gate 5 removed on the device side: a
+`copy` whose source turns out to be absent has already created its destination,
+and a caller told `not_started` would believe the export untouched.
 
 **What this suite does not prove, and must not be read as proving.** Every socket
 in it is a loopback socket to a harness in `packages/client/test/harness/`. That
 harness is real in the ways that matter for the transport — a real TCP
-connection, a real HTTP request, a real RFC 6455 handshake, real frames, with the
-server's half of the framing written separately from the client's — and it is
-**not a relay and not a device**. There is no TLS, no tunnel, no logical stream,
+connection, a real HTTP request, a real RFC 6455 handshake, real frames — and its
+**WebSocket** framing is written separately from the client's, so the two halves
+of that layer are independent. Its **9P** layer is not: the harness encodes and
+decodes with the client's own codec, so nothing it asserts is a second opinion
+about 9P bytes. The second opinion about those is the shared corpus above, where
+the other implementation is the Rust one. And the harness is **not a relay and
+not a device**. There is no TLS, no tunnel, no logical stream,
 no grant, no confinement, no provider and no filesystem behind it; its 9P replies
 are whatever a test says they are. This document's own rule applies without
 qualification: "constructing a compatible-looking object or passing an in-process

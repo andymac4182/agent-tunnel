@@ -237,6 +237,15 @@ export class ConsumerSession {
         // A tag held only until its flush is answered: the original reply beat
         // the `Rflush`, which 9P explicitly permits. Honour it by dropping it,
         // not by closing — "respect a normal reply arriving before `Rflush`".
+        //
+        // If nothing is still waiting to flush it, this reply is the last word
+        // on that tag and the number is released here. Without that, a tag
+        // whose flush could never be sent — the quota was full — stayed held
+        // for the life of the session, one slot lost per occurrence.
+        if ((this.flushesAgainst.get(tag)?.size ?? 0) === 0) {
+          this.flushesAgainst.delete(tag);
+          this.heldTags.delete(tag);
+        }
         return;
       }
       this.failSession('PROTOCOL_VIOLATION', 1002, 'reply-for-unknown-tag');
@@ -262,8 +271,19 @@ export class ConsumerSession {
           code: code ?? 'EINVAL',
           operation: record.request.kind,
           // An `Rlerror` is a reply, so the request reached the device and the
-          // device answered it. A refused mutation is `failed` and never
-          // `unknown`: the device told this side what happened.
+          // device answered it: `failed` rather than `unknown`.
+          //
+          // **`failed` here is the wire's floor, not the device's ledger.**
+          // Gate 5 records that some `Rlerror`s the device sends are `unknown`
+          // on its side — a `Tmkdir`, `Tsymlink`, `Tlcreate` or truncating open
+          // whose post-effect identity read failed, where the node exists and
+          // the reply says only that something went wrong — and that a
+          // composite `Tsetattr` whose later field failed is `partial`. Nothing
+          // on the wire carries that distinction, so a consumer cannot recover
+          // it and must not invent it. A caller that needs the device's own
+          // verdict reads `ConnectionStatus::fs` on the device; a caller that
+          // has only this error treats `failed` on a mutation as "at least this
+          // much", and never as proof that nothing applied.
           outcome: record.mutating ? 'failed' : 'not_started',
           retryable: false,
         }),
@@ -276,11 +296,18 @@ export class ConsumerSession {
   /**
    * A reply is checked against its own request's bounds.
    *
-   * The same rule `crates/tunnel-fs-ninep` applies in the other direction: an
-   * `Rread`/`Rreaddir` may not carry more than the `count` asked for, an
-   * `Rwrite` may not acknowledge more than the `Twrite` carried, and a
-   * zero-qid `Rwalk` for a non-empty `Twalk` is not a successful clone. A short
-   * read or a short write stays ordinary.
+   * Three of the rules `crates/tunnel-fs-ninep` applies in the other direction:
+   * an `Rread` may not carry more than the `count` asked for, an `Rwrite` may
+   * not acknowledge more than the `Twrite` carried, and a zero-qid `Rwalk` for
+   * a non-empty `Twalk` is not a successful clone. A short read or a short
+   * write stays ordinary.
+   *
+   * **`Rreaddir` is deliberately not in that list**, and the comment here used
+   * to claim it was. Its `count[4]` bounds the packed block, which the codec
+   * has already consumed into entries by the time this runs, and the block's
+   * own byte length is not retained; the framing bound that does apply to it —
+   * `count` leaving room for its own reply inside `msize` — is enforced in the
+   * codec for both directions.
    */
   private checkReplyBounds(request: Message, reply: Message): string | undefined {
     if (reply.kind === 'Rread' && request.kind === 'Tread') {
@@ -369,8 +396,17 @@ export class ConsumerSession {
     this.freeFids.push(fid);
   }
 
-  /** The version handshake and the attach, in that order and once each. */
-  async open(): Promise<Qid> {
+  /**
+   * The version handshake and the attach, in that order and once each.
+   *
+   * Both steps are bounded. The `Tversion` occupies no tag slot, and an earlier
+   * round used that to skip the request timer for it as well — so a peer that
+   * answered the HTTP 101 and then said nothing left `connectFilesystem`
+   * hanging with no deadline anywhere in the path. The contract requires an
+   * `AbortSignal` **plus** a bounded deadline on every network operation, and a
+   * handshake is one.
+   */
+  async open(options: { signal?: AbortSignal | undefined } = {}): Promise<Qid> {
     if (this.versionSent || this.attachSent) {
       throw new FilesystemError({
         code: 'PROTOCOL_VIOLATION',
@@ -379,6 +415,28 @@ export class ConsumerSession {
         retryable: false,
       });
     }
+    if (options.signal?.aborted === true) {
+      throw new FilesystemError({
+        code: 'ABORTED',
+        operation: 'session:open',
+        outcome: 'not_started',
+        retryable: false,
+      });
+    }
+    const onAbort = (): void => {
+      // `Aborted` maps to no close code, so the socket is closed normally; what
+      // matters is that the pending handshake is answered rather than left.
+      this.failSession('ABORTED', undefined, 'connect-aborted');
+    };
+    options.signal?.addEventListener('abort', onAbort, { once: true });
+    try {
+      return await this.handshake();
+    } finally {
+      options.signal?.removeEventListener('abort', onAbort);
+    }
+  }
+
+  private async handshake(): Promise<Qid> {
     this.versionSent = true;
     const reply = await this.sendRaw(
       {
@@ -395,6 +453,17 @@ export class ConsumerSession {
     }
     // Negotiation reduces only, and the dialect was already chosen by the
     // subprotocol: a server naming another one ignored the handshake.
+    //
+    // **An `Rversion` above this side's offer is refused, not reduced.** 9P
+    // requires the server's value to be at most the client's, so a larger one
+    // is a peer that did not negotiate; clamping it silently would leave this
+    // side and that peer disagreeing about the frame bound until the first
+    // over-size message closed the session with 1002 in the middle of somebody's
+    // read. Refusing at the handshake puts the failure where it belongs.
+    if (reply.msize > this.limits.msize) {
+      this.failSession('PROTOCOL_VIOLATION', 1002, 'rversion-above-offer');
+      throw this.endError('session:open');
+    }
     try {
       negotiateVersion(reply.version);
       this.negotiated = negotiateMsize(reply.msize, this.limits.msize);
@@ -521,7 +590,9 @@ export class ConsumerSession {
       // The bytes are on the transport. From here nothing this side observes
       // can prove the request did not happen.
       record.dispatched = true;
-      if (this.limits.requestTimeoutMs > 0 && tag !== C.NOTAG) {
+      if (this.limits.requestTimeoutMs > 0) {
+        // `NOTAG` included: the version handshake is a network operation like
+        // any other, and it is the one a silent peer holds open for ever.
         record.timer = setTimeout(() => {
           this.expire(record);
         }, this.limits.requestTimeoutMs);
@@ -540,6 +611,13 @@ export class ConsumerSession {
    */
   private expire(record: Outstanding): void {
     if (!this.outstanding.has(record.tag)) {
+      return;
+    }
+    if (record.tag === C.NOTAG) {
+      // The version handshake cannot be flushed — `Tflush` names a tag, and
+      // `NOTAG` is not one — and a peer that will not answer `Tversion` has no
+      // session to preserve. `DEADLINE_EXCEEDED` closes 1011.
+      this.failSession('DEADLINE_EXCEEDED', 1011, 'version-deadline');
       return;
     }
     this.retire(record);
@@ -593,9 +671,11 @@ export class ConsumerSession {
     try {
       flushTag = this.allocateTag();
     } catch {
-      // No tag to flush with. The victim's tag stays held rather than being
-      // reused, because reusing it would let a late reply for the old request
-      // land on a new one.
+      // No tag to flush with, because the quota is full. The victim's tag stays
+      // held rather than being reused — reusing it would let a late reply for
+      // the old request land on a new one — and it is released when that late
+      // reply arrives, or when the session ends. It is **not** held for ever,
+      // which is what an earlier round did.
       return;
     }
     const flushes = this.flushesAgainst.get(victim) ?? new Set<number>();
@@ -605,8 +685,16 @@ export class ConsumerSession {
     try {
       await this.sendRaw({ kind: 'Tflush', tag: flushTag, oldtag: victim }, flushTag);
     } catch {
-      // The session ended under the flush; `failSession` has already answered
-      // every caller.
+      // The flush itself failed — the session ended under it, or the frame was
+      // refused. `failSession` has answered every caller either way, but this
+      // flush is no longer outstanding and must leave both records: a stale
+      // entry in the victim's set keeps its tag reserved and blocks the release
+      // above, which is the same leak by another route.
+      flushes.delete(flushTag);
+      this.outstanding.get(victim)?.flushedBy.delete(flushTag);
+      if (flushes.size === 0) {
+        this.flushesAgainst.delete(victim);
+      }
       return;
     }
     flushes.delete(flushTag);

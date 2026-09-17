@@ -25,6 +25,31 @@ import type { ClientRequest, IncomingMessage } from 'node:http';
 
 import { FilesystemError } from './errors.ts';
 
+/**
+ * Node's error codes for "this peer's certificate could not be verified".
+ *
+ * A TLS failure must not look like an outage: reporting it `BACKEND_UNAVAILABLE`
+ * with `retryable: true` tells a caller to try again, when what actually
+ * happened is that the endpoint could not be trusted and trying again will
+ * reach the same untrusted peer. It is reported as `INSECURE_ENDPOINT`, which is
+ * the same answer a plain-HTTP endpoint gets and is never retryable.
+ */
+export function isTlsVerificationFailure(error: unknown): boolean {
+  const code = (error as { code?: unknown }).code;
+  if (typeof code !== 'string') {
+    return false;
+  }
+  return (
+    code.startsWith('ERR_TLS') ||
+    code.startsWith('ERR_SSL') ||
+    code.includes('CERT') ||
+    code.includes('CERTIFICATE') ||
+    code === 'UNABLE_TO_VERIFY_LEAF_SIGNATURE' ||
+    code === 'SELF_SIGNED_CERT_IN_CHAIN' ||
+    code === 'EPROTO'
+  );
+}
+
 /** RFC 6455's fixed GUID for the accept hash. */
 const GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 
@@ -77,10 +102,23 @@ export interface UpgradeOptions {
    * is off by default and a non-loopback host is refused even when it is on.
    */
   allowInsecureLoopback?: boolean;
+  /**
+   * A bounded deadline for the handshake, in milliseconds.
+   *
+   * A peer can accept a TCP connection and then say nothing, so without this
+   * there is no deadline anywhere in `connectFilesystem`'s path: `fetch` has
+   * the caller's signal, and the upgrade had neither.
+   */
+  timeoutMs?: number | undefined;
+  /** The caller's own cancellation, honoured during the handshake. */
+  signal?: AbortSignal | undefined;
   handlers: TransportHandlers;
 }
 
-function fail(code: 'INVALID_UPGRADE' | 'INSECURE_ENDPOINT' | 'SUBPROTOCOL_REQUIRED', detail: string): never {
+function fail(
+  code: 'INVALID_UPGRADE' | 'INSECURE_ENDPOINT' | 'SUBPROTOCOL_REQUIRED' | 'DEADLINE_EXCEEDED' | 'ABORTED',
+  detail: string,
+): never {
   throw new FilesystemError({
     code,
     operation: `upgrade:${detail}`,
@@ -89,11 +127,29 @@ function fail(code: 'INVALID_UPGRADE' | 'INSECURE_ENDPOINT' | 'SUBPROTOCOL_REQUI
   });
 }
 
-const LOOPBACK = new Set(['localhost', '127.0.0.1', '::1', '[::1]']);
-
-/** Whether this URL may be spoken to without TLS. */
+/**
+ * Whether this URL's host is a loopback **address**.
+ *
+ * Decided by address only — `127.0.0.0/8` and `::1` — and never by name.
+ * `localhost` used to be in this set, and it is a name a `hosts` file or a DNS
+ * answer can point anywhere: with the insecure opt-in set, that would have sent
+ * a bearer token in clear to whatever the name resolved to. A name is not an
+ * address, and the development harness this exists for always has one.
+ */
 export function isLoopback(url: URL): boolean {
-  return LOOPBACK.has(url.hostname);
+  const host = url.hostname.replace(/^\[|\]$/gu, '');
+  if (host === '::1' || host === '0:0:0:0:0:0:0:1') {
+    return true;
+  }
+  const octets = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/u.exec(host);
+  if (octets === null) {
+    return false;
+  }
+  const parts = octets.slice(1).map((part) => Number(part));
+  if (parts.some((part) => part > 255)) {
+    return false;
+  }
+  return parts[0] === 127;
 }
 
 /**
@@ -325,7 +381,12 @@ class SocketTransport implements BinaryTransport {
             : 1005;
         const reason = new TextDecoder('utf-8', { fatal: false }).decode(frame.payload.subarray(2));
         if (!this.closeSent) {
-          this.write(buildFrame(OPCODE_CLOSE, frame.payload.subarray(0, 2)));
+          // A close payload is either empty or at least a two-byte code. One
+          // stray byte is neither, and echoing it back would answer a malformed
+          // frame with another one, so the reply carries no payload at all.
+          const echo =
+            frame.payload.byteLength >= 2 ? frame.payload.subarray(0, 2) : new Uint8Array(0);
+          this.write(buildFrame(OPCODE_CLOSE, echo));
           this.closeSent = true;
         }
         this.socket.end();
@@ -405,6 +466,18 @@ export function upgrade(options: UpgradeOptions): Promise<BinaryTransport> {
   const send = secure ? httpsRequest : httpRequest;
 
   return new Promise<BinaryTransport>((resolve, reject) => {
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let onAbort: (() => void) | undefined;
+    const finish = (): void => {
+      settled = true;
+      if (timer !== undefined) {
+        clearTimeout(timer);
+      }
+      if (onAbort !== undefined) {
+        options.signal?.removeEventListener('abort', onAbort);
+      }
+    };
     const httpUrl = new URL(options.url.toString());
     httpUrl.protocol = secure ? 'https:' : 'http:';
     const outgoing: ClientRequest = send(httpUrl, {
@@ -422,6 +495,11 @@ export function upgrade(options: UpgradeOptions): Promise<BinaryTransport> {
     });
 
     outgoing.on('upgrade', (response: IncomingMessage, socket: Socket, head: Buffer) => {
+      if (settled) {
+        socket.destroy();
+        return;
+      }
+      finish();
       const accept = response.headers['sec-websocket-accept'];
       const selected = response.headers['sec-websocket-protocol'];
       const extensions = response.headers['sec-websocket-extensions'];
@@ -455,6 +533,11 @@ export function upgrade(options: UpgradeOptions): Promise<BinaryTransport> {
     });
 
     outgoing.on('response', (response: IncomingMessage) => {
+      if (settled) {
+        response.destroy();
+        return;
+      }
+      finish();
       // Not an upgrade: the endpoint answered the contract's JSON error body,
       // and the caller needs its code rather than "the socket failed".
       const chunks: Buffer[] = [];
@@ -466,16 +549,74 @@ export function upgrade(options: UpgradeOptions): Promise<BinaryTransport> {
       });
     });
 
-    outgoing.on('error', () => {
+    outgoing.on('error', (error: unknown) => {
+      if (settled) {
+        return;
+      }
+      finish();
+      const tls = isTlsVerificationFailure(error);
       reject(
         new FilesystemError({
-          code: 'BACKEND_UNAVAILABLE',
-          operation: 'upgrade:connect',
+          code: tls ? 'INSECURE_ENDPOINT' : 'BACKEND_UNAVAILABLE',
+          operation: tls ? 'upgrade:tls' : 'upgrade:connect',
           outcome: 'not_started',
-          retryable: true,
+          // A certificate this side could not verify is not an outage, and
+          // telling a caller to retry it would be telling it to reach the same
+          // untrusted peer again.
+          retryable: !tls,
         }),
       );
     });
+
+    if (options.signal !== undefined) {
+      if (options.signal.aborted) {
+        finish();
+        outgoing.destroy();
+        reject(
+          new FilesystemError({
+            code: 'ABORTED',
+            operation: 'upgrade:signal',
+            outcome: 'not_started',
+            retryable: false,
+          }),
+        );
+        return;
+      }
+      onAbort = (): void => {
+        if (settled) {
+          return;
+        }
+        finish();
+        outgoing.destroy();
+        reject(
+          new FilesystemError({
+            code: 'ABORTED',
+            operation: 'upgrade:signal',
+            outcome: 'not_started',
+            retryable: false,
+          }),
+        );
+      };
+      options.signal.addEventListener('abort', onAbort, { once: true });
+    }
+    if (options.timeoutMs !== undefined && options.timeoutMs > 0) {
+      timer = setTimeout(() => {
+        if (settled) {
+          return;
+        }
+        finish();
+        outgoing.destroy();
+        reject(
+          new FilesystemError({
+            code: 'DEADLINE_EXCEEDED',
+            operation: 'upgrade:deadline',
+            outcome: 'not_started',
+            retryable: true,
+          }),
+        );
+      }, options.timeoutMs);
+      timer.unref?.();
+    }
     outgoing.end();
   });
 }

@@ -148,6 +148,22 @@ function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+/**
+ * The schema says `additionalProperties: false` at **every** level, so a key
+ * this client does not know about is a descriptor it cannot honour rather than
+ * one it can ignore. An earlier round enforced that for `features` only, which
+ * made the strictness look like a property of one object instead of the rule it
+ * is — and an unknown key is exactly where a future field with a meaning would
+ * arrive.
+ */
+function refuseExtraKeys(value: Record<string, unknown>, allowed: readonly string[], where: string): void {
+  for (const key of Object.keys(value)) {
+    if (!allowed.includes(key)) {
+      malformed(`${where}-extra`);
+    }
+  }
+}
+
 const IDENTIFIER = /^[A-Za-z0-9._-]{1,128}$/u;
 
 /**
@@ -179,6 +195,23 @@ export function validateDescriptor(value: unknown): Descriptor {
   if (value['capabilityStatus'] !== 'current' && value['capabilityStatus'] !== 'last-known') {
     malformed('capabilityStatus');
   }
+  refuseExtraKeys(
+    value,
+    [
+      'schemaVersion',
+      'deviceId',
+      'serviceId',
+      'grantRevision',
+      'availability',
+      'capabilityStatus',
+      'transport',
+      'root',
+      'operations',
+      'features',
+      'limits',
+    ],
+    'descriptor',
+  );
   const transport = value['transport'];
   if (
     !isObject(transport) ||
@@ -191,6 +224,7 @@ export function validateDescriptor(value: unknown): Descriptor {
     // than discovered after the upgrade.
     malformed('transport');
   }
+  refuseExtraKeys(transport, ['type', 'subprotocol', 'dialect'], 'transport');
   const root = value['root'];
   if (
     !isObject(root) ||
@@ -202,6 +236,7 @@ export function validateDescriptor(value: unknown): Descriptor {
   ) {
     malformed('root');
   }
+  refuseExtraKeys(root, ['path', 'pathStyle', 'caseSensitivity', 'readOnly'], 'root');
   const operations = value['operations'];
   if (!Array.isArray(operations) || operations.length === 0) {
     // An empty grant derives an empty operation list, and discovery must
@@ -234,6 +269,7 @@ export function validateDescriptor(value: unknown): Descriptor {
   if (!isObject(limits)) {
     malformed('limits');
   }
+  refuseExtraKeys(limits, Object.keys(LIMIT_CEILINGS), 'limits');
   for (const [name, ceiling] of Object.entries(LIMIT_CEILINGS)) {
     const limit = limits[name];
     if (typeof limit !== 'number' || !Number.isInteger(limit) || limit < 1) {

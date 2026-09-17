@@ -12,6 +12,7 @@ import { after, describe, it } from 'node:test';
 
 import { connectFilesystem, fetchDescriptor } from '../src/filesystem.ts';
 import { validateDescriptor, GRANT_REVISION_HEADER } from '../src/descriptor.ts';
+import { isLoopback, isTlsVerificationFailure } from '../src/websocket.ts';
 import { FilesystemError } from '../src/errors.ts';
 import { descriptorFixture } from './harness/descriptor.ts';
 import { grantRevisionOf, startEndpoint, type Endpoint } from './harness/endpoint.ts';
@@ -141,6 +142,23 @@ describe('the descriptor', () => {
         })(),
       ],
       ['an identifier outside the narrow set', { ...descriptorFixture(), deviceId: 'a device' }],
+      // `additionalProperties: false` is the schema's rule at every level, not
+      // only for `features`: an unknown key is where a future field with a
+      // meaning would arrive, and ignoring it would honour a descriptor this
+      // client does not understand.
+      ['an unknown key at the top level', { ...descriptorFixture(), surprise: true }],
+      [
+        'an unknown key in transport',
+        {
+          ...descriptorFixture(),
+          transport: { ...descriptorFixture().transport, compression: 'deflate' },
+        },
+      ],
+      ['an unknown key in root', { ...descriptorFixture(), root: { ...descriptorFixture().root, hostPath: '/tmp' } }],
+      [
+        'an unknown key in limits',
+        { ...descriptorFixture(), limits: { ...descriptorFixture().limits, maxRetries: 3 } },
+      ],
     ];
     for (const [what, value] of bend) {
       it(what, () => {
@@ -236,6 +254,105 @@ describe('the upgrade', () => {
       (error: FilesystemError) => error.code === 'DEVICE_OFFLINE',
     );
     assert.equal(endpoint.connections.length, 0, 'no upgrade should have been attempted');
+  });
+
+  it('is bounded: a peer that answers 101 and then says nothing does not hang', async () => {
+    // Every step of `connectFilesystem` is bounded. The fetch has the caller's
+    // signal, the upgrade has both a signal and a deadline, and the `Tversion`
+    // — which occupies no tag slot and was therefore skipped by the request
+    // timer in an earlier round — is on the deadline like any other request.
+    const endpoint = await endpointWith({
+      descriptor: descriptorFixture({
+        limits: { ...descriptorFixture().limits, requestTimeoutSeconds: 1 },
+      }),
+      onRequest: () => {
+        // Answer nothing at all, including the version handshake.
+      },
+    });
+    const started = Date.now();
+    await assert.rejects(
+      connectFilesystem({ endpoint: endpoint.url, token, allowInsecureLoopback: true }),
+      (error: FilesystemError) => {
+        assert.equal(error.code, 'DEADLINE_EXCEEDED');
+        // The `Tversion` was dispatched and mutates nothing, so `failed` — and
+        // never `unknown`, which would say a side effect might have happened
+        // during a handshake that cannot have one.
+        assert.equal(error.outcome, 'failed');
+        return true;
+      },
+    );
+    assert.ok(Date.now() - started < 5000, 'it did not wait for ever');
+  });
+
+  it('is cancellable: a signal aborted during the handshake ends the connect', async () => {
+    const controller = new AbortController();
+    const endpoint = await endpointWith({
+      descriptor: descriptorFixture(),
+      onRequest: () => {
+        controller.abort();
+      },
+    });
+    await assert.rejects(
+      connectFilesystem({
+        endpoint: endpoint.url,
+        token,
+        allowInsecureLoopback: true,
+        signal: controller.signal,
+      }),
+      (error: FilesystemError) => {
+        assert.equal(error.code, 'ABORTED');
+        return true;
+      },
+    );
+  });
+
+  it('refuses a plain-http endpoint whose host is loopback only by NAME', async () => {
+    // `localhost` is a name a hosts file or a DNS answer can point anywhere,
+    // and with the insecure opt-in set that would have sent the bearer token in
+    // clear to whatever it resolved to. Loopback is decided by address.
+    await assert.rejects(
+      fetchDescriptor({
+        endpoint: 'http://localhost:1/v1/devices/d/services/s/fs',
+        token,
+        allowInsecureLoopback: true,
+      }),
+      (error: FilesystemError) => error.code === 'INSECURE_ENDPOINT',
+    );
+    for (const host of ['127.0.0.1', '127.1.2.3', '[::1]']) {
+      assert.equal(isLoopback(new URL(`http://${host}:1/fs`)), true, host);
+    }
+    for (const host of ['localhost', 'example.com', '128.0.0.1', '10.0.0.1']) {
+      assert.equal(isLoopback(new URL(`http://${host}:1/fs`)), false, host);
+    }
+  });
+
+  it('reports a transport failure as a FilesystemError, and a TLS failure as not retryable', async () => {
+    // A bare `TypeError` out of `fetch` gave a caller branching on `code`
+    // nothing to branch on; and a certificate this side could not verify is not
+    // an outage, so it must not look retryable.
+    const endpoint = await endpointWith({ descriptor: descriptorFixture() });
+    const url = new URL(endpoint.url);
+    url.port = '1';
+    await assert.rejects(
+      fetchDescriptor({ endpoint: url.toString(), token, allowInsecureLoopback: true }),
+      (error: FilesystemError) => {
+        assert.ok(error instanceof FilesystemError);
+        assert.equal(error.code, 'BACKEND_UNAVAILABLE');
+        assert.equal(error.outcome, 'not_started');
+        return true;
+      },
+    );
+    for (const code of [
+      'ERR_TLS_CERT_ALTNAME_INVALID',
+      'DEPTH_ZERO_SELF_SIGNED_CERT',
+      'UNABLE_TO_VERIFY_LEAF_SIGNATURE',
+      'CERT_HAS_EXPIRED',
+    ]) {
+      assert.equal(isTlsVerificationFailure({ code }), true, code);
+    }
+    for (const code of ['ECONNREFUSED', 'ENOTFOUND', 'ETIMEDOUT']) {
+      assert.equal(isTlsVerificationFailure({ code }), false, code);
+    }
   });
 
   it('sends the version handshake first and attaches the root once', async () => {
