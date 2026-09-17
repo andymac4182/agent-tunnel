@@ -988,7 +988,9 @@ async fn exercise(
             .ok_or_else(|| HarnessError::InvalidInput(format!("fixture {label} is missing")))
     };
 
-    // The certificate the fixture issues carries `127.0.0.1` as an IP SAN, so
+    // The cluster relay's leaf carries `127.0.0.1` as an IP SAN -- asked for by
+    // name at the one site that issues it, and deliberately not a property of
+    // the shared fixture default, which stays narrow (M4-17).  So
     // the endpoint names the address the relay actually listens on and node
     // verifies the chain against the fixture CA with no name to resolve and no
     // verification to disable.  Disabling verification is not available here

@@ -1390,8 +1390,16 @@ fail and the gate went red 3 of 3 — task row M4-17. The widening is now an
 opt-in, `CertificateProfile::server_with_loopback_ip`, asked for at the cluster
 relay leaf that gate 6's driver actually dials; the Redis TLS forwarder issues
 from `server_without_ip_sans` at its own site; and a unit test asserts the
-forwarder's leaf is refused for `127.0.0.1` and accepted for `localhost`, so a
-re-widening reddens a fast test rather than a twenty-minute gate.
+forwarder's leaf is refused for `127.0.0.1` and accepted for `localhost`.
+State precisely what that test guards: because `server_without_ip_sans` is a
+subtraction, a re-widening of the shared default is **neutralised** at this
+site rather than caught, and the test stays green because the leaf stays
+narrow. The test reddens when this leaf itself changes — the site pointed back
+at `issue_server`, the subtraction broken, or an IP SAN introduced below the
+profile — and it does so in milliseconds instead of through a gate run. The
+companion assertion that the opt-in leaf *is* accepted for `127.0.0.1` is what
+keeps the refusal a real observation rather than an artefact of a verifier
+that never checks IP SANs at all.
 
 That much was true of the first round of this gate too, and it was **not
 enough**: the driver set `tlsVerified = true` once `connectFilesystem` returned,

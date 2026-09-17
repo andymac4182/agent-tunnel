@@ -82,8 +82,14 @@ pub async fn verify(redis_url: &str) -> Result<RedisTlsEvidence> {
 /// was widened elsewhere for an unrelated consumer.
 ///
 /// `forwarder_leaf_is_refused_for_the_loopback_address` asserts the property
-/// directly against the issued certificate, so a re-widening reddens a unit
-/// test rather than only this gate.
+/// directly against the issued certificate, not against the profile, so it
+/// catches any route by which this leaf comes to carry an IP subject
+/// alternative name. Be precise about what that does and does not do: a
+/// re-widening of the shared default is **neutralised** here by the
+/// subtraction rather than caught, and the test stays green because the leaf
+/// stays narrow. What reddens the test is a change to this leaf itself —
+/// pointing the site back at `issue_server`, breaking
+/// `server_without_ip_sans`, or an IP SAN introduced below the profile.
 fn issue_forwarder_leaf(pki: &FixturePki) -> Result<crate::CertificateMaterial> {
     pki.issue_server_without_ip_sans("redis-tls-forwarder")
         .map_err(|error| HarnessError::Pki(error.to_string()))
