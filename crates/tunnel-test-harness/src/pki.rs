@@ -5,7 +5,7 @@ use rcgen::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::fmt;
+use std::{fmt, net::IpAddr};
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
@@ -131,24 +131,63 @@ pub struct CertificateProfile {
 impl CertificateProfile {
     /// A server leaf for the fixture's own listeners.
     ///
-    /// Two names, and the second is load-bearing rather than decorative.
-    /// `localhost` is what every in-process consumer in this crate sends as
-    /// SNI; `127.0.0.1` becomes an **IP** subject alternative name — `rcgen`
-    /// parses a name that is an address into one — and exists so a consumer
-    /// outside this process can verify the chain against the loopback address
-    /// the relay actually binds, with no name to resolve. The gate-6 driver is
-    /// that consumer: `node` trusts this CA through `NODE_EXTRA_CA_CERTS` and
-    /// verifies the certificate the ordinary way, which is the point. The
-    /// alternative was to have that client skip verification, and TLS
-    /// verification is one of the things under test.
+    /// One name, and deliberately one: `localhost` is what every in-process
+    /// consumer in this crate sends as SNI, and nothing else is granted.
+    ///
+    /// **Do not widen this.** Several fixtures use a server leaf to prove that
+    /// a connection to the *wrong* name is refused, and a name added here is
+    /// silently granted to all of them — which is exactly how M4-17 happened:
+    /// a loopback address added here for one out-of-process consumer disarmed
+    /// `verify-m7-redis-tls`'s `wrong_server_name_rejected` case, because the
+    /// wrong name it dials became a name the leaf legitimately carries. A
+    /// consumer that needs to verify the chain against the loopback *address*
+    /// asks for it at its own site with
+    /// [`CertificateProfile::server_with_loopback_ip`].
     pub fn server(subject: impl Into<String>) -> Self {
         Self {
             role: CertificateRole::Server,
             subject: subject.into(),
-            dns_names: vec!["localhost".to_owned(), "127.0.0.1".to_owned()],
+            dns_names: vec!["localhost".to_owned()],
             uri_san: None,
             validity: Validity::one_day(),
         }
+    }
+
+    /// A server leaf that additionally carries `127.0.0.1` as an **IP**
+    /// subject alternative name — `rcgen` parses a name that is an address
+    /// into one.
+    ///
+    /// This exists for a consumer *outside* this process that must verify the
+    /// chain against the loopback address a listener actually binds, with no
+    /// name to resolve. The gate-6 driver of `verify-m4-fs-client-e2e` is that
+    /// consumer: `node` trusts the fixture CA through `NODE_EXTRA_CA_CERTS`
+    /// and verifies the certificate the ordinary way, which is the point. The
+    /// alternative was to have that client skip verification, and TLS
+    /// verification is one of the things that gate tests.
+    ///
+    /// Call this only at a listener such a consumer dials. It is an opt-in so
+    /// that the widening reaches exactly those listeners and no others.
+    pub fn server_with_loopback_ip(subject: impl Into<String>) -> Self {
+        let mut profile = Self::server(subject);
+        profile.dns_names.push("127.0.0.1".to_owned());
+        profile
+    }
+
+    /// A server leaf with every address-shaped name removed.
+    ///
+    /// This is **not** a synonym for [`CertificateProfile::server`], though the
+    /// two agree today. It is for a site whose correctness depends on the
+    /// *absence* of an IP subject alternative name — a negative case that
+    /// dials a loopback address and requires refusal. Such a site states that
+    /// dependency here rather than inheriting whatever the shared default
+    /// happens to carry, so a future widening of the default reddens nothing
+    /// silently.
+    pub fn server_without_ip_sans(subject: impl Into<String>) -> Self {
+        let mut profile = Self::server(subject);
+        profile
+            .dns_names
+            .retain(|name| name.parse::<IpAddr>().is_err());
+        profile
     }
 
     pub fn device(tenant_id: Uuid, device_id: Uuid) -> Self {
@@ -221,6 +260,23 @@ impl FixturePki {
 
     pub fn issue_server(&self, subject: impl Into<String>) -> Result<CertificateMaterial> {
         self.issue(CertificateProfile::server(subject))
+    }
+
+    /// See [`CertificateProfile::server_with_loopback_ip`] for when this, and
+    /// not [`FixturePki::issue_server`], is the right helper.
+    pub fn issue_server_with_loopback_ip(
+        &self,
+        subject: impl Into<String>,
+    ) -> Result<CertificateMaterial> {
+        self.issue(CertificateProfile::server_with_loopback_ip(subject))
+    }
+
+    /// See [`CertificateProfile::server_without_ip_sans`].
+    pub fn issue_server_without_ip_sans(
+        &self,
+        subject: impl Into<String>,
+    ) -> Result<CertificateMaterial> {
+        self.issue(CertificateProfile::server_without_ip_sans(subject))
     }
 
     pub fn issue_device(&self, tenant_id: Uuid, device_id: Uuid) -> Result<CertificateMaterial> {

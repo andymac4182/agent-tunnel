@@ -550,10 +550,16 @@ It pins these choices, each of which this document did not previously settle:
   counts and closed labels, so a driver that decided for itself what passing
   meant could not smuggle a verdict past the validator.
 * **TLS verification is proven by a pair of observations, because a connect that
-  resolved is not one.** The fixture's server leaf now carries `127.0.0.1`
+  resolved is not one.** The **cluster relay's** server leaf carries `127.0.0.1`
   alongside `localhost`, so a consumer outside the harness process can name the
   loopback address the relay actually binds and verify the chain with no name to
-  resolve; `node` trusts the fixture CA through `NODE_EXTRA_CA_CERTS`, and
+  resolve. That widening is an opt-in asked for at that leaf alone
+  (`CertificateProfile::server_with_loopback_ip`), not a property of the shared
+  fixture server profile: it was the shared profile once, and M4-17 is what that
+  cost — `verify-m7-redis-tls`'s wrong-server-name refusal is built on a leaf
+  that names `localhost` and nothing else, and a name granted to every fixture
+  listener disarmed it. `node` trusts the fixture CA through
+  `NODE_EXTRA_CA_CERTS`, and
   `allowInsecureLoopback` is never passed. **That much is not evidence on its
   own**, and a first round of this gate proved it by failing: it asserted a
   verified chain once a connect returned, and the whole gate passed under
