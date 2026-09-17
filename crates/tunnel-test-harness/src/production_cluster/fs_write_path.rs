@@ -229,7 +229,7 @@ pub fn validate_fs_write_path_evidence(evidence: &FsWritePathEvidence) -> Result
     // read-only grant, which is the failure this whole case exists to catch.
     const PRE_DISPATCH: [u32; 3] = [EPERM, FsErrorCode::Einval.errno(), ENOTSUP];
 
-    let checks: [(&str, bool); 34] = [
+    let checks: [(&str, bool); 35] = [
         ("three relays", evidence.relay_count == 3),
         (
             "the session ran against the owning relay",
@@ -299,6 +299,23 @@ pub fn validate_fs_write_path_evidence(evidence: &FsWritePathEvidence) -> Result
                 .read_only_refusal_errnos
                 .iter()
                 .all(|errno| PRE_DISPATCH.contains(errno)),
+        ),
+        (
+            // The contract: "Read-only policy denies every mutating opcode
+            // **and flag**, including `O_TRUNC` on open." The first two
+            // attempts are exactly those two flag shapes on an ordinary
+            // unopened file, so `EPERM` here is the grant refusing a flag —
+            // where `ENOTSUP` would mean the profile refused the combination
+            // for some other reason and the grant was never consulted.
+            "a mutating open flag is refused by the grant itself",
+            evidence
+                .read_only_refusal_errnos
+                .first()
+                .is_some_and(|errno| *errno == EPERM)
+                && evidence
+                    .read_only_refusal_errnos
+                    .get(1)
+                    .is_some_and(|errno| *errno == EPERM),
         ),
         (
             "the read-only export is byte-for-byte unchanged",
@@ -1063,6 +1080,15 @@ async fn read_only_case(
     expect_walk(client.walk(root_fid, file, &["target.bin"]).await?, 1)?;
     let tree = 2_u32;
     expect_walk(client.walk(root_fid, tree, &["tree"]).await?, 1)?;
+    // A second, unopened binding of the same file, so the two mutating
+    // `Tlopen` shapes below are refused by the **grant** rather than by
+    // anything else. Aiming them at the directory fid would have them refused
+    // for its kind — gate 3 denies a writable `O_DIRECTORY` outright — and a
+    // refusal that would have happened under a write grant too proves nothing
+    // about the read-only one. Aiming them at `file` would meet the session's
+    // "already open" rule instead. This binding meets neither.
+    let unopened = 4_u32;
+    expect_walk(client.walk(root_fid, unopened, &["target.bin"]).await?, 1)?;
     // Opened read-only, so the `Twrite` below is refused for the fid's *state*
     // rather than for the flags — which is the second of the three layers and
     // is what makes "the mutating flag is rejected before any backend access"
@@ -1073,11 +1099,11 @@ async fn read_only_case(
     // flag shapes, which are refusals of a *flag* rather than of an opcode.
     let mutations: Vec<Message> = vec![
         Message::Tlopen {
-            fid: tree,
+            fid: unopened,
             flags: O_WRONLY,
         },
         Message::Tlopen {
-            fid: tree,
+            fid: unopened,
             flags: O_WRONLY | O_TRUNC,
         },
         Message::Tlcreate {
@@ -1479,6 +1505,9 @@ mod tests {
                 e.read_only_refusals_attempted -= 1;
                 e.read_only_refusal_errnos.pop();
                 e.read_only_refusals_attempted -= 1;
+            }),
+            ("a mutating open flag was refused for another reason", |e| {
+                e.read_only_refusal_errnos[0] = ENOTSUP;
             }),
             ("a read-only refusal came from the host", |e| {
                 // `EACCES` can only be the host's answer, so a refusal carrying
