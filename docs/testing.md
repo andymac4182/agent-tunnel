@@ -1043,6 +1043,140 @@ The connector's settling of the mutation ledger has **no unit test** and is
 deliberately absent from the suite rather than listed there with a green it did
 not earn; it is exercised only through the harness gate.
 
+### Implementation gate 6: the shared client, and the fuzzing both codecs share
+
+The client is `packages/client`. One command runs everything, offline, with
+`node_modules` deleted:
+
+```sh
+cd packages/client && npm test
+```
+
+Type checking is separate and is the only thing that needs an install
+(`npm ci && npm run typecheck`), which keeps the suite runnable with nothing
+fetched. There are still **zero runtime dependencies**; RFC 6455's client half
+is written out in `src/websocket.ts` rather than depended on, because the
+contract needs `Authorization` on the upgrade and neither Node's global
+`WebSocket` nor a dependency-free package can otherwise send one.
+
+**The shared fuzzing this document asks for.** "Fuzz the incremental Rust and
+TypeScript codecs with the same corpus and compare accepted values and rejection
+behavior" is not what gate 3's 43 golden fixtures did: nothing was generated,
+and neither codec was ever run against input the other had judged.
+`packages/client/fuzz/` generates the corpus in **one** place — 4,096 cases,
+deterministic from a seed the corpus file records — and both implementations
+produce a verdict on every one:
+
+* The generator knows the wire **shape** of all 41 message types and draws each
+  field from a pool of boundary values, so the cases land inside fields rather
+  than spending themselves on the truncation and unknown-opcode paths a
+  byte-flipper reaches. It then mutates a share of what it built, mixes in pure
+  noise, packs two frames into one binary message, and chunks streams.
+* Nothing in the generator imports either codec, so a rule one of them gets
+  wrong cannot also be wrong in the generator and cancel out.
+* The canonical form a verdict is compared in is written out **twice**, once per
+  side. A shared renderer would be a third implementation both sides trusted,
+  and a field either codec dropped would be dropped from the comparison with it.
+* `crates/tunnel-fs-ninep/tests/shared_fuzz.rs` is the Rust half. It runs in the
+  ordinary workspace suite, compares against its checked-in verdicts and
+  **refuses to rewrite them** — the same rule the golden fixtures follow, so an
+  ordinary run cannot overwrite the evidence it checks. Rewriting after a
+  deliberate change is `AGENT_TUNNEL_FUZZ_WRITE=1 cargo test -p tunnel-fs-ninep
+  --test shared_fuzz`.
+* `npm test` regenerates the corpus from the seed and asserts it is exactly what
+  the committed file holds, so a corpus trimmed by hand to the cases that agree
+  fails rather than quietly narrowing the cross-check. A failing case is
+  reproducible from the seed alone.
+
+The rule is **accept and agree, or both refuse**, compared over a shared refusal
+vocabulary rather than over "it threw". Four disagreements were found, all in the
+TypeScript and all fixed; the Rust codec was right in every one. They are
+recorded with their reasoning in
+[filesystem-api.md](filesystem-api.md#pinned-in-code-gate-3)'s gate-3 residue,
+which that fuzzing closes. The two verdict files are byte-identical.
+
+The corpus weights `NOTAG` for the two version opcodes and draws `Rlerror` from
+an errno pool, because a uniform tag pool spent almost every version frame on
+the one refusal that guards it: 41 of 41 message types are now decoded, where
+`Tversion` was reached once and `Rlerror` three times in 4,096 cases. Nothing new
+surfaced, and **that is a weaker result than it may look**: both codecs decode an
+`Rversion`'s `msize` without judging it, so agreement shows the rule is in
+neither codec rather than that it belongs in a session — and the Rust side has no
+consumer-side `Rversion` rule to compare against at all, being the server end.
+The differences that remain between the two implementations are session-layer
+rules a corpus of frames does not reach.
+
+**What the client's own suite covers.** The namespace, with every refused class
+refused by its own rule and the checking **order** that decides which rule a path
+violating several of them reports. The descriptor: the schema's rules, the HTTP
+failure vocabulary of
+[filesystem-api.md](filesystem-api.md#http-failures-before-upgrade) at every
+status it tabulates, and the refusals that must happen before a session opens.
+The upgrade: the grant-revision header, the selected subprotocol, the accept
+hash, and an extension nothing offered. The session: one `Tversion` on `NOTAG`
+and one `Tattach`, a reply for a tag nothing waits on, a reply of the wrong type,
+an `Rread` longer than its `Tread`, a text frame, two 9P messages in one binary
+message, valid WebSocket fragmentation reassembled, the tag and fid quotas, and
+`Tflush` — including an original reply that beat its `Rflush` and is honoured.
+The bytes: a file spanning many messages at `msize` 256, a write spanning many,
+a short write whose remainder goes as a fresh write rather than a replay, copy,
+stat, directory enumeration, create, rename and recursive removal. The limits:
+the materialization ceiling enforced against the running total while reading,
+its release on ownership transfer, and `msize` negotiation reducing.
+
+**The outcome classification, which is the obligation gate 5 named for this
+side.** There is no wire field for an outcome, so the client derives one from its
+own dispatch and reply history. It is tested as a pure function and over a real
+socket that goes away mid-write: a dispatched mutation with no reply is
+`unknown` at **every** close code the contract pins, an error carrying `partial`
+or `unknown` is never retryable, and a truncating open that fails afterwards is
+never reported `not_started`. What makes that last floor correct is asserted as a
+fact about the **client** — the open it sent carried `O_TRUNC`, so it asked for
+an effect — and not by checking that the harness then truncated, which would be
+asserting the harness's own handler. For the same reason the interrupted write
+uses content whose bytes all differ: an all-zero source makes the "landed at the
+right offset" comparison true by construction.
+
+A composite that made something and then failed is covered on its own, because
+it is the client's version of the defect gate 5 removed on the device side: a
+`copy` whose source turns out to be absent has already created its destination,
+and a caller told `not_started` would believe the export untouched. The same
+floor is exercised for a recursive `mkdir` interrupted after one `Rmkdir` and a
+recursive `remove` that unlinked a child before failing, and in the other
+direction for the traversal budget, which fires during a post-order descent and
+must therefore report `not_started` with zero `Tunlinkat` on the wire.
+
+Two of those cases are about the **type** of the failure rather than its floor,
+and they are the ones an outcome can escape through: a directory entry the device
+listed but this namespace refuses — an ordinary host file called `bad.` — and an
+exception from the caller's own chunk source, which `writeStream` iterates inside
+the composite. Both are `PathRefusal` or a plain `Error`, neither carries an
+`outcome`, and both are reachable **after** the composite has applied something.
+Each is asserted to arrive as a `FilesystemError` carrying the floor with the
+original as `cause`, and — when nothing has applied — to be passed through
+unchanged.
+
+**What this suite does not prove, and must not be read as proving.** Every socket
+in it is a loopback socket to a harness in `packages/client/test/harness/`. That
+harness is real in the ways that matter for the transport — a real TCP
+connection, a real HTTP request, a real RFC 6455 handshake, real frames — and its
+**WebSocket** framing is written separately from the client's, so the two halves
+of that layer are independent. Its **9P** layer is not: the harness encodes and
+decodes with the client's own codec, so nothing it asserts is a second opinion
+about 9P bytes. The second opinion about those is the shared corpus above, where
+the other implementation is the Rust one. And the harness is **not a relay and
+not a device**. There is no TLS, no tunnel, no logical stream,
+no grant, no confinement, no provider and no filesystem behind it; its 9P replies
+are whatever a test says they are. This document's own rule applies without
+qualification: "constructing a compatible-looking object or passing an in-process
+mock proves neither endpoint interoperability nor authorization", and nothing
+here is evidence about `crates/tunnel-relay` or `crates/tunnel-fs-provider`.
+Nor are the four native adapters covered: none exists, so no row of the
+[contract compilation table](#contract-compilation-and-capability-profiles) above
+has been satisfied. Rotation, revocation under a live session, the cross-relay
+hop, and every clock the device does not enforce remain exactly as gates 4 and 5
+left them.
+
 ### Shared dataset and native semantics
 
 Build one synthetic mount dataset and access that same authorized mount through Files SDK, Mastra, just-bash, and AI SDK tools concurrently. A file created through one writable view must be readable byte-for-byte through every other view; rename/remove must be visible without undocumented persistent caching. Compare native directory and metadata results after normalizing only documented differences. AI SDK FilesV4 uploads are also visible as ordinary files in their configured upload directory, while its native methods accept only its own references. Use real relay/device processes and sockets; preserve a separate fast mocked suite for error translation and upstream contract fixtures.

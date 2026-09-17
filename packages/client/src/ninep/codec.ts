@@ -42,24 +42,6 @@ function checkTag(kind: C.MessageName, tag: number): void {
   }
 }
 
-function checkVersion(version: string): void {
-  // The WebSocket subprotocol selected the dialect before a byte of 9P was
-  // sent, so another dialect is a peer that ignored the handshake, not a
-  // negotiation step. There is no `version = "unknown"` reply in this profile.
-  if (version !== C.VERSION) {
-    fail('UnsupportedVersion', 'version');
-  }
-}
-
-function checkNegotiatedMsize(msize: number): void {
-  if (msize < C.MSIZE_FLOOR) {
-    fail('MsizeBelowFloor', 'msize');
-  }
-  if (msize > C.MSIZE_CEILING) {
-    fail('OverCeiling', 'msize');
-  }
-}
-
 /**
  * A requested or returned `count[4]` must leave room for its own framing.
  *
@@ -105,13 +87,21 @@ function checkErrno(ecode: number): void {
  * ------------------------------------------------------------------ */
 
 function readQid(reader: Reader, field: string): Qid {
-  const qid: Qid = {
-    type: reader.u8(`${field}.type`),
+  // The type byte is decided the instant it is read, before the twelve bytes
+  // behind it. Reading the whole qid first and judging it afterwards gives a
+  // *different answer* for a qid that is both malformed and truncated — the
+  // truncation, which is the less specific of the two — and the shared corpus
+  // found exactly that disagreeing with `crates/tunnel-fs-ninep`, whose
+  // `Reader::qid` decides the kind first.
+  const type = reader.u8(`${field}.type`);
+  if (!C.QID_TYPES.has(type)) {
+    fail('QidType', field);
+  }
+  return {
+    type,
     version: reader.u32(`${field}.version`),
     path: reader.u64(`${field}.path`),
   };
-  checkQid(qid, field);
-  return qid;
 }
 
 function writeQid(writer: Writer, qid: Qid, field: string): void {
@@ -135,6 +125,16 @@ export function decodeDirEntries(block: Uint8Array): DirEntry[] {
       const qid = readQid(reader, 'entry.qid');
       const offset = reader.u64('entry.offset');
       const type = reader.u8('entry.type');
+      // Two sources that can disagree is one too many: the dirent byte is
+      // *required to agree* with the qid rather than one being preferred. It is
+      // decided here, before the name is read, because a record can be wrong in
+      // both ways at once and the answer must not depend on which field the
+      // reader reaches next. Checking it after the name made a record with a
+      // mismatched type byte *and* a non-UTF-8 name report the name — which the
+      // shared corpus caught disagreeing with `crates/tunnel-fs-ninep`.
+      if (C.DIRENT_BY_QID_TYPE.get(qid.type) !== type) {
+        fail('DirentTypeDisagreesWithQid', 'entry.type');
+      }
       const name = reader.string('entry.name');
       entry = { qid, offset, type, name };
     } catch (error) {
@@ -143,11 +143,6 @@ export function decodeDirEntries(block: Uint8Array): DirEntry[] {
         fail('MalformedDirentBlock', 'entries');
       }
       throw error;
-    }
-    // Two sources that can disagree is one too many: the dirent byte is
-    // *required to agree* with the qid rather than one being preferred.
-    if (C.DIRENT_BY_QID_TYPE.get(entry.qid.type) !== entry.type) {
-      fail('DirentTypeDisagreesWithQid', 'entry.type');
     }
     entries.push(entry);
   }
@@ -176,10 +171,15 @@ function decodeBody(kind: C.MessageName, tag: number, reader: Reader): Message {
   switch (kind) {
     case 'Tversion':
     case 'Rversion': {
+      // The offered `msize` and the offered dialect are **negotiation values,
+      // not framing values**, so nothing about them is decided here. A
+      // `Tversion` offering 65,537 is well formed and is answered by reducing
+      // it; a `Tversion` naming another dialect is well formed and terminates
+      // the session. Refusing either inside the decoder would turn a
+      // negotiable offer into a framing violation. See `negotiateMsize` and
+      // `profile.checkDialect`.
       const msize = reader.u32('msize');
       const version = reader.string('version');
-      checkVersion(version);
-      checkNegotiatedMsize(msize);
       return { kind, tag, msize, version };
     }
     case 'Tattach':
@@ -400,8 +400,6 @@ function encodeBody(message: Message, writer: Writer): void {
   switch (message.kind) {
     case 'Tversion':
     case 'Rversion':
-      checkVersion(message.version);
-      checkNegotiatedMsize(message.msize);
       writer.u32(message.msize, 'msize');
       writer.string(message.version, 'version');
       return;
@@ -688,6 +686,13 @@ export function encode(message: Message, options: DecodeOptions = {}): Uint8Arra
  * has no trustworthy boundary to resynchronise on, so a well-formed frame
  * arriving after one is not decoded.
  */
+export interface PushResult {
+  /** The frames this push completed, in order, however the push ended. */
+  messages: Message[];
+  /** The framing violation that ended it, if one did. The decoder is latched. */
+  error?: NinepError;
+}
+
 export class FrameDecoder {
   private readonly msize: number;
   private retained: Uint8Array = new Uint8Array(0);
@@ -716,20 +721,37 @@ export class FrameDecoder {
     return this.latched !== undefined;
   }
 
-  push(chunk: Uint8Array): Message[] {
+  /**
+   * Feed bytes in, take whatever completed out.
+   *
+   * The result carries **both** the frames this push completed and the framing
+   * violation that ended it, because a push can produce both and they are not
+   * alternatives. An earlier shape of this method threw, which discarded every
+   * frame already decoded from the same chunk: a carrier chunk holding a
+   * well-formed reply followed by a malformed one lost the reply, and the tag
+   * waiting on it would never have been retired. The shared corpus found it
+   * against `crates/tunnel-fs-ninep`, whose pull-shaped `decode` hands each
+   * frame back before the error that follows it.
+   */
+  push(chunk: Uint8Array): PushResult {
     if (this.latched !== undefined) {
-      fail('DecoderLatched');
+      return { messages: [], error: new NinepError('DecoderLatched') };
     }
     const merged = new Uint8Array(this.retained.byteLength + chunk.byteLength);
     merged.set(this.retained, 0);
     merged.set(chunk, this.retained.byteLength);
     this.retained = merged;
 
-    const out: Message[] = [];
+    const messages: Message[] = [];
     try {
       for (;;) {
-        if (this.retained.byteLength < C.HEADER_BYTES) {
-          return out;
+        // The declared size is checked as soon as its four bytes exist, not
+        // once a whole header does: a peer that declares four gigabytes and
+        // stops must be refused then, not waited on. That is where the Rust
+        // decoder takes it, and this side deferred it until seven bytes had
+        // arrived.
+        if (this.retained.byteLength < 4) {
+          return { messages };
         }
         const size = new DataView(
           this.retained.buffer,
@@ -738,15 +760,16 @@ export class FrameDecoder {
         ).getUint32(0, true);
         checkDeclaredSize(size, this.msize);
         if (this.retained.byteLength < size) {
-          return out;
+          return { messages };
         }
-        out.push(decodeFrame(this.retained.subarray(0, size), this.msize));
+        messages.push(decodeFrame(this.retained.subarray(0, size), this.msize));
         this.retained = this.retained.subarray(size);
       }
     } catch (error) {
       if (error instanceof NinepError) {
         this.latched = error;
         this.retained = new Uint8Array(0);
+        return { messages, error };
       }
       throw error;
     }
@@ -758,9 +781,33 @@ export class FrameDecoder {
  * 256 accepted, 65,536 accepted, 65,537 reduced to 65,536.
  */
 export function negotiateMsize(offered: number, maximum: number = C.MSIZE_CEILING): number {
-  if (offered < C.MSIZE_FLOOR) {
+  const negotiated = Math.min(offered, maximum, C.MSIZE_CEILING);
+  // The floor applies to what was *negotiated*, not to what was offered: a
+  // generous offer reduced below the floor by this side's own maximum is as
+  // unusable as a small offer, and `crates/tunnel-fs-ninep::negotiate` takes it
+  // in that order too.
+  if (negotiated < C.MSIZE_FLOOR) {
     fail('MsizeBelowFloor', 'msize');
   }
-  return Math.min(offered, maximum);
+  return negotiated;
+}
+
+/**
+ * The dialect refusal, out of the codec and beside negotiation where it
+ * belongs.
+ *
+ * The WebSocket subprotocol `agent-tunnel.9p.v1` selected the dialect before a
+ * byte of 9P was sent, so a `Tversion` naming another one is a peer that
+ * ignored the handshake rather than a negotiation step: the session terminates
+ * with 1002 and there is no `version = "unknown"` reply in this profile. It is
+ * a `NinepError` for that reason — the close code is the same 1002 every
+ * framing violation carries — but it is taken *after* decoding, on a frame that
+ * was well formed.
+ */
+export function negotiateVersion(offered: string): string {
+  if (offered !== C.VERSION) {
+    fail('UnsupportedVersion', 'version');
+  }
+  return offered;
 }
 

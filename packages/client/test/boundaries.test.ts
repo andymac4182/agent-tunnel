@@ -16,6 +16,7 @@ import {
   decodeExact,
   encode,
   negotiateMsize,
+  negotiateVersion,
 } from '../src/ninep/codec.ts';
 import type { Message } from '../src/ninep/codec.ts';
 import * as profile from '../src/ninep/profile.ts';
@@ -42,7 +43,13 @@ describe('msize negotiation reduces only', () => {
     assert.equal(negotiateMsize(1024, 4096), 1024);
   });
 
-  it('a Tversion below the floor or above the ceiling is refused on the wire', () => {
+  it("a Tversion's offered msize is a negotiation value, not a framing one", () => {
+    // Found by the shared corpus: this side used to refuse a `Tversion`
+    // carrying 65,537 or 255 *inside the decoder*, where every failure is a
+    // framing violation. `crates/tunnel-fs-ninep` decodes the frame — it is
+    // perfectly well formed — and answers 65,537 by reducing it, which is what
+    // "negotiation reduces only" means. Refusing it here made an offer this
+    // profile knows how to answer into a 1002 close.
     const bytes = encode({
       kind: 'Tversion',
       tag: C.NOTAG,
@@ -50,23 +57,27 @@ describe('msize negotiation reduces only', () => {
       version: C.VERSION,
     });
     const view = new DataView(bytes.buffer);
-    view.setUint32(C.HEADER_BYTES, 255, true);
-    assert.throws(() => decodeExact(bytes), { reason: 'MsizeBelowFloor' });
-    view.setUint32(C.HEADER_BYTES, C.MSIZE_CEILING + 1, true);
-    assert.throws(() => decodeExact(bytes), { reason: 'OverCeiling' });
-    view.setUint32(C.HEADER_BYTES, C.MSIZE_FLOOR, true);
-    assert.doesNotThrow(() => decodeExact(bytes));
+    for (const offered of [0, 255, C.MSIZE_CEILING + 1, 0xffffffff]) {
+      view.setUint32(C.HEADER_BYTES, offered, true);
+      const decoded = decodeExact(bytes);
+      assert.equal(decoded.kind, 'Tversion');
+      assert.equal(decoded.kind === 'Tversion' ? decoded.msize : -1, offered);
+    }
+    assert.equal(negotiateMsize(C.MSIZE_CEILING + 1), C.MSIZE_CEILING);
+    assert.throws(() => negotiateMsize(255), { reason: 'MsizeBelowFloor' });
   });
 
   it('another dialect terminates rather than answering version "unknown"', () => {
-    assert.throws(
-      () => encode({ kind: 'Tversion', tag: C.NOTAG, msize: 65536, version: '9P2000' }),
-      { reason: 'UnsupportedVersion' },
-    );
-    assert.throws(
-      () => encode({ kind: 'Rversion', tag: C.NOTAG, msize: 65536, version: 'unknown' }),
-      { reason: 'UnsupportedVersion' },
-    );
+    // Also the negotiation layer's, for the same reason: the bytes are well
+    // formed, and what is wrong with them is which dialect they name. The close
+    // code is 1002 either way, so this refusal stays a `NinepError`.
+    assert.equal(negotiateVersion(C.VERSION), C.VERSION);
+    assert.throws(() => negotiateVersion('9P2000'), { reason: 'UnsupportedVersion' });
+    assert.throws(() => negotiateVersion('unknown'), { reason: 'UnsupportedVersion' });
+    // The codec itself encodes and decodes the offer without judging it.
+    const other = encode({ kind: 'Tversion', tag: C.NOTAG, msize: 65536, version: '9P2000' });
+    const decoded = decodeExact(other);
+    assert.equal(decoded.kind === 'Tversion' ? decoded.version : '', '9P2000');
   });
 });
 
@@ -302,10 +313,42 @@ describe('malformed frames', () => {
     const decoder = new FrameDecoder();
     const bad = tclunk.slice();
     bad[4] = 0xfe; // not a 9P opcode at all
-    assert.throws(() => decoder.push(bad), { reason: 'UnknownMessageType' });
+    assert.equal(decoder.push(bad).error?.reason, 'UnknownMessageType');
     assert.equal(decoder.isLatched, true);
     // A well-formed frame arriving after one is not decoded.
-    assert.throws(() => decoder.push(tclunk), { reason: 'DecoderLatched' });
+    const after = decoder.push(tclunk);
+    assert.deepEqual(after.messages, []);
+    assert.equal(after.error?.reason, 'DecoderLatched');
+  });
+
+  it('a push that ends in a violation still yields the frames it completed first', () => {
+    // The shared corpus found this against `crates/tunnel-fs-ninep`, whose
+    // pull-shaped `decode` hands each frame back before the error behind it.
+    // Throwing discarded every frame already decoded from the same chunk, so a
+    // carrier chunk holding a good reply followed by a bad frame lost the
+    // reply — and the tag waiting on it would never have been retired.
+    const decoder = new FrameDecoder();
+    const bad = tclunk.slice();
+    bad[4] = 0xfe;
+    const chunk = new Uint8Array(tclunk.byteLength + bad.byteLength);
+    chunk.set(tclunk, 0);
+    chunk.set(bad, tclunk.byteLength);
+    const result = decoder.push(chunk);
+    assert.equal(result.messages.length, 1);
+    assert.equal(result.messages[0]?.kind, 'Tclunk');
+    assert.equal(result.error?.reason, 'UnknownMessageType');
+  });
+
+  it('a declared size is refused as soon as its four bytes exist', () => {
+    // Not once a whole seven-byte header has arrived: a peer that declares a
+    // gigabyte and then stops must be refused then, not waited on. This side
+    // deferred the check until seven bytes were retained, so such a peer left
+    // the session open. The Rust decoder checks at four.
+    const decoder = new FrameDecoder();
+    const result = decoder.push(Uint8Array.of(0x00, 0x07, 0xf4, 0x00));
+    assert.deepEqual(result.messages, []);
+    assert.equal(result.error?.reason, 'OverCeiling');
+    assert.equal(decoder.isLatched, true);
   });
 });
 
