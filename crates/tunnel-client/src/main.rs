@@ -145,6 +145,11 @@ struct ConnectStatusResult {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // The process-wide `rustls` provider is chosen here, explicitly, rather
+    // than inferred from which provider features happen to be enabled across
+    // the whole dependency graph. See
+    // `tunnel_transport::install_process_crypto_provider`.
+    let _ = tunnel_transport::install_process_crypto_provider();
     let args = env::args_os().skip(1).collect::<Vec<_>>();
     let command = match parse_command(&args) {
         Ok(command) => command,

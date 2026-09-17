@@ -145,6 +145,24 @@ impl RuntimeConfig {
                 mcp.validate()
                     .map_err(|error| RuntimeConfigError::Invalid(error.0))?;
             }
+            if let Some(acp) = &export.acp {
+                if export.kind != ExportKind::HttpForward {
+                    return Err(RuntimeConfigError::Invalid(
+                        "an acp table is only valid on an http-forward export",
+                    ));
+                }
+                if export.mcp.is_some() {
+                    // One handler is registered per service identifier, so two
+                    // application tables on one export would silently mean
+                    // "whichever `with_*_exports` ran last".  Refusing is the
+                    // only answer that cannot depend on registration order.
+                    return Err(RuntimeConfigError::Invalid(
+                        "an export carries either an mcp table or an acp table, never both",
+                    ));
+                }
+                acp.validate()
+                    .map_err(|error| RuntimeConfigError::Invalid(error.0))?;
+            }
             match (export.kind, export.fs.as_ref()) {
                 (ExportKind::Fs, None) => {
                     return Err(RuntimeConfigError::Invalid(
@@ -294,6 +312,10 @@ pub struct ExportConfig {
     /// An MCP export served by the connector itself (M3-02): only valid on
     /// an `http-forward` export.  See `tunnel_mcp_export::config`.
     pub mcp: Option<tunnel_mcp_export::McpExportConfig>,
+    /// An ACP export served by the connector itself (M8 chunk 3): only valid
+    /// on an `http-forward` export, and never alongside an `mcp` table on the
+    /// same export.  See `tunnel_acp_export::config`.
+    pub acp: Option<tunnel_acp_export::AcpExportConfig>,
     /// A filesystem export served by the connector itself (M4 gate 4): only
     /// valid on an `fs` export, and required on one.  The root is operator
     /// configuration and is the one path this profile opens by name.
@@ -340,6 +362,7 @@ impl Default for ExportConfig {
             kind: ExportKind::Echo,
             device_canary: None,
             mcp: None,
+            acp: None,
             fs: None,
         }
     }

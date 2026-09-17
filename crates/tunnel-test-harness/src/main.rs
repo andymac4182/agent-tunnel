@@ -7,6 +7,11 @@ use tunnel_test_harness::{
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // The process-wide `rustls` provider is chosen here, explicitly, rather
+    // than inferred from which provider features happen to be enabled across
+    // the whole dependency graph. See
+    // `tunnel_transport::install_process_crypto_provider`.
+    let _ = tunnel_transport::install_process_crypto_provider();
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
     let _ = tracing_subscriber::fmt()

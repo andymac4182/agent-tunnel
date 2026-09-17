@@ -500,6 +500,30 @@ fn ring_provider() -> Arc<CryptoProvider> {
     Arc::new(crypto::ring::default_provider())
 }
 
+/// Install `ring` as this process's default `rustls` crypto provider.
+///
+/// **Every binary in this workspace must call this before any TLS work.**
+/// `rustls` will only infer a process default when exactly one provider
+/// feature is enabled in the build, and a workspace does not control that: a
+/// single dependency anywhere in the graph that asks for `aws-lc-rs` turns the
+/// inference into a panic — "Could not automatically determine the
+/// process-level CryptoProvider" — in binaries that never named that
+/// dependency. That is not hypothetical; it is what happened when M8 chunk 3
+/// added the pinned ACP HTTP client, whose `reqwest` feature set pulls
+/// `rustls/aws-lc-rs`, and the relay binary started panicking at startup.
+///
+/// Every `rustls` configuration this crate builds already passes
+/// [`ring_provider`] explicitly, so nothing here depends on the inference for
+/// its *choice*. This makes the process-wide default explicit as well, so a
+/// dependency's feature flags cannot decide it and cannot remove it.
+///
+/// Idempotent, and deliberately not an error: a provider already installed by
+/// an earlier call — or by another library — is left alone. `true` means this
+/// call installed it.
+pub fn install_process_crypto_provider() -> bool {
+    crypto::ring::default_provider().install_default().is_ok()
+}
+
 fn require_client_ca_with_provider(
     ca_pem: &[u8],
     provider: Arc<CryptoProvider>,

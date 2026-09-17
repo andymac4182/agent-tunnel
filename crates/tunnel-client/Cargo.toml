@@ -11,6 +11,7 @@ publish.workspace = true
 tunnel-core.workspace = true
 tunnel-protocol = { path = "../tunnel-protocol" }
 tunnel-http-bridge = { path = "../tunnel-http-bridge" }
+tunnel-acp-export = { path = "../tunnel-acp-export" }
 tunnel-mcp-export = { path = "../tunnel-mcp-export" }
 bytes = "1"
 http = "1"

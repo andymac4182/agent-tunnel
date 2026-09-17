@@ -36,6 +36,7 @@ tunnel-core.workspace = true
 tunnel-catalog = { path = "../tunnel-catalog" }
 tunnel-cluster = { path = "../tunnel-cluster" }
 tunnel-http-bridge = { path = "../tunnel-http-bridge" }
+tunnel-acp = { path = "../tunnel-acp" }
 tunnel-http-forward = { path = "../tunnel-http-forward" }
 tunnel-mcp = { path = "../tunnel-mcp" }
 tunnel-protocol = { path = "../tunnel-protocol" }

@@ -717,16 +717,14 @@ impl HttpForwardServeConfig {
         let response = self
             .response_body_bytes
             .unwrap_or(defaults.sse_response_body());
-        let limits = tunnel_mcp::McpLimits::new(
-            self.request_body_bytes.unwrap_or(defaults.request_body()),
-            response.min(defaults.json_response_body()),
-            response,
-        )
-        .map_err(|_| {
-            ConfigError::Invalid(
-                "http_forward body limits must be 1..=16MiB (request) and 1..=1GiB (response)",
-            )
-        })?;
+        let request_body = self.request_body_bytes.unwrap_or(defaults.request_body());
+        let json_response = response.min(defaults.json_response_body());
+        let limits =
+            tunnel_mcp::McpLimits::new(request_body, json_response, response).map_err(|_| {
+                ConfigError::Invalid(
+                    "http_forward body limits must be 1..=16MiB (request) and 1..=1GiB (response)",
+                )
+            })?;
         let mut bridge = tunnel_http_bridge::BridgeConfig::default();
         if let Some(seconds) = self.deadline_seconds {
             bridge = bridge
@@ -737,15 +735,47 @@ impl HttpForwardServeConfig {
         }
         let mut exports = crate::HttpForwardExports::new();
         for id in &self.profiles {
-            let profile = tunnel_mcp::McpProfile::parse_id(id).ok_or(ConfigError::Invalid(
-                "http_forward.profiles may name only mcp-2026-07-28 and mcp-2025-11-25",
-            ))?;
-            let policies = profile
-                .policies(limits)
-                .map_err(|_| ConfigError::Invalid("pinned http_forward profile is inconsistent"))?;
+            // Two pinned application profiles live in this repository and each
+            // owns its own tables: MCP's in `tunnel-mcp`, ACP's in
+            // `tunnel-acp`.  A name is resolved against each in turn and a
+            // name neither owns is refused; there is no prefix rule.
+            let (selected_id, policies) = if let Some(profile) =
+                tunnel_mcp::McpProfile::parse_id(id)
+            {
+                (
+                    profile.id(),
+                    profile.policies(limits).map_err(|_| {
+                        ConfigError::Invalid("pinned http_forward profile is inconsistent")
+                    })?,
+                )
+            } else if let Some(profile) = tunnel_acp::AcpProfile::parse_id(id) {
+                // The ACP profile carries its own finite limits type with
+                // its own ceilings.  The three configured numbers are the
+                // same three numbers; they are validated again here because
+                // each profile owns its own bounds and neither may be read
+                // through the other's.
+                let acp_limits =
+                        tunnel_acp::AcpLimits::new(request_body, json_response, response).map_err(
+                            |_| {
+                                ConfigError::Invalid(
+                                    "http_forward body limits must be 1..=16MiB (request) and 1..=1GiB (response)",
+                                )
+                            },
+                        )?;
+                (
+                    profile.id(),
+                    profile.policies(acp_limits).map_err(|_| {
+                        ConfigError::Invalid("pinned http_forward profile is inconsistent")
+                    })?,
+                )
+            } else {
+                return Err(ConfigError::Invalid(
+                    "http_forward.profiles may name only mcp-2026-07-28, mcp-2025-11-25 and acp-http-v1",
+                ));
+            };
             exports = exports
                 .with_profile(
-                    profile.id(),
+                    selected_id,
                     crate::HttpForwardExport::new(Arc::new(policies), bridge),
                 )
                 .map_err(|_| ConfigError::Invalid("http_forward.profiles repeats a profile"))?;
@@ -1415,7 +1445,7 @@ consumer_tls_private_key = "consumer-key.pem"
         assert!(config.http_forward.is_none());
         assert!(config.listener_options().unwrap().http_forward.is_none());
         let configured = format!(
-            "{}\n[http_forward]\nprofiles = [\"mcp-2026-07-28\", \"mcp-2025-11-25\"]\nrequest_body_bytes = 65536\ndeadline_seconds = 60\n",
+            "{}\n[http_forward]\nprofiles = [\"mcp-2026-07-28\", \"mcp-2025-11-25\", \"acp-http-v1\"]\nrequest_body_bytes = 65536\ndeadline_seconds = 60\n",
             valid_toml()
         );
         let config = ServeConfig::parse(&configured).expect("http_forward parses");
@@ -1423,7 +1453,30 @@ consumer_tls_private_key = "consumer-key.pem"
         let exports = options.http_forward.expect("exports");
         assert_eq!(
             exports.profile_ids().collect::<Vec<_>>(),
-            vec!["mcp-2025-11-25", "mcp-2026-07-28"]
+            vec!["acp-http-v1", "mcp-2025-11-25", "mcp-2026-07-28"]
+        );
+        // The ACP profile is selectable by the same catalog capability, and
+        // the profile it selects is ACP's own table rather than MCP's: only
+        // ACP routes DELETE at its endpoint.
+        let acp = exports
+            .select(&serde_json::json!({"http_forward_profile": "acp-http-v1"}))
+            .expect("the ACP profile is selectable");
+        assert!(
+            acp.profile
+                .request
+                .headers
+                .allows(tunnel_acp::headers::ACP_CONNECTION_ID),
+            "the selected profile is ACP's own table"
+        );
+        let mcp = exports
+            .select(&serde_json::json!({"http_forward_profile": "mcp-2026-07-28"}))
+            .expect("the MCP profile is still selectable");
+        assert!(
+            !mcp.profile
+                .request
+                .headers
+                .allows(tunnel_acp::headers::ACP_CONNECTION_ID),
+            "and the two tables are not the same table"
         );
         assert!(
             !exports.has_fixture_interposer(),
@@ -1438,6 +1491,9 @@ consumer_tls_private_key = "consumer-key.pem"
             "[http_forward]\nprofiles = []\n",
             "[http_forward]\nprofiles = [\"mcp-2024-11-05\"]\n",
             "[http_forward]\nprofiles = [\"fixture\"]\n",
+            "[http_forward]\nprofiles = [\"acp-http-v2\"]\n",
+            "[http_forward]\nprofiles = [\"acp-http-v1\", \"acp-http-v1\"]\n",
+            "[http_forward]\nprofiles = [\"acp-http-v1\"]\nrequest_body_bytes = 0\n",
             "[http_forward]\nprofiles = [\"mcp-2026-07-28\", \"mcp-2026-07-28\"]\n",
             "[http_forward]\nprofiles = [\"mcp-2026-07-28\"]\nrequest_body_bytes = 0\n",
             "[http_forward]\nprofiles = [\"mcp-2026-07-28\"]\nresponse_body_bytes = 2000000000\n",

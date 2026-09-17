@@ -34,9 +34,38 @@ tokio = { version = "1.48", features = [
 # defines the fixture binary gets `CARGO_BIN_EXE_*`.  `tunnel-mcp-fixture`
 # holds `tunnel-mcp-export`'s tests the same way.
 [dev-dependencies]
+# The **official pinned ACP client**, at the same exact versions `tunnel-acp`
+# pins for the profile tables.  `client` is the transport half of
+# `agent-client-protocol-http`; neither refused draft feature is named here,
+# and `tunnel-acp/tests/pin.rs` scans every manifest in this workspace to say
+# so.  Enabling it unifies the feature for the whole workspace build, which is
+# the same class of consequence M8-C04 records for `serde_json/preserve_order`.
+agent-client-protocol = "=2.1.0"
+agent-client-protocol-http = { version = "=2.1.0", default-features = false, features = [
+    "client",
+] }
+bytes = "1"
+futures = "0.3"
+http = "1"
+http-body = "1"
+http-body-util = "0.1"
+hyper = { version = "1.7", features = ["http2", "server"] }
+hyper-util = { version = "0.1", features = ["service", "tokio"] }
+reqwest = { version = "0.13", default-features = false, features = [
+    # The pinned HTTP client crate's own reqwest features, plus `http2`: this
+    # profile is HTTP/2 only, so the consumer must speak h2 with prior
+    # knowledge over cleartext.
+    "http2",
+    "json",
+    "rustls",
+    "stream",
+] }
 tempfile = "3.21"
+tokio-util = { version = "0.7", default-features = false }
+toml = { workspace = true }
 tunnel-acp = { path = "../tunnel-acp" }
 tunnel-acp-export = { path = "../tunnel-acp-export" }
+tunnel-http-bridge = { path = "../tunnel-http-bridge" }
 
 [target.'cfg(unix)'.dependencies]
 # `setsid` through a maintained safe wrapper, so the fixture that deliberately

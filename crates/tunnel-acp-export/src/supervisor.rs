@@ -155,6 +155,39 @@ pub enum AgentEvent {
     Ended(ChildEnd),
 }
 
+/// One agent→host message on its way to an SSE stream.
+///
+/// **This is the transport path, and it is deliberately separate from
+/// [`AgentEvent`].** `AgentEvent` is diagnostics — identifiers, phases and
+/// counters, never a payload — and widening it to carry bytes would have made
+/// every existing consumer of it a payload consumer. This carries the exact
+/// compact bytes the child wrote, already validated by the profile, and
+/// nothing else: it is read only by the bridge that frames it as an SSE event.
+///
+/// Ordering is the reason it is one channel from one task: the supervisor's
+/// single stdout reader sends here in the order the agent wrote, so wire order
+/// is the channel's order and not a property anything downstream has to
+/// reconstruct.
+#[derive(Clone)]
+pub struct OutboundMessage {
+    /// `params.sessionId`, when the message carries one.
+    pub session: Option<String>,
+    pub kind: MessageKind,
+    /// The compact message bytes, exactly as the child wrote them.
+    pub compact: Vec<u8>,
+}
+
+impl core::fmt::Debug for OutboundMessage {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("OutboundMessage")
+            .field("kind", &self.kind)
+            .field("session", &self.session)
+            .field("bytes", &self.compact.len())
+            .finish()
+    }
+}
+
 /// A dispatched prompt. Awaiting it does not stop the reader.
 #[derive(Debug)]
 pub struct PromptTicket {
@@ -262,6 +295,25 @@ impl Supervisor {
     pub fn start(
         config: SupervisorConfig,
     ) -> Result<(Self, mpsc::Receiver<AgentEvent>), SpawnError> {
+        Self::start_forwarding(config, None)
+    }
+
+    /// Spawn the child with an additional **transport** sink for agent→host
+    /// messages.
+    ///
+    /// `forward` receives every notification and every agent-originated
+    /// request, in the order the child wrote them, carrying the compact bytes
+    /// the HTTP bridge frames as SSE events. Responses to the supervisor's own
+    /// dispatched requests are not forwarded: those resolve a waiter here, and
+    /// the bridge composes its answer with the *host's* JSON-RPC id, which is
+    /// a different id in a different scope.
+    ///
+    /// # Errors
+    /// [`SpawnError`] when the process cannot be started.
+    pub fn start_forwarding(
+        config: SupervisorConfig,
+        forward: Option<mpsc::Sender<OutboundMessage>>,
+    ) -> Result<(Self, mpsc::Receiver<AgentEvent>), SpawnError> {
         let counters = Arc::new(ChildCounters::default());
         let (child, events) = crate::child::spawn(&config.child, &counters)?;
         let child = Arc::new(child);
@@ -293,6 +345,7 @@ impl Supervisor {
                 started: supervisor.started,
                 permission_timeout_ms: supervisor.permission_timeout_ms,
                 counters: Arc::clone(&counters),
+                forward,
             },
         ));
         tokio::spawn(observe_deadlines(
@@ -331,13 +384,26 @@ impl Supervisor {
     /// [`SupervisorError::ChildGone`], or the lifecycle's refusal of a second
     /// `initialize`.
     pub async fn initialize(&self) -> Result<Value, SupervisorError> {
-        let (_, reply) = self.dispatch(
-            "initialize",
-            json!({"protocolVersion": 1, "clientCapabilities": {}, "clientInfo": {"name": "tunnel-acp-export", "version": "0.1.0"}}),
-            PendingKind::Call,
-            None,
-            false,
-        )?;
+        self.initialize_with(json!({
+            "protocolVersion": 1,
+            "clientCapabilities": {},
+            "clientInfo": {"name": "tunnel-acp-export", "version": "0.1.0"},
+        }))
+        .await
+    }
+
+    /// `initialize` the agent with the caller's own params.
+    ///
+    /// The HTTP bridge forwards the **host's** `initialize` params verbatim
+    /// rather than substituting its own: capability negotiation is between the
+    /// host's ACP client and the agent, and a bridge that rewrote it would be
+    /// negotiating on the host's behalf.
+    ///
+    /// # Errors
+    /// [`SupervisorError::ChildGone`], or the lifecycle's refusal of a second
+    /// `initialize`.
+    pub async fn initialize_with(&self, params: Value) -> Result<Value, SupervisorError> {
+        let (_, reply) = self.dispatch("initialize", params, PendingKind::Call, None, false)?;
         let value = reply.await.map_err(|_| SupervisorError::ChildGone)??;
         self.try_with(|shared| {
             shared
@@ -354,6 +420,15 @@ impl Supervisor {
     /// [`LifecycleRule::SessionLimit`] at one session beyond the bound, and
     /// [`LifecycleRule::ConnectionNotReady`] before `initialize`.
     pub async fn new_session(&self, cwd: &str) -> Result<String, SupervisorError> {
+        self.new_session_with(json!({"cwd": cwd, "mcpServers": []}))
+            .await
+    }
+
+    /// Create a session from the caller's own params.
+    ///
+    /// # Errors
+    /// As [`Supervisor::new_session`].
+    pub async fn new_session_with(&self, params: Value) -> Result<String, SupervisorError> {
         // The bound is checked before dispatch, so a ninth session is never
         // asked for.
         self.try_with(|shared| {
@@ -371,13 +446,7 @@ impl Supervisor {
             }
             Ok(())
         })?;
-        let (_, reply) = self.dispatch(
-            "session/new",
-            json!({"cwd": cwd, "mcpServers": []}),
-            PendingKind::Call,
-            None,
-            true,
-        )?;
+        let (_, reply) = self.dispatch("session/new", params, PendingKind::Call, None, true)?;
         let value = reply.await.map_err(|_| SupervisorError::ChildGone)??;
         let session = value
             .get("sessionId")
@@ -411,10 +480,29 @@ impl Supervisor {
     /// [`LifecycleRule::SessionNotReady`] before the subscriber arrives, and
     /// [`LifecycleRule::ConnectionNotReady`] once admission has stopped.
     pub fn prompt(&self, session: &str, text: &str) -> Result<PromptTicket, SupervisorError> {
+        self.prompt_with(
+            session,
+            json!({"sessionId": session, "prompt": [{"type": "text", "text": text}]}),
+        )
+    }
+
+    /// Start the session's one active prompt from the caller's own params.
+    ///
+    /// The HTTP bridge forwards the host's `session/prompt` params verbatim:
+    /// a v1 prompt is a list of content blocks, and a bridge that rebuilt it
+    /// from the first text block would silently drop the rest.
+    ///
+    /// # Errors
+    /// As [`Supervisor::prompt`].
+    pub fn prompt_with(
+        &self,
+        session: &str,
+        params: Value,
+    ) -> Result<PromptTicket, SupervisorError> {
         self.try_with(|shared| shared.connection.begin_prompt(session))?;
         let reply = self.dispatch(
             "session/prompt",
-            json!({"sessionId": session, "prompt": [{"type": "text", "text": text}]}),
+            params,
             PendingKind::Prompt,
             Some(session),
             true,
@@ -459,6 +547,48 @@ impl Supervisor {
             .map_err(|_| SupervisorError::ChildGone)
     }
 
+    /// Forward a `session/cancel` notification.
+    ///
+    /// `docs/acp.md`: the bridge resolves pending permission callbacks with
+    /// `cancelled`, forwards cancellation, and then **waits for the original
+    /// prompt response**. It does not synthesize one: a confirmed cancelled
+    /// turn has `stopReason: "cancelled"` and only the agent can say so.
+    ///
+    /// # Errors
+    /// [`SupervisorError::ChildGone`].
+    pub async fn cancel_session(
+        &self,
+        session: &str,
+        params: Value,
+    ) -> Result<(), SupervisorError> {
+        let now = self.now_ms();
+        let cancelled =
+            self.with(|shared| shared.callbacks.cancel_session_permissions(session, now));
+        for (_, id) in cancelled {
+            // Tell the agent on the wire, exactly as the deadline path does.
+            let _ = self
+                .child
+                .send(&permission_response(&id, &PermissionOutcome::Cancelled))
+                .await;
+        }
+        let body = serde_json::to_vec(&json!({
+            "jsonrpc": "2.0",
+            "method": "session/cancel",
+            "params": params,
+        }))
+        .unwrap_or_default();
+        self.child
+            .send(&body)
+            .await
+            .map_err(|_| SupervisorError::ChildGone)
+    }
+
+    /// Whether this connection opened `session`.
+    #[must_use]
+    pub fn has_session(&self, session: &str) -> bool {
+        self.with(|shared| shared.open_sessions.iter().any(|open| open == session))
+    }
+
     /// Stop admission, cancel outstanding permissions, and end the child's
     /// life — which signals its process group.
     ///
@@ -485,6 +615,16 @@ impl Supervisor {
             // table decides, not this line.
             let _ = shared.connection.advance(LifecycleEvent::Reaped);
         });
+    }
+
+    /// End the child's life without awaiting anything.
+    ///
+    /// The synchronous form of the kill half of [`Supervisor::drain`], for a
+    /// connector whose own teardown is not async — `HttpHandlers::drop` is
+    /// exactly that. It signals the child's process group; it does not wait
+    /// for the reap, and it is idempotent.
+    pub fn kill(&self) {
+        self.child.kill();
     }
 
     /// Wait for the child to be reaped, however its life ended.
@@ -674,6 +814,8 @@ struct ReaderContext {
     started: Instant,
     permission_timeout_ms: u64,
     counters: Arc<ChildCounters>,
+    /// The transport sink, when a bridge asked for one.
+    forward: Option<mpsc::Sender<OutboundMessage>>,
 }
 
 async fn read_agent(mut events: mpsc::Receiver<ChildEvent>, context: ReaderContext) {
@@ -685,6 +827,7 @@ async fn read_agent(mut events: mpsc::Receiver<ChildEvent>, context: ReaderConte
         started,
         permission_timeout_ms,
         counters,
+        forward,
     } = context;
     let _alive = TaskGuard::new(&counters);
     let host_scope = scope.id_scope(Direction::HostToAgent);
@@ -697,6 +840,21 @@ async fn read_agent(mut events: mpsc::Receiver<ChildEvent>, context: ReaderConte
                 match message.kind {
                     MessageKind::Notification => {
                         let session = message.session_id().map(ToOwned::to_owned);
+                        // The transport copy goes first, and from this one
+                        // task, so the order an SSE stream sees is the order
+                        // the agent wrote.
+                        if let Some(forward) = &forward
+                            && forward
+                                .send(OutboundMessage {
+                                    session: session.clone(),
+                                    kind: MessageKind::Notification,
+                                    compact: message.compact.clone(),
+                                })
+                                .await
+                                .is_err()
+                        {
+                            return;
+                        }
                         if to_host.send(AgentEvent::Update { session }).await.is_err() {
                             return;
                         }
@@ -718,10 +876,28 @@ async fn read_agent(mut events: mpsc::Receiver<ChildEvent>, context: ReaderConte
                             )
                         };
                         let event = match registered {
-                            Ok(()) => AgentEvent::Permission {
-                                id: id.clone(),
-                                session,
-                            },
+                            Ok(()) => {
+                                // Only an admitted callback reaches the host.
+                                // One the bounded table refused was answered
+                                // `cancelled` below and must never appear on a
+                                // stream as if it were outstanding.
+                                if let Some(forward) = &forward
+                                    && forward
+                                        .send(OutboundMessage {
+                                            session: Some(session.clone()),
+                                            kind: MessageKind::Request,
+                                            compact: message.compact.clone(),
+                                        })
+                                        .await
+                                        .is_err()
+                                {
+                                    return;
+                                }
+                                AgentEvent::Permission {
+                                    id: id.clone(),
+                                    session,
+                                }
+                            }
                             Err(rejection) => {
                                 // Refused before the host ever saw it; tell the
                                 // agent so its own wait ends.
