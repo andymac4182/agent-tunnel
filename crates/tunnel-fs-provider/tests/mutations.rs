@@ -291,6 +291,91 @@ fn a_remove_decides_the_kind_from_the_resolver_rather_than_from_the_walk() {
 }
 
 #[test]
+fn a_special_file_cannot_be_removed_or_renamed_away() {
+    // The pinned narrowing, and the cost it carries. The profile refuses a
+    // FIFO, a socket and a device node at every other operation and leaves
+    // them out of a listing, so a `delete` grant that could nonetheless unlink
+    // one would be the single place their existence was observable through the
+    // export. A rename is covered by the same check for the same reason:
+    // renaming away removes a name, so a spelling that got around the refusal
+    // would be a refusal in name only.
+    //
+    // The cost is that a special file placed inside an export out of band
+    // cannot be cleared through it, and that is accepted rather than hidden.
+    //
+    // A unix-domain socket is what the fixture uses, because `std` can bind
+    // one and this crate has no way to call `mknod`; the decision under test is
+    // the node *kind*, and a socket is one of the kinds.
+    let fixture = Fixture::new();
+    let socket_path = fixture.inside("socket.sock");
+    let listener =
+        std::os::unix::net::UnixListener::bind(&socket_path).expect("bind a fixture socket");
+    let mut provider = writer(&fixture);
+    handshake(&mut provider, ROOT);
+    let root_clone = 1_u32;
+    let _ = exchange(&mut provider, twalk(2, ROOT, root_clone, &[]));
+
+    let reply = one_frame(exchange(
+        &mut provider,
+        tunlinkat(3, root_clone, "socket.sock", 0),
+    ));
+    assert_eq!(error_code(&reply), FsErrorCode::Enotsup);
+    let reply = one_frame(exchange(
+        &mut provider,
+        trenameat(4, root_clone, "socket.sock", root_clone, "moved.sock"),
+    ));
+    assert_eq!(error_code(&reply), FsErrorCode::Enotsup);
+    assert!(socket_path.exists(), "the socket is still there");
+    assert!(!fixture.inside("moved.sock").exists());
+    // Refused before the host was asked to change anything.
+    let stats = provider.stats();
+    assert_eq!(stats.mutations_dispatched, 0);
+    assert_eq!(stats.mutations_applied, 0);
+
+    drop(listener);
+    let _ = std::fs::remove_file(&socket_path);
+}
+
+#[test]
+fn a_symbolic_link_name_can_be_removed_although_the_feature_is_off() {
+    // The one place this module is more permissive than the resolver, and it is
+    // deliberate: `unlinkat` never follows its final component, so removing a
+    // link's *name* cannot be steered outside the root by it, and refusing
+    // would leave a link an export cannot traverse also one it can never clear.
+    let fixture = Fixture::new();
+    fixture.file("/target.bin", b"synthetic");
+    std::os::unix::fs::symlink("target.bin", fixture.inside("alias"))
+        .expect("a fixture symbolic link");
+    // No `symlinks` feature: this export cannot read the link or create one.
+    let (mut provider, _authority) = fixture.provider_with(
+        full_grant(),
+        tunnel_fs_core::FeatureSet::NONE
+            .with(tunnel_fs_core::Feature::AtomicRename)
+            .with(tunnel_fs_core::Feature::ExclusiveCreate),
+        tunnel_fs_provider::default_limits(),
+    );
+    handshake(&mut provider, ROOT);
+    let root_clone = 1_u32;
+    let _ = exchange(&mut provider, twalk(2, ROOT, root_clone, &[]));
+    let reply = one_frame(exchange(
+        &mut provider,
+        tunlinkat(3, root_clone, "alias", 0),
+    ));
+    assert!(
+        matches!(reply.message, Message::Runlinkat),
+        "a symbolic link's name is removable: {:?}",
+        reply.message
+    );
+    assert!(!fixture.inside("alias").exists());
+    // And the file it pointed at is untouched: `unlinkat` removed the name, not
+    // what the name referred to.
+    assert_eq!(
+        std::fs::read(fixture.inside("target.bin")).expect("the target"),
+        b"synthetic"
+    );
+}
+
+#[test]
 fn a_symbolic_link_is_created_and_read_back_and_the_target_is_not_resolved() {
     let fixture = Fixture::new();
     fixture.file("/target.bin", b"synthetic");
