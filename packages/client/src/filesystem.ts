@@ -774,8 +774,15 @@ export class RemoteFilesystem {
       // mutation, which is the failure this whole class of fix exists to
       // prevent. It is wrapped so the outcome exists, with the original kept as
       // `cause` so nothing is lost by wrapping it.
+      // `partial` is written out rather than merged because this branch is
+      // only reached once something applied, so it is the same floor the merge
+      // below would produce; if the vocabulary ever changes, both must move.
+      const code =
+        error instanceof Error && error.name === 'AbortError'
+          ? 'ABORTED'
+          : 'EINVAL';
       return new FilesystemError({
-        code: 'EINVAL',
+        code,
         operation,
         path,
         outcome: 'partial',
