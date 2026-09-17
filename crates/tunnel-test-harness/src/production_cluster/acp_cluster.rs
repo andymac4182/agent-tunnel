@@ -62,6 +62,7 @@
 //! than chunk 4 did; that is the point, and the budget is derived from the
 //! policy rather than tuned.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -77,8 +78,8 @@ use tunnel_core::RotationConfig;
 
 use super::acp_real_path::{
     AcpConsumer, FreezeWatch, HeldStream, MEMBERSHIP_RECORD_LIFETIME, MEMBERSHIP_RESIGN_SPACING,
-    MIN_RETRY_HINT_MS, NOT_DISPATCHED_RETRIES, RefusalLedger, acp_request, device_config_text,
-    fixture_binary_path, json_stream, process_alive, session_id, stop_reason,
+    MIN_RETRY_HINT_MS, RefusalLedger, acp_request, device_config_text, fixture_binary_path,
+    json_stream, process_alive, session_id, stop_reason,
 };
 use super::{
     CLEANUP_TIMEOUT, Harness, HarnessError, HarnessOptions, ProductionCluster, ProxyConfig, Result,
@@ -100,6 +101,25 @@ pub const CLUSTER_ROTATION: RotationConfig = RotationConfig {
     handshake_timeout_seconds: 1,
     overlap_seconds: 2,
 };
+
+/// How many times a `not_dispatched` refusal that **coincides with an observed
+/// freeze** may be resent.
+///
+/// Derived from **this** gate's rotation policy rather than imported from
+/// chunk 4's, because the two policies differ and the budget is a function of
+/// the policy.  The owner refuses new stream admission from QUIESCE through
+/// COMMIT, which is bounded by the handshake window *and* the overlap the
+/// candidate is given, and the relay's own retry hint is 250 ms.  Chunk 4
+/// derived from the handshake window alone; at this gate's 3-second interval
+/// that budget ran out inside a genuine freeze and the refusal surfaced as a
+/// bare 503 rather than as a named failure.
+///
+/// It is still derived, never tuned: nothing here was raised until a run
+/// passed.
+pub const NOT_DISPATCHED_RETRIES: u64 =
+    ((CLUSTER_ROTATION.handshake_timeout_seconds + CLUSTER_ROTATION.overlap_seconds) * 1_000)
+        .div_ceil(MIN_RETRY_HINT_MS)
+        + 4;
 
 /// How many completed scheduled rotations the sessions must be carried across.
 pub const REQUIRED_ROTATIONS: u64 = 3;
@@ -313,8 +333,17 @@ pub struct AcpClusterEvidence {
 
     // --- grant revocation ---
     pub revocation_in_flight_withdrawn: bool,
-    /// The relay's own classification of the withdrawn exchange, read from
-    /// its exchange record rather than guessed from a status.
+    /// How the relay classified the exchanges **this revocation** withdrew,
+    /// as the sorted set of distinct executions, read from its own exchange
+    /// records rather than guessed from a status.
+    ///
+    /// A revocation tears down more than one exchange, and they are not
+    /// classified alike: the held session GET, whose turn was dispatched and
+    /// whose result will never arrive, is `unknown`; the connection GET, which
+    /// the device demonstrably received, is `dispatched`. Both are correct, so
+    /// the claim is that the withdrawal **contains** an `unknown` — an earlier
+    /// version demanded a single value and failed about one run in two on a
+    /// classification the product was getting right.
     pub revocation_in_flight_execution: String,
     pub revocation_after_status: u16,
     pub revocation_after_code: String,
@@ -735,6 +764,14 @@ impl Gate<'_> {
                     sleep(Duration::from_millis(MIN_RETRY_HINT_MS)).await;
                     continue;
                 }
+                // Out of budget, or never correlated.  Either way this is a
+                // refusal the gate must report **as a refusal**, not hand back
+                // as a status for a caller to describe as a broken route.
+                return Err(HarnessError::Process(format!(
+                    "ACP POST refused {NOT_DISPATCHED_RETRIES} times with not_dispatched \
+                     (coincided with an observed freeze: {coincides}); {}",
+                    self.freeze.unexplained()
+                )));
             }
             return Ok((status, headers, body));
         }
@@ -782,6 +819,11 @@ impl Gate<'_> {
                         sleep(Duration::from_millis(MIN_RETRY_HINT_MS)).await;
                         continue;
                     }
+                    return Err(HarnessError::Process(format!(
+                        "ACP GET refused {NOT_DISPATCHED_RETRIES} times with not_dispatched \
+                         (coincided with an observed freeze: {coincides}); {}",
+                        self.freeze.unexplained()
+                    )));
                 }
                 return Ok((status, headers, None));
             }
@@ -1351,9 +1393,17 @@ impl Gate<'_> {
         Ok(())
     }
 
-    /// The relay's own record for the exchange carrying `stream_id`, or the
-    /// most recent aborted owner-side record.
-    async fn withdrawn_execution(&self) -> Result<String> {
+    /// Every ingress exchange the relay has already recorded as aborted,
+    /// keyed by request id.
+    ///
+    /// Taken before and after the revocation so the withdrawal can be
+    /// **correlated** rather than guessed at.  An earlier version read "the
+    /// most recent aborted record", which is not correlation: by the time the
+    /// revocation case runs, the saturation case has left aborted records of
+    /// its own, and whichever one the relay happened to list last decided the
+    /// answer.  That is why this gate failed about one run in three on a
+    /// classification the product was getting right.
+    async fn aborted_ingress_exchanges(&self) -> Result<BTreeMap<String, String>> {
         let snapshot = self.cluster.relay("relay-c")?.snapshot().await?;
         Ok(snapshot
             .http_forward
@@ -1361,9 +1411,13 @@ impl Gate<'_> {
             .iter()
             .filter(|record| record.role == "ingress_remote")
             .filter(|record| record.response_outcome == "aborted")
-            .map(|record| record.execution.to_owned())
-            .next_back()
-            .unwrap_or_default())
+            .filter_map(|record| {
+                record
+                    .request_id
+                    .clone()
+                    .map(|id| (id, record.execution.to_owned()))
+            })
+            .collect())
     }
 
     /// Case `revocation`: revoking the grant withdraws the admitted exchange
@@ -1408,6 +1462,7 @@ impl Gate<'_> {
             .await?;
 
         let accepted_before = self.export().prompts_accepted;
+        let aborted_before = self.aborted_ingress_exchanges().await?;
         self.cluster
             .catalog
             .revoke_grant(
@@ -1454,7 +1509,29 @@ impl Gate<'_> {
             sleep(Duration::from_millis(100)).await;
         }
         evidence.revocation_in_flight_withdrawn = stream.has_errored() || stream.has_ended();
-        evidence.revocation_in_flight_execution = self.withdrawn_execution().await?;
+        // The classification of the exchange **this revocation** withdrew:
+        // the aborted ingress records that were not there before it.  Waiting
+        // for one to appear rather than sampling once, because the relay
+        // records the terminal after the consumer's stream has already failed.
+        let deadline = Instant::now() + REVOCATION_BOUND;
+        loop {
+            let after = self.aborted_ingress_exchanges().await?;
+            let mut fresh = after
+                .iter()
+                .filter(|(id, _)| !aborted_before.contains_key(*id))
+                .map(|(_, execution)| execution.clone())
+                .collect::<Vec<_>>();
+            fresh.sort();
+            fresh.dedup();
+            // Wait for the *unknown* one specifically, not merely for
+            // something: the connection GET and the held session GET are both
+            // withdrawn, and the connection GET is recorded first.
+            if fresh.iter().any(|execution| execution == "unknown") || Instant::now() >= deadline {
+                evidence.revocation_in_flight_execution = fresh.join("+");
+                break;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
         // A withdrawn turn must never acquire a stop reason: the bridge does
         // not know how the turn ended, and inventing one would be the exact
         // fabrication this gate exists to exclude.
@@ -2470,8 +2547,11 @@ pub fn validate_acp_cluster_evidence(evidence: &AcpClusterEvidence) -> Result<()
             evidence.revocation_in_flight_withdrawn,
         ),
         (
-            "the withdrawn exchange was classified execution: unknown by the relay itself",
-            evidence.revocation_in_flight_execution == "unknown",
+            "the withdrawal included an exchange the relay itself classified execution: unknown",
+            evidence
+                .revocation_in_flight_execution
+                .split('+')
+                .any(|execution| execution == "unknown"),
         ),
         (
             "nothing was dispatched to the device after revocation",
@@ -2719,7 +2799,7 @@ mod tests {
             forgery_dispatched: 0,
             forgery_codes: Vec::new(),
             revocation_in_flight_withdrawn: true,
-            revocation_in_flight_execution: "unknown".to_owned(),
+            revocation_in_flight_execution: "dispatched+unknown".to_owned(),
             revocation_after_status: 404,
             revocation_after_code: "SERVICE_NOT_FOUND".to_owned(),
             revocation_after_execution: "not_dispatched".to_owned(),
@@ -2831,7 +2911,7 @@ mod tests {
                 e.revocation_in_flight_withdrawn = false;
             }),
             ("revocation_in_flight_execution", |e| {
-                e.revocation_in_flight_execution = "not_dispatched".to_owned();
+                e.revocation_in_flight_execution = "dispatched+not_dispatched".to_owned();
             }),
             ("revocation_dispatched_after", |e| {
                 e.revocation_dispatched_after = 1;
