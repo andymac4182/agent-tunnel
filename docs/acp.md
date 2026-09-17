@@ -6,7 +6,9 @@ Status: implementation design, researched 2026-09-09. Nothing in this document s
 
 Use stable **ACP v1** JSON-RPC messages. Its established local transport is newline-delimited UTF-8 JSON on a subprocess's stdin/stdout. The official transport page still describes Streamable HTTP as a draft. [ACP v1 transports](https://agentclientprotocol.com/protocol/v1/transports)
 
-For the remote HTTP binding, target the upstream **Streamable HTTP & WebSocket Transport RFD**, using its last listed revision, **2026-05-04**, as the initial compatibility baseline. This is an experimental upstream transport, not a claim of a finalized standard. Prefer the official Rust `agent-client-protocol` and `agent-client-protocol-http` crates behind a narrow adapter. Pin exact dependency versions and the upstream transport source in the implementation PR; a package version is not an ACP wire version. [Transport RFD](https://agentclientprotocol.com/rfds/streamable-http-websocket-transport), [Rust SDK](https://github.com/agentclientprotocol/rust-sdk)
+For the remote HTTP binding, target the upstream **Streamable HTTP & WebSocket Transport RFD**. This is an experimental upstream transport, not a claim of a finalized standard. Prefer the official Rust `agent-client-protocol` and `agent-client-protocol-http` crates behind a narrow adapter. Pin exact dependency versions and the upstream transport source in the implementation PR; a package version is not an ACP wire version. [Transport RFD](https://agentclientprotocol.com/rfds/streamable-http-websocket-transport), [Rust SDK](https://github.com/agentclientprotocol/rust-sdk)
+
+**Corrected 2026-09-17 (M8-01, defect M8-C01).** This paragraph previously named "its last listed revision, **2026-05-04**" as the baseline. That was already wrong on the 2026-09-09 reading that produced this document: the RFD's revision history ends at **2026-07-02**, with 2026-06-05 before it. The pinned revision is 2026-07-02, at an immutable commit, and the one point where the pinned SDK goes beyond it is recorded in [sources.md](sources.md#acp).
 
 ACP v2 remains draft and changes prompt completion semantics. Keep it disabled until a separate version profile and fixtures exist; never interpret a v2 prompt acknowledgment as v1 turn completion. [ACP v2 announcement](https://agentclientprotocol.com/announcements/acp-v2-draft)
 
@@ -62,6 +64,8 @@ The upstream draft baseline is:
 | DELETE with connection header | HTTP 202; terminate the connection |
 
 Use HTTP/2 for the external Streamable HTTP profile. POST uses `application/json`; GET accepts `text/event-stream`. The draft rejects batches with 501 and also offers a WebSocket upgrade on the same endpoint. External WebSocket compatibility can follow the HTTP milestone; it is independent of the mandatory device WebSockets. [Upstream HTTP binding](https://agentclientprotocol.com/rfds/streamable-http-websocket-transport)
+
+**The pinned SDK does not reject batches** (M8-C02). Its 2.0.0 release added batch preservation across the HTTP and WebSocket transports, so it accepts and routes what the RFD answers with 501. Agent Tunnel's profile follows the RFD, which is the stricter behaviour; a later chunk that runs the SDK's own client or server through this profile meets the disagreement and must decide it explicitly rather than discovering it.
 
 Agent Tunnel policy adds authentication and bounded admission around that binding. Authenticate every request, SSE subscription, and status lookup, including renewed credentials for an existing connection. Bind connection/session ownership to the authenticated principal, tenant, device, service, and policy revision. Renewing a token cannot transfer a connection to a different principal. Revocation or token expiry closes its event streams and begins child cleanup.
 
@@ -208,6 +212,23 @@ Trace the HTTP request ID, operation ID, tenant/device/service, owner epoch, log
 5. **Failure and operability:** drop HTTP acknowledgments, break each SSE stream, stop consumers reading, exhaust quotas, deny callbacks, crash children after recorded fake side effects, and interrupt device control. Prove terminal/unknown states and no automatic prompt replay. Confirm packet/trace evidence shows HTTP/SSE uses the existing data socket, and that no local inbound port is open.
 
 Release gates require real pinned SDK interoperability, bounded-memory evidence, clean CLI installation and process cleanup on each supported OS, and documented capability coverage. Rust validation remains `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, and `cargo test --workspace --locked`. Future live-agent smoke tests use dedicated workspaces/VMs with explicit credentials; no test controls the user's active desktop.
+
+## Pinned in code (M8-01)
+
+`crates/tunnel-acp` resolves the profile points this document leaves open. It is pure: no sockets, no child process, no Axum, no clock. **It establishes no interoperability**; the exact artifacts, their checksums and the revision reconciliation are in [sources.md](sources.md#acp).
+
+- **Profile identifier** `acp-http-v1`, selected the way MCP's profiles are: relay `[http_forward]` configuration plus the catalog service capability `http_forward_profile`.
+- **Routes.** `POST`, `GET` and `DELETE` at the single export-local path `/acp`. `PUT`, `PATCH`, `HEAD` and `OPTIONS` are not routed; a trailing slash, a different case and any query are refused by the codec.
+- **HTTP/2 only.** An HTTP/1.1 consumer is `HttpVersionNotAllowed`, which carries `HTTP_UNSUPPORTED_FEATURE` — a distinct rule and code from an unadvertised route, and from a batch.
+- **Request headers**, each a singleton: `content-type`, `accept`, `acp-connection-id`, `acp-session-id`, `tunnel-principal-binding`. The last is not an ACP header: the ingress derives it per principal, exactly as for `mcp-2025-11-25`, and it is request-direction only.
+- **Response headers**, each a singleton: `content-type`, `cache-control`, `x-accel-buffering`, `acp-connection-id`. A response may **not** carry `acp-session-id`: a new session's identifier is returned in the `session/new` response body, and a second header-borne source of session identity would not be validated.
+- **Message rules.** One strict JSON object (duplicate member names compared after unescaping, invalid UTF-8, lone surrogate escapes, raw control characters, depth above 64 and trailing data all refused), `jsonrpc` exactly `"2.0"`, an `id` that is a string or an integer, and `params` an object. A top-level JSON array is a **batch** and is refused with **501** by its own code, decided from the first non-whitespace byte, so a malformed batch is still refused for being a batch.
+- **Version negotiation.** Only protocol version 1. Any other integer, v2 included, is refused with its own code and a `supported: [1]` payload, in both the `initialize` request and its result; a non-integer is a separate shape rule.
+- **A v2 prompt acknowledgement is not a v1 turn completion.** A `session/prompt` result with no `stopReason` is refused by a rule of its own rather than deserializing as a finished turn. The accepted path runs the pinned crate's own `PromptResponse` deserializer and `StopReason` vocabulary.
+- **Methods.** `initialize`, `session/new`, `session/load`, `session/prompt`, `session/cancel`, `session/update` and `session/request_permission`, every name read from the pinned schema's tables rather than retyped. There is no prefix or wildcard rule. The RFD's abbreviated `request_permission` resolves against the normative `session/request_permission` for reading the RFD, and **is not itself an accepted method**.
+- **Limits.** Finite and bounded: 1 MiB request body, 1 MiB JSON response, 64 MiB cumulative SSE response, with ceilings and no unlimited sentinel.
+- **Evidence.** `scripts/acp-guard-deletion.py` defeats each of these rules in turn; 31 of 31 measurable guards turned a test red, and the one remaining guard — `unstable_protocol_v2` staying off — is enforced by the compiler and reported separately rather than counted as a red test.
+- **Not proven.** Everything else. No HTTP handler, no SSE stream, no connection or session state, no child process, no tunnel, and no run against any ACP implementation.
 
 ## Research provenance
 
