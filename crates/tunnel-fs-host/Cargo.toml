@@ -28,6 +28,14 @@ rustix = { version = "1.1", default-features = false, features = ["fs", "std"] }
 # thread-local hook the crate's own race tests use to hold open the window
 # between inspecting a name and opening it; see `resolver::race_window`.
 race-window-hook = []
+# Off by default and never enabled by a shipped build, on the same terms as
+# `race-window-hook` and for the same reason: it compiles in a thread-local
+# hook that occupies the window between a creating syscall and the identity
+# read that gives its reply a qid.  That window is microseconds wide and the
+# rule it protects — a failure *after* an effect is `unknown`, never
+# `not_started` — cannot be measured by racing threads.  See
+# `write::post_effect`.
+post-effect-hook = []
 
 [lints]
 workspace = true

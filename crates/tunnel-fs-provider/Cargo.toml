@@ -23,5 +23,13 @@ tunnel-fs-ninep = { path = "../tunnel-fs-ninep" }
 [target.'cfg(unix)'.dependencies]
 tunnel-fs-host = { path = "../tunnel-fs-host" }
 
+[features]
+# Off by default and never enabled by a shipped build.  It forwards gate 2's
+# `post-effect-hook` so this crate's own tests can occupy the window between a
+# creating syscall and the identity read that gives its reply a qid, which is
+# the only way to measure "after the effect, a failure is `unknown`" rather
+# than assert it.
+post-effect-hook = ["tunnel-fs-host/post-effect-hook"]
+
 [lints]
 workspace = true

@@ -28,18 +28,19 @@
 //!
 //! [`tunnel_fs_provider::Provider::step`] performs the host call inline, on the
 //! exchange task. Every call it makes is one bounded `openat`, `statat`,
-//! `pread` or `getdents` against a local filesystem, so the stall is short — but
-//! it is a stall, and on a network or FUSE filesystem it would not be short.
-//! Moving the step onto a blocking pool needs the provider's state to be split
-//! across an await point, which is gate 5's shape rather than gate 4's; it is
-//! recorded as residue rather than claimed.
+//! `pread`, `pwrite` or `getdents` against a local filesystem, so the stall is
+//! short — but it is a stall, and on a network or FUSE filesystem it would not
+//! be short. Gate 4 expected gate 5 to move the step onto a blocking pool;
+//! **gate 5 did not**, so the call is still inline and a `pwrite` is now among
+//! the ones it makes. It stays residue rather than a claim, and
+//! `docs/filesystem-api.md` records that the prediction did not come true.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use bytes::Bytes;
 
-use tunnel_fs_core::{Capability, CapabilitySet, FeatureSet, Limits, SessionErrorCode};
+use tunnel_fs_core::{Capability, CapabilitySet, Feature, FeatureSet, Limits, SessionErrorCode};
 use tunnel_fs_ninep::{FrameDecoder, MAX_MESSAGE_BYTES};
 use tunnel_fs_provider::{
     Authority, Authorization, Outbound, Provider, ProviderStats, RECORD_HEADER_LEN, default_limits,
@@ -64,10 +65,13 @@ pub struct FsExport {
     pub allowed: CapabilitySet,
     /// The features this provider implements.
     ///
-    /// Operator configuration, and **default absent**: the contract's features
-    /// are all opt-in, and `hardLinks` in particular disables the `st_nlink`
-    /// write refusal, so a build that enabled one by omission would widen an
-    /// export nobody asked to widen.
+    /// Operator configuration, and **default absent except for
+    /// [`ALWAYS_IMPLEMENTED`]**: the contract's features are opt-in, and
+    /// `hardLinks` in particular disables the `st_nlink` write refusal, so a
+    /// build that enabled one by omission would widen an export nobody asked to
+    /// widen. `exclusiveCreate` is the one exception and is not a choice —
+    /// `Tlcreate` is always exclusive here, so the flag reports what is true
+    /// rather than what was configured.
     pub features: FeatureSet,
     /// The negotiated limits.
     pub limits: Limits,
@@ -80,13 +84,29 @@ impl FsExport {
         Self {
             root: root.into(),
             allowed: CapabilitySet::from_slice(&[Capability::Read, Capability::List]),
-            features: FeatureSet::NONE,
+            features: FeatureSet::NONE.with(ALWAYS_IMPLEMENTED),
             limits: default_limits(),
         }
     }
 }
 
-/// The features an operator's `[exports.<service>.fs]` table named.
+/// The features this implementation has whether an operator names them or not.
+///
+/// **`exclusiveCreate` is not a configuration choice here, it is a property.**
+/// `Tlcreate` opens `O_CREAT | O_EXCL` unconditionally, so exclusive creation
+/// is what this provider always does; leaving the flag off by default would
+/// tell a client honouring "`overwrite:false` uses exclusive create" that the
+/// one guarantee it needs is absent, and it would then reach for the
+/// exists-then-create race the contract forbids. An operator cannot turn it
+/// off, because there is nothing to turn off.
+///
+/// Every other feature stays opt-in and absent by default — `hardLinks` in
+/// particular, because advertising it switches off the `st_nlink` write
+/// refusal.
+pub const ALWAYS_IMPLEMENTED: Feature = Feature::ExclusiveCreate;
+
+/// The features an operator's `[exports.<service>.fs]` table named, plus the
+/// ones this build always has.
 ///
 /// Unknown names are **ignored rather than refused**, for the same reason an
 /// unknown capability name is: the list is forward-compatible, a feature this
@@ -96,9 +116,9 @@ impl FsExport {
 /// only ever fail to turn something *on*.
 #[must_use]
 pub fn parse_features(names: &[String]) -> FeatureSet {
-    let mut set = FeatureSet::NONE;
+    let mut set = FeatureSet::NONE.with(ALWAYS_IMPLEMENTED);
     for name in names {
-        if let Some(feature) = tunnel_fs_core::Feature::ALL
+        if let Some(feature) = Feature::ALL
             .into_iter()
             .find(|feature| feature.as_str() == name.trim())
         {

@@ -1821,8 +1821,14 @@ GATE5_TEST = [
     "tunnel-fs-host",
     "-p",
     "tunnel-fs-provider",
+    "--features",
+    # The window between a creating syscall and the identity read that follows
+    # it is microseconds wide; without this hook the rule that a failure *after*
+    # an effect is `unknown` could only be asserted, not measured.
+    "tunnel-fs-provider/post-effect-hook",
     "--lib",
     "--tests",
+    "--no-fail-fast",
 ]
 
 WRITE = CRATE / "src" / "write.rs"
@@ -1855,15 +1861,19 @@ GATE5_CASES: list[tuple[str, list[Edit]]] = [
         ],
     ),
     (
-        # This one deletion reaches **two** pinned claims, and that is worth
-        # stating rather than splitting into cases that cannot be written.
-        # With the hard-link check gone, a multiply-linked file is writable —
-        # and the truncating open in the same test then truncates it, so the
-        # content-intact assertion fails too.  That assertion is the only form
-        # in which "truncation happens through the descriptor **after** the
-        # rule permitted it" can be measured by deletion: the alternative
-        # ordering is `O_TRUNC` on the resolving open, which is not a deletion
-        # but a different implementation.
+        # This one deletion reaches **two** pinned claims, and both are now
+        # reported: the multiply-linked file becomes writable, and the
+        # truncating open — which lives in its own test rather than in the
+        # refusal loop — then truncates it, so the content-intact assertion
+        # fails too.  An earlier round put the truncating case last inside a
+        # loop, where the first iteration's panic meant it was never reached
+        # and the red was credited to a different assertion entirely; the
+        # suite also ran with the default fail-fast, so only the first failing
+        # binary was reported.  Both are fixed, and the content assertion is
+        # the only form in which "truncation happens through the descriptor
+        # **after** the rule permitted it" is measurable by deletion — the
+        # alternative ordering is `O_TRUNC` on the resolving open, which is a
+        # different implementation rather than a deletion.
         "the hard-link write rule, and the truncation that follows it",
         [
             (
@@ -1994,6 +2004,101 @@ GATE5_CASES: list[tuple[str, list[Edit]]] = [
                 }""",
                 """                CacheEffect::InsertCreated(entry) => {
                     self.insert(fid, queued.generation, entry);
+                }""",
+            )
+        ],
+    ),
+    (
+        # The post-effect mapping for `mkdirat`: with it gone the race answer
+        # keeps its own `not_started`, and a directory that exists is reported
+        # as a request that never began.
+        "a mkdir that loses its identity read is unknown, not not-started",
+        [
+            (
+                WRITE,
+                """        identify_after_effect(&parent, name, FileKind::Directory)
+            .and_then(|identity| check_same_device(self.identity(), identity).map(|()| identity))
+            .map_err(after_effect)""",
+                """        identify_after_effect(&parent, name, FileKind::Directory)
+            .and_then(|identity| check_same_device(self.identity(), identity).map(|()| identity))""",
+            )
+        ],
+    ),
+    (
+        "a symlink that loses its identity read is unknown, not not-started",
+        [
+            (
+                WRITE,
+                "        identify_after_effect(&parent, name, FileKind::Symlink).map_err(after_effect)",
+                "        identify_after_effect(&parent, name, FileKind::Symlink)",
+            )
+        ],
+    ),
+    (
+        # The effecting syscall of a size change. Routed through `host_error`
+        # it reports `not_started` for a call that was made.
+        "a failed ftruncate on an unopened fid is failed, not not-started",
+        [
+            (
+                RESOLVER,
+                """        // As in [`ExportRoot::open_truncate`]: the effecting syscall reports
+        // `failed`, never `not_started`.
+        handle.set_size(size)""",
+                "        rustix::fs::ftruncate(handle.as_fd(), size).map_err(host_error)",
+            )
+        ],
+    ),
+    (
+        "a rename inspects its destination as well as its source",
+        [
+            (
+                WRITE,
+                "        inspect_replaceable(&to_parent, to_name)?;\n",
+                "",
+            )
+        ],
+    ),
+    (
+        # The other direction from every other mode case: this one is red when
+        # the file-type bits are *refused* rather than discarded, because the
+        # reference client sends them on every chmod.
+        "a Tsetattr mode discards the file-type bits rather than refusing them",
+        [
+            (
+                WRITE,
+                "        let mode = mode_of(mode & !MODE_TYPE_BITS)?;",
+                "        let mode = mode_of(mode)?;",
+            )
+        ],
+    ),
+    (
+        # The timestamp half of `Tsetattr`. Dropping the field-without-`_SET`
+        # case answers `Rsetattr` for a `touch` that did not happen.
+        "a timestamp field without its _SET companion is applied, not dropped",
+        [
+            (
+                PROVIDER_SRC,
+                """    if valid & explicit == 0 {""",
+                """    if valid & explicit == 0 && valid == u32::MAX {""",
+            )
+        ],
+    ),
+    (
+        "an applied Tsetattr field is counted partial rather than unknown",
+        [
+            (
+                PROVIDER_SRC,
+                """                Outcome::Partial => {
+                    self.stats.mutations_dispatched += 1;
+                    self.stats.mutations_applied += 1;
+                    self.stats.mutation_partial += 1;
+                    self.undelivered_effect = true;
+                }""",
+                """                Outcome::Partial => {
+                    self.stats.mutations_dispatched += 1;
+                    self.stats.mutations_applied += 1;
+                    self.undelivered_effect = true;
+                    self.note_effect_undelivered();
                 }""",
             )
         ],

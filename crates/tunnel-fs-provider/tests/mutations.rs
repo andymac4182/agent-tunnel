@@ -30,8 +30,8 @@ mod support;
 use support::{
     Fixture, error_code, exchange, full_grant, handshake, one_frame, read_and_list, tclunk,
     tgetattr, tlcreate, tlink, tlopen, tmkdir, tread, treadlink, tremove, trenameat, tsetattr,
-    tsetattr_mode, tsetattr_size, tsymlink, tunlinkat, twalk, twrite, write_and_delete,
-    write_features, written,
+    tsetattr_mode, tsetattr_mtime, tsetattr_size, tsymlink, tunlinkat, twalk, twrite,
+    write_and_delete, write_features, written,
 };
 use tunnel_fs_core::{FsErrorCode, Outcome};
 use tunnel_fs_ninep::flags::{
@@ -465,17 +465,14 @@ fn a_multiply_linked_file_cannot_be_written_truncated_or_resized() {
     let fid = 1_u32;
     let _ = exchange(&mut provider, twalk(2, ROOT, fid, &["shared.bin"]));
 
-    for (label, flags) in [
-        ("write", O_WRONLY),
-        ("read-write", O_RDWR),
-        ("truncate", O_WRONLY | O_TRUNC),
-    ] {
+    // The **truncating** open is deliberately not in this loop; it has its own
+    // test below. A guard-deletion case that makes the hard-link rule
+    // disappear panics on whichever iteration comes first, so a loop that
+    // reached the truncating case last would never measure it — the reported
+    // red would be about a different assertion entirely.
+    for (label, flags) in [("write", O_WRONLY), ("read-write", O_RDWR)] {
         let reply = one_frame(exchange(&mut provider, tlopen(3, fid, flags)));
         assert_eq!(error_code(&reply), FsErrorCode::Eperm, "{label}");
-        // The content is intact, which is the half that matters for the
-        // truncating case: the refusal must not follow a truncation that
-        // already happened, and that is why the resolving open carries no
-        // `O_TRUNC`.
         assert_eq!(
             std::fs::read(fixture.inside("shared.bin")).expect("intact"),
             b"original-content",
@@ -506,6 +503,152 @@ fn a_multiply_linked_file_cannot_be_written_truncated_or_resized() {
     let stats = provider.stats();
     assert_eq!(stats.mutations_dispatched, 0);
     assert_eq!(stats.mutations_applied, 0);
+}
+
+#[test]
+fn a_truncating_open_of_a_multiply_linked_file_leaves_its_content_intact() {
+    // **Its own test, and the ordering is the point.** Gate 2 pinned that
+    // truncation happens through the descriptor *after* the hard-link rule has
+    // permitted it, so the resolving open never carries `O_TRUNC`; the
+    // observable form of that is a refused truncating open whose file still has
+    // its bytes. An implementation that put `O_TRUNC` on the resolving open
+    // would answer the same `EPERM` and leave an empty file behind, and only
+    // this assertion tells them apart.
+    //
+    // Separated from the loop above so a guard deletion that reaches this
+    // *does* reach it: with the rule gone the open is admitted, the truncation
+    // happens, and the content assertion is what goes red.
+    let fixture = Fixture::new();
+    fixture.file("/shared.bin", b"original-content");
+    std::fs::hard_link(fixture.inside("shared.bin"), fixture.inside("second.bin"))
+        .expect("a second link");
+    let mut provider = writer(&fixture);
+    handshake(&mut provider, ROOT);
+    let fid = 1_u32;
+    let _ = exchange(&mut provider, twalk(2, ROOT, fid, &["shared.bin"]));
+
+    let reply = one_frame(exchange(&mut provider, tlopen(3, fid, O_WRONLY | O_TRUNC)));
+    assert_eq!(error_code(&reply), FsErrorCode::Eperm);
+    assert_eq!(
+        std::fs::read(fixture.inside("shared.bin")).expect("intact"),
+        b"original-content",
+        "the refusal must not follow a truncation that already happened"
+    );
+    assert_eq!(provider.stats().mutations_dispatched, 0);
+}
+
+#[test]
+fn a_size_change_the_host_refuses_is_failed_and_not_not_started() {
+    // The unopened-fid path: `ExportRoot::set_size` resolves, applies the
+    // hard-link rule and then truncates. The truncation **is** the effecting
+    // syscall, so its failure is `failed` — the host was asked and reported it
+    // changed nothing — where routing it through `host_error` would report
+    // `not_started` for a call that was made.
+    //
+    // A size no filesystem can represent is what makes the host refuse: the
+    // exact code is the host's business and the vocabulary's, and what this
+    // asserts is the *outcome*, which is the profile's.
+    let fixture = Fixture::new();
+    fixture.file("/resize.bin", &synthetic(1_024));
+    let mut provider = writer(&fixture);
+    handshake(&mut provider, ROOT);
+    let fid = 1_u32;
+    let _ = exchange(&mut provider, twalk(2, ROOT, fid, &["resize.bin"]));
+
+    let reply = one_frame(exchange(&mut provider, tsetattr_size(3, fid, u64::MAX)));
+    assert!(
+        matches!(reply.message, Message::Rlerror { .. }),
+        "a size the host cannot represent is refused: {:?}",
+        reply.message
+    );
+    let stats = provider.stats();
+    assert_eq!(stats.mutations_dispatched, 1, "the host was asked");
+    assert_eq!(stats.mutation_failed, 1, "and reported it changed nothing");
+    assert_eq!(stats.mutations_refused, 0, "not a pre-dispatch refusal");
+    assert_eq!(stats.mutations_applied, 0);
+    // And it really did change nothing.
+    assert_eq!(
+        std::fs::metadata(fixture.inside("resize.bin"))
+            .expect("the file")
+            .len(),
+        1_024
+    );
+}
+
+#[test]
+fn a_rename_onto_a_special_files_name_is_refused() {
+    // `renameat` removes whatever occupies the destination, so a rename onto a
+    // socket's name is a spelling of the special-file removal this profile
+    // otherwise refuses — which would make that refusal a refusal in name only.
+    // Both endpoints are inspected, not just the source.
+    let fixture = Fixture::new();
+    fixture.file("/ordinary.bin", b"synthetic");
+    let socket_path = fixture.inside("socket.sock");
+    let listener =
+        std::os::unix::net::UnixListener::bind(&socket_path).expect("bind a fixture socket");
+    let mut provider = writer(&fixture);
+    handshake(&mut provider, ROOT);
+    let root_clone = 1_u32;
+    let _ = exchange(&mut provider, twalk(2, ROOT, root_clone, &[]));
+
+    let reply = one_frame(exchange(
+        &mut provider,
+        trenameat(3, root_clone, "ordinary.bin", root_clone, "socket.sock"),
+    ));
+    assert_eq!(error_code(&reply), FsErrorCode::Enotsup);
+    assert!(socket_path.exists(), "the socket survives");
+    assert!(
+        fixture.inside("ordinary.bin").exists(),
+        "and so does the source"
+    );
+    assert_eq!(provider.stats().mutations_dispatched, 0);
+
+    // A rename onto a **free** name is the ordinary case and still works: the
+    // destination inspection refuses an occupant it may not remove, not every
+    // destination.
+    let reply = one_frame(exchange(
+        &mut provider,
+        trenameat(4, root_clone, "ordinary.bin", root_clone, "moved.bin"),
+    ));
+    assert!(matches!(reply.message, Message::Rrenameat));
+    assert!(fixture.inside("moved.bin").exists());
+
+    drop(listener);
+    let _ = std::fs::remove_file(&socket_path);
+}
+
+#[test]
+fn a_setattr_mode_carrying_the_file_type_bits_still_applies() {
+    // Linux's own v9fs client sends `Tsetattr`'s `mode` as the kernel's
+    // `ia_mode`, which carries the node's type bits alongside its permissions.
+    // Refusing them would refuse every `chmod` from the reference client, and
+    // they grant nothing — a type bit *describes* a node and cannot change one,
+    // and `fchmod` ignores them — so they are discarded rather than refused.
+    // The set-user-ID, set-group-ID and sticky bits are a different case and
+    // stay refused, because those do grant.
+    let fixture = Fixture::new();
+    fixture.file("/attrs.bin", b"synthetic");
+    let mut provider = writer(&fixture);
+    handshake(&mut provider, ROOT);
+    let fid = 1_u32;
+    let _ = exchange(&mut provider, twalk(2, ROOT, fid, &["attrs.bin"]));
+
+    // `S_IFREG | 0o640`, which is exactly what v9fs sends for `chmod 640`.
+    let reply = one_frame(exchange(&mut provider, tsetattr_mode(3, fid, 0o100_640)));
+    assert!(
+        matches!(reply.message, Message::Rsetattr),
+        "the reference client's chmod is served: {:?}",
+        reply.message
+    );
+    let reply = one_frame(exchange(&mut provider, tgetattr(4, fid, GETATTR_BASIC)));
+    match reply.message {
+        Message::Rgetattr(attributes) => assert_eq!(attributes.mode & 0o7777, 0o640),
+        other => panic!("expected Rgetattr, got {other:?}"),
+    }
+
+    // And a set-user-ID bit is still refused, type bits or no type bits.
+    let reply = one_frame(exchange(&mut provider, tsetattr_mode(5, fid, 0o104_755)));
+    assert_eq!(error_code(&reply), FsErrorCode::Einval);
 }
 
 #[test]
@@ -690,10 +833,17 @@ fn a_composite_setattr_that_fails_after_a_field_applied_is_partial() {
     let stats = provider.stats();
     assert_eq!(stats.mutations_dispatched, 1);
     assert_eq!(stats.mutations_applied, 1);
-    assert_eq!(
-        stats.mutation_unknown, 1,
-        "an applied effect whose reply is an Rlerror is never acknowledged"
-    );
+    // **`partial`, not `unknown`, and the difference is what the consumer was
+    // told.** An `Rlerror` *is* delivered here — the caller learns that the
+    // mode field failed — so labelling it `unknown` would describe a reply that
+    // arrived as one that did not. What the caller cannot tell from that
+    // `Rlerror` alone is that the size field already applied, and `partial` is
+    // the name for exactly that.
+    assert_eq!(stats.mutation_partial, 1);
+    assert_eq!(stats.mutation_unknown, 0);
+    // Delivered, like any other effect-carrying reply: the ledger opened and
+    // the connector — `exchange`, here — settled it.
+    assert_eq!(stats.mutations_acknowledged, 1);
     assert_eq!(stats.mutations_refused, 0);
     assert_eq!(stats.mutation_failed, 0);
 
@@ -706,13 +856,35 @@ fn a_composite_setattr_that_fails_after_a_field_applied_is_partial() {
 }
 
 #[test]
-fn a_setattr_naming_only_fields_this_profile_ignores_changes_nothing() {
-    // Gate 3 refuses an empty mask and excludes uid, gid and ctime from it. What
-    // can still arrive is a timestamp field without its `_SET` companion, which
-    // means "use the current time" — and this profile has no clock. Answering
-    // `Rsetattr` for it would report a mutation that did not happen.
+fn a_timestamp_field_without_its_set_companion_is_touch_and_applies() {
+    // `.L` gives each timestamp two mask bits, and **the field bit without its
+    // `_SET` companion is the ordinary spelling, not an exotic one**: it means
+    // "use the current time", it is what `utimes(NULL)` sends, and that is what
+    // `touch` sends. An earlier round of this gate dropped it silently and
+    // still answered `Rsetattr`, reporting success for a request that partly
+    // did not happen — which the contract forbids. Refusing it would have been
+    // the other wrong answer: it would refuse `touch`.
+    //
+    // The clock is the **host's**: `UTIME_NOW` is resolved by the kernel inside
+    // `futimens`, and nothing in this profile reads one. So this is not the
+    // clock enforcement gate 5 deliberately does not do.
     let fixture = Fixture::new();
     fixture.file("/attrs.bin", b"synthetic");
+    // Backdated well past any plausible run, so "the time moved" is a
+    // comparison rather than a race with the filesystem's timestamp
+    // granularity.
+    let backdated = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+    let file = std::fs::File::options()
+        .write(true)
+        .open(fixture.inside("attrs.bin"))
+        .expect("open the fixture");
+    file.set_modified(backdated).expect("backdate the fixture");
+    drop(file);
+    let before = std::fs::metadata(fixture.inside("attrs.bin"))
+        .and_then(|metadata| metadata.modified())
+        .expect("the backdated time");
+    assert_eq!(before, backdated);
+
     let mut provider = writer(&fixture);
     handshake(&mut provider, ROOT);
     let fid = 1_u32;
@@ -721,8 +893,57 @@ fn a_setattr_naming_only_fields_this_profile_ignores_changes_nothing() {
         &mut provider,
         tsetattr(3, fid, tunnel_fs_ninep::flags::SETATTR_MTIME, 0, 0),
     ));
-    assert_eq!(error_code(&reply), FsErrorCode::Enotsup);
-    assert_eq!(provider.stats().mutations_applied, 0);
+    assert!(
+        matches!(reply.message, Message::Rsetattr),
+        "a touch is answered, not refused: {:?}",
+        reply.message
+    );
+    let after = std::fs::metadata(fixture.inside("attrs.bin"))
+        .and_then(|metadata| metadata.modified())
+        .expect("the touched time");
+    assert!(
+        after > before,
+        "the Rsetattr reported a mutation that must have happened"
+    );
+    let stats = provider.stats();
+    assert_eq!(stats.mutations_applied, 1);
+    assert_eq!(stats.mutation_partial, 0);
+    assert_eq!(stats.mutation_unknown, 0);
+}
+
+#[test]
+fn an_explicit_timestamp_is_applied_exactly_as_supplied() {
+    // The other half of the mask: with `_SET` alongside the field bit, the
+    // caller's own value is what lands — no normalisation, no rounding to the
+    // host's clock.
+    let fixture = Fixture::new();
+    fixture.file("/attrs.bin", b"synthetic");
+    let mut provider = writer(&fixture);
+    handshake(&mut provider, ROOT);
+    let fid = 1_u32;
+    let _ = exchange(&mut provider, twalk(2, ROOT, fid, &["attrs.bin"]));
+    let reply = one_frame(exchange(
+        &mut provider,
+        tsetattr_mtime(3, fid, 1_700_000_000, 123_456_789),
+    ));
+    assert!(matches!(reply.message, Message::Rsetattr));
+    let reply = one_frame(exchange(&mut provider, tgetattr(4, fid, GETATTR_BASIC)));
+    match reply.message {
+        Message::Rgetattr(attributes) => {
+            assert_eq!(attributes.mtime_sec, 1_700_000_000);
+            assert_eq!(attributes.mtime_nsec, 123_456_789);
+        }
+        other => panic!("expected Rgetattr, got {other:?}"),
+    }
+
+    // And a nanosecond field at or above one second is refused rather than
+    // normalised into the seconds field — which is also what keeps the two
+    // host sentinels unreachable from a caller's own value.
+    let reply = one_frame(exchange(
+        &mut provider,
+        tsetattr_mtime(5, fid, 1_700_000_000, 1_000_000_000),
+    ));
+    assert_eq!(error_code(&reply), FsErrorCode::Einval);
 }
 
 #[test]
@@ -873,6 +1094,106 @@ fn a_narrowed_grant_refuses_a_queued_write_before_the_host_is_touched() {
     assert_eq!(stats.grant_refusals, 1);
     assert_eq!(stats.mutations_dispatched, 0, "refused before the host");
     assert_eq!(stats.mutations_refused, 1);
+}
+
+// ------------------------------------- the window after an effect, on a hook
+
+// Where the fixture's export root goes, so a hook can reach it from a `fn()`
+// that takes no arguments.  A line comment rather than a doc comment: rustdoc
+// generates nothing for a macro invocation and says so as a hard error.
+#[cfg(feature = "post-effect-hook")]
+thread_local! {
+    static HOOKED_ROOT: std::cell::RefCell<Option<std::path::PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(feature = "post-effect-hook")]
+#[test]
+fn a_mkdir_whose_identity_read_loses_a_race_is_unknown_and_never_not_started() {
+    // **The window this measures is microseconds wide**, so it is stepped into
+    // deliberately rather than raced for — exactly the way gate 2 measures the
+    // window between inspecting a name and opening it, and under a feature no
+    // shipped build enables.
+    //
+    // `mkdirat` creates a directory and returns nothing, so the qid the
+    // `Rmkdir` has to carry costs a second syscall. If that second syscall
+    // loses a race — another process removed or replaced the name — the
+    // directory **still exists**, and answering with the race's own `ENOENT`
+    // unchanged would tell the caller its `Tmkdir` never started. A caller that
+    // believed it and retried would meet `EEXIST` on a name it does not believe
+    // it created.
+    let fixture = Fixture::new();
+    let mut provider = writer(&fixture);
+    handshake(&mut provider, ROOT);
+    let parent = 1_u32;
+    let _ = exchange(&mut provider, twalk(2, ROOT, parent, &[]));
+
+    HOOKED_ROOT.with(|slot| *slot.borrow_mut() = Some(fixture.export()));
+    tunnel_fs_host::write::post_effect::set(|| {
+        // Stand in for the racing process: remove the directory that was just
+        // created, between the `mkdirat` and the `statat` that reads it back.
+        HOOKED_ROOT.with(|slot| {
+            if let Some(root) = slot.borrow().as_ref() {
+                let _ = std::fs::remove_dir(root.join("raced"));
+            }
+        });
+    });
+    let reply = one_frame(exchange(&mut provider, tmkdir(3, parent, "raced", 0o755)));
+    tunnel_fs_host::write::post_effect::clear();
+    HOOKED_ROOT.with(|slot| *slot.borrow_mut() = None);
+
+    // The uniform race answer, which is `ENOENT` and discloses nothing about
+    // the host's concurrent activity.
+    assert_eq!(error_code(&reply), FsErrorCode::Enoent);
+    let stats = provider.stats();
+    // And the outcome is the point: dispatched, applied, and **unknown** — not
+    // `not_started`, which is what an unwrapped `host_error` would have said.
+    assert_eq!(stats.mutations_dispatched, 1);
+    assert_eq!(stats.mutations_applied, 1);
+    assert_eq!(stats.mutation_unknown, 1);
+    assert_eq!(stats.mutations_refused, 0, "the host was asked");
+    assert_eq!(stats.mutation_failed, 0, "and it did change something");
+    // Gate 1's ordering is what forbids the weakening, asserted rather than
+    // assumed.
+    assert_eq!(
+        Outcome::Unknown.merge(Outcome::NotStarted),
+        Outcome::Unknown
+    );
+}
+
+#[cfg(feature = "post-effect-hook")]
+#[test]
+fn a_symlink_whose_identity_read_loses_a_race_is_unknown_too() {
+    // The same shape for `symlinkat`, which also creates a node and returns
+    // nothing. Listed separately rather than looped, so a guard deletion that
+    // reaches one is reported against the operation it belongs to.
+    let fixture = Fixture::new();
+    fixture.file("/target.bin", b"synthetic");
+    let mut provider = writer(&fixture);
+    handshake(&mut provider, ROOT);
+    let parent = 1_u32;
+    let _ = exchange(&mut provider, twalk(2, ROOT, parent, &[]));
+
+    HOOKED_ROOT.with(|slot| *slot.borrow_mut() = Some(fixture.export()));
+    tunnel_fs_host::write::post_effect::set(|| {
+        HOOKED_ROOT.with(|slot| {
+            if let Some(root) = slot.borrow().as_ref() {
+                let _ = std::fs::remove_file(root.join("raced"));
+            }
+        });
+    });
+    let reply = one_frame(exchange(
+        &mut provider,
+        tsymlink(3, parent, "raced", "target.bin"),
+    ));
+    tunnel_fs_host::write::post_effect::clear();
+    HOOKED_ROOT.with(|slot| *slot.borrow_mut() = None);
+
+    assert_eq!(error_code(&reply), FsErrorCode::Enoent);
+    let stats = provider.stats();
+    assert_eq!(stats.mutations_applied, 1);
+    assert_eq!(stats.mutation_unknown, 1);
+    assert_eq!(stats.mutations_refused, 0);
 }
 
 // ------------------------------------------------------------------ helpers

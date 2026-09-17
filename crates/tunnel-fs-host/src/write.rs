@@ -60,15 +60,73 @@ use tunnel_fs_core::{Feature, FsError, FsErrorCode, Outcome, Primitive, VirtualP
 
 use crate::identity::{FileIdentity, FileKind};
 use crate::policy::{
-    check_exportable, check_hard_link_write, check_same_device, host_error, mutation_error,
+    after_effect, check_exportable, check_hard_link_write, check_same_device, host_error,
+    mutation_error,
 };
 use crate::resolver::{ExportRoot, Handle, retry};
+
+/// The test-only hook that occupies the window between a creating syscall and
+/// the identity read that gives its reply a qid.
+///
+/// This module exists **only** under the `post-effect-hook` feature, which no
+/// shipped build enables: with the feature off there is no hook, no
+/// thread-local and no call site. It is here on exactly the terms
+/// [`crate::resolver::race_window`] is, and for the same reason — the window is
+/// microseconds wide, and the rule it protects is one this gate would otherwise
+/// have to assert rather than measure: after the effect, a failure is
+/// `unknown`, never `not_started`.
+#[cfg(feature = "post-effect-hook")]
+pub mod post_effect {
+    use std::cell::Cell;
+
+    thread_local! {
+        static HOOK: Cell<Option<fn()>> = const { Cell::new(None) };
+    }
+
+    /// Run `hook` on this thread after each creating syscall in this module and
+    /// before the identity read that follows it.
+    pub fn set(hook: fn()) {
+        HOOK.with(|slot| slot.set(Some(hook)));
+    }
+
+    /// Stop running any hook on this thread.
+    pub fn clear() {
+        HOOK.with(|slot| slot.set(None));
+    }
+
+    pub(crate) fn fire() {
+        if let Some(hook) = HOOK.with(Cell::get) {
+            hook();
+        }
+    }
+}
+
+/// Fire the post-effect hook, or do nothing when it is not compiled in.
+#[inline]
+fn fire_post_effect_hook() {
+    #[cfg(feature = "post-effect-hook")]
+    post_effect::fire();
+}
 
 /// The permission bits a caller may set.
 ///
 /// `0o777` exactly: no set-user-ID, no set-group-ID and no sticky bit. A mode
 /// outside it is refused rather than masked.
 pub const MODE_BITS_ALLOWED: u32 = 0o777;
+
+/// `S_IFMT`: the file-type bits of a mode word.
+///
+/// **Discarded from a `Tsetattr` mode rather than refused**, and this is the one
+/// place a mode is repaired rather than rejected — so the reason had better be
+/// good. It is: Linux's own v9fs client sends `Tsetattr`'s `mode` as the
+/// kernel's `ia_mode`, which carries the node's type bits alongside its
+/// permissions, so refusing them would refuse every `chmod` from the reference
+/// client. They are not a grant of anything either — a type bit *describes* a
+/// node and cannot change one; `fchmod` ignores them — so dropping them cannot
+/// apply a permission the caller did not ask for, which is what the
+/// refuse-never-repair rule exists to prevent. The set-user-ID, set-group-ID
+/// and sticky bits are a different case and stay refused: those do grant.
+pub const MODE_TYPE_BITS: u32 = 0o170_000;
 
 /// Translate a requested permission word, refusing anything outside
 /// [`MODE_BITS_ALLOWED`].
@@ -132,29 +190,24 @@ impl Handle {
     ///
     /// # Errors
     ///
-    /// [`FsErrorCode::Einval`] for a mode outside [`MODE_BITS_ALLOWED`], or a
-    /// translated host failure marked [`Outcome::Failed`].
+    /// [`FsErrorCode::Einval`] for a mode outside [`MODE_BITS_ALLOWED`] once
+    /// its file-type bits are discarded, or a translated host failure marked
+    /// [`Outcome::Failed`].
     pub fn set_mode(&self, mode: u32) -> Result<(), FsError> {
-        let mode = mode_of(mode)?;
+        let mode = mode_of(mode & !MODE_TYPE_BITS)?;
         retry(|| rustix::fs::fchmod(self.as_fd(), mode)).map_err(mutation_error)
     }
 
     /// Change this descriptor's access and modification times.
     ///
-    /// Each half is either a supplied `(seconds, nanoseconds)` pair or `None`,
-    /// which leaves that timestamp alone. The `ctime` is the host's and is never
-    /// settable, which is how gate 3's mask refusal of `ctime` is honoured here
-    /// rather than only there.
+    /// The `ctime` is the host's and is never settable, which is how gate 3's
+    /// mask refusal of `ctime` is honoured here rather than only there.
     ///
     /// # Errors
     ///
     /// A translated host failure marked [`Outcome::Failed`], or
     /// [`FsErrorCode::Einval`] for a nanosecond field outside its range.
-    pub fn set_times(
-        &self,
-        atime: Option<(u64, u64)>,
-        mtime: Option<(u64, u64)>,
-    ) -> Result<(), FsError> {
+    pub fn set_times(&self, atime: TimeChange, mtime: TimeChange) -> Result<(), FsError> {
         let times = rustix::fs::Timestamps {
             last_access: timespec_of(atime)?,
             last_modification: timespec_of(mtime)?,
@@ -163,25 +216,64 @@ impl Handle {
     }
 }
 
-/// A supplied timestamp, or the host's own "leave this one alone" sentinel.
+/// What a `Tsetattr` asks of one timestamp.
 ///
-/// `UTIME_OMIT` is written out as its Linux value the way every other numeric
-/// constant in this profile is, rather than taken from a libc binding: the two
-/// hosts agree on it, and a build that took it from a binding would agree with
-/// whichever host it was compiled on instead of with the wire.
-fn timespec_of(value: Option<(u64, u64)>) -> Result<rustix::fs::Timespec, FsError> {
-    /// `UTIME_OMIT`, the `tv_nsec` value meaning "do not change this field".
-    const OMIT: i64 = 0x3fff_ffff;
-    let Some((seconds, nanoseconds)) = value else {
-        return Ok(rustix::fs::Timespec {
-            tv_sec: 0,
-            tv_nsec: OMIT as _,
-        });
+/// `.L` gives each timestamp two mask bits: one saying "change this field" and
+/// one saying "use the value I supplied rather than the current time". The
+/// second is optional, and **the field bit without it is the ordinary case, not
+/// an exotic one**: it is what `utimes(NULL)` sends, which is what `touch`
+/// sends, so a profile that refused it would refuse `touch`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TimeChange {
+    /// Leave this timestamp alone.
+    Omit,
+    /// Set it to the host's current time.
+    ///
+    /// **The host's clock, not this profile's.** `UTIME_NOW` is resolved by the
+    /// kernel inside `futimens`; nothing here reads a clock. So this is not the
+    /// clock enforcement the gate deliberately does not do — it is the absence
+    /// of one, handed to the only party that has it.
+    Now,
+    /// Set it to a supplied `(seconds, nanoseconds)`.
+    Explicit(u64, u64),
+}
+
+/// Translate one [`TimeChange`] into the host's own representation.
+///
+/// **`UTIME_NOW` and `UTIME_OMIT` are taken from `rustix`, not written out**,
+/// and that is the opposite of what this profile does with the `.L` flag masks
+/// — deliberately, because they are the opposite kind of constant. A flag mask
+/// is a **wire** value: it arrives in a 9P message and must mean the same thing
+/// on every serving host, so writing Linux's numbers out by hand is what keeps
+/// a macOS build and a Linux build agreeing with each other. These two are
+/// **host** values that legitimately differ — Apple spells them `-1` and `-2`,
+/// Linux `(1 << 30) - 1` and `(1 << 30) - 2` — and hand-writing either set
+/// would be the same mistake gate 2 already refuses for errnos, where using
+/// `FsErrorCode::from_errno` on a host errno mistranslates on every non-Linux
+/// host. An earlier round of this gate did write them out, with the two
+/// swapped, and a `touch` silently changed nothing.
+fn timespec_of(value: TimeChange) -> Result<rustix::fs::Timespec, FsError> {
+    let (seconds, nanoseconds) = match value {
+        TimeChange::Omit => {
+            return Ok(rustix::fs::Timespec {
+                tv_sec: 0,
+                tv_nsec: rustix::fs::UTIME_OMIT,
+            });
+        }
+        TimeChange::Now => {
+            return Ok(rustix::fs::Timespec {
+                tv_sec: 0,
+                tv_nsec: rustix::fs::UTIME_NOW,
+            });
+        }
+        TimeChange::Explicit(seconds, nanoseconds) => (seconds, nanoseconds),
     };
     if nanoseconds >= 1_000_000_000 {
         // A nanosecond field at or above one second is not a time this host can
         // represent, and normalising it into the seconds field would apply a
-        // different timestamp from the one the caller named.
+        // different timestamp from the one the caller named. It is also what
+        // keeps both sentinels unreachable from a caller's own value on the
+        // host that spells them inside that range.
         return Err(FsError::refused(FsErrorCode::Einval));
     }
     let tv_sec = i64::try_from(seconds).map_err(|_| FsError::refused(FsErrorCode::Einval))?;
@@ -306,20 +398,18 @@ impl ExportRoot {
             .ok_or(FsError::refused(FsErrorCode::Einval))?;
         let parent = self.resolve_parent(path)?;
         retry(|| rustix::fs::mkdirat(parent.as_fd(), name, mode)).map_err(mutation_error)?;
-        // The qid the reply carries has to describe the directory that was
-        // made, and the only way to learn its identity is to ask.  A `statat`
-        // on the same anchored parent descriptor cannot re-resolve an earlier
-        // component; what it can observe is another process having replaced the
-        // name in between, which is reported as the race it is rather than as a
-        // successful `Rmkdir` naming something else.
-        let stat = rustix::fs::statat(parent.as_fd(), name, AtFlags::SYMLINK_NOFOLLOW)
-            .map_err(host_error)?;
-        let identity = FileIdentity::from_stat(&stat);
-        if identity.kind() != FileKind::Directory {
-            return Err(crate::policy::lost_race());
-        }
-        check_same_device(self.identity(), identity)?;
-        Ok(identity)
+        // **Past this point the directory exists**, so every failure below is
+        // reported through [`after_effect`] and is `unknown`, never
+        // `not_started`.  The qid the reply carries has to describe the
+        // directory that was made, and the only way to learn its identity is to
+        // ask; a `statat` on the same anchored parent descriptor cannot
+        // re-resolve an earlier component, but it *can* observe another process
+        // having replaced or removed the name in between.  Reporting that
+        // race's own `ENOENT` unchanged would tell a caller its `Tmkdir` never
+        // started, with a directory on the host to show otherwise.
+        identify_after_effect(&parent, name, FileKind::Directory)
+            .and_then(|identity| check_same_device(self.identity(), identity).map(|()| identity))
+            .map_err(after_effect)
     }
 
     /// Remove a name from its directory.
@@ -378,6 +468,11 @@ impl ExportRoot {
         let from_parent = self.resolve_parent(from)?;
         let to_parent = self.resolve_parent(to)?;
         inspect_removable(&from_parent, from_name)?;
+        // **Both endpoints, not just the source.** `renameat` removes whatever
+        // occupies the destination, so a rename onto a socket's or a FIFO's
+        // name is a spelling of the special-file removal this module otherwise
+        // refuses — which would make that refusal a refusal in name only.
+        inspect_replaceable(&to_parent, to_name)?;
         retry(|| rustix::fs::renameat(from_parent.as_fd(), from_name, to_parent.as_fd(), to_name))
             .map_err(mutation_error)
     }
@@ -408,13 +503,10 @@ impl ExportRoot {
             .ok_or(FsError::refused(FsErrorCode::Einval))?;
         let parent = self.resolve_parent(path)?;
         retry(|| rustix::fs::symlinkat(target, parent.as_fd(), name)).map_err(mutation_error)?;
-        let stat = rustix::fs::statat(parent.as_fd(), name, AtFlags::SYMLINK_NOFOLLOW)
-            .map_err(host_error)?;
-        let identity = FileIdentity::from_stat(&stat);
-        if identity.kind() != FileKind::Symlink {
-            return Err(crate::policy::lost_race());
-        }
-        Ok(identity)
+        // As in [`ExportRoot::make_directory`]: the link exists from here on,
+        // so the identity read that gives the reply its qid reports `unknown`
+        // when it fails rather than claiming the request never started.
+        identify_after_effect(&parent, name, FileKind::Symlink).map_err(after_effect)
     }
 
     /// Create a hard link to an already-resolved descriptor.
@@ -481,6 +573,66 @@ impl ExportRoot {
         check_exportable(handle.kind())?;
         check_same_device(self.identity(), handle.identity())?;
         Ok(handle)
+    }
+}
+
+/// Read back the node a just-performed creation made, by name on its anchored
+/// parent.
+///
+/// Split out because both callers need the same three steps and the same
+/// answer, and because it is the one read in this module that happens **after**
+/// an effect: its caller wraps it in [`after_effect`], and a reader should be
+/// able to see that the wrapping covers the whole of it rather than one line.
+///
+/// A kind other than the one just created can only mean the name was replaced
+/// between the creating syscall and this one. That is the race, and it takes
+/// the uniform `ENOENT` answer the resolver already gives one — with the
+/// outcome the caller adds, because here the race followed a real effect.
+fn identify_after_effect(
+    parent: &Handle,
+    name: &str,
+    expected: FileKind,
+) -> Result<FileIdentity, FsError> {
+    fire_post_effect_hook();
+    let stat =
+        rustix::fs::statat(parent.as_fd(), name, AtFlags::SYMLINK_NOFOLLOW).map_err(host_error)?;
+    let identity = FileIdentity::from_stat(&stat);
+    if identity.kind() == expected {
+        Ok(identity)
+    } else {
+        Err(crate::policy::lost_race())
+    }
+}
+
+/// Refuse a destination whose current occupant this profile may not remove.
+///
+/// Absence is the ordinary case and is fine: a rename onto a free name replaces
+/// nothing. An occupant is held to exactly the rule
+/// [`inspect_removable`] applies, because `renameat` removes it.
+///
+/// **The window between this inspection and the `renameat` is not closed by
+/// it**, and that is recorded rather than implied: another process can put a
+/// socket at the destination in between, and the rename will then replace it.
+/// Closing that window would need a `renameat` variant that refuses to replace
+/// — `RENAME_NOREPLACE` exists on Linux and has no portable equivalent on the
+/// only host this profile has run on — so what this narrowing buys is that a
+/// *caller* cannot spell the removal, not that the host cannot race into it.
+/// The escape it would be is bounded the same way every other race here is: the
+/// destination parent is an anchored descriptor inside the export, so whatever
+/// is replaced is inside the export too.
+fn inspect_replaceable(parent: &Handle, name: &str) -> Result<(), FsError> {
+    match rustix::fs::statat(parent.as_fd(), name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) => {
+            let identity = FileIdentity::from_stat(&stat);
+            if identity.kind() == FileKind::Symlink {
+                return Ok(());
+            }
+            check_exportable(identity.kind())?;
+            let parent_identity = parent.current_identity()?;
+            check_same_device(parent_identity, identity)
+        }
+        Err(errno) if errno == rustix::io::Errno::NOENT => Ok(()),
+        Err(errno) => Err(host_error(errno)),
     }
 }
 

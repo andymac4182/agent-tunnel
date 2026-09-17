@@ -1632,6 +1632,12 @@ struct M2Actor {
     peer_fence_message_id: Option<String>,
     rotation_started: Instant,
     rotations_completed: u64,
+    /// The filesystem mutation ledger, summed over completed exchanges.
+    ///
+    /// Folded in at `HttpActorRequest::Done`, which is the one place a
+    /// filesystem exchange's own counters reach the actor, and published in
+    /// every status snapshot from there on.
+    fs_counters: crate::FsCounters,
     status: watch::Sender<ConnectionStatus>,
     cancellation: CancellationToken,
     control_local_addr: Option<std::net::SocketAddr>,
@@ -1780,6 +1786,7 @@ async fn run_m2_session(
         peer_fence_message_id: None,
         rotation_started: Instant::now(),
         rotations_completed: 0,
+        fs_counters: crate::FsCounters::default(),
         status,
         cancellation: cancellation.clone(),
         control_local_addr,
@@ -2398,6 +2405,7 @@ impl M2Actor {
             queue_frames: self.pending_outputs.len(),
             queue_bytes: self.aggregate_retained_bytes(),
             rotations_completed: self.rotations_completed,
+            fs: self.fs_counters,
             recovery_attempt,
             recovery_attempt_started_at_ms,
             recovery_attempt_deadline_ms,
@@ -8914,6 +8922,7 @@ mod tests {
             peer_fence_message_id: None,
             rotation_started: Instant::now(),
             rotations_completed: 0,
+            fs_counters: crate::FsCounters::default(),
             status,
             cancellation,
             control_local_addr: None,

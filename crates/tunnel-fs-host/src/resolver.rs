@@ -369,7 +369,13 @@ impl ExportRoot {
     /// As [`ExportRoot::open_write`], under [`Primitive::OpenTruncate`].
     pub fn open_truncate(&self, path: &VirtualPath) -> Result<Handle, FsError> {
         let handle = self.open_for_size_change(path, Primitive::OpenTruncate)?;
-        rustix::fs::ftruncate(handle.as_fd(), 0).map_err(host_error)?;
+        // Through `Handle::set_size`, not a bare `ftruncate` mapped by
+        // `host_error`: the truncation **is** the effecting syscall, so its
+        // failure is `failed` — the host was asked and reported it changed
+        // nothing — and `host_error` would report `not_started` for a call that
+        // was made. `EFBIG`, an immutable file's `EPERM` and a media `EIO` all
+        // arrive here.
+        handle.set_size(0)?;
         Ok(handle)
     }
 
@@ -380,7 +386,9 @@ impl ExportRoot {
     /// As [`ExportRoot::open_write`], under [`Primitive::SetattrSize`].
     pub fn set_size(&self, path: &VirtualPath, size: u64) -> Result<(), FsError> {
         let handle = self.open_for_size_change(path, Primitive::SetattrSize)?;
-        rustix::fs::ftruncate(handle.as_fd(), size).map_err(host_error)
+        // As in [`ExportRoot::open_truncate`]: the effecting syscall reports
+        // `failed`, never `not_started`.
+        handle.set_size(size)
     }
 
     fn open_for_size_change(

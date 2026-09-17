@@ -184,7 +184,19 @@ pub fn vpath(text: &str) -> VirtualPath {
 pub fn exchange(provider: &mut Provider<TestAuthority>, frame: Frame) -> Vec<Outbound> {
     let mut out = provider.accept(&frame);
     while provider.has_work() {
-        out.extend(provider.step());
+        let produced = provider.step();
+        // **This helper stands in for the connector, so it settles the mutation
+        // ledger the way the connector does.** A reply that reaches the carrier
+        // is an acknowledgement; without this the ledger would stay open for
+        // every mutation these tests perform and `Provider::close` would report
+        // all of them `unknown`, which is the opposite of what an ordinary
+        // exchange means. The tests that are *about* an undelivered reply drive
+        // `accept` and `step` themselves and decline to confirm, which is
+        // exactly the shape a dropped consumer has.
+        if produced.iter().any(|out| matches!(out, Outbound::Frame(_))) {
+            provider.confirm_effect_delivered();
+        }
+        out.extend(produced);
     }
     out
 }
@@ -375,6 +387,30 @@ pub fn tsetattr_size(tag: u16, fid: u32, size: u64) -> Frame {
 /// A `Tsetattr` naming only a new mode.
 pub fn tsetattr_mode(tag: u16, fid: u32, mode: u32) -> Frame {
     tsetattr(tag, fid, tunnel_fs_ninep::flags::SETATTR_MODE, mode, 0)
+}
+
+/// A `Tsetattr` naming an **explicit** modification time.
+///
+/// Both mask bits: the field bit and its `_SET` companion. Without the second
+/// the same request means `touch`, which is a different case and has its own
+/// helper spelling in the test that uses it.
+pub fn tsetattr_mtime(tag: u16, fid: u32, seconds: u64, nanoseconds: u64) -> Frame {
+    Frame::new(
+        tag,
+        Message::Tsetattr {
+            fid,
+            valid: tunnel_fs_ninep::flags::SETATTR_MTIME
+                | tunnel_fs_ninep::flags::SETATTR_MTIME_SET,
+            mode: 0,
+            uid: 0,
+            gid: 0,
+            size: 0,
+            atime_sec: 0,
+            atime_nsec: 0,
+            mtime_sec: seconds,
+            mtime_nsec: nanoseconds,
+        },
+    )
 }
 
 pub fn tsetattr(tag: u16, fid: u32, valid: u32, mode: u32, size: u64) -> Frame {

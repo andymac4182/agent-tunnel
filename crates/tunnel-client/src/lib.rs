@@ -219,6 +219,63 @@ pub struct ConnectionStatus {
     pub control_local_addr: Option<SocketAddr>,
     pub active_local_addr: Option<SocketAddr>,
     pub candidate_local_addr: Option<SocketAddr>,
+    /// The filesystem mutation ledger, summed over every filesystem exchange
+    /// this session has completed.
+    ///
+    /// **Counters, and counters only.** Every field is an event count, so no
+    /// path, name, byte of content or credential is representable here — the
+    /// same construction rule `tunnel_fs_provider::ProviderStats` is built to,
+    /// and the reason it can be republished unfiltered.
+    ///
+    /// It is here because a ledger nothing exposes is a ledger no operator can
+    /// read: `AGENTS.md` requires diagnostics to expose counters, and how far a
+    /// mutation got — dispatched, applied, `failed`, `partial` or `unknown` —
+    /// is the counter a filesystem export has that nothing else does. Zero for
+    /// a session that served no filesystem stream.
+    pub fs: FsCounters,
+}
+
+/// The filesystem mutation ledger as a session total.
+///
+/// A distinct type rather than `ProviderStats` itself, because this is a **sum
+/// over exchanges** where the provider's own counters are per session;
+/// republishing that type directly would let a reader take `mutations_applied`
+/// here for the number one 9P session applied.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FsCounters {
+    /// Filesystem exchanges that ran to completion on this device session.
+    pub exchanges: u64,
+    /// Mutating requests refused before the host was touched. `not_started`.
+    pub mutations_refused: u64,
+    /// Mutating requests handed to the host.
+    pub mutations_dispatched: u64,
+    /// Dispatched mutations the host applied, whole or in part.
+    pub mutations_applied: u64,
+    /// Applied mutations whose reply reached the carrier.
+    pub mutations_acknowledged: u64,
+    /// Dispatched mutations the host reported changed nothing. `failed`.
+    pub mutation_failed: u64,
+    /// Mutations that applied part of what they were asked for. `partial`.
+    pub mutation_partial: u64,
+    /// Applied mutations whose outcome the consumer cannot learn. `unknown`.
+    pub mutation_unknown: u64,
+    /// Bytes the host acknowledged writing.
+    pub bytes_written: u64,
+}
+
+impl FsCounters {
+    /// Fold one completed exchange's provider counters into this total.
+    pub fn absorb(&mut self, stats: &tunnel_fs_provider::ProviderStats) {
+        self.exchanges += 1;
+        self.mutations_refused += stats.mutations_refused;
+        self.mutations_dispatched += stats.mutations_dispatched;
+        self.mutations_applied += stats.mutations_applied;
+        self.mutations_acknowledged += stats.mutations_acknowledged;
+        self.mutation_failed += stats.mutation_failed;
+        self.mutation_partial += stats.mutation_partial;
+        self.mutation_unknown += stats.mutation_unknown;
+        self.bytes_written += stats.bytes_written;
+    }
 }
 
 impl Default for ConnectionStatus {
@@ -258,6 +315,7 @@ impl Default for ConnectionStatus {
             control_local_addr: None,
             active_local_addr: None,
             candidate_local_addr: None,
+            fs: FsCounters::default(),
         }
     }
 }

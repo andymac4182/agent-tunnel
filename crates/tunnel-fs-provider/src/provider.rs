@@ -8,7 +8,9 @@ use std::collections::{BTreeMap, VecDeque};
 use tunnel_fs_core::{
     CapabilitySet, FeatureSet, FsError, FsErrorCode, Limits, Outcome, Primitive, SessionErrorCode,
 };
-use tunnel_fs_host::{DirReader, ExportRoot, FileKind, Handle, HostEntry, Intent, Metadata};
+use tunnel_fs_host::{
+    DirReader, ExportRoot, FileKind, Handle, HostEntry, Intent, Metadata, TimeChange,
+};
 use tunnel_fs_ninep::{
     Accepted, Attributes, COUNTED_REPLY_OVERHEAD, DirEntry, ENTRY_OVERHEAD, Frame, GETATTR_ALL,
     GETATTR_BASIC, Message, Primitives, Qid, QidKind, RequestPaths, Session, SessionError,
@@ -126,11 +128,12 @@ pub struct ProviderStats {
     pub mutations_dispatched: u64,
     /// Dispatched mutations the host reported it applied, whole or in part.
     pub mutations_applied: u64,
-    /// Applied mutations whose reply this dispatcher produced.
+    /// Applied mutations whose reply reached the carrier.
     ///
-    /// `mutations_applied - mutations_acknowledged` is the number whose effect
-    /// happened and whose reply the consumer has not been given, which is
-    /// exactly [`Outcome::Unknown`].
+    /// `mutations_applied - mutations_acknowledged == mutation_unknown` is an
+    /// identity, which is why this is counted where delivery is confirmed
+    /// rather than where the reply is built: a reply that was produced and
+    /// could not be sent is not an acknowledgement of anything.
     pub mutations_acknowledged: u64,
     /// Dispatched mutations the host reported changed nothing.
     ///
@@ -307,7 +310,15 @@ impl<A: Authority> Provider<A> {
     /// filesystem side effect nor its arrival, and this settles the ledger
     /// rather than claiming either.
     pub fn confirm_effect_delivered(&mut self) {
-        self.undelivered_effect = false;
+        if self.undelivered_effect {
+            self.undelivered_effect = false;
+            // Counted **here** and not where the reply was built, so that
+            // `mutations_applied - mutations_acknowledged == mutation_unknown`
+            // is an identity rather than an approximation: a reply the
+            // connector could not send must not be counted as acknowledged and
+            // then counted again as unknown.
+            self.stats.mutations_acknowledged += 1;
+        }
     }
 
     /// Record that the reply carrying the outstanding effect could not be sent.
@@ -499,11 +510,31 @@ impl<A: Authority> Provider<A> {
                     self.stats.mutations_dispatched += 1;
                     self.stats.mutation_failed += 1;
                 }
-                // A partial or unknown effect is never reported by an
-                // `Rlerror`: it has a reply carrying what was applied, and it
-                // is settled rather than failed. Counting it here would report
-                // an effect twice.
-                Outcome::Partial | Outcome::Unknown => {
+                // **Both of these are reported by an `Rlerror`, and they are
+                // not the same fact.**
+                //
+                // `Partial` is a composite mutation — a multi-field `Tsetattr`
+                // — whose later field failed after an earlier one applied. The
+                // consumer *is* told: it receives the `Rlerror` naming the
+                // field that failed, and what it cannot tell from that alone is
+                // that part of the request applied. So this opens the ledger
+                // like any other effect-carrying reply and lets the connector
+                // settle it on the send; counting it `unknown` here would label
+                // a reply that was delivered as one that was not.
+                //
+                // `Unknown` is the post-effect identity read: the host changed
+                // and no code in the closed vocabulary can say what it made, so
+                // the caller cannot learn the outcome however well the reply is
+                // delivered. That one is counted here and the ledger is closed
+                // with it, because there is nothing left for delivery to
+                // settle.
+                Outcome::Partial => {
+                    self.stats.mutations_dispatched += 1;
+                    self.stats.mutations_applied += 1;
+                    self.stats.mutation_partial += 1;
+                    self.undelivered_effect = true;
+                }
+                Outcome::Unknown => {
                     self.stats.mutations_dispatched += 1;
                     self.stats.mutations_applied += 1;
                     self.undelivered_effect = true;
@@ -535,9 +566,6 @@ impl<A: Authority> Provider<A> {
         let frame = Frame::new(queued.tag, reply.message);
         if let Err(error) = self.session.complete(&frame) {
             return self.refuse(queued.tag, error);
-        }
-        if reply.effect.is_some() {
-            self.stats.mutations_acknowledged += 1;
         }
         if let Some(fid) = self.primary_fid(&queued.frame.message) {
             match reply.cache {
@@ -916,9 +944,22 @@ impl<A: Authority> Provider<A> {
         // The qid is taken from the descriptor that was actually opened, not
         // from the `statat` above: the two can disagree, and the descriptor is
         // the only authority.
-        let opened = handle.metadata()?;
+        //
+        // **A truncating open has already emptied the file by the time this
+        // runs**, so both failures below are reported `unknown` rather than
+        // `not_started`: the content is gone and an `Rlerror` saying the
+        // request never started would invite a caller to conclude otherwise. A
+        // non-truncating open changed nothing and keeps its own outcome.
+        let effected = |error: FsError| {
+            if truncating {
+                tunnel_fs_host::after_effect(error)
+            } else {
+                error
+            }
+        };
+        let opened = handle.metadata().map_err(effected)?;
         if (opened.kind() == FileKind::Directory) != matches!(mode, OpenKind::Directory) {
-            return Err(FsError::refused(FsErrorCode::Einval));
+            return Err(effected(FsError::refused(FsErrorCode::Einval)));
         }
         let iounit = self.session.msize().saturating_sub(COUNTED_REPLY_OVERHEAD);
         let reply = Reply::opening(
@@ -1124,7 +1165,9 @@ impl<A: Authority> Provider<A> {
         let handle = self
             .root
             .create(&path, mode, flags & O_TRUNC != 0, access == O_RDWR)?;
-        let created = handle.metadata()?;
+        // **The file exists by now**, so a failed identity read is `unknown`:
+        // the create happened and this reply cannot say what it made.
+        let created = handle.metadata().map_err(tunnel_fs_host::after_effect)?;
         let iounit = self.session.msize().saturating_sub(COUNTED_REPLY_OVERHEAD);
         Ok(Reply::creating(
             Message::Rlcreate {
@@ -1297,7 +1340,7 @@ impl<A: Authority> Provider<A> {
             SETATTR_MTIME_SET,
             request.mtime,
         );
-        if atime.is_some() || mtime.is_some() {
+        if atime != TimeChange::Omit || mtime != TimeChange::Omit {
             let result = match self.cached(fid) {
                 Some(entry) => entry.handle.set_times(atime, mtime),
                 None => self
@@ -1344,21 +1387,27 @@ struct SetattrRequest {
     mtime: (u64, u64),
 }
 
-/// Whether one `Tsetattr` timestamp is to be set, and to what.
+/// What one `Tsetattr` timestamp field asks for.
 ///
-/// `.L` gives each timestamp two bits: one saying "change this field" and one
-/// saying "use the value I supplied rather than the current time". This profile
-/// has **no clock**, so the "current time" spelling — the field bit without its
-/// `_SET` companion — is answered by the host's own `UTIME_NOW`… which this
-/// implementation does not use either. It returns `None` for that combination,
-/// so such a request changes nothing and is refused as an empty effect rather
-/// than silently applying a time this provider made up.
-const fn times_of(valid: u32, field: u32, explicit: u32, value: (u64, u64)) -> Option<(u64, u64)> {
-    if valid & field != 0 && valid & explicit != 0 {
-        Some(value)
-    } else {
-        None
+const fn times_of(valid: u32, field: u32, explicit: u32, value: (u64, u64)) -> TimeChange {
+    if valid & field == 0 {
+        return TimeChange::Omit;
     }
+    if valid & explicit == 0 {
+        // The field bit without its `_SET` companion means "use the current
+        // time", and it is the **ordinary** spelling rather than an exotic one:
+        // `utimes(NULL)` sends it, which is what `touch` sends. An earlier
+        // round of this gate dropped it silently and answered `Rsetattr`, which
+        // reported success for a request that partly did not happen — exactly
+        // what the contract forbids. Refusing it instead would have been the
+        // other wrong answer: it would refuse `touch`.
+        //
+        // The clock is the **host's**, resolved by the kernel inside
+        // `futimens` through `UTIME_NOW`. Nothing in this profile reads one, so
+        // this is not the clock enforcement gate 5 deliberately does not do.
+        return TimeChange::Now;
+    }
+    TimeChange::Explicit(value.0, value.1)
 }
 
 /// Refuse `O_APPEND`, which this profile does not implement.

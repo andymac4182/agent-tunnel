@@ -193,9 +193,22 @@ pub struct FsWritePathEvidence {
     pub interrupt_within_sent_bytes: bool,
     /// Whether the gate re-sent anything after the interruption.
     ///
-    /// Always false, and recorded so the claim is evidence rather than prose:
-    /// "Do not automatically retry mutations", and an ambiguous one least of
-    /// all.
+    /// **Always false, and structural rather than measured — which is worth
+    /// saying plainly, because the prefix checks above cannot detect a replay
+    /// and it would be easy to read them as if they could.** A `Twrite` is
+    /// positioned, so a block re-applied at its own offset is byte-identical
+    /// and leaves the file a perfect prefix of the source either way. What the
+    /// prefix checks *do* catch is a block applied at the **wrong** offset or
+    /// out of order, which is a different defect.
+    ///
+    /// The non-replay claim rests on two things that are not this field: no
+    /// code path in this gate re-sends anything after the interruption, and no
+    /// path in the dispatcher performs a queued request twice — `step` pops
+    /// each entry once. The device-side counter that *would* measure it is
+    /// `mutations_applied`, which is now published in the connector's status
+    /// snapshot; reading it from a consumer is not possible, because there is
+    /// no wire field for an outcome, and correlating it across a session the
+    /// gate deliberately abandoned is not something this gate attempts.
     pub interrupt_replayed: bool,
     // (g) a host failure.
     pub host_failure_errno: Option<u32>,
@@ -363,7 +376,10 @@ pub fn validate_fs_write_path_evidence(evidence: &FsWritePathEvidence) -> Result
                 && evidence.interrupt_host_bytes >= evidence.interrupt_acknowledged_bytes,
         ),
         (
-            "the interrupted file is a prefix of the source, so nothing was replayed",
+            // What this catches is a block applied at the wrong offset or out
+            // of order — **not** a replay, which a positioned write makes
+            // invisible to any comparison of the result.
+            "the interrupted file is a prefix of the source, so nothing landed out of place",
             evidence.interrupt_is_source_prefix,
         ),
         (
@@ -1201,11 +1217,13 @@ async fn read_only_case(
 /// * every **acknowledged** byte is on the host and correct — the acknowledged
 ///   prefix is `bytesAcknowledged`, a lower bound confirmed by replies;
 /// * the whole file is a **prefix of the source** — a block applied twice, or
-///   at the wrong offset, would put bytes there that do not match;
+///   at the wrong offset, would put bytes there that do not match — though a
+///   block replayed at its *own* offset would not, which is why non-replay is
+///   claimed structurally below rather than measured here;
 /// * the host holds **no more than was sent**;
-/// * and nothing is re-sent. A retry would be a second dispatch of a mutation
-///   whose first dispatch is ambiguous, which is precisely what the contract
-///   forbids.
+/// * and nothing is re-sent — structurally, because there is no retry in this
+///   function. A retry would be a second dispatch of a mutation whose first
+///   dispatch is ambiguous, which is precisely what the contract forbids.
 async fn interrupted_case(
     target: &Target,
     ca: &[u8],
@@ -1279,8 +1297,10 @@ async fn interrupted_case(
     evidence.interrupt_is_source_prefix =
         settled.len() <= block.len() && settled[..] == block[..settled.len()];
     evidence.interrupt_within_sent_bytes = settled.len() <= block.len();
-    // Nothing was re-sent: there is no retry anywhere in this function, and the
-    // field records that as evidence rather than leaving it to the reader.
+    // Nothing was re-sent. This is a **structural** claim about this function —
+    // there is no retry in it — and not something the checks above measured: a
+    // positioned write replayed at its own offset is byte-identical, so no
+    // comparison of the resulting file could tell the two apart.
     evidence.interrupt_replayed = false;
     Ok(())
 }
@@ -1556,7 +1576,7 @@ mod tests {
             ("the host holds more than was sent", |e| {
                 e.interrupt_within_sent_bytes = false;
             }),
-            ("an ambiguous mutation was replayed", |e| {
+            ("an ambiguous mutation was re-sent", |e| {
                 e.interrupt_replayed = true;
             }),
             ("the host failure named another code", |e| {

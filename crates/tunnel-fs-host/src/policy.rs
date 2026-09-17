@@ -95,6 +95,33 @@ pub fn mutation_error(errno: Errno) -> FsError {
     }
 }
 
+/// Strengthen a failure that happened **after** the effecting syscall.
+///
+/// Several mutations cannot describe themselves in one syscall: `mkdirat` and
+/// `symlinkat` create a node and return nothing, so the qid the reply has to
+/// carry costs a second call, and that second call can fail. **The effect has
+/// already happened at that point**, so reporting the second call's own errno
+/// unchanged would say the request never started when a directory or a link
+/// exists — the exact failure the outcome vocabulary is for.
+///
+/// The answer is [`Outcome::Unknown`] rather than [`Outcome::Partial`], and the
+/// distinction is worth stating: the node was created *whole*, and what is
+/// unknown is not how much applied but whether anything did, **from the
+/// caller's side**. The caller receives an `Rlerror` naming a code, and no code
+/// in the closed vocabulary can mean "it worked and I cannot tell you what I
+/// made". A caller that treated that `Rlerror` as `not_started` and retried
+/// would meet `EEXIST` on a name it does not believe it created.
+///
+/// Merged rather than assigned, so a failure that was already `Unknown` stays
+/// so and gate 1's monotonic ordering is what decides — never this function.
+#[must_use]
+pub fn after_effect(error: FsError) -> FsError {
+    FsError::Filesystem {
+        code: error.code(),
+        outcome: error.outcome().merge(Outcome::Unknown),
+    }
+}
+
 /// A resolution that observed the filesystem change underneath it.
 ///
 /// Reported as `ENOENT`: the entry this resolution had identified is not there

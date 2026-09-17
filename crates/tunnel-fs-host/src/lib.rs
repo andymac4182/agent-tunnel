@@ -89,11 +89,11 @@ pub use identity::{FileIdentity, FileKind};
 #[cfg(unix)]
 pub use metadata::{DirReader, HostEntry, Metadata};
 #[cfg(unix)]
-pub use policy::{MAX_LINK_HOPS, code_from_errno, mutation_error};
+pub use policy::{MAX_LINK_HOPS, after_effect, code_from_errno, mutation_error};
 #[cfg(unix)]
 pub use resolver::{ExportRoot, Handle, Intent};
 #[cfg(unix)]
-pub use write::{EFFECTING_FAILURE_OUTCOME, MODE_BITS_ALLOWED};
+pub use write::{EFFECTING_FAILURE_OUTCOME, MODE_BITS_ALLOWED, MODE_TYPE_BITS, TimeChange};
 
 /// Why this host cannot serve a filesystem export, or `None` when it can.
 ///
