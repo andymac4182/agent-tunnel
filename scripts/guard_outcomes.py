@@ -35,7 +35,15 @@ from collections.abc import Iterable
 #: ``REFUSED BY COMPILER`` — the guard is enforced by the type system or a
 #: feature gate, so defeating it does not build.  A stronger guarantee than a
 #: red test, reported separately and never counted in a red tally.
-USABLE_OUTCOMES = frozenset({"RED", "REFUSED BY COMPILER"})
+#: ``DOCUMENTED GREEN`` — the suite argues, in the case's own comment, why
+#: nothing can go red: the rule is defence in depth behind a guard that refuses
+#: first, so the green result *is* the measurement.  Reported separately and
+#: never counted in a red total.  A case marked this way that actually goes red
+#: becomes ``EXPECTED A DOCUMENTED GREEN, GOT: ...``, which is not usable —
+#: the rule became load-bearing and the comment explaining the green is wrong.
+#: This is distinct from a **stale** case, which nobody can explain and which
+#: must stay unusable (see task row M4-18).
+USABLE_OUTCOMES = frozenset({"RED", "REFUSED BY COMPILER", "DOCUMENTED GREEN"})
 
 #: Spellings worth explaining when they are listed, because the bare status
 #: reads as harmless.

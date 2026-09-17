@@ -647,40 +647,62 @@ async fn a_grandchild_dies_when_the_child_is_killed_for_bad_output() {
     );
 }
 
-/// **Every supervisor background task ends with its child.**
+/// **Nothing still holds the child handle once the child is gone.**
 ///
 /// This is the mechanism behind the other cleanup tests rather than a
-/// tidiness check: each background task holds an `Arc<ChildHandle>`, and one
-/// that loops forever keeps the handle's `Drop` — where the synchronous
-/// process-group kill lives — from ever running. The M8-C07 review found the
+/// tidiness check: the synchronous process-group kill lives in
+/// `ChildHandle::drop`, which runs when the **last `Arc` goes**, so anything
+/// still holding one keeps it from running. The M8-C07 review found the
 /// deadline ticker doing exactly that, and there was nothing a test could read
 /// to notice, because the child still died by another route.
+///
+/// The assertion is on `child_handle_holders`, read from `Arc::strong_count`,
+/// and **not** on the `background_tasks` counter. A future task that clones
+/// the handle without taking a `TaskGuard` would be invisible to the counter
+/// and would recreate the defect with this test still green; `strong_count` is
+/// the quantity that actually gates the drop and cannot be forgotten.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn every_background_task_ends_with_the_child() {
+async fn nothing_holds_the_child_handle_once_the_child_is_gone() {
     let workspace = tempfile::tempdir().expect("workspace");
     let (supervisor, mut events, session) = ready(config(workspace.path())).await;
     let ticket = supervisor.prompt(&session, "ok").expect("prompt");
     within(ticket.stop_reason()).await.expect("turn completed");
-    assert!(
-        supervisor.diagnostics().background_tasks > 0,
-        "the reader and the deadline ticker are running"
+    let before = supervisor.diagnostics();
+    // Exactly two, not "more than none": `> 0` would pass with only one of the
+    // reader and the deadline ticker running, which is the very state this
+    // test exists to rule out.
+    assert_eq!(
+        before.background_tasks, 2,
+        "the reader and the deadline ticker are both running"
+    );
+    assert_eq!(
+        before.child_handle_holders, 2,
+        "and both of them hold the child handle"
     );
 
     supervisor.drain().await;
     // Drain the event channel so the reader's final send cannot be what holds
-    // it open; the claim is about the tasks, not about a blocked consumer.
+    // it open; the claim is about the handle, not about a blocked consumer.
     while events.try_recv().is_ok() {}
 
-    let mut alive_tasks = supervisor.diagnostics().background_tasks;
+    let mut live = supervisor.diagnostics();
     for _ in 0..500 {
-        if alive_tasks == 0 {
+        if live.child_handle_holders == 0 {
+            assert_eq!(
+                live.background_tasks, 0,
+                "the instrumented counter agrees with the strong count"
+            );
             return;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
         while events.try_recv().is_ok() {}
-        alive_tasks = supervisor.diagnostics().background_tasks;
+        live = supervisor.diagnostics();
     }
-    panic!("{alive_tasks} supervisor task(s) outlived the child they supervise");
+    panic!(
+        "{} holder(s) of the child handle outlived the child, so its Drop -- where \
+         the process-group kill lives -- can never run ({} instrumented task(s))",
+        live.child_handle_holders, live.background_tasks
+    );
 }
 
 /// **A runtime torn down mid-flight still kills the group.**
@@ -726,8 +748,16 @@ fn a_runtime_torn_down_without_draining_still_kills_the_group() {
     assert!(!pid.is_empty(), "the wrapper started a grandchild");
     assert!(alive(&pid), "the grandchild is running before the teardown");
 
-    // No drain, no kill, no Drop on the Supervisor at all: just the runtime
-    // going away, which is what a panicking test does.
+    // No drain and no explicit kill: just the runtime going away, which is
+    // what a panicking test does.
+    //
+    // This deliberately leaves the child leader as a **zombie of this test
+    // process** — nothing is left to `wait()` on it once the runtime is gone.
+    // That is harmless (the test binary exits shortly after and init reaps it)
+    // and it is not what this test measures: the claim is about the
+    // *grandchild*, which is not our child and cannot be a zombie of ours.
+    // Please do not "fix" it by reaping here; doing so would need a handle the
+    // teardown has already destroyed, which is the whole point.
     drop(runtime);
 
     for _ in 0..500 {

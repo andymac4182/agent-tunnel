@@ -14,16 +14,25 @@
 //!   never reassembled.
 //! * stderr is drained so the child cannot block on it, and only counted.
 //!   Nothing of it is retained, forwarded or logged.
-//! * The child runs in its own process group and every end of its life signals
-//!   the whole group with `SIGKILL` through `rustix`, keeping this crate
-//!   `forbid(unsafe_code)`. **"Every end of its life" includes the ends that do
-//!   not run any of this crate's async code**: [`ChildHandle::drop`] sends the
-//!   group signal *synchronously*, because a runtime torn down by a panic drops
-//!   its tasks instead of running them and would otherwise leave the group
-//!   behind with only the leader reaped. That was the M8-C07 review's first
-//!   finding, and the two process-table tests in `tunnel-acp-fixture` —
-//!   dropping a supervisor without draining it, and a child that exits by
-//!   itself — are what now hold it. **A descendant that leaves the group — `setsid`,
+//! * The child runs in its own process group and **every end the supervisor
+//!   lives to see** signals the whole group with `SIGKILL` through `rustix`,
+//!   keeping this crate `forbid(unsafe_code)`. That includes the ends that run
+//!   none of this crate's async code: [`ChildHandle::drop`] sends the group
+//!   signal *synchronously*, because a runtime torn down by a panic drops its
+//!   tasks instead of running them and would otherwise leave the group behind
+//!   with only the leader reaped. That was the M8-C07 review's first finding,
+//!   and the process-table tests in `tunnel-acp-fixture` — a child that exits
+//!   by itself, a supervisor dropped without draining, and a runtime torn down
+//!   with the supervisor still live — are what now hold it.
+//! * **"Every end the supervisor lives to see" is the exact claim, and one
+//!   route is deliberately outside it: the device process dying.** On a
+//!   `SIGKILL`, a `process::exit` or a crash, no `Drop` of any kind runs. The
+//!   child then sees stdin at end of file and exits on its own, but nobody
+//!   signals its group, so a wrapper's grandchild is orphaned. This is not
+//!   closable from inside the process: it needs a kernel-side parent-death
+//!   facility (Linux has `PR_SET_PDEATHSIG`; macOS has no equivalent) or the
+//!   same containment boundary the escaping-descendant hole needs. Recorded on
+//!   M8-C07 as a sibling gap rather than left as a gap in this sentence. **A descendant that leaves the group — `setsid`,
 //!   `setpgid`, a daemon double fork — is outside this boundary and is not
 //!   killed.** That is inherited hole M3-09, and this crate ships a fixture
 //!   that demonstrates it rather than a claim that it does not exist. Group
@@ -201,12 +210,16 @@ impl Drop for ChildHandle {
     /// **leader only**, and the group is left behind. This is one `rustix`
     /// syscall, so it can run in `Drop` on any thread with no runtime at all.
     ///
-    /// The signal is sent only while the leader is still unreaped. POSIX keeps
-    /// a process-group ID from being reused while any member lives, so that is
-    /// the window in which `group` is guaranteed to still mean this group; once
-    /// the supervisor task has reaped the leader it has already sent the
-    /// post-wait group signal itself, and repeating it here could in principle
-    /// reach a recycled group id.
+    /// The signal is sent only while `exited` says the leader has not been
+    /// reaped, which **narrows** the window in which `group` could mean some
+    /// other group; it does not close it. POSIX keeps a process-group ID from
+    /// being reused while any member lives, but that argument assumes the
+    /// supervisor task is the only reaper, and it is not: during runtime
+    /// teardown tokio's own orphan reaper can reap the `kill_on_drop`ped
+    /// leader before this runs, while `exited` is still false. The remaining
+    /// race is microseconds wide and needs pid wraparound on top, so it is
+    /// theoretical — but it is narrowed, not eliminated, and saying otherwise
+    /// would be the kind of claim this chunk is not allowed to make.
     fn drop(&mut self) {
         self.kill.cancel();
         if !*self.exited.borrow() {

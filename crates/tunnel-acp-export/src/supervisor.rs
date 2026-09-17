@@ -207,9 +207,25 @@ pub struct Diagnostics {
     pub stderr_bytes: u64,
     pub stderr_over_cap: u64,
     pub group_kills: u64,
-    /// Supervisor background tasks still alive. Must reach 0 once the child
-    /// has been reaped: a task that outlives its child disables the
-    /// synchronous process-group cleanup.
+    /// Holders of the child handle other than this `Supervisor`, read from
+    /// `Arc::strong_count`.
+    ///
+    /// **This is the quantity that actually gates cleanup.** The synchronous
+    /// process-group kill lives in `ChildHandle::drop`, which runs when the
+    /// last `Arc` goes; anything still holding one keeps it from running. It
+    /// must reach 0 once the child has been reaped.
+    ///
+    /// It is deliberately preferred to `background_tasks` below for that
+    /// assertion: a future task that clones the `Arc` without taking a
+    /// `TaskGuard` would be invisible to the counter and would recreate the
+    /// M8-C07 defect **with the test still green**. `strong_count` needs no
+    /// instrumentation and cannot be forgotten.
+    pub child_handle_holders: u64,
+    /// Supervisor background tasks still alive, by explicit instrumentation.
+    ///
+    /// Kept alongside `child_handle_holders` because it names *what* is still
+    /// running rather than only that something is; it is the more readable of
+    /// the two and the weaker of the two.
     pub background_tasks: u64,
     pub resolutions: u64,
     pub permission_expirations: u64,
@@ -496,6 +512,8 @@ impl Supervisor {
             stderr_bytes: self.counters.stderr_bytes.load(Ordering::Relaxed),
             stderr_over_cap: self.counters.stderr_over_cap.load(Ordering::Relaxed),
             group_kills: self.counters.group_kills.load(Ordering::Relaxed),
+            // Minus one for this `Supervisor`'s own handle.
+            child_handle_holders: (Arc::strong_count(&self.child) as u64).saturating_sub(1),
             background_tasks: self.counters.background_tasks.load(Ordering::Relaxed),
             resolutions,
             permission_expirations,
