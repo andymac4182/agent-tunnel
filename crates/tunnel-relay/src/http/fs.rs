@@ -696,6 +696,10 @@ async fn pump(
     let closed = registration.base.closed.clone();
     registration.base.claim_admission();
     let mut cleanup = handle.echo_cleanup_guard(key.clone(), stream_id, operation_id.clone(), None);
+    // The invariant this depends on: `accept_reset` publishes the watch before
+    // anything cancels `closed` in the same actor turn, so either exit reads the
+    // reason.  Reordering that in the actor would silently downgrade a 1008 to a
+    // codeless close.
     // Cloned before the carriers consume the registration: the connector's
     // RESET is observed here out of band, ahead of its ordered delivery, and a
     // stream the actor closes for a revocation ends this loop through

@@ -376,7 +376,9 @@ impl DirReader {
             let raw = entry.file_name();
             let name = entry_name(raw)?;
             if name == "." || name == ".." {
-                skipped += 1;
+                // The two fixed entries are not charged to the skip budget: a
+                // negotiated ceiling of one or two would otherwise refuse every
+                // listing before a single entry was served.
                 continue;
             }
             // The kind and the identity are asked of the host by name relative
