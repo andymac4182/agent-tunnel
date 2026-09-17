@@ -809,6 +809,55 @@ Pin each published package, its exact resolved dependencies, and the upstream so
 | AI SDK native files | Compile `FilesV4` against pinned `@ai-sdk/provider`; exercise `ai.uploadFile` and the provider instance's optional metadata/download/delete methods using `createFilesApi`. This is a managed file-object view, with the reference restrictions below, not a directory API. |
 | AI SDK live tools | Register native filesystem tools or supported individual `files-sdk/ai-sdk` factories; validate actual schemas, abort propagation, bounded output and structured partial/unknown outcomes. Keep these gates separate from FilesV4. Ordinary CI does not require paid model calls. |
 
+#### The table, as satisfied (2026-09-17, task row M4-14)
+
+Four adapters exist, as export subpaths of `packages/client`. Two commands carry
+the evidence and they are separate on purpose:
+
+```sh
+cd packages/client && npm ci && npm run typecheck   # contract compilation
+cd packages/client && npm run test:peers            # registration and behaviour
+```
+
+**Compilation** is `npm run typecheck`. Each adapter's *source* imports the
+upstream declarations — `import type { Adapter, … } from 'files-sdk'`,
+`from '@mastra/core/workspace'`, `from 'just-bash'`, `from '@ai-sdk/provider'` —
+and is annotated with the upstream interface (`implements WorkspaceFilesystem`,
+`implements IFileSystem`, `const adapter: FilesAdapter`, `const api:
+TunnelFilesApi`), so `tsc` checks the implementations against the installed
+`.d.ts` under the lockfile. There is no `any`, no assertion onto an upstream
+type and no `@ts-expect-error` anywhere in `src/adapters/`. Those imports are
+**type-only**, so they erase at run time and the package keeps zero runtime
+dependencies; the four packages are exact-pinned dev and peer dependencies, and
+`npm test` is still green with `node_modules` deleted.
+
+`test/peers/contract.peers.ts` additionally asserts the installed versions are
+the pinned ones and that the upstream `FilesError` class and the
+`@mastra/core/workspace` error namespace are assignable to the option types the
+adapters ask consumers for — so an upstream signature change is a type error
+here rather than a surprise at a consumer's call site.
+
+| Row | What was run | Result |
+| --- | --- | --- |
+| Files SDK | `new Files({ adapter: createFilesAdapter({ remote, FilesError }) })`, then `head`, `exists`, `download`, `upload`, `copy`, `move`, `delete`, `list` through the wrapper; `files.capabilities` read back; `url`/`signedUploadUrl` permanent errors; a conditional upload refused before any socket traffic. | Pass. `capabilities` reports `rangeRead` and `delimiter` true, `metadata`, `cacheControl`, `serverSideCopy` and `multipart` false, `signedUrl: { supported: false }`, and every conditional primitive false. |
+| Files SDK retries | `new Files({ adapter, retries: 5 })` with a dispatched `Twrite` that never answers, then a 1011 close. | Pass, and this is the row that matters: **one `Twrite` on the wire, not six.** The error is a real `FilesError`, `Provider`, `permanent: true`, `applied: false`, with the client's `FilesystemError` and its `outcome: 'unknown'` as `cause`. |
+| Mastra | `new Workspace({ filesystem: new TunnelMastraFilesystem({ remote, errors }) })`, `workspace.init()`, then `readFile`, `writeFile`, `exists`, `stat`, `readdir` through `workspace.filesystem`, then `workspace.destroy()`. | Pass. `workspace.sandbox` is `undefined`: filesystem access implies no host command-execution sandbox. `destroy()` leaves the borrowed client `ready`. |
+| Mastra errors | The real `FileNotFoundError`, `FileExistsError` and `StaleFileError` raised through the adapter. | Pass, by `instanceof` against the installed classes. |
+| just-bash | `new Bash({ fs: new TunnelJustBashFilesystem({ remote }), cwd: '/', defenseInDepth: { excludeViolationTypes: ['setTimeout'] } })`, then `cat`, `ls`, a `wc -l` pipeline, `echo > file`, `cp && mv && ls`, `find -name`, and a 256-byte binary round trip through `wc -c`. Network, Python and JavaScript execution all off. | Pass. **The `setTimeout` exclusion is required**: just-bash 3.4.2 blocks the global for the duration of a script and the shared client arms a timer for every request deadline, so without it the first `cat` fails before a byte reaches the socket. One exclusion is enough. |
+| just-bash failures | Shell `>>`, and a dispatched write that never answers. | Pass. `>>` **rejects out of `exec`** rather than becoming an exit status, and the file is untouched. The interrupted write leaves `exec` with a nonzero status that carries nothing, while `drainOperationFailures()` holds one record with `outcome: 'unknown'`. |
+| AI SDK FilesV4 | `ai.uploadFile({ api, … })` with a counting wrapper; then `getFileMetadata`, `downloadFile` and `deleteFile` invoked on the instance itself. | Pass. **One provider call**, matching the inspected helper: it calls once and rethrows, with no `maxRetries` to disable. An ambiguous upload rethrows with `outcome: 'unknown'`, mints no reference, sends one `Twrite`, and leaves its path in `incompleteUploads()`. |
+| AI SDK live tools | — | **Not satisfied.** No tool factories are implemented: no native filesystem `tool()` definitions, no filtered `files-sdk/ai-sdk` factories, no `bash-tool` wrapper. Input schemas, abort propagation, bounded output and model-visible outcome fields are all untested. This row remains open. |
+
+**What none of this establishes.** Every socket is the loopback harness in
+`packages/client/test/harness/`. It is not `crates/tunnel-relay` and not
+`crates/tunnel-fs-provider`; there is no TLS, no tunnel, no grant, no
+confinement and no filesystem behind it. This document's own rule applies
+without qualification, so no row above is evidence of endpoint interoperability
+or authorization. The read-only-mount and writable-profile pairing below is
+exercised only where the descriptor fixture can express it — a read-only export
+is proven to refuse `createFilesApi` at construction — and a real read-only
+*grant*, enforced by a device, is untested here.
+
 Run each supported adapter against a read-only mount and the documented writable profile. Where a framework expects an operation the endpoint cannot provide, prove the published adapter behavior: reject construction if that capability is mandatory, or expose an explicit unsupported-operation error if the framework permits it. An absent capability must never become fabricated metadata, a silently ignored option, or a successful no-op. Compile-time interface coverage and runtime capability coverage are separate results.
 
 ### Discovery, authentication, and session admission
@@ -1171,11 +1220,79 @@ are whatever a test says they are. This document's own rule applies without
 qualification: "constructing a compatible-looking object or passing an in-process
 mock proves neither endpoint interoperability nor authorization", and nothing
 here is evidence about `crates/tunnel-relay` or `crates/tunnel-fs-provider`.
-Nor are the four native adapters covered: none exists, so no row of the
-[contract compilation table](#contract-compilation-and-capability-profiles) above
-has been satisfied. Rotation, revocation under a live session, the cross-relay
+Rotation, revocation under a live session, the cross-relay
 hop, and every clock the device does not enforce remain exactly as gates 4 and 5
 left them.
+
+### Implementation gate 6: the four native adapters
+
+Added 2026-09-17 (task row M4-14). The adapters are export subpaths of the same
+package, so they run under the same one command:
+
+```sh
+cd packages/client && npm test
+```
+
+**508 tests, 508 pass, 0 fail**, offline with `node_modules` deleted — 88 of them
+the adapter suites. The contract-compilation evidence, which needs an install, is
+tabulated under [Contract compilation and capability
+profiles](#the-table-as-satisfied-2026-09-17-task-row-m4-14) above; this section
+is the behaviour.
+
+**Why the offline suites use stand-in framework classes, and why that is not the
+substitution this document forbids.** `npm test` runs with `node_modules`
+deleted, so it cannot load `files-sdk` or `@mastra/core`. The two adapters that
+need a *runtime* class — Files SDK's `FilesError`, Mastra's nine error classes —
+take them as constructor options, and the offline suites pass local classes with
+the same constructor shapes and assert exactly which arguments the adapter chose.
+The interface those stand-ins stand in for is checked by `tsc` against the
+installed declarations, and the real classes are used in `test/peers/`. The
+Files SDK suite also carries upstream's own retry predicate copied verbatim from
+`internal/retry.ts` as a test **oracle**, so a suite that cannot load the package
+can still ask the question the package asks; the real `Files` wrapper with
+`retries: 5` counts dispatches in the peers suite.
+
+**What the suites cover.** The object-key namespace, refused by gate 1's rules
+under gate 1's names, with the two key-shaped refusals — absolute and
+trailing-separator — under their own; a percent sign kept literal rather than
+decoded into traversal. The advertised capability surface, each flag checked
+against the method that would honour it: a non-`/` delimiter refused because
+`supportsDelimiter` means upstream will not gate it, user metadata and
+cache-control refused rather than dropped, `url` and `signedUploadUrl` permanent.
+Inclusive byte ranges, which are not `slice`'s. `exists` false only for a
+confirmed absence, in all four views. A directory refused by an object `delete`
+rather than reported absent. A native rename with no `Tunlinkat` on the wire.
+Bounded, single-use, query-bound pagination cursors, and a traversal budget that
+fails rather than returning a short complete page. Mastra's eleven operations,
+both timestamp policies — including a matching stat, a real `StaleFileError` on
+a mismatch, a missing file proceeding as the pinned `LocalFilesystem` does, and
+an unrelated stat failure preserved — and the `createdAt` fallback declared in
+`getInfo().metadata`. just-bash's synchronous members asserted to send nothing,
+its lexical `..` clamp, and `drainOperationFailures()` with its bound and its
+counted overflow. FilesV4 uploads from bytes, text, strictly decoded base64 and a
+stream; the reference bound refused before a file is created and with nothing
+evicted; foreign provider keys, unknown ids, closed-adapter ids and nonempty
+header overrides all refused; a reference proven to be an alias for a path by
+having another writer replace what it resolves to.
+
+**The outcome rows, which are the point of the whole section.** For each adapter,
+a dispatched mutation with no reply and a 1011 close, and a composite that
+applied one step and then failed. Files SDK: a permanent `Provider` error with
+`applied` unset and the outcome surviving only on `cause`, with upstream's
+predicate asserted to refuse a retry. Mastra: `TUNNEL_UNKNOWN` and
+`TUNNEL_PARTIAL`, asserted **not** to be `FileNotFoundError` — the class of
+mistake that reads as "nothing happened". just-bash: the record present in the
+side channel, and absent for a `not_started` failure, because a channel for
+ambiguous mutations should not fill with unambiguous ones. FilesV4: a throw, with
+`incompleteUploads()` holding the path, and a delete that rejects rather than
+answering `deleted: false`. Every adapter is also asserted to put no path, name
+or content into the message it hands its framework.
+
+**What these suites do not prove.** The same loopback harness, with the same
+consequence: not a relay, not a device, no TLS, no grant, no confinement. And the
+AI SDK **live tools** row of the contract-compilation table is not satisfied at
+all — no tool factories exist, so schemas, abort propagation, bounded output and
+model-visible outcome fields are untested.
 
 ### Shared dataset and native semantics
 

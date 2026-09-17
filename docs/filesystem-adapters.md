@@ -1,6 +1,30 @@
 # SDK adapter implementation plan
 
-Status: design ready for implementation, 2026-09-09; no adapter is implemented or published. The [filesystem endpoint contract](filesystem-api.md) is authoritative. All `@agent-tunnel/*` names below are proposed package names, not packages to install today. External SDK facts are pinned in the linked research notes; actual package installation/compilation is an implementation gate.
+Status: design ready for implementation, 2026-09-09; **amended 2026-09-17 — all four adapters are now implemented against installed, exact-pinned published packages** (task row M4-14, *implemented awaiting verification*). The [filesystem endpoint contract](filesystem-api.md) is authoritative. External SDK facts were pinned in the linked research notes from *source* snapshots; what an installed artifact actually contains is recorded in [Pinned packages, as installed](#pinned-packages-as-installed) below, including the three places the artifact differs from what this plan assumed.
+
+The `@agent-tunnel/*` names below remain **proposed package names**. The adapters ship as export subpaths of `packages/client` — `@agent-tunnel/client/files-sdk`, `/mastra`, `/just-bash`, `/ai-sdk` — rather than as four published packages, because splitting one lockfile and one offline test command into five is packaging work that changes no interface and would have to be undone to keep `npm test` runnable with `node_modules` deleted. The ownership table's *contents* are implemented as written; only the artifact boundary is deferred.
+
+## Pinned packages, as installed
+
+Verified 2026-09-17 against the npm registry and against the installed trees in `packages/client/node_modules`, with `packages/client/package-lock.json` committed. Every version this plan named exists; one it left as a range is now exact.
+
+| Package | Pinned | Exists | What the installed artifact actually declares |
+| --- | --- | --- | --- |
+| `files-sdk` | 2.4.0 | yes (latest is 2.5.0) | `Adapter<Raw>` requires `name`, `raw`, `upload`, `download`, `head`, `exists`, `delete`, `copy`, `list`, `url`, `signedUploadUrl`, exactly as planned, with `move`, `deleteMany`, `resumableUpload` and `conditional` optional. `FilesErrorCode` is `NotFound`, `Unauthorized`, `Conflict`, `ReadOnly`, `Provider`. |
+| `@mastra/core` | 1.65.0 | yes (latest is 1.67.0) | `WorkspaceFilesystem` has exactly the eleven asynchronous operations the plan counts, plus `id`/`name`/`provider`, optional `readOnly`/`basePath`/`icon`, and the optional lifecycle. `engines.node` is `>=22.13.0`. |
+| `just-bash` | 3.4.2 | yes (it is latest) | `IFileSystem` is the eighteen methods [testing.md](testing.md) lists plus synchronous `resolvePath`/`getAllPaths` and optional `readFileBytes`/`readdirWithFileTypes`. `engines.node` is `>=20.18.1`. |
+| `ai` | 7.0.94 | yes (latest is 7.0.105) | `uploadFile` accepts a `FilesV4` or a `ProviderV4`, calls `uploadFile` **once** and rethrows, with no `maxRetries` option — as the plan states. `engines.node` is `>=22`. |
+| `@ai-sdk/provider` | **4.0.11** | yes | The plan named only a peer range. 4.0.11 is the exact version `ai` 7.0.94 depends on, so it is the pin: any other would put two copies of `FilesV4` in a consumer's tree. `FilesV4` requires `specificationVersion: 'v4'`, `provider` and `uploadFile`; metadata, download and delete are optional. |
+
+The intersection of the pinned `engines` is **Node 22.13 or newer**, which is what the plan's matrix says. `packages/client` itself requires Node 24 for its own type-stripping test runner; that is this repository's tooling choice and not a consumer requirement.
+
+### Three differences from what this plan assumed
+
+1. **`files-sdk`'s retry gate makes the error class load-bearing.** Its `canRetry` is `error.code === "Provider" && !(error.aborted || error.permanent)`, applied to the result of `FilesError.wrap(cause)` — which returns `cause` unchanged **only** when `cause instanceof FilesError` and otherwise builds a fresh `Provider` error with `permanent` unset. An adapter throwing its own error type would therefore have every failure, an `unknown` mutation included, classified as retryable. `createFilesAdapter` takes the consumer's own `FilesError` class as a required option for that reason; `instanceof` is identity-sensitive, so a second copy of `files-sdk` in a tree would otherwise break the same way.
+2. **`just-bash`'s defense-in-depth blocks `globalThis.setTimeout` for the duration of a script.** The shared client arms a timer for every request deadline, so a `Bash` over a remote filesystem fails its first command before a byte reaches the socket. Upstream's own violation message names the remedy for trusted host-runtime code, and a `fs` the application injected is exactly that: supported constructions pass `defenseInDepth: { excludeViolationTypes: ['setTimeout'] }`. It is the **only** exclusion needed. Nothing in this plan anticipated it; it was found by running the real `Bash`.
+3. **`just-bash` 3.4.2 does not re-export three of `IFileSystem`'s own option types.** `ReadFileOptions`, `WriteFileOptions` and `DirentEntry` are declared in `dist/fs/interface.d.ts` and used in the interface's signatures, but the package root omits them from its `export type` list and its `exports` map exposes only `.` and `./browser`. They are extracted from the installed interface with `Parameters<>`/`ReturnType<>` rather than copied, because a local substitute is what [testing.md](testing.md) says cannot satisfy contract compilation.
+
+Two smaller observations, recorded because they are easy to get wrong: `ai.uploadFile` turns a plain **string** `data` into `{ type: 'data', data }`, which `FilesV4` defines as *base64*, not inline text — plain text must go through `{ type: 'text', text }`; and neither `files-sdk` nor `ai` exposes `./package.json` through its `exports` map, so a version assertion reads the installed tree rather than importing it.
 
 ## Supported integration paths
 
@@ -139,6 +163,30 @@ Provide bounded `read`, `list`, `write` and other granted tools over the shared 
 Alternatively use the supported individual factories from `files-sdk/ai-sdk` over the Files adapter, filtering unsupported URL and ungranted write tools. Bound actual received content, not only a pre-read `head`. Or wrap the just-bash instance with `bash-tool`, preserving structured operation failures and limiting output. Its inspected hydration/text wrapper can UTF-8-decode binary data and fully buffer files; disable automatic initial uploads and do not certify it for binary streaming.
 
 AI SDK's `Experimental_SandboxSession` and `@ai-sdk/sandbox-just-bash` are a separate exact-version integration gate. They include process methods as well as files, have buffering caveats, and the inspected package uses a different just-bash major version. Do not claim this endpoint can be passed directly to them. If prioritized, use remote filesystem operations plus a local simulated Bash for `run`/`spawn`; native remote process execution remains outside this API.
+
+## As implemented: `partial`, `unknown`, and what each interface cannot say
+
+`docs/filesystem-api.md` gives the shared client a four-word outcome vocabulary — `not_started`, `failed`, `partial`, `unknown` — and forbids the automatic replay of an ambiguous mutation. **None of the four interfaces above has that vocabulary.** Each adapter therefore chooses a surface, and the choice is recorded here rather than left to be inferred from a mapping table.
+
+| Consumer | Where `partial`/`unknown` goes | What it cannot express, stated |
+| --- | --- | --- |
+| Files SDK | A `Provider` `FilesError` with `permanent: true`, carrying the client's `FilesystemError` as `cause`. `applied` is **never** set — upstream it means a conditional mutation committed, which is a stronger claim than "may have happened". | `FilesError` has no outcome field, so `partial` and `unknown` arrive identically and survive only on `cause.outcome`. A consumer that logs the error and drops the cause has lost the distinction. |
+| Mastra | A `FilesystemError` with code `TUNNEL_PARTIAL` or `TUNNEL_UNKNOWN` and the client's error attached as `cause`. Never one of Mastra's semantic classes. | Mastra has no outcome concept and `code` is the only field open enough to carry one, so a tool switching on Mastra's own error classes falls through to a default. That is the correct outcome and the limit of the interface: `FileNotFoundError` after a half-applied write reads as "nothing happened". |
+| just-bash | A plain `Error` whose message is a code and an operation, **plus** the bounded `drainOperationFailures()` side channel carrying operation, code, virtual path, outcome and acknowledged bytes. 64 entries per execution, with overflow counted rather than dropped. | A Bash exit code and a line of stderr keep none of it. An AI tool wrapper reporting a failed execution must include the drained result and must never infer "safe to retry" from a nonzero exit code. |
+| AI SDK `FilesV4` | A throw, carrying the client's `FilesystemError` unchanged. `uploadFile` mints no reference and records the path it was writing in `incompleteUploads()`. | `warnings` rides only on results, and these calls have none. `deleteFile`'s `deleted: false` is the one field an ambiguous outcome could have been flattened into: after an `unknown` nobody knows the provider did not delete it, and `true` would be worse. There is no third value, so the call rejects. |
+
+The rule the four share: **no adapter emits a failure its framework would classify as retryable.** For Files SDK that is structural — `permanent: true` on every `Provider` error it builds, reads and session losses included, because the shared client never reconnects behind the caller's back and no second attempt through a closed client could succeed.
+
+### Named limits of the implemented adapters
+
+* **`appendFile` is unsupported in every view that has one.** Gate 5 does not advertise `nativeAppend`. Mastra's `appendFile` and shell `>>` both fail with an explicit unsupported-operation error rather than a stat-then-positioned-write, which is the race the contract forbids. In `just-bash` 3.4.2 a redirect-target failure **rejects out of `exec`** rather than becoming a shell exit status, so a consumer must catch it.
+* **Recursive directory copy is refused, not composed.** The shared client's `copy` is a bounded file read and write; Mastra's `copyFile({ recursive: true })` and `cp -r` are refused rather than half-copying a tree.
+* **`lstat` is `stat` and `realpath` is the identity**, for as long as `symlinks` is absent from the feature set. Named rather than implied.
+* **`readFileBytes` is not implemented.** Its `ByteString` return type is branded and only upstream's own constructors produce one; upstream declares the method optional and falls back to `readFileBuffer`.
+* **`getAllPaths()` returns the empty array**, which upstream permits: it is synchronous and this filesystem is remote. Glob discovery that depends on it finds nothing; globs resolved through `readdir` work.
+* **The Mastra adapter implements `WorkspaceFilesystem` rather than extending `MastraFilesystem`.** Extending the base class is a *value* import of `@mastra/core`, which would put a framework dependency inside a package whose shape is that it has none; upstream's own class documentation sanctions implementing the interface directly. The cost, named: no Mastra logger reaches the adapter.
+* **Files SDK `url` and `signedUploadUrl` are permanent unsupported errors**, `signedUrl: { supported: false }` is advertised, and the `conditional` block is absent entirely so every compare-and-set call fails before provider I/O.
+* **Files SDK pagination cursors are live, session-local traversals** keyed in a per-adapter map: at most 16, 60-second idle expiry, single use, and bound to their own prefix, delimiter and grant revision. A reused, expired or re-queried cursor is refused rather than silently restarting page one.
 
 ## Delivery slices and acceptance
 
