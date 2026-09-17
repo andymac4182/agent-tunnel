@@ -2851,6 +2851,18 @@ mod tests {
         for (name, mutate) in mutations {
             let mut evidence = passing_evidence();
             mutate(&mut evidence);
+            // Rebuild the disclosure from the mutated run before validating.
+            //
+            // Two of these fields — the rotation count and the span — are also
+            // quoted in the rotation disclosure, so mutating one made the
+            // *disclosure* rule fail and the rule under test was never
+            // reached.  The guard-deletion suite found it: deleting "three
+            // completed rotations are required" and "the window must finish
+            // inside one membership record" reddened nothing, because this
+            // test was catching those two mutations by the wrong rule.  The
+            // disclosure rule keeps its own test below.
+            evidence.not_covered =
+                not_covered(evidence.rotation_span_ms, evidence.rotations_across_span);
             assert!(
                 validate_acp_cluster_evidence(&evidence).is_err(),
                 "falsifying {name} was accepted by the validator"

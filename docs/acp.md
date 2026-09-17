@@ -599,6 +599,229 @@ vacuously. The connection-capacity table at its real bounds. The
 still refused 501. macOS is the only host, and the only agent is this
 repository's own synthetic fixture; no ACP **server** has been run.
 
+## Implemented in code (M8 chunk 5)
+
+Chunk 5 is the gate `verify-m8-acp-cluster`, registered beside chunk 4's in
+`scripts/m8-harness-verify.sh`. It takes the same three-relay production
+cluster — device owned by **relay-a**, consumer entering at **relay-c**, every
+exchange across the private mTLS HTTP/3 peer hop — and adds the six things
+chunk 4 listed as chunk 5's, plus the one chunk 4 recorded that it could not
+claim at all.
+
+### Three completed rotations, with two sessions live across them
+
+**This is the headline, and it turned out to be provable without any product
+change.** Chunk 4's "Not proven" said: "**An ACP connection carried across a
+completed scheduled rotation**: `rotations_completed` is recorded per run and
+disclosed from the field, never asserted in prose." That is now asserted, and
+the reason it is possible is a distinction the earlier record did not draw:
+
+- A **scheduled device data-socket rotation** (`tunnel_protocol::rotation`)
+  replaces the device's data WebSocket, fencing, draining and replaying its
+  logical streams. `docs/acp.md` has always said this "leaves ACP connections,
+  sessions, requests, callbacks, and GET streams intact".
+- A **membership re-sign** (`membership_runtime.rs`) invalidates every peer
+  admission and every stream riding it. **That** is M7-C80.
+
+They share no code: nothing in the rotation state machine touches membership
+and nothing in `membership_runtime.rs` touches `RotationState`. So the demand
+is met without weakening what "kept active" means, without routing the consumer
+to the owner relay, and without re-signing in a way that misses a live stream:
+the consumer stays at the non-owner ingress, the rotations are real scheduled
+rotations driven by the connector's own policy timer, and membership is simply
+not re-signed between the moment the streams open and the moment the third
+rotation completes.
+
+What the case holds and what it measures:
+
+- **Two sessions on one connection**, each with its own subscriber, each
+  carrying a completed warm-up turn before the window and a turn **held open on
+  a pending permission callback** across it. So a prompt, a callback and a
+  pending response all span each drain.
+- **Three completed rotations**, from the connector's counter and the owner
+  relay's own independent counter, which must agree. `wait_for_rotation`
+  requires the candidate to be gone, the active generation to have advanced and
+  the active socket to have moved, so a half-finished attempt cannot be counted.
+- **The anti-cheat `verify-m7-i08-synthetic-rotation` uses**: the window must be
+  at least `interval × 3` long. Recovery activations bump the same counter, so
+  a window shorter than the schedule counted recoveries rather than rotations.
+- **No lost updates, no duplicate callbacks, no repeated side effects.** Per
+  session: the callback is observed **exactly once**, an update arrives before
+  the window and another after the held callback is answered, and the held
+  turn's `stopReason: "end_turn"` is read off the wire — **correlated by
+  JSON-RPC id**, not by "any message carrying a stopReason". That correlation
+  is load-bearing and was a real bug in the first draft of this gate: a held
+  stream keeps every message it has seen, so the loose picker matched the
+  *warm-up* turn's `end_turn` still sitting in the buffer and reported it as
+  the held turn's result. One session passed anyway, for the wrong reason.
+- **The side effect is counted from the agent's own append-only ledger**, one
+  per held turn, and again after a settle window. This needed a fixture
+  addition: every ledger-writing directive before this one also **crashed** the
+  agent, so a turn that must survive three rotations and then finish had no way
+  to record a durable effect. `effect` and `effect-permission` are that
+  addition, and they are the only reason this claim rests on what the agent
+  wrote rather than on the harness counting SSE messages.
+- **The documented socket count.** Every device socket passes a `TcpProxy`, so
+  the count is read from underneath the tunnel: **two at every settled steady
+  state** and a peak of **three**, with a distinct data-socket address per
+  rotation. The device tunnel session id and owner epoch are unchanged, so
+  these are rotations and not a reconnect.
+
+**Recorded run:** 3 rotations, connector and owner agreeing, in **11,223 ms**;
+steady-state sockets `[2, 2, 2]`, peak 3, five distinct data-socket addresses;
+both turns `end_turn`; one callback each; side effects 2 and 2 after settle;
+no leftover processes.
+
+### The ceiling this does not escape, and what would be needed to
+
+A peer admission's deadline is `min(trust_deadline, peer_deadline)` **anchored
+at admission and never extended** — `membership_runtime.rs` says so in terms:
+"never extended by a later checkpoint receipt". The fixture signs records at
+60 s, which is the product maximum (`tunnel_cluster::membership::
+MAX_RECORD_LIFETIME`). Re-signing invalidates the admission (M7-C80); letting
+the record expire invalidates it too, through the same cancellation token with
+`TrustExpired` instead of `MembershipChanged`. From a live stream's point of
+view the two are indistinguishable.
+
+**So an ACP connection on a non-owner ingress cannot outlive one membership
+record, and no re-sign policy changes that.** This gate's rotation case is
+bounded by `ROTATION_CEILING` to finish inside one record rather than escaping
+the limit, and the gate's `NOT_COVERED` says so with the run's own numbers.
+M8-C14 reached the same ceiling from the other side, by expiry rather than by a
+re-sign.
+
+The product change that would lift it is the one M7-C80 already names, plus its
+sibling: allow a same-key, same-binding version bump with a non-shrinking trust
+deadline to **re-bind** an existing admission to the new record version rather
+than invalidating it, and let a refreshed record **extend** the admission
+deadline it was anchored to. Both halves are needed — the first alone still
+leaves expiry fatal. Neither is attempted here.
+
+### Two users in two tenants
+
+Two tenants, two devices, two owners (relay-a and relay-b), two ACP exports,
+entering at the same non-owner ingress.
+
+- **Identical ids, both types.** Both principals send `session/new` with the
+  string id `"1"` and then a prompt with the **number** `1`, and the two
+  exports independently issue the **same session identifier**. Each reply
+  arrives on its own caller's stream **exactly once** — a cross-routed answer
+  would show as two on one stream, which a per-stream "did it finish" check
+  would miss.
+- **Connection ids are the one identifier that cannot be made to collide, and
+  that is recorded rather than asserted around.** A connection id is
+  `acp-{epoch:016x}-{sequence:x}` with a per-export epoch, so two separately
+  started exports cannot mint the same one and no consumer can make them. The
+  reusable-identifier property is therefore met the way the product allows: a
+  **live** connection id from tenant A, presented in tenant B's context by
+  tenant B's own principal, is refused **byte-identically** to an id that never
+  existed. An earlier draft asserted the collision itself, which would have
+  been asserting something the gate cannot cause.
+- **Byte-identical, not merely "both refused".** Every refusal is compared
+  against the same request naming `ffffffffffffffffffffffffffffffff`, on the
+  same route with the same credential, field for field: status, every response
+  header except `date`, and the body bytes. M3-04's `Answer` is the precedent.
+  Both a second principal **of the same tenant** — the sharpest probe, since
+  nothing but the principal binding separates it — and a principal of the other
+  tenant are indistinguishable from the fiction. The status is pinned to
+  **404**, so the comparison cannot pass by both probes being some unrelated
+  error, and the genuine owner's own next turn still completes, so the refusals
+  are not passing because the connection had already gone.
+- **Nothing reached another process.** Tenant B's export opened exactly one
+  session — its own principal's. A refusal that had already started a child
+  would be a leak whatever it answered.
+
+### Three forged heads, each refused before a byte reaches the device
+
+A forged `tunnel-principal-binding` (shaped exactly like a real one, sixteen
+bytes of lowercase hex, so the refusal cannot be for being malformed), a forged
+`x-agent-tunnel-owner`, and a forged internal identity claim
+(`x-agent-tunnel-tenant-id` naming the *other* tenant, plus
+`x-agent-tunnel-principal-id`). All three answered **400** with
+`not_dispatched`; the ingress's own `ingress_rejected_before_admission` rose by
+three; and the export's `connections_opened` was **unchanged**, which is the
+claim that matters — a forged `initialize` that got through would have opened a
+connection and started a child.
+
+### Revocation, interruptions, and saturation
+
+- **Grant revocation** withdraws the admitted exchange, and the relay's own
+  exchange record classifies it **`execution: unknown`** — read from the
+  product's classification rather than inferred from a status. A later request
+  is `404 SERVICE_NOT_FOUND` / `not_dispatched`, nothing is dispatched
+  afterwards, and **the withdrawn turn never acquires a `stopReason`**. The
+  victim is a **third** principal, M3-04's precedent: an earlier draft revoked
+  the principal every other case drives, and every case after it met
+  `404 SERVICE_NOT_FOUND`.
+- **Peer-key rotation** (the ingress relay's peer pins withdrawn, and the
+  ingress→owner path dropped so a pooled connection cannot carry the stream on
+  regardless of the pin set) and **owner loss** (the owner relay stopped) each
+  produce an **explicit interruption** — the stream *fails*, rather than ending
+  cleanly, because a clean end would say the turn finished — and **neither ever
+  produces a `stopReason`**. Fabricating one is the failure these two cases
+  exist to exclude, and it fails the run by name.
+- **Both forwarding segments saturated concurrently**, sampled in one loop so
+  "concurrently" is a measurement rather than an arrangement. Chunk 4 listed
+  bounded per-hop queues as "not asserted rather than asserted vacuously"
+  because no case saturated a hop. Recorded run: the ingress→owner hop at
+  **195,933** bytes in flight and the owner's receive side at **195,717**,
+  against a **196,608**-byte peer credit window — both at ~99.6% — while a live
+  SSE stream on a separate transport still completed a turn read off the wire.
+  Each segment is reported by the larger of the two directions it can back up
+  in, because asserting one named direction per segment would have measured
+  whichever one this fixture happens to fill.
+
+### Rotation-freeze refusals
+
+M3-15 is open and this gate inherits chunk 4's discipline, with one correction
+it forced. The gate runs the device at a **3-second** rotation interval — the
+configuration floor, and the production fixture's own setting — so it meets far
+more freezes than chunk 4 does. Chunk 4's gate applies the refusal discipline
+to **POSTs only**, and a session GET that lands in a QUIESCE→COMMIT freeze
+fails the run as though the route were broken, counted in neither refusal
+tally. That is **M8-C15**, filed rather than worked around; this gate counts
+and correlates refusals in both directions. In the recorded runs there were
+**no refusals at all**.
+
+### Evidence
+
+`python3 scripts/acp-guard-deletion.py --suite m8c5`: see the figure recorded
+on task row M8-04, re-run immediately before it was written down. Per M8-C12
+every single figure this harness produces is provisional until re-run, because
+a random red from an unstable test in the crates it runs leaks into it.
+
+Chunk 5's guards are **validator rules** rather than codec rules, so the suite
+runs the harness's own library tests: `every_claim_can_fail_on_its_own` asserts
+that each claim can fail on its own, and a rule that has been deleted or
+neutered stops rejecting its own falsification and that test names it. The
+suite deliberately does **not** run the gate itself — the gate needs Redis,
+three relays and about fifty seconds, so running it once per case would exceed
+the harness's 600 s per-case ceiling and would make every figure a measure of
+the fixture's stability rather than of the guard.
+
+### Not proven
+
+- **Per-OS process-tree cleanup is not claimed.** macOS is the only host any of
+  this has run on, and M8-C07's descendant that leaves its process group is not
+  reached at all. This is M4's precedent: say so, rather than imply coverage.
+- **No OS sandbox guarantee.** Until a tested sandbox profile exists the export
+  is **trusted-agent execution**, and filesystem confinement is not claimed from
+  `cwd` alone.
+- **No real-agent interoperability.** The only agent is this repository's own
+  synthetic fixture and no ACP **server** has been run; the roadmap gate's
+  real-agent clause is dedicated-VM work.
+- **An ACP connection outliving one membership record**, for the reason set out
+  above. This is a real ceiling, not an untested corner.
+- **M7-C85 was not reached.** That wedge needs 128 consumer cancellations on
+  one device session. This gate produces far more than chunk 4 did, but roughly
+  twenty — an order of magnitude short — so it stays open and this gate says
+  nothing about whether a cancelled exchange is reclaimed. The figure is
+  disclosed from the connector's `open_journal_entries` rather than asserted.
+- The connection-capacity table at its real bounds; the permission deadline and
+  the idle, prompt-wall-time and output-stall bounds over the real route; the
+  `X-Agent-Tunnel-Operation-Id` header and the operation facility;
+  `session/load`, still refused 501.
+
 ## Research provenance
 
 The linked official pages were read on 2026-09-09. Source history exposed protocol commit `b4eddcd86937c972e65240e5199403f6d8a8cc2c` and SDK commit `7d8291d42236023c683bfc52f13d27746cda59ea`. The SDK commit explicitly distinguishes stable v1 builders from draft v2 APIs. These are observed source references, not a dependency lock or a claim that every immutable transport file was fetched. The first slice must pin and verify exact crate/schema/transport contents before implementation advertises compatibility. [Protocol history](https://github.com/agentclientprotocol/agent-client-protocol/commits/main), [SDK reference](https://github.com/agentclientprotocol/rust-sdk/commit/7d8291d42236023c683bfc52f13d27746cda59ea)
