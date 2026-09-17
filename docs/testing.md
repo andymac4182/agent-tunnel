@@ -1347,6 +1347,137 @@ AI SDK **live tools** row of the contract-compilation table is not satisfied at
 all — no tool factories exist, so schemas, abort propagation, bounded output and
 model-visible outcome fields are untested.
 
+### Implementation gate 6, end to end: the real client against real sockets (`verify-m4-fs-client-e2e`)
+
+The two sections above are the shared client and the four adapters against a
+**loopback harness**. Gate 6 says in terms that this is not enough —
+"compilation against a source interface or a fake in-memory adapter is
+insufficient to claim remote compatibility" — and this gate is the sentence
+that residue asked for. It is the first evidence in `packages/client`'s history
+about `crates/tunnel-relay` and `crates/tunnel-fs-provider` rather than about a
+peer that speaks the wire.
+
+**How node is driven.** `crates/tunnel-test-harness/src/production_cluster/fs_client_e2e.rs`
+stands up the three-relay production cluster, a real Redis catalog and a real
+device connector serving five filesystem exports seeded side by side, then
+spawns `node` on `packages/client/e2e/gate.ts`, which imports that package's own
+`src/`. A child process is the shape, and the alternatives are named rather than
+dismissed: embedding a JavaScript runtime in the harness, or reimplementing the
+client in Rust, each give up the only thing worth proving — that *the package*
+interoperates. Three channels, each for what it carries: a **plan file** named
+in argv, because a consumer token must not appear in a process listing;
+**stdout** as newline-delimited JSON ending in exactly one report; and **stdin**
+carrying `go` lines. Every judgement is taken in Rust by
+`validate_fs_client_e2e_evidence` over scalars, counts and closed labels, so a
+driver that decided for itself what passing meant could not smuggle a verdict
+past the validator.
+
+**TLS is real and verification is not disabled.** The fixture's server leaf now
+carries `127.0.0.1` as an IP subject alternative name — `rcgen` turns a name
+that parses as an address into one — so the endpoint can be the loopback address
+the relay binds with no name to resolve. `node` trusts the fixture CA through
+`NODE_EXTRA_CA_CERTS` and verifies the chain the ordinary way; the client's own
+`allowInsecureLoopback` is never passed, so an unverifiable chain is
+`INSECURE_ENDPOINT` and not a session. Turning verification off was not an
+option, because the client's TLS requirement is one of the things under test.
+
+**Nothing is a sleep.** Two of the cases need the harness to act at a point
+inside the driver's run, and both are rendezvous on stdin rather than a wait
+chosen to be long enough:
+
+* The **grant-revision** case. The client fetches a descriptor, announces the
+  revision it read, and holds. The harness moves the grant in the authoritative
+  catalog, polls a fresh descriptor until it reports the new revision, and only
+  then releases the driver — whose upgrade then carries a revision that no
+  longer exists and is refused `409 CAPABILITIES_CHANGED`. That refusal is the
+  only way to observe from outside that `X-Agent-Tunnel-Grant-Revision` is sent
+  at all.
+* The **ledger readings**. One consumer session is one device exchange, and the
+  driver holds at three points, so the harness can wait for the device's
+  exchange count to reach a known number and read `ConnectionStatus::fs` at a
+  boundary rather than at a guess about how far the device has got.
+
+**What one run proves.** The descriptor fetched and validated by the client's
+own schema rules; an unsigned token refused `UNAUTHENTICATED`; the authenticated
+upgrade with `agent-tunnel.9p.v1` selected and the 65,536-byte `msize`
+negotiated; a checksummed 393,216-byte `readFile` over seven `Rread` messages; a
+checksummed 393,216-byte `writeStream` over seven `Twrite` messages, verified
+byte for byte on the host by the harness; a forty-entry directory listed with
+every name exactly once; a read-only grant refusing mutations **at both layers**
+— `ENOTSUP` and `not_started` locally for four operations the descriptor does
+not advertise, which is the statement that a caller's mistake never reaches the
+socket, and `EPERM` from the device for `Tlcreate`, `Tmkdir`, `Tunlinkat` and a
+writable `Tlopen` issued through the raw session a custom 9P client would use,
+with the export byte-for-byte unchanged afterwards; and the Mastra adapter
+driven end to end over the same sockets, reading, writing, listing, stat-ing and
+refusing `appendFile`.
+
+**The `unknown` outcome is deterministic, not a race.** Gate 5 named this
+obligation for the client's side: there is no wire field for an outcome, so a
+dispatched mutation with no reply is `unknown` and the device's own ledger is
+the only place the truth lives. Reaching that honestly needs a mutation that is
+genuinely dispatched and unanswered, and `writeStream` cannot provide one — it
+awaits each `Rwrite` before sending the next, so at most one write is ever
+outstanding and the close would land in a window that is a coin toss. So the
+case uses the exported `ConsumerSession` directly: `sendRaw` encodes and sends
+inside its promise executor, so issuing twenty-four writes without awaiting puts
+all twenty-four on the transport, and the session is closed in the **same
+synchronous turn**, before the event loop can deliver one reply. Everything
+under it is the same product code `connectFilesystem` runs.
+
+**The client's view and the device's ledger disagree twice, and both times the
+client is right not to claim.** This is the point of reading them side by side
+rather than either alone.
+
+* The `unknown` exchange is the **first** the device serves, so its counters are
+  a delta from zero. The client reports `unknown` for twenty-four writes and
+  acknowledges nothing; the device reports two mutations dispatched, two
+  applied, two **acknowledged** and 32,768 bytes written. One write reached the
+  host and its reply reached the carrier, and no field on the wire could have
+  told the client so. The harness checks the host file holds exactly those bytes
+  at the source pattern's own offsets — so nothing was applied twice or out of
+  order — that it equals the ledger's `bytes_written`, and that
+  `mutations_applied - mutations_acknowledged == mutation_unknown`, the identity
+  gate 5 pins.
+* The read-only exchange is bracketed by two more readings. The client reports
+  **`failed`** for the three mutating opcodes, which is the wire's floor and the
+  strongest thing an `Rlerror` licenses — and `not_started` for the writable
+  open, because opening for writing carries no effect, which is gate 5's own
+  `Primitive::is_mutating` distinction reaching the client through
+  `isMutatingRequest`. The device, meanwhile, dispatched nothing, applied
+  nothing and wrote nothing.
+
+**One gap is measured rather than assumed.** `FsCounters::mutations_refused`
+documents itself as "mutating requests refused before the host was touched", and
+over that read-only exchange it stays at **zero** while three such refusals
+happen. The reason is structural: the refusal is taken by gate 3's session
+inside `Provider::accept`, which returns a `SessionError` and never produces the
+decoded primitives the ledger classifies a mutation from, so `Provider::refuse`
+can only count `errors_sent`. A mutation refused at **admission** is therefore
+invisible in the one place an operator reads how far a mutation got; only a
+mutation refused after the queue wait is counted. The validator pins the zero
+deliberately rather than asserting the number it ought to be: this gate is not
+the place to change the provider, and a run in which it moves is a change that
+should be read and documented rather than silently absorbed.
+
+**Red-then-green.** `scripts/fs-guard-deletion.py --suite gate6-e2e` deletes one
+rule of the validator at a time — replacing its condition with `true`, because
+the rule list is a fixed-length array and removing an entry stops the crate
+compiling, which that script refuses to call a red test — and requires the
+mutation table in the same file to go red. **10 of 10** deletions do.
+
+**What this gate does not prove.** The seventh component, the AI SDK live
+directory tools, still does not exist. Three of the four adapters have still
+never spoken to a relay, and the one that has reached its framework as stand-in
+error classes with the same constructor shapes the offline suites use — so
+"registered with the real thing that consumes it" (task row M4-14) and "driven
+against real relay and device sockets" (this row) are two facts proven
+separately rather than one fact proven once. No filesystem session has been held
+across a scheduled data-socket rotation, no grant has been revoked under a live
+*client* session, a consumer still reaches only the owning relay, and the
+shared dataset across all four views, two adapters borrowing one client, clocks
+and budgets are exactly as gate 6 left them.
+
 ### Shared dataset and native semantics
 
 Build one synthetic mount dataset and access that same authorized mount through Files SDK, Mastra, just-bash, and AI SDK tools concurrently. A file created through one writable view must be readable byte-for-byte through every other view; rename/remove must be visible without undocumented persistent caching. Compare native directory and metadata results after normalizing only documented differences. AI SDK FilesV4 uploads are also visible as ordinary files in their configured upload directory, while its native methods accept only its own references. Use real relay/device processes and sockets; preserve a separate fast mocked suite for error translation and upstream contract fixtures.
