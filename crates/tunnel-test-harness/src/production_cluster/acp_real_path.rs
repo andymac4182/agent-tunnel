@@ -126,7 +126,14 @@ const FREEZE_COINCIDENCE: Duration = Duration::from_millis(750);
 const FROZEN_PHASES: [&str; 3] = ["quiescing", "draining", "committing"];
 
 /// The cases this gate runs, in order.
-pub const ACP_CASES: [&str; 3] = ["conversation", "permission-allow", "permission-reject"];
+pub const ACP_CASES: [&str; 6] = [
+    "conversation",
+    "permission-allow",
+    "permission-reject",
+    "cancel",
+    "sse-loss-session",
+    "sse-loss-connection",
+];
 
 /// What this gate deliberately does not establish.
 ///
@@ -187,6 +194,22 @@ pub struct AcpRealPathEvidence {
     /// A permission response whose id answers nothing outstanding.
     pub unknown_request_id_refused: bool,
 
+    // --- cancellation ---
+    /// `session/cancel` produced this `stopReason`, read off the wire.
+    pub cancel_stop_reason: String,
+    /// The outcome the agent recorded receiving for the permission that was
+    /// outstanding when the cancellation arrived.
+    pub cancel_outcome_at_agent: String,
+    /// An update arrived **after** the cancellation and **before** the
+    /// original prompt's result, which is `docs/acp.md`'s "Accept remaining
+    /// updates until that response".
+    pub update_after_cancel_before_result: bool,
+
+    // --- subscriber loss, each required stream broken independently ---
+    /// Per broken stream: the five consequences, each observed separately.
+    pub session_loss: LossEvidence,
+    pub connection_loss: LossEvidence,
+
     // --- the M7-C80 accommodation, made visible in the evidence ---
     pub resign_spacing_ms: u128,
     /// How old the membership records in force were when a case ended.  Every
@@ -207,6 +230,32 @@ pub struct AcpRealPathEvidence {
     /// Child processes still alive after the gate tore everything down, read
     /// from the process table.
     pub leftover_processes: usize,
+}
+
+/// `docs/acp.md`'s five consequences of an established required SSE stream
+/// breaking, each recorded separately.
+///
+/// They are five fields rather than one boolean because the document names
+/// five things and a single "the transport ended" flag would let four of them
+/// regress silently.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct LossEvidence {
+    /// The transport ended, and by the subscriber-loss rule rather than by a
+    /// child ending or a deadline.
+    pub terminated_by_loss: bool,
+    /// Pending permissions resolved `cancelled`.  Never approved.
+    pub permissions_cancelled: u64,
+    pub permissions_approved: u64,
+    /// A prompt after the loss is refused.
+    pub new_prompt_refused: bool,
+    /// The *other* required stream was closed too, and **errored** rather than
+    /// ending cleanly: a broken ACP stream must not look like an orderly one.
+    pub other_stream_errored: bool,
+    /// The old connection cannot be reattached to, and a fresh `initialize`
+    /// works.
+    pub reconnect_requires_initialize: bool,
+    /// The child is gone from the **process table**, not from a counter.
+    pub child_gone_from_process_table: bool,
 }
 
 /// A refusal the relay answered that this gate resent, and why it was allowed
@@ -1174,6 +1223,250 @@ impl Gate<'_> {
     }
 }
 
+impl Gate<'_> {
+    /// Case `cancel`: `session/cancel` over the real route.
+    ///
+    /// `docs/acp.md`: "The bridge resolves pending permission callbacks with
+    /// `{"outcome":{"outcome":"cancelled"}}`, forwards cancellation, and waits
+    /// for the original prompt response. Accept remaining updates until that
+    /// response. A confirmed cancelled turn has `stopReason: "cancelled"`."
+    ///
+    /// All four halves are checked: the permission resolves cancelled at the
+    /// **agent**, an update arrives after the cancellation and before the
+    /// result, and the turn's own result says `cancelled`.
+    async fn case_cancel(&mut self, evidence: &mut AcpRealPathEvidence) -> Result<()> {
+        let marker = self
+            .workspace
+            .join(tunnel_acp_fixture::PERMISSION_OUTCOME_FILE);
+        let _ = std::fs::remove_file(&marker);
+
+        let conversation = self.open_conversation(evidence).await?;
+        let status = self
+            .prompt(&conversation, "prompt-cancel", "permission")
+            .await?;
+        if status != http::StatusCode::ACCEPTED {
+            return Err(HarnessError::Http(format!(
+                "the cancelled prompt answered {status}, not 202"
+            )));
+        }
+        // Wait for the callback, so the cancellation really has something
+        // outstanding to resolve.
+        conversation
+            .session_stream
+            .wait_for("the permission callback", |value| {
+                (value.get("method").and_then(Value::as_str) == Some("session/request_permission"))
+                    .then(|| ())
+            })
+            .await?;
+        let seen_before_cancel = conversation.session_stream.seen().len();
+
+        let headers = self.session_headers(&conversation);
+        let (status, _h, _b) = self
+            .post(
+                &conversation.consumer,
+                &headers,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/cancel",
+                    "params": {"sessionId": conversation.session},
+                }),
+            )
+            .await?;
+        if status != http::StatusCode::ACCEPTED {
+            return Err(HarnessError::Http(format!(
+                "session/cancel answered {status}, not 202"
+            )));
+        }
+
+        // The turn's own result, off the wire.
+        evidence.cancel_stop_reason = conversation
+            .session_stream
+            .wait_for("the cancelled turn's result", stop_reason)
+            .await?;
+
+        // **Updates are accepted until that response.** The fixture reports
+        // the outcome it received as an update before it finishes, so an
+        // update landing after the cancellation and before the result is the
+        // observation `docs/acp.md` asks for.  Position in the recorded stream
+        // is what makes it "after": the messages are appended in arrival
+        // order.
+        let seen = conversation.session_stream.seen();
+        let result_at = seen.iter().position(|value| stop_reason(value).is_some());
+        evidence.update_after_cancel_before_result = result_at.is_some_and(|result_at| {
+            seen.iter().enumerate().any(|(index, value)| {
+                index >= seen_before_cancel
+                    && index < result_at
+                    && value.get("method").and_then(Value::as_str) == Some("session/update")
+            })
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        evidence.cancel_outcome_at_agent = loop {
+            if let Ok(text) = std::fs::read_to_string(&marker) {
+                let text = text.trim().to_owned();
+                if !text.is_empty() {
+                    break text;
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(HarnessError::Timeout(
+                    "the agent never recorded the cancelled permission".into(),
+                ));
+            }
+            sleep(Duration::from_millis(50)).await;
+        };
+        self.close_conversation(conversation).await;
+        Ok(())
+    }
+
+    /// Cases `sse-loss-session` and `sse-loss-connection`: break one
+    /// **established required** SSE stream over the real route and observe the
+    /// whole ACP connection terminate.
+    ///
+    /// Each required stream is broken independently, because
+    /// `docs/acp.md` names "an established required SSE stream" without
+    /// distinguishing them and this profile has two kinds.  `docs/acp.md`
+    /// names five consequences and each is asserted separately in
+    /// [`LossEvidence`].
+    ///
+    /// **An SDK reopening a GET would not be evidence that anything was
+    /// recovered**, which is why the reconnect check requires the *old*
+    /// connection to be gone rather than a new GET to succeed.
+    async fn case_sse_loss(
+        &mut self,
+        evidence: &mut AcpRealPathEvidence,
+        break_session_stream: bool,
+    ) -> Result<()> {
+        let conversation = self.open_conversation(evidence).await?;
+        let before = self.export();
+
+        // The child exists, read from the process table, **before** the break.
+        let pids = self
+            .acp_diagnostics
+            .child_pids(&self.service_id.to_string());
+        let child = pids
+            .iter()
+            .copied()
+            .find(|pid| process_alive(*pid))
+            .ok_or_else(|| HarnessError::Process("no live agent child to observe".into()))?;
+
+        // Leave a permission outstanding, so the loss has one to cancel.
+        let status = self
+            .prompt(&conversation, "prompt-loss", "permission")
+            .await?;
+        if status != http::StatusCode::ACCEPTED {
+            return Err(HarnessError::Http(format!(
+                "the prompt answered {status}, not 202"
+            )));
+        }
+        conversation
+            .session_stream
+            .wait_for("the permission callback", |value| {
+                (value.get("method").and_then(Value::as_str) == Some("session/request_permission"))
+                    .then(|| ())
+            })
+            .await?;
+
+        let mut loss = LossEvidence::default();
+        if break_session_stream {
+            conversation.session_stream.break_now();
+        } else {
+            conversation.connection_stream.break_now();
+        }
+
+        // (1) the transport terminated, by the subscriber-loss rule.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let now = self.export();
+            if now.connections_ended_by_subscriber_loss
+                > before.connections_ended_by_subscriber_loss
+            {
+                loss.terminated_by_loss =
+                    now.connections_ended_by_child == before.connections_ended_by_child;
+                // (2) pending permissions cancelled, never approved.
+                loss.permissions_cancelled =
+                    now.permissions_cancelled_by_loss - before.permissions_cancelled_by_loss;
+                loss.permissions_approved = now.permissions_answered - before.permissions_answered;
+                break;
+            }
+            if Instant::now() >= deadline {
+                return Err(HarnessError::Timeout(
+                    "breaking an established required stream did not terminate the transport"
+                        .into(),
+                ));
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+
+        // (3) new prompts are refused.
+        let status = self
+            .prompt(&conversation, "prompt-after-loss", "ok")
+            .await?;
+        loss.new_prompt_refused = status == http::StatusCode::NOT_FOUND;
+
+        // (4) the other required stream closed, and errored rather than
+        // ending cleanly.
+        let other = if break_session_stream {
+            &conversation.connection_stream
+        } else {
+            &conversation.session_stream
+        };
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if other.has_errored() {
+                loss.other_stream_errored = true;
+                break;
+            }
+            if other.has_ended() || Instant::now() >= deadline {
+                // An orderly end is a failure here, and is recorded as such
+                // rather than as a pass.
+                break;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+
+        // (5) a reconnect must initialize anew: the old connection is gone,
+        // and a fresh initialize opens a different one.
+        let (status, _h, stream) = self
+            .open_stream(
+                &conversation.consumer,
+                &self.connection_headers(&conversation),
+            )
+            .await?;
+        let old_gone = status == http::StatusCode::NOT_FOUND;
+        if let Some(stream) = stream {
+            stream.break_now();
+        }
+        let fresh = self
+            .open_conversation(&mut AcpRealPathEvidence::default())
+            .await?;
+        loss.reconnect_requires_initialize =
+            old_gone && fresh.connection != conversation.connection;
+
+        // (6) the child is gone from the process table.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if !process_alive(child) {
+                loss.child_gone_from_process_table = true;
+                break;
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+
+        if break_session_stream {
+            evidence.session_loss = loss;
+        } else {
+            evidence.connection_loss = loss;
+        }
+        self.close_conversation(fresh).await;
+        conversation.consumer.shutdown();
+        Ok(())
+    }
+}
+
 /// Run every case in order, with the M7-C80 accommodation between them.
 async fn run(
     cluster: &mut ProductionCluster,
@@ -1286,6 +1579,9 @@ async fn run(
                 "conversation" => gate.case_conversation(&mut evidence).await?,
                 "permission-allow" => gate.case_permission(&mut evidence, true).await?,
                 "permission-reject" => gate.case_permission(&mut evidence, false).await?,
+                "cancel" => gate.case_cancel(&mut evidence).await?,
+                "sse-loss-session" => gate.case_sse_loss(&mut evidence, true).await?,
+                "sse-loss-connection" => gate.case_sse_loss(&mut evidence, false).await?,
                 other => {
                     return Err(HarnessError::InvalidInput(format!(
                         "unknown ACP gate case {other}"
@@ -1352,7 +1648,7 @@ async fn run(
 /// The first rule that did not hold.
 pub fn validate_acp_real_path_evidence(evidence: &AcpRealPathEvidence) -> Result<()> {
     let executed: Vec<&str> = evidence.cases_executed.iter().map(String::as_str).collect();
-    let checks: [(&str, bool); 20] = [
+    let checks: [(&str, bool); 23] = [
         ("three relays", evidence.relay_count == 3),
         (
             "the device is owned by relay-a and the consumer entered at relay-c",
@@ -1425,6 +1721,19 @@ pub fn validate_acp_real_path_evidence(evidence: &AcpRealPathEvidence) -> Result
             "a response on the wrong connection is refused",
             evidence.wrong_connection_refused,
         ),
+        // --- cancellation ---
+        (
+            "a confirmed cancelled turn has stopReason cancelled, read off the wire",
+            evidence.cancel_stop_reason == "cancelled",
+        ),
+        (
+            "the agent itself recorded receiving a cancelled permission",
+            evidence.cancel_outcome_at_agent == "cancelled:",
+        ),
+        (
+            "an update was accepted after the cancellation and before the prompt result",
+            evidence.update_after_cancel_before_result,
+        ),
         // --- the M7-C80 accommodation ---
         (
             "membership was re-signed no more often than the accommodation allows",
@@ -1443,6 +1752,52 @@ pub fn validate_acp_real_path_evidence(evidence: &AcpRealPathEvidence) -> Result
         ),
     ];
     for (rule, passed) in checks {
+        if !passed {
+            return Err(HarnessError::Process(format!(
+                "ACP real-path gate failed: {rule}"
+            )));
+        }
+    }
+    // **The per-case rules come after "every case executed", deliberately.**
+    // A case that did not run leaves its evidence at `Default`, and every one
+    // of its rules then fails — which would report a case that never executed
+    // as six substantive failures. The completeness rule above names the real
+    // problem first.
+    let loss_checks = |label: &str, loss: &LossEvidence| -> Vec<(String, bool)> {
+        vec![
+            (
+                format!("{label}: the transport terminated by the subscriber-loss rule"),
+                loss.terminated_by_loss,
+            ),
+            (
+                format!("{label}: the pending permission resolved cancelled and none was approved"),
+                loss.permissions_cancelled == 1 && loss.permissions_approved == 0,
+            ),
+            (
+                format!("{label}: a new prompt is refused"),
+                loss.new_prompt_refused,
+            ),
+            (
+                format!("{label}: the other required stream errored rather than ending cleanly"),
+                loss.other_stream_errored,
+            ),
+            (
+                format!("{label}: a reconnect must initialize anew"),
+                loss.reconnect_requires_initialize,
+            ),
+            (
+                format!("{label}: the child is gone from the process table"),
+                loss.child_gone_from_process_table,
+            ),
+        ]
+    };
+    for (rule, passed) in loss_checks("a broken session stream", &evidence.session_loss)
+        .into_iter()
+        .chain(loss_checks(
+            "a broken connection stream",
+            &evidence.connection_loss,
+        ))
+    {
         if !passed {
             return Err(HarnessError::Process(format!(
                 "ACP real-path gate failed: {rule}"
