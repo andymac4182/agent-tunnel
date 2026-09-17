@@ -142,7 +142,8 @@ async fn conversation(
         StatusCode::ACCEPTED
     );
 
-    let session = within(read_session_id(stream)).await;
+    let mut connection_body = std::pin::pin!(stream.into_body());
+    let session = within(read_session_id(&mut connection_body)).await;
     let session_stream = exchange(
         export,
         Arc::clone(profile),
@@ -190,7 +191,10 @@ async fn conversation(
         listening_sockets()
     );
 
-    let stop = within(read_stop_reason(session_stream)).await;
+    // The stream stays established across the DELETE below: the body is
+    // borrowed, not consumed.
+    let mut session_body = std::pin::pin!(session_stream.into_body());
+    let stop = within(read_stop_reason(&mut session_body)).await;
     assert_eq!(stop, "end_turn", "the turn completed, read off the wire");
 
     let request = Request::builder()
@@ -244,8 +248,10 @@ async fn the_acp_export_serves_a_whole_conversation_with_nothing_listening() {
     export.shutdown();
 }
 
-async fn read_session_id(response: http::Response<ChannelBody>) -> String {
-    read_until(response, |value| {
+/// As [`read_stop_reason`], the body is borrowed so the connection stream
+/// stays established for the rest of the conversation.
+async fn read_session_id(body: &mut std::pin::Pin<&mut ChannelBody>) -> String {
+    read_until(body, |value| {
         value
             .pointer("/result/sessionId")
             .and_then(Value::as_str)
@@ -254,8 +260,16 @@ async fn read_session_id(response: http::Response<ChannelBody>) -> String {
     .await
 }
 
-async fn read_stop_reason(response: http::Response<ChannelBody>) -> String {
-    read_until(response, |value| {
+/// Read a stream's stop reason **without letting the body go**.
+///
+/// The body is borrowed rather than consumed, so the caller keeps the stream
+/// established. Under `docs/acp.md`'s subscriber-loss policy — implemented in
+/// M8 chunk 4 — dropping an established required stream terminates its whole
+/// ACP transport, so a helper that consumed the response here would end the
+/// connection and the DELETE that follows would be answered 404 rather than
+/// 202. That is the correct behaviour and this is the helper adapting to it.
+async fn read_stop_reason(body: &mut std::pin::Pin<&mut ChannelBody>) -> String {
+    read_until(body, |value| {
         value
             .pointer("/result/stopReason")
             .and_then(Value::as_str)
@@ -265,10 +279,9 @@ async fn read_stop_reason(response: http::Response<ChannelBody>) -> String {
 }
 
 async fn read_until(
-    response: http::Response<ChannelBody>,
+    body: &mut std::pin::Pin<&mut ChannelBody>,
     pick: impl Fn(&Value) -> Option<String>,
 ) -> String {
-    let mut body = std::pin::pin!(response.into_body());
     let mut buffer = Vec::new();
     while let Some(frame) = body.frame().await {
         let Ok(frame) = frame else { break };

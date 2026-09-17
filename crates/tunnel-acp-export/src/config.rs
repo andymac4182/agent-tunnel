@@ -48,6 +48,12 @@ pub const MAX_SUBSCRIBE_DEADLINE_MS: u64 = 600_000;
 pub const DEFAULT_PERMISSION_TIMEOUT_MS: u64 = 60_000;
 /// The ceiling on the permission deadline.
 pub const MAX_PERMISSION_TIMEOUT_MS: u64 = 3_600_000;
+/// `docs/acp.md`: "Output credit stall | 30 seconds, then cancel/close; never
+/// drop an event and continue."
+pub const DEFAULT_OUTPUT_STALL_MS: u64 = 30_000;
+/// The ceiling on the output-credit stall deadline.  There is no unlimited
+/// value: a stall that never ends is the deadlock this bound exists to break.
+pub const MAX_OUTPUT_STALL_MS: u64 = 600_000;
 /// `docs/acp.md`: 8 sessions per ACP connection.
 pub const DEFAULT_SESSION_LIMIT: usize = tunnel_acp::lifecycle::MAX_SESSIONS_PER_CONNECTION;
 /// `docs/acp.md`: 1 MiB, rejected before unbounded reassembly.
@@ -118,6 +124,9 @@ pub struct AcpDeadlinesConfig {
     pub subscribe_ms: Option<u64>,
     /// How long a `session/request_permission` may stay outstanding.
     pub permission_ms: Option<u64>,
+    /// How long one message may wait for room on a stream's queue before the
+    /// connection is ended.
+    pub output_stall_ms: Option<u64>,
 }
 
 /// A rejected ACP export configuration.  Messages are fixed strings.
@@ -141,6 +150,7 @@ pub struct ValidatedAcp {
     pub workspace: PathBuf,
     pub subscribe_deadline: Duration,
     pub permission_timeout: Duration,
+    pub output_stall_deadline: Duration,
     pub session_limit: usize,
 }
 
@@ -218,6 +228,16 @@ impl AcpExportConfig {
             ));
         }
 
+        let output_stall_ms = self
+            .deadlines
+            .output_stall_ms
+            .unwrap_or(DEFAULT_OUTPUT_STALL_MS);
+        if output_stall_ms == 0 || output_stall_ms > MAX_OUTPUT_STALL_MS {
+            return Err(AcpConfigError(
+                "acp.deadlines.output_stall_ms must be 1..=600000",
+            ));
+        }
+
         Ok(ValidatedAcp {
             profile,
             limits,
@@ -233,6 +253,7 @@ impl AcpExportConfig {
             workspace: agent.workspace.clone(),
             subscribe_deadline: Duration::from_millis(subscribe_ms),
             permission_timeout: Duration::from_millis(permission_ms),
+            output_stall_deadline: Duration::from_millis(output_stall_ms),
             session_limit: DEFAULT_SESSION_LIMIT,
         })
     }

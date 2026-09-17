@@ -29,6 +29,7 @@ use tunnel_acp::lifecycle::{
     Outcome, PendingKind, PermissionOutcome, RequestId,
 };
 use tunnel_acp::message::{AcpRule, MessageKind, read_turn_completion};
+use tunnel_acp::terminal::AcpTerminal;
 
 use crate::child::{ChildConfig, ChildCounters, ChildEnd, ChildEvent, ChildHandle, SpawnError};
 
@@ -215,15 +216,27 @@ impl PromptTicket {
     /// the pinned profile refuses by its own rule. [`SupervisorError::ChildGone`]
     /// when the child ended first.
     pub async fn stop_reason(self) -> Result<String, SupervisorError> {
+        Ok(self.completion().await?.1)
+    }
+
+    /// The turn's terminal **and** its wire spelling.
+    ///
+    /// The [`AcpTerminal`] is built here, where the pinned `StopReason` is
+    /// already in scope, so the classification runs on the schema's own type
+    /// rather than on a string anybody could have retyped.  The bridge records
+    /// it; that is what makes `tunnel_acp::terminal` a rule the product
+    /// applies rather than a table only a test reads.
+    pub async fn completion(self) -> Result<(AcpTerminal, String), SupervisorError> {
         let value = self.reply.await.map_err(|_| SupervisorError::ChildGone)??;
         let stop = read_turn_completion(&value)
             .map_err(|rejection| SupervisorError::Protocol(rejection.rule))?;
         // The pinned crate's own serialization, so the vocabulary is the
         // schema's rather than a string retyped here.
-        serde_json::to_value(stop)
+        let spelling = serde_json::to_value(stop)
             .ok()
             .and_then(|value| value.as_str().map(ToOwned::to_owned))
-            .ok_or(SupervisorError::Protocol(AcpRule::UnknownStopReason))
+            .ok_or(SupervisorError::Protocol(AcpRule::UnknownStopReason))?;
+        Ok((AcpTerminal::Turn(stop), spelling))
     }
 }
 
@@ -589,6 +602,48 @@ impl Supervisor {
         self.with(|shared| shared.open_sessions.iter().any(|open| open == session))
     }
 
+    /// Every session this connection has open.
+    #[must_use]
+    pub fn open_sessions(&self) -> Vec<String> {
+        self.with(|shared| shared.open_sessions.clone())
+    }
+
+    /// Resolve every outstanding permission on every open session as
+    /// **cancelled**, tell the agent on the wire, and report how many there
+    /// were.
+    ///
+    /// This is the "resolve pending permissions as cancelled" half of
+    /// `docs/acp.md`'s subscriber-loss policy.  [`Supervisor::drain`] cancels
+    /// them too, but discards the count and never tells the agent; the
+    /// termination path needs both, because "how many permissions were
+    /// cancelled" is the observation a test reads instead of trusting that
+    /// cancellation happened.
+    ///
+    /// A timeout and a lost subscriber therefore resolve a callback the same
+    /// way, which is the point: `docs/acp.md` says timeout and disconnect never
+    /// mean permission.
+    pub async fn cancel_all_permissions(&self) -> usize {
+        let now = self.now_ms();
+        let cancelled = self.with(|shared| {
+            let sessions: Vec<String> = shared.open_sessions.clone();
+            let mut all = Vec::new();
+            for session in sessions {
+                all.extend(shared.callbacks.cancel_session_permissions(&session, now));
+            }
+            all
+        });
+        for (_, id) in &cancelled {
+            // The agent learns on the wire, exactly as the deadline path and
+            // `session/cancel` do.  A supervisor's belief about what it
+            // resolved is not evidence that the agent was told.
+            let _ = self
+                .child
+                .send(&permission_response(id, &PermissionOutcome::Cancelled))
+                .await;
+        }
+        cancelled.len()
+    }
+
     /// Stop admission, cancel outstanding permissions, and end the child's
     /// life — which signals its process group.
     ///
@@ -779,6 +834,29 @@ fn id_value(id: &RequestId) -> Value {
     }
 }
 
+/// The `optionId`s a `session/request_permission` offered, in the order the
+/// agent listed them.
+///
+/// An agent that offers none yields an empty list, which admits no selection
+/// at all — which is right: there was nothing to select.
+fn offered_options(message: &serde_json::Value) -> Vec<String> {
+    message
+        .pointer("/params/options")
+        .and_then(serde_json::Value::as_array)
+        .map(|options| {
+            options
+                .iter()
+                .filter_map(|option| {
+                    option
+                        .get("optionId")
+                        .and_then(serde_json::Value::as_str)
+                        .map(ToOwned::to_owned)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn id_from_value(value: &Value) -> Option<RequestId> {
     match value {
         Value::String(text) => Some(RequestId::Text(text.clone())),
@@ -866,13 +944,17 @@ async fn read_agent(mut events: mpsc::Receiver<ChildEvent>, context: ReaderConte
                         let session = message.session_id().unwrap_or_default().to_owned();
                         let registered = {
                             let mut guard = shared.lock().unwrap_or_else(PoisonError::into_inner);
-                            guard.callbacks.register(
+                            // The options the agent offered are recorded with
+                            // the callback, so the host's answer can be
+                            // checked against them (`docs/acp.md`: "Validate
+                            // the response against ... the offered option").
+                            guard.callbacks.register_permission(
                                 &agent_scope,
                                 id.clone(),
-                                PendingKind::Permission,
                                 Some(&session),
                                 now,
                                 permission_timeout_ms,
+                                offered_options(&message.value),
                             )
                         };
                         let event = match registered {

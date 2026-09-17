@@ -646,3 +646,107 @@ fn a_session_cannot_be_opened_before_initialize() {
         .expect_err("before initialize");
     assert_eq!(refused.rule, LifecycleRule::ConnectionNotReady);
 }
+
+/// `docs/acp.md`: "Validate the response against the outstanding callback,
+/// principal, session, direction, and **offered option**."
+///
+/// The offered-option half was missing entirely until M8 chunk 4 (defect
+/// M8-C11): any `optionId` at all resolved a permission callback.  A host
+/// could therefore answer with an option the agent had no branch for, and the
+/// agent would act on a decision it never offered.
+#[test]
+fn a_permission_response_must_name_an_option_the_agent_offered() {
+    let mut table = CallbackTable::new(MAX_PENDING_PER_DIRECTION);
+    let agent = IdScope::new("t", "p", "d", "s", "c", Direction::AgentToHost);
+    table
+        .register_permission(
+            &agent,
+            RequestId::text("permission-1"),
+            Some("session-1"),
+            0,
+            1_000,
+            vec!["permit-one".to_owned(), "reject-one".to_owned()],
+        )
+        .expect("registered");
+
+    // An option nobody offered.
+    let refused = table
+        .resolve(
+            &agent,
+            &RequestId::text("permission-1"),
+            Outcome::Permission(PermissionOutcome::Selected("invented".to_owned())),
+            1,
+        )
+        .expect_err("an unoffered option is refused");
+    assert_eq!(refused.rule, LifecycleRule::OptionNotOffered);
+    assert_eq!(refused.rule.code(), "ACP_OPTION_NOT_OFFERED");
+
+    // **The callback is still outstanding**, which is the property that
+    // matters: a refusal must not consume the decision, or an invented option
+    // would silently deny the host its real answer.
+    assert_eq!(table.pending_in(&agent), 1);
+
+    // The genuine answer still works.
+    table
+        .resolve(
+            &agent,
+            &RequestId::text("permission-1"),
+            Outcome::Permission(PermissionOutcome::Selected("permit-one".to_owned())),
+            2,
+        )
+        .expect("an offered option resolves");
+    assert_eq!(table.pending_in(&agent), 0);
+}
+
+/// Cancellation is not a selection, so it is never checked against the offered
+/// list — a timeout and a `session/cancel` must resolve a callback whatever
+/// the agent offered.
+#[test]
+fn a_cancellation_is_not_checked_against_the_offered_options() {
+    let mut table = CallbackTable::new(MAX_PENDING_PER_DIRECTION);
+    let agent = IdScope::new("t", "p", "d", "s", "c", Direction::AgentToHost);
+    table
+        .register_permission(
+            &agent,
+            RequestId::text("permission-1"),
+            Some("session-1"),
+            0,
+            1_000,
+            Vec::new(),
+        )
+        .expect("registered");
+    table
+        .resolve(
+            &agent,
+            &RequestId::text("permission-1"),
+            Outcome::Permission(PermissionOutcome::Cancelled),
+            1,
+        )
+        .expect("a cancellation resolves whatever was offered");
+}
+
+/// An agent that offered no options at all admits no selection.
+#[test]
+fn an_agent_that_offered_nothing_admits_no_selection() {
+    let mut table = CallbackTable::new(MAX_PENDING_PER_DIRECTION);
+    let agent = IdScope::new("t", "p", "d", "s", "c", Direction::AgentToHost);
+    table
+        .register_permission(
+            &agent,
+            RequestId::text("permission-1"),
+            Some("session-1"),
+            0,
+            1_000,
+            Vec::new(),
+        )
+        .expect("registered");
+    let refused = table
+        .resolve(
+            &agent,
+            &RequestId::text("permission-1"),
+            Outcome::Permission(PermissionOutcome::Selected("anything".to_owned())),
+            1,
+        )
+        .expect_err("there was nothing to select");
+    assert_eq!(refused.rule, LifecycleRule::OptionNotOffered);
+}

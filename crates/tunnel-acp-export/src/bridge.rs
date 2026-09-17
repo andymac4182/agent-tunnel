@@ -82,6 +82,59 @@ pub const STREAM_BACKLOG: usize = 32;
 /// How often a connection's watchdog reads its clock.
 const WATCHDOG_TICK: Duration = Duration::from_millis(20);
 
+/// ACP transport connections this export tracks at once.
+///
+/// **Copied from `tunnel_mcp_export::http_backend`'s session table (M3-04),
+/// design and all, rather than re-derived.**  Two caps, and the refusal is at
+/// the door:
+///
+/// * a global cap, so one export cannot grow without bound; and
+/// * a per-principal cap of an eighth of it, so one authorized principal
+///   cannot fill the table.
+///
+/// **Nothing is ever evicted to make room.**  An evict-oldest table of this
+/// shape is a cross-principal denial channel: eviction picks by age, not by
+/// owner, so any single authorized principal could open `MAX + 1` connections
+/// and evict every other principal's live ones — turning a legitimate
+/// capability into a denial capability against unrelated tenants.  Refusing the
+/// newcomer is what closes that, and the per-principal cap is what stops one
+/// principal from starving the global cap for everybody.
+///
+/// An ACP connection owns a child process, so the refusal is taken **before
+/// the child is spawned**: the export never starts an agent it could not track.
+pub const MAX_TRACKED_CONNECTIONS: usize = 256;
+
+/// Connections one principal may hold at once.
+pub const MAX_CONNECTIONS_PER_BINDING: usize = MAX_TRACKED_CONNECTIONS / 8;
+
+/// How long one message may wait for room on a stream's queue before the
+/// connection is ended.
+///
+/// `docs/acp.md`'s limits table: "Output credit stall | 30 seconds, then
+/// cancel/close; **never drop an event and continue**."  The second half is the
+/// rule that matters — a bridge that skipped the event and carried on would
+/// leave a silent hole in a stream that has no `Last-Event-ID` replay to fill
+/// it, and the consumer would have no way to know.  So the stall is terminal.
+pub const OUTPUT_STALL_DEADLINE: Duration = Duration::from_secs(30);
+
+/// Whether an export holding `live` connections, of which `held` belong to the
+/// principal asking, may open one more.
+///
+/// **Both caps, and the newcomer is the one refused.**  The global cap bounds
+/// the export; the per-principal cap is what makes the global one safe, because
+/// without it one authorized principal reaches `MAX_TRACKED_CONNECTIONS` alone
+/// and every other principal is refused from then on.  Neither cap ever evicts:
+/// see [`MAX_TRACKED_CONNECTIONS`] for why evict-oldest is a cross-principal
+/// denial channel rather than a capacity policy.
+///
+/// It is a free function so the rule can be tested as arithmetic.  Proving the
+/// denial property against real connections would mean spawning 257 child
+/// processes to establish a property that is entirely about two comparisons.
+#[must_use]
+pub const fn admits(live: usize, held: usize) -> bool {
+    live < MAX_TRACKED_CONNECTIONS && held < MAX_CONNECTIONS_PER_BINDING
+}
+
 /// An exchange the export interrupts instead of answering.  It carries no
 /// message: the peer learns only the bridge's sanitized code.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -133,6 +186,55 @@ struct Counters {
     /// connection ends, so they survive the connection they belonged to.
     child_batch_output: AtomicU64,
     child_invalid_output: AtomicU64,
+    /// `initialize` refused because the export, or this principal's share of
+    /// it, was full.  No child was spawned for any of these.
+    connections_refused_at_capacity: AtomicU64,
+    /// Connections terminated because an **established** required SSE stream
+    /// broke.  Distinct from a stream that never arrived, which is a
+    /// subscription deadline and a different rule.
+    connections_ended_by_subscriber_loss: AtomicU64,
+    /// Permissions resolved `cancelled` because the transport was terminated
+    /// under them.  Never approved.
+    permissions_cancelled_by_loss: AtomicU64,
+    /// Connections terminated because a message could not be queued within
+    /// [`OUTPUT_STALL_DEADLINE`].
+    output_stalls: AtomicU64,
+    /// The last measured **microseconds** a message actually waited for queue
+    /// room before the stall deadline ended its connection, with the bound it
+    /// exceeded.  Strictly greater than the bound, and in microseconds for the
+    /// same reason the subscription deadlines are.
+    last_stall_elapsed_us: AtomicU64,
+    last_stall_bound_us: AtomicU64,
+    /// Operations this export classified through
+    /// [`tunnel_acp::terminal::AcpTerminal`], counted by the outcome that rule
+    /// produced.
+    ///
+    /// **This is what makes the mapping a rule the product applies.**  Without
+    /// it `terminal.rs` would be a table only its own unit tests read, and a
+    /// gate asserting `AcpTerminal::LostAfterDispatch.result_status()` would be
+    /// evaluating a pure function rather than observing a decision.  These are
+    /// incremented where the export decides, and read back from
+    /// [`AcpDiagnostics`].
+    terminals_succeeded: AtomicU64,
+    terminals_cancelled: AtomicU64,
+    terminals_failed: AtomicU64,
+    terminals_unknown: AtomicU64,
+}
+
+/// Classify one ended operation and count it by the outcome the rule gave.
+///
+/// The `match` is on the rule's own output, so a change to
+/// [`tunnel_acp::terminal`] changes what this export reports.  An outcome the
+/// protocol vocabulary does not contain is impossible by that module's own
+/// test, and is counted as unknown here rather than silently dropped.
+fn record_terminal(counters: &Counters, terminal: tunnel_acp::terminal::AcpTerminal) {
+    let counter = match terminal.result_status() {
+        "succeeded" => &counters.terminals_succeeded,
+        "cancelled" => &counters.terminals_cancelled,
+        "failed" => &counters.terminals_failed,
+        _ => &counters.terminals_unknown,
+    };
+    counter.fetch_add(1, Ordering::Release);
 }
 
 /// A snapshot of an export's counters.  Identifiers, phases and counters
@@ -159,6 +261,16 @@ pub struct AcpDiagnostics {
     pub connections_ended_by_child: u64,
     pub child_batch_output: u64,
     pub child_invalid_output: u64,
+    pub connections_refused_at_capacity: u64,
+    pub connections_ended_by_subscriber_loss: u64,
+    pub permissions_cancelled_by_loss: u64,
+    pub output_stalls: u64,
+    pub last_stall_elapsed_us: u64,
+    pub last_stall_bound_us: u64,
+    pub terminals_succeeded: u64,
+    pub terminals_cancelled: u64,
+    pub terminals_failed: u64,
+    pub terminals_unknown: u64,
     pub live_connections: u64,
 }
 
@@ -185,6 +297,15 @@ struct Target {
     /// prompt hung until DELETE**. Marking one target closed and carrying on is
     /// what stops one lost subscriber from silently disabling a connection.
     closed: Mutex<bool>,
+    /// A clone of the live body's sender, parked here when a subscriber takes
+    /// the queue.
+    ///
+    /// **This is what makes a broken established stream observable while the
+    /// agent is silent.**  The stream's pump only discovers its body is gone
+    /// when it next writes, so a connection with nothing to say would not
+    /// notice the break at all — and `docs/acp.md`'s policy is about the break,
+    /// not about the next message.  The watchdog asks this on its own tick.
+    body: Mutex<Option<StreamSender>>,
 }
 
 impl Target {
@@ -196,7 +317,37 @@ impl Target {
             created: Instant::now(),
             subscribed: Mutex::new(false),
             closed: Mutex::new(false),
+            body: Mutex::new(None),
         }
+    }
+
+    /// Park the live body's sender at subscription time.
+    fn watch_body(&self, sender: StreamSender) {
+        *self.body.lock().unwrap_or_else(PoisonError::into_inner) = Some(sender);
+    }
+
+    /// Whether this stream was established and has since broken.
+    ///
+    /// Deliberately **not** true for a stream that never had a subscriber:
+    /// that is a subscription deadline, which is a different rule with a
+    /// different consequence, and conflating them would let a slow consumer's
+    /// missing GET masquerade as a lost one.
+    /// **No guard case defeats the `is_subscribed` half, deliberately.**  It
+    /// is implied by the body test rather than load-bearing beside it: `body`
+    /// is parked only when a subscriber takes the queue, so a target that
+    /// never had one reads `None` here and is not broken either way.  A
+    /// guard-deletion run reported exactly that — removing it reddened
+    /// nothing — so it stays as a statement of the rule and is not claimed as
+    /// a guarded one.
+    fn established_and_broken(&self) -> bool {
+        if !self.is_subscribed() || self.is_closed() {
+            return false;
+        }
+        self.body
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(StreamSender::is_closed)
     }
 
     fn close(&self) {
@@ -390,6 +541,22 @@ impl AcpExport {
             connections_ended_by_child: counters.connections_ended_by_child.load(Ordering::Acquire),
             child_batch_output: load(&counters.child_batch_output),
             child_invalid_output: load(&counters.child_invalid_output),
+            connections_refused_at_capacity: load(&counters.connections_refused_at_capacity),
+            // Acquire, and read before the measurements below, for the same
+            // reason the expiry counters are: the terminating task publishes
+            // the elapsed time and then releases the count, so a relaxed read
+            // could see the count with a stale elapsed and compare 0 against 0.
+            connections_ended_by_subscriber_loss: counters
+                .connections_ended_by_subscriber_loss
+                .load(Ordering::Acquire),
+            permissions_cancelled_by_loss: load(&counters.permissions_cancelled_by_loss),
+            output_stalls: counters.output_stalls.load(Ordering::Acquire),
+            last_stall_elapsed_us: load(&counters.last_stall_elapsed_us),
+            last_stall_bound_us: load(&counters.last_stall_bound_us),
+            terminals_succeeded: counters.terminals_succeeded.load(Ordering::Acquire),
+            terminals_cancelled: counters.terminals_cancelled.load(Ordering::Acquire),
+            terminals_failed: counters.terminals_failed.load(Ordering::Acquire),
+            terminals_unknown: counters.terminals_unknown.load(Ordering::Acquire),
             live_connections: self
                 .inner
                 .connections
@@ -441,6 +608,28 @@ impl AcpExport {
                 .connections_closed
                 .fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// How many connections this principal holds.
+    fn held_by(&self, binding: Option<&String>) -> usize {
+        self.inner
+            .connections
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+            .filter(|connection| connection.principal.as_ref() == binding)
+            .count()
+    }
+
+    /// Whether a new connection for `binding` fits under **both** caps.
+    fn has_room_for(&self, binding: Option<&String>) -> bool {
+        let live = self
+            .inner
+            .connections
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len();
+        admits(live, self.held_by(binding))
     }
 
     fn connection(&self, id: &str) -> Option<Arc<Connection>> {
@@ -546,6 +735,21 @@ impl AcpExport {
         message: AcpMessage,
     ) -> Result<Response<ExportBody>, ExportError> {
         let validated = &self.inner.validated;
+        // **The capacity decision is taken before the child is spawned**, so
+        // the export never starts an agent it could not track, and a refusal
+        // costs a would-be attacker a process nobody created.  Refuse, never
+        // evict: see [`MAX_TRACKED_CONNECTIONS`].
+        let binding = principal_binding(headers);
+        if !self.has_room_for(binding.as_ref()) {
+            self.inner
+                .counters
+                .connections_refused_at_capacity
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                Bytes::from_static(b"{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32002,\"message\":\"the export is at its connection limit\"},\"id\":null}"),
+            ));
+        }
         let sequence = self.inner.next.fetch_add(1, Ordering::Relaxed);
         let id = format!("acp-{:016x}-{sequence:x}", self.inner.epoch);
         let scope = ConnectionScope {
@@ -555,7 +759,7 @@ impl AcpExport {
             // so that two connections still scope their ids apart by the one
             // identifier this chunk actually has.
             tenant: "in-process".to_owned(),
-            principal: principal_binding(headers).unwrap_or_else(|| "none".to_owned()),
+            principal: binding.clone().unwrap_or_else(|| "none".to_owned()),
             device: "in-process".to_owned(),
             service: "acp".to_owned(),
             connection: id.clone(),
@@ -602,7 +806,7 @@ impl AcpExport {
         let connection = Arc::new(Connection {
             id: id.clone(),
             supervisor,
-            principal: principal_binding(headers),
+            principal: binding,
             workspace: validated.workspace.to_string_lossy().into_owned(),
             limits: validated.limits,
             subscribe_deadline: validated.subscribe_deadline,
@@ -624,7 +828,12 @@ impl AcpExport {
             .connections_opened
             .fetch_add(1, Ordering::Relaxed);
 
-        tokio::spawn(dispatch_outbound(Arc::clone(&connection), forward_rx));
+        tokio::spawn(dispatch_outbound(
+            self.clone(),
+            Arc::clone(&connection),
+            forward_rx,
+            validated.output_stall_deadline,
+        ));
         tokio::spawn(watch_deadlines(self.clone(), Arc::clone(&connection)));
 
         let body = serde_json::to_vec(&json!({
@@ -771,17 +980,31 @@ impl AcpExport {
             // `stop_reason` runs the pinned crate's own v1 turn-completion
             // reader: a v2 acknowledgement with no `stopReason` is refused by
             // its own rule rather than delivered as a finished turn.
-            let body = match ticket.stop_reason().await {
-                Ok(stop) => serde_json::to_vec(&json!({
-                    "jsonrpc": "2.0",
-                    "id": host_id,
-                    "result": {"stopReason": stop},
-                })),
-                Err(error) => serde_json::to_vec(&json!({
-                    "jsonrpc": "2.0",
-                    "id": host_id,
-                    "error": {"code": -32603, "message": error.to_string()},
-                })),
+            let body = match ticket.completion().await {
+                Ok((terminal, stop)) => {
+                    // The export classifies the turn it just finished, through
+                    // the one rule that decides terminals.
+                    record_terminal(&connection.counters, terminal);
+                    serde_json::to_vec(&json!({
+                        "jsonrpc": "2.0",
+                        "id": host_id,
+                        "result": {"stopReason": stop},
+                    }))
+                }
+                Err(error) => {
+                    // The child is gone, or its answer was refused, with the
+                    // prompt already dispatched: `docs/acp.md` marks dispatched
+                    // unresolved work `outcome_unknown`.
+                    record_terminal(
+                        &connection.counters,
+                        tunnel_acp::terminal::AcpTerminal::LostAfterDispatch,
+                    );
+                    serde_json::to_vec(&json!({
+                        "jsonrpc": "2.0",
+                        "id": host_id,
+                        "error": {"code": -32603, "message": error.to_string()},
+                    }))
+                }
             }
             .unwrap_or_default();
             let _ = target.tx.send(Bytes::from(body)).await;
@@ -861,6 +1084,10 @@ impl AcpExport {
         let bytes = Arc::new(AtomicU64::new(0));
         let (sender, body) =
             ChannelResponseBody::channel(connection.limits.sse_response_body(), bytes);
+        // Park a clone so the connection's watchdog can see this stream break
+        // even if the agent never sends another message. Without it, a broken
+        // stream on a quiet connection is invisible until the next write.
+        target.watch_body(sender.clone());
         tokio::spawn(pump_stream(
             queue,
             sender,
@@ -906,16 +1133,28 @@ impl AcpExport {
 /// send. A target whose body has gone away is marked closed and its messages
 /// are dropped; the loop carries on.
 ///
-/// **What this is not.** `docs/acp.md` says an established required SSE stream
-/// breaking should terminate the whole ACP transport in v0. That is *subscriber
-/// loss*, it is M8-03's open half, and it is not implemented: this bridge keeps
-/// the connection and its other sessions running. The change here is narrower
-/// and only removes a silent, destructive failure — it is not the documented
-/// policy.
+/// **Subscriber loss on an *established* stream ends the transport** (M8 chunk
+/// 4), which is `docs/acp.md`'s documented v0 policy and was M8-03's open half.
+/// Chunk 3 deliberately kept the connection alive here, because the behaviour it
+/// was replacing — the first failed send silently disabling every other stream
+/// and hanging every prompt until DELETE — was worse than either policy. That
+/// was a stopgap and said so. The policy is now implemented: see
+/// [`end_with_subscriber_loss`]. A target that never had a subscriber is *not*
+/// this rule; that is a subscription deadline.
+///
+/// **The output-credit stall is terminal, and the event is never skipped.**
+/// `docs/acp.md`: "Output credit stall | 30 seconds, then cancel/close; never
+/// drop an event and continue." A bridge that dropped the message and carried
+/// on would leave a hole in a stream with no `Last-Event-ID` replay to fill it,
+/// and the consumer could not tell. So a stall ends the connection with the
+/// message still unsent.
 async fn dispatch_outbound(
+    export: AcpExport,
     connection: Arc<Connection>,
     mut inbox: mpsc::Receiver<OutboundMessage>,
+    stall_deadline: Duration,
 ) {
+    let bound_us = u64::try_from(stall_deadline.as_micros()).unwrap_or(u64::MAX);
     while let Some(message) = inbox.recv().await {
         let target = match message.session.as_deref() {
             Some(session) => connection.session_target(session),
@@ -931,14 +1170,102 @@ async fn dispatch_outbound(
                 .fetch_add(1, Ordering::Relaxed);
             continue;
         }
-        if target.tx.send(Bytes::from(message.compact)).await.is_err() {
-            target.close();
-            connection
-                .counters
-                .streams_lost
-                .fetch_add(1, Ordering::Relaxed);
+        let waited = Instant::now();
+        match tokio::time::timeout(stall_deadline, target.tx.send(Bytes::from(message.compact)))
+            .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                // The body went away while this message was queued: the
+                // established stream broke.
+                target.close();
+                connection
+                    .counters
+                    .streams_lost
+                    .fetch_add(1, Ordering::Relaxed);
+                // **A latency path, not a separate rule.** The connection's
+                // watchdog notices the same break within a tick, and a
+                // guard-deletion run confirmed that removing this branch
+                // reddens nothing. It is kept because ending at the moment a
+                // message could not be delivered is better than ending up to
+                // a tick later, not because anything depends on it.
+                if target.is_subscribed() {
+                    end_with_subscriber_loss(&export, &connection).await;
+                    return;
+                }
+            }
+            Err(_) => {
+                // The stall bound elapsed with no room. Publish the
+                // measurement **before** the counter a reader waits on, for
+                // the same reason the expiry measurements are ordered that
+                // way, then end the connection. `message.compact` was moved
+                // into the send future and is gone with it: nothing here
+                // skips it and continues.
+                let elapsed = u64::try_from(waited.elapsed().as_micros()).unwrap_or(u64::MAX);
+                connection
+                    .counters
+                    .last_stall_elapsed_us
+                    .store(elapsed, Ordering::Relaxed);
+                connection
+                    .counters
+                    .last_stall_bound_us
+                    .store(bound_us, Ordering::Relaxed);
+                connection
+                    .counters
+                    .output_stalls
+                    .fetch_add(1, Ordering::Release);
+                end_with_subscriber_loss(&export, &connection).await;
+                return;
+            }
         }
     }
+}
+
+/// End a connection because an established required SSE stream broke, or
+/// because output credit stalled past its bound.
+///
+/// `docs/acp.md`: "Once an established required SSE stream breaks, terminate
+/// that ACP transport connection in v0: refuse new prompts, resolve pending
+/// permissions as cancelled, request cancellation of active turns, close
+/// streams, and clean up the child. A reconnect must initialize anew."
+///
+/// Each of those five is a separate consequence and each is done here:
+///
+/// 1. **New prompts are refused** — the connection leaves the export's map
+///    first, so a later POST finds nothing and is answered 404.
+/// 2. **Pending permissions resolve `cancelled`** — never approved, and the
+///    agent is told on the wire while it is still alive to hear it.
+/// 3. **Active turns are asked to cancel** — a real `session/cancel` per open
+///    session, sent *before* the child is killed, because the policy says
+///    request cancellation rather than merely stop.
+/// 4. **Streams close** — every open body is failed, not ended cleanly.
+/// 5. **A reconnect must initialize anew** — there is no connection left to
+///    reattach to, which is the same fact as (1) seen from the GET side.
+async fn end_with_subscriber_loss(export: &AcpExport, connection: &Arc<Connection>) {
+    // (1) and (5): out of the map before anything slow happens, so no further
+    // work is admitted while the teardown runs.
+    export.remove(&connection.id);
+    // (2): resolve, count, and tell the agent.
+    let cancelled = connection.supervisor.cancel_all_permissions().await;
+    connection
+        .counters
+        .permissions_cancelled_by_loss
+        .fetch_add(cancelled as u64, Ordering::Relaxed);
+    // (3): ask each open turn to cancel before the child is killed. A child
+    // that is about to be killed cannot answer, which is exactly why this is a
+    // request and not a claim that the turn ended cleanly.
+    for session in connection.supervisor.open_sessions() {
+        let _ = connection
+            .supervisor
+            .cancel_session(&session, json!({"sessionId": session}))
+            .await;
+    }
+    connection
+        .counters
+        .connections_ended_by_subscriber_loss
+        .fetch_add(1, Ordering::Release);
+    // (4) and the child: close every stream and drain.
+    close_connection(connection).await;
 }
 
 /// Drain one stream's queue into its SSE body, framing each message.
@@ -1009,6 +1336,22 @@ async fn watch_deadlines(export: AcpExport, connection: Arc<Connection>) {
                 return;
             }
             _ = ticker.tick() => {}
+        }
+        // **An established required stream that broke ends the transport**, and
+        // it is checked here so that a connection whose agent has gone quiet
+        // still notices. Both the connection stream and every session stream
+        // are required; `docs/acp.md` asks each to be broken independently and
+        // each has the same consequence.
+        let broken = connection.with(|state| {
+            state.connection.established_and_broken()
+                || state
+                    .sessions
+                    .values()
+                    .any(|target| target.established_and_broken())
+        });
+        if broken {
+            end_with_subscriber_loss(&export, &connection).await;
+            return;
         }
         let target = connection.with(|state| Arc::clone(&state.connection));
         if !target.is_subscribed() && target.created.elapsed() > bound {
@@ -1206,4 +1549,74 @@ async fn collect_limited(body: ChannelBody, limit: u64) -> Result<Bytes, ()> {
         }
     }
     Ok(Bytes::from(out))
+}
+
+#[cfg(test)]
+mod capacity_tests {
+    use super::{MAX_CONNECTIONS_PER_BINDING, MAX_TRACKED_CONNECTIONS, admits};
+
+    /// The per-principal cap is a real fraction of the table, not the table
+    /// itself.  If these were equal the second test below could not fail, and
+    /// the whole discipline would be one cap wearing two names.
+    #[test]
+    fn the_per_principal_cap_is_a_share_of_the_table() {
+        assert_eq!(MAX_TRACKED_CONNECTIONS, 256);
+        assert_eq!(MAX_CONNECTIONS_PER_BINDING, 32);
+        const { assert!(MAX_CONNECTIONS_PER_BINDING < MAX_TRACKED_CONNECTIONS) };
+    }
+
+    #[test]
+    fn both_caps_are_exact_at_the_boundary_and_refuse_one_beyond() {
+        // The global cap, with this principal holding nothing.
+        assert!(admits(MAX_TRACKED_CONNECTIONS - 1, 0));
+        assert!(!admits(MAX_TRACKED_CONNECTIONS, 0));
+        // The per-principal cap, with the table otherwise empty.
+        assert!(admits(0, MAX_CONNECTIONS_PER_BINDING - 1));
+        assert!(!admits(0, MAX_CONNECTIONS_PER_BINDING));
+    }
+
+    /// **The cross-principal denial channel is closed.**
+    ///
+    /// One principal at its own cap cannot grow the table any further, so it
+    /// cannot drive the global count to `MAX_TRACKED_CONNECTIONS` and refuse
+    /// everybody else.  The most it can occupy is its share, and seven eighths
+    /// of the table remain for other principals — which is the property
+    /// evict-oldest destroys, because eviction picks by age rather than by
+    /// owner.
+    #[test]
+    fn one_principal_cannot_fill_the_table_and_deny_the_rest() {
+        let mine = MAX_CONNECTIONS_PER_BINDING;
+        assert!(
+            !admits(mine, mine),
+            "a principal at its share is refused its next connection"
+        );
+        // A different principal, with the table holding only the first one's
+        // full share, is still admitted.
+        assert!(
+            admits(mine, 0),
+            "another principal is unaffected by the first one's share"
+        );
+        // A `const` block: the compiler refuses the build if one principal's
+        // share ever grows past an eighth of the table, which is stronger than
+        // a test that has to be run.
+        const {
+            assert!(
+                MAX_TRACKED_CONNECTIONS - MAX_CONNECTIONS_PER_BINDING
+                    >= MAX_TRACKED_CONNECTIONS * 7 / 8,
+                "seven eighths of the table survive one principal's maximum"
+            )
+        };
+    }
+
+    /// A full table refuses rather than evicting: there is no input to
+    /// [`admits`] that both reports full and admits.
+    #[test]
+    fn a_full_table_has_no_admitting_input() {
+        for held in 0..=MAX_CONNECTIONS_PER_BINDING {
+            assert!(
+                !admits(MAX_TRACKED_CONNECTIONS, held),
+                "a full table admitted a newcomer holding {held}"
+            );
+        }
+    }
 }

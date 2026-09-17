@@ -48,12 +48,21 @@ fn get() -> http::request::Builder {
         .header("accept", "text/event-stream")
 }
 
+/// Drive one exchange against the export, **bounded**.
+///
+/// The bound is not decoration.  `exchange` awaits a response that a broken
+/// export may never produce, and an unbounded wait here turns a guard-deletion
+/// case from evidence into a hang: a mutation that stops `initialize` ever
+/// resolving made every test that opens a connection wait forever, so the
+/// case's `cargo test` hit the harness's 600 s ceiling and was reported
+/// `NOT EVIDENCE (timed out)` rather than `RED` (task row M8-C13).  A bounded
+/// wait makes the same mutation fail by name, which is what the case is for.
 async fn send(
     export: &AcpExport,
     profile: &Arc<Profile>,
     request: Request<Full<Bytes>>,
 ) -> http::Response<ChannelBody> {
-    exchange(export, Arc::clone(profile), request).await
+    within(exchange(export, Arc::clone(profile), request)).await
 }
 
 fn json_body(value: &Value) -> Full<Bytes> {
@@ -341,21 +350,29 @@ async fn a_second_session_subscriber_is_refused_409() {
     export.shutdown();
 }
 
-/// **One lost subscriber closes one stream, and nothing else.**
+/// **A lost *established* required SSE stream terminates the whole ACP
+/// transport**, and each of `docs/acp.md`'s five consequences is asserted
+/// separately (M8 chunk 4).
 ///
-/// Found by review. The connection has a single task routing agent→host
-/// messages, and it used to return on the first failed send. A dropped SSE
-/// body is ordinary — a client closing one session's stream, or this bridge
-/// expiring a session whose GET never arrived — so the first such event ended
-/// the router, which dropped the supervisor's forward channel, which ended the
-/// supervisor's reader: **every other session and the connection stream itself
-/// stopped receiving, and every outstanding prompt hung until DELETE.** Silent,
-/// and destructive.
+/// `docs/acp.md`: "Once an established required SSE stream breaks, terminate
+/// that ACP transport connection in v0: refuse new prompts, resolve pending
+/// permissions as cancelled, request cancellation of active turns, close
+/// streams, and clean up the child. A reconnect must initialize anew."
 ///
-/// Two sessions, one subscriber dropped, and the survivor's turn still
-/// completes on the wire.
+/// **This replaces a chunk-3 test that asserted the opposite**, and the
+/// replacement is a behaviour change rather than a correction of a mistake.
+/// `dropping_one_session_stream_leaves_the_others_delivering` held that one
+/// lost subscriber closed one stream and left the connection running. That was
+/// a deliberate stopgap: the behaviour it replaced — the first failed send
+/// silently ending the router, so every other stream went quiet and every
+/// prompt hung until DELETE — was worse than either policy, and chunk 3 said in
+/// terms that the narrow fix "is not the documented policy". It now is.
+///
+/// A second session is opened so the test can show the *other* stream closing
+/// too, which is the half that distinguishes "terminate the transport" from
+/// "close the stream that broke".
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn dropping_one_session_stream_leaves_the_others_delivering() {
+async fn a_lost_established_session_stream_terminates_the_whole_transport() {
     let workspace = workspace();
     let export = acp_export(workspace.path());
     let profile = Arc::new(export.profile_policies().expect("profile"));
@@ -365,11 +382,8 @@ async fn dropping_one_session_stream_leaves_the_others_delivering() {
     let first = open_session(&export, &profile, &connection, workspace.path(), stream).await;
     let first_stream = send(&export, &profile, get_session(&connection, &first.id)).await;
     assert_eq!(first_stream.status(), StatusCode::OK);
+    let first_held = HeldStream::hold(first_stream);
 
-    // A second session on the same connection, and the connection stream is
-    // re-read for its result.  `open_session` consumed the first response, so
-    // the second `session/new` result is read from the same subscriber -- which
-    // is exactly the stream this test must show still works.
     let second_id = within(second_session(
         &export,
         &profile,
@@ -380,72 +394,399 @@ async fn dropping_one_session_stream_leaves_the_others_delivering() {
     let second_stream = send(&export, &profile, get_session(&connection, &second_id)).await;
     assert_eq!(second_stream.status(), StatusCode::OK);
 
-    // The client goes away on the first session only.
-    drop(first_stream);
+    // The child is read from the process table **before** the break, so the
+    // cleanup consequence is checked against a process that really existed.
+    let pids = export.child_pids();
+    assert_eq!(pids.len(), 1, "one child per connection");
+    let child = pids[0];
+    assert!(common::is_alive(child), "the child is running");
 
-    // **A message must actually be routed to the lost stream**, or the router
-    // never meets the failure this test exists for and the destructive version
-    // stays green.  A turn on the first session is what does it: the agent's
-    // update is sent to a target whose body is gone.
-    let mut diagnostics = export.diagnostics();
-    for round in 0..20 {
-        if diagnostics.streams_lost >= 1 {
-            break;
-        }
-        let request = post()
-            .header(headers::ACP_CONNECTION_ID, &connection)
-            .header(headers::ACP_SESSION_ID, &first.id)
-            .body(json_body(&json!({
-                "jsonrpc": "2.0",
-                "id": format!("prompt-1-{round}"),
-                "method": "session/prompt",
-                "params": {"sessionId": first.id, "prompt": [{"type": "text", "text": "ok"}]},
-            })))
-            .expect("request");
-        let _ = send(&export, &profile, request).await;
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        diagnostics = export.diagnostics();
-    }
-    assert_eq!(
-        diagnostics.streams_lost, 1,
-        "the lost stream was noticed and counted: {diagnostics:?}"
-    );
-
-    // A turn on the surviving session still completes, read off the wire.
+    // Ask for a permission and wait for it to be outstanding, so there is a
+    // pending callback for the break to resolve.
     let request = post()
         .header(headers::ACP_CONNECTION_ID, &connection)
-        .header(headers::ACP_SESSION_ID, &second_id)
+        .header(headers::ACP_SESSION_ID, &first.id)
         .body(json_body(&json!({
             "jsonrpc": "2.0",
-            "id": "prompt-2",
+            "id": "prompt-permission",
             "method": "session/prompt",
-            "params": {"sessionId": second_id, "prompt": [{"type": "text", "text": "ok"}]},
+            "params": {"sessionId": first.id, "prompt": [{"type": "text", "text": "permission"}]},
         })))
         .expect("request");
     assert_eq!(
         send(&export, &profile, request).await.status(),
         StatusCode::ACCEPTED
     );
-    let (payloads, _ending) = within(collect_stream(second_stream)).await;
-    let stop = payloads
-        .iter()
-        .filter_map(|payload| serde_json::from_slice::<Value>(payload).ok())
-        .find_map(|value| {
-            value
-                .pointer("/result/stopReason")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned)
-        });
+    // The permission request is observed **on the wire**, not inferred from the
+    // 202 above: `docs/acp.md`'s 202 means accepted by the bridge and no more.
+    let method = within(first_held.wait_for_pointer("/method")).await;
+    assert_eq!(method, "session/request_permission");
+
+    // The consumer goes away on the first session's established stream.
+    first_held.break_now();
+
+    // The whole transport ends.
+    let mut diagnostics = export.diagnostics();
+    for _ in 0..400 {
+        if diagnostics.connections_ended_by_subscriber_loss == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        diagnostics = export.diagnostics();
+    }
+
+    // (i) the transport terminated, by the subscriber-loss rule and not by
+    // some other ending.
     assert_eq!(
-        stop.as_deref(),
-        Some("end_turn"),
-        "the surviving session's turn completed on the wire: {payloads:?}"
+        diagnostics.connections_ended_by_subscriber_loss, 1,
+        "{diagnostics:?}"
+    );
+    assert_eq!(
+        diagnostics.connections_ended_by_child, 0,
+        "the child did not end this; the lost subscriber did: {diagnostics:?}"
+    );
+    assert_eq!(diagnostics.live_connections, 0, "{diagnostics:?}");
+
+    // (ii) pending permissions resolved cancelled, never approved.
+    assert_eq!(
+        diagnostics.permissions_cancelled_by_loss, 1,
+        "the outstanding permission was cancelled: {diagnostics:?}"
+    );
+    assert_eq!(
+        diagnostics.permissions_answered, 0,
+        "nothing was approved: {diagnostics:?}"
     );
 
-    // The connection is still live: one lost stream did not end it.
-    let diagnostics = export.diagnostics();
-    assert_eq!(diagnostics.live_connections, 1, "{diagnostics:?}");
-    assert_eq!(diagnostics.connections_ended_by_child, 0, "{diagnostics:?}");
+    // (iii) new prompts are refused.
+    let request = post()
+        .header(headers::ACP_CONNECTION_ID, &connection)
+        .header(headers::ACP_SESSION_ID, &second_id)
+        .body(json_body(&json!({
+            "jsonrpc": "2.0",
+            "id": "prompt-after",
+            "method": "session/prompt",
+            "params": {"sessionId": second_id, "prompt": [{"type": "text", "text": "ok"}]},
+        })))
+        .expect("request");
+    assert_eq!(
+        send(&export, &profile, request).await.status(),
+        StatusCode::NOT_FOUND,
+        "a prompt on a terminated transport is refused"
+    );
+
+    // (iv) the other stream closed, and it **errored** rather than ending
+    // cleanly: a broken ACP stream must not look like an orderly one.
+    let (_payloads, ending) = within(collect_stream(second_stream)).await;
+    assert_eq!(
+        ending,
+        Ending::Errored,
+        "the surviving session's stream errored, rather than ending cleanly"
+    );
+
+    // (v) a reconnect must initialize anew: the old connection is gone.
+    assert_eq!(
+        send(&export, &profile, get_connection(&connection))
+            .await
+            .status(),
+        StatusCode::NOT_FOUND,
+        "the old connection cannot be reattached to"
+    );
+    let fresh = initialize(&export, &profile).await;
+    assert_ne!(fresh, connection, "a reconnect is a new connection");
+
+    // (vi) the child was cleaned up, read from the process table rather than
+    // from a counter.
+    for _ in 0..200 {
+        if !common::is_alive(child) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        !common::is_alive(child),
+        "the terminated connection's child is gone from the process table"
+    );
+    export.shutdown();
+}
+
+/// The **connection** stream is a required stream too, and breaking it has the
+/// same consequence as breaking a session stream (M8 chunk 4).
+///
+/// `docs/acp.md` names "an established required SSE stream" without
+/// distinguishing them, and this profile has two kinds. Breaking each one
+/// independently is what shows the rule is about the stream being required
+/// rather than about which handler happened to notice. Here the session stream
+/// stays perfectly healthy and the connection stream is the one that goes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lost_established_connection_stream_terminates_the_whole_transport() {
+    let workspace = workspace();
+    let export = acp_export(workspace.path());
+    let profile = Arc::new(export.profile_policies().expect("profile"));
+    let connection = initialize(&export, &profile).await;
+    let stream = send(&export, &profile, get_connection(&connection)).await;
+    let session = open_session(&export, &profile, &connection, workspace.path(), stream).await;
+
+    let session_stream = send(&export, &profile, get_session(&connection, &session.id)).await;
+    assert_eq!(session_stream.status(), StatusCode::OK);
+
+    let pids = export.child_pids();
+    assert_eq!(pids.len(), 1);
+    let child = pids[0];
+    assert!(common::is_alive(child));
+
+    // The connection GET goes away; the session GET is untouched.
+    session.connection_stream.break_now();
+
+    let mut diagnostics = export.diagnostics();
+    for _ in 0..400 {
+        if diagnostics.connections_ended_by_subscriber_loss == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        diagnostics = export.diagnostics();
+    }
+    assert_eq!(
+        diagnostics.connections_ended_by_subscriber_loss, 1,
+        "breaking the connection stream ends the transport: {diagnostics:?}"
+    );
+    assert_eq!(diagnostics.live_connections, 0, "{diagnostics:?}");
+
+    // The healthy session stream is closed with it, and errors rather than
+    // ending cleanly.
+    let (_payloads, ending) = within(collect_stream(session_stream)).await;
+    assert_eq!(ending, Ending::Errored);
+
+    // A reconnect must initialize anew.
+    assert_eq!(
+        send(&export, &profile, get_connection(&connection))
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+
+    for _ in 0..200 {
+        if !common::is_alive(child) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(!common::is_alive(child), "the child is gone");
+    export.shutdown();
+}
+
+/// **The output-credit stall is bounded, measured, and the event is never
+/// dropped and continued past** (M8 chunk 4).
+///
+/// `docs/acp.md`'s limits table: "Output credit stall | 30 seconds, then
+/// cancel/close; never drop an event and continue." The second clause is the
+/// one with teeth: this profile has no `Last-Event-ID` replay, so a bridge that
+/// skipped a message it could not deliver would leave a hole the consumer could
+/// never learn about. So a stall ends the connection instead.
+///
+/// The bound is **shortened** here so the stall can be reached cheaply, exactly
+/// as chunk 2 and chunk 3 shortened the permission and subscription deadlines,
+/// and the elapsed time is read from the export's own measurement rather than
+/// from the constant it was configured with. The documented 30 seconds is
+/// asserted separately, as a default, by
+/// `the_documented_output_stall_default_is_thirty_seconds`.
+///
+/// The subscriber here **takes its queue and never reads the body**, which is a
+/// stalled consumer rather than a lost one: the distinction matters, because a
+/// lost consumer is the subscriber-loss rule and would end the connection for a
+/// different reason and with a different counter.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn output_credit_stalls_are_bounded_and_the_event_is_never_skipped() {
+    let workspace = workspace();
+    let export = acp_export_with(workspace.path(), "[deadlines]\noutput_stall_ms = 400\n");
+    let profile = Arc::new(export.profile_policies().expect("profile"));
+    let connection = initialize(&export, &profile).await;
+    let stream = send(&export, &profile, get_connection(&connection)).await;
+    let session = open_session(&export, &profile, &connection, workspace.path(), stream).await;
+
+    // Subscribe **directly against the export**, then deliberately never poll
+    // the body.
+    //
+    // Directly, because the bound under test is the export's own. The gate-2
+    // `forward`/`serve` carrier in `exchange` has credit-based flow control of
+    // its own, and it drains the export's body into that credit whether or not
+    // the consumer is reading — so a stalled consumer behind it stalls the
+    // *carrier*, some tens of kilobytes later, and the export never sees
+    // backpressure at all. Going through it here would measure the wrong
+    // bound and would have passed while proving nothing. The whole chain is
+    // exercised over the real three-relay path by the `verify-m8-acp-real-path`
+    // gate; this test is about this queue.
+    let stalled = export
+        .handle(
+            get_session(&connection, &session.id)
+                .map(|_| tunnel_http_bridge::ChannelBody::full(Bytes::new())),
+        )
+        .await
+        .expect("the session GET is answered");
+    assert_eq!(stalled.status(), StatusCode::OK);
+
+    let request = post()
+        .header(headers::ACP_CONNECTION_ID, &connection)
+        .header(headers::ACP_SESSION_ID, &session.id)
+        .body(json_body(&json!({
+            "jsonrpc": "2.0",
+            "id": "prompt-flood",
+            "method": "session/prompt",
+            "params": {"sessionId": session.id, "prompt": [{"type": "text", "text": "updates:512"}]},
+        })))
+        .expect("request");
+    assert_eq!(
+        send(&export, &profile, request).await.status(),
+        StatusCode::ACCEPTED
+    );
+
+    let mut diagnostics = export.diagnostics();
+    for _ in 0..400 {
+        if diagnostics.output_stalls == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        diagnostics = export.diagnostics();
+    }
+    assert_eq!(
+        diagnostics.output_stalls, 1,
+        "the stall bound was reached: {diagnostics:?}"
+    );
+
+    // **Observed elapsing**, not a constant read back: the measurement the
+    // dispatcher recorded must exceed the bound it was running against.
+    assert_eq!(diagnostics.last_stall_bound_us, 400_000, "{diagnostics:?}");
+    assert!(
+        diagnostics.last_stall_elapsed_us > diagnostics.last_stall_bound_us,
+        "the stall was measured and exceeded its bound: {diagnostics:?}"
+    );
+
+    // The connection ended rather than the message being skipped.
+    assert_eq!(diagnostics.live_connections, 0, "{diagnostics:?}");
+    assert_eq!(
+        diagnostics.messages_dropped_on_closed_stream, 0,
+        "nothing was dropped and continued past: {diagnostics:?}"
+    );
+    export.shutdown();
+}
+
+/// The number `docs/acp.md` publishes, asserted as the shipped default.
+///
+/// A shortened bound proves the mechanism; it does not prove the value the
+/// document promises. This is the other half, and it is a configuration
+/// assertion rather than an observation — which is why it is a separate test
+/// with a name that says so, and not a line inside the measured one.
+#[test]
+fn the_documented_output_stall_default_is_thirty_seconds() {
+    assert_eq!(
+        tunnel_acp_export::DEFAULT_OUTPUT_STALL_MS,
+        30_000,
+        "docs/acp.md's limits table says 30 seconds"
+    );
+    assert_eq!(
+        tunnel_acp_export::OUTPUT_STALL_DEADLINE,
+        Duration::from_secs(30)
+    );
+}
+
+/// **The export applies `tunnel_acp::terminal`**, rather than the rule being a
+/// table only its own unit tests read (M8 chunk 4).
+///
+/// A completed turn is classified `succeeded` and a turn whose child died
+/// before answering is classified `outcome_unknown`, and both are counted where
+/// the export decides. Without this the mapping would have no consumer at all,
+/// and a gate asserting `AcpTerminal::LostAfterDispatch.result_status()` would
+/// be evaluating a pure function rather than observing a decision.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_export_classifies_its_terminals_through_the_terminal_rule() {
+    let workspace = workspace();
+    let export = acp_export(workspace.path());
+    let profile = Arc::new(export.profile_policies().expect("profile"));
+
+    // A turn that completes.
+    let connection = initialize(&export, &profile).await;
+    let stream = send(&export, &profile, get_connection(&connection)).await;
+    let session = open_session(&export, &profile, &connection, workspace.path(), stream).await;
+    let session_stream = send(&export, &profile, get_session(&connection, &session.id)).await;
+    let held = HeldStream::hold(session_stream);
+    let request = post()
+        .header(headers::ACP_CONNECTION_ID, &connection)
+        .header(headers::ACP_SESSION_ID, &session.id)
+        .body(json_body(&json!({
+            "jsonrpc": "2.0",
+            "id": "prompt-ok",
+            "method": "session/prompt",
+            "params": {"sessionId": session.id, "prompt": [{"type": "text", "text": "ok"}]},
+        })))
+        .expect("request");
+    assert_eq!(
+        send(&export, &profile, request).await.status(),
+        StatusCode::ACCEPTED
+    );
+    let stop = within(held.wait_for_pointer("/result/stopReason")).await;
+    assert_eq!(stop, "end_turn");
+    let mut diagnostics = export.diagnostics();
+    for _ in 0..200 {
+        if diagnostics.terminals_succeeded == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        diagnostics = export.diagnostics();
+    }
+    assert_eq!(
+        diagnostics.terminals_succeeded, 1,
+        "the export classified the completed turn: {diagnostics:?}"
+    );
+    assert_eq!(diagnostics.terminals_unknown, 0, "{diagnostics:?}");
+
+    // A turn whose child dies before answering.
+    let connection = initialize(&export, &profile).await;
+    let stream = send(&export, &profile, get_connection(&connection)).await;
+    let session = open_session(&export, &profile, &connection, workspace.path(), stream).await;
+    let crashed = send(&export, &profile, get_session(&connection, &session.id)).await;
+    let crashed = HeldStream::hold(crashed);
+    let request = post()
+        .header(headers::ACP_CONNECTION_ID, &connection)
+        .header(headers::ACP_SESSION_ID, &session.id)
+        .body(json_body(&json!({
+            "jsonrpc": "2.0",
+            "id": "prompt-crash",
+            "method": "session/prompt",
+            "params": {
+                "sessionId": session.id,
+                "prompt": [{"type": "text", "text": "effect-crash:unit"}],
+            },
+        })))
+        .expect("request");
+    assert_eq!(
+        send(&export, &profile, request).await.status(),
+        StatusCode::ACCEPTED
+    );
+    let mut diagnostics = export.diagnostics();
+    for _ in 0..400 {
+        if diagnostics.terminals_unknown >= 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        diagnostics = export.diagnostics();
+    }
+    assert_eq!(
+        diagnostics.terminals_unknown, 1,
+        "the export classified the lost turn outcome_unknown: {diagnostics:?}"
+    );
+    // The agent recorded its side effect exactly once, on disk, before dying.
+    let ledger = workspace
+        .path()
+        .join(tunnel_acp_fixture::SIDE_EFFECT_LEDGER);
+    let recorded = std::fs::read_to_string(&ledger).unwrap_or_default();
+    assert_eq!(
+        recorded
+            .lines()
+            .filter(|line| line.trim() == "unit")
+            .count(),
+        1,
+        "the agent's own ledger holds the effect exactly once: {recorded:?}"
+    );
+    drop(crashed);
     export.shutdown();
 }
 
@@ -552,20 +893,40 @@ async fn the_documented_ten_second_deadline_is_the_one_that_elapses() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_session_whose_subscriber_never_arrives_closes_its_window() {
     let workspace = workspace();
-    let export = acp_export_with(workspace.path(), "[deadlines]\nsubscribe_ms = 300\n");
+    // **1500 ms, not 300.** The bound applies to the *connection* GET as well
+    // as the session GET, and 300 ms is the wall time between `initialize`
+    // returning and this test getting round to sending the connection GET on a
+    // loaded machine. When that window closed first the connection ended, the
+    // session's window never expired, and this test failed for a reason that
+    // had nothing to do with what it measures. It surfaced as a test reddening
+    // at random across a whole guard-deletion suite, which is how it was
+    // found. The deadline is still observed and still elapses; only the
+    // fragility is gone.
+    //
+    // **1500 ms was not enough either.** Running all five ACP guard suites back
+    // to back keeps this machine compiling and running the workspace for half
+    // an hour, and the connection GET still missed a 1500 ms window under it.
+    // 5000 ms is chosen against that load rather than against an idle machine.
+    // The underlying coupling — one configuration value bounding two different
+    // windows — is what M8-C12 records as not fixed.
+    let export = acp_export_with(workspace.path(), "[deadlines]\nsubscribe_ms = 5000\n");
     let profile = Arc::new(export.profile_policies().expect("profile"));
     let connection = initialize(&export, &profile).await;
     let stream = send(&export, &profile, get_connection(&connection)).await;
     let session = open_session(&export, &profile, &connection, workspace.path(), stream).await;
 
     let mut diagnostics = export.diagnostics();
-    for _ in 0..600 {
+    for _ in 0..1500 {
         if diagnostics.session_subscribe_expired == 1 {
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
         diagnostics = export.diagnostics();
     }
+    assert_eq!(
+        diagnostics.connection_subscribe_expired, 0,
+        "the connection's own window must not be what closed: {diagnostics:?}"
+    );
     assert_eq!(diagnostics.session_subscribe_expired, 1);
     assert!(
         diagnostics.last_expiry_elapsed_us > diagnostics.last_expiry_bound_us,
@@ -785,6 +1146,9 @@ async fn delete_answers_202_and_the_child_is_gone_from_the_process_table() {
 
 struct Session {
     id: String,
+    /// The connection GET, held open.  A `Session` that dropped it would
+    /// terminate its own transport: see [`HeldStream`].
+    connection_stream: HeldStream,
 }
 
 fn get_connection(connection: &str) -> Request<Full<Bytes>> {
@@ -859,30 +1223,84 @@ async fn open_session(
         StatusCode::ACCEPTED,
         "session/new answers 202; the result travels on the connection GET"
     );
-    let id = within(read_session_id(stream)).await;
-    Session { id }
+    let held = HeldStream::hold(stream);
+    let id = within(held.wait_for_session_id()).await;
+    Session {
+        id,
+        connection_stream: held,
+    }
 }
 
-/// Read the connection stream until the `session/new` result arrives, then
-/// stop holding it: the stream stays subscribed for the rest of the test
-/// because its receiver was taken, which is the point.
-async fn read_session_id(response: http::Response<ChannelBody>) -> String {
-    let mut body = std::pin::pin!(response.into_body());
-    let mut buffer = Vec::new();
-    while let Some(frame) = body.frame().await {
-        let Ok(frame) = frame else { break };
-        if let Ok(data) = frame.into_data() {
-            buffer.extend_from_slice(&data);
-        }
-        for payload in sse_payloads(&buffer) {
-            if let Ok(value) = serde_json::from_slice::<Value>(&payload)
-                && let Some(session) = value.pointer("/result/sessionId").and_then(Value::as_str)
-            {
-                return session.to_owned();
+/// A subscribed SSE stream held open, draining in the background, for the rest
+/// of a test.
+///
+/// **Holding is now load-bearing.** Under `docs/acp.md`'s subscriber-loss
+/// policy an established stream whose body is dropped terminates its whole ACP
+/// transport, so a test that reads one event and lets the response go has
+/// destroyed the connection it was building. Parking the body in a drain task
+/// keeps the stream established until a test asks for a break with
+/// [`HeldStream::break_now`], which is the only place a break should come from.
+struct HeldStream {
+    payloads: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl HeldStream {
+    fn hold(response: http::Response<ChannelBody>) -> Self {
+        let payloads = Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+        let sink = Arc::clone(&payloads);
+        let task = tokio::spawn(async move {
+            let mut body = std::pin::pin!(response.into_body());
+            let mut buffer = Vec::new();
+            let mut taken = 0usize;
+            while let Some(frame) = body.frame().await {
+                let Ok(frame) = frame else { return };
+                if let Ok(data) = frame.into_data() {
+                    buffer.extend_from_slice(&data);
+                }
+                let all = sse_payloads(&buffer);
+                if all.len() > taken {
+                    let mut guard = sink
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    guard.extend_from_slice(&all[taken..]);
+                    taken = all.len();
+                }
             }
+        });
+        Self { payloads, task }
+    }
+
+    /// Break this established stream the way a consumer going away breaks it:
+    /// the drain task is aborted, which drops the response body.
+    fn break_now(&self) {
+        self.task.abort();
+    }
+
+    fn seen(&self) -> Vec<Vec<u8>> {
+        self.payloads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Wait for a payload whose JSON pointer resolves to a string.
+    async fn wait_for_pointer(&self, pointer: &str) -> String {
+        loop {
+            for payload in self.seen() {
+                if let Ok(value) = serde_json::from_slice::<Value>(&payload)
+                    && let Some(found) = value.pointer(pointer).and_then(Value::as_str)
+                {
+                    return found.to_owned();
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
-    panic!("the connection stream never carried a session/new result");
+
+    async fn wait_for_session_id(&self) -> String {
+        self.wait_for_pointer("/result/sessionId").await
+    }
 }
 
 /// How a stream stopped producing.

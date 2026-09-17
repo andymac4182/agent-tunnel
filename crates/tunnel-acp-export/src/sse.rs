@@ -133,7 +133,17 @@ pub fn sse_event(compact: &[u8]) -> Bytes {
 pub const STREAM_QUEUE: usize = 8;
 
 /// The sending half of a [`ChannelResponseBody`].
-#[derive(Debug)]
+///
+/// **Clone is what makes subscriber loss observable without a message to
+/// send.**  A pump only learns its body is gone when it next tries to write,
+/// so a connection whose agent has fallen silent would not notice a broken
+/// stream at all.  A clone parked on the stream's [`Target`][t] lets the
+/// connection's watchdog ask [`StreamSender::is_closed`] on its own schedule.
+/// Cloning the sender does not keep the body alive: `is_closed` reports the
+/// *receiving* half being dropped, which is exactly the event being watched.
+///
+/// [t]: crate::bridge
+#[derive(Clone, Debug)]
 pub struct StreamSender {
     tx: mpsc::Sender<Result<Bytes, StreamFailure>>,
 }

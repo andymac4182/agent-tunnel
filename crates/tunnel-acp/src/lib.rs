@@ -46,6 +46,7 @@ pub mod json;
 pub mod lifecycle;
 pub mod message;
 pub mod pin;
+pub mod terminal;
 
 use tunnel_http_bridge::Profile;
 use tunnel_http_forward::{

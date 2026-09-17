@@ -3445,6 +3445,7 @@ dependencies = [
  "toml",
  "tunnel-http-bridge",
  "tunnel-http-forward",
+ "tunnel-protocol",
 ]
 
 [[package]]
@@ -3757,6 +3758,9 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "tunnel-acp",
+ "tunnel-acp-export",
+ "tunnel-acp-fixture",
  "tunnel-catalog",
  "tunnel-client",
  "tunnel-cluster",

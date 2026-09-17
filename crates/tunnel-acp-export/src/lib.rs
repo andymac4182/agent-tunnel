@@ -44,14 +44,17 @@ pub mod config;
 pub mod sse;
 pub mod supervisor;
 
-pub use bridge::{AcpDiagnostics, AcpExport, ExportError, STREAM_BACKLOG};
+pub use bridge::{
+    AcpDiagnostics, AcpExport, ExportError, MAX_CONNECTIONS_PER_BINDING, MAX_TRACKED_CONNECTIONS,
+    OUTPUT_STALL_DEADLINE, STREAM_BACKLOG,
+};
 pub use child::{
     ChildConfig, ChildCounters, ChildEnd, ChildEvent, ChildHandle, ChildMessage, SendError,
     SpawnError,
 };
 pub use config::{
     AcpAgentConfig, AcpConfigError, AcpDeadlinesConfig, AcpExportConfig, AcpLimitsConfig,
-    DEFAULT_PERMISSION_TIMEOUT_MS, DEFAULT_SUBSCRIBE_DEADLINE_MS,
+    DEFAULT_OUTPUT_STALL_MS, DEFAULT_PERMISSION_TIMEOUT_MS, DEFAULT_SUBSCRIBE_DEADLINE_MS,
 };
 pub use sse::{ExportBody, sse_event};
 pub use supervisor::{
