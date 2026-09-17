@@ -11,6 +11,9 @@ of `docs/filesystem-api.md`.  Two suites live here:
 * `gate4` — the endpoint, the dispatcher and the read path, which spans four
   crates: the resolver's metadata and enumeration additions, the provider, the
   relay route and the connector's export.
+* `gate5` — write grants and partial failure: the resolver's mutating
+  primitives, the hard-link write rule on a real write, and the dispatcher's
+  outcome ledger.
 
 A guard whose deletion leaves every test green is **not** load-bearing on its
 own, and this script prints that outcome rather than hiding it: several of the
@@ -1804,6 +1807,214 @@ GATE4_CASES: list[tuple[str, list[Edit]]] = [
 ]
 
 
+# The test command for gate 5.  Narrower than gate 4's: every guard below lives
+# in the resolver's write module or in the dispatcher, and the tests that
+# measure them are in those two crates.  The relay and the connector are
+# unchanged by this gate except for the connector's settling of the mutation
+# ledger, which has no unit test and is recorded as unmeasured rather than
+# listed here with a green it did not earn.
+GATE5_TEST = [
+    "cargo",
+    "test",
+    "--offline",
+    "-p",
+    "tunnel-fs-host",
+    "-p",
+    "tunnel-fs-provider",
+    "--lib",
+    "--tests",
+]
+
+WRITE = CRATE / "src" / "write.rs"
+
+GATE5_CASES: list[tuple[str, list[Edit]]] = [
+    (
+        "a create is exclusive whatever the request asked for",
+        [
+            (
+                WRITE,
+                """                OFlags::CREATE
+                    | OFlags::EXCL
+                    | if readable {""",
+                """                OFlags::CREATE
+                    | if readable {""",
+            )
+        ],
+    ),
+    (
+        "a mode outside the permission bits is refused, not masked",
+        [
+            (
+                WRITE,
+                """    if mode & !MODE_BITS_ALLOWED != 0 {
+        return Err(FsError::refused(FsErrorCode::Einval));
+    }
+""",
+                "    let mode = mode & MODE_BITS_ALLOWED;\n",
+            )
+        ],
+    ),
+    (
+        # This one deletion reaches **two** pinned claims, and that is worth
+        # stating rather than splitting into cases that cannot be written.
+        # With the hard-link check gone, a multiply-linked file is writable —
+        # and the truncating open in the same test then truncates it, so the
+        # content-intact assertion fails too.  That assertion is the only form
+        # in which "truncation happens through the descriptor **after** the
+        # rule permitted it" can be measured by deletion: the alternative
+        # ordering is `O_TRUNC` on the resolving open, which is not a deletion
+        # but a different implementation.
+        "the hard-link write rule, and the truncation that follows it",
+        [
+            (
+                RESOLVER,
+                """        check_hard_link_write(
+            primitive,
+            handle.identity(),
+            self.features.has(Feature::HardLinks),
+        )?;
+""",
+                "",
+            )
+        ],
+    ),
+    (
+        "the hard-link rule consults the link count the descriptor reports now",
+        [
+            (
+                WRITE,
+                """        let identity = handle.current_identity()?;
+        if identity.kind() == FileKind::Directory {""",
+                """        let identity = handle.identity();
+        if identity.kind() == FileKind::Directory {""",
+            )
+        ],
+    ),
+    (
+        "a failed mutation is reported failed, not not-started",
+        [
+            (
+                POLICY,
+                """    FsError::Filesystem {
+        code: code_from_errno(errno),
+        outcome: Outcome::Failed,
+    }
+}""",
+                """    host_error(errno)
+}""",
+            )
+        ],
+    ),
+    (
+        "an applied effect opens the ledger the connector settles",
+        [
+            (
+                PROVIDER_SRC,
+                """            // The ledger opens here and is settled by the connector. Between
+            // these two points the effect has happened and the consumer has not
+            // been told, which is the only window in which `unknown` is the
+            // truthful answer.
+            self.undelivered_effect = true;""",
+                "",
+            )
+        ],
+    ),
+    (
+        "a session that ends holding an effect reports it unknown",
+        [
+            (
+                PROVIDER_SRC,
+                """        self.note_effect_undelivered();
+        self.session.close();""",
+                "        self.session.close();",
+            )
+        ],
+    ),
+    (
+        "a failure after an applied field is escalated to partial",
+        [
+            (
+                PROVIDER_SRC,
+                """    fn escalate(error: FsError, applied: bool) -> FsError {
+        if !applied {
+            return error;
+        }""",
+                """    fn escalate(error: FsError, applied: bool) -> FsError {
+        if !applied || applied {
+            return error;
+        }""",
+            )
+        ],
+    ),
+    (
+        "O_APPEND is refused because the hosts disagree about it",
+        [
+            (
+                PROVIDER_SRC,
+                """    if flags & O_APPEND == 0 {
+        Ok(())
+    } else {
+        Err(FsError::refused(FsErrorCode::Enotsup))
+    }""",
+                "    let _ = flags;\n    Ok(())",
+            )
+        ],
+    ),
+    (
+        "a remove decides the node's kind rather than assuming it",
+        [
+            (
+                PROVIDER_SRC,
+                "        let directory = metadata.kind() == FileKind::Directory;",
+                "        let directory = false;",
+            )
+        ],
+    ),
+    (
+        # **The one generation guard this gate makes load-bearing.**  Gate 4
+        # measured its three descriptor-cache generation guards as green alone
+        # and recorded them as defence in depth behind gate 3's own stamp; this
+        # gate does not change that, because the dispatcher still performs one
+        # request at a time.  What it adds is a *fourth* generation-keyed
+        # decision that is not masked: `Tlcreate` rebinds its fid, so the
+        # session stamps a fresh generation when the reply is applied, and a
+        # descriptor filed under the generation the request arrived with is
+        # immediately unreachable — the created file cannot be written through
+        # the very fid that made it.
+        "a created fid's descriptor is keyed by the generation the create made",
+        [
+            (
+                PROVIDER_SRC,
+                """                CacheEffect::InsertCreated(entry) => {
+                    let generation = self
+                        .session
+                        .fid(fid)
+                        .map_or(queued.generation, tunnel_fs_ninep::FidState::generation);
+                    self.insert(fid, generation, entry);
+                }""",
+                """                CacheEffect::InsertCreated(entry) => {
+                    self.insert(fid, queued.generation, entry);
+                }""",
+            )
+        ],
+    ),
+    (
+        "a name-removing operation refuses a special file",
+        [
+            (
+                WRITE,
+                """    check_exportable(identity.kind())?;
+    // A mount point is not this export's to remove even when its name is.
+    let parent_identity = parent.current_identity()?;
+    check_same_device(parent_identity, identity)""",
+                """    let _ = parent;
+    Ok(())""",
+            )
+        ],
+    ),
+]
+
+
 @dataclass
 class Suite:
     """One suite's guards and the command that measures them.
@@ -1829,6 +2040,7 @@ SUITES: list[Suite] = [
         GATE3_CASES,
     ),
     Suite("gate4", [CRATE, PROVIDER, RELAY, CLIENT], GATE4_TEST, GATE4_CASES),
+    Suite("gate5", [CRATE, PROVIDER], GATE5_TEST, GATE5_CASES),
 ]
 
 
@@ -1908,7 +2120,7 @@ def main() -> int:
     parser.add_argument("--case", help="run only cases whose name contains this text")
     parser.add_argument(
         "--suite",
-        help="run only this suite (gate2, gate3 or gate4); default is all",
+        help="run only this suite (gate2, gate3, gate4 or gate5); default is all",
     )
     arguments = parser.parse_args()
 
