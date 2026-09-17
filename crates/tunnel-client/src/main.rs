@@ -145,6 +145,16 @@ struct ConnectStatusResult {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // The process-wide `rustls` provider is chosen here, explicitly, rather
+    // than inferred from which provider features happen to be enabled across
+    // the whole dependency graph (task row M8-C09). An error means something
+    // installed one before this line, which is fatal: whatever that is has
+    // decided this process's cryptography.
+    if let Err(error) = tunnel_transport::install_process_crypto_provider() {
+        eprintln!("tunnel: {error}");
+        return ExitCode::FAILURE;
+    }
+    debug_assert!(tunnel_transport::process_provider_is_ring());
     let args = env::args_os().skip(1).collect::<Vec<_>>();
     let command = match parse_command(&args) {
         Ok(command) => command,
@@ -280,10 +290,19 @@ fn run_legacy_check_config(path: Option<PathBuf>) -> Result<(), CliError> {
 
 async fn run_connect(path: PathBuf, json: bool) -> Result<(), CliError> {
     let config = load_runtime_config(&path)?;
-    // Configured MCP exports become in-process http-forward/1 handlers; an
-    // http-forward export without one is still refused at OPEN.
+    // Configured MCP and ACP exports become in-process http-forward/1
+    // handlers; an http-forward export without one is still refused at OPEN.
+    // **Both registrations run**, because an `[exports.<id>.acp]` table that
+    // was parsed and validated and then never registered would be an export
+    // the operator configured and the binary silently refused.
     let handlers = tunnel_client::http_forward::HttpHandlers::new()
         .with_mcp_exports(&config)
+        .map_err(|error| CliError {
+            code: "CONFIG_ERROR",
+            message: error.to_string(),
+            retryable: false,
+        })?
+        .with_acp_exports(&config)
         .map_err(|error| CliError {
             code: "CONFIG_ERROR",
             message: error.to_string(),

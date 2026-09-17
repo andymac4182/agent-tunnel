@@ -500,6 +500,85 @@ fn ring_provider() -> Arc<CryptoProvider> {
     Arc::new(crypto::ring::default_provider())
 }
 
+/// A process that already had a `rustls` crypto provider before this one was
+/// installed.
+///
+/// It is an error rather than a shrug: the only way to see it is for something
+/// to have installed a provider before the first line of `main`, and whatever
+/// that is has decided the process's cryptography instead of this workspace.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProviderAlreadyInstalled;
+
+impl core::fmt::Display for ProviderAlreadyInstalled {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str(
+            "a rustls crypto provider was already installed before this process chose one",
+        )
+    }
+}
+
+impl std::error::Error for ProviderAlreadyInstalled {}
+
+/// Install `ring` as this process's default `rustls` crypto provider.
+///
+/// **Every binary in this workspace must call this before any TLS work.**
+/// `rustls` will only infer a process default when exactly one provider
+/// feature is enabled in the build, and a workspace does not control that: a
+/// single dependency anywhere in the graph that asks for `aws-lc-rs` turns the
+/// inference into a panic — "Could not automatically determine the
+/// process-level CryptoProvider" — in binaries that never named that
+/// dependency. That is not hypothetical; it is what happened when M8 chunk 3
+/// added the pinned ACP HTTP client, whose `reqwest` feature set pulls
+/// `rustls/aws-lc-rs` (task row M8-C09).
+///
+/// Every `rustls` configuration this crate builds already passes
+/// [`ring_provider`] explicitly, so nothing here depends on the inference for
+/// its *choice*. What this fixes is the sites that build a `rustls` config
+/// **without** naming a provider, which are not all in this workspace: the
+/// nearest one is `redis-rs`'s own `ClientConfig::builder()` on a `rediss://`
+/// URL, reached through `tunnel-catalog`.
+///
+/// # Errors
+/// [`ProviderAlreadyInstalled`] when a provider was installed before this
+/// call. **Treat it as fatal.** It is the only signal available that something
+/// ran before `main` and chose the process's cryptography; swallowing it —
+/// which this function used to invite by returning a `bool` nobody read — makes
+/// the one observable symptom of that invisible.
+pub fn install_process_crypto_provider() -> Result<(), ProviderAlreadyInstalled> {
+    crypto::ring::default_provider()
+        .install_default()
+        .map_err(|_| ProviderAlreadyInstalled)
+}
+
+/// Whether the process's default provider is the `ring` one this workspace
+/// installs.
+///
+/// Compared by cipher suite list, which is what a `CryptoProvider` exposes;
+/// there is no identity to compare. **Be exact about what that distinguishes:**
+/// it catches a provider with a different suite set, and it would not catch a
+/// hypothetical other provider offering exactly `ring`'s suites in exactly
+/// `ring`'s order. The stronger statement is the `Ok` from
+/// [`install_process_crypto_provider`], which says *this* call installed it.
+#[must_use]
+pub fn process_provider_is_ring() -> bool {
+    let Some(installed) = CryptoProvider::get_default() else {
+        return false;
+    };
+    // Discriminate on the secure-random implementation's own type name, not on
+    // the cipher-suite list.
+    //
+    // An earlier version of this compared `cipher_suites` against ring's, which
+    // could not fail for the reason it claimed: rustls 0.23's `ring` and
+    // `aws_lc_rs` default providers offer the same suites in the same order
+    // (non-FIPS, tls12), so this returned `true` for *precisely* the provider
+    // M8-C09 exists to exclude.  Review caught it.
+    //
+    // `SecureRandom` is `Debug` and each provider's implementing type is a
+    // distinct named struct -- ring's is `Ring` -- so the rendered type name
+    // separates them where the suite list cannot.
+    format!("{:?}", installed.secure_random).starts_with("Ring")
+}
+
 fn require_client_ca_with_provider(
     ca_pem: &[u8],
     provider: Arc<CryptoProvider>,

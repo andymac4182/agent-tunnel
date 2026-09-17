@@ -8,6 +8,12 @@ here:
 * `m8c1` — `crates/tunnel-acp`: the `http-forward/1` profile tables, the strict
   JSON scanner, the JSON-RPC message rules, the version negotiation, the v1
   turn-completion rule, and the two draft features that must stay off.
+* `m8c3` — the in-process HTTP/SSE bridge in `crates/tunnel-acp-export`: the
+  SSE encoding, the one-subscriber rule, the subscription deadlines, the
+  session routing, the workspace policy and the connection's cleanup.  Its
+  sibling suite `m8c3-relay` holds the relay's `[http_forward]` profile
+  allowlist, which lives in a different crate and needs a different test
+  command.
 * `m8c2` — the pure lifecycle in `crates/tunnel-acp/src/lifecycle.rs`, the
   supervisor in `crates/tunnel-acp-export` and the synthetic agent in
   `crates/tunnel-acp-fixture`: id scoping, resolve-exactly-once, the bounds,
@@ -947,9 +953,377 @@ C2_CASES: list[tuple[str, list[Edit], bool]] = [
     ),
 ]
 
+
+# ------------------------------------------------------------- m8c3: chunk 3
+#
+# The in-process HTTP/SSE bridge (`crates/tunnel-acp-export/src/bridge.rs` and
+# `src/sse.rs`), its operator configuration, and the relay's `[http_forward]`
+# profile allowlist.
+#
+# Two kinds of case are deliberately absent rather than faked:
+#
+# **Two earlier exemptions were wrong and are now cases.**  Both were claimed
+# here as "cannot be measured", and review measured them:
+#
+# * **The 202 rule.**  The claim was that nothing could be defeated because no
+#   assertion terminates on a status.  The mutation that matters is not
+#   `202 -> 200`; it is a **lying 202** -- answer 202 and then never deliver the
+#   result.  That is constructible, it reddens four tests, and it is exactly the
+#   rule "no claim terminates on a status" exists to protect.  It has no
+#   business being the one rule exempted from the standard everything else here
+#   is held to.
+# * **The inbound listener.**  A listener bound inside `AcpExport::from_config`
+#   is a perfectly good deletion case and reddens `no_listener.rs`.  The
+#   positive control inside that test checks the *detector*; it says nothing
+#   about the export path, which is what a guard case has to defeat.
+
+BRIDGE = EXPORT / "src" / "bridge.rs"
+SSE = EXPORT / "src" / "sse.rs"
+RELAY_CONFIG = REPO / "crates" / "tunnel-relay" / "src" / "config.rs"
+
+# `--features tunnel-acp-fixture/interop` so the **pinned client's** own tests
+# are part of this suite's evidence.  They are off by default -- the client
+# drags a second `rustls` crypto provider into whatever build it is in
+# (M8-C09) -- but a guard-deletion run is exactly where they belong: several of
+# these rules are witnessed by the real client and by nothing else.
+C3_CARGO_TEST = [
+    "cargo",
+    "test",
+    "-p",
+    "tunnel-acp-export",
+    "-p",
+    "tunnel-acp-fixture",
+    "--features",
+    "tunnel-acp-fixture/interop",
+    "--locked",
+    "--no-fail-fast",
+]
+
+C3_RELAY_TEST = [
+    "cargo",
+    "test",
+    "-p",
+    "tunnel-relay",
+    "--lib",
+    "--locked",
+    "--no-fail-fast",
+    "http_forward_profiles",
+]
+
+C3_CASES: list[tuple[str, list[Edit], bool]] = [
+    # --------------------------------------------------------- the 202 rule
+    (
+        # A **lying 202**: the POST is still accepted, and the result the host
+        # is waiting for on its session stream never arrives.  If any claim in
+        # this chunk terminated on the status, this would stay green.
+        "a 202 is followed by the result on the stream (prompt)",
+        [
+            (
+                BRIDGE,
+                """            }
+            .unwrap_or_default();
+            let _ = target.tx.send(Bytes::from(body)).await;
+        });
+        no_body(StatusCode::ACCEPTED)
+    }
+
+    async fn answer_permission(""",
+                """            }
+            .unwrap_or_default();
+            let _ = body;
+        });
+        no_body(StatusCode::ACCEPTED)
+    }
+
+    async fn answer_permission(""",
+            )
+        ],
+        False,
+    ),
+    (
+        "a 202 is followed by the result on the stream (session/new)",
+        [
+            (
+                BRIDGE,
+                """                "result": {"sessionId": session},
+            }))
+            .unwrap_or_default();
+            let _ = target.tx.send(Bytes::from(body)).await;""",
+                """                "result": {"sessionId": session},
+            }))
+            .unwrap_or_default();
+            let _ = (target, body);""",
+            )
+        ],
+        False,
+    ),
+    # ----------------------------------------------------- one lost subscriber
+    (
+        # Restores the destructive behaviour review found: the connection's one
+        # router returning on the first failed send, which silently stopped
+        # every other stream on the connection.
+        "one lost subscriber closes one stream and nothing else",
+        [
+            (
+                BRIDGE,
+                """        if target.tx.send(Bytes::from(message.compact)).await.is_err() {
+            target.close();
+            connection
+                .counters
+                .streams_lost
+                .fetch_add(1, Ordering::Relaxed);
+        }""",
+                """        if target.tx.send(Bytes::from(message.compact)).await.is_err() {
+            return;
+        }""",
+            )
+        ],
+        False,
+    ),
+    # -------------------------------------------------- a child ends its transport
+    (
+        "a child that is gone ends its transport",
+        [
+            (
+                BRIDGE,
+                """            () = connection.supervisor.wait_exited() => {
+                end_with_child(&export, &connection).await;
+                return;
+            }""",
+                "            () = connection.supervisor.wait_exited() => return,",
+            )
+        ],
+        False,
+    ),
+    (
+        # **Two edits, because the rule is written in two places**, and the
+        # first run of this case proved why: a pump blocked on its queue is
+        # woken by the shutdown signal, and a pump whose queue ran dry checks
+        # the signal itself. Which one fires is a race, so defeating either
+        # alone leaves the other standing and reports the rule as not
+        # load-bearing when it is. The same shape as the m8c2 suite's "only a
+        # permission expires on a permission deadline".
+        "a broken stream errors its body rather than ending cleanly",
+        [
+            (
+                BRIDGE,
+                """            () = shutdown.cancelled() => {
+                // A connection that ended while a stream was open fails the
+                // body rather than ending it cleanly: `docs/acp.md` refuses to
+                // let a broken ACP stream look like an orderly one.
+                sender.fail(StreamFailure::Interrupted).await;
+                return;
+            }""",
+                "            () = shutdown.cancelled() => return,",
+            ),
+            (
+                BRIDGE,
+                """            if shutdown.is_cancelled() {
+                sender.fail(StreamFailure::Interrupted).await;
+            }
+            return;""",
+                "            return;",
+            ),
+        ],
+        False,
+    ),
+    # ------------------------------------------------------ the inbound listener
+    (
+        # "No listener" has no branch to delete, so the case *adds* one, in the
+        # export's own constructor.  That is the path `no_listener.rs` is about;
+        # its in-test positive control only checks the detector.
+        "the ACP export opens no listener of its own",
+        [
+            (
+                BRIDGE,
+                """    pub fn from_config(config: &AcpExportConfig) -> Result<Self, AcpConfigError> {
+        let validated = config.validate()?;""",
+                """    pub fn from_config(config: &AcpExportConfig) -> Result<Self, AcpConfigError> {
+        let validated = config.validate()?;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("guard-deletion listener");
+        std::mem::forget(listener);""",
+            )
+        ],
+        False,
+    ),
+    # ------------------------------------------------------ the SSE encoding
+    (
+        "an SSE event ends with a blank line, not one newline",
+        [(SSE, r'event.extend_from_slice(b"\n\n");', r'event.extend_from_slice(b"\n");')],
+        False,
+    ),
+    (
+        "an SSE event begins with `data: `",
+        [(SSE, 'event.extend_from_slice(b"data: ");', 'event.extend_from_slice(b"data:");')],
+        False,
+    ),
+    (
+        # M8-C05, defeated by *adding* the header, because "only these headers"
+        # cannot be measured by deletion.
+        "no response carries acp-session-id (M8-C05)",
+        [
+            (
+                SSE,
+                """    if let Ok(value) = HeaderValue::from_str(connection) {""",
+                """    headers.insert(
+        http::HeaderName::from_static(tunnel_acp::headers::ACP_SESSION_ID),
+        HeaderValue::from_static("session-1"),
+    );
+    if let Ok(value) = HeaderValue::from_str(connection) {""",
+            )
+        ],
+        False,
+    ),
+    # --------------------------------------------------------- one subscriber
+    (
+        "a second subscriber on one stream is refused",
+        [
+            (
+                BRIDGE,
+                """        let Some(queue) = target.take() else {
+            // The one-subscriber rule, and it is structural: there is nothing
+            // left to take.
+            self.inner
+                .counters
+                .subscribers_refused
+                .fetch_add(1, Ordering::Relaxed);
+            return no_body(StatusCode::CONFLICT);
+        };""",
+                """        let queue = target
+            .take()
+            .unwrap_or_else(|| mpsc::channel(STREAM_BACKLOG).1);""",
+            )
+        ],
+        False,
+    ),
+    (
+        "an expired session's window stays closed",
+        [
+            (
+                BRIDGE,
+                """            // silently reopens.
+            target.close();""",
+                "            // silently reopens.",
+            )
+        ],
+        False,
+    ),
+    # ------------------------------------------------------------- readiness
+    (
+        "a session admits its prompt only once its subscriber arrived",
+        [
+            (
+                BRIDGE,
+                "            let _ = connection.supervisor.subscriber_ready(session);",
+                "",
+            )
+        ],
+        False,
+    ),
+    # ------------------------------------------------------------- deadlines
+    (
+        "a subscription that never arrives expires",
+        [
+            (
+                BRIDGE,
+                "        if !target.is_subscribed() && target.created.elapsed() > bound {",
+                "        if false && !target.is_subscribed() && target.created.elapsed() > bound {",
+            )
+        ],
+        False,
+    ),
+    (
+        "a session subscription that never arrives expires",
+        [
+            (
+                BRIDGE,
+                "                .filter(|target| !target.is_subscribed() && target.created.elapsed() > bound)",
+                "                .filter(|_target| false)",
+            )
+        ],
+        False,
+    ),
+    # --------------------------------------------------------------- routing
+    (
+        "a session-scoped message goes to its own session's stream",
+        [
+            (
+                BRIDGE,
+                """        let target = match message.session.as_deref() {
+            Some(session) => connection.session_target(session),
+            None => Some(connection.with(|state| Arc::clone(&state.connection))),
+        };""",
+                """        let target = Some(connection.with(|state| Arc::clone(&state.connection)));""",
+            )
+        ],
+        False,
+    ),
+    # ------------------------------------------------------ workspace policy
+    (
+        "the host cannot choose a workspace or attach MCP servers",
+        [
+            (
+                BRIDGE,
+                """        if params.get("cwd").and_then(Value::as_str) != Some(connection.workspace.as_str())""",
+                """        if false
+            && params.get("cwd").and_then(Value::as_str) != Some(connection.workspace.as_str())""",
+            )
+        ],
+        False,
+    ),
+    # --------------------------------------------------------------- cleanup
+    (
+        "a connection that ends takes its child with it",
+        [(BRIDGE, "    connection.supervisor.drain().await;", "")],
+        False,
+    ),
+]
+
+C3_RELAY_CASES: list[tuple[str, list[Edit], bool]] = [
+    (
+        "the relay's profile allowlist admits the ACP profile",
+        [
+            (
+                RELAY_CONFIG,
+                "            } else if let Some(profile) = tunnel_acp::AcpProfile::parse_id(id) {",
+                "            } else if let Some(profile) = tunnel_acp::AcpProfile::parse_id(id).filter(|_| false) {",
+            )
+        ],
+        False,
+    ),
+    (
+        "and admits nothing else",
+        [
+            (
+                RELAY_CONFIG,
+                """            } else {
+                return Err(ConfigError::Invalid(
+                    "http_forward.profiles may name only mcp-2026-07-28, mcp-2025-11-25 and acp-http-v1",
+                ));
+            };""",
+                """            } else {
+                (
+                    tunnel_acp::AcpProfile::HttpV1.id(),
+                    tunnel_acp::AcpProfile::HttpV1
+                        .policies(tunnel_acp::AcpLimits::default())
+                        .map_err(|_| {
+                            ConfigError::Invalid("pinned http_forward profile is inconsistent")
+                        })?,
+                )
+            };""",
+            )
+        ],
+        False,
+    ),
+]
+
+RELAY_CRATE = REPO / "crates" / "tunnel-relay"
+
 SUITES: list[Suite] = [
     Suite("m8c1", [CRATE], CARGO_TEST, CASES),
     Suite("m8c2", [CRATE, EXPORT, FIXTURE], C2_CARGO_TEST, C2_CASES),
+    Suite("m8c3", [EXPORT, FIXTURE], C3_CARGO_TEST, C3_CASES),
+    Suite("m8c3-relay", [RELAY_CRATE], C3_RELAY_TEST, C3_RELAY_CASES),
 ]
 
 
@@ -1037,7 +1411,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--list", action="store_true", help="print case names and exit")
     parser.add_argument("--case", help="run only cases whose name contains this text")
-    parser.add_argument("--suite", help="run only this suite (m8c1, m8c2)")
+    parser.add_argument(
+        "--suite", help="run only this suite (m8c1, m8c2, m8c3, m8c3-relay)"
+    )
     arguments = parser.parse_args()
 
     suites = SUITES

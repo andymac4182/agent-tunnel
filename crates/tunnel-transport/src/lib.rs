@@ -37,9 +37,10 @@ pub use server::{
     serve_with_listener_options, serve_with_socket_options,
 };
 pub use tls::{
-    CertificateRole, ClientTlsConfigError, SanName, SpkiSha256, TlsConfigError, TlsIdentity,
-    TlsIdentityError, load_client_config_from_pem, load_client_config_from_pem_with_alpn,
+    CertificateRole, ClientTlsConfigError, ProviderAlreadyInstalled, SanName, SpkiSha256,
+    TlsConfigError, TlsIdentity, TlsIdentityError, install_process_crypto_provider,
+    load_client_config_from_pem, load_client_config_from_pem_with_alpn,
     load_peer_client_config_from_pem, load_peer_server_config_from_pem, load_quinn_client_config,
     load_quinn_server_config, load_server_config_from_pem, load_server_config_from_pem_with_alpn,
-    require_client_ca, require_root_certificates, spki_sha256_from_der,
+    process_provider_is_ring, require_client_ca, require_root_certificates, spki_sha256_from_der,
 };

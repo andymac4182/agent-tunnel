@@ -249,6 +249,146 @@ Chunk 2 adds the **pure lifecycle** (`crates/tunnel-acp/src/lifecycle.rs`), the 
 - **Evidence.** `scripts/acp-guard-deletion.py --suite m8c2` defeats each rule in turn, including the three cleanup mechanisms, each witnessed by a **surviving process** rather than by a counter. The script grew a third refusal in this chunk: a timed-out run is `NOT EVIDENCE (timed out)`, not `RED (hung)` — the old spelling was counted in neither the red tally nor the unusable filter (M8-C06). The filter itself was then inverted and shared with `scripts/fs-guard-deletion.py` as `scripts/guard_outcomes.py`: `RED`, `REFUSED BY COMPILER` and `DOCUMENTED GREEN` are usable and **everything else fails closed**, because a deny list of prefixes had let four spellings through, `still green` included (M8-C08). `DOCUMENTED GREEN` exists because failing closed changed the **exit contract of the filesystem harness**, which verified M4 rows cite: sixteen of its cases are green *by design*, each with a written reason, and a harness must distinguish those from a case nobody can explain. Sixteen were marked and measured; two in `gate3` were deliberately left unmarked as **not established**, because guessing would turn an open question into a documented finding. That inversion earned its keep immediately — it caught a guard case of this chunk's own that was not load-bearing, which is why `nothing_holds_the_child_handle_once_the_child_is_gone` exists.
 - **Not proven.** Everything else: no HTTP handler, no SSE stream, no session over the wire, no tunnel, no relay, no real ACP client, and no non-macOS host. The M8-C02 batch disagreement is met only on the **stdio** side; its acceptance is about the SSE stream, so that row stays open.
 
+## Implemented in code (M8 chunk 3)
+
+Chunk 3 adds the **in-process HTTP/SSE bridge**: `crates/tunnel-acp-export`'s
+`bridge::AcpExport`, an `HttpHandler` registered through
+`HttpHandlers::with_acp_exports` and served over `tunnel-http-bridge`'s gate-2
+`forward`/`serve` path. It adds no tunnel, no relay, no cluster and no
+principal; those remain chunks 4 and 5. Everything chunks 1 and 2 declined to
+claim is still unclaimed.
+
+- **A complete v1 conversation, driven by the official pinned client.**
+  `agent-client-protocol` / `agent-client-protocol-http` `=2.1.0` — the same
+  artifacts chunk 1 pinned — speaks cleartext HTTP/2 with prior knowledge to a
+  loopback gateway, through `forward`/`serve`, to the synthetic fixture agent:
+  `initialize` → 200 with `Acp-Connection-Id`; the connection GET;
+  `session/new` answered **202** with its result routed to the connection GET;
+  the session GET; `session/prompt` answered **202** with its result arriving
+  on the session GET; `session/update` chunks; `session/request_permission`
+  reaching the host, whose POSTed response resolves it; `stopReason:
+  "end_turn"`; and the client's own DELETE. This is the first thing in this
+  repository that is interoperability evidence rather than a table asserting
+  itself.
+- **No claim terminates on an HTTP status.** `docs/acp.md` says 202 means
+  accepted by the bridge and nothing more, so every claim about a prompt, a
+  session or a permission anchors to a message observed on the wire.
+  `stopReason` is read from the message the client received. The permission
+  outcome is read from a marker file **the agent itself wrote**, recording what
+  it received rather than what the bridge believes it forwarded. A status is
+  asserted only where the bridge *refused* and nothing was dispatched — and
+  each of those also asserts that nothing reached the agent.
+- **Wire order is taken at the transport.** The gateway taps every response
+  body before any client handler sees it, and the session stream's order is
+  asserted as a sequence: the permission callback, then the chunk reporting its
+  outcome, then the turn's result. The client's own handler record is compared
+  as a **multiset only**. M3-03 recorded rmcp delivering log sequence 4 before
+  3 with the wire intact; a handler-order assertion would measure the SDK's
+  concurrency rather than this bridge's ordering.
+- **The SSE encoding is byte for byte.** Every event is exactly `data:
+  <compact>\n\n`, asserted by rebuilding the recorded stream from its parsed
+  payloads and comparing the bytes — so an extra field, a keep-alive comment or
+  a different terminator fails rather than being tolerated. There is no `id:`
+  field and therefore no `Last-Event-ID` replay, which is this profile's stated
+  position.
+- **One subscriber per connection and per session, structurally.** A stream's
+  queue has one receiving half and a subscriber *takes* it; a second GET finds
+  nothing to take and is refused **409**. The same mechanism closes an expired
+  session's window, so a late GET is refused rather than silently reopening.
+- **The subscription deadlines are observed, not asserted against a constant.**
+  The watchdog records the elapsed time it actually ran with the bound it
+  exceeded, in **microseconds** — milliseconds are the bound's own unit, and a
+  watchdog firing at 300.4 ms reports 300 once truncated, which reads as equal
+  rather than as exceeded. One test runs at the **real documented ten seconds**
+  and waits them out; the rest shorten the bound so the mechanism is cheap to
+  measure. A connection whose GET never arrives is ended and its child is gone
+  **from the process table**.
+- **A prompt before its session subscriber is refused**, `docs/acp.md`'s own
+  rule, with the refusal shown to be the readiness rule and not something else:
+  the same prompt succeeds once the subscriber is there, and its `stopReason`
+  is read off the wire.
+- **The host cannot choose a workspace or attach MCP servers.** A `session/new`
+  whose `cwd` is not the configured workspace, and one with a nonempty
+  `mcpServers`, are both refused before anything reaches the agent, and no
+  session is opened by either.
+- **No inbound device listener exists, read from the socket table.** `serve`
+  takes no address, so there is no call whose absence could be asserted.
+  `tests/no_listener.rs` runs a whole conversation and asks the operating
+  system for this process's listening sockets — with a positive control that
+  binds a real one first — and also compares the socket count against a
+  baseline taken **after** a warm-up conversation, because `tokio::process`
+  makes the runtime build its own signalling socket pair the first time it
+  spawns anything. That pair is Tokio's, and counting it as a listener would be
+  wrong in the other direction.
+- **M8-C05 is decided: strip at the bridge, and say so.** The pinned SDK's
+  server sets `Acp-Session-Id` on every session-scoped SSE response
+  (`agent-client-protocol-http` 2.1.0 `http_server.rs`, `handle_get`); this
+  profile follows the RFD, which names only `Acp-Connection-Id` on responses
+  and returns a new session's identifier in the `session/new` response body.
+  The allowlist is **not** widened. The consequence is recorded rather than
+  hidden: **this device's session-scoped SSE responses are not byte-identical
+  to the pinned server's.** What the chunk proves is that they do not need to
+  be — the pinned *client* reads that header on no response, and completed a
+  whole v1 conversation without it. The half that remains open is a bridge that
+  **fronts or mirrors** the SDK's own server, which this chunk does not do; that
+  is a different direction — the header arrives on the request-parsing side and
+  needs its own decision — and it is tracked as **M8-C10** rather than left
+  implicit in this one.
+- **The batch disagreement is closed in both directions.** A host that POSTs a
+  JSON-RPC array is refused **501** by the batch rule's own code, and nothing is
+  dispatched. A batch arriving on the *device's* SSE stream is refused by that
+  same rule at the child boundary — the child's own `batch_output` and
+  `invalid_output` counters each read 1, so the refusal is observed where it
+  happens rather than inferred — and because a connection has exactly one child,
+  a child that dies this way **closes its transport**: the connection is removed,
+  every target is closed, and a later GET is answered 404. That is `acp.md`'s own
+  policy below, now implemented rather than merely stated.
+
+  An earlier draft of this bullet recorded the device half as **"cannot be proven
+  without a product change"**, reasoning that the response head is already on the
+  wire so no status can carry the refusal. That reasoning was about the wrong
+  question: M8-C02's acceptance never asked for a mid-stream 501, it asked the
+  bridge to *guarantee the stream never carries a batch and prove it with a child
+  that deliberately emits one*, which is provable and now proved. The correction
+  is recorded rather than silently applied, because "cannot be proven" is a claim
+  like any other and this one was wrong. What stays open is narrower and is on
+  M8-C02: whether the profile should refuse such a child at admission instead.
+- **Evidence.** `scripts/acp-guard-deletion.py --suite m8c3` defeats each of
+  this chunk's rules in turn: **17 of 17 turned a test red**. Its sibling
+  `--suite m8c3-relay`, which needs a different crate and a different test
+  command, is **2 of 2**. Both classify their outcomes with the shared
+  `scripts/guard_outcomes.py` allow list, so anything but `RED`, `REFUSED BY
+  COMPILER` or `DOCUMENTED GREEN` fails closed.
+
+  **Two rules were exempted from that in the first draft, and both exemptions
+  were wrong.** The 202 rule was called unmeasurable "because nothing here
+  terminates on a status"; the mutation that matters is not `202 → 200` but a
+  **lying 202** — accept the POST and never deliver the result — which is
+  constructible, reddens several tests, and is precisely the rule "no claim
+  terminates on a status" exists to protect. "No inbound listener" was called
+  unguardable; a listener bound inside the export's own constructor is a
+  perfectly good case, and the positive control inside `no_listener.rs` checks
+  the *detector*, not the export path. Both are cases now. The one rule exempted
+  from the standard everything else was held to turned out not to need the
+  exemption.
+- **There is no principal in this chunk.** `docs/acp.md` derives a principal at
+  the relay ingress, and the in-process gate-2 bridge has no ingress in front of
+  it: every request carries no `tunnel-principal-binding` at all. That is the
+  M3-01/M3-02 precedent exactly. The bridge compares the value for equality
+  with the one its connection was opened with and never interprets or derives
+  one, so a connection here is bound to "no principal" and refuses any other
+  value — which is a mechanism, not a principal-binding claim.
+- **macOS is the only host.** Nothing here ran on Linux or Windows.
+- **Not proven.** The tunnel, a relay, the cluster, rotation, peer hops, two
+  users and cross-tenant isolation (chunks 4 and 5). Subscriber loss on an
+  established stream, output credit and an HTTP-level `outcome_unknown` —
+  M8-03's remaining half. `session/cancel` is forwarded and cancels that
+  session's outstanding permissions, but no test drives a cancelled turn.
+  `session/load` is an accepted method of the profile and is **refused 501** by
+  the bridge, because `docs/acp.md` requires a negotiated capability and an
+  authorized stored session mapping first. The idle, prompt-wall-time and
+  output-stall bounds of the limits table are not implemented.
+
 ## Research provenance
 
 The linked official pages were read on 2026-09-09. Source history exposed protocol commit `b4eddcd86937c972e65240e5199403f6d8a8cc2c` and SDK commit `7d8291d42236023c683bfc52f13d27746cda59ea`. The SDK commit explicitly distinguishes stable v1 builders from draft v2 APIs. These are observed source references, not a dependency lock or a claim that every immutable transport file was fetched. The first slice must pin and verify exact crate/schema/transport contents before implementation advertises compatibility. [Protocol history](https://github.com/agentclientprotocol/agent-client-protocol/commits/main), [SDK reference](https://github.com/agentclientprotocol/rust-sdk/commit/7d8291d42236023c683bfc52f13d27746cda59ea)

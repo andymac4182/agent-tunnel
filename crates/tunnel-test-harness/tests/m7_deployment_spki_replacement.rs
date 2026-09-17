@@ -2203,6 +2203,7 @@ fn write_client_config(
                 kind: LocalExportKind::Echo,
                 device_canary: Some(CANARY.to_owned()),
                 mcp: None,
+                acp: None,
                 fs: None,
             },
         )]),

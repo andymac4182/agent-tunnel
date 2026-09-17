@@ -23,6 +23,10 @@ tokio = { version = "1.48", features = [
     "io-std",
     "io-util",
     "macros",
+    # The interop gateway's loopback listener.  It is the *host* side of the
+    # conversation; the device side opens nothing, which `no_listener.rs`
+    # measures on the socket table.
+    "net",
     "process",
     "rt",
     "rt-multi-thread",
@@ -33,10 +37,79 @@ tokio = { version = "1.48", features = [
 # The supervisor's end-to-end tests live here, because only the crate that
 # defines the fixture binary gets `CARGO_BIN_EXE_*`.  `tunnel-mcp-fixture`
 # holds `tunnel-mcp-export`'s tests the same way.
+# The **official pinned ACP client**, at the same exact versions `tunnel-acp`
+# pins for the profile tables, behind a feature that is **off by default**.
+#
+# Why a feature and not a dev-dependency (task rows M8-C04 and M8-C09).
+# `agent-client-protocol-http`'s `client` feature requires `reqwest` with its
+# `rustls` feature, and `reqwest` 0.13's `rustls` is `["__rustls-aws-lc-rs",
+# ...]`.  Cargo unifies features across one build, so an unconditional
+# dev-dependency here put a **second** `rustls` crypto provider into every
+# workspace-wide build -- including the `tunnel-relay` binary the M7 startup
+# tests spawn, which then differed from the binary `cargo build -p
+# tunnel-relay` produces, and which panicked because `rustls` will only infer a
+# process default when exactly one provider feature is on.  M8-C04's acceptance
+# already named the remedy: keep the SDK out of the shared build graph.
+#
+# So the interop driver is opt-in.  `cargo test --workspace` builds no
+# `aws-lc-rs` (and no `aws-lc-sys` C build); the pinned-client evidence runs as
+# its own command:
+#
+#     cargo test -p tunnel-acp-fixture --features interop --test pinned_client
+#
+# These are `[dependencies]` rather than `[dev-dependencies]` only because
+# Cargo has no optional dev-dependencies; test targets see both.  Neither
+# refused ACP draft feature is named, and `tunnel-acp/tests/pin.rs` scans every
+# manifest in this workspace to say so.
+#
+# What this does **not** remove: `tunnel-acp` depends on
+# `agent-client-protocol` unconditionally for the pinned schema's own method
+# names, so `serde_json/preserve_order` (M8-C04) is still unified workspace-wide
+# and is unaffected by this feature.
+[dependencies.agent-client-protocol]
+version = "=2.1.0"
+optional = true
+
+[dependencies.agent-client-protocol-http]
+version = "=2.1.0"
+default-features = false
+features = ["client"]
+optional = true
+
+[dependencies.reqwest]
+version = "0.13"
+default-features = false
+# The pinned HTTP client crate's own reqwest features, plus `http2`: this
+# profile is HTTP/2 only, so the consumer must speak h2 with prior knowledge
+# over cleartext.
+features = ["http2", "json", "rustls", "stream"]
+optional = true
+
+[features]
+default = []
+# Drive the bridge with the official pinned ACP client.
+interop = [
+    "dep:agent-client-protocol",
+    "dep:agent-client-protocol-http",
+    "dep:reqwest",
+]
+
 [dev-dependencies]
+bytes = "1"
+http = "1"
+http-body = "1"
+http-body-util = "0.1"
+# The loopback h2 gateway the pinned client talks to.  Unconditional
+# dev-dependencies, because Cargo has no optional ones; the code that uses them
+# is behind `interop`.
+hyper = { version = "1.7", features = ["http2", "server"] }
+hyper-util = { version = "0.1", features = ["service", "tokio"] }
 tempfile = "3.21"
+tokio-util = { version = "0.7", default-features = false }
+toml = { workspace = true }
 tunnel-acp = { path = "../tunnel-acp" }
 tunnel-acp-export = { path = "../tunnel-acp-export" }
+tunnel-http-bridge = { path = "../tunnel-http-bridge" }
 
 [target.'cfg(unix)'.dependencies]
 # `setsid` through a maintained safe wrapper, so the fixture that deliberately

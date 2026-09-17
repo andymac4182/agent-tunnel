@@ -156,6 +156,32 @@ impl DeviceHttpDiagnostics {
     }
 }
 
+/// Read access to the payload-free counters of registered ACP exports.
+#[derive(Clone, Debug, Default)]
+pub struct AcpExportDiagnostics {
+    exports: BTreeMap<String, tunnel_acp_export::AcpExport>,
+}
+
+impl AcpExportDiagnostics {
+    /// The counters of the export registered for `service_id`.
+    #[must_use]
+    pub fn get(&self, service_id: &str) -> Option<tunnel_acp_export::AcpDiagnostics> {
+        self.exports
+            .get(service_id)
+            .map(tunnel_acp_export::AcpExport::diagnostics)
+    }
+
+    /// The child process ids of the export's live ACP connections, so a test
+    /// reads the process table rather than a counter.
+    #[must_use]
+    pub fn child_pids(&self, service_id: &str) -> Vec<u32> {
+        self.exports
+            .get(service_id)
+            .map(tunnel_acp_export::AcpExport::child_pids)
+            .unwrap_or_default()
+    }
+}
+
 /// Read access to the payload-free counters of registered MCP exports.
 #[derive(Clone, Debug, Default)]
 pub struct McpExportDiagnostics {
@@ -187,6 +213,10 @@ pub struct HttpHandlers {
     diagnostics: DeviceHttpDiagnostics,
     /// The registered MCP exports, kept only for their payload-free counters.
     mcp: BTreeMap<String, tunnel_mcp_export::McpExport>,
+    /// The registered ACP exports, kept for their counters **and** for the
+    /// teardown below: an ACP export owns a supervised child per live
+    /// connection, so nobody may rely on its `Drop` running.
+    acp: BTreeMap<String, tunnel_acp_export::AcpExport>,
 }
 
 /// Ending the registry ends the protocol sessions it served.
@@ -200,6 +230,9 @@ pub struct HttpHandlers {
 impl Drop for HttpHandlers {
     fn drop(&mut self) {
         for export in self.mcp.values() {
+            export.shutdown();
+        }
+        for export in self.acp.values() {
             export.shutdown();
         }
     }
@@ -269,6 +302,65 @@ impl HttpHandlers {
             );
         }
         Ok(self)
+    }
+
+    /// Register every `[exports.<service>.acp]` export of a validated runtime
+    /// configuration (M8 chunk 3, the bridge half of M8-02).
+    ///
+    /// Each export carries its selected ACP profile's `http-forward/1`
+    /// policies, so the device validates heads against exactly the allowlist
+    /// the relay enforces, and every POST body is buffered and validated
+    /// before the supervised agent is spoken to.  It is the sibling of
+    /// [`HttpHandlers::with_mcp_exports`] and is deliberately shaped the same.
+    ///
+    /// **A handler is registered per service identifier, and an export carries
+    /// either an `mcp` table or an `acp` table.** Configuration validation
+    /// refuses both on one export, so the order the two `with_*_exports` calls
+    /// run in cannot decide which handler a service gets.
+    ///
+    /// # Errors
+    /// The first export configuration rule violated.
+    pub fn with_acp_exports(
+        mut self,
+        config: &crate::RuntimeConfig,
+    ) -> Result<Self, tunnel_acp_export::AcpConfigError> {
+        for (service_id, export) in &config.exports {
+            let Some(acp) = &export.acp else { continue };
+            if export.kind != crate::ExportKind::HttpForward {
+                return Err(tunnel_acp_export::AcpConfigError(
+                    "an acp table is only valid on an http-forward export",
+                ));
+            }
+            let acp_export = tunnel_acp_export::AcpExport::from_config(acp)?;
+            let profile = acp_export.profile_policies().map_err(|_| {
+                tunnel_acp_export::AcpConfigError("the pinned ACP profile tables are inconsistent")
+            })?;
+            self.acp.insert(service_id.clone(), acp_export.clone());
+            let handler_export = acp_export.clone();
+            let handler = move |request: Request<ChannelBody>| -> HttpHandlerFuture {
+                let export = handler_export.clone();
+                Box::pin(async move { export.handle(request).await.map_err(|_| HttpHandlerError) })
+            };
+            self.exports.insert(
+                service_id.clone(),
+                HttpExport {
+                    profile: Arc::new(profile),
+                    config: BridgeConfig::default(),
+                    handler: Arc::new(handler),
+                },
+            );
+        }
+        Ok(self)
+    }
+
+    /// A shareable view of every registered ACP export's payload-free
+    /// counters.  It stays valid after the handlers move into
+    /// [`crate::connect_with_http_handlers`].
+    #[must_use]
+    pub fn acp_diagnostics_source(&self) -> AcpExportDiagnostics {
+        AcpExportDiagnostics {
+            exports: self.acp.clone(),
+        }
     }
 
     /// A shareable view of every registered MCP export's payload-free

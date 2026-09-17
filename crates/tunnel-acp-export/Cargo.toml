@@ -13,10 +13,16 @@ publish.workspace = true
 # are chunks 3 to 5.
 [dependencies]
 bytes = "1"
+http = "1"
+http-body = "1"
+http-body-util = "0.1"
+serde = { workspace = true }
 serde_json = "1.0"
 tokio = { version = "1.48", features = ["io-util", "macros", "process", "rt", "sync", "time"] }
 tokio-util = { version = "0.7", default-features = false }
 tunnel-acp = { path = "../tunnel-acp" }
+tunnel-http-bridge = { path = "../tunnel-http-bridge" }
+tunnel-http-forward = { path = "../tunnel-http-forward" }
 
 [target.'cfg(unix)'.dependencies]
 # Safe process-group signalling, exactly as `tunnel-mcp-export` does it, so
@@ -29,6 +35,7 @@ rustix = { version = "1.1", default-features = false, features = ["process", "st
 # `tunnel-mcp-export`.
 [dev-dependencies]
 tempfile = "3.21"
+toml = { workspace = true }
 tokio = { version = "1.48", features = [
     "io-util",
     "macros",

@@ -1,21 +1,30 @@
 #![forbid(unsafe_code)]
-//! The device-side ACP supervisor: one stdio child per authorized ACP
-//! transport connection (task row M8-02's supervisor half, and M8-03's
-//! lifecycle half).
+//! The device-side ACP export: one stdio child per ACP transport connection,
+//! and the in-process HTTP/SSE bridge in front of it (task row M8-02's
+//! supervisor **and** bridge halves, and M8-03's lifecycle half).
 //!
 //! **What this crate is.** Child startup from configuration only, newline
 //! JSON-RPC stdio framing validated by the pinned `tunnel-acp` profile, the
 //! `starting`/`ready`/`draining`/`stopped`/`failed` lifecycle driven as a
 //! transition table, bounded channels, a **separate reader** that keeps
 //! handling agent callbacks while a prompt is pending, a capped stderr drain
-//! that never blocks child exit, and a process-group `SIGKILL` on every end of
-//! a child's life.
+//! that never blocks child exit, a process-group `SIGKILL` on every end of a
+//! child's life — and, since chunk 3, [`bridge::AcpExport`]: the in-process
+//! `HttpHandler` that serves the ACP Streamable HTTP binding over
+//! `tunnel-http-bridge`'s gate-2 `forward`/`serve` path, with connection- and
+//! session-scoped SSE streams, one subscriber each, and the documented
+//! subscription deadlines.
 //!
 //! **What this crate is not, and does not claim.**
 //!
-//! * **No HTTP, no SSE, no tunnel, no relay, no real ACP client.** Nothing
-//!   here has spoken to an ACP implementation; the only agent it has run is
-//!   the synthetic fixture in `tunnel-acp-fixture`. Chunks 3 to 5.
+//! * **No tunnel, no relay, no cluster.** The bridge runs over the in-process
+//!   gate-2 path. The rotating device WebSockets, three relays, peer hops and
+//!   cross-tenant isolation are chunks 4 and 5.
+//! * **No principal.** `docs/acp.md` derives a principal at the relay ingress,
+//!   and there is no ingress in front of the in-process bridge: every request
+//!   in this crate's tests carries `tunnel-principal-binding: None`. That is
+//!   the M3-01/M3-02 precedent exactly, and it is recorded rather than left for
+//!   a reader to infer.
 //! * **No process-tree containment.** The group kill reaches the child's
 //!   process group. A descendant that calls `setsid`, calls `setpgid` or
 //!   double-forks leaves that group and is **not** killed — the inherited hole
@@ -29,16 +38,25 @@
 //! The clock lives here and nowhere below: `tunnel_acp::lifecycle` takes
 //! caller-supplied observations and never reads `Instant`.
 
+pub mod bridge;
 pub mod child;
+pub mod config;
+pub mod sse;
 pub mod supervisor;
 
+pub use bridge::{AcpDiagnostics, AcpExport, ExportError, STREAM_BACKLOG};
 pub use child::{
     ChildConfig, ChildCounters, ChildEnd, ChildEvent, ChildHandle, ChildMessage, SendError,
     SpawnError,
 };
+pub use config::{
+    AcpAgentConfig, AcpConfigError, AcpDeadlinesConfig, AcpExportConfig, AcpLimitsConfig,
+    DEFAULT_PERMISSION_TIMEOUT_MS, DEFAULT_SUBSCRIBE_DEADLINE_MS,
+};
+pub use sse::{ExportBody, sse_event};
 pub use supervisor::{
-    AgentEvent, ConnectionScope, Diagnostics, PromptTicket, Supervisor, SupervisorConfig,
-    SupervisorError,
+    AgentEvent, ConnectionScope, Diagnostics, OutboundMessage, PromptTicket, Supervisor,
+    SupervisorConfig, SupervisorError,
 };
 
 #[cfg(test)]

@@ -145,6 +145,24 @@ impl RuntimeConfig {
                 mcp.validate()
                     .map_err(|error| RuntimeConfigError::Invalid(error.0))?;
             }
+            if let Some(acp) = &export.acp {
+                if export.kind != ExportKind::HttpForward {
+                    return Err(RuntimeConfigError::Invalid(
+                        "an acp table is only valid on an http-forward export",
+                    ));
+                }
+                if export.mcp.is_some() {
+                    // One handler is registered per service identifier, so two
+                    // application tables on one export would silently mean
+                    // "whichever `with_*_exports` ran last".  Refusing is the
+                    // only answer that cannot depend on registration order.
+                    return Err(RuntimeConfigError::Invalid(
+                        "an export carries either an mcp table or an acp table, never both",
+                    ));
+                }
+                acp.validate()
+                    .map_err(|error| RuntimeConfigError::Invalid(error.0))?;
+            }
             match (export.kind, export.fs.as_ref()) {
                 (ExportKind::Fs, None) => {
                     return Err(RuntimeConfigError::Invalid(
@@ -294,6 +312,10 @@ pub struct ExportConfig {
     /// An MCP export served by the connector itself (M3-02): only valid on
     /// an `http-forward` export.  See `tunnel_mcp_export::config`.
     pub mcp: Option<tunnel_mcp_export::McpExportConfig>,
+    /// An ACP export served by the connector itself (M8 chunk 3): only valid
+    /// on an `http-forward` export, and never alongside an `mcp` table on the
+    /// same export.  See `tunnel_acp_export::config`.
+    pub acp: Option<tunnel_acp_export::AcpExportConfig>,
     /// A filesystem export served by the connector itself (M4 gate 4): only
     /// valid on an `fs` export, and required on one.  The root is operator
     /// configuration and is the one path this profile opens by name.
@@ -340,6 +362,7 @@ impl Default for ExportConfig {
             kind: ExportKind::Echo,
             device_canary: None,
             mcp: None,
+            acp: None,
             fs: None,
         }
     }
@@ -739,5 +762,75 @@ env = { SYNTHETIC_SECRET = "synthetic-env-value" }
         ] {
             assert!(RuntimeConfig::parse(&broken).is_err(), "{broken}");
         }
+    }
+
+    const ACP_EXPORT: &str = "[exports.33333333-3333-4333-8333-333333333333]\ntype = \"http-forward\"\n\n[exports.33333333-3333-4333-8333-333333333333.acp]\nprofile = \"acp-http-v1\"\n\n[exports.33333333-3333-4333-8333-333333333333.acp.agent]\ncommand = \"/opt/synthetic/acp-agent\"\nargs = [\"agent\"]\nworkspace = \"/srv/synthetic-workspace\"\n";
+
+    #[test]
+    fn acp_exports_parse_validate_and_register_handlers() {
+        let input = valid_toml().replace(
+            "[exports.echo]\ntype = \"echo\"\ndevice_canary = \"fixture-one\"\n",
+            ACP_EXPORT,
+        );
+        let config = RuntimeConfig::parse(&input).expect("acp export");
+        let export = &config.exports["33333333-3333-4333-8333-333333333333"];
+        assert_eq!(export.kind, ExportKind::HttpForward);
+        assert!(export.acp.is_some());
+
+        // Registration is what the binary does; a table that parsed and was
+        // never registered would be an export the operator configured and the
+        // connector silently refused at OPEN.
+        let handlers = crate::http_forward::HttpHandlers::new()
+            .with_mcp_exports(&config)
+            .expect("mcp handlers")
+            .with_acp_exports(&config)
+            .expect("acp handlers");
+        assert!(handlers.contains("33333333-3333-4333-8333-333333333333"));
+        let counters = handlers
+            .acp_diagnostics_source()
+            .get("33333333-3333-4333-8333-333333333333")
+            .expect("acp export counters");
+        assert_eq!(counters.connections_opened, 0);
+        assert!(handlers.acp_diagnostics_source().get("echo").is_none());
+        // No child is started by registration alone: `initialize` starts one.
+        assert!(
+            handlers
+                .acp_diagnostics_source()
+                .child_pids("33333333-3333-4333-8333-333333333333")
+                .is_empty()
+        );
+
+        // An acp table on an echo export, an unknown profile and a relative
+        // command are configuration errors.
+        for broken in [
+            input.replace("type = \"http-forward\"", "type = \"echo\""),
+            input.replace("acp-http-v1", "acp-http-v2"),
+            input.replace("/opt/synthetic/acp-agent", "acp-agent"),
+            input.replace("/srv/synthetic-workspace", "synthetic-workspace"),
+        ] {
+            assert!(RuntimeConfig::parse(&broken).is_err(), "{broken}");
+        }
+    }
+
+    /// One handler is registered per service identifier, so two application
+    /// tables on one export would mean "whichever `with_*_exports` ran last".
+    #[test]
+    fn an_export_carries_an_mcp_table_or_an_acp_table_and_never_both() {
+        let both = valid_toml()
+            .replace(
+                "[exports.echo]\ntype = \"echo\"\ndevice_canary = \"fixture-one\"\n",
+                MCP_EXPORT,
+            )
+            .replace(
+                "[exports.22222222-2222-4222-8222-222222222222.mcp]\nprofile = \"mcp-2026-07-28\"\n",
+                "[exports.22222222-2222-4222-8222-222222222222.acp]\nprofile = \"acp-http-v1\"\n\n[exports.22222222-2222-4222-8222-222222222222.acp.agent]\ncommand = \"/opt/synthetic/acp-agent\"\nargs = [\"agent\"]\nworkspace = \"/srv/synthetic-workspace\"\n\n[exports.22222222-2222-4222-8222-222222222222.mcp]\nprofile = \"mcp-2026-07-28\"\n",
+            );
+        // Not vacuous: the edit really did put both tables on one export.
+        assert!(both.contains(".acp]") && both.contains(".mcp]"), "{both}");
+        let error = RuntimeConfig::parse(&both).expect_err("both tables are refused");
+        assert!(
+            format!("{error}").contains("never both"),
+            "refused for the wrong reason: {error}"
+        );
     }
 }
