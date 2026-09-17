@@ -339,7 +339,7 @@ claim is still unclaimed.
   only break. That is recorded on M8-C02 rather than tested into a shape that
   passes by accident.
 - **Evidence.** `scripts/acp-guard-deletion.py --suite m8c3` defeats each of
-  this chunk's rules in turn: **11 of 11 turned a test red**. Its sibling
+  this chunk's rules in turn: **17 of 17 turned a test red**. Its sibling
   `--suite m8c3-relay`, which needs a different crate and a different test
   command, is **2 of 2**. Both classify their outcomes with the shared
   `scripts/guard_outcomes.py` allow list, so anything but `RED`, `REFUSED BY
