@@ -708,8 +708,16 @@ export class RemoteFilesystem {
    * not before, and no later failure may be reported `not_started`. Without it,
    * `mkdir('/a/b', { recursive: true })` interrupted after `/a` was made told
    * the caller nothing had happened, with `/a` standing in the export.
+   *
+   * It returns **how many directories it created**, which is zero when every
+   * component already existed. A caller composing `mkdir` with a second
+   * operation needs that number and nothing else can supply it: whether a
+   * later failure is `not_started` or `partial` turns on whether this call
+   * changed the export, and a preliminary `stat` to find out would be the
+   * exists-then-act race this contract forbids. The adapters use it for
+   * exactly that.
    */
-  async mkdir(path: string, options: { recursive?: boolean | undefined; signal?: AbortSignal | undefined } = {}): Promise<void> {
+  async mkdir(path: string, options: { recursive?: boolean | undefined; signal?: AbortSignal | undefined } = {}): Promise<number> {
     this.require('mkdir', path);
     const components = validatePath(path, this.bounds);
     const recursive = options.recursive === true;
@@ -745,6 +753,7 @@ export class RemoteFilesystem {
         await this.clunkQuietly(parentFid);
       }
     }
+    return made;
   }
 
   /**

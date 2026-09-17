@@ -27,6 +27,16 @@ Specification snapshot: `aa8ce049f089f92618340190d4ece141f663310d`.
 
 These records contain inspected immutable source references and distinguish source versions from unverified published-package compatibility. [filesystem-adapters.md](filesystem-adapters.md) maps those findings into the shared 9P/WSS endpoint without claiming all SDKs speak the same native protocol.
 
+**Pinned 2026-09-17 (M4-14): the published packages, installed.** The notes above are *source* snapshots. These are the artifacts the four adapters are compiled and registered against, exact-pinned in `packages/client/package.json` as both dev and peer dependencies with `packages/client/package-lock.json` committed:
+
+- [`files-sdk` 2.4.0](https://www.npmjs.com/package/files-sdk/v/2.4.0) — `Adapter<Raw>` for `new Files({ adapter })`. Latest on the registry is 2.5.0; the pin is the version the research note inspected.
+- [`@mastra/core` 1.65.0](https://www.npmjs.com/package/@mastra/core/v/1.65.0) — `WorkspaceFilesystem` and `Workspace` from its `./workspace` export. Latest is 1.67.0.
+- [`just-bash` 3.4.2](https://www.npmjs.com/package/just-bash/v/3.4.2) — `IFileSystem` for `new Bash({ fs })`. It is the current latest.
+- [`ai` 7.0.94](https://www.npmjs.com/package/ai/v/7.0.94) — the `uploadFile` helper. Latest is 7.0.105.
+- [`@ai-sdk/provider` 4.0.11](https://www.npmjs.com/package/@ai-sdk/provider/v/4.0.11) — `FilesV4`. **Exact rather than a range**, because it is the version `ai` 7.0.94 itself depends on: the pin makes the `FilesV4` `ai.uploadFile` reaches the same one the adapter was compiled against. It does not make the tree single-copy — `@mastra/core` brings two more nested copies of its own.
+
+What the installed artifacts actually declare, where they differ from the source notes, and the three upstream behaviours only running them revealed are recorded in [filesystem-adapters.md](filesystem-adapters.md#pinned-packages-as-installed). No adapter has been run against a relay or a device.
+
 ## ACP
 
 [acp.md](acp.md) records the official Agent Client Protocol v1 method/schema sources and draft HTTP binding. The CLI HTTP-to-stdio bridge requires pinned official SDK interoperability, callback/permission routing and no ambiguous prompt replay. See [official ACP documentation](https://agentclientprotocol.com/).

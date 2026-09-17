@@ -14,6 +14,11 @@ of `docs/filesystem-api.md`.  Two suites live here:
 * `gate5` — write grants and partial failure: the resolver's mutating
   primitives, the hard-link write rule on a real write, and the dispatcher's
   outcome ledger.
+* `gate6-adapters` — the four native SDK adapters in `packages/client`.  This
+  one is **TypeScript**, so its runner is `node --test` rather than `cargo`
+  and its not-evidence check is a module that failed to load rather than a
+  crate that failed to build.  It needs no install: the suite is the offline
+  one, which runs with `node_modules` deleted.
 
 A guard whose deletion leaves every test green is **not** load-bearing on its
 own, and this script prints that outcome rather than hiding it: several of the
@@ -24,6 +29,7 @@ honesty applies to gate 3's.
     python3 scripts/fs-guard-deletion.py                 # every case
     python3 scripts/fs-guard-deletion.py --list          # names only
     python3 scripts/fs-guard-deletion.py --suite gate3   # one suite
+    python3 scripts/fs-guard-deletion.py --suite gate6-adapters
     python3 scripts/fs-guard-deletion.py --case "32-hop" # substring filter
 
 Exit status is 0 when every case produced a usable result, and 1 when any case
@@ -71,6 +77,11 @@ RELAY = REPO / "crates" / "tunnel-relay"
 RELAY_FS = RELAY / "src" / "http" / "fs.rs"
 CLIENT = REPO / "crates" / "tunnel-client"
 CLIENT_FS = CLIENT / "src" / "fs_export.rs"
+
+CLIENT_PKG = REPO / "packages" / "client"
+ADAPTER_FILES = CLIENT_PKG / "src" / "adapters" / "files-sdk.ts"
+ADAPTER_MASTRA = CLIENT_PKG / "src" / "adapters" / "mastra.ts"
+ADAPTER_OUTCOMES = CLIENT_PKG / "src" / "adapters" / "outcomes.ts"
 
 NINEP = REPO / "crates" / "tunnel-fs-ninep"
 NINEP_WIRE = NINEP / "src" / "wire.rs"
@@ -2120,6 +2131,143 @@ GATE5_CASES: list[tuple[str, list[Edit]]] = [
 ]
 
 
+# The offline suite `docs/testing.md` documents for this package — the same
+# glob `npm test` runs, with the reporter swapped for TAP so a failing case can
+# **name** the tests it turned red, as the cargo suites do.  (`npm test -- …`
+# appends a second `--test-reporter`, which node ignores.)  It needs no install,
+# so a case here cannot be reported red for a missing dependency.
+GATE6_TEST = [
+    "node",
+    "--test",
+    "--test-reporter=tap",
+    "test/**/*.test.ts",
+]
+
+GATE6_CASES: list[tuple[str, list[Edit]]] = [
+    (
+        "list stat fan-out bounded below the tag quota",
+        [
+            (
+                ADAPTER_FILES,
+                "    Math.floor(remote.descriptor.limits.maxInflightRequests / 4),",
+                "    Number.POSITIVE_INFINITY,",
+            )
+        ],
+    ),
+    (
+        "a failed stat stops the rest of the fan-out",
+        [
+            (
+                ADAPTER_OUTCOMES,
+                "      if (failed) {\n        return;\n      }\n",
+                "",
+            )
+        ],
+    ),
+    (
+        "files-sdk upload floor",
+        [
+            (
+                ADAPTER_FILES,
+                "          throw withAppliedFloor(error, 'upload', path, applied);",
+                "          throw error;",
+            )
+        ],
+    ),
+    (
+        "files-sdk copy floor",
+        [
+            (
+                ADAPTER_FILES,
+                "          throw withAppliedFloor(error, 'copy', destination, applied);",
+                "          throw error;",
+            )
+        ],
+    ),
+    (
+        "files-sdk move floor",
+        [
+            (
+                ADAPTER_FILES,
+                "          throw withAppliedFloor(error, 'move', destination, applied);",
+                "          throw error;",
+            )
+        ],
+    ),
+    (
+        "a confirmed upload survives its courtesy stat",
+        [
+            (
+                ADAPTER_FILES,
+                "        } catch {\n          return result;\n        }",
+                "        } catch (error) {\n          throw error;\n        }",
+            )
+        ],
+    ),
+    (
+        "mastra writeFile floor",
+        [
+            (
+                ADAPTER_MASTRA,
+                "        throw withAppliedFloor(error, 'writeFile', virtual, applied);",
+                "        throw error;",
+            )
+        ],
+    ),
+    (
+        "mastra copyFile floor",
+        [
+            (
+                ADAPTER_MASTRA,
+                "        throw withAppliedFloor(error, 'copyFile', destination, applied);",
+                "        throw error;",
+            )
+        ],
+    ),
+    (
+        "mastra readdir nested names carry their subpath",
+        [
+            (
+                ADAPTER_MASTRA,
+                "          const record = toEntry(entry, `${prefix}${entry.name}`);",
+                "          const record = toEntry(entry, entry.name);",
+            )
+        ],
+    ),
+    (
+        "mastra readdir keeps directories under an extension filter",
+        [
+            (
+                ADAPTER_MASTRA,
+                "          if (record.type === 'directory' || matchesExtension(entry.name, extensions)) {",
+                "          if (matchesExtension(entry.name, extensions)) {",
+            )
+        ],
+    ),
+    (
+        "mastra readdir matches an extension by equality, not by suffix",
+        [
+            (
+                ADAPTER_MASTRA,
+                "  return extensions.some((pattern) => pattern === extension || pattern === extension.slice(1));",
+                "  return extensions.some((pattern) => name.endsWith(pattern));",
+            )
+        ],
+    ),
+    (
+        "mastra reduces a foreign exception to its name",
+        [
+            (
+                ADAPTER_MASTRA,
+                "      const raised = new E.FilesystemError(summarize(error), 'TUNNEL_INTERNAL', path);",
+                "      return error instanceof Error ? error : new Error(String(error));\n"
+                "      const raised = new E.FilesystemError(summarize(error), 'TUNNEL_INTERNAL', path);",
+            )
+        ],
+    ),
+]
+
+
 @dataclass
 class Suite:
     """One suite's guards and the command that measures them.
@@ -2134,6 +2282,15 @@ class Suite:
     crates: list[Path]
     cargo_test: list[str]
     cases: list[tuple[str, list[Edit]]] = field(default_factory=list)
+    #: `cargo` classifies a compile error as not-evidence; `node` classifies a
+    #: module that failed to load the same way, and reads TAP rather than
+    #: libtest output.  The field exists because gate 6 is TypeScript and
+    #: calling a `SyntaxError` a red test would credit a guard for a failure
+    #: that says nothing about behaviour.
+    runner: str = "cargo"
+    #: Where the command runs.  The cargo suites run at the repository root;
+    #: `npm test` runs in the package.
+    cwd: Path = REPO
 
 
 SUITES: list[Suite] = [
@@ -2146,6 +2303,14 @@ SUITES: list[Suite] = [
     ),
     Suite("gate4", [CRATE, PROVIDER, RELAY, CLIENT], GATE4_TEST, GATE4_CASES),
     Suite("gate5", [CRATE, PROVIDER], GATE5_TEST, GATE5_CASES),
+    Suite(
+        "gate6-adapters",
+        [CLIENT_PKG / "src"],
+        GATE6_TEST,
+        GATE6_CASES,
+        runner="node",
+        cwd=CLIENT_PKG,
+    ),
 ]
 
 
@@ -2157,18 +2322,69 @@ def cargo_env() -> dict[str, str]:
     return env
 
 
+def run_node_tests(suite: Suite) -> tuple[str, list[str]]:
+    """Run one TypeScript suite and classify the outcome.
+
+    The same refusal as the cargo runner, in the form this runtime takes it: a
+    **module that failed to load** is never reported as a red test.  Node strips
+    types rather than checking them, so a deleted guard cannot produce a type
+    error here — but it can produce a syntax error or leave an import
+    unresolvable, and counting either as evidence would credit the guard for a
+    failure that says nothing about behaviour.  A run in which no test executed
+    at all is treated the same way.
+    """
+    try:
+        done = subprocess.run(
+            suite.cargo_test,
+            cwd=suite.cwd,
+            env=cargo_env(),
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+    except subprocess.TimeoutExpired:
+        return "RED (hung)", []
+    combined = done.stdout + done.stderr
+    # A load failure is diagnosed from node's own machinery, not from the word
+    # appearing anywhere in the run: a genuinely red test whose failure message
+    # happens to quote `SyntaxError` would otherwise be withheld credit it
+    # earned.  `ERR_*` codes are node's own and never appear in a passing run;
+    # `SyntaxError` counts only when node names it as the failing construct.
+    load_markers = ("ERR_MODULE_NOT_FOUND", "Cannot find module", "ERR_UNSUPPORTED")
+    failed_to_load = any(marker in combined for marker in load_markers) or any(
+        line.lstrip().startswith(("SyntaxError:", "[SyntaxError", "throw new SyntaxError"))
+        for line in combined.splitlines()
+    )
+    if failed_to_load:
+        return "MODULE FAILED TO LOAD (not evidence)", []
+    if "# pass 0" in done.stdout or "# tests 0" in done.stdout:
+        return "NO TEST RAN (not evidence)", []
+    failures = sorted(
+        {
+            line.split(" - ", 1)[1].strip()
+            for line in done.stdout.splitlines()
+            if line.strip().startswith("not ok ") and " - " in line
+        }
+    )
+    if done.returncode == 0:
+        return "still green", []
+    return "RED", failures
+
+
 def run_tests(suite: Suite) -> tuple[str, list[str]]:
-    """Run one suite's crate tests and classify the outcome.
+    """Run one suite's tests and classify the outcome.
 
     A build that did not compile is **never** reported as a red test.  A
     deleted guard can leave the crate unbuildable — an unused import, a binding
     that is now dead — and counting that as evidence would credit the guard for
     a failure that says nothing about confinement.
     """
+    if suite.runner == "node":
+        return run_node_tests(suite)
     try:
         done = subprocess.run(
             suite.cargo_test,
-            cwd=REPO,
+            cwd=suite.cwd,
             env=cargo_env(),
             capture_output=True,
             text=True,
@@ -2225,7 +2441,10 @@ def main() -> int:
     parser.add_argument("--case", help="run only cases whose name contains this text")
     parser.add_argument(
         "--suite",
-        help="run only this suite (gate2, gate3, gate4 or gate5); default is all",
+        help=(
+            "run only this suite (gate2, gate3, gate4, gate5 or "
+            "gate6-adapters); default is all"
+        ),
     )
     arguments = parser.parse_args()
 
@@ -2298,10 +2517,14 @@ def main() -> int:
         red = sum(1 for row in rows if row[2] == "RED")
         print(f"\n{suite.name}: {red} of {len(rows)} deletions turned a test red")
 
+    # Every "not evidence" outcome must reach this list, or a suite whose cases
+    # all failed to build would exit 0 and read as a clean run.  The node
+    # runner's two spellings are here for that reason: an earlier version left
+    # them out and a deliberately broken case exited 0.
     unusable = [
         f"[{suite_name}] {name}"
         for suite_name, name, outcome, _ in results
-        if outcome.startswith("BUILD") or outcome.startswith("COULD")
+        if outcome.startswith(("BUILD", "COULD", "MODULE", "NO TEST"))
     ]
     if unusable:
         print("\nno usable result for: " + ", ".join(unusable))

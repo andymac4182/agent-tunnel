@@ -9,9 +9,13 @@ with its `grantRevision` header, an authenticated WebSocket upgrade written out
 so it can set `Authorization`, the consumer-side 9P session with its tags, fids,
 flush and close codes, and the bytes and limits of the [shared client
 API](../../docs/filesystem-api.md#shared-client-api). **The four native
-adapters are not here** — `@agent-tunnel/files-sdk`, `@agent-tunnel/mastra`,
-`@agent-tunnel/just-bash` and `@agent-tunnel/ai-sdk` are separate packages, none
-of which exists, and they are the rest of implementation gate 6.
+adapters are here too**, as export subpaths rather than as four published
+packages: `@agent-tunnel/client/files-sdk`, `/mastra`, `/just-bash` and
+`/ai-sdk`. Each depends on its framework **by type only**, so this package still
+has zero runtime dependencies and `npm test` still runs with `node_modules`
+deleted. What remains of implementation gate 6 is the seventh component — the AI
+SDK live directory tools — and every one of these components against a real
+relay and a real device.
 
 **What has never run against a relay or a device.** Every socket in this
 package's tests is a loopback socket to a harness in `test/harness/`, which
@@ -30,6 +34,11 @@ or a fake in-memory adapter is insufficient to claim remote compatibility".
 | `src/session.ts` | The consumer session: lifecycle, tags, fids, flush, close codes, **outcome classification** |
 | `src/paths.ts` | The virtual path namespace, refusing exactly what gate 1 refuses |
 | `src/filesystem.ts` | `connectFilesystem`, the API methods, the composite operations and the budgets |
+| `src/adapters/files-sdk.ts` | `createFilesAdapter`: `files-sdk` 2.4.0's `Adapter<Raw>`, the object view |
+| `src/adapters/mastra.ts` | `TunnelMastraFilesystem`: `@mastra/core` 1.65.0's `WorkspaceFilesystem`, with both timestamp policies |
+| `src/adapters/just-bash.ts` | `TunnelJustBashFilesystem`: `just-bash` 3.4.2's `IFileSystem`, plus `drainOperationFailures()` |
+| `src/adapters/ai-sdk.ts` | `createFilesApi`: `@ai-sdk/provider` 4.0.11's `FilesV4`, managed references over one upload directory |
+| `src/adapters/outcomes.ts`, `keys.ts` | What the adapters share: the outcome vocabulary, and object keys |
 
 The outcome classification is the obligation gate 5 named for this side: there
 is no wire field for an outcome, so a client derives one from its own dispatch
@@ -78,6 +87,33 @@ npm ci && npm run typecheck
 `typescript` and `@types/node` are exact-pinned dev-only dependencies with a
 committed `package-lock.json`. They are deliberately kept out of `npm test` so
 the cross-check itself stays runnable with nothing fetched.
+
+So are the four frameworks — `files-sdk` 2.4.0, `@mastra/core` 1.65.0,
+`just-bash` 3.4.2, `ai` 7.0.94 and `@ai-sdk/provider` 4.0.11 — as exact dev
+**and** peer dependencies. `typecheck` is where the adapters are checked against
+their own declarations, which is the contract compilation
+[`docs/testing.md`](../../docs/testing.md) asks for: every adapter source imports
+the upstream types and is annotated with the upstream interface, with no `any`,
+no assertion onto an upstream type and no suppressed error.
+
+```sh
+npm run test:peers
+```
+
+registers each adapter with the real thing that consumes it — `new Files({
+adapter })`, `new Workspace({ filesystem })`, `new Bash({ fs })`,
+`ai.uploadFile({ api })` — against the same loopback harness. It needs the
+install and is therefore **not** part of `npm test`.
+
+Two things a consumer has to know, both found by running the real packages:
+`createFilesAdapter` takes the consumer's own `FilesError` class, because
+`files-sdk`'s retry gate rebuilds a foreign error as a *retryable* one — it must
+come from the **same module instance** as the `Files` it is passed to, and the
+adapter cannot verify that, so a second installed copy makes every failure
+including an `unknown` mutation retryable with nothing reporting it; and a
+`Bash` over this filesystem needs `defenseInDepth: { excludeViolationTypes:
+['setTimeout'] }`, because just-bash blocks the global for the duration of a
+script and this client arms a timer for every request deadline.
 
 ## What it checks
 
@@ -275,6 +311,16 @@ this client's own socket path would not be.
 * **A rotating device tunnel**, a cross-relay hop, a real grant, a real
   revocation, and every clock the contract names: this client enforces its own
   request deadline, and the device enforces none.
-* **The four native adapters** against their pinned published packages.
+* **The four native adapters against a relay or a device.** They compile against
+  their pinned published packages' own declarations and run against the real
+  `Files`, `Workspace`, `Bash` and `ai.uploadFile` — but over the same loopback
+  harness, so the same sentence applies: that says they satisfy their
+  frameworks, not that the endpoint behind them interoperates.
+* **The AI SDK live directory tools.** The seventh component does not exist, so
+  nothing is proven about tool schemas, abort propagation, bounded model-visible
+  output or a model-visible outcome field.
+* **One dataset through all four views at once.** Each adapter's suite drives its
+  own connection; no test has two adapters borrowing one client, so aggregate
+  budgets and the "close one while another has live fids" case are unexercised.
 
 All fixture values are synthetic, as `fixtures/README.md` records.
