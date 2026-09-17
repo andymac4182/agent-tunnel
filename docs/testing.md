@@ -1373,11 +1373,25 @@ driver that decided for itself what passing meant could not smuggle a verdict
 past the validator.
 
 **TLS is proven by a pair, because a connect that resolved proves nothing.**
-The fixture's server leaf now carries `127.0.0.1` as an IP subject alternative
-name — `rcgen` turns a name that parses as an address into one — so the endpoint
-can be the loopback address the relay binds with no name to resolve. `node`
-trusts the fixture CA through `NODE_EXTRA_CA_CERTS` and verifies the chain the
-ordinary way, and the client's own `allowInsecureLoopback` is never passed.
+The **cluster relay's** server leaf carries `127.0.0.1` as an IP subject
+alternative name — `rcgen` turns a name that parses as an address into one — so
+the endpoint can be the loopback address the relay binds with no name to
+resolve. `node` trusts the fixture CA through `NODE_EXTRA_CA_CERTS` and verifies
+the chain the ordinary way, and the client's own `allowInsecureLoopback` is
+never passed.
+
+The leaf that carries the address is **only** that one, and the distinction is
+load-bearing rather than tidy. It was first written into the shared
+`CertificateProfile::server`, which every fixture listener in the harness uses,
+and `verify-m7-redis-tls` builds `wrong_server_name_rejected` by dialling its
+forwarder at `rediss://127.0.0.1` and requiring refusal. A name granted to every
+listener made the wrong name a right name, so that negative case could no longer
+fail and the gate went red 3 of 3 — task row M4-17. The widening is now an
+opt-in, `CertificateProfile::server_with_loopback_ip`, asked for at the cluster
+relay leaf that gate 6's driver actually dials; the Redis TLS forwarder issues
+from `server_without_ip_sans` at its own site; and a unit test asserts the
+forwarder's leaf is refused for `127.0.0.1` and accepted for `localhost`, so a
+re-widening reddens a fast test rather than a twenty-minute gate.
 
 That much was true of the first round of this gate too, and it was **not
 enough**: the driver set `tlsVerified = true` once `connectFilesystem` returned,
