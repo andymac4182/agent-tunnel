@@ -62,7 +62,12 @@ pub struct FsExport {
     /// OPEN named. The contract's local-allowlist rule: "The connector
     /// independently enforces its local allowlist."
     pub allowed: CapabilitySet,
-    /// The features this provider implements. Gate 4 advertises none.
+    /// The features this provider implements.
+    ///
+    /// Operator configuration, and **default absent**: the contract's features
+    /// are all opt-in, and `hardLinks` in particular disables the `st_nlink`
+    /// write refusal, so a build that enabled one by omission would widen an
+    /// export nobody asked to widen.
     pub features: FeatureSet,
     /// The negotiated limits.
     pub limits: Limits,
@@ -79,6 +84,28 @@ impl FsExport {
             limits: default_limits(),
         }
     }
+}
+
+/// The features an operator's `[exports.<service>.fs]` table named.
+///
+/// Unknown names are **ignored rather than refused**, for the same reason an
+/// unknown capability name is: the list is forward-compatible, a feature this
+/// build cannot implement is one it must treat as absent, and refusing the
+/// export instead would make adding a feature a breaking change for every older
+/// device. The direction of the leniency is the safe one — an unknown name can
+/// only ever fail to turn something *on*.
+#[must_use]
+pub fn parse_features(names: &[String]) -> FeatureSet {
+    let mut set = FeatureSet::NONE;
+    for name in names {
+        if let Some(feature) = tunnel_fs_core::Feature::ALL
+            .into_iter()
+            .find(|feature| feature.as_str() == name.trim())
+        {
+            set = set.with(feature);
+        }
+    }
+    set
 }
 
 /// The capabilities the OPEN's `fs_capabilities` metadata named.
@@ -378,9 +405,20 @@ async fn emit(
                 }
                 let mut record = Vec::with_capacity(encoded.len() + RECORD_HEADER_LEN);
                 encode_message(&encoded, &mut record);
+                // The mutation ledger is settled here and nowhere else,
+                // because this is the only place that knows whether the reply
+                // left. A reply reporting an effect that reached the carrier is
+                // acknowledged; one that did not is the contract's `unknown`
+                // outcome — "Session loss during a potentially dispatched
+                // mutation carries `outcome: unknown`" — and it is recorded
+                // rather than guessed either way. Reaching the carrier is all a
+                // device can ever confirm, and the contract is explicit that it
+                // proves neither the side effect nor its delivery.
                 if outbound.send_data(Bytes::from(record)).await.is_err() {
+                    provider.note_effect_undelivered();
                     return true;
                 }
+                provider.confirm_effect_delivered();
             }
             Outbound::Close(code) => {
                 report.closed_with = Some(code);

@@ -905,9 +905,9 @@ impl<A: Authority> Provider<A> {
             // resolving open never carries `O_TRUNC`, which is gate 2's pinned
             // choice and is what keeps a refused write from following a
             // truncation that already destroyed the file.
-            let handle =
-                self.root
-                    .open_writable(&path, truncating, flags & O_ACCMODE == O_RDWR)?;
+            let handle = self
+                .root
+                .open_writable(&path, truncating, flags & O_ACCMODE == O_RDWR)?;
             (handle, None, OpenKind::File)
         } else {
             let handle = self.root.open_read(&path)?;
@@ -1172,23 +1172,19 @@ impl<A: Authority> Provider<A> {
     fn perform_mkdir(&mut self, accepted: &Accepted, mode: u32) -> Result<Reply, FsError> {
         let path = Self::child_path(accepted)?.clone();
         let identity = self.root.make_directory(&path, mode)?;
-        Ok(
-            Reply::plain(Message::Rmkdir {
-                qid: Qid::new(QidKind::Directory, identity.qid_path()),
-            })
-            .with_effect(Applied::Whole),
-        )
+        Ok(Reply::plain(Message::Rmkdir {
+            qid: Qid::new(QidKind::Directory, identity.qid_path()),
+        })
+        .with_effect(Applied::Whole))
     }
 
     fn perform_symlink(&mut self, accepted: &Accepted, target: &str) -> Result<Reply, FsError> {
         let path = Self::child_path(accepted)?.clone();
         let identity = self.root.symlink(&path, target)?;
-        Ok(
-            Reply::plain(Message::Rsymlink {
-                qid: Qid::new(QidKind::Symlink, identity.qid_path()),
-            })
-            .with_effect(Applied::Whole),
-        )
+        Ok(Reply::plain(Message::Rsymlink {
+            qid: Qid::new(QidKind::Symlink, identity.qid_path()),
+        })
+        .with_effect(Applied::Whole))
     }
 
     fn perform_unlink(&mut self, accepted: &Accepted, directory: bool) -> Result<Reply, FsError> {
@@ -1289,8 +1285,18 @@ impl<A: Authority> Provider<A> {
             result.map_err(|error| Self::escalate(error, applied))?;
             applied = true;
         }
-        let atime = times_of(request.valid, SETATTR_ATIME, SETATTR_ATIME_SET, request.atime);
-        let mtime = times_of(request.valid, SETATTR_MTIME, SETATTR_MTIME_SET, request.mtime);
+        let atime = times_of(
+            request.valid,
+            SETATTR_ATIME,
+            SETATTR_ATIME_SET,
+            request.atime,
+        );
+        let mtime = times_of(
+            request.valid,
+            SETATTR_MTIME,
+            SETATTR_MTIME_SET,
+            request.mtime,
+        );
         if atime.is_some() || mtime.is_some() {
             let result = match self.cached(fid) {
                 Some(entry) => entry.handle.set_times(atime, mtime),

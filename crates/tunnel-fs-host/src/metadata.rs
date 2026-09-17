@@ -561,7 +561,8 @@ impl ExportRoot {
             .file_name()
             .ok_or(FsError::refused(FsErrorCode::Einval))?;
         let parent = self.resolve_parent(path)?;
-        let target = rustix::fs::readlinkat(parent.as_fd(), name, Vec::new()).map_err(host_error)?;
+        let target =
+            rustix::fs::readlinkat(parent.as_fd(), name, Vec::new()).map_err(host_error)?;
         let bytes = target.to_bytes();
         if bytes.is_empty() {
             return Err(FsError::refused(FsErrorCode::Enoent));

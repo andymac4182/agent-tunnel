@@ -4085,7 +4085,7 @@ impl M2Actor {
                                 .filter_map(|name| tunnel_fs_core::Capability::parse(name))
                                 .collect::<Vec<_>>(),
                         ),
-                        features: tunnel_fs_core::FeatureSet::NONE,
+                        features: crate::fs_export::parse_features(&settings.features),
                         limits: tunnel_fs_provider::default_limits(),
                     },
                     // Narrowed here, not later: the stream's authority holds

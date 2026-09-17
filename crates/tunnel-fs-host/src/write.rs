@@ -374,15 +374,8 @@ impl ExportRoot {
         let from_parent = self.resolve_parent(from)?;
         let to_parent = self.resolve_parent(to)?;
         inspect_removable(&from_parent, from_name)?;
-        retry(|| {
-            rustix::fs::renameat(
-                from_parent.as_fd(),
-                from_name,
-                to_parent.as_fd(),
-                to_name,
-            )
-        })
-        .map_err(mutation_error)
+        retry(|| rustix::fs::renameat(from_parent.as_fd(), from_name, to_parent.as_fd(), to_name))
+            .map_err(mutation_error)
     }
 
     /// Create a symbolic link.
@@ -523,7 +516,10 @@ fn inspect_removable(parent: &Handle, name: &str) -> Result<(), FsError> {
 #[cfg(target_os = "linux")]
 fn link_descriptor(source: &Handle, parent: &Handle, name: &str) -> Result<(), FsError> {
     use rustix::fs::CWD;
-    let spelling = format!("/proc/self/fd/{}", rustix::fd::AsRawFd::as_raw_fd(&source.as_fd()));
+    let spelling = format!(
+        "/proc/self/fd/{}",
+        rustix::fd::AsRawFd::as_raw_fd(&source.as_fd())
+    );
     retry(|| {
         rustix::fs::linkat(
             CWD,
