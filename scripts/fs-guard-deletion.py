@@ -2308,15 +2308,56 @@ GATE6_E2E_CASES: list[tuple[str, list[Edit]]] = [
         [(HARNESS_E2E, "            evidence.driver_failures.is_empty(),", "            true,")],
     ),
     (
-        "the client verified the relay's certificate",
-        [(HARNESS_E2E, "            evidence.tls_verified,", "            true,")],
+        "node could not have skipped certificate verification",
+        [
+            (
+                HARNESS_E2E,
+                '            evidence.node_tls_reject_unauthorized == "unset"\n'
+                '                && evidence.probe_tls_reject_unauthorized == "unset",',
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "an unverifiable certificate is refused by the same client",
+        [
+            (
+                HARNESS_E2E,
+                '            evidence.probe_extra_ca == "unset"\n'
+                '                && evidence.probe_code == "INSECURE_ENDPOINT"\n'
+                "                && !evidence.probe_retryable,",
+                "            true,",
+            )
+        ],
     ),
     (
         "a superseded grant revision is refused at the upgrade",
         [
             (
                 HARNESS_E2E,
-                '            evidence.revision_upgrade_code == "CAPABILITIES_CHANGED",',
+                "            evidence.revision_upgrade_status == 409\n"
+                '                && evidence.revision_upgrade_code == "CAPABILITIES_CHANGED",',
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the read spanned more than four messages",
+        [
+            (
+                HARNESS_E2E,
+                "            evidence.read_messages >= MIN_MESSAGES,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the write spanned more than four messages, each acknowledged",
+        [
+            (
+                HARNESS_E2E,
+                "            evidence.write_messages >= MIN_MESSAGES\n"
+                "                && evidence.write_acknowledgements == evidence.write_messages,",
                 "            true,",
             )
         ],
@@ -2332,21 +2373,15 @@ GATE6_E2E_CASES: list[tuple[str, list[Edit]]] = [
         ],
     ),
     (
-        "a mutation refused at admission is absent from the device's ledger",
+        "the device applied nothing under a read-only grant",
         [
             (
                 HARNESS_E2E,
-                "            evidence.read_only_device_refused == 0,",
-                "            true,",
-            )
-        ],
-    ),
-    (
-        "the client's view and the device's ledger differ by the refused opcodes",
-        [
-            (
-                HARNESS_E2E,
-                "            evidence.read_only_client_overstated == 3,",
+                "            !evidence.read_only_device_applied_anything\n"
+                "                && evidence.read_only_ledger_after.bytes_written\n"
+                "                    == evidence.read_only_ledger_before.bytes_written\n"
+                "                && evidence.read_only_ledger_after.mutations_dispatched\n"
+                "                    == evidence.read_only_ledger_before.mutations_dispatched,",
                 "            true,",
             )
         ],
@@ -2373,14 +2408,14 @@ GATE6_E2E_CASES: list[tuple[str, list[Edit]]] = [
         ],
     ),
     (
-        "the device's own ledger identity holds",
+        "the host holds exactly what the device's ledger says it wrote",
         [
             (
                 HARNESS_E2E,
-                "            evidence.ledger_identity_holds\n"
-                "                && ledger.mutations_dispatched >= ledger.mutations_applied\n"
-                "                && evidence.unknown_host_matches_ledger\n"
-                "                && evidence.unknown_host_pattern_matches,",
+                "            evidence.unknown_host_matches_ledger\n"
+                "                && evidence.unknown_host_pattern_matches\n"
+                "                && evidence.ledger_identity_holds\n"
+                "                && ledger.mutations_dispatched >= ledger.mutations_applied,",
                 "            true,",
             )
         ],
@@ -2396,8 +2431,27 @@ GATE6_E2E_CASES: list[tuple[str, list[Edit]]] = [
             )
         ],
     ),
+    (
+        "the driver loaded this repository's own client module",
+        [
+            (
+                HARNESS_E2E,
+                "            evidence.client_module_is_the_package && !evidence.client_module_path.is_empty(),",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the session ran against the relay this gate arranged",
+        [
+            (
+                HARNESS_E2E,
+                "            !evidence.owner_node.is_empty() && evidence.owner_node == evidence.expected_owner_node,",
+                "            true,",
+            )
+        ],
+    ),
 ]
-
 
 @dataclass
 class Suite:

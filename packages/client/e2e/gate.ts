@@ -40,14 +40,17 @@ import {
   ConsumerSession,
   FilesystemError,
   RemoteFilesystem,
+  UpgradeRejected,
   attachSession,
   connectFilesystem,
   fetchDescriptor,
   upgrade,
+  upgradeRejectionError,
   type BinaryTransport,
   type Descriptor,
 } from '../src/index.ts';
 import { GRANT_REVISION_HEADER, SUBPROTOCOL } from '../src/descriptor.ts';
+import { MESSAGE_TYPES } from '../src/ninep/constants.ts';
 import { TunnelMastraFilesystem, type MastraErrorClasses } from '../src/adapters/mastra.ts';
 
 /* ------------------------------------------------------------------ *
@@ -119,7 +122,22 @@ function equalBytes(left: Uint8Array, right: Uint8Array): boolean {
  */
 interface Report {
   // (a) TLS and the descriptor, read by the real client over a verified socket.
-  tlsVerified: boolean;
+  /**
+   * Whether this process was **able** to skip verification.
+   *
+   * `NODE_TLS_REJECT_UNAUTHORIZED=0` turns node's certificate verification off
+   * process-wide, and an earlier round of this gate passed with it set: the
+   * driver simply asserted `tlsVerified = true` once a connect resolved, which
+   * is true of an unverified connect too. The harness now removes the variable
+   * and refuses to run when its own environment sets it, and the driver reports
+   * what it actually sees so the validator can pin it unset rather than trust
+   * that it was.
+   */
+  nodeTlsRejectUnauthorized: string;
+  /** The module specifier this driver resolved for the client under test. */
+  clientModulePath: string;
+  /** Whether the composed public entry point was driven, not only its pieces. */
+  publicEntryPointUsed: boolean;
   descriptorSchemaVersion: string;
   descriptorSubprotocol: string;
   descriptorDialect: string;
@@ -131,6 +149,7 @@ interface Report {
   unauthenticatedCode: string;
   unauthenticatedOutcome: string;
   // (c) the grant-revision header, against a revision that really moved.
+  revisionUpgradeStatus: number;
   revisionUpgradeCode: string;
   revisionUpgradeOutcome: string;
   revisionUpgradeRetryable: boolean;
@@ -145,6 +164,7 @@ interface Report {
   // (f) a checksummed write spanning many messages.
   writeBytes: number;
   writeMessages: number;
+  writeAcknowledgements: number;
   // (g) a directory listing.
   listingNamesObserved: number;
   listingEveryNameExactlyOnce: boolean;
@@ -183,7 +203,9 @@ interface Report {
 
 function blankReport(): Report {
   return {
-    tlsVerified: false,
+    nodeTlsRejectUnauthorized: '',
+    clientModulePath: '',
+    publicEntryPointUsed: false,
     descriptorSchemaVersion: '',
     descriptorSubprotocol: '',
     descriptorDialect: '',
@@ -193,6 +215,7 @@ function blankReport(): Report {
     descriptorAvailability: '',
     unauthenticatedCode: '',
     unauthenticatedOutcome: '',
+    revisionUpgradeStatus: 0,
     revisionUpgradeCode: '',
     revisionUpgradeOutcome: '',
     revisionUpgradeRetryable: true,
@@ -204,6 +227,7 @@ function blankReport(): Report {
     readMessages: 0,
     writeBytes: 0,
     writeMessages: 0,
+    writeAcknowledgements: 0,
     listingNamesObserved: 0,
     listingEveryNameExactlyOnce: false,
     readOnlyReadMatches: false,
@@ -254,6 +278,19 @@ function emit(line: unknown): void {
 }
 
 /**
+ * The last line, written and **flushed** before the process may exit.
+ *
+ * `process.stdout.write` to a pipe is asynchronous once the buffer fills, and
+ * the report is the largest line this driver produces; exiting on the next tick
+ * relied on it fitting in the pipe buffer.
+ */
+function emitFinal(line: unknown): Promise<void> {
+  return new Promise((resolve) => {
+    process.stdout.write(`${JSON.stringify(line)}\n`, () => resolve());
+  });
+}
+
+/**
  * Wait for one `go` line from the harness.
  *
  * `next()` rather than `for await`, deliberately: a `for await` that leaves its
@@ -262,6 +299,30 @@ function emit(line: unknown): void {
  * see an iterator that was already done and report the harness as having
  * closed stdin. There are two rendezvous, and they share one iterator.
  */
+/**
+ * Run one case between a pair of rendezvous, and **always** close the pair.
+ *
+ * The closing event is emitted from a `finally`, because a case that throws
+ * between the two leaves the harness blocked on a rendezvous that never
+ * arrives — which it can only report as a timeout, burying the failure the
+ * report was about to carry. The harness treats the closing event as "this
+ * case is over", not as "this case succeeded".
+ */
+async function bracket(
+  name: string,
+  lines: AsyncIterableIterator<string>,
+  body: () => Promise<void>,
+): Promise<void> {
+  emit({ event: `${name}-start` });
+  await awaitGo(lines);
+  try {
+    await body();
+  } finally {
+    emit({ event: `${name}-done` });
+    await awaitGo(lines);
+  }
+}
+
 async function awaitGo(lines: AsyncIterableIterator<string>): Promise<void> {
   for (;;) {
     const next = await lines.next();
@@ -284,6 +345,45 @@ interface RawClient {
   remote: RemoteFilesystem;
   session: ConsumerSession;
   descriptor: Descriptor;
+  /** Frames this session actually sent and received, counted by opcode. */
+  frames: FrameCounts;
+}
+
+/**
+ * Frames counted at the transport, by the opcode byte of the 9P header.
+ *
+ * A 9P message is `size[4] type[1] tag[2] …`, so the opcode is byte 4 of every
+ * complete message — and one complete message is exactly what a consumer
+ * binary WebSocket message carries in this profile, which is why counting here
+ * is counting messages and not counting fragments.
+ */
+class FrameCounts {
+  private readonly sent = new Map<number, number>();
+  private readonly received = new Map<number, number>();
+
+  note(bytes: Uint8Array, into: Map<number, number>): void {
+    if (bytes.byteLength < 5) {
+      return;
+    }
+    const opcode = bytes[4] as number;
+    into.set(opcode, (into.get(opcode) ?? 0) + 1);
+  }
+
+  noteSent(bytes: Uint8Array): void {
+    this.note(bytes, this.sent);
+  }
+
+  noteReceived(bytes: Uint8Array): void {
+    this.note(bytes, this.received);
+  }
+
+  sentCount(opcode: number): number {
+    return this.sent.get(opcode) ?? 0;
+  }
+
+  receivedCount(opcode: number): number {
+    return this.received.get(opcode) ?? 0;
+  }
 }
 
 /**
@@ -299,8 +399,9 @@ interface RawClient {
  */
 async function connectRaw(endpoint: string, plan: Plan): Promise<RawClient> {
   const descriptor = await fetchDescriptor({ endpoint, token: token(plan) });
+  const frames = new FrameCounts();
   let session: ConsumerSession | undefined;
-  const transport: BinaryTransport = await upgrade({
+  const socket: BinaryTransport = await upgrade({
     url: new URL(endpoint),
     subprotocol: SUBPROTOCOL,
     headers: {
@@ -311,10 +412,27 @@ async function connectRaw(endpoint: string, plan: Plan): Promise<RawClient> {
     allowInsecureLoopback: false,
     timeoutMs: descriptor.limits.requestTimeoutSeconds * 1000,
     handlers: {
-      onMessage: (bytes) => session?.onMessage(bytes),
+      onMessage: (bytes) => {
+        frames.noteReceived(bytes);
+        session?.onMessage(bytes);
+      },
       onClose: (info) => session?.onClose(info),
     },
   });
+  // An explicit delegate rather than a spread: `isOpen` is a getter, and
+  // copying it would freeze the value the session reads.
+  const transport: BinaryTransport = {
+    get isOpen() {
+      return socket.isOpen;
+    },
+    send(bytes) {
+      frames.noteSent(bytes);
+      socket.send(bytes);
+    },
+    close(code, reason) {
+      socket.close(code, reason);
+    },
+  };
   session = new ConsumerSession(transport, {
     msize: descriptor.limits.maxMessageBytes,
     maxInflightRequests: descriptor.limits.maxInflightRequests,
@@ -322,7 +440,7 @@ async function connectRaw(endpoint: string, plan: Plan): Promise<RawClient> {
     requestTimeoutMs: descriptor.limits.requestTimeoutSeconds * 1000,
   });
   const remote = await attachSession(descriptor, transport, session);
-  return { remote, session, descriptor };
+  return { remote, session, descriptor, frames };
 }
 
 /**
@@ -389,19 +507,21 @@ async function revisionCase(
     transport.close(1000, 'superseded-admitted');
     report.failures.push('a superseded grant revision was admitted at the upgrade');
   } catch (error) {
-    // `upgrade` throws its own `UpgradeRejected` for a non-101; the status and
-    // the contract's JSON body are what matter, and both are on it.
-    const status = (error as { status?: number }).status;
-    const body = (error as { body?: string }).body ?? '';
-    let code = '';
-    try {
-      code = (JSON.parse(body) as { error?: { code?: string } }).error?.code ?? '';
-    } catch {
-      code = '';
+    if (!(error instanceof UpgradeRejected)) {
+      throw error;
     }
-    report.revisionUpgradeCode = status === 409 ? code : `HTTP_${String(status ?? 0)}:${code}`;
-    report.revisionUpgradeOutcome = 'not_started';
-    report.revisionUpgradeRetryable = false;
+    // The **client's own** mapping from a refused upgrade to its error
+    // vocabulary, not this driver's reading of the status line.
+    // `connectFilesystem` cannot be used for this case — it always fetches a
+    // fresh descriptor, so it could never carry a superseded revision — and a
+    // driver that hard-coded `not_started` here would be asserting a constant
+    // it had written itself. `upgradeRejectionError` is the exact function
+    // `connectFilesystem` calls on this path, exported for that reason.
+    const mapped = upgradeRejectionError(error);
+    report.revisionUpgradeStatus = error.status;
+    report.revisionUpgradeCode = mapped.code;
+    report.revisionUpgradeOutcome = mapped.outcome;
+    report.revisionUpgradeRetryable = mapped.retryable;
   }
 }
 
@@ -413,15 +533,13 @@ async function revisionCase(
  * messages, and a directory listing.
  */
 async function readWriteCase(plan: Plan, report: Report): Promise<void> {
-  const remote = await connectFilesystem({
-    endpoint: plan.endpoints.readWrite,
-    token: token(plan),
-  });
+  // `connectRaw` rather than `connectFilesystem`, for one reason: the message
+  // counts below have to be **counted**, and that needs the transport. It runs
+  // the same exported pieces `connectFilesystem` composes, in the same order.
+  // The composed entry point itself is driven by the adapter case, which
+  // records that it was.
+  const { remote, frames } = await connectRaw(plan.endpoints.readWrite, plan);
   try {
-    // The socket carried a verified certificate chain: `allowInsecureLoopback`
-    // was never passed, so an `https:` endpoint is the only thing this client
-    // would have spoken to and the CA came from the runtime's own trust store.
-    report.tlsVerified = true;
     const descriptor = remote.descriptor;
     report.descriptorSchemaVersion = descriptor.schemaVersion;
     report.descriptorSubprotocol = descriptor.transport.subprotocol;
@@ -434,14 +552,18 @@ async function readWriteCase(plan: Plan, report: Report): Promise<void> {
     report.negotiatedMsize = remote.msize;
     report.sessionLifecycle = remote.state;
 
-    // (e) The checksummed read. `maxCount` is what one `Rread` can carry, so
-    // the message count is a fact about the negotiated `msize` and the file
-    // rather than a guess.
+    // (e) The checksummed read. The message count is **counted at the
+    // transport**, by the opcode byte of each complete message the socket
+    // delivered: one consumer binary message is one complete 9P message in this
+    // profile, so counting `Rread` opcodes is counting `Rread` messages. An
+    // earlier round computed `ceil(bytes / maxCount)` here, which would have
+    // reported "more than four messages" for any chunking at all — including a
+    // chunking that never happened.
+    const readFramesBefore = frames.receivedCount(MESSAGE_TYPES.Rread);
     const bytes = await remote.readFile(plan.read.path);
     report.readBytes = bytes.byteLength;
     report.readChecksumMatches = fnv1a(bytes) === BigInt(plan.read.checksum);
-    const readCount = remote.msize - 11;
-    report.readMessages = Math.ceil(bytes.byteLength / readCount);
+    report.readMessages = frames.receivedCount(MESSAGE_TYPES.Rread) - readFramesBefore;
 
     // (f) The checksummed write, handed over as a stream of chunks so the
     // client's own `Twrite` chunking is what spans the messages.
@@ -451,9 +573,15 @@ async function readWriteCase(plan: Plan, report: Report): Promise<void> {
     for (let at = 0; at < source.byteLength; at += chunkBytes) {
       chunks.push(source.subarray(at, Math.min(at + chunkBytes, source.byteLength)));
     }
+    const writeFramesBefore = frames.sentCount(MESSAGE_TYPES.Twrite);
     await remote.writeStream(plan.write.path, chunks);
     report.writeBytes = source.byteLength;
-    report.writeMessages = Math.ceil(source.byteLength / (remote.msize - 23));
+    // Counted at the transport too, on the way out: `Twrite` opcodes actually
+    // handed to `send`, not a division.
+    report.writeMessages = frames.sentCount(MESSAGE_TYPES.Twrite) - writeFramesBefore;
+    // And the replies to them, so a `Twrite` count that did not produce a
+    // matching `Rwrite` count could not be read as a completed write.
+    report.writeAcknowledgements = frames.receivedCount(MESSAGE_TYPES.Rwrite);
 
     // (g) The listing.
     const names: string[] = [];
@@ -486,9 +614,15 @@ async function readOnlyCase(
 ): Promise<void> {
   // The harness reads the device's ledger on both sides of this case, so it
   // can say what the device believes happened while the client is reporting
-  // what the wire let it conclude. Announce and hold before anything connects.
-  emit({ event: 'read-only-start' });
-  await awaitGo(lines);
+  // what the wire let it conclude. `bracket` emits the closing event from a
+  // `finally`: a case that threw between the two used to leave the harness
+  // waiting on a rendezvous that would never arrive, which it reported as a
+  // device that never recorded an exchange — burying the real failure the
+  // report was carrying.
+  await bracket('read-only', lines, () => readOnlyBody(plan, report));
+}
+
+async function readOnlyBody(plan: Plan, report: Report): Promise<void> {
   const { remote, session, descriptor } = await connectRaw(plan.endpoints.readOnly, plan);
   try {
     report.readOnlyRootReadOnly = descriptor.root.readOnly;
@@ -606,8 +740,6 @@ async function readOnlyCase(
   } finally {
     await remote.close();
   }
-  emit({ event: 'read-only-done' });
-  await awaitGo(lines);
 }
 
 /**
@@ -633,6 +765,13 @@ async function unknownCase(
   report: Report,
   lines: AsyncIterableIterator<string>,
 ): Promise<void> {
+  // Bracketed, so the harness's ledger reading happens whether this case
+  // succeeds or throws. Its opening rendezvous costs nothing — no exchange has
+  // happened yet — and its closing one is what the ledger delta is measured to.
+  await bracket('unknown', lines, () => unknownBody(plan, report));
+}
+
+async function unknownBody(plan: Plan, report: Report): Promise<void> {
   const { remote, session: live } = await connectRaw(plan.endpoints.unknown, plan);
   try {
     // Create the file through the ordinary primitives, and await those: the
@@ -697,10 +836,6 @@ async function unknownCase(
   } finally {
     await remote.close();
   }
-  // The device's exchange is over; hold here until the harness has read its
-  // ledger, so no later case can fold a second exchange into that reading.
-  emit({ event: 'unknown-done' });
-  await awaitGo(lines);
 }
 
 /**
@@ -781,6 +916,10 @@ async function adapterCase(plan: Plan, report: Report): Promise<void> {
     endpoint: plan.endpoints.adapter,
     token: token(plan),
   });
+  // `connectFilesystem` itself, not its pieces: the read-write case has to hold
+  // the transport to count frames, so this is where the composed public entry
+  // point is driven against the real endpoint, and the report says so.
+  report.publicEntryPointUsed = true;
   const filesystem = new TunnelMastraFilesystem({ remote, errors });
   try {
     await filesystem.init();
@@ -827,6 +966,42 @@ async function adapterCase(plan: Plan, report: Report): Promise<void> {
  * Main
  * ------------------------------------------------------------------ */
 
+/**
+ * The TLS negative probe, run in its **own process** with the fixture CA
+ * withheld.
+ *
+ * Verification cannot be turned off and on inside one process:
+ * `NODE_EXTRA_CA_CERTS` is read once at startup. So the harness spawns this
+ * driver a second time without it, and this mode makes the same descriptor
+ * fetch against the same endpoint. The client must refuse with
+ * `INSECURE_ENDPOINT` — its own code for "a certificate this side could not
+ * verify", which it deliberately does not report as an outage and never marks
+ * retryable, because retrying reaches the same untrusted peer.
+ *
+ * Without this, "the client verified the relay's certificate" is a sentence
+ * about an environment variable that happened not to be set, not an
+ * observation. The main run proves a verified chain is **accepted**; this
+ * proves an unverifiable one is **refused**, and only the pair says
+ * verification happened.
+ */
+async function tlsProbe(plan: Plan): Promise<void> {
+  let code = 'ADMITTED';
+  let retryable = true;
+  try {
+    await fetchDescriptor({ endpoint: plan.endpoints.readWrite, token: token(plan) });
+  } catch (error) {
+    code = codeOf(error);
+    retryable = retryableOf(error);
+  }
+  emit({
+    event: 'tls-probe',
+    code,
+    retryable,
+    nodeTlsRejectUnauthorized: process.env['NODE_TLS_REJECT_UNAUTHORIZED'] ?? 'unset',
+    extraCa: process.env['NODE_EXTRA_CA_CERTS'] ?? 'unset',
+  });
+}
+
 async function main(): Promise<void> {
   const planPath = process.argv[2];
   if (planPath === undefined) {
@@ -834,7 +1009,16 @@ async function main(): Promise<void> {
   }
   const { readFile } = await import('node:fs/promises');
   const plan = JSON.parse(await readFile(planPath, 'utf8')) as Plan;
+  if (process.argv[3] === '--tls-probe') {
+    await tlsProbe(plan);
+    return;
+  }
   const report = blankReport();
+  report.nodeTlsRejectUnauthorized = process.env['NODE_TLS_REJECT_UNAUTHORIZED'] ?? 'unset';
+  // The specifier this driver actually resolved for the client under test, so
+  // the harness compares a path node produced against the path it expects
+  // rather than asking whether a file exists somewhere.
+  report.clientModulePath = import.meta.resolve('../src/index.ts');
   const lines = createInterface({ input: process.stdin })[Symbol.asyncIterator]();
 
   // The order is load-bearing in one place and stated rather than left to be
@@ -863,7 +1047,7 @@ async function main(): Promise<void> {
       process.stderr.write(`gate6-e2e: case ${name} failed: ${codeOf(error)}\n`);
     }
   }
-  emit({ event: 'report', report });
+  await emitFinal({ event: 'report', report });
 }
 
 main().then(

@@ -172,8 +172,15 @@ impl From<&tunnel_client::FsCounters> for DeviceLedger {
 pub struct FsClientE2eEvidence {
     pub relay_count: usize,
     pub owner_node: String,
-    /// The driver ran this package's own sources under `node`, not a copy.
-    pub driver_is_the_package: bool,
+    /// The module specifier the driver resolved for the client under test, as
+    /// `node` produced it, compared against this repository's own path.
+    pub client_module_path: String,
+    pub client_module_is_the_package: bool,
+    /// Whether `connectFilesystem` itself — not only the pieces it composes —
+    /// was driven against the real endpoint.
+    pub public_entry_point_used: bool,
+    /// The relay this gate expects to own the device.
+    pub expected_owner_node: String,
     /// Every endpoint the driver was given was `https:`, and the driver never
     /// passed `allowInsecureLoopback`.
     pub endpoints_all_https: bool,
@@ -181,8 +188,23 @@ pub struct FsClientE2eEvidence {
     /// not run must never read as a case that passed.
     pub driver_failures: Vec<String>,
 
-    // (a) TLS and the descriptor, through the client itself.
-    pub tls_verified: bool,
+    // (a) TLS, observed rather than assumed, and the descriptor.
+    /// What the driver's own process saw for `NODE_TLS_REJECT_UNAUTHORIZED`.
+    ///
+    /// Must be `unset`. Setting it to `0` turns node's certificate verification
+    /// off process-wide, and an earlier round of this gate passed with it set:
+    /// the driver asserted a verified chain once a connect resolved, which is
+    /// equally true of an unverified one. The harness removes it from the
+    /// child's environment and refuses to run when its own environment sets it,
+    /// and this field is what the child actually saw.
+    pub node_tls_reject_unauthorized: String,
+    /// The same, for the negative probe's process.
+    pub probe_tls_reject_unauthorized: String,
+    /// The probe process ran with no fixture CA at all.
+    pub probe_extra_ca: String,
+    /// The code the client produced for a certificate it could not verify.
+    pub probe_code: String,
+    pub probe_retryable: bool,
     pub descriptor_schema_version: String,
     pub descriptor_subprotocol: String,
     pub descriptor_dialect: String,
@@ -197,6 +219,7 @@ pub struct FsClientE2eEvidence {
 
     // (c) the grant-revision header against a revision that really moved.
     pub revision_advanced_in_catalog: bool,
+    pub revision_upgrade_status: u16,
     pub revision_upgrade_code: String,
     pub revision_upgrade_outcome: String,
     pub revision_upgrade_retryable: bool,
@@ -214,6 +237,7 @@ pub struct FsClientE2eEvidence {
     // (f) a checksummed write spanning many messages, verified on the host.
     pub write_bytes: u64,
     pub write_messages: usize,
+    pub write_acknowledgements: usize,
     pub write_host_bytes: u64,
     pub write_host_checksum_matches: bool,
 
@@ -254,11 +278,17 @@ pub struct FsClientE2eEvidence {
     pub read_only_device_refused: u64,
     /// Whether the device applied anything at all under a read-only grant.
     pub read_only_device_applied_anything: bool,
-    /// Requests the client could only report `failed` that the device's ledger
-    /// records as refused before the host was consulted.  A measured
-    /// disagreement, recorded rather than resolved: the client is right not to
-    /// claim, and the counter is the only place the answer lives.
-    pub read_only_client_overstated: usize,
+    /// Mutating requests the client could report no better than `failed` — the
+    /// wire's floor — while the device applied nothing.
+    ///
+    /// Named for what it counts. An earlier round called this an overstatement
+    /// "against the ledger", which it is not: the ledger's own refusal counter
+    /// is zero for these (see [`FsClientE2eEvidence::read_only_device_refused`]
+    /// and task row M4-16), so the comparison the name implied could not be
+    /// made. What it is is a count of the client's reports at the floor, and
+    /// the ledger half of the disagreement is the applied/dispatched/written
+    /// zeroes beside it.
+    pub read_only_client_reported_failed: usize,
 
     // (i) an outcome the client classifies `unknown`, beside the device's own
     // ledger.
@@ -304,15 +334,19 @@ pub struct FsClientE2eEvidence {
 #[allow(clippy::too_many_lines)]
 pub fn validate_fs_client_e2e_evidence(evidence: &FsClientE2eEvidence) -> Result<()> {
     let ledger = &evidence.ledger_after;
-    let checks: [(&str, bool); 46] = [
+    let checks: [(&str, bool); 47] = [
         ("three relays", evidence.relay_count == 3),
         (
-            "the session ran against the owning relay",
-            !evidence.owner_node.is_empty(),
+            "the session ran against the relay this gate attached the device to",
+            !evidence.owner_node.is_empty() && evidence.owner_node == evidence.expected_owner_node,
         ),
         (
             "the driver ran the package's own sources",
-            evidence.driver_is_the_package,
+            evidence.client_module_is_the_package && !evidence.client_module_path.is_empty(),
+        ),
+        (
+            "the composed public entry point was driven, not only its pieces",
+            evidence.public_entry_point_used,
         ),
         (
             "every endpoint the client was given was https",
@@ -323,8 +357,19 @@ pub fn validate_fs_client_e2e_evidence(evidence: &FsClientE2eEvidence) -> Result
             evidence.driver_failures.is_empty(),
         ),
         (
-            "the client verified the relay's certificate",
-            evidence.tls_verified,
+            // Three facts, and none of them is "a connect resolved".
+            "node could not have skipped certificate verification",
+            evidence.node_tls_reject_unauthorized == "unset"
+                && evidence.probe_tls_reject_unauthorized == "unset",
+        ),
+        (
+            // The negative half. A verified chain being accepted says nothing
+            // on its own; an unverifiable one being refused is what makes the
+            // pair an observation about verification.
+            "the same client refuses the same endpoint with the fixture CA withheld",
+            evidence.probe_extra_ca == "unset"
+                && evidence.probe_code == "INSECURE_ENDPOINT"
+                && !evidence.probe_retryable,
         ),
         (
             "the descriptor carries this profile's schema version",
@@ -368,9 +413,14 @@ pub fn validate_fs_client_e2e_evidence(evidence: &FsClientE2eEvidence) -> Result
         ),
         (
             "an upgrade carrying the superseded revision is refused",
-            evidence.revision_upgrade_code == "CAPABILITIES_CHANGED",
+            evidence.revision_upgrade_status == 409
+                && evidence.revision_upgrade_code == "CAPABILITIES_CHANGED",
         ),
         (
+            // The outcome and the retryability come from the client's own
+            // `upgradeRejectionError`, which is the function `connectFilesystem`
+            // calls on this path — exported for this gate rather than copied,
+            // so a driver cannot assert a constant it wrote itself.
             "that refusal happened before anything could be admitted",
             evidence.revision_upgrade_outcome == "not_started"
                 && !evidence.revision_upgrade_retryable,
@@ -404,8 +454,9 @@ pub fn validate_fs_client_e2e_evidence(evidence: &FsClientE2eEvidence) -> Result
             evidence.write_bytes == WRITE_FILE_BYTES as u64,
         ),
         (
-            "the write spanned more than four messages",
-            evidence.write_messages >= MIN_MESSAGES,
+            "the write spanned more than four messages, each of them acknowledged",
+            evidence.write_messages >= MIN_MESSAGES
+                && evidence.write_acknowledgements == evidence.write_messages,
         ),
         (
             "the host holds exactly the bytes the client sent",
@@ -474,37 +525,26 @@ pub fn validate_fs_client_e2e_evidence(evidence: &FsClientE2eEvidence) -> Result
                     == evidence.read_only_ledger_before.mutations_dispatched,
         ),
         (
-            // **This is a gap, measured rather than assumed, and the number is
-            // zero.** `FsCounters::mutations_refused` documents itself as
-            // "mutating requests refused before the host was touched", and
-            // these three are exactly that — and it does not move, because the
-            // refusal is taken by gate 3's session in `Provider::accept`, which
-            // returns a `SessionError` and never produces the decoded
-            // primitives the ledger classifies a mutation from. `refuse` can
-            // therefore only count `errors_sent`. So a mutation refused at
-            // **admission** is invisible in the one place an operator reads how
-            // far a mutation got, and only a mutation refused after the queue
-            // wait is counted. Pinned at zero deliberately: this gate is not
-            // the place to change the provider, and a run in which the number
-            // moves is a change to that behaviour that should be read and
-            // documented rather than silently absorbed.
-            "a mutation refused at admission is still absent from the device's ledger",
-            evidence.read_only_device_refused == 0,
+            // `FsCounters::mutations_refused` documents itself as "mutating
+            // requests refused before the host was touched", and these three
+            // are exactly that — and it does not move, because the refusal is
+            // taken by gate 3's session in `Provider::accept`, which returns a
+            // `SessionError` and never produces the decoded primitives the
+            // ledger classifies a mutation from, so `refuse` can only count
+            // `errors_sent`. **That is a defect, tracked as task row M4-16, and
+            // this gate does not assert it either way.** An earlier round
+            // pinned the counter at zero, which made the gate *require* the
+            // provider to disagree with its own documentation and would have
+            // turned the fix red. The value is recorded in the evidence and
+            // read in the summary; what is asserted here is only the bound that
+            // is true whether or not M4-16 lands.
+            "the ledger's refusal counter never exceeds the mutations sent",
+            evidence.read_only_device_refused <= 3,
         ),
         (
             "the ledger readings bracket exactly the read-only exchange",
             evidence.read_only_ledger_before.exchanges == 2
                 && evidence.read_only_ledger_after.exchanges == 3,
-        ),
-        (
-            // Not "must be zero": it is three, every run, and that is the
-            // point. It is recorded so the number is read rather than assumed,
-            // and asserted to be exactly the count of mutating opcodes the
-            // case sent, so a client that started claiming `not_started` for a
-            // refused mutation — or the device's ledger losing its refusal
-            // counter — would fail here rather than quietly agreeing.
-            "the client's view and the device's ledger differ by exactly the refused opcodes",
-            evidence.read_only_client_overstated == 3,
         ),
         (
             "no refusal was reported retryable",
@@ -532,11 +572,22 @@ pub fn validate_fs_client_e2e_evidence(evidence: &FsClientE2eEvidence) -> Result
             evidence.ledger_before == DeviceLedger::default() && ledger.exchanges == 1,
         ),
         (
-            "the device's own ledger identity holds",
-            evidence.ledger_identity_holds
-                && ledger.mutations_dispatched >= ledger.mutations_applied
-                && evidence.unknown_host_matches_ledger
-                && evidence.unknown_host_pattern_matches,
+            // **The content of this rule is the host, not the identity.**
+            // `mutations_acknowledged` and `mutation_unknown` are both gated on
+            // the same undelivered-effect decision in the provider, so
+            // `applied - acknowledged == unknown` cannot fail within one
+            // session and proves nothing about this run; it is checked and
+            // recorded because it is gate 5's stated invariant and a future
+            // concurrent dispatcher could break it, not because it discriminates
+            // here. What does discriminate is that the bytes on the host equal
+            // the ledger's own `bytes_written` and lie at the source pattern's
+            // offsets — so nothing was applied twice, out of order, or beyond
+            // what was sent.
+            "the host holds exactly what the device's ledger says it wrote",
+            evidence.unknown_host_matches_ledger
+                && evidence.unknown_host_pattern_matches
+                && evidence.ledger_identity_holds
+                && ledger.mutations_dispatched >= ledger.mutations_applied,
         ),
         (
             "one adapter drove the same sockets end to end",
@@ -620,6 +671,15 @@ fn fnv1a(bytes: &[u8]) -> u64 {
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     hash
+}
+
+/// The filesystem path inside a `file:` URL, or `None` for anything else.
+///
+/// `import.meta.resolve` answers a URL, and comparing a URL to a path would
+/// compare two spellings of the same thing; this takes the path out so the
+/// comparison can be made on canonicalised files.
+fn url_path(url: &str) -> Option<PathBuf> {
+    url.strip_prefix("file://").map(PathBuf::from)
 }
 
 /// The repository root, from this crate's own manifest directory.
@@ -806,12 +866,24 @@ async fn run(
 enum DriverEvent {
     /// The revision the client read, awaiting the catalog change.
     Descriptor { revision: String },
-    /// The `unknown` case's exchange is over; the ledger may be read.
+    /// Nothing has connected for the `unknown` case yet.
+    UnknownStart,
+    /// The `unknown` case is over — successfully or not — and the ledger may be
+    /// read. The driver emits this from a `finally`, so a case that threw does
+    /// not leave this side waiting on a rendezvous that never comes.
     UnknownDone,
     /// Nothing has connected for the read-only case yet.
     ReadOnlyStart,
-    /// The read-only case's exchange is over.
+    /// The read-only case is over, on either path.
     ReadOnlyDone,
+    /// The negative TLS probe, from its own process.
+    #[serde(rename_all = "camelCase")]
+    TlsProbe {
+        code: String,
+        retryable: bool,
+        node_tls_reject_unauthorized: String,
+        extra_ca: String,
+    },
     /// The one terminal line.
     Report { report: Box<DriverReport> },
 }
@@ -821,7 +893,9 @@ enum DriverEvent {
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct DriverReport {
-    tls_verified: bool,
+    node_tls_reject_unauthorized: String,
+    client_module_path: String,
+    public_entry_point_used: bool,
     descriptor_schema_version: String,
     descriptor_subprotocol: String,
     descriptor_dialect: String,
@@ -831,6 +905,7 @@ struct DriverReport {
     descriptor_availability: String,
     unauthenticated_code: String,
     unauthenticated_outcome: String,
+    revision_upgrade_status: u16,
     revision_upgrade_code: String,
     revision_upgrade_outcome: String,
     revision_upgrade_retryable: bool,
@@ -842,6 +917,7 @@ struct DriverReport {
     read_messages: usize,
     write_bytes: u64,
     write_messages: usize,
+    write_acknowledgements: usize,
     listing_names_observed: usize,
     listing_every_name_exactly_once: bool,
     read_only_read_matches: bool,
@@ -882,6 +958,11 @@ async fn exercise(
 ) -> Result<()> {
     evidence.owner_node = await_owner(cluster, tenant_id, device_id, session_id).await?;
     let owner_relay = cluster.relay("relay-a")?;
+    // The device attached to `relay-a`, and gate 4 admits a filesystem session
+    // only at the relay that owns the device. Comparing the claim against that
+    // node's own identifier is the check; a non-empty string would have been
+    // satisfied by any owner at all, including one this gate did not arrange.
+    evidence.expected_owner_node = owner_relay.node_id.clone();
     let owner_addr = owner_relay.consumer_addr()?;
     let ca = harness.pki.server_ca.certificate_der.clone();
     let principal = &harness.topology.consumers_a[0];
@@ -965,13 +1046,26 @@ async fn exercise(
         })
     });
 
+    // **Refuse to run at all if this process could hand the driver a way to skip
+    // certificate verification.** Removing the variable from the child's
+    // environment is not enough on its own: an operator who set it meant
+    // something by it, and a gate that silently ignored it would be reporting a
+    // verified chain in an environment configured not to verify. The child's
+    // environment is scrubbed as well, and the driver reports what it saw.
+    if std::env::var_os("NODE_TLS_REJECT_UNAUTHORIZED").is_some() {
+        return Err(HarnessError::InvalidInput(
+            "NODE_TLS_REJECT_UNAUTHORIZED is set in this environment; this gate proves \
+             certificate verification and will not run where it can be skipped"
+                .into(),
+        ));
+    }
+
     let work = tempfile::tempdir().map_err(HarnessError::Io)?;
     let plan_path = work.path().join("plan.json");
-    std::fs::write(
+    write_private(
         &plan_path,
-        serde_json::to_vec(&plan).map_err(HarnessError::Json)?,
-    )
-    .map_err(HarnessError::Io)?;
+        &serde_json::to_vec(&plan).map_err(HarnessError::Json)?,
+    )?;
     let ca_path = work.path().join("fixture-ca.pem");
     std::fs::write(&ca_path, harness.pki.server_ca.certificate_pem.as_bytes())
         .map_err(HarnessError::Io)?;
@@ -983,14 +1077,17 @@ async fn exercise(
             "the gate-6 driver is not where this gate expects it".into(),
         ));
     }
-    // The driver imports `../src/index.ts`, so what node runs is the package's
-    // own sources rather than a copy this crate keeps.
-    evidence.driver_is_the_package = root.join("packages/client/src/index.ts").is_file();
+
+    // The TLS negative probe, first and in its own process, because
+    // `NODE_EXTRA_CA_CERTS` is read once at startup and cannot be withdrawn
+    // inside a run. The same driver, the same endpoint, the same client — and
+    // no fixture CA. It must be refused.
+    tls_probe(&driver, &plan_path, evidence).await?;
 
     // Nothing has opened a filesystem session yet, so this reading is zero and
     // is asserted to be: it is what makes the `unknown` case's ledger a delta
     // from nothing rather than a number that has to be disentangled from every
-    // other case's writes.
+    // other case's writes. The probe opens none: it is refused at TLS.
     evidence.ledger_before = DeviceLedger::from(&device_client.status_snapshot().fs);
 
     let mut child = tokio::process::Command::new("node")
@@ -1001,6 +1098,8 @@ async fn exercise(
         .env_remove("HTTP_PROXY")
         .env_remove("HTTPS_PROXY")
         .env_remove("NODE_OPTIONS")
+        // The one that made an earlier round's TLS claim vacuous.
+        .env_remove("NODE_TLS_REJECT_UNAUTHORIZED")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -1020,6 +1119,7 @@ async fn exercise(
     let mut lines = BufReader::new(stdout).lines();
 
     let mut report: Option<DriverReport> = None;
+    let mut plan_removed = false;
     loop {
         let line = timeout(DRIVER_LINE_WAIT, lines.next_line())
             .await
@@ -1030,6 +1130,15 @@ async fn exercise(
         };
         if line.trim().is_empty() {
             continue;
+        }
+        if !plan_removed {
+            // The driver's first event proves it has read the plan, and the
+            // plan is the one file in this run that holds a consumer token.
+            // The temporary directory is removed on the ordinary path anyway;
+            // this narrows the window in which a `SIGKILL` of the harness could
+            // leave the token on disk to the driver's own startup.
+            let _ = std::fs::remove_file(&plan_path);
+            plan_removed = true;
         }
         let event: DriverEvent = serde_json::from_str(&line).map_err(HarnessError::Json)?;
         match event {
@@ -1054,11 +1163,17 @@ async fn exercise(
                 .await?;
                 release(&mut stdin).await?;
             }
+            DriverEvent::UnknownStart => {
+                release(&mut stdin).await?;
+            }
             DriverEvent::UnknownDone => {
                 // The `unknown` case is the first exchange this device serves,
                 // so one completed exchange is exactly it.
                 evidence.ledger_after = await_exchanges(device_client, 1).await?;
                 release(&mut stdin).await?;
+            }
+            DriverEvent::TlsProbe { .. } => {
+                // Read from the probe's own process, not this one.
             }
             DriverEvent::ReadOnlyStart => {
                 // Two exchanges have completed by now — the `unknown` case and
@@ -1133,11 +1248,20 @@ async fn exercise(
         .mutations_refused
         .saturating_sub(before.mutations_refused);
     evidence.read_only_device_applied_anything = after.mutations_applied > before.mutations_applied;
-    evidence.read_only_client_overstated = evidence
+    evidence.read_only_client_reported_failed = evidence
         .read_only_device_outcomes
         .iter()
         .filter(|outcome| *outcome == "failed")
         .count();
+    // The path `node` resolved for the client, compared against this
+    // repository's own file. A file-exists check would have said only that a
+    // package is present somewhere; this says the module the driver loaded is
+    // that file.
+    let expected_module = std::fs::canonicalize(root.join("packages/client/src/index.ts")).ok();
+    let resolved_module =
+        url_path(&evidence.client_module_path).and_then(|path| std::fs::canonicalize(path).ok());
+    evidence.client_module_is_the_package =
+        expected_module.is_some() && expected_module == resolved_module;
 
     let adapter_written =
         std::fs::read(adapter.directory.path().join("copy.bin")).unwrap_or_default();
@@ -1164,7 +1288,9 @@ async fn exercise(
 /// Copy the driver's half of the report into the evidence.
 fn absorb(report: &DriverReport, evidence: &mut FsClientE2eEvidence) {
     evidence.driver_failures = report.failures.clone();
-    evidence.tls_verified = report.tls_verified;
+    evidence.node_tls_reject_unauthorized = report.node_tls_reject_unauthorized.clone();
+    evidence.client_module_path = report.client_module_path.clone();
+    evidence.public_entry_point_used = report.public_entry_point_used;
     evidence.descriptor_schema_version = report.descriptor_schema_version.clone();
     evidence.descriptor_subprotocol = report.descriptor_subprotocol.clone();
     evidence.descriptor_dialect = report.descriptor_dialect.clone();
@@ -1174,6 +1300,7 @@ fn absorb(report: &DriverReport, evidence: &mut FsClientE2eEvidence) {
     evidence.descriptor_availability = report.descriptor_availability.clone();
     evidence.unauthenticated_code = report.unauthenticated_code.clone();
     evidence.unauthenticated_outcome = report.unauthenticated_outcome.clone();
+    evidence.revision_upgrade_status = report.revision_upgrade_status;
     evidence.revision_upgrade_code = report.revision_upgrade_code.clone();
     evidence.revision_upgrade_outcome = report.revision_upgrade_outcome.clone();
     evidence.revision_upgrade_retryable = report.revision_upgrade_retryable;
@@ -1185,6 +1312,7 @@ fn absorb(report: &DriverReport, evidence: &mut FsClientE2eEvidence) {
     evidence.read_messages = report.read_messages;
     evidence.write_bytes = report.write_bytes;
     evidence.write_messages = report.write_messages;
+    evidence.write_acknowledgements = report.write_acknowledgements;
     evidence.listing_names_observed = report.listing_names_observed;
     evidence.listing_every_name_exactly_once = report.listing_every_name_exactly_once;
     evidence.read_only_read_matches = report.read_only_read_matches;
@@ -1288,6 +1416,83 @@ async fn advance_revision(
     }
 }
 
+/// Write a file only this user can read.
+///
+/// The plan carries a consumer token, and a world-readable temporary file is a
+/// worse place for one than a process environment.
+fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    std::fs::write(path, bytes).map_err(HarnessError::Io)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .map_err(HarnessError::Io)?;
+    }
+    Ok(())
+}
+
+/// The TLS negative probe: the same driver, the same endpoint, no fixture CA.
+///
+/// This is the half that makes "the client verified the relay's certificate" an
+/// observation. A connect that resolves says only that *something* answered; it
+/// is equally true when verification is off. So the same client is pointed at
+/// the same endpoint in a process that cannot build a chain to the fixture CA,
+/// and must refuse with `INSECURE_ENDPOINT` -- which this client deliberately
+/// distinguishes from an outage and never marks retryable, since retrying
+/// reaches the same untrusted peer.
+async fn tls_probe(
+    driver: &Path,
+    plan_path: &Path,
+    evidence: &mut FsClientE2eEvidence,
+) -> Result<()> {
+    let output = timeout(
+        DRIVER_LINE_WAIT,
+        tokio::process::Command::new("node")
+            .arg(driver)
+            .arg(plan_path)
+            .arg("--tls-probe")
+            .env_remove("NODE_EXTRA_CA_CERTS")
+            .env_remove("NODE_TLS_REJECT_UNAUTHORIZED")
+            .env_remove("HTTP_PROXY")
+            .env_remove("HTTPS_PROXY")
+            .env_remove("NODE_OPTIONS")
+            .stdin(Stdio::null())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .map_err(|_| HarnessError::Timeout("the TLS probe did not finish".into()))?
+    .map_err(|error| HarnessError::Process(format!("spawning the TLS probe: {error}")))?;
+    if !output.status.success() {
+        return Err(HarnessError::Process(
+            "the TLS probe exited with a failure".into(),
+        ));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let line = text
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .ok_or_else(|| HarnessError::Process("the TLS probe reported nothing".into()))?;
+    match serde_json::from_str::<DriverEvent>(line).map_err(HarnessError::Json)? {
+        DriverEvent::TlsProbe {
+            code,
+            retryable,
+            node_tls_reject_unauthorized,
+            extra_ca,
+        } => {
+            evidence.probe_code = code;
+            evidence.probe_retryable = retryable;
+            evidence.probe_tls_reject_unauthorized = node_tls_reject_unauthorized;
+            evidence.probe_extra_ca = extra_ca;
+            Ok(())
+        }
+        _ => Err(HarnessError::Process(
+            "the TLS probe reported something other than a probe result".into(),
+        )),
+    }
+}
+
 /// Release the driver from a rendezvous.
 async fn release(stdin: &mut tokio::process::ChildStdin) -> Result<()> {
     stdin.write_all(b"go\n").await.map_err(HarnessError::Io)?;
@@ -1353,10 +1558,17 @@ mod tests {
         FsClientE2eEvidence {
             relay_count: 3,
             owner_node: "relay-a".into(),
-            driver_is_the_package: true,
+            client_module_path: "file:///repo/packages/client/src/index.ts".into(),
+            client_module_is_the_package: true,
+            public_entry_point_used: true,
+            expected_owner_node: "relay-a".into(),
             endpoints_all_https: true,
             driver_failures: Vec::new(),
-            tls_verified: true,
+            node_tls_reject_unauthorized: "unset".into(),
+            probe_tls_reject_unauthorized: "unset".into(),
+            probe_extra_ca: "unset".into(),
+            probe_code: "INSECURE_ENDPOINT".into(),
+            probe_retryable: false,
             descriptor_schema_version: SCHEMA_VERSION.into(),
             descriptor_subprotocol: SUBPROTOCOL.into(),
             descriptor_dialect: DIALECT.into(),
@@ -1367,6 +1579,7 @@ mod tests {
             unauthenticated_code: "UNAUTHENTICATED".into(),
             unauthenticated_outcome: "not_started".into(),
             revision_advanced_in_catalog: true,
+            revision_upgrade_status: 409,
             revision_upgrade_code: "CAPABILITIES_CHANGED".into(),
             revision_upgrade_outcome: "not_started".into(),
             revision_upgrade_retryable: false,
@@ -1378,6 +1591,7 @@ mod tests {
             read_messages: 7,
             write_bytes: WRITE_FILE_BYTES as u64,
             write_messages: 7,
+            write_acknowledgements: 7,
             write_host_bytes: WRITE_FILE_BYTES as u64,
             write_host_checksum_matches: true,
             listing_names_observed: LISTING_ENTRIES,
@@ -1409,26 +1623,41 @@ mod tests {
             ],
             read_only_any_retryable: false,
             read_only_host_unchanged: true,
+            // Two exchanges have completed: the `unknown` case, which applied
+            // one write, and the read-write case, whose `Tlcreate` and seven
+            // `Twrite`s are eight mutations of which seven carried bytes. The
+            // numbers are consistent with each other deliberately -- a fixture
+            // that was not would let a rule about their difference pass on
+            // arithmetic that could not occur.
             read_only_ledger_before: DeviceLedger {
                 exchanges: 2,
-                mutations_dispatched: 2,
-                mutations_applied: 2,
-                mutations_acknowledged: 2,
+                mutations_refused: 0,
+                mutations_dispatched: 10,
+                mutations_applied: 10,
+                mutations_acknowledged: 8,
+                mutation_failed: 0,
+                mutation_partial: 0,
+                mutation_unknown: 2,
                 bytes_written: 393_216 + UNKNOWN_CHUNK_BYTES as u64,
-                ..DeviceLedger::default()
             },
+            // The read-only exchange refuses three mutating opcodes and a
+            // writable open, and moves nothing: the refusals never reach the
+            // queue, so not even `mutations_refused` records them (task row
+            // M4-16).
             read_only_ledger_after: DeviceLedger {
                 exchanges: 3,
                 mutations_refused: 0,
-                mutations_dispatched: 2,
-                mutations_applied: 2,
-                mutations_acknowledged: 2,
+                mutations_dispatched: 10,
+                mutations_applied: 10,
+                mutations_acknowledged: 8,
+                mutation_failed: 0,
+                mutation_partial: 0,
+                mutation_unknown: 2,
                 bytes_written: 393_216 + UNKNOWN_CHUNK_BYTES as u64,
-                ..DeviceLedger::default()
             },
             read_only_device_refused: 0,
             read_only_device_applied_anything: false,
-            read_only_client_overstated: 3,
+            read_only_client_reported_failed: 3,
             unknown_requests: UNKNOWN_WRITES,
             unknown_classified_unknown: UNKNOWN_WRITES,
             unknown_any_retryable: false,
@@ -1468,14 +1697,40 @@ mod tests {
         let mutations: Vec<Mutation> = vec![
             ("relays", |e| e.relay_count = 2),
             ("no owner", |e| e.owner_node.clear()),
-            ("a driver that is not the package", |e| {
-                e.driver_is_the_package = false;
+            ("a driver that loaded some other package", |e| {
+                e.client_module_is_the_package = false;
+            }),
+            ("a driver that reported no module at all", |e| {
+                e.client_module_path.clear();
+            }),
+            ("the composed entry point never driven", |e| {
+                e.public_entry_point_used = false;
+            }),
+            ("an owner this gate did not arrange", |e| {
+                e.expected_owner_node = "relay-b".into();
             }),
             ("a plaintext endpoint", |e| e.endpoints_all_https = false),
             ("a case that did not run", |e| {
                 e.driver_failures.push("read-write:SESSION_LOST".into());
             }),
-            ("TLS not verified", |e| e.tls_verified = false),
+            ("a driver that could have skipped verification", |e| {
+                e.node_tls_reject_unauthorized = "0".into();
+            }),
+            ("a probe that could have skipped verification", |e| {
+                e.probe_tls_reject_unauthorized = "0".into();
+            }),
+            ("a probe that was handed the fixture CA after all", |e| {
+                e.probe_extra_ca = "/tmp/fixture-ca.pem".into();
+            }),
+            ("an unverifiable certificate the client accepted", |e| {
+                e.probe_code = "ADMITTED".into();
+            }),
+            ("an unverifiable certificate reported as an outage", |e| {
+                e.probe_code = "BACKEND_UNAVAILABLE".into();
+            }),
+            ("an untrusted peer worth retrying", |e| {
+                e.probe_retryable = true;
+            }),
             ("descriptor schema", |e| {
                 e.descriptor_schema_version = "agent-tunnel.fs.v2".into();
             }),
@@ -1509,6 +1764,9 @@ mod tests {
             ("a superseded revision admitted", |e| {
                 e.revision_upgrade_code = String::new();
             }),
+            ("a refusal that was not a 409", |e| {
+                e.revision_upgrade_status = 403;
+            }),
             ("a superseded revision that may have happened", |e| {
                 e.revision_upgrade_outcome = "unknown".into();
             }),
@@ -1529,6 +1787,9 @@ mod tests {
             ("a read in one message", |e| e.read_messages = 1),
             ("a short write", |e| e.write_bytes = 1_024),
             ("a write in one message", |e| e.write_messages = 1),
+            ("writes the device never acknowledged", |e| {
+                e.write_acknowledgements = 1;
+            }),
             ("a host file of the wrong length", |e| {
                 e.write_host_bytes = 1_024;
             }),
@@ -1572,8 +1833,8 @@ mod tests {
             ("a writable open reported as an effect", |e| {
                 e.read_only_device_outcomes[3] = "failed".into();
             }),
-            ("a ledger that started counting admission refusals", |e| {
-                e.read_only_device_refused = 3;
+            ("a ledger counting more refusals than were sent", |e| {
+                e.read_only_device_refused = 4;
             }),
             ("a mutation the device dispatched to the host", |e| {
                 e.read_only_ledger_after.mutations_dispatched += 1;
@@ -1589,9 +1850,6 @@ mod tests {
             }),
             ("a read-only exchange the device never finished", |e| {
                 e.read_only_ledger_after.exchanges = 2;
-            }),
-            ("a client and a device that agree by accident", |e| {
-                e.read_only_client_overstated = 0;
             }),
             ("a refusal reported retryable", |e| {
                 e.read_only_any_retryable = true;

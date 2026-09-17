@@ -1372,14 +1372,35 @@ carrying `go` lines. Every judgement is taken in Rust by
 driver that decided for itself what passing meant could not smuggle a verdict
 past the validator.
 
-**TLS is real and verification is not disabled.** The fixture's server leaf now
-carries `127.0.0.1` as an IP subject alternative name — `rcgen` turns a name
-that parses as an address into one — so the endpoint can be the loopback address
-the relay binds with no name to resolve. `node` trusts the fixture CA through
-`NODE_EXTRA_CA_CERTS` and verifies the chain the ordinary way; the client's own
-`allowInsecureLoopback` is never passed, so an unverifiable chain is
-`INSECURE_ENDPOINT` and not a session. Turning verification off was not an
-option, because the client's TLS requirement is one of the things under test.
+**TLS is proven by a pair, because a connect that resolved proves nothing.**
+The fixture's server leaf now carries `127.0.0.1` as an IP subject alternative
+name — `rcgen` turns a name that parses as an address into one — so the endpoint
+can be the loopback address the relay binds with no name to resolve. `node`
+trusts the fixture CA through `NODE_EXTRA_CA_CERTS` and verifies the chain the
+ordinary way, and the client's own `allowInsecureLoopback` is never passed.
+
+That much was true of the first round of this gate too, and it was **not
+enough**: the driver set `tlsVerified = true` once `connectFilesystem` returned,
+which is equally true when verification is off, and review demonstrated the
+whole gate passing under `NODE_TLS_REJECT_UNAUTHORIZED=0`. Three things replace
+that assertion, and all three are observations:
+
+* The harness **refuses to run** when `NODE_TLS_REJECT_UNAUTHORIZED` is set in
+  its own environment. Removing it from the child would not be enough on its
+  own — an operator who set it meant something by it, and reporting a verified
+  chain in an environment configured not to verify would be the same mistake
+  one layer down.
+* It is removed from every child's environment, and the driver reports what its
+  process **actually saw**, which the validator pins to `unset`.
+* A **negative probe** runs the same driver against the same endpoint in a
+  second process with `NODE_EXTRA_CA_CERTS` withheld — the variable is read once
+  at startup and cannot be withdrawn inside a run, which is why it is a separate
+  process. The client must refuse with `INSECURE_ENDPOINT`, non-retryable, which
+  is its own code for a certificate it could not verify and which it
+  deliberately does not report as an outage.
+
+A verified chain being **accepted** and an unverifiable one being **refused** are
+what make the pair evidence about verification; neither alone is.
 
 **Nothing is a sleep.** Two of the cases need the harness to act at a point
 inside the driver's run, and both are rendezvous on stdin rather than a wait
@@ -1400,9 +1421,15 @@ chosen to be long enough:
 **What one run proves.** The descriptor fetched and validated by the client's
 own schema rules; an unsigned token refused `UNAUTHENTICATED`; the authenticated
 upgrade with `agent-tunnel.9p.v1` selected and the 65,536-byte `msize`
-negotiated; a checksummed 393,216-byte `readFile` over seven `Rread` messages; a
-checksummed 393,216-byte `writeStream` over seven `Twrite` messages, verified
-byte for byte on the host by the harness; a forty-entry directory listed with
+negotiated; a checksummed 393,216-byte `readFile` over **eight** `Rread` messages; a
+checksummed 393,216-byte `writeStream` over **twelve** `Twrite` messages each
+answered by its own `Rwrite`, verified byte for byte on the host by the harness
+— and both counts are **counted at the transport**, by the opcode byte of each
+complete message the socket carried, because one consumer binary message is one
+complete 9P message in this profile. A first round divided the file size by the
+maximum payload instead, which would have reported "more than four messages" for
+a chunking that never happened; its arithmetic guess of seven was wrong for both
+directions; a forty-entry directory listed with
 every name exactly once; a read-only grant refusing mutations **at both layers**
 — `ENOTSUP` and `not_started` locally for four operations the descriptor does
 not advertise, which is the statement that a caller's mistake never reaches the
@@ -1431,8 +1458,13 @@ rather than either alone.
 
 * The `unknown` exchange is the **first** the device serves, so its counters are
   a delta from zero. The client reports `unknown` for twenty-four writes and
-  acknowledges nothing; the device reports two mutations dispatched, two
-  applied, two **acknowledged** and 32,768 bytes written. One write reached the
+  acknowledges nothing; in the recorded runs the device reports two mutations
+  dispatched, two applied, two **acknowledged** and 32,768 bytes written — the
+  `Tlcreate` and one `Twrite`. **Those numbers are recorded, not pinned.**
+  `SocketTransport.close()` ends and destroys the socket at once, discarding
+  node's userland write buffer, so "all twenty-four are dispatched" means all
+  twenty-four were handed to `send`; how many reach the device depends on kernel
+  socket buffering, and in practice most of them never leave the process. One write reached the
   host and its reply reached the carrier, and no field on the wire could have
   told the client so. The harness checks the host file holds exactly those bytes
   at the source pattern's own offsets — so nothing was applied twice or out of
@@ -1447,24 +1479,30 @@ rather than either alone.
   `isMutatingRequest`. The device, meanwhile, dispatched nothing, applied
   nothing and wrote nothing.
 
-**One gap is measured rather than assumed.** `FsCounters::mutations_refused`
-documents itself as "mutating requests refused before the host was touched", and
-over that read-only exchange it stays at **zero** while three such refusals
-happen. The reason is structural: the refusal is taken by gate 3's session
-inside `Provider::accept`, which returns a `SessionError` and never produces the
-decoded primitives the ledger classifies a mutation from, so `Provider::refuse`
-can only count `errors_sent`. A mutation refused at **admission** is therefore
-invisible in the one place an operator reads how far a mutation got; only a
-mutation refused after the queue wait is counted. The validator pins the zero
-deliberately rather than asserting the number it ought to be: this gate is not
-the place to change the provider, and a run in which it moves is a change that
-should be read and documented rather than silently absorbed.
+**One defect is measured rather than assumed, and it is tracked as task row
+M4-16.** `FsCounters::mutations_refused` documents itself as "mutating requests
+refused before the host was touched", and over that read-only exchange it stays
+at **zero** while three such refusals happen. The reason is structural: the
+refusal is taken by gate 3's session inside `Provider::accept`, which returns a
+`SessionError` and never produces the decoded primitives the ledger classifies a
+mutation from, so `Provider::refuse` can only count `errors_sent`. A mutation
+refused at **admission** is therefore invisible in the one place an operator
+reads how far a mutation got; only a mutation refused after the queue wait is
+counted.
+
+A first round **pinned** that zero, which was the wrong shape for a
+characterisation: it made the gate *require* the provider to disagree with its
+own documentation, so landing M4-16's fix would have turned this gate red. The
+value is now recorded in the evidence and printed in the summary, and what is
+asserted is only the bound that holds either way — the counter never exceeds the
+mutations the case sent. What discriminates about the read-only exchange is the
+other reading beside it: nothing dispatched, nothing applied, nothing written.
 
 **Red-then-green.** `scripts/fs-guard-deletion.py --suite gate6-e2e` deletes one
 rule of the validator at a time — replacing its condition with `true`, because
 the rule list is a fixed-length array and removing an entry stops the crate
 compiling, which that script refuses to call a red test — and requires the
-mutation table in the same file to go red. **10 of 10** deletions do.
+mutation table in the same file to go red. **14 of 14** deletions do.
 
 **What this gate does not prove.** The seventh component, the AI SDK live
 directory tools, still does not exist. Three of the four adapters have still
