@@ -161,8 +161,43 @@ describe('the eleven operations over a real socket', () => {
       flat.map((entry) => entry.name).sort(),
       ['a.ts', 'b.md', 'sub'],
     );
+    // A directory survives an extension filter, as the pinned LocalFilesystem
+    // does: the filter applies to files only, so a recursive listing keeps the
+    // structure its nested names are relative to.
     const deep = await fs.readdir('/', { recursive: true, extension: '.ts' });
-    assert.deepEqual(deep.map((entry) => entry.name).sort(), ['a.ts', 'c.ts']);
+    assert.deepEqual(deep.map((entry) => entry.name).sort(), ['a.ts', 'sub', 'sub/c.ts']);
+  });
+
+  it('prefixes a nested name with its subpath, so two same-named files differ', async () => {
+    // Without the prefix both come back as `x.txt` and a Mastra tool can
+    // address neither. The reference builds `${entry.name}/${e.name}` as it
+    // returns up each level.
+    const { fs } = await mount({ 'a/x.txt': '1', 'b/x.txt': '2' });
+    const deep = await fs.readdir('/', { recursive: true });
+    assert.deepEqual(
+      deep.map((entry) => entry.name).sort(),
+      ['a', 'a/x.txt', 'b', 'b/x.txt'],
+    );
+    // And the names are usable: each addresses its own file.
+    assert.equal(await fs.readFile('/a/x.txt', { encoding: 'utf8' }), '1');
+    assert.equal(await fs.readFile('/b/x.txt', { encoding: 'utf8' }), '2');
+  });
+
+  it('matches an extension by equality, with or without its dot, and never by suffix', async () => {
+    const { fs } = await mount({ 'x.ts': '1', 'y.mts': '2', 'z.js': '3', '.gitignore': '4' });
+    const named = async (extension: string | string[]): Promise<string[]> =>
+      (await fs.readdir('/', { extension })).map((entry) => entry.name).sort();
+
+    // Upstream is `e === ext || e === ext.slice(1)` over `extname(name)`.
+    assert.deepEqual(await named('.ts'), ['x.ts']);
+    assert.deepEqual(await named('ts'), ['x.ts']);
+    // `.mts` is a different extension, so a bare `s` selects nothing — where an
+    // `endsWith` test would have matched all three of `.ts`, `.mts` and `.js`.
+    assert.deepEqual(await named('s'), []);
+    assert.deepEqual(await named(['ts', '.js']), ['x.ts', 'z.js']);
+    // A leading dot is the whole name and has no extension, which is what
+    // `extname` says.
+    assert.deepEqual(await named('gitignore'), []);
   });
 
   it('fails a listing on the traversal budget instead of truncating it', async () => {
@@ -301,5 +336,117 @@ describe('outcomes, and what Mastra can and cannot say about them', () => {
     // path the caller itself wrote; there is no host path anywhere on the wire
     // for this client to have learned.
     assert.equal((error as { path?: string }).path, '/missing.txt');
+  });
+});
+
+describe('the composites this adapter owns, and the floors they carry', () => {
+  // `writeFile` and `copyFile` create parents by default, so both are
+  // composites **at this layer**. A `PermissionError` after a directory was
+  // made would read as "the write was refused and nothing happened", which
+  // contradicts the export.
+
+  it('a writeFile whose create is refused, after its parents were made, is TUNNEL_PARTIAL', async () => {
+    const { fs, wired } = await mount({}, {}, 'reject', (provider) => {
+      provider.failAfter.set('Tlcreate', { after: 0, ecode: 13 });
+    });
+    const error = await raised(async () => fs.writeFile('/new/dir/a.txt', 'hello'));
+    assert.equal(wired.provider.has('/new/dir'), true);
+    assert.equal(error.name, 'FilesystemError');
+    assert.equal(codeOf(error), 'TUNNEL_PARTIAL');
+    // Never `PermissionError`: a tool reading that would believe the export
+    // untouched.
+    assert.notEqual(error.name, 'PermissionError');
+    const cause = (error as { cause?: unknown }).cause;
+    assert.ok(cause instanceof FilesystemError);
+    assert.equal(cause.outcome, 'partial');
+  });
+
+  it('a copyFile whose create is refused, after its parents were made, is TUNNEL_PARTIAL', async () => {
+    const { fs, wired } = await mount({ 'a.txt': 'payload' }, {}, 'reject', (provider) => {
+      provider.failAfter.set('Tlcreate', { after: 0, ecode: 13 });
+    });
+    const error = await raised(async () => fs.copyFile('/a.txt', '/new/dir/b.txt'));
+    assert.equal(wired.provider.has('/new/dir'), true);
+    assert.equal(codeOf(error), 'TUNNEL_PARTIAL');
+    const cause = (error as { cause?: unknown }).cause;
+    assert.ok(cause instanceof FilesystemError);
+    assert.equal(cause.outcome, 'partial');
+  });
+
+  it('a parent chain that already existed sets no floor', async () => {
+    const { fs } = await mount({ 'new/dir/keep.txt': 'x' }, {}, 'reject', (provider) => {
+      provider.failAfter.set('Tlcreate', { after: 0, ecode: 13 });
+    });
+    const error = await raised(async () => fs.writeFile('/new/dir/a.txt', 'hello'));
+    // Nothing was applied, so this is the plain permission failure it is, in
+    // the class a Mastra tool branches on.
+    assert.equal(error.name, 'PermissionError');
+  });
+
+  it('recursive:false creates no parent, so it can set no floor either', async () => {
+    const { fs, wired } = await mount();
+    const error = await raised(async () =>
+      fs.writeFile('/other/b.txt', 'x', { recursive: false }),
+    );
+    assert.equal(wired.provider.has('/other'), false);
+    assert.equal(error.name, 'FileNotFoundError');
+  });
+});
+
+describe('errors this adapter did not expect', () => {
+  it('passes one of the injected classes through whole', async () => {
+    // `StaleFileError` is Mastra's own answer and carries the timestamps a tool
+    // reads off it; rewriting it would destroy them.
+    const { fs } = await mount({ 'a.txt': 'x' }, {}, 'check-before-write');
+    const error = await raised(async () =>
+      fs.writeFile('/a.txt', 'y', { expectedMtime: new Date(7) }),
+    );
+    assert.equal(error.name, 'StaleFileError');
+    assert.equal((error as { expectedMtime?: Date }).expectedMtime?.getTime(), 7);
+  });
+
+  it('reduces anything else to its constructor name', async () => {
+    const { fs } = await mount({ 'a.txt': 'x' });
+    // A caller's own exception out of an option getter, standing in for any
+    // internal failure. Its text is not this package's to forward into a
+    // framework's logger, where it could carry a value never meant to leave.
+    const options = {
+      get encoding(): never {
+        throw new TypeError('a secret value from somewhere else');
+      },
+    };
+    const error = await raised(async () => fs.readFile('/a.txt', options as never));
+    assert.equal(codeOf(error), 'TUNNEL_INTERNAL');
+    assert.equal(error.message.includes('a secret value'), false, error.message);
+    assert.equal(error.message, 'TypeError');
+    assert.ok((error as { cause?: unknown }).cause instanceof TypeError);
+  });
+});
+
+describe('a read-only export denies every mutation entry point', () => {
+  it('refuses the write surface and still serves reads', async () => {
+    const { fs, wired } = await mount({ 'a.txt': 'x', 'dir/b.txt': 'y' }, {
+      root: { ...descriptorFixture().root, readOnly: true },
+      operations: ['readFile', 'readStream', 'stat', 'readDirectory'],
+    });
+    assert.equal(fs.readOnly, true);
+    for (const call of [
+      async () => fs.writeFile('/c.txt', 'x'),
+      async () => fs.appendFile('/a.txt', 'x'),
+      async () => fs.deleteFile('/a.txt'),
+      async () => fs.copyFile('/a.txt', '/c.txt'),
+      async () => fs.moveFile('/a.txt', '/c.txt'),
+      async () => fs.mkdir('/new'),
+      async () => fs.rmdir('/dir'),
+    ]) {
+      const error = await raised(call);
+      assert.match(codeOf(error), /^TUNNEL_ENOTSUP$/u, error.message);
+    }
+    const mutating = new Set(['Tlcreate', 'Twrite', 'Tmkdir', 'Tunlinkat', 'Trename', 'Trenameat', 'Tsetattr']);
+    assert.deepEqual(
+      wired.connection.received.filter((message) => mutating.has(message.kind)),
+      [],
+    );
+    assert.equal(await fs.readFile('/a.txt', { encoding: 'utf8' }), 'x');
   });
 });

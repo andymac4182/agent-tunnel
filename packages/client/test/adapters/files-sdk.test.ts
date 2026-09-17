@@ -407,3 +407,136 @@ describe('outcomes, and what Files SDK can and cannot say about them', () => {
     assert.match(error.message, /^ENOENT \(T?walk\)$/u);
   });
 });
+
+describe('the composites this adapter owns, and the floors they carry', () => {
+  // Every one of these creates the key's parent directories first. A directory
+  // made and a failure afterwards is a change to the export the failing step
+  // knows nothing about — the class of defect the shared client spent three
+  // rounds removing from `writeInto`, `mkdir` and `remove`, sitting one layer
+  // up in the adapter.
+
+  it('a move whose source is absent, after its destination parents were made, is partial', async () => {
+    const { adapter, wired } = await adapterOver({});
+    const move = adapter.move;
+    assert.ok(move !== undefined);
+    const error = await failure(async () => move.call(adapter, 'missing.txt', 'new/dir/b.txt'));
+
+    // `/new/dir` stands in the export. `NotFound` with an outcome of
+    // `not_started` would tell the caller nothing happened.
+    assert.equal(wired.provider.has('/new/dir'), true);
+    assert.equal(error.code, 'Provider');
+    assert.equal(error.permanent, true);
+    assert.equal(upstreamWouldRetry(error), false);
+    const cause = error.cause;
+    assert.ok(cause instanceof FilesystemError);
+    assert.equal(cause.outcome, 'partial');
+  });
+
+  it('an upload whose create is refused, after its parents were made, is partial', async () => {
+    const { adapter, wired } = await adapterOver({}, {}, (provider) => {
+      provider.failAfter.set('Tlcreate', { after: 0, ecode: 13 });
+    });
+    const error = await failure(async () => adapter.upload('new/dir/a.txt', 'hello'));
+    assert.equal(wired.provider.has('/new/dir'), true);
+    assert.equal(error.code, 'Provider');
+    const cause = error.cause;
+    assert.ok(cause instanceof FilesystemError);
+    assert.equal(cause.outcome, 'partial');
+  });
+
+  it('a copy whose create is refused, after its parents were made, is partial', async () => {
+    // The refusal is `Tlcreate`, so the shared client's own `copy` has applied
+    // nothing and reports `failed`. The floor here is the adapter's alone:
+    // `/new/dir` exists because this call made it.
+    const { adapter, wired } = await adapterOver({ 'a.txt': 'payload' }, {}, (provider) => {
+      provider.failAfter.set('Tlcreate', { after: 0, ecode: 13 });
+    });
+    const error = await failure(async () => adapter.copy('a.txt', 'new/dir/b.txt'));
+    assert.equal(wired.provider.has('/new/dir'), true);
+    assert.equal(error.code, 'Provider');
+    const cause = error.cause;
+    assert.ok(cause instanceof FilesystemError);
+    assert.equal(cause.outcome, 'partial');
+  });
+
+  it('a parent chain that already existed sets no floor', async () => {
+    // The floor is what was **applied**, not what was attempted. `mkdir`
+    // reports how many directories it made, and a chain that was already there
+    // made none — so this failure is the plain absence it is.
+    const { adapter } = await adapterOver({ 'new/dir/keep.txt': 'x' });
+    const move = adapter.move;
+    assert.ok(move !== undefined);
+    const error = await failure(async () => move.call(adapter, 'missing.txt', 'new/dir/b.txt'));
+    assert.equal(error.code, 'NotFound');
+    const cause = error.cause;
+    assert.ok(cause instanceof FilesystemError);
+    assert.equal(cause.outcome, 'not_started');
+  });
+
+  it('a confirmed upload is not failed by its courtesy stat', async () => {
+    // The write is acknowledged; the trailing `stat` only fills in the optional
+    // `lastModified`. Reporting a completed upload as a failure — and as one
+    // whose outcome is the stat's own `not_started` — would tell a caller the
+    // key was never written while it holds exactly what was sent.
+    const { adapter, wired } = await adapterOver({}, {}, (provider) => {
+      provider.failAfter.set('Tgetattr', { after: 0, ecode: 13 });
+    });
+    const result = await adapter.upload('a.txt', 'hello');
+    assert.equal(result.key, 'a.txt');
+    assert.equal(result.size, 5);
+    assert.equal(result.lastModified, undefined, 'absent rather than invented');
+    assert.equal(utf8(wired.provider.read('/a.txt') as Uint8Array), 'hello');
+  });
+});
+
+describe('a page is a page the adapter can actually produce', () => {
+  it('lists more keys than the session may have requests in flight', async () => {
+    // Each item is a `stat`: a walk, a getattr and a clunk. The session refuses
+    // a request beyond `maxInflightRequests` **locally** with
+    // `RESOURCE_EXHAUSTED`, and the profile pins that at 64 — so a page fanned
+    // out at once could never be produced for a directory with more keys than
+    // the quota, and `DEFAULT_PAGE` of 100 would be a number this adapter can
+    // never fulfil.
+    const quota = descriptorFixture().limits.maxInflightRequests;
+    const count = quota + 6;
+    const seed: Record<string, string> = {};
+    for (let index = 0; index < count; index += 1) {
+      seed[`f${index}.txt`] = 'x';
+    }
+    const { adapter } = await adapterOver(seed);
+    const page = await adapter.list();
+    assert.equal(page.items.length, count);
+    assert.equal(page.cursor, undefined);
+    assert.equal(new Set(page.items.map((item) => item.key)).size, count);
+  });
+});
+
+describe('a read-only export denies every mutation entry point', () => {
+  it('refuses upload, delete, copy and move before anything reaches the socket', async () => {
+    const { adapter, wired } = await adapterOver({ 'a.txt': 'x' }, {
+      root: { ...descriptorFixture().root, readOnly: true },
+      operations: ['readFile', 'readStream', 'stat', 'readDirectory'],
+    });
+    const move = adapter.move;
+    assert.ok(move !== undefined);
+    for (const call of [
+      async () => adapter.upload('b.txt', 'x'),
+      async () => adapter.delete('a.txt'),
+      async () => adapter.copy('a.txt', 'b.txt'),
+      async () => move.call(adapter, 'a.txt', 'b.txt'),
+    ]) {
+      const error = await failure(call);
+      assert.match(error.message, /^ENOTSUP/u);
+      assert.equal(upstreamWouldRetry(error), false);
+    }
+    // Not "nothing was sent" — `delete` stats first, which a read grant allows.
+    // What must be true is that **no mutating opcode** reached the socket.
+    const mutating = new Set(['Tlcreate', 'Twrite', 'Tmkdir', 'Tunlinkat', 'Trename', 'Trenameat', 'Tsetattr']);
+    assert.deepEqual(
+      wired.connection.received.filter((message) => mutating.has(message.kind)),
+      [],
+    );
+    // Reads still work, which is what a read-only profile is for.
+    assert.equal((await adapter.head('a.txt')).size, 1);
+  });
+});

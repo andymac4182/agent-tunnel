@@ -27,8 +27,13 @@
  * const files = new Files({ adapter, retries: 0 });
  * ```
  *
- * A second copy of `files-sdk` in a consumer's tree would otherwise produce
- * errors the wrapper does not recognise as its own.
+ * **`FilesError` must come from the same module instance as `Files`** — one
+ * `import { Files, FilesError } from 'files-sdk'`, not a second installed copy.
+ * This adapter **cannot check that**: a `FilesError` from another copy is a
+ * perfectly good class with the right shape, and the wrapper would quietly
+ * rebuild everything it produced, an `unknown` mutation included, as a
+ * retryable `Provider` error. The injection moves the identity requirement to
+ * the consumer; nothing here detects a violation of it at run time.
  *
  * ## `partial` and `unknown`
  *
@@ -69,7 +74,7 @@ import type {
 import type { RemoteFilesystem, Stat } from '../filesystem.ts';
 import { FilesystemError } from '../errors.ts';
 import { PathRefusal, type PathBounds } from '../paths.ts';
-import { isAborted, isAmbiguous, summarize } from './outcomes.ts';
+import { isAborted, isAmbiguous, mapBounded, summarize, withAppliedFloor } from './outcomes.ts';
 import { checkPrefix, KeyRefusal, keyForPath, pathForKey } from './keys.ts';
 
 /**
@@ -142,6 +147,19 @@ export function createFilesAdapter(options: FilesAdapterOptions): FilesAdapter {
   };
   const cursors = new Map<string, Cursor>();
   let nextCursor = 0;
+  /**
+   * How many `stat` calls a listing may have in flight.
+   *
+   * A quarter of the session's own tag quota, floored at one: enough to make a
+   * page of a hundred keys quick, far enough below the quota that this
+   * adapter's listing cannot exhaust the tags another borrower of the same
+   * client is using. It is derived from the descriptor rather than fixed,
+   * because negotiation may reduce the quota.
+   */
+  const statConcurrency = Math.max(
+    1,
+    Math.floor(remote.descriptor.limits.maxInflightRequests / 4),
+  );
 
   /* ------------------------------------------------------------------ *
    * Errors
@@ -185,6 +203,25 @@ export function createFilesAdapter(options: FilesAdapterOptions): FilesAdapter {
 
   const rethrow = (error: unknown): never => {
     throw translate(error);
+  };
+
+  /**
+   * Create the directories a key implies, and report whether that changed
+   * anything.
+   *
+   * "Upload creates parent directories as needed", and `copy` and `move` need
+   * the same for their destination. Each is therefore a **composite at this
+   * layer**, not only inside the shared client: a directory made here and a
+   * failure afterwards is a change to the export that the failing step knows
+   * nothing about. The count is what decides the floor, and it comes from
+   * `mkdir` itself rather than from a preliminary `stat`.
+   */
+  const ensureParent = async (path: string, opts: OperationOptions | undefined): Promise<boolean> => {
+    const parent = path.slice(0, path.lastIndexOf('/')) || '/';
+    if (parent === '/' || !remote.supports('mkdir')) {
+      return false;
+    }
+    return (await remote.mkdir(parent, { recursive: true, ...signalOf(opts) })) > 0;
   };
 
   /* ------------------------------------------------------------------ *
@@ -447,14 +484,7 @@ export function createFilesAdapter(options: FilesAdapterOptions): FilesAdapter {
           });
         }
         const path = pathForKey(key, bounds);
-        // "Upload creates parent directories as needed". That makes this a
-        // composite, and the shared client's recursive `mkdir` carries the
-        // floor: a directory made before a later failure is never reported as
-        // nothing having happened.
-        const parent = path.slice(0, path.lastIndexOf('/')) || '/';
-        if (parent !== '/' && remote.supports('mkdir')) {
-          await remote.mkdir(parent, { recursive: true, ...signalOf(opts) });
-        }
+        const applied = await ensureParent(path, opts);
         let size = 0;
         const counted = async function* (): AsyncGenerator<Uint8Array> {
           for await (const chunk of bodyChunks(body)) {
@@ -462,17 +492,31 @@ export function createFilesAdapter(options: FilesAdapterOptions): FilesAdapter {
             yield chunk;
           }
         };
-        await remote.writeStream(path, counted(), signalOf(opts));
+        try {
+          await remote.writeStream(path, counted(), signalOf(opts));
+        } catch (error) {
+          throw withAppliedFloor(error, 'upload', path, applied);
+        }
         const result: UploadResult = {
           key,
           size,
           contentType: opts?.contentType ?? 'application/octet-stream',
         };
-        if (remote.supports('stat')) {
+        if (!remote.supports('stat')) {
+          return result;
+        }
+        // **The write has been confirmed.** This `stat` is a courtesy: it fills
+        // in `lastModified`, which is optional in `UploadResult` because not
+        // every provider has one. A failure of it cannot fail the upload —
+        // reporting a completed write as an error, and worse as an error whose
+        // outcome is the stat's own `not_started`, would tell a caller the key
+        // was never written when it holds exactly what was sent.
+        try {
           const stat = await remote.stat(path, signalOf(opts));
           return { ...result, lastModified: stat.modifiedAtMs };
+        } catch {
+          return result;
         }
-        return result;
       } catch (error) {
         return rethrow(error);
       }
@@ -578,11 +622,12 @@ export function createFilesAdapter(options: FilesAdapterOptions): FilesAdapter {
       try {
         const source = pathForKey(from, bounds);
         const destination = pathForKey(to, bounds);
-        const parent = destination.slice(0, destination.lastIndexOf('/')) || '/';
-        if (parent !== '/' && remote.supports('mkdir')) {
-          await remote.mkdir(parent, { recursive: true, ...signalOf(opts) });
+        const applied = await ensureParent(destination, opts);
+        try {
+          await remote.copy(source, destination, signalOf(opts));
+        } catch (error) {
+          throw withAppliedFloor(error, 'copy', destination, applied);
         }
-        await remote.copy(source, destination, signalOf(opts));
       } catch (error) {
         rethrow(error);
       }
@@ -598,11 +643,12 @@ export function createFilesAdapter(options: FilesAdapterOptions): FilesAdapter {
       try {
         const source = pathForKey(from, bounds);
         const destination = pathForKey(to, bounds);
-        const parent = destination.slice(0, destination.lastIndexOf('/')) || '/';
-        if (parent !== '/' && remote.supports('mkdir')) {
-          await remote.mkdir(parent, { recursive: true, ...signalOf(opts) });
+        const applied = await ensureParent(destination, opts);
+        try {
+          await remote.rename(source, destination, signalOf(opts));
+        } catch (error) {
+          throw withAppliedFloor(error, 'move', destination, applied);
         }
-        await remote.rename(source, destination, signalOf(opts));
       } catch (error) {
         rethrow(error);
       }
@@ -693,13 +739,19 @@ export function createFilesAdapter(options: FilesAdapterOptions): FilesAdapter {
           page.items.push(key);
         }
 
-        const items = await Promise.all(
-          page.items.map(async (key) => {
-            const path = `/${key}`;
-            const stat = await remote.stat(path);
-            return storedFile(key, path, stat, sizeOf(stat, 'list', key), undefined);
-          }),
-        );
+        // **Bounded, not `Promise.all`.** Each `stat` is a walk, a getattr and
+        // a clunk, and the session refuses a request beyond
+        // `maxInflightRequests` locally with `RESOURCE_EXHAUSTED` — the profile
+        // pins that at 64. A page of 100 fanned out at once therefore could not
+        // be produced at all on a directory with more than that many keys, and
+        // the default page size would have been a number this adapter can never
+        // fulfil. The pool is a quarter of the quota so that a second borrower
+        // of the same client is not starved by one listing.
+        const items = await mapBounded(page.items, statConcurrency, async (key) => {
+          const path = `/${key}`;
+          const stat = await remote.stat(path, signalOf(opts));
+          return storedFile(key, path, stat, sizeOf(stat, 'list', key), undefined);
+        });
 
         if (exhausted) {
           return delimiter === undefined || page.prefixes.length === 0

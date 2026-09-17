@@ -107,7 +107,10 @@ install and is therefore **not** part of `npm test`.
 
 Two things a consumer has to know, both found by running the real packages:
 `createFilesAdapter` takes the consumer's own `FilesError` class, because
-`files-sdk`'s retry gate rebuilds a foreign error as a *retryable* one; and a
+`files-sdk`'s retry gate rebuilds a foreign error as a *retryable* one — it must
+come from the **same module instance** as the `Files` it is passed to, and the
+adapter cannot verify that, so a second installed copy makes every failure
+including an `unknown` mutation retryable with nothing reporting it; and a
 `Bash` over this filesystem needs `defenseInDepth: { excludeViolationTypes:
 ['setTimeout'] }`, because just-bash blocks the global for the duration of a
 script and this client arms a timer for every request deadline.

@@ -77,7 +77,7 @@ import type {
 import type { DirectoryEntry, RemoteFilesystem, Stat } from '../filesystem.ts';
 import { FilesystemError } from '../errors.ts';
 import { PathRefusal, validatePath, type PathBounds } from '../paths.ts';
-import { isAmbiguous, summarize } from './outcomes.ts';
+import { isAmbiguous, summarize, withAppliedFloor } from './outcomes.ts';
 
 /** The subset of `@mastra/core/workspace`'s error classes this adapter raises. */
 export interface MastraErrorClasses {
@@ -242,19 +242,20 @@ export class TunnelMastraFilesystem implements WorkspaceFilesystem {
     await this.guard('writeFile', path, async () => {
       const virtual = this.check(path);
       await this.applyMtimePolicy(virtual, options?.expectedMtime);
-      // "Writes create parents by default unless `recursive:false`."
-      if (options?.recursive !== false) {
-        const parent = parentOf(virtual);
-        if (parent !== '/' && this.remote.supports('mkdir')) {
-          await this.remote.mkdir(parent, { recursive: true });
-        }
-      }
+      // "Writes create parents by default unless `recursive:false`." That makes
+      // this a composite **at this layer**, and the directories it makes are a
+      // change to the export that a failing write knows nothing about.
+      const applied = options?.recursive === false ? false : await this.ensureParent(virtual);
       // "Honor `overwrite:false` using exclusive creation" — the shared client
       // sends `Tlcreate`, which this profile makes exclusive whatever the flag
       // word said. It is never an exists-then-create race.
-      await this.remote.writeFile(virtual, toBytes(content), {
-        overwrite: options?.overwrite !== false,
-      });
+      try {
+        await this.remote.writeFile(virtual, toBytes(content), {
+          overwrite: options?.overwrite !== false,
+        });
+      } catch (error) {
+        throw withAppliedFloor(error, 'writeFile', virtual, applied);
+      }
     });
   }
 
@@ -327,11 +328,12 @@ export class TunnelMastraFilesystem implements WorkspaceFilesystem {
           retryable: false,
         });
       }
-      const parent = parentOf(destination);
-      if (parent !== '/' && this.remote.supports('mkdir')) {
-        await this.remote.mkdir(parent, { recursive: true });
+      const applied = await this.ensureParent(destination);
+      try {
+        await this.remote.copy(source, destination, { overwrite: options?.overwrite !== false });
+      } catch (error) {
+        throw withAppliedFloor(error, 'copyFile', destination, applied);
       }
-      await this.remote.copy(source, destination, { overwrite: options?.overwrite !== false });
     });
   }
 
@@ -394,6 +396,21 @@ export class TunnelMastraFilesystem implements WorkspaceFilesystem {
   /**
    * Immediate children, or a bounded recursive listing.
    *
+   * **Three rules here are the pinned `LocalFilesystem`'s and not inventions**,
+   * because a Mastra tool reads this result and has no other way to address
+   * what it finds:
+   *
+   * * A nested entry's `name` is **prefixed with its subpath** — the reference
+   *   builds `` `${entry.name}/${e.name}` `` as it returns up each level. Without
+   *   it, `/a/x.txt` and `/b/x.txt` both come back as `x.txt` and a tool can
+   *   address neither.
+   * * A directory entry is pushed **before** its contents, and an extension
+   *   filter applies to **files only**, so a filtered recursive listing keeps
+   *   the structure the names are relative to rather than returning orphans.
+   * * An extension matches `extname(name)` by **equality**, against the pattern
+   *   with or without its leading dot — so `.ts` and `ts` both select `x.ts`
+   *   and `s` selects nothing. A suffix test would have let `s` match.
+   *
    * "Materialized directory/file results fail on limits rather than silently
    * truncate": the entry budget is the descriptor's and a listing that reaches
    * it is an error, not a short array that reads as a complete directory.
@@ -408,7 +425,7 @@ export class TunnelMastraFilesystem implements WorkspaceFilesystem {
       const maxDepth = options?.maxDepth ?? limits.maxTraversalDepth;
       const out: FileEntry[] = [];
       let seen = 0;
-      const visit = async (at: string, depth: number): Promise<void> => {
+      const visit = async (at: string, prefix: string, depth: number): Promise<void> => {
         for await (const entry of this.remote.readDirectory(at)) {
           seen += 1;
           if (seen > limits.maxTraversalEntries) {
@@ -420,8 +437,8 @@ export class TunnelMastraFilesystem implements WorkspaceFilesystem {
               retryable: false,
             });
           }
-          const record = toEntry(entry);
-          if (matches(record, extensions)) {
+          const record = toEntry(entry, `${prefix}${entry.name}`);
+          if (record.type === 'directory' || matchesExtension(entry.name, extensions)) {
             out.push(record);
           }
           if (
@@ -429,11 +446,15 @@ export class TunnelMastraFilesystem implements WorkspaceFilesystem {
             entry.kind === 'directory' &&
             depth + 1 <= maxDepth
           ) {
-            await visit(at === '/' ? `/${entry.name}` : `${at}/${entry.name}`, depth + 1);
+            await visit(
+              at === '/' ? `/${entry.name}` : `${at}/${entry.name}`,
+              `${prefix}${entry.name}/`,
+              depth + 1,
+            );
           }
         }
       };
-      await visit(root, 0);
+      await visit(root, '', 0);
       return out;
     });
   }
@@ -540,6 +561,23 @@ export class TunnelMastraFilesystem implements WorkspaceFilesystem {
     }
   }
 
+  /**
+   * Create a path's parent directories, reporting whether that changed
+   * anything.
+   *
+   * The count comes from `mkdir` itself — a chain whose components all existed
+   * returns zero — so the floor is set by what was actually applied and never
+   * by a preliminary `stat`, which would be the exists-then-act race the
+   * contract forbids.
+   */
+  private async ensureParent(path: string): Promise<boolean> {
+    const parent = parentOf(path);
+    if (parent === '/' || !this.remote.supports('mkdir')) {
+      return false;
+    }
+    return (await this.remote.mkdir(parent, { recursive: true })) > 0;
+  }
+
   private async kindOf(path: string, force: boolean): Promise<Stat['kind'] | undefined> {
     try {
       return (await this.remote.stat(path)).kind;
@@ -577,7 +615,18 @@ export class TunnelMastraFilesystem implements WorkspaceFilesystem {
       return new E.FilesystemError(`${error.rule} (${operation})`, 'TUNNEL_PATH_REFUSED', path);
     }
     if (!(error instanceof FilesystemError)) {
-      return error instanceof Error ? error : new Error(String(error));
+      // One of the injected classes passes through whole: `StaleFileError` from
+      // the check-before-write policy is Mastra's own answer and rewriting it
+      // would destroy the timestamps a tool reads off it.
+      if (error instanceof E.FilesystemError) {
+        return error;
+      }
+      // Anything else is reduced to its constructor name. An internal
+      // `TypeError`'s text is not this package's to forward into a framework's
+      // logger, where it could carry a value that was never meant to leave.
+      const raised = new E.FilesystemError(summarize(error), 'TUNNEL_INTERNAL', path);
+      Object.defineProperty(raised, 'cause', { value: error, configurable: true, writable: true });
+      return raised;
     }
     const at = error.path ?? path;
     if (isAmbiguous(error)) {
@@ -622,27 +671,45 @@ function parentOf(path: string): string {
 }
 
 function toBytes(content: FileContent): Uint8Array {
-  if (typeof content === 'string') {
-    return encoder.encode(content);
-  }
-  return content instanceof Uint8Array
-    ? content
-    : new Uint8Array((content as ArrayBufferView).buffer);
+  // `FileContent` is `string | Buffer | Uint8Array`, and a `Buffer` **is** a
+  // `Uint8Array`, so there is no third case. An earlier round carried an
+  // `ArrayBufferView` branch that could not be reached and that would have
+  // ignored `byteOffset`/`byteLength` if it had been.
+  return typeof content === 'string' ? encoder.encode(content) : content;
 }
 
-function toEntry(entry: DirectoryEntry): FileEntry {
+function toEntry(entry: DirectoryEntry, name: string): FileEntry {
   if (entry.kind === 'symlink') {
     // `FileEntry` has an `isSymlink` flag, so a link can be reported honestly
     // here — unlike `FileStat.type`, which has no word for one. The target is
     // not read: `readlink` needs the `symlinks` feature and a `read` grant.
-    return { name: entry.name, type: 'file', isSymlink: true };
+    return { name, type: 'file', isSymlink: true };
   }
-  return { name: entry.name, type: entry.kind };
+  return { name, type: entry.kind };
 }
 
-function matches(entry: FileEntry, extensions: string[] | undefined): boolean {
-  if (extensions === undefined || entry.type === 'directory') {
-    return extensions === undefined;
+/**
+ * The pinned `LocalFilesystem`'s extension rule, which is an **equality** test
+ * on the extension and not a suffix test on the name.
+ *
+ * Upstream: `extensions.some((e) => e === ext || e === ext.slice(1))` over
+ * `nodePath.extname(entry.name)`. So `.ts` and `ts` both select `x.ts`, and
+ * `s` selects nothing — where an `endsWith` would have matched it. Applied to
+ * the **bare** name rather than the subpath-prefixed one, because that is what
+ * upstream extracts the extension from.
+ */
+function matchesExtension(name: string, extensions: string[] | undefined): boolean {
+  if (extensions === undefined) {
+    return true;
   }
-  return extensions.some((extension) => entry.name.endsWith(extension));
+  const extension = extnameOf(name);
+  return extensions.some((pattern) => pattern === extension || pattern === extension.slice(1));
+}
+
+/** `node:path`'s `extname`, for the cases a filename can present. */
+function extnameOf(name: string): string {
+  const dot = name.lastIndexOf('.');
+  // A leading dot is the whole name — `.gitignore` has no extension — and a
+  // name with no dot has none either. Both are what `extname` returns.
+  return dot <= 0 ? '' : name.slice(dot);
 }

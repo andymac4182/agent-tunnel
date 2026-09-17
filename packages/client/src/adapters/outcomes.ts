@@ -20,8 +20,99 @@
  * a framework's `message` field, and it carries a code and an operation only.
  */
 
-import { FilesystemError, type Outcome } from '../errors.ts';
+import { FilesystemError, mergeOutcome, type Outcome } from '../errors.ts';
 import { PathRefusal } from '../paths.ts';
+
+/**
+ * Re-report an adapter composite's failure with the floor its own progress sets.
+ *
+ * This is `RemoteFilesystem.withCompositeFloor`, one layer up, and it is here
+ * for the same reason it is there: **every adapter composes.** `upload`, `copy`
+ * and `move` create the key's parent directories before doing their own work,
+ * and Mastra's `writeFile` and `copyFile` do the same. A directory made by that
+ * `mkdir` is a change to the export, so a later failure of the same adapter call
+ * is not `not_started` however the failing step describes itself — and a
+ * consumer told `not_started` believes the export untouched.
+ *
+ * `applied` is decided by what the composite is **known** to have changed:
+ * `RemoteFilesystem.mkdir` returns how many directories it created, so a chain
+ * that found every component already present sets no floor. It is not inferred
+ * from a preliminary `stat`, which would be the exists-then-act race the
+ * contract forbids.
+ *
+ * The merge is gate 1's and only ever strengthens, so a step that ended
+ * `unknown` stays `unknown`.
+ */
+export function withAppliedFloor(
+  error: unknown,
+  operation: string,
+  path: string | undefined,
+  applied: boolean,
+): unknown {
+  if (!applied) {
+    // Nothing is known to have changed, so there is no floor to impose and
+    // rewriting the error would only lose information.
+    return error;
+  }
+  if (!(error instanceof FilesystemError)) {
+    // A `PathRefusal`, or anything else without an outcome field, escaping a
+    // call that has already changed the export. A retry wrapper reading
+    // `outcome` would see `undefined` and be free to try again.
+    return new FilesystemError({
+      code: error instanceof Error && error.name === 'AbortError' ? 'ABORTED' : 'EINVAL',
+      operation,
+      ...(path === undefined ? {} : { path }),
+      outcome: 'partial',
+      retryable: false,
+      cause: error,
+    });
+  }
+  return new FilesystemError({
+    code: error.code,
+    operation,
+    path: error.path ?? path,
+    outcome: mergeOutcome(error.outcome, 'partial'),
+    retryable: false,
+    bytesAcknowledged: error.bytesAcknowledged,
+    closeCode: error.closeCode,
+    // The original is kept whole. `cause` is where `partial` versus `unknown`
+    // survives once a framework has flattened the code.
+    cause: error.cause ?? error,
+  });
+}
+
+/**
+ * Map over values with a bounded number of in-flight operations.
+ *
+ * The session refuses a request beyond `maxInflightRequests` **locally**, with
+ * `RESOURCE_EXHAUSTED`, because the device answers an over-quota request by
+ * closing 1013 and a client that sent one would lose every other outstanding
+ * request over its own accounting. So an adapter that fans out one call per
+ * result — a listing that stats each key — must bound its own fan-out below
+ * that quota, or a directory with more keys than the quota can never produce a
+ * page at all.
+ */
+export async function mapBounded<T, R>(
+  values: readonly T[],
+  concurrency: number,
+  run: (value: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const out = new Array<R>(values.length);
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    for (;;) {
+      const index = next;
+      next += 1;
+      if (index >= values.length) {
+        return;
+      }
+      out[index] = await run(values[index] as T, index);
+    }
+  };
+  const workers = Math.max(1, Math.min(concurrency, values.length));
+  await Promise.all(Array.from({ length: workers }, worker));
+  return out;
+}
 
 /** The outcome an error carries, when it carries one at all. */
 export function outcomeOf(error: unknown): Outcome | undefined {

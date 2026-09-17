@@ -12,6 +12,7 @@ import {
   TunnelJustBashFilesystem,
 } from '../../src/adapters/just-bash.ts';
 import { FilesystemError } from '../../src/errors.ts';
+import { descriptorFixture } from '../harness/descriptor.ts';
 import { closeAll, waitFor, wire, type Wired } from './wiring.ts';
 import type { FakeProvider } from '../harness/provider.ts';
 
@@ -246,5 +247,37 @@ describe('drainOperationFailures: the outcome a shell cannot carry', () => {
 
   it('bounds at the documented 64 by default', () => {
     assert.equal(MAX_OPERATION_FAILURES, 64);
+  });
+});
+
+describe('a read-only export denies every mutation entry point', () => {
+  it('refuses the write surface and still serves reads', async () => {
+    const wired = await wire({ 'a.txt': 'x', 'dir/b.txt': 'y' }, {
+      root: { ...descriptorFixture().root, readOnly: true },
+      operations: ['readFile', 'readStream', 'stat', 'readDirectory'],
+    });
+    const fs = new TunnelJustBashFilesystem({ remote: wired.remote });
+    for (const call of [
+      async () => fs.writeFile('/c.txt', 'x'),
+      async () => fs.appendFile('/a.txt', 'x'),
+      async () => fs.rm('/a.txt'),
+      async () => fs.mkdir('/new'),
+      async () => fs.cp('/a.txt', '/c.txt'),
+      async () => fs.mv('/a.txt', '/c.txt'),
+      async () => fs.chmod('/a.txt', 0o644),
+      async () => fs.utimes('/a.txt', new Date(0), new Date(0)),
+    ]) {
+      const error = await raised(call);
+      assert.match(error.message, /^ENOTSUP/u, error.message);
+    }
+    const mutating = new Set(['Tlcreate', 'Twrite', 'Tmkdir', 'Tunlinkat', 'Trename', 'Trenameat', 'Tsetattr']);
+    assert.deepEqual(
+      wired.connection.received.filter((message) => mutating.has(message.kind)),
+      [],
+    );
+    assert.equal(await fs.readFile('/a.txt'), 'x');
+    assert.deepEqual((await fs.readdir('/')).sort(), ['a.txt', 'dir']);
+    // Nothing ambiguous happened, so the side channel stays empty.
+    assert.deepEqual(fs.drainOperationFailures(), { entries: [], dropped: 0 });
   });
 });

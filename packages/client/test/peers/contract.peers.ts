@@ -349,15 +349,21 @@ describe('just-bash: a real Bash over the real IFileSystem', () => {
     });
     const fs = new TunnelJustBashFilesystem({ remote });
     const bash = new Bash({ fs, cwd: '/', defenseInDepth: { excludeViolationTypes } });
-    const pending = bash.exec('echo abc > /fresh.txt').catch(() => ({ exitCode: 1 }));
+    const pending = bash.exec('echo abc > /fresh.txt');
     await waitFor(() => wired.connection.received.some((message) => message.kind === 'Twrite'));
     wired.connection.close(1011, 'synthetic');
-    const result = await pending;
 
-    // All a tool wrapper would see from Bash alone.
-    assert.notEqual(result.exitCode, 0);
+    // **There is no exit status.** A redirect-target failure rejects out of
+    // `exec` in just-bash 3.4.2, exactly as `>>` does, so a tool wrapper that
+    // only reads `ExecResult` never runs at all — and one that catches and
+    // synthesises a status has invented the very thing that carries nothing.
+    await assert.rejects(pending, (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.match(error.message, /SESSION_LOST \(writeFile\)/u);
+      return true;
+    });
 
-    // What it must also report, and must not infer "safe to retry" without.
+    // What a wrapper must therefore report, and must not infer "safe to retry" without.
     const drained = fs.drainOperationFailures();
     assert.equal(drained.dropped, 0);
     assert.equal(drained.entries.length, 1);
