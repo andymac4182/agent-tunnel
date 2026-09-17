@@ -75,9 +75,13 @@ export function withAppliedFloor(
     retryable: false,
     bytesAcknowledged: error.bytesAcknowledged,
     closeCode: error.closeCode,
-    // The original is kept whole. `cause` is where `partial` versus `unknown`
-    // survives once a framework has flattened the code.
-    cause: error.cause ?? error,
+    // **The original, not what the original wrapped.** The fields above are
+    // copied, so `outcome`, `code` and `bytesAcknowledged` survive either way —
+    // but the error being replaced carries its own `operation`, and reaching
+    // past it to `error.cause` drops that and leaves a chain with a hole in the
+    // middle. `cause` is also where `partial` versus `unknown` survives once a
+    // framework has flattened the code, so it is worth keeping whole.
+    cause: error,
   });
 }
 
@@ -99,14 +103,29 @@ export async function mapBounded<T, R>(
 ): Promise<R[]> {
   const out = new Array<R>(values.length);
   let next = 0;
+  // **The first failure stops the rest.** `Promise.all` rejects as soon as one
+  // worker throws, so without this the others keep pulling from `next` and keep
+  // sending requests — spending the very quota the bound exists to protect,
+  // after the caller already holds an error, and with their own failures
+  // swallowed because nothing is awaiting them any more. A run that failed on
+  // its fourth item was observed dispatching sixteen and then nineteen.
+  let failed = false;
   const worker = async (): Promise<void> => {
     for (;;) {
+      if (failed) {
+        return;
+      }
       const index = next;
       next += 1;
       if (index >= values.length) {
         return;
       }
-      out[index] = await run(values[index] as T, index);
+      try {
+        out[index] = await run(values[index] as T, index);
+      } catch (error) {
+        failed = true;
+        throw error;
+      }
     }
   };
   const workers = Math.max(1, Math.min(concurrency, values.length));

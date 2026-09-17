@@ -509,7 +509,56 @@ describe('a page is a page the adapter can actually produce', () => {
     assert.equal(page.cursor, undefined);
     assert.equal(new Set(page.items.map((item) => item.key)).size, count);
   });
+
+  it('stops dispatching stats once one of them has failed', async () => {
+    // `Promise.all` rejects on the first failure, so without a shared flag the
+    // other workers keep pulling from the queue and keep sending requests —
+    // spending the quota this bound exists to protect, after the caller already
+    // holds an error, with their own failures swallowed because nothing awaits
+    // them any more.
+    //
+    // The peer fails **once**, deliberately. A peer that failed every stat
+    // would kill every worker at the same moment, and a pool that had kept
+    // going would still have looked bounded; one failure among successes is the
+    // shape where the survivors drain the rest of the page. On this shape the
+    // unflagged version dispatches all 40.
+    const keys = 40;
+    const seed: Record<string, string> = {};
+    for (let index = 0; index < keys; index += 1) {
+      seed[`f${index}.txt`] = 'x';
+    }
+    const { adapter, wired } = await adapterOver(seed, {}, (provider) => {
+      provider.failAfter.set('Tgetattr', { after: 3, ecode: 13, times: 1 });
+    });
+    await failure(async () => adapter.list());
+    const stats = (): number =>
+      wired.connection.received.filter((message) => message.kind === 'Tgetattr').length;
+
+    // Let everything settle, then require it to stay settled. The rejection
+    // reaches the caller before the surviving workers next reach their check,
+    // so the count still moves for one turn; what must not happen is that it
+    // keeps moving.
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    const settled = stats();
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    assert.equal(stats(), settled, 'no stat may be dispatched once the failure has been observed');
+
+    // The substantive claim: the rest of the page is never stat-ed. Without the
+    // flag this is exactly `keys`, because the workers whose own stats
+    // succeeded drain the queue after the caller already holds the error.
+    assert.ok(settled < keys, `the rest of the page must not be stat-ed, saw ${settled} of ${keys}`);
+    // The irreducible window: a worker whose own stat succeeded can pass its
+    // check before the failing worker's rejection handler runs, so up to one
+    // further pool may start. It is bounded by the pool, not by the page.
+    const pool = statConcurrencyFor(descriptorFixture().limits.maxInflightRequests);
+    assert.ok(settled <= 2 * pool, `expected at most two pools, saw ${settled}`);
+  });
 });
+
+/** The pool size the adapter derives, mirrored here so the bound is named once. */
+function statConcurrencyFor(maxInflightRequests: number): number {
+  return Math.max(1, Math.floor(maxInflightRequests / 4));
+}
 
 describe('a read-only export denies every mutation entry point', () => {
   it('refuses upload, delete, copy and move before anything reaches the socket', async () => {

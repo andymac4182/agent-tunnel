@@ -53,8 +53,9 @@ export class FakeProvider {
    * Constructing that needs a peer that fails the second request and not the
    * first, which no seeding arrangement produces on its own.
    */
-  failAfter = new Map<Message['kind'], { after: number; ecode: number }>();
+  failAfter = new Map<Message['kind'], { after: number; ecode: number; times?: number }>();
   private succeeded = new Map<Message['kind'], number>();
+  private failedCount = new Map<Message['kind'], number>();
 
   constructor(seed: Record<string, string | Uint8Array> = {}) {
     for (const [name, content] of Object.entries(seed)) {
@@ -119,7 +120,13 @@ export class FakeProvider {
     const scheduled = this.failAfter.get(message.kind);
     if (scheduled !== undefined) {
       const done = this.succeeded.get(message.kind) ?? 0;
-      if (done >= scheduled.after) {
+      const failures = this.failedCount.get(message.kind) ?? 0;
+      // `times` bounds how many failures are emitted before the peer goes back
+      // to answering normally. Unbounded is the default; a bounded one is what
+      // a **fan-out** case needs, because a peer that fails everything kills
+      // every worker at once and a pool that kept running would look bounded.
+      if (done >= scheduled.after && (scheduled.times === undefined || failures < scheduled.times)) {
+        this.failedCount.set(message.kind, failures + 1);
         error(scheduled.ecode);
         return;
       }

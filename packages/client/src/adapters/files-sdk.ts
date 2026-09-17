@@ -181,7 +181,14 @@ export function createFilesAdapter(options: FilesAdapterOptions): FilesAdapter {
     if (isAmbiguous(error)) {
       // The one mapping this whole module exists to get right. `applied` stays
       // unset; `cause.outcome` is where `partial` and `unknown` survive.
-      return provider(summarize(error), error);
+      //
+      // `aborted` is carried through even here. Nothing retries an ambiguous
+      // failure either way — `canRetry` refuses on `permanent` alone, and the
+      // wrapper substitutes its own abort error when the caller's signal fired
+      // — but an `ABORTED` client error merged up to `partial` is still an
+      // abort, and reporting `aborted: false` for one would be a field that
+      // disagrees with what happened.
+      return provider(summarize(error), error, isAborted(error));
     }
     switch (error.code) {
       case 'ENOENT':
