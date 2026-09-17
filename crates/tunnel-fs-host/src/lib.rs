@@ -77,15 +77,23 @@ pub mod metadata;
 pub mod policy;
 #[cfg(unix)]
 pub mod resolver;
+// Gate 2's crate serving implementation gate 5: the mutating primitives, each
+// anchored the same way every read is.  It is here and not in the dispatcher
+// because each one ends in a syscall naming a final component relative to a
+// directory descriptor this crate resolved.
+#[cfg(unix)]
+pub mod write;
 
 #[cfg(unix)]
 pub use identity::{FileIdentity, FileKind};
 #[cfg(unix)]
 pub use metadata::{DirReader, HostEntry, Metadata};
 #[cfg(unix)]
-pub use policy::{MAX_LINK_HOPS, code_from_errno};
+pub use policy::{MAX_LINK_HOPS, after_effect, code_from_errno, mutation_error};
 #[cfg(unix)]
 pub use resolver::{ExportRoot, Handle, Intent};
+#[cfg(unix)]
+pub use write::{EFFECTING_FAILURE_OUTCOME, MODE_BITS_ALLOWED, MODE_TYPE_BITS, TimeChange};
 
 /// Why this host cannot serve a filesystem export, or `None` when it can.
 ///

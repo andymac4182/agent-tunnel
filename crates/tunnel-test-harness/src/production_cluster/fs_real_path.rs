@@ -47,8 +47,7 @@ use tunnel_fs_ninep::{
 };
 use uuid::Uuid;
 
-mod wire;
-
+use super::fs_wire as wire;
 use wire::{Event, NinepClient, Target, UpgradeFailure, errno_of, unexpected};
 
 use super::http_forward_real_path::{connect_consumer, empty_stream, once_stream, request};
@@ -710,6 +709,9 @@ async fn run(
                     // derived from the grant, so a difference configured here
                     // would prove the connector rather than the grant.
                     capabilities: vec!["read".to_owned(), "list".to_owned()],
+                    // Gate 4 advertises no optional feature, so every one that
+                    // gates a primitive refuses it before the host.
+                    features: Vec::new(),
                 }),
             },
         );
@@ -1437,7 +1439,11 @@ async fn open_session(target: &Target, ca: &[u8], token: &str) -> Result<NinepCl
 }
 
 /// One authenticated HTTPS request to the filesystem URL.
-async fn http_get(
+///
+/// `pub(super)` because the gate-5 sibling reads the same URL with the same
+/// client: one HTTP helper for both gates rather than two that could disagree
+/// about what a descriptor read looks like.
+pub(super) async fn http_get(
     addr: std::net::SocketAddr,
     ca: &[u8],
     method: &str,

@@ -102,6 +102,18 @@ pub struct DeviceHttpExchangeRecord {
     /// The handler's request body queue.
     pub request_body_high_water: usize,
     pub report: Option<ExchangeReport>,
+    /// The filesystem exchange's own payload-free report, for a `fs_9p` stream.
+    ///
+    /// `None` for every HTTP exchange, and the carrier for the provider's
+    /// mutation ledger on a filesystem one: the record is how a completed
+    /// exchange reaches the actor, so it is where the ledger has to travel to
+    /// be published in a status snapshot at all. Counters and closed labels
+    /// only, like everything else here.
+    /// Boxed, because it is present on one exchange kind in two and the
+    /// record travels inside `HttpActorRequest::Done`: carrying the counters
+    /// inline widened every variant of that enum by the size of a ledger no
+    /// HTTP exchange has.
+    pub fs: Option<Box<crate::fs_export::FsExchangeReport>>,
     /// The device record log: request record headers the connector actor
     /// received in order (after sequence deduplication), BODY octets, and
     /// whether the ordered request FIN arrived.  Payload-free.

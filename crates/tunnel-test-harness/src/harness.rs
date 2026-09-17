@@ -52,9 +52,10 @@ pub struct HarnessOptions {
     /// gate ([`MCP_GATE_SERVICES`]) on the first tenant-A device, each with
     /// mirrored `http:invoke` grants.  Only that gate enables it.
     pub mcp_services: bool,
-    /// Seed the six filesystem services of the M4 gate-4 authorization matrix
-    /// ([`FS_GATE_SERVICES`]) on the first tenant-A device.  Only that gate
-    /// enables it.
+    /// Seed the filesystem services of the M4 gates ([`FS_GATE_SERVICES`]) on
+    /// the first tenant-A device.  Only the two M4 filesystem gates enable it,
+    /// and both seed the whole table: a gate looks its exports up by label, so
+    /// a row one gate does not use costs it a catalog record and nothing else.
     pub fs_services: bool,
 }
 
@@ -152,7 +153,7 @@ impl HarnessOptions {
     }
 
     /// Opt into the `http-forward` service used by the HTTP forwarding gate.
-    /// Seed the M4 gate-4 filesystem services.
+    /// Seed the M4 filesystem services.
     #[must_use]
     pub fn fs_services(mut self, value: bool) -> Self {
         self.fs_services = value;
@@ -490,6 +491,32 @@ pub const FS_GATE_SERVICES: &[FsGateService] = &[
         label: "revocable",
         display_name: "Synthetic filesystem export revoked under a live session",
         operations: &["fs:connect", "fs:read", "fs:list"],
+        case_sensitivity: Some("insensitive-preserving"),
+        host_supported: true,
+    },
+    FsGateService {
+        // Implementation gate 5's own export: every capability, so the write
+        // grant is the relay's decision rather than the device's, and every
+        // mutating primitive the profile defines is reachable on it.
+        //
+        // It is a **separate export** from `read-list` for the same reason
+        // every other row here is one: the gate's read-only denial matrix runs
+        // against `read-list` in the same run, and two grants side by side on
+        // one device is what stops one session's answers being credited to the
+        // other's configuration.
+        label: "write-full",
+        display_name: "Synthetic writable filesystem export",
+        operations: &["fs:connect", "fs:read", "fs:write", "fs:list", "fs:delete"],
+        case_sensitivity: Some("insensitive-preserving"),
+        host_supported: true,
+    },
+    FsGateService {
+        // The export gate 5 interrupts a write on, held apart from
+        // `write-full` so that a session dropped mid-stream cannot disturb a
+        // case that reads its own tree back byte for byte.
+        label: "write-interrupted",
+        display_name: "Synthetic writable filesystem export for an interrupted write",
+        operations: &["fs:connect", "fs:read", "fs:write", "fs:list", "fs:delete"],
         case_sensitivity: Some("insensitive-preserving"),
         host_supported: true,
     },

@@ -471,10 +471,10 @@ fn the_same_reclassification_admits_the_open_for_a_grant_that_holds_list() {
     }
 }
 
-// ------------------------------------------------------------- gate 5's work
+// --------------------------------------- the read-only grant's own refusals
 
 #[test]
-fn every_mutating_opcode_is_refused_even_under_a_full_grant() {
+fn every_mutating_opcode_is_refused_under_a_read_only_grant() {
     // A fresh provider per opcode, because several of them change the session's
     // own fid state on either answer — `Tremove` releases its fid whatever the
     // reply is — and a shared session would make one refusal depend on the
@@ -542,26 +542,23 @@ fn every_mutating_opcode_is_refused_even_under_a_full_grant() {
         },
     ];
     assert_eq!(mutations.len(), 10, "every mutating opcode in the profile");
-    // The three refusals a mutation can meet, each taken by a different layer
-    // and all of them before the host:
+    // The two refusals a mutation meets under a `read`+`list` grant, each taken
+    // by a different layer and **both of them before the host**, which is what
+    // makes every one of them `not_started`:
     //
-    // * `EPERM` — gate 1's capability table, for `Tsymlink` and `Tlink`, whose
-    //   features this profile does not advertise.
+    // * `EPERM` — gate 1's capability table, which is where a missing `write`
+    //   or `delete` and an unadvertised `symlinks` or `hardLinks` feature are
+    //   all decided.
     // * `EINVAL` — gate 3's session, for a fid used in a way its state forbids:
-    //   a `Twrite` needs a fid open for writing, and gate 4 will not open one.
-    // * `ENOTSUP` — this dispatcher, for a mutation that reached it: gate 4
-    //   implements the read path and refuses the rest whatever the grant says.
-    const REFUSALS: [FsErrorCode; 3] = [
-        FsErrorCode::Eperm,
-        FsErrorCode::Einval,
-        FsErrorCode::Enotsup,
-    ];
+    //   a `Twrite` needs a fid open for writing, and this grant cannot open
+    //   one, so the flag is rejected before any backend access.
+    const REFUSALS: [FsErrorCode; 2] = [FsErrorCode::Eperm, FsErrorCode::Einval];
 
     for mutation in mutations {
         let fixture = Fixture::new();
         fixture.file("/notes.txt", b"synthetic");
         fixture.dir("/tree");
-        let (mut provider, _authority) = fixture.provider(full_grant());
+        let (mut provider, _authority) = fixture.provider(read_and_list());
         handshake(&mut provider, ROOT);
         let _ = exchange(&mut provider, twalk(2, ROOT, 1, &["notes.txt"]));
         let _ = exchange(&mut provider, twalk(3, ROOT, 2, &["tree"]));
@@ -571,15 +568,28 @@ fn every_mutating_opcode_is_refused_even_under_a_full_grant() {
             &mut provider,
             tunnel_fs_ninep::Frame::new(10, mutation),
         ));
-        // `Tsymlink` and `Tlink` need features this profile does not advertise,
-        // so gate 1's own capability table refuses them first, with `EPERM`.
-        // Every other mutation reaches this dispatcher and is `ENOTSUP`,
-        // because gate 4 does not implement it whatever the grant says.
         let code = error_code(&reply);
         assert!(
             REFUSALS.contains(&code),
             "{described} must be refused by one of the pinned codes, got {code:?}"
         );
+        // Nothing was dispatched, so nothing is ambiguous: the whole of this
+        // matrix is `not_started`, and the ledger says so rather than the
+        // comment claiming it.
+        let stats = provider.stats();
+        assert_eq!(
+            stats.mutations_dispatched, 0,
+            "{described} must be refused before the host is touched"
+        );
+        assert_eq!(stats.mutations_applied, 0);
+        assert_eq!(stats.mutation_unknown, 0);
+        assert_eq!(stats.mutation_partial, 0);
+        // `mutations_refused` is deliberately **not** asserted at one: most of
+        // these are refused by gate 3's session inside `accept`, before the
+        // request is queued at all, so they never reach the dispatcher's own
+        // ledger. That is the refusal happening a layer earlier than this
+        // counter, and saying so is better than moving the counter to make the
+        // number look tidy.
 
         // And nothing happened to the export.
         assert_eq!(
@@ -596,16 +606,35 @@ fn every_mutating_opcode_is_refused_even_under_a_full_grant() {
 
 #[test]
 fn a_write_flag_on_an_open_is_refused_before_the_host_is_touched() {
+    // The contract's own words: "Read-only policy denies every mutating opcode
+    // and flag, including `O_TRUNC` on open". The flag word is what is refused
+    // here, not the opcode — a `Tlopen` this grant would happily serve
+    // read-only is refused the moment it carries a write or a truncate bit,
+    // and `O_TRUNC` is refused **before** the host is asked, so the file cannot
+    // have been emptied by a request that was then denied.
     let fixture = Fixture::new();
     fixture.file("/notes.txt", b"synthetic");
-    let (mut provider, _authority) = fixture.provider(full_grant());
+    let (mut provider, _authority) = fixture.provider(read_and_list());
     handshake(&mut provider, ROOT);
     let _ = exchange(&mut provider, twalk(2, ROOT, 1, &["notes.txt"]));
 
-    for flags in [O_WRONLY, O_RDWR, O_WRONLY | O_TRUNC] {
+    // Two pre-dispatch refusals, taken by two layers and both `not_started`:
+    // gate 1's capability table answers `EPERM` for a write or truncate
+    // primitive this grant does not hold, and gate 3's flag decoding answers
+    // `ENOTSUP` for `O_TRUNC` on a *read-only* access mode, which is a
+    // combination the profile refuses outright rather than a permission it
+    // lacks. Both are listed because collapsing them would hide which layer
+    // made the decision.
+    for (flags, expected) in [
+        (O_WRONLY, FsErrorCode::Eperm),
+        (O_RDWR, FsErrorCode::Eperm),
+        (O_WRONLY | O_TRUNC, FsErrorCode::Eperm),
+        (O_RDONLY | O_TRUNC, FsErrorCode::Enotsup),
+    ] {
         let reply = one_frame(exchange(&mut provider, tlopen(3, 1, flags)));
-        assert_eq!(error_code(&reply), FsErrorCode::Enotsup);
+        assert_eq!(error_code(&reply), expected, "flags {flags:#o}");
     }
+    assert_eq!(provider.stats().mutations_dispatched, 0);
     assert_eq!(
         std::fs::read(fixture.inside("notes.txt")).expect("the file survives"),
         b"synthetic"
@@ -789,26 +818,48 @@ fn a_refused_remove_releases_its_fid_and_the_descriptor_with_it() {
     // binding, before this dispatcher is asked anything. That is recorded on
     // `Provider::cached` rather than hidden, and it is why those guards are
     // measured as defence in depth instead of counted as load-bearing.
+    //
+    // The refusal is the **host's**, not the grant's: a full grant removing a
+    // directory that still has a child is `ENOTEMPTY`. That matters for gate 5,
+    // because a grant refusal is taken by gate 3's session inside `accept` and
+    // never reaches the queue at all, where 9P's release-on-either-answer rule
+    // is about a request that *was* admitted and then failed. The host refusal
+    // is the only way to reach that path from a client.
     let fixture = Fixture::new();
-    fixture.file("/first.txt", b"first-body");
+    fixture.dir("/first");
+    fixture.file("/first/child.txt", b"first-body");
     fixture.file("/second.txt", b"second-body-which-is-longer");
 
     let (mut provider, _authority) = fixture.provider(full_grant());
     handshake(&mut provider, ROOT);
-    let _ = exchange(&mut provider, twalk(2, ROOT, 1, &["first.txt"]));
-    let _ = exchange(&mut provider, tlopen(3, 1, O_RDONLY));
-    let reply = one_frame(exchange(&mut provider, tread(4, 1, 0, 64)));
+    let _ = exchange(&mut provider, twalk(2, ROOT, 1, &["first"]));
+    let _ = exchange(&mut provider, tlopen(3, 1, O_RDONLY | O_DIRECTORY));
+    let reply = one_frame(exchange(&mut provider, treaddir(4, 1, 0, 4_096)));
     match reply.message {
-        Message::Rread { data } => assert_eq!(data, b"first-body"),
-        other => panic!("expected Rread, got {other:?}"),
+        Message::Rreaddir { data } => {
+            assert_eq!(parse_entries(&data).expect("block").len(), 1);
+        }
+        other => panic!("expected Rreaddir, got {other:?}"),
     }
 
-    // Refused — writes are gate 5's — and the fid is released anyway.
+    // Dispatched and refused by the host, and the fid is released anyway.
     let reply = one_frame(exchange(
         &mut provider,
         tunnel_fs_ninep::Frame::new(5, Message::Tremove { fid: 1 }),
     ));
-    assert_eq!(error_code(&reply), FsErrorCode::Enotsup);
+    assert_eq!(error_code(&reply), FsErrorCode::Enotempty);
+    assert!(
+        fixture.inside("first/child.txt").exists(),
+        "a refused remove removes nothing"
+    );
+    // Dispatched, and reported `failed` rather than `not_started`: the host was
+    // asked and answered that it changed nothing, which gate 4 had no way to
+    // say.
+    let stats = provider.stats();
+    assert_eq!(stats.mutations_dispatched, 1);
+    assert_eq!(stats.mutation_failed, 1);
+    assert_eq!(stats.mutations_applied, 0);
+    assert_eq!(stats.mutations_refused, 0);
 
     // The number is free, so the client may bind it to a different file.
     let reply = one_frame(exchange(&mut provider, twalk(6, ROOT, 1, &["second.txt"])));

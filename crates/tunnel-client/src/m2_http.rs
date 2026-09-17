@@ -424,16 +424,20 @@ impl M2Actor {
         };
         let freeze = PauseController::new(self.writes_frozen);
         let task = tokio::spawn(async move {
-            let (_report, _, _) = tokio::join!(
+            let (report, _, _) = tokio::join!(
                 crate::fs_export::serve(export, grant, authority, request_rx, response_tx),
                 pump_outbound(response_rx, writer),
                 pump_inbound(reader, request_tx),
             );
-            // The filesystem exchange keeps no bounded record of its own: the
-            // provider's counters live on the device's diagnostics, and an
-            // exchange record shaped for HTTP heads would have nothing to hold.
+            // The exchange record is shaped for HTTP heads and has nothing to
+            // hold for a 9P stream — **except the report**, which is the only
+            // path the provider's mutation ledger has to the actor and so to a
+            // status snapshot. An earlier round of this gate discarded it here,
+            // which left the whole outcome ledger recorded nowhere a running
+            // binary could read.
             let record = DeviceHttpExchangeRecord {
                 stream_id,
+                fs: Some(Box::new(report)),
                 ..DeviceHttpExchangeRecord::default()
             };
             let _ = sink.send(HttpActorRequest::Done { record }).await;
@@ -495,6 +499,14 @@ impl M2Actor {
                     record.request_fin_received = http.fin_ready;
                     record.request_framing_invalid = request.invalid;
                     record.cancel_received = http.cancel_received;
+                }
+                if let Some(fs) = record.fs.as_ref() {
+                    // Folded into the session total here and nowhere else, so
+                    // the ledger is published in every status snapshot from
+                    // this point on. Counters only; nothing here can carry a
+                    // path, a name or a byte of content.
+                    self.fs_counters.absorb(&fs.stats);
+                    self.publish_status();
                 }
                 self.http_handlers.diagnostics().record(record);
                 Ok(())

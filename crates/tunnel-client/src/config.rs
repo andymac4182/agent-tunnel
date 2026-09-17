@@ -312,6 +312,16 @@ pub struct FsExportSettings {
     /// OPEN named, so a relay can only ever narrow it. Default deny: an export
     /// that names nothing admits no session, which is gate 1's own rule.
     pub capabilities: Vec<String>,
+    /// The optional provider features this export implements.
+    ///
+    /// The descriptor's own `features` spellings — `atomicRename`,
+    /// `exclusiveCreate`, `symlinks`, `hardLinks` and the rest. **Default
+    /// none**, which is the contract's own default: every feature is opt-in,
+    /// and `hardLinks` in particular switches off the `st_nlink` write refusal,
+    /// so an export that enabled one by omission would be wider than the
+    /// operator asked for. A name this build does not know is ignored rather
+    /// than refused, which can only ever fail to turn something on.
+    pub features: Vec<String>,
 }
 
 impl Default for FsExportSettings {
@@ -319,6 +329,7 @@ impl Default for FsExportSettings {
         Self {
             root: PathBuf::new(),
             capabilities: Vec::new(),
+            features: Vec::new(),
         }
     }
 }

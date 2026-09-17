@@ -184,7 +184,19 @@ pub fn vpath(text: &str) -> VirtualPath {
 pub fn exchange(provider: &mut Provider<TestAuthority>, frame: Frame) -> Vec<Outbound> {
     let mut out = provider.accept(&frame);
     while provider.has_work() {
-        out.extend(provider.step());
+        let produced = provider.step();
+        // **This helper stands in for the connector, so it settles the mutation
+        // ledger the way the connector does.** A reply that reaches the carrier
+        // is an acknowledgement; without this the ledger would stay open for
+        // every mutation these tests perform and `Provider::close` would report
+        // all of them `unknown`, which is the opposite of what an ordinary
+        // exchange means. The tests that are *about* an undelivered reply drive
+        // `accept` and `step` themselves and decline to confirm, which is
+        // exactly the shape a dropped consumer has.
+        if produced.iter().any(|out| matches!(out, Outbound::Frame(_))) {
+            provider.confirm_effect_delivered();
+        }
+        out.extend(produced);
     }
     out
 }
@@ -273,6 +285,180 @@ pub fn tclunk(tag: u16, fid: u32) -> Frame {
 
 pub fn tflush(tag: u16, oldtag: u16) -> Frame {
     Frame::new(tag, Message::Tflush { oldtag })
+}
+
+// -------------------------------------------------------- gate 5's requests
+
+pub fn tlcreate(tag: u16, fid: u32, name: &str, flags: u32, mode: u32) -> Frame {
+    Frame::new(
+        tag,
+        Message::Tlcreate {
+            fid,
+            name: name.to_owned(),
+            flags,
+            mode,
+            gid: 0,
+        },
+    )
+}
+
+pub fn twrite(tag: u16, fid: u32, offset: u64, data: &[u8]) -> Frame {
+    Frame::new(
+        tag,
+        Message::Twrite {
+            fid,
+            offset,
+            data: data.to_vec(),
+        },
+    )
+}
+
+pub fn tmkdir(tag: u16, dfid: u32, name: &str, mode: u32) -> Frame {
+    Frame::new(
+        tag,
+        Message::Tmkdir {
+            dfid,
+            name: name.to_owned(),
+            mode,
+            gid: 0,
+        },
+    )
+}
+
+pub fn tunlinkat(tag: u16, dirfid: u32, name: &str, flags: u32) -> Frame {
+    Frame::new(
+        tag,
+        Message::Tunlinkat {
+            dirfid,
+            name: name.to_owned(),
+            flags,
+        },
+    )
+}
+
+pub fn trenameat(tag: u16, olddirfid: u32, oldname: &str, newdirfid: u32, newname: &str) -> Frame {
+    Frame::new(
+        tag,
+        Message::Trenameat {
+            olddirfid,
+            oldname: oldname.to_owned(),
+            newdirfid,
+            newname: newname.to_owned(),
+        },
+    )
+}
+
+pub fn tremove(tag: u16, fid: u32) -> Frame {
+    Frame::new(tag, Message::Tremove { fid })
+}
+
+pub fn tsymlink(tag: u16, fid: u32, name: &str, target: &str) -> Frame {
+    Frame::new(
+        tag,
+        Message::Tsymlink {
+            fid,
+            name: name.to_owned(),
+            target: target.to_owned(),
+            gid: 0,
+        },
+    )
+}
+
+pub fn treadlink(tag: u16, fid: u32) -> Frame {
+    Frame::new(tag, Message::Treadlink { fid })
+}
+
+pub fn tlink(tag: u16, dfid: u32, fid: u32, name: &str) -> Frame {
+    Frame::new(
+        tag,
+        Message::Tlink {
+            dfid,
+            fid,
+            name: name.to_owned(),
+        },
+    )
+}
+
+/// A `Tsetattr` naming only a new size.
+pub fn tsetattr_size(tag: u16, fid: u32, size: u64) -> Frame {
+    tsetattr(tag, fid, tunnel_fs_ninep::flags::SETATTR_SIZE, 0, size)
+}
+
+/// A `Tsetattr` naming only a new mode.
+pub fn tsetattr_mode(tag: u16, fid: u32, mode: u32) -> Frame {
+    tsetattr(tag, fid, tunnel_fs_ninep::flags::SETATTR_MODE, mode, 0)
+}
+
+/// A `Tsetattr` naming an **explicit** modification time.
+///
+/// Both mask bits: the field bit and its `_SET` companion. Without the second
+/// the same request means `touch`, which is a different case and has its own
+/// helper spelling in the test that uses it.
+pub fn tsetattr_mtime(tag: u16, fid: u32, seconds: u64, nanoseconds: u64) -> Frame {
+    Frame::new(
+        tag,
+        Message::Tsetattr {
+            fid,
+            valid: tunnel_fs_ninep::flags::SETATTR_MTIME
+                | tunnel_fs_ninep::flags::SETATTR_MTIME_SET,
+            mode: 0,
+            uid: 0,
+            gid: 0,
+            size: 0,
+            atime_sec: 0,
+            atime_nsec: 0,
+            mtime_sec: seconds,
+            mtime_nsec: nanoseconds,
+        },
+    )
+}
+
+pub fn tsetattr(tag: u16, fid: u32, valid: u32, mode: u32, size: u64) -> Frame {
+    Frame::new(
+        tag,
+        Message::Tsetattr {
+            fid,
+            valid,
+            mode,
+            uid: 0,
+            gid: 0,
+            size,
+            atime_sec: 0,
+            atime_nsec: 0,
+            mtime_sec: 0,
+            mtime_nsec: 0,
+        },
+    )
+}
+
+/// The count an `Rwrite` acknowledged.
+pub fn written(frame: &Frame) -> u32 {
+    match &frame.message {
+        Message::Rwrite { count } => *count,
+        other => panic!("expected an Rwrite, got {other:?}"),
+    }
+}
+
+/// A grant with `write` and `delete` but neither `read` nor `list`.
+///
+/// The shape the contract's own `Twalk` disclosure note describes: it can reach
+/// a name and change it, and it can observe nothing about it but a qid.
+pub fn write_and_delete() -> CapabilitySet {
+    CapabilitySet::from_slice(&[Capability::Write, Capability::Delete])
+}
+
+/// The features a write-serving export advertises in these tests.
+///
+/// `atomicRename` because `Trenameat` needs it, `exclusiveCreate` because this
+/// implementation's create is always exclusive, and `symlinks` because the
+/// symbolic-link cases need it. **`hardLinks` is deliberately absent**: with it
+/// on, the `st_nlink` write refusal switches off, and that refusal is one of the
+/// things gate 5 has to prove is reachable on a real write.
+pub fn write_features() -> FeatureSet {
+    FeatureSet::NONE
+        .with(tunnel_fs_core::Feature::AtomicRename)
+        .with(tunnel_fs_core::Feature::ExclusiveCreate)
+        .with(tunnel_fs_core::Feature::Symlinks)
 }
 
 /// Negotiate and attach, returning the root qid.

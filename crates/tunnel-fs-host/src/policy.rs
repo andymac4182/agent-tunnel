@@ -68,6 +68,60 @@ pub fn host_error(errno: Errno) -> FsError {
     FsError::refused(code_from_errno(errno))
 }
 
+/// A host failure from the one syscall that could have changed the host.
+///
+/// The difference from [`host_error`] is the **outcome**, and it is the whole
+/// of what implementation gate 5 adds to this vocabulary. Gate 4 could only
+/// ever produce [`Outcome::NotStarted`], because nothing it dispatched could
+/// change anything; a mutation is dispatched, so its failure is a report from
+/// the host that it applied nothing — [`Outcome::Failed`] — rather than a
+/// refusal taken before the host was asked.
+///
+/// Everything a mutation does *before* that syscall — authorizing the
+/// primitive, resolving the parent, inspecting the final component — keeps
+/// [`host_error`] and stays `NotStarted`. That split is what makes the outcome
+/// a fact about the host rather than a label attached to a whole operation.
+///
+/// **This is never used for a partial effect.** A `pwrite` that transferred
+/// some bytes returns the count rather than an error, so the partial case
+/// reaches the wire as a short `Rwrite` and never through here. A syscall that
+/// failed and a syscall that half-succeeded are different observations and this
+/// function only ever describes the first.
+#[must_use]
+pub fn mutation_error(errno: Errno) -> FsError {
+    FsError::Filesystem {
+        code: code_from_errno(errno),
+        outcome: Outcome::Failed,
+    }
+}
+
+/// Strengthen a failure that happened **after** the effecting syscall.
+///
+/// Several mutations cannot describe themselves in one syscall: `mkdirat` and
+/// `symlinkat` create a node and return nothing, so the qid the reply has to
+/// carry costs a second call, and that second call can fail. **The effect has
+/// already happened at that point**, so reporting the second call's own errno
+/// unchanged would say the request never started when a directory or a link
+/// exists — the exact failure the outcome vocabulary is for.
+///
+/// The answer is [`Outcome::Unknown`] rather than [`Outcome::Partial`], and the
+/// distinction is worth stating: the node was created *whole*, and what is
+/// unknown is not how much applied but whether anything did, **from the
+/// caller's side**. The caller receives an `Rlerror` naming a code, and no code
+/// in the closed vocabulary can mean "it worked and I cannot tell you what I
+/// made". A caller that treated that `Rlerror` as `not_started` and retried
+/// would meet `EEXIST` on a name it does not believe it created.
+///
+/// Merged rather than assigned, so a failure that was already `Unknown` stays
+/// so and gate 1's monotonic ordering is what decides — never this function.
+#[must_use]
+pub fn after_effect(error: FsError) -> FsError {
+    FsError::Filesystem {
+        code: error.code(),
+        outcome: error.outcome().merge(Outcome::Unknown),
+    }
+}
+
 /// A resolution that observed the filesystem change underneath it.
 ///
 /// Reported as `ENOENT`: the entry this resolution had identified is not there

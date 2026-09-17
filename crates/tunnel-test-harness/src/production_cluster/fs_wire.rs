@@ -1,5 +1,5 @@
-//! A minimal 9P2000.L consumer over a real TLS WebSocket, for the M4 gate-4
-//! gate only.
+//! A minimal 9P2000.L consumer over a real TLS WebSocket, shared by the M4
+//! filesystem gates.
 //!
 //! There is no shipped Rust consumer client — the contract's first certified
 //! runtime is Node — so the gate speaks the wire itself.  It is deliberately
@@ -37,12 +37,12 @@ use tunnel_fs_ninep::{
 use crate::{HarnessError, Result};
 
 /// The header a Node client sends the descriptor's `grantRevision` in.
-pub(super) const GRANT_REVISION_HEADER: &str = "x-agent-tunnel-grant-revision";
+pub(crate) const GRANT_REVISION_HEADER: &str = "x-agent-tunnel-grant-revision";
 /// How long one handshake, send or receive may take.
 const IO_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Why an upgrade did not produce a 9P socket.
-pub(super) enum UpgradeFailure {
+pub(crate) enum UpgradeFailure {
     /// The relay answered an HTTP status instead of `101`.
     Status {
         /// The status code.
@@ -56,7 +56,7 @@ pub(super) enum UpgradeFailure {
 
 impl UpgradeFailure {
     /// The status, or a harness failure turned into one.
-    pub(super) fn into_status(self) -> Result<(u16, Option<Vec<u8>>)> {
+    pub(crate) fn into_status(self) -> Result<(u16, Option<Vec<u8>>)> {
         match self {
             Self::Status { status, body } => Ok((status, body)),
             Self::Harness(error) => Err(error),
@@ -66,7 +66,7 @@ impl UpgradeFailure {
 
 /// One event read off the consumer socket.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) enum Event {
+pub(crate) enum Event {
     /// A complete 9P message.
     Frame(Frame),
     /// The server closed, with the close code it named.
@@ -76,7 +76,7 @@ pub(super) enum Event {
 }
 
 /// A 9P2000.L client over one consumer WebSocket.
-pub(super) struct NinepClient {
+pub(crate) struct NinepClient {
     socket: WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
     /// The bound in force: the profile ceiling until `Rversion` reduces it.
     msize: u32,
@@ -86,7 +86,7 @@ pub(super) struct NinepClient {
 }
 
 /// Where one upgrade is aimed.
-pub(super) struct Target {
+pub(crate) struct Target {
     /// The relay's public consumer address.
     pub consumer_addr: SocketAddr,
     /// The device the export belongs to.
@@ -100,7 +100,7 @@ impl NinepClient {
     ///
     /// `subprotocol` is a parameter rather than the constant because one case
     /// this gate has to prove is an upgrade that offers the wrong one.
-    pub(super) async fn connect(
+    pub(crate) async fn connect(
         target: &Target,
         server_ca_der: &[u8],
         token: &str,
@@ -115,7 +115,7 @@ impl NinepClient {
     /// descriptor is a revision a consumer carries into its upgrade, so the
     /// header has to be settable on the upgrade and not only on the
     /// descriptor read.
-    pub(super) async fn connect_with(
+    pub(crate) async fn connect_with(
         target: &Target,
         server_ca_der: &[u8],
         token: &str,
@@ -198,7 +198,7 @@ impl NinepClient {
     }
 
     /// The subprotocol the server selected.
-    pub(super) fn selected_subprotocol(&self) -> &str {
+    pub(crate) fn selected_subprotocol(&self) -> &str {
         &self.selected
     }
 
@@ -214,7 +214,7 @@ impl NinepClient {
     }
 
     /// Send one frame as exactly one binary message.
-    pub(super) async fn send_frame(&mut self, frame: &Frame) -> Result<()> {
+    pub(crate) async fn send_frame(&mut self, frame: &Frame) -> Result<()> {
         let bytes = frame
             .to_bytes(self.msize)
             .map_err(|error| HarnessError::Http(format!("9P encode refused: {error:?}")))?;
@@ -228,7 +228,7 @@ impl NinepClient {
     }
 
     /// Read the next event, ignoring ping/pong and refusing text.
-    pub(super) async fn recv_event(&mut self) -> Result<Event> {
+    pub(crate) async fn recv_event(&mut self) -> Result<Event> {
         loop {
             let message = timeout(IO_TIMEOUT, self.socket.next())
                 .await
@@ -262,7 +262,7 @@ impl NinepClient {
     }
 
     /// Read the next frame, treating a close as a failure.
-    pub(super) async fn recv_frame(&mut self) -> Result<Frame> {
+    pub(crate) async fn recv_frame(&mut self) -> Result<Frame> {
         match self.recv_event().await? {
             Event::Frame(frame) => Ok(frame),
             Event::Close(code) => Err(HarnessError::Process(format!(
@@ -279,7 +279,7 @@ impl NinepClient {
     /// Replies for other tags are not expected on a serial caller and are
     /// refused rather than skipped: silently dropping one would hide an
     /// interleaving the gate did not ask for.
-    pub(super) async fn call(&mut self, message: Message) -> Result<Message> {
+    pub(crate) async fn call(&mut self, message: Message) -> Result<Message> {
         let tag = self.take_tag();
         self.send_frame(&Frame::new(tag, message)).await?;
         let reply = self.recv_frame().await?;
@@ -293,7 +293,7 @@ impl NinepClient {
     }
 
     /// `Tversion`, which occupies [`NOTAG`] and reduces the bound in force.
-    pub(super) async fn version(&mut self, offered: u32) -> Result<(u32, String)> {
+    pub(crate) async fn version(&mut self, offered: u32) -> Result<(u32, String)> {
         self.send_frame(&Frame::new(
             NOTAG,
             Message::Tversion {
@@ -313,7 +313,7 @@ impl NinepClient {
     }
 
     /// `Tattach` with the only field values this profile permits.
-    pub(super) async fn attach(&mut self, fid: u32) -> Result<Qid> {
+    pub(crate) async fn attach(&mut self, fid: u32) -> Result<Qid> {
         match self.attach_with(fid, NOFID, "", "").await? {
             Message::Rattach { qid } => Ok(qid),
             other => Err(unexpected("Rattach", &other)),
@@ -321,7 +321,7 @@ impl NinepClient {
     }
 
     /// `Tattach` with caller-chosen `afid` and `uname`, for the forged cases.
-    pub(super) async fn attach_with(
+    pub(crate) async fn attach_with(
         &mut self,
         fid: u32,
         afid: u32,
@@ -339,7 +339,7 @@ impl NinepClient {
     }
 
     /// `Twalk`.
-    pub(super) async fn walk(&mut self, fid: u32, newfid: u32, names: &[&str]) -> Result<Message> {
+    pub(crate) async fn walk(&mut self, fid: u32, newfid: u32, names: &[&str]) -> Result<Message> {
         self.call(Message::Twalk {
             fid,
             newfid,
@@ -349,32 +349,32 @@ impl NinepClient {
     }
 
     /// `Tlopen`.
-    pub(super) async fn lopen(&mut self, fid: u32, flags: u32) -> Result<Message> {
+    pub(crate) async fn lopen(&mut self, fid: u32, flags: u32) -> Result<Message> {
         self.call(Message::Tlopen { fid, flags }).await
     }
 
     /// `Tread`.
-    pub(super) async fn read(&mut self, fid: u32, offset: u64, count: u32) -> Result<Message> {
+    pub(crate) async fn read(&mut self, fid: u32, offset: u64, count: u32) -> Result<Message> {
         self.call(Message::Tread { fid, offset, count }).await
     }
 
     /// `Treaddir`.
-    pub(super) async fn readdir(&mut self, fid: u32, offset: u64, count: u32) -> Result<Message> {
+    pub(crate) async fn readdir(&mut self, fid: u32, offset: u64, count: u32) -> Result<Message> {
         self.call(Message::Treaddir { fid, offset, count }).await
     }
 
     /// `Tgetattr`.
-    pub(super) async fn getattr(&mut self, fid: u32, request_mask: u64) -> Result<Message> {
+    pub(crate) async fn getattr(&mut self, fid: u32, request_mask: u64) -> Result<Message> {
         self.call(Message::Tgetattr { fid, request_mask }).await
     }
 
     /// `Tclunk`.
-    pub(super) async fn clunk(&mut self, fid: u32) -> Result<Message> {
+    pub(crate) async fn clunk(&mut self, fid: u32) -> Result<Message> {
         self.call(Message::Tclunk { fid }).await
     }
 
     /// `Tflush` of `oldtag`.
-    pub(super) async fn flush(&mut self, oldtag: u16) -> Result<Message> {
+    pub(crate) async fn flush(&mut self, oldtag: u16) -> Result<Message> {
         self.call(Message::Tflush { oldtag }).await
     }
 
@@ -382,14 +382,27 @@ impl NinepClient {
     ///
     /// The pipelining the flush case needs: two requests have to be in flight
     /// before either reply is read.
-    pub(super) async fn send(&mut self, message: Message) -> Result<u16> {
+    pub(crate) async fn send(&mut self, message: Message) -> Result<u16> {
         let tag = self.take_tag();
         self.send_frame(&Frame::new(tag, message)).await?;
         Ok(tag)
     }
 
+    /// Drop the socket without a close frame and without draining it.
+    ///
+    /// The other half of [`NinepClient::close`], and it exists for exactly one
+    /// case: a consumer that goes away **while a mutation is in flight**. A
+    /// polite close would let the device finish and deliver every outstanding
+    /// reply, which is the case where nothing is ambiguous; dropping the
+    /// transport mid-stream is what leaves a write that may or may not have
+    /// been applied and whose reply the consumer will never see, and that is
+    /// the state the contract calls `unknown`.
+    pub(crate) fn abandon(self) {
+        drop(self);
+    }
+
     /// Close the socket politely and drain what the server sends back.
-    pub(super) async fn close(mut self) {
+    pub(crate) async fn close(mut self) {
         let _ = timeout(IO_TIMEOUT, self.socket.send(WsMessage::Close(None))).await;
         let _ = timeout(Duration::from_secs(5), async {
             while let Some(message) = self.socket.next().await {
@@ -403,7 +416,7 @@ impl NinepClient {
 }
 
 /// The errno an `Rlerror` carries, or `None` for any other reply.
-pub(super) fn errno_of(message: &Message) -> Option<u32> {
+pub(crate) fn errno_of(message: &Message) -> Option<u32> {
     match message {
         Message::Rlerror { code } => Some(code.errno()),
         _ => None,
@@ -411,7 +424,7 @@ pub(super) fn errno_of(message: &Message) -> Option<u32> {
 }
 
 /// A payload-free "wrong reply" failure: the message *type* and nothing else.
-pub(super) fn unexpected(expected: &str, got: &Message) -> HarnessError {
+pub(crate) fn unexpected(expected: &str, got: &Message) -> HarnessError {
     HarnessError::Process(format!(
         "expected {expected}, received {}",
         got.message_type()
@@ -419,7 +432,7 @@ pub(super) fn unexpected(expected: &str, got: &Message) -> HarnessError {
 }
 
 /// A TLS client configuration trusting only the fixture CA.
-pub(super) fn tls_config(server_ca_der: &[u8]) -> Result<rustls::ClientConfig> {
+pub(crate) fn tls_config(server_ca_der: &[u8]) -> Result<rustls::ClientConfig> {
     let mut roots = rustls::RootCertStore::empty();
     roots
         .add(CertificateDer::from(server_ca_der.to_vec()))

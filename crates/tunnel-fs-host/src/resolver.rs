@@ -74,6 +74,14 @@ pub enum Intent {
     /// the descriptor after the hard-link rule has been applied to it, so a
     /// refused write cannot have already discarded the file.
     Write,
+    /// Read and change content through one descriptor.
+    ///
+    /// A separate intent rather than `Write` with a flag, because 9P's
+    /// `O_RDWR` is one fid a client may both `Tread` and `Twrite`, and a
+    /// descriptor opened `O_WRONLY` would answer `EBADF` to the first. It
+    /// carries `O_TRUNC` no more than [`Intent::Write`] does, for the same
+    /// reason.
+    ReadWrite,
 }
 
 impl Intent {
@@ -81,6 +89,7 @@ impl Intent {
         match self {
             Self::Inspect | Self::Read => OFlags::RDONLY,
             Self::Write => OFlags::WRONLY,
+            Self::ReadWrite => OFlags::RDWR,
         }
     }
 }
@@ -125,6 +134,26 @@ impl Handle {
     /// A translated host failure.
     pub fn current_identity(&self) -> Result<FileIdentity, FsError> {
         identity_of(&self.descriptor)
+    }
+
+    /// Adopt a descriptor an anchored `*at` syscall in this crate produced.
+    ///
+    /// The identity comes from `fstat` on that descriptor and from nowhere
+    /// else, which is the same authority every other [`Handle`] in this crate
+    /// carries: it describes the file the syscall reached, not the name it was
+    /// asked about. Kept `pub(crate)` because the caller has to be a function
+    /// that just performed such a syscall — adopting a descriptor from anywhere
+    /// else would be a handle with no anchoring behind it.
+    ///
+    /// # Errors
+    ///
+    /// A translated host failure from the `fstat`.
+    pub(crate) fn from_verified(descriptor: OwnedFd) -> Result<Self, FsError> {
+        let identity = identity_of(&descriptor)?;
+        Ok(Self {
+            descriptor,
+            identity,
+        })
     }
 }
 
@@ -310,7 +339,22 @@ impl ExportRoot {
     /// not advertised and the resolved regular file has `st_nlink > 1`;
     /// [`FsErrorCode::Eisdir`] for a directory; or any confinement refusal.
     pub fn open_write(&self, path: &VirtualPath) -> Result<Handle, FsError> {
-        self.open_for_size_change(path, Primitive::OpenWrite)
+        self.open_for_size_change_with(path, Primitive::OpenWrite, Intent::Write)
+    }
+
+    /// Open a file for reading **and** writing, applying the hard-link rule.
+    ///
+    /// The same decision as [`ExportRoot::open_write`] under the same
+    /// primitive: the grant that permits writing is what `O_RDWR` needs beyond
+    /// a read, and the read half adds no authority a `read` grant does not
+    /// already carry — which the caller has checked, because `OpenRead` is one
+    /// of the primitives an `O_RDWR` `Tlopen` decodes to.
+    ///
+    /// # Errors
+    ///
+    /// As [`ExportRoot::open_write`].
+    pub fn open_read_write(&self, path: &VirtualPath) -> Result<Handle, FsError> {
+        self.open_for_size_change_with(path, Primitive::OpenWrite, Intent::ReadWrite)
     }
 
     /// Open a file for writing and truncate it to zero.
@@ -325,7 +369,13 @@ impl ExportRoot {
     /// As [`ExportRoot::open_write`], under [`Primitive::OpenTruncate`].
     pub fn open_truncate(&self, path: &VirtualPath) -> Result<Handle, FsError> {
         let handle = self.open_for_size_change(path, Primitive::OpenTruncate)?;
-        rustix::fs::ftruncate(handle.as_fd(), 0).map_err(host_error)?;
+        // Through `Handle::set_size`, not a bare `ftruncate` mapped by
+        // `host_error`: the truncation **is** the effecting syscall, so its
+        // failure is `failed` — the host was asked and reported it changed
+        // nothing — and `host_error` would report `not_started` for a call that
+        // was made. `EFBIG`, an immutable file's `EPERM` and a media `EIO` all
+        // arrive here.
+        handle.set_size(0)?;
         Ok(handle)
     }
 
@@ -336,7 +386,9 @@ impl ExportRoot {
     /// As [`ExportRoot::open_write`], under [`Primitive::SetattrSize`].
     pub fn set_size(&self, path: &VirtualPath, size: u64) -> Result<(), FsError> {
         let handle = self.open_for_size_change(path, Primitive::SetattrSize)?;
-        rustix::fs::ftruncate(handle.as_fd(), size).map_err(host_error)
+        // As in [`ExportRoot::open_truncate`]: the effecting syscall reports
+        // `failed`, never `not_started`.
+        handle.set_size(size)
     }
 
     fn open_for_size_change(
@@ -344,8 +396,17 @@ impl ExportRoot {
         path: &VirtualPath,
         primitive: Primitive,
     ) -> Result<Handle, FsError> {
+        self.open_for_size_change_with(path, primitive, Intent::Write)
+    }
+
+    pub(crate) fn open_for_size_change_with(
+        &self,
+        path: &VirtualPath,
+        primitive: Primitive,
+        intent: Intent,
+    ) -> Result<Handle, FsError> {
         self.authorize(primitive)?;
-        let handle = self.resolve(path, Intent::Write)?;
+        let handle = self.resolve(path, intent)?;
         if handle.kind() == FileKind::Directory {
             return Err(FsError::refused(FsErrorCode::Eisdir));
         }
@@ -722,7 +783,7 @@ fn identity_of<Fd: AsFd>(descriptor: Fd) -> Result<FileIdentity, FsError> {
 /// for it: mapping it to `EINVAL` would report a delivered signal as a
 /// malformed request. Every host call in this crate is short and restartable,
 /// so the only correct response is to make it again.
-fn retry<T>(mut call: impl FnMut() -> rustix::io::Result<T>) -> rustix::io::Result<T> {
+pub(crate) fn retry<T>(mut call: impl FnMut() -> rustix::io::Result<T>) -> rustix::io::Result<T> {
     loop {
         match call() {
             Err(errno) if errno == rustix::io::Errno::INTR => {}
