@@ -1,0 +1,38 @@
+[package]
+name = "tunnel-acp"
+description = "Pinned ACP v1 HTTP profile, http-forward/1 allowlists and buffered JSON-RPC message validation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# This crate does no I/O.  It holds the M8-01 pin and the `http-forward/1`
+# profile tables; the HTTP handler, the SSE bridge and the child process are
+# later chunks and live elsewhere.
+#
+# The two official SDK crates are exact-pinned.  They are dependencies rather
+# than a note in a document so that the pin is the artifact `Cargo.lock`
+# records, and so that the normative v1 method names, the `StopReason`
+# vocabulary and the v1 `session/prompt` response shape this crate validates
+# against come from the published crate itself instead of from strings retyped
+# here.
+#
+# Both take no features at all: the two ACP draft features named in `pin.rs`
+# stay off, and `tests/pin.rs` fails if any manifest in this workspace names
+# one.  That scan reads manifest text, so do not spell those feature names in
+# a comment here.
+[dependencies]
+agent-client-protocol = { version = "=2.1.0", default-features = false }
+agent-client-protocol-http = { version = "=2.1.0", default-features = false }
+http = "1"
+serde = { workspace = true }
+serde_json = "1.0"
+tunnel-http-bridge = { path = "../tunnel-http-bridge" }
+tunnel-http-forward = { path = "../tunnel-http-forward" }
+
+[dev-dependencies]
+toml = { workspace = true }
+
+[lints]
+workspace = true

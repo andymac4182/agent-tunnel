@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/tunnel-acp",
     "crates/tunnel-catalog",
     "crates/tunnel-client",
     "crates/tunnel-cluster",
