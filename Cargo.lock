@@ -3149,6 +3149,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "tunnel-acp-export"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "rustix",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tunnel-acp",
+]
+
+[[package]]
+name = "tunnel-acp-fixture"
+version = "0.1.0"
+dependencies = [
+ "rustix",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tunnel-acp",
+ "tunnel-acp-export",
+]
+
+[[package]]
 name = "tunnel-catalog"
 version = "0.1.0"
 dependencies = [

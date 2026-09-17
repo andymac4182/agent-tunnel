@@ -1,0 +1,47 @@
+[package]
+name = "tunnel-acp-fixture"
+description = "Deterministic synthetic ACP v1 stdio agent fixture: no model, no credentials, no network, synthetic effects only"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "tunnel-acp-fixture"
+path = "src/main.rs"
+
+# This fixture deliberately does NOT use the pinned ACP SDK's server.  It
+# hand-writes the newline-delimited v1 JSON-RPC messages `docs/acp.md` records,
+# because its job is to emit the *pathological* lines a real agent library
+# would refuse to produce -- an oversized line, a malformed line, a batch --
+# and because running the SDK's server here would look like interoperability
+# evidence, which this chunk does not have and must not imply.
+[dependencies]
+serde_json = "1.0"
+tokio = { version = "1.48", features = [
+    "io-std",
+    "io-util",
+    "macros",
+    "process",
+    "rt",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }
+
+# The supervisor's end-to-end tests live here, because only the crate that
+# defines the fixture binary gets `CARGO_BIN_EXE_*`.  `tunnel-mcp-fixture`
+# holds `tunnel-mcp-export`'s tests the same way.
+[dev-dependencies]
+tempfile = "3.21"
+tunnel-acp = { path = "../tunnel-acp" }
+tunnel-acp-export = { path = "../tunnel-acp-export" }
+
+[target.'cfg(unix)'.dependencies]
+# `setsid` through a maintained safe wrapper, so the fixture that deliberately
+# escapes its process group still keeps `forbid(unsafe_code)`.
+rustix = { version = "1.1", default-features = false, features = ["process", "std"] }
+
+[lints]
+workspace = true

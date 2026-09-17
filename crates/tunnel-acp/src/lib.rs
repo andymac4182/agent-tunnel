@@ -5,15 +5,18 @@
 //! **What this crate is.** One `http-forward/1` [`Profile`] — routes, method
 //! set and per-direction header allowlists — plus the buffer-before-dispatch
 //! validation of a single ACP JSON-RPC message, plus the pinned-artifact
-//! assertions in [`pin`].  It is pure: no sockets, no child process, no Axum,
-//! no clock.
+//! assertions in [`pin`], plus (chunk 2) the pure connection and session
+//! [`lifecycle`].  It is pure: no sockets, no child process, no Axum, **no
+//! clock** — [`lifecycle`] takes deadline observations from its caller rather
+//! than reading one.
 //!
 //! **What this crate is not.** It is not evidence of interoperability with any
 //! ACP client.  A profile table that passes its own tests says only that the
 //! table is the one that was pinned.  Nothing here has spoken to an agent, a
 //! relay or a device, and compiling against the official SDK is not the same
-//! as running against it.  The HTTP handler, SSE streams, connection and
-//! session state, the child process and the tunnel are chunks 2 to 5.
+//! as running against it.  The HTTP handler, SSE streams, sessions over the
+//! wire and the tunnel are chunks 3 to 5; the supervised child process is
+//! `tunnel-acp-export`.
 //!
 //! **The codec is not here either.** `http-forward/1` is implemented in
 //! `tunnel-http-forward` and is already verified; this crate only instantiates
@@ -40,6 +43,7 @@
 //! are recorded in `docs/sources.md` and `docs/acp.md`.
 
 pub mod json;
+pub mod lifecycle;
 pub mod message;
 pub mod pin;
 
