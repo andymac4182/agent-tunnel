@@ -1198,7 +1198,14 @@ C3_CASES: list[tuple[str, list[Edit], bool]] = [
     ),
     (
         "an expired session's window stays closed",
-        [(BRIDGE, "            target.close();", "")],
+        [
+            (
+                BRIDGE,
+                """            // silently reopens.
+            target.close();""",
+                "            // silently reopens.",
+            )
+        ],
         False,
     ),
     # ------------------------------------------------------------- readiness
