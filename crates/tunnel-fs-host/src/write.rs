@@ -76,9 +76,13 @@ fn mode_of(mode: u32) -> Result<Mode, FsError> {
     if mode & !MODE_BITS_ALLOWED != 0 {
         return Err(FsError::refused(FsErrorCode::Einval));
     }
-    // The host's raw mode word is `u16` on Apple and `u32` on Linux, so the
-    // conversion is a fallible one written once rather than a cast per host.
-    // It cannot fail: the check above bounds `mode` at `0o777`.
+    // The host's raw mode word is `u16` on Apple and `u32` on Linux, so this
+    // is a narrowing on one host and the identity on the other — which is
+    // exactly what the `allow` is for, and why a cast is the wrong fix: `as`
+    // compiles on both and would silently truncate if the bound above ever
+    // moved, where the fallible conversion cannot. It cannot fail today: the
+    // check above bounds `mode` at `0o777`.
+    #[allow(clippy::useless_conversion)]
     let raw = mode
         .try_into()
         .map_err(|_| FsError::refused(FsErrorCode::Einval))?;
