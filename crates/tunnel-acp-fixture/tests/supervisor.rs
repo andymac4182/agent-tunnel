@@ -117,6 +117,46 @@ async fn wait_gone(pid: &str) -> bool {
     false
 }
 
+/// `(pgid, state)` from the process table, or `None` if the pid is gone.
+///
+/// The state matters because `kill -0` succeeds on a **zombie**: a descendant
+/// that something did kill but that nobody has reaped yet would read as
+/// "survived" and pass a survival assertion for entirely the wrong reason.
+fn process_row(pid: &str) -> Option<(String, String)> {
+    let output = std::process::Command::new("/bin/ps")
+        .args(["-o", "pgid=,stat=", "-p", pid])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let line = text.trim();
+    if line.is_empty() {
+        return None;
+    }
+    let mut fields = line.split_whitespace();
+    let pgid = fields.next()?.to_owned();
+    let state = fields.next().unwrap_or("").to_owned();
+    Some((pgid, state))
+}
+
+/// Kills a pid when it goes out of scope, however the test left — including
+/// through a panic in an `expect` several lines above the cleanup.
+///
+/// The M8-C07 review found a leaked 300-second descendant that came from
+/// exactly that: an assertion sitting above the `kill -9`.
+struct PidGuard(String);
+
+impl Drop for PidGuard {
+    fn drop(&mut self) {
+        if self.0.is_empty() {
+            return;
+        }
+        let _ = std::process::Command::new("/bin/kill")
+            .args(["-9", &self.0])
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+}
+
 async fn next_event(events: &mut mpsc::Receiver<AgentEvent>) -> AgentEvent {
     within(events.recv()).await.expect("an agent event")
 }
@@ -286,6 +326,14 @@ async fn child_output_ends_with(directive: &str, message_limit: u64) -> (ChildEn
                     diagnostics.group_kills >= 1,
                     "every end of life signals the process group"
                 );
+                // The supervisor *killed* it, rather than the child happening
+                // to exit on its own when the writer dropped stdin. Without
+                // this the group-kill counter alone would not distinguish the
+                // two, and a refusal that never killed anything would pass.
+                assert_eq!(
+                    diagnostics.killed, 1,
+                    "the refusal cancelled the child, it did not wait for EOF"
+                );
                 assert_eq!(supervisor.lifecycle(), ChildLifecycle::Failed);
                 return (end, diagnostics.invalid_output);
             }
@@ -327,7 +375,12 @@ async fn a_batch_line_from_the_child_is_refused_for_being_a_batch() {
             assert_eq!(end, ChildEnd::InvalidLine(AcpRule::BatchNotSupported));
             assert_eq!(AcpRule::BatchNotSupported.status(), 501);
             within(supervisor.wait_exited()).await;
-            assert_eq!(supervisor.diagnostics().batch_output, 1);
+            let diagnostics = supervisor.diagnostics();
+            assert_eq!(diagnostics.batch_output, 1);
+            assert_eq!(
+                diagnostics.killed, 1,
+                "the batch cancelled the child, it did not wait for EOF"
+            );
             return;
         }
     }
@@ -350,10 +403,22 @@ async fn a_stderr_flood_is_drained_and_counted_without_blocking_child_exit() {
     let stop = within(ticket.stop_reason()).await.expect("turn completed");
     assert_eq!(stop, "end_turn");
 
-    let diagnostics = supervisor.diagnostics();
+    // `write_all` returns once the pipe absorbs the tail, so some of the flood
+    // can still be unread when the completion arrives. Poll rather than
+    // sampling once: a single sample would produce a **false red**, which is
+    // the worse kind of flake in a suite whose whole point is that a green
+    // result means something.
+    let mut diagnostics = supervisor.diagnostics();
+    for _ in 0..500 {
+        if diagnostics.stderr_bytes >= FLOOD {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        diagnostics = supervisor.diagnostics();
+    }
     assert_eq!(
         diagnostics.stderr_bytes, FLOOD,
-        "every byte was drained and counted"
+        "every byte was drained and counted, and not one more"
     );
     assert_eq!(diagnostics.stderr_over_cap, 1, "the sink reported its cap");
 
@@ -432,6 +497,11 @@ async fn the_agent_callback_bound_is_exact_at_sixteen_against_a_real_child() {
     assert_eq!(LIMIT, 16, "docs/acp.md's bounds table");
     assert_eq!(refused, vec![LifecycleRule::PendingLimit]);
     assert_eq!(
+        supervisor.pending(Direction::AgentToHost),
+        LIMIT,
+        "the table is full at the bound, not merely refusing"
+    );
+    assert_eq!(
         supervisor.pending(Direction::HostToAgent),
         1,
         "the host direction has its own budget: only the prompt is outstanding"
@@ -453,19 +523,99 @@ async fn a_wrapper_grandchild_dies_with_the_process_group() {
     within(ticket.stop_reason()).await.expect("turn completed");
 
     let pid = read_pid(&workspace.path().join("grandchild.pid")).await;
+    // The guard kills it however this test leaves, including through a panic
+    // in an assertion below.
+    let _guard = PidGuard(pid.clone());
     assert!(!pid.is_empty(), "the wrapper started a grandchild");
     assert!(alive(&pid), "the grandchild is running before the kill");
 
     supervisor.drain().await;
     // The process table, not the parent's belief.
-    let gone = wait_gone(&pid).await;
-    if !gone {
-        let _ = std::process::Command::new("/bin/kill")
-            .args(["-9", &pid])
-            .status();
-    }
-    assert!(gone, "grandchild {pid} outlived its process group");
+    assert!(
+        wait_gone(&pid).await,
+        "grandchild {pid} outlived its process group"
+    );
     assert!(supervisor.diagnostics().group_kills >= 1);
+}
+
+/// **The end of life that runs none of the supervisor's kill path.**
+///
+/// The child exits by itself: nothing cancels the kill token, nothing calls
+/// `start_kill`, and only the post-wait group signal is left to reach the
+/// grandchild. The M8-C07 review found that `ChildEnd::Closed` was never
+/// exercised end to end, and that the guard-deletion case for the group kill
+/// reddened on a **counter** rather than on a surviving process.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_grandchild_dies_when_the_child_exits_by_itself() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let script = wrapper_script(workspace.path());
+    let mut config =
+        SupervisorConfig::new(child_config(workspace.path(), &script, &["agent"]), scope());
+    config.child.command = script;
+    let (supervisor, mut events, session) = ready(config).await;
+    let pid = read_pid(&workspace.path().join("grandchild.pid")).await;
+    let _guard = PidGuard(pid.clone());
+    assert!(!pid.is_empty(), "the wrapper started a grandchild");
+    assert!(alive(&pid), "the grandchild is running before the exit");
+
+    let _ticket = supervisor.prompt(&session, "exit:0").expect("prompt");
+    loop {
+        if let AgentEvent::Ended(end) = next_event(&mut events).await {
+            assert_eq!(end, ChildEnd::Closed, "the child ended by itself");
+            break;
+        }
+    }
+    within(supervisor.wait_exited()).await;
+    assert_eq!(
+        supervisor.diagnostics().killed,
+        0,
+        "nothing cancelled the child: this is the natural-exit path"
+    );
+    assert!(
+        wait_gone(&pid).await,
+        "grandchild {pid} outlived a child that exited by itself"
+    );
+    assert!(supervisor.diagnostics().group_kills >= 1);
+}
+
+/// **A supervisor dropped without `drain()` still ends its child's group.**
+///
+/// This is what connection loss looks like from the device side, and the
+/// M8-C07 review found it leaking the agent's whole process tree: the deadline
+/// ticker looped forever holding an `Arc<ChildHandle>`, so the handle's `Drop`
+/// — which is where cleanup lives — never ran.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_supervisor_dropped_without_draining_still_kills_the_group() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let script = wrapper_script(workspace.path());
+    let mut config =
+        SupervisorConfig::new(child_config(workspace.path(), &script, &["agent"]), scope());
+    config.child.command = script;
+    let child_pid;
+    let pid;
+    {
+        let (supervisor, events, session) = ready(config).await;
+        let ticket = supervisor.prompt(&session, "ok").expect("prompt");
+        within(ticket.stop_reason()).await.expect("turn completed");
+        child_pid = supervisor.pid().expect("a child pid");
+        pid = read_pid(&workspace.path().join("grandchild.pid")).await;
+        assert!(!pid.is_empty(), "the wrapper started a grandchild");
+        assert!(alive(&pid), "the grandchild is running before the drop");
+        // No `drain()`, no `kill()`, no `wait_exited()`: the owner simply goes
+        // away, exactly as it would if its connection were lost.
+        drop(events);
+        drop(supervisor);
+    }
+    let _guard = PidGuard(pid.clone());
+    let leader = child_pid.to_string();
+    assert!(
+        wait_gone(&leader).await,
+        "the child leader {leader} outlived its supervisor"
+    );
+    assert!(
+        wait_gone(&pid).await,
+        "grandchild {pid} outlived a supervisor that was dropped rather than drained"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -477,7 +627,11 @@ async fn a_grandchild_dies_when_the_child_is_killed_for_bad_output() {
     config.child.command = script;
     let (supervisor, mut events, session) = ready(config).await;
     let pid = read_pid(&workspace.path().join("grandchild.pid")).await;
+    let _guard = PidGuard(pid.clone());
     assert!(!pid.is_empty(), "the wrapper started a grandchild");
+    // The control the first wrapper test has: without it this passes
+    // vacuously if `sleep` had already died for some unrelated reason.
+    assert!(alive(&pid), "the grandchild is running before the kill");
 
     let _ticket = supervisor.prompt(&session, "malformed").expect("prompt");
     loop {
@@ -487,13 +641,102 @@ async fn a_grandchild_dies_when_the_child_is_killed_for_bad_output() {
         }
     }
     within(supervisor.wait_exited()).await;
-    let gone = wait_gone(&pid).await;
-    if !gone {
-        let _ = std::process::Command::new("/bin/kill")
-            .args(["-9", &pid])
-            .status();
+    assert!(
+        wait_gone(&pid).await,
+        "grandchild {pid} outlived a killed child"
+    );
+}
+
+/// **Every supervisor background task ends with its child.**
+///
+/// This is the mechanism behind the other cleanup tests rather than a
+/// tidiness check: each background task holds an `Arc<ChildHandle>`, and one
+/// that loops forever keeps the handle's `Drop` — where the synchronous
+/// process-group kill lives — from ever running. The M8-C07 review found the
+/// deadline ticker doing exactly that, and there was nothing a test could read
+/// to notice, because the child still died by another route.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_background_task_ends_with_the_child() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let (supervisor, mut events, session) = ready(config(workspace.path())).await;
+    let ticket = supervisor.prompt(&session, "ok").expect("prompt");
+    within(ticket.stop_reason()).await.expect("turn completed");
+    assert!(
+        supervisor.diagnostics().background_tasks > 0,
+        "the reader and the deadline ticker are running"
+    );
+
+    supervisor.drain().await;
+    // Drain the event channel so the reader's final send cannot be what holds
+    // it open; the claim is about the tasks, not about a blocked consumer.
+    while events.try_recv().is_ok() {}
+
+    let mut alive_tasks = supervisor.diagnostics().background_tasks;
+    for _ in 0..500 {
+        if alive_tasks == 0 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        while events.try_recv().is_ok() {}
+        alive_tasks = supervisor.diagnostics().background_tasks;
     }
-    assert!(gone, "grandchild {pid} outlived a killed child");
+    panic!("{alive_tasks} supervisor task(s) outlived the child they supervise");
+}
+
+/// **A runtime torn down mid-flight still kills the group.**
+///
+/// This is the shape the M8-C07 review actually caught: a panicking
+/// `#[tokio::test]`. When a runtime is dropped, its tasks are **dropped, not
+/// run**, so nothing in this crate's async code executes — `kill_on_drop`
+/// reaps the leader and the group would be left behind. Only a synchronous
+/// `Drop` can act here, which is why the group signal lives in
+/// `ChildHandle::drop` and not only in the supervisor task.
+///
+/// Deliberately not a `#[tokio::test]`: the point is to own the runtime and
+/// destroy it.
+#[test]
+fn a_runtime_torn_down_without_draining_still_kills_the_group() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let script = wrapper_script(workspace.path());
+    let mut config =
+        SupervisorConfig::new(child_config(workspace.path(), &script, &["agent"]), scope());
+    config.child.command = script;
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let pid = runtime.block_on(async move {
+        // Everything is moved into the runtime and never handed back, so the
+        // only thing that can end the child is the teardown below.
+        let (supervisor, events, session) = ready(config).await;
+        let ticket = supervisor.prompt(&session, "ok").expect("prompt");
+        within(ticket.stop_reason()).await.expect("turn completed");
+        let pid = read_pid(&workspace.path().join("grandchild.pid")).await;
+        // Park the supervisor inside the runtime, so nothing outside it can
+        // end the child and the teardown is the only thing left.
+        tokio::spawn(async move {
+            let _live = (supervisor, events);
+            std::future::pending::<()>().await;
+        });
+        pid
+    });
+    let _guard = PidGuard(pid.clone());
+    assert!(!pid.is_empty(), "the wrapper started a grandchild");
+    assert!(alive(&pid), "the grandchild is running before the teardown");
+
+    // No drain, no kill, no Drop on the Supervisor at all: just the runtime
+    // going away, which is what a panicking test does.
+    drop(runtime);
+
+    for _ in 0..500 {
+        if !alive(&pid) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("grandchild {pid} outlived the runtime that supervised it");
 }
 
 /// **The escaping descendant, measured rather than assumed.**
@@ -508,10 +751,19 @@ async fn a_grandchild_dies_when_the_child_is_killed_for_bad_output() {
 /// If `setsid` did not succeed, the test says so and makes no claim either
 /// way, because an escape that never happened proves nothing about one that
 /// does.
+///
+/// It asserts the **mechanism**, not only the outcome. `kill -0` succeeds on a
+/// zombie, so a descendant that a future containment really did kill but that
+/// nobody had reaped yet would read as "survived" and keep this test green for
+/// the wrong reason. The process table must show it in a different process
+/// group from the child, and in a state that is not `Z`. 500 ms is generous in
+/// the right direction: `SIGKILL` to a group member takes effect immediately,
+/// so a slow machine makes survival harder to observe, not easier.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_descendant_that_calls_setsid_survives_the_process_group_kill() {
     let workspace = tempfile::tempdir().expect("workspace");
     let (supervisor, _events, session) = ready(config(workspace.path())).await;
+    let child_group = supervisor.pid().expect("a child pid").to_string();
     let pid_path = workspace.path().join("detached.pid");
     let ticket = supervisor
         .prompt(&session, "detach:detached.pid")
@@ -519,34 +771,39 @@ async fn a_descendant_that_calls_setsid_survives_the_process_group_kill() {
     within(ticket.stop_reason()).await.expect("turn completed");
 
     let pid = read_pid(&pid_path).await;
+    // Registered before any assertion, so nothing below can leak it.
+    let _guard = PidGuard(pid.clone());
     assert!(!pid.is_empty(), "the agent started a descendant");
     let escaped = std::fs::read_to_string(marker_file(&pid_path)).unwrap_or_default();
 
     supervisor.drain().await;
-    assert!(supervisor.diagnostics().group_kills >= 1);
+    let group_kills = supervisor.diagnostics().group_kills;
     // Give the group kill every chance to reach it.
     tokio::time::sleep(Duration::from_millis(500)).await;
-    let survived = alive(&pid);
+    let row = process_row(&pid);
     eprintln!(
-        "MEASURED escaping descendant: pid {pid}, setsid marker {escaped:?}, group kills {}, \
-         alive 500 ms after the group SIGKILL: {survived}",
-        supervisor.diagnostics().group_kills
+        "MEASURED escaping descendant: pid {pid}, setsid marker {escaped:?}, \
+         child process group {child_group}, group kills {group_kills}, \
+         process table 500 ms after the group SIGKILL: {row:?}"
     );
 
-    // Clean up before any assertion, so a red run leaks nothing.
-    let _ = std::process::Command::new("/bin/kill")
-        .args(["-9", &pid])
-        .status();
-
+    assert!(group_kills >= 1, "a group signal was actually sent");
     assert_eq!(
         escaped, "ok",
         "the fixture must actually have left the group for this measurement to mean anything"
     );
-    assert!(
-        survived,
-        "MEASUREMENT: the escaping descendant {pid} was expected to survive the group kill \
+    let (pgid, state) = row.expect(
+        "MEASUREMENT: the escaping descendant was expected to survive the group kill \
          (M3-09, inherited). If it did not, process-tree containment changed and this \
-         chunk's recorded limitation must be revisited rather than quietly relaxed."
+         chunk's recorded limitation must be revisited rather than quietly relaxed.",
+    );
+    assert!(
+        !state.starts_with('Z'),
+        "the descendant is alive, not an unreaped zombie: state {state}"
+    );
+    assert_ne!(
+        pgid, child_group,
+        "it survived *because* it left the child's process group, not by outrunning the signal"
     );
 }
 

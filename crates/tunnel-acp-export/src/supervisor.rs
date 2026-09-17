@@ -207,6 +207,10 @@ pub struct Diagnostics {
     pub stderr_bytes: u64,
     pub stderr_over_cap: u64,
     pub group_kills: u64,
+    /// Supervisor background tasks still alive. Must reach 0 once the child
+    /// has been reaped: a task that outlives its child disables the
+    /// synchronous process-group cleanup.
+    pub background_tasks: u64,
     pub resolutions: u64,
     pub permission_expirations: u64,
 }
@@ -265,12 +269,15 @@ impl Supervisor {
         };
         tokio::spawn(read_agent(
             events,
-            Arc::clone(&shared),
-            Arc::clone(&child),
-            to_host.clone(),
-            config.scope.clone(),
-            supervisor.started,
-            supervisor.permission_timeout_ms,
+            ReaderContext {
+                shared: Arc::clone(&shared),
+                child: Arc::clone(&child),
+                to_host: to_host.clone(),
+                scope: config.scope.clone(),
+                started: supervisor.started,
+                permission_timeout_ms: supervisor.permission_timeout_ms,
+                counters: Arc::clone(&counters),
+            },
         ));
         tokio::spawn(observe_deadlines(
             Arc::clone(&shared),
@@ -278,6 +285,7 @@ impl Supervisor {
             to_host,
             config.deadline_tick,
             supervisor.started,
+            Arc::clone(&counters),
         ));
         Ok((supervisor, from_agent))
     }
@@ -437,6 +445,13 @@ impl Supervisor {
 
     /// Stop admission, cancel outstanding permissions, and end the child's
     /// life — which signals its process group.
+    ///
+    /// **This is not a graceful shutdown.** It does not close stdin, and it
+    /// does not give the child a grace period to finish and exit by itself;
+    /// `docs/acp.md`'s bounded grace period is not implemented. It cancels and
+    /// kills. The [`ChildLifecycle::Stopped`] that results therefore records
+    /// *who ended the child* — the supervisor, deliberately — and not *how the
+    /// process died.
     pub async fn drain(&self) {
         let now = self.now_ms();
         self.with(|shared| {
@@ -450,8 +465,8 @@ impl Supervisor {
         self.child.kill();
         self.child.wait_exited().await;
         self.with(|shared| {
-            // Draining then reaped is the orderly end; the transition table
-            // decides, not this line.
+            // Draining then reaped is what reaches `Stopped`; the transition
+            // table decides, not this line.
             let _ = shared.connection.advance(LifecycleEvent::Reaped);
         });
     }
@@ -481,6 +496,7 @@ impl Supervisor {
             stderr_bytes: self.counters.stderr_bytes.load(Ordering::Relaxed),
             stderr_over_cap: self.counters.stderr_over_cap.load(Ordering::Relaxed),
             group_kills: self.counters.group_kills.load(Ordering::Relaxed),
+            background_tasks: self.counters.background_tasks.load(Ordering::Relaxed),
             resolutions,
             permission_expirations,
         }
@@ -561,6 +577,43 @@ impl Supervisor {
     }
 }
 
+/// Counts one live supervisor background task for as long as it exists.
+///
+/// The count is what makes "this task ended with its child" observable. A task
+/// that loops forever holds an `Arc<ChildHandle>` and silently disables the
+/// synchronous cleanup in `ChildHandle::drop`; before the M8-C07 review there
+/// was nothing a test could read to notice.
+struct TaskGuard(Arc<ChildCounters>);
+
+impl TaskGuard {
+    fn new(counters: &Arc<ChildCounters>) -> Self {
+        counters.background_tasks.fetch_add(1, Ordering::Relaxed);
+        Self(Arc::clone(counters))
+    }
+}
+
+impl Drop for TaskGuard {
+    fn drop(&mut self) {
+        self.0.background_tasks.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+impl Drop for Supervisor {
+    /// A supervisor that goes away ends its child, whether or not anyone
+    /// called [`Supervisor::drain`].
+    ///
+    /// Connection loss in a later chunk is exactly "the owner went away
+    /// without draining", so a cleanup path that only ran on the happy path
+    /// would leak the agent's whole process tree at the moment it matters
+    /// most. Cancelling here makes the supervisor task send the group signal
+    /// while the leader is still unreaped; if the runtime is being torn down
+    /// and that task never runs, [`crate::child::ChildHandle::drop`] sends it
+    /// synchronously instead.
+    fn drop(&mut self) {
+        self.child.kill();
+    }
+}
+
 fn id_value(id: &RequestId) -> Value {
     match id {
         RequestId::Text(text) => Value::String(text.clone()),
@@ -593,15 +646,29 @@ fn permission_response(id: &RequestId, outcome: &PermissionOutcome) -> Vec<u8> {
 
 /// The separate reader: it keeps handling agent callbacks while a prompt is
 /// pending, because it is not the task awaiting the prompt.
-async fn read_agent(
-    mut events: mpsc::Receiver<ChildEvent>,
+/// Everything the reader task needs. A struct rather than eight arguments,
+/// which is also what `clippy::too_many_arguments` asks for.
+struct ReaderContext {
     shared: Arc<Mutex<Shared>>,
     child: Arc<ChildHandle>,
     to_host: mpsc::Sender<AgentEvent>,
     scope: ConnectionScope,
     started: Instant,
     permission_timeout_ms: u64,
-) {
+    counters: Arc<ChildCounters>,
+}
+
+async fn read_agent(mut events: mpsc::Receiver<ChildEvent>, context: ReaderContext) {
+    let ReaderContext {
+        shared,
+        child,
+        to_host,
+        scope,
+        started,
+        permission_timeout_ms,
+        counters,
+    } = context;
+    let _alive = TaskGuard::new(&counters);
     let host_scope = scope.id_scope(Direction::HostToAgent);
     let agent_scope = scope.id_scope(Direction::AgentToHost);
     while let Some(event) = events.recv().await {
@@ -715,11 +782,23 @@ async fn observe_deadlines(
     to_host: mpsc::Sender<AgentEvent>,
     tick: Duration,
     started: Instant,
+    counters: Arc<ChildCounters>,
 ) {
+    let _alive = TaskGuard::new(&counters);
     let mut ticker = tokio::time::interval(tick);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        ticker.tick().await;
+        // **This task must end when the child does.** It holds an
+        // `Arc<ChildHandle>`, and a ticker that loops forever keeps that
+        // strong count above zero, so `ChildHandle::drop` — which is where the
+        // synchronous process-group kill lives — would never run for a
+        // supervisor that was dropped rather than drained. That was the
+        // M8-C07 review's first finding, and it left real `sleep` grandchildren
+        // behind with their leaders already reaped.
+        tokio::select! {
+            () = child.wait_exited() => return,
+            _ = ticker.tick() => {}
+        }
         let now = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let expired = {
             let mut guard = shared.lock().unwrap_or_else(PoisonError::into_inner);

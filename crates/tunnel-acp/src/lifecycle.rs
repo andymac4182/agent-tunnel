@@ -197,7 +197,12 @@ pub enum ChildLifecycle {
     Ready,
     /// Admission has stopped; outstanding work is being resolved.
     Draining,
-    /// The process is gone and was reaped after an orderly end.
+    /// Admission had already stopped when the process was reaped.
+    ///
+    /// This records **who ended the child** — the supervisor, deliberately,
+    /// having drained first — not *how the process died*. There is no graceful
+    /// stdin close or grace period behind it; `docs/acp.md`'s bounded grace
+    /// period is not implemented. Do not read `Stopped` as "exited cleanly".
     Stopped,
     /// The process is gone after startup failure, a protocol violation or a
     /// crash.
@@ -497,6 +502,13 @@ impl CallbackTable {
             .pending
             .iter()
             .filter(|(_, entry)| {
+                // The kind check is **deliberately redundant** with `register`
+                // only ever giving a permission a deadline. "Only a permission
+                // expires here" is the rule, and it is worth stating on both
+                // sides: a later kind that acquires a deadline for some other
+                // purpose must not silently start being cancelled as though a
+                // host had failed to answer it. The guard-deletion case
+                // defeats both halves together for that reason.
                 entry.kind == PendingKind::Permission
                     && entry.deadline.is_some_and(|deadline| now > deadline)
             })

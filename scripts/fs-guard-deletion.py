@@ -70,6 +70,9 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from guard_outcomes import unusable as unusable_outcomes  # noqa: E402
+
 REPO = Path(__file__).resolve().parent.parent
 CRATE = REPO / "crates" / "tunnel-fs-host"
 RESOLVER = CRATE / "src" / "resolver.rs"
@@ -2703,15 +2706,16 @@ def main() -> int:
         red = sum(1 for row in rows if row[2] == "RED")
         print(f"\n{suite.name}: {red} of {len(rows)} deletions turned a test red")
 
-    # Every "not evidence" outcome must reach this list, or a suite whose cases
-    # all failed to build would exit 0 and read as a clean run.  The node
-    # runner's two spellings are here for that reason: an earlier version left
-    # them out and a deliberately broken case exited 0.
-    unusable = [
-        f"[{suite_name}] {name}"
-        for suite_name, name, outcome, _ in results
-        if outcome.startswith(("BUILD", "COULD", "MODULE", "NO TEST"))
-    ]
+    # Shared with scripts/acp-guard-deletion.py, and an allow list rather than
+    # the deny list of prefixes this used to carry (task row M8-C08).  That
+    # list -- BUILD, COULD, MODULE, NO TEST -- failed open: "still green",
+    # which this file returns in two places and which means the guard was
+    # defeated and NOTHING went red, matched none of them, so a run in which
+    # every guard stayed green printed "0 of N" and exited 0.  Now anything
+    # that is not RED or REFUSED BY COMPILER fails closed and is named.
+    unusable = unusable_outcomes(
+        (suite_name, name, outcome) for suite_name, name, outcome, _ in results
+    )
     if unusable:
         print("\nno usable result for: " + ", ".join(unusable))
         return 1

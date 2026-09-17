@@ -29,11 +29,15 @@ removed**:
 
 A **third refusal**, added by chunk 2: a run that *timed out* returns
 `NOT EVIDENCE (timed out)`, not `RED (hung)`.  A timed-out run names no failing
-test, which is the same observation refusal 2's sibling makes below; and the
-old spelling was counted as neither red (the tally matches the exact string
-`RED`) nor unusable (that filter is matched by prefix), so a suite whose every
-case hung printed a 0-of-N summary and still exited 0.  Recorded as M8-C06.
-Any further status added here must be added to the `unusable` filter as well.
+test, which is the same observation refusal 2's sibling makes below.  Recorded
+as M8-C06.
+
+The classification of those outcomes is **not in this file**.  It lives in
+`scripts/guard_outcomes.py`, shared with `scripts/fs-guard-deletion.py`, and it
+is an **allow list**: `RED` and `REFUSED BY COMPILER` are usable and everything
+else fails closed.  The deny-list-of-prefixes each harness used to carry failed
+open, which is how `RED (hung)` and `still green` both went uncounted (M8-C08).
+A new outcome spelling added here therefore needs no change there.
 
 A fourth outcome exists here that the filesystem suite has no use for.  One
 guard — `unstable_protocol_v2` staying off — is enforced by the compiler
@@ -73,6 +77,9 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from guard_outcomes import unusable as unusable_outcomes  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
 CRATE = REPO / "crates" / "tunnel-acp"
@@ -862,6 +869,53 @@ C2_CASES: list[tuple[str, list[Edit], bool]] = [
         False,
     ),
     # ----------------------------------------------------------- the stderr sink
+    # ------------------------------------------------------------- cleanup
+    #
+    # Added after the M8-C07 review found three processes alive at the end of a
+    # guard run.  Each of these defeats one of the three places cleanup has to
+    # happen, and each is witnessed by a **surviving process in the process
+    # table**, not by a counter.
+    (
+        "a supervisor that is dropped rather than drained ends its child",
+        [
+            (
+                SUPERVISOR,
+                """    fn drop(&mut self) {
+        self.child.kill();
+    }""",
+                "    fn drop(&mut self) {}",
+            )
+        ],
+        False,
+    ),
+    (
+        "the child handle kills the group synchronously, not only from a task",
+        [
+            (
+                CHILD,
+                """        self.kill.cancel();
+        if !*self.exited.borrow() {
+            let _ = kill_group(self.pid);
+        }""",
+                "        self.kill.cancel();",
+            )
+        ],
+        False,
+    ),
+    (
+        "the deadline ticker ends when the child does",
+        [
+            (
+                SUPERVISOR,
+                """        tokio::select! {
+            () = child.wait_exited() => return,
+            _ = ticker.tick() => {}
+        }""",
+                "        ticker.tick().await;",
+            )
+        ],
+        False,
+    ),
     (
         "a stderr flood is counted",
         [
@@ -1064,20 +1118,14 @@ def main() -> int:
                 "compiler and are reported separately, never counted as a red test"
             )
 
-    # Every "not evidence" outcome must reach this list, or a suite whose cases
-    # all failed to build would exit 0 and read as a clean run.
-    unusable = [
-        f"[{suite_name}] {name}"
-        for suite_name, name, outcome, _ in results
-        # "NOT" covers NOT EVIDENCE (no named failure) and NOT EVIDENCE (timed
-        # out).  This filter is matched by prefix, so every new unusable
-        # spelling has to be added here as well as returned -- a status the
-        # filter does not know about is silently absent from the tally and the
-        # run still exits 0.  That is not hypothetical: "RED (hung)" was such a
-        # spelling until M8 chunk 2 (defect M8-C06), and it is the third time
-        # this filter has swallowed a status in this repository's history.
-        if outcome.startswith(("BUILD", "COULD", "EXPECTED", "NOT"))
-    ]
+    # Shared, and an allow list rather than a deny list: see
+    # scripts/guard_outcomes.py and task row M8-C08.  Anything that is not RED
+    # or REFUSED BY COMPILER fails closed and is named, including "still green"
+    # -- a guard that was defeated with nothing going red is not load-bearing,
+    # and a run of nothing but those must not exit 0.
+    unusable = unusable_outcomes(
+        (suite_name, name, outcome) for suite_name, name, outcome, _ in results
+    )
     if unusable:
         print("\nno usable result for: " + ", ".join(unusable))
         return 1

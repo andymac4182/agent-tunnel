@@ -26,6 +26,7 @@
 //! | `batch` | one stdout line that is a JSON-RPC **array** (M8-C02) |
 //! | `stderr-flood:<bytes>` | write `<bytes>` to stderr, then finish |
 //! | `detach:<file>` | start a descendant that calls `setsid` and survives its process group, then finish |
+//! | `exit:<code>` | finish the turn, then exit by itself — the one end of life that runs none of the supervisor's kill path |
 //! | `silent` | never answer the prompt |
 //!
 //! The echoed permission outcome is what makes a timeout observable **on the
@@ -306,6 +307,19 @@ async fn run_directive(
             let started = spawn_detached(Path::new(&file));
             update(&out, &session, &format!("detached:{started}")).await;
             finish(&out, &id, "end_turn").await;
+        }
+        // The child ending by itself, which is the one end of life that runs
+        // none of the supervisor's kill path: no cancellation, no `start_kill`,
+        // only the post-wait group signal. The M8-C07 review found that half
+        // untested end to end.
+        "exit" => {
+            let code = argument
+                .and_then(|value| value.parse::<i32>().ok())
+                .unwrap_or(0);
+            finish(&out, &id, "end_turn").await;
+            // Let the writer task flush the line before the process goes.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            std::process::exit(code);
         }
         "silent" => {}
         _ => {

@@ -7,3 +7,4 @@
 *.key
 /work/
 /.claude/worktrees/
+__pycache__/
