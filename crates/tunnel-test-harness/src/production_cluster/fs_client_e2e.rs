@@ -463,8 +463,7 @@ pub fn validate_fs_client_e2e_evidence(evidence: &FsClientE2eEvidence) -> Result
             // asserted exactly, because either one drifting would be a client
             // inventing or losing a distinction the wire has.
             "a refused mutation is reported at the wire's floor and no lower",
-            evidence.read_only_device_outcomes
-                == ["failed", "failed", "failed", "not_started"],
+            evidence.read_only_device_outcomes == ["failed", "failed", "failed", "not_started"],
         ),
         (
             "the device applied nothing and wrote nothing under a read-only grant",
@@ -786,7 +785,10 @@ async fn run(
     .await;
     if scenario.is_err() {
         // Payload-free: identifiers, labels and counters only.
-        eprintln!("fs client device status: {:?}", client.status_snapshot().phase);
+        eprintln!(
+            "fs client device status: {:?}",
+            client.status_snapshot().phase
+        );
         eprintln!("fs client partial evidence: {evidence:?}");
     }
     let stop = timeout(CLEANUP_TIMEOUT, client.stop()).await;
@@ -906,7 +908,10 @@ async fn exercise(
     // client's own `allowInsecureLoopback` is exactly that harness and is never
     // passed by the driver.
     let endpoint = |service: Uuid| {
-        format!("https://127.0.0.1:{}/v1/devices/{device_id}/services/{service}/fs", owner_addr.port())
+        format!(
+            "https://127.0.0.1:{}/v1/devices/{device_id}/services/{service}/fs",
+            owner_addr.port()
+        )
     };
     let rw = fixture("client-rw")?;
     let ro = fixture("client-ro")?;
@@ -952,13 +957,13 @@ async fn exercise(
             "listing": ["source.bin", "copy.bin"],
         },
     });
-    evidence.endpoints_all_https = plan["endpoints"]
-        .as_object()
-        .is_some_and(|endpoints| {
-            endpoints
-                .values()
-                .all(|value| value.as_str().is_some_and(|url| url.starts_with("https://")))
-        });
+    evidence.endpoints_all_https = plan["endpoints"].as_object().is_some_and(|endpoints| {
+        endpoints.values().all(|value| {
+            value
+                .as_str()
+                .is_some_and(|url| url.starts_with("https://"))
+        })
+    });
 
     let work = tempfile::tempdir().map_err(HarnessError::Io)?;
     let plan_path = work.path().join("plan.json");
@@ -1018,9 +1023,7 @@ async fn exercise(
     loop {
         let line = timeout(DRIVER_LINE_WAIT, lines.next_line())
             .await
-            .map_err(|_| {
-                HarnessError::Timeout("the node driver stopped reporting".into())
-            })?
+            .map_err(|_| HarnessError::Timeout("the node driver stopped reporting".into()))?
             .map_err(HarnessError::Io)?;
         let Some(line) = line else {
             break;
@@ -1114,9 +1117,10 @@ async fn exercise(
             .enumerate()
             .all(|(index, byte)| *byte == chunk[index % UNKNOWN_CHUNK_BYTES]);
     let ledger = evidence.ledger_after;
-    evidence.ledger_identity_holds =
-        ledger.mutations_applied.saturating_sub(ledger.mutations_acknowledged)
-            == ledger.mutation_unknown;
+    evidence.ledger_identity_holds = ledger
+        .mutations_applied
+        .saturating_sub(ledger.mutations_acknowledged)
+        == ledger.mutation_unknown;
     evidence.unknown_host_matches_ledger = evidence.unknown_host_bytes == ledger.bytes_written;
     evidence.device_applied_beyond_client_knowledge = ledger
         .bytes_written
@@ -1128,8 +1132,7 @@ async fn exercise(
     evidence.read_only_device_refused = after
         .mutations_refused
         .saturating_sub(before.mutations_refused);
-    evidence.read_only_device_applied_anything =
-        after.mutations_applied > before.mutations_applied;
+    evidence.read_only_device_applied_anything = after.mutations_applied > before.mutations_applied;
     evidence.read_only_client_overstated = evidence
         .read_only_device_outcomes
         .iter()
