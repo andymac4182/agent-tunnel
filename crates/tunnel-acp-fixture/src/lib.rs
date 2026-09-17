@@ -28,6 +28,8 @@
 //! | `detach:<file>` | start a descendant that calls `setsid` and survives its process group, then finish |
 //! | `exit:<code>` | finish the turn, then exit by itself — the one end of life that runs none of the supervisor's kill path |
 //! | `silent` | never answer the prompt |
+//! | `updates:<n>` | emit `n` `session/update` chunks as fast as it can, then finish — enough of them fills a stream's bounded queue, so an unread subscriber stalls output credit |
+//! | `effect-crash:<name>` | append one line to the workspace's own side-effect ledger, flush it to disk, then **die without answering the prompt** |
 //!
 //! The echoed permission outcome is what makes a timeout observable **on the
 //! wire**: the supervisor's belief about what it sent is not evidence that the
@@ -63,6 +65,19 @@ pub const PERMISSION_OUTCOME_FILE: &str = "permission-outcome.txt";
 /// Written next to the pid file: `ok` when `setsid` succeeded, `err` when it
 /// did not. A test must not assume the escape happened.
 pub const SETSID_MARKER: &str = "setsid";
+
+/// The agent's own append-only record of the synthetic side effects it has
+/// performed, one name per line, in its workspace.
+///
+/// **This is the ledger a test must read after a fault, and the reason it
+/// exists is that the alternative is not evidence.** A harness counter that
+/// increments where the harness *believes* it dispatched proves only what the
+/// harness believed; it cannot distinguish "the effect happened once" from
+/// "the effect happened twice and one attempt was not recorded", which is the
+/// exact question a replay test asks. This file is written by the agent
+/// process, at the moment the effect happens, and survives the process dying
+/// immediately afterwards.
+pub const SIDE_EFFECT_LEDGER: &str = "side-effects.log";
 
 type Waiters = Arc<Mutex<HashMap<String, oneshot::Sender<Value>>>>;
 
@@ -321,11 +336,56 @@ async fn run_directive(
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             std::process::exit(code);
         }
+        // Enough updates to overrun a stream's bounded queue. A subscriber
+        // that took its queue but never reads the body then stalls output
+        // credit, which is the bound `docs/acp.md` puts at 30 seconds.
+        "updates" => {
+            let count = argument
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(64);
+            for index in 0..count {
+                update(&out, &session, &format!("chunk-{index}")).await;
+            }
+            finish(&out, &id, "end_turn").await;
+        }
+        // A synthetic side effect recorded on disk, then a crash before the
+        // turn can be answered. The consumer is left with a dispatched request
+        // and no result, which is `outcome_unknown`; the ledger is how a test
+        // learns the effect happened exactly once.
+        "effect-crash" => {
+            let name = argument.unwrap_or_else(|| "effect".to_owned());
+            record_side_effect(&name);
+            // `abort` rather than `exit`: no destructor runs, no buffered
+            // stdout is flushed, and the turn is never answered. That is the
+            // crash this directive is for, and it is why the ledger is
+            // flushed to disk *before* this line rather than at exit.
+            std::process::abort();
+        }
         "silent" => {}
         _ => {
             update(&out, &session, "synthetic listing").await;
             finish(&out, &id, "end_turn").await;
         }
+    }
+}
+
+/// Append one synthetic side effect to the workspace ledger and flush it.
+///
+/// Opened for append and `sync_all`ed before returning, so the record is on
+/// disk before the caller crashes. An effect that is not durable by the time
+/// the process dies would make an exactly-once claim unfalsifiable.
+fn record_side_effect(name: &str) {
+    use std::io::Write as _;
+
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(SIDE_EFFECT_LEDGER)
+    else {
+        return;
+    };
+    if writeln!(file, "{name}").is_ok() {
+        let _ = file.sync_all();
     }
 }
 

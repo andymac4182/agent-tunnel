@@ -3445,6 +3445,7 @@ dependencies = [
  "toml",
  "tunnel-http-bridge",
  "tunnel-http-forward",
+ "tunnel-protocol",
 ]
 
 [[package]]

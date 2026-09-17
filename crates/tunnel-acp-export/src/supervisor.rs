@@ -589,6 +589,48 @@ impl Supervisor {
         self.with(|shared| shared.open_sessions.iter().any(|open| open == session))
     }
 
+    /// Every session this connection has open.
+    #[must_use]
+    pub fn open_sessions(&self) -> Vec<String> {
+        self.with(|shared| shared.open_sessions.clone())
+    }
+
+    /// Resolve every outstanding permission on every open session as
+    /// **cancelled**, tell the agent on the wire, and report how many there
+    /// were.
+    ///
+    /// This is the "resolve pending permissions as cancelled" half of
+    /// `docs/acp.md`'s subscriber-loss policy.  [`Supervisor::drain`] cancels
+    /// them too, but discards the count and never tells the agent; the
+    /// termination path needs both, because "how many permissions were
+    /// cancelled" is the observation a test reads instead of trusting that
+    /// cancellation happened.
+    ///
+    /// A timeout and a lost subscriber therefore resolve a callback the same
+    /// way, which is the point: `docs/acp.md` says timeout and disconnect never
+    /// mean permission.
+    pub async fn cancel_all_permissions(&self) -> usize {
+        let now = self.now_ms();
+        let cancelled = self.with(|shared| {
+            let sessions: Vec<String> = shared.open_sessions.clone();
+            let mut all = Vec::new();
+            for session in sessions {
+                all.extend(shared.callbacks.cancel_session_permissions(&session, now));
+            }
+            all
+        });
+        for (_, id) in &cancelled {
+            // The agent learns on the wire, exactly as the deadline path and
+            // `session/cancel` do.  A supervisor's belief about what it
+            // resolved is not evidence that the agent was told.
+            let _ = self
+                .child
+                .send(&permission_response(id, &PermissionOutcome::Cancelled))
+                .await;
+        }
+        cancelled.len()
+    }
+
     /// Stop admission, cancel outstanding permissions, and end the child's
     /// life — which signals its process group.
     ///
