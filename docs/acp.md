@@ -1148,14 +1148,17 @@ product.
 
 ### Evidence
 
-`python3 scripts/acp-guard-deletion.py --suite m8c5`: **32 of 32** defeated
-guards turned a test red, no documented greens and no compiler refusals. The
-figure was **re-run at the final revision before being written down**, per
+`python3 scripts/acp-guard-deletion.py --suite m8c5`: **39 of 39** defeated
+guards turned a test red, no documented greens and no compiler refusals, and
+the suite was **run twice at the final revision** with the same figure, per
 M8-C12: every figure this harness produces is provisional until re-run, because
-a random red from an unstable test in the crates it runs leaks into it.
+a random red from an unstable test in the crates it runs leaks into it. Seven
+of the thirty-nine are new in review round 1, guarding rules that either did not
+exist or were not load-bearing when the first figure was recorded.
 
-**Two of those guards were not load-bearing when first written, and the suite
-said so.** The first run reported **30 of 32** with two `still green`:
+**Three of those guards were not load-bearing when first written, and the suite
+or the reviewer said so.** The first run reported **30 of 32** with two `still
+green`:
 defeating "three completed rotations are required" and "the window must finish
 inside one membership record" reddened nothing, because both fields are also
 quoted in the rotation disclosure, so the falsification test tripped the
@@ -1166,7 +1169,11 @@ the disclosure rule keeps its own separate test. A third run reported **31 of
 text had changed and its case still named the old one, which the harness
 refuses to count either way rather than reporting a false red. Both are
 recorded rather than quietly fixed: the allow-list failing closed (M8-C08) is
-what caught the first, and the ambiguity refusal the second.
+what caught the first, and the ambiguity refusal the second. The third was
+found by review rather than by the suite — the replay rule had **no guard case
+and no falsification at all**, so a figure of 32 of 32 said nothing whatever
+about it. A rule with no case is invisible to this harness, which is the one
+thing its tally cannot tell you about itself.
 
 Chunk 5's guards are **validator rules** rather than codec rules, so the suite
 runs the harness's own library tests: `every_claim_can_fail_on_its_own` asserts
