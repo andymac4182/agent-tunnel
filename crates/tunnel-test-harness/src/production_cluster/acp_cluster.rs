@@ -280,6 +280,10 @@ pub struct AcpClusterEvidence {
 
     // --- the accommodation and the refusal ledger ---
     pub membership_resigns: u64,
+    /// Route probes the case boundaries needed after a re-sign before the
+    /// ingress answered again.  Disclosed, never asserted: it is the gate's
+    /// own settling, not a property of the product.
+    pub boundary_route_probes: u64,
     pub max_membership_age_at_case_end_ms: u128,
     pub resign_spacing_ms: u128,
     pub not_dispatched_refusals: u64,
@@ -411,6 +415,11 @@ pub struct AcpClusterEvidence {
     pub owner_device_queue_peak_sampled: usize,
     pub owner_device_queue_high_water: usize,
     pub owner_device_queue_limit: usize,
+    /// The saturating upload's own `stopReason`, read off the wire.
+    pub saturating_upload_stop_reason: String,
+    /// The status the live probe's POST met, recorded so a failure here is
+    /// diagnosable rather than a bare false.
+    pub live_probe_status: u16,
     /// A live SSE stream on a separate transport still completed a turn while
     /// the parked stream was unread and stalling.
     pub live_stream_served_while_parked: bool,
@@ -490,6 +499,10 @@ struct Gate<'h> {
     /// and the only one.
     membership_signed_at: Instant,
     membership_resigns: u64,
+    /// How many route probes the case boundaries needed before the route
+    /// answered again.  Disclosed, so the settling is visible rather than
+    /// hidden inside a helper.
+    boundary_route_probes: u64,
     ingress_addr: SocketAddr,
     ca: Vec<u8>,
     token: String,
@@ -889,7 +902,57 @@ impl Gate<'_> {
         self.membership_signed_at = Instant::now();
         self.membership_resigns += 1;
         self.wait_peers_ready().await?;
+        self.wait_route_answers().await?;
         Ok(())
+    }
+
+    /// Wait until the ingress route actually answers again after a re-sign.
+    ///
+    /// **`peer_runtime.is_ready()` is not sufficient, and a run proved it.**
+    /// A re-sign invalidates every peer admission; readiness can come back
+    /// while the owner still answers `503 PEER_UNAVAILABLE` with
+    /// `not_dispatched`, which is the *same body* the relay returns for a
+    /// rotation freeze (M3-15's open ambiguity). One run met sixteen of those
+    /// at the first request of the next case, with the connector reporting
+    /// `phase="active"` — no freeze anywhere near it — and the gate correctly
+    /// refused to call it a freeze and failed by name.
+    ///
+    /// The answer is to settle the route here, in the gate's own setup between
+    /// cases, rather than to widen what counts as a freeze. Widening the
+    /// correlation would have made the refusal discipline meaningless in
+    /// exactly the way M3-15 warns about.
+    ///
+    /// The probe is a GET naming a connection id that never existed, so it
+    /// starts no child and has no side effect: a live route answers it 404, an
+    /// unready owner answers 503. It goes through [`Self::probe`], which does
+    /// **not** touch the refusal ledger — the ledger is about refusals met by
+    /// the cases, and a boundary's own settling is not one.
+    async fn wait_route_answers(&mut self) -> Result<()> {
+        let base = self.base_uri.clone();
+        let token = self.token.clone();
+        let deadline = Instant::now() + ROUTE_SETTLE_BOUND;
+        loop {
+            let answer = self
+                .probe(
+                    &base,
+                    &token,
+                    "GET",
+                    &[("acp-connection-id", ABSENT_CONNECTION)],
+                    None,
+                )
+                .await?;
+            self.boundary_route_probes += 1;
+            if answer.status != 503 {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(HarnessError::Timeout(format!(
+                    "the ingress route still answered 503 {:?} after a membership re-sign",
+                    ROUTE_SETTLE_BOUND
+                )));
+            }
+            sleep(Duration::from_millis(200)).await;
+        }
     }
 
     async fn wait_peers_ready(&self) -> Result<()> {
@@ -1196,6 +1259,10 @@ const INTERRUPTION_BOUND: Duration = Duration::from_secs(45);
 /// Long enough to cover the membership reconcile interval, so "still serving"
 /// is not just "the relay has not looked yet".
 const PIN_WITHDRAWAL_OBSERVATION: Duration = Duration::from_secs(8);
+
+/// How long the ingress route has to start answering again after a membership
+/// re-sign before the gate reports that it never did.
+const ROUTE_SETTLE_BOUND: Duration = Duration::from_secs(45);
 
 /// How long a revoked in-flight exchange has to be withdrawn.
 const REVOCATION_BOUND: Duration = Duration::from_secs(30);
@@ -1942,7 +2009,30 @@ impl Gate<'_> {
         // as everything else here is.  The upload has completed by now, so
         // this is not "while the request direction is full"; it is "while a
         // hop is carrying a stalled stream", which is what it says.
+        // **Wait for the saturating upload's own result first.**  It shares a
+        // session with the probe, and `docs/acp.md` allows one active prompt
+        // per session, so a probe POSTed while the upload is still running is
+        // refused `ACP_PROMPT_ALREADY_ACTIVE` — which is that rule working,
+        // not this property failing.  Two runs in eight failed that way before
+        // this wait existed, and the case finished in under a second rather
+        // than timing out, which is what gave it away.
+        //
+        // Waiting also strengthens the claim: the saturating request itself
+        // completed, read off the wire, rather than merely being accepted.
+        evidence.saturating_upload_stop_reason = timeout(
+            Duration::from_secs(60),
+            live_stream.wait_for(
+                "the saturating upload's result",
+                stop_reason_for("sat-upload"),
+            ),
+        )
+        .await
+        .ok()
+        .and_then(std::result::Result::ok)
+        .unwrap_or_default();
+
         let status = self.prompt(&live, &live_session, "sat-probe", "ok").await?;
+        evidence.live_probe_status = status.as_u16();
         evidence.live_stream_served_while_parked = status == http::StatusCode::ACCEPTED
             && timeout(
                 Duration::from_secs(60),
@@ -2473,6 +2563,7 @@ async fn run(
             .checked_sub(MEMBERSHIP_RESIGN_SPACING)
             .unwrap_or_else(Instant::now),
         membership_resigns: 0,
+        boundary_route_probes: 0,
         ingress_addr,
         ca,
         token,
@@ -2534,6 +2625,7 @@ async fn run(
     .await;
 
     evidence.membership_resigns = gate.membership_resigns;
+    evidence.boundary_route_probes = gate.boundary_route_probes;
     evidence.not_dispatched_refusals = gate.ledger.refusals.load(Ordering::SeqCst);
     evidence.not_dispatched_retries = gate.ledger.retries.load(Ordering::SeqCst);
     evidence.unexplained_refusal = gate
@@ -2679,7 +2771,7 @@ pub fn validate_acp_cluster_evidence(evidence: &AcpClusterEvidence) -> Result<()
             )));
         }
     }
-    let later: [(&str, bool); 22] = [
+    let later: [(&str, bool); 23] = [
         // --- two users in two tenants ---
         (
             "the two principals really did reuse the same JSON-RPC ids, in both types",
@@ -2795,8 +2887,12 @@ pub fn validate_acp_cluster_evidence(evidence: &AcpClusterEvidence) -> Result<()
             evidence.owner_device_queue_limit > 0 && evidence.owner_device_queue_high_water > 0,
         ),
         (
+            "the saturating upload completed, read off the wire",
+            evidence.saturating_upload_stop_reason == "end_turn",
+        ),
+        (
             "a live SSE stream still completed a turn while a stream was parked and stalling",
-            evidence.live_stream_served_while_parked,
+            evidence.live_stream_served_while_parked && evidence.live_probe_status == 202,
         ),
     ];
     for (rule, passed) in later {
@@ -3012,6 +3108,7 @@ mod tests {
             side_effects_in_ledger: 2,
             side_effects_after_settle: 2,
             membership_resigns: 2,
+            boundary_route_probes: 2,
             max_membership_age_at_case_end_ms: 15_621,
             resign_spacing_ms: MEMBERSHIP_RESIGN_SPACING.as_millis(),
             not_dispatched_refusals: 0,
@@ -3052,6 +3149,8 @@ mod tests {
             owner_device_queue_peak_sampled: 0,
             owner_device_queue_high_water: 1,
             owner_device_queue_limit: 4_063_232,
+            saturating_upload_stop_reason: "end_turn".to_owned(),
+            live_probe_status: 202,
             live_stream_served_while_parked: true,
             open_journal_entries: 0,
             open_streams_retired: 0,
@@ -3388,6 +3487,11 @@ mod tests {
                     e.owner_device_queue_high_water = 0;
                 },
                 "owner-to-device segment carried measured load",
+            ),
+            (
+                "saturating_upload_stop_reason",
+                |e| e.saturating_upload_stop_reason = "cancelled".to_owned(),
+                "saturating upload completed",
             ),
             (
                 "live_stream_served_while_parked",

@@ -1679,7 +1679,7 @@ async fn main() -> ExitCode {
                         &evidence,
                     )?;
                     println!(
-                        "M8 ACP cluster passed: relays={} owner={} ingress={} non_owner={} cases={:?} rotations_across_span={} owner_rotations={} span_ms={} met_schedule={} distinct_sockets={} new_per_round={:?} steady={:?} socket_peak={} connection_alive={} device_session_stable={} epoch_stable={} effects={} effects_after_settle={} sessions={:?} resign_spacing_ms={} max_membership_age_ms={} resigns={} refusals={} retries={} unexplained={:?} leftover_processes={} open_journal_entries={} open_streams_retired={} not_covered={}",
+                        "M8 ACP cluster passed: relays={} owner={} ingress={} non_owner={} cases={:?} rotations_across_span={} owner_rotations={} span_ms={} met_schedule={} distinct_sockets={} new_per_round={:?} steady={:?} socket_peak={} connection_alive={} device_session_stable={} epoch_stable={} effects={} effects_after_settle={} sessions={:?} resign_spacing_ms={} max_membership_age_ms={} resigns={} boundary_route_probes={} refusals={} retries={} unexplained={:?} leftover_processes={} open_journal_entries={} open_streams_retired={} not_covered={}",
                         evidence.relay_count,
                         evidence.owner_node,
                         evidence.ingress_node,
@@ -1702,6 +1702,7 @@ async fn main() -> ExitCode {
                         evidence.resign_spacing_ms,
                         evidence.max_membership_age_at_case_end_ms,
                         evidence.membership_resigns,
+                        evidence.boundary_route_probes,
                         evidence.not_dispatched_refusals,
                         evidence.not_dispatched_retries,
                         evidence.unexplained_refusal,

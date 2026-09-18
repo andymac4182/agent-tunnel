@@ -1985,8 +1985,7 @@ C5_CASES: list[tuple[str, list[Edit], bool]] = [
         [
             (
                 ACP_CLUSTER,
-                """            evidence.owner_device_queue_limit > 0
-                && evidence.owner_device_queue_high_water > 0,""",
+                "            evidence.owner_device_queue_limit > 0 && evidence.owner_device_queue_high_water > 0,",
                 "            true,",
             )
         ],
@@ -1997,7 +1996,18 @@ C5_CASES: list[tuple[str, list[Edit], bool]] = [
         [
             (
                 ACP_CLUSTER,
-                "            evidence.live_stream_served_while_parked,",
+                "            evidence.live_stream_served_while_parked && evidence.live_probe_status == 202,",
+                "            true,",
+            )
+        ],
+        False,
+    ),
+    (
+        "the saturating upload must have completed, read off the wire",
+        [
+            (
+                ACP_CLUSTER,
+                '            evidence.saturating_upload_stop_reason == "end_turn",',
                 "            true,",
             )
         ],
@@ -2043,8 +2053,7 @@ C5_CASES: list[tuple[str, list[Edit], bool]] = [
         [
             (
                 ACP_CLUSTER,
-                """                span.distinct_agent_ids >= 1
-                    && span.identified_messages == span.distinct_agent_ids,""",
+                "                span.distinct_agent_ids >= 1 && span.identified_messages == span.distinct_agent_ids,",
                 "                true,",
             )
         ],
