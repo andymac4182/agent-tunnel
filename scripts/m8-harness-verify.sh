@@ -69,13 +69,24 @@ gate "M8 ACP over three relays: a v1 conversation, permissions, cancellation, su
 # profile exists), or real-agent interoperability (the agent is this
 # repository's own synthetic fixture).  The gate's own NOT_COVERED carries all
 # of this, and the validator requires the evidence to carry it.
-# The label says peer-**path** loss, not peer-key rotation, and names one
-# saturated direction rather than two segments.  Both corrections come from
-# chunk 5's own review: no gate drives a real peer-key rotation against a live
-# ACP stream (M8-C16), and `record_exchange` fires at exchange termination, so
-# no two high-water marks it writes can show two segments full at once.  A
-# label is evidence too -- it is what a reader sees when the gate passes.
-gate "M8 ACP across three relays: three completed rotations with two sessions live, two tenants reusing identical ids, forged heads, revocation, peer-path loss, owner loss, and the request direction of the ingress-to-owner hop driven against its credit window with the owner-to-device segment measured as load" \
+# The label distinguishes peer-**path** loss from peer-**key** rotation and
+# names one saturated direction rather than two segments.  A label is evidence
+# too -- it is what a reader sees when the gate passes.
+#
+# Chunk 7 adds the key rotation (M8-C16) and, with it, the reason the two are
+# listed apart: a pin withdrawal governs new dials and leaves an in-flight
+# stream serving, while the verifier dropping the old key tears it down.  The
+# key arm's teardown is attributed by the product's own invalidation reason
+# against a same-key control arm, not by the timing of the interruption.
+#
+# Simultaneous saturation is still NOT claimed, and is now recorded as
+# unreachable rather than narrowed: `record_exchange` fires at exchange
+# termination and the peer hop publishes no live gauge, so no instrument can
+# show two directions of that hop full at once (M8-C22).  The owner-to-device
+# segment, which does publish live per-direction gauges, is sampled coherently
+# several hundred times a run and never shows both loaded -- an observation
+# the gate has a rule for, so it cannot be produced by never looking.
+gate "M8 ACP across three relays: three completed rotations with two sessions live, two tenants reusing identical ids, forged heads, revocation, an attributed peer-key rotation, peer-path loss, owner loss, and the request direction of the ingress-to-owner hop driven against its credit window with the owner-to-device segment measured as load and its two directions sampled together" \
   cargo run --locked -p tunnel-test-harness -- verify-m8-acp-cluster
 
 echo "m8-harness-verify: implemented M8 harness suite passed" >&2

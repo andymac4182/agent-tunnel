@@ -2082,6 +2082,104 @@ C5_CASES: list[tuple[str, list[Edit], bool]] = [
         ],
         False,
     ),
+    # ------------------------------------------- peer-key rotation (M8-C16)
+    (
+        "the staged key overlap must have reached every relay's verifier",
+        [
+            (
+                ACP_CLUSTER,
+                "            evidence.key_overlap_staged,",
+                "            true,",
+            )
+        ],
+        False,
+    ),
+    (
+        "the withdrawn key must have left the ingress relay's own verifier",
+        [
+            (
+                ACP_CLUSTER,
+                "            evidence.key_left_ingress_verifier,\n        ),\n        (",
+                "            true,\n        ),\n        (",
+            )
+        ],
+        False,
+    ),
+    (
+        "the key arm's teardown must be attributed to the withdrawn key",
+        [
+            (
+                ACP_CLUSTER,
+                """            evidence
+                .key_rotation_reasons
+                .iter()
+                .any(|reason| reason == "membership_revoked"),""",
+                "            true,",
+            )
+        ],
+        False,
+    ),
+    (
+        "the same-key control arm must name no key, and must not be empty",
+        [
+            (
+                ACP_CLUSTER,
+                """            !evidence.version_bump_reasons.is_empty()
+                && !evidence
+                    .version_bump_reasons
+                    .iter()
+                    .any(|reason| reason == "membership_revoked"),""",
+                "            true,",
+            )
+        ],
+        False,
+    ),
+    (
+        "a key rotation must produce an explicit interruption",
+        [
+            (
+                ACP_CLUSTER,
+                """            "peer-key rotation",
+            evidence.key_rotation_interrupted,""",
+                """            "peer-key rotation",
+            true,""",
+            )
+        ],
+        False,
+    ),
+    (
+        "a key rotation must never fabricate a stopReason",
+        [
+            (
+                ACP_CLUSTER,
+                """            evidence.key_rotation_no_stop_reason,
+        ),
+        (
+            "owner loss",""",
+                """            true,
+        ),
+        (
+            "owner loss",""",
+            )
+        ],
+        False,
+    ),
+    # -------------------------------- the recorded saturation impossibility
+    (
+        "'never both loaded' must be an observation, not an absence of looking",
+        [
+            (
+                ACP_CLUSTER,
+                """            evidence.owner_device_coherent_samples >= MIN_COHERENT_SAMPLES
+                || evidence
+                    .owner_device_request_bytes_at_instant
+                    .min(evidence.owner_device_response_bytes_at_instant)
+                    > 0,""",
+                "            true,",
+            )
+        ],
+        False,
+    ),
     (
         "the rotation disclosure must carry this run's own measurement",
         [

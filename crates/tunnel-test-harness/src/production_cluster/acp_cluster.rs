@@ -1,13 +1,30 @@
 //! `verify-m8-acp-cluster`: ACP across three relays, three completed
-//! scheduled rotations, two tenants, revocation, peer-**path** loss, owner
-//! loss and one saturated direction of one hop (task row M8-04, M8 chunk 5).
+//! scheduled rotations, two tenants, revocation, peer-**path** loss, peer-
+//! **key** rotation, owner loss and one saturated direction of one hop (task
+//! rows M8-04 and M8-C16, M8 chunks 5 and 7).
 //!
 //! **This header says peer-path loss and one direction deliberately.**  Review
 //! withdrew both of the wider claims it used to make, and `NOT_COVERED` below
 //! has said so since — but this comment did not, and a module header is what a
-//! reader meets first.  No gate here drives a real peer-**key** rotation
-//! (M8-C16), and `record_exchange` fires at exchange termination, so no two
-//! high-water marks it writes can show two segments saturated at once.
+//! reader meets first.
+//!
+//! Chunk 7 closes the first of those two.  A real peer-**key** rotation is now
+//! driven through the owner's membership record against a live ACP SSE stream
+//! on a non-owner ingress, and the teardown is **attributed**: the same
+//! sequence is run twice, once with a byte-identical key list so only the
+//! record version moves, and the product's own
+//! `PeerInvalidationReason` separates them — `MembershipChanged` for the
+//! control arm, `MembershipRevoked` for the key arm.  See
+//! [`Gate::case_key_rotation`].
+//!
+//! The second is **not** closed, and is recorded as unreachable rather than
+//! narrowed again.  `record_exchange` fires at exchange termination, so no two
+//! high-water marks it writes can show two segments saturated at once, and the
+//! peer hop publishes no live gauge to sample instead.  The owner↔device
+//! segment does publish one, per direction, coherently — so this gate now
+//! looks there, several hundred times a run, and records that both directions
+//! are never loaded together and why.  What a product change would have to add
+//! is on task row **M8-C22**.
 //!
 //! This is the sibling of [`super::acp_real_path`], which put ACP on the real
 //! cluster for the first time.  Everything that gate listed as chunk 5's is
@@ -77,22 +94,26 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
+use chrono::Utc;
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use tokio::time::{sleep, timeout};
+use tunnel_catalog::RedisMembershipPublisher;
 use tunnel_client::http_forward::{AcpExportDiagnostics, HttpHandlers};
 use tunnel_client::{ConnectOptions, ConnectionHandle};
 use tunnel_core::RotationConfig;
+use tunnel_relay::PeerInvalidationReason;
 
 use super::acp_real_path::{
     AcpConsumer, FreezeWatch, HeldStream, MEMBERSHIP_RECORD_LIFETIME, MEMBERSHIP_RESIGN_SPACING,
     MIN_RETRY_HINT_MS, RefusalLedger, acp_request, device_config_text, fixture_binary_path,
     json_stream, process_alive, session_id, stop_reason,
 };
+use super::membership_hint_drop::{INCOMING_SPKI, TARGET_NODE, target_peer_spki};
 use super::{
-    CLEANUP_TIMEOUT, Harness, HarnessError, HarnessOptions, ProductionCluster, ProxyConfig, Result,
-    RunningHarness, SCENARIO_TIMEOUT, STARTUP_TIMEOUT, TcpProxy, finish_scenario_with_cleanup,
-    push_cleanup_error,
+    CLEANUP_TIMEOUT, Harness, HarnessError, HarnessOptions, ProductionCluster, ProductionRelay,
+    ProxyConfig, Result, RunningHarness, SCENARIO_TIMEOUT, STARTUP_TIMEOUT, TcpProxy,
+    finish_scenario_with_cleanup, publish_verified_pins, push_cleanup_error,
 };
 
 /// The rotation policy this gate runs the device under.
@@ -154,19 +175,24 @@ const ROTATION_EFFECT: &str = "rotation-span";
 /// The order is not cosmetic.  `rotation-span` is first because it needs the
 /// most membership headroom of any case here.  `owner-loss` is last because
 /// it removes relay-a from the cluster, and `peer-path-loss` before it because
-/// it leaves a relay's pin set and peer path rewritten.
-pub const CLUSTER_CASES: [&str; 7] = [
+/// it leaves a relay's pin set and peer path rewritten.  `peer-key-rotation`
+/// sits immediately before those two: it rewrites the owner's **membership
+/// record key set** and restores it, which every later case depends on, and it
+/// is deliberately not adjacent to `rotation-span` so the two cases that need
+/// the most membership headroom do not share a boundary's re-sign.
+pub const CLUSTER_CASES: [&str; 8] = [
     "rotation-span",
     "two-tenant-ids",
     "forged-heads",
     "saturation",
     "revocation",
+    "peer-key-rotation",
     "peer-path-loss",
     "owner-loss",
 ];
 
 /// What this gate deliberately does not establish.
-pub const NOT_COVERED: [&str; 11] = [
+pub const NOT_COVERED: [&str; 12] = [
     "an ACP connection surviving a membership re-sign, or outliving its membership record: M7-C80 is open, a peer admission's deadline is never extended, and this gate's rotation case is bounded to finish inside one record rather than escaping that limit",
     "per-OS process-tree cleanup: macOS is the only host any of this has run on, and a descendant that leaves its process group is not reached at all (M8-C07)",
     "any OS sandbox guarantee: until a tested sandbox profile exists this export is trusted-agent execution, and filesystem confinement is not claimed from cwd alone",
@@ -174,10 +200,11 @@ pub const NOT_COVERED: [&str; 11] = [
     "no retry beyond the moment of observation: a ledger is read when a stream has failed and again after a settle window, and a replay issued after that would not be observed",
     "the connection-capacity table at its real bounds: 256 tracked and 32 per principal are proven as arithmetic in tunnel-acp-export, not by opening 257 connections here",
     "the permission deadline and the idle, prompt-wall-time bounds of the limits table over the real route: they are measured against the export's own clock in tunnel-acp-export, not here",
-    "two forwarding segments saturated at the same instant: the peer-hop figure is written when an exchange terminates, so it is an all-time high-water mark of finished exchanges rather than a live gauge, and no instrument here can show the two segments full simultaneously",
-    "the response direction of the peer hop driven to its credit window: the flood against a parked stream backs up behind the export's own output-credit stall, whose record lands only after that 30 s bound, so this gate measures the request direction and says so",
+    "both directions of the ingress-to-owner PEER hop loaded at the same instant: that hop publishes no live gauge at all -- HttpExchangeRecord is written when an exchange terminates and its peer_send_in_flight_high_water and peer_receive_queue_high_water are two independent all-time max latches, so both reading high is equally consistent with two disjoint bursts. It cannot be shown without a product change, named in full on task row M8-C22: one coincident latch updated while both figures are in hand, surfaced on the record, plus a live per-hop pair on the forwarding snapshot for any observation window shorter than the exchange. The owner-to-device segment IS shown loaded in both directions at one instant here, from one coherent snapshot pass, and that is a different segment",
+    "the response direction of the peer hop driven to its credit window: the flood against a parked stream backs up behind the export's own output-credit stall, whose record lands only after that 30 s bound, so a bounded sampling window strictly shorter than 30 s can never see that record exist at all -- this gate measures the request direction of that hop and says so",
     "this property at the shipped default configuration: the default rotation interval is 300 s and a membership record lives at most 60 s, so on a non-owner ingress an ACP connection is invalidated long before its first scheduled rotation; three rotations are reachable here only because the gate runs the device at the 3 s configuration floor",
-    "a real peer-key rotation against a live ACP stream: withdrawing the ingress relay's peer pins governs new dials and is measured here to leave an in-flight stream serving, while the verifier dropping the old key -- which verify-m7-membership-hint-drop exercises -- is not driven (M8-C16)",
+    "peer-key rotation as a survivable event: the key-rotation case drives the real teardown and attributes it, it does not show an ACP stream surviving one. Nor does it separate the key change from the record-version bump that must accompany it ON THE WIRE -- the verifier refuses an equal-version re-sign, so every key change is also a version change, and the attribution rests on the reason the product itself latched (MembershipRevoked, reachable only through the membership runtime's in-process invalidation callback) together with the same-key control arm beside it",
+    "any of this at the shipped rotation default, or a key rotation reaching the consumer as a typed terminal: the interruption is an explicit stream failure with no stopReason, which is what the consumer sees, and no code on the wire names the key",
 ];
 
 /// The limits of this gate's claim, with the ones carrying a measurement
@@ -406,6 +433,45 @@ pub struct AcpClusterEvidence {
     /// ...and never produced a `stopReason` either.
     pub owner_loss_no_stop_reason: bool,
 
+    // --- peer-key rotation (M8-C16) ---
+    /// The staged overlap really reached every relay's verifier: the owner's
+    /// record approved the old key **and** the incoming key together before
+    /// either arm ran.  Without this, "the old key left the verifier" would be
+    /// a claim about a window that never opened.
+    pub key_overlap_staged: bool,
+    /// **Control arm.** A membership record for the owner re-signed at a
+    /// strictly newer version with a **byte-identical key list** — same SPKIs,
+    /// same key ids, same lifetimes — against a live ACP stream.  This is
+    /// M7-C80's event with the key change subtracted, and it is the only
+    /// reason the key arm's teardown can be attributed to the key.
+    pub version_bump_interrupted: bool,
+    /// What the ingress relay's membership runtime latched as the reason for
+    /// every peer admission of the owner it invalidated in the control arm,
+    /// as the sorted set of distinct labels.
+    ///
+    /// Read from `MembershipRuntime`'s invalidation callback, which is the
+    /// **only** channel the product exposes: `PeerInvalidationReason` has no
+    /// string form, no serialization, and no counter, and both mechanisms
+    /// surface identically on the wire (503 `PEER_UNTRUSTED`) and in every
+    /// serialized snapshot.
+    pub version_bump_reasons: Vec<String>,
+    /// **Key arm.** The old peer key leaves the owner's record — the shape
+    /// `verify-m7-membership-hint-drop` stages — against a live ACP stream on
+    /// a non-owner ingress.
+    pub key_rotation_interrupted: bool,
+    /// ...and never produced a `stopReason` for the turn it interrupted.
+    pub key_rotation_no_stop_reason: bool,
+    /// The reasons latched in the key arm, the same way.
+    pub key_rotation_reasons: Vec<String>,
+    /// The withdrawn key really did leave the ingress relay's verifier — the
+    /// same verified state `admit_peer` binds against — within the bound.
+    pub key_left_ingress_verifier: bool,
+    /// Route probes this case needed between and after its arms.  Disclosed
+    /// rather than asserted, and kept apart from
+    /// [`AcpClusterEvidence::boundary_route_probes`] so a case's own settling
+    /// is never counted as a boundary's.
+    pub key_rotation_route_probes: u64,
+
     // --- saturation ---
     /// The **request** direction of the ingress→owner peer hop: high-water
     /// bytes the ingress had sent that the owner had not consumed, and the
@@ -423,6 +489,25 @@ pub struct AcpClusterEvidence {
     pub owner_device_queue_peak_sampled: usize,
     pub owner_device_queue_high_water: usize,
     pub owner_device_queue_limit: usize,
+    /// **Both directions of the owner↔device segment, at one instant.**
+    ///
+    /// The peer hop cannot show this and no amount of sampling fixes that: its
+    /// only published figures are two independent all-time `max` latches
+    /// written when an exchange terminates.  This segment can, because
+    /// `parked_bytes` (owner→device, waiting for send credit) and
+    /// `receive_buffered_bytes` (device→owner, waiting for the reader) are
+    /// live gauges produced by **one** owner-actor snapshot pass, so a sample
+    /// that finds both above zero is a same-instant observation rather than
+    /// two marks laid side by side.
+    ///
+    /// These two carry the sample whose *smaller* direction was largest — the
+    /// best-attested instant, not the best number in either direction taken
+    /// separately, which is the trick a pair of independent maxima plays.
+    pub owner_device_request_bytes_at_instant: usize,
+    pub owner_device_response_bytes_at_instant: usize,
+    /// Samples taken, so a zero above is "looked and did not find" rather than
+    /// "never looked".
+    pub owner_device_coherent_samples: u64,
     /// The saturating upload's own `stopReason`, read off the wire.
     pub saturating_upload_stop_reason: String,
     /// The status the live probe's POST met, recorded so a failure here is
@@ -511,6 +596,9 @@ struct Gate<'h> {
     /// answered again.  Disclosed, so the settling is visible rather than
     /// hidden inside a helper.
     boundary_route_probes: u64,
+    /// The same count for the key-rotation case's own settling, kept apart so
+    /// neither number can absorb the other's.
+    key_rotation_route_probes: u64,
     ingress_addr: SocketAddr,
     ca: Vec<u8>,
     token: String,
@@ -936,9 +1024,22 @@ impl Gate<'_> {
     /// **not** touch the refusal ledger — the ledger is about refusals met by
     /// the cases, and a boundary's own settling is not one.
     async fn wait_route_answers(&mut self) -> Result<()> {
+        let probes = self.probe_until_route_answers().await?;
+        self.boundary_route_probes += probes;
+        Ok(())
+    }
+
+    /// The probe loop itself, returning how many probes it took.
+    ///
+    /// Split out so a **case** that has to settle the route can do so without
+    /// its probes landing in `boundary_route_probes`, whose whole meaning is
+    /// "what the boundaries needed".  A shared counter would let one number
+    /// quietly absorb the other's.
+    async fn probe_until_route_answers(&self) -> Result<u64> {
         let base = self.base_uri.clone();
         let token = self.token.clone();
         let deadline = Instant::now() + ROUTE_SETTLE_BOUND;
+        let mut probes = 0u64;
         loop {
             let answer = self
                 .probe(
@@ -949,9 +1050,9 @@ impl Gate<'_> {
                     None,
                 )
                 .await?;
-            self.boundary_route_probes += 1;
+            probes += 1;
             if answer.status != 503 {
-                return Ok(());
+                return Ok(probes);
             }
             if Instant::now() >= deadline {
                 return Err(HarnessError::Timeout(format!(
@@ -1274,6 +1375,136 @@ const ROUTE_SETTLE_BOUND: Duration = Duration::from_secs(45);
 
 /// How long a revoked in-flight exchange has to be withdrawn.
 const REVOCATION_BOUND: Duration = Duration::from_secs(30);
+
+/// How long a published membership record has to reach every relay's
+/// **verifier** — not merely Redis — before the key-rotation case reports that
+/// it never did.
+///
+/// This is the fixture's configured `cluster.membership_refresh_seconds`, the
+/// same contractual bound `verify-m7-membership-hint-drop` asserts against.
+/// The case nudges each runtime while it waits, exactly as
+/// `resign_membership_now` does, so in practice convergence lands far inside
+/// it; the bound is the contract, not the expectation.
+const KEY_STAGE_BOUND: Duration = Duration::from_secs(20);
+
+/// How long the saturation case samples, and how often.
+///
+/// The window covers the whole life of both loads it is watching — the flood
+/// and the near-limit upload both complete inside the first second — so its
+/// length is not about waiting for something to arrive. It is about making
+/// "the two directions were never loaded together" an **observation** rather
+/// than a shrug: a handful of samples would not distinguish that from bad
+/// luck. The interval is the smallest that keeps the owner-actor snapshot pass
+/// off the critical path.
+const SATURATION_SAMPLE_WINDOW: Duration = Duration::from_secs(12);
+const SATURATION_SAMPLE_INTERVAL: Duration = Duration::from_millis(25);
+
+/// The fewest coherent samples that make "never both loaded" a finding.
+///
+/// The nominal count over the window above is 480. This floor is a fifth of
+/// it, so a slow snapshot pass or a loaded machine cannot redden the run — and
+/// it is a floor derived from the window rather than a number raised until a
+/// run passed: observed counts sit near the nominal.
+const MIN_COHERENT_SAMPLES: u64 = 96;
+
+/// What one arm of the key-rotation case observed.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct KeyRotationArm {
+    interrupted: bool,
+    no_stop_reason: bool,
+    key_left_verifier: bool,
+    reasons: Vec<String>,
+}
+
+/// The reasons a relay's membership runtime latched for peer admissions it
+/// invalidated.
+///
+/// **This is the only channel there is.** `PeerInvalidationReason` has no
+/// string form, no `Serialize`, no counter and no tracing field, and the two
+/// mechanisms the key-rotation case has to separate are identical in every
+/// serialized snapshot and on the wire. The runtime's invalidation callback is
+/// where the product says which one it chose, so the gate records it there and
+/// nowhere else.
+#[derive(Debug, Default)]
+struct InvalidationLedger {
+    /// `(observing relay, invalidated peer, reason label)`, in order.
+    seen: std::sync::Mutex<Vec<(String, String, &'static str)>>,
+}
+
+impl InvalidationLedger {
+    fn clear(&self) {
+        self.seen
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
+    }
+
+    fn record(&self, observer: &str, peer: &str, reason: PeerInvalidationReason) {
+        self.seen
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push((observer.to_owned(), peer.to_owned(), reason_label(reason)));
+    }
+
+    /// The distinct reason labels `observer` latched for admissions of `peer`,
+    /// sorted, so the set is stable whatever order the dispatcher ran in.
+    fn labels_for(&self, observer: &str, peer: &str) -> Vec<String> {
+        let seen = self.seen.lock().unwrap_or_else(|error| error.into_inner());
+        let mut labels: Vec<String> = seen
+            .iter()
+            .filter(|(node, invalidated, _)| node == observer && invalidated == peer)
+            .map(|(_, _, reason)| (*reason).to_owned())
+            .collect();
+        labels.sort();
+        labels.dedup();
+        labels
+    }
+}
+
+/// A payload-free label for each reason.
+///
+/// The mapping lives here rather than in the product because the product has
+/// none: these variants are carried as a `u8` on an atomic and never
+/// stringified. Naming every variant rather than the two under test is
+/// deliberate — a third reason arriving must show up as itself, not fall into
+/// an "other" bucket that a rule would then read as one of the two.
+const fn reason_label(reason: PeerInvalidationReason) -> &'static str {
+    match reason {
+        PeerInvalidationReason::TrustExpired => "trust_expired",
+        PeerInvalidationReason::MembershipRevoked => "membership_revoked",
+        PeerInvalidationReason::MembershipChanged => "membership_changed",
+        PeerInvalidationReason::AuthorityUnknown => "authority_unknown",
+        PeerInvalidationReason::PersistenceUnavailable => "persistence_unavailable",
+        PeerInvalidationReason::RuntimeCancelled => "runtime_cancelled",
+    }
+}
+
+/// Install a recording invalidation callback on one relay.
+///
+/// It **chains the fixture's own pin publication**, including the failed-closed
+/// handling and the `pin_publication_pending` latch (M7-C81), so installing it
+/// changes what the fixture records and nothing about what it does. A recorder
+/// that replaced the pin publication would have quietly turned this case into
+/// a second hint-drop gate.
+fn install_reason_recorder(relay: &ProductionRelay, ledger: &Arc<InvalidationLedger>) {
+    let membership = Arc::clone(&relay.membership);
+    let pins = relay.pins.clone();
+    let pending = Arc::clone(&relay.pin_publication_pending);
+    let ledger = Arc::clone(ledger);
+    let observer = relay.node_id.clone();
+    relay
+        .membership
+        .set_invalidation_callback(Some(Arc::new(move |identity, reason| {
+            ledger.record(&observer, &identity.node_id, reason);
+            if let Err(error) = publish_verified_pins(&membership, &pins) {
+                tracing::warn!(?error, "key-rotation pin publication failed closed");
+                let _ = pins.replace(std::iter::empty::<tunnel_transport::SpkiSha256>());
+                pending.store(true, Ordering::SeqCst);
+            } else {
+                pending.store(false, Ordering::SeqCst);
+            }
+        })));
+}
 
 impl Gate<'_> {
     /// Case `two-tenant-ids`: two users in two tenants reusing identical
@@ -1778,6 +2009,378 @@ impl Gate<'_> {
         Ok((interrupted, no_stop_reason))
     }
 
+    /// Case `peer-key-rotation` (task row M8-C16): a **real** key change
+    /// through the owner's membership record, driven against a live ACP SSE
+    /// stream on a non-owner ingress, with the mechanism that tore the stream
+    /// down established rather than assumed.
+    ///
+    /// # What M8-C16 says is hard, and how this answers it
+    ///
+    /// A key change arrives *through* a membership record, and the verifier
+    /// refuses an equal-version re-sign outright
+    /// (`MembershipError::EqualVersionConflict`), so **every key change is
+    /// also a version change**.  A version change on its own invalidates a
+    /// peer admission (M7-C80).  A case that simply withdrew the key and
+    /// asserted an interruption would therefore have measured M7-C80 and
+    /// credited the key with it — the exact error the `peer-path-loss` case
+    /// was relabelled for.
+    ///
+    /// Two independent things separate them here, and neither is sufficient
+    /// alone:
+    ///
+    /// 1. **The control arm.**  The same live-stream setup, the same publish,
+    ///    the same convergence wait — with a **byte-identical key list**.
+    ///    Same SPKIs, same key ids, same `not_before`/`expires_at`.  Only
+    ///    `record_version` and `issued_at` differ.  Whatever that arm does is
+    ///    what a version bump does, and the key arm's result is read against
+    ///    it rather than against nothing.
+    /// 2. **The reason the product itself latched.**
+    ///    `RuntimeState::revalidate_active` chooses
+    ///    `PeerInvalidationReason::MembershipRevoked` when and only when
+    ///    `bind_peer` **fails** for that admission — the withdrawn-key path —
+    ///    and `MembershipChanged` when the binding still verifies and only the
+    ///    record version moved.  The choice is made by the product, in one
+    ///    expression, before this gate sees anything.
+    ///
+    /// **The reason is not on the wire, and that is recorded rather than
+    /// worked around.**  `PeerInvalidationReason` has no string form, no
+    /// serialization, no counter and no tracing field; both mechanisms answer
+    /// a fresh admission with the same `503 PEER_UNTRUSTED` /
+    /// `not_dispatched` and produce the same `ingress`/`pool_connect`/
+    /// `membership` peer-fault tuple.  The invalidation callback is the only
+    /// channel, so the gate installs a recorder on it — chaining the fixture's
+    /// own pin publication, so nothing about the fixture's behaviour changes.
+    /// That the attribution is in-process and not observable by a consumer is
+    /// carried in `NOT_COVERED`.
+    ///
+    /// # What is still not claimed
+    ///
+    /// Not that an ACP stream *survives* a key rotation — it does not, and the
+    /// gate asserts the teardown.  Not that a version bump and a key
+    /// withdrawal are distinguishable **from the stream's side**: both arms
+    /// are expected to interrupt, and the stream cannot tell them apart.  The
+    /// distinction is the product's own recorded reason, and the control arm
+    /// is what stops that reason being read as a coincidence.
+    async fn case_key_rotation(&mut self, evidence: &mut AcpClusterEvidence) -> Result<()> {
+        let old_spki = target_peer_spki(self.cluster)?;
+        let ledger = Arc::new(InvalidationLedger::default());
+        for relay in &self.cluster.relays {
+            install_reason_recorder(relay, &ledger);
+        }
+
+        // ---- stage the overlap ------------------------------------------
+        //
+        // Both keys approved together, so the old key is still admissible
+        // while the arms run and the later withdrawal is the *only* thing
+        // that removes it.  This is setup, not the measurement: no ACP stream
+        // is live yet, so nothing here can be mistaken for a teardown.
+        let overlap_version = self.next_record_version();
+        self.publish_owner_keys(overlap_version, &[&old_spki, INCOMING_SPKI])
+            .await?;
+        evidence.key_overlap_staged = self
+            .converge_owner_keys(overlap_version, &[&old_spki, INCOMING_SPKI])
+            .await?;
+        if !evidence.key_overlap_staged {
+            return Err(HarnessError::Timeout(format!(
+                "the staged key overlap did not reach every relay's verifier within {KEY_STAGE_BOUND:?}"
+            )));
+        }
+        self.settle_key_rotation_route().await?;
+
+        // ---- arm one: the control, a same-key version bump ---------------
+        let control = self
+            .key_rotation_arm(
+                "keyrot-control",
+                &[&old_spki, INCOMING_SPKI],
+                &ledger,
+                &old_spki,
+            )
+            .await?;
+        evidence.version_bump_interrupted = control.interrupted;
+        evidence.version_bump_reasons = control.reasons;
+        self.settle_key_rotation_route().await?;
+
+        // ---- arm two: the key change ------------------------------------
+        let rotated = self
+            .key_rotation_arm("keyrot-key", &[INCOMING_SPKI], &ledger, &old_spki)
+            .await?;
+        evidence.key_rotation_interrupted = rotated.interrupted;
+        evidence.key_rotation_no_stop_reason = rotated.no_stop_reason;
+        evidence.key_rotation_reasons = rotated.reasons;
+        evidence.key_left_ingress_verifier = rotated.key_left_verifier;
+
+        eprintln!(
+            "ACP cluster peer-key rotation: control(interrupted={} reasons={:?}) \
+             key(interrupted={} no_stop_reason={} left_verifier={} reasons={:?})",
+            evidence.version_bump_interrupted,
+            evidence.version_bump_reasons,
+            evidence.key_rotation_interrupted,
+            evidence.key_rotation_no_stop_reason,
+            evidence.key_left_ingress_verifier,
+            evidence.key_rotation_reasons,
+        );
+
+        // ---- restore ------------------------------------------------------
+        //
+        // Back to the single real key, so every later case meets a cluster
+        // whose owner is admissible again.  The recorder stays installed: it
+        // chains the fixture's own pin publication, so leaving it is the
+        // smaller change of the two.
+        let restore_version = self.next_record_version();
+        self.publish_owner_keys(restore_version, &[&old_spki])
+            .await?;
+        if !self
+            .converge_owner_keys(restore_version, &[&old_spki])
+            .await?
+        {
+            return Err(HarnessError::Timeout(
+                "the restored owner key did not reach every relay's verifier".into(),
+            ));
+        }
+        for relay in self.cluster.relays.iter().filter(|r| r.running.is_some()) {
+            publish_verified_pins(&relay.membership, &relay.pins)?;
+        }
+        self.wait_peers_ready().await?;
+        self.settle_key_rotation_route().await?;
+        evidence.key_rotation_route_probes = self.key_rotation_route_probes;
+        Ok(())
+    }
+
+    /// One arm: hold a turn open on a pending permission callback, publish the
+    /// owner's record with `spkis`, and report what the stream did.
+    ///
+    /// The two arms differ in **exactly one argument**.  That is the point: a
+    /// control that took a different path through the gate would not control
+    /// for anything.
+    async fn key_rotation_arm(
+        &mut self,
+        label: &str,
+        spkis: &[&str],
+        ledger: &Arc<InvalidationLedger>,
+        old_spki: &str,
+    ) -> Result<KeyRotationArm> {
+        let conversation = self.open_connection().await?;
+        let (session, stream) = self
+            .open_session(&conversation, &format!("{label}-new"), &[])
+            .await?;
+        let held = format!("{label}-held");
+        let status = self
+            .prompt(&conversation, &session, &held, "permission")
+            .await?;
+        if status != http::StatusCode::ACCEPTED {
+            return Err(HarnessError::Http(format!(
+                "the {label} held prompt answered {status}, not 202"
+            )));
+        }
+        stream
+            .wait_for(&format!("the {label} callback"), |value| {
+                (method_of(value) == Some("session/request_permission")).then_some(true)
+            })
+            .await?;
+
+        // Everything before this point is setup; the ledger must carry only
+        // what this arm's publish caused.
+        ledger.clear();
+        let version = self.next_record_version();
+        self.publish_owner_keys(version, spkis).await?;
+        let converged = self.converge_owner_keys(version, spkis).await?;
+        if !converged {
+            return Err(HarnessError::Timeout(format!(
+                "the {label} record did not reach every relay's verifier within {KEY_STAGE_BOUND:?}"
+            )));
+        }
+        // Whether the withdrawn key left the state `admit_peer` actually binds
+        // against, at the ingress that holds the admission.  For the control
+        // arm the key was never withdrawn, so this is vacuously true and is
+        // not what that arm is read for.
+        let key_left_verifier = !spkis.contains(&old_spki)
+            && !self
+                .cluster
+                .relay(self.ingress_node_id())?
+                .membership
+                .snapshot()
+                .memberships
+                .iter()
+                .any(|record| {
+                    record.node_id == TARGET_NODE
+                        && record.spki_sha256.iter().any(|held| held == old_spki)
+                });
+
+        let deadline = Instant::now() + INTERRUPTION_BOUND;
+        while Instant::now() < deadline {
+            if stream.has_errored() || stream.has_ended() {
+                break;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+        // An explicit interruption is the stream *failing*, as everywhere else
+        // in this gate: a clean end would say the turn finished.
+        let interrupted = stream.has_errored();
+        let picker = stop_reason_for(&held);
+        let no_stop_reason = !stream.seen().iter().any(|value| picker(value).is_some());
+        stream.break_now();
+        conversation.connection_stream.break_now();
+        conversation.consumer.shutdown();
+        Ok(KeyRotationArm {
+            interrupted,
+            no_stop_reason,
+            key_left_verifier,
+            reasons: ledger.labels_for(self.ingress_node_id(), TARGET_NODE),
+        })
+    }
+
+    fn ingress_node_id(&self) -> &'static str {
+        "relay-c"
+    }
+
+    /// Take the next membership record version and reserve it.
+    ///
+    /// Drawn from the same counter [`ProductionCluster::resign_membership_now`]
+    /// uses, and advanced past what this case publishes.  A case that issued
+    /// versions out of that counter's sight would leave the next boundary's
+    /// re-sign issuing a **rollback**, which the verifier refuses — the
+    /// boundary would then spin to its own deadline and fail for an unrelated
+    /// reason.
+    fn next_record_version(&mut self) -> u64 {
+        let version = self.cluster.membership_resign_inputs.next_record_version;
+        self.cluster.membership_resign_inputs.next_record_version = version.saturating_add(1);
+        version
+    }
+
+    /// Sign and publish the **owner's** membership record approving exactly
+    /// `spkis`, at `version`.
+    ///
+    /// Key ids are derived from the SPKI rather than from the version, so two
+    /// records approving the same keys carry byte-identical key lists.  That
+    /// is what makes the control arm a control: were the id to move with the
+    /// version, a reader could fairly say the control arm changed the key set
+    /// too.
+    async fn publish_owner_keys(&mut self, version: u64, spkis: &[&str]) -> Result<()> {
+        let now = Utc::now();
+        let node = self
+            .cluster
+            .fixture
+            .nodes
+            .iter()
+            .find(|node| node.node_id == TARGET_NODE)
+            .ok_or_else(|| {
+                HarnessError::InvalidInput("the owner node fixture is missing".into())
+            })?;
+        let peer_endpoint = self
+            .cluster
+            .peer_proxies
+            .get(TARGET_NODE)
+            .ok_or_else(|| HarnessError::InvalidInput("the owner peer proxy is missing".into()))?
+            .address();
+        // Sorted by key id.  `MembershipRecord` requires keys in activation
+        // order and, for keys activating at the same instant, strictly
+        // increasing key id (`MembershipError::RelayKeysUnordered`) -- these
+        // all share `now`, so the id is the whole order.  Sorting is what lets
+        // the id be derived from the SPKI rather than from the caller's
+        // argument order: the same SPKI set yields the same list whichever way
+        // it is passed, which is the property the control arm rests on.
+        let mut keys: Vec<crate::cluster_fixture::FixturePeerKey> = spkis
+            .iter()
+            .map(|spki| crate::cluster_fixture::FixturePeerKey {
+                key_id: format!("{TARGET_NODE}-peer-{}", &spki[..16]),
+                spki_sha256: (*spki).to_owned(),
+                not_before: now,
+                expires_at: now + crate::cluster_fixture::M7_MEMBERSHIP_LIFETIME,
+                revoked: false,
+            })
+            .collect();
+        keys.sort_by(|left, right| left.key_id.cmp(&right.key_id));
+        let record = self
+            .cluster
+            .checkpoint_authority
+            .issuer
+            .sign_membership_with_endpoint_and_keys(
+                &self.cluster.fixture.deployment_id,
+                &self.cluster.fixture.deployment_incarnation,
+                node,
+                crate::cluster_fixture::MembershipRecordOptions {
+                    record_version: version,
+                    peer_endpoint,
+                    keys,
+                    now,
+                    expires_at: now + crate::cluster_fixture::M7_MEMBERSHIP_LIFETIME,
+                },
+            )
+            .map_err(|error| {
+                HarnessError::Pki(format!("signing the owner key-rotation record: {error}"))
+            })?;
+        let inputs = &self.cluster.membership_resign_inputs;
+        let publisher =
+            RedisMembershipPublisher::connect(&inputs.redis_url, &inputs.redis_namespace)
+                .await
+                .map_err(|error| {
+                    HarnessError::Redis(format!("connecting the key-rotation publisher: {error}"))
+                })?;
+        publisher
+            .publish_signed_membership_for_node(TARGET_NODE, &record.catalog_record())
+            .await
+            .map_err(|error| {
+                HarnessError::Redis(format!("publishing the key-rotation record: {error}"))
+            })?;
+        self.cluster
+            .fixture
+            .memberships
+            .insert(TARGET_NODE.to_owned(), record);
+        Ok(())
+    }
+
+    /// Wait until **every** running relay's verifier carries exactly `spkis`
+    /// for the owner at `version`.
+    ///
+    /// This reads the verified state `admit_peer` binds against, not the bytes
+    /// in Redis, so convergence here is the thing the teardown is a
+    /// consequence of.  Each tick nudges the membership runtimes the same way
+    /// `resign_membership_now` does, so the case measures the teardown rather
+    /// than the refresh interval.
+    async fn converge_owner_keys(&self, version: u64, spkis: &[&str]) -> Result<bool> {
+        let deadline = Instant::now() + KEY_STAGE_BOUND;
+        loop {
+            let converged = self
+                .cluster
+                .relays
+                .iter()
+                .filter(|relay| relay.running.is_some())
+                .all(|relay| {
+                    relay
+                        .membership
+                        .snapshot()
+                        .memberships
+                        .iter()
+                        .any(|record| {
+                            record.node_id == TARGET_NODE
+                                && record.record_version == version
+                                && record.spki_sha256.len() == spkis.len()
+                                && spkis
+                                    .iter()
+                                    .all(|spki| record.spki_sha256.iter().any(|held| held == spki))
+                        })
+                });
+            if converged {
+                return Ok(true);
+            }
+            if Instant::now() >= deadline {
+                return Ok(false);
+            }
+            for relay in self.cluster.relays.iter().filter(|r| r.running.is_some()) {
+                relay.membership.notify_membership_changed();
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Settle the ingress route inside this case, counting the probes into the
+    /// case's own field rather than the boundaries'.
+    async fn settle_key_rotation_route(&mut self) -> Result<()> {
+        let probes = self.probe_until_route_answers().await?;
+        self.key_rotation_route_probes += probes;
+        Ok(())
+    }
+
     /// Case `peer-path-loss`: losing the ingress-to-owner peer path interrupts
     /// the live stream explicitly and never fabricates a stop reason — and,
     /// separately, withdrawing the ingress relay's peer **pins** does not.
@@ -1950,6 +2553,44 @@ impl Gate<'_> {
     /// `docs/acp.md`'s bounded per-hop queues were listed by chunk 4 as "not
     /// asserted rather than asserted vacuously" because no case saturated a
     /// hop.  This case asserts them.
+    ///
+    /// # Simultaneity: looked for, not found, and recorded as unreachable
+    ///
+    /// Review left "both segments at once" as something no instrument could
+    /// show.  That was right about the **peer hop** and incomplete about the
+    /// rest, so this case now separates the two.
+    ///
+    /// **The peer hop cannot show it, and no sampling fixes that.**  Its only
+    /// published figures are `peer_send_in_flight_high_water` and
+    /// `peer_receive_queue_high_water` on `HttpExchangeRecord`: two
+    /// independent all-time `max` latches, written once, when the exchange
+    /// *terminates*.  Both reading high is equally consistent with two
+    /// disjoint bursts, and there is no live gauge to sample instead — the
+    /// live `CreditState` and `QueueState` counters are private to
+    /// `tunnel_relay::http::forward` and reach no snapshot.  What would be
+    /// needed is written down on task row **M8-C22** and named in
+    /// `NOT_COVERED`; it is a product change, and none is attempted here.
+    /// This is also why a bounded loop shorter than the export's 30 s
+    /// output-credit stall can never see the response direction's record at
+    /// all: the record does not exist until the stall expires.
+    ///
+    /// **The owner↔device segment *can* show it, was watched for it, and
+    /// never showed it.**  `parked_bytes` (owner→device, held for send credit)
+    /// and `receive_buffered_bytes` (device→owner, held for the reader) are
+    /// live gauges produced by one owner-actor snapshot pass, so a sample
+    /// finding both above zero would be a same-instant observation.  Across
+    /// the whole window in which both loads exist, hundreds of samples find
+    /// both at zero, every run.  Neither direction ever accumulates *at this
+    /// segment*: the profile admits at most a 1 MiB body against a 4,063,232-
+    /// byte session budget and ample per-stream credit, so the request
+    /// direction cannot reach backpressure here at all, and the response
+    /// direction's backup lands at the ingress's own public response buffer
+    /// rather than at the owner's receive buffer — which is the same thing the
+    /// ingress's 362-byte receive queue has been saying all along.
+    ///
+    /// So the figures are disclosed and **nothing is asserted about
+    /// simultaneity**.  What *is* asserted is that the looking happened, so
+    /// that "never both loaded" cannot be produced by a run that never looked.
     async fn case_saturation(&mut self, evidence: &mut AcpClusterEvidence) -> Result<()> {
         // The stalled connection: a session nobody reads, flooded with
         // updates.  This backs up the response direction through the device,
@@ -1991,19 +2632,52 @@ impl Gate<'_> {
         // be read out of the word "concurrently".
         let mut ingress = (0usize, 0usize, 0usize);
         let mut device_queue_peak = 0usize;
-        let deadline = Instant::now() + Duration::from_secs(25);
+        // The best-attested *instant*, kept by the larger of its two smaller
+        // halves.  Keeping the two directions' maxima separately is precisely
+        // the mistake this field exists to avoid: two independent maxima say
+        // nothing about one instant.
+        let mut coherent = (0usize, 0usize);
+        let deadline = Instant::now() + SATURATION_SAMPLE_WINDOW;
         while Instant::now() < deadline {
             let a = self.hop_high_water("relay-c", "ingress_remote").await?;
             ingress = (ingress.0.max(a.0), ingress.1.max(a.1), ingress.2.max(a.2));
+            // One snapshot pass, so the two directions below are the same
+            // instant.  `queue_bytes` is a session-wide, direction-agnostic
+            // charge and cannot separate them, which is why the per-stream
+            // live gauges are read as well.
             let session = self.owner_session().await?;
             device_queue_peak = device_queue_peak.max(session.queue_bytes);
             evidence.owner_device_queue_high_water = session.data_bytes_high_water;
             evidence.owner_device_queue_limit = session.data_bytes_limit;
-            if ingress.2 > 0 && ingress.0 * 2 > ingress.2 {
+            let toward_device: usize = session
+                .streams
+                .iter()
+                .filter_map(|stream| stream.http.as_ref())
+                .map(|http| http.parked_bytes)
+                .sum();
+            let from_device: usize = session
+                .streams
+                .iter()
+                .filter_map(|stream| stream.http.as_ref())
+                .map(|http| http.receive_buffered_bytes)
+                .sum();
+            evidence.owner_device_coherent_samples += 1;
+            if toward_device.min(from_device) > coherent.0.min(coherent.1) {
+                coherent = (toward_device, from_device);
+            }
+            if ingress.2 > 0 && ingress.0 * 2 > ingress.2 && coherent.0.min(coherent.1) > 0 {
+                // Everything this case can show has been shown.  Today the
+                // second conjunct never holds and the loop runs its window
+                // out, which is what makes the zero below a finding; if a
+                // later change makes the segment observable in both
+                // directions, this stops paying for a window it no longer
+                // needs.
                 break;
             }
-            sleep(Duration::from_millis(200)).await;
+            sleep(SATURATION_SAMPLE_INTERVAL).await;
         }
+        evidence.owner_device_request_bytes_at_instant = coherent.0;
+        evidence.owner_device_response_bytes_at_instant = coherent.1;
         // The **request** direction of the ingress-to-owner peer hop: bytes
         // this relay had sent toward the owner that the owner had not yet
         // consumed.  `peer_receive_queue` on the same record is the other end
@@ -2015,13 +2689,17 @@ impl Gate<'_> {
         evidence.ingress_request_direction_saturated = ingress.2 > 0 && ingress.0 * 2 > ingress.2;
         eprintln!(
             "ACP cluster saturation: ingress_request(send={} recv={}) window={} \
-             owner_device(queue_peak={} high_water={} limit={})",
+             owner_device(queue_peak={} high_water={} limit={}) \
+             owner_device_at_one_instant(to_device={} from_device={} over {} samples)",
             ingress.0,
             ingress.1,
             ingress.2,
             device_queue_peak,
             evidence.owner_device_queue_high_water,
-            evidence.owner_device_queue_limit
+            evidence.owner_device_queue_limit,
+            evidence.owner_device_request_bytes_at_instant,
+            evidence.owner_device_response_bytes_at_instant,
+            evidence.owner_device_coherent_samples,
         );
 
         // A live SSE stream still delivers **while the parked stream is still
@@ -2584,6 +3262,7 @@ async fn run(
             .unwrap_or_else(Instant::now),
         membership_resigns: 0,
         boundary_route_probes: 0,
+        key_rotation_route_probes: 0,
         ingress_addr,
         ca,
         token,
@@ -2623,6 +3302,7 @@ async fn run(
                 "forged-heads" => gate.case_forged_heads(&mut evidence).await?,
                 "saturation" => gate.case_saturation(&mut evidence).await?,
                 "revocation" => gate.case_revocation(&mut evidence).await?,
+                "peer-key-rotation" => gate.case_key_rotation(&mut evidence).await?,
                 "peer-path-loss" => gate.case_peer_path_loss(&mut evidence).await?,
                 "owner-loss" => gate.case_owner_loss(&mut evidence).await?,
                 other => {
@@ -2791,7 +3471,47 @@ pub fn validate_acp_cluster_evidence(evidence: &AcpClusterEvidence) -> Result<()
             )));
         }
     }
-    let later: [(&str, bool); 23] = [
+    let later: [(&str, bool); 28] = [
+        // --- peer-key rotation (M8-C16) ---
+        (
+            // Without this the key arm is a claim about a window that never
+            // opened: if the overlap never reached the verifiers, the old key
+            // was not approved when the stream was established and its later
+            // absence explains nothing.
+            "the staged key overlap reached every relay's verifier before either arm ran",
+            evidence.key_overlap_staged,
+        ),
+        (
+            // The verified state `admit_peer` binds against, at the ingress
+            // that actually holds the admission -- not the bytes in Redis and
+            // not some other relay's view.
+            "the withdrawn peer key left the ingress relay's own verifier",
+            evidence.key_left_ingress_verifier,
+        ),
+        (
+            // **The attribution M8-C16 asks for.**  `revalidate_active`
+            // reaches for `MembershipRevoked` when and only when `bind_peer`
+            // fails for that admission -- the withdrawn-key path -- so this is
+            // the product naming the cause, not the gate inferring one from a
+            // coincidence of timing.
+            "the product attributed the key arm's teardown to the withdrawn key",
+            evidence
+                .key_rotation_reasons
+                .iter()
+                .any(|reason| reason == "membership_revoked"),
+        ),
+        (
+            // ...and the control beside it, without which the reason above is
+            // a label nobody checked.  Non-empty first: a control arm that
+            // invalidated nothing would satisfy "no key was named" vacuously
+            // and quietly stop controlling for anything.
+            "the same-key control arm was attributed to the record version, naming no key",
+            !evidence.version_bump_reasons.is_empty()
+                && !evidence
+                    .version_bump_reasons
+                    .iter()
+                    .any(|reason| reason == "membership_revoked"),
+        ),
         // --- two users in two tenants ---
         (
             "the two principals really did reuse the same JSON-RPC ids, in both types",
@@ -2914,6 +3634,27 @@ pub fn validate_acp_cluster_evidence(evidence: &AcpClusterEvidence) -> Result<()
             evidence.owner_device_queue_limit > 0 && evidence.owner_device_queue_high_water > 0,
         ),
         (
+            // **The rule behind a recorded impossibility.**  This gate does
+            // not claim two directions loaded at one instant, and the reason
+            // it does not is an observation rather than an assumption: the
+            // one segment that publishes live per-direction gauges was
+            // sampled coherently, many times, across the whole window in
+            // which both loads existed, and never showed both above zero.
+            //
+            // Without this rule that sentence would be unfalsifiable -- a run
+            // that never sampled at all would record exactly the same zeros.
+            // The disjunct is deliberate: if a later change makes the segment
+            // observable in both directions, the loop breaks early and the
+            // rule holds on the observation instead of on the sample count,
+            // so it never becomes a reason to keep looking at nothing.
+            "the owner-to-device segment's two directions were sampled together often enough for 'never both loaded' to be an observation, or were seen both loaded",
+            evidence.owner_device_coherent_samples >= MIN_COHERENT_SAMPLES
+                || evidence
+                    .owner_device_request_bytes_at_instant
+                    .min(evidence.owner_device_response_bytes_at_instant)
+                    > 0,
+        ),
+        (
             "the saturating upload completed, read off the wire",
             evidence.saturating_upload_stop_reason == "end_turn",
         ),
@@ -2929,14 +3670,21 @@ pub fn validate_acp_cluster_evidence(evidence: &AcpClusterEvidence) -> Result<()
             )));
         }
     }
-    // Peer-key rotation and owner loss are checked together, because the
-    // property is the same one and stating it twice separately invites one of
-    // them to be quietly weakened.
+    // Peer-path loss, peer-key rotation and owner loss are checked together,
+    // because the property is the same one and stating it three times
+    // separately invites one of them to be quietly weakened.  Each message
+    // names its own label, so a falsification can demand the rule that fired
+    // be the one under test rather than any of the three.
     for (label, interrupted, no_stop_reason) in [
         (
             "peer-path loss",
             evidence.path_loss_interrupted,
             evidence.path_loss_no_stop_reason,
+        ),
+        (
+            "peer-key rotation",
+            evidence.key_rotation_interrupted,
+            evidence.key_rotation_no_stop_reason,
         ),
         (
             "owner loss",
@@ -3170,12 +3918,23 @@ mod tests {
             path_loss_no_stop_reason: true,
             owner_loss_interrupted: true,
             owner_loss_no_stop_reason: true,
+            key_overlap_staged: true,
+            version_bump_interrupted: true,
+            version_bump_reasons: vec!["membership_changed".to_owned()],
+            key_rotation_interrupted: true,
+            key_rotation_no_stop_reason: true,
+            key_rotation_reasons: vec!["membership_revoked".to_owned()],
+            key_left_ingress_verifier: true,
+            key_rotation_route_probes: 3,
             ingress_request_peer_send_in_flight: 195_933,
             peer_window: 196_608,
             ingress_request_direction_saturated: true,
             owner_device_queue_peak_sampled: 0,
             owner_device_queue_high_water: 1,
             owner_device_queue_limit: 4_063_232,
+            owner_device_request_bytes_at_instant: 1,
+            owner_device_response_bytes_at_instant: 1,
+            owner_device_coherent_samples: 1,
             saturating_upload_stop_reason: "end_turn".to_owned(),
             live_probe_status: 202,
             live_stream_served_while_parked: true,
@@ -3236,12 +3995,20 @@ mod tests {
         // rule being falsifiable -- the shadowing class that made two of this
         // chunk's own guards non-load-bearing.
         //
-        // Two fragments are each shared by two rules ("explicit interruption"
-        // and "typed refusal").  That works only because the sibling rule
-        // still passes under the mutation, so the named one is the one that
-        // fires.  It is true today and is not enforced: if a future edit makes
-        // a sibling fail first, this test would credit the wrong rule.  Prefer
-        // a fragment unique to one rule when adding entries.
+        // **The two fragments that were shared across two rules are not any
+        // more.**  "explicit interruption" and "fabricated terminal" each
+        // belonged to two iterations of the interruption loop, and worked only
+        // because the sibling still passed under the mutation -- luck, not a
+        // rule.  A third label (peer-key rotation) would have had to be lucky
+        // three ways, so each fragment now names its own label, which the
+        // loop's message already carries.
+        //
+        // One fragment is still shared, and legitimately: "typed refusal" is
+        // reached by two mutations of the **same** compound rule (the status
+        // and the code of the revocation's refusal).  Two falsifications of
+        // one rule is the point of the mechanism; two rules behind one
+        // fragment was the hazard.  Prefer a fragment unique to one rule when
+        // adding entries.
         let mutations: Vec<Falsification> = vec![
             ("relay_count", |e| e.relay_count = 2, "three relays"),
             (
@@ -3488,29 +4255,78 @@ mod tests {
                 },
                 "withdrawn turn never acquired a stop reason",
             ),
+            // Each of these names its own label.  They used to share the
+            // fragments "explicit interruption" and "fabricated terminal"
+            // across two rules apiece, which the comment above flagged as
+            // working only by luck: the loop's message already carries the
+            // label, so the fragment can demand the right one, and with a
+            // third label in that loop the luck would have had to hold three
+            // ways.
             (
                 "path_loss_interrupted",
                 |e| e.path_loss_interrupted = false,
-                "explicit interruption",
+                "peer-path loss did not produce an explicit interruption",
             ),
             (
                 "path_loss_no_stop_reason",
                 |e| {
                     e.path_loss_no_stop_reason = false;
                 },
-                "fabricated terminal",
+                "peer-path loss produced a stopReason",
+            ),
+            (
+                "key_rotation_interrupted",
+                |e| e.key_rotation_interrupted = false,
+                "peer-key rotation did not produce an explicit interruption",
+            ),
+            (
+                "key_rotation_no_stop_reason",
+                |e| {
+                    e.key_rotation_no_stop_reason = false;
+                },
+                "peer-key rotation produced a stopReason",
+            ),
+            (
+                "key_overlap_staged",
+                |e| e.key_overlap_staged = false,
+                "staged key overlap reached every relay's verifier",
+            ),
+            (
+                "key_left_ingress_verifier",
+                |e| e.key_left_ingress_verifier = false,
+                "withdrawn peer key left the ingress relay's own verifier",
+            ),
+            (
+                "key_rotation_reasons",
+                |e| {
+                    // The teardown attributed to the record version rather
+                    // than to the key: exactly the mistake M8-C16 was filed
+                    // for, now a falsification rather than a caveat.
+                    e.key_rotation_reasons = vec!["membership_changed".to_owned()];
+                },
+                "attributed the key arm's teardown to the withdrawn key",
+            ),
+            (
+                "version_bump_reasons",
+                |e| {
+                    // The control arm attributed to a key it never changed.
+                    // If this could pass, the key arm's reason would be
+                    // evidence of nothing.
+                    e.version_bump_reasons = vec!["membership_revoked".to_owned()];
+                },
+                "same-key control arm was attributed to the record version",
             ),
             (
                 "owner_loss_interrupted",
                 |e| e.owner_loss_interrupted = false,
-                "explicit interruption",
+                "owner loss did not produce an explicit interruption",
             ),
             (
                 "owner_loss_no_stop_reason",
                 |e| {
                     e.owner_loss_no_stop_reason = false;
                 },
-                "fabricated terminal",
+                "owner loss produced a stopReason",
             ),
             (
                 "ingress_request_direction_saturated",
@@ -3537,6 +4353,20 @@ mod tests {
                     e.live_stream_served_while_parked = false;
                 },
                 "parked and stalling",
+            ),
+            (
+                // Guards the recorded impossibility itself: a run that never
+                // sampled records the same zeros as a run that sampled and
+                // found nothing, and only this rule tells them apart.  The
+                // mutation clears both halves of the disjunction, because
+                // clearing one leaves the other carrying the rule.
+                "owner_device_coherent_samples",
+                |e| {
+                    e.owner_device_coherent_samples = 0;
+                    e.owner_device_request_bytes_at_instant = 0;
+                    e.owner_device_response_bytes_at_instant = 0;
+                },
+                "sampled together often enough",
             ),
             (
                 "leftover_processes",
