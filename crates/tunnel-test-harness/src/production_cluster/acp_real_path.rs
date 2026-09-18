@@ -112,7 +112,7 @@ pub const MEMBERSHIP_RESIGN_SPACING: Duration = Duration::from_secs(15);
 pub const MEMBERSHIP_RECORD_LIFETIME: Duration = Duration::from_secs(60);
 
 /// The relay's own retry hint for an owner-not-ready refusal.
-const MIN_RETRY_HINT_MS: u64 = 250;
+pub(super) const MIN_RETRY_HINT_MS: u64 = 250;
 /// Margin above the handshake window, so a resend budget derived from the
 /// rotation policy is not tight against it.
 const RETRY_MARGIN: u64 = 4;
@@ -125,9 +125,9 @@ pub const NOT_DISPATCHED_RETRIES: u64 = (ACP_GATE_ROTATION.handshake_timeout_sec
 
 /// How close to an observed frozen sample a refusal must be to count as
 /// coinciding with it.
-const FREEZE_COINCIDENCE: Duration = Duration::from_millis(750);
+pub(super) const FREEZE_COINCIDENCE: Duration = Duration::from_millis(750);
 /// The connector phases in which the owner refuses new stream admission.
-const FROZEN_PHASES: [&str; 3] = ["quiescing", "draining", "committing"];
+pub(super) const FROZEN_PHASES: [&str; 3] = ["quiescing", "draining", "committing"];
 
 /// The cases this gate runs, in order.
 pub const ACP_CASES: [&str; 7] = [
@@ -346,10 +346,10 @@ pub struct LossEvidence {
 /// A refusal the relay answered that this gate resent, and why it was allowed
 /// to.
 #[derive(Debug, Default)]
-struct RefusalLedger {
-    refusals: AtomicU64,
-    retries: AtomicU64,
-    unexplained: std::sync::Mutex<Option<String>>,
+pub(super) struct RefusalLedger {
+    pub(super) refusals: AtomicU64,
+    pub(super) retries: AtomicU64,
+    pub(super) unexplained: std::sync::Mutex<Option<String>>,
 }
 
 /// The connector's rotation phase, sampled from its own status watch.
@@ -357,7 +357,7 @@ struct RefusalLedger {
 /// A refusal is only resendable if it coincides with a phase **this observed**
 /// — never because a refusal looked like one a rotation would produce.
 #[derive(Debug, Default)]
-struct FreezeWatch {
+pub(super) struct FreezeWatch {
     frozen: std::sync::atomic::AtomicBool,
     seen_frozen: std::sync::atomic::AtomicBool,
     last_frozen_ms: AtomicU64,
@@ -367,7 +367,7 @@ struct FreezeWatch {
 }
 
 impl FreezeWatch {
-    fn record(&self, phase: &str, rotations_completed: u64) {
+    pub(super) fn record(&self, phase: &str, rotations_completed: u64) {
         let mut started = self.started.lock().unwrap_or_else(|e| e.into_inner());
         if started.is_none() {
             *started = Some(Instant::now());
@@ -388,7 +388,7 @@ impl FreezeWatch {
         }
     }
 
-    fn coincides(&self) -> bool {
+    pub(super) fn coincides(&self) -> bool {
         if self.frozen.load(Ordering::SeqCst) {
             return true;
         }
@@ -407,7 +407,7 @@ impl FreezeWatch {
 
     /// The sentence a refusal outside a freeze is reported with.  It names the
     /// connector state, so the failure is diagnosable without a rerun.
-    fn unexplained(&self) -> String {
+    pub(super) fn unexplained(&self) -> String {
         let phase = self.phase.lock().unwrap_or_else(|e| e.into_inner()).clone();
         format!(
             "not_dispatched refusal outside a rotation freeze: connector phase={phase:?} rotations_completed={}",
@@ -425,13 +425,13 @@ impl FreezeWatch {
 ///
 /// One connection carries the long-lived GET streams and the POSTs beside
 /// them, which is what h2 multiplexing is for and what the profile assumes.
-struct AcpConsumer {
-    sender: hyper::client::conn::http2::SendRequest<StreamBody<ConsumerStream>>,
+pub(super) struct AcpConsumer {
+    pub(super) sender: hyper::client::conn::http2::SendRequest<StreamBody<ConsumerStream>>,
     task: tokio::task::JoinHandle<()>,
 }
 
 impl AcpConsumer {
-    async fn connect(addr: SocketAddr, ca_der: &[u8]) -> Result<Self> {
+    pub(super) async fn connect(addr: SocketAddr, ca_der: &[u8]) -> Result<Self> {
         let mut roots = rustls::RootCertStore::empty();
         roots
             .add(CertificateDer::from(ca_der.to_vec()))
@@ -466,13 +466,13 @@ impl AcpConsumer {
         Ok(Self { sender, task })
     }
 
-    fn shutdown(self) {
+    pub(super) fn shutdown(self) {
         self.task.abort();
     }
 }
 
 /// One ACP exchange's request, built for the public route.
-fn acp_request(
+pub(super) fn acp_request(
     method: &str,
     uri: &str,
     token: &str,
@@ -492,7 +492,7 @@ fn acp_request(
         .map_err(|error| HarnessError::Http(format!("building an ACP request: {error}")))
 }
 
-fn json_stream(value: &Value) -> StreamBody<ConsumerStream> {
+pub(super) fn json_stream(value: &Value) -> StreamBody<ConsumerStream> {
     let bytes = Bytes::from(serde_json::to_vec(value).unwrap_or_default());
     StreamBody::new(Box::pin(futures_util::stream::once(async move {
         Ok(Frame::data(bytes))
@@ -507,7 +507,7 @@ fn json_stream(value: &Value) -> StreamBody<ConsumerStream> {
 /// established required stream whose body is dropped terminates the whole ACP
 /// transport. A reader that took one message and let the response go would
 /// destroy the connection it was reading.
-struct HeldStream {
+pub(super) struct HeldStream {
     payloads: Arc<std::sync::Mutex<Vec<Value>>>,
     errored: Arc<std::sync::atomic::AtomicBool>,
     ended: Arc<std::sync::atomic::AtomicBool>,
@@ -515,7 +515,7 @@ struct HeldStream {
 }
 
 impl HeldStream {
-    fn hold(response: http::Response<hyper::body::Incoming>) -> Self {
+    pub(super) fn hold(response: http::Response<hyper::body::Incoming>) -> Self {
         let payloads = Arc::new(std::sync::Mutex::new(Vec::new()));
         let errored = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -561,7 +561,7 @@ impl HeldStream {
         }
     }
 
-    fn seen(&self) -> Vec<Value> {
+    pub(super) fn seen(&self) -> Vec<Value> {
         self.payloads
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -572,7 +572,11 @@ impl HeldStream {
     ///
     /// Bounded: a stream that never carries it is a failure with a name, not a
     /// hang.
-    async fn wait_for<T>(&self, what: &str, pick: impl Fn(&Value) -> Option<T>) -> Result<T> {
+    pub(super) async fn wait_for<T>(
+        &self,
+        what: &str,
+        pick: impl Fn(&Value) -> Option<T>,
+    ) -> Result<T> {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             for value in self.seen() {
@@ -595,15 +599,15 @@ impl HeldStream {
     }
 
     /// Break this established stream the way a consumer going away breaks it.
-    fn break_now(&self) {
+    pub(super) fn break_now(&self) {
         self.task.abort();
     }
 
-    fn has_errored(&self) -> bool {
+    pub(super) fn has_errored(&self) -> bool {
         self.errored.load(Ordering::SeqCst)
     }
 
-    fn has_ended(&self) -> bool {
+    pub(super) fn has_ended(&self) -> bool {
         self.ended.load(Ordering::SeqCst)
     }
 }
@@ -612,7 +616,7 @@ impl HeldStream {
 ///
 /// The encoding is this profile's own and is asserted byte for byte in
 /// `tunnel-acp-export`; this is only the reader.
-fn sse_payloads(bytes: &[u8]) -> Vec<Vec<u8>> {
+pub(super) fn sse_payloads(bytes: &[u8]) -> Vec<Vec<u8>> {
     let mut payloads = Vec::new();
     let mut rest = bytes;
     while !rest.is_empty() {
@@ -638,7 +642,7 @@ fn sse_payloads(bytes: &[u8]) -> Vec<Vec<u8>> {
 /// `supervisor_refusal` puts that in `error.message`, so the rule really is on
 /// the wire.  An answer that was accepted, or one carrying no rule, yields an
 /// empty string rather than a guess — the validator then names it.
-fn refusal_rule(status: http::StatusCode, body: &str) -> String {
+pub(super) fn refusal_rule(status: http::StatusCode, body: &str) -> String {
     if status == http::StatusCode::ACCEPTED {
         return String::new();
     }
@@ -655,14 +659,14 @@ fn refusal_rule(status: http::StatusCode, body: &str) -> String {
         .unwrap_or_default()
 }
 
-fn stop_reason(value: &Value) -> Option<String> {
+pub(super) fn stop_reason(value: &Value) -> Option<String> {
     value
         .pointer("/result/stopReason")
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
 }
 
-fn session_id(value: &Value) -> Option<String> {
+pub(super) fn session_id(value: &Value) -> Option<String> {
     value
         .pointer("/result/sessionId")
         .and_then(Value::as_str)
@@ -673,7 +677,7 @@ fn session_id(value: &Value) -> Option<String> {
 ///
 /// `kill -0` alone succeeds on a zombie, so a cleanup claim resting on it
 /// would stay green for the wrong reason.
-fn process_alive(pid: u32) -> bool {
+pub(super) fn process_alive(pid: u32) -> bool {
     let Ok(output) = std::process::Command::new("ps")
         .args(["-o", "state=", "-p", &pid.to_string()])
         .output()
@@ -687,7 +691,12 @@ fn process_alive(pid: u32) -> bool {
 /// The device runtime configuration: the harness device profile plus one
 /// `[exports.<service>.acp]` table, parsed and validated by `tunnel-client`
 /// exactly as `tunnel-client connect` loads it.
-fn device_config_text(base: &str, service: &str, fixture: &Path, workspace: &Path) -> String {
+pub(super) fn device_config_text(
+    base: &str,
+    service: &str,
+    fixture: &Path,
+    workspace: &Path,
+) -> String {
     let quote = |value: &str| serde_json::to_string(value).unwrap_or_default();
     format!(
         "{base}\n[exports.\"{service}\"]\ntype = \"http-forward\"\n\n[exports.\"{service}\".acp]\nprofile = \"acp-http-v1\"\n\n[exports.\"{service}\".acp.agent]\ncommand = {}\nargs = [\"agent\"]\nworkspace = {}\n",
@@ -697,7 +706,7 @@ fn device_config_text(base: &str, service: &str, fixture: &Path, workspace: &Pat
 }
 
 /// Where the ACP fixture binary is.
-fn fixture_binary_path() -> Result<PathBuf> {
+pub(super) fn fixture_binary_path() -> Result<PathBuf> {
     if let Ok(path) = std::env::var("TUNNEL_ACP_FIXTURE_BIN") {
         return Ok(PathBuf::from(path));
     }
