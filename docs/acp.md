@@ -837,6 +837,14 @@ connection and started a child.
   session queue reached a high-water of **164,232** bytes against its
   **4,063,232**-byte budget: measured load, and nowhere near its bound.
 
+  The saturating upload's own `stopReason` is read off the wire before the live
+  probe is sent, for two reasons. It shares a session with the probe, and
+  `docs/acp.md` allows one active prompt per session, so a probe sent while the
+  upload is still running is refused `ACP_PROMPT_ALREADY_ACTIVE` — that rule
+  working, not this property failing, which cost two runs in eight before the
+  wait existed. And it makes the saturating request one that demonstrably
+  **completed** rather than one merely accepted.
+
   **What the earlier draft got wrong, in two ways.** It reported both figures
   as two different segments; they were the *same* direction of the *same* hop
   seen from each end — `peer_receive_queue` is the far end of the send
@@ -1116,8 +1124,27 @@ interval chunk 4's budget ran out inside a genuine freeze. A refusal that
 exhausts its budget, or never correlates, now **fails by name with the freeze
 correlation attached** rather than being handed back as a bare 503 for the
 caller to describe as a broken route. In the recorded runs there were **no
-refusals at all**: `not_dispatched_refusals` and `not_dispatched_retries` both
-zero across six consecutive green runs.
+refusals at all** in most runs, and where a run did meet them — two of eight in
+the last stability set — every one coincided with an observed freeze and was
+resent inside the budget.
+
+**One run failed by name on an *uncorrelated* refusal, and the fix went where
+it belonged.** Sixteen `not_dispatched` refusals arrived at the first request
+of a case with the connector reporting `phase="active"` — no freeze anywhere
+near them. The cause is not a rotation at all: `Gate::boundary` re-signs
+membership between cases, which invalidates every peer admission, and
+`peer_runtime.is_ready()` can come back while the owner still answers `503
+PEER_UNAVAILABLE` with `not_dispatched`. That is **the same body the relay
+returns for a rotation freeze**, which is precisely M3-15's open ambiguity.
+
+The boundary now settles the route before the next case starts, with a probe
+that names a connection id which never existed so it starts no child and has no
+side effect. **The correlation was deliberately not widened to absorb it**:
+widening what counts as a freeze would have made the refusal discipline
+meaningless in exactly the way M3-15 warns about, and the gate failing by name
+is what surfaced the real cause. The probe count is disclosed as
+`boundary_route_probes` — the gate's own settling, not a property of the
+product.
 
 ### Evidence
 
