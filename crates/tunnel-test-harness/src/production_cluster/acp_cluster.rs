@@ -544,8 +544,16 @@ pub struct AcpClusterEvidence {
     /// sequencing rather than observed, and the budget explanation beside it
     /// was untested. The upload now runs concurrently with the sampler.
     pub owner_device_loaded_samples: u64,
-    /// How long the upload was in flight, which bounds the window above.
+    /// How long the last upload was in flight, which bounds the window above.
     pub owner_device_upload_ms: u128,
+    /// How many uploads it took to observe the instant.
+    ///
+    /// **Disclosed, and one is not asserted.** An upload that collides with a
+    /// rotation freeze is refused and resent, so `prompt` can stay outstanding
+    /// for seconds with almost none of it bytes moving; the case retries a
+    /// bounded number of times rather than calling that a failure of the
+    /// property, and says how many it needed.
+    pub owner_device_upload_attempts: u64,
     /// The saturating upload's own `stopReason`, read off the wire.
     pub saturating_upload_stop_reason: String,
     /// The status the live probe's POST met, recorded so a failure here is
@@ -1454,6 +1462,17 @@ const SATURATION_SAMPLE_INTERVAL: Duration = Duration::from_millis(25);
 /// sampler ever looked fails by name instead of quietly recording a reading it
 /// never took.
 const MIN_LOADED_SAMPLES: u64 = 64;
+
+/// How many independent near-limit uploads the saturation case may take to
+/// observe both directions loaded at one instant.
+///
+/// Derived from the collision it exists to survive rather than tuned: the
+/// device rotates every 3 s and a QUIESCE-to-COMMIT freeze spans the handshake
+/// plus the candidate's overlap, so an upload can be refused and resent for
+/// seconds — observed once in twelve runs at 12,040 ms against a 156-188 ms
+/// norm. Three independent transfers cannot all land inside one freeze. The
+/// count actually used is recorded on the evidence.
+const SATURATION_UPLOAD_ATTEMPTS: u64 = 3;
 
 /// What one arm of the key-rotation case observed.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -2794,8 +2813,6 @@ impl Gate<'_> {
         // segment is read.
         let filler = "x".repeat(900_000);
         let gate: &Self = &*self;
-        let upload_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let upload_started = Instant::now();
 
         // Sample while both directions are backed up.  The stalled stream is
         // unread throughout, so the response direction stays full.
@@ -2813,99 +2830,110 @@ impl Gate<'_> {
         // already ended.  The claim is narrowed to what the instruments can
         // show, and the limit is recorded in `NOT_COVERED` rather than left to
         // be read out of the word "concurrently".
-        let upload = async {
-            let outcome = gate
-                .prompt(&live, &live_session, "sat-upload", &filler)
-                .await;
-            upload_in_flight.store(false, Ordering::SeqCst);
-            outcome
-        };
-        let sampler = async {
-            let mut ingress = (0usize, 0usize, 0usize);
-            let mut device_queue_peak = 0usize;
-            // The best-attested *instant*, kept by the larger of its two
-            // smaller halves.  Keeping the two directions' maxima separately
-            // is precisely the mistake this field exists to avoid: two
-            // independent maxima say nothing about one instant.
-            let mut coherent = (0usize, 0usize);
-            let mut samples = 0u64;
-            let mut loaded_samples = 0u64;
-            let mut high_water = 0usize;
-            let mut limit = 0usize;
-            let deadline = Instant::now() + SATURATION_SAMPLE_WINDOW;
-            while Instant::now() < deadline {
-                // Read before the snapshot, so a sample can only be *under*
-                // credited as loaded, never over.
-                let loaded = upload_in_flight.load(Ordering::SeqCst);
-                let a = gate.hop_high_water(INGRESS_NODE, "ingress_remote").await?;
-                ingress = (ingress.0.max(a.0), ingress.1.max(a.1), ingress.2.max(a.2));
-                // One snapshot pass, so the two directions below are the same
-                // instant.  `queue_bytes` is a session-wide,
-                // direction-agnostic charge and cannot separate them, which is
-                // why the per-stream live gauges are read as well.
-                let session = gate.owner_session().await?;
-                device_queue_peak = device_queue_peak.max(session.queue_bytes);
-                high_water = session.data_bytes_high_water;
-                limit = session.data_bytes_limit;
-                let toward_device: usize = session
-                    .streams
-                    .iter()
-                    .filter_map(|stream| stream.http.as_ref())
-                    .map(|http| http.parked_bytes)
-                    .sum();
-                let from_device: usize = session
-                    .streams
-                    .iter()
-                    .filter_map(|stream| stream.http.as_ref())
-                    .map(|http| http.receive_buffered_bytes)
-                    .sum();
-                samples += 1;
-                if loaded {
-                    loaded_samples += 1;
+        // **Bounded attempts, disclosed rather than hidden.**  One attempt was
+        // not enough: a run whose upload collides with a rotation freeze meets
+        // `not_dispatched`, and `post_as` resends -- so `prompt` stays
+        // outstanding for seconds while almost none of that time is bytes
+        // moving. Observed once in twelve runs: a 12,040 ms "upload" against a
+        // 156-188 ms norm, with both directions reading zero throughout.
+        //
+        // Each attempt is an independent observation of the same property, so
+        // repeating it is measurement rather than tuning; the count is
+        // recorded either way, and a run that needed a second attempt says so.
+        // Three is derived from the collision it exists to survive: the device
+        // rotates every 3 s and a freeze spans the handshake plus the
+        // candidate's overlap, so three independent ~160 ms transfers cannot
+        // all land inside one.
+        let mut ingress = (0usize, 0usize, 0usize);
+        let mut device_queue_peak = 0usize;
+        // The best-attested *instant*, kept by the larger of its two smaller
+        // halves.  Keeping the two directions' maxima separately is precisely
+        // the mistake this field exists to avoid: two independent maxima say
+        // nothing about one instant.
+        let mut coherent = (0usize, 0usize);
+        let mut samples = 0u64;
+        let mut loaded_samples = 0u64;
+        let mut high_water = 0usize;
+        let mut limit = 0usize;
+        let mut upload_id = String::new();
+        let mut attempts = 0u64;
+        while attempts < SATURATION_UPLOAD_ATTEMPTS && coherent.0.min(coherent.1) == 0 {
+            attempts += 1;
+            upload_id = if attempts == 1 {
+                "sat-upload".to_owned()
+            } else {
+                format!("sat-upload-{attempts}")
+            };
+            let in_flight = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let flag = Arc::clone(&in_flight);
+            let id = upload_id.clone();
+            let started = Instant::now();
+            let upload = async {
+                let outcome = gate.prompt(&live, &live_session, &id, &filler).await;
+                flag.store(false, Ordering::SeqCst);
+                outcome
+            };
+            // Sample only while this attempt's transfer is outstanding.  The
+            // ingress peer-hop figure is deliberately not read here: it comes
+            // from a terminated exchange record, so it cannot exist yet, and
+            // reading it would only slow the loop down inside the one window
+            // that matters.
+            let sampler = async {
+                let mut local = (0usize, 0usize);
+                let mut taken = 0u64;
+                let deadline = Instant::now() + SATURATION_SAMPLE_WINDOW;
+                while in_flight.load(Ordering::SeqCst) && Instant::now() < deadline {
+                    let session = gate.owner_session().await?;
+                    device_queue_peak = device_queue_peak.max(session.queue_bytes);
+                    high_water = session.data_bytes_high_water;
+                    limit = session.data_bytes_limit;
+                    let toward_device: usize = session
+                        .streams
+                        .iter()
+                        .filter_map(|stream| stream.http.as_ref())
+                        .map(|http| http.parked_bytes)
+                        .sum();
+                    let from_device: usize = session
+                        .streams
+                        .iter()
+                        .filter_map(|stream| stream.http.as_ref())
+                        .map(|http| http.receive_buffered_bytes)
+                        .sum();
+                    taken += 1;
+                    if toward_device.min(from_device) > local.0.min(local.1) {
+                        local = (toward_device, from_device);
+                    }
                 }
-                if toward_device.min(from_device) > coherent.0.min(coherent.1) {
-                    coherent = (toward_device, from_device);
-                }
-                if !loaded
-                    && ingress.2 > 0
-                    && ingress.0 * 2 > ingress.2
-                    && coherent.0.min(coherent.1) > 0
-                {
-                    // Everything this case can show has been shown.  Today the
-                    // third conjunct never holds and the loop runs its window
-                    // out, which is what makes the zero below a finding; if a
-                    // later change makes the segment observable in both
-                    // directions, this stops paying for a window it no longer
-                    // needs.
-                    break;
-                }
-                if !loaded {
-                    // No sleep while the upload is in flight: that window is
-                    // short and is the only one in which both directions of
-                    // this segment can be loaded at once, so it is sampled as
-                    // densely as the snapshot pass allows.
-                    sleep(SATURATION_SAMPLE_INTERVAL).await;
-                }
+                Ok::<_, HarnessError>((local, taken))
+            };
+            let (upload_outcome, measured) = tokio::join!(upload, sampler);
+            upload_outcome?;
+            let (local, taken) = measured?;
+            samples += taken;
+            loaded_samples += taken;
+            if local.0.min(local.1) > coherent.0.min(coherent.1) {
+                coherent = local;
             }
-            Ok::<_, HarnessError>((
-                ingress,
-                device_queue_peak,
-                coherent,
-                samples,
-                loaded_samples,
-                high_water,
-                limit,
-            ))
-        };
-        let (upload_outcome, measured) = tokio::join!(upload, sampler);
-        upload_outcome?;
-        let (ingress, device_queue_peak, coherent, samples, loaded_samples, high_water, limit) =
-            measured?;
-        evidence.owner_device_upload_ms = upload_started.elapsed().as_millis();
+            evidence.owner_device_upload_ms = started.elapsed().as_millis();
+        }
+
+        // The peer hop's own figure, which only exists once the exchange has
+        // terminated, so it is read after the transfers rather than during.
+        let deadline = Instant::now() + SATURATION_SAMPLE_WINDOW;
+        while Instant::now() < deadline {
+            let a = gate.hop_high_water(INGRESS_NODE, "ingress_remote").await?;
+            ingress = (ingress.0.max(a.0), ingress.1.max(a.1), ingress.2.max(a.2));
+            samples += 1;
+            if ingress.2 > 0 && ingress.0 * 2 > ingress.2 {
+                break;
+            }
+            sleep(SATURATION_SAMPLE_INTERVAL).await;
+        }
         evidence.owner_device_queue_high_water = high_water;
         evidence.owner_device_queue_limit = limit;
         evidence.owner_device_coherent_samples = samples;
         evidence.owner_device_loaded_samples = loaded_samples;
+        evidence.owner_device_upload_attempts = attempts;
         evidence.owner_device_request_bytes_at_instant = coherent.0;
         evidence.owner_device_response_bytes_at_instant = coherent.1;
         // The **request** direction of the ingress-to-owner peer hop: bytes
@@ -2921,7 +2949,7 @@ impl Gate<'_> {
             "ACP cluster saturation: ingress_request(send={} recv={}) window={} \
              owner_device(queue_peak={} high_water={} limit={}) \
              owner_device_at_one_instant(to_device={} from_device={} over {} samples, \
-             {} of them while the {} ms upload was in flight)",
+             {} of them during {} upload attempt(s), the last {} ms)",
             ingress.0,
             ingress.1,
             ingress.2,
@@ -2932,6 +2960,7 @@ impl Gate<'_> {
             evidence.owner_device_response_bytes_at_instant,
             evidence.owner_device_coherent_samples,
             evidence.owner_device_loaded_samples,
+            evidence.owner_device_upload_attempts,
             evidence.owner_device_upload_ms,
         );
 
@@ -2954,7 +2983,7 @@ impl Gate<'_> {
             Duration::from_secs(60),
             live_stream.wait_for(
                 "the saturating upload's result",
-                stop_reason_for("sat-upload"),
+                stop_reason_for(&upload_id),
             ),
         )
         .await
@@ -4205,6 +4234,7 @@ mod tests {
             owner_device_coherent_samples: 518,
             owner_device_loaded_samples: 517,
             owner_device_upload_ms: 171,
+            owner_device_upload_attempts: 1,
             saturating_upload_stop_reason: "end_turn".to_owned(),
             live_probe_status: 202,
             live_stream_served_while_parked: true,

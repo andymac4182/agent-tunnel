@@ -79,14 +79,23 @@ gate "M8 ACP over three relays: a v1 conversation, permissions, cancellation, su
 # key arm's teardown is attributed by the product's own invalidation reason
 # against a same-key control arm, not by the timing of the interruption.
 #
-# Simultaneous saturation is still NOT claimed, and is now recorded as
-# unreachable rather than narrowed: `record_exchange` fires at exchange
-# termination and the peer hop publishes no live gauge, so no instrument can
-# show two directions of that hop full at once (M8-C22).  The owner-to-device
-# segment, which does publish live per-direction gauges, is sampled coherently
-# several hundred times a run and never shows both loaded -- an observation
-# the gate has a rule for, so it cannot be produced by never looking.
-gate "M8 ACP across three relays: three completed rotations with two sessions live, two tenants reusing identical ids, forged heads, revocation, an attributed peer-key rotation, peer-path loss, owner loss, and the request direction of the ingress-to-owner hop driven against its credit window with the owner-to-device segment measured as load and its two directions sampled together" \
+# **What that key arm is, stated here because a label is what a reader sees.**
+# The withdrawn key is the owner's OWN serving key and its replacement is a
+# phantom no certificate presents, so the owner also fails closed and
+# invalidates its own admission of the ingress.  The case attributes the
+# INGRESS's decision and records both ends' reasons; which end closed the
+# socket first is not shown, and a genuine rotation needs a fixture relay that
+# re-keys.
+#
+# Simultaneity splits between the two hops.  The peer hop cannot show it at
+# all: `record_exchange` fires at exchange termination and the hop publishes no
+# live gauge, so its two figures are independent all-time latches (M8-C22).
+# The owner-to-device segment does publish live per-direction gauges, and the
+# gate asserts both directions carrying bytes at one coherent instant, sampled
+# while the near-limit upload is still in flight.  An earlier version claimed
+# the reverse for that segment; it had sampled only after the upload's POST
+# returned, which on this profile means after the body had already arrived.
+gate "M8 ACP across three relays: three completed rotations with two sessions live, two tenants reusing identical ids, forged heads, revocation, an owner-key withdrawal whose teardown the ingress attributes to the key rather than the record version, peer-path loss, owner loss, and the request direction of the ingress-to-owner hop driven against its credit window with both directions of the owner-to-device segment carrying bytes at one coherent instant" \
   cargo run --locked -p tunnel-test-harness -- verify-m8-acp-cluster
 
 echo "m8-harness-verify: implemented M8 harness suite passed" >&2

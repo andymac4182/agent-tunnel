@@ -854,17 +854,50 @@ connection and started a child.
   explicit interruption, neither produces a `stopReason`, and a later admission
   meets `503 PEER_UNTRUSTED` / `not_dispatched` either way. **The product
   distinguishes them.** `RuntimeState::revalidate_active` reaches for
-  `PeerInvalidationReason::MembershipRevoked` when and only when `bind_peer`
-  **fails** for that admission — the withdrawn-key path — and for
-  `MembershipChanged` when the binding still verifies and only the record
-  version moved. Observed every run: control `["membership_changed"]`, key
-  `["membership_revoked"]`. The attribution is the product's own, and the
-  control arm is what stops it being read as a coincidence of timing.
+  `PeerInvalidationReason::MembershipRevoked` where `bind_peer` **fails** for
+  that admission — the withdrawn-key path — and for `MembershipChanged` where
+  the binding still verifies and only the record version moved. Observed in all
+  fourteen runs: control `["membership_changed"]`, key `["membership_revoked"]`,
+  asserted as exact sets rather than as "contains". `MembershipRevoked` is also
+  the reason `install_unready_candidate` and `mark_unready` use, and this case
+  excludes those only because convergence on the ingress's own verifier is
+  observed before the reason is read — so the exact-set rule is what keeps that
+  exclusion honest.
+
+  **What the key arm actually is: an owner self-revocation with a phantom
+  successor.** `INCOMING_SPKI` is a digest no fixture certificate presents, so
+  the key being withdrawn is the **owner's own serving key**. The owner cannot
+  find its local key in the record it has just reconciled, takes the
+  `MembershipRejected` branch of `membership_runtime.rs`, goes **Unready**, and
+  invalidates every admission it holds — including its admission of the ingress
+  — with the same `MembershipRevoked`. The run's own logs carry a `PeerRejected`
+  reconcile failure and a failed-closed pin publication inside this case, every
+  run.
+
+  So the key arm is **three concurrent teardowns**: the ingress revalidating the
+  owner, the owner failing closed and invalidating the ingress, and the version
+  bump. The control arm controls for the third only, and the run confirms the
+  asymmetry: control `owner_reasons=[] owner_unready=false`, key
+  `owner_reasons=["membership_revoked"] owner_unready=true`, in all fourteen
+  runs, both asserted. What the ingress latched is therefore the **ingress's own
+  decision**, correctly attributed and correctly separated from a version bump
+  — and it is **not** evidence about which of the three closed the socket first.
+
+  **A genuine rotation would not include the owner going unready**, and this
+  fixture cannot stage one: the admission under test binds the SPKI the owner
+  actually presents, so withdrawing that SPKI and unreadying the owner are the
+  same act. Escaping it needs a fixture relay that really re-keys, which is
+  recorded on M8-C16 rather than attempted.
+
+  The case restores through **membership** readiness, not peer readiness: the
+  two are different, the second returns first, and returning on it left the
+  cluster still settling into a later case.
 
   **The attribution is in-process and a consumer cannot make it.**
-  `PeerInvalidationReason` has no string form, no serialization, no counter and
-  no tracing field; it is a `u8` latched first-writer-wins on the admission's
-  cancellation token, and the only channel out is
+  `PeerInvalidationReason` has no serialization, no counter and no tracing
+  field, and no string form beyond `Debug`; it is a `u8` latched
+  first-writer-wins on the admission's cancellation token, and the only channel
+  out is
   `MembershipRuntime::set_invalidation_callback`. The gate records there,
   chaining the fixture's own `publish_verified_pins` and its M7-C81 pending
   latch, so installing the recorder changes what the fixture *records* and
@@ -886,14 +919,19 @@ connection and started a child.
 
   **The two figures in that paragraph do not reproduce alike, and saying so is
   the whole of M8-C20.** 195,933 is fixed by construction — the upload is a
-  fixed size — and was observed in all five chunk-7 runs, as in eight of the
-  m8c6 pass's nine. The owner→device high-water is whatever the run saw:
-  **145,682-197,724 across fourteen runs** (nine at `e40a33a`, five at chunk
-  7's final revision). The figure once recorded here as characteristic,
-  164,232, is **not among them** — chunk 7 observed 164,176 beside it, which
-  corroborates the spread rather than rescuing the number. Nothing is broken:
-  the rule is `the owner-to-device segment must have carried measured load`,
-  which every one of those meets.
+  fixed size — and was observed in all fourteen chunk-7 runs, as in eight of the
+  m8c6 pass's nine. The owner→device high-water is whatever the run saw, and it
+  is quoted here as two ranges rather than one because **chunk 7 changed the
+  workload**: its sampler now runs concurrently with the upload, which shifts
+  the timing the high-water is a mark of, so the two sets measure different
+  things and averaging them would be a third version of the same mistake.
+
+  * m8c6, nine runs at `e40a33a`: **145,682-197,724**.
+  * chunk 7, fourteen runs at its final revision: **131,436-164,304**.
+
+  The figure once recorded here as characteristic, 164,232, is in neither set.
+  Nothing is broken: the rule is `the owner-to-device segment must have carried
+  measured load`, which every one of those twenty-three meets.
 
   The saturating upload's own `stopReason` is read off the wire before the live
   probe is sent, for two reasons. It shares a session with the probe, and
@@ -922,37 +960,50 @@ connection and started a child.
   asserted rather than asserted vacuously"; one direction of one hop is now
   asserted, and the rest is disclosed.
 
-  **Chunk 7 looked for simultaneity properly, and recorded that it cannot be
-  had — on one hop structurally, on the other empirically.** The two are worth
-  keeping apart.
+  **Chunk 7 looked for simultaneity properly. One hop still cannot show it;
+  the other does, and the first attempt to say otherwise was an artefact.**
 
   *The peer hop, structurally.* `peer_send_in_flight_high_water` and
   `peer_receive_queue_high_water` are **two independent all-time `max`
-  latches**, so both reading high is equally consistent with two disjoint
-  bursts — and there is nothing live to sample instead, because the hop's live
-  counters are private to `tunnel_relay::http::forward` and reach no snapshot.
-  This is a tooling gap rather than a defect in the forwarding path, and what a
-  product change would have to add is written out on **M8-C22**.
+  latches**, written once when the exchange terminates, so both reading high is
+  equally consistent with two disjoint bursts — and there is nothing live to
+  sample instead, because the hop's live counters are private to
+  `tunnel_relay::http::forward` and reach no snapshot. This is a tooling gap
+  rather than a defect in the forwarding path, and what a product change would
+  have to add is written out on **M8-C22**.
 
-  *The owner↔device segment, empirically.* That segment **does** publish live
-  per-direction gauges — `parked_bytes` (owner→device) and
-  `receive_buffered_bytes` (device→owner) — produced by one owner-actor
-  snapshot pass, so a sample finding both above zero would be a same-instant
-  observation. The gate now takes roughly **445 such samples per run** across
-  the whole window in which both loads exist, and finds **both at zero in every
-  sample of every run**. The reason is the profile's own shape: `acp-http-v1`
-  admits at most a 1 MiB body against a 4,063,232-byte session budget with
-  ample per-stream credit, so the request direction cannot reach backpressure
-  at that segment at all, and the response direction's backup lands in the
-  ingress's own public response buffer rather than in the owner's receive
-  buffer — which is what the ingress's 362-byte receive queue has been
-  reporting all along.
+  *The owner↔device segment: measured.* That segment **does** publish live
+  per-direction gauges — `parked_bytes` (owner→device, held for send credit)
+  and `receive_buffered_bytes` (device→owner, held for the reader) — produced
+  by one owner-actor snapshot pass, so a sample finding both above zero is a
+  same-instant observation. Across fourteen runs the segment shows
+  **`to_device = 308` and `from_device` between 188 and 752 bytes at one
+  coherent instant**, every run, from 819-1,129 samples taken inside a
+  154-183 ms transfer.
 
-  **A validator rule asserts that the sampling happened**, so "never both
-  loaded" cannot be produced by a run that never looked. That is M8-C17's
-  lesson applied to a negative result: a recorded impossibility with no rule
-  behind it is invisible to the mutation harness, and would read identically to
-  an omission.
+  **An earlier version of this section said the opposite, and the correction is
+  the interesting part.** It reported both directions at zero in every sample
+  and explained it by the profile's limits: a 1 MiB body against a
+  4,063,232-byte session budget with ample per-stream credit, so the request
+  direction supposedly could not reach backpressure at this segment at all.
+  That explanation was never tested. The sampler ran only **after** the
+  upload's POST returned, and `acp-http-v1` parses the whole JSON-RPC body
+  before it can accept — so a 202 meant the 900 KB had already been delivered
+  and every sample was of an idle segment. `to_device = 0` was guaranteed by
+  ordering, not observed. The upload now runs concurrently with the sampler and
+  the reading reverses. A negative result with a plausible story attached is
+  the easiest thing in this repository to get wrong, which is why the rule
+  below is a positive assertion rather than a disclosure.
+
+  **The rule is `both directions of the owner-to-device segment carried bytes at
+  one coherent instant`**, with a second rule requiring the samples to have been
+  taken while the upload was still in flight, so the reading cannot be produced
+  by a run that looked at the wrong time. **Attempts are bounded and
+  disclosed**: an upload that collides with a rotation freeze is refused and
+  resent, and one run in twelve (before this was handled) spent 12,040 ms in
+  `prompt` against a 156-188 ms norm with almost none of it bytes moving. The
+  case retries up to three independent uploads and records how many it used —
+  one, in all fourteen runs since.
 
 ### Rotation-freeze refusals
 
