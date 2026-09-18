@@ -918,9 +918,18 @@ connection and started a child.
   budget.
 
   **The two figures in that paragraph do not reproduce alike, and saying so is
-  the whole of M8-C20.** 195,933 is fixed by construction — the upload is a
-  fixed size — and was observed in all fourteen chunk-7 runs, as in eight of the
-  m8c6 pass's nine. The owner→device high-water is whatever the run saw, and it
+  the whole of M8-C20.** 195,933 is **not** fixed by construction; the sentence
+  that said it was — "the upload is a fixed size" — was falsified by the m8c8
+  verification pass and is recorded as **M8-C23**. It was observed in all
+  fourteen chunk-7 runs and in eight of the m8c6 pass's nine, but in only
+  **thirteen of fourteen** at the merged revision `85941c9`, where one run
+  recorded **180,510**. That run carried `refusals = 2` and `retries = 2`, both
+  correlated (`unexplained = None`), but `owner_device_upload_attempts = 1`, so
+  the documented upload-retry path was **not** taken and the deviation is
+  explained by no mechanism recorded here. What the gate actually requires is
+  weaker, and that does reproduce: `the request direction of the
+  ingress-to-owner peer hop reached over half its credit window`, which every
+  recorded run meets. The owner→device high-water is whatever the run saw, and it
   is quoted here as two ranges rather than one because **chunk 7 changed the
   workload**: its sampler now runs concurrently with the upload, which shifts
   the timing the high-water is a mark of, so the two sets measure different
@@ -928,10 +937,20 @@ connection and started a child.
 
   * m8c6, nine runs at `e40a33a`: **145,682-197,724**.
   * chunk 7, fourteen runs at its final revision: **131,436-164,304**.
+  * m8c8, fourteen runs at `85941c9`: **145,602-147,964**.
 
-  The figure once recorded here as characteristic, 164,232, is in neither set.
-  Nothing is broken: the rule is `the owner-to-device segment must have carried
-  measured load`, which every one of those twenty-three meets.
+  The figure once recorded here as characteristic, 164,232, is in none of the
+  three sets. Nothing is broken: the rule is `the owner-to-device segment must
+  have carried measured load`, which every one of those thirty-seven meets.
+
+  **Read every interval on this page as the observed spread of one sample, not
+  as a bound.** The m8c8 pass re-measured the whole group over fourteen fresh
+  runs and landed outside the quoted interval on four further axes —
+  `from_device` (180-760 against 188-752), sample counts (786-1,123 against
+  819-1,129), transfer duration (157-188 ms against 154-183 ms) and
+  `max_membership_age_at_case_end_ms` (15,618-15,739 against 15,637-15,733).
+  None of those crosses a rule and nothing is misbehaving; quoting a fourteen-run
+  min-max as though it bounded the property is the habit M8-C23 records.
 
   The saturating upload's own `stopReason` is read off the wire before the live
   probe is sent, for two reasons. It shares a session with the probe, and
@@ -979,7 +998,11 @@ connection and started a child.
   same-instant observation. Across fourteen runs the segment shows
   **`to_device` and `from_device` both above zero at one coherent instant**,
   every run, from 819-1,129 samples taken inside a 154-183 ms transfer:
-  `to_device = 308` in all fourteen, `from_device` between 188 and 752.
+  `to_device = 308` in all fourteen, `from_device` between 188 and 752. The
+  m8c8 pass reproduced the property in a further fourteen runs at `85941c9` —
+  `to_device = 308` again in all fourteen — with the spread a little wider than
+  the interval above (`from_device` 180-760, 786-1,123 samples, 157-188 ms);
+  see M8-C23 on reading these as samples rather than bounds.
 
   **That `308` is not a quantum, and review is why this paragraph says so.**
   Reading the same figure fourteen times looks like a constant, and a constant
