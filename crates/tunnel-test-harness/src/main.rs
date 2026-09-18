@@ -1679,7 +1679,7 @@ async fn main() -> ExitCode {
                         &evidence,
                     )?;
                     println!(
-                        "M8 ACP cluster passed: relays={} owner={} ingress={} non_owner={} cases={:?} rotations_across_span={} owner_rotations={} span_ms={} met_schedule={} distinct_sockets={} new_per_round={:?} steady={:?} socket_peak={} connection_alive={} device_session_stable={} epoch_stable={} effects={} effects_after_settle={} sessions={:?} resign_spacing_ms={} max_membership_age_ms={} resigns={} boundary_route_probes={} refusals={} retries={} unexplained={:?} leftover_processes={} open_journal_entries={} open_streams_retired={} not_covered={} revocation_after=({}/{}/{}) revocation_after_prompt_status={}",
+                        "M8 ACP cluster passed: relays={} owner={} ingress={} non_owner={} cases={:?} rotations_across_span={} owner_rotations={} span_ms={} met_schedule={} distinct_sockets={} new_per_round={:?} steady={:?} socket_peak={} connection_alive={} device_session_stable={} epoch_stable={} effects={} effects_after_settle={} sessions={:?} resign_spacing_ms={} max_membership_age_ms={} resigns={} boundary_route_probes={} refusals={} retries={} unexplained={:?} leftover_processes={} open_journal_entries={} open_streams_retired={} not_covered={} revocation_after=({}/{}/{}) revocation_after_prompt_status={} key_overlap_staged={} version_bump=(interrupted={} reasons={:?}) key_rotation=(interrupted={} no_stop_reason={} left_verifier={} reasons={:?}) key_rotation_route_probes={} owner_device_at_one_instant=(to_device={} from_device={} samples={})",
                         evidence.relay_count,
                         evidence.owner_node,
                         evidence.ingress_node,
@@ -1719,6 +1719,22 @@ async fn main() -> ExitCode {
                         evidence.revocation_after_code,
                         evidence.revocation_after_execution,
                         evidence.revocation_after_prompt_status,
+                        // Printed for the same reason: the key-rotation
+                        // attribution is the whole point of that case, and a
+                        // reason set only a validator sees is a figure nobody
+                        // can quote.  The control arm is printed beside it
+                        // because the key arm's reason means nothing alone.
+                        evidence.key_overlap_staged,
+                        evidence.version_bump_interrupted,
+                        evidence.version_bump_reasons,
+                        evidence.key_rotation_interrupted,
+                        evidence.key_rotation_no_stop_reason,
+                        evidence.key_left_ingress_verifier,
+                        evidence.key_rotation_reasons,
+                        evidence.key_rotation_route_probes,
+                        evidence.owner_device_request_bytes_at_instant,
+                        evidence.owner_device_response_bytes_at_instant,
+                        evidence.owner_device_coherent_samples,
                     );
                     Ok(())
                 }),

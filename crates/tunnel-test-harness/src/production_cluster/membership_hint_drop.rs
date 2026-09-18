@@ -57,7 +57,7 @@ use tunnel_client::{ConnectOptions, ConnectionHandle, TransportProfile};
 use tunnel_relay::{MembershipReadiness, RelaySnapshot};
 
 /// The identity whose peer key is rotated out.
-const TARGET_NODE: &str = "relay-a";
+pub(super) const TARGET_NODE: &str = "relay-a";
 /// The ingress that holds the pooled peer stream to the rotated identity.
 const AFFECTED_INGRESS: &str = "relay-c";
 /// The ingress used by the unaffected sibling route.
@@ -87,7 +87,8 @@ const POLL: Duration = Duration::from_millis(50);
 /// A 64-hex SPKI that no fixture certificate presents.  It stands in for the
 /// incoming key of a staged rotation: approved alongside the real key during
 /// the overlap, and the only approved key after the withdrawal.
-const INCOMING_SPKI: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+pub(super) const INCOMING_SPKI: &str =
+    "1111111111111111111111111111111111111111111111111111111111111111";
 
 /// The typed public outcome observed for the withdrawn key's fresh admission.
 ///
@@ -1173,7 +1174,7 @@ fn classify_withdrawn_admission(status: u16, body: Option<&[u8]>) -> WithdrawnAd
     }
 }
 
-fn target_peer_spki(cluster: &ProductionCluster) -> Result<String> {
+pub(super) fn target_peer_spki(cluster: &ProductionCluster) -> Result<String> {
     cluster
         .fixture
         .nodes

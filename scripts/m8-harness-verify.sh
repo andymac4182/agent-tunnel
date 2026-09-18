@@ -69,13 +69,33 @@ gate "M8 ACP over three relays: a v1 conversation, permissions, cancellation, su
 # profile exists), or real-agent interoperability (the agent is this
 # repository's own synthetic fixture).  The gate's own NOT_COVERED carries all
 # of this, and the validator requires the evidence to carry it.
-# The label says peer-**path** loss, not peer-key rotation, and names one
-# saturated direction rather than two segments.  Both corrections come from
-# chunk 5's own review: no gate drives a real peer-key rotation against a live
-# ACP stream (M8-C16), and `record_exchange` fires at exchange termination, so
-# no two high-water marks it writes can show two segments full at once.  A
-# label is evidence too -- it is what a reader sees when the gate passes.
-gate "M8 ACP across three relays: three completed rotations with two sessions live, two tenants reusing identical ids, forged heads, revocation, peer-path loss, owner loss, and the request direction of the ingress-to-owner hop driven against its credit window with the owner-to-device segment measured as load" \
+# The label distinguishes peer-**path** loss from peer-**key** rotation and
+# names one saturated direction rather than two segments.  A label is evidence
+# too -- it is what a reader sees when the gate passes.
+#
+# Chunk 7 adds the key rotation (M8-C16) and, with it, the reason the two are
+# listed apart: a pin withdrawal governs new dials and leaves an in-flight
+# stream serving, while the verifier dropping the old key tears it down.  The
+# key arm's teardown is attributed by the product's own invalidation reason
+# against a same-key control arm, not by the timing of the interruption.
+#
+# **What that key arm is, stated here because a label is what a reader sees.**
+# The withdrawn key is the owner's OWN serving key and its replacement is a
+# phantom no certificate presents, so the owner also fails closed and
+# invalidates its own admission of the ingress.  The case attributes the
+# INGRESS's decision and records both ends' reasons; which end closed the
+# socket first is not shown, and a genuine rotation needs a fixture relay that
+# re-keys.
+#
+# Simultaneity splits between the two hops.  The peer hop cannot show it at
+# all: `record_exchange` fires at exchange termination and the hop publishes no
+# live gauge, so its two figures are independent all-time latches (M8-C22).
+# The owner-to-device segment does publish live per-direction gauges, and the
+# gate asserts both directions carrying bytes at one coherent instant, sampled
+# while the near-limit upload is still in flight.  An earlier version claimed
+# the reverse for that segment; it had sampled only after the upload's POST
+# returned, which on this profile means after the body had already arrived.
+gate "M8 ACP across three relays: three completed rotations with two sessions live, two tenants reusing identical ids, forged heads, revocation, an owner-key withdrawal whose teardown the ingress attributes to the key rather than the record version, peer-path loss, owner loss, and the request direction of the ingress-to-owner hop driven against its credit window with both directions of the owner-to-device segment carrying bytes at one coherent instant" \
   cargo run --locked -p tunnel-test-harness -- verify-m8-acp-cluster
 
 echo "m8-harness-verify: implemented M8 harness suite passed" >&2

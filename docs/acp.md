@@ -402,7 +402,7 @@ every exchange crosses the private mTLS HTTP/3 peer hop and the device's own
 data WebSocket. The gate is `verify-m8-acp-real-path`, registered in the new
 `scripts/m8-harness-verify.sh`. Chunks 1 to 3 had no tunnel, no relay and no
 principal; those arrive here. Two users, cross-tenant isolation, revocation,
-owner loss and peer-key rotation remain chunk 5. **Read that with chunk 5's result:** owner loss was delivered; a real peer-**key** change was not, and is **M8-C16**. Chunk 5 drives a peer-path loss and says so, because withdrawing a pin set governs only new dials and leaves an in-flight stream serving.
+owner loss and peer-key rotation remain chunk 5. **Read that with chunk 5's and chunk 7's results:** owner loss was delivered by chunk 5, which also drives a peer-**path** loss and says so, because withdrawing a pin set governs only new dials and leaves an in-flight stream serving; the real peer-**key** change was **M8-C16** and is driven by chunk 7, in its own case beside the path-loss one.
 
 - **A whole v1 conversation over the real route, with no claim terminating on a
   status.** The consumer speaks **HTTP/2**, because `acp-http-v1` admits nothing
@@ -826,10 +826,85 @@ connection and started a child.
   apart, and the pin half is recorded as the finding it is —
   `pin_withdrawal_left_stream_serving`, observed over a window long enough to
   cover the membership reconcile interval, so "still serving" is not merely
-  "the relay has not looked yet". **A real key change through the membership
-  record — the verifier dropping the old key, which
-  `verify-m7-membership-hint-drop` exercises — is not driven here**, and that
-  is **M8-C16**.
+  "the relay has not looked yet". This case is **kept** rather than replaced by
+  the one below: it is about what a pin set governs, which is a different
+  mechanism and a different fact.
+- **Peer-key rotation** (M8 chunk 7, closing **M8-C16**) drives the real key
+  change through the owner's membership record against a live ACP SSE stream on
+  the non-owner ingress — the shape `verify-m7-membership-hint-drop` stages, now
+  against ACP.
+
+  **Why it needs two arms.** A key change arrives through a membership record,
+  and the verifier refuses an equal-version re-sign
+  (`MembershipError::EqualVersionConflict`), so **every key change is also a
+  version change** — and a version change alone invalidates a peer admission
+  (M7-C80). Asserting an interruption after withdrawing a key would therefore
+  have measured M7-C80 and credited the key with it, which is exactly the error
+  the case above was relabelled for.
+
+  So the case stages an overlap — the owner's record approving the old key and
+  an incoming key together, converged in **every** relay's verifier before
+  anything is measured — and then runs the same sequence twice. The **control
+  arm** publishes a byte-identical key list at a strictly newer version: same
+  SPKIs, same key ids, same windows, with the ids derived from the SPKI rather
+  than from the version so the two records' key lists cannot differ. The **key
+  arm** drops the old key. The two calls differ in one argument.
+
+  **From the stream's side they are indistinguishable.** Both produce an
+  explicit interruption, neither produces a `stopReason`, and a later admission
+  meets `503 PEER_UNTRUSTED` / `not_dispatched` either way. **The product
+  distinguishes them.** `RuntimeState::revalidate_active` reaches for
+  `PeerInvalidationReason::MembershipRevoked` where `bind_peer` **fails** for
+  that admission — the withdrawn-key path — and for `MembershipChanged` where
+  the binding still verifies and only the record version moved. Observed in all
+  fourteen runs: control `["membership_changed"]`, key `["membership_revoked"]`,
+  asserted as exact sets rather than as "contains". `MembershipRevoked` is also
+  the reason `install_unready_candidate` and `mark_unready` use, and this case
+  excludes those only because convergence on the ingress's own verifier is
+  observed before the reason is read — so the exact-set rule is what keeps that
+  exclusion honest.
+
+  **What the key arm actually is: an owner self-revocation with a phantom
+  successor.** `INCOMING_SPKI` is a digest no fixture certificate presents, so
+  the key being withdrawn is the **owner's own serving key**. The owner cannot
+  find its local key in the record it has just reconciled, takes the
+  `MembershipRejected` branch of `membership_runtime.rs`, goes **Unready**, and
+  invalidates every admission it holds — including its admission of the ingress
+  — with the same `MembershipRevoked`. The run's own logs carry a `PeerRejected`
+  reconcile failure and a failed-closed pin publication inside this case, every
+  run.
+
+  So the key arm is **three concurrent teardowns**: the ingress revalidating the
+  owner, the owner failing closed and invalidating the ingress, and the version
+  bump. The control arm controls for the third only, and the run confirms the
+  asymmetry: control `owner_reasons=[] owner_unready=false`, key
+  `owner_reasons=["membership_revoked"] owner_unready=true`, in all fourteen
+  runs, both asserted. What the ingress latched is therefore the **ingress's own
+  decision**, correctly attributed and correctly separated from a version bump
+  — and it is **not** evidence about which of the three closed the socket first.
+
+  **A genuine rotation would not include the owner going unready**, and this
+  fixture cannot stage one: the admission under test binds the SPKI the owner
+  actually presents, so withdrawing that SPKI and unreadying the owner are the
+  same act. Escaping it needs a fixture relay that really re-keys, which is
+  recorded on M8-C16 rather than attempted.
+
+  The case restores through **membership** readiness, not peer readiness: the
+  two are different, the second returns first, and returning on it left the
+  cluster still settling into a later case.
+
+  **The attribution is in-process and a consumer cannot make it.**
+  `PeerInvalidationReason` has no serialization, no counter and no tracing
+  field, and no string form beyond `Debug`; it is a `u8` latched
+  first-writer-wins on the admission's cancellation token, and the only channel
+  out is
+  `MembershipRuntime::set_invalidation_callback`. The gate records there,
+  chaining the fixture's own `publish_verified_pins` and its M7-C81 pending
+  latch, so installing the recorder changes what the fixture *records* and
+  nothing about what it *does*. The limit is carried in `NOT_COVERED`.
+
+  **Not claimed**: that an ACP stream survives a key rotation — it does not,
+  and the case asserts the teardown.
 - **The request direction of the ingress→owner peer hop was driven to its
   credit window**, and the owner→device segment was measured beside it. This is
   narrower than an earlier draft of this section claimed, and the correction is
@@ -839,13 +914,24 @@ connection and started a child.
   yet consumed, against a **196,608**-byte peer credit window — 99.7% — while a
   live SSE stream on a separate transport still completed a turn read off the
   wire, with a third stream parked unread and stalling. The owner→device
-  session queue reached a high-water of **164,232** bytes against its
-  **4,063,232**-byte budget: measured load, and nowhere near its bound.
-  **That number is one run's, and it does not reproduce** — over nine runs at
-  `e40a33a` the high-water was 145,682 / 147,656 / 147,656 / 147,704 /
-  147,848 / 147,912 / 148,100 / 148,144 / 197,724 bytes, and 164,232 was not
-  observed once. Nothing is broken: the rule is a threshold all of those meet.
-  M8-C20 covers this site as well as M8-04's.
+  session queue carried **measured load**, nowhere near its **4,063,232**-byte
+  budget.
+
+  **The two figures in that paragraph do not reproduce alike, and saying so is
+  the whole of M8-C20.** 195,933 is fixed by construction — the upload is a
+  fixed size — and was observed in all fourteen chunk-7 runs, as in eight of the
+  m8c6 pass's nine. The owner→device high-water is whatever the run saw, and it
+  is quoted here as two ranges rather than one because **chunk 7 changed the
+  workload**: its sampler now runs concurrently with the upload, which shifts
+  the timing the high-water is a mark of, so the two sets measure different
+  things and averaging them would be a third version of the same mistake.
+
+  * m8c6, nine runs at `e40a33a`: **145,682-197,724**.
+  * chunk 7, fourteen runs at its final revision: **131,436-164,304**.
+
+  The figure once recorded here as characteristic, 164,232, is in neither set.
+  Nothing is broken: the rule is `the owner-to-device segment must have carried
+  measured load`, which every one of those twenty-three meets.
 
   The saturating upload's own `stopReason` is read off the wire before the live
   probe is sent, for two reasons. It shares a session with the probe, and
@@ -873,6 +959,60 @@ connection and started a child.
   mark, which *are* live. Chunk 4 listed bounded per-hop queues as "not
   asserted rather than asserted vacuously"; one direction of one hop is now
   asserted, and the rest is disclosed.
+
+  **Chunk 7 looked for simultaneity properly. One hop still cannot show it;
+  the other does, and the first attempt to say otherwise was an artefact.**
+
+  *The peer hop, structurally.* `peer_send_in_flight_high_water` and
+  `peer_receive_queue_high_water` are **two independent all-time `max`
+  latches**, written once when the exchange terminates, so both reading high is
+  equally consistent with two disjoint bursts — and there is nothing live to
+  sample instead, because the hop's live counters are private to
+  `tunnel_relay::http::forward` and reach no snapshot. This is a tooling gap
+  rather than a defect in the forwarding path, and what a product change would
+  have to add is written out on **M8-C22**.
+
+  *The owner↔device segment: measured.* That segment **does** publish live
+  per-direction gauges — `parked_bytes` (owner→device, held for send credit)
+  and `receive_buffered_bytes` (device→owner, held for the reader) — produced
+  by one owner-actor snapshot pass, so a sample finding both above zero is a
+  same-instant observation. Across fourteen runs the segment shows
+  **`to_device` and `from_device` both above zero at one coherent instant**,
+  every run, from 819-1,129 samples taken inside a 154-183 ms transfer:
+  `to_device = 308` in all fourteen, `from_device` between 188 and 752.
+
+  **That `308` is not a quantum, and review is why this paragraph says so.**
+  Reading the same figure fourteen times looks like a constant, and a constant
+  standing in for an observation is the defect this repository keeps finding.
+  An independent review run read **`to_device = 16,384`** — a full record
+  parked for credit — so the gauge is live and 308 is simply the tail record
+  being the one most often caught parked. The rule asserts `> 0` rather than a
+  value, which is why it was right either way; but the prose said "identical in
+  all fourteen" and a single further run falsified that reading of it.
+
+  **An earlier version of this section said the opposite, and the correction is
+  the interesting part.** It reported both directions at zero in every sample
+  and explained it by the profile's limits: a 1 MiB body against a
+  4,063,232-byte session budget with ample per-stream credit, so the request
+  direction supposedly could not reach backpressure at this segment at all.
+  That explanation was never tested. The sampler ran only **after** the
+  upload's POST returned, and `acp-http-v1` parses the whole JSON-RPC body
+  before it can accept — so a 202 meant the 900 KB had already been delivered
+  and every sample was of an idle segment. `to_device = 0` was guaranteed by
+  ordering, not observed. The upload now runs concurrently with the sampler and
+  the reading reverses. A negative result with a plausible story attached is
+  the easiest thing in this repository to get wrong, which is why the rule
+  below is a positive assertion rather than a disclosure.
+
+  **The rule is `both directions of the owner-to-device segment carried bytes at
+  one coherent instant`**, with a second rule requiring the samples to have been
+  taken while the upload was still in flight, so the reading cannot be produced
+  by a run that looked at the wrong time. **Attempts are bounded and
+  disclosed**: an upload that collides with a rotation freeze is refused and
+  resent, and one run in twelve (before this was handled) spent 12,040 ms in
+  `prompt` against a 156-188 ms norm with almost none of it bytes moving. The
+  case retries up to three independent uploads and records how many it used —
+  one, in all fourteen runs since.
 
 ### Rotation-freeze refusals
 
