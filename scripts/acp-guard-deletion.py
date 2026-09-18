@@ -2042,7 +2042,7 @@ C5_CASES: list[tuple[str, list[Edit], bool]] = [
         [
             (
                 ACP_CLUSTER,
-                "            evidence.revocation_after_prompt_status >= 400,",
+                "            evidence.revocation_after_prompt_status == 404,",
                 "            true,",
             )
         ],
