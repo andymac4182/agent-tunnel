@@ -1,12 +1,20 @@
 //! `verify-m8-acp-cluster`: ACP across three relays, three completed
-//! scheduled rotations, two tenants, revocation, peer-key rotation, owner loss
-//! and saturated forwarding (task row M8-04, M8 chunk 5).
+//! scheduled rotations, two tenants, revocation, peer-**path** loss, owner
+//! loss and one saturated direction of one hop (task row M8-04, M8 chunk 5).
+//!
+//! **This header says peer-path loss and one direction deliberately.**  Review
+//! withdrew both of the wider claims it used to make, and `NOT_COVERED` below
+//! has said so since — but this comment did not, and a module header is what a
+//! reader meets first.  No gate here drives a real peer-**key** rotation
+//! (M8-C16), and `record_exchange` fires at exchange termination, so no two
+//! high-water marks it writes can show two segments saturated at once.
 //!
 //! This is the sibling of [`super::acp_real_path`], which put ACP on the real
 //! cluster for the first time.  Everything that gate listed as chunk 5's is
 //! here: two users in two tenants, cross-tenant isolation, grant revocation,
-//! owner loss, peer-key rotation, saturation — and the one it could not do at
-//! all, **an ACP connection carried across a completed scheduled rotation**.
+//! owner loss, peer-path loss, saturation of one direction — and the one it
+//! could not do at all, **an ACP connection carried across a completed
+//! scheduled rotation**.
 //!
 //! # The headline: three completed rotations, and why it is possible here
 //!
@@ -1924,12 +1932,24 @@ impl Gate<'_> {
             ))
     }
 
-    /// Case `saturation`: both forwarding segments driven to backpressure at
-    /// the same time, with a third, live SSE stream still delivering.
+    /// Case `saturation`: the **request direction of the ingress→owner peer
+    /// hop** driven against its credit window, with the owner↔device segment
+    /// measured beside it as **load**, and a third, live SSE stream still
+    /// delivering.
+    ///
+    /// **This used to say "both forwarding segments driven to backpressure at
+    /// the same time … This case saturates both", and review withdrew that.**
+    /// `HttpExchangeRecord` is written at exchange *termination*, so its
+    /// figures are all-time high-water marks of finished exchanges and
+    /// simultaneity is not measurable with that instrument at all; the two
+    /// numbers the old comment leaned on were the same direction of the same
+    /// hop seen from each end.  The narrowed claim is the one the rules below
+    /// enforce and the one `NOT_COVERED` carries — this comment simply had not
+    /// caught up, which is the M8-C18 shape.
     ///
     /// `docs/acp.md`'s bounded per-hop queues were listed by chunk 4 as "not
     /// asserted rather than asserted vacuously" because no case saturated a
-    /// hop.  This case saturates both.
+    /// hop.  This case asserts them.
     async fn case_saturation(&mut self, evidence: &mut AcpClusterEvidence) -> Result<()> {
         // The stalled connection: a session nobody reads, flooded with
         // updates.  This backs up the response direction through the device,
