@@ -354,7 +354,12 @@ claim is still unclaimed.
   like any other and this one was wrong. What stays open is narrower and is on
   M8-C02: whether the profile should refuse such a child at admission instead.
 - **Evidence.** `scripts/acp-guard-deletion.py --suite m8c3` defeats each of
-  this chunk's rules in turn: **17 of 17 turned a test red**. Its sibling
+  this chunk's rules in turn: **16 of 16 turned a test red** (twice at
+  `e40a33a`). This said 17 of 17, and that was true when written: chunk 4
+  retired the case "one lost subscriber closes one stream and nothing else"
+  in `f61a655` when it replaced chunk 3's narrow router fix with the
+  documented subscriber-loss policy, and never re-ran this suite. M8-C17. Its
+  sibling
   `--suite m8c3-relay`, which needs a different crate and a different test
   command, is **2 of 2**. Both classify their outcomes with the shared
   `scripts/guard_outcomes.py` allow list, so anything but `RED`, `REFUSED BY
@@ -836,6 +841,11 @@ connection and started a child.
   wire, with a third stream parked unread and stalling. The owner→device
   session queue reached a high-water of **164,232** bytes against its
   **4,063,232**-byte budget: measured load, and nowhere near its bound.
+  **That number is one run's, and it does not reproduce** — over nine runs at
+  `e40a33a` the high-water was 145,682 / 147,656 / 147,656 / 147,704 /
+  147,848 / 147,912 / 148,100 / 148,144 / 197,724 bytes, and 164,232 was not
+  observed once. Nothing is broken: the rule is a threshold all of those meet.
+  M8-C20 covers this site as well as M8-04's.
 
   The saturating upload's own `stopReason` is read off the wire before the live
   probe is sent, for two reasons. It shares a session with the probe, and
