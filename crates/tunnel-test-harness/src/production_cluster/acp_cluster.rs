@@ -145,20 +145,20 @@ const ROTATION_EFFECT: &str = "rotation-span";
 ///
 /// The order is not cosmetic.  `rotation-span` is first because it needs the
 /// most membership headroom of any case here.  `owner-loss` is last because
-/// it removes relay-a from the cluster, and `peer-key-rotation` before it
-/// because it leaves a relay's pin set rewritten.
+/// it removes relay-a from the cluster, and `peer-path-loss` before it because
+/// it leaves a relay's pin set and peer path rewritten.
 pub const CLUSTER_CASES: [&str; 7] = [
     "rotation-span",
     "two-tenant-ids",
     "forged-heads",
     "saturation",
     "revocation",
-    "peer-key-rotation",
+    "peer-path-loss",
     "owner-loss",
 ];
 
 /// What this gate deliberately does not establish.
-pub const NOT_COVERED: [&str; 7] = [
+pub const NOT_COVERED: [&str; 11] = [
     "an ACP connection surviving a membership re-sign, or outliving its membership record: M7-C80 is open, a peer admission's deadline is never extended, and this gate's rotation case is bounded to finish inside one record rather than escaping that limit",
     "per-OS process-tree cleanup: macOS is the only host any of this has run on, and a descendant that leaves its process group is not reached at all (M8-C07)",
     "any OS sandbox guarantee: until a tested sandbox profile exists this export is trusted-agent execution, and filesystem confinement is not claimed from cwd alone",
@@ -166,6 +166,10 @@ pub const NOT_COVERED: [&str; 7] = [
     "no retry beyond the moment of observation: a ledger is read when a stream has failed and again after a settle window, and a replay issued after that would not be observed",
     "the connection-capacity table at its real bounds: 256 tracked and 32 per principal are proven as arithmetic in tunnel-acp-export, not by opening 257 connections here",
     "the permission deadline and the idle, prompt-wall-time bounds of the limits table over the real route: they are measured against the export's own clock in tunnel-acp-export, not here",
+    "two forwarding segments saturated at the same instant: the peer-hop figure is written when an exchange terminates, so it is an all-time high-water mark of finished exchanges rather than a live gauge, and no instrument here can show the two segments full simultaneously",
+    "the response direction of the peer hop driven to its credit window: the flood against a parked stream backs up behind the export's own output-credit stall, whose record lands only after that 30 s bound, so this gate measures the request direction and says so",
+    "this property at the shipped default configuration: the default rotation interval is 300 s and a membership record lives at most 60 s, so on a non-owner ingress an ACP connection is invalidated long before its first scheduled rotation; three rotations are reachable here only because the gate runs the device at the 3 s configuration floor",
+    "a real peer-key rotation against a live ACP stream: withdrawing the ingress relay's peer pins governs new dials and is measured here to leave an in-flight stream serving, while the verifier dropping the old key -- which verify-m7-membership-hint-drop exercises -- is not driven (M8-C16)",
 ];
 
 /// The limits of this gate's claim, with the ones carrying a measurement
@@ -200,10 +204,18 @@ pub struct SessionSpan {
     pub stop_reason: String,
     /// The stream neither errored nor ended at any point in the window.
     pub stream_alive_through_window: bool,
-    /// Every distinct JSON-RPC id seen from the agent on this stream, so a
-    /// replayed message is visible as a repeat rather than inferred.
+    /// Every **distinct** JSON-RPC id seen from the agent on this stream.
     pub distinct_agent_ids: usize,
-    /// Total messages observed on this stream.
+    /// Messages on this stream that **carry** an id.
+    ///
+    /// Compared for equality with `distinct_agent_ids`, which is the only
+    /// comparison that detects a replay: a message repeated under an id
+    /// already seen raises this and leaves the distinct count alone.  An
+    /// earlier version asserted `messages >= distinct_agent_ids` against the
+    /// *total* message count, which holds by construction — the distinct set
+    /// is drawn from the messages — so it could not fail and said nothing.
+    pub identified_messages: usize,
+    /// Total messages observed on this stream, disclosed for context.
     pub messages: usize,
 }
 
@@ -249,9 +261,13 @@ pub struct AcpClusterEvidence {
     /// The device owner epoch was unchanged across the window.
     pub device_epoch_stable: bool,
     /// Distinct data-socket local addresses the device used, from the proxy.
-    /// A completed rotation moves to a new socket, so this is the rotation
-    /// count seen from underneath the tunnel rather than from a counter.
+    /// Disclosed for context; the load-bearing figure is the per-round one
+    /// below, because a cumulative count is satisfied by one rotation.
     pub distinct_device_sockets: usize,
+    /// How many **newly seen** device socket addresses each rotation round
+    /// added.  One per round is the claim: a rotation that came back on the
+    /// predecessor's socket adds none.
+    pub new_sockets_per_round: Vec<usize>,
     /// Device sockets open at each settled steady state.
     pub steady_state_sockets: Vec<usize>,
     /// The high-water mark of concurrent device sockets.
@@ -346,6 +362,13 @@ pub struct AcpClusterEvidence {
     /// classification the product was getting right.
     pub revocation_in_flight_execution: String,
     pub revocation_after_status: u16,
+    /// The status a prompt on the revoked principal's own session met.
+    pub revocation_after_prompt_status: u16,
+    /// How many admissions were **attempted** after the revocation.
+    ///
+    /// Without this the "nothing dispatched" counters are unfalsifiable: a
+    /// zero delta proves nothing if nothing tried.
+    pub revocation_dispatch_attempts: u64,
     pub revocation_after_code: String,
     pub revocation_after_execution: String,
     /// ACP prompts the export accepted after the grant was revoked.
@@ -354,25 +377,43 @@ pub struct AcpClusterEvidence {
     pub revocation_no_stop_reason: bool,
 
     // --- explicit interruptions ---
-    /// Peer-key rotation interrupted the live stream explicitly.
-    pub key_rotation_interrupted: bool,
+    /// Withdrawing the ingress relay's peer pins left the in-flight stream
+    /// serving.
+    ///
+    /// **Recorded, not asserted as a requirement** — it is a finding about
+    /// what a pin set governs (new dials), and it is why this gate no longer
+    /// calls the case that follows it peer-key rotation.
+    pub pin_withdrawal_left_stream_serving: bool,
+    /// Losing the ingress-to-owner peer path interrupted the live stream
+    /// explicitly.
+    pub path_loss_interrupted: bool,
     /// ...and never produced a `stopReason` for the turn it interrupted.
-    pub key_rotation_no_stop_reason: bool,
+    pub path_loss_no_stop_reason: bool,
     /// Owner loss interrupted the live stream explicitly.
     pub owner_loss_interrupted: bool,
     /// ...and never produced a `stopReason` either.
     pub owner_loss_no_stop_reason: bool,
 
     // --- saturation ---
-    /// The ingress→owner peer hop's high-water in-flight bytes, and the
-    /// window it is measured against.
-    pub ingress_peer_send_in_flight: usize,
-    pub owner_peer_send_in_flight: usize,
+    /// The **request** direction of the ingress→owner peer hop: high-water
+    /// bytes the ingress had sent that the owner had not consumed, and the
+    /// credit window it is measured against.
+    ///
+    /// From `HttpExchangeRecord`, which the relay writes at exchange
+    /// *termination*, so this is an all-time high-water mark of finished
+    /// exchanges and not a live gauge.
+    pub ingress_request_peer_send_in_flight: usize,
     pub peer_window: usize,
-    /// Both segments were over half their window at the same time.
-    pub both_segments_saturated: bool,
-    /// A second, live SSE stream still delivered while both hops were full.
-    pub live_stream_served_while_saturated: bool,
+    /// That direction reached over half its credit window.
+    pub ingress_request_direction_saturated: bool,
+    /// The owner→device segment: the largest **instantaneous** queue depth
+    /// sampled, the session's own high-water mark, and the configured limit.
+    pub owner_device_queue_peak_sampled: usize,
+    pub owner_device_queue_high_water: usize,
+    pub owner_device_queue_limit: usize,
+    /// A live SSE stream on a separate transport still completed a turn while
+    /// the parked stream was unread and stalling.
+    pub live_stream_served_while_parked: bool,
 
     // --- M7-C85, disclosed rather than asserted ---
     /// Retained OPEN journal entries on the device connector at the end of the
@@ -898,7 +939,12 @@ impl Gate<'_> {
                 return Ok(open);
             }
             if Instant::now() >= deadline {
-                return Ok(open);
+                // Flagged rather than returned quietly: an unsettled sample is
+                // not a steady state, and returning the open count as though
+                // it were would let a run that never settled record a `2`.
+                return Err(HarnessError::Timeout(format!(
+                    "the device never settled between rotations; {open} sockets open at the bound"
+                )));
             }
             sleep(Duration::from_millis(100)).await;
         }
@@ -1144,6 +1190,13 @@ const FORGED_BINDING: &str = "0a1b2c3d4e5f60718a7f2c9a1b4d6e8f";
 /// gate reports that it did not arrive.
 const INTERRUPTION_BOUND: Duration = Duration::from_secs(45);
 
+/// How long a live stream is watched after its ingress relay's peer pins are
+/// withdrawn, before the gate records that the withdrawal left it serving.
+///
+/// Long enough to cover the membership reconcile interval, so "still serving"
+/// is not just "the relay has not looked yet".
+const PIN_WITHDRAWAL_OBSERVATION: Duration = Duration::from_secs(8);
+
 /// How long a revoked in-flight exchange has to be withdrawn.
 const REVOCATION_BOUND: Duration = Duration::from_secs(30);
 
@@ -1261,7 +1314,11 @@ impl Gate<'_> {
                 None,
             )
             .await?;
-        evidence.cross_tenant_foreign_matches_unknown = cross.indistinguishable_from(&cross_absent);
+        // The status is pinned here as it is for the sibling and `in_b`
+        // probes: byte-equality alone would be satisfied by two identical
+        // unrelated errors.
+        evidence.cross_tenant_foreign_matches_unknown =
+            cross.indistinguishable_from(&cross_absent) && cross.status == 404;
 
         // The same live identifier, presented in the *other tenant's* context
         // by that tenant's own principal.  Two exports cannot be made to mint
@@ -1462,6 +1519,7 @@ impl Gate<'_> {
             .await?;
 
         let accepted_before = self.export().prompts_accepted;
+        let opened_before = self.export().connections_opened;
         let aborted_before = self.aborted_ingress_exchanges().await?;
         self.cluster
             .catalog
@@ -1475,20 +1533,34 @@ impl Gate<'_> {
             .await
             .map_err(|error| HarnessError::Redis(format!("revoking the ACP grant: {error}")))?;
 
-        // Only the revocation's own typed refusal ends this wait; a transient
-        // owner-not-ready 503 from a rotation freeze is retried, so the loop
-        // cannot mistake a freeze for a revocation.
+        // **The probe after revocation is a real dispatch attempt**, not a
+        // read.  An earlier version issued only GETs, which start nothing, so
+        // "nothing was dispatched afterwards" held whether or not the
+        // revocation worked — the counters could not have moved either way.
+        // This POSTs a fresh `initialize`, which on this profile is exactly
+        // the request that opens a connection and **starts a child**: if it
+        // were admitted, `connections_opened` would rise.
+        //
+        // Only the revocation's own typed refusal ends the wait; a transient
+        // owner-not-ready 503 from a rotation freeze is retried by `probe`'s
+        // caller loop, so this cannot mistake a freeze for a revocation.
+        let initialize = json!({
+            "jsonrpc": "2.0",
+            "id": "rev-after",
+            "method": "initialize",
+            "params": {
+                "protocolVersion": 1,
+                "clientCapabilities": {},
+                "clientInfo": {"name": "tunnel-acp-cluster-gate", "version": "0.1.0"},
+            },
+        });
         let deadline = Instant::now() + REVOCATION_BOUND;
+        let mut attempts = 0u64;
         loop {
             let answer = self
-                .probe(
-                    &base,
-                    &victim,
-                    "GET",
-                    &[("acp-connection-id", conversation.connection.as_str())],
-                    None,
-                )
+                .probe(&base, &victim, "POST", &[], Some(&initialize))
                 .await?;
+            attempts += 1;
             let (code, execution) = answer.error();
             if answer.status == 404 || Instant::now() >= deadline {
                 evidence.revocation_after_status = answer.status;
@@ -1498,6 +1570,30 @@ impl Gate<'_> {
             }
             sleep(Duration::from_millis(200)).await;
         }
+        // A prompt on the revoked principal's own live session, too, so the
+        // prompt counter is a counter something actually tried to move.
+        let (prompt_status, _headers, _body) = self
+            .post_as(
+                &conversation.consumer,
+                &base,
+                &victim,
+                &[
+                    ("acp-connection-id", conversation.connection.as_str()),
+                    ("acp-session-id", session.as_str()),
+                ],
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": "rev-after-prompt",
+                    "method": "session/prompt",
+                    "params": {
+                        "sessionId": session,
+                        "prompt": [{"type": "text", "text": "ok"}],
+                    },
+                }),
+            )
+            .await?;
+        evidence.revocation_after_prompt_status = prompt_status.as_u16();
+        evidence.revocation_dispatch_attempts = attempts + 1;
 
         // The in-flight exchange must be withdrawn by itself, inside the
         // bound, rather than the gate releasing it and calling that a result.
@@ -1539,10 +1635,17 @@ impl Gate<'_> {
             .seen()
             .iter()
             .any(|value| stop_reason_for("rev-held")(value).is_some());
+        // Both counters, because two different admissions were attempted: a
+        // fresh `initialize` that would have started a child, and a prompt on
+        // the still-open session that would have reached the agent.
         evidence.revocation_dispatched_after = self
             .export()
             .prompts_accepted
-            .saturating_sub(accepted_before);
+            .saturating_sub(accepted_before)
+            + self
+                .export()
+                .connections_opened
+                .saturating_sub(opened_before);
 
         stream.break_now();
         conversation.connection_stream.break_now();
@@ -1554,7 +1657,7 @@ impl Gate<'_> {
     /// received an **explicit interruption** and whether any `stopReason` was
     /// ever fabricated for the turn.
     ///
-    /// Both the peer-key-rotation and owner-loss cases are this shape, and
+    /// The owner-loss case is this shape, and
     /// writing it once keeps the two answers comparable.
     async fn interruption_case(
         &mut self,
@@ -1600,30 +1703,83 @@ impl Gate<'_> {
         Ok((interrupted, no_stop_reason))
     }
 
-    /// Case `peer-key-rotation`: withdrawing the ingress relay's peer pins
-    /// interrupts the live stream explicitly and never fabricates a stop
-    /// reason.
-    async fn case_key_rotation(&mut self, evidence: &mut AcpClusterEvidence) -> Result<()> {
-        let (interrupted, no_stop_reason) = self
-            .interruption_case("keyrot", async |gate: &mut Self| {
-                let relay = gate.cluster.relay("relay-c")?;
-                relay
-                    .pins
-                    .replace(std::iter::empty::<tunnel_transport::SpkiSha256>())
-                    .map_err(|error| {
-                        HarnessError::Process(format!("withdrawing relay-c peer pins: {error}"))
-                    })?;
-                // Also drop the ingress→owner path, so an already-pooled
-                // connection cannot carry the stream on regardless of the pin
-                // set: a pin set governs new dials, and this case is about an
-                // in-flight stream.
-                gate.cluster
-                    .set_peer_path_drop_from("relay-a", "relay-c", true)?;
-                Ok(())
+    /// Case `peer-path-loss`: losing the ingress-to-owner peer path interrupts
+    /// the live stream explicitly and never fabricates a stop reason — and,
+    /// separately, withdrawing the ingress relay's peer **pins** does not.
+    ///
+    /// **This case is deliberately not called peer-key rotation any more.**
+    /// An earlier version withdrew relay-c's pins *and* dropped the path in
+    /// one step and labelled the result peer-key rotation. The interruption
+    /// that produced was the path loss: a pin set governs **new dials**, as
+    /// this gate's own comment said at the time, so an already-pooled peer
+    /// connection carries an in-flight stream straight through a pin
+    /// withdrawal. Labelling that as a key event would have credited the key
+    /// rotation with a teardown it did not cause.
+    ///
+    /// So the two are now measured apart, and the pin half is recorded as the
+    /// finding it is rather than folded into the other's assertion. **What is
+    /// still not driven here is a real key change through the membership
+    /// record** — the verifier dropping the old key, which
+    /// `verify-m7-membership-hint-drop` exercises — and that is M8-C16.
+    async fn case_peer_path_loss(&mut self, evidence: &mut AcpClusterEvidence) -> Result<()> {
+        let conversation = self.open_connection().await?;
+        let (session, stream) = self.open_session(&conversation, "path-new", &[]).await?;
+        let held = "path-held";
+        let status = self
+            .prompt(&conversation, &session, held, "permission")
+            .await?;
+        if status != http::StatusCode::ACCEPTED {
+            return Err(HarnessError::Http(format!(
+                "the peer-path-loss held prompt answered {status}, not 202"
+            )));
+        }
+        stream
+            .wait_for("the peer-path-loss callback", |value| {
+                (method_of(value) == Some("session/request_permission")).then_some(true)
             })
             .await?;
-        evidence.key_rotation_interrupted = interrupted;
-        evidence.key_rotation_no_stop_reason = no_stop_reason;
+
+        // --- half one: the pin withdrawal, on its own ---
+        {
+            let relay = self.cluster.relay("relay-c")?;
+            relay
+                .pins
+                .replace(std::iter::empty::<tunnel_transport::SpkiSha256>())
+                .map_err(|error| {
+                    HarnessError::Process(format!("withdrawing relay-c peer pins: {error}"))
+                })?;
+        }
+        // Observed for a bounded window rather than asserted either way: the
+        // point is to record what a pin withdrawal alone does to a stream that
+        // is already riding an admitted peer connection.
+        let observe_until = Instant::now() + PIN_WITHDRAWAL_OBSERVATION;
+        while Instant::now() < observe_until {
+            if stream.has_errored() || stream.has_ended() {
+                break;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+        evidence.pin_withdrawal_left_stream_serving = !stream.has_errored() && !stream.has_ended();
+
+        // --- half two: the path loss ---
+        self.cluster
+            .set_peer_path_drop_from("relay-a", "relay-c", true)?;
+        let deadline = Instant::now() + INTERRUPTION_BOUND;
+        while Instant::now() < deadline {
+            if stream.has_errored() || stream.has_ended() {
+                break;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+        evidence.path_loss_interrupted = stream.has_errored();
+        let picker = stop_reason_for(held);
+        evidence.path_loss_no_stop_reason =
+            !stream.seen().iter().any(|value| picker(value).is_some());
+
+        stream.break_now();
+        conversation.connection_stream.break_now();
+        conversation.consumer.shutdown();
+
         // Restore both halves, so the owner-loss case measures owner loss
         // rather than this case's leftovers.  The pin set is re-derived from
         // the membership snapshot rather than remembered here: that is the
@@ -1732,47 +1888,62 @@ impl Gate<'_> {
 
         // Sample while both directions are backed up.  The stalled stream is
         // unread throughout, so the response direction stays full.
-        // Both segments are sampled in the same loop, so "concurrently" is a
-        // measurement rather than an arrangement: the run only stops early
-        // when both are over half at the same sample.
+        // **What these two figures are, exactly.**  The peer-hop figure comes
+        // from `HttpExchangeRecord`, which the relay writes when an exchange
+        // *terminates*, so it is an all-time high-water mark of finished
+        // exchanges rather than a live gauge.  The owner-to-device figure is
+        // `queue_bytes`, which is instantaneous, plus the session's own
+        // high-water mark.
+        //
+        // That asymmetry is why this case **does not claim the two segments
+        // were saturated simultaneously**.  An earlier version did, sampling
+        // both in one loop and calling that a measurement of concurrency; it
+        // was not, because one of the two only appears after its exchange has
+        // already ended.  The claim is narrowed to what the instruments can
+        // show, and the limit is recorded in `NOT_COVERED` rather than left to
+        // be read out of the word "concurrently".
         let mut ingress = (0usize, 0usize, 0usize);
-        let mut owner = (0usize, 0usize, 0usize);
+        let mut device_queue_peak = 0usize;
         let deadline = Instant::now() + Duration::from_secs(25);
         while Instant::now() < deadline {
             let a = self.hop_high_water("relay-c", "ingress_remote").await?;
-            let b = self.hop_high_water("relay-a", "owner_peer").await?;
             ingress = (ingress.0.max(a.0), ingress.1.max(a.1), ingress.2.max(a.2));
-            owner = (owner.0.max(b.0), owner.1.max(b.1), owner.2.max(b.2));
-            let window = ingress.2.max(owner.2);
-            if window > 0
-                && ingress.0.max(ingress.1) * 2 > window
-                && owner.0.max(owner.1) * 2 > window
-            {
+            let session = self.owner_session().await?;
+            device_queue_peak = device_queue_peak.max(session.queue_bytes);
+            evidence.owner_device_queue_high_water = session.data_bytes_high_water;
+            evidence.owner_device_queue_limit = session.data_bytes_limit;
+            if ingress.2 > 0 && ingress.0 * 2 > ingress.2 {
                 break;
             }
             sleep(Duration::from_millis(200)).await;
         }
-        // Each segment is reported by the larger of the two directions it can
-        // back up in: the ingress fills its *send* side driving a large
-        // request toward the owner, and the owner fills its *receive* side
-        // taking a flood back from the device that the parked consumer is not
-        // draining.  Asserting one named direction per segment would have
-        // measured whichever one this fixture happens to fill.
-        evidence.ingress_peer_send_in_flight = ingress.0.max(ingress.1);
-        evidence.owner_peer_send_in_flight = owner.0.max(owner.1);
-        evidence.peer_window = ingress.2.max(owner.2);
-        evidence.both_segments_saturated = evidence.peer_window > 0
-            && evidence.ingress_peer_send_in_flight * 2 > evidence.peer_window
-            && evidence.owner_peer_send_in_flight * 2 > evidence.peer_window;
+        // The **request** direction of the ingress-to-owner peer hop: bytes
+        // this relay had sent toward the owner that the owner had not yet
+        // consumed.  `peer_receive_queue` on the same record is the other end
+        // of the same direction, not the response direction, which an earlier
+        // version of the prose had wrong.
+        evidence.ingress_request_peer_send_in_flight = ingress.0;
+        evidence.peer_window = ingress.2;
+        evidence.owner_device_queue_peak_sampled = device_queue_peak;
+        evidence.ingress_request_direction_saturated = ingress.2 > 0 && ingress.0 * 2 > ingress.2;
         eprintln!(
-            "ACP cluster saturation: ingress(send={} recv={}) owner(send={} recv={}) window={}",
-            ingress.0, ingress.1, owner.0, owner.1, evidence.peer_window
+            "ACP cluster saturation: ingress_request(send={} recv={}) window={} \
+             owner_device(queue_peak={} high_water={} limit={})",
+            ingress.0,
+            ingress.1,
+            ingress.2,
+            device_queue_peak,
+            evidence.owner_device_queue_high_water,
+            evidence.owner_device_queue_limit
         );
 
-        // A live SSE stream still delivers while both hops are full.  Read
-        // off the wire, as everything else here is.
+        // A live SSE stream still delivers **while the parked stream is still
+        // unread and stalling**, on a separate transport.  Read off the wire,
+        // as everything else here is.  The upload has completed by now, so
+        // this is not "while the request direction is full"; it is "while a
+        // hop is carrying a stalled stream", which is what it says.
         let status = self.prompt(&live, &live_session, "sat-probe", "ok").await?;
-        evidence.live_stream_served_while_saturated = status == http::StatusCode::ACCEPTED
+        evidence.live_stream_served_while_parked = status == http::StatusCode::ACCEPTED
             && timeout(
                 Duration::from_secs(60),
                 live_stream.wait_for(
@@ -1965,10 +2136,19 @@ impl Gate<'_> {
 
         // Wait out three completed rotations, checking after each that the
         // held streams are still live.  `wait_for_rotation` cross-checks the
-        // connector against the owner's own snapshot and requires the
-        // candidate to be gone and the active socket to have moved, so a
-        // half-finished attempt cannot be counted.
+        // connector against the owner's own snapshot, requires the candidate to
+        // be gone, and — **because the previous active address is passed** —
+        // refuses an attempt that came back on the predecessor's data socket.
+        //
+        // An earlier version passed `None` there, which switches that last
+        // check off, while this comment and `docs/acp.md` both claimed the
+        // socket had to have moved.  It did move in every recorded run, but
+        // nothing was asserting it: that is exactly the "a rotation happened"
+        // versus "a counter moved" distinction this whole case rests on, so it
+        // is now checked twice — by the helper, and by the per-round address
+        // count below.
         let mut generation = baseline_generation;
+        let mut previous_active_local_addr = before.active_local_addr;
         for round in 1..=REQUIRED_ROTATIONS {
             let session = self
                 .cluster
@@ -1977,14 +2157,26 @@ impl Gate<'_> {
                         .as_mut()
                         .ok_or_else(|| HarnessError::Process("the device client is gone".into()))?,
                     generation,
-                    None,
+                    previous_active_local_addr,
                     baseline_rotations + round,
                 )
                 .await?;
             generation = session.active_generation;
+            previous_active_local_addr = self
+                .client
+                .as_ref()
+                .and_then(|client| client.status_snapshot().active_local_addr);
+            let before_round = sockets.len();
             for connection in self.proxy.connections() {
                 sockets.insert(connection.source_addr.to_string());
             }
+            // **One new data socket per rotation, per round.** A cumulative
+            // `>= 3` is satisfied by a single rotation, because the baseline
+            // already contributes the control socket and the initial data
+            // socket; only a per-round count says each rotation moved.
+            evidence
+                .new_sockets_per_round
+                .push(sockets.len() - before_round);
             steady.push(self.steady_sockets().await?);
             // The streams must still be live *at this rotation*, not merely at
             // the end: a stream that died in rotation one and was never read
@@ -2078,6 +2270,10 @@ impl Gate<'_> {
                 .iter()
                 .filter(|value| method_of(value) == Some("session/request_permission"))
                 .count();
+            let identified = seen
+                .iter()
+                .filter(|value| typed_id(value).is_some())
+                .count();
             let distinct: std::collections::BTreeSet<String> =
                 seen.iter().filter_map(typed_id).collect();
             evidence.sessions.push(SessionSpan {
@@ -2088,6 +2284,7 @@ impl Gate<'_> {
                 stop_reason: stop,
                 stream_alive_through_window: !stream.has_errored() && !stream.has_ended(),
                 distinct_agent_ids: distinct.len(),
+                identified_messages: identified,
                 messages: seen.len(),
             });
         }
@@ -2315,7 +2512,7 @@ async fn run(
                 "forged-heads" => gate.case_forged_heads(&mut evidence).await?,
                 "saturation" => gate.case_saturation(&mut evidence).await?,
                 "revocation" => gate.case_revocation(&mut evidence).await?,
-                "peer-key-rotation" => gate.case_key_rotation(&mut evidence).await?,
+                "peer-path-loss" => gate.case_peer_path_loss(&mut evidence).await?,
                 "owner-loss" => gate.case_owner_loss(&mut evidence).await?,
                 other => {
                     return Err(HarnessError::InvalidInput(format!(
@@ -2434,9 +2631,13 @@ pub fn validate_acp_cluster_evidence(evidence: &AcpClusterEvidence) -> Result<()
             evidence.rotation_span_ms < ROTATION_CEILING.as_millis(),
         ),
         (
-            "the device moved to a new data socket for each rotation",
-            evidence.distinct_device_sockets
-                >= usize::try_from(REQUIRED_ROTATIONS).unwrap_or(usize::MAX),
+            // Per round, not cumulative.  `distinct >= 3` is satisfied after a
+            // single rotation, because the baseline already contributes the
+            // control socket and the initial data socket.
+            "every rotation round moved the device to exactly one new data socket",
+            evidence.new_sockets_per_round.len()
+                == usize::try_from(REQUIRED_ROTATIONS).unwrap_or(usize::MAX)
+                && evidence.new_sockets_per_round.iter().all(|new| *new == 1),
         ),
         (
             "two device sockets at every settled steady state",
@@ -2478,7 +2679,7 @@ pub fn validate_acp_cluster_evidence(evidence: &AcpClusterEvidence) -> Result<()
             )));
         }
     }
-    let later: [(&str, bool); 17] = [
+    let later: [(&str, bool); 22] = [
         // --- two users in two tenants ---
         (
             "the two principals really did reuse the same JSON-RPC ids, in both types",
@@ -2554,8 +2755,27 @@ pub fn validate_acp_cluster_evidence(evidence: &AcpClusterEvidence) -> Result<()
                 .any(|execution| execution == "unknown"),
         ),
         (
+            // The attempt count first: a zero dispatch delta is evidence only
+            // if something tried to dispatch.
+            "admission was actually attempted after revocation",
+            evidence.revocation_dispatch_attempts >= 2,
+        ),
+        (
             "nothing was dispatched to the device after revocation",
             evidence.revocation_dispatched_after == 0,
+        ),
+        (
+            // Previously unenforced: the documents named this refusal and no
+            // rule checked it, so a 30 s timeout could leave whatever came
+            // last recorded with the run still green.
+            "the request after revocation met the revocation's own typed refusal",
+            evidence.revocation_after_status == 404
+                && evidence.revocation_after_code == "SERVICE_NOT_FOUND"
+                && evidence.revocation_after_execution == "not_dispatched",
+        ),
+        (
+            "a prompt on the revoked principal's own session was refused too",
+            evidence.revocation_after_prompt_status >= 400,
         ),
         (
             "the withdrawn turn never acquired a stop reason",
@@ -2563,8 +2783,20 @@ pub fn validate_acp_cluster_evidence(evidence: &AcpClusterEvidence) -> Result<()
         ),
         // --- saturation ---
         (
-            "both forwarding segments were over half their peer window at once, with a live SSE stream still served",
-            evidence.both_segments_saturated && evidence.live_stream_served_while_saturated,
+            "the request direction of the ingress-to-owner peer hop reached over half its credit window",
+            evidence.ingress_request_direction_saturated,
+        ),
+        (
+            // Not a saturation threshold: the owner-to-device segment is
+            // measured and disclosed, and asserting a fraction of a 4 MiB
+            // session budget this case does not drive would be asserting
+            // vacuously — which is the thing chunk 4 declined to do.
+            "the owner-to-device segment carried measured load",
+            evidence.owner_device_queue_limit > 0 && evidence.owner_device_queue_high_water > 0,
+        ),
+        (
+            "a live SSE stream still completed a turn while a stream was parked and stalling",
+            evidence.live_stream_served_while_parked,
         ),
     ];
     for (rule, passed) in later {
@@ -2579,9 +2811,9 @@ pub fn validate_acp_cluster_evidence(evidence: &AcpClusterEvidence) -> Result<()
     // them to be quietly weakened.
     for (label, interrupted, no_stop_reason) in [
         (
-            "peer-key rotation",
-            evidence.key_rotation_interrupted,
-            evidence.key_rotation_no_stop_reason,
+            "peer-path loss",
+            evidence.path_loss_interrupted,
+            evidence.path_loss_no_stop_reason,
         ),
         (
             "owner loss",
@@ -2635,10 +2867,10 @@ pub fn validate_acp_cluster_evidence(evidence: &AcpClusterEvidence) -> Result<()
                 span.updates_after >= 1,
             ),
             (
-                // Every agent-originated message with an id carried a distinct
-                // one, so nothing was replayed under an id already seen.
+                // Equality, not `>=`: a replay raises the identified count and
+                // leaves the distinct count alone, so only equality detects it.
                 "no message was repeated under an id already seen on this stream",
-                span.distinct_agent_ids >= 1 && span.messages >= span.distinct_agent_ids,
+                span.distinct_agent_ids >= 1 && span.identified_messages == span.distinct_agent_ids,
             ),
         ];
         for (rule, passed) in rules {
@@ -2751,6 +2983,7 @@ mod tests {
             stop_reason: "end_turn".to_owned(),
             stream_alive_through_window: true,
             distinct_agent_ids: 3,
+            identified_messages: 3,
             messages: 5,
         };
         let mut evidence = AcpClusterEvidence {
@@ -2773,6 +3006,7 @@ mod tests {
             device_session_stable: true,
             device_epoch_stable: true,
             distinct_device_sockets: 5,
+            new_sockets_per_round: vec![1, 1, 1],
             steady_state_sockets: vec![2, 2, 2],
             device_socket_peak: 3,
             side_effects_in_ledger: 2,
@@ -2801,19 +3035,24 @@ mod tests {
             revocation_in_flight_withdrawn: true,
             revocation_in_flight_execution: "dispatched+unknown".to_owned(),
             revocation_after_status: 404,
+            revocation_after_prompt_status: 404,
+            revocation_dispatch_attempts: 2,
             revocation_after_code: "SERVICE_NOT_FOUND".to_owned(),
             revocation_after_execution: "not_dispatched".to_owned(),
             revocation_dispatched_after: 0,
             revocation_no_stop_reason: true,
-            key_rotation_interrupted: true,
-            key_rotation_no_stop_reason: true,
+            pin_withdrawal_left_stream_serving: true,
+            path_loss_interrupted: true,
+            path_loss_no_stop_reason: true,
             owner_loss_interrupted: true,
             owner_loss_no_stop_reason: true,
-            ingress_peer_send_in_flight: 195_933,
-            owner_peer_send_in_flight: 195_717,
+            ingress_request_peer_send_in_flight: 195_933,
             peer_window: 196_608,
-            both_segments_saturated: true,
-            live_stream_served_while_saturated: true,
+            ingress_request_direction_saturated: true,
+            owner_device_queue_peak_sampled: 0,
+            owner_device_queue_high_water: 1,
+            owner_device_queue_limit: 4_063_232,
+            live_stream_served_while_parked: true,
             open_journal_entries: 0,
             open_streams_retired: 0,
             leftover_processes: 0,
@@ -2821,6 +3060,24 @@ mod tests {
         evidence.not_covered =
             not_covered(evidence.rotation_span_ms, evidence.rotations_across_span);
         evidence
+    }
+
+    /// The lifetime the disclosure quotes must be the lifetime actually
+    /// signed.
+    ///
+    /// The rotation disclosure formats this gate's own
+    /// `MEMBERSHIP_RECORD_LIFETIME`, not the `valid_until` of the record in
+    /// force. That is only honest while the two agree, so the agreement is
+    /// asserted here rather than assumed: if the fixture ever signs a
+    /// different lifetime, this fails instead of the disclosure quietly
+    /// stating a number no record ever carried.
+    #[test]
+    fn the_disclosed_record_lifetime_is_the_one_the_fixture_signs() {
+        assert_eq!(
+            i64::try_from(MEMBERSHIP_RECORD_LIFETIME.as_secs()).unwrap_or(i64::MAX),
+            crate::cluster_fixture::M7_MEMBERSHIP_LIFETIME.num_seconds(),
+            "the disclosure quotes a record lifetime the fixture does not sign"
+        );
     }
 
     #[test]
@@ -2836,124 +3093,359 @@ mod tests {
     /// meaningful: a rule that has been deleted or neutered stops rejecting
     /// its own falsification, and this test names it.  Without it, a deleted
     /// rule would simply stop being checked and nothing would go red.
-    /// One falsification: a name, and the single field it spoils.
-    type Falsification = (&'static str, fn(&mut AcpClusterEvidence));
+    /// One falsification: a name, the single field it spoils, and a fragment
+    /// of the rule that must be the one to reject it.
+    ///
+    /// The fragment is what stops a *different* rule shadowing the one under
+    /// test.  Asserting only `is_err()` is how two guards in this very file
+    /// came to be non-load-bearing: the disclosure rule was rejecting
+    /// mutations the rotation rules were supposed to catch, and nothing
+    /// noticed until the guard-deletion suite reported them `still green`.
+    type Falsification = (&'static str, fn(&mut AcpClusterEvidence), &'static str);
 
     #[test]
     fn every_claim_can_fail_on_its_own() {
         let mutations: Vec<Falsification> = vec![
-            ("relay_count", |e| e.relay_count = 2),
-            ("non_owner_ingress", |e| e.non_owner_ingress = false),
-            ("owner_node", |e| e.owner_node = "relay-c".to_owned()),
-            ("ingress_node", |e| e.ingress_node = "relay-a".to_owned()),
-            ("cases_executed", |e| {
-                e.cases_executed.pop();
-            }),
-            ("rotations_across_span", |e| e.rotations_across_span = 2),
-            ("owner_rotations_across_span", |e| {
-                e.owner_rotations_across_span = 2;
-            }),
-            ("rotation_span_met_schedule", |e| {
-                e.rotation_span_met_schedule = false;
-            }),
-            ("rotation_span_ms", |e| {
-                e.rotation_span_ms = ROTATION_CEILING.as_millis() + 1;
-            }),
-            ("distinct_device_sockets", |e| e.distinct_device_sockets = 1),
-            ("steady_state_sockets", |e| {
-                e.steady_state_sockets = vec![2, 3, 2];
-            }),
-            ("device_socket_peak", |e| e.device_socket_peak = 4),
-            ("connection_stream_alive", |e| {
-                e.connection_stream_alive = false;
-            }),
-            ("device_session_stable", |e| e.device_session_stable = false),
-            ("device_epoch_stable", |e| e.device_epoch_stable = false),
-            ("side_effects_in_ledger", |e| e.side_effects_in_ledger = 3),
-            ("side_effects_after_settle", |e| {
-                e.side_effects_after_settle = 3;
-            }),
-            ("max_membership_age_at_case_end_ms", |e| {
-                e.max_membership_age_at_case_end_ms = MEMBERSHIP_RECORD_LIFETIME.as_millis() + 1;
-            }),
-            ("unexplained_refusal", |e| {
-                e.unexplained_refusal = Some("phase=active".to_owned());
-            }),
-            ("shared_rpc_ids", |e| {
-                e.shared_rpc_ids = vec!["s:1".to_owned()]
-            }),
-            ("connection_id_inert_in_other_tenant", |e| {
-                e.connection_id_inert_in_other_tenant = false;
-            }),
-            ("session_ids_collide", |e| e.session_ids_collide = false),
-            ("replies_routed_per_principal", |e| {
-                e.replies_routed_per_principal = false;
-            }),
-            ("same_tenant_foreign_matches_unknown", |e| {
-                e.same_tenant_foreign_matches_unknown = false;
-            }),
-            ("cross_tenant_foreign_matches_unknown", |e| {
-                e.cross_tenant_foreign_matches_unknown = false;
-            }),
-            ("foreign_refusal_status", |e| e.foreign_refusal_status = 403),
-            ("genuine_request_still_served", |e| {
-                e.genuine_request_still_served = false;
-            }),
-            ("tenant_b_sessions_opened", |e| {
-                e.tenant_b_sessions_opened = 2
-            }),
-            ("forgeries_refused", |e| e.forgeries_refused = 2),
-            ("forgery_dispatched", |e| e.forgery_dispatched = 1),
-            ("forgery_ingress_rejections", |e| {
-                e.forgery_ingress_rejections = 0;
-            }),
-            ("revocation_in_flight_withdrawn", |e| {
-                e.revocation_in_flight_withdrawn = false;
-            }),
-            ("revocation_in_flight_execution", |e| {
-                e.revocation_in_flight_execution = "dispatched+not_dispatched".to_owned();
-            }),
-            ("revocation_dispatched_after", |e| {
-                e.revocation_dispatched_after = 1;
-            }),
-            ("revocation_no_stop_reason", |e| {
-                e.revocation_no_stop_reason = false;
-            }),
-            ("key_rotation_interrupted", |e| {
-                e.key_rotation_interrupted = false;
-            }),
-            ("key_rotation_no_stop_reason", |e| {
-                e.key_rotation_no_stop_reason = false;
-            }),
-            ("owner_loss_interrupted", |e| {
-                e.owner_loss_interrupted = false
-            }),
-            ("owner_loss_no_stop_reason", |e| {
-                e.owner_loss_no_stop_reason = false;
-            }),
-            ("both_segments_saturated", |e| {
-                e.both_segments_saturated = false;
-            }),
-            ("live_stream_served_while_saturated", |e| {
-                e.live_stream_served_while_saturated = false;
-            }),
-            ("leftover_processes", |e| e.leftover_processes = 1),
-            ("session stop_reason", |e| {
-                e.sessions[0].stop_reason = "cancelled".to_owned();
-            }),
-            ("session callbacks", |e| e.sessions[1].callbacks = 2),
-            ("session updates_before", |e| {
-                e.sessions[0].updates_before = 0
-            }),
-            ("session updates_after", |e| e.sessions[1].updates_after = 0),
-            ("session stream_alive_through_window", |e| {
-                e.sessions[0].stream_alive_through_window = false;
-            }),
-            ("session count", |e| {
-                e.sessions.pop();
-            }),
+            ("relay_count", |e| e.relay_count = 2, "three relays"),
+            (
+                "non_owner_ingress",
+                |e| e.non_owner_ingress = false,
+                "owned by relay-a",
+            ),
+            (
+                "owner_node",
+                |e| e.owner_node = "relay-c".to_owned(),
+                "owned by relay-a",
+            ),
+            (
+                "ingress_node",
+                |e| e.ingress_node = "relay-a".to_owned(),
+                "owned by relay-a",
+            ),
+            (
+                "cases_executed",
+                |e| {
+                    e.cases_executed.pop();
+                },
+                "every case executed",
+            ),
+            (
+                "rotations_across_span",
+                |e| e.rotations_across_span = 2,
+                "at least three scheduled rotations completed",
+            ),
+            (
+                "owner_rotations_across_span",
+                |e| {
+                    e.owner_rotations_across_span = 2;
+                },
+                "owner counted the same rotations independently",
+            ),
+            (
+                "rotation_span_met_schedule",
+                |e| {
+                    e.rotation_span_met_schedule = false;
+                },
+                "at least as long as the configured rotation schedule",
+            ),
+            (
+                "rotation_span_ms",
+                |e| {
+                    e.rotation_span_ms = ROTATION_CEILING.as_millis() + 1;
+                },
+                "finished inside one membership record",
+            ),
+            (
+                "new_sockets_per_round",
+                |e| {
+                    e.new_sockets_per_round = vec![1, 0, 1];
+                },
+                "exactly one new data socket",
+            ),
+            (
+                "new_sockets_per_round length",
+                |e| {
+                    e.new_sockets_per_round.pop();
+                },
+                "exactly one new data socket",
+            ),
+            (
+                "steady_state_sockets",
+                |e| {
+                    e.steady_state_sockets = vec![2, 3, 2];
+                },
+                "two device sockets at every settled steady state",
+            ),
+            (
+                "device_socket_peak",
+                |e| e.device_socket_peak = 4,
+                "at most one candidate data socket",
+            ),
+            (
+                "connection_stream_alive",
+                |e| {
+                    e.connection_stream_alive = false;
+                },
+                "connection GET stayed live",
+            ),
+            (
+                "device_session_stable",
+                |e| e.device_session_stable = false,
+                "not a reconnect",
+            ),
+            (
+                "device_epoch_stable",
+                |e| e.device_epoch_stable = false,
+                "not a reconnect",
+            ),
+            (
+                "side_effects_in_ledger",
+                |e| e.side_effects_in_ledger = 3,
+                "side effect exactly once",
+            ),
+            (
+                "side_effects_after_settle",
+                |e| {
+                    e.side_effects_after_settle = 3;
+                },
+                "side effect exactly once",
+            ),
+            (
+                "max_membership_age_at_case_end_ms",
+                |e| {
+                    e.max_membership_age_at_case_end_ms =
+                        MEMBERSHIP_RECORD_LIFETIME.as_millis() + 1;
+                },
+                "membership records' lifetime",
+            ),
+            (
+                "unexplained_refusal",
+                |e| {
+                    e.unexplained_refusal = Some("phase=active".to_owned());
+                },
+                "coincided with an observed rotation freeze",
+            ),
+            (
+                "shared_rpc_ids",
+                |e| e.shared_rpc_ids = vec!["s:1".to_owned()],
+                "reuse the same JSON-RPC ids",
+            ),
+            (
+                "connection_id_inert_in_other_tenant",
+                |e| {
+                    e.connection_id_inert_in_other_tenant = false;
+                },
+                "refused in the other byte-identically",
+            ),
+            (
+                "session_ids_collide",
+                |e| e.session_ids_collide = false,
+                "same session identifier",
+            ),
+            (
+                "replies_routed_per_principal",
+                |e| {
+                    e.replies_routed_per_principal = false;
+                },
+                "routed to the principal that asked",
+            ),
+            (
+                "same_tenant_foreign_matches_unknown",
+                |e| {
+                    e.same_tenant_foreign_matches_unknown = false;
+                },
+                "another principal of the same tenant",
+            ),
+            (
+                "cross_tenant_foreign_matches_unknown",
+                |e| {
+                    e.cross_tenant_foreign_matches_unknown = false;
+                },
+                "a principal of the other tenant",
+            ),
+            (
+                "foreign_refusal_status",
+                |e| e.foreign_refusal_status = 403,
+                "not some other error",
+            ),
+            (
+                "genuine_request_still_served",
+                |e| {
+                    e.genuine_request_still_served = false;
+                },
+                "genuine owner was still served",
+            ),
+            (
+                "tenant_b_sessions_opened",
+                |e| e.tenant_b_sessions_opened = 2,
+                "tenant B's export served exactly its own principal",
+            ),
+            (
+                "forgeries_refused",
+                |e| e.forgeries_refused = 2,
+                "every forged head was refused before dispatch",
+            ),
+            (
+                "forgery_dispatched",
+                |e| e.forgery_dispatched = 1,
+                "not one forged head reached the device",
+            ),
+            (
+                "forgery_ingress_rejections",
+                |e| {
+                    e.forgery_ingress_rejections = 0;
+                },
+                "rejection before admission",
+            ),
+            (
+                "revocation_in_flight_withdrawn",
+                |e| {
+                    e.revocation_in_flight_withdrawn = false;
+                },
+                "revocation withdrew the admitted exchange",
+            ),
+            (
+                "revocation_in_flight_execution",
+                |e| {
+                    e.revocation_in_flight_execution = "dispatched+not_dispatched".to_owned();
+                },
+                "classified execution: unknown",
+            ),
+            (
+                "revocation_dispatch_attempts",
+                |e| {
+                    e.revocation_dispatch_attempts = 0;
+                },
+                "admission was actually attempted after revocation",
+            ),
+            (
+                "revocation_dispatched_after",
+                |e| {
+                    e.revocation_dispatched_after = 1;
+                },
+                "nothing was dispatched to the device after revocation",
+            ),
+            (
+                "revocation_after_status",
+                |e| e.revocation_after_status = 503,
+                "typed refusal",
+            ),
+            (
+                "revocation_after_code",
+                |e| {
+                    e.revocation_after_code = "PEER_UNAVAILABLE".to_owned();
+                },
+                "typed refusal",
+            ),
+            (
+                "revocation_after_prompt_status",
+                |e| {
+                    e.revocation_after_prompt_status = 202;
+                },
+                "own session was refused too",
+            ),
+            (
+                "revocation_no_stop_reason",
+                |e| {
+                    e.revocation_no_stop_reason = false;
+                },
+                "withdrawn turn never acquired a stop reason",
+            ),
+            (
+                "path_loss_interrupted",
+                |e| e.path_loss_interrupted = false,
+                "explicit interruption",
+            ),
+            (
+                "path_loss_no_stop_reason",
+                |e| {
+                    e.path_loss_no_stop_reason = false;
+                },
+                "fabricated terminal",
+            ),
+            (
+                "owner_loss_interrupted",
+                |e| e.owner_loss_interrupted = false,
+                "explicit interruption",
+            ),
+            (
+                "owner_loss_no_stop_reason",
+                |e| {
+                    e.owner_loss_no_stop_reason = false;
+                },
+                "fabricated terminal",
+            ),
+            (
+                "ingress_request_direction_saturated",
+                |e| {
+                    e.ingress_request_direction_saturated = false;
+                },
+                "over half its credit window",
+            ),
+            (
+                "owner_device_queue_high_water",
+                |e| {
+                    e.owner_device_queue_high_water = 0;
+                },
+                "owner-to-device segment carried measured load",
+            ),
+            (
+                "live_stream_served_while_parked",
+                |e| {
+                    e.live_stream_served_while_parked = false;
+                },
+                "parked and stalling",
+            ),
+            (
+                "leftover_processes",
+                |e| e.leftover_processes = 1,
+                "outlived the gate",
+            ),
+            (
+                "session stop_reason",
+                |e| {
+                    e.sessions[0].stop_reason = "cancelled".to_owned();
+                },
+                "held turn completed end_turn",
+            ),
+            (
+                "session callbacks",
+                |e| e.sessions[1].callbacks = 2,
+                "callback arrived exactly once",
+            ),
+            (
+                "session updates_before",
+                |e| e.sessions[0].updates_before = 0,
+                "warm-up update arrived before the window",
+            ),
+            (
+                "session updates_after",
+                |e| e.sessions[1].updates_after = 0,
+                "own update arrived after its callback",
+            ),
+            (
+                "session identified_messages",
+                |e| {
+                    e.sessions[0].identified_messages = 4;
+                },
+                "repeated under an id already seen",
+            ),
+            (
+                "session stream_alive_through_window",
+                |e| {
+                    e.sessions[0].stream_alive_through_window = false;
+                },
+                "session stream stayed live",
+            ),
+            (
+                "session count",
+                |e| {
+                    e.sessions.pop();
+                },
+                "sessions were carried across the window",
+            ),
         ];
-        for (name, mutate) in mutations {
+        for (name, mutate, expected) in mutations {
             let mut evidence = passing_evidence();
             mutate(&mut evidence);
             // Rebuild the disclosure from the mutated run before validating.
@@ -2968,9 +3460,15 @@ mod tests {
             // disclosure rule keeps its own test below.
             evidence.not_covered =
                 not_covered(evidence.rotation_span_ms, evidence.rotations_across_span);
+            let error = validate_acp_cluster_evidence(&evidence)
+                .expect_err(&format!("falsifying {name} was accepted by the validator"));
+            // **The rule that rejected it must be the rule under test.**
+            // `is_err()` alone is satisfied by any rule firing, which is how a
+            // shadowed rule looks identical to a load-bearing one.
             assert!(
-                validate_acp_cluster_evidence(&evidence).is_err(),
-                "falsifying {name} was accepted by the validator"
+                error.to_string().contains(expected),
+                "falsifying {name} was rejected by the wrong rule: \
+                 expected one naming {expected:?}, got {error}"
             );
         }
     }

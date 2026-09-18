@@ -1680,12 +1680,13 @@ C5_CASES: list[tuple[str, list[Edit], bool]] = [
         False,
     ),
     (
-        "the device must move to a new data socket per rotation",
+        "every rotation round must move the device to one new data socket",
         [
             (
                 ACP_CLUSTER,
-                """            evidence.distinct_device_sockets
-                >= usize::try_from(REQUIRED_ROTATIONS).unwrap_or(usize::MAX),""",
+                """            evidence.new_sockets_per_round.len()
+                == usize::try_from(REQUIRED_ROTATIONS).unwrap_or(usize::MAX)
+                && evidence.new_sockets_per_round.iter().all(|new| *new == 1),""",
                 "            true,",
             )
         ],
@@ -1969,12 +1970,82 @@ C5_CASES: list[tuple[str, list[Edit], bool]] = [
     ),
     # --------------------------------------------------------- saturation
     (
-        "both segments must be saturated with a live stream still served",
+        "the request direction of the peer hop must reach half its credit window",
         [
             (
                 ACP_CLUSTER,
-                "            evidence.both_segments_saturated && evidence.live_stream_served_while_saturated,",
+                "            evidence.ingress_request_direction_saturated,",
                 "            true,",
+            )
+        ],
+        False,
+    ),
+    (
+        "the owner-to-device segment must have carried measured load",
+        [
+            (
+                ACP_CLUSTER,
+                """            evidence.owner_device_queue_limit > 0
+                && evidence.owner_device_queue_high_water > 0,""",
+                "            true,",
+            )
+        ],
+        False,
+    ),
+    (
+        "a live stream must still be served while another is parked and stalling",
+        [
+            (
+                ACP_CLUSTER,
+                "            evidence.live_stream_served_while_parked,",
+                "            true,",
+            )
+        ],
+        False,
+    ),
+    (
+        "admission must actually be attempted after revocation",
+        [
+            (
+                ACP_CLUSTER,
+                "            evidence.revocation_dispatch_attempts >= 2,",
+                "            true,",
+            )
+        ],
+        False,
+    ),
+    (
+        "the request after revocation must meet the revocation's own typed refusal",
+        [
+            (
+                ACP_CLUSTER,
+                """            evidence.revocation_after_status == 404
+                && evidence.revocation_after_code == "SERVICE_NOT_FOUND"
+                && evidence.revocation_after_execution == "not_dispatched",""",
+                "            true,",
+            )
+        ],
+        False,
+    ),
+    (
+        "a prompt on the revoked principal's own session must be refused",
+        [
+            (
+                ACP_CLUSTER,
+                "            evidence.revocation_after_prompt_status >= 400,",
+                "            true,",
+            )
+        ],
+        False,
+    ),
+    (
+        "a message repeated under an id already seen must fail the run",
+        [
+            (
+                ACP_CLUSTER,
+                """                span.distinct_agent_ids >= 1
+                    && span.identified_messages == span.distinct_agent_ids,""",
+                "                true,",
             )
         ],
         False,

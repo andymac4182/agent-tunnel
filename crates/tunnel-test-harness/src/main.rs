@@ -1679,7 +1679,7 @@ async fn main() -> ExitCode {
                         &evidence,
                     )?;
                     println!(
-                        "M8 ACP cluster passed: relays={} owner={} ingress={} non_owner={} cases={:?} rotations_across_span={} owner_rotations={} span_ms={} met_schedule={} distinct_sockets={} steady={:?} socket_peak={} connection_alive={} device_session_stable={} epoch_stable={} effects={} effects_after_settle={} sessions={:?} resign_spacing_ms={} max_membership_age_ms={} resigns={} refusals={} retries={} unexplained={:?} leftover_processes={} open_journal_entries={} open_streams_retired={} not_covered={}",
+                        "M8 ACP cluster passed: relays={} owner={} ingress={} non_owner={} cases={:?} rotations_across_span={} owner_rotations={} span_ms={} met_schedule={} distinct_sockets={} new_per_round={:?} steady={:?} socket_peak={} connection_alive={} device_session_stable={} epoch_stable={} effects={} effects_after_settle={} sessions={:?} resign_spacing_ms={} max_membership_age_ms={} resigns={} refusals={} retries={} unexplained={:?} leftover_processes={} open_journal_entries={} open_streams_retired={} not_covered={}",
                         evidence.relay_count,
                         evidence.owner_node,
                         evidence.ingress_node,
@@ -1690,6 +1690,7 @@ async fn main() -> ExitCode {
                         evidence.rotation_span_ms,
                         evidence.rotation_span_met_schedule,
                         evidence.distinct_device_sockets,
+                        evidence.new_sockets_per_round,
                         evidence.steady_state_sockets,
                         evidence.device_socket_peak,
                         evidence.connection_stream_alive,
