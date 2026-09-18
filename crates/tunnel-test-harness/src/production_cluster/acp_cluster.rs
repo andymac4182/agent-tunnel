@@ -2866,8 +2866,15 @@ pub fn validate_acp_cluster_evidence(evidence: &AcpClusterEvidence) -> Result<()
                 && evidence.revocation_after_execution == "not_dispatched",
         ),
         (
-            "a prompt on the revoked principal's own session was refused too",
-            evidence.revocation_after_prompt_status >= 400,
+            "a prompt on the revoked principal's own session was refused too, with the same status",
+            // Pinned to 404, not left at `>= 400`.  Review asked why this was
+            // looser than the sibling rule that pins 404/SERVICE_NOT_FOUND/
+            // not_dispatched, and the honest answer was that nobody had
+            // measured it -- so the field was printed into the evidence line
+            // first, a run established 404, and only then was it pinned.  A
+            // rule must not assert a value nobody has observed, and `>= 400`
+            // would have passed on a 500 from a relay that fell over.
+            evidence.revocation_after_prompt_status == 404,
         ),
         (
             "the withdrawn turn never acquired a stop reason",
@@ -3204,6 +3211,17 @@ mod tests {
 
     #[test]
     fn every_claim_can_fail_on_its_own() {
+        // Each entry carries the fragment its rule's message must contain, so
+        // a mutation that reddens *some other* rule does not count as that
+        // rule being falsifiable -- the shadowing class that made two of this
+        // chunk's own guards non-load-bearing.
+        //
+        // Two fragments are each shared by two rules ("explicit interruption"
+        // and "typed refusal").  That works only because the sibling rule
+        // still passes under the mutation, so the named one is the one that
+        // fires.  It is true today and is not enforced: if a future edit makes
+        // a sibling fail first, this test would credit the wrong rule.  Prefer
+        // a fragment unique to one rule when adding entries.
         let mutations: Vec<Falsification> = vec![
             ("relay_count", |e| e.relay_count = 2, "three relays"),
             (

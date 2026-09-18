@@ -1679,7 +1679,7 @@ async fn main() -> ExitCode {
                         &evidence,
                     )?;
                     println!(
-                        "M8 ACP cluster passed: relays={} owner={} ingress={} non_owner={} cases={:?} rotations_across_span={} owner_rotations={} span_ms={} met_schedule={} distinct_sockets={} new_per_round={:?} steady={:?} socket_peak={} connection_alive={} device_session_stable={} epoch_stable={} effects={} effects_after_settle={} sessions={:?} resign_spacing_ms={} max_membership_age_ms={} resigns={} boundary_route_probes={} refusals={} retries={} unexplained={:?} leftover_processes={} open_journal_entries={} open_streams_retired={} not_covered={}",
+                        "M8 ACP cluster passed: relays={} owner={} ingress={} non_owner={} cases={:?} rotations_across_span={} owner_rotations={} span_ms={} met_schedule={} distinct_sockets={} new_per_round={:?} steady={:?} socket_peak={} connection_alive={} device_session_stable={} epoch_stable={} effects={} effects_after_settle={} sessions={:?} resign_spacing_ms={} max_membership_age_ms={} resigns={} boundary_route_probes={} refusals={} retries={} unexplained={:?} leftover_processes={} open_journal_entries={} open_streams_retired={} not_covered={} revocation_after=({}/{}/{}) revocation_after_prompt_status={}",
                         evidence.relay_count,
                         evidence.owner_node,
                         evidence.ingress_node,
@@ -1710,6 +1710,15 @@ async fn main() -> ExitCode {
                         evidence.open_journal_entries,
                         evidence.open_streams_retired,
                         evidence.not_covered.len(),
+                        // Printed so both revocation refusals are established
+                        // figures rather than fields only a validator sees.
+                        // The prompt rule was `>= 400` because nobody had
+                        // measured it; printing it here established 404, and
+                        // it is pinned there now.
+                        evidence.revocation_after_status,
+                        evidence.revocation_after_code,
+                        evidence.revocation_after_execution,
+                        evidence.revocation_after_prompt_status,
                     );
                     Ok(())
                 }),
