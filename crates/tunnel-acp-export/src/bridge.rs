@@ -1376,11 +1376,38 @@ async fn watch_deadlines(export: AcpExport, connection: Arc<Connection>) {
             close_connection(&connection).await;
             return;
         }
+        // **An expiry is counted once, and `is_closed` is what makes that
+        // true.** The connection branch above fires once by construction: it
+        // returns. This one is a sweep over `state.sessions` and runs again on
+        // every 20 ms tick, so the filter itself has to stop re-matching a
+        // target it has already expired. `Target::close()` sets `closed` and
+        // takes the receiving half; it deliberately leaves `subscribed` false
+        // and deliberately leaves the entry in `state.sessions`, because that
+        // entry is what lets a late session GET find a closed target and be
+        // refused 409 rather than fall through to 404. Without the
+        // `is_closed()` term the same target matched on every tick for the
+        // life of the connection, so `session_subscribe_expired` counted
+        // **ticks, not expiries**, and `last_expiry_elapsed_us` /
+        // `last_expiry_bound_us` were rewritten 50 times a second after the
+        // first expiry -- which defeats the publish-before-count ordering
+        // below, since the pair a reader samples would then belong to an
+        // arbitrary later tick rather than to the expiry (M8-C25).
+        //
+        // The term masks nothing. A never-subscribed target's receiver is
+        // parked in `rx` until `close()` takes it, so a send cannot have
+        // failed on it first, and the only other closer is `close_connection`,
+        // after which this watchdog has returned. `established_and_broken`
+        // beside it already excludes closed targets; this sweep is now
+        // consistent with it.
         let expired: Vec<Arc<Target>> = connection.with(|state| {
             state
                 .sessions
                 .values()
-                .filter(|target| !target.is_subscribed() && target.created.elapsed() > bound)
+                .filter(|target| {
+                    !target.is_subscribed()
+                        && !target.is_closed()
+                        && target.created.elapsed() > bound
+                })
                 .cloned()
                 .collect()
         });
