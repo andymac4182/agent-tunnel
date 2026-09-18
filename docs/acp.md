@@ -803,10 +803,25 @@ zero across six consecutive green runs.
 
 ### Evidence
 
-`python3 scripts/acp-guard-deletion.py --suite m8c5`: see the figure recorded
-on task row M8-04, re-run immediately before it was written down. Per M8-C12
-every single figure this harness produces is provisional until re-run, because
+`python3 scripts/acp-guard-deletion.py --suite m8c5`: **32 of 32** defeated
+guards turned a test red, no documented greens and no compiler refusals. The
+figure was **re-run at the final revision before being written down**, per
+M8-C12: every figure this harness produces is provisional until re-run, because
 a random red from an unstable test in the crates it runs leaks into it.
+
+**Two of those guards were not load-bearing when first written, and the suite
+said so.** The first run reported **30 of 32** with two `still green`:
+defeating "three completed rotations are required" and "the window must finish
+inside one membership record" reddened nothing, because both fields are also
+quoted in the rotation disclosure, so the falsification test tripped the
+*disclosure* rule and never reached the rule under test. The test now rebuilds
+the disclosure from the mutated run, so each rule is measured in isolation, and
+the disclosure rule keeps its own separate test. A third run reported **31 of
+32** with one `COULD NOT APPLY: guard text not found` — the revocation rule's
+text had changed and its case still named the old one, which the harness
+refuses to count either way rather than reporting a false red. Both are
+recorded rather than quietly fixed: the allow-list failing closed (M8-C08) is
+what caught the first, and the ambiguity refusal the second.
 
 Chunk 5's guards are **validator rules** rather than codec rules, so the suite
 runs the harness's own library tests: `every_claim_can_fail_on_its_own` asserts
