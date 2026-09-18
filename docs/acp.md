@@ -977,9 +977,18 @@ connection and started a child.
   and `receive_buffered_bytes` (device→owner, held for the reader) — produced
   by one owner-actor snapshot pass, so a sample finding both above zero is a
   same-instant observation. Across fourteen runs the segment shows
-  **`to_device = 308` and `from_device` between 188 and 752 bytes at one
-  coherent instant**, every run, from 819-1,129 samples taken inside a
-  154-183 ms transfer.
+  **`to_device` and `from_device` both above zero at one coherent instant**,
+  every run, from 819-1,129 samples taken inside a 154-183 ms transfer:
+  `to_device = 308` in all fourteen, `from_device` between 188 and 752.
+
+  **That `308` is not a quantum, and review is why this paragraph says so.**
+  Reading the same figure fourteen times looks like a constant, and a constant
+  standing in for an observation is the defect this repository keeps finding.
+  An independent review run read **`to_device = 16,384`** — a full record
+  parked for credit — so the gauge is live and 308 is simply the tail record
+  being the one most often caught parked. The rule asserts `> 0` rather than a
+  value, which is why it was right either way; but the prose said "identical in
+  all fourteen" and a single further run falsified that reading of it.
 
   **An earlier version of this section said the opposite, and the correction is
   the interesting part.** It reported both directions at zero in every sample
