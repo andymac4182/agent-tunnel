@@ -1376,6 +1376,15 @@ const ROUTE_SETTLE_BOUND: Duration = Duration::from_secs(45);
 /// How long a revoked in-flight exchange has to be withdrawn.
 const REVOCATION_BOUND: Duration = Duration::from_secs(30);
 
+/// The non-owner ingress the consumer enters at, and the relay whose pooled
+/// peer admission of the owner the key-rotation case measures.
+///
+/// The validator already asserts the run really used this relay
+/// (`evidence.ingress_node == "relay-c"`), so naming it once here keeps the
+/// case's reads of "the ingress relay's own verifier" pointing at the relay
+/// the evidence is about rather than at a literal repeated beside them.
+const INGRESS_NODE: &str = "relay-c";
+
 /// How long a published membership record has to reach every relay's
 /// **verifier** — not merely Redis — before the key-rotation case reports that
 /// it never did.
@@ -2190,13 +2199,17 @@ impl Gate<'_> {
             )));
         }
         // Whether the withdrawn key left the state `admit_peer` actually binds
-        // against, at the ingress that holds the admission.  For the control
-        // arm the key was never withdrawn, so this is vacuously true and is
-        // not what that arm is read for.
+        // against, at the ingress that holds the admission.
+        //
+        // **This is false for the control arm, and deliberately so.**  That
+        // arm withdraws nothing, so there is no key whose absence could be
+        // observed; reporting `true` there would read as "the check passed"
+        // for a check that was never applicable.  Only the key arm's value is
+        // carried into the evidence, and only it has a rule.
         let key_left_verifier = !spkis.contains(&old_spki)
             && !self
                 .cluster
-                .relay(self.ingress_node_id())?
+                .relay(INGRESS_NODE)?
                 .membership
                 .snapshot()
                 .memberships
@@ -2225,12 +2238,8 @@ impl Gate<'_> {
             interrupted,
             no_stop_reason,
             key_left_verifier,
-            reasons: ledger.labels_for(self.ingress_node_id(), TARGET_NODE),
+            reasons: ledger.labels_for(INGRESS_NODE, TARGET_NODE),
         })
-    }
-
-    fn ingress_node_id(&self) -> &'static str {
-        "relay-c"
     }
 
     /// Take the next membership record version and reserve it.
