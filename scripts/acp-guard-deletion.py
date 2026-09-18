@@ -2110,25 +2110,44 @@ C5_CASES: list[tuple[str, list[Edit], bool]] = [
         [
             (
                 ACP_CLUSTER,
-                """            evidence
-                .key_rotation_reasons
-                .iter()
-                .any(|reason| reason == "membership_revoked"),""",
+                '            evidence.key_rotation_reasons == vec!["membership_revoked".to_owned()],',
                 "            true,",
             )
         ],
         False,
     ),
     (
-        "the same-key control arm must name no key, and must not be empty",
+        "the same-key control arm must name the version and nothing else",
         [
             (
                 ACP_CLUSTER,
-                """            !evidence.version_bump_reasons.is_empty()
-                && !evidence
-                    .version_bump_reasons
+                '            evidence.version_bump_reasons == vec!["membership_changed".to_owned()],',
+                "            true,",
+            )
+        ],
+        False,
+    ),
+    (
+        "the key arm must still be an owner self-revocation, as the documents assume",
+        [
+            (
+                ACP_CLUSTER,
+                """            evidence.key_rotation_owner_unready
+                && evidence
+                    .key_rotation_owner_reasons
                     .iter()
                     .any(|reason| reason == "membership_revoked"),""",
+                "            true,",
+            )
+        ],
+        False,
+    ),
+    (
+        "the control arm must leave the owner ready, or it controls for nothing",
+        [
+            (
+                ACP_CLUSTER,
+                "            !evidence.version_bump_owner_unready && evidence.version_bump_owner_reasons.is_empty(),",
                 "            true,",
             )
         ],
@@ -2166,15 +2185,23 @@ C5_CASES: list[tuple[str, list[Edit], bool]] = [
     ),
     # -------------------------------- the recorded saturation impossibility
     (
-        "'never both loaded' must be an observation, not an absence of looking",
+        "both directions of the owner-to-device segment must be loaded at one instant",
         [
             (
                 ACP_CLUSTER,
-                """            evidence.owner_device_coherent_samples >= MIN_COHERENT_SAMPLES
-                || evidence
-                    .owner_device_request_bytes_at_instant
-                    .min(evidence.owner_device_response_bytes_at_instant)
-                    > 0,""",
+                """            evidence.owner_device_request_bytes_at_instant > 0
+                && evidence.owner_device_response_bytes_at_instant > 0,""",
+                "            true,",
+            )
+        ],
+        False,
+    ),
+    (
+        "the segment must have been sampled while the upload was in flight",
+        [
+            (
+                ACP_CLUSTER,
+                "            evidence.owner_device_loaded_samples >= MIN_LOADED_SAMPLES,",
                 "            true,",
             )
         ],

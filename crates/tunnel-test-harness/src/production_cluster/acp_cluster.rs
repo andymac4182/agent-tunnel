@@ -8,14 +8,21 @@
 //! has said so since — but this comment did not, and a module header is what a
 //! reader meets first.
 //!
-//! Chunk 7 closes the first of those two.  A real peer-**key** rotation is now
-//! driven through the owner's membership record against a live ACP SSE stream
-//! on a non-owner ingress, and the teardown is **attributed**: the same
-//! sequence is run twice, once with a byte-identical key list so only the
-//! record version moves, and the product's own
+//! Chunk 7 closes the first of those two, and closes it narrower than its
+//! first draft said.  A peer-**key** rotation is now driven through the
+//! owner's membership record against a live ACP SSE stream on a non-owner
+//! ingress, and the **ingress's own attribution** of the teardown is
+//! established: the same sequence runs twice, once with an identical key list
+//! so only the record version moves, and the product's own
 //! `PeerInvalidationReason` separates them — `MembershipChanged` for the
-//! control arm, `MembershipRevoked` for the key arm.  See
-//! [`Gate::case_key_rotation`].
+//! control arm, `MembershipRevoked` for the key arm.
+//!
+//! **What it is not.** The withdrawn key is the owner's own serving key and
+//! the incoming one is a phantom, so the key arm also takes the owner Unready
+//! and tears down from both ends at once.  Which end closed the socket first
+//! is not shown, both ends' reasons are recorded rather than inferred, and a
+//! genuine rotation needs a fixture relay that re-keys.  See
+//! [`Gate::case_key_rotation`], whose header is the long version.
 //!
 //! The second is **not** closed, and is recorded as unreachable rather than
 //! narrowed again.  `record_exchange` fires at exchange termination, so no two
@@ -94,7 +101,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use tokio::time::{sleep, timeout};
@@ -102,7 +109,7 @@ use tunnel_catalog::RedisMembershipPublisher;
 use tunnel_client::http_forward::{AcpExportDiagnostics, HttpHandlers};
 use tunnel_client::{ConnectOptions, ConnectionHandle};
 use tunnel_core::RotationConfig;
-use tunnel_relay::PeerInvalidationReason;
+use tunnel_relay::{MembershipReadiness, PeerInvalidationReason};
 
 use super::acp_real_path::{
     AcpConsumer, FreezeWatch, HeldStream, MEMBERSHIP_RECORD_LIFETIME, MEMBERSHIP_RESIGN_SPACING,
@@ -192,7 +199,7 @@ pub const CLUSTER_CASES: [&str; 8] = [
 ];
 
 /// What this gate deliberately does not establish.
-pub const NOT_COVERED: [&str; 12] = [
+pub const NOT_COVERED: [&str; 13] = [
     "an ACP connection surviving a membership re-sign, or outliving its membership record: M7-C80 is open, a peer admission's deadline is never extended, and this gate's rotation case is bounded to finish inside one record rather than escaping that limit",
     "per-OS process-tree cleanup: macOS is the only host any of this has run on, and a descendant that leaves its process group is not reached at all (M8-C07)",
     "any OS sandbox guarantee: until a tested sandbox profile exists this export is trusted-agent execution, and filesystem confinement is not claimed from cwd alone",
@@ -203,7 +210,8 @@ pub const NOT_COVERED: [&str; 12] = [
     "both directions of the ingress-to-owner PEER hop loaded at the same instant: that hop publishes no live gauge at all -- HttpExchangeRecord is written when an exchange terminates and its peer_send_in_flight_high_water and peer_receive_queue_high_water are two independent all-time max latches, so both reading high is equally consistent with two disjoint bursts. It cannot be shown without a product change, named in full on task row M8-C22: one coincident latch updated while both figures are in hand, surfaced on the record, plus a live per-hop pair on the forwarding snapshot for any observation window shorter than the exchange. The owner-to-device segment IS shown loaded in both directions at one instant here, from one coherent snapshot pass, and that is a different segment",
     "the response direction of the peer hop driven to its credit window: the flood against a parked stream backs up behind the export's own output-credit stall, whose record lands only after that 30 s bound, so a bounded sampling window strictly shorter than 30 s can never see that record exist at all -- this gate measures the request direction of that hop and says so",
     "this property at the shipped default configuration: the default rotation interval is 300 s and a membership record lives at most 60 s, so on a non-owner ingress an ACP connection is invalidated long before its first scheduled rotation; three rotations are reachable here only because the gate runs the device at the 3 s configuration floor",
-    "peer-key rotation as a survivable event: the key-rotation case drives the real teardown and attributes it, it does not show an ACP stream surviving one. Nor does it separate the key change from the record-version bump that must accompany it ON THE WIRE -- the verifier refuses an equal-version re-sign, so every key change is also a version change, and the attribution rests on the reason the product itself latched (MembershipRevoked, reachable only through the membership runtime's in-process invalidation callback) together with the same-key control arm beside it",
+    "peer-key rotation as a survivable event: the key-rotation case drives the teardown and attributes the INGRESS's own decision, it does not show an ACP stream surviving one. Nor does it separate the key change from the record-version bump that must accompany it ON THE WIRE -- the verifier refuses an equal-version re-sign, so every key change is also a version change, and the attribution rests on the reason the product itself latched (MembershipRevoked, reachable only through the membership runtime's in-process invalidation callback) together with the same-key control arm beside it",
+    "which end's teardown closed the socket first: the withdrawn key is the OWNER's own serving key and the incoming one is a phantom no certificate presents, so the key arm also drives the owner's runtime through MembershipRejected to Unready, invalidating its own admission of the ingress at the same moment. The key arm is three concurrent teardowns -- ingress-side revalidation, owner-side fail-closed, and the version bump -- and the control arm controls for the third only. Both ends' latched reasons are recorded rather than inferred, and a genuine rotation, where the owner presents the incoming key, needs a fixture relay that re-keys (M8-C16)",
     "any of this at the shipped rotation default, or a key rotation reaching the consumer as a typed terminal: the interruption is an explicit stream failure with no stopReason, which is what the consumer sees, and no code on the wire names the key",
 ];
 
@@ -463,6 +471,22 @@ pub struct AcpClusterEvidence {
     pub key_rotation_no_stop_reason: bool,
     /// The reasons latched in the key arm, the same way.
     pub key_rotation_reasons: Vec<String>,
+    /// **The second teardown, recorded rather than left to be inferred.**
+    ///
+    /// The withdrawn key is the owner's *own* serving key and the incoming one
+    /// is a phantom no certificate presents, so the key arm also takes the
+    /// owner's membership runtime through `MembershipRejected`, which
+    /// invalidates every admission the owner holds — including its admission
+    /// of the ingress. These two fields are the owner's own decision about the
+    /// ingress, so a reader can see that the key arm tears down from both ends
+    /// at once and the ingress-side latch is not by itself a statement about
+    /// which end closed the socket first.
+    pub key_rotation_owner_reasons: Vec<String>,
+    pub key_rotation_owner_unready: bool,
+    /// The same two for the control arm, which is what establishes that a
+    /// version bump alone does **not** unready the owner.
+    pub version_bump_owner_reasons: Vec<String>,
+    pub version_bump_owner_unready: bool,
     /// The withdrawn key really did leave the ingress relay's verifier — the
     /// same verified state `admit_peer` binds against — within the bound.
     pub key_left_ingress_verifier: bool,
@@ -508,6 +532,20 @@ pub struct AcpClusterEvidence {
     /// Samples taken, so a zero above is "looked and did not find" rather than
     /// "never looked".
     pub owner_device_coherent_samples: u64,
+    /// ...of which this many were taken **while the near-limit upload was
+    /// still in flight**, which is the only window in which both directions of
+    /// this segment could be loaded at once.
+    ///
+    /// **This is the figure that matters and the one an earlier version did
+    /// not have.** That version sampled only after the upload's POST returned
+    /// 202 — and `acp-http-v1` parses the whole JSON-RPC body before
+    /// accepting, so a 202 means the 900 KB had already arrived. Every sample
+    /// was therefore of an idle segment, `to_device = 0` was guaranteed by
+    /// sequencing rather than observed, and the budget explanation beside it
+    /// was untested. The upload now runs concurrently with the sampler.
+    pub owner_device_loaded_samples: u64,
+    /// How long the upload was in flight, which bounds the window above.
+    pub owner_device_upload_ms: u128,
     /// The saturating upload's own `stopReason`, read off the wire.
     pub saturating_upload_stop_reason: String,
     /// The status the live probe's POST met, recorded so a failure here is
@@ -1408,13 +1446,14 @@ const KEY_STAGE_BOUND: Duration = Duration::from_secs(20);
 const SATURATION_SAMPLE_WINDOW: Duration = Duration::from_secs(12);
 const SATURATION_SAMPLE_INTERVAL: Duration = Duration::from_millis(25);
 
-/// The fewest coherent samples that make "never both loaded" a finding.
+/// The fewest coherent samples that must land **while the upload is in
+/// flight** for the both-directions reading to be an observation.
 ///
-/// The nominal count over the window above is 480. This floor is a fifth of
-/// it, so a slow snapshot pass or a loaded machine cannot redden the run — and
-/// it is a floor derived from the window rather than a number raised until a
-/// run passed: observed counts sit near the nominal.
-const MIN_COHERENT_SAMPLES: u64 = 96;
+/// A floor, not a tuned number: observed counts are 517-711, an order of
+/// magnitude above it, and it exists so a run whose upload finished before the
+/// sampler ever looked fails by name instead of quietly recording a reading it
+/// never took.
+const MIN_LOADED_SAMPLES: u64 = 64;
 
 /// What one arm of the key-rotation case observed.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -1422,7 +1461,14 @@ struct KeyRotationArm {
     interrupted: bool,
     no_stop_reason: bool,
     key_left_verifier: bool,
+    /// The owner's own membership runtime was observed not-Ready during the
+    /// arm.  True for the key arm, by construction; the control arm is what
+    /// says whether a version bump alone does it.
+    owner_unready: bool,
+    /// What the **ingress** latched for its admission of the owner.
     reasons: Vec<String>,
+    /// What the **owner** latched for its admission of the ingress.
+    owner_reasons: Vec<String>,
 }
 
 /// The reasons a relay's membership runtime latched for peer admissions it
@@ -2018,10 +2064,12 @@ impl Gate<'_> {
         Ok((interrupted, no_stop_reason))
     }
 
-    /// Case `peer-key-rotation` (task row M8-C16): a **real** key change
-    /// through the owner's membership record, driven against a live ACP SSE
-    /// stream on a non-owner ingress, with the mechanism that tore the stream
-    /// down established rather than assumed.
+    /// Case `peer-key-rotation` (task row M8-C16): a key change through the
+    /// owner's membership record — specifically an **owner-key withdrawal with
+    /// a phantom successor** — driven against a live ACP SSE stream on a
+    /// non-owner ingress, with the ingress's own attribution of the teardown
+    /// established rather than assumed, and the owner's simultaneous
+    /// fail-closed recorded beside it rather than hidden.
     ///
     /// # What M8-C16 says is hard, and how this answers it
     ///
@@ -2052,24 +2100,58 @@ impl Gate<'_> {
     ///    expression, before this gate sees anything.
     ///
     /// **The reason is not on the wire, and that is recorded rather than
-    /// worked around.**  `PeerInvalidationReason` has no string form, no
-    /// serialization, no counter and no tracing field; both mechanisms answer
-    /// a fresh admission with the same `503 PEER_UNTRUSTED` /
-    /// `not_dispatched` and produce the same `ingress`/`pool_connect`/
+    /// worked around.**  `PeerInvalidationReason` has no serialization, no
+    /// counter and no tracing field, and no string form beyond `Debug`; both
+    /// mechanisms answer a fresh admission with the same `503 PEER_UNTRUSTED`
+    /// / `not_dispatched` and produce the same `ingress`/`pool_connect`/
     /// `membership` peer-fault tuple.  The invalidation callback is the only
     /// channel, so the gate installs a recorder on it — chaining the fixture's
     /// own pin publication, so nothing about the fixture's behaviour changes.
     /// That the attribution is in-process and not observable by a consumer is
     /// carried in `NOT_COVERED`.
     ///
+    /// # What this key arm actually is: an owner self-revocation
+    ///
+    /// **This is the most important paragraph here, and an earlier version of
+    /// this case did not have it anywhere.**  [`INCOMING_SPKI`] is a digest no
+    /// fixture certificate presents, so the key the key arm withdraws is the
+    /// owner's **own serving key** and its replacement is a phantom.  The
+    /// owner's own membership runtime therefore cannot find its local key in
+    /// the record it just reconciled, takes the `MembershipRejected` branch of
+    /// `membership_runtime.rs`, goes **Unready**, and invalidates *every*
+    /// admission it holds — including its admission of the ingress — with the
+    /// same `MembershipRevoked`.  The run's own logs say so: a
+    /// `PeerRejected` reconcile failure and a failed-closed pin publication
+    /// land inside this case, every run.
+    ///
+    /// So the key arm is **three concurrent teardowns**: the ingress
+    /// revalidating the owner, the owner failing closed and invalidating the
+    /// ingress, and the version bump.  The control arm controls for the third
+    /// only.  What the ingress latched is therefore the **ingress's own
+    /// decision**, correctly attributed and correctly separated from a version
+    /// bump — and it is **not** evidence about which of the three closed the
+    /// socket first.  Both ends' reasons are recorded
+    /// ([`AcpClusterEvidence::key_rotation_owner_reasons`],
+    /// [`AcpClusterEvidence::key_rotation_owner_unready`]) so the second
+    /// mechanism is visible rather than inferred.
+    ///
+    /// **A real rotation would not include the owner going unready** — there
+    /// the owner presents the incoming key — and this fixture cannot stage one:
+    /// the admission under test binds the SPKI the owner actually presents, so
+    /// withdrawing that SPKI and unreadying the owner are the same act.
+    /// Escaping it needs a fixture relay that genuinely re-keys, which is
+    /// recorded on M8-C16 rather than attempted here.
+    ///
     /// # What is still not claimed
     ///
     /// Not that an ACP stream *survives* a key rotation — it does not, and the
     /// gate asserts the teardown.  Not that a version bump and a key
     /// withdrawal are distinguishable **from the stream's side**: both arms
-    /// are expected to interrupt, and the stream cannot tell them apart.  The
-    /// distinction is the product's own recorded reason, and the control arm
-    /// is what stops that reason being read as a coincidence.
+    /// are expected to interrupt, and the stream cannot tell them apart.  Not
+    /// which end's teardown reached the socket first, for the reason above.
+    /// What *is* established is that the ingress attributed its own teardown
+    /// to the key rather than to the record version, and that a version bump
+    /// alone yields the other reason and leaves the owner Ready.
     async fn case_key_rotation(&mut self, evidence: &mut AcpClusterEvidence) -> Result<()> {
         let old_spki = target_peer_spki(self.cluster)?;
         let ledger = Arc::new(InvalidationLedger::default());
@@ -2083,8 +2165,11 @@ impl Gate<'_> {
         // while the arms run and the later withdrawal is the *only* thing
         // that removes it.  This is setup, not the measurement: no ACP stream
         // is live yet, so nothing here can be mistaken for a teardown.
+        // One instant for every record this case publishes, so the overlap and
+        // the control carry identical key windows as well as identical ids.
+        let staged_now = Utc::now();
         let overlap_version = self.next_record_version();
-        self.publish_owner_keys(overlap_version, &[&old_spki, INCOMING_SPKI])
+        self.publish_owner_keys(overlap_version, &[&old_spki, INCOMING_SPKI], staged_now)
             .await?;
         evidence.key_overlap_staged = self
             .converge_owner_keys(overlap_version, &[&old_spki, INCOMING_SPKI])
@@ -2103,30 +2188,46 @@ impl Gate<'_> {
                 &[&old_spki, INCOMING_SPKI],
                 &ledger,
                 &old_spki,
+                staged_now,
             )
             .await?;
         evidence.version_bump_interrupted = control.interrupted;
         evidence.version_bump_reasons = control.reasons;
+        evidence.version_bump_owner_reasons = control.owner_reasons;
+        evidence.version_bump_owner_unready = control.owner_unready;
         self.settle_key_rotation_route().await?;
 
         // ---- arm two: the key change ------------------------------------
         let rotated = self
-            .key_rotation_arm("keyrot-key", &[INCOMING_SPKI], &ledger, &old_spki)
+            .key_rotation_arm(
+                "keyrot-key",
+                &[INCOMING_SPKI],
+                &ledger,
+                &old_spki,
+                staged_now,
+            )
             .await?;
         evidence.key_rotation_interrupted = rotated.interrupted;
         evidence.key_rotation_no_stop_reason = rotated.no_stop_reason;
         evidence.key_rotation_reasons = rotated.reasons;
         evidence.key_left_ingress_verifier = rotated.key_left_verifier;
+        evidence.key_rotation_owner_reasons = rotated.owner_reasons;
+        evidence.key_rotation_owner_unready = rotated.owner_unready;
 
         eprintln!(
-            "ACP cluster peer-key rotation: control(interrupted={} reasons={:?}) \
-             key(interrupted={} no_stop_reason={} left_verifier={} reasons={:?})",
+            "ACP cluster peer-key rotation: control(interrupted={} ingress_reasons={:?} \
+             owner_reasons={:?} owner_unready={}) key(interrupted={} no_stop_reason={} \
+             left_verifier={} ingress_reasons={:?} owner_reasons={:?} owner_unready={})",
             evidence.version_bump_interrupted,
             evidence.version_bump_reasons,
+            evidence.version_bump_owner_reasons,
+            evidence.version_bump_owner_unready,
             evidence.key_rotation_interrupted,
             evidence.key_rotation_no_stop_reason,
             evidence.key_left_ingress_verifier,
             evidence.key_rotation_reasons,
+            evidence.key_rotation_owner_reasons,
+            evidence.key_rotation_owner_unready,
         );
 
         // ---- restore ------------------------------------------------------
@@ -2136,7 +2237,7 @@ impl Gate<'_> {
         // chains the fixture's own pin publication, so leaving it is the
         // smaller change of the two.
         let restore_version = self.next_record_version();
-        self.publish_owner_keys(restore_version, &[&old_spki])
+        self.publish_owner_keys(restore_version, &[&old_spki], staged_now)
             .await?;
         if !self
             .converge_owner_keys(restore_version, &[&old_spki])
@@ -2146,6 +2247,15 @@ impl Gate<'_> {
                 "the restored owner key did not reach every relay's verifier".into(),
             ));
         }
+        // **Membership readiness, not just peer readiness.**  The key arm
+        // drives the owner's own runtime Unready (see this case's header), and
+        // `wait_peers_ready` reads `PeerRuntime::is_ready`, which is a
+        // different thing and comes back first.  Returning on peer readiness
+        // alone leaves a later case measuring this one's recovery -- the
+        // shape `wait_route_answers` exists for at the boundaries, and the
+        // most likely residue behind an `owner-loss` run that met a long run
+        // of uncorrelated refusals.
+        self.wait_owner_membership_ready().await?;
         for relay in self.cluster.relays.iter().filter(|r| r.running.is_some()) {
             publish_verified_pins(&relay.membership, &relay.pins)?;
         }
@@ -2167,6 +2277,7 @@ impl Gate<'_> {
         spkis: &[&str],
         ledger: &Arc<InvalidationLedger>,
         old_spki: &str,
+        staged_now: DateTime<Utc>,
     ) -> Result<KeyRotationArm> {
         let conversation = self.open_connection().await?;
         let (session, stream) = self
@@ -2191,7 +2302,7 @@ impl Gate<'_> {
         // what this arm's publish caused.
         ledger.clear();
         let version = self.next_record_version();
-        self.publish_owner_keys(version, spkis).await?;
+        self.publish_owner_keys(version, spkis, staged_now).await?;
         let converged = self.converge_owner_keys(version, spkis).await?;
         if !converged {
             return Err(HarnessError::Timeout(format!(
@@ -2219,8 +2330,18 @@ impl Gate<'_> {
                         && record.spki_sha256.iter().any(|held| held == old_spki)
                 });
 
+        // Watch the owner's own membership readiness while waiting, because
+        // the key arm drives it Unready and a readiness excursion that is over
+        // by the time the arm returns would otherwise be invisible.
+        let mut owner_unready = false;
         let deadline = Instant::now() + INTERRUPTION_BOUND;
         while Instant::now() < deadline {
+            if !matches!(
+                self.cluster.relay(TARGET_NODE)?.membership.readiness(),
+                MembershipReadiness::Ready
+            ) {
+                owner_unready = true;
+            }
             if stream.has_errored() || stream.has_ended() {
                 break;
             }
@@ -2238,7 +2359,12 @@ impl Gate<'_> {
             interrupted,
             no_stop_reason,
             key_left_verifier,
+            owner_unready,
             reasons: ledger.labels_for(INGRESS_NODE, TARGET_NODE),
+            // The owner's *own* decision about the ingress, which the key arm
+            // provokes and the control arm does not.  Recorded so the second
+            // teardown is visible rather than inferred.
+            owner_reasons: ledger.labels_for(TARGET_NODE, INGRESS_NODE),
         })
     }
 
@@ -2257,15 +2383,28 @@ impl Gate<'_> {
     }
 
     /// Sign and publish the **owner's** membership record approving exactly
-    /// `spkis`, at `version`.
+    /// `spkis`, at `version`, with every key anchored at `now`.
     ///
     /// Key ids are derived from the SPKI rather than from the version, so two
-    /// records approving the same keys carry byte-identical key lists.  That
-    /// is what makes the control arm a control: were the id to move with the
-    /// version, a reader could fairly say the control arm changed the key set
-    /// too.
-    async fn publish_owner_keys(&mut self, version: u64, spkis: &[&str]) -> Result<()> {
-        let now = Utc::now();
+    /// records approving the same keys carry the same key list.  That is what
+    /// makes the control arm a control: were the id to move with the version,
+    /// a reader could fairly say the control arm changed the key set too.
+    ///
+    /// **`now` is a parameter rather than `Utc::now()` here, and that is the
+    /// whole point.**  An earlier version took a fresh instant per call, so
+    /// the overlap record and the control record carried key windows differing
+    /// by however many seconds had elapsed between them — and the code, the
+    /// documents and the tracker all claimed the two lists were byte-identical.
+    /// The design survived (the latched reason ignores both the binding and
+    /// the deadline) but the claim did not. The case now stages one instant
+    /// and publishes every record in both arms against it, so "identical
+    /// except for `record_version`" is true rather than nearly true.
+    async fn publish_owner_keys(
+        &mut self,
+        version: u64,
+        spkis: &[&str],
+        now: DateTime<Utc>,
+    ) -> Result<()> {
         let node = self
             .cluster
             .fixture
@@ -2379,6 +2518,32 @@ impl Gate<'_> {
                 relay.membership.notify_membership_changed();
             }
             sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Wait until **every** running relay's membership runtime is Ready again.
+    ///
+    /// Distinct from [`Self::wait_peers_ready`], which reads `PeerRuntime`.
+    /// The key arm takes the owner's own runtime Unready, and that is the
+    /// slower of the two to come back.
+    async fn wait_owner_membership_ready(&self) -> Result<()> {
+        let deadline = Instant::now() + KEY_STAGE_BOUND;
+        loop {
+            let ready = self
+                .cluster
+                .relays
+                .iter()
+                .filter(|relay| relay.running.is_some())
+                .all(|relay| matches!(relay.membership.readiness(), MembershipReadiness::Ready));
+            if ready {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(HarnessError::Timeout(format!(
+                    "membership readiness did not return within {KEY_STAGE_BOUND:?} after the key rotation"
+                )));
+            }
+            sleep(Duration::from_millis(50)).await;
         }
     }
 
@@ -2618,10 +2783,19 @@ impl Gate<'_> {
 
         // The request direction: a prompt close to the profile's 1 MiB body
         // limit, which is the largest request this profile admits at all.
+        //
+        // **It runs concurrently with the sampler below, and that is the whole
+        // correction.**  An earlier version awaited this POST and only then
+        // began sampling. `acp-http-v1` parses the entire JSON-RPC body before
+        // it can accept, so its 202 means the 900 KB had already arrived: every
+        // sample was of an idle segment, `to_device = 0` was guaranteed by
+        // sequencing rather than observed, and the credit-budget explanation
+        // beside it was never tested. The upload is now in flight while the
+        // segment is read.
         let filler = "x".repeat(900_000);
-        let _ = self
-            .prompt(&live, &live_session, "sat-upload", &filler)
-            .await?;
+        let gate: &Self = &*self;
+        let upload_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let upload_started = Instant::now();
 
         // Sample while both directions are backed up.  The stalled stream is
         // unread throughout, so the response direction stays full.
@@ -2639,52 +2813,99 @@ impl Gate<'_> {
         // already ended.  The claim is narrowed to what the instruments can
         // show, and the limit is recorded in `NOT_COVERED` rather than left to
         // be read out of the word "concurrently".
-        let mut ingress = (0usize, 0usize, 0usize);
-        let mut device_queue_peak = 0usize;
-        // The best-attested *instant*, kept by the larger of its two smaller
-        // halves.  Keeping the two directions' maxima separately is precisely
-        // the mistake this field exists to avoid: two independent maxima say
-        // nothing about one instant.
-        let mut coherent = (0usize, 0usize);
-        let deadline = Instant::now() + SATURATION_SAMPLE_WINDOW;
-        while Instant::now() < deadline {
-            let a = self.hop_high_water("relay-c", "ingress_remote").await?;
-            ingress = (ingress.0.max(a.0), ingress.1.max(a.1), ingress.2.max(a.2));
-            // One snapshot pass, so the two directions below are the same
-            // instant.  `queue_bytes` is a session-wide, direction-agnostic
-            // charge and cannot separate them, which is why the per-stream
-            // live gauges are read as well.
-            let session = self.owner_session().await?;
-            device_queue_peak = device_queue_peak.max(session.queue_bytes);
-            evidence.owner_device_queue_high_water = session.data_bytes_high_water;
-            evidence.owner_device_queue_limit = session.data_bytes_limit;
-            let toward_device: usize = session
-                .streams
-                .iter()
-                .filter_map(|stream| stream.http.as_ref())
-                .map(|http| http.parked_bytes)
-                .sum();
-            let from_device: usize = session
-                .streams
-                .iter()
-                .filter_map(|stream| stream.http.as_ref())
-                .map(|http| http.receive_buffered_bytes)
-                .sum();
-            evidence.owner_device_coherent_samples += 1;
-            if toward_device.min(from_device) > coherent.0.min(coherent.1) {
-                coherent = (toward_device, from_device);
+        let upload = async {
+            let outcome = gate
+                .prompt(&live, &live_session, "sat-upload", &filler)
+                .await;
+            upload_in_flight.store(false, Ordering::SeqCst);
+            outcome
+        };
+        let sampler = async {
+            let mut ingress = (0usize, 0usize, 0usize);
+            let mut device_queue_peak = 0usize;
+            // The best-attested *instant*, kept by the larger of its two
+            // smaller halves.  Keeping the two directions' maxima separately
+            // is precisely the mistake this field exists to avoid: two
+            // independent maxima say nothing about one instant.
+            let mut coherent = (0usize, 0usize);
+            let mut samples = 0u64;
+            let mut loaded_samples = 0u64;
+            let mut high_water = 0usize;
+            let mut limit = 0usize;
+            let deadline = Instant::now() + SATURATION_SAMPLE_WINDOW;
+            while Instant::now() < deadline {
+                // Read before the snapshot, so a sample can only be *under*
+                // credited as loaded, never over.
+                let loaded = upload_in_flight.load(Ordering::SeqCst);
+                let a = gate.hop_high_water(INGRESS_NODE, "ingress_remote").await?;
+                ingress = (ingress.0.max(a.0), ingress.1.max(a.1), ingress.2.max(a.2));
+                // One snapshot pass, so the two directions below are the same
+                // instant.  `queue_bytes` is a session-wide,
+                // direction-agnostic charge and cannot separate them, which is
+                // why the per-stream live gauges are read as well.
+                let session = gate.owner_session().await?;
+                device_queue_peak = device_queue_peak.max(session.queue_bytes);
+                high_water = session.data_bytes_high_water;
+                limit = session.data_bytes_limit;
+                let toward_device: usize = session
+                    .streams
+                    .iter()
+                    .filter_map(|stream| stream.http.as_ref())
+                    .map(|http| http.parked_bytes)
+                    .sum();
+                let from_device: usize = session
+                    .streams
+                    .iter()
+                    .filter_map(|stream| stream.http.as_ref())
+                    .map(|http| http.receive_buffered_bytes)
+                    .sum();
+                samples += 1;
+                if loaded {
+                    loaded_samples += 1;
+                }
+                if toward_device.min(from_device) > coherent.0.min(coherent.1) {
+                    coherent = (toward_device, from_device);
+                }
+                if !loaded
+                    && ingress.2 > 0
+                    && ingress.0 * 2 > ingress.2
+                    && coherent.0.min(coherent.1) > 0
+                {
+                    // Everything this case can show has been shown.  Today the
+                    // third conjunct never holds and the loop runs its window
+                    // out, which is what makes the zero below a finding; if a
+                    // later change makes the segment observable in both
+                    // directions, this stops paying for a window it no longer
+                    // needs.
+                    break;
+                }
+                if !loaded {
+                    // No sleep while the upload is in flight: that window is
+                    // short and is the only one in which both directions of
+                    // this segment can be loaded at once, so it is sampled as
+                    // densely as the snapshot pass allows.
+                    sleep(SATURATION_SAMPLE_INTERVAL).await;
+                }
             }
-            if ingress.2 > 0 && ingress.0 * 2 > ingress.2 && coherent.0.min(coherent.1) > 0 {
-                // Everything this case can show has been shown.  Today the
-                // second conjunct never holds and the loop runs its window
-                // out, which is what makes the zero below a finding; if a
-                // later change makes the segment observable in both
-                // directions, this stops paying for a window it no longer
-                // needs.
-                break;
-            }
-            sleep(SATURATION_SAMPLE_INTERVAL).await;
-        }
+            Ok::<_, HarnessError>((
+                ingress,
+                device_queue_peak,
+                coherent,
+                samples,
+                loaded_samples,
+                high_water,
+                limit,
+            ))
+        };
+        let (upload_outcome, measured) = tokio::join!(upload, sampler);
+        upload_outcome?;
+        let (ingress, device_queue_peak, coherent, samples, loaded_samples, high_water, limit) =
+            measured?;
+        evidence.owner_device_upload_ms = upload_started.elapsed().as_millis();
+        evidence.owner_device_queue_high_water = high_water;
+        evidence.owner_device_queue_limit = limit;
+        evidence.owner_device_coherent_samples = samples;
+        evidence.owner_device_loaded_samples = loaded_samples;
         evidence.owner_device_request_bytes_at_instant = coherent.0;
         evidence.owner_device_response_bytes_at_instant = coherent.1;
         // The **request** direction of the ingress-to-owner peer hop: bytes
@@ -2699,7 +2920,8 @@ impl Gate<'_> {
         eprintln!(
             "ACP cluster saturation: ingress_request(send={} recv={}) window={} \
              owner_device(queue_peak={} high_water={} limit={}) \
-             owner_device_at_one_instant(to_device={} from_device={} over {} samples)",
+             owner_device_at_one_instant(to_device={} from_device={} over {} samples, \
+             {} of them while the {} ms upload was in flight)",
             ingress.0,
             ingress.1,
             ingress.2,
@@ -2709,6 +2931,8 @@ impl Gate<'_> {
             evidence.owner_device_request_bytes_at_instant,
             evidence.owner_device_response_bytes_at_instant,
             evidence.owner_device_coherent_samples,
+            evidence.owner_device_loaded_samples,
+            evidence.owner_device_upload_ms,
         );
 
         // A live SSE stream still delivers **while the parked stream is still
@@ -3480,7 +3704,7 @@ pub fn validate_acp_cluster_evidence(evidence: &AcpClusterEvidence) -> Result<()
             )));
         }
     }
-    let later: [(&str, bool); 28] = [
+    let later: [(&str, bool); 31] = [
         // --- peer-key rotation (M8-C16) ---
         (
             // Without this the key arm is a claim about a window that never
@@ -3503,23 +3727,46 @@ pub fn validate_acp_cluster_evidence(evidence: &AcpClusterEvidence) -> Result<()
             // fails for that admission -- the withdrawn-key path -- so this is
             // the product naming the cause, not the gate inferring one from a
             // coincidence of timing.
+            // Exact equality, not `any`.  `MembershipRevoked` is also the
+            // reason for `install_unready_candidate` and `mark_unready`, so
+            // "contains one" would accept a run where the ingress latched
+            // several reasons for several causes.  This case excludes those
+            // only because `converge_owner_keys` observed the ingress
+            // retaining the new record first, and pinning the exact set is
+            // what keeps that exclusion honest.
             "the product attributed the key arm's teardown to the withdrawn key",
-            evidence
-                .key_rotation_reasons
-                .iter()
-                .any(|reason| reason == "membership_revoked"),
+            evidence.key_rotation_reasons == vec!["membership_revoked".to_owned()],
         ),
         (
             // ...and the control beside it, without which the reason above is
-            // a label nobody checked.  Non-empty first: a control arm that
-            // invalidated nothing would satisfy "no key was named" vacuously
-            // and quietly stop controlling for anything.
+            // a label nobody checked.  Exact equality here too: an earlier
+            // version was `!is_empty && !any(revoked)`, whose first conjunct
+            // no falsification ever exercised.
             "the same-key control arm was attributed to the record version, naming no key",
-            !evidence.version_bump_reasons.is_empty()
-                && !evidence
-                    .version_bump_reasons
+            evidence.version_bump_reasons == vec!["membership_changed".to_owned()],
+        ),
+        (
+            // **The disclosure, made load-bearing.**  The key arm withdraws
+            // the owner's own serving key for a phantom successor, so it also
+            // takes the owner Unready and invalidates the owner's admission of
+            // the ingress.  Every claim this case makes is written for that
+            // shape, so the run must confirm it still has it: if a future
+            // fixture re-keys the owner properly, this fails and forces the
+            // documents to be revisited rather than letting them go quietly
+            // stale.
+            "the key arm is still an owner self-revocation, as everything written about it assumes",
+            evidence.key_rotation_owner_unready
+                && evidence
+                    .key_rotation_owner_reasons
                     .iter()
                     .any(|reason| reason == "membership_revoked"),
+        ),
+        (
+            // ...and the control arm is not.  This is what makes the pair a
+            // control at all: a version bump on its own leaves the owner Ready
+            // and produces no owner-side invalidation of the ingress.
+            "the same-key control arm left the owner ready and invalidated nothing from the owner's side",
+            !evidence.version_bump_owner_unready && evidence.version_bump_owner_reasons.is_empty(),
         ),
         // --- two users in two tenants ---
         (
@@ -3643,25 +3890,32 @@ pub fn validate_acp_cluster_evidence(evidence: &AcpClusterEvidence) -> Result<()
             evidence.owner_device_queue_limit > 0 && evidence.owner_device_queue_high_water > 0,
         ),
         (
-            // **The rule behind a recorded impossibility.**  This gate does
-            // not claim two directions loaded at one instant, and the reason
-            // it does not is an observation rather than an assumption: the
-            // one segment that publishes live per-direction gauges was
-            // sampled coherently, many times, across the whole window in
-            // which both loads existed, and never showed both above zero.
+            // **This rule replaces a recorded impossibility, and the
+            // replacement is the point.**  An earlier version asserted only
+            // that the looking happened, and recorded that both directions
+            // were never loaded together.  That reading was an artefact: the
+            // sampler ran only after the upload's POST returned, and
+            // `acp-http-v1` parses the whole body before accepting, so the
+            // 900 KB was always already delivered.  With the upload in flight
+            // the segment shows both directions carrying bytes at one
+            // coherent instant, every run, and the "profile limits make this
+            // unreachable" explanation that stood beside the old reading was
+            // simply wrong.
             //
-            // Without this rule that sentence would be unfalsifiable -- a run
-            // that never sampled at all would record exactly the same zeros.
-            // The disjunct is deliberate: if a later change makes the segment
-            // observable in both directions, the loop breaks early and the
-            // rule holds on the observation instead of on the sample count,
-            // so it never becomes a reason to keep looking at nothing.
-            "the owner-to-device segment's two directions were sampled together often enough for 'never both loaded' to be an observation, or were seen both loaded",
-            evidence.owner_device_coherent_samples >= MIN_COHERENT_SAMPLES
-                || evidence
-                    .owner_device_request_bytes_at_instant
-                    .min(evidence.owner_device_response_bytes_at_instant)
-                    > 0,
+            // Both figures come from one owner-actor snapshot pass, so this is
+            // a same-instant observation rather than two marks laid side by
+            // side -- which is exactly what the peer hop cannot offer
+            // (M8-C22).
+            "both directions of the owner-to-device segment carried bytes at one coherent instant",
+            evidence.owner_device_request_bytes_at_instant > 0
+                && evidence.owner_device_response_bytes_at_instant > 0,
+        ),
+        (
+            // Hygiene behind the rule above: without it, a run whose upload
+            // completed before the sampler looked could record the reading
+            // without having taken it.
+            "the segment was sampled while the upload was still in flight",
+            evidence.owner_device_loaded_samples >= MIN_LOADED_SAMPLES,
         ),
         (
             "the saturating upload completed, read off the wire",
@@ -3933,17 +4187,24 @@ mod tests {
             key_rotation_interrupted: true,
             key_rotation_no_stop_reason: true,
             key_rotation_reasons: vec!["membership_revoked".to_owned()],
+            key_rotation_owner_reasons: vec!["membership_revoked".to_owned()],
+            key_rotation_owner_unready: true,
+            version_bump_owner_reasons: Vec::new(),
+            version_bump_owner_unready: false,
             key_left_ingress_verifier: true,
             key_rotation_route_probes: 3,
             ingress_request_peer_send_in_flight: 195_933,
             peer_window: 196_608,
             ingress_request_direction_saturated: true,
-            owner_device_queue_peak_sampled: 0,
-            owner_device_queue_high_water: 1,
+            owner_device_queue_peak_sampled: 180_744,
+            owner_device_queue_high_water: 180_824,
             owner_device_queue_limit: 4_063_232,
-            owner_device_request_bytes_at_instant: 1,
-            owner_device_response_bytes_at_instant: 1,
-            owner_device_coherent_samples: 1,
+            // Real figures from a passing run, as everything else here is.
+            owner_device_request_bytes_at_instant: 308,
+            owner_device_response_bytes_at_instant: 188,
+            owner_device_coherent_samples: 518,
+            owner_device_loaded_samples: 517,
+            owner_device_upload_ms: 171,
             saturating_upload_stop_reason: "end_turn".to_owned(),
             live_probe_status: 202,
             live_stream_served_while_parked: true,
@@ -4326,6 +4587,45 @@ mod tests {
                 "same-key control arm was attributed to the record version",
             ),
             (
+                // The other half of that rule.  It used to read
+                // `!is_empty && !any(revoked)` with only the second conjunct
+                // falsified, so a control arm that invalidated *nothing* --
+                // and therefore controlled for nothing -- would have passed.
+                "version_bump_reasons empty",
+                |e| {
+                    e.version_bump_reasons = Vec::new();
+                },
+                "same-key control arm was attributed to the record version",
+            ),
+            (
+                "key_rotation_owner_unready",
+                |e| {
+                    e.key_rotation_owner_unready = false;
+                },
+                "still an owner self-revocation",
+            ),
+            (
+                "key_rotation_owner_reasons",
+                |e| {
+                    e.key_rotation_owner_reasons = Vec::new();
+                },
+                "still an owner self-revocation",
+            ),
+            (
+                "version_bump_owner_unready",
+                |e| {
+                    e.version_bump_owner_unready = true;
+                },
+                "control arm left the owner ready",
+            ),
+            (
+                "version_bump_owner_reasons",
+                |e| {
+                    e.version_bump_owner_reasons = vec!["membership_revoked".to_owned()];
+                },
+                "control arm left the owner ready",
+            ),
+            (
                 "owner_loss_interrupted",
                 |e| e.owner_loss_interrupted = false,
                 "owner loss did not produce an explicit interruption",
@@ -4364,18 +4664,27 @@ mod tests {
                 "parked and stalling",
             ),
             (
-                // Guards the recorded impossibility itself: a run that never
-                // sampled records the same zeros as a run that sampled and
-                // found nothing, and only this rule tells them apart.  The
-                // mutation clears both halves of the disjunction, because
-                // clearing one leaves the other carrying the rule.
-                "owner_device_coherent_samples",
+                "owner_device_request_bytes_at_instant",
                 |e| {
-                    e.owner_device_coherent_samples = 0;
                     e.owner_device_request_bytes_at_instant = 0;
+                },
+                "carried bytes at one coherent instant",
+            ),
+            (
+                "owner_device_response_bytes_at_instant",
+                |e| {
                     e.owner_device_response_bytes_at_instant = 0;
                 },
-                "sampled together often enough",
+                "carried bytes at one coherent instant",
+            ),
+            (
+                // Without this, a run whose upload finished before the sampler
+                // looked could record the reading without having taken it.
+                "owner_device_loaded_samples",
+                |e| {
+                    e.owner_device_loaded_samples = 0;
+                },
+                "sampled while the upload was still in flight",
             ),
             (
                 "leftover_processes",
