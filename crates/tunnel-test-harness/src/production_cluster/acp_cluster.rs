@@ -547,8 +547,8 @@ pub struct AcpClusterEvidence {
     ///
     /// **Measured, with the fold repaired and only the upload's own hop
     /// counted: the request direction reads 180,510-195,933 -- 91.8-99.66%
-    /// of the credit window -- in 7 of 7 runs.**  The receive direction
-    /// reads 0 in 6 of those 7 and 53 in the seventh.  So the live
+    /// of the credit window -- in 10 of 10 runs.**  The receive direction
+    /// reads 0 in 8 of those 10, and 53 and 8 in the other two.  So the live
     /// publication does show this hop saturated in one direction, and the
     /// reason the two directions never pair up is the traffic, not the
     /// instrument.
@@ -1585,7 +1585,7 @@ const SATURATION_THRESHOLD_PERCENT: u64 = 90;
 /// every pass whatever the upload is doing.  A floor resting on that counted
 /// the loop.  Hops open before an attempt begins are excluded by request id.
 ///
-/// Observed **249-484** with both corrections, an order of magnitude above
+/// Observed **249-659** with both corrections, an order of magnitude above
 /// the floor, which is the margin `MIN_LOADED_SAMPLES` keeps.  Provisional
 /// until re-run, per M8-C12.
 const MIN_PEER_HOP_SAMPLES: u64 = 32;
@@ -3266,7 +3266,7 @@ impl Gate<'_> {
         // a direction reaches while still accepting writes without blocking;
         // what makes a direction saturated is that it stands at its window so
         // the next write waits for credit.  Observed 180,510-195,933 of
-        // 196,608 -- 91.8-99.66% -- in seven of seven runs at the repaired
+        // 196,608 -- 91.8-99.66% -- in ten of ten runs with the repaired
         // tip, the low end being M8-C23's sub-mode, which this threshold is
         // deliberately set below rather than at a run's reading.
         evidence.ingress_request_direction_saturated = ingress.2 > 0
