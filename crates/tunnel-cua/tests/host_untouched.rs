@@ -426,9 +426,12 @@ fn the_two_m5_crates_declare_only_allowlisted_dependencies() {
         }
     }
 
-    // Non-vacuity, and the specific drift the flat union could not see: the
-    // pure crate's budget and the fixture's really are different, so a name
-    // allowed for one is refused for the other.
+    // A tripwire against re-flattening the const, **not** a demonstration of
+    // non-vacuity: both sides are literals written here, so this can only fail
+    // if someone merges the two budgets back into one. The discrimination that
+    // actually bites is the manifest loop above, which reads each crate's real
+    // declarations -- under the old flat union the fixture could have taken
+    // `tunnel-http-bridge` unnoticed, and now it cannot.
     let pure = M5_ALLOWED_DEPENDENCIES[0].1;
     let fixture = M5_ALLOWED_DEPENDENCIES[1].1;
     assert!(pure.contains(&"tunnel-http-bridge") && !fixture.contains(&"tunnel-http-bridge"));
