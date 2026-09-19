@@ -791,9 +791,12 @@ CASES_C3: list[tuple[str, list[Edit], bool]] = [
         [
             (
                 CAPTURE,
+                # Re-pointed: the review round moved the multiplication into a
+                # `u64` intermediate. The rule is unchanged -- the conversion
+                # must happen -- and the replacement is the same pass-through.
                 "        (\n"
-                "            point.x * IDENTITY_SCALE_PERCENT / self.scale_percent,\n"
-                "            point.y * IDENTITY_SCALE_PERCENT / self.scale_percent,\n"
+                "            (point.x as u64 * identity / scale) as u32,\n"
+                "            (point.y as u64 * identity / scale) as u32,\n"
                 "        )",
                 "        (point.x, point.y)",
             )
@@ -807,7 +810,16 @@ CASES_C3: list[tuple[str, list[Edit], bool]] = [
         [
             (
                 CAPTURE,
-                "        if width == 0 || height == 0 || scale_percent == 0 || scale_percent > MAX_SCALE_PERCENT {\n"
+                # Re-pointed: the review round added the `MAX_CAPTURE_DIMENSION`
+                # bounds, so `cargo fmt` broke the condition across lines. The
+                # rule is unchanged: impossible geometry issues no identity.
+                "        if width == 0\n"
+                "            || height == 0\n"
+                "            || width > MAX_CAPTURE_DIMENSION\n"
+                "            || height > MAX_CAPTURE_DIMENSION\n"
+                "            || scale_percent == 0\n"
+                "            || scale_percent > MAX_SCALE_PERCENT\n"
+                "        {\n"
                 "            return Err(GeometryError);\n"
                 "        }\n",
                 "",
