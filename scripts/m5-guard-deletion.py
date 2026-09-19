@@ -57,6 +57,7 @@ OPERATION = CRATE / "src" / "operation.rs"
 OUTCOME = CRATE / "src" / "outcome.rs"
 CAPABILITY = CRATE / "src" / "capability.rs"
 SCHEMA = CRATE / "src" / "schema.rs"
+PLAN = CRATE / "src" / "plan.rs"
 JSON = CRATE / "src" / "json.rs"
 MARKER = CRATE / "src" / "marker.rs"
 CLIENT = FIXTURE / "src" / "client.rs"
@@ -281,22 +282,11 @@ CASES: list[tuple[str, list[Edit], bool]] = [
         ],
         False,
     ),
-    (
-        # The ordering itself: validation above the dispatch boundary. Moving
-        # the capability check below it would dispatch an ungranted operation.
-        "an operation outside the negotiated set is refused before dispatch",
-        [
-            (
-                CLIENT,
-                """        if !self.permits(request.operation()) {
-            return Dispatch::NotDispatched(NotDispatched::NotPermitted);
-        }
-""",
-                "",
-            )
-        ],
-        False,
-    ),
+    # The case "an operation outside the negotiated set is refused before
+    # dispatch" used to live here, editing the fixture's dispatcher. The check
+    # moved into `plan.rs` when the ordering contract moved into the production
+    # crate, so it is now "the capability check runs before anything is planned
+    # for dispatch", above.
     # ----------------------------------------- the outcome classification
     (
         # The trap: HTTP 200 with `success: false`.
@@ -412,14 +402,11 @@ CASES: list[tuple[str, list[Edit], bool]] = [
         [
             (
                 CAPABILITY,
-                """        let Dispatch::Dispatched(Completion::Ok(result)) = dispatch else {
+                """        if !matches!(dispatch, Dispatch::Dispatched(Completion::Ok(_))) {
             return None;
-        };""",
-                """        let result = match dispatch {
-            Dispatch::Dispatched(Completion::Ok(result)) => result.clone(),
-            _ => serde_json::Value::Null,
-        };
-        let result = &result;""",
+        }
+""",
+                "",
             )
         ],
         False,
@@ -455,8 +442,10 @@ CASES: list[tuple[str, list[Edit], bool]] = [
         [
             (
                 CAPABILITY,
-                "            _ => Self::Unknown,",
-                "            _ => Self::Denied,",
+                """            Some(Value::Bool(false)) => Self::Denied,
+            _ => Self::Unknown,""",
+                """            Some(Value::Bool(false)) => Self::Denied,
+            _ => Self::Denied,""",
             )
         ],
         False,
@@ -496,6 +485,125 @@ CASES: list[tuple[str, list[Edit], bool]] = [
                 return Err(MarkerError::MarkerMismatch { x, y });
             }""",
                 "            let _ = found;",
+            )
+        ],
+        False,
+    ),
+    # ------------------------------- locally-answered is not dispatched
+    (
+        # The first review's headline finding: `describe` is answered from
+        # device-side state and reporting it as a dispatch made
+        # `reached_the_backend()` true with an empty ledger -- falsifying this
+        # chunk's central invariant in the one case the fault table missed.
+        "an operation answered from device-side state is not reported as a dispatch",
+        [
+            (
+                CLIENT,
+                "                return Dispatch::AnsweredLocally(self.describe());",
+                "                return Dispatch::Dispatched(Completion::Ok(self.describe()));",
+            )
+        ],
+        False,
+    ),
+    (
+        "a locally-answered operation is planned as a local answer, never as a command",
+        [
+            (
+                PLAN,
+                """        return Ok(Planned::AnswerLocally { operation });""",
+                """        return Ok(Planned::Dispatch {
+            command: "version",
+            payload: command_payload("version", request.params()),
+            operation,
+        });""",
+            )
+        ],
+        False,
+    ),
+    (
+        # The ordering itself, now that it lives in the production crate.
+        "the capability check runs before anything is planned for dispatch",
+        [
+            (
+                PLAN,
+                """    if !permitted.contains(&operation) {
+        return Err(Dispatch::NotDispatched(NotDispatched::NotPermitted));
+    }
+""",
+                "",
+            )
+        ],
+        False,
+    ),
+    (
+        # Discovery must not become a way to send an arbitrary command name.
+        "the discovery entry point admits only the commands describe reads",
+        [
+            (
+                PLAN,
+                """    if !Operation::DESCRIBE_READS.contains(&command) {
+        return Err(NotDispatched::Operation(crate::operation::Refusal::Unknown));
+    }
+""",
+                "",
+            )
+        ],
+        False,
+    ),
+    # ------------------------- capture authority, from the right response
+    (
+        # The second review finding: authority was read from the probe result,
+        # a response that does not carry the key, so `Denied` was unreachable.
+        "capture authority is read from a dispatched version reading",
+        [
+            (
+                CAPABILITY,
+                "            Dispatch::Dispatched(Completion::Ok(result)) => Self::from_status(result),",
+                "            Dispatch::Dispatched(Completion::Ok(_)) => Self::Unknown,",
+            )
+        ],
+        False,
+    ),
+    (
+        "a version reading that did not happen is unknown rather than a denial",
+        [
+            (
+                CAPABILITY,
+                '''            _ => Self::Unknown,
+        }
+    }
+
+    /// Whether a capture may be attempted.''',
+                '''            _ => Self::Denied,
+        }
+    }
+
+    /// Whether a capture may be attempted.''',
+            )
+        ],
+        False,
+    ),
+    # --------------------------------- the wire outcome for a refusal
+    (
+        # The third review finding: a pre-dispatch refusal rendered as
+        # `failed`, collapsing the distinction at the boundary a consumer sees.
+        "a pre-dispatch refusal renders as its own wire outcome, not as failed",
+        [
+            (
+                SCHEMA,
+                "            outcome: ResponseOutcome::NotDispatched,",
+                "            outcome: ResponseOutcome::Failed,",
+            )
+        ],
+        False,
+    ),
+    (
+        "a locally-answered operation renders as its own wire outcome",
+        [
+            (
+                SCHEMA,
+                "            outcome: ResponseOutcome::AnsweredLocally,",
+                "            outcome: ResponseOutcome::Ok,",
             )
         ],
         False,
