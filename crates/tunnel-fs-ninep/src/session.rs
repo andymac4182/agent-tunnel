@@ -370,6 +370,31 @@ impl Session {
         self.reserved_fids.clear();
     }
 
+    /// The primitives a frame decodes to, without admitting it.
+    ///
+    /// [`Session::request`] classifies a frame and then throws the
+    /// classification away when it refuses one, so a caller that wants to know
+    /// **what** it refused has nothing to ask.  This is that question, and it
+    /// is deliberately the *same* computation rather than a second one: a
+    /// caller re-deriving a request's primitives from its opcode would get
+    /// `Tlopen` wrong, because whether an open is a mutation is decided by its
+    /// flag word — `O_TRUNC` discards content and `O_WRONLY` alone does not.
+    ///
+    /// `None` for a frame this session could not classify at all, which is a
+    /// narrower answer than it looks: a request refused for its *fid state* —
+    /// a `Twrite` to a fid that is not open for writing — is refused before
+    /// any primitive is decided, so the session never formed an opinion about
+    /// whether it was a mutation and this does not invent one.
+    ///
+    /// Pure: it reads the session and changes nothing, so it may be asked
+    /// before or after a refusal and answers the same either way.
+    #[must_use]
+    pub fn required_primitives(&self, frame: &Frame) -> Option<Primitives> {
+        self.classify(frame)
+            .ok()
+            .map(|(accepted, _)| accepted.primitives)
+    }
+
     /// Admit one request.
     ///
     /// # Errors
