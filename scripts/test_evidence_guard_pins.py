@@ -166,6 +166,54 @@ def main() -> int:
         "a hash that prefixes no recorded pin must not be exempt",
     )
 
+    # The shapes review constructed against the looser predicate.  Each
+    # satisfied "a 40-hex hash, a URL containing it, and a labelled digest
+    # somewhere on the line", and none of them is a record of anything.
+    # Pinned here so the tightening cannot be quietly undone.
+    other = "c" * 40
+    for label, line in {
+        "a negated label is not a record": (
+            f"No checksum was recorded for https://github.com/o/r/tree/{UNRECORDED};"
+            f" the log id {RFD_DIGEST} is unrelated"
+        ),
+        "http is not https": (
+            f"http://github.com/o/r/blob/{UNRECORDED}/f SHA-256 {RFD_DIGEST}"
+        ),
+        "a compare link names two commits and pins neither": (
+            f"https://github.com/o/r/compare/{UNRECORDED}...{other} SHA-256 {RFD_DIGEST}"
+        ),
+        "a query parameter is not a repository path": (
+            f"https://example.org/?q={UNRECORDED} checksum {RFD_DIGEST}"
+        ),
+    }.items():
+        check(
+            UNRECORDED not in guard.recorded_upstream_pins(line),
+            f"must not be read as a pin record: {label}",
+        )
+
+    # A KNOWN LIMIT, asserted so that closing it announces itself.
+    #
+    # A line naming one commit in a blob/tree/commit URL and a labelled digest
+    # of some *other* artifact satisfies every structural condition, and no
+    # regex separates them.  This asserts the gap rather than hiding it: if a
+    # future change makes the predicate reject this, the test goes red and
+    # whoever tightened it must come here, read the reasoning and update it --
+    # the same shape as the escaping-descendant test in the ACP supervisor.
+    #
+    # The gap cannot launder history: the exemption is reachable only for a
+    # hash git cannot resolve, so a wrong pin can never turn a non-ancestor
+    # commit into a verified row.
+    unrelated_pair = (
+        f"Observed (NOT a lock): https://github.com/o/r/commit/{UNRECORDED}/x"
+        f" ; the crate checksum {RFD_DIGEST}"
+    )
+    check(
+        UNRECORDED in guard.recorded_upstream_pins(unrelated_pair),
+        "the digest-belongs-to-another-artifact gap is still open; if this "
+        "fails the predicate was tightened -- update the limit recorded in "
+        "recorded_upstream_pins and on task row M8-C21",
+    )
+
     print("test_evidence_guard_pins: PASS")
     return 0
 

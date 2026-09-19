@@ -99,8 +99,29 @@ PIN_DIGEST_RE = re.compile(r"(?<![0-9a-fA-F])[0-9a-f]{64}(?![0-9a-fA-F])")
 # The digest must be labelled, so an unexplained 64-hex blob cannot stand in
 # for "we hashed the artifact".  crates.io checksums are SHA-256 of the
 # published .crate and are written in sources.md as "checksum".
-PIN_DIGEST_LABEL_RE = re.compile(r"sha-?256|checksum", re.IGNORECASE)
-URL_RE = re.compile(r"https?://[^\s<>()\[\]`]+")
+# The label must be ADJACENT to the digest, not merely somewhere on the line.
+# Review constructed the false positives that forced this: a line reading "No
+# checksum was recorded for <url>; the log id <64hex> is unrelated" satisfied a
+# line-wide label search, and so did a digest belonging to a different artifact
+# mentioned in the same sentence.  A pin must be one record, not three facts
+# that happen to share a line.
+# "SHA-256 of that file `<digest>`" is the shape sources.md actually uses, so
+# the bridge between label and digest may contain words -- but it is bounded,
+# and it may not skip over another digest to reach a later one.
+PIN_LABELLED_DIGEST_RE = re.compile(
+    r"(?:sha-?256|checksum)"
+    r"(?:(?!(?<![0-9a-fA-F])[0-9a-f]{64}(?![0-9a-fA-F])).){0,48}?"
+    r"(?<![0-9a-fA-F])[0-9a-f]{64}(?![0-9a-fA-F])",
+    re.IGNORECASE,
+)
+# The hash must be a PATH SEGMENT of an https blob/tree/commit URL, not a
+# substring of any URL anywhere on the line.  Review showed the looser form
+# pins an unrelated commit named in passing, pins both ends of a /compare/A...B
+# link, and accepts `https://example.org/?q=<hash>` with no repository at all.
+# Every genuine record in sources.md is already of this shape.
+PIN_URL_HASH_RE = re.compile(
+    r"https://[^\s<>()\[\]`]*?/(?:blob|tree|commit|commits)/(?<![0-9a-fA-F])([0-9a-f]{40})(?![0-9a-fA-F])"
+)
 
 
 def recorded_upstream_pins(sources_text: str) -> "set[str]":
@@ -115,20 +136,30 @@ def recorded_upstream_pins(sources_text: str) -> "set[str]":
 
     An entry missing the URL or missing the digest records less than the rule
     requires and yields no pin, so the citation that depends on it fails.
+
+    The hash must be a path segment of an https blob/tree/commit URL, and the
+    digest must be label-adjacent, because review constructed false positives
+    against the looser forms: an unrelated commit named in passing, both ends
+    of a /compare/A...B link, an `http://` URL, `https://example.org/?q=<hash>`
+    with no repository at all, and a line whose only "checksum" was a negation.
+
+    What this CANNOT check, recorded rather than papered over.  A line that
+    names one commit in a blob/tree/commit URL and a labelled digest of some
+    *other* artifact satisfies every structural condition, and no regex can
+    tell the two apart -- review constructed exactly that case.  The four
+    remaining defences are: sources.md is small and reviewed; the exemption is
+    reachable only for a hash git cannot resolve, so it can never launder a
+    non-ancestor commit into a verified row; a wrong pin exempts a citation
+    that is still counted and printed; and the self-test pins the shapes that
+    are rejected.  A tighter rule would need sources.md to carry one record per
+    line in a fixed form, which is a documentation change, not a guard change.
     """
     pins: "set[str]" = set()
     for line in sources_text.splitlines():
-        if not PIN_DIGEST_RE.search(line):
+        if not PIN_LABELLED_DIGEST_RE.search(line):
             continue
-        if not PIN_DIGEST_LABEL_RE.search(line):
-            continue
-        urls = URL_RE.findall(line)
-        if not urls:
-            continue
-        for match in PIN_HASH_RE.finditer(line):
-            token = match.group(1)
-            if any(token in url for url in urls):
-                pins.add(token)
+        for match in PIN_URL_HASH_RE.finditer(line):
+            pins.add(match.group(1))
     return pins
 
 
