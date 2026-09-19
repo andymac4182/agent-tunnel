@@ -35,8 +35,9 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::capture::{CaptureId, Point};
 use crate::json::{self, JsonError};
-use crate::operation::{Operation, Refusal, refusal};
+use crate::operation::{Button, Operation, Refusal, refusal};
 
 /// A validated `computer.v1` request. Nothing has been dispatched.
 ///
@@ -75,10 +76,121 @@ pub enum Params {
     ScreenInfo { display: u32 },
     /// `cursor_position` takes nothing.
     CursorPosition,
+    /// `click` takes a capture reference, a point in that capture's pixel
+    /// space, and an optional button.
+    Click {
+        capture: CaptureId,
+        point: Point,
+        button: Button,
+    },
+    /// `double_click` takes a capture reference and a point.
+    DoubleClick { capture: CaptureId, point: Point },
+    /// `move` takes a capture reference and a point.
+    Move { capture: CaptureId, point: Point },
+    /// `drag` takes a capture reference and two points in it.
+    Drag {
+        capture: CaptureId,
+        from: Point,
+        to: Point,
+    },
+    /// `scroll` takes a capture reference, a point, and a bounded delta.
+    Scroll {
+        capture: CaptureId,
+        point: Point,
+        dx: i32,
+        dy: i32,
+    },
+    /// `type_text` takes the text. **The text is never rendered by `Debug`;**
+    /// see [`Keystrokes`].
+    TypeText { text: Keystrokes },
+    /// `press_key` takes one key name.
+    PressKey { key: Keystrokes },
+    /// `hotkey` takes a chord of key names.
+    Hotkey { keys: Vec<Keystrokes> },
+}
+
+/// A string of keystrokes, which **must never appear in a diagnostic**.
+///
+/// `AGENTS.md`: diagnostics carry identifiers, phases and counters, never
+/// payloads, keystrokes, screenshots or credentials. [`Params`] derives
+/// `Debug`, [`Request`] derives `Debug`, and every refusal in this module is
+/// formatted somewhere — so a plain `String` here would put a password into a
+/// log the first time anyone wrote `{request:?}` while debugging. This type is
+/// the enforcement rather than the reminder: its `Debug` renders a length and
+/// nothing else, and there is no `Display`.
+///
+/// ```
+/// use tunnel_cua::schema::Keystrokes;
+/// let secret = Keystrokes::new("hunter2");
+/// let rendered = format!("{secret:?}");
+/// assert!(!rendered.contains("hunter2"));
+/// assert!(rendered.contains("redacted"));
+/// assert!(rendered.contains('7'), "the length is still legible: {rendered}");
+/// ```
+///
+/// The value does of course reach the backend: that is what typing is. What it
+/// must not reach is a log line, and the only way out of this type is
+/// [`Keystrokes::as_str`], which is called in exactly one place —
+/// [`crate::plan::command_payload`], building the `/cmd` body.
+#[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct Keystrokes(String);
+
+impl Keystrokes {
+    #[must_use]
+    pub fn new(text: &str) -> Self {
+        Self(text.to_owned())
+    }
+
+    /// The only way out. Used to build the upstream request body.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Character count. Safe to log: it is a counter.
+    #[must_use]
+    pub fn characters(&self) -> usize {
+        self.0.chars().count()
+    }
+}
+
+impl core::fmt::Debug for Keystrokes {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            formatter,
+            "Keystrokes(<redacted, {} chars>)",
+            self.characters()
+        )
+    }
 }
 
 /// The display index used when `params` does not name one.
 pub const DEFAULT_DISPLAY: u32 = 0;
+
+/// The largest coordinate this profile accepts in a request, before the
+/// capture's own dimensions narrow it further.
+///
+/// A first bound at the schema, so an absurd integer is refused without a
+/// capture lookup; the real bound is [`crate::capture::CaptureIdentity::contains`].
+pub const MAX_COORDINATE: u32 = 65_535;
+
+/// The largest `type_text` payload, in bytes of UTF-8.
+///
+/// Small on purpose: a consumer typing 4 KiB into a desktop in one operation
+/// is not a case this profile is for, and the request limit
+/// ([`crate::DEFAULT_REQUEST_BODY_LIMIT`]) is sixteen times larger, so without
+/// this bound the limit that actually applied to keystrokes would be an
+/// accident of the body limit.
+pub const MAX_TEXT_BYTES: usize = 4_096;
+
+/// The longest key name.
+pub const MAX_KEY_BYTES: usize = 32;
+
+/// The most keys in one chord.
+pub const MAX_HOTKEY_KEYS: usize = 8;
+
+/// The largest scroll delta in either direction.
+pub const MAX_SCROLL_DELTA: i32 = 1_024;
 
 /// The largest display index this profile accepts.
 ///
@@ -193,32 +305,191 @@ fn validate_params(
     let accepted: &[&str] = match operation {
         Operation::Describe | Operation::CursorPosition => &[],
         Operation::Capture | Operation::ScreenInfo => &["display"],
+        Operation::Click => &["capture", "x", "y", "button"],
+        Operation::DoubleClick | Operation::Move => &["capture", "x", "y"],
+        Operation::Drag => &["capture", "x", "y", "to_x", "to_y"],
+        Operation::Scroll => &["capture", "x", "y", "dx", "dy"],
+        Operation::TypeText => &["text"],
+        Operation::PressKey => &["key"],
+        Operation::Hotkey => &["keys"],
     };
     for name in params.keys() {
         if !accepted.contains(&name.as_str()) {
             return Err(SchemaError::UnknownMember);
         }
     }
-    let display = match params.get("display") {
-        None => DEFAULT_DISPLAY,
-        Some(value) => {
-            let number = value
-                .as_u64()
-                .ok_or(SchemaError::WrongType { name: "display" })?;
-            let index =
-                u32::try_from(number).map_err(|_| SchemaError::OutOfRange { name: "display" })?;
-            if index > MAX_DISPLAY {
-                return Err(SchemaError::OutOfRange { name: "display" });
-            }
-            index
-        }
-    };
     Ok(match operation {
         Operation::Describe => Params::Describe,
-        Operation::Capture => Params::Capture { display },
-        Operation::ScreenInfo => Params::ScreenInfo { display },
+        Operation::Capture => Params::Capture {
+            display: display_of(params)?,
+        },
+        Operation::ScreenInfo => Params::ScreenInfo {
+            display: display_of(params)?,
+        },
         Operation::CursorPosition => Params::CursorPosition,
+        Operation::Click => Params::Click {
+            capture: capture_of(params)?,
+            point: point_of(params, "x", "y")?,
+            // Absent is the default button, which is the one place in this
+            // module an absent member is not a refusal -- and it is safe for
+            // the same reason `display` is: the default is the narrower
+            // behaviour, not a wider one.
+            button: match params.get("button") {
+                None => Button::DEFAULT,
+                Some(value) => {
+                    let name = value
+                        .as_str()
+                        .ok_or(SchemaError::WrongType { name: "button" })?;
+                    Button::parse(name).ok_or(SchemaError::OutOfRange { name: "button" })?
+                }
+            },
+        },
+        Operation::DoubleClick => Params::DoubleClick {
+            capture: capture_of(params)?,
+            point: point_of(params, "x", "y")?,
+        },
+        Operation::Move => Params::Move {
+            capture: capture_of(params)?,
+            point: point_of(params, "x", "y")?,
+        },
+        Operation::Drag => Params::Drag {
+            capture: capture_of(params)?,
+            from: point_of(params, "x", "y")?,
+            to: point_of(params, "to_x", "to_y")?,
+        },
+        Operation::Scroll => Params::Scroll {
+            capture: capture_of(params)?,
+            point: point_of(params, "x", "y")?,
+            dx: delta_of(params, "dx")?,
+            dy: delta_of(params, "dy")?,
+        },
+        Operation::TypeText => {
+            let text = params
+                .get("text")
+                .ok_or(SchemaError::MissingMember { name: "text" })?
+                .as_str()
+                .ok_or(SchemaError::WrongType { name: "text" })?;
+            if text.is_empty() || text.len() > MAX_TEXT_BYTES {
+                return Err(SchemaError::OutOfRange { name: "text" });
+            }
+            Params::TypeText {
+                text: Keystrokes::new(text),
+            }
+        }
+        Operation::PressKey => Params::PressKey {
+            key: key_of(params.get("key"), "key")?,
+        },
+        Operation::Hotkey => {
+            let keys = params
+                .get("keys")
+                .ok_or(SchemaError::MissingMember { name: "keys" })?
+                .as_array()
+                .ok_or(SchemaError::WrongType { name: "keys" })?;
+            if keys.is_empty() || keys.len() > MAX_HOTKEY_KEYS {
+                return Err(SchemaError::OutOfRange { name: "keys" });
+            }
+            Params::Hotkey {
+                keys: keys
+                    .iter()
+                    .map(|value| key_of(Some(value), "keys"))
+                    .collect::<Result<Vec<_>, _>>()?,
+            }
+        }
     })
+}
+
+fn display_of(params: &serde_json::Map<String, Value>) -> Result<u32, SchemaError> {
+    let Some(value) = params.get("display") else {
+        return Ok(DEFAULT_DISPLAY);
+    };
+    let number = value
+        .as_u64()
+        .ok_or(SchemaError::WrongType { name: "display" })?;
+    let index = u32::try_from(number).map_err(|_| SchemaError::OutOfRange { name: "display" })?;
+    if index > MAX_DISPLAY {
+        return Err(SchemaError::OutOfRange { name: "display" });
+    }
+    Ok(index)
+}
+
+/// The capture identity an action carries forward. **Required, never
+/// defaulted**: an action with no capture is an action whose coordinates mean
+/// nothing, and defaulting to "the current capture" would silently act on an
+/// image the consumer never saw.
+fn capture_of(params: &serde_json::Map<String, Value>) -> Result<CaptureId, SchemaError> {
+    let value = params
+        .get("capture")
+        .ok_or(SchemaError::MissingMember { name: "capture" })?
+        .as_u64()
+        .ok_or(SchemaError::WrongType { name: "capture" })?;
+    Ok(CaptureId::new(value))
+}
+
+fn coordinate_of(
+    params: &serde_json::Map<String, Value>,
+    name: &'static str,
+) -> Result<u32, SchemaError> {
+    let number = params
+        .get(name)
+        .ok_or(SchemaError::MissingMember { name })?
+        .as_u64()
+        .ok_or(SchemaError::WrongType { name })?;
+    let value = u32::try_from(number).map_err(|_| SchemaError::OutOfRange { name })?;
+    if value > MAX_COORDINATE {
+        return Err(SchemaError::OutOfRange { name });
+    }
+    Ok(value)
+}
+
+fn point_of(
+    params: &serde_json::Map<String, Value>,
+    x: &'static str,
+    y: &'static str,
+) -> Result<Point, SchemaError> {
+    Ok(Point::new(
+        coordinate_of(params, x)?,
+        coordinate_of(params, y)?,
+    ))
+}
+
+fn delta_of(
+    params: &serde_json::Map<String, Value>,
+    name: &'static str,
+) -> Result<i32, SchemaError> {
+    let number = params
+        .get(name)
+        .ok_or(SchemaError::MissingMember { name })?
+        .as_i64()
+        .ok_or(SchemaError::WrongType { name })?;
+    let value = i32::try_from(number).map_err(|_| SchemaError::OutOfRange { name })?;
+    if value.unsigned_abs() > MAX_SCROLL_DELTA.unsigned_abs() {
+        return Err(SchemaError::OutOfRange { name });
+    }
+    Ok(value)
+}
+
+/// Validate one key name.
+///
+/// **Fail closed on the characters, not only the length.** A key name is
+/// forwarded to a backend that maps it onto a keyboard layout; a name carrying
+/// a separator, a control character or whitespace is a name this profile has
+/// not reasoned about, and the cost of guessing is a keystroke nobody asked
+/// for. ASCII letters, digits, `_` and `-`, and nothing else.
+fn key_of(value: Option<&Value>, name: &'static str) -> Result<Keystrokes, SchemaError> {
+    let text = value
+        .ok_or(SchemaError::MissingMember { name })?
+        .as_str()
+        .ok_or(SchemaError::WrongType { name })?;
+    if text.is_empty() || text.len() > MAX_KEY_BYTES {
+        return Err(SchemaError::OutOfRange { name });
+    }
+    if !text
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    {
+        return Err(SchemaError::OutOfRange { name });
+    }
+    Ok(Keystrokes::new(text))
 }
 
 /// The `outcome` member of a `computer.v1` response.
@@ -307,8 +578,17 @@ impl Response {
         }
     }
 
-    /// A dispatched operation that failed. Its effect did not happen, so the
-    /// consumer may retry.
+    /// A dispatched operation that failed.
+    ///
+    /// **Retryable only when the operation does not mutate the target**, and
+    /// chunk 3 is why that clause exists. For a read, a backend-reported
+    /// failure means the effect did not happen and a retry costs a round trip.
+    /// For a click it means the *backend* believes the effect did not happen,
+    /// on a code path where the backend has already been handed the command —
+    /// and this profile does not stake a duplicated click on the backend's
+    /// self-report. The rule is [`Operation::mutates_target`], the same
+    /// predicate the lease and
+    /// [`crate::outcome::Dispatch::retry_is_safe_for`] read.
     #[must_use]
     pub fn failed(operation: Operation, code: &str, message: &str) -> Self {
         Self {
@@ -319,7 +599,7 @@ impl Response {
             error: Some(ResponseError {
                 code: code.to_owned(),
                 message: message.to_owned(),
-                retryable: true,
+                retryable: !operation.mutates_target(),
             }),
         }
     }
@@ -347,8 +627,59 @@ impl Response {
     /// Renders as `outcome: "not_dispatched"`, **not** as `failed`: the
     /// backend never saw this, and a consumer must be able to learn that from
     /// the wire rather than infer it from a retryability flag.
+    /// **Only for an operation name this build cannot parse.** That is the
+    /// case the `&str` exists for, and it is the one case where `retryable:
+    /// true` is unconditionally right: a name the allowlist rejects was never
+    /// dispatched and can never have been an input operation, so no side
+    /// effect can have happened. For anything that *is* an [`Operation`], use
+    /// [`Response::not_dispatched_for`], which derives retryability instead of
+    /// assuming it.
     #[must_use]
     pub fn not_dispatched(operation: &str, code: &str, message: &str) -> Self {
+        Self::not_dispatched_retryable(operation, code, message, true)
+    }
+
+    /// A pre-dispatch refusal of a known operation, with retryability
+    /// **derived** from the refusal and the operation.
+    ///
+    /// **This exists because the default was the thing a future facade would
+    /// get wrong.** The M3-15 rule — a `PeerUnavailable` refusal is never
+    /// auto-retried for an operation that synthesises input — reached the wire
+    /// only if a caller remembered to compute it and pass it to
+    /// [`Response::not_dispatched_retryable`]. Nothing enforced that, and
+    /// [`Response::not_dispatched`]'s hardcoded `true` was the easy path.
+    /// Here the rule is read from
+    /// [`crate::outcome::Dispatch::retry_is_safe_for`], which is the single
+    /// place it is decided.
+    #[must_use]
+    pub fn not_dispatched_for(
+        operation: Operation,
+        refusal: crate::outcome::NotDispatched,
+        code: &str,
+        message: &str,
+    ) -> Self {
+        let retryable =
+            crate::outcome::Dispatch::NotDispatched(refusal).retry_is_safe_for(operation);
+        Self::not_dispatched_retryable(operation.name(), code, message, retryable)
+    }
+
+    /// A pre-dispatch refusal whose retryability the caller decides.
+    ///
+    /// Needed because not every not-dispatched refusal is safe to retry once
+    /// input operations exist. **M3-15 is the case**: a rotation freeze
+    /// refuses a new request with the same retryable `503 PEER_UNAVAILABLE`
+    /// body that the relay uses for every other owner-not-ready condition, so
+    /// a consumer cannot tell a scheduled freeze from a fault state — and a
+    /// click retried through a fault state is a click that may land twice. The
+    /// decision lives in [`crate::outcome::Dispatch::retry_is_safe_for`]; this
+    /// is how it reaches the wire.
+    #[must_use]
+    pub fn not_dispatched_retryable(
+        operation: &str,
+        code: &str,
+        message: &str,
+        retryable: bool,
+    ) -> Self {
         Self {
             version: crate::SCHEMA_VERSION.to_owned(),
             operation: operation.to_owned(),
@@ -357,7 +688,7 @@ impl Response {
             error: Some(ResponseError {
                 code: code.to_owned(),
                 message: message.to_owned(),
-                retryable: true,
+                retryable,
             }),
         }
     }

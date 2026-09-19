@@ -259,6 +259,16 @@ display scale and target identity into subsequent actions, and reject stale or
 mismatched capture coordinates. Preserve upstream permission-denied or unsupported
 results; do not silently escalate scope, change backend, or steal focus.
 
+**The command names above are pinned; the parameter names are not.** M5-01 read
+the released registry and recorded which commands 0.3.46 accepts, which is what
+`tunnel_http_forward::cua_pin::ALLOWED_COMMANDS` carries. It did not record each
+command's parameter schema, and no backend has been probed, so the `x`/`y`,
+`start_x`/`end_x`, `dx`/`dy`, `text`, `key` and `keys` members the adapter sends
+are this repository's choice rather than a measurement. They are exercised only
+against the Lane A fixture, which accepts what it is sent. M5-C06 owns
+reconciling them against a real backend, and the table's own "validate
+backend-specific coordinate and delta semantics" is the same warning.
+
 ### Authentication and platform limits
 
 Computer Server defaults to `127.0.0.1`. In the inspected `/cmd` and `/ws` paths,
