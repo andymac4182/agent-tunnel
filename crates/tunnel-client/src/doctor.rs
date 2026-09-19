@@ -54,6 +54,20 @@ pub(crate) struct DoctorResult {
     pub(crate) permissions: PermissionCheck,
     pub(crate) expiry: ExpiryCheck,
     pub(crate) supervisor_ipc: CapabilityCheck,
+    /// Whether this installation can contain a supervised child's process
+    /// group when the device itself is killed (M3-09).
+    ///
+    /// The sentinel is a **separate executable**, so an installation missing
+    /// it supervises children perfectly and leaks their process groups on
+    /// every crash -- a state indistinguishable from correct operation unless
+    /// something reports it. This is that something, and it is checked here
+    /// because startup is the last moment at which it is cheap to fix.
+    ///
+    /// A missing sentinel is reported, **not** failed: it is a degradation of
+    /// cleanup, not a reason to refuse to run, and an operator who cannot
+    /// install the sentinel is better off with a warned-about device than no
+    /// device. It never changes `ok` or the exit code.
+    pub(crate) process_containment: CapabilityCheck,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -114,6 +128,7 @@ pub(crate) fn inspect(path: &Path, now: SystemTime) -> DoctorInspection {
         status: "not_implemented",
         code: "SUPERVISOR_IPC_NOT_IMPLEMENTED",
     };
+    let process_containment = process_containment_check();
 
     let config = match ConnectConfig::load(path) {
         Ok(config) => config.resolve_relative_to(path.parent().unwrap_or_else(|| Path::new("."))),
@@ -124,6 +139,7 @@ pub(crate) fn inspect(path: &Path, now: SystemTime) -> DoctorInspection {
                 permissions: PermissionCheck::not_run(),
                 expiry: ExpiryCheck::not_run(),
                 supervisor_ipc,
+                process_containment,
             };
             return inspection(
                 result,
@@ -146,6 +162,7 @@ pub(crate) fn inspect(path: &Path, now: SystemTime) -> DoctorInspection {
         permissions,
         expiry,
         supervisor_ipc,
+        process_containment,
     };
 
     let failure = first_credential_failure(&result);
@@ -455,6 +472,39 @@ fn unix_seconds(now: SystemTime) -> i64 {
     }
 }
 
+/// Report whether a parent-death sentinel could be armed on this host.
+///
+/// Reads a path and starts nothing, which keeps the doctor's promise that it
+/// stops at files and never invokes an export.
+fn process_containment_check() -> CapabilityCheck {
+    containment_check(tunnel_deadman::availability())
+}
+
+/// The [`tunnel_deadman::Availability`] to [`CapabilityCheck`] mapping, as a
+/// pure function of its input.
+///
+/// Split from the lookup above so a test can assert the **degraded** arm on a
+/// machine where the sentinel happens to be installed. Left fused, a test
+/// would take whichever arm the host produced — on any developer machine that
+/// has built the workspace, the `Armable` one — and its assertions about the
+/// degraded reporting would hold vacuously.
+fn containment_check(availability: tunnel_deadman::Availability) -> CapabilityCheck {
+    match availability {
+        tunnel_deadman::Availability::Armable => CapabilityCheck {
+            status: "ok",
+            code: "PROCESS_CONTAINMENT_SENTINEL_PRESENT",
+        },
+        tunnel_deadman::Availability::SentinelMissing => CapabilityCheck {
+            status: "degraded",
+            code: "PROCESS_CONTAINMENT_SENTINEL_MISSING",
+        },
+        tunnel_deadman::Availability::UnsupportedPlatform => CapabilityCheck {
+            status: "not_implemented",
+            code: "PROCESS_CONTAINMENT_UNSUPPORTED_PLATFORM",
+        },
+    }
+}
+
 /// Parse only the certificate validity sequence needed by the local doctor.
 /// The parser is deliberately strict and rejects indefinite-length BER.
 fn certificate_validity(der: &[u8]) -> Result<(i64, i64), ()> {
@@ -708,6 +758,60 @@ mod tests {
         assert!(!json.contains("client-key.pem"));
         assert!(!json.contains("relay.example.test"));
         assert!(fixture.directory.path().exists());
+    }
+
+    /// M3-09 / M3-19: a missing parent-death sentinel must be **visible**.
+    ///
+    /// Without a report, an installation that shipped the device binary
+    /// without `tunnel-deadman` beside it supervises children perfectly and
+    /// leaks their process groups on every crash — a state nothing in the
+    /// product distinguishes from correct operation. The check is also
+    /// required **not** to fail the run: cleanup degrades, the device still
+    /// works, and refusing to start would be worse than warning.
+    #[test]
+    fn a_missing_parent_death_sentinel_is_reported_and_does_not_fail_the_doctor() {
+        // The degraded state is constructed, not waited for. On any machine
+        // that has built this workspace the sentinel IS installed, so a test
+        // that ran `inspect` and looked at whatever came back would take the
+        // `Armable` arm and assert nothing about the case it is named for.
+        let missing = containment_check(tunnel_deadman::Availability::SentinelMissing);
+        assert_eq!(missing.status, "degraded");
+        assert_eq!(missing.code, "PROCESS_CONTAINMENT_SENTINEL_MISSING");
+        assert_eq!(
+            containment_check(tunnel_deadman::Availability::Armable).status,
+            "ok"
+        );
+        assert_eq!(
+            containment_check(tunnel_deadman::Availability::UnsupportedPlatform).status,
+            "not_implemented"
+        );
+
+        // And a degraded containment does not become a failed doctor: it is a
+        // degradation of cleanup, not a reason to refuse to run. Asserted
+        // against a result that actually carries the degraded check, so the
+        // claim holds on a host where the sentinel is present.
+        let fixture = fixture(false);
+        let inspection = inspect(
+            &fixture.config,
+            UNIX_EPOCH + Duration::from_secs(1_800_000_000),
+        );
+        let mut result = inspection
+            .output
+            .result
+            .clone()
+            .expect("successful doctor inspection has a result");
+        result.process_containment = missing;
+        assert!(
+            first_credential_failure(&result).is_none(),
+            "containment is not part of the doctor's verdict"
+        );
+        assert!(inspection.output.ok);
+        assert_eq!(inspection.exit_code, 0);
+        let json = serde_json::to_string(&inspection.output).expect("doctor serializes");
+        assert!(
+            json.contains("process_containment"),
+            "and it reaches the JSON an operator actually reads"
+        );
     }
 
     #[test]
