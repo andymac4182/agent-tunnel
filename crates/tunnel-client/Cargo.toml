@@ -12,6 +12,9 @@ tunnel-core.workspace = true
 tunnel-protocol = { path = "../tunnel-protocol" }
 tunnel-http-bridge = { path = "../tunnel-http-bridge" }
 tunnel-acp-export = { path = "../tunnel-acp-export" }
+# The doctor reports whether the parent-death sentinel executable is installed
+# (M3-09); without it, supervised process groups leak on every crash.
+tunnel-deadman = { path = "../tunnel-deadman" }
 tunnel-mcp-export = { path = "../tunnel-mcp-export" }
 bytes = "1"
 http = "1"

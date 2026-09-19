@@ -3529,6 +3529,7 @@ dependencies = [
  "toml",
  "tunnel-acp-export",
  "tunnel-core",
+ "tunnel-deadman",
  "tunnel-fs-core",
  "tunnel-fs-host",
  "tunnel-fs-ninep",
@@ -3584,6 +3585,14 @@ dependencies = [
  "serde_json",
  "tokio",
  "tunnel-cua",
+]
+
+[[package]]
+name = "tunnel-deadman"
+version = "0.1.0"
+dependencies = [
+ "rustix",
+ "tempfile",
 ]
 
 [[package]]
@@ -3660,6 +3669,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "toml",
+ "tunnel-deadman",
  "tunnel-http-bridge",
  "tunnel-http-forward",
  "tunnel-mcp",
@@ -3678,11 +3688,13 @@ dependencies = [
  "hyper",
  "hyper-util",
  "rmcp",
+ "rustix",
  "serde_json",
  "tempfile",
  "tokio",
  "tokio-util",
  "toml",
+ "tunnel-deadman",
  "tunnel-http-bridge",
  "tunnel-mcp",
  "tunnel-mcp-export",

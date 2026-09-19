@@ -18,6 +18,19 @@
 //!   killed.  The group is signalled after the leader is reaped; POSIX keeps
 //!   a process-group ID from being reused while any member lives, so the
 //!   signal reaches only surviving members of this group.
+//! * That group kill only happens on an end of life **this process lives to
+//!   see**.  A `SIGKILL`, a `process::exit` or a crash of the device runs no
+//!   `Drop` at all, so before this it left the whole group orphaned — not
+//!   only an escaping descendant, but the ordinary `npx` wrapper's real
+//!   server, the case the group kill exists for.  Each child is therefore
+//!   also watched by a [`tunnel_deadman`] sentinel: a sibling process holding
+//!   the read end of a pipe this process holds the write end of, which
+//!   `SIGKILL`s the group when that pipe reaches end of file for any reason.
+//!   The sentinel is stood down only after the child has been killed and
+//!   reaped.  **It does not widen the group kill's reach**: a descendant that
+//!   left the group escapes the sentinel exactly as it escapes the
+//!   supervisor, and `docs/tasks.md` M3-09 records which mechanisms would and
+//!   would not close that on which platform.
 //! * Dropping the [`ChildHandle`] kills the process group; the supervisor
 //!   reaps the leader.
 //!   No lock is held across child I/O: a writer task owns stdin, a reader
@@ -88,6 +101,15 @@ pub struct ChildCounters {
     pub running: AtomicU64,
     /// Process-group kills sent (each end of a child's life sends one).
     pub group_kills: AtomicU64,
+    /// Children for which a parent-death sentinel was armed.  A child counted
+    /// in `spawned` but not here is one whose group survives this process
+    /// being `SIGKILL`ed.
+    pub deadman_armed: AtomicU64,
+    /// Sentinels that **reported** standing down after their child was killed
+    /// and reaped.  Counted from the sentinel's own exit status, not from the
+    /// supervisor having asked, so a sentinel that fired on the way out is
+    /// not recorded here.
+    pub deadman_stood_down: AtomicU64,
 }
 
 /// A spawn failure.  Carries no path or OS message.
@@ -175,6 +197,15 @@ pub fn spawn(
     let group = child.id();
     counters.spawned.fetch_add(1, Ordering::Relaxed);
     counters.running.fetch_add(1, Ordering::Relaxed);
+    // Armed before any task can end the child.  A window remains, between the
+    // spawn above and this line, in which a device crash leaves this group
+    // unwatched; it is microseconds and cannot be closed without arming the
+    // sentinel before the pid it watches exists, but it is not zero and is not
+    // claimed to be.
+    let deadman = group.and_then(tunnel_deadman::Deadman::arm);
+    if deadman.is_some() {
+        counters.deadman_armed.fetch_add(1, Ordering::Relaxed);
+    }
 
     let kill = CancellationToken::new();
     let (exited_tx, exited_rx) = watch::channel(false);
@@ -212,6 +243,40 @@ pub fn spawn(
         }
         supervisor_counters.exited.fetch_add(1, Ordering::Relaxed);
         supervisor_counters.running.fetch_sub(1, Ordering::Relaxed);
+        // Only now: the leader is reaped and the group is signalled, so the
+        // sentinel has nothing left to watch.  (It *does* briefly outlive the
+        // freed group id — that is a trade the deadman module documents, not
+        // the reason for this ordering.)
+        //
+        // **Standing it down any earlier reopens the trigger hole for the
+        // length of the gap.**  The sentinel exits on the stand-down token
+        // *without signalling anything* — `tunnel_deadman::watch` returns
+        // before it reaches `kill_group` — so between an early stand-down and
+        // the kill above, the group would be alive and unwatched, and a
+        // `SIGKILL` of this process in that interval would leak it.
+        //
+        // Nothing observable distinguishes the two orderings, which was
+        // measured rather than assumed: with the block hoisted above the kill,
+        // all six tests in `tunnel-mcp-fixture`'s `process_residue` stay green,
+        // `deadman_stood_down` included — in both orderings the group dies from
+        // the `kill_group` above and the sentinel exits stood-down.  So
+        // `docs/tasks.md` M3-09 names this ordering as held by construction
+        // with no test, instead of pretending a test covers it.
+        if let Some(deadman) = deadman {
+            // `stand_down` writes a byte and reaps; it blocks only for as long
+            // as the sentinel takes to exit, but it does block, so it does not
+            // belong on a runtime worker.  The counter follows the sentinel's
+            // own exit status, never the fact that it was asked: a sentinel
+            // that fired anyway must not be recorded as an orderly shutdown.
+            if tokio::task::spawn_blocking(move || deadman.stand_down())
+                .await
+                .unwrap_or(false)
+            {
+                supervisor_counters
+                    .deadman_stood_down
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
         let _ = exited_tx.send(true);
     });
 

@@ -33,4 +33,17 @@ gate "M3 MCP cloud client (rmcp) over non-owner ingress and the rotating tunnel 
 gate "M3-04 MCP session isolation, concurrent correlation, unknown outcomes, revocation and rotation across two principals" \
   cargo run --locked -p tunnel-test-harness -- verify-m3-mcp-isolation
 
+# M3-09.  These read the process table for what the stdio export's children
+# left behind, and one of them SIGKILLs a supervisor, so they are registered
+# here rather than left to `cargo test --workspace` alone: a gate names the
+# claim, and a green workspace run does not.  `--test-threads=1` because the
+# measurements are of a shared, global resource — the process table — and two
+# of them running at once would read each other's descendants.
+#
+# These tests `exec` the `tunnel-mcp-fixture` and `tunnel-deadman` binaries and
+# `cargo test --test` builds neither (M3-19), so they depend on the workspace
+# `--bins` build above having already refreshed them.  Do not reorder them.
+gate "M3-09 stdio export process-tree residue: two escaping descendants, the in-group control, and a SIGKILLed supervisor" \
+  cargo test --locked -p tunnel-mcp-fixture --test process_residue -- --test-threads=1
+
 echo "m3-harness-verify: implemented M3 harness suite passed" >&2
