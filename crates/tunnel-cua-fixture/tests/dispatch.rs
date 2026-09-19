@@ -23,12 +23,15 @@ use tunnel_cua::capability::{
     CallerGrant, CaptureAuthority, LocalConfiguration, ProbeEvidence, UpstreamSupport,
 };
 use tunnel_cua::endpoint::BackendEndpoint;
+use tunnel_cua::lease::{SessionId, TargetSession};
 use tunnel_cua::marker;
 use tunnel_cua::operation::{Deferral, Refusal};
 use tunnel_cua::outcome::{Completion, Dispatch, NotDispatched};
 use tunnel_cua::schema::{SchemaError, validate_request};
 
-use tunnel_cua_fixture::client::{Dispatcher, read_commands, request_body};
+use tunnel_cua_fixture::client::{
+    DeviceState, Dispatcher, SessionFacade, read_commands, request_body,
+};
 use tunnel_cua_fixture::{
     CURSOR, FixtureBackend, IMAGE_SEED, LedgerEntry, SCREEN_HEIGHT, SCREEN_WIDTH, from_hex,
 };
@@ -37,7 +40,18 @@ const LIMIT: u64 = tunnel_cua::DEFAULT_REQUEST_BODY_LIMIT;
 
 /// Build a dispatcher permitting everything the backend and a full grant
 /// allow, having actually probed the backend.
-async fn negotiated(backend: &FixtureBackend) -> Dispatcher {
+/// The one session every read-only test drives. It holds **no input lease**,
+/// which is the point: reads are shared, so none of these tests needs one.
+fn facade(dispatcher: Dispatcher) -> SessionFacade {
+    SessionFacade::new(
+        DeviceState::new(),
+        dispatcher,
+        SessionId::new(1),
+        TargetSession::new("console:1"),
+    )
+}
+
+async fn negotiated(backend: &FixtureBackend) -> SessionFacade {
     let endpoint = BackendEndpoint::new(backend.address()).expect("the fixture binds loopback");
     let commands = read_commands(endpoint)
         .await
@@ -46,7 +60,10 @@ async fn negotiated(backend: &FixtureBackend) -> Dispatcher {
     // The probe is a real dispatch. It is the only thing that can produce
     // `ProbeEvidence`, and it leaves its own ledger entry -- which every test
     // below accounts for.
-    let bare = Dispatcher::new(endpoint, BTreeSet::from([Operation::ScreenInfo]));
+    let bare = facade(Dispatcher::new(
+        endpoint,
+        BTreeSet::from([Operation::ScreenInfo]),
+    ));
     let probe_body = request_body("screen_info", json!({}));
     let probe = bare.handle(&probe_body, LIMIT).await;
     let probe_request = validate_request(&probe_body, LIMIT).expect("a valid probe request");
@@ -56,7 +73,8 @@ async fn negotiated(backend: &FixtureBackend) -> Dispatcher {
     // The capture authority comes from a **`version`** reading, which is the
     // response that carries `desktop_capture_authorized`. It is a second real
     // dispatch and leaves its own ledger entry too.
-    let capture_authority = CaptureAuthority::from_version_reading(&bare.read_version().await);
+    let capture_authority =
+        CaptureAuthority::from_version_reading(&bare.dispatcher().read_version().await);
 
     let local = Operation::ALL
         .into_iter()
@@ -64,12 +82,12 @@ async fn negotiated(backend: &FixtureBackend) -> Dispatcher {
     let grant = Operation::ALL
         .into_iter()
         .fold(CallerGrant::none(), CallerGrant::with);
-    Dispatcher::negotiated(
+    facade(Dispatcher::negotiated(
         endpoint,
         &local,
         &UpstreamSupport::new(&commands, evidence, capture_authority),
         &grant,
-    )
+    ))
 }
 
 /// The two discovery dispatches `negotiated` performs, so every ledger
@@ -185,26 +203,6 @@ async fn no_refused_operation_reaches_the_backend() {
 
     for (operation, expected) in [
         (
-            "click",
-            SchemaError::Operation(Refusal::Deferred(Deferral::SynthesisesInput)),
-        ),
-        (
-            "type_text",
-            SchemaError::Operation(Refusal::Deferred(Deferral::SynthesisesInput)),
-        ),
-        (
-            "press_key",
-            SchemaError::Operation(Refusal::Deferred(Deferral::SynthesisesInput)),
-        ),
-        (
-            "drag",
-            SchemaError::Operation(Refusal::Deferred(Deferral::SynthesisesInput)),
-        ),
-        (
-            "scroll",
-            SchemaError::Operation(Refusal::Deferred(Deferral::SynthesisesInput)),
-        ),
-        (
             "accessibility_tree",
             SchemaError::Operation(Refusal::Deferred(Deferral::NeedsBackendProbe)),
         ),
@@ -245,7 +243,7 @@ async fn no_refused_operation_reaches_the_backend() {
 async fn every_schema_rejection_leaves_the_ledger_empty() {
     let backend = FixtureBackend::start().await.unwrap();
     let endpoint = BackendEndpoint::new(backend.address()).unwrap();
-    let dispatcher = Dispatcher::new(endpoint, BTreeSet::from(Operation::ALL));
+    let dispatcher = facade(Dispatcher::new(endpoint, BTreeSet::from(Operation::ALL)));
 
     for body in [
         b"".to_vec(),
@@ -279,7 +277,10 @@ async fn every_schema_rejection_leaves_the_ledger_empty() {
 async fn an_ungranted_operation_is_refused_before_dispatch() {
     let backend = FixtureBackend::start().await.unwrap();
     let endpoint = BackendEndpoint::new(backend.address()).unwrap();
-    let dispatcher = Dispatcher::new(endpoint, BTreeSet::from([Operation::ScreenInfo]));
+    let dispatcher = facade(Dispatcher::new(
+        endpoint,
+        BTreeSet::from([Operation::ScreenInfo]),
+    ));
 
     let dispatch = dispatcher
         .handle(&request_body("capture", json!({})), LIMIT)
@@ -295,7 +296,10 @@ async fn an_ungranted_operation_is_refused_before_dispatch() {
     // negotiated set and not from the backend.
     let commands = read_commands(endpoint).await.unwrap();
     assert!(commands.iter().any(|name| name == "screenshot"));
-    let permitted = Dispatcher::new(endpoint, BTreeSet::from([Operation::Capture]));
+    let permitted = facade(Dispatcher::new(
+        endpoint,
+        BTreeSet::from([Operation::Capture]),
+    ));
     assert!(matches!(
         permitted
             .handle(&request_body("capture", json!({})), LIMIT)
@@ -413,19 +417,22 @@ async fn describe_reports_the_negotiated_set_rather_than_the_configuration() {
     let backend = FixtureBackend::start().await.unwrap();
     let endpoint = BackendEndpoint::new(backend.address()).unwrap();
 
-    let wide = Dispatcher::new(endpoint, BTreeSet::from(Operation::ALL));
+    let wide = facade(Dispatcher::new(endpoint, BTreeSet::from(Operation::ALL)));
     let Dispatch::AnsweredLocally(all) = wide
         .handle(&request_body("describe", json!({})), LIMIT)
         .await
     else {
         panic!("describe should have been answered locally");
     };
-    assert_eq!(all["operations"].as_array().unwrap().len(), 4);
+    assert_eq!(
+        all["operations"].as_array().unwrap().len(),
+        Operation::ALL.len()
+    );
 
-    let narrow = Dispatcher::new(
+    let narrow = facade(Dispatcher::new(
         endpoint,
         BTreeSet::from([Operation::Describe, Operation::CursorPosition]),
-    );
+    ));
     let Dispatch::AnsweredLocally(some) = narrow
         .handle(&request_body("describe", json!({})), LIMIT)
         .await
@@ -477,12 +484,15 @@ async fn a_non_loopback_backend_cannot_be_dispatched_to_at_all() {
 async fn capture_authority_comes_from_the_version_reading_and_gates_capture() {
     let backend = FixtureBackend::start().await.unwrap();
     let endpoint = BackendEndpoint::new(backend.address()).unwrap();
-    let bare = Dispatcher::new(endpoint, BTreeSet::from([Operation::ScreenInfo]));
+    let bare = facade(Dispatcher::new(
+        endpoint,
+        BTreeSet::from([Operation::ScreenInfo]),
+    ));
 
     // The default: the key is absent, which is what the pinned server does.
     // Absent is not denied, so capture stays available.
     assert_eq!(
-        CaptureAuthority::from_version_reading(&bare.read_version().await),
+        CaptureAuthority::from_version_reading(&bare.dispatcher().read_version().await),
         CaptureAuthority::Unknown,
         "the fixture must omit the key by default, as the released server does"
     );
@@ -490,14 +500,14 @@ async fn capture_authority_comes_from_the_version_reading_and_gates_capture() {
     // Explicitly granted.
     backend.capture_authority().set(Some(true));
     assert_eq!(
-        CaptureAuthority::from_version_reading(&bare.read_version().await),
+        CaptureAuthority::from_version_reading(&bare.dispatcher().read_version().await),
         CaptureAuthority::Granted
     );
 
     // Explicitly denied: the one state that removes capture from the
     // negotiated set.
     backend.capture_authority().set(Some(false));
-    let denied = CaptureAuthority::from_version_reading(&bare.read_version().await);
+    let denied = CaptureAuthority::from_version_reading(&bare.dispatcher().read_version().await);
     assert_eq!(denied, CaptureAuthority::Denied);
 
     // And the gate actually bites, through the real negotiation.
@@ -513,13 +523,13 @@ async fn capture_authority_comes_from_the_version_reading_and_gates_capture() {
         .into_iter()
         .fold(CallerGrant::none(), CallerGrant::with);
 
-    let refusing = Dispatcher::negotiated(
+    let refusing = facade(Dispatcher::negotiated(
         endpoint,
         &local,
         &UpstreamSupport::new(&commands, evidence.clone(), denied),
         &grant,
-    );
-    assert!(!refusing.permits(Operation::Capture));
+    ));
+    assert!(!refusing.dispatcher().permits(Operation::Capture));
     let before = backend.ledger().count("screenshot");
     let dispatch = refusing
         .handle(&request_body("capture", json!({})), LIMIT)
@@ -537,13 +547,13 @@ async fn capture_authority_comes_from_the_version_reading_and_gates_capture() {
     // Non-vacuity: the identical setup with an absent authority does permit
     // capture and does dispatch it, so the refusal above came from the
     // authority rather than from anything else in the negotiation.
-    let permitting = Dispatcher::negotiated(
+    let permitting = facade(Dispatcher::negotiated(
         endpoint,
         &local,
         &UpstreamSupport::new(&commands, evidence, CaptureAuthority::Unknown),
         &grant,
-    );
-    assert!(permitting.permits(Operation::Capture));
+    ));
+    assert!(permitting.dispatcher().permits(Operation::Capture));
     assert!(matches!(
         permitting
             .handle(&request_body("capture", json!({})), LIMIT)

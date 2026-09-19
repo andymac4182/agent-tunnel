@@ -44,6 +44,22 @@
 //!
 //! The two rows with zero entries and the two with one entry are what make the
 //! distinction checkable rather than asserted.
+//!
+//! # The click counter counts **effects**, not dispatches
+//!
+//! The other named trap is *a click counter that counts dispatches rather than
+//! effects*. [`LedgerEntry::pointer_clicks`] is written from the command name
+//! the fixture accepted, and `double_click` records **2**. So
+//! [`Ledger::pointer_clicks`] and [`Ledger::len`] disagree for exactly the
+//! command where a dispatch counter would be wrong, and
+//! `crates/tunnel-cua-fixture/tests/input_lease.rs` uses that disagreement as
+//! its control: one `double_click` exchange, one ledger entry, **two** clicks.
+//! A counter the harness incremented could not produce that number.
+//!
+//! [`LedgerEntry::typed_characters`] is a count and never the text. **The
+//! fixture does not store typed text anywhere**, which is why a test asserts
+//! on lengths: `AGENTS.md` keeps keystrokes out of diagnostics, and an
+//! in-memory ledger a panic message prints is a diagnostic.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -84,6 +100,16 @@ pub struct LedgerEntry {
     pub command: String,
     /// The `display` parameter, when the command carried one.
     pub display: Option<u32>,
+    /// The `x`/`y` the command arrived with, in the **backend's** coordinate
+    /// space. This is what makes the display-scale carry-forward measurable
+    /// end to end rather than only in a unit test: the device converts, and
+    /// this records what actually arrived.
+    pub point: Option<(u32, u32)>,
+    /// How many pointer clicks this command **performs** — not how many
+    /// commands were sent. `double_click` is 2.
+    pub pointer_clicks: u32,
+    /// How many characters this command typed. A count, never the text.
+    pub typed_characters: usize,
 }
 
 impl LedgerEntry {
@@ -92,7 +118,36 @@ impl LedgerEntry {
         Self {
             command: command.to_owned(),
             display,
+            point: None,
+            pointer_clicks: pointer_clicks_for(command),
+            typed_characters: 0,
         }
+    }
+
+    #[must_use]
+    pub const fn with_point(mut self, point: Option<(u32, u32)>) -> Self {
+        self.point = point;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_typed_characters(mut self, characters: usize) -> Self {
+        self.typed_characters = characters;
+        self
+    }
+}
+
+/// How many clicks one backend command performs.
+///
+/// **Read from the command name, at the fixture, at the moment the command is
+/// accepted.** A `double_click` is two clicks delivered by one command, which
+/// is precisely the case a counter of dispatches gets wrong.
+#[must_use]
+pub fn pointer_clicks_for(command: &str) -> u32 {
+    match command {
+        "left_click" | "right_click" => 1,
+        "double_click" => 2,
+        _ => 0,
     }
 }
 
@@ -135,10 +190,43 @@ impl Ledger {
             .count()
     }
 
-    /// Total entries.
+    /// Total entries — **the number of commands accepted**, which is
+    /// deliberately not the number of clicks performed.
     #[must_use]
     pub fn len(&self) -> usize {
         self.entries().len()
+    }
+
+    /// **How many pointer clicks this backend actually performed.**
+    ///
+    /// The answer to "did the click happen once?". It is not
+    /// [`Ledger::len`] and it is not a count of `left_click` entries: one
+    /// `double_click` command contributes 2, so a harness that counted its own
+    /// dispatches would report 1 where this reports 2.
+    #[must_use]
+    pub fn pointer_clicks(&self) -> u32 {
+        self.entries()
+            .iter()
+            .map(|entry| entry.pointer_clicks)
+            .sum()
+    }
+
+    /// How many characters were typed. A count; the text is never stored.
+    #[must_use]
+    pub fn typed_characters(&self) -> usize {
+        self.entries()
+            .iter()
+            .map(|entry| entry.typed_characters)
+            .sum()
+    }
+
+    /// The backend coordinates of every command that carried them, in order.
+    #[must_use]
+    pub fn points(&self) -> Vec<(u32, u32)> {
+        self.entries()
+            .iter()
+            .filter_map(|entry| entry.point)
+            .collect()
     }
 
     #[must_use]
@@ -279,12 +367,52 @@ impl CaptureAuthorityKnob {
     }
 }
 
+/// What scale this fixture's `screenshot` reports, and therefore how large
+/// the image it returns is.
+///
+/// **It exists so the display-scale carry-forward is exercised at a value
+/// where it is not the identity.** At 100 the conversion from capture pixels
+/// to backend points is `x -> x`, so a test that only ever ran at 100 could
+/// not tell a device that applies the scale from one that forwards the pixel
+/// unchanged. At 200 the fixture serves a 256x192 image of its 128x96 screen,
+/// and a click at pixel (100, 80) must arrive at (50, 40).
+#[derive(Clone, Debug)]
+pub struct CaptureScaleKnob {
+    percent: Arc<Mutex<u32>>,
+}
+
+impl Default for CaptureScaleKnob {
+    fn default() -> Self {
+        Self {
+            percent: Arc::new(Mutex::new(tunnel_cua::capture::IDENTITY_SCALE_PERCENT)),
+        }
+    }
+}
+
+impl CaptureScaleKnob {
+    /// Report captures at this scale, as a percentage. 100 is 1x.
+    pub fn set(&self, percent: u32) {
+        *self
+            .percent
+            .lock()
+            .expect("the knob mutex is never poisoned by fixture code") = percent;
+    }
+
+    fn get(&self) -> u32 {
+        *self
+            .percent
+            .lock()
+            .expect("the knob mutex is never poisoned by fixture code")
+    }
+}
+
 /// A running fixture backend.
 pub struct FixtureBackend {
     address: SocketAddr,
     ledger: Ledger,
     faults: Faults,
     capture_authority: CaptureAuthorityKnob,
+    capture_scale: CaptureScaleKnob,
     handle: tokio::task::JoinHandle<()>,
 }
 
@@ -303,17 +431,20 @@ impl FixtureBackend {
         let ledger = Ledger::new();
         let faults = Faults::new();
         let capture_authority = CaptureAuthorityKnob::default();
+        let capture_scale = CaptureScaleKnob::default();
         let handle = tokio::spawn(serve(
             listener,
             ledger.clone(),
             faults.clone(),
             capture_authority.clone(),
+            capture_scale.clone(),
         ));
         Ok(Self {
             address,
             ledger,
             faults,
             capture_authority,
+            capture_scale,
             handle,
         })
     }
@@ -340,6 +471,12 @@ impl FixtureBackend {
         &self.capture_authority
     }
 
+    /// What scale this backend's captures report.
+    #[must_use]
+    pub const fn capture_scale(&self) -> &CaptureScaleKnob {
+        &self.capture_scale
+    }
+
     /// Stop serving.
     pub fn stop(self) {
         self.handle.abort();
@@ -351,6 +488,7 @@ async fn serve(
     ledger: Ledger,
     faults: Faults,
     capture_authority: CaptureAuthorityKnob,
+    capture_scale: CaptureScaleKnob,
 ) {
     loop {
         let Ok((stream, _)) = listener.accept().await else {
@@ -359,8 +497,10 @@ async fn serve(
         let ledger = ledger.clone();
         let faults = faults.clone();
         let capture_authority = capture_authority.clone();
+        let capture_scale = capture_scale.clone();
         tokio::spawn(async move {
-            let _ = handle_connection(stream, ledger, faults, capture_authority).await;
+            let _ =
+                handle_connection(stream, ledger, faults, capture_authority, capture_scale).await;
         });
     }
 }
@@ -372,6 +512,7 @@ async fn handle_connection(
     ledger: Ledger,
     faults: Faults,
     capture_authority: CaptureAuthorityKnob,
+    capture_scale: CaptureScaleKnob,
 ) -> std::io::Result<()> {
     let Some((path, body)) = read_request(&mut stream).await? else {
         return Ok(());
@@ -387,7 +528,17 @@ async fn handle_connection(
             )
             .await
         }
-        CMD_PATH => handle_cmd(&mut stream, &ledger, &faults, &capture_authority, &body).await,
+        CMD_PATH => {
+            handle_cmd(
+                &mut stream,
+                &ledger,
+                &faults,
+                &capture_authority,
+                &capture_scale,
+                &body,
+            )
+            .await
+        }
         _ => {
             write_response(
                 &mut stream,
@@ -405,6 +556,7 @@ async fn handle_cmd(
     ledger: &Ledger,
     faults: &Faults,
     capture_authority: &CaptureAuthorityKnob,
+    capture_scale: &CaptureScaleKnob,
     body: &[u8],
 ) -> std::io::Result<()> {
     // Shape 3: a malformed body is a pre-dispatch `HTTPException`, unframed.
@@ -423,6 +575,26 @@ async fn handle_cmd(
         .pointer("/params/display")
         .and_then(Value::as_u64)
         .and_then(|value| u32::try_from(value).ok());
+    let coordinate = |name: &str| {
+        request
+            .pointer(&format!("/params/{name}"))
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+    };
+    // `drag` names its start point differently, so the recorded point is the
+    // one the command actually acts at in each case.
+    let point = match (coordinate("x"), coordinate("y")) {
+        (Some(x), Some(y)) => Some((x, y)),
+        _ => match (coordinate("start_x"), coordinate("start_y")) {
+            (Some(x), Some(y)) => Some((x, y)),
+            _ => None,
+        },
+    };
+    // A count, never the text. Nothing in this fixture stores typed text.
+    let typed_characters = request
+        .pointer("/params/text")
+        .and_then(Value::as_str)
+        .map_or(0, |text| text.chars().count());
 
     let fault = faults.get(command);
 
@@ -439,7 +611,11 @@ async fn handle_cmd(
         _ => {}
     }
 
-    ledger.record(LedgerEntry::new(command, display));
+    ledger.record(
+        LedgerEntry::new(command, display)
+            .with_point(point)
+            .with_typed_characters(typed_characters),
+    );
 
     match fault {
         Fault::DropAfterLedger => {
@@ -484,7 +660,12 @@ async fn handle_cmd(
         Fault::None => {
             framed(
                 stream,
-                success_payload(command, display, capture_authority.get()),
+                success_payload(
+                    command,
+                    display,
+                    capture_authority.get(),
+                    capture_scale.get(),
+                ),
             )
             .await
         }
@@ -493,7 +674,12 @@ async fn handle_cmd(
 }
 
 /// The successful result for each read-only command.
-fn success_payload(command: &str, display: Option<u32>, capture_authority: Option<bool>) -> Value {
+fn success_payload(
+    command: &str,
+    display: Option<u32>,
+    capture_authority: Option<bool>,
+    capture_scale: u32,
+) -> Value {
     let display = display.unwrap_or(0);
     match command {
         "version" => {
@@ -528,12 +714,23 @@ fn success_payload(command: &str, display: Option<u32>, capture_authority: Optio
         }),
         "screenshot" => {
             let seed = IMAGE_SEED.wrapping_add(display);
-            let image = tunnel_cua::marker::encode(SCREEN_WIDTH, SCREEN_HEIGHT, seed)
+            // The image is the screen at the reported scale, so `width` and
+            // `height` are always the image's own pixel dimensions. A device
+            // that read them as points would place every coordinate wrong on a
+            // scaled display, which is the failure the carry-forward exists to
+            // stop.
+            let scale = u16::try_from(capture_scale / tunnel_cua::capture::IDENTITY_SCALE_PERCENT)
+                .unwrap_or(1)
+                .max(1);
+            let width = SCREEN_WIDTH * scale;
+            let height = SCREEN_HEIGHT * scale;
+            let image = tunnel_cua::marker::encode(width, height, seed)
                 .expect("the fixture's own dimensions are valid");
             json!({
                 "success": true,
-                "width": SCREEN_WIDTH,
-                "height": SCREEN_HEIGHT,
+                "width": width,
+                "height": height,
+                "scale_percent": capture_scale,
                 // **The seed is deliberately not on the wire.** An earlier
                 // revision shipped it, which invited a future test to verify
                 // an image against the seed that travelled with it -- the

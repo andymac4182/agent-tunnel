@@ -2,7 +2,8 @@
 """Defeat one `computer.v1` guard at a time, run the tests it should protect,
 and restore it.
 
-This is the red-then-green evidence behind M5 chunk 2. One suite lives here:
+This is the red-then-green evidence behind M5 chunks 2 and 3. Two suites live
+here:
 
 * `m5c2` — `crates/tunnel-cua` and `crates/tunnel-cua-fixture`: the
   loopback endpoint check, the read-only operation allowlist, the strict
@@ -11,6 +12,10 @@ This is the red-then-green evidence behind M5 chunk 2. One suite lives here:
   rule, the pre-dispatch 400/401 shape and the 503), the three-way capability
   intersection with its probe requirement, the absent-by-default capture
   authority, and the synthetic-image marker check.
+* `m5c3` -- the input half: the exclusive input lease, the capture-identity
+  carry-forward with its staleness, target and bounds rules, the display-scale
+  conversion, the narrower retry rule for operations that synthesise input,
+  and the redaction that keeps typed text out of every diagnostic.
 
 It follows `scripts/acp-guard-deletion.py` and `scripts/fs-guard-deletion.py`,
 **including their refusals, none of which may be removed**:
@@ -60,6 +65,9 @@ SCHEMA = CRATE / "src" / "schema.rs"
 PLAN = CRATE / "src" / "plan.rs"
 JSON = CRATE / "src" / "json.rs"
 MARKER = CRATE / "src" / "marker.rs"
+LEASE = CRATE / "src" / "lease.rs"
+CAPTURE = CRATE / "src" / "capture.rs"
+FIXTURE_LIB = FIXTURE / "src" / "lib.rs"
 CLIENT = FIXTURE / "src" / "client.rs"
 
 # --no-fail-fast so every red test is named. Without it cargo stops after the
@@ -149,20 +157,21 @@ CASES: list[tuple[str, list[Edit], bool]] = [
         False,
     ),
     (
-        "a deferred input operation is refused rather than treated as unknown-but-allowed",
+        # **This case's subject changed under it, and the case was re-pointed
+        # rather than deleted.** It used to delete the eight input names from
+        # `DEFERRED_OPERATIONS`; chunk 3 carries those operations, so the rows
+        # are gone and the case reported `COULD NOT APPLY` -- no evidence,
+        # which must never be read as a pass. What the rule was ever about is
+        # that a name the document's table carries and this build does not is
+        # refused **as a deferral**, distinguishably from a typo. One entry is
+        # left to say that about, so the case now deletes it.
+        "a deferred operation is refused rather than treated as unknown-but-allowed",
         [
             (
                 OPERATION,
-                """    ("click", Deferral::SynthesisesInput),
-    ("double_click", Deferral::SynthesisesInput),
-    ("move", Deferral::SynthesisesInput),
-    ("drag", Deferral::SynthesisesInput),
-    ("scroll", Deferral::SynthesisesInput),
-    ("type_text", Deferral::SynthesisesInput),
-    ("press_key", Deferral::SynthesisesInput),
-    ("hotkey", Deferral::SynthesisesInput),
-""",
-                "",
+                """pub const DEFERRED_OPERATIONS: &[(&str, Deferral)] =
+    &[("accessibility_tree", Deferral::NeedsBackendProbe)];""",
+                """pub const DEFERRED_OPERATIONS: &[(&str, Deferral)] = &[];""",
             )
         ],
         False,
@@ -244,9 +253,13 @@ CASES: list[tuple[str, list[Edit], bool]] = [
         [
             (
                 SCHEMA,
-                """            if index > MAX_DISPLAY {
-                return Err(SchemaError::OutOfRange { name: "display" });
-            }
+                # Re-pointed: the display parsing moved out of `validate_params`
+                # into `display_of` when chunk 3 added eight more parameter
+                # shapes, so the snippet lost four spaces of indentation. The
+                # rule is unchanged.
+                """    if index > MAX_DISPLAY {
+        return Err(SchemaError::OutOfRange { name: "display" });
+    }
 """,
                 "",
             )
@@ -499,8 +512,12 @@ CASES: list[tuple[str, list[Edit], bool]] = [
         [
             (
                 CLIENT,
-                "                return Dispatch::AnsweredLocally(self.describe());",
-                "                return Dispatch::Dispatched(Completion::Ok(self.describe()));",
+                # Re-pointed: `dispatch_planned` now returns the plan beside the
+                # outcome, so the arm returns a tuple. The substitution is the
+                # same lie as before -- reporting a locally-answered operation
+                # as a dispatch.
+                "                return (Some(planned), Dispatch::AnsweredLocally(self.describe()));",
+                "                return (Some(planned), Dispatch::Dispatched(Completion::Ok(self.describe())));",
             )
         ],
         False,
@@ -510,12 +527,16 @@ CASES: list[tuple[str, list[Edit], bool]] = [
         [
             (
                 PLAN,
-                """        return Ok(Planned::AnswerLocally { operation });""",
-                """        return Ok(Planned::Dispatch {
-            command: "version",
-            payload: command_payload("version", request.params()),
-            operation,
-        });""",
+                # Re-pointed: the local-answer arm became a `let ... else` when
+                # chunk 3 made the command depend on the parameters, and
+                # `command_payload` gained the capture argument -- so the old
+                # replacement no longer compiled and reported BUILD FAILED,
+                # which the harness refuses to call a red test. Same
+                # substitution: plan a dispatch where a local answer is due.
+                """    let Some(command) = dispatch_command(operation, request.params()) else {
+        return Ok(Planned::AnswerLocally { operation });
+    };""",
+                """    let command = dispatch_command(operation, request.params()).unwrap_or("version");""",
             )
         ],
         False,
@@ -619,6 +640,418 @@ CASES: list[tuple[str, list[Edit], bool]] = [
 ]
 
 
+# ---------------------------------------------------------------- chunk 3
+#: The input half: the exclusive lease, the capture-identity carry-forward,
+#: the display-scale conversion, the narrower retry rule and the keystroke
+#: redaction. Same crates and same cargo invocation as `m5c2`; a separate list
+#: so the two chunks' counts stay separable in a task row.
+#:
+#: **One rule of chunk 3 has no case here, and the omission is deliberate.**
+#: `Planned`'s variants are `#[non_exhaustive]`, so an outside crate cannot
+#: forge a dispatch -- and after chunk 3 a forged one skips the lease and the
+#: capture check rather than merely an allowlist. A deletion harness looks for
+#: a red *test*, and there is no red test for "this does not compile
+#: elsewhere"; that is exactly how the claim drifted last round. Three
+#: `compile_fail,E0639` doctests in `crates/tunnel-cua/src/plan.rs` enforce it
+#: instead.
+CASES_C3: list[tuple[str, list[Edit], bool]] = [
+    # ------------------------------------------------------- the input lease
+    (
+        # The refusal the whole contract exists for: two authorized agents must
+        # not interleave keyboard or pointer actions.
+        "an input operation is refused to a session that does not hold the lease",
+        [
+            (
+                LEASE,
+                "        if holder.session != session {\n"
+                "            return Err(LeaseRefusal::HeldByAnotherSession);\n"
+                "        }\n"
+                "        if grant_revision > holder.grant_revision {",
+                "        if grant_revision > holder.grant_revision {",
+            )
+        ],
+        False,
+    ),
+    (
+        # A lease is never taken implicitly, so an unleased target must refuse
+        # rather than fall through to a dispatch.
+        "an input operation with no lease at all is refused rather than admitted",
+        [
+            (
+                LEASE,
+                "        let holder = self.held.get(target).ok_or(LeaseRefusal::NotHeld)?;",
+                "        let Some(holder) = self.held.get(target) else {\n"
+                "            return Ok(LeaseId(0));\n"
+                "        };",
+            )
+        ],
+        False,
+    ),
+    (
+        # M3-16, the half that is closed: a revoked holder is refused at the
+        # point of use.
+        "a superseded grant revision refuses the lease holder",
+        [
+            (
+                LEASE,
+                "        if grant_revision > holder.grant_revision {\n"
+                "            return Err(LeaseRefusal::GrantRevoked);\n"
+                "        }\n",
+                "",
+            )
+        ],
+        False,
+    ),
+    (
+        # A release must name the holding it owns, or one agent drops another's
+        # lease mid-gesture.
+        "a release must name the current holding and not merely the target",
+        [
+            (
+                LEASE,
+                "        if holder.lease != grant.lease {\n"
+                "            return Err(LeaseRefusal::NotTheHolder);\n"
+                "        }\n",
+                "",
+            )
+        ],
+        False,
+    ),
+    (
+        # The reconcile must be driven by the revision, not by being called.
+        "reconciling a grant frees only leases whose revision is behind",
+        [
+            (
+                LEASE,
+                "holder.session == session && grant_revision > holder.grant_revision",
+                "holder.session == session",
+            )
+        ],
+        False,
+    ),
+    # ------------------------------------------- the capture carry-forward
+    (
+        # Staleness: a newer capture supersedes the one a coordinate names.
+        "a superseded capture is refused rather than acted on",
+        [
+            (
+                CAPTURE,
+                "        if self.current.get(&(target.clone(), identity.display())) != Some(&id) {\n"
+                "            return Err(CaptureRefusal::Superseded);\n"
+                "        }\n",
+                "",
+            )
+        ],
+        False,
+    ),
+    (
+        # Target identity: a coordinate from another machine's screen.
+        "a capture belonging to another target session is refused",
+        [
+            (
+                CAPTURE,
+                "        if identity.target() != target {\n"
+                "            return Err(CaptureRefusal::TargetMismatch);\n"
+                "        }\n",
+                "",
+            )
+        ],
+        False,
+    ),
+    (
+        # Coordinate dimensions.
+        "coordinates outside the capture are refused",
+        [
+            (
+                CAPTURE,
+                "        if !identity.contains(point) {\n"
+                "            return Err(CaptureRefusal::OutsideCapture);\n"
+                "        }\n",
+                "",
+            )
+        ],
+        False,
+    ),
+    (
+        # The bound is half-open: the pixel at `width` does not exist.
+        "the capture bound is half-open, so the pixel at the width is outside",
+        [
+            (
+                CAPTURE,
+                "        point.x < self.width && point.y < self.height",
+                "        point.x <= self.width && point.y <= self.height",
+            )
+        ],
+        False,
+    ),
+    (
+        # **Display scale.** Forwarding the pixel clicks at half the intended
+        # position on a 2x display, on the right screen, with no error anywhere.
+        "a capture pixel is converted through the display scale",
+        [
+            (
+                CAPTURE,
+                # Re-pointed: the review round moved the multiplication into a
+                # `u64` intermediate. The rule is unchanged -- the conversion
+                # must happen -- and the replacement is the same pass-through.
+                "        (\n"
+                "            (point.x as u64 * identity / scale) as u32,\n"
+                "            (point.y as u64 * identity / scale) as u32,\n"
+                "        )",
+                "        (point.x, point.y)",
+            )
+        ],
+        False,
+    ),
+    (
+        # A capture that could not be recorded must issue no identity: a zero
+        # scale would make every backend coordinate zero.
+        "impossible capture geometry is refused rather than recorded",
+        [
+            (
+                CAPTURE,
+                # Re-pointed: the review round added the `MAX_CAPTURE_DIMENSION`
+                # bounds, so `cargo fmt` broke the condition across lines. The
+                # rule is unchanged: impossible geometry issues no identity.
+                "        if width == 0\n"
+                "            || height == 0\n"
+                "            || width > MAX_CAPTURE_DIMENSION\n"
+                "            || height > MAX_CAPTURE_DIMENSION\n"
+                "            || scale_percent == 0\n"
+                "            || scale_percent > MAX_SCALE_PERCENT\n"
+                "        {\n"
+                "            return Err(GeometryError);\n"
+                "        }\n",
+                "",
+            )
+        ],
+        False,
+    ),
+    # ------------------------------- the ordering, where the planner reads it
+    (
+        "the planner checks the input lease before it plans a dispatch",
+        [
+            (
+                PLAN,
+                "        context\n"
+                "            .leases\n"
+                "            .check(context.target, context.session, context.grant_revision)\n"
+                "            .map_err(|refusal| {\n"
+                "                Dispatch::NotDispatched(NotDispatched::InputAuthority(InputRefusal::Lease(refusal)))\n"
+                "            })?;\n",
+                "",
+            )
+        ],
+        False,
+    ),
+    (
+        "the planner resolves the capture identity before it plans a dispatch",
+        [
+            (
+                PLAN,
+                "        resolve_capture(operation, request.params(), context)?",
+                "        None",
+            )
+        ],
+        False,
+    ),
+    (
+        # Checking only the start point is the natural mistake.
+        "a drag is bounds-checked at both ends",
+        [
+            (
+                PLAN,
+                "            context\n"
+                "                .captures\n"
+                "                .resolve_point(*capture, context.target, *from)\n"
+                "                .map_err(refuse)?;\n",
+                "",
+            )
+        ],
+        False,
+    ),
+    (
+        # A click that ignored the button would send `left_click` for a right
+        # click.
+        "the button selects the upstream click command",
+        [
+            (
+                PLAN,
+                "        Params::Click { button, .. } => Some(button.upstream_command()),",
+                "        Params::Click { .. } => operation.upstream_command(),",
+            )
+        ],
+        False,
+    ),
+    (
+        # The conversion has to be *used*, not merely available.
+        "the request payload carries the converted coordinate and not the raw pixel",
+        [
+            (
+                PLAN,
+                "        capture.map_or((point.x, point.y), |identity| {\n"
+                "            identity.to_backend_point(point)\n"
+                "        })",
+                "        (point.x, point.y)",
+            )
+        ],
+        False,
+    ),
+    # --------------------------------------------------------- the retry rule
+    (
+        # **The rule that costs a duplicated click if it is wrong.**
+        "an input operation that reached the backend is never retryable",
+        [
+            (
+                OUTCOME,
+                "            Self::Dispatched(_) => false,\n"
+                "            Self::NotDispatched(NotDispatched::PeerUnavailable) => false,",
+                "            Self::Dispatched(_) => true,\n"
+                "            Self::NotDispatched(NotDispatched::PeerUnavailable) => false,",
+            )
+        ],
+        False,
+    ),
+    (
+        # M3-15: a rotation freeze is indistinguishable from a fault state, so
+        # a click is never retried on one.
+        "a peer-unavailable refusal is never auto-retried for an input operation",
+        [
+            (
+                OUTCOME,
+                "            Self::Dispatched(_) => false,\n"
+                "            Self::NotDispatched(NotDispatched::PeerUnavailable) => false,",
+                "            Self::Dispatched(_) => false,\n"
+                "            Self::NotDispatched(NotDispatched::PeerUnavailable) => true,",
+            )
+        ],
+        False,
+    ),
+    (
+        # And the wire has to carry it, or a consumer re-derives the rule.
+        "a failed input operation renders as non-retryable on the wire",
+        [
+            (
+                SCHEMA,
+                "                retryable: !operation.mutates_target(),",
+                "                retryable: true,",
+            )
+        ],
+        False,
+    ),
+    # ------------------------------------------------ never log typed text
+    (
+        # `AGENTS.md`: diagnostics carry identifiers, phases and counters, never
+        # keystrokes. The redaction is the enforcement, not the reminder.
+        "typed text is redacted from every diagnostic",
+        [
+            (
+                SCHEMA,
+                "        write!(\n"
+                "            formatter,\n"
+                '            "Keystrokes(<redacted, {} chars>)",\n'
+                "            self.characters()\n"
+                "        )",
+                '        write!(formatter, "Keystrokes({})", self.0)',
+            )
+        ],
+        False,
+    ),
+    (
+        # A key name is mapped onto a keyboard layout by the backend; one
+        # carrying a separator or a control character is a name this profile
+        # has not reasoned about.
+        "a key name is restricted to a conservative character set",
+        [
+            (
+                SCHEMA,
+                "    if !text\n"
+                "        .bytes()\n"
+                "        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')\n"
+                "    {\n"
+                "        return Err(SchemaError::OutOfRange { name });\n"
+                "    }\n",
+                "",
+            )
+        ],
+        False,
+    ),
+    # ------------------------------- the click counter counts effects
+    (
+        # **The trap in one case.** With `double_click` contributing 1 the
+        # ledger would be counting dispatches, and the control that reads 2 is
+        # the thing that breaks -- which is the point of having it.
+        "the click counter counts effects, so a double click contributes two",
+        [(FIXTURE_LIB, '        "double_click" => 2,', '        "double_click" => 1,')],
+        False,
+    ),
+    # ------------------- the review round's four rules
+    (
+        # **The major review finding.** `acquire` used to write the supplied
+        # revision into an existing holding, so a revoked holder could clear
+        # its own `GrantRevoked` refusal by taking the lease again -- and
+        # `reconcile_grant` would then free nothing. One call defeated both
+        # halves of the M3-16 story.
+        "a revoked holder cannot re-acquire its own lease to clear the refusal",
+        [
+            (
+                LEASE,
+                "            if grant_revision > holder.grant_revision {\n"
+                "                return Err(LeaseRefusal::GrantRevoked);\n"
+                "            }\n",
+                "",
+            )
+        ],
+        False,
+    ),
+    (
+        # The plan's `Debug` is hand-written because a derived one renders the
+        # payload, and for `type_text` the payload is the text.
+        "a planned dispatch never renders its payload, because the payload can be keystrokes",
+        [
+            (
+                PLAN,
+                '                .field(\n'
+                '                    "payload",\n'
+                '                    &format_args!("<{} bytes>", payload.to_string().len()),\n'
+                '                )\n',
+                '                .field("payload", payload)\n',
+            )
+        ],
+        False,
+    ),
+    (
+        # The M3-15 rule has to be *derived* at the wire, not assumed, or a
+        # future facade gets the default wrong.
+        "a not-dispatched refusal of a known operation derives its retryability",
+        [
+            (
+                SCHEMA,
+                "        let retryable =\n"
+                "            crate::outcome::Dispatch::NotDispatched(refusal).retry_is_safe_for(operation);",
+                "        let retryable = true;",
+            )
+        ],
+        False,
+    ),
+    (
+        # A capture dimension nobody bounded reaches `contains` and
+        # `to_backend_point`.
+        "a capture dimension is bounded where the capture is recorded",
+        [
+            (
+                CAPTURE,
+                "            || width > MAX_CAPTURE_DIMENSION\n"
+                "            || height > MAX_CAPTURE_DIMENSION\n",
+                "",
+            )
+        ],
+        False,
+    ),
+]
+
+
+
 @dataclass
 class Suite:
     name: str
@@ -628,7 +1061,10 @@ class Suite:
     cwd: Path = REPO
 
 
-SUITES: list[Suite] = [Suite("m5c2", [CRATE, FIXTURE], CARGO_TEST, CASES)]
+SUITES: list[Suite] = [
+    Suite("m5c2", [CRATE, FIXTURE], CARGO_TEST, CASES),
+    Suite("m5c3", [CRATE, FIXTURE], CARGO_TEST, CASES_C3),
+]
 
 #: Cases whose green result is itself the measurement. Empty today, and kept
 #: so a future case that needs one has the mechanism rather than inventing it.
@@ -708,7 +1144,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--list", action="store_true", help="print case names and exit")
     parser.add_argument("--case", help="run only cases whose name contains this text")
-    parser.add_argument("--suite", help="run only this suite (m5c2)")
+    parser.add_argument("--suite", help="run only this suite (m5c2 or m5c3)")
     arguments = parser.parse_args()
 
     suites = SUITES

@@ -28,12 +28,24 @@ fn evidence() -> ProbeEvidence {
     .expect("a dispatched, succeeded screen_info probe is evidence")
 }
 
+/// Everything the pinned server registers that this profile dispatches — the
+/// four read commands plus the input commands chunk 3 added. A `/commands`
+/// reading from a backend that carries the whole surface.
 fn commands() -> Vec<String> {
     [
         "version",
         "screenshot",
         "get_screen_size",
         "get_cursor_position",
+        "left_click",
+        "right_click",
+        "double_click",
+        "move_cursor",
+        "drag",
+        "scroll",
+        "type_text",
+        "press_key",
+        "hotkey",
     ]
     .iter()
     .map(|name| (*name).to_owned())
@@ -325,4 +337,43 @@ fn the_default_local_configuration_and_grant_are_empty() {
         assert!(!LocalConfiguration::none().contains(operation));
         assert!(!CallerGrant::none().contains(operation));
     }
+}
+
+/// **The backend term of the intersection, on the input half.**
+///
+/// `docs/integrations.md` records that the released registry is filtered by
+/// `backend_policy.exposed_command_registry` and that under `CUA_BACKEND=vnc`
+/// it narrows to a VNC-remote subset — so a backend that does not advertise
+/// `left_click` is a real shape, not a hypothetical. `click` must drop out of
+/// the negotiated set on such a backend even with local configuration and the
+/// caller's grant both saying yes.
+#[test]
+fn an_operation_whose_command_the_backend_does_not_advertise_is_not_negotiated() {
+    let narrowed: Vec<String> = commands()
+        .into_iter()
+        .filter(|name| name != "left_click" && name != "type_text")
+        .collect();
+    let upstream = UpstreamSupport::new(&narrowed, evidence(), CaptureAuthority::Unknown);
+    let negotiated = negotiate(&everything(), &upstream, &granted_everything());
+
+    assert!(
+        !negotiated.contains(&Operation::Click),
+        "left_click is gone"
+    );
+    assert!(
+        !negotiated.contains(&Operation::TypeText),
+        "type_text is gone"
+    );
+    // The rest survive, so the narrowing is per command rather than a blanket
+    // refusal of everything that acts.
+    assert!(negotiated.contains(&Operation::DoubleClick));
+    assert!(negotiated.contains(&Operation::PressKey));
+    assert!(negotiated.contains(&Operation::Capture));
+    assert_eq!(negotiated.len(), Operation::ALL.len() - 2);
+
+    // Non-vacuity: with the full listing both are negotiated.
+    let full = UpstreamSupport::new(&commands(), evidence(), CaptureAuthority::Unknown);
+    let everything_negotiated = negotiate(&everything(), &full, &granted_everything());
+    assert!(everything_negotiated.contains(&Operation::Click));
+    assert!(everything_negotiated.contains(&Operation::TypeText));
 }

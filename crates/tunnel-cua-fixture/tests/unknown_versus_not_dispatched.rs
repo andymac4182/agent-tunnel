@@ -29,16 +29,29 @@ use tunnel_cua::Operation;
 use tunnel_cua::endpoint::BackendEndpoint;
 use tunnel_cua::outcome::{Completion, Dispatch, FailureCode, NotDispatched, UnknownReason};
 
-use tunnel_cua_fixture::client::{Dispatcher, request_body};
+use tunnel_cua::lease::{SessionId, TargetSession};
+
+use tunnel_cua_fixture::client::{DeviceState, Dispatcher, SessionFacade, request_body};
 use tunnel_cua_fixture::{Fault, FixtureBackend};
 
 const LIMIT: u64 = tunnel_cua::DEFAULT_REQUEST_BODY_LIMIT;
 
-async fn dispatcher(backend: &FixtureBackend) -> Dispatcher {
-    Dispatcher::new(
+/// A session with the full negotiated set and **no input lease**. Every
+/// operation in this file is read-only, so none needs one.
+fn facade(dispatcher: Dispatcher) -> SessionFacade {
+    SessionFacade::new(
+        DeviceState::new(),
+        dispatcher,
+        SessionId::new(1),
+        TargetSession::new("console:1"),
+    )
+}
+
+async fn dispatcher(backend: &FixtureBackend) -> SessionFacade {
+    facade(Dispatcher::new(
         BackendEndpoint::new(backend.address()).expect("the fixture binds loopback"),
         BTreeSet::from(Operation::ALL),
-    )
+    ))
 }
 
 /// The whole distinction, as one table, run against one fixture.
@@ -261,7 +274,7 @@ async fn a_backend_that_is_not_listening_is_not_dispatched() {
     // Give the listener a moment to actually go away.
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    let dispatcher = Dispatcher::new(endpoint, BTreeSet::from(Operation::ALL));
+    let dispatcher = facade(Dispatcher::new(endpoint, BTreeSet::from(Operation::ALL)));
     let dispatch = dispatcher
         .handle(&request_body("screen_info", json!({})), LIMIT)
         .await;
@@ -287,9 +300,13 @@ async fn a_deadline_that_expires_after_the_write_is_unknown_and_the_ledger_shows
     backend
         .faults()
         .set("get_screen_size", Fault::DropAfterLedger);
-    let dispatcher = dispatcher(&backend)
-        .await
-        .with_deadline(std::time::Duration::from_secs(5));
+    let dispatcher = facade(
+        Dispatcher::new(
+            BackendEndpoint::new(backend.address()).expect("the fixture binds loopback"),
+            BTreeSet::from(Operation::ALL),
+        )
+        .with_deadline(std::time::Duration::from_secs(5)),
+    );
 
     let dispatch = dispatcher
         .handle(&request_body("screen_info", json!({})), LIMIT)
