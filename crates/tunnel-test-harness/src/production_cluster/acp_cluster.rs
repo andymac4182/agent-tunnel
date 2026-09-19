@@ -208,7 +208,7 @@ pub const NOT_COVERED: [&str; 13] = [
     "no retry beyond the moment of observation: a ledger is read when a stream has failed and again after a settle window, and a replay issued after that would not be observed",
     "the connection-capacity table at its real bounds: 256 tracked and 32 per principal are proven as arithmetic in tunnel-acp-export, not by opening 257 connections here",
     "the permission deadline and the idle, prompt-wall-time bounds of the limits table over the real route: they are measured against the export's own clock in tunnel-acp-export, not here",
-    "both directions of the ingress-to-owner PEER hop SATURATED at the same instant -- but the reason has changed, and the change is the point. M8-C22's product change has landed: the hop now latches its send/receive pair AT ONE INSTANT, at the credit charge and the receive push, and publishes that pair both on HttpExchangeRecord and, while the hop is still open, on the forwarding snapshot's live_peer_hops. So simultaneity on this hop is now MEASURABLE, where before it was not expressible at all. What the measurement returns is that the two directions are NOT loaded together: across six runs on this branch the best-attested instant has a smaller half of 61-229 bytes against a 196,608-byte window (0%), while the request direction alone reaches 195,933-195,950 (99.66%). The response direction's backup lands at the ingress's own public response buffer rather than at this hop's receive queue, which is what the hop's 362-byte all-time receive high-water was already saying. The gate now ASSERTS that reading, so it cannot go stale. The owner-to-device segment IS shown carrying bytes in both directions at one instant here, and that is a different segment; prefer 'carrying bytes' over 'loaded', since a 308-byte parked record is a real same-instant observation and is not the segment under load",
+    "both directions of the ingress-to-owner PEER hop SATURATED at the same instant -- but the reason has changed, and the change is the point. M8-C22's product change has landed: the hop now latches its send/receive pair AT ONE INSTANT, at the credit charge and the receive push, and publishes that pair both on HttpExchangeRecord and, while the hop is still open, on the forwarding snapshot's live_peer_hops. So simultaneity on this hop is now MEASURABLE, where before it was not expressible at all. What the measurement returns is that the two directions are NOT loaded together: across six runs on this branch the best-attested instant has a smaller half of 61-229 bytes against a 196,608-byte window (0%), while the request direction alone reaches 195,933-195,950 (99.66%). Where the response direction's backlog is held is NOT established, and an earlier draft of this entry asserted it was the ingress's own public response buffer. That was an inference and the measurement refutes it: the hop's receive high-water (362), the ingress's response handoff (362) and its queued public response body (354) are all the same negligible magnitude, so the response direction is not backing up at ANY published buffer on this path. The backlog is held behind the export's own 30 s output-credit budget, which is the same bound that keeps the terminated record from existing inside a bounded window; that is consistent with these figures but is not shown by them. The gate now ASSERTS that reading, so it cannot go stale. The owner-to-device segment IS shown carrying bytes in both directions at one instant here, and that is a different segment; prefer 'carrying bytes' over 'loaded', since a 308-byte parked record is a real same-instant observation and is not the segment under load",
     "the response direction of the peer hop driven to its credit window: the flood against a parked stream backs up behind the export's own output-credit stall, whose record lands only after that 30 s bound, so a bounded sampling window strictly shorter than 30 s can never see that record exist at all -- this gate measures the request direction of that hop and says so",
     "this property at the shipped default configuration: the default rotation interval is 300 s and a membership record lives at most 60 s, so on a non-owner ingress an ACP connection is invalidated long before its first scheduled rotation; three rotations are reachable here only because the gate runs the device at the 3 s configuration floor",
     "peer-key rotation as a survivable event: the key-rotation case drives the teardown and attributes the INGRESS's own decision, it does not show an ACP stream surviving one. Nor does it separate the key change from the record-version bump that must accompany it ON THE WIRE -- the verifier refuses an equal-version re-sign, so every key change is also a version change, and the attribution rests on the reason the product itself latched (MembershipRevoked, reachable only through the membership runtime's in-process invalidation callback) together with the same-key control arm beside it",
@@ -521,14 +521,55 @@ pub struct AcpClusterEvidence {
     /// snapshot, so it is observable while the exchange is still running.
     pub peer_hop_coincident_send: usize,
     pub peer_hop_coincident_receive: usize,
-    /// The largest `live` pair the sampler itself caught, which is coarser
-    /// than the in-relay latch above and is recorded to show the sampler saw
-    /// the hop at all rather than only reading a latch.
+    /// The largest value the sampler read in each direction, **as two
+    /// independent maxima and never as a pair**.
+    ///
+    /// These witness only that the live publication was read while the hop
+    /// was open -- the thing the terminated record cannot do. They are
+    /// explicitly *not* evidence of simultaneity, which is exactly the error
+    /// two independent latches invite (M8-C22); every simultaneity claim here
+    /// rests on `peer_hop_coincident_*`.
+    ///
+    /// **An earlier version ordered these by the smaller half, as the
+    /// coincident latch is ordered, and so read 0/0 whenever the receive
+    /// direction was idle** -- which is most of this window. It therefore
+    /// could not witness a loaded hop in the runs where witnessing mattered.
+    ///
+    /// **Corrected to independent maxima, they still read 0/0 -- and that
+    /// reading is the case for the latch rather than an embarrassment to
+    /// it.**  These are *instantaneous* gauges; the load is a ~160 ms burst
+    /// and each sampling pass is a whole relay snapshot, so the in-flight
+    /// bytes have drained again before the next pass looks. A sampler cannot
+    /// catch this hop loaded, at any interval a gate can afford. That is
+    /// precisely why M8-C22's acceptance asked for a **latch written at the
+    /// mutation points** rather than for a gauge to poll: the latch sees
+    /// every instant, and 436-526 passes of polling see none of them.
     pub peer_hop_live_sampled_send: usize,
     pub peer_hop_live_sampled_receive: usize,
-    /// Live peer-hop samples taken while the upload was in flight, so a zero
-    /// pair is "looked and did not find" rather than "never looked".
+    /// Snapshot passes that **actually found an `ingress_remote` hop open**
+    /// while the upload was in flight.
+    ///
+    /// Passes that found none are not counted: counting them made this a
+    /// tally of snapshot passes rather than of observations of the hop, and
+    /// the whole point of the figure is to separate "sampled and found
+    /// nothing" from "never sampled".
     pub peer_hop_live_samples: u64,
+    /// The reported coincident pair was reached by the **live** publication
+    /// rather than only by the terminated record.
+    ///
+    /// Disclosed, not asserted: both publications carry the same latch, so a
+    /// false here weakens nothing about the pair's value. What it does mean
+    /// is that this run did not exercise the live path's whole reason for
+    /// existing, and a reader should not cite it as evidence that a bounded
+    /// window can see the pair.
+    pub peer_hop_coincident_from_live: bool,
+    /// The ingress's own response-side buffers, published beside the peer
+    /// hop's receive high-water so that **where the response direction backs
+    /// up is measured rather than asserted**.  Disclosed, not asserted: the
+    /// claim they support is an explanation, and an explanation that has to
+    /// be true would be a rule.
+    pub ingress_response_handoff_high_water: usize,
+    pub ingress_response_body_high_water: usize,
     /// The smaller half of the coincident pair as a percentage of the hop's
     /// credit window, which is what a saturation threshold is stated against.
     pub peer_hop_coincident_percent: u64,
@@ -1497,22 +1538,44 @@ const MIN_LOADED_SAMPLES: u64 = 64;
 /// not a saturation threshold** (task rows M8-C22, M8-05).  Half a window is
 /// a level a hop reaches while still accepting writes without blocking; what
 /// makes a direction saturated is that it is at its window, so the next write
-/// waits for credit.  The figure is provisional until re-run and is set from
-/// what the request direction is observed to reach -- 91.8-99.7% of the
-/// window across the recorded runs, and 195,933 of 196,608 in the large
-/// majority (M8-C23) -- with the threshold placed below the observed floor
-/// rather than at it, so the rule names a level that means saturated without
-/// pinning a run's exact reading.
+/// waits for credit.
+///
+/// **The floor this sits below is the all-time one, not this series'.**  The
+/// recorded range across every run is **91.8-99.7%** of the window (M8-C23,
+/// which also carries the unexplained sub-mode: one run each at 180,510, or
+/// 91.8%).  This branch's six runs all read 99.66%, but quoting *that* as the
+/// floor would be quoting a series rather than a property.  90% sits **1.8
+/// points below the all-time floor**, which is a narrow margin against a
+/// reading nobody has explained -- so a sub-90% reading is a **re-run of
+/// M8-C23's open question, not a regression of the coincident latch**, and
+/// should be read that way.  Provisional until re-run, per M8-C12.
 const SATURATION_THRESHOLD_PERCENT: u64 = 90;
 
 /// The fewest **live peer-hop** samples that must land while the upload is in
 /// flight for the hop's pair to be a reading rather than an absence.
 ///
-/// Provisional until re-run.  It is deliberately far below the owner-actor
-/// sampler's floor: each pass here is a second relay snapshot on the same
-/// loop, so the count is lower by construction, and the figure exists to
-/// separate "sampled and found nothing" from "never sampled".
+/// Counts only passes that **found a hop open**, not snapshot passes: an
+/// earlier version counted every pass, which made this a tally of the loop
+/// rather than of observations of the hop and so proved nothing about the
+/// live publication at all.
+///
+/// Observed **436-526** with the corrected counter, an order of magnitude
+/// above the floor, which is the same margin `MIN_LOADED_SAMPLES` keeps.
+/// Provisional until re-run, per M8-C12.
 const MIN_PEER_HOP_SAMPLES: u64 = 32;
+
+/// The level at which the disclosed negative -- the peer hop's two directions
+/// are not loaded together -- stops being true and must be rewritten.
+///
+/// **The saturation threshold alone is too loose a tripwire for a
+/// disclosure.**  Asserting only `not saturated` while observing **0%** would
+/// let the coincident pair climb to half the credit window with the prose
+/// beside it still claiming the directions are never both loaded, and that
+/// prose would be stale without anything going red.  This ceiling is set just
+/// above the observed 0% so any real coincident load reddens the run and
+/// forces the paragraph to be rewritten, which is the whole purpose of making
+/// a disclosure load-bearing.  Provisional until re-run, per M8-C12.
+const COINCIDENT_DISCLOSURE_CEILING_PERCENT: u64 = 5;
 
 /// How many independent near-limit uploads the saturation case may take to
 /// observe both directions loaded at one instant.
@@ -2783,6 +2846,29 @@ impl Gate<'_> {
     /// for one relay role.  The same latch as [`Self::hop_live_pair`]'s,
     /// published a second time once the hop closes, so a hop that finished
     /// before the sampler's last pass is still accounted for.
+    /// The ingress's own response-side buffers for one role: the
+    /// carrier&rarr;bridge handoff and the queued public response body.
+    ///
+    /// **This exists so "the response direction backs up at the ingress's own
+    /// public response buffer rather than at the peer hop's receive queue" is
+    /// a measurement rather than an inference.**  The peer hop's receive
+    /// high-water is published beside these two, so the comparison is between
+    /// figures rather than between a figure and an explanation.
+    async fn ingress_response_buffers(&self, node: &str, role: &str) -> Result<(usize, usize)> {
+        let snapshot = self.cluster.relay(node)?.snapshot().await?;
+        Ok(snapshot
+            .http_forward
+            .exchanges
+            .iter()
+            .filter(|record| record.role == role)
+            .fold((0usize, 0usize), |(handoff, body), record| {
+                (
+                    handoff.max(record.response_handoff_high_water),
+                    body.max(record.response_body_high_water),
+                )
+            }))
+    }
+
     async fn recorded_coincident(&self, node: &str, role: &str) -> Result<HopBytePair> {
         let snapshot = self.cluster.relay(node)?.snapshot().await?;
         Ok(snapshot
@@ -2964,7 +3050,9 @@ impl Gate<'_> {
         let mut coherent = (0usize, 0usize);
         // The peer hop's own pair, on the same principle: the best-attested
         // instant rather than two independent maxima (task row M8-C22).
-        let mut peer_live = HopBytePair::default();
+        // Two independent maxima, never a pair -- see the sampler below.
+        let mut peer_live_send = 0usize;
+        let mut peer_live_receive = 0usize;
         let mut peer_coincident = HopBytePair::default();
         let mut peer_window_live = 0usize;
         let mut peer_hop_samples = 0u64;
@@ -3004,7 +3092,17 @@ impl Gate<'_> {
             let sampler = async {
                 let mut local = (0usize, 0usize);
                 let mut taken = 0u64;
-                let mut hop_live = HopBytePair::default();
+                // **`hop_live_send`/`hop_live_receive` are deliberately two
+                // INDEPENDENT maxima and are never a pair.**  Ordering them
+                // by `smaller()`, as the coincident latch is ordered, made
+                // them read 0/0 whenever the receive half was idle -- which
+                // is most of this window -- so they could not witness that
+                // the sampler had seen a loaded hop at all.  They exist only
+                // to show the live publication was read while the hop was
+                // open; every simultaneity claim rests on `hop_coincident`,
+                // which is the only pair here.
+                let mut hop_live_send = 0usize;
+                let mut hop_live_receive = 0usize;
                 let mut hop_coincident = HopBytePair::default();
                 let mut hop_window = 0usize;
                 let mut hop_samples = 0u64;
@@ -3012,14 +3110,21 @@ impl Gate<'_> {
                 while in_flight.load(Ordering::SeqCst) && Instant::now() < deadline {
                     let (live, coincident, window) =
                         gate.hop_live_pair(INGRESS_NODE, "ingress_remote").await?;
-                    hop_samples += 1;
-                    if live.smaller() > hop_live.smaller() {
-                        hop_live = live;
+                    // **Count only a pass that actually found a hop.**  A
+                    // zero window means `live_peer_hops` carried no
+                    // `ingress_remote` entry on this pass, and counting those
+                    // made the sample floor a count of snapshot passes rather
+                    // than of observations of the hop -- which is the one
+                    // thing this figure exists to distinguish.
+                    if window > 0 {
+                        hop_samples += 1;
+                        hop_window = hop_window.max(window);
+                        hop_live_send = hop_live_send.max(live.send_bytes);
+                        hop_live_receive = hop_live_receive.max(live.receive_bytes);
+                        if coincident.smaller() > hop_coincident.smaller() {
+                            hop_coincident = coincident;
+                        }
                     }
-                    if coincident.smaller() > hop_coincident.smaller() {
-                        hop_coincident = coincident;
-                    }
-                    hop_window = hop_window.max(window);
                     let session = gate.owner_session().await?;
                     device_queue_peak = device_queue_peak.max(session.queue_bytes);
                     high_water = session.data_bytes_high_water;
@@ -3044,7 +3149,7 @@ impl Gate<'_> {
                 Ok::<_, HarnessError>((
                     local,
                     taken,
-                    hop_live,
+                    (hop_live_send, hop_live_receive),
                     hop_coincident,
                     hop_window,
                     hop_samples,
@@ -3053,13 +3158,13 @@ impl Gate<'_> {
             let (upload_outcome, measured) = tokio::join!(upload, sampler);
             upload_outcome?;
             let (local, taken, hop_live, hop_coincident, hop_window, hop_samples) = measured?;
+            let (hop_live_send, hop_live_receive) = hop_live;
             samples += taken;
             loaded_samples += taken;
             peer_hop_samples += hop_samples;
             peer_window_live = peer_window_live.max(hop_window);
-            if hop_live.smaller() > peer_live.smaller() {
-                peer_live = hop_live;
-            }
+            peer_live_send = peer_live_send.max(hop_live_send);
+            peer_live_receive = peer_live_receive.max(hop_live_receive);
             if hop_coincident.smaller() > peer_coincident.smaller() {
                 peer_coincident = hop_coincident;
             }
@@ -3112,12 +3217,21 @@ impl Gate<'_> {
         // read from whichever source has it: the live publication while the
         // hop was open, or the record once it closed.  They are the same
         // latch, published twice.
+        let live_coincident = peer_coincident;
         let recorded_coincident = self
             .recorded_coincident(INGRESS_NODE, "ingress_remote")
             .await?;
         if recorded_coincident.smaller() > peer_coincident.smaller() {
             peer_coincident = recorded_coincident;
         }
+        // **Which publication the reported pair came from, recorded rather
+        // than left to be assumed.**  The live half exists so a window
+        // shorter than the exchange need not fall back on the terminated
+        // record; a run where the reported pair came only from the record is
+        // one where that fallback happened, and saying so is the difference
+        // between the live path being proven and being merely present.
+        evidence.peer_hop_coincident_from_live =
+            live_coincident.smaller() >= peer_coincident.smaller() && peer_coincident.smaller() > 0;
         let peer_window_observed = if peer_window_live > 0 {
             peer_window_live
         } else {
@@ -3125,9 +3239,14 @@ impl Gate<'_> {
         };
         evidence.peer_hop_coincident_send = peer_coincident.send_bytes;
         evidence.peer_hop_coincident_receive = peer_coincident.receive_bytes;
-        evidence.peer_hop_live_sampled_send = peer_live.send_bytes;
-        evidence.peer_hop_live_sampled_receive = peer_live.receive_bytes;
+        evidence.peer_hop_live_sampled_send = peer_live_send;
+        evidence.peer_hop_live_sampled_receive = peer_live_receive;
         evidence.peer_hop_live_samples = peer_hop_samples;
+        let (response_handoff, response_body) = self
+            .ingress_response_buffers(INGRESS_NODE, "ingress_remote")
+            .await?;
+        evidence.ingress_response_handoff_high_water = response_handoff;
+        evidence.ingress_response_body_high_water = response_body;
         evidence.peer_hop_coincident_percent = if peer_window_observed > 0 {
             (peer_coincident.smaller() as u64 * 100) / peer_window_observed as u64
         } else {
@@ -3138,18 +3257,25 @@ impl Gate<'_> {
                 >= peer_window_observed as u64 * SATURATION_THRESHOLD_PERCENT;
         eprintln!(
             "ACP cluster saturation peer hop (M8-C22): coincident(send={} receive={} \
-             smaller={} = {}% of window {}) live_sampled(send={} receive={}) over {} \
-             live samples; threshold {}% -> both_directions_saturated={}",
+             smaller={} = {}% of window {}, from_live={}) live_sampled_independent_maxima(\
+             send={} receive={}) over {} samples that found the hop open; \
+             threshold {}% -> both_directions_saturated={}; \
+             where the response direction backs up: peer_hop_receive_high_water={} vs \
+             ingress_response_handoff={} ingress_response_body={}",
             peer_coincident.send_bytes,
             peer_coincident.receive_bytes,
             peer_coincident.smaller(),
             evidence.peer_hop_coincident_percent,
             peer_window_observed,
-            peer_live.send_bytes,
-            peer_live.receive_bytes,
+            evidence.peer_hop_coincident_from_live,
+            peer_live_send,
+            peer_live_receive,
             peer_hop_samples,
             SATURATION_THRESHOLD_PERCENT,
             evidence.peer_hop_both_directions_saturated,
+            ingress.1,
+            response_handoff,
+            response_body,
         );
         eprintln!(
             "ACP cluster saturation: ingress_request(send={} recv={}) window={} \
@@ -4144,8 +4270,9 @@ pub fn validate_acp_cluster_evidence(evidence: &AcpClusterEvidence) -> Result<()
             // be rewritten, rather than leaving a paragraph claiming an
             // impossibility that has since become possible.  That is M8-C16's
             // precedent for a load-bearing disclosure.
-            "both directions of the ingress-to-owner peer hop were never saturated at one instant, which is the measured and disclosed reading",
-            !evidence.peer_hop_both_directions_saturated,
+            "both directions of the ingress-to-owner peer hop were never loaded together beyond a negligible fraction of the credit window, which is the measured and disclosed reading",
+            !evidence.peer_hop_both_directions_saturated
+                && evidence.peer_hop_coincident_percent < COINCIDENT_DISCLOSURE_CEILING_PERCENT,
         ),
         (
             // Not a saturation threshold: the owner-to-device segment is
@@ -4193,7 +4320,7 @@ pub fn validate_acp_cluster_evidence(evidence: &AcpClusterEvidence) -> Result<()
             // hop -- because the publication regressed, or because the hop
             // closed before the sampler's first pass -- would report a zero
             // pair indistinguishably from one that looked and found nothing.
-            "the peer hop's live pair was sampled while the upload was in flight",
+            "the peer hop's live publication was read, with the hop open, while the upload was in flight",
             evidence.peer_hop_live_samples >= MIN_PEER_HOP_SAMPLES,
         ),
         (
@@ -4479,11 +4606,20 @@ mod tests {
             // The coincident pair really is this small: the peer hop's two
             // directions are not loaded together, and the fixture carries the
             // measured reading rather than an aspirational one.
-            peer_hop_coincident_send: 200,
-            peer_hop_coincident_receive: 229,
-            peer_hop_live_sampled_send: 163_113,
-            peer_hop_live_sampled_receive: 53,
-            peer_hop_live_samples: 570,
+            peer_hop_coincident_send: 174,
+            peer_hop_coincident_receive: 61,
+            // Both zero, measured: an instantaneous gauge cannot catch a
+            // ~160 ms burst across whole-snapshot sampling passes, which is
+            // the case for the latch rather than against it.
+            peer_hop_live_sampled_send: 0,
+            peer_hop_live_sampled_receive: 0,
+            peer_hop_live_samples: 526,
+            // False in this run: the live publication was read throughout,
+            // but the best pair came from the terminated record.  Disclosed,
+            // not asserted -- observed true in 1 of 3.
+            peer_hop_coincident_from_live: false,
+            ingress_response_handoff_high_water: 362,
+            ingress_response_body_high_water: 354,
             peer_hop_coincident_percent: 0,
             peer_hop_both_directions_saturated: false,
             owner_device_queue_peak_sampled: 180_744,
@@ -4943,7 +5079,21 @@ mod tests {
                 |e| {
                     e.peer_hop_both_directions_saturated = true;
                 },
-                "never saturated at one instant",
+                "never loaded together beyond a negligible fraction",
+            ),
+            (
+                // The second falsification of the *same* compound rule, and
+                // the one the saturation flag alone cannot reach: a
+                // coincident pair climbing to half the window without
+                // crossing the saturation threshold would leave the "never
+                // both loaded" prose stale while the run stayed green.  Two
+                // falsifications of one rule is the mechanism working; two
+                // rules behind one fragment is the hazard it guards.
+                "peer_hop_coincident_percent",
+                |e| {
+                    e.peer_hop_coincident_percent = 50;
+                },
+                "never loaded together beyond a negligible fraction",
             ),
             (
                 // M8-C22's hygiene rule.  Its fragment names the peer hop's
@@ -4954,7 +5104,7 @@ mod tests {
                 |e| {
                     e.peer_hop_live_samples = 0;
                 },
-                "peer hop's live pair was sampled",
+                "peer hop's live publication was read",
             ),
             (
                 "owner_device_queue_high_water",

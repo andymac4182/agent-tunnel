@@ -2241,7 +2241,7 @@ C5_CASES: list[tuple[str, list[Edit], bool]] = [
     ),
     # ------------------------------- the peer hop's coincident pair (M8-C22)
     (
-        "the peer hop's live pair must have been sampled while the upload was in flight",
+        "the peer hop's live publication must have been read with the hop open",
         [
             (
                 ACP_CLUSTER,
@@ -2252,7 +2252,7 @@ C5_CASES: list[tuple[str, list[Edit], bool]] = [
         False,
     ),
     (
-        "the peer hop's two directions must be disclosed as never saturated together",
+        "the peer hop's two directions must be disclosed as never loaded together",
         [
             (
                 ACP_CLUSTER,
