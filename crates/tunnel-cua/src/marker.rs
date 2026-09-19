@@ -188,11 +188,18 @@ pub fn verify(
     if image.width != width || image.height != height {
         return Err(MarkerError::BadDimensions);
     }
-    if image.seed != seed {
-        // A seed that travelled with the image is not evidence; the caller
-        // said which seed it expected, and that is what is checked.
-        return Err(MarkerError::MarkerMismatch { x: 0, y: 0 });
-    }
+    // **There is deliberately no `image.seed != seed` early return.** One was
+    // written here and `scripts/m5-guard-deletion.py` reported it as the one
+    // case in the suite that stayed green when deleted — because the loop
+    // below recomputes every marker from the **caller's** `seed`, so a
+    // mismatched image already fails at its first pixel. The early return
+    // therefore added no checking, and it actively lied about where: it
+    // reported `MarkerMismatch { x: 0, y: 0 }` for a whole-image seed
+    // disagreement. It was removed rather than exempted from the harness.
+    //
+    // The seed recorded inside the blob is not consulted by this function at
+    // all, which is the property that matters: a seed that travelled with the
+    // image is not evidence about the image.
     for y in 0..height {
         for x in 0..width {
             let found = image.marker_at(x, y).ok_or(MarkerError::LengthMismatch)?;
