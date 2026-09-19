@@ -244,8 +244,9 @@ pub fn spawn(
         supervisor_counters.exited.fetch_add(1, Ordering::Relaxed);
         supervisor_counters.running.fetch_sub(1, Ordering::Relaxed);
         // Only now: the leader is reaped and the group is signalled, so the
-        // sentinel has nothing left to do and can no longer outlive the group
-        // id it holds.
+        // sentinel has nothing left to watch.  (It *does* briefly outlive the
+        // freed group id — that is a trade the deadman module documents, not
+        // the reason for this ordering.)
         //
         // **Standing it down any earlier reopens the trigger hole for the
         // length of the gap.**  The sentinel exits on the stand-down token

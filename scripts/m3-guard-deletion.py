@@ -159,10 +159,15 @@ CASES: list[tuple[str, list[Edit], bool]] = [
     ),
     (
         # The orderly path.  Dropping the handle instead of standing the
-        # sentinel down still closes the pipe, so the sentinel fires a group
-        # signal at an id whose group has already been reaped and may since
-        # have been reissued.  The counter is how a test sees the difference
-        # between "stood down" and "fired and nobody noticed".
+        # sentinel down still closes the pipe, but with **no token**, so the
+        # sentinel reads a bare end of file and fires — a redundant group
+        # `SIGKILL` sent after the supervisor has already killed and reaped
+        # that group, which is the one moment at which the id may genuinely
+        # have been freed.  (This is the token-failure path the deadman
+        # module's docs name; it is not an argument about the *ordering* of
+        # the stand-down, which guards a crash window instead.)  The counter
+        # is how a test sees the difference between "stood down" and "fired
+        # and nobody noticed".
         "an orderly end stands the sentinel down rather than letting it fire",
         [
             (

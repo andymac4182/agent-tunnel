@@ -45,22 +45,44 @@
 //! `SIGKILL` cannot be caught, blocked or handled, which is precisely why the
 //! signal must be delivered by a process other than the one being killed.
 //!
-//! # Why the stand-down token, and the one race it leaves
+//! # Why the stand-down token, and where the ordering matters
 //!
-//! A process-group ID is not reused while any member of the group is alive,
-//! so a sentinel that fires while the group still exists cannot hit an
-//! unrelated group.  Once the last member has been reaped the id is free
-//! again.  The supervisor therefore calls [`Deadman::stand_down`] **after** it
-//! has killed and reaped its own child, so the ordinary path never leaves a
-//! sentinel that could fire against a reissued id.
+//! **The obvious story about the ordering is wrong, and it is written down
+//! here because it took two review rounds to stop repeating it.**  The
+//! tempting account is: a group id can be reissued once the group is gone, so
+//! stand the sentinel down *after* the kill and the reap, or it might fire at
+//! a reissued id.  That does not hold.  A stood-down sentinel **never signals
+//! at all** — [`watch`] returns [`EXIT_STOOD_DOWN`] before it reaches
+//! `kill_group` — so on the orderly path no stand-down ordering can produce a
+//! fire against any id, reissued or not.  The reuse race is orthogonal to
+//! this ordering.
 //!
-//! The residual race is named rather than implied: if the supervisor is
-//! `SIGKILL`ed, the orphaned child may exit on its own (it sees its stdin at
-//! end of file), be reaped by `init`, and have its group id reissued before
-//! the sentinel is scheduled.  The sentinel would then signal a group it does
-//! not own.  The window is the sentinel's wakeup latency *and* a full wrap of
-//! the host's pid space, so it is vanishingly unlikely, but it is real and is
-//! recorded as a task row rather than left to be rediscovered.
+//! What the ordering actually guards is a **crash window**.  Standing the
+//! sentinel down *before* the supervisor's own group kill leaves an interval
+//! in which the child's group is alive and **no longer watched**; a `SIGKILL`
+//! of the supervisor inside that interval leaks the group, which is the exact
+//! hole this crate exists to close.  So: stand down only after the kill and
+//! the reap, because until then the group still needs a watcher.
+//!
+//! And the reuse race, where it does touch this ordering, argues the **other
+//! way**.  If the token never arrives — the write fails, the pipe is already
+//! gone — the sentinel sees a bare end of file and *fires*
+//! ([`EXIT_FIRED`]).  In the late ordering that firing happens after the
+//! group has been reaped, so the id may already be free; an early stand-down
+//! would have fired while the group was still alive and therefore still
+//! unreusable.  The crash window is the larger and more likely exposure, so
+//! the late ordering stays, but it is a trade and not a free win.
+//!
+//! # The residual reuse race
+//!
+//! Named rather than implied, and it lives on the `SIGKILL` path rather than
+//! in the ordering above: if the supervisor is killed, the orphaned child may
+//! exit on its own (it sees its stdin at end of file), be reaped by `init`,
+//! and have its group id reissued before the sentinel is scheduled.  The
+//! sentinel would then signal a group it does not own.  The window is the
+//! sentinel's wakeup latency *and* a full wrap of the host's pid space, so it
+//! is vanishingly unlikely, but it is real and is recorded as a task row
+//! rather than left to be rediscovered.
 //!
 //! # Platforms
 //!
@@ -156,8 +178,12 @@ impl Deadman {
     /// Tell the sentinel not to fire, then wait for it to exit.
     ///
     /// Call this **only after** the supervised child has been killed and
-    /// reaped, so that the sentinel can never outlive the group id it was
-    /// given.
+    /// reaped — not because a sentinel stood down earlier might fire at a
+    /// reissued id (a stood-down sentinel does not fire at all), but because
+    /// until the kill lands the group still needs a watcher: standing down
+    /// first leaves it alive and unwatched, and a `SIGKILL` of this process in
+    /// that interval leaks it.  See the module docs for the trade this makes
+    /// against the token-failure path.
     ///
     /// Returns whether the sentinel really did stand down, read from its exit
     /// status ([`EXIT_STOOD_DOWN`] rather than [`EXIT_FIRED`]).  **The return

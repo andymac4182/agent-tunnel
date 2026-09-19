@@ -492,8 +492,15 @@ async fn without_a_sentinel_a_sigkilled_supervisor_leaks_its_childs_group() {
 }
 
 /// The sentinel must not fire when the supervisor ends its child in an
-/// orderly way, or every ordinary shutdown would carry a group signal aimed
-/// at an id that may since have been reissued.
+/// orderly way.
+///
+/// The reason is **not** that a firing sentinel might hit a reissued group id
+/// — that framing is the one this chunk kept getting wrong. It is that a
+/// sentinel which fires on an orderly shutdown is a sentinel whose stand-down
+/// path does not work, and the stand-down path is the only thing keeping an
+/// ordinary shutdown from carrying a redundant group `SIGKILL` at a group the
+/// supervisor has already killed and reaped — the one moment at which the id
+/// genuinely may have been freed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_orderly_shutdown_stands_the_sentinel_down_instead_of_firing_it() {
     let workspace = tempfile::tempdir().expect("workspace");
