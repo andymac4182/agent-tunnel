@@ -2256,7 +2256,8 @@ C5_CASES: list[tuple[str, list[Edit], bool]] = [
         [
             (
                 ACP_CLUSTER,
-                "            !evidence.peer_hop_both_directions_saturated,",
+                """            !evidence.peer_hop_both_directions_saturated
+                && evidence.peer_hop_coincident_percent < COINCIDENT_DISCLOSURE_CEILING_PERCENT,""",
                 "            true,",
             )
         ],
