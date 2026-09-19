@@ -82,6 +82,31 @@ fn sources_md_still_records_the_divergence_from_the_inspected_tree() {
          which is the whole reason it is not the pin",
         cua_pin::INSPECTED_VERSION
     );
+    // The reconciliation originally claimed the two trees differed only in
+    // `pyproject.toml`. That was false — `handlers/cua_driver.py` differs too,
+    // and it is a file this pin cites. Losing that sentence would restore the
+    // overclaim, so it is asserted rather than trusted to survive editing.
+    assert!(
+        sources.contains("cua_driver.py"),
+        "docs/sources.md no longer records that handlers/cua_driver.py differs \
+         between the inspected and released commits"
+    );
+    assert!(
+        sources.contains("desktop_capture_authorized"),
+        "docs/sources.md no longer records what that difference actually changes"
+    );
+}
+
+/// `/ws` being deferred is a decision with a reason, not an omission.
+#[test]
+fn the_websocket_deferral_is_recorded_as_a_decision() {
+    let sources = read_doc("sources.md");
+    assert!(
+        sources.contains(cua_pin::WEBSOCKET_DEFERRAL_RECORDED_AS),
+        "docs/sources.md no longer says {:?}, so the deferred surface reads as \
+         an omission rather than a choice",
+        cua_pin::WEBSOCKET_DEFERRAL_RECORDED_AS
+    );
 }
 
 /// Both of these are load-bearing for any adapter that parses a `/cmd`
@@ -101,18 +126,30 @@ fn the_two_downstream_critical_properties_are_still_written_down() {
         "docs/integrations.md no longer warns that a successful HTTP status can \
          carry a failed command result"
     );
-    // The property is recorded as its evidence, not as a bare boolean: the
-    // constant names the released construct that makes a 200 able to carry a
-    // failure, so a reader can go and check it.
+    // These two assertions must compare the constants against the *document*,
+    // not against literals retyped here. An earlier version checked
+    // `SUCCESS_FALSE_UNDER_200_EVIDENCE.contains("StreamingResponse")` and
+    // `PRE_DISPATCH_ERROR_STATUSES == [400, 401]`, which could only fail if
+    // someone edited the constant in the same commit — `assert!(CONST)` with
+    // the lint sidestepped syntactically rather than answered.
     assert!(
-        cua_pin::SUCCESS_FALSE_UNDER_200_EVIDENCE.contains("StreamingResponse"),
-        "the recorded evidence no longer names the construct it rests on"
+        integrations.contains("StreamingResponse")
+            || integrations.contains("after the response has begun"),
+        "docs/integrations.md no longer records *why* a 200 can carry a failure, \
+         so {} is a claim with nothing behind it",
+        cua_pin::SUCCESS_FALSE_UNDER_200_EVIDENCE
     );
-    assert_eq!(
-        cua_pin::PRE_DISPATCH_ERROR_STATUSES,
-        &[400, 401],
-        "the released handler raises HTTPException with these statuses before dispatch"
+    assert!(
+        integrations.contains("HTTPException"),
+        "docs/integrations.md no longer records that pre-dispatch failures bypass \
+         the data: framing"
     );
+    for status in cua_pin::PRE_DISPATCH_ERROR_STATUSES {
+        assert!(
+            integrations.contains(&status.to_string()),
+            "docs/integrations.md no longer names the pre-dispatch status {status}"
+        );
+    }
 }
 
 /// Every allowlisted command must appear in the operation table that claims to

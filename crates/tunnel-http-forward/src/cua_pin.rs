@@ -150,10 +150,15 @@ pub const UNAVAILABLE_FLAG: &str = "UNAVAILABLE_WITHOUT_CONTAINER_NAME";
 /// processes commands sequentially and does not echo a request ID, so one
 /// in-flight command per socket would be forced and correlation would have to
 /// live in the adapter. `/cmd` is the pinned surface.
-pub const WEBSOCKET_SURFACE_IS_DEFERRED: bool = true;
+///
+/// Recorded as the phrase `docs/sources.md` must keep, so the deferral cannot
+/// quietly become an omission; `tests/cua_pin.rs` checks the document for it.
+pub const WEBSOCKET_DEFERRAL_RECORDED_AS: &str = "`/ws` is deferred";
 
-/// `cua-driver` is **not** a published crate: `index.crates.io` answers 404 for
-/// it while answering 200 for a control crate from the same host. It is an
+/// `cua-driver` is **not** a published crate, confirmed two ways:
+/// `index.crates.io` answers 404 for it and 200 for a control crate, and the
+/// JSON API answers 404 for it and 200 for the control once a descriptive
+/// `User-Agent` is sent (its 403 is a UA policy, not a host limitation). It is an
 /// optional extra of the pinned distribution, declared as the range below, and
 /// is reached through the server's own backend handler behind the same `/cmd`
 /// surface. No separate driver profile is pinned or planned.

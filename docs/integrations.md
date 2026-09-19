@@ -174,8 +174,9 @@ The pinned CUA artifact is the published distribution **`cua-computer-server`
 the acquisition method and the Python requirement (3.12-3.13). The permalinks
 below point at that release commit. They previously pointed at
 `bd4c10020cd7cac07c0d19b0f53ba4b007fbcb15`, a development commit whose manifest
-declares 0.3.45; every `main.py` line range cited here is byte-identical between
-the two, and `sources.md` records that reconciliation.
+declares 0.3.45. `main.py` is byte-identical between the two, so every line range
+cited here still holds; `handlers/cua_driver.py` is **not** identical, and
+`sources.md` records that reconciliation in full.
 
 **There is one pinned profile, not two.** Earlier revisions of this section
 listed a native Rust **Cua Driver** as a second candidate profile, citing a
@@ -205,9 +206,14 @@ the response is `data: <JSON>\n\n` framing with `text/plain` media type. Parse t
 framing with byte/event limits; a successful HTTP status can still contain
 `success:false`. Do not assume a normal JSON response or a conventional
 `text/event-stream` response. Prefer one `/cmd` exchange per logical request.
-Both properties were confirmed against the released sdist, not only the
-development tree; upstream's own auth-availability test asserts a 200 whose body
-text contains `success`. Two further shapes the adapter must handle: the success
+The reason a 200 can carry a failure is structural, not incidental: the success
+and error payloads are both yielded from one generator inside a
+`StreamingResponse`, so the status is committed **after the response has begun**
+and before the command's outcome is known. Read the payload, never the status, to
+decide whether a command succeeded. Both properties were **read from the source
+in the released sdist**, not only from the development tree, and neither has been
+observed on a socket; upstream's own auth-availability test asserts a 200 whose
+body text contains `success`. Two further shapes the adapter must handle: the success
 payload is `{"success": True, **result}`, so a handler result carrying its own
 `success` key wins; and pre-dispatch failures — malformed body, missing or
 unknown command, cloud auth — are raised as `HTTPException` and arrive as real
@@ -237,9 +243,10 @@ registers, so the table is unchanged by the pin. Two released details it does no
 capture: the registry is filtered by `backend_policy.exposed_command_registry`,
 which under `CUA_BACKEND=vnc` narrows the map to a VNC-remote subset, so the
 advertised set is backend-dependent and `/commands` must be read per backend
-rather than assumed; and twelve aliases exist (`click`, `type`, `key`, `shell`,
-`exec` and the file-command spellings). Send canonical names and do not depend on
-alias resolution.
+rather than assumed; and twelve aliases exist (`click` and `tap`, `type`, `key`,
+`shell`, `exec`, and the six file-command spellings `read_file`, `write_file`,
+`ls`, `mkdir`, `rm`, `rmdir`). Send canonical names and do not depend on alias
+resolution.
 Do not forward arbitrary command names: the initial allowlist is the table above.
 Our VFS has its own provider and confinement, rather than inheriting CUA's host
 file commands. Capability discovery is the intersection of local configuration,
@@ -288,6 +295,11 @@ Sources that ship in the pinned 0.3.46 distribution:
 [legacy Linux handler](https://github.com/trycua/cua/blob/c07d287af35cf37cfcf94290c46db2720ec47822/libs/python/computer-server/computer_server/handlers/linux.py#L1-L80),
 [backend selection](https://github.com/trycua/cua/blob/c07d287af35cf37cfcf94290c46db2720ec47822/libs/python/computer-server/computer_server/handlers/factory.py),
 [Cua Driver backend handler](https://github.com/trycua/cua/blob/c07d287af35cf37cfcf94290c46db2720ec47822/libs/python/computer-server/computer_server/handlers/cua_driver.py).
+This last file is the one place the released artifact differs behaviourally from
+the 2026-09-09 development tree: it makes `desktop_capture_authorized`
+conditional on `hasattr`, so on the supported 0.22.x SDK the released server
+**omits that key** from session state rather than failing. Treat capture
+authority as absent-by-default, not as false.
 
 Sources that do **not** ship in it, and so are monorepo reading rather than
 pinned artifact — left at the 2026-09-09 development commit and not repointed,
