@@ -1235,8 +1235,40 @@ C3_CASES: list[tuple[str, list[Edit], bool]] = [
         [
             (
                 BRIDGE,
-                "                .filter(|target| !target.is_subscribed() && target.created.elapsed() > bound)",
+                """                .filter(|target| {
+                    !target.is_subscribed()
+                        && !target.is_closed()
+                        && target.created.elapsed() > bound
+                })""",
                 "                .filter(|_target| false)",
+            )
+        ],
+        False,
+    ),
+    (
+        # **M8-C25.** Deleting only the `is_closed` term leaves the expiry
+        # working and leaves every assertion about *closing* green: the window
+        # still closes, the target is still closed, the late GET is still
+        # refused 409. What it reintroduces is the re-count -- the sweep
+        # matching the same already-closed target on every 20 ms tick -- so the
+        # only thing that can redden is a test that asserts the counter counts
+        # **expiries** rather than ticks. Before this fix nothing did, which is
+        # why the rule was invisible to this harness while the defect was live,
+        # and why M8-C17's lesson applies here by name: a rule with no guard
+        # case is a rule this suite reports on without measuring.
+        #
+        # The expected witness is
+        # `an_expired_session_window_is_counted_once_not_once_per_watchdog_tick`
+        # in `crates/tunnel-acp-fixture/tests/bridge.rs`, whose message
+        # "counted once per expiry, not once per watchdog tick" is unique to
+        # this rule.
+        "an expired session window is counted once, not once per watchdog tick",
+        [
+            (
+                BRIDGE,
+                """                        && !target.is_closed()
+""",
+                "",
             )
         ],
         False,

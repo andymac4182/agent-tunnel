@@ -939,6 +939,89 @@ async fn a_session_whose_subscriber_never_arrives_closes_its_window() {
     export.shutdown();
 }
 
+/// **An expiry is counted once, not once per watchdog tick** (M8-C25).
+///
+/// The test above asserts `session_subscribe_expired == 1` at one sampled
+/// instant, and that assertion is a race: it can only be won by a sample that
+/// lands inside the first tick after the expiry. Before the fix the session
+/// sweep re-matched an already-closed target on every 20 ms tick for the life
+/// of the connection, so the counter climbed to ~1,400 over the poll window
+/// and the test above was red about one run in four -- but *nothing* asserted
+/// the once-only property itself, so the rule was invisible to the guard
+/// harness and a deletion run would have reported it as protected by a red it
+/// did not cause.
+///
+/// This test makes it load-bearing. It waits for the expiry, then deliberately
+/// lets **many** further ticks pass and asserts the counter and the published
+/// measurement have not moved. The connection branch needs no such test: it
+/// returns after firing, so it cannot run twice by construction.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_expired_session_window_is_counted_once_not_once_per_watchdog_tick() {
+    let workspace = workspace();
+    // 5000 ms for the reason recorded on the test above: this bound is shared
+    // with the connection GET, and a shorter one closes the wrong window
+    // first on a loaded machine.
+    let export = acp_export_with(workspace.path(), "[deadlines]\nsubscribe_ms = 5000\n");
+    let profile = Arc::new(export.profile_policies().expect("profile"));
+    let connection = initialize(&export, &profile).await;
+    let stream = send(&export, &profile, get_connection(&connection)).await;
+    let session = open_session(&export, &profile, &connection, workspace.path(), stream).await;
+
+    let mut diagnostics = export.diagnostics();
+    for _ in 0..1500 {
+        if diagnostics.session_subscribe_expired >= 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        diagnostics = export.diagnostics();
+    }
+    assert_eq!(
+        diagnostics.connection_subscribe_expired, 0,
+        "the connection's own window must not be what closed: {diagnostics:?}"
+    );
+    assert_eq!(
+        diagnostics.session_subscribe_expired, 1,
+        "the first observation of the expiry is a single expiry: {diagnostics:?}"
+    );
+    let first_elapsed = diagnostics.last_expiry_elapsed_us;
+    let first_bound = diagnostics.last_expiry_bound_us;
+
+    // **Twenty-five watchdog ticks.** `WATCHDOG_TICK` is 20 ms, so a sweep that
+    // re-counted a closed target would add about 25 here; one that counts
+    // expiries adds nothing. The margin is what makes the failure unambiguous
+    // rather than a race in the other direction.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let after = export.diagnostics();
+    assert_eq!(
+        after.session_subscribe_expired, 1,
+        "an expired session window is counted once per expiry, not once per watchdog tick: \
+         {after:?}"
+    );
+    // The measurement published before the counter belongs to the expiry, and
+    // stays that way: a sweep that ran again would have overwritten both with
+    // an arbitrary later tick's figures, which is what defeats the
+    // publish-before-count ordering the watchdog establishes.
+    assert_eq!(
+        after.last_expiry_elapsed_us, first_elapsed,
+        "the published elapsed belongs to the expiry and is not rewritten by later ticks: \
+         {after:?}"
+    );
+    assert_eq!(
+        after.last_expiry_bound_us, first_bound,
+        "the published bound belongs to the expiry and is not rewritten by later ticks: {after:?}"
+    );
+    assert!(
+        after.last_expiry_elapsed_us > after.last_expiry_bound_us,
+        "{after:?}"
+    );
+    // And the window is still closed, by the mechanism this fix must not
+    // change: the target stays in `state.sessions`, so a late GET finds a
+    // closed target and is refused 409 rather than falling through to 404.
+    let late = send(&export, &profile, get_session(&connection, &session.id)).await;
+    assert_eq!(late.status(), StatusCode::CONFLICT);
+    export.shutdown();
+}
+
 /// `docs/acp.md`: "reject session prompts until that subscriber is ready".
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_prompt_before_its_session_subscriber_is_refused_and_nothing_is_dispatched() {

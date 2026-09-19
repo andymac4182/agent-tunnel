@@ -303,6 +303,26 @@ claim is still unclaimed.
   and waits them out; the rest shorten the bound so the mechanism is cheap to
   measure. A connection whose GET never arrives is ended and its child is gone
   **from the process table**.
+- **An expiry is counted once, and that is now falsifiable.** `session_subscribe_expired`
+  is a count of **sessions whose subscription window closed**, not of watchdog
+  ticks since the first such closure, and `last_expiry_elapsed_us` /
+  `last_expiry_bound_us` are the measurement **of that expiry**, not of an
+  arbitrary later tick. Both halves are asserted by
+  `an_expired_session_window_is_counted_once_not_once_per_watchdog_tick`, which
+  waits for the expiry and then lets **twenty-five further 20 ms ticks** pass
+  before re-reading all three. **This was false until M8-C25 was fixed**: the
+  session sweep matched an already-closed target on every tick for the life of
+  the connection, so the counter reached ~1,400 over one test's polling window
+  — and nothing asserted the property, so the rule was invisible to
+  `scripts/acp-guard-deletion.py` and would have been reported as protected by
+  a red it did not cause (M8-C17's lesson, arriving a second time). The sweep's
+  `!target.is_closed()` term is what makes it true, and the `m8c3` guard case
+  "an expired session window is counted once, not once per watchdog tick"
+  deletes exactly that term. It is deliberately **not** fixed by dropping the
+  target from `state.sessions`: the entry is what a late session GET finds, and
+  without it the refusal would be **404 rather than 409**, contradicting the
+  one-subscriber bullet above. The connection branch needs no such case — it
+  returns after firing, so it cannot run twice by construction.
 - **A prompt before its session subscriber is refused**, `docs/acp.md`'s own
   rule, with the refusal shown to be the readiness rule and not something else:
   the same prompt succeeds once the subscriber is there, and its `stopReason`
