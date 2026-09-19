@@ -70,7 +70,7 @@
 //! trigger fix at once and is not implemented here.
 
 use std::io::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
 /// The byte string the supervisor writes before closing the pipe when it is
@@ -109,12 +109,24 @@ impl Deadman {
     /// executable cannot be located, or when it cannot be spawned.  A caller
     /// that gets [`None`] keeps whatever containment it already had; the
     /// sentinel only ever adds.
+    ///
+    /// **A [`None`] on a Unix host is a silent reversion to the behaviour this
+    /// crate exists to fix, so it is not silent.**  The sentinel is a separate
+    /// executable, so a packaging slip — shipping the device binary without
+    /// `tunnel-deadman` beside it — produces a supervisor that runs perfectly
+    /// and leaks its children's process group on every crash, which is
+    /// indistinguishable from correct operation to anyone watching.  This
+    /// warns on stderr, once per process, and [`availability`] lets a
+    /// startup or diagnostic path report it before anything is supervised.
     #[must_use]
     pub fn arm(leader: u32) -> Option<Self> {
         if !cfg!(unix) {
             return None;
         }
-        let executable = sentinel_path()?;
+        let Some(executable) = sentinel_path() else {
+            warn_sentinel_missing();
+            return None;
+        };
         let mut command = Command::new(executable);
         command
             .arg(leader.to_string())
@@ -128,7 +140,10 @@ impl Deadman {
             use std::os::unix::process::CommandExt as _;
             command.process_group(0);
         }
-        let sentinel = command.spawn().ok()?;
+        let Ok(sentinel) = command.spawn() else {
+            warn_sentinel_missing();
+            return None;
+        };
         Some(Self { sentinel })
     }
 
@@ -177,16 +192,80 @@ impl Drop for Deadman {
     }
 }
 
+/// Whether a sentinel could be armed on this host at all.
+///
+/// Call it from a startup or diagnostic path: it answers the question
+/// "**will** the children of this process be watched?" before any child
+/// exists, which is the only moment at which a missing sentinel is cheap to
+/// fix.  It reads a path and starts nothing.
+///
+/// [`Availability::SentinelMissing`] means this build will behave exactly as
+/// it did before the sentinel existed: every supervised process group
+/// survives a crash of this process.
+#[must_use]
+pub fn availability() -> Availability {
+    if !cfg!(unix) {
+        return Availability::UnsupportedPlatform;
+    }
+    if sentinel_path().is_some() {
+        Availability::Armable
+    } else {
+        Availability::SentinelMissing
+    }
+}
+
+/// What [`availability`] found.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Availability {
+    /// The sentinel executable is present; children will be watched.
+    Armable,
+    /// A Unix host with no sentinel executable beside the running one and no
+    /// [`SENTINEL_PATH_ENV`] pointing at one.  Containment silently reverts
+    /// to the pre-sentinel behaviour.
+    SentinelMissing,
+    /// Not a Unix host.  Neither the group kill nor the sentinel exists here.
+    UnsupportedPlatform,
+}
+
+/// Warn once per process that containment has silently reverted.
+///
+/// Once, not per child: an export may supervise up to 64 children and a line
+/// per child would bury the fact rather than report it.
+fn warn_sentinel_missing() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        eprintln!(
+            "tunnel-deadman: no `{SENTINEL_BIN}` executable found beside this binary \
+             (and no {SENTINEL_PATH_ENV} set): supervised child process groups will \
+             NOT be cleaned up if this process is killed or crashes. Install \
+             `{SENTINEL_BIN}` alongside the device binary."
+        );
+    });
+}
+
 /// Locate the sentinel executable: [`SENTINEL_PATH_ENV`] if set, otherwise
 /// [`SENTINEL_BIN`] beside the running executable.  A test binary lives in
 /// `target/<profile>/deps`, so the parent of `deps` is searched too.
 #[must_use]
 pub fn sentinel_path() -> Option<PathBuf> {
-    if let Some(explicit) = std::env::var_os(SENTINEL_PATH_ENV) {
+    let executable = std::env::current_exe().ok()?;
+    resolve_sentinel(std::env::var_os(SENTINEL_PATH_ENV).as_deref(), &executable)
+}
+
+/// The resolution rule itself, with both inputs passed in.
+///
+/// Split out from [`sentinel_path`] so it can be tested without mutating the
+/// process environment — which, since the 2024 edition, is `unsafe`, and this
+/// crate forbids `unsafe`.  Testing it matters because the rule is what
+/// decides whether an installation is watched at all, and because an explicit
+/// path that names nothing must resolve to [`None`] rather than be taken on
+/// trust.
+#[must_use]
+fn resolve_sentinel(explicit: Option<&std::ffi::OsStr>, executable: &Path) -> Option<PathBuf> {
+    if let Some(explicit) = explicit {
         let path = PathBuf::from(explicit);
         return path.is_file().then_some(path);
     }
-    let executable = std::env::current_exe().ok()?;
     let directory = executable.parent()?;
     let beside = directory.join(SENTINEL_BIN);
     if beside.is_file() {
@@ -246,6 +325,53 @@ mod tests {
         // as a death, not as an orderly shutdown.
         assert_eq!(STAND_DOWN, b"stand-down\n");
         assert_ne!(STAND_DOWN, b"stand-down".as_slice());
+    }
+
+    #[test]
+    fn an_explicit_path_to_a_non_file_resolves_to_no_sentinel() {
+        // The state a packaging slip produces: a path is configured and
+        // nothing is there. It must resolve to None — reported as missing —
+        // rather than be taken on trust, because a supervisor that believes
+        // it is watched and is not is the failure this crate exists to make
+        // visible. The end-to-end consequence is measured in
+        // `tunnel-mcp-fixture`'s
+        // `without_a_sentinel_a_sigkilled_supervisor_leaks_its_childs_group`;
+        // this is the resolution rule underneath it.
+        let directory = tempfile::tempdir().expect("directory");
+        let absent = directory.path().join("not-a-sentinel");
+        assert!(resolve_sentinel(Some(absent.as_os_str()), Path::new("/usr/bin/device")).is_none());
+    }
+
+    #[test]
+    fn an_explicit_path_to_a_real_file_is_taken_over_the_search() {
+        let directory = tempfile::tempdir().expect("directory");
+        let present = directory.path().join("some-sentinel");
+        std::fs::write(&present, b"#!/bin/sh\n").expect("write");
+        assert_eq!(
+            resolve_sentinel(Some(present.as_os_str()), Path::new("/usr/bin/device")).as_deref(),
+            Some(present.as_path())
+        );
+    }
+
+    #[test]
+    fn a_test_binary_in_deps_finds_the_sentinel_one_directory_up() {
+        // Without this, every measurement in `process_residue.rs` would run
+        // against an unarmed supervisor and silently measure nothing.
+        let directory = tempfile::tempdir().expect("directory");
+        let deps = directory.path().join("deps");
+        std::fs::create_dir(&deps).expect("deps");
+        let sentinel = directory.path().join(SENTINEL_BIN);
+        std::fs::write(&sentinel, b"#!/bin/sh\n").expect("write");
+        assert_eq!(
+            resolve_sentinel(None, &deps.join("some_test-abc123")).as_deref(),
+            Some(sentinel.as_path())
+        );
+    }
+
+    #[test]
+    fn a_binary_with_no_sentinel_beside_it_resolves_to_none() {
+        let directory = tempfile::tempdir().expect("directory");
+        assert!(resolve_sentinel(None, &directory.path().join("device")).is_none());
     }
 
     #[test]

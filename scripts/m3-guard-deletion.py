@@ -2,12 +2,24 @@
 """Defeat one process-containment guard at a time, run the tests it should
 protect, and restore it.
 
-This is the red-then-green evidence behind M3-09.  One suite lives here:
+This is the red-then-green evidence behind M3-09.  Two suites live here:
 
 * `m3c09` — `crates/tunnel-deadman` and the stdio export's child supervision
-  in `crates/tunnel-mcp-export`: the sentinel firing on a bare end of file,
-  the sentinel being armed at all, the stand-down on the orderly path, and the
-  fixture's own honesty about whether it really detached.
+  in `crates/tunnel-mcp-export`, witnessed by the process-table measurements
+  in `crates/tunnel-mcp-fixture/tests/process_residue.rs`: the sentinel firing
+  on a bare end of file, the sentinel being armed at all, the stand-down on
+  the orderly path, and the fixture's own honesty about whether it really
+  detached.
+* `m3c09-deadman` — the resolution rule that decides whether an installation
+  is watched at all, witnessed by `tunnel-deadman`'s own unit tests.
+
+**One rule of M3-09 is deliberately not here**, and is recorded in that row's
+"Not covered" list instead: the *ordering* of the stand-down against the group
+kill.  Hoisting the stand-down above the kill leaves every test in both suites
+green, because the group still dies — the sentinel kills it a moment earlier
+instead of the supervisor.  Nothing observable distinguishes the two orderings
+on a host where the group id is not reused, so no case was added rather than a
+case that would pass either way and look like coverage.
 
 **The fourth case is not like the others and is the point of having it.**  It
 defeats the *fixture*, not the product: it makes the escaping descendant fail
@@ -181,7 +193,45 @@ class Suite:
     cwd: Path = REPO
 
 
-SUITES: list[Suite] = [Suite("m3c09", [DEADMAN, EXPORT, FIXTURE], CARGO_TEST, CASES)]
+#: A second suite, for the rules whose witnesses are `tunnel-deadman`'s own
+#: unit tests rather than the process-table measurements.  It is separate
+#: because a single `cargo test --test process_residue` names a target that
+#: only the fixture crate has, and **this suite edits only a package its own
+#: invocation rebuilds** — the rule M3-19 exists to state.
+DEADMAN_TEST = [
+    "cargo",
+    "test",
+    "-p",
+    "tunnel-deadman",
+    "--locked",
+    "--no-fail-fast",
+]
+
+DEADMAN_CASES: list[tuple[str, list[Edit], bool]] = [
+    (
+        # The rule that makes a missing sentinel *detectable*.  Without it, a
+        # configured path that names nothing resolves to a path anyway; `arm`
+        # then fails at spawn instead of at resolution, and `availability` —
+        # which the device's doctor reports and which starts no process —
+        # would tell an operator the installation is watched when it is not.
+        # A packaging slip would then be invisible in the one place built to
+        # show it.
+        "a configured sentinel path that names no file resolves to no sentinel",
+        [
+            (
+                DEADMAN_LIB,
+                "        return path.is_file().then_some(path);",
+                "        return Some(path);",
+            )
+        ],
+        False,
+    ),
+]
+
+SUITES: list[Suite] = [
+    Suite("m3c09", [DEADMAN, EXPORT, FIXTURE], CARGO_TEST, CASES),
+    Suite("m3c09-deadman", [DEADMAN], DEADMAN_TEST, DEADMAN_CASES),
+]
 
 #: Cases whose green result is itself the measurement.  Empty today, and kept
 #: so a future case that needs one has the mechanism rather than inventing it.
@@ -300,7 +350,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--list", action="store_true", help="print case names and exit")
     parser.add_argument("--case", help="run only cases whose name contains this text")
-    parser.add_argument("--suite", help="run only this suite (m3c09)")
+    parser.add_argument("--suite", help="run only this suite (m3c09, m3c09-deadman)")
     arguments = parser.parse_args()
 
     suites = SUITES

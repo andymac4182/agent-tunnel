@@ -357,7 +357,11 @@ impl FixtureServer {
     }
 }
 
-/// The file the `supervise` probe writes: `<child-pid> <helper-pid>`.
+/// The file the `supervise` probe writes, three space-separated fields:
+/// `<wrapper-pid> <helper-pid> <sentinels-armed>`.  The third is what lets a
+/// test tell "the mechanism ran and contained this" from "the mechanism was
+/// never there", which is the difference between the two `SIGKILL`
+/// measurements in `tests/process_residue.rs`.
 pub const SUPERVISE_REPORT: &str = "supervise.report";
 /// The wrapper's own pid file inside the probe's workspace.
 pub const WRAPPER_PID_FILE: &str = "wrapper.pid";

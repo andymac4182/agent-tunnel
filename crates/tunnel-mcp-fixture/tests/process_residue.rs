@@ -105,7 +105,7 @@ fn process_row(pid: &str) -> Option<(String, String)> {
     }
     let mut fields = line.split_whitespace();
     let pgid = fields.next()?.to_owned();
-    let state = fields.next().unwrap_or(String::new().as_str()).to_owned();
+    let state = fields.next().unwrap_or("").to_owned();
     Some((pgid, state))
 }
 

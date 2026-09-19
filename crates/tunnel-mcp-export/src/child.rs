@@ -197,8 +197,11 @@ pub fn spawn(
     let group = child.id();
     counters.spawned.fetch_add(1, Ordering::Relaxed);
     counters.running.fetch_add(1, Ordering::Relaxed);
-    // Armed before any task can end the child, so there is no window in which
-    // a device crash leaves this group with nobody watching it.
+    // Armed before any task can end the child.  A window remains, between the
+    // spawn above and this line, in which a device crash leaves this group
+    // unwatched; it is microseconds and cannot be closed without arming the
+    // sentinel before the pid it watches exists, but it is not zero and is not
+    // claimed to be.
     let deadman = group.and_then(tunnel_deadman::Deadman::arm);
     if deadman.is_some() {
         counters.deadman_armed.fetch_add(1, Ordering::Relaxed);

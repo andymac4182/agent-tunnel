@@ -3529,6 +3529,7 @@ dependencies = [
  "toml",
  "tunnel-acp-export",
  "tunnel-core",
+ "tunnel-deadman",
  "tunnel-fs-core",
  "tunnel-fs-host",
  "tunnel-fs-ninep",
