@@ -19,8 +19,13 @@
 //!   before this chunk nobody signalled the group at all and even an
 //!   ordinary in-group helper survived.
 //!   [`a_sigkilled_supervisor_still_kills_the_group`] measures that it no
-//!   longer does, and [`the_group_kill_reaches_an_in_group_helper`] is the
-//!   control that the helper is the sort of thing a group kill reaches.
+//!   longer does.  It has **two** controls, because on its own it would only
+//!   show that a helper was gone and not that anything here removed it:
+//!   [`without_a_sentinel_a_sigkilled_supervisor_leaks_its_childs_group`]
+//!   runs the identical probe with no sentinel — the state of `origin/main` —
+//!   and requires the helper to survive, and
+//!   [`the_group_kill_reaches_an_in_group_helper`] shows a helper of this
+//!   shape is the sort of thing a group signal reaches at all.
 //!
 //! Every assertion here is against `/bin/ps`, and every one of them checks
 //! the process **state** as well as the pid, because `kill -0` and a bare pid
@@ -409,6 +414,80 @@ async fn a_sigkilled_supervisor_still_kills_the_group() {
         "MEASUREMENT (M3-09): the in-group helper of a SIGKILLed supervisor's child must \
          be gone from the process table, not merely detached from a closed handle. It \
          was still {helper_row:?}"
+    );
+}
+
+/// **The control for the test above: the leak this chunk closes, asserted as
+/// still present when the mechanism is absent.**
+///
+/// The green test alone proves only that a helper was gone; it cannot say
+/// whether the sentinel was what removed it, or whether the helper would have
+/// died anyway on this host.  So the same probe runs again with the sentinel
+/// executable deliberately unlocatable — which is exactly the state of
+/// `origin/main`, where no sentinel exists at all — and the helper is
+/// required to **survive**.
+///
+/// The two tests differ in one respect and reach opposite outcomes, which is
+/// what makes the pair evidence rather than a pair of observations.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn without_a_sentinel_a_sigkilled_supervisor_leaks_its_childs_group() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let mut probe = std::process::Command::new(fixture_binary())
+        .arg(SUPERVISE_MODE)
+        .arg(workspace.path())
+        // Not a file, so `Deadman::arm` finds no sentinel and returns None:
+        // the supervisor is exactly as unarmed as it was before this chunk.
+        .env(
+            tunnel_deadman::SENTINEL_PATH_ENV,
+            workspace.path().join("no-such-sentinel"),
+        )
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("the supervisor probe started");
+    let probe_pid = probe.id().to_string();
+    let mut guard = PidGuard::watch(&probe_pid);
+
+    let report = read_pid(&workspace.path().join(SUPERVISE_REPORT)).await;
+    let fields = report.split_whitespace().collect::<Vec<_>>();
+    assert_eq!(fields.len(), 3, "the probe reported three fields");
+    let (wrapper, helper, armed) = (fields[0], fields[1], fields[2]);
+    guard.also(wrapper);
+    guard.also(helper);
+    assert_eq!(armed, "0", "no sentinel was armed, which is the point");
+    assert!(alive(helper), "the helper runs before the supervisor dies");
+
+    assert!(
+        std::process::Command::new("/bin/kill")
+            .args(["-9", &probe_pid])
+            .status()
+            .expect("kill ran")
+            .success()
+    );
+    let _ = probe.wait();
+    // Generous in the safe direction: a longer wait can only give the helper
+    // more chance to die, so a survival seen after it is a stronger claim.
+    tokio::time::sleep(SETTLE).await;
+    let helper_row = process_row(helper);
+    let wrapper_row = process_row(wrapper);
+    eprintln!(
+        "MEASURED unarmed supervisor (the pre-chunk behaviour): probe {probe_pid}, \
+         wrapper {wrapper}, helper {helper}, wrapper row {wrapper_row:?}, helper row \
+         {helper_row:?}"
+    );
+    assert!(
+        is_live(helper_row.as_ref()),
+        "MEASUREMENT (M3-09): without a sentinel the in-group helper of a SIGKILLed \
+         supervisor's child SURVIVES — that is the leak. If this ever passes by dying, \
+         the sibling test proves nothing and both must be re-derived. It was \
+         {helper_row:?}"
+    );
+    let (helper_group, state) = helper_row.expect("it is in the table");
+    assert!(!state.starts_with('Z'), "alive, not an unreaped corpse");
+    assert_eq!(
+        helper_group, wrapper,
+        "and it survives inside the very process group nobody signalled"
     );
 }
 

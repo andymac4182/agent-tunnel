@@ -125,9 +125,12 @@ Rejections are local JSON-RPC errors with fixed messages. They never echo header
 - stdout carries newline-delimited JSON-RPC. Each line must be one strict object within the JSON limit; otherwise the child is killed and its exchanges are interrupted.
 - stderr is drained, and only its byte count is kept.
 - **Process group.** The child runs in its own process group (`process_group(0)`). Every end of its life sends `SIGKILL` to the whole group through `rustix`, so the crate keeps `forbid(unsafe_code)`. That covers a kill on a dropped handle or cancellation, a crash, a normal exit and a session end. A wrapper such as `npx`, `uvx` or a shell script therefore cannot orphan the real server.
-  - **Boundary.** A descendant that leaves the group (`setsid`, `setpgid`, or a daemonizing double fork) is not killed.
+  - **Boundary.** A descendant that leaves the group (`setsid`, `setpgid`, or a daemonizing double fork) is not killed. This is **measured, not assumed**: `crates/tunnel-mcp-fixture/tests/process_residue.rs` starts such a descendant by both routes, confirms it really left the group, and reads it back out of the process table alive afterwards.
   - **Ordering.** The group is signalled after the leader is reaped. POSIX does not reuse a process-group ID while any member lives.
-  - **Tracked.** The residue is recorded as M3-09 in [tasks.md](tasks.md).
+- **Parent-death sentinel.** The group kill above only happens on an end of life **the device process lives to see**. A `SIGKILL`, a `process::exit` or a crash runs no `Drop` at all, so nobody signalled the group and even an in-group helper — the `npx` wrapper's real server, the case the group kill exists for — was orphaned and survived. Each child is therefore also watched by a `tunnel-deadman` sentinel: a sibling process, in a process group of its own, holding the read end of a pipe the device holds the write end of. When the device dies for any reason the kernel closes that descriptor, the sentinel wakes on end of file and signals the group. It is stood down only after the child has been killed and reaped, and the stand-down is counted from the sentinel's own exit status rather than from the device having asked.
+  - **What it does not do.** It does **not** widen the group kill's reach. It sends the same group signal from a different process, so a descendant that left the group escapes it exactly as it escapes the device. Reach and trigger are separate holes with separate fixes, and only the trigger is closed here.
+- **Not contained, by platform.** A detaching descendant is contained by a kernel boundary or not at all: cgroup v2 (`cgroup.kill`) on Linux, a job object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` on Windows, and on **macOS nothing in-process** — short of a sandbox, container or VM, an MCP server that daemonizes leaves processes running after the export ends. macOS is the only host any of this has run on. Operators running a server that detaches must treat its descendants as their own to clean up.
+  - **Tracked.** The residue is recorded as M3-09 in [tasks.md](tasks.md), with its ACP sibling at M8-C07.
 
 **2026-07-28 over stdio.**
 
@@ -178,7 +181,7 @@ Rejections are local JSON-RPC errors with fixed messages. They never echo header
 - Server→client log notifications (`notifications/message`) and per-request cancellation over the real cluster; both are covered by M3-03 below.
 - `Last-Event-ID` resume. The stdio bridge emits no event IDs, so a legacy stream cannot resume; an HTTP backend's own resume is forwarded but untested (M3-10).
 - Browser `Origin` handling, OAuth protected-resource discovery and audience checks (M3-11). HTTP/2 consumers (M3-12).
-- Descendants that leave the child's process group (M3-09). Non-Unix hosts, where the group kill is absent and the end-to-end tests are `cfg(unix)` (M3-12).
+- Descendants that leave the child's process group. Now **measured** rather than assumed, and still not contained on macOS: see the process policy above and M3-09. Non-Unix hosts, where both the group kill and the sentinel are absent and the end-to-end tests are `cfg(unix)` (M3-12).
 - Throughput and cost of one child per 2026 request with real servers.
 
 ## Pinned in code (M3-03)
