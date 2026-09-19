@@ -386,8 +386,11 @@ impl Session {
     /// any primitive is decided, so the session never formed an opinion about
     /// whether it was a mutation and this does not invent one.
     ///
-    /// Pure: it reads the session and changes nothing, so it may be asked
-    /// before or after a refusal and answers the same either way.
+    /// Pure: it reads the session and changes nothing. That does **not** make
+    /// it insensitive to when it is asked — a refusal may close the session,
+    /// and a closed session classifies to `Err(Closed)` and so answers `None`.
+    /// Ask it before the refusal is delivered, which is what the call site in
+    /// `Provider::accept` does and why it does it there.
     #[must_use]
     pub fn required_primitives(&self, frame: &Frame) -> Option<Primitives> {
         self.classify(frame)

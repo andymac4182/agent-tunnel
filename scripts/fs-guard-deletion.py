@@ -1591,6 +1591,10 @@ GATE4_CASES: list[tuple[str, list[Edit]]] = [
         # gate 5's own `Primitive::is_mutating`, and this defeats it while
         # leaving the counter moving, so only the cases that assert a
         # *non*-mutating refusal is **not** counted can catch it.
+        # The substitution widens the predicate to "classified at all", which
+        # is broader than the naive opcode fix rather than equal to it -- it
+        # subsumes that fix, so reddening under it is the stronger signal, but
+        # the name promises something narrower than the mutation actually is.
         "an admission refusal is classified from its primitives, not its opcode",
         [
             (

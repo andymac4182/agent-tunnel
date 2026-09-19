@@ -515,6 +515,14 @@ impl<A: Authority> Provider<A> {
     /// not open for writing is refused for its fid state before any primitive
     /// is decided, so nothing here ever decided it was a write. Task row M4-20
     /// records that residue.
+    ///
+    /// **It counts every refusal, not only a capability refusal.** This runs on
+    /// any `Err` from `request`, so a classifiable mutation refused *after* the
+    /// grant allowed it — a reservation failure such as a tag collision, under
+    /// a writable grant — is counted here too. That is the counter's documented
+    /// wording, "refused before the host was touched", read literally: the host
+    /// was not touched in that case either. It is broader than the capability
+    /// refusals M4-16 was filed about, and is deliberate rather than incidental.
     fn note_refused_mutation(&mut self, frame: &Frame) {
         if self
             .session
