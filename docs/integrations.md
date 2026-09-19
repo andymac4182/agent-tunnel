@@ -167,33 +167,53 @@ leave optional network, JavaScript and Python execution off initially.
 
 ## CUA compatibility targets
 
-The inspected CUA revision is
-[`bd4c10020cd7cac07c0d19b0f53ba4b007fbcb15`](https://github.com/trycua/cua/tree/bd4c10020cd7cac07c0d19b0f53ba4b007fbcb15).
-It contains two useful surfaces. Pin and test each independently; a shared
-repository does not make their command schemas or MCP protocol support identical.
+The pinned CUA artifact is the published distribution **`cua-computer-server`
+0.3.46**, built from
+[`c07d287af35cf37cfcf94290c46db2720ec47822`](https://github.com/trycua/cua/tree/c07d287af35cf37cfcf94290c46db2720ec47822/libs/python/computer-server).
+[sources.md](sources.md#just-bash-and-cua) records the wheel and sdist digests,
+the acquisition method and the Python requirement (3.12-3.13). The permalinks
+below point at that release commit. They previously pointed at
+`bd4c10020cd7cac07c0d19b0f53ba4b007fbcb15`, a development commit whose manifest
+declares 0.3.45; every `main.py` line range cited here is byte-identical between
+the two, and `sources.md` records that reconciliation.
 
-1. **Computer Server:** optional Python sidecar with local HTTP `/cmd`, WebSocket
-   `/ws`, status/discovery endpoints, and optional MCP `/mcp`. Use this for an
-   initial typed `computer.v1` adapter without reimplementing OS automation.
-   [Server documentation](https://github.com/trycua/cua/blob/bd4c10020cd7cac07c0d19b0f53ba4b007fbcb15/libs/python/computer-server/README.md).
-2. **Cua Driver:** native Rust runtime with `cua-driver mcp` over stdio and an
-   application SDK. Expose the configured stdio command through the MCP adapter
-   as another supported backend profile. Evaluate direct Rust SDK embedding after
-   lifecycle, distribution and OS permission attribution are proven. The inspected
-   [Rust workspace](https://github.com/trycua/cua/blob/bd4c10020cd7cac07c0d19b0f53ba4b007fbcb15/libs/cua-driver/rust/Cargo.toml)
-   declares `0.24.0`; this is not a claim that the release was installed or tested.
-   [Driver integration documentation](https://github.com/trycua/cua/blob/bd4c10020cd7cac07c0d19b0f53ba4b007fbcb15/libs/cua-driver/README.md).
+**There is one pinned profile, not two.** Earlier revisions of this section
+listed a native Rust **Cua Driver** as a second candidate profile, citing a
+workspace `Cargo.toml` that declares `0.24.0`. That premise was wrong and is
+**withdrawn, not deferred**: `cua-driver` is not a published crate
+(`index.crates.io` returns 404 for it, and 200 for a control crate from the same
+host). It is an optional extra of the Python server — 0.3.46 declares
+`driver = ["cua-driver>=0.22.2,<0.23.0"]`, a PyPI distribution, in a range that
+excludes the `0.24.0` previously quoted — and is reached through the server's own
+`computer_server/handlers/cua_driver.py` backend, behind the same `/cmd` surface.
+Do not plan a separate stdio or Rust-SDK profile for it.
+
+**Computer Server:** optional Python sidecar with local HTTP `/cmd`, WebSocket
+`/ws`, status/discovery endpoints, and optional MCP `/mcp`. Use this for an
+initial `computer.v1` adapter without reimplementing OS automation.
+[Server documentation](https://github.com/trycua/cua/blob/c07d287af35cf37cfcf94290c46db2720ec47822/libs/python/computer-server/README.md).
+`computer.v1` is an [`http-forward/1`](http-forwarding.md) profile carrying its
+own schema, not a typed gateway of its own. Only `/cmd` is pinned; `/mcp`,
+`/pty`, `/responses` and `/playwright_exec` are outside it.
 
 ### Computer Server adapter
 
-`POST /cmd` accepts `{"command":"screenshot","params":{}}`. In the inspected
-[HTTP implementation](https://github.com/trycua/cua/blob/bd4c10020cd7cac07c0d19b0f53ba4b007fbcb15/libs/python/computer-server/computer_server/main.py#L763-L872),
+`POST /cmd` accepts `{"command":"screenshot","params":{}}`. In the released
+0.3.46
+[HTTP implementation](https://github.com/trycua/cua/blob/c07d287af35cf37cfcf94290c46db2720ec47822/libs/python/computer-server/computer_server/main.py#L763-L872),
 the response is `data: <JSON>\n\n` framing with `text/plain` media type. Parse that
 framing with byte/event limits; a successful HTTP status can still contain
 `success:false`. Do not assume a normal JSON response or a conventional
 `text/event-stream` response. Prefer one `/cmd` exchange per logical request.
+Both properties were confirmed against the released sdist, not only the
+development tree; upstream's own auth-availability test asserts a 200 whose body
+text contains `success`. Two further shapes the adapter must handle: the success
+payload is `{"success": True, **result}`, so a handler result carrying its own
+`success` key wins; and pre-dispatch failures — malformed body, missing or
+unknown command, cloud auth — are raised as `HTTPException` and arrive as real
+400/401 responses with **no** `data:` framing at all.
 
-The local [`/ws` implementation](https://github.com/trycua/cua/blob/bd4c10020cd7cac07c0d19b0f53ba4b007fbcb15/libs/python/computer-server/computer_server/main.py#L627-L760)
+The local [`/ws` implementation](https://github.com/trycua/cua/blob/c07d287af35cf37cfcf94290c46db2720ec47822/libs/python/computer-server/computer_server/main.py#L627-L760)
 processes commands sequentially and does not echo a tunnel request ID. If used,
 allow one in-flight command per local socket and track correlation in the Rust
 adapter. Rotation of the outer data WebSocket must leave the local operation
@@ -210,8 +230,16 @@ result was lost.
 | `type_text`, `press_key`, `hotkey` | Same command names; preserve keyboard layout behavior |
 | `accessibility_tree` | `get_accessibility_tree`, only when backed by real supported data |
 
-The [command registry](https://github.com/trycua/cua/blob/bd4c10020cd7cac07c0d19b0f53ba4b007fbcb15/libs/python/computer-server/computer_server/main.py#L393-L477)
+The [command registry](https://github.com/trycua/cua/blob/c07d287af35cf37cfcf94290c46db2720ec47822/libs/python/computer-server/computer_server/main.py#L393-L477)
 also exposes shell, host files, clipboard, window management and other features.
+All nine operations in the table above map to command names that 0.3.46 actually
+registers, so the table is unchanged by the pin. Two released details it does not
+capture: the registry is filtered by `backend_policy.exposed_command_registry`,
+which under `CUA_BACKEND=vnc` narrows the map to a VNC-remote subset, so the
+advertised set is backend-dependent and `/commands` must be read per backend
+rather than assumed; and twelve aliases exist (`click`, `type`, `key`, `shell`,
+`exec` and the file-command spellings). Send canonical names and do not depend on
+alias resolution.
 Do not forward arbitrary command names: the initial allowlist is the table above.
 Our VFS has its own provider and confinement, rather than inheriting CUA's host
 file commands. Capability discovery is the intersection of local configuration,
@@ -228,8 +256,14 @@ results; do not silently escalate scope, change backend, or steal focus.
 
 Computer Server defaults to `127.0.0.1`. In the inspected `/cmd` and `/ws` paths,
 local mode does not require authentication when `CONTAINER_NAME` is absent; the
-upstream [auth availability tests](https://github.com/trycua/cua/blob/bd4c10020cd7cac07c0d19b0f53ba4b007fbcb15/libs/python/computer-server/tests/test_auth_availability.py)
-explicitly preserve this behavior. Cloud mode uses CUA-specific container/API-key
+upstream [auth availability tests](https://github.com/trycua/cua/blob/c07d287af35cf37cfcf94290c46db2720ec47822/libs/python/computer-server/tests/test_auth_availability.py)
+explicitly preserve this behavior. Those tests ship in the 0.3.46 sdist (not in
+the wheel) and are byte-identical to the inspected tree's. They also record a
+setting this section previously omitted: `UNAVAILABLE_WITHOUT_CONTAINER_NAME`,
+which, when truthy with `CONTAINER_NAME` unset, makes the server answer 503 (or
+`UNAVAILABLE_WITHOUT_CONTAINER_NAME_RESPONSE_STATUS_CODE`). A supervising device
+must treat that 503 as "backend deliberately unavailable", not as a transient
+fault to retry through. Cloud mode uses CUA-specific container/API-key
 authentication (`X-Container-Name` and `X-API-Key` on `/cmd`), which is separate
 from our relay identity and grants. Do not forward relay tokens into CUA or
 advertise upstream cloud auth as generic local bearer-token protection.
@@ -250,11 +284,18 @@ image/text payloads are excluded from routine logs.
 | VNC Computer Server | Screen/pointer/keyboard only; host shell, files, PTY, browser and window surfaces are refused by upstream policy. |
 | Computer Server with Cua Driver backend | Separate held-key/mouse-down/up calls are unsupported; capture scope and escalation policy are explicit. Android is not supported by this backend. |
 
-Sources: [driver lifecycle and permissions](https://github.com/trycua/cua/blob/bd4c10020cd7cac07c0d19b0f53ba4b007fbcb15/libs/cua-driver/README.md),
+Sources that ship in the pinned 0.3.46 distribution:
+[legacy Linux handler](https://github.com/trycua/cua/blob/c07d287af35cf37cfcf94290c46db2720ec47822/libs/python/computer-server/computer_server/handlers/linux.py#L1-L80),
+[backend selection](https://github.com/trycua/cua/blob/c07d287af35cf37cfcf94290c46db2720ec47822/libs/python/computer-server/computer_server/handlers/factory.py),
+[Cua Driver backend handler](https://github.com/trycua/cua/blob/c07d287af35cf37cfcf94290c46db2720ec47822/libs/python/computer-server/computer_server/handlers/cua_driver.py).
+
+Sources that do **not** ship in it, and so are monorepo reading rather than
+pinned artifact — left at the 2026-09-09 development commit and not repointed,
+because no release commit of ours governs them:
+[driver lifecycle and permissions](https://github.com/trycua/cua/blob/bd4c10020cd7cac07c0d19b0f53ba4b007fbcb15/libs/cua-driver/README.md),
 [Windows runtime requirements](https://github.com/trycua/cua/blob/bd4c10020cd7cac07c0d19b0f53ba4b007fbcb15/libs/cua-driver/rust/Skills/cua-driver/WINDOWS.md#L471-L528),
-[legacy Linux handler](https://github.com/trycua/cua/blob/bd4c10020cd7cac07c0d19b0f53ba4b007fbcb15/libs/python/computer-server/computer_server/handlers/linux.py#L1-L80),
-[native platform crates](https://github.com/trycua/cua/blob/bd4c10020cd7cac07c0d19b0f53ba4b007fbcb15/libs/cua-driver/rust/README.md),
-[backend selection](https://github.com/trycua/cua/blob/bd4c10020cd7cac07c0d19b0f53ba4b007fbcb15/libs/python/computer-server/computer_server/handlers/factory.py).
+[native platform crates](https://github.com/trycua/cua/blob/bd4c10020cd7cac07c0d19b0f53ba4b007fbcb15/libs/cua-driver/rust/README.md).
+The platform limits they support are unverified against any released artifact.
 
 ## Integration acceptance gates
 
