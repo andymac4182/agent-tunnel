@@ -61,27 +61,62 @@ pub enum Dispatch {
     NotDispatched(NotDispatched),
     /// The backend saw it. Whether it succeeded is [`Completion`].
     Dispatched(Completion),
+    /// **The device answered without contacting the backend, and the answer is
+    /// correct.** Not a refusal and not a dispatch.
+    ///
+    /// This third arm exists because the first review of this chunk found the
+    /// two-arm version telling a lie: `describe` is answered entirely from the
+    /// negotiated capability set, and reporting it as
+    /// [`Dispatch::Dispatched`] made [`Dispatch::reached_the_backend`] return
+    /// `true` for an operation that never sent a byte — falsifying the very
+    /// invariant this module exists to state, in the one case the fault table
+    /// did not cover.
+    ///
+    /// Collapsing it into [`Dispatch::NotDispatched`] would have been the
+    /// other lie: nothing was refused, and the consumer has its answer.
+    ///
+    /// **This matters well beyond `describe`.** Chunk 3's lease query is
+    /// answered the same way — from device-side state, with no backend
+    /// exchange — and would have inherited exactly this defect.
+    AnsweredLocally(Value),
 }
 
 impl Dispatch {
     /// Whether a consumer may send this request again.
     ///
     /// The single most load-bearing method in the crate. It is `true` only for
-    /// [`Dispatch::NotDispatched`] and for [`Completion::Failed`], and there
-    /// is deliberately no way for a caller to override it.
+    /// [`Dispatch::NotDispatched`], for [`Completion::Failed`] and for
+    /// [`Dispatch::AnsweredLocally`], and there is deliberately no way for a
+    /// caller to override it.
+    ///
+    /// A locally-answered operation is safe to repeat because **no effect
+    /// happened anywhere** — not on the backend, and not on the device. That
+    /// is a different reason from a `Failed`, whose effect provably did not
+    /// happen, and both are different from an `Unknown`.
     #[must_use]
     pub const fn retry_is_safe(&self) -> bool {
         match self {
-            Self::NotDispatched(_) => true,
+            Self::NotDispatched(_) | Self::AnsweredLocally(_) => true,
             Self::Dispatched(Completion::Failed { .. }) => true,
             Self::Dispatched(Completion::Ok(_) | Completion::Unknown(_)) => false,
         }
     }
 
     /// Whether the backend saw the command. Distinct from success.
+    ///
+    /// **The invariant this method carries:** for any exchange, this is `true`
+    /// exactly when the backend recorded one ledger entry for it.
+    /// `crates/tunnel-cua-fixture/tests/unknown_versus_not_dispatched.rs`
+    /// asserts it row by row, `describe` included.
     #[must_use]
     pub const fn reached_the_backend(&self) -> bool {
         matches!(self, Self::Dispatched(_))
+    }
+
+    /// Whether the device answered this without a backend exchange.
+    #[must_use]
+    pub const fn answered_locally(&self) -> bool {
+        matches!(self, Self::AnsweredLocally(_))
     }
 }
 

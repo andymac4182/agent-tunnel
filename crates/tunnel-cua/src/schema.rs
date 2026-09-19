@@ -26,9 +26,11 @@
 //! {"version": "computer.v1", "operation": "capture", "outcome": "ok", "result": {...}}
 //! ```
 //!
-//! `outcome` is one of `ok`, `failed` or `unknown`, which are the three arms of
-//! [`crate::outcome::Completion`] and nothing else. There is no fourth arm and
-//! no absent-means-success rule: see [`crate::outcome`] for why that matters.
+//! `outcome` is one of `ok`, `failed`, `unknown`, `not_dispatched` or
+//! `answered_locally` — a closed set mirroring [`crate::outcome::Dispatch`],
+//! with no absent-means-success rule. See [`crate::outcome`] for why the
+//! not-dispatched/unknown split matters, and [`ResponseOutcome`] for why the
+//! wire format has to carry it rather than collapsing it into `failed`.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -221,11 +223,27 @@ fn validate_params(
 
 /// The `outcome` member of a `computer.v1` response.
 ///
-/// Three arms, closed. Serialized in lowercase, and **never** omitted: a
-/// response with no `outcome` is not a success, and this enum has no default
-/// so that no `#[serde(default)]` can quietly make it one.
+/// **Five arms, closed**, mirroring [`crate::outcome::Dispatch`] on the wire.
+/// Serialized in lowercase, and **never** omitted: a response with no
+/// `outcome` is not a success, and this enum has no default so that no
+/// `#[serde(default)]` can quietly make it one.
+///
+/// # Why there is a fourth arm
+///
+/// The first review of this chunk found the three-arm version rendering a
+/// pre-dispatch refusal as `Failed` — whose own contract is "dispatched and
+/// failed". That collapsed, at the boundary a consumer actually sees, the
+/// exact distinction this crate exists to keep: whether the backend saw the
+/// command. `retryable: true` kept it safe, so it was a contract defect rather
+/// than a double-click risk, but a consumer reading `failed` had no way to
+/// learn that nothing had been sent.
+///
+/// `not_dispatched` is therefore its own value. Retryability remains an
+/// explicit field rather than something a consumer derives from the outcome:
+/// `failed` and `not_dispatched` are both retryable for **different reasons**,
+/// and a consumer that wants to log which one happened can.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum ResponseOutcome {
     /// The operation was dispatched and succeeded.
     Ok,
@@ -234,6 +252,13 @@ pub enum ResponseOutcome {
     /// The operation was dispatched and its effect is **not known**. Not
     /// retryable. See [`crate::outcome::Completion::Unknown`].
     Unknown,
+    /// The operation never reached the backend: it was refused by validation,
+    /// by the allowlist, by the capability set, or by the backend before
+    /// dispatch. Nothing happened anywhere, so a retry is safe.
+    NotDispatched,
+    /// The device answered without contacting the backend, and the answer is
+    /// correct. See [`crate::outcome::Dispatch::AnsweredLocally`].
+    AnsweredLocally,
 }
 
 /// A `computer.v1` response, as the device-side facade renders it.
@@ -318,18 +343,37 @@ impl Response {
 
     /// A refusal that happened before dispatch. The operation name is the one
     /// the consumer sent, which may not be an [`Operation`] at all.
+    ///
+    /// Renders as `outcome: "not_dispatched"`, **not** as `failed`: the
+    /// backend never saw this, and a consumer must be able to learn that from
+    /// the wire rather than infer it from a retryability flag.
     #[must_use]
     pub fn not_dispatched(operation: &str, code: &str, message: &str) -> Self {
         Self {
             version: crate::SCHEMA_VERSION.to_owned(),
             operation: operation.to_owned(),
-            outcome: ResponseOutcome::Failed,
+            outcome: ResponseOutcome::NotDispatched,
             result: None,
             error: Some(ResponseError {
                 code: code.to_owned(),
                 message: message.to_owned(),
                 retryable: true,
             }),
+        }
+    }
+
+    /// An operation the device answered without contacting the backend.
+    ///
+    /// Carries a result, like [`Response::ok`], because the answer is a real
+    /// answer -- and a distinct outcome, because the backend was not involved.
+    #[must_use]
+    pub fn answered_locally(operation: Operation, result: Value) -> Self {
+        Self {
+            version: crate::SCHEMA_VERSION.to_owned(),
+            operation: operation.name().to_owned(),
+            outcome: ResponseOutcome::AnsweredLocally,
+            result: Some(result),
+            error: None,
         }
     }
 }

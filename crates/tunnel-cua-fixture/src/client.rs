@@ -27,7 +27,8 @@ use tunnel_cua::operation::Operation;
 use tunnel_cua::outcome::{
     Completion, Dispatch, NotDispatched, UnknownReason, classify_backend_response,
 };
-use tunnel_cua::schema::{self, Params, Request};
+use tunnel_cua::plan::{Planned, discovery_payload, plan};
+use tunnel_cua::schema::Request;
 
 use crate::CMD_PATH;
 
@@ -83,23 +84,28 @@ impl Dispatcher {
 
     /// Validate a consumer request body and dispatch it if everything allows.
     ///
-    /// The whole point of the function is the order of what follows.
+    /// **The ordering is not written here.** It lives in
+    /// [`tunnel_cua::plan::plan`], in the production crate, so a future
+    /// device-side facade inherits it rather than re-deriving it. This
+    /// function is the part that is genuinely transport: take the plan, and
+    /// either send it or answer it locally.
     pub async fn handle(&self, body: &[u8], limit: u64) -> Dispatch {
         // ---- above the dispatch boundary: nothing has been sent -------------
-        let request = match schema::validate_request(body, limit) {
-            Ok(request) => request,
-            Err(error) => return Dispatch::NotDispatched(NotDispatched::Schema(error)),
+        let planned = match plan(body, limit, &self.permitted) {
+            Ok(planned) => planned,
+            Err(refused) => return refused,
         };
-        if !self.permits(request.operation()) {
-            return Dispatch::NotDispatched(NotDispatched::NotPermitted);
-        }
-        let Some(command) = request.operation().upstream_command() else {
-            // `describe` dispatches nothing of its own. It is answered from
-            // the negotiated set, which is the only honest thing it could be
-            // answered from: a config echo would be the trap.
-            return Dispatch::Dispatched(Completion::Ok(self.describe()));
+        let payload = match planned {
+            // `describe` is answered from the negotiated set -- the only
+            // honest thing it could be answered from, since a config echo
+            // would be the trap. It is **not** a dispatch, and reporting it as
+            // one made `reached_the_backend()` true for an operation that sent
+            // no bytes.
+            Planned::AnswerLocally { .. } => {
+                return Dispatch::AnsweredLocally(self.describe());
+            }
+            Planned::Dispatch { payload, .. } => payload,
         };
-        let payload = command_payload(command, request.params());
 
         // ---- the dispatch boundary -----------------------------------------
         // Past this line the backend may have seen the command, so no failure
@@ -108,7 +114,29 @@ impl Dispatcher {
         self.send(&payload).await
     }
 
-    /// The `describe` answer: the negotiated set and nothing else.
+    /// Read the backend's `version` response, which is where
+    /// `desktop_capture_authorized` lives.
+    ///
+    /// Separate from [`Dispatcher::handle`] because `version` is not a
+    /// `computer.v1` operation: it is issued during capability discovery, on
+    /// nobody's behalf, and it goes through
+    /// [`tunnel_cua::plan::discovery_payload`] which admits only the commands
+    /// `describe` reads.
+    pub async fn read_version(&self) -> Dispatch {
+        match discovery_payload(tunnel_cua::capability::CAPTURE_AUTHORITY_COMMAND) {
+            Err(refusal) => Dispatch::NotDispatched(refusal),
+            Ok(payload) => self.send(&payload).await,
+        }
+    }
+
+    /// The `describe` answer: the negotiated set, and facts this dispatcher
+    /// can actually observe.
+    ///
+    /// `endpoint_is_loopback` is **derived from the endpoint**, not written as
+    /// a literal. It is tautologically true given that
+    /// [`BackendEndpoint`] cannot hold anything else -- but a hardcoded `true`
+    /// asserting a safety property is the config-echo shape this chunk spends
+    /// its length policing, and a derived one costs nothing.
     fn describe(&self) -> Value {
         json!({
             "operations": self
@@ -116,7 +144,7 @@ impl Dispatcher {
                 .iter()
                 .map(|operation| operation.name())
                 .collect::<Vec<_>>(),
-            "endpoint_is_loopback": true,
+            "endpoint_is_loopback": self.endpoint.address().ip().is_loopback(),
         })
     }
 
@@ -148,6 +176,17 @@ impl Dispatcher {
         );
         // Written and flushed as one unit. Until this returns Ok, nothing was
         // fully delivered and the request is safely `NotReached`.
+        //
+        // **The assumption this rests on, stated rather than left implicit.**
+        // Treating a partial write as `NotDispatched` is only sound because
+        // the backend will not act on a truncated request: the pinned server
+        // reads a `Content-Length`-framed body and dispatches to the command
+        // registry **after** the body is complete, so bytes that never arrived
+        // cannot have been parsed into a command. A backend that dispatched
+        // incrementally -- a chunked or streaming command surface -- would
+        // break this, and `/ws` is exactly such a surface. It is deferred
+        // (`cua_pin::WEBSOCKET_DEFERRAL_RECORDED_AS`), and a chunk that takes
+        // it up must revisit this mapping rather than inherit it.
         stream
             .write_all(request.as_bytes())
             .await
@@ -187,18 +226,6 @@ impl FailureStage {
             Self::Reading => {
                 Dispatch::Dispatched(Completion::Unknown(UnknownReason::TransportLost))
             }
-        }
-    }
-}
-
-/// The `/cmd` request body for one operation.
-fn command_payload(command: &str, params: &Params) -> Value {
-    match params {
-        Params::Capture { display } | Params::ScreenInfo { display } => {
-            json!({"command": command, "params": {"display": display}})
-        }
-        Params::Describe | Params::CursorPosition => {
-            json!({"command": command, "params": {}})
         }
     }
 }

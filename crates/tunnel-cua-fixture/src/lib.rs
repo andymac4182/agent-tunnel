@@ -171,9 +171,22 @@ pub enum Fault {
     /// Record the ledger entry, then answer 200 with a framed payload that has
     /// **no `success` member at all**. Absent is not true.
     SuccessAbsent,
-    /// Record the ledger entry, then answer 200 with framed JSON in which the
-    /// handler's own result carries `success: false`, overriding the envelope
-    /// — the `{"success": True, **result}` shape the pin records.
+    /// Record the ledger entry, then answer 200 with a framed payload that
+    /// **looks like a successful capture** but whose `success` is `false` —
+    /// the `{"success": True, **result}` shape the pin records, after the
+    /// merge.
+    ///
+    /// **This cannot be byte-distinct from [`Fault::SuccessFalse`] in the way
+    /// that matters, and the first review was right to say so.** The envelope
+    /// merge happens inside the *server*: by the time anything reaches a
+    /// socket there is exactly one `success` member, and a client cannot tell
+    /// an overriding handler result from a plain failure. That is the whole
+    /// hazard — there is no wire signal to key on — so the fault differs in
+    /// the only way it can, by carrying a success-shaped payload (`image`,
+    /// dimensions, no `error`) instead of an error string. What the test
+    /// built on it shows is narrower than "the override is detected": it is
+    /// that a payload which reads as a success in every other respect is still
+    /// classified as a failure on the strength of `success` alone.
     ResultOverridesEnvelope,
 }
 
@@ -231,11 +244,47 @@ pub const REGISTERED_COMMANDS: &[&str] = &[
     "hotkey",
 ];
 
+/// What the fixture's `version` response says about capture authority.
+///
+/// **`None` is the default, and it is the faithful one.** The released 0.3.46
+/// server made `desktop_capture_authorized` conditional on `hasattr`, so on
+/// the supported 0.22.x SDK it **omits the key entirely**. A fixture that
+/// emitted `false` by default would make every absent-is-not-denied test
+/// vacuous.
+///
+/// `Some(false)` exists so the `Denied` arm of
+/// [`tunnel_cua::capability::CaptureAuthority`] can be exercised at all. No
+/// real backend has been observed emitting it here; task row M5-C03 records
+/// that arm as **modelled, not measured**.
+#[derive(Clone, Debug, Default)]
+pub struct CaptureAuthorityKnob {
+    value: Arc<Mutex<Option<bool>>>,
+}
+
+impl CaptureAuthorityKnob {
+    /// Emit `desktop_capture_authorized` with this value, or omit the key
+    /// entirely for `None`.
+    pub fn set(&self, value: Option<bool>) {
+        *self
+            .value
+            .lock()
+            .expect("the knob mutex is never poisoned by fixture code") = value;
+    }
+
+    fn get(&self) -> Option<bool> {
+        *self
+            .value
+            .lock()
+            .expect("the knob mutex is never poisoned by fixture code")
+    }
+}
+
 /// A running fixture backend.
 pub struct FixtureBackend {
     address: SocketAddr,
     ledger: Ledger,
     faults: Faults,
+    capture_authority: CaptureAuthorityKnob,
     handle: tokio::task::JoinHandle<()>,
 }
 
@@ -253,11 +302,18 @@ impl FixtureBackend {
         let address = listener.local_addr()?;
         let ledger = Ledger::new();
         let faults = Faults::new();
-        let handle = tokio::spawn(serve(listener, ledger.clone(), faults.clone()));
+        let capture_authority = CaptureAuthorityKnob::default();
+        let handle = tokio::spawn(serve(
+            listener,
+            ledger.clone(),
+            faults.clone(),
+            capture_authority.clone(),
+        ));
         Ok(Self {
             address,
             ledger,
             faults,
+            capture_authority,
             handle,
         })
     }
@@ -278,21 +334,33 @@ impl FixtureBackend {
         &self.faults
     }
 
+    /// What this backend's `version` response says about capture authority.
+    #[must_use]
+    pub const fn capture_authority(&self) -> &CaptureAuthorityKnob {
+        &self.capture_authority
+    }
+
     /// Stop serving.
     pub fn stop(self) {
         self.handle.abort();
     }
 }
 
-async fn serve(listener: TcpListener, ledger: Ledger, faults: Faults) {
+async fn serve(
+    listener: TcpListener,
+    ledger: Ledger,
+    faults: Faults,
+    capture_authority: CaptureAuthorityKnob,
+) {
     loop {
         let Ok((stream, _)) = listener.accept().await else {
             return;
         };
         let ledger = ledger.clone();
         let faults = faults.clone();
+        let capture_authority = capture_authority.clone();
         tokio::spawn(async move {
-            let _ = handle_connection(stream, ledger, faults).await;
+            let _ = handle_connection(stream, ledger, faults, capture_authority).await;
         });
     }
 }
@@ -303,6 +371,7 @@ async fn handle_connection(
     mut stream: TcpStream,
     ledger: Ledger,
     faults: Faults,
+    capture_authority: CaptureAuthorityKnob,
 ) -> std::io::Result<()> {
     let Some((path, body)) = read_request(&mut stream).await? else {
         return Ok(());
@@ -318,7 +387,7 @@ async fn handle_connection(
             )
             .await
         }
-        CMD_PATH => handle_cmd(&mut stream, &ledger, &faults, &body).await,
+        CMD_PATH => handle_cmd(&mut stream, &ledger, &faults, &capture_authority, &body).await,
         _ => {
             write_response(
                 &mut stream,
@@ -335,6 +404,7 @@ async fn handle_cmd(
     stream: &mut TcpStream,
     ledger: &Ledger,
     faults: &Faults,
+    capture_authority: &CaptureAuthorityKnob,
     body: &[u8],
 ) -> std::io::Result<()> {
     // Shape 3: a malformed body is a pre-dispatch `HTTPException`, unframed.
@@ -398,26 +468,54 @@ async fn handle_cmd(
         Fault::ResultOverridesEnvelope => {
             // `{"success": True, **result}` with a result carrying its own
             // `success`: on the wire there is one member, and it is the
-            // handler's.
-            framed(stream, json!({"success": false, "image": "synthetic"})).await
+            // handler's. Everything else here is success-shaped, so only
+            // `success` distinguishes it.
+            framed(
+                stream,
+                json!({
+                    "success": false,
+                    "width": SCREEN_WIDTH,
+                    "height": SCREEN_HEIGHT,
+                    "image_hex": "00",
+                }),
+            )
+            .await
         }
-        Fault::None => framed(stream, success_payload(command, display)).await,
+        Fault::None => {
+            framed(
+                stream,
+                success_payload(command, display, capture_authority.get()),
+            )
+            .await
+        }
         Fault::PreDispatchRejection { .. } | Fault::Unavailable => unreachable!("returned above"),
     }
 }
 
 /// The successful result for each read-only command.
-fn success_payload(command: &str, display: Option<u32>) -> Value {
+fn success_payload(command: &str, display: Option<u32>, capture_authority: Option<bool>) -> Value {
     let display = display.unwrap_or(0);
     match command {
-        "version" => json!({
-            "success": true,
-            "version": FIXTURE_VERSION,
-            // `desktop_capture_authorized` is **deliberately absent**, which is
+        "version" => {
+            // `desktop_capture_authorized` is **absent by default**, which is
             // what the released server does on the supported 0.22.x SDK.
-            // Adding it here would make every absent-is-not-false test vacuous.
-            "desktop_unlocked": true,
-        }),
+            // Emitting it unconditionally would make every
+            // absent-is-not-denied test vacuous.
+            let mut payload = json!({
+                "success": true,
+                "version": FIXTURE_VERSION,
+                "desktop_unlocked": true,
+            });
+            if let Some(authorized) = capture_authority
+                && let Some(object) = payload.as_object_mut()
+            {
+                object.insert(
+                    tunnel_cua::capability::CAPTURE_AUTHORITY_MEMBER.to_owned(),
+                    Value::Bool(authorized),
+                );
+            }
+            payload
+        }
         "get_screen_size" => json!({
             "success": true,
             "width": SCREEN_WIDTH,
@@ -436,7 +534,13 @@ fn success_payload(command: &str, display: Option<u32>) -> Value {
                 "success": true,
                 "width": SCREEN_WIDTH,
                 "height": SCREEN_HEIGHT,
-                "seed": seed,
+                // **The seed is deliberately not on the wire.** An earlier
+                // revision shipped it, which invited a future test to verify
+                // an image against the seed that travelled with it -- the
+                // precise thing `marker::verify` refuses to do, and the reason
+                // its own seed field is never consulted. A test must know
+                // which display it asked for and derive the seed itself.
+                //
                 // Hex rather than base64, so the fixture needs no encoder
                 // dependency and a test can decode it with `from_hex` below.
                 "image_hex": to_hex(&image),

@@ -32,6 +32,24 @@
 //! [`CaptureAuthority::Unknown`]. Reading absence as "denied" is a live bug
 //! waiting to happen: a device that did so would refuse capture on every
 //! correctly-permissioned host running the supported SDK.
+//!
+//! **And it is read from the right response.** The key is a member of the
+//! **`version`** payload, not of `get_screen_size` or `get_cursor_position`.
+//! An earlier revision of this module derived capture authority from the probe
+//! result, which meant that against the pinned backend it could only ever be
+//! `Unknown` and the capture gate at [`negotiate`] could never refuse — an
+//! unreachable rule, the same defect class as the dead marker check deleted
+//! from `marker.rs` in this chunk, and caught by the same review. It is now a
+//! separate input to [`UpstreamSupport::new`], produced by
+//! [`CaptureAuthority::from_version_reading`] from a dispatched `version`
+//! command.
+//!
+//! **Two consequences to hold together.** The key is absent by default *and*
+//! it lives on a response this profile only reads during discovery. So
+//! [`CaptureAuthority::Denied`] is **modelled, not measured**: no real backend
+//! has been seen to emit `false`, the fixture is what exercises that arm, and
+//! task row M5-C03 says so rather than letting a tri-state imply three
+//! observed states.
 
 use std::collections::BTreeSet;
 
@@ -39,6 +57,7 @@ use serde_json::Value;
 
 use crate::Operation;
 use crate::outcome::{Completion, Dispatch};
+use crate::schema::Request;
 
 /// What the device operator has turned on locally.
 ///
@@ -105,39 +124,41 @@ impl CallerGrant {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProbeEvidence {
     probe: Operation,
-    capture_authority: CaptureAuthority,
 }
 
 impl ProbeEvidence {
     /// Read evidence out of a probe's dispatch result.
     ///
-    /// Returns `None` unless the probe was **dispatched and succeeded**.
-    /// `probe` must be an operation that the OS permission layer gates and
-    /// that changes nothing: `screen_info` or `cursor_position`. `describe`
-    /// is refused because it is the config echo; `capture` is refused because
-    /// a probe must be cheap enough to run on every supervision cycle.
+    /// Returns `None` unless the probe was **dispatched and succeeded**. The
+    /// probe must be an operation that the OS permission layer gates and that
+    /// changes nothing: `screen_info` or `cursor_position`. `describe` is
+    /// refused because it is the config echo; `capture` is refused because a
+    /// probe must be cheap enough to run on every supervision cycle.
+    ///
+    /// **The probe is taken from the validated [`Request`] that produced the
+    /// dispatch, not from a free-standing label.** The first review found the
+    /// old signature took an `Operation` the caller simply asserted, so the
+    /// *which-probe* half of this evidence was unverified: a caller could
+    /// dispatch `cursor_position` and label it `screen_info`. Requiring the
+    /// request narrows that to a caller deliberately pairing a request with
+    /// another request's dispatch, which the type cannot prevent — nothing in
+    /// the value links them — so this is a tightening, not a proof, and is
+    /// labelled as one.
     #[must_use]
-    pub fn from_probe(probe: Operation, dispatch: &Dispatch) -> Option<Self> {
+    pub fn from_probe(request: &Request, dispatch: &Dispatch) -> Option<Self> {
+        let probe = request.operation();
         if !matches!(probe, Operation::ScreenInfo | Operation::CursorPosition) {
             return None;
         }
-        let Dispatch::Dispatched(Completion::Ok(result)) = dispatch else {
+        if !matches!(dispatch, Dispatch::Dispatched(Completion::Ok(_))) {
             return None;
-        };
-        Some(Self {
-            probe,
-            capture_authority: CaptureAuthority::from_status(result),
-        })
+        }
+        Some(Self { probe })
     }
 
     #[must_use]
     pub const fn probe(&self) -> Operation {
         self.probe
-    }
-
-    #[must_use]
-    pub const fn capture_authority(&self) -> CaptureAuthority {
-        self.capture_authority
     }
 }
 
@@ -146,21 +167,38 @@ impl ProbeEvidence {
 pub struct UpstreamSupport {
     commands: BTreeSet<String>,
     evidence: ProbeEvidence,
+    capture_authority: CaptureAuthority,
 }
 
 impl UpstreamSupport {
-    /// Build from a `/commands` reading plus probe evidence.
+    /// Build from a `/commands` reading, probe evidence, and a capture
+    /// authority read from a **`version`** reading.
     ///
-    /// Both are required. The `/commands` listing alone is backend-dependent
-    /// and says nothing about permission; the probe alone says nothing about
-    /// which other commands exist. Neither is sufficient, which is why there
-    /// is one constructor rather than two.
+    /// All three are required, and the third is separate from the second for a
+    /// reason the first review of this chunk had to point out: **`desktop_capture_authorized`
+    /// is a member of the `version` response, not of `get_screen_size` or
+    /// `get_cursor_position`.** The old code derived it from the probe result,
+    /// so against the pinned backend it could only ever be `Unknown` and the
+    /// capture gate could never refuse — an unreachable rule of exactly the
+    /// kind deleted from `marker.rs` in this same chunk. Use
+    /// [`CaptureAuthority::from_version_reading`] to produce it.
     #[must_use]
-    pub fn new(advertised_commands: &[String], evidence: ProbeEvidence) -> Self {
+    pub fn new(
+        advertised_commands: &[String],
+        evidence: ProbeEvidence,
+        capture_authority: CaptureAuthority,
+    ) -> Self {
         Self {
             commands: advertised_commands.iter().cloned().collect(),
             evidence,
+            capture_authority,
         }
+    }
+
+    /// The capture authority read from the `version` response.
+    #[must_use]
+    pub const fn capture_authority(&self) -> CaptureAuthority {
+        self.capture_authority
     }
 
     #[must_use]
@@ -205,8 +243,15 @@ pub enum CaptureAuthority {
 /// The status member whose absence is not a denial.
 pub const CAPTURE_AUTHORITY_MEMBER: &str = "desktop_capture_authorized";
 
+/// The command whose response carries [`CAPTURE_AUTHORITY_MEMBER`].
+///
+/// **Not the probe.** `get_screen_size` and `get_cursor_position` do not carry
+/// it, which is why reading capture authority from a probe result could only
+/// ever produce [`CaptureAuthority::Unknown`].
+pub const CAPTURE_AUTHORITY_COMMAND: &str = "version";
+
 impl CaptureAuthority {
-    /// Read the authority out of a backend status payload.
+    /// Read the authority out of a **`version`** response payload.
     ///
     /// An absent key is [`CaptureAuthority::Unknown`]. A non-boolean value is
     /// also `Unknown` rather than `Denied`: this profile reports what it does
@@ -216,6 +261,28 @@ impl CaptureAuthority {
         match status.get(CAPTURE_AUTHORITY_MEMBER) {
             Some(Value::Bool(true)) => Self::Granted,
             Some(Value::Bool(false)) => Self::Denied,
+            _ => Self::Unknown,
+        }
+    }
+
+    /// Read the authority out of a dispatched `version` command's result.
+    ///
+    /// Anything other than a dispatched success is [`CaptureAuthority::Unknown`]:
+    /// a backend that did not answer has told us nothing about capture, and
+    /// "told us nothing" is not "said no".
+    ///
+    /// **What this can and cannot observe on the pinned backend.** 0.3.46 made
+    /// the key conditional on `hasattr`, so on the supported 0.22.x SDK the
+    /// server **omits it** and the honest answer here is `Unknown` on every
+    /// correctly-permissioned host. [`CaptureAuthority::Denied`] is therefore
+    /// **modelled, not measured**: this repository has never seen a real
+    /// backend emit `false`, and the fixture is what exercises that arm. Task
+    /// row M5-C03 records it as modelled rather than letting the tri-state
+    /// imply three observed states.
+    #[must_use]
+    pub fn from_version_reading(dispatch: &Dispatch) -> Self {
+        match dispatch {
+            Dispatch::Dispatched(Completion::Ok(result)) => Self::from_status(result),
             _ => Self::Unknown,
         }
     }
@@ -257,8 +324,7 @@ pub fn negotiate(
         .filter(|operation| {
             // Capture carries one extra gate, and only in the direction that
             // refuses: a backend that said `false` is taken at its word.
-            *operation != Operation::Capture
-                || upstream.evidence().capture_authority().permits_attempt()
+            *operation != Operation::Capture || upstream.capture_authority().permits_attempt()
         })
         .collect()
 }

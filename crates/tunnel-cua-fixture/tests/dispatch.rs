@@ -19,12 +19,14 @@ use std::collections::BTreeSet;
 use serde_json::json;
 
 use tunnel_cua::Operation;
-use tunnel_cua::capability::{CallerGrant, LocalConfiguration, ProbeEvidence, UpstreamSupport};
+use tunnel_cua::capability::{
+    CallerGrant, CaptureAuthority, LocalConfiguration, ProbeEvidence, UpstreamSupport,
+};
 use tunnel_cua::endpoint::BackendEndpoint;
 use tunnel_cua::marker;
 use tunnel_cua::operation::{Deferral, Refusal};
 use tunnel_cua::outcome::{Completion, Dispatch, NotDispatched};
-use tunnel_cua::schema::SchemaError;
+use tunnel_cua::schema::{SchemaError, validate_request};
 
 use tunnel_cua_fixture::client::{Dispatcher, read_commands, request_body};
 use tunnel_cua_fixture::{
@@ -45,11 +47,16 @@ async fn negotiated(backend: &FixtureBackend) -> Dispatcher {
     // `ProbeEvidence`, and it leaves its own ledger entry -- which every test
     // below accounts for.
     let bare = Dispatcher::new(endpoint, BTreeSet::from([Operation::ScreenInfo]));
-    let probe = bare
-        .handle(&request_body("screen_info", json!({})), LIMIT)
-        .await;
-    let evidence = ProbeEvidence::from_probe(Operation::ScreenInfo, &probe)
+    let probe_body = request_body("screen_info", json!({}));
+    let probe = bare.handle(&probe_body, LIMIT).await;
+    let probe_request = validate_request(&probe_body, LIMIT).expect("a valid probe request");
+    let evidence = ProbeEvidence::from_probe(&probe_request, &probe)
         .expect("a succeeded screen_info probe is evidence");
+
+    // The capture authority comes from a **`version`** reading, which is the
+    // response that carries `desktop_capture_authorized`. It is a second real
+    // dispatch and leaves its own ledger entry too.
+    let capture_authority = CaptureAuthority::from_version_reading(&bare.read_version().await);
 
     let local = Operation::ALL
         .into_iter()
@@ -60,15 +67,23 @@ async fn negotiated(backend: &FixtureBackend) -> Dispatcher {
     Dispatcher::negotiated(
         endpoint,
         &local,
-        &UpstreamSupport::new(&commands, evidence),
+        &UpstreamSupport::new(&commands, evidence, capture_authority),
         &grant,
     )
 }
 
-/// The probe that `negotiated` performs, so every ledger assertion can account
-/// for it explicitly rather than by an off-by-one nobody notices.
-fn probe_entry() -> LedgerEntry {
-    LedgerEntry::new("get_screen_size", Some(0))
+/// The two discovery dispatches `negotiated` performs, so every ledger
+/// assertion accounts for them explicitly rather than by an off-by-one nobody
+/// notices.
+///
+/// There are two because capability discovery genuinely needs two different
+/// responses: a probe the OS permission layer gates (`get_screen_size`), and
+/// the `version` reading that carries `desktop_capture_authorized`.
+fn discovery_entries() -> Vec<LedgerEntry> {
+    vec![
+        LedgerEntry::new("get_screen_size", Some(0)),
+        LedgerEntry::new("version", None),
+    ]
 }
 
 #[tokio::test]
@@ -87,21 +102,37 @@ async fn each_read_only_operation_dispatches_exactly_the_command_the_table_names
         let dispatch = dispatcher
             .handle(&request_body(operation, json!({})), LIMIT)
             .await;
-        assert!(
-            matches!(dispatch, Dispatch::Dispatched(Completion::Ok(_))),
-            "{operation} should have succeeded, got {dispatch:?}"
-        );
         let added = &backend.ledger().entries()[before..];
         match expected {
-            None => assert!(
-                added.is_empty(),
-                "describe must dispatch no command, it added {added:?}"
-            ),
+            // `describe` is answered from device-side state. It must report
+            // itself as such -- **not** as a dispatch, which would make
+            // `reached_the_backend()` true for an operation that sent nothing.
+            None => {
+                assert!(
+                    matches!(dispatch, Dispatch::AnsweredLocally(_)),
+                    "{operation} should have been answered locally, got {dispatch:?}"
+                );
+                assert!(
+                    added.is_empty(),
+                    "describe must dispatch no command, it added {added:?}"
+                );
+            }
             Some(command) => {
+                assert!(
+                    matches!(dispatch, Dispatch::Dispatched(Completion::Ok(_))),
+                    "{operation} should have succeeded, got {dispatch:?}"
+                );
                 assert_eq!(added.len(), 1, "{operation} dispatched {added:?}");
                 assert_eq!(added[0].command, command);
             }
         }
+        // The invariant, on every operation rather than only on the ones the
+        // fault table covers.
+        assert_eq!(
+            dispatch.reached_the_backend(),
+            added.len() == 1,
+            "{operation}: the client and the ledger disagree"
+        );
     }
     backend.stop();
 }
@@ -126,14 +157,15 @@ async fn the_ledger_equals_the_commands_that_were_dispatched_and_nothing_more() 
             .await;
     }
 
+    let mut expected = discovery_entries();
+    expected.extend([
+        LedgerEntry::new("get_cursor_position", None),
+        LedgerEntry::new("screenshot", Some(2)),
+        LedgerEntry::new("get_screen_size", Some(1)),
+    ]);
     assert_eq!(
         backend.ledger().entries(),
-        vec![
-            probe_entry(),
-            LedgerEntry::new("get_cursor_position", None),
-            LedgerEntry::new("screenshot", Some(2)),
-            LedgerEntry::new("get_screen_size", Some(1)),
-        ],
+        expected,
         "the ledger is the authority on what the backend was asked to do"
     );
     backend.stop();
@@ -339,7 +371,7 @@ async fn a_byte_count_would_not_have_caught_the_wrong_display() {
     // right image came back" and "the right image was requested" are separate
     // facts, both checked.
     assert_eq!(
-        backend.ledger().entries()[1..],
+        backend.ledger().entries()[discovery_entries().len()..],
         [
             LedgerEntry::new("screenshot", Some(0)),
             LedgerEntry::new("screenshot", Some(1)),
@@ -382,11 +414,11 @@ async fn describe_reports_the_negotiated_set_rather_than_the_configuration() {
     let endpoint = BackendEndpoint::new(backend.address()).unwrap();
 
     let wide = Dispatcher::new(endpoint, BTreeSet::from(Operation::ALL));
-    let Dispatch::Dispatched(Completion::Ok(all)) = wide
+    let Dispatch::AnsweredLocally(all) = wide
         .handle(&request_body("describe", json!({})), LIMIT)
         .await
     else {
-        panic!("describe should have succeeded");
+        panic!("describe should have been answered locally");
     };
     assert_eq!(all["operations"].as_array().unwrap().len(), 4);
 
@@ -394,11 +426,11 @@ async fn describe_reports_the_negotiated_set_rather_than_the_configuration() {
         endpoint,
         BTreeSet::from([Operation::Describe, Operation::CursorPosition]),
     );
-    let Dispatch::Dispatched(Completion::Ok(some)) = narrow
+    let Dispatch::AnsweredLocally(some) = narrow
         .handle(&request_body("describe", json!({})), LIMIT)
         .await
     else {
-        panic!("describe should have succeeded");
+        panic!("describe should have been answered locally");
     };
     assert_eq!(
         some["operations"],
@@ -425,5 +457,99 @@ async fn a_non_loopback_backend_cannot_be_dispatched_to_at_all() {
     let backend = FixtureBackend::start().await.unwrap();
     assert!(backend.address().ip().is_loopback());
     assert!(BackendEndpoint::new(backend.address()).is_ok());
+    backend.stop();
+}
+
+/// **Capture authority is read from the `version` response, end to end.**
+///
+/// The first review found this being derived from the probe result — a
+/// response that does not carry `desktop_capture_authorized` — so against the
+/// pinned backend the `Denied` arm was unreachable and the capture gate could
+/// never refuse. This runs the real discovery path against the fixture and
+/// checks all three states.
+///
+/// **What this does not show.** No real backend has been observed emitting
+/// `false`; the fixture is what produces it here, and task row M5-C03 records
+/// the `Denied` arm as modelled rather than measured. The *default* case is
+/// the faithful one: the fixture omits the key, exactly as the released server
+/// does on the supported 0.22.x SDK.
+#[tokio::test]
+async fn capture_authority_comes_from_the_version_reading_and_gates_capture() {
+    let backend = FixtureBackend::start().await.unwrap();
+    let endpoint = BackendEndpoint::new(backend.address()).unwrap();
+    let bare = Dispatcher::new(endpoint, BTreeSet::from([Operation::ScreenInfo]));
+
+    // The default: the key is absent, which is what the pinned server does.
+    // Absent is not denied, so capture stays available.
+    assert_eq!(
+        CaptureAuthority::from_version_reading(&bare.read_version().await),
+        CaptureAuthority::Unknown,
+        "the fixture must omit the key by default, as the released server does"
+    );
+
+    // Explicitly granted.
+    backend.capture_authority().set(Some(true));
+    assert_eq!(
+        CaptureAuthority::from_version_reading(&bare.read_version().await),
+        CaptureAuthority::Granted
+    );
+
+    // Explicitly denied: the one state that removes capture from the
+    // negotiated set.
+    backend.capture_authority().set(Some(false));
+    let denied = CaptureAuthority::from_version_reading(&bare.read_version().await);
+    assert_eq!(denied, CaptureAuthority::Denied);
+
+    // And the gate actually bites, through the real negotiation.
+    let commands = read_commands(endpoint).await.unwrap();
+    let probe_body = request_body("screen_info", json!({}));
+    let probe = bare.handle(&probe_body, LIMIT).await;
+    let evidence =
+        ProbeEvidence::from_probe(&validate_request(&probe_body, LIMIT).unwrap(), &probe).unwrap();
+    let local = Operation::ALL
+        .into_iter()
+        .fold(LocalConfiguration::none(), LocalConfiguration::with);
+    let grant = Operation::ALL
+        .into_iter()
+        .fold(CallerGrant::none(), CallerGrant::with);
+
+    let refusing = Dispatcher::negotiated(
+        endpoint,
+        &local,
+        &UpstreamSupport::new(&commands, evidence.clone(), denied),
+        &grant,
+    );
+    assert!(!refusing.permits(Operation::Capture));
+    let before = backend.ledger().count("screenshot");
+    let dispatch = refusing
+        .handle(&request_body("capture", json!({})), LIMIT)
+        .await;
+    assert_eq!(
+        dispatch,
+        Dispatch::NotDispatched(NotDispatched::NotPermitted)
+    );
+    assert_eq!(
+        backend.ledger().count("screenshot"),
+        before,
+        "a refused capture must not reach the backend"
+    );
+
+    // Non-vacuity: the identical setup with an absent authority does permit
+    // capture and does dispatch it, so the refusal above came from the
+    // authority rather than from anything else in the negotiation.
+    let permitting = Dispatcher::negotiated(
+        endpoint,
+        &local,
+        &UpstreamSupport::new(&commands, evidence, CaptureAuthority::Unknown),
+        &grant,
+    );
+    assert!(permitting.permits(Operation::Capture));
+    assert!(matches!(
+        permitting
+            .handle(&request_body("capture", json!({})), LIMIT)
+            .await,
+        Dispatch::Dispatched(Completion::Ok(_))
+    ));
+    assert_eq!(backend.ledger().count("screenshot"), before + 1);
     backend.stop();
 }

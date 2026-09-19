@@ -252,6 +252,98 @@ fn a_response_serializes_with_its_outcome_and_never_omits_it() {
     );
 }
 
+/// **`Response::not_dispatched` renders as its own outcome, not as `failed`.**
+///
+/// The first review of this chunk found it rendering as `failed` — whose
+/// contract is "the operation was dispatched and failed" — which collapsed, on
+/// the wire, the exact distinction this crate exists for. It was also the one
+/// constructor with no test at all.
+#[test]
+fn a_pre_dispatch_refusal_is_distinguishable_from_a_dispatched_failure_on_the_wire() {
+    let refused = Response::not_dispatched("click", "operation_deferred", "not carried yet");
+    assert_eq!(refused.outcome, ResponseOutcome::NotDispatched);
+    assert_eq!(refused.operation, "click");
+    assert!(refused.result.is_none());
+    let error = refused.error.as_ref().expect("a refusal carries an error");
+    assert!(error.retryable, "nothing happened, so a retry is safe");
+
+    let text = serde_json::to_string(&refused).unwrap();
+    assert!(text.contains(r#""outcome":"not_dispatched""#), "{text}");
+
+    // The distinction is on the wire, not merely in the retryable flag: a
+    // dispatched failure is also retryable, so a consumer keying on
+    // retryability alone could not tell the two apart.
+    let failed = Response::failed(
+        Operation::Capture,
+        "backend_reported",
+        "the backend said no",
+    );
+    assert!(failed.error.as_ref().unwrap().retryable);
+    assert_ne!(refused.outcome, failed.outcome);
+    assert_eq!(
+        refused.error.as_ref().unwrap().retryable,
+        failed.error.as_ref().unwrap().retryable,
+        "both are retryable, which is why the outcome has to carry the difference"
+    );
+
+    // And it round-trips, so a consumer can actually read it back.
+    let parsed: Response = serde_json::from_str(&text).unwrap();
+    assert_eq!(parsed.outcome, ResponseOutcome::NotDispatched);
+}
+
+/// A locally-answered operation is its own outcome too: it carries a result
+/// like a success, and says the backend was not involved.
+#[test]
+fn a_locally_answered_operation_renders_as_its_own_outcome() {
+    let local = Response::answered_locally(
+        Operation::Describe,
+        serde_json::json!({"operations": ["describe"]}),
+    );
+    assert_eq!(local.outcome, ResponseOutcome::AnsweredLocally);
+    assert!(local.result.is_some(), "a local answer is still an answer");
+    assert!(local.error.is_none());
+    let text = serde_json::to_string(&local).unwrap();
+    assert!(text.contains(r#""outcome":"answered_locally""#), "{text}");
+    assert_ne!(
+        local.outcome,
+        Response::ok(Operation::Describe, Value::Null).outcome
+    );
+}
+
+/// Every arm of the wire outcome is distinct, so none of them can be conflated
+/// by a consumer branching on the string.
+#[test]
+fn the_five_wire_outcomes_serialize_to_five_distinct_strings() {
+    let spellings: Vec<String> = [
+        ResponseOutcome::Ok,
+        ResponseOutcome::Failed,
+        ResponseOutcome::Unknown,
+        ResponseOutcome::NotDispatched,
+        ResponseOutcome::AnsweredLocally,
+    ]
+    .iter()
+    .map(|outcome| serde_json::to_string(outcome).unwrap())
+    .collect();
+    let mut sorted = spellings.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(
+        sorted.len(),
+        5,
+        "two outcomes share a spelling: {spellings:?}"
+    );
+    assert_eq!(
+        spellings,
+        vec![
+            "\"ok\"",
+            "\"failed\"",
+            "\"unknown\"",
+            "\"not_dispatched\"",
+            "\"answered_locally\""
+        ]
+    );
+}
+
 /// A response with no `outcome` must not deserialize. There is no default, and
 /// this is the test that keeps one from being added.
 #[test]
@@ -262,7 +354,13 @@ fn a_response_without_an_outcome_does_not_deserialize() {
     let text = r#"{"version":"computer.v1","operation":"capture","outcome":"success"}"#;
     assert!(serde_json::from_str::<Response>(text).is_err());
     // Non-vacuity: the three real spellings do.
-    for outcome in ["ok", "failed", "unknown"] {
+    for outcome in [
+        "ok",
+        "failed",
+        "unknown",
+        "not_dispatched",
+        "answered_locally",
+    ] {
         let text =
             format!(r#"{{"version":"computer.v1","operation":"capture","outcome":"{outcome}"}}"#);
         assert!(serde_json::from_str::<Response>(&text).is_ok(), "{outcome}");

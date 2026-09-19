@@ -43,10 +43,11 @@ async fn dispatcher(backend: &FixtureBackend) -> Dispatcher {
 
 /// The whole distinction, as one table, run against one fixture.
 ///
-/// Reading it top to bottom is the argument: the two `NotDispatched` rows add
-/// nothing to the ledger and the three `Unknown`/`Failed` rows each add
-/// exactly one entry, so the classification is tracking what the backend saw
-/// rather than what the client guessed.
+/// Reading it top to bottom is the argument: the `NotDispatched` rows add
+/// nothing to the ledger and the `Unknown`/`Failed`/`Ok` rows each add exactly
+/// one entry, so the classification is tracking what the backend saw rather
+/// than what the client guessed. The locally-answered case is checked first,
+/// separately, because it is the one shape that is neither.
 #[tokio::test]
 async fn the_fault_table_agrees_with_the_ledger_row_by_row() {
     let backend = FixtureBackend::start().await.unwrap();
@@ -105,6 +106,27 @@ async fn the_fault_table_agrees_with_the_ledger_row_by_row() {
             ledger_entries_added: 0,
         },
     ];
+
+    // **The row the first version of this table was missing.** `describe` is
+    // answered from device-side state: nothing is sent, nothing is recorded,
+    // and the classification must say so. The old table only ever sent
+    // `screen_info`, which is exactly why it did not catch `describe` being
+    // reported as a dispatch -- an invariant test that never exercises the one
+    // operation that can violate the invariant proves less than it claims.
+    let local = dispatcher
+        .handle(&request_body("describe", json!({})), LIMIT)
+        .await;
+    assert!(
+        local.answered_locally(),
+        "describe must report itself as answered locally, got {local:?}"
+    );
+    assert!(!local.reached_the_backend());
+    assert!(local.retry_is_safe(), "no effect happened anywhere");
+    assert!(
+        backend.ledger().is_empty(),
+        "describe left {:?} on the ledger",
+        backend.ledger().entries()
+    );
 
     for row in rows {
         backend.faults().set("get_screen_size", row.fault);

@@ -8,9 +8,21 @@ fn probe_ok(status: serde_json::Value) -> Dispatch {
     Dispatch::Dispatched(Completion::Ok(status))
 }
 
+/// A validated request for `operation`, since `ProbeEvidence` now takes the
+/// request that produced the dispatch rather than a caller-supplied label.
+fn request(operation: Operation) -> crate::schema::Request {
+    let body = json!({
+        "version": crate::SCHEMA_VERSION,
+        "operation": operation.name(),
+        "params": {},
+    })
+    .to_string();
+    crate::schema::validate_request(body.as_bytes(), 4096).expect("a well-formed probe request")
+}
+
 fn evidence() -> ProbeEvidence {
     ProbeEvidence::from_probe(
-        Operation::ScreenInfo,
+        &request(Operation::ScreenInfo),
         &probe_ok(json!({"width": 1280, "height": 800})),
     )
     .expect("a dispatched, succeeded screen_info probe is evidence")
@@ -48,8 +60,13 @@ fn granted_everything() -> CallerGrant {
 /// from it and nothing can be advertised.
 #[test]
 fn only_a_dispatched_succeeded_probe_is_evidence() {
-    assert!(ProbeEvidence::from_probe(Operation::ScreenInfo, &probe_ok(json!({}))).is_some());
-    assert!(ProbeEvidence::from_probe(Operation::CursorPosition, &probe_ok(json!({}))).is_some());
+    assert!(
+        ProbeEvidence::from_probe(&request(Operation::ScreenInfo), &probe_ok(json!({}))).is_some()
+    );
+    assert!(
+        ProbeEvidence::from_probe(&request(Operation::CursorPosition), &probe_ok(json!({})))
+            .is_some()
+    );
 
     for not_evidence in [
         Dispatch::NotDispatched(NotDispatched::NotReached),
@@ -62,7 +79,7 @@ fn only_a_dispatched_succeeded_probe_is_evidence() {
         Dispatch::Dispatched(Completion::Unknown(UnknownReason::TransportLost)),
     ] {
         assert!(
-            ProbeEvidence::from_probe(Operation::ScreenInfo, &not_evidence).is_none(),
+            ProbeEvidence::from_probe(&request(Operation::ScreenInfo), &not_evidence).is_none(),
             "{not_evidence:?} must not be probe evidence"
         );
     }
@@ -72,10 +89,16 @@ fn only_a_dispatched_succeeded_probe_is_evidence() {
 /// on a supervision cycle. Neither may stand in for the probe.
 #[test]
 fn describe_and_capture_are_refused_as_probes() {
-    assert!(ProbeEvidence::from_probe(Operation::Describe, &probe_ok(json!({}))).is_none());
-    assert!(ProbeEvidence::from_probe(Operation::Capture, &probe_ok(json!({}))).is_none());
+    assert!(
+        ProbeEvidence::from_probe(&request(Operation::Describe), &probe_ok(json!({}))).is_none()
+    );
+    assert!(
+        ProbeEvidence::from_probe(&request(Operation::Capture), &probe_ok(json!({}))).is_none()
+    );
     // Non-vacuity: the two that are accepted are accepted from the same value.
-    assert!(ProbeEvidence::from_probe(Operation::ScreenInfo, &probe_ok(json!({}))).is_some());
+    assert!(
+        ProbeEvidence::from_probe(&request(Operation::ScreenInfo), &probe_ok(json!({}))).is_some()
+    );
 }
 
 /// **`desktop_capture_authorized` is absent-by-default, not false.**
@@ -125,7 +148,7 @@ fn an_absent_capture_authority_is_unknown_and_unknown_permits_an_attempt() {
 
 #[test]
 fn the_negotiated_set_is_the_intersection_of_all_three_inputs() {
-    let upstream = UpstreamSupport::new(&commands(), evidence());
+    let upstream = UpstreamSupport::new(&commands(), evidence(), CaptureAuthority::Unknown);
 
     // All three agree on everything.
     let all = negotiate(&everything(), &upstream, &granted_everything());
@@ -160,7 +183,7 @@ fn the_negotiated_set_is_the_intersection_of_all_three_inputs() {
         .into_iter()
         .filter(|name| name != "screenshot")
         .collect();
-    let narrowed = UpstreamSupport::new(&without_screenshot, evidence());
+    let narrowed = UpstreamSupport::new(&without_screenshot, evidence(), CaptureAuthority::Unknown);
     let upstream_narrow = negotiate(&everything(), &narrowed, &granted_everything());
     assert!(!upstream_narrow.contains(&Operation::Capture));
     assert!(upstream_narrow.contains(&Operation::ScreenInfo));
@@ -181,13 +204,18 @@ fn the_negotiated_set_is_the_intersection_of_all_three_inputs() {
 /// sets contain it — and an absent key does not.
 #[test]
 fn a_denied_capture_authority_removes_capture_and_an_absent_one_does_not() {
+    // Read from a **`version`** reading, which is the response that actually
+    // carries the key. The previous revision of this test fed the key to a
+    // `screen_info` probe -- a payload the pinned server cannot emit -- so the
+    // `Denied` arm was exercised only against a shape that does not exist.
     let denied = UpstreamSupport::new(
         &commands(),
-        ProbeEvidence::from_probe(
-            Operation::ScreenInfo,
-            &probe_ok(json!({"desktop_capture_authorized": false})),
-        )
-        .unwrap(),
+        evidence(),
+        CaptureAuthority::from_version_reading(&probe_ok(json!({
+            "version": "0.3.46",
+            "desktop_unlocked": true,
+            "desktop_capture_authorized": false,
+        }))),
     );
     let set = negotiate(&everything(), &denied, &granted_everything());
     assert!(!set.contains(&Operation::Capture));
@@ -197,15 +225,78 @@ fn a_denied_capture_authority_removes_capture_and_an_absent_one_does_not() {
     assert!(set.contains(&Operation::Describe));
 
     // Absent: capture stays in, which is the whole absent-is-not-false point.
-    let absent = UpstreamSupport::new(&commands(), evidence());
+    let absent = UpstreamSupport::new(&commands(), evidence(), CaptureAuthority::Unknown);
     assert!(negotiate(&everything(), &absent, &granted_everything()).contains(&Operation::Capture));
+}
+
+/// **Capture authority comes from the `version` response, not from the probe.**
+///
+/// The probe commands do not carry the key, so deriving authority from a probe
+/// result could only ever produce `Unknown` against the pinned backend --
+/// making the `Denied` arm unreachable by construction. This test pins the
+/// reading to the right response and records what each backend state produces.
+#[test]
+fn capture_authority_is_read_from_a_version_reading_and_not_from_a_probe() {
+    // The command whose response carries it is `version`, and it is the
+    // command `describe` reads -- not either probe command.
+    assert_eq!(CAPTURE_AUTHORITY_COMMAND, "version");
+    assert!(Operation::DESCRIBE_READS.contains(&CAPTURE_AUTHORITY_COMMAND));
+    for probe in [Operation::ScreenInfo, Operation::CursorPosition] {
+        assert_ne!(
+            probe.upstream_command(),
+            Some(CAPTURE_AUTHORITY_COMMAND),
+            "{} must not be mistaken for the version reading",
+            probe.name()
+        );
+    }
+
+    // What the pinned backend actually emits on the supported 0.22.x SDK: no
+    // key at all. This is the normal answer on a working host.
+    assert_eq!(
+        CaptureAuthority::from_version_reading(&probe_ok(json!({
+            "version": "0.3.46",
+            "desktop_unlocked": true,
+        }))),
+        CaptureAuthority::Unknown
+    );
+    // The two states a backend can assert.
+    assert_eq!(
+        CaptureAuthority::from_version_reading(&probe_ok(
+            json!({"desktop_capture_authorized": true})
+        )),
+        CaptureAuthority::Granted
+    );
+    assert_eq!(
+        CaptureAuthority::from_version_reading(&probe_ok(
+            json!({"desktop_capture_authorized": false})
+        )),
+        CaptureAuthority::Denied
+    );
+
+    // A reading that did not happen tells us nothing, and "nothing" is not
+    // "no". Every non-success is Unknown.
+    for not_a_reading in [
+        Dispatch::NotDispatched(NotDispatched::NotReached),
+        Dispatch::NotDispatched(NotDispatched::BackendUnavailable),
+        Dispatch::Dispatched(Completion::Failed {
+            code: FailureCode::PermissionDenied,
+        }),
+        Dispatch::Dispatched(Completion::Unknown(UnknownReason::TransportLost)),
+        Dispatch::AnsweredLocally(json!({"desktop_capture_authorized": false})),
+    ] {
+        assert_eq!(
+            CaptureAuthority::from_version_reading(&not_a_reading),
+            CaptureAuthority::Unknown,
+            "{not_a_reading:?} is not a version reading"
+        );
+    }
 }
 
 /// `describe` maps to no single command, so it must not be excluded merely
 /// because a backend's registry is narrow.
 #[test]
 fn describe_survives_a_narrowed_registry_because_it_is_not_a_command() {
-    let bare = UpstreamSupport::new(&[], evidence());
+    let bare = UpstreamSupport::new(&[], evidence(), CaptureAuthority::Unknown);
     assert!(bare.supports(Operation::Describe));
     assert!(!bare.supports(Operation::Capture));
     assert!(!bare.supports(Operation::ScreenInfo));
@@ -221,7 +312,7 @@ fn describe_survives_a_narrowed_registry_because_it_is_not_a_command() {
 /// forgetting to configure it exports nothing.
 #[test]
 fn the_default_local_configuration_and_grant_are_empty() {
-    let upstream = UpstreamSupport::new(&commands(), evidence());
+    let upstream = UpstreamSupport::new(&commands(), evidence(), CaptureAuthority::Unknown);
     assert!(
         negotiate(
             &LocalConfiguration::default(),

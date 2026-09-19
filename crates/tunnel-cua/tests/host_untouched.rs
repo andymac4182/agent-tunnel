@@ -115,7 +115,24 @@ const DENIED: &[(&str, &str)] = &[
     ("core-graphics-types", "macOS Quartz types"),
     ("cocoa", "macOS AppKit"),
     ("objc", "Objective-C runtime bridge"),
+    ("objc2", "Objective-C runtime bridge (objc2 generation)"),
     ("objc2-app-kit", "macOS AppKit"),
+    // How a *modern* macOS capture is actually taken. The first review of this
+    // chunk pointed out that `core-graphics` and `objc2-app-kit` no longer
+    // cover the path on their own: `CGDisplayCreateImage` is deprecated, and
+    // current crates reach ScreenCaptureKit or the objc2 Core Graphics
+    // bindings directly. A denylist that named only the old path would have
+    // been a denylist with a hole in exactly the direction it exists to cover.
+    (
+        "objc2-core-graphics",
+        "macOS Quartz through objc2: capture and event posting",
+    ),
+    ("objc2-screen-capture-kit", "macOS ScreenCaptureKit"),
+    ("screencapturekit", "macOS ScreenCaptureKit"),
+    (
+        "core-graphics-helmer-fork",
+        "a maintained fork of the macOS Quartz bindings",
+    ),
     ("x11", "X11 client"),
     ("x11rb", "X11 client"),
     ("xcb", "X11 client"),
@@ -318,7 +335,7 @@ fn the_denylist_scan_is_reading_a_real_populated_lockfile() {
         );
     }
     assert!(
-        DENIED.len() >= 20,
+        DENIED.len() >= 24,
         "the denylist was truncated to {} entries",
         DENIED.len()
     );

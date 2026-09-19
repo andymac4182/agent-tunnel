@@ -58,6 +58,7 @@ pub mod json;
 pub mod marker;
 pub mod operation;
 pub mod outcome;
+pub mod plan;
 pub mod schema;
 
 pub use operation::Operation;
