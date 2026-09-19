@@ -374,11 +374,17 @@ claim is still unclaimed.
   like any other and this one was wrong. What stays open is narrower and is on
   M8-C02: whether the profile should refuse such a child at admission instead.
 - **Evidence.** `scripts/acp-guard-deletion.py --suite m8c3` defeats each of
-  this chunk's rules in turn: **16 of 16 turned a test red** (twice at
-  `e40a33a`). This said 17 of 17, and that was true when written: chunk 4
-  retired the case "one lost subscriber closes one stream and nothing else"
-  in `f61a655` when it replaced chunk 3's narrow router fix with the
-  documented subscriber-loss policy, and never re-ran this suite. M8-C17. Its
+  this chunk's rules in turn: **17 of 17 turned a test red at `1e9b746`**, and the
+  history of that number is worth keeping because it moved in both
+  directions. It said 17 of 17 originally and that was true when written;
+  chunk 4 then retired the case "one lost subscriber closes one stream and
+  nothing else" in `f61a655` when it replaced chunk 3's narrow router fix
+  with the documented subscriber-loss policy, and never re-ran this suite,
+  making it 16 of 16 (twice at `e40a33a`) — M8-C17. PR #44 then added the
+  M8-C25 case and it is 17 again. **The two 17s are not the same 17**, and a
+  reader who saw only the first and last would think nothing had happened.
+  That is why M8-C17's third instance is recorded as the first to move a
+  figure back *up*. Its
   sibling
   `--suite m8c3-relay`, which needs a different crate and a different test
   command, is **2 of 2**. Both classify their outcomes with the shared
