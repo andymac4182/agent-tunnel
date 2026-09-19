@@ -145,7 +145,7 @@ CASES: list[tuple[str, list[Edit], bool]] = [
         [
             (
                 CHILD,
-                "            let _ = tokio::task::spawn_blocking(move || deadman.stand_down()).await;",
+                "            if tokio::task::spawn_blocking(move || deadman.stand_down())\n                .await\n                .unwrap_or(false)\n            {\n                supervisor_counters\n                    .deadman_stood_down\n                    .fetch_add(1, Ordering::Relaxed);\n            }",
                 "            drop(deadman);",
             )
         ],

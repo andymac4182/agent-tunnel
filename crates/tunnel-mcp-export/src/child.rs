@@ -105,7 +105,10 @@ pub struct ChildCounters {
     /// in `spawned` but not here is one whose group survives this process
     /// being `SIGKILL`ed.
     pub deadman_armed: AtomicU64,
-    /// Sentinels stood down after their child was killed and reaped.
+    /// Sentinels that **reported** standing down after their child was killed
+    /// and reaped.  Counted from the sentinel's own exit status, not from the
+    /// supervisor having asked, so a sentinel that fired on the way out is
+    /// not recorded here.
     pub deadman_stood_down: AtomicU64,
 }
 
@@ -244,11 +247,17 @@ pub fn spawn(
         if let Some(deadman) = deadman {
             // `stand_down` writes a byte and reaps; it blocks only for as long
             // as the sentinel takes to exit, but it does block, so it does not
-            // belong on a runtime worker.
-            let _ = tokio::task::spawn_blocking(move || deadman.stand_down()).await;
-            supervisor_counters
-                .deadman_stood_down
-                .fetch_add(1, Ordering::Relaxed);
+            // belong on a runtime worker.  The counter follows the sentinel's
+            // own exit status, never the fact that it was asked: a sentinel
+            // that fired anyway must not be recorded as an orderly shutdown.
+            if tokio::task::spawn_blocking(move || deadman.stand_down())
+                .await
+                .unwrap_or(false)
+            {
+                supervisor_counters
+                    .deadman_stood_down
+                    .fetch_add(1, Ordering::Relaxed);
+            }
         }
         let _ = exited_tx.send(true);
     });

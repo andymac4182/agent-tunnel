@@ -143,14 +143,27 @@ impl Deadman {
     /// Call this **only after** the supervised child has been killed and
     /// reaped, so that the sentinel can never outlive the group id it was
     /// given.
-    pub fn stand_down(mut self) {
+    ///
+    /// Returns whether the sentinel really did stand down, read from its exit
+    /// status ([`EXIT_STOOD_DOWN`] rather than [`EXIT_FIRED`]).  **The return
+    /// value is the only honest witness there is**: a caller that merely
+    /// called this function knows it asked, not that the sentinel agreed, and
+    /// a counter incremented on the call rather than on the answer would
+    /// report an orderly shutdown for a sentinel that fired a group signal on
+    /// the way out.
+    #[must_use]
+    pub fn stand_down(mut self) -> bool {
         if let Some(pipe) = self.sentinel.stdin.as_mut() {
             let _ = pipe.write_all(STAND_DOWN);
             let _ = pipe.flush();
         }
         // Closing the write end is what the sentinel is blocked on.
         drop(self.sentinel.stdin.take());
-        let _ = self.sentinel.wait();
+        self.sentinel
+            .wait()
+            .ok()
+            .and_then(|status| status.code())
+            .is_some_and(|code| code == EXIT_STOOD_DOWN)
     }
 }
 
