@@ -8,13 +8,136 @@
 //! only; never header values, paths, bodies or credentials.
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 
 use serde::Serialize;
 use tunnel_http_forward::{RecordPosition, TrackerSnapshot};
 
 /// The most recent records retained per kind.
 pub const MAX_HTTP_FORWARD_RECORDS: usize = 64;
+
+/// One peer hop's send and receive byte counts **as they stood at a single
+/// instant**.
+///
+/// The peer hop's two published high-water figures are independent all-time
+/// `max` latches, so both reading high is equally consistent with two
+/// disjoint bursts (task row M8-C22).  This pair is the answer to that: it is
+/// only ever written from one of the hop's two mutation points, each of which
+/// already holds one of the two figures under its own lock and reads the
+/// other from a live atomic, so the two numbers are a reading of the same
+/// moment rather than two readings joined afterwards.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct HopBytePair {
+    /// Credited bytes sent on the peer stream and not yet consumed by the
+    /// peer.
+    pub send_bytes: usize,
+    /// Peer DATA bytes received here and not yet consumed by the next hop.
+    pub receive_bytes: usize,
+}
+
+impl HopBytePair {
+    /// The smaller of the two directions.  A coincident latch is ordered by
+    /// this, because it is what a claim of *both* directions loaded rests on:
+    /// a pair is better attested than another exactly when the weaker of its
+    /// two halves is larger.
+    #[must_use]
+    pub const fn smaller(self) -> usize {
+        if self.send_bytes < self.receive_bytes {
+            self.send_bytes
+        } else {
+            self.receive_bytes
+        }
+    }
+}
+
+/// A peer hop's live byte pair, plus the best-attested coincident instant it
+/// has reached.
+///
+/// Held behind an `Arc` by the hop itself and by a weak entry in
+/// [`HttpForwardDiagnostics`], so the live pair is readable on the forwarding
+/// snapshot for as long as the hop exists and disappears with it.  Without
+/// the live half, any assertion about the hop is post-hoc: a stalled response
+/// direction terminates only at the export's 30 s output-credit budget, so an
+/// observation window shorter than the exchange sees no record at all.
+#[derive(Debug, Default)]
+pub struct HopLivePair {
+    send_bytes: AtomicUsize,
+    receive_bytes: AtomicUsize,
+    /// Leaf lock.  Acquired while a caller holds the hop's credit or queue
+    /// lock, and never acquires either, so the two orders cannot cycle.
+    coincident: Mutex<HopBytePair>,
+}
+
+impl HopLivePair {
+    /// Record the send direction's current level, reading the receive
+    /// direction as it stands at this instant.
+    pub fn note_send(&self, send_bytes: usize) {
+        self.send_bytes.store(send_bytes, Ordering::Relaxed);
+        let receive_bytes = self.receive_bytes.load(Ordering::Relaxed);
+        self.latch(HopBytePair {
+            send_bytes,
+            receive_bytes,
+        });
+    }
+
+    /// Record the receive direction's current level, reading the send
+    /// direction as it stands at this instant.
+    pub fn note_receive(&self, receive_bytes: usize) {
+        self.receive_bytes.store(receive_bytes, Ordering::Relaxed);
+        let send_bytes = self.send_bytes.load(Ordering::Relaxed);
+        self.latch(HopBytePair {
+            send_bytes,
+            receive_bytes,
+        });
+    }
+
+    fn latch(&self, candidate: HopBytePair) {
+        if candidate.smaller() == 0 {
+            return;
+        }
+        let mut held = self
+            .coincident
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if candidate.smaller() > held.smaller() {
+            *held = candidate;
+        }
+    }
+
+    /// The pair as it stands now.
+    #[must_use]
+    pub fn live(&self) -> HopBytePair {
+        HopBytePair {
+            send_bytes: self.send_bytes.load(Ordering::Relaxed),
+            receive_bytes: self.receive_bytes.load(Ordering::Relaxed),
+        }
+    }
+
+    /// The pair at the instant the smaller of the two was largest.
+    #[must_use]
+    pub fn coincident(&self) -> HopBytePair {
+        *self
+            .coincident
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// One peer hop that is still open, sampled from the forwarding snapshot.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct HttpLiveHopRecord {
+    /// `ingress_remote` or `owner_peer`.
+    pub role: &'static str,
+    pub request_id: Option<String>,
+    pub stream_id: Option<u64>,
+    /// The hop's send/receive bytes as of this snapshot pass.
+    pub live: HopBytePair,
+    /// The best-attested coincident pair this hop has reached so far.
+    pub coincident: HopBytePair,
+    /// The hop's per-direction credit window.
+    pub window: usize,
+}
 
 /// A payload-free record-grammar position of one direction: counters of the
 /// record headers seen and where the byte stream stops.  Nothing here is
@@ -188,6 +311,12 @@ pub struct HttpExchangeRecord {
     /// Largest number of peer DATA bytes received and queued here but not
     /// yet consumed by the next hop.
     pub peer_receive_queue_high_water: usize,
+    /// The send/receive pair **at one instant**: the moment the smaller of
+    /// the hop's two directions was largest.  The two fields above are
+    /// independent all-time latches and cannot show simultaneity; this one
+    /// can, because it is written as a pair from a single mutation point
+    /// (task row M8-C22).
+    pub peer_coincident: HopBytePair,
     /// The peer hop's per-direction credit window, when a peer hop exists.
     pub peer_window: usize,
     /// Terminal labels: `complete`, `aborted` or `pending`.
@@ -225,6 +354,22 @@ pub struct HttpForwardDiagnosticSnapshot {
     pub hop_aggregate_send_high_water: usize,
     pub hop_aggregate_receive_high_water: usize,
     pub hop_aggregate_limit: usize,
+    /// Every peer hop still open on this relay, with its live send/receive
+    /// pair and its coincident latch.  An observation window shorter than an
+    /// exchange sees the hop here; `exchanges` above only gains the hop once
+    /// it has terminated.
+    pub live_peer_hops: Vec<HttpLiveHopRecord>,
+}
+
+/// A registered live hop.  The diagnostics hold only a weak reference, so a
+/// hop deregisters itself by being dropped and no teardown path can leak one.
+#[derive(Debug)]
+struct LiveHopEntry {
+    role: &'static str,
+    request_id: Option<String>,
+    stream_id: Option<u64>,
+    window: usize,
+    pair: Weak<HopLivePair>,
 }
 
 #[derive(Debug, Default)]
@@ -240,6 +385,7 @@ struct Inner {
     ingress_rejected_before_admission: u64,
     hop_aggregate_send_high_water: usize,
     hop_aggregate_receive_high_water: usize,
+    live_hops: Vec<LiveHopEntry>,
 }
 
 fn push_bounded<T>(queue: &mut VecDeque<T>, value: T) {
@@ -299,6 +445,32 @@ impl HttpForwardDiagnostics {
             inner.ingress_rejected_before_admission.saturating_add(1);
     }
 
+    /// Publish one open peer hop's live pair on the snapshot.
+    ///
+    /// The entry holds a weak reference: when the hop's shared state is
+    /// dropped the entry stops resolving and the next snapshot pass removes
+    /// it, so there is no deregistration path to forget.
+    pub fn register_live_hop(
+        &self,
+        role: &'static str,
+        request_id: Option<String>,
+        stream_id: Option<u64>,
+        window: usize,
+        pair: &Arc<HopLivePair>,
+    ) {
+        let mut inner = self.lock();
+        inner
+            .live_hops
+            .retain(|entry| entry.pair.strong_count() > 0);
+        inner.live_hops.push(LiveHopEntry {
+            role,
+            request_id,
+            stream_id,
+            window,
+            pair: Arc::downgrade(pair),
+        });
+    }
+
     pub fn note_hop_aggregate(&self, send: usize, receive: usize) {
         let mut inner = self.lock();
         inner.hop_aggregate_send_high_water = inner.hop_aggregate_send_high_water.max(send);
@@ -308,8 +480,27 @@ impl HttpForwardDiagnostics {
 
     #[must_use]
     pub fn snapshot(&self) -> HttpForwardDiagnosticSnapshot {
-        let inner = self.lock();
+        let mut inner = self.lock();
+        inner
+            .live_hops
+            .retain(|entry| entry.pair.strong_count() > 0);
+        let live_peer_hops = inner
+            .live_hops
+            .iter()
+            .filter_map(|entry| {
+                let pair = entry.pair.upgrade()?;
+                Some(HttpLiveHopRecord {
+                    role: entry.role,
+                    request_id: entry.request_id.clone(),
+                    stream_id: entry.stream_id,
+                    live: pair.live(),
+                    coincident: pair.coincident(),
+                    window: entry.window,
+                })
+            })
+            .collect();
         HttpForwardDiagnosticSnapshot {
+            live_peer_hops,
             owner_streams: inner.owner_streams.iter().cloned().collect(),
             exchanges: inner.exchanges.iter().cloned().collect(),
             rotations: inner.rotations.iter().cloned().collect(),
@@ -352,5 +543,93 @@ mod tests {
             (MAX_HTTP_FORWARD_RECORDS + 3) as u64
         );
         assert_eq!(snapshot.exchanges[0].stream_id, Some(3));
+    }
+
+    /// The property the two independent `max` latches do not have: two
+    /// disjoint bursts must not produce a pair, because at no instant were
+    /// both directions loaded (task row M8-C22).
+    #[test]
+    fn disjoint_bursts_latch_no_coincident_pair() {
+        let pair = HopLivePair::default();
+        // Burst one: the send direction fills and drains, receive idle.
+        pair.note_send(190_000);
+        pair.note_send(0);
+        // Burst two: the receive direction fills and drains, send idle.
+        pair.note_receive(190_000);
+        pair.note_receive(0);
+        assert_eq!(pair.coincident(), HopBytePair::default());
+        assert_eq!(pair.coincident().smaller(), 0);
+    }
+
+    /// The pair is the instant the *smaller* half is largest, not the two
+    /// directions' separate maxima joined afterwards.
+    #[test]
+    fn coincident_pair_keeps_the_best_attested_instant() {
+        let pair = HopLivePair::default();
+        // An instant with a large send and a tiny receive.
+        pair.note_send(190_000);
+        pair.note_receive(10);
+        assert_eq!(
+            pair.coincident(),
+            HopBytePair {
+                send_bytes: 190_000,
+                receive_bytes: 10,
+            }
+        );
+        // A better-attested instant: both halves substantial.  The smaller
+        // half rises from 10 to 40_000, so this one replaces it.
+        pair.note_receive(40_000);
+        assert_eq!(
+            pair.coincident(),
+            HopBytePair {
+                send_bytes: 190_000,
+                receive_bytes: 40_000,
+            }
+        );
+        // The send direction drains.  A fall never latches, and the live
+        // reading follows it down while the latch stands.
+        pair.note_send(0);
+        assert_eq!(
+            pair.live(),
+            HopBytePair {
+                send_bytes: 0,
+                receive_bytes: 40_000,
+            }
+        );
+        assert_eq!(pair.coincident().smaller(), 40_000);
+        // A larger single direction with a smaller partner does not displace
+        // it: 190_000/40_000 is better attested than 200_000/20.
+        pair.note_send(200_000);
+        pair.note_receive(20);
+        assert_eq!(pair.coincident().smaller(), 40_000);
+    }
+
+    /// A live hop is published while it exists and disappears with it, so a
+    /// window shorter than the exchange can see the hop and a finished one
+    /// leaves no stale entry.
+    #[test]
+    fn live_hops_are_published_then_reaped() {
+        let diagnostics = HttpForwardDiagnostics::default();
+        let pair = Arc::new(HopLivePair::default());
+        pair.note_send(120);
+        pair.note_receive(340);
+        diagnostics.register_live_hop(
+            "owner_peer",
+            Some("r-1".to_owned()),
+            Some(7),
+            196_608,
+            &pair,
+        );
+        let snapshot = diagnostics.snapshot();
+        assert_eq!(snapshot.live_peer_hops.len(), 1);
+        let hop = &snapshot.live_peer_hops[0];
+        assert_eq!(hop.role, "owner_peer");
+        assert_eq!(hop.stream_id, Some(7));
+        assert_eq!(hop.window, 196_608);
+        assert_eq!(hop.live.send_bytes, 120);
+        assert_eq!(hop.live.receive_bytes, 340);
+        assert_eq!(hop.coincident.smaller(), 120);
+        drop(pair);
+        assert!(diagnostics.snapshot().live_peer_hops.is_empty());
     }
 }
