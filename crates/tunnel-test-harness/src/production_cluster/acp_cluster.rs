@@ -543,7 +543,7 @@ pub struct AcpClusterEvidence {
     /// catch this hop loaded, at any interval a gate can afford. That is
     /// precisely why M8-C22's acceptance asked for a **latch written at the
     /// mutation points** rather than for a gauge to poll: the latch sees
-    /// every instant, and 436-526 passes of polling see none of them.
+    /// every instant, and 436-612 passes of polling see none of them.
     pub peer_hop_live_sampled_send: usize,
     pub peer_hop_live_sampled_receive: usize,
     /// Snapshot passes that **actually found an `ingress_remote` hop open**
@@ -1559,7 +1559,7 @@ const SATURATION_THRESHOLD_PERCENT: u64 = 90;
 /// rather than of observations of the hop and so proved nothing about the
 /// live publication at all.
 ///
-/// Observed **436-526** with the corrected counter, an order of magnitude
+/// Observed **436-612** with the corrected counter, an order of magnitude
 /// above the floor, which is the same margin `MIN_LOADED_SAMPLES` keeps.
 /// Provisional until re-run, per M8-C12.
 const MIN_PEER_HOP_SAMPLES: u64 = 32;
