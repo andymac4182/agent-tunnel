@@ -26,14 +26,31 @@
 //! that is checkable rather than assertable: see `tests/host_untouched.rs`,
 //! which reads this crate's manifest and the workspace lockfile.
 //!
-//! # Scope of chunk 2 — read-only operations only
+//! # Scope after chunk 3 — the read-only surface plus the input half
 //!
-//! [`Operation`] carries exactly `describe`, `capture`, `screen_info` and
-//! `cursor_position`. The input operations — `click`, `type_text`,
-//! `press_key`, `drag`, `scroll` — and the exclusive input lease are chunk 3,
-//! because they carry the double-dispatch and lease traps. They are **named**
-//! in [`operation::DEFERRED_OPERATIONS`] and refused by name, so a caller that
-//! sends one gets a deferral rather than the same answer as a typo.
+//! [`Operation`] carries twelve of `docs/integrations.md`'s thirteen names:
+//! the four read-only ones from chunk 2 (`describe`, `capture`, `screen_info`,
+//! `cursor_position`) and the eight that synthesise input (`click`,
+//! `double_click`, `move`, `drag`, `scroll`, `type_text`, `press_key`,
+//! `hotkey`). `accessibility_tree` remains in
+//! [`operation::DEFERRED_OPERATIONS`] and is refused **as a deferral**, which
+//! is a different answer from the one a typo gets.
+//!
+//! The input half brings three obligations the read-only half does not have,
+//! all of them state that spans exchanges and therefore — per D3 — device-side
+//! rather than codec state:
+//!
+//! * [`lease`] — **the exclusive input lease, one per target OS session.** Two
+//!   authorized agents cannot interleave keyboard or pointer actions. Reads
+//!   are deliberately *not* gated, so two agents may watch one screen.
+//! * [`capture`] — **capture identity, dimensions, display scale and target
+//!   identity carried into actions.** A coordinate is meaningless without the
+//!   image it was picked from, so a stale, mismatched or out-of-bounds
+//!   reference is refused rather than best-guessed, and the display scale is
+//!   *applied* rather than merely carried.
+//! * [`outcome::Dispatch::retry_is_safe_for`] — **an input operation that
+//!   reached the backend is never retryable**, whatever came back. That is the
+//!   difference between one click and two.
 //!
 //! # The two layers, and why the order matters
 //!
@@ -41,6 +58,8 @@
 //!   consumer JSON  --schema::validate_request-->  Request      (no dispatch yet)
 //!                  --operation allowlist      ->  Operation    (no dispatch yet)
 //!                  --capability::negotiate    ->  permitted    (no dispatch yet)
+//!                  --lease::InputLeases::check->  input held   (no dispatch yet)
+//!                  --capture::Captures        ->  coordinates  (no dispatch yet)
 //!                  --endpoint::BackendEndpoint->  loopback     (no dispatch yet)
 //!   ================================== dispatch boundary ======================
 //!                  --outcome::classify_backend_response-> Dispatch
@@ -53,8 +72,10 @@
 //! exists for.
 
 pub mod capability;
+pub mod capture;
 pub mod endpoint;
 pub mod json;
+pub mod lease;
 pub mod marker;
 pub mod operation;
 pub mod outcome;

@@ -6,7 +6,7 @@
 //! fixture's own ledger back, which is empty.
 
 use super::*;
-use crate::operation::Deferral;
+use crate::operation::{Button, Deferral};
 
 const LIMIT: u64 = crate::DEFAULT_REQUEST_BODY_LIMIT;
 
@@ -14,15 +14,188 @@ fn body(text: &str) -> Result<Request, SchemaError> {
     validate_request(text.as_bytes(), LIMIT)
 }
 
+/// The minimal accepted request for each of the twelve operations, and the
+/// table is exhaustive by construction: it is indexed by
+/// [`Operation::ALL`], so a new operation with no row here fails the test
+/// rather than being skipped.
+fn minimal_params(operation: Operation) -> &'static str {
+    match operation {
+        Operation::Describe
+        | Operation::Capture
+        | Operation::ScreenInfo
+        | Operation::CursorPosition => "{}",
+        Operation::Click | Operation::DoubleClick | Operation::Move => {
+            r#"{"capture":1,"x":0,"y":0}"#
+        }
+        Operation::Drag => r#"{"capture":1,"x":0,"y":0,"to_x":1,"to_y":1}"#,
+        Operation::Scroll => r#"{"capture":1,"x":0,"y":0,"dx":0,"dy":1}"#,
+        Operation::TypeText => r#"{"text":"a"}"#,
+        Operation::PressKey => r#"{"key":"a"}"#,
+        Operation::Hotkey => r#"{"keys":["a"]}"#,
+    }
+}
+
 #[test]
 fn a_minimal_request_for_each_operation_validates() {
     for operation in Operation::ALL {
         let text = format!(
-            r#"{{"version":"computer.v1","operation":"{}","params":{{}}}}"#,
-            operation.name()
+            r#"{{"version":"computer.v1","operation":"{}","params":{}}}"#,
+            operation.name(),
+            minimal_params(operation)
         );
         let request = body(&text).unwrap_or_else(|error| panic!("{}: {error}", operation.name()));
         assert_eq!(request.operation(), operation);
+    }
+}
+
+/// **Every required parameter of every input operation is required**, and an
+/// empty `params` is refused rather than defaulted.
+///
+/// The one deliberate default is `click`'s button; everything else must be
+/// named. A defaulted capture would be the worst of them: it would silently
+/// act on an image the consumer never saw.
+#[test]
+fn an_input_operation_refuses_an_empty_params_object() {
+    for operation in Operation::INPUT {
+        let text = format!(
+            r#"{{"version":"computer.v1","operation":"{}","params":{{}}}}"#,
+            operation.name()
+        );
+        assert!(
+            matches!(body(&text), Err(SchemaError::MissingMember { .. })),
+            "{} accepted an empty params object",
+            operation.name()
+        );
+    }
+}
+
+/// Keystroke and coordinate bounds, each at its edge.
+#[test]
+fn keystroke_and_coordinate_parameters_are_bounded_and_fail_closed() {
+    let request = |operation: &str, params: String| {
+        body(&format!(
+            r#"{{"version":"computer.v1","operation":"{operation}","params":{params}}}"#
+        ))
+    };
+    // Text: empty and oversized are both refused; the boundary length is not.
+    assert!(request("type_text", r#"{"text":""}"#.to_owned()).is_err());
+    let at_limit = "a".repeat(MAX_TEXT_BYTES);
+    assert!(request("type_text", format!(r#"{{"text":"{at_limit}"}}"#)).is_ok());
+    let over = "a".repeat(MAX_TEXT_BYTES + 1);
+    assert_eq!(
+        request("type_text", format!(r#"{{"text":"{over}"}}"#)),
+        Err(SchemaError::OutOfRange { name: "text" })
+    );
+
+    // Key names: a conservative charset, so a separator or a space cannot
+    // reach a backend that would map it onto a keyboard layout.
+    for refused in ["", "a b", "a,b", "a+b", "a\tb", "ctrl shift", "é"] {
+        assert!(
+            request("press_key", format!(r#"{{"key":"{refused}"}}"#)).is_err(),
+            "press_key accepted {refused:?}"
+        );
+    }
+    for accepted in ["a", "Return", "F13", "page_up", "alt-left"] {
+        assert!(
+            request("press_key", format!(r#"{{"key":"{accepted}"}}"#)).is_ok(),
+            "press_key refused {accepted:?}"
+        );
+    }
+
+    // Chords: bounded in length, and every member goes through the same rule.
+    let too_many = (0..=MAX_HOTKEY_KEYS)
+        .map(|_| "\"a\"")
+        .collect::<Vec<_>>()
+        .join(",");
+    assert_eq!(
+        request("hotkey", format!(r#"{{"keys":[{too_many}]}}"#)),
+        Err(SchemaError::OutOfRange { name: "keys" })
+    );
+    assert!(request("hotkey", r#"{"keys":["cmd","shift","a"]}"#.to_owned()).is_ok());
+    assert!(request("hotkey", r#"{"keys":["cmd","a b"]}"#.to_owned()).is_err());
+
+    // Scroll deltas: signed, bounded both ways.
+    assert!(
+        request(
+            "scroll",
+            format!(r#"{{"capture":1,"x":0,"y":0,"dx":0,"dy":{MAX_SCROLL_DELTA}}}"#)
+        )
+        .is_ok()
+    );
+    assert_eq!(
+        request(
+            "scroll",
+            format!(
+                r#"{{"capture":1,"x":0,"y":0,"dx":0,"dy":{}}}"#,
+                MAX_SCROLL_DELTA + 1
+            )
+        ),
+        Err(SchemaError::OutOfRange { name: "dy" })
+    );
+    assert_eq!(
+        request(
+            "scroll",
+            format!(
+                r#"{{"capture":1,"x":0,"y":0,"dx":{},"dy":0}}"#,
+                -MAX_SCROLL_DELTA - 1
+            )
+        ),
+        Err(SchemaError::OutOfRange { name: "dx" })
+    );
+
+    // Coordinates: bounded at the schema before any capture is consulted.
+    assert_eq!(
+        request(
+            "click",
+            format!(
+                r#"{{"capture":1,"x":{},"y":0}}"#,
+                u64::from(MAX_COORDINATE) + 1
+            )
+        ),
+        Err(SchemaError::OutOfRange { name: "x" })
+    );
+    // And a negative coordinate is a type error, not a wrap-around.
+    assert_eq!(
+        request("click", r#"{"capture":1,"x":-1,"y":0}"#.to_owned()),
+        Err(SchemaError::WrongType { name: "x" })
+    );
+}
+
+/// The button is the one input parameter with a default, and an unknown
+/// spelling is refused rather than folded into it.
+#[test]
+fn the_click_button_defaults_to_left_and_an_unknown_button_is_refused() {
+    let request = |params: &str| {
+        body(&format!(
+            r#"{{"version":"computer.v1","operation":"click","params":{params}}}"#
+        ))
+    };
+    assert_eq!(
+        request(r#"{"capture":7,"x":1,"y":2}"#).unwrap().params(),
+        &Params::Click {
+            capture: crate::capture::CaptureId::new(7),
+            point: crate::capture::Point::new(1, 2),
+            button: Button::Left,
+        }
+    );
+    assert_eq!(
+        request(r#"{"capture":7,"x":1,"y":2,"button":"right"}"#)
+            .unwrap()
+            .params(),
+        &Params::Click {
+            capture: crate::capture::CaptureId::new(7),
+            point: crate::capture::Point::new(1, 2),
+            button: Button::Right,
+        }
+    );
+    for refused in ["middle", "Left", "", "LEFT"] {
+        assert_eq!(
+            request(&format!(
+                r#"{{"capture":7,"x":1,"y":2,"button":"{refused}"}}"#
+            )),
+            Err(SchemaError::OutOfRange { name: "button" }),
+            "button={refused:?}"
+        );
     }
 }
 
@@ -147,37 +320,21 @@ fn the_version_is_compared_exactly() {
 
 /// **The allowlist's fail-closed behaviour, at the schema boundary.**
 ///
-/// An input operation and a typo both end in a refusal and neither is
-/// dispatched; they are distinguishable only in the diagnostic.
+/// A deferred operation and a typo both end in a refusal and neither is
+/// dispatched; they are distinguishable only in the diagnostic. The input
+/// operations chunk 3 carries are no longer on this list — they are on the
+/// *accepted* one, which `an_input_operation_is_accepted_with_its_own_parameters`
+/// covers.
 #[test]
-fn an_input_operation_is_deferred_and_a_typo_is_unknown_and_neither_dispatches() {
+fn a_deferred_operation_is_deferred_and_a_typo_is_unknown_and_neither_dispatches() {
     for (name, expected) in [
-        (
-            "click",
-            SchemaError::Operation(Refusal::Deferred(Deferral::SynthesisesInput)),
-        ),
-        (
-            "type_text",
-            SchemaError::Operation(Refusal::Deferred(Deferral::SynthesisesInput)),
-        ),
-        (
-            "press_key",
-            SchemaError::Operation(Refusal::Deferred(Deferral::SynthesisesInput)),
-        ),
-        (
-            "drag",
-            SchemaError::Operation(Refusal::Deferred(Deferral::SynthesisesInput)),
-        ),
-        (
-            "scroll",
-            SchemaError::Operation(Refusal::Deferred(Deferral::SynthesisesInput)),
-        ),
         (
             "accessibility_tree",
             SchemaError::Operation(Refusal::Deferred(Deferral::NeedsBackendProbe)),
         ),
         ("clcik", SchemaError::Operation(Refusal::Unknown)),
         ("screenshot", SchemaError::Operation(Refusal::Unknown)),
+        ("left_click", SchemaError::Operation(Refusal::Unknown)),
         ("run_command", SchemaError::Operation(Refusal::Unknown)),
         ("", SchemaError::Operation(Refusal::Unknown)),
     ] {

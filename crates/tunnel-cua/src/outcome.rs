@@ -51,6 +51,9 @@ use serde_json::Value;
 
 use tunnel_http_forward::cua_pin;
 
+use crate::Operation;
+use crate::capture::CaptureRefusal;
+use crate::lease::LeaseRefusal;
 use crate::operation::Refusal;
 use crate::schema::SchemaError;
 
@@ -93,12 +96,60 @@ impl Dispatch {
     /// happened anywhere** — not on the backend, and not on the device. That
     /// is a different reason from a `Failed`, whose effect provably did not
     /// happen, and both are different from an `Unknown`.
+    ///
+    /// # This is the transport-level fact, and for an input operation it is
+    /// not the whole answer
+    ///
+    /// It knows nothing about *what* was dispatched, so it cannot express the
+    /// rule chunk 3 needs: an operation that synthesises input and reached the
+    /// backend is never retryable. Use [`Dispatch::retry_is_safe_for`] for any
+    /// decision an operation is available at, and read this one only as "the
+    /// transport permits it". `retry_is_safe_for` is never wider than this,
+    /// and a test asserts that over the full cross-product.
     #[must_use]
     pub const fn retry_is_safe(&self) -> bool {
         match self {
             Self::NotDispatched(_) | Self::AnsweredLocally(_) => true,
             Self::Dispatched(Completion::Failed { .. }) => true,
             Self::Dispatched(Completion::Ok(_) | Completion::Unknown(_)) => false,
+        }
+    }
+
+    /// Whether a consumer may send **this operation** again.
+    ///
+    /// The narrower of the two, and the one a facade must call. It starts from
+    /// [`Dispatch::retry_is_safe`] and then applies two rules that exist only
+    /// because input operations do:
+    ///
+    /// 1. **An input operation that reached the backend is never retryable**,
+    ///    whatever the backend said afterwards. `Unknown` was already
+    ///    non-retryable; this extends it to `Failed`, where the backend
+    ///    reports that the effect did not happen. For a read that report is
+    ///    worth acting on. For a click it is a backend's opinion about its own
+    ///    side effect, on a path where it has already been handed the command,
+    ///    and this profile does not stake a duplicated click on it.
+    /// 2. **A [`NotDispatched::PeerUnavailable`] refusal is never auto-retried
+    ///    for an input operation** (M3-15). Nothing was dispatched *on this
+    ///    attempt*, which is why [`Dispatch::retry_is_safe`] says `true` — but
+    ///    the relay's answer cannot distinguish a scheduled rotation freeze
+    ///    from a fault state in which an earlier operation is still in flight
+    ///    at the device.
+    ///
+    /// A consumer that has its own evidence may still choose to resend; what
+    /// this returns is whether *this profile* will call a resend safe, and
+    /// there is deliberately no argument that overrides it.
+    #[must_use]
+    pub const fn retry_is_safe_for(&self, operation: Operation) -> bool {
+        if !self.retry_is_safe() {
+            return false;
+        }
+        if !operation.mutates_target() {
+            return true;
+        }
+        match self {
+            Self::Dispatched(_) => false,
+            Self::NotDispatched(NotDispatched::PeerUnavailable) => false,
+            Self::NotDispatched(_) | Self::AnsweredLocally(_) => true,
         }
     }
 
@@ -142,7 +193,50 @@ pub enum NotDispatched {
     /// The backend answered 503: deliberately unavailable, not a transient
     /// fault. A supervisor must not retry through this.
     BackendUnavailable,
+    /// The input lease or the capture identity refused the operation. Checked
+    /// above the dispatch boundary; nothing was sent. See [`crate::plan`].
+    InputAuthority(InputRefusal),
+    /// The relay refused the request because the device-side peer was not
+    /// ready: a rotation freeze, no active carrier, an unfenced owner.
+    ///
+    /// **Its own variant because of M3-15.** The relay answers all of those
+    /// with one retryable `503 PEER_UNAVAILABLE` `not_dispatched` body, so a
+    /// consumer cannot tell a *scheduled* freeze — during which nothing was
+    /// dispatched and a retry is genuinely free — from a fault state, during
+    /// which an earlier operation may still be in flight at the device. For a
+    /// read the distinction costs a round trip. For a click it is the
+    /// difference between one click and two, so
+    /// [`Dispatch::retry_is_safe_for`] refuses to auto-retry this for a
+    /// mutating operation. M3-15's remaining work is to make the two
+    /// distinguishable at the relay; until then this profile takes the safe
+    /// side.
+    PeerUnavailable,
 }
+
+/// Why an input operation was refused before anything was sent.
+///
+/// The two halves of the input contract, kept as separate types so that
+/// "you do not hold the lease" and "that capture is stale" cannot be confused
+/// for one another in a diagnostic — they have entirely different remedies.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum InputRefusal {
+    /// The exclusive input lease refused. See [`crate::lease`].
+    Lease(LeaseRefusal),
+    /// The capture identity or its coordinates refused. See
+    /// [`crate::capture`].
+    Capture(CaptureRefusal),
+}
+
+impl core::fmt::Display for InputRefusal {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Lease(refusal) => write!(formatter, "{refusal}"),
+            Self::Capture(refusal) => write!(formatter, "{refusal}"),
+        }
+    }
+}
+
+impl std::error::Error for InputRefusal {}
 
 /// What a dispatched operation did.
 #[derive(Clone, Debug, Eq, PartialEq)]
