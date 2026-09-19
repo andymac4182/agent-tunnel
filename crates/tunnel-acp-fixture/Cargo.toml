@@ -19,6 +19,16 @@ path = "src/main.rs"
 # evidence, which this chunk does not have and must not imply.
 [dependencies]
 serde_json = "1.0"
+# The `supervise` probe runs a **real** `tunnel_acp_export::child` supervisor
+# inside the fixture *binary*, so these are ordinary dependencies rather than
+# dev-dependencies: a dev-dependency is not linked into `[[bin]]`.  The probe
+# exists because the supervisor's most dangerous end of life — a `SIGKILL` —
+# cannot be reached from inside the test process that owns the handle, so
+# something other than the test has to be the supervisor.  `tunnel-mcp-fixture`
+# carries `tunnel-mcp-export` and `tunnel-deadman` in exactly this position for
+# exactly this reason.
+tunnel-acp-export = { path = "../tunnel-acp-export" }
+tunnel-deadman = { path = "../tunnel-deadman" }
 tokio = { version = "1.48", features = [
     "io-std",
     "io-util",
@@ -108,7 +118,6 @@ tempfile = "3.21"
 tokio-util = { version = "0.7", default-features = false }
 toml = { workspace = true }
 tunnel-acp = { path = "../tunnel-acp" }
-tunnel-acp-export = { path = "../tunnel-acp-export" }
 tunnel-http-bridge = { path = "../tunnel-http-bridge" }
 
 [target.'cfg(unix)'.dependencies]

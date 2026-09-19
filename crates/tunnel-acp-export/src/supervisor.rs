@@ -273,6 +273,16 @@ pub struct Diagnostics {
     /// running rather than only that something is; it is the more readable of
     /// the two and the weaker of the two.
     pub background_tasks: u64,
+    /// Children for which a parent-death sentinel was armed.
+    ///
+    /// **This is what lets a measurement tell "the mechanism ran and contained
+    /// this" from "the mechanism was never there".** A `SIGKILL` test that
+    /// only observed a dead helper could not say which of the two it had
+    /// found, and that difference is the whole of M8-C07's trigger half.
+    pub deadman_armed: u64,
+    /// Sentinels that reported standing down, read from the sentinel's own
+    /// exit status rather than from the supervisor having asked.
+    pub deadman_stood_down: u64,
     pub resolutions: u64,
     pub permission_expirations: u64,
 }
@@ -710,6 +720,8 @@ impl Supervisor {
             // Minus one for this `Supervisor`'s own handle.
             child_handle_holders: (Arc::strong_count(&self.child) as u64).saturating_sub(1),
             background_tasks: self.counters.background_tasks.load(Ordering::Relaxed),
+            deadman_armed: self.counters.deadman_armed.load(Ordering::Relaxed),
+            deadman_stood_down: self.counters.deadman_stood_down.load(Ordering::Relaxed),
             resolutions,
             permission_expirations,
         }

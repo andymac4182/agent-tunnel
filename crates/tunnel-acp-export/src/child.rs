@@ -24,19 +24,29 @@
 //!   and the process-table tests in `tunnel-acp-fixture` — a child that exits
 //!   by itself, a supervisor dropped without draining, and a runtime torn down
 //!   with the supervisor still live — are what now hold it.
-//! * **"Every end the supervisor lives to see" is the exact claim, and one
-//!   route is deliberately outside it: the device process dying.** On a
-//!   `SIGKILL`, a `process::exit` or a crash, no `Drop` of any kind runs. The
+//! * **The device process dying used to be outside that claim, and is no
+//!   longer.** On a `SIGKILL`, a `process::exit` or a crash, no `Drop` of any
+//!   kind runs — not the supervisor task's, not [`ChildHandle::drop`]'s. The
 //!   child then sees stdin at end of file and exits on its own, but nobody
-//!   signals its group, so a wrapper's grandchild is orphaned. This is not
-//!   closable from inside the process: it needs a kernel-side parent-death
-//!   facility (Linux has `PR_SET_PDEATHSIG`; macOS has no equivalent) or the
-//!   same containment boundary the escaping-descendant hole needs. Recorded on
-//!   M8-C07 as a sibling gap rather than left as a gap in this sentence. **A descendant that leaves the group — `setsid`,
-//!   `setpgid`, a daemon double fork — is outside this boundary and is not
-//!   killed.** That is inherited hole M3-09, and this crate ships a fixture
-//!   that demonstrates it rather than a claim that it does not exist. Group
-//!   signalling is Unix-only; macOS is the only host this has run on.
+//!   signalled its group, so even an ordinary **in-group** helper (the
+//!   `npx`/`uvx`/`/bin/sh` wrapper's real agent, the case the group kill exists
+//!   for) was orphaned and survived. Each child is therefore also watched by a
+//!   [`tunnel_deadman`] sentinel: a sibling process, in a process group of its
+//!   own, holding the read end of a pipe this process holds the write end of.
+//!   When this process dies for **any** reason the kernel closes that
+//!   descriptor, the sentinel wakes on end of file and `SIGKILL`s the group.
+//!   `SIGKILL` cannot be caught, which is exactly why the signal has to come
+//!   from a process other than the one being killed.
+//! * **The sentinel does not widen the group kill's reach, and must never be
+//!   described as if it did.** A descendant that leaves the group — `setsid`,
+//!   `setpgid`, a daemon double fork — escapes the sentinel exactly as it
+//!   escapes this supervisor, because the sentinel sends the *same* group
+//!   signal from a different process and `killpg`'s delivery set does not
+//!   mention the sender. That is inherited hole M3-09, `docs/tasks.md` records
+//!   which kernel boundary would close it on which platform, and this crate
+//!   ships a fixture that demonstrates the escape rather than a claim that it
+//!   does not exist. Group signalling is Unix-only; macOS is the only host this
+//!   has run on.
 //! * No lock is held across child I/O: a writer task owns stdin, a reader task
 //!   owns stdout and a supervisor task owns the process.
 
@@ -138,6 +148,16 @@ pub struct ChildCounters {
     /// The M8-C07 review found exactly that, so "every background task ended
     /// with the child" is something a test can now read rather than assume.
     pub background_tasks: AtomicU64,
+    /// Children for which a parent-death sentinel was armed. A child counted
+    /// in `spawned` but not here is one whose process group survives this
+    /// process being `SIGKILL`ed — the pre-sentinel behaviour, reached
+    /// silently whenever the sentinel executable is not installed.
+    pub deadman_armed: AtomicU64,
+    /// Sentinels that **reported** standing down after their child was killed
+    /// and reaped. Read from the sentinel's own exit status, never from this
+    /// process having asked: a sentinel that fired a group signal on its way
+    /// out must not be recorded as an orderly shutdown.
+    pub deadman_stood_down: AtomicU64,
 }
 
 /// A spawn failure. Carries no path and no OS message.
@@ -278,6 +298,15 @@ pub fn spawn(
     let group = child.id();
     counters.spawned.fetch_add(1, Ordering::Relaxed);
     counters.running.fetch_add(1, Ordering::Relaxed);
+    // Armed before any task can end the child. A window remains, between the
+    // spawn above and this line, in which a crash of this process leaves the
+    // group unwatched; it is microseconds and cannot be closed without arming
+    // the sentinel before the pid it watches exists, but it is not zero and is
+    // not claimed to be.
+    let deadman = group.and_then(tunnel_deadman::Deadman::arm);
+    if deadman.is_some() {
+        counters.deadman_armed.fetch_add(1, Ordering::Relaxed);
+    }
 
     let kill = CancellationToken::new();
     let (exited_tx, exited_rx) = watch::channel(false);
@@ -319,6 +348,42 @@ pub fn spawn(
         }
         supervisor_counters.exited.fetch_add(1, Ordering::Relaxed);
         supervisor_counters.running.fetch_sub(1, Ordering::Relaxed);
+        // Only now: the leader is reaped and the group is signalled, so the
+        // sentinel has nothing left to watch.
+        //
+        // **What this ordering guards is a crash window, and it is not an
+        // argument about pid reuse.** The sentinel exits on the stand-down
+        // token *without signalling anything* — `tunnel_deadman::watch`
+        // returns before it reaches `kill_group` — so no ordering of an
+        // orderly stand-down can produce a fire against any group id,
+        // reissued or not. What standing down any earlier would do is leave
+        // an interval in which the child's group is **alive and no longer
+        // watched**, and a `SIGKILL` of this process inside that interval
+        // leaks it, which is the exact hole the sentinel exists to close.
+        //
+        // **And it is a stated trade, not a free win.** On the path where the
+        // token never arrives — the write fails, the pipe is already gone —
+        // the sentinel sees a bare end of file and *fires*; in this late
+        // ordering that firing lands after the group has been reaped, when the
+        // id may already be free, whereas an early stand-down would have fired
+        // while the group was still alive and therefore still unreusable. The
+        // crash window is the larger exposure so the late ordering stays, but
+        // the reuse race mildly argues the other way. `docs/tasks.md` M3-18
+        // carries it.
+        if let Some(deadman) = deadman {
+            // `stand_down` writes a byte and reaps; it blocks only for as long
+            // as the sentinel takes to exit, but it does block, so it does not
+            // belong on a runtime worker. The counter follows the sentinel's
+            // own exit status, never the fact that it was asked.
+            if tokio::task::spawn_blocking(move || deadman.stand_down())
+                .await
+                .unwrap_or(false)
+            {
+                supervisor_counters
+                    .deadman_stood_down
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
         let _ = exited_tx.send(true);
     });
 

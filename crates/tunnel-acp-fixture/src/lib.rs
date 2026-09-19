@@ -50,6 +50,29 @@ pub const AGENT_MODE: &str = "agent";
 /// The argv verb that runs a descendant which deliberately leaves its process
 /// group. It takes a pid file path.
 pub const DETACHED_MODE: &str = "detached";
+/// The argv verb that runs an in-group helper: it publishes its pid and then
+/// waits, **without** leaving the process group it was started in. It is the
+/// control that makes every escape measurement mean something.
+pub const HELPER_MODE: &str = "helper";
+/// The argv verb that runs the `npx`-shaped wrapper the `supervise` probe
+/// supervises: `wrapper <pid-file> <helper-pid-file>`.
+pub const WRAPPER_MODE: &str = "wrapper";
+/// The argv verb that runs a real ACP export supervisor a test can `SIGKILL`:
+/// `supervise <workspace>`.
+pub const SUPERVISE_MODE: &str = "supervise";
+/// The file the `supervise` probe writes in its workspace, three
+/// space-separated fields: `<wrapper-pid> <helper-pid> <sentinels-armed>`.
+///
+/// The third field is what lets a test tell "the mechanism ran and contained
+/// this" from "the mechanism was never there", which is the difference between
+/// the two `SIGKILL` measurements in `tests/process_residue.rs`.
+pub const SUPERVISE_REPORT: &str = "supervise.report";
+/// The wrapper's own pid file inside the probe's workspace.
+pub const WRAPPER_PID_FILE: &str = "wrapper.pid";
+/// The wrapper's in-group helper pid file inside the probe's workspace.
+pub const HELPER_PID_FILE: &str = "helper.pid";
+/// The longest the `supervise` probe waits for a pid to be published.
+pub const PUBLISH_WAIT_SECONDS: u64 = 10;
 /// The longest a detached descendant lives on its own, so a failed run leaks
 /// nothing for more than this.
 pub const DETACHED_LIFETIME_SECONDS: u64 = 300;
@@ -480,4 +503,138 @@ pub async fn run_detached(pid_file: &Path) {
 #[must_use]
 pub fn marker_file(pid_file: &Path) -> PathBuf {
     pid_file.with_extension(SETSID_MARKER)
+}
+
+// ------------------------------------------------ the parent-death probe (M8-C07)
+
+/// Publish a pid atomically, so a reader never sees a half-written file.
+///
+/// `std::fs` rather than `tokio::fs`, as everything else in this crate does:
+/// the crate does not enable tokio's `fs` feature, and a single small write in
+/// a fixture is not worth widening its dependency graph for.
+fn publish_pid(pid_file: &Path) {
+    let temporary = pid_file.with_extension("tmp");
+    if std::fs::write(&temporary, std::process::id().to_string()).is_ok() {
+        let _ = std::fs::rename(&temporary, pid_file);
+    }
+}
+
+/// Read a published pid, bounded. Empty when it never appeared.
+async fn read_published_pid(path: &Path) -> String {
+    let deadline =
+        tokio::time::Instant::now() + std::time::Duration::from_secs(PUBLISH_WAIT_SECONDS);
+    while tokio::time::Instant::now() < deadline {
+        let pid = std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
+        if !pid.is_empty() {
+            return pid;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    String::new()
+}
+
+/// Run an **in-group** helper: publish the pid, then wait.
+///
+/// It stays in the process group it was started in, so it is exactly what a
+/// group `SIGKILL` is supposed to reach. That is its whole purpose: it is the
+/// control against which an escaping descendant's survival means something.
+pub async fn run_helper(pid_file: &Path) {
+    publish_pid(pid_file);
+    tokio::time::sleep(std::time::Duration::from_secs(DETACHED_LIFETIME_SECONDS)).await;
+}
+
+/// Run the wrapper the `supervise` probe uses as its export backend.
+///
+/// It models the shape that makes a process-group kill worth having at all: an
+/// `npx`/`uvx`/`/bin/sh` wrapper that starts a helper which **does not read
+/// stdin**, and then reads stdin itself. When the supervisor goes away the
+/// wrapper sees end of file and exits, but the helper has no way to notice and
+/// no reason to stop. Only something that signals the group ends it — and if
+/// the supervisor was `SIGKILL`ed, the supervisor is not there to be that
+/// something.
+///
+/// Both pids are published, so a test asserts against the process table rather
+/// than against anybody's belief about what it started.
+pub async fn run_wrapper(pid_file: &Path, helper_pid_file: &Path) {
+    publish_pid(pid_file);
+    if let Ok(executable) = std::env::current_exe() {
+        // No `process_group`: the helper stays in the wrapper's group, which is
+        // the supervised child's group.
+        let spawned = std::process::Command::new(executable)
+            .arg(HELPER_MODE)
+            .arg(helper_pid_file)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        if let Ok(mut child) = spawned {
+            // Reap it whenever it ends, so it never lingers as a zombie.
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+    }
+    // Drain stdin to end of file, then exit, as a wrapper does.
+    let mut stdin = tokio::io::stdin();
+    let mut buffer = [0u8; 1024];
+    loop {
+        match tokio::io::AsyncReadExt::read(&mut stdin, &mut buffer).await {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {}
+        }
+    }
+}
+
+/// Run one real [`tunnel_acp_export::child`] supervisor over [`run_wrapper`],
+/// report the pids it created, and then **park forever**.
+///
+/// This exists because the supervisor's most dangerous end of life cannot be
+/// reached from inside a test process: a `SIGKILL` runs no `Drop`, no
+/// `kill_on_drop` and no handler, so to measure it something other than the
+/// test has to be the supervisor and the test has to kill it. A test that
+/// dropped a handle and asserted the handle was closed would prove nothing
+/// about this at all.
+///
+/// It drives [`tunnel_acp_export::child::spawn`] directly rather than the full
+/// [`tunnel_acp_export::Supervisor`], for the same reason `tunnel-mcp-fixture`
+/// does: the deadman is armed at that level, and the wrapper here drains stdin
+/// rather than speaking ACP, so a `Supervisor` would refuse to initialize
+/// against it and the probe would measure a failed handshake instead of a
+/// process group.
+pub async fn run_supervise(workspace: &Path) {
+    let Ok(executable) = std::env::current_exe() else {
+        return;
+    };
+    let config = tunnel_acp_export::ChildConfig {
+        command: executable,
+        args: vec![
+            WRAPPER_MODE.to_owned(),
+            workspace.join(WRAPPER_PID_FILE).display().to_string(),
+            workspace.join(HELPER_PID_FILE).display().to_string(),
+        ],
+        workspace: workspace.to_path_buf(),
+        inherit_env: Vec::new(),
+        env: std::collections::BTreeMap::new(),
+        message_limit: 1 << 20,
+        stderr_cap: 1 << 16,
+    };
+    let counters = Arc::new(tunnel_acp_export::ChildCounters::default());
+    let Ok((handle, _events)) = tunnel_acp_export::child::spawn(&config, &counters) else {
+        return;
+    };
+    let wrapper = read_published_pid(&workspace.join(WRAPPER_PID_FILE)).await;
+    let helper = read_published_pid(&workspace.join(HELPER_PID_FILE)).await;
+    let armed = counters
+        .deadman_armed
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let temporary = workspace.join("supervise.tmp");
+    if std::fs::write(&temporary, format!("{wrapper} {helper} {armed}")).is_ok() {
+        let _ = std::fs::rename(&temporary, workspace.join(SUPERVISE_REPORT));
+    }
+    // Hold the handle so nothing drops it, and wait to be killed.
+    std::future::pending::<()>().await;
+    drop(handle);
 }

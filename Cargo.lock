@@ -3464,6 +3464,7 @@ dependencies = [
  "tokio-util",
  "toml",
  "tunnel-acp",
+ "tunnel-deadman",
  "tunnel-http-bridge",
  "tunnel-http-forward",
 ]
@@ -3489,6 +3490,7 @@ dependencies = [
  "toml",
  "tunnel-acp",
  "tunnel-acp-export",
+ "tunnel-deadman",
  "tunnel-http-bridge",
 ]
 
