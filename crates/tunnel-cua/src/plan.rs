@@ -1042,10 +1042,12 @@ mod tests {
 
     /// **Nothing a planner produces carries the typed text into a diagnostic.**
     ///
-    /// `Planned` derives `Debug` and its payload is a `serde_json::Value`, so
-    /// the *payload* necessarily holds the text -- that is the request body.
-    /// What must never happen is the text reaching a log through the validated
-    /// parameters, which is the value a facade would naturally format.
+    /// `Planned`'s payload is a `serde_json::Value`, so the *payload* necessarily
+    /// holds the text -- that is the request body. `Debug` is **hand-written** for
+    /// exactly that reason, rendering the payload only as its size; see the doctest
+    /// on [`Planned`], and do not replace it with a derive. What must never happen
+    /// is the text reaching a log through the validated parameters either, which is
+    /// the value a facade would naturally format -- that is what this test covers.
     #[test]
     fn the_validated_parameters_never_render_the_typed_text() {
         let request =
