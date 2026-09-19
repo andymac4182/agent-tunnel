@@ -16,10 +16,20 @@ This is the red-then-green evidence behind M3-09.  Two suites live here:
 **One rule of M3-09 is deliberately not here**, and is recorded in that row's
 "Not covered" list instead: the *ordering* of the stand-down against the group
 kill.  Hoisting the stand-down above the kill leaves every test in both suites
-green, because the group still dies — the sentinel kills it a moment earlier
-instead of the supervisor.  Nothing observable distinguishes the two orderings
-on a host where the group id is not reused, so no case was added rather than a
-case that would pass either way and look like coverage.
+green — measured by doing it, not inferred — and the reason is not the obvious
+one — on a hoist the sentinel does not
+fire early, it **does not fire at all**.  `watch` returns `EXIT_STOOD_DOWN` on
+the stand-down token without calling `kill_group`, so in both orderings the
+group is killed by the supervisor's own `kill_group` and the sentinel exits
+stood-down either way; the `deadman_stood_down` counter reads that exit status,
+so it increments in both.
+
+What the ordering really guards is a **crash window**: the hoist leaves the
+group alive and unwatched between the two calls, so a `SIGKILL` of the device
+inside it leaks the group.  It is microseconds wide and cannot be hit
+deterministically without widening it — and widening it is an **addition**,
+which a deletion case may not make.  Hence no case, rather than a case that
+would pass either way and look like coverage.
 
 **The fourth case is not like the others and is the point of having it.**  It
 defeats the *fixture*, not the product: it makes the escaping descendant fail

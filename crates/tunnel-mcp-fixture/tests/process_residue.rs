@@ -523,7 +523,12 @@ async fn an_orderly_shutdown_stands_the_sentinel_down_instead_of_firing_it() {
     assert_eq!(
         counters.deadman_stood_down.load(Ordering::Relaxed),
         1,
-        "the sentinel was stood down, and only after the child was killed and reaped"
+        // Deliberately says only what it checks. The counter reads the
+        // sentinel's exit status, so this proves the sentinel stood down
+        // rather than fired. It proves nothing about *when* it was asked,
+        // and the ordering it was asked in is named as untested in M3-09's
+        // "Not covered" list rather than implied to be covered here.
+        "the sentinel exited stood-down rather than fired"
     );
     // And the orderly path still cleaned the group up itself.
     let row = wait_not_alive(&helper).await;

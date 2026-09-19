@@ -477,7 +477,19 @@ fn unix_seconds(now: SystemTime) -> i64 {
 /// Reads a path and starts nothing, which keeps the doctor's promise that it
 /// stops at files and never invokes an export.
 fn process_containment_check() -> CapabilityCheck {
-    match tunnel_deadman::availability() {
+    containment_check(tunnel_deadman::availability())
+}
+
+/// The [`tunnel_deadman::Availability`] to [`CapabilityCheck`] mapping, as a
+/// pure function of its input.
+///
+/// Split from the lookup above so a test can assert the **degraded** arm on a
+/// machine where the sentinel happens to be installed. Left fused, a test
+/// would take whichever arm the host produced — on any developer machine that
+/// has built the workspace, the `Armable` one — and its assertions about the
+/// degraded reporting would hold vacuously.
+fn containment_check(availability: tunnel_deadman::Availability) -> CapabilityCheck {
+    match availability {
         tunnel_deadman::Availability::Armable => CapabilityCheck {
             status: "ok",
             code: "PROCESS_CONTAINMENT_SENTINEL_PRESENT",
@@ -758,33 +770,41 @@ mod tests {
     /// works, and refusing to start would be worse than warning.
     #[test]
     fn a_missing_parent_death_sentinel_is_reported_and_does_not_fail_the_doctor() {
+        // The degraded state is constructed, not waited for. On any machine
+        // that has built this workspace the sentinel IS installed, so a test
+        // that ran `inspect` and looked at whatever came back would take the
+        // `Armable` arm and assert nothing about the case it is named for.
+        let missing = containment_check(tunnel_deadman::Availability::SentinelMissing);
+        assert_eq!(missing.status, "degraded");
+        assert_eq!(missing.code, "PROCESS_CONTAINMENT_SENTINEL_MISSING");
+        assert_eq!(
+            containment_check(tunnel_deadman::Availability::Armable).status,
+            "ok"
+        );
+        assert_eq!(
+            containment_check(tunnel_deadman::Availability::UnsupportedPlatform).status,
+            "not_implemented"
+        );
+
+        // And a degraded containment does not become a failed doctor: it is a
+        // degradation of cleanup, not a reason to refuse to run. Asserted
+        // against a result that actually carries the degraded check, so the
+        // claim holds on a host where the sentinel is present.
         let fixture = fixture(false);
         let inspection = inspect(
             &fixture.config,
             UNIX_EPOCH + Duration::from_secs(1_800_000_000),
         );
-        let result = inspection
+        let mut result = inspection
             .output
             .result
-            .as_ref()
+            .clone()
             .expect("successful doctor inspection has a result");
-        // Whichever this host is, the code says which and never says nothing.
+        result.process_containment = missing;
         assert!(
-            matches!(
-                result.process_containment.code,
-                "PROCESS_CONTAINMENT_SENTINEL_PRESENT"
-                    | "PROCESS_CONTAINMENT_SENTINEL_MISSING"
-                    | "PROCESS_CONTAINMENT_UNSUPPORTED_PLATFORM"
-            ),
-            "the doctor names the containment state: {}",
-            result.process_containment.code
+            first_credential_failure(&result).is_none(),
+            "containment is not part of the doctor's verdict"
         );
-        assert_eq!(
-            result.process_containment.status == "degraded",
-            result.process_containment.code == "PROCESS_CONTAINMENT_SENTINEL_MISSING",
-            "a missing sentinel is the degraded state and nothing else is"
-        );
-        // Whatever it found, it did not change the verdict.
         assert!(inspection.output.ok);
         assert_eq!(inspection.exit_code, 0);
         let json = serde_json::to_string(&inspection.output).expect("doctor serializes");

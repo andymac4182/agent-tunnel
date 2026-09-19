@@ -245,8 +245,22 @@ pub fn spawn(
         supervisor_counters.running.fetch_sub(1, Ordering::Relaxed);
         // Only now: the leader is reaped and the group is signalled, so the
         // sentinel has nothing left to do and can no longer outlive the group
-        // id it holds.  Standing it down any earlier would reopen the window
-        // this whole mechanism exists to close.
+        // id it holds.
+        //
+        // **Standing it down any earlier reopens the trigger hole for the
+        // length of the gap.**  The sentinel exits on the stand-down token
+        // *without signalling anything* — `tunnel_deadman::watch` returns
+        // before it reaches `kill_group` — so between an early stand-down and
+        // the kill above, the group would be alive and unwatched, and a
+        // `SIGKILL` of this process in that interval would leak it.
+        //
+        // Nothing observable distinguishes the two orderings, which was
+        // measured rather than assumed: with the block hoisted above the kill,
+        // all six tests in `tunnel-mcp-fixture`'s `process_residue` stay green,
+        // `deadman_stood_down` included — in both orderings the group dies from
+        // the `kill_group` above and the sentinel exits stood-down.  So
+        // `docs/tasks.md` M3-09 names this ordering as held by construction
+        // with no test, instead of pretending a test covers it.
         if let Some(deadman) = deadman {
             // `stand_down` writes a byte and reaps; it blocks only for as long
             // as the sentinel takes to exit, but it does block, so it does not
