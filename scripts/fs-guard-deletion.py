@@ -335,13 +335,25 @@ GATE2_CASES: list[tuple[str, list[Edit]]] = [
         ],
     ),
     (
+        # Re-anchored by task row **M4-18**.  The rule is unchanged and the
+        # guard was never lost: `ExportRoot::open_for_size_change_with` still
+        # takes the grant decision before it resolves anything, so a caller
+        # without the primitive is refused before a single component of the
+        # path is opened.  What moved was the *line beneath it*: gates 4 and 5
+        # generalised `self.resolve(path, Intent::Write)?` to
+        # `self.resolve(path, intent)?` so one helper could serve `OpenWrite`,
+        # `OpenTruncate`, `SetattrSize` and the read-write open.  The case's
+        # pinned text stopped matching and the script refused to apply it,
+        # which is exactly what it should do — an unapplied edit is not a
+        # result.  The anchor is the current spelling; the deletion is the same
+        # deletion it always was.
         "grant check before resolution",
         [
             (
                 RESOLVER,
                 """        self.authorize(primitive)?;
-        let handle = self.resolve(path, Intent::Write)?;""",
-                "        let handle = self.resolve(path, Intent::Write)?;",
+        let handle = self.resolve(path, intent)?;""",
+                "        let handle = self.resolve(path, intent)?;",
             )
         ],
     ),
@@ -1515,21 +1527,37 @@ GATE4_CASES: list[tuple[str, list[Edit]]] = [
         ],
     ),
     (
-        "refuse a writing open before the host is touched",
+        # Re-aimed by task row **M4-18**, which is a different act from the
+        # re-anchoring above and is recorded as one.
+        #
+        # This case used to delete gate 4's blanket refusal of `OpenWrite`,
+        # `OpenTruncate` and `Create` before the host was touched.  Gate 5
+        # **implemented** those writes and removed that block on purpose, so
+        # the old text is gone by design: the case was obsolete, not stale, and
+        # re-anchoring it was impossible because the rule it deleted no longer
+        # exists.
+        #
+        # What survives of gate 4's claim is the accounting, and
+        # `ProviderStats::mutations_refused` says so in its own words: "Every
+        # one of these is `Outcome::NotStarted`, which is the claim gate 4
+        # could make about *every* refusal it produced and gate 5 can no
+        # longer."  The rule now is that a refusal taken **before** the
+        # effecting syscall is counted as a refusal and never as a dispatched
+        # failure — the distinction that lets a consumer tell "the host was
+        # never asked" from "the host was asked and changed nothing".
+        #
+        # The arm is emptied rather than removed, because `error.outcome()` is
+        # matched exhaustively and a missing arm would not compile, and a build
+        # failure is not evidence.  Its sibling — gate 5's "a failed mutation
+        # is reported failed, not not-started" — defeats the `Outcome::Failed`
+        # arm; this one defeats the `NotStarted` arm, which had no case at all
+        # until now.
+        "a refusal before the host is counted not-started, never dispatched",
         [
             (
                 PROVIDER_SRC,
-                """        if required.iter().any(|primitive| {
-            matches!(
-                primitive,
-                Primitive::OpenWrite | Primitive::OpenTruncate | Primitive::Create
-            )
-        }) {
-            self.stats.mutations_refused += 1;
-            return Err(FsError::refused(FsErrorCode::Enotsup));
-        }
-""",
-                "",
+                "                Outcome::NotStarted => self.stats.mutations_refused += 1,",
+                "                Outcome::NotStarted => {}",
             )
         ],
     ),

@@ -7,6 +7,7 @@
 //! state machine.  It is independent of Axum, HTTP servers, ACP/MCP JSON-RPC
 //! types, child supervision, and clocks.
 
+pub mod cua_pin;
 pub mod decoder;
 pub mod error;
 pub mod head;
