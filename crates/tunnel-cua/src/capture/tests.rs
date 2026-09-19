@@ -172,6 +172,8 @@ fn impossible_capture_geometry_is_refused_rather_than_recorded() {
         (128, 0, IDENTITY_SCALE_PERCENT),
         (128, 96, 0),
         (128, 96, MAX_SCALE_PERCENT + 1),
+        (MAX_CAPTURE_DIMENSION + 1, 96, IDENTITY_SCALE_PERCENT),
+        (128, MAX_CAPTURE_DIMENSION + 1, IDENTITY_SCALE_PERCENT),
     ] {
         assert_eq!(
             captures.record(&target, 0, width, height, scale).err(),
@@ -180,7 +182,28 @@ fn impossible_capture_geometry_is_refused_rather_than_recorded() {
         );
     }
     assert!(captures.is_empty(), "a refused capture issues no identity");
-    // Non-vacuity: the boundary value itself is accepted.
+    // Non-vacuity: every boundary value itself is accepted.
     assert!(captures.record(&target, 0, 1, 1, MAX_SCALE_PERCENT).is_ok());
-    assert_eq!(captures.len(), 1);
+    assert!(
+        captures
+            .record(
+                &target,
+                1,
+                MAX_CAPTURE_DIMENSION,
+                MAX_CAPTURE_DIMENSION,
+                IDENTITY_SCALE_PERCENT
+            )
+            .is_ok()
+    );
+    assert_eq!(captures.len(), 2);
+
+    // And the widest accepted capture converts without wrapping, which is the
+    // arithmetic the u64 intermediate exists for.
+    let widest = captures
+        .record(&target, 2, MAX_CAPTURE_DIMENSION, 8, MAX_SCALE_PERCENT)
+        .unwrap();
+    assert_eq!(
+        widest.to_backend_point(Point::new(MAX_CAPTURE_DIMENSION - 1, 0)),
+        ((MAX_CAPTURE_DIMENSION - 1) / 8, 0)
+    );
 }

@@ -973,7 +973,71 @@ CASES_C3: list[tuple[str, list[Edit], bool]] = [
         [(FIXTURE_LIB, '        "double_click" => 2,', '        "double_click" => 1,')],
         False,
     ),
+    # ------------------- the review round's four rules
+    (
+        # **The major review finding.** `acquire` used to write the supplied
+        # revision into an existing holding, so a revoked holder could clear
+        # its own `GrantRevoked` refusal by taking the lease again -- and
+        # `reconcile_grant` would then free nothing. One call defeated both
+        # halves of the M3-16 story.
+        "a revoked holder cannot re-acquire its own lease to clear the refusal",
+        [
+            (
+                LEASE,
+                "            if grant_revision > holder.grant_revision {\n"
+                "                return Err(LeaseRefusal::GrantRevoked);\n"
+                "            }\n",
+                "",
+            )
+        ],
+        False,
+    ),
+    (
+        # The plan's `Debug` is hand-written because a derived one renders the
+        # payload, and for `type_text` the payload is the text.
+        "a planned dispatch never renders its payload, because the payload can be keystrokes",
+        [
+            (
+                PLAN,
+                '                .field(\n'
+                '                    "payload",\n'
+                '                    &format_args!("<{} bytes>", payload.to_string().len()),\n'
+                '                )\n',
+                '                .field("payload", payload)\n',
+            )
+        ],
+        False,
+    ),
+    (
+        # The M3-15 rule has to be *derived* at the wire, not assumed, or a
+        # future facade gets the default wrong.
+        "a not-dispatched refusal of a known operation derives its retryability",
+        [
+            (
+                SCHEMA,
+                "        let retryable =\n"
+                "            crate::outcome::Dispatch::NotDispatched(refusal).retry_is_safe_for(operation);",
+                "        let retryable = true;",
+            )
+        ],
+        False,
+    ),
+    (
+        # A capture dimension nobody bounded reaches `contains` and
+        # `to_backend_point`.
+        "a capture dimension is bounded where the capture is recorded",
+        [
+            (
+                CAPTURE,
+                "            || width > MAX_CAPTURE_DIMENSION\n"
+                "            || height > MAX_CAPTURE_DIMENSION\n",
+                "",
+            )
+        ],
+        False,
+    ),
 ]
+
 
 
 @dataclass

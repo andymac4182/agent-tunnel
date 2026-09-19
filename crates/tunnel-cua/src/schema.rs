@@ -627,9 +627,40 @@ impl Response {
     /// Renders as `outcome: "not_dispatched"`, **not** as `failed`: the
     /// backend never saw this, and a consumer must be able to learn that from
     /// the wire rather than infer it from a retryability flag.
+    /// **Only for an operation name this build cannot parse.** That is the
+    /// case the `&str` exists for, and it is the one case where `retryable:
+    /// true` is unconditionally right: a name the allowlist rejects was never
+    /// dispatched and can never have been an input operation, so no side
+    /// effect can have happened. For anything that *is* an [`Operation`], use
+    /// [`Response::not_dispatched_for`], which derives retryability instead of
+    /// assuming it.
     #[must_use]
     pub fn not_dispatched(operation: &str, code: &str, message: &str) -> Self {
         Self::not_dispatched_retryable(operation, code, message, true)
+    }
+
+    /// A pre-dispatch refusal of a known operation, with retryability
+    /// **derived** from the refusal and the operation.
+    ///
+    /// **This exists because the default was the thing a future facade would
+    /// get wrong.** The M3-15 rule — a `PeerUnavailable` refusal is never
+    /// auto-retried for an operation that synthesises input — reached the wire
+    /// only if a caller remembered to compute it and pass it to
+    /// [`Response::not_dispatched_retryable`]. Nothing enforced that, and
+    /// [`Response::not_dispatched`]'s hardcoded `true` was the easy path.
+    /// Here the rule is read from
+    /// [`crate::outcome::Dispatch::retry_is_safe_for`], which is the single
+    /// place it is decided.
+    #[must_use]
+    pub fn not_dispatched_for(
+        operation: Operation,
+        refusal: crate::outcome::NotDispatched,
+        code: &str,
+        message: &str,
+    ) -> Self {
+        let retryable =
+            crate::outcome::Dispatch::NotDispatched(refusal).retry_is_safe_for(operation);
+        Self::not_dispatched_retryable(operation.name(), code, message, retryable)
     }
 
     /// A pre-dispatch refusal whose retryability the caller decides.

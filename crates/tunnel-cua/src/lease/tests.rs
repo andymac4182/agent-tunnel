@@ -79,6 +79,7 @@ fn reacquiring_returns_the_same_holding_and_a_single_release_ends_it() {
     let first = leases.acquire(&target, A, R0).unwrap();
     let again = leases.acquire(&target, A, R0).unwrap();
     assert_eq!(first.lease(), again.lease());
+    assert_eq!(again.grant_revision(), R0);
     assert_eq!(leases.len(), 1);
 
     leases.release(&first).unwrap();
@@ -176,8 +177,21 @@ fn a_superseded_grant_revision_refuses_the_holder_at_the_point_of_use() {
     );
     // A revision *behind* the recorded one is not a revocation -- it is a
     // stale reading, and refusing on it would be the wrong direction.
-    let refreshed = leases.acquire(&target, A, R1).unwrap();
-    assert_eq!(leases.check(&target, A, R0), Ok(refreshed.lease()));
+    assert_eq!(leases.check(&target, A, R0), Ok(grant.lease()));
+
+    // **This leg used to assert the defect.** It re-acquired at R1, took the
+    // `Ok`, and concluded that the refusal above was recoverable -- which is
+    // precisely the laundering `acquire` now refuses. See
+    // `a_revoked_holder_cannot_re_acquire_its_own_lease_to_clear_the_refusal`.
+    assert_eq!(
+        leases.acquire(&target, A, R1).map(|_| ()),
+        Err(LeaseRefusal::GrantRevoked)
+    );
+    assert_eq!(
+        leases.check(&target, A, R1),
+        Err(LeaseRefusal::GrantRevoked),
+        "and the refusal still stands afterwards"
+    );
 }
 
 /// **M3-16, part two: refusing the holder does not free the target.**
@@ -241,4 +255,80 @@ fn releasing_a_session_drops_only_its_own_leases() {
     assert_eq!(leases.release_all_for_session(A), vec![first.clone()]);
     assert_eq!(leases.holder(&first), None);
     assert_eq!(leases.holder(&second), Some(B));
+}
+
+/// **The hole review found, and the rule that closes it.**
+///
+/// `acquire` used to write the supplied revision into an existing holding. So
+/// a holder that `check` had just refused with `GrantRevoked` could simply
+/// acquire again at the advanced revision, have it recorded, and pass `check`
+/// — and `reconcile_grant` at that revision would then free nothing, because
+/// the recorded revision was no longer behind. **One call defeated both halves
+/// of the M3-16 story**, and re-acquiring is the obvious client response to a
+/// refusal. The old tests stopped before the re-acquire, so nothing measured
+/// it; this is that measurement.
+#[test]
+fn a_revoked_holder_cannot_re_acquire_its_own_lease_to_clear_the_refusal() {
+    let mut leases = InputLeases::new();
+    let target = target();
+
+    let grant = leases.acquire(&target, A, R0).unwrap();
+    assert_eq!(grant.grant_revision(), R0, "the holding records R0");
+    assert_eq!(
+        leases.check(&target, A, R1),
+        Err(LeaseRefusal::GrantRevoked),
+        "the holder is refused at the point of use"
+    );
+
+    // The move that used to launder the revocation.
+    assert_eq!(
+        leases.acquire(&target, A, R1).map(|_| ()),
+        Err(LeaseRefusal::GrantRevoked),
+        "re-acquiring must not raise the recorded revision"
+    );
+
+    // Both halves still hold afterwards: the holder is still refused, and the
+    // reconcile still has something to free.
+    assert_eq!(
+        leases.check(&target, A, R1),
+        Err(LeaseRefusal::GrantRevoked)
+    );
+    assert_eq!(leases.reconcile_grant(A, R1), vec![target.clone()]);
+    assert_eq!(leases.holder(&target), None);
+
+    // **The control that keeps this from being a lockout.** A legitimately
+    // re-granted consumer releases and acquires afresh, which mints a new
+    // holding at the new revision and passes `check`.
+    let mut leases = InputLeases::new();
+    let grant = leases.acquire(&target, A, R0).unwrap();
+    assert_eq!(grant.grant_revision(), R0);
+    leases.release(&grant).unwrap();
+    let regranted = leases.acquire(&target, A, R1).unwrap();
+    assert_eq!(regranted.grant_revision(), R1);
+    assert_eq!(leases.check(&target, A, R1), Ok(regranted.lease()));
+    assert_ne!(regranted.lease(), grant.lease(), "a fresh holding");
+}
+
+/// A revision at or below the recorded one is a **stale reading**, not a
+/// revocation: accepted, and it changes nothing. Without this leg the rule
+/// above would be indistinguishable from "re-acquiring is always refused".
+#[test]
+fn re_acquiring_at_a_stale_revision_is_accepted_and_changes_nothing() {
+    let mut leases = InputLeases::new();
+    let target = target();
+
+    let first = leases.acquire(&target, A, R1).unwrap();
+    let again = leases
+        .acquire(&target, A, R0)
+        .expect("a stale reading is not a revocation");
+    assert_eq!(again.lease(), first.lease());
+    assert_eq!(
+        again.grant_revision(),
+        R1,
+        "the recorded revision is the holding's, not the caller's"
+    );
+    // And the recorded revision really did not drop: reconciling at R1 frees
+    // nothing, which it would not if the holding had been lowered to R0.
+    assert!(leases.reconcile_grant(A, R1).is_empty());
+    assert_eq!(leases.check(&target, A, R1), Ok(first.lease()));
 }

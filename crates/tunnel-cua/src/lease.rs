@@ -34,11 +34,16 @@
 //! This module splits that into two facts, because they have different answers
 //! and only one of them is closed:
 //!
-//! 1. **A revoked holder cannot use the lease.** Every acquisition records the
-//!    [`GrantRevision`] it was authorized under, and [`InputLeases::check`]
-//!    refuses with [`LeaseRefusal::GrantRevoked`] when the revision it is given
-//!    has moved past the recorded one. This is fail-closed at the point of use
-//!    and needs no new signal *beyond the revision itself*.
+//! 1. **A revoked holder cannot use the lease, and cannot launder the
+//!    refusal away either.** Every acquisition records the [`GrantRevision`]
+//!    it was authorized under, and [`InputLeases::check`] refuses with
+//!    [`LeaseRefusal::GrantRevoked`] when the revision it is given has moved
+//!    past the recorded one. **[`InputLeases::acquire`] refuses to raise an
+//!    existing holding's recorded revision** for the same reason — review
+//!    found that re-acquiring used to clear the refusal *and* leave
+//!    [`InputLeases::reconcile_grant`] with nothing to free, which defeated
+//!    both halves with one call. Fail-closed at the point of use, and it
+//!    needs no new signal *beyond the revision itself*.
 //! 2. **A revoked holder still blocks the target.** Nothing is released by
 //!    (1): the entry stays, so a second agent still gets
 //!    [`LeaseRefusal::HeldByAnotherSession`]. [`InputLeases::reconcile_grant`]
@@ -231,28 +236,61 @@ impl InputLeases {
     /// Take the exclusive input lease for `target`.
     ///
     /// Re-acquiring a lease this session already holds is **idempotent**: the
-    /// same [`LeaseId`] comes back, and the recorded revision is refreshed to
-    /// the one this acquisition was authorized under. A second agent gets
-    /// [`LeaseRefusal::HeldByAnotherSession`] and nothing else changes.
+    /// same [`LeaseId`] comes back and **the recorded revision does not
+    /// change**. A second agent gets [`LeaseRefusal::HeldByAnotherSession`]
+    /// and nothing else changes.
+    ///
+    /// # Re-acquiring cannot clear a revocation, and an earlier revision of
+    /// this function let it
+    ///
+    /// **This is the review finding that mattered most in chunk 3, recorded
+    /// rather than quietly fixed.** `acquire` used to write the supplied
+    /// revision into an existing holding. So a holder that
+    /// [`InputLeases::check`] had just refused with
+    /// [`LeaseRefusal::GrantRevoked`] could call `acquire` again with the
+    /// advanced revision, have it recorded, and pass `check` — and
+    /// [`InputLeases::reconcile_grant`] would then free nothing, because the
+    /// recorded revision was no longer behind. Both halves of the M3-16 story
+    /// were defeated by one call, and re-acquiring is the *obvious* client
+    /// response to a refusal ("my lease was refused; take it again"). The old
+    /// test stopped before the re-acquire, so nothing measured it.
+    ///
+    /// An acquisition that would **raise** an existing holding's recorded
+    /// revision is therefore refused with [`LeaseRefusal::GrantRevoked`]. A
+    /// revision at or below the recorded one is a stale reading rather than a
+    /// revocation, so it is accepted and still changes nothing.
+    ///
+    /// **This is not a lockout for a legitimately re-granted consumer**, and
+    /// that is why the rule can be this blunt: `release` then `acquire` mints
+    /// a fresh holding at the new revision. What is refused is *raising the
+    /// revision of a holding that already exists*, which is exactly the move
+    /// that would launder a revocation.
     ///
     /// # Errors
-    /// [`LeaseRefusal::HeldByAnotherSession`].
+    /// [`LeaseRefusal::HeldByAnotherSession`] if another session holds the
+    /// target; [`LeaseRefusal::GrantRevoked`] if this session holds it under
+    /// an older grant revision than the one supplied.
     pub fn acquire(
         &mut self,
         target: &TargetSession,
         session: SessionId,
         grant_revision: GrantRevision,
     ) -> Result<LeaseGrant, LeaseRefusal> {
-        if let Some(holder) = self.held.get_mut(target) {
+        if let Some(holder) = self.held.get(target) {
             if holder.session != session {
                 return Err(LeaseRefusal::HeldByAnotherSession);
             }
-            holder.grant_revision = grant_revision;
+            // **Never raise an existing holding's recorded revision.** Doing
+            // so would let a revoked holder clear its own refusal, and would
+            // leave `reconcile_grant` with nothing to free. See the doc above.
+            if grant_revision > holder.grant_revision {
+                return Err(LeaseRefusal::GrantRevoked);
+            }
             return Ok(LeaseGrant {
                 target: target.clone(),
                 session,
                 lease: holder.lease,
-                grant_revision,
+                grant_revision: holder.grant_revision,
             });
         }
         self.next += 1;

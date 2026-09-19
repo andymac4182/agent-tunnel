@@ -181,7 +181,7 @@ pub struct SessionContext<'a> {
 /// let permitted: BTreeSet<Operation> = [Operation::Click].into_iter().collect();
 /// assert!(plan(click, 4096, &permitted, &context).is_err());
 /// ```
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub enum Planned {
     /// Send this command with this payload to the backend.
     #[non_exhaustive]
@@ -200,6 +200,69 @@ pub enum Planned {
     /// getting wrong.
     #[non_exhaustive]
     AnswerLocally { operation: Operation },
+}
+
+/// **`Debug` is hand-written, and the reason is keystrokes.**
+///
+/// A derived `Debug` renders `payload` in full, and for `type_text` the
+/// payload *is* the text — so `{planned:?}` in a log line would print a
+/// password, defeating [`crate::schema::Keystrokes`]'s redaction one layer up.
+/// Review caught the claim "never log typed text" being true of the validated
+/// parameters and false of the plan built from them.
+///
+/// This renders the command, the operation and the payload's **size**, which
+/// are identifiers and a counter. The payload itself still travels — it is the
+/// request body — but nothing formats it.
+///
+/// ```
+/// use std::collections::BTreeSet;
+/// use tunnel_cua::Operation;
+/// use tunnel_cua::capture::Captures;
+/// use tunnel_cua::lease::{GrantRevision, InputLeases, SessionId, TargetSession};
+/// use tunnel_cua::plan::{SessionContext, plan};
+///
+/// let target = TargetSession::new("console:1");
+/// let mut leases = InputLeases::new();
+/// let session = SessionId::new(1);
+/// leases.acquire(&target, session, GrantRevision::new(0)).unwrap();
+/// let captures = Captures::new();
+/// let context = SessionContext {
+///     session,
+///     target: &target,
+///     grant_revision: GrantRevision::new(0),
+///     leases: &leases,
+///     captures: &captures,
+/// };
+///
+/// let body = br#"{"version":"computer.v1","operation":"type_text","params":{"text":"hunter2"}}"#;
+/// let permitted: BTreeSet<Operation> = [Operation::TypeText].into_iter().collect();
+/// let planned = plan(body, 4096, &permitted, &context).expect("a granted type_text plans");
+/// let rendered = format!("{planned:?}");
+/// assert!(!rendered.contains("hunter2"), "the plan leaked the typed text: {rendered}");
+/// assert!(rendered.contains("type_text"), "the command is still legible");
+/// ```
+impl core::fmt::Debug for Planned {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Dispatch {
+                command,
+                payload,
+                operation,
+            } => formatter
+                .debug_struct("Planned::Dispatch")
+                .field("command", command)
+                .field("operation", &operation.name())
+                .field(
+                    "payload",
+                    &format_args!("<{} bytes>", payload.to_string().len()),
+                )
+                .finish(),
+            Self::AnswerLocally { operation } => formatter
+                .debug_struct("Planned::AnswerLocally")
+                .field("operation", &operation.name())
+                .finish(),
+        }
+    }
 }
 
 /// Run every pre-dispatch check, in order.

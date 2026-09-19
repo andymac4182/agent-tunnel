@@ -103,6 +103,15 @@ pub const IDENTITY_SCALE_PERCENT: u32 = 100;
 /// makes every coordinate zero.
 pub const MAX_SCALE_PERCENT: u32 = 800;
 
+/// The largest capture dimension this profile records, in pixels.
+///
+/// Matches [`crate::schema::MAX_COORDINATE`], because a capture larger than
+/// the largest coordinate a request may carry has a region no request could
+/// ever point at. Bounded where a capture is *recorded*, so that
+/// [`CaptureIdentity::contains`] and [`CaptureIdentity::to_backend_point`]
+/// never see a dimension nobody checked.
+pub const MAX_CAPTURE_DIMENSION: u32 = 65_535;
+
 impl CaptureIdentity {
     #[must_use]
     pub const fn id(&self) -> CaptureId {
@@ -158,11 +167,20 @@ impl CaptureIdentity {
     /// display, so there is no exact answer for odd pixels; truncation keeps
     /// the point inside the same backend point as the pixel, which rounding
     /// would not.
+    /// The multiplication is done in `u64` and the division brings it back.
+    /// Review pointed out that `point.x * IDENTITY_SCALE_PERCENT` wraps in
+    /// release for an x above ~42.9M. That is unreachable with real geometry
+    /// *and* with [`MAX_CAPTURE_DIMENSION`], which bounds it three orders of
+    /// magnitude lower — but an arithmetic guard that depends on a bound
+    /// somewhere else stops being true when that bound moves, and the wider
+    /// intermediate costs nothing.
     #[must_use]
     pub const fn to_backend_point(&self, point: Point) -> (u32, u32) {
+        let scale = self.scale_percent as u64;
+        let identity = IDENTITY_SCALE_PERCENT as u64;
         (
-            point.x * IDENTITY_SCALE_PERCENT / self.scale_percent,
-            point.y * IDENTITY_SCALE_PERCENT / self.scale_percent,
+            (point.x as u64 * identity / scale) as u32,
+            (point.y as u64 * identity / scale) as u32,
         )
     }
 }
@@ -236,7 +254,8 @@ impl Captures {
     /// could have looked at.
     ///
     /// # Errors
-    /// [`GeometryError`] for zero dimensions or a scale outside
+    /// [`GeometryError`] for a dimension outside
+    /// `1..=`[`MAX_CAPTURE_DIMENSION`] or a scale outside
     /// `1..=`[`MAX_SCALE_PERCENT`].
     pub fn record(
         &mut self,
@@ -246,7 +265,13 @@ impl Captures {
         height: u32,
         scale_percent: u32,
     ) -> Result<CaptureIdentity, GeometryError> {
-        if width == 0 || height == 0 || scale_percent == 0 || scale_percent > MAX_SCALE_PERCENT {
+        if width == 0
+            || height == 0
+            || width > MAX_CAPTURE_DIMENSION
+            || height > MAX_CAPTURE_DIMENSION
+            || scale_percent == 0
+            || scale_percent > MAX_SCALE_PERCENT
+        {
             return Err(GeometryError);
         }
         self.next += 1;

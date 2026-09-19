@@ -506,6 +506,23 @@ async fn a_revoked_grant_refuses_the_holder_but_only_a_reconcile_frees_the_targe
     );
     assert_eq!(backend.ledger().pointer_clicks(), clicks);
 
+    // **And the holder cannot lift its own refusal by taking the lease
+    // again**, which is the obvious client response to one and is what review
+    // found this test stopping short of. If it could, the refusal above would
+    // be advisory and the reconcile below would free nothing.
+    assert_eq!(
+        first.acquire_input_lease().map(|_| ()),
+        Err(LeaseRefusal::GrantRevoked)
+    );
+    let still_refused = first.handle(&click(identity, 1, 1), LIMIT).await;
+    assert_eq!(
+        still_refused,
+        Dispatch::NotDispatched(NotDispatched::InputAuthority(InputRefusal::Lease(
+            LeaseRefusal::GrantRevoked
+        )))
+    );
+    assert_eq!(backend.ledger().pointer_clicks(), clicks);
+
     // Half two, open: the target is still blocked, by a lease nobody may use.
     assert_eq!(
         second.acquire_input_lease().map(|_| ()),
@@ -681,6 +698,48 @@ fn a_peer_unavailable_refusal_is_not_auto_retried_for_an_input_operation() {
     // input operations being un-retryable everywhere.
     let schema_refusal = Dispatch::NotDispatched(NotDispatched::NotPermitted);
     assert!(schema_refusal.retry_is_safe_for(Operation::Click));
+}
+
+/// **The wire constructor that derives retryability rather than assuming it.**
+///
+/// Review's point was that the M3-15 rule reached the wire only if a caller
+/// remembered to compute it, and `Response::not_dispatched`'s hardcoded `true`
+/// was the easy path. `not_dispatched_for` reads the rule from
+/// `retry_is_safe_for`, so the two cannot drift.
+#[test]
+fn the_wire_derives_retryability_from_the_refusal_and_the_operation() {
+    let rendered = Response::not_dispatched_for(
+        Operation::Click,
+        NotDispatched::PeerUnavailable,
+        "peer_unavailable",
+        "the device-side peer was not ready",
+    );
+    assert_eq!(rendered.outcome, ResponseOutcome::NotDispatched);
+    assert!(
+        !rendered.error.as_ref().unwrap().retryable,
+        "a click is never auto-retried through a peer-unavailable refusal"
+    );
+
+    // Three controls, so this is reading the rule rather than refusing
+    // everything: the same refusal for a read is retryable; a different
+    // refusal for the same click is retryable; and the operation name is
+    // echoed from the operation rather than from a caller's string.
+    let read = Response::not_dispatched_for(
+        Operation::Capture,
+        NotDispatched::PeerUnavailable,
+        "peer_unavailable",
+        "the device-side peer was not ready",
+    );
+    assert!(read.error.as_ref().unwrap().retryable);
+
+    let other = Response::not_dispatched_for(
+        Operation::Click,
+        NotDispatched::NotPermitted,
+        "not_permitted",
+        "the operation is not in the negotiated set",
+    );
+    assert!(other.error.as_ref().unwrap().retryable);
+    assert_eq!(rendered.operation, "click");
 }
 
 /// `retry_is_safe_for` is **never wider** than `retry_is_safe`, over the whole
