@@ -2252,6 +2252,17 @@ C5_CASES: list[tuple[str, list[Edit], bool]] = [
         False,
     ),
     (
+        "the peer hop's request direction must reach the saturation threshold on the LIVE publication",
+        [
+            (
+                ACP_CLUSTER,
+                "            evidence.peer_hop_live_send_percent >= SATURATION_THRESHOLD_PERCENT,",
+                "            true,",
+            )
+        ],
+        False,
+    ),
+    (
         "the peer hop's two directions must be disclosed as never loaded together",
         [
             (
