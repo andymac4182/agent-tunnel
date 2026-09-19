@@ -9,6 +9,7 @@ members = [
     "crates/tunnel-core",
     "crates/tunnel-cua",
     "crates/tunnel-cua-fixture",
+    "crates/tunnel-deadman",
     "crates/tunnel-fs-core",
     "crates/tunnel-fs-host",
     "crates/tunnel-fs-ninep",

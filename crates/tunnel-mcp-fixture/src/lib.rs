@@ -25,7 +25,13 @@
 //!   [`stream_event_message`], pausing after each index listed in `gates`
 //!   until the test releases it, then returns [`stream_result`];
 //! * `gate` — waits for the test's release marker, then returns
-//!   `released-<label>`.
+//!   `released-<label>`;
+//! * `detach` — starts a descendant that **deliberately leaves** this
+//!   server's process group by `route` (`setsid` or `daemon`), waits for it
+//!   to publish its pid, and says whether it did.  It is the fixture task row
+//!   M3-09 asks for, and it records whether the escape syscall actually
+//!   succeeded so a test can refuse to draw a containment conclusion from a
+//!   descendant that never detached.
 //!
 //! Every call appends `<tool>` to `invocations.log` in the marker directory,
 //! so a test can prove a tool ran exactly once.  `initialize`,
@@ -62,8 +68,89 @@ pub const IMAGE_PNG_BASE64: &str =
 /// its process ID to the path given as the second argument and then waits,
 /// bounded by [`DESCENDANT_LIFETIME`], without leaving its process group.
 pub const DESCENDANT_MODE: &str = "descendant";
+/// The binary's first argument that runs a descendant which **deliberately
+/// leaves** the server's process group: `detached <route> <pid-file>`.  See
+/// [`DetachRoute`].
+pub const DETACHED_MODE: &str = "detached";
+/// The binary's first argument for the middle process of the `daemon` route.
+/// It starts the real descendant in a new process group and exits at once, so
+/// the descendant is orphaned and reparented exactly as a double-forked
+/// daemon is.
+pub const DAEMONIZER_MODE: &str = "daemonize";
+/// The binary's first argument that runs the `npx`-shaped wrapper the
+/// `supervise` probe supervises: `wrapper <pid-file> <helper-pid-file>`.
+pub const WRAPPER_MODE: &str = "wrapper";
+/// The binary's first argument that runs a real export supervisor a test can
+/// `SIGKILL`: `supervise <workspace>`.
+pub const SUPERVISE_MODE: &str = "supervise";
+/// The binary's first argument that runs a backend which starts one escaping
+/// descendant and then behaves like an ordinary stdio server:
+/// `detach-host <route> <pid-file>`.
+///
+/// The host exists so the escaping process is a **descendant** of the
+/// supervised child rather than the supervised child itself.  A supervisor
+/// signals its own child by pid as well as by group, so a child that detached
+/// from its own group would still be killed and the measurement would be of
+/// the direct signal, not of the group's reach.
+pub const DETACH_HOST_MODE: &str = "detach-host";
 /// The longest a synthetic descendant lives on its own.
 pub const DESCENDANT_LIFETIME: Duration = Duration::from_secs(180);
+
+/// How a descendant gets out of the supervised child's process group.
+///
+/// **Both routes must be measured, not one.**  They leave by different
+/// syscalls and a containment mechanism can close one and not the other: a
+/// mechanism that only tracked sessions would stop `setsid` and miss
+/// `setpgid`, and one that only tracked parentage would stop neither.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DetachRoute {
+    /// `setsid`: a brand new session *and* process group, and no controlling
+    /// terminal.  The classic server-goes-into-the-background move.
+    Setsid,
+    /// A double fork: the descendant is started by a middle process which
+    /// exits immediately, so the descendant is reparented to `init` and its
+    /// ancestry back to the supervisor is destroyed, and it is placed in a
+    /// process group of its own.  This is what a daemonizing server does, and
+    /// it defeats containment by parent-chain walking as well as containment
+    /// by process group.
+    Daemon,
+}
+
+impl DetachRoute {
+    /// The wire spelling used in tool arguments and argv.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Setsid => "setsid",
+            Self::Daemon => "daemon",
+        }
+    }
+
+    /// Parse the wire spelling.  An unknown route is [`None`] rather than a
+    /// silent default: a typo in a test must not quietly measure the other
+    /// route and report it under the wrong name.
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "setsid" => Some(Self::Setsid),
+            "daemon" => Some(Self::Daemon),
+            _ => None,
+        }
+    }
+}
+
+/// Written next to a detached descendant's pid file: `ok` when the escape
+/// syscall succeeded, `err` when it did not.
+///
+/// **A test must read this and refuse to conclude anything when it says
+/// `err`.**  A fixture that failed to detach makes every containment claim
+/// built on it vacuous: the descendant would be killed by the plain group
+/// signal and the mechanism under test would never have been exercised.
+pub const ESCAPE_MARKER_EXTENSION: &str = "escape";
+/// The longest the `detach` tool waits for its descendant to publish a pid
+/// before answering.  The tool answers either way and says what happened; it
+/// never blocks a test indefinitely on a process that failed to start.
+pub const DETACH_PUBLISH_WAIT: Duration = Duration::from_secs(10);
 /// The longest a server waits for a release marker.
 pub const RELEASE_WAIT: Duration = Duration::from_secs(120);
 /// How often a waiting server looks for its release marker.
@@ -121,6 +208,18 @@ pub fn release_marker(name: &str) -> String {
 #[must_use]
 pub fn descendant_pid_file(label: &str) -> String {
     format!("descendant-{label}.pid")
+}
+
+/// The pid file a `detach` label writes.
+#[must_use]
+pub fn detached_pid_file(label: &str) -> String {
+    format!("detached-{label}.pid")
+}
+
+/// Where a detached descendant records whether its escape syscall succeeded.
+#[must_use]
+pub fn escape_marker(pid_file: &Path) -> PathBuf {
+    pid_file.with_extension(ESCAPE_MARKER_EXTENSION)
 }
 
 /// The fixture server.
@@ -199,6 +298,293 @@ impl FixtureServer {
             });
         }
     }
+
+    /// Start a descendant that deliberately leaves this server's process
+    /// group by `route`.  Returns whether the process started at all.
+    fn spawn_detached(&self, label: &str, route: DetachRoute) -> bool {
+        let Some(dir) = &self.marker_dir else {
+            return false;
+        };
+        let Ok(executable) = std::env::current_exe() else {
+            return false;
+        };
+        let pid_file = dir.join(detached_pid_file(label));
+        let mut command = std::process::Command::new(executable);
+        match route {
+            // One hop: the descendant itself calls `setsid`.
+            DetachRoute::Setsid => {
+                command
+                    .arg(DETACHED_MODE)
+                    .arg(route.as_str())
+                    .arg(&pid_file);
+            }
+            // Two hops: a middle process starts the descendant and exits, so
+            // the descendant is reparented away from this server entirely.
+            DetachRoute::Daemon => {
+                command.arg(DAEMONIZER_MODE).arg(&pid_file);
+            }
+        }
+        let spawned = command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        let Ok(mut child) = spawned else {
+            return false;
+        };
+        // Reap it so it never lingers as a zombie.  For the daemon route this
+        // is the middle process, which exits immediately.
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+        true
+    }
+
+    /// Wait, bounded, for a detached descendant to publish its pid.
+    async fn await_detached(&self, label: &str) -> bool {
+        let Some(dir) = &self.marker_dir else {
+            return false;
+        };
+        let pid_file = dir.join(detached_pid_file(label));
+        let deadline = tokio::time::Instant::now() + DETACH_PUBLISH_WAIT;
+        while tokio::time::Instant::now() < deadline {
+            if tokio::fs::try_exists(&pid_file).await.unwrap_or(false) {
+                return true;
+            }
+            tokio::time::sleep(RELEASE_POLL).await;
+        }
+        false
+    }
+}
+
+/// The file the `supervise` probe writes: `<child-pid> <helper-pid>`.
+pub const SUPERVISE_REPORT: &str = "supervise.report";
+/// The wrapper's own pid file inside the probe's workspace.
+pub const WRAPPER_PID_FILE: &str = "wrapper.pid";
+/// The wrapper's in-group helper pid file inside the probe's workspace.
+pub const HELPER_PID_FILE: &str = "helper.pid";
+
+/// Run one real [`tunnel_mcp_export::child`] supervisor over [`run_wrapper`],
+/// report the pids it created, and then **park forever**.
+///
+/// This exists because the supervisor's most dangerous end of life cannot be
+/// reached from inside a test process: a `SIGKILL` runs no `Drop`, no
+/// `kill_on_drop` and no handler, so to measure it something other than the
+/// test has to be the supervisor and the test has to kill it.  A test that
+/// dropped a handle and asserted the handle was closed would prove nothing
+/// about this at all.
+pub async fn run_supervise(workspace: &Path) {
+    let Ok(executable) = std::env::current_exe() else {
+        return;
+    };
+    let backend = tunnel_mcp_export::config::StdioBackend {
+        command: executable,
+        args: vec![
+            WRAPPER_MODE.to_owned(),
+            workspace.join(WRAPPER_PID_FILE).display().to_string(),
+            workspace.join(HELPER_PID_FILE).display().to_string(),
+        ],
+        env: std::collections::BTreeMap::new(),
+        inherit_env: Vec::new(),
+        workspace: workspace.to_path_buf(),
+        max_children: 1,
+        session_idle: Duration::from_secs(600),
+    };
+    let counters = std::sync::Arc::new(tunnel_mcp_export::child::ChildCounters::default());
+    let Ok((handle, _events)) = tunnel_mcp_export::child::spawn(&backend, 1 << 20, &counters)
+    else {
+        return;
+    };
+    let wrapper = read_pid(&workspace.join(WRAPPER_PID_FILE)).await;
+    let helper = read_pid(&workspace.join(HELPER_PID_FILE)).await;
+    let armed = counters
+        .deadman_armed
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let temporary = workspace.join("supervise.tmp");
+    if tokio::fs::write(&temporary, format!("{wrapper} {helper} {armed}"))
+        .await
+        .is_ok()
+    {
+        let _ = tokio::fs::rename(&temporary, workspace.join(SUPERVISE_REPORT)).await;
+    }
+    // Hold the handle so nothing drops it, and wait to be killed.
+    std::future::pending::<()>().await;
+    drop(handle);
+}
+
+/// Read a published pid, bounded.  Empty when it never appeared.
+async fn read_pid(path: &Path) -> String {
+    let deadline = tokio::time::Instant::now() + DETACH_PUBLISH_WAIT;
+    while tokio::time::Instant::now() < deadline {
+        let pid = tokio::fs::read_to_string(path)
+            .await
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
+        if !pid.is_empty() {
+            return pid;
+        }
+        tokio::time::sleep(RELEASE_POLL).await;
+    }
+    String::new()
+}
+
+/// Run the wrapper the `supervise` probe uses as an export backend.
+///
+/// It models the shape that makes the process group kill worth having in the
+/// first place: an `npx`/`uvx`/`/bin/sh` wrapper that starts a helper which
+/// **does not read stdin**, and then reads stdin itself.  When the supervisor
+/// goes away the wrapper sees end of file and exits, but the helper has no
+/// way to notice and no reason to stop.  Only something that signals the
+/// group ends it — and if the supervisor was `SIGKILL`ed, the supervisor is
+/// not there to be that something.
+///
+/// Both pids are published so a test asserts against the process table rather
+/// than against anybody's belief about what it started.
+pub async fn run_wrapper(pid_file: &Path, helper_pid_file: &Path) {
+    publish_pid(pid_file).await;
+    if let Ok(executable) = std::env::current_exe() {
+        // No `process_group`: the helper stays in the wrapper's group, which
+        // is the supervised child's group.  It is exactly what a group kill
+        // is supposed to reach.
+        let spawned = std::process::Command::new(executable)
+            .arg(DESCENDANT_MODE)
+            .arg(helper_pid_file)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        if let Ok(mut child) = spawned {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+    }
+    // Drain stdin to end of file, then exit, as a wrapper does.
+    let mut stdin = tokio::io::stdin();
+    let mut buffer = [0u8; 1024];
+    loop {
+        match tokio::io::AsyncReadExt::read(&mut stdin, &mut buffer).await {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {}
+        }
+    }
+}
+
+/// Run the backend that starts one escaping descendant and then drains stdin.
+///
+/// For [`DetachRoute::Setsid`] the descendant is this process's direct child
+/// and calls `setsid` itself; for [`DetachRoute::Daemon`] this process starts
+/// the middle process, which starts the descendant in a new group and exits.
+/// Either way the escaping process is a descendant of the supervised child,
+/// never the supervised child itself.
+pub async fn run_detach_host(route: DetachRoute, pid_file: &Path) {
+    if let Ok(executable) = std::env::current_exe() {
+        let mut command = std::process::Command::new(executable);
+        match route {
+            DetachRoute::Setsid => {
+                command.arg(DETACHED_MODE).arg(route.as_str()).arg(pid_file);
+            }
+            DetachRoute::Daemon => {
+                command.arg(DAEMONIZER_MODE).arg(pid_file);
+            }
+        }
+        let spawned = command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        if let Ok(mut child) = spawned {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+    }
+    let mut stdin = tokio::io::stdin();
+    let mut buffer = [0u8; 1024];
+    loop {
+        match tokio::io::AsyncReadExt::read(&mut stdin, &mut buffer).await {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {}
+        }
+    }
+}
+
+/// Publish a pid atomically, so a reader never sees a half-written file.
+async fn publish_pid(pid_file: &Path) {
+    let temporary = pid_file.with_extension("tmp");
+    if tokio::fs::write(&temporary, std::process::id().to_string())
+        .await
+        .is_ok()
+    {
+        let _ = tokio::fs::rename(&temporary, pid_file).await;
+    }
+}
+
+/// Run the middle process of the [`DetachRoute::Daemon`] route.
+///
+/// It starts the real descendant in a **new process group** and returns at
+/// once.  The caller (the binary's `main`) then exits, so the descendant is
+/// orphaned and reparented to `init`: nothing in the process table records
+/// that the supervised server ever started it.  This is the half of a
+/// double-forked daemon that matters for containment, reached without
+/// `fork`, so this crate stays `forbid(unsafe_code)`.
+pub fn run_daemonizer(pid_file: &Path) {
+    let Ok(executable) = std::env::current_exe() else {
+        return;
+    };
+    let mut command = std::process::Command::new(executable);
+    command
+        .arg(DETACHED_MODE)
+        .arg(DetachRoute::Daemon.as_str())
+        .arg(pid_file)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
+    // Deliberately not waited on: exiting now is what orphans it.
+    let _ = command.spawn();
+}
+
+/// Run a descendant that has escaped the supervised child's process group.
+///
+/// For [`DetachRoute::Setsid`] it calls `setsid` here; for
+/// [`DetachRoute::Daemon`] the escape already happened, in the new process
+/// group its middle process placed it in.  Either way it records **whether
+/// the escape really happened** next to the pid, because a fixture that
+/// failed to detach would make every containment measurement built on it
+/// vacuous.
+pub async fn run_detached(route: DetachRoute, pid_file: &Path) {
+    let escaped = match route {
+        #[cfg(unix)]
+        DetachRoute::Setsid => rustix::process::setsid().is_ok(),
+        #[cfg(not(unix))]
+        DetachRoute::Setsid => false,
+        // The middle process placed this one in a group of its own, and it
+        // has already exited, so this process is both out of the group and
+        // orphaned.  Confirm the group rather than assume it: the pid of a
+        // process that leads its own group is its own group id.
+        #[cfg(unix)]
+        DetachRoute::Daemon => {
+            rustix::process::getpgrp().as_raw_nonzero().get()
+                == i32::try_from(std::process::id()).unwrap_or(-1)
+        }
+        #[cfg(not(unix))]
+        DetachRoute::Daemon => false,
+    };
+    let _ = tokio::fs::write(escape_marker(pid_file), if escaped { "ok" } else { "err" }).await;
+    let temporary = pid_file.with_extension("tmp");
+    if tokio::fs::write(&temporary, std::process::id().to_string())
+        .await
+        .is_ok()
+    {
+        let _ = tokio::fs::rename(&temporary, pid_file).await;
+    }
+    tokio::time::sleep(DESCENDANT_LIFETIME).await;
 }
 
 /// Run a synthetic descendant: publish the pid atomically, then wait.
@@ -283,6 +669,14 @@ fn tools() -> Vec<Tool> {
             "gate",
             "Wait for a release marker",
             schema(serde_json::json!({"label": {"type": "string"}})),
+        ),
+        Tool::new(
+            "detach",
+            "Start a descendant that leaves this server's process group",
+            schema(serde_json::json!({
+                "label": {"type": "string"},
+                "route": {"type": "string", "enum": ["setsid", "daemon"]},
+            })),
         ),
     ]
 }
@@ -405,6 +799,28 @@ impl ServerHandler for FixtureServer {
                     }
                 }
                 Ok(CallToolResult::success(vec![ContentBlock::text("done")]).into())
+            }
+            "detach" => {
+                let label = argument_label(&request).unwrap_or_else(|| "default".to_owned());
+                let route = request
+                    .arguments
+                    .as_ref()
+                    .and_then(|arguments| arguments.get("route"))
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(DetachRoute::parse);
+                let Some(route) = route else {
+                    return Err(ErrorData::invalid_params("unknown detach route", None));
+                };
+                let started = self.spawn_detached(&label, route);
+                // Answer only once the descendant exists, so a test that
+                // kills the server next cannot win a race against a process
+                // that had not been created yet.
+                let published = started && self.await_detached(&label).await;
+                Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                    "detached:{}:{label}:{published}",
+                    route.as_str()
+                ))])
+                .into())
             }
             "sleep" => {
                 let label = argument_label(&request).unwrap_or_else(|| "default".to_owned());
