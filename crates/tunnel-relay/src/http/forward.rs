@@ -58,7 +58,9 @@ use tunnel_protocol::{ResultDetail, reset_reason};
 
 use super::*;
 use crate::actor::{HttpPeerReset, HttpRead, HttpStreamRegistration};
-use crate::http_forward_diagnostics::{HttpExchangeRecord, HttpForwardDiagnostics};
+use crate::http_forward_diagnostics::{
+    HopBytePair, HopLivePair, HttpExchangeRecord, HttpForwardDiagnostics,
+};
 
 mod aggregate;
 mod hold;
@@ -647,6 +649,11 @@ struct HopShared {
     aggregate: Arc<HopAggregate>,
     /// The peer relay's recorded rotation freeze, as it reported it.
     peer_pause: PauseController,
+    /// The hop's live send/receive pair and its coincident latch.  Updated
+    /// from the credit charge and the receive push -- the two points that
+    /// already hold one of the two figures -- so the pair is a reading of one
+    /// instant rather than two independent maxima (task row M8-C22).
+    live: Arc<HopLivePair>,
 }
 
 impl Drop for HopShared {
@@ -716,6 +723,12 @@ impl HopShared {
                 queue.queued_bytes = queue.queued_bytes.saturating_add(data.len());
                 queue.queued_records = queue.queued_records.saturating_add(1);
                 queue.high_water = queue.high_water.max(queue.queued_bytes);
+                // The receive half of the coincident pair, read while the
+                // queue lock is held so the level published is the one just
+                // written.  `note_receive` reads the send side from an atomic
+                // and takes only the leaf coincident lock, so this cannot
+                // cycle with the credit lock.
+                self.live.note_receive(queue.queued_bytes);
             }
             queue.events.push_back(event);
         }
@@ -829,9 +842,11 @@ impl CarrierWriter for PeerHopWriter {
                 credit.sent_bytes = credit.sent_bytes.saturating_add(cost);
                 credit.sent_records = credit.sent_records.saturating_add(records);
                 let in_flight = credit.sent_bytes.saturating_sub(credit.peer_consumed_bytes);
-                credit.in_flight_high_water = credit
-                    .in_flight_high_water
-                    .max(usize::try_from(in_flight).unwrap_or(usize::MAX));
+                let in_flight = usize::try_from(in_flight).unwrap_or(usize::MAX);
+                credit.in_flight_high_water = credit.in_flight_high_water.max(in_flight);
+                // The send half of the coincident pair, read while the credit
+                // lock is held.  See `HopShared::push` for the other half.
+                shared.live.note_send(in_flight);
             }
             for (permit, piece) in permits.zip(pieces) {
                 permit.send(HopCommand::Record(encode_hop(&HopRecord::Data(piece))));
@@ -883,6 +898,10 @@ impl CarrierReader for PeerHopReader {
                             queue.consumed_bytes.saturating_add(hop_cost(data.len()));
                         queue.consumed_records = queue.consumed_records.saturating_add(1);
                         let consumed = (queue.consumed_bytes, queue.consumed_records);
+                        // Keep the live receive level truthful as the queue
+                        // drains.  A fall never latches, because the latch
+                        // only moves when the smaller half grows.
+                        shared.live.note_receive(queue.queued_bytes);
                         shared.consumed_tx.send_replace(consumed);
                     }
                     event
@@ -925,6 +944,18 @@ impl PeerHop {
         self.shared.queue().high_water
     }
 
+    /// The send/receive pair at the instant the smaller of the two was
+    /// largest (task row M8-C22).
+    fn coincident(&self) -> HopBytePair {
+        self.shared.live.coincident()
+    }
+
+    /// The hop's live pair, for publication on the forwarding snapshot while
+    /// the exchange is still running.
+    pub(crate) fn live_pair(&self) -> &Arc<HopLivePair> {
+        &self.shared.live
+    }
+
     /// Let the writer flush its terminal record, then stop both tasks.
     async fn finish(self, grace: Duration) {
         let Self {
@@ -959,6 +990,7 @@ pub(crate) fn spawn_peer_hop<S: PeerSendHalf, R: PeerRecvHalf>(
         stop: CancellationToken::new(),
         aggregate,
         peer_pause: PauseController::new(false),
+        live: Arc::new(HopLivePair::default()),
     });
     let (notifier, signal): (ResetNotifier, ResetSignal) = reset_signal_pair();
     let (commands, mut command_rx) = mpsc::channel::<HopCommand>(4);
@@ -1128,6 +1160,13 @@ pub(crate) fn spawn_peer_hop<S: PeerSendHalf, R: PeerRecvHalf>(
                         let released = bytes.saturating_sub(credit.peer_consumed_bytes);
                         credit.peer_consumed_bytes = credit.peer_consumed_bytes.max(bytes);
                         credit.peer_consumed_records = credit.peer_consumed_records.max(records);
+                        // Keep the live send level truthful as the peer
+                        // reports consumption.  A fall never latches.
+                        let in_flight =
+                            credit.sent_bytes.saturating_sub(credit.peer_consumed_bytes);
+                        shared
+                            .live
+                            .note_send(usize::try_from(in_flight).unwrap_or(usize::MAX));
                         released
                     };
                     shared.aggregate.release_send(released);
@@ -1533,6 +1572,16 @@ pub(crate) async fn http_forward_route(
                 .for_peer(&route.owner_token().node_id);
             let (hop_writer, hop_reader, hop) =
                 spawn_peer_hop(send, recv, exchange_deadline, aggregate);
+            // Publish this hop's live pair while the exchange runs.  The
+            // terminated-exchange record below cannot be seen by an
+            // observation window shorter than the exchange (task row M8-C22).
+            diagnostics.register_live_hop(
+                "ingress_remote",
+                Some(request_id.clone()),
+                None,
+                PEER_HOP_WINDOW_BYTES,
+                hop.live_pair(),
+            );
             let owner_freeze = hop.peer_pause_signal();
             let outbound = tokio::spawn(pump_outbound(to_device_rx, hop_writer));
             let inbound = tokio::spawn(pump_inbound(hop_reader, from_device_tx));
@@ -1654,6 +1703,7 @@ async fn hop_finish_and_record(
 ) {
     let send_high_water = hop.send_in_flight_high_water();
     let receive_high_water = hop.receive_queue_high_water();
+    let coincident = hop.coincident();
     let (aggregate_send, aggregate_receive) = hop.aggregate_high_water();
     diagnostics.note_hop_aggregate(aggregate_send, aggregate_receive);
     hop.finish(RELAY_TERMINAL_GRACE).await;
@@ -1665,7 +1715,7 @@ async fn hop_finish_and_record(
         request_handoff,
         response_handoff,
         body,
-        Some((send_high_water, receive_high_water)),
+        Some((send_high_water, receive_high_water, coincident)),
         report,
     );
 }
@@ -1679,7 +1729,7 @@ fn record_exchange(
     request_handoff: &QueueStats,
     response_handoff: &QueueStats,
     body: &QueueStats,
-    peer: Option<(usize, usize)>,
+    peer: Option<(usize, usize, HopBytePair)>,
     report: ExchangeReport,
 ) {
     diagnostics.record_exchange(HttpExchangeRecord {
@@ -1689,8 +1739,9 @@ fn record_exchange(
         request_handoff_high_water: request_handoff.high_water(),
         response_handoff_high_water: response_handoff.high_water(),
         response_body_high_water: body.high_water(),
-        peer_send_in_flight_high_water: peer.map_or(0, |(send, _)| send),
-        peer_receive_queue_high_water: peer.map_or(0, |(_, receive)| receive),
+        peer_send_in_flight_high_water: peer.map_or(0, |(send, _, _)| send),
+        peer_receive_queue_high_water: peer.map_or(0, |(_, receive, _)| receive),
+        peer_coincident: peer.map_or_else(HopBytePair::default, |(_, _, pair)| pair),
         peer_window: if peer.is_some() {
             PEER_HOP_WINDOW_BYTES
         } else {
@@ -1875,6 +1926,16 @@ pub(crate) async fn handle_peer_http_stream(
     let deadline = tokio::time::Instant::now() + token_remaining;
     let aggregate = handle.http_hop_aggregates().for_peer(&source_node);
     let (hop_writer, hop_reader, hop) = spawn_peer_hop(send, recv, deadline, aggregate);
+    // Publish the owner end of this hop's live pair for the duration of the
+    // exchange, so simultaneity is observable before the record exists
+    // (task row M8-C22).
+    handle.http_forward_diagnostics().register_live_hop(
+        "owner_peer",
+        Some(request_id.clone()),
+        Some(stream_id),
+        PEER_HOP_WINDOW_BYTES,
+        hop.live_pair(),
+    );
     let (actor_writer, actor_reader, signal_task, freeze) = actor_carriers(&handle, registration);
     // The ingress's progress clocks pause for exactly this owner's freeze.
     let pause_task = tokio::spawn(hop_writer.pauser().relay(freeze));
@@ -1948,6 +2009,7 @@ pub(crate) async fn handle_peer_http_stream(
     let _ = pause_task.await;
     let send_high_water = hop.send_in_flight_high_water();
     let receive_high_water = hop.receive_queue_high_water();
+    let coincident = hop.coincident();
     let (aggregate_send, aggregate_receive) = hop.aggregate_high_water();
     handle
         .http_forward_diagnostics()
@@ -1977,6 +2039,7 @@ pub(crate) async fn handle_peer_http_stream(
             response_body_high_water: 0,
             peer_send_in_flight_high_water: send_high_water,
             peer_receive_queue_high_water: receive_high_water,
+            peer_coincident: coincident,
             peer_window: PEER_HOP_WINDOW_BYTES,
             request_outcome: outcome_label(aborted(up_end)),
             response_outcome: outcome_label(aborted(down_end)),

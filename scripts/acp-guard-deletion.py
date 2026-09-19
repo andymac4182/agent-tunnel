@@ -2002,7 +2002,7 @@ C5_CASES: list[tuple[str, list[Edit], bool]] = [
     ),
     # --------------------------------------------------------- saturation
     (
-        "the request direction of the peer hop must reach half its credit window",
+        "the request direction of the peer hop must reach the enforced saturation threshold of its credit window",
         [
             (
                 ACP_CLUSTER,
@@ -2234,6 +2234,41 @@ C5_CASES: list[tuple[str, list[Edit], bool]] = [
             (
                 ACP_CLUSTER,
                 "            evidence.owner_device_loaded_samples >= MIN_LOADED_SAMPLES,",
+                "            true,",
+            )
+        ],
+        False,
+    ),
+    # ------------------------------- the peer hop's coincident pair (M8-C22)
+    (
+        "the peer hop's live publication must have been read with the hop open",
+        [
+            (
+                ACP_CLUSTER,
+                "            evidence.peer_hop_live_samples >= MIN_PEER_HOP_SAMPLES,",
+                "            true,",
+            )
+        ],
+        False,
+    ),
+    (
+        "the peer hop's request direction must reach the saturation threshold on the LIVE publication",
+        [
+            (
+                ACP_CLUSTER,
+                "            evidence.peer_hop_live_send_percent >= SATURATION_THRESHOLD_PERCENT,",
+                "            true,",
+            )
+        ],
+        False,
+    ),
+    (
+        "the peer hop's two directions must be disclosed as never loaded together",
+        [
+            (
+                ACP_CLUSTER,
+                """            !evidence.peer_hop_both_directions_saturated
+                && evidence.peer_hop_coincident_percent < COINCIDENT_DISCLOSURE_CEILING_PERCENT,""",
                 "            true,",
             )
         ],
