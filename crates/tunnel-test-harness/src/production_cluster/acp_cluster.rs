@@ -2871,7 +2871,6 @@ impl Gate<'_> {
     /// The best coincident pair carried by a **terminated** exchange record
     /// for one relay role.  The same latch as [`Self::hop_live_pair`]'s,
     /// published a second time once the hop closes, so a hop that finished
-    /// before the sampler's last pass is still accounted for.
     /// The ingress's own response-side buffers for one role: the
     /// carrier&rarr;bridge handoff and the queued public response body.
     ///
@@ -2898,6 +2897,10 @@ impl Gate<'_> {
             }))
     }
 
+    /// The best coincident pair carried by a **terminated** exchange record
+    /// for one role: the same latch the live publication carries, published
+    /// a second time once the hop closes, so a hop that finished before the
+    /// sampler's last pass is still accounted for.
     async fn recorded_coincident(&self, node: &str, role: &str) -> Result<HopBytePair> {
         let snapshot = self.cluster.relay(node)?.snapshot().await?;
         Ok(snapshot
@@ -3262,9 +3265,10 @@ impl Gate<'_> {
         // floor** (task row M8-05).  `over half its credit window` is a level
         // a direction reaches while still accepting writes without blocking;
         // what makes a direction saturated is that it stands at its window so
-        // the next write waits for credit.  Observed 195,933-195,950 of
-        // 196,608 -- 99.66% -- in four of four runs on this branch, so the
-        // threshold is set below that floor rather than at a run's reading.
+        // the next write waits for credit.  Observed 180,510-195,933 of
+        // 196,608 -- 91.8-99.66% -- in seven of seven runs at the repaired
+        // tip, the low end being M8-C23's sub-mode, which this threshold is
+        // deliberately set below rather than at a run's reading.
         evidence.ingress_request_direction_saturated = ingress.2 > 0
             && ingress.0 as u64 * 100 >= ingress.2 as u64 * SATURATION_THRESHOLD_PERCENT;
 
@@ -4679,7 +4683,7 @@ mod tests {
             ingress_request_peer_send_in_flight: 195_933,
             peer_window: 196_608,
             ingress_request_direction_saturated: true,
-            // --- M8-C22, from run 1 of the four-run series on this branch ---
+            // --- M8-C22, from run 2 of the seven-run series at the repaired tip ---
             // The coincident pair really is this small: the peer hop's two
             // directions are not loaded together, and the fixture carries the
             // measured reading rather than an aspirational one.
@@ -4693,8 +4697,9 @@ mod tests {
             peer_hop_live_send_percent: 99,
             peer_hop_live_samples: 402,
             // False in this run: the live publication was read throughout,
-            // but the best *pair* came from the terminated record.
-            // Disclosed, not asserted -- observed true in 1 of 7.
+            // and it showed the request direction saturated, but the best
+            // *pair* came from the terminated record.  Disclosed, not
+            // asserted -- observed true in 1 of 7.
             peer_hop_coincident_from_live: false,
             ingress_response_handoff_high_water: 362,
             ingress_response_body_high_water: 354,
