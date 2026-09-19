@@ -157,20 +157,21 @@ CASES: list[tuple[str, list[Edit], bool]] = [
         False,
     ),
     (
-        "a deferred input operation is refused rather than treated as unknown-but-allowed",
+        # **This case's subject changed under it, and the case was re-pointed
+        # rather than deleted.** It used to delete the eight input names from
+        # `DEFERRED_OPERATIONS`; chunk 3 carries those operations, so the rows
+        # are gone and the case reported `COULD NOT APPLY` -- no evidence,
+        # which must never be read as a pass. What the rule was ever about is
+        # that a name the document's table carries and this build does not is
+        # refused **as a deferral**, distinguishably from a typo. One entry is
+        # left to say that about, so the case now deletes it.
+        "a deferred operation is refused rather than treated as unknown-but-allowed",
         [
             (
                 OPERATION,
-                """    ("click", Deferral::SynthesisesInput),
-    ("double_click", Deferral::SynthesisesInput),
-    ("move", Deferral::SynthesisesInput),
-    ("drag", Deferral::SynthesisesInput),
-    ("scroll", Deferral::SynthesisesInput),
-    ("type_text", Deferral::SynthesisesInput),
-    ("press_key", Deferral::SynthesisesInput),
-    ("hotkey", Deferral::SynthesisesInput),
-""",
-                "",
+                """pub const DEFERRED_OPERATIONS: &[(&str, Deferral)] =
+    &[("accessibility_tree", Deferral::NeedsBackendProbe)];""",
+                """pub const DEFERRED_OPERATIONS: &[(&str, Deferral)] = &[];""",
             )
         ],
         False,
@@ -252,9 +253,13 @@ CASES: list[tuple[str, list[Edit], bool]] = [
         [
             (
                 SCHEMA,
-                """            if index > MAX_DISPLAY {
-                return Err(SchemaError::OutOfRange { name: "display" });
-            }
+                # Re-pointed: the display parsing moved out of `validate_params`
+                # into `display_of` when chunk 3 added eight more parameter
+                # shapes, so the snippet lost four spaces of indentation. The
+                # rule is unchanged.
+                """    if index > MAX_DISPLAY {
+        return Err(SchemaError::OutOfRange { name: "display" });
+    }
 """,
                 "",
             )
@@ -507,8 +512,12 @@ CASES: list[tuple[str, list[Edit], bool]] = [
         [
             (
                 CLIENT,
-                "                return Dispatch::AnsweredLocally(self.describe());",
-                "                return Dispatch::Dispatched(Completion::Ok(self.describe()));",
+                # Re-pointed: `dispatch_planned` now returns the plan beside the
+                # outcome, so the arm returns a tuple. The substitution is the
+                # same lie as before -- reporting a locally-answered operation
+                # as a dispatch.
+                "                return (Some(planned), Dispatch::AnsweredLocally(self.describe()));",
+                "                return (Some(planned), Dispatch::Dispatched(Completion::Ok(self.describe())));",
             )
         ],
         False,
@@ -518,12 +527,16 @@ CASES: list[tuple[str, list[Edit], bool]] = [
         [
             (
                 PLAN,
-                """        return Ok(Planned::AnswerLocally { operation });""",
-                """        return Ok(Planned::Dispatch {
-            command: "version",
-            payload: command_payload("version", request.params()),
-            operation,
-        });""",
+                # Re-pointed: the local-answer arm became a `let ... else` when
+                # chunk 3 made the command depend on the parameters, and
+                # `command_payload` gained the capture argument -- so the old
+                # replacement no longer compiled and reported BUILD FAILED,
+                # which the harness refuses to call a red test. Same
+                # substitution: plan a dispatch where a local answer is due.
+                """    let Some(command) = dispatch_command(operation, request.params()) else {
+        return Ok(Planned::AnswerLocally { operation });
+    };""",
+                """    let command = dispatch_command(operation, request.params()).unwrap_or("version");""",
             )
         ],
         False,
