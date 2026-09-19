@@ -119,6 +119,19 @@ pub struct ProviderStats {
     ///
     /// Every one of these is [`Outcome::NotStarted`], which is the claim gate 4
     /// could make about *every* refusal it produced and gate 5 can no longer.
+    ///
+    /// **Both refusal points, since task row M4-16.** A mutation refused after
+    /// the queue wait is counted in [`Provider::fail_queued`]; one refused at
+    /// *admission*, by the session inside [`Provider::accept`], is counted by
+    /// [`Provider::note_refused_mutation`]. The second is the common case and
+    /// was missing: every capability refusal under a read-only grant is taken
+    /// there, so an export being hammered by an unauthorized consumer used to
+    /// read zero here.
+    ///
+    /// What it still does not count is a request refused before the session
+    /// decided what primitives it needed — a `Twrite` to a fid that is not open
+    /// for writing, which is refused for its fid state. That is a bound, it is
+    /// deliberate, and task row M4-20 records it.
     pub mutations_refused: u64,
     /// Mutating requests this dispatcher handed to the host.
     ///
@@ -381,7 +394,14 @@ impl<A: Authority> Provider<A> {
         let tag = frame.tag;
         let accepted = match self.session.request(frame) {
             Ok(accepted) => accepted,
-            Err(error) => return self.refuse(tag, error),
+            Err(error) => {
+                // **Before** `refuse`, which may close the session: a closed
+                // session classifies nothing, and the classification has to be
+                // taken while the state that produced the refusal is still
+                // there.
+                self.note_refused_mutation(frame);
+                return self.refuse(tag, error);
+            }
         };
 
         match &frame.message {
@@ -471,6 +491,46 @@ impl<A: Authority> Provider<A> {
             .primitives
             .iter()
             .any(Primitive::is_mutating)
+    }
+
+    /// Count a mutation the session refused at **admission**, before it was
+    /// ever queued.
+    ///
+    /// Task row M4-16. [`ProviderStats::mutations_refused`] is where an
+    /// operator reads that a mutation was stopped before the host was touched,
+    /// and until this existed it only ever moved for a mutation refused
+    /// *after* the queue wait, in [`Provider::fail_queued`] — so every
+    /// capability refusal under a read-only grant, which is the whole of what
+    /// an unauthorized consumer produces, was invisible there.
+    ///
+    /// The classification comes from [`Session::required_primitives`], which is
+    /// the session's **own** decoding rather than a second one taken from the
+    /// opcode. That is the load-bearing part: `Tlopen` is a mutation when its
+    /// flags carry `O_TRUNC` and is not when they carry only `O_WRONLY`, and a
+    /// counter that read the opcode alone would report a truncation for an open
+    /// that discarded nothing.
+    ///
+    /// A frame the session could not classify is **not** counted, and that is
+    /// the honest bound rather than an oversight: a `Twrite` to a fid that is
+    /// not open for writing is refused for its fid state before any primitive
+    /// is decided, so nothing here ever decided it was a write. Task row M4-20
+    /// records that residue.
+    ///
+    /// **It counts every refusal, not only a capability refusal.** This runs on
+    /// any `Err` from `request`, so a classifiable mutation refused *after* the
+    /// grant allowed it — a reservation failure such as a tag collision, under
+    /// a writable grant — is counted here too. That is the counter's documented
+    /// wording, "refused before the host was touched", read literally: the host
+    /// was not touched in that case either. It is broader than the capability
+    /// refusals M4-16 was filed about, and is deliberate rather than incidental.
+    fn note_refused_mutation(&mut self, frame: &Frame) {
+        if self
+            .session
+            .required_primitives(frame)
+            .is_some_and(|primitives| primitives.iter().any(Primitive::is_mutating))
+        {
+            self.stats.mutations_refused += 1;
+        }
     }
 
     // ------------------------------------------------------------- answering
