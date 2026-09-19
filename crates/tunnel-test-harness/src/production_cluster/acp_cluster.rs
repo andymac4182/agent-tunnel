@@ -208,7 +208,7 @@ pub const NOT_COVERED: [&str; 13] = [
     "no retry beyond the moment of observation: a ledger is read when a stream has failed and again after a settle window, and a replay issued after that would not be observed",
     "the connection-capacity table at its real bounds: 256 tracked and 32 per principal are proven as arithmetic in tunnel-acp-export, not by opening 257 connections here",
     "the permission deadline and the idle, prompt-wall-time bounds of the limits table over the real route: they are measured against the export's own clock in tunnel-acp-export, not here",
-    "both directions of the ingress-to-owner PEER hop SATURATED at the same instant -- but the reason has changed, and the change is the point. M8-C22's product change has landed: the hop now latches its send/receive pair AT ONE INSTANT, at the credit charge and the receive push, and publishes that pair both on HttpExchangeRecord and, while the hop is still open, on the forwarding snapshot's live_peer_hops. So simultaneity on this hop is now MEASURABLE, where before it was not expressible at all. What the measurement returns is that the two directions are NOT loaded together: across seven runs with the sampler repaired the best-attested instant has a smaller half of 61-217 bytes against a 196,608-byte window (0%), while the request direction alone reads 180,510-195,933 (91.8-99.66%) ON THE LIVE PUBLICATION, which the gate now asserts. Where the response direction's backlog is held is NOT established, and an earlier draft of this entry asserted it was the ingress's own public response buffer. That was an inference and the measurement refutes it: the hop's receive high-water (362), the ingress's response handoff (362) and its queued public response body (354) are all the same negligible magnitude, so the response direction is not backing up at ANY published buffer on this path. WHERE it is held is not established here, and no replacement location is asserted: an earlier draft named the export's 30 s output-credit budget, which would have traded one unproven location for another. The gate now ASSERTS that reading, so it cannot go stale. The owner-to-device segment IS shown carrying bytes in both directions at one instant here, and that is a different segment; prefer 'carrying bytes' over 'loaded', since a 308-byte parked record is a real same-instant observation and is not the segment under load",
+    "both directions of the ingress-to-owner PEER hop SATURATED at the same instant -- but the reason has changed, and the change is the point. M8-C22's product change has landed: the hop now latches its send/receive pair AT ONE INSTANT, at the credit charge and the receive push, and publishes that pair both on HttpExchangeRecord and, while the hop is still open, on the forwarding snapshot's live_peer_hops. So simultaneity on this hop is now MEASURABLE, where before it was not expressible at all. What the measurement returns is that the two directions are NOT loaded together: across fourteen runs with the sampler repaired the best-attested instant has a smaller half of 61-217 bytes against a 196,608-byte window (0%), while the request direction alone reads 180,510-195,933 (91.8-99.66%) ON THE LIVE PUBLICATION, which the gate now asserts. Where the response direction's backlog is held is NOT established, and an earlier draft of this entry asserted it was the ingress's own public response buffer. That was an inference and the measurement refutes it: the hop's receive high-water (362), the ingress's response handoff (362) and its queued public response body (354) are all the same negligible magnitude, so the response direction is not backing up at ANY published buffer on this path. WHERE it is held is not established here, and no replacement location is asserted: an earlier draft named the export's 30 s output-credit budget, which would have traded one unproven location for another. The gate now ASSERTS that reading, so it cannot go stale. The owner-to-device segment IS shown carrying bytes in both directions at one instant here, and that is a different segment; prefer 'carrying bytes' over 'loaded', since a 308-byte parked record is a real same-instant observation and is not the segment under load",
     "the response direction of the peer hop driven to its credit window: the flood against a parked stream backs up behind the export's own output-credit stall, whose record lands only after that 30 s bound, so a bounded sampling window strictly shorter than 30 s can never see that record exist at all -- this gate measures the request direction of that hop and says so",
     "this property at the shipped default configuration: the default rotation interval is 300 s and a membership record lives at most 60 s, so on a non-owner ingress an ACP connection is invalidated long before its first scheduled rotation; three rotations are reachable here only because the gate runs the device at the 3 s configuration floor",
     "peer-key rotation as a survivable event: the key-rotation case drives the teardown and attributes the INGRESS's own decision, it does not show an ACP stream surviving one. Nor does it separate the key change from the record-version bump that must accompany it ON THE WIRE -- the verifier refuses an equal-version re-sign, so every key change is also a version change, and the attribution rests on the reason the product itself latched (MembershipRevoked, reachable only through the membership runtime's in-process invalidation callback) together with the same-key control arm beside it",
@@ -1562,7 +1562,8 @@ const MIN_LOADED_SAMPLES: u64 = 64;
 /// **The floor this sits below is the all-time one, not this series'.**  The
 /// recorded range across every run is **91.8-99.7%** of the window (M8-C23,
 /// which also carries the unexplained sub-mode: one run each at 180,510, or
-/// 91.8%).  This branch's six runs all read 99.66%, but quoting *that* as the
+/// 91.8%).  This branch's six *recorded-series* runs all read 99.66%, but quoting
+/// *that* as the
 /// floor would be quoting a series rather than a property.  90% sits **1.8
 /// points below the all-time floor**, which is a narrow margin against a
 /// reading nobody has explained -- so a sub-90% reading is a **re-run of
@@ -3160,12 +3161,20 @@ impl Gate<'_> {
                     // passes is a count of the loop.  Anything whose request
                     // id was already open before this attempt began is not
                     // this attempt's.
+                    //
+                    // **Fail closed on a hop with no request id.**  Both
+                    // `register_live_hop` call sites pass `Some` today, so
+                    // this is unreachable -- but `is_none_or` would have
+                    // counted an id-less hop AS the upload's, which is the
+                    // permissive direction and would silently reinflate the
+                    // sample count in exactly the way this filter exists to
+                    // prevent.  A hop we cannot attribute is not counted.
                     let mut saw_upload_hop = false;
                     for hop in &hops {
                         let is_upload_hop = hop
                             .request_id
                             .as_deref()
-                            .is_none_or(|id| !preexisting.contains(id));
+                            .is_some_and(|id| !preexisting.contains(id));
                         if !is_upload_hop {
                             continue;
                         }
@@ -4323,7 +4332,7 @@ pub fn validate_acp_cluster_evidence(evidence: &AcpClusterEvidence) -> Result<()
             // simultaneity on this hop is now *measurable*, which it was not.
             //
             // **What it measures is that the two directions are not loaded
-            // together.**  Across seven runs with the sampler repaired, the
+            // together.**  Across fourteen runs with the sampler repaired, the
             // best-attested instant's smaller half is 61-217 bytes against a
             // 196,608-byte window -- 0% -- while the request direction alone
             // reads 180,510-195,933 (91.8-99.66%) on the live publication.
@@ -4396,7 +4405,9 @@ pub fn validate_acp_cluster_evidence(evidence: &AcpClusterEvidence) -> Result<()
             // load-bearing.**  Read from `live_peer_hops` while the exchange
             // was still running -- not from the record it writes when it
             // terminates -- the upload's hop shows its request direction at
-            // the saturation threshold. Observed 91.8-99.66% in 7 of 7.
+            // the saturation threshold. Observed 91.8-99.66% in 7 of 7 -- the
+            // subset of the fourteen-run series that followed this rule
+            // landing, which is every run that could have exercised it.
             //
             // Until this rule existed the gate asserted nothing about the
             // live publication beyond "some hop was open", which a parked
