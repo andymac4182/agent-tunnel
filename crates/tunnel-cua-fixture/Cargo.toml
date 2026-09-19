@@ -1,0 +1,37 @@
+[package]
+name = "tunnel-cua-fixture"
+description = "Deterministic synthetic CUA backend on loopback: synthetic marker images, an authoritative in-memory ledger, and fault injection after the ledger entry"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# **Lane A only. This fixture cannot touch a screen or an input device, and
+# that is checkable rather than assertable**: `tunnel-cua/tests/host_untouched.rs`
+# reads this manifest and refuses anything outside its allowlist, and walks
+# this crate's transitive closure in `Cargo.lock` for input/capture crates.
+#
+# The HTTP/1.1 server and client here are hand-written over `tokio::net`
+# rather than taken from `hyper`. That is deliberate and is not
+# not-invented-here: the fixture's whole job is to emit responses a correct
+# HTTP library refuses to produce -- a body truncated mid-framing, a
+# connection dropped after the ledger entry exists, a pre-dispatch 401 with no
+# `data:` event -- and a library would fight every one of them. It also keeps
+# the dependency surface this crate is judged on down to `tokio` and
+# `serde_json`.
+[dependencies]
+serde_json = "1.0"
+tokio = { version = "1.48", features = [
+    "io-util",
+    "macros",
+    "net",
+    "rt",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }
+tunnel-cua = { path = "../tunnel-cua" }
+
+[lints]
+workspace = true
