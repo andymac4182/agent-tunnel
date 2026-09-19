@@ -77,6 +77,36 @@ CARGO_TEST = [
     "--no-fail-fast",
 ]
 
+#: **A fourth refusal, and this suite is the reason it exists (task row
+#: M3-19).**  The tests here do not merely link the code under test: they
+#: `exec` two *binaries*, `tunnel-mcp-fixture` and `tunnel-deadman`, and read
+#: the process table for what those binaries did.  `cargo test --test
+#: process_residue` selects test targets, and it builds **no binary belonging
+#: to another package at all** — so a case that edits `crates/tunnel-deadman`
+#: is run against whatever sentinel executable happened to be lying in the
+#: target directory.
+#:
+#: That was measured, not assumed.  The first run of this suite reported the
+#: sentinel's group kill as `still green` — a guard that is the entire
+#: mechanism, defeated, with nothing going red — because the deleted code was
+#: never rebuilt and the binary on disk still had it.  A harness that silently
+#: tests a stale artifact is worse than no harness: it reports "this guard is
+#: not load-bearing" about a guard that is.
+#:
+#: So every case builds these binaries first, and a build failure here is a
+#: build failure for the case.  **This step may not be removed to make the
+#: suite faster.**
+CARGO_BUILD_BINARIES = [
+    "cargo",
+    "build",
+    "--locked",
+    "-p",
+    "tunnel-deadman",
+    "-p",
+    "tunnel-mcp-fixture",
+    "--bins",
+]
+
 # An edit is (file, exact text to remove or replace, replacement).
 Edit = tuple[Path, str, str]
 
@@ -170,7 +200,23 @@ def run_tests(suite: Suite) -> tuple[str, list[str]]:
     """Run one suite's tests and classify the outcome.
 
     A build that did not compile is **never** reported as a red test.
+
+    The binaries the tests `exec` are rebuilt first; see
+    [`CARGO_BUILD_BINARIES`] for why a stale one is a silent false green.
     """
+    try:
+        built = subprocess.run(
+            CARGO_BUILD_BINARIES,
+            cwd=suite.cwd,
+            env=cargo_env(),
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+    except subprocess.TimeoutExpired:
+        return "NOT EVIDENCE (timed out)", []
+    if built.returncode != 0:
+        return "BUILD FAILED", []
     try:
         done = subprocess.run(
             suite.cargo_test,
