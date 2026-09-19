@@ -1562,6 +1562,51 @@ GATE4_CASES: list[tuple[str, list[Edit]]] = [
         ],
     ),
     (
+        # Task row **M4-16**.  The sibling above counts a mutation refused
+        # *after* the queue wait; this one counts a mutation refused at
+        # **admission**, by gate 3's session inside `Provider::accept`, which
+        # is where every capability refusal under a read-only grant is taken.
+        # Deleting it restores the defect exactly: the ledger reads zero while
+        # an export is being hammered by an unauthorized consumer.
+        "a mutation refused at admission is counted",
+        [
+            (
+                PROVIDER_SRC,
+                """        if self
+            .session
+            .required_primitives(frame)
+            .is_some_and(|primitives| primitives.iter().any(Primitive::is_mutating))
+        {
+            self.stats.mutations_refused += 1;
+        }""",
+                "        let _ = frame;",
+            )
+        ],
+    ),
+    (
+        # The other half of M4-16, and the one a naive fix fails.  Counting
+        # every classifiable refusal — rather than only the refusals whose
+        # decoded primitives are mutating — reads `Tlopen` by opcode, and a
+        # `Tlopen` carrying `O_WRONLY` alone destroys nothing.  The rule is
+        # gate 5's own `Primitive::is_mutating`, and this defeats it while
+        # leaving the counter moving, so only the cases that assert a
+        # *non*-mutating refusal is **not** counted can catch it.
+        # The substitution widens the predicate to "classified at all", which
+        # is broader than the naive opcode fix rather than equal to it -- it
+        # subsumes that fix, so reddening under it is the stronger signal, but
+        # the name promises something narrower than the mutation actually is.
+        "an admission refusal is classified from its primitives, not its opcode",
+        [
+            (
+                PROVIDER_SRC,
+                """            .required_primitives(frame)
+            .is_some_and(|primitives| primitives.iter().any(Primitive::is_mutating))""",
+                """            .required_primitives(frame)
+            .is_some()""",
+            )
+        ],
+    ),
+    (
         "key the descriptor cache by fid generation",
         [
             (

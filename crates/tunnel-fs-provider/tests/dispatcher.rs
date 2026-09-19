@@ -542,6 +542,21 @@ fn every_mutating_opcode_is_refused_under_a_read_only_grant() {
         },
     ];
     assert_eq!(mutations.len(), 10, "every mutating opcode in the profile");
+    // What each of those must add to `mutations_refused`, in the same order.
+    //
+    // **Task row M4-16.** Every one of these is a mutation refused before the
+    // host was touched, which is that counter's own definition, and before
+    // M4-16 the whole column read zero — the refusal is taken by gate 3's
+    // session inside `accept`, and nothing there classified it.
+    //
+    // The one zero is `Twrite`, and it is a **bound rather than a miss**: this
+    // grant can never open a fid for writing, so the write is refused for its
+    // *fid state* — `EINVAL`, not `EPERM` — before the session decides what
+    // primitives it needs. Nothing decided it was a write, so nothing counts it
+    // as one. Task row M4-20 records that residue. Asserting the zero here is
+    // the point: a counter that moved for this one would be counting the
+    // opcode, which is exactly what it must not do.
+    const COUNTED: [u64; 10] = [1, 0, 1, 1, 1, 1, 1, 1, 1, 1];
     // The two refusals a mutation meets under a `read`+`list` grant, each taken
     // by a different layer and **both of them before the host**, which is what
     // makes every one of them `not_started`:
@@ -554,7 +569,7 @@ fn every_mutating_opcode_is_refused_under_a_read_only_grant() {
     //   one, so the flag is rejected before any backend access.
     const REFUSALS: [FsErrorCode; 2] = [FsErrorCode::Eperm, FsErrorCode::Einval];
 
-    for mutation in mutations {
+    for (mutation, counted) in mutations.into_iter().zip(COUNTED) {
         let fixture = Fixture::new();
         fixture.file("/notes.txt", b"synthetic");
         fixture.dir("/tree");
@@ -584,12 +599,18 @@ fn every_mutating_opcode_is_refused_under_a_read_only_grant() {
         assert_eq!(stats.mutations_applied, 0);
         assert_eq!(stats.mutation_unknown, 0);
         assert_eq!(stats.mutation_partial, 0);
-        // `mutations_refused` is deliberately **not** asserted at one: most of
-        // these are refused by gate 3's session inside `accept`, before the
-        // request is queued at all, so they never reach the dispatcher's own
-        // ledger. That is the refusal happening a layer earlier than this
-        // counter, and saying so is better than moving the counter to make the
-        // number look tidy.
+        // And the ledger says the mutation was refused, which is the whole of
+        // task row M4-16: these are refused by gate 3's session inside
+        // `accept`, before the request is queued at all, and that is precisely
+        // the case the counter used to miss.
+        assert_eq!(
+            stats.mutations_refused, counted,
+            "{described} must add exactly {counted} to mutations_refused"
+        );
+        // Counted as a refusal and never as anything else: a refusal that
+        // incremented the dispatch ledger would be claiming the host was asked.
+        assert_eq!(stats.mutation_failed, 0, "{described}");
+        assert_eq!(stats.errors_sent, 1, "{described}");
 
         // And nothing happened to the export.
         assert_eq!(
@@ -602,6 +623,102 @@ fn every_mutating_opcode_is_refused_under_a_read_only_grant() {
         assert!(!fixture.inside("hard").exists());
         assert!(!fixture.inside("tree/moved.txt").exists());
     }
+}
+
+/// Refuse one `Tlopen` at admission and report what the ledger did.
+///
+/// Returns `(error code, mutations_refused, errors_sent)` over a fresh session,
+/// so no case's number can be credited to another's.
+fn refuse_an_open(grant: tunnel_fs_core::CapabilitySet, flags: u32) -> (FsErrorCode, u64, u64) {
+    let fixture = Fixture::new();
+    fixture.file("/notes.txt", b"synthetic");
+    let (mut provider, _authority) = fixture.provider(grant);
+    handshake(&mut provider, ROOT);
+    let _ = exchange(&mut provider, twalk(2, ROOT, 1, &["notes.txt"]));
+    let before = provider.stats();
+    assert_eq!(before.mutations_refused, 0, "the walk is not a mutation");
+
+    let reply = one_frame(exchange(&mut provider, tlopen(3, 1, flags)));
+    let stats = provider.stats();
+    // Whatever the counter says, the host was never asked.
+    assert_eq!(stats.mutations_dispatched, 0);
+    assert_eq!(stats.mutations_applied, 0);
+    assert_eq!(
+        std::fs::read(fixture.inside("notes.txt")).expect("the file survives"),
+        b"synthetic"
+    );
+    (
+        error_code(&reply),
+        stats.mutations_refused,
+        stats.errors_sent,
+    )
+}
+
+#[test]
+fn a_refused_open_is_counted_from_its_flags_and_never_from_its_opcode() {
+    // **Task row M4-16, and the half of it that a counter keyed on the opcode
+    // would get wrong.** Both of these are a `Tlopen` refused `EPERM` at
+    // admission under the same grant, over the same file, differing in one
+    // flag bit — and exactly one of them is a mutation. `O_TRUNC` discards the
+    // file's content, so an open carrying it that was refused is a mutation
+    // refused before the host was touched; `O_WRONLY` alone changes nothing, so
+    // a refusal of it is not a refused mutation and counting it would inflate
+    // the ledger with opens that could never have destroyed anything. That is
+    // gate 5's own `Primitive::is_mutating` distinction, and it is the reason
+    // this counts from the primitives the session decoded rather than from the
+    // message type.
+    let (truncating_code, truncating_refused, truncating_errors) =
+        refuse_an_open(read_and_list(), O_WRONLY | O_TRUNC);
+    assert_eq!(truncating_code, FsErrorCode::Eperm);
+    assert_eq!(
+        truncating_refused, 1,
+        "a truncating open refused at admission is a refused mutation"
+    );
+    assert_eq!(truncating_errors, 1);
+
+    let (writing_code, writing_refused, writing_errors) = refuse_an_open(read_and_list(), O_WRONLY);
+    assert_eq!(
+        writing_code,
+        FsErrorCode::Eperm,
+        "the same refusal, so the codes cannot be what separates the two"
+    );
+    assert_eq!(
+        writing_refused, 0,
+        "opening for writing changes nothing, so its refusal is not a refused mutation"
+    );
+    assert_eq!(
+        writing_errors, 1,
+        "it was still refused — the refusal is real and only its classification differs"
+    );
+}
+
+#[test]
+fn a_refused_read_is_not_counted_as_a_refused_mutation() {
+    // The negative control the positive cases are worthless without. Both of
+    // these are refused `EPERM` at admission by the same code path, for the
+    // same reason — the grant does not carry the capability — and neither is a
+    // mutation. A counter that moved here would be counting refusals, not
+    // refused mutations, and would read the same whether a consumer was
+    // probing an export for readable bytes or trying to empty it.
+    let (read_code, read_refused, read_errors) = refuse_an_open(list_only(), O_RDONLY);
+    assert_eq!(read_code, FsErrorCode::Eperm);
+    assert_eq!(read_refused, 0, "a read is not a mutation");
+    assert_eq!(read_errors, 1);
+
+    // And a directory enumeration refused for a missing `list`, which decodes
+    // to a different primitive again.
+    let fixture = Fixture::new();
+    fixture.file("/notes.txt", b"synthetic");
+    let (mut provider, _authority) = fixture.provider(read_only());
+    handshake(&mut provider, ROOT);
+    let reply = one_frame(exchange(
+        &mut provider,
+        tlopen(2, ROOT, O_RDONLY | O_DIRECTORY),
+    ));
+    assert_eq!(error_code(&reply), FsErrorCode::Eperm);
+    let stats = provider.stats();
+    assert_eq!(stats.errors_sent, 1, "it was refused");
+    assert_eq!(stats.mutations_refused, 0, "and it is not a mutation");
 }
 
 #[test]
