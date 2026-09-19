@@ -11,8 +11,9 @@
 //! been seen by a backend.
 //!
 //! So the order is one function here, [`plan`], and the fixture's dispatcher
-//! calls it. There is deliberately **no way to reach the backend without a
-//! [`Planned`]**, and `Planned` has no public constructor.
+//! calls it. [`Planned`] is the only thing that authorizes a send, and its
+//! variants are `#[non_exhaustive]` so that a caller outside this crate cannot
+//! build one — see [`Planned`] for what that does and does not guarantee.
 //!
 //! ```text
 //!   body --schema::validate_request--> Request      (nothing sent)
@@ -37,11 +38,75 @@ use crate::schema::{self, Params};
 
 /// What the caller should do next, once every pre-dispatch check has passed.
 ///
-/// No public constructor: the only way to obtain one is [`plan`], so a value
-/// of this type is the evidence that the sequence ran in order.
+/// Outside this crate the only way to obtain one is [`plan`], so a value of
+/// this type is evidence that the sequence ran in order.
+///
+/// # How that is enforced, and a correction
+///
+/// Both variants are `#[non_exhaustive]`. **An earlier revision of this module
+/// claimed `Planned` "has no public constructor" and that `plan` was "the only
+/// way to obtain one". Both statements were false**, and review proved it
+/// rather than argued it, by compiling a crate outside this workspace that
+/// built `Planned::Dispatch { command: "left_click", .. }` — an input command
+/// this profile defers and refuses everywhere else. **Rust has no private enum
+/// variant**: any code that can name a `pub enum` in a `pub mod` can construct
+/// its variants, so the guarantee was decorative for as long as it was merely
+/// written down.
+///
+/// `#[non_exhaustive]` on each variant is what actually buys it. External
+/// construction now fails to compile with `E0639`, while [`plan`] keeps
+/// building them freely inside this crate. The cost is real and is paid by
+/// `tunnel-cua-fixture`: an external `match` on these variants must carry `..`.
+///
+/// This is enforced by a **compile-fail doctest** rather than by
+/// `scripts/m5-guard-deletion.py`. A deletion harness defeats a rule and looks
+/// for a red test, and there is no red test for "this does not compile
+/// elsewhere" — which is exactly how the false claim survived a suite that was
+/// otherwise 37-for-37. A doctest is compiled as its own external crate, so it
+/// sees this type the way a consumer does.
+///
+/// ```compile_fail,E0639
+/// use serde_json::json;
+/// use tunnel_cua::Operation;
+/// use tunnel_cua::plan::Planned;
+///
+/// // Forging a dispatch for a deferred input command. This must not compile.
+/// let forged = Planned::Dispatch {
+///     command: "left_click",
+///     payload: json!({"x": 100, "y": 200}),
+///     operation: Operation::Capture,
+/// };
+/// ```
+///
+/// ```compile_fail,E0639
+/// use tunnel_cua::Operation;
+/// use tunnel_cua::plan::Planned;
+///
+/// let forged = Planned::AnswerLocally { operation: Operation::Capture };
+/// ```
+///
+/// The non-vacuity control: the type is still reachable and usable from
+/// outside, so the two failures above are about *construction* rather than the
+/// doctest being unable to see the crate at all.
+///
+/// ```
+/// use std::collections::BTreeSet;
+/// use tunnel_cua::Operation;
+/// use tunnel_cua::plan::{Planned, plan};
+///
+/// let body = br#"{"version":"computer.v1","operation":"capture","params":{}}"#;
+/// let permitted: BTreeSet<Operation> = [Operation::Capture].into_iter().collect();
+/// let planned = plan(body, 4096, &permitted).expect("a granted capture plans a dispatch");
+/// match planned {
+///     Planned::Dispatch { command, .. } => assert_eq!(command, "screenshot"),
+///     Planned::AnswerLocally { .. } => panic!("capture dispatches"),
+///     _ => unreachable!(),
+/// }
+/// ```
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Planned {
     /// Send this command with this payload to the backend.
+    #[non_exhaustive]
     Dispatch {
         /// The canonical `cua-computer-server` command name.
         command: &'static str,
@@ -55,6 +120,7 @@ pub enum Planned {
     /// The caller renders this as [`Dispatch::AnsweredLocally`], never as a
     /// dispatch — which is the distinction the first review found this chunk
     /// getting wrong.
+    #[non_exhaustive]
     AnswerLocally { operation: Operation },
 }
 

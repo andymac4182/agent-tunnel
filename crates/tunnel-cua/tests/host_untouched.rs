@@ -284,10 +284,16 @@ fn neither_m5_crate_can_reach_a_crate_capable_of_input_or_capture() {
 
 /// The gap is real, and this test says so out loud so it cannot be forgotten.
 ///
-/// It asserts the state of the world that *makes* the gap exist — `windows-sys`
-/// present in the lockfile through a `cfg(windows)` edge — so that if the
-/// world ever changes the assertion changes with it, and the row it names has
-/// to be revisited rather than quietly outliving its reason.
+/// It asserts that a Win32 binding crate is **present in the lockfile at all**,
+/// so that if one ever leaves, the row it names has to be revisited rather than
+/// quietly outliving its reason.
+///
+/// **What it does not assert, corrected after review said so.** It does not
+/// check that the edge is `cfg(windows)`-gated. It cannot: `Cargo.lock` carries
+/// no `cfg` information, which is the whole reason M5-C04 exists. So an
+/// **ungated** Win32 dependency — precisely the failure M5-C04 is about — would
+/// satisfy this test exactly as the gated one does. The design is right and is
+/// unclosable by a lockfile scan; only the earlier sentence overclaimed.
 #[test]
 fn the_win32_binding_gap_is_recorded_rather_than_silently_excluded() {
     let packages = lock_package_names();
@@ -367,50 +373,66 @@ fn manifest_dependency_names(manifest: &Path) -> BTreeSet<String> {
     names
 }
 
-/// Every direct dependency of the two M5 crates, named.
+/// Every direct dependency of the two M5 crates, **per crate**.
 ///
 /// A denylist answers "none of the known-bad crates". This answers the
 /// stronger question for the two crates that would host the defect: "only
 /// these, and nothing else". A new dependency on either crate turns this red
 /// and has to be argued for rather than merged in passing.
-const M5_ALLOWED_DEPENDENCIES: &[&str] = &[
-    // tunnel-cua
-    "serde",
-    "serde_json",
-    "toml",
-    "tunnel-http-bridge",
-    "tunnel-http-forward",
-    // tunnel-cua-fixture
-    "tokio",
-    "tunnel-cua",
+///
+/// **Per crate rather than a flat union, corrected after review.** The earlier
+/// version was one list checked against both manifests, so `tunnel-cua-fixture`
+/// could have gained `tunnel-http-bridge` — or `tunnel-cua` an async runtime —
+/// without the test noticing, because the name was allowed *somewhere*. The
+/// pure crate and the fixture have deliberately different budgets, and a check
+/// that cannot tell them apart is not checking the thing it claims.
+const M5_ALLOWED_DEPENDENCIES: &[(&str, &[&str])] = &[
+    (
+        // Pure: no async runtime, no I/O, no sockets.
+        "tunnel-cua",
+        &[
+            "serde",
+            "serde_json",
+            "toml",
+            "tunnel-http-bridge",
+            "tunnel-http-forward",
+        ],
+    ),
+    (
+        // The fixture binds a loopback socket, so it gets a runtime -- and
+        // nothing else. In particular **not** `tunnel-http-bridge`.
+        "tunnel-cua-fixture",
+        &["serde_json", "tokio", "tunnel-cua"],
+    ),
 ];
 
 #[test]
 fn the_two_m5_crates_declare_only_allowlisted_dependencies() {
     let root = workspace_root();
-    let manifests = [
-        root.join("crates").join("tunnel-cua").join("Cargo.toml"),
-        root.join("crates")
-            .join("tunnel-cua-fixture")
-            .join("Cargo.toml"),
-    ];
-    for manifest in &manifests {
+    for (crate_name, allowed) in M5_ALLOWED_DEPENDENCIES {
+        let manifest = root.join("crates").join(crate_name).join("Cargo.toml");
         assert!(manifest.is_file(), "{} is missing", manifest.display());
-        let names = manifest_dependency_names(manifest);
+        let names = manifest_dependency_names(&manifest);
         assert!(
             !names.is_empty(),
-            "{} declares no dependencies at all; the scan is reading the wrong file",
-            manifest.display()
+            "{crate_name} declares no dependencies at all; the scan is reading the wrong file"
         );
         for name in &names {
             assert!(
-                M5_ALLOWED_DEPENDENCIES.contains(&name.as_str()),
-                "{} declares {name}, which is not on the M5 allowlist. \
-                 Adding a dependency to an M5 crate is a safety decision, not a build detail.",
-                manifest.display()
+                allowed.contains(&name.as_str()),
+                "{crate_name} declares {name}, which is not on *its own* M5 allowlist. \
+                 Adding a dependency to an M5 crate is a safety decision, not a build detail."
             );
         }
     }
+
+    // Non-vacuity, and the specific drift the flat union could not see: the
+    // pure crate's budget and the fixture's really are different, so a name
+    // allowed for one is refused for the other.
+    let pure = M5_ALLOWED_DEPENDENCIES[0].1;
+    let fixture = M5_ALLOWED_DEPENDENCIES[1].1;
+    assert!(pure.contains(&"tunnel-http-bridge") && !fixture.contains(&"tunnel-http-bridge"));
+    assert!(fixture.contains(&"tokio") && !pure.contains(&"tokio"));
 }
 
 /// Neither M5 crate declares a feature that could turn one of these on later.
