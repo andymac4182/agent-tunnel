@@ -120,6 +120,44 @@ fn a_release_must_name_the_holding_it_owns() {
     assert_eq!(leases.holder(&target), Some(B), "B still has it");
 }
 
+/// **Releasing a superseded holding of your own is refused too**, and the
+/// session check cannot catch this one.
+///
+/// A takes the lease, releases it, and takes it again. The first grant now
+/// names a holding that has been replaced. The holder is still A, so the
+/// session comparison passes — the only thing standing between this and A
+/// silently dropping its own *current* lease is the lease-identifier check.
+///
+/// This leg exists because the guard harness found the rule green without it:
+/// every other release test was decided by the session comparison first, so
+/// deleting the identifier check changed nothing that was measured. A rule
+/// nothing can break is not a guard, and this is the case that breaks it.
+#[test]
+fn releasing_a_superseded_holding_of_your_own_does_not_drop_the_current_one() {
+    let mut leases = InputLeases::new();
+    let target = target();
+
+    let first = leases.acquire(&target, A, R0).unwrap();
+    leases.release(&first).unwrap();
+    let second = leases.acquire(&target, A, R0).unwrap();
+    assert_ne!(first.lease(), second.lease());
+
+    assert_eq!(
+        leases.release(&first),
+        Err(LeaseRefusal::NotTheHolder),
+        "the first holding is gone; releasing it must not touch the second"
+    );
+    assert_eq!(
+        leases.holder(&target),
+        Some(A),
+        "A's current lease survived the stale release"
+    );
+    assert_eq!(leases.check(&target, A, R0), Ok(second.lease()));
+    // Non-vacuity: the current grant does release it.
+    leases.release(&second).unwrap();
+    assert!(leases.is_empty());
+}
+
 /// **M3-16, part one: a revoked holder cannot use the lease.**
 ///
 /// `check` is given the revision the device believes the grant carries. When
