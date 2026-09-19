@@ -13,13 +13,30 @@ writes, edits, or reformats them.  It fails (exit 1) when a row marked verified:
      crates/tunnel-test-harness/src/main.rs nor referenced by
      scripts/m7-harness-verify.sh, or
   2. cites a commit hash that git resolves to a real commit object which is not
-     an ancestor of HEAD (evidence borrowed from an unmerged sibling commit).
+     an ancestor of HEAD (evidence borrowed from an unmerged sibling commit), or
+  3. cites a commit hash that git cannot resolve at all AND that
+     docs/sources.md does not record as a pinned upstream artifact (M8-C21).
 
 Hex tokens that git does not resolve to a commit are ignored: they are digests,
 blob ids, log-file fragments or squashed short hashes, not a claim that "this
 commit is in our history".  Gate tokens embedded inside a longer path or
 filename (e.g. a `...-verify-m7-transport-fixed.log` log name) are ignored via a
 left word boundary, so only real gate citations are checked.
+
+The upstream-pin rule (M8-C21) is keyed on docs/sources.md and on nothing else.
+An upstream artifact is not in this repository's history, so a row that pins one
+can never satisfy rule 2 -- and refusing every such row would make a pin row
+permanently unverifiable, which is a strange conclusion for a repository whose
+M8-01 reads "Pin stable ACP v1...".  The exemption is therefore narrow and
+mechanical: the cited short hash must be a prefix of a full 40-character hash
+that docs/sources.md records beside a URL carrying that same hash (repository,
+commit and path) and beside a labelled SHA-256 content digest.  Absent that
+entry the citation is still a hard failure, so adding a pin costs a
+`sources.md` record, which is strictly more than deleting a cue word.  The rule
+is deliberately NOT keyed on any marker in docs/tasks.md: a marker in the
+tracker would be a new cue word that can be added or deleted at will, which is
+the deny-list failure recorded as M8-C08 merely inverted.  Both halves are
+pinned in scripts/test_evidence_guard_pins.py, red fixture included.
 
 Usage:
   python3 scripts/m7-evidence-guard.py [--verbose]
@@ -37,6 +54,7 @@ import sys
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MAIN_RS = os.path.join(REPO_ROOT, "crates", "tunnel-test-harness", "src", "main.rs")
 HARNESS_VERIFY = os.path.join(REPO_ROOT, "scripts", "m7-harness-verify.sh")
+SOURCES = os.path.join(REPO_ROOT, "docs", "sources.md")
 DOCS = [
     os.path.join(REPO_ROOT, "docs", "m7-edge-cases.md"),
     os.path.join(REPO_ROOT, "docs", "tasks.md"),
@@ -69,6 +87,55 @@ HASH_RE = re.compile(r"(?<![0-9a-fA-Fx])([0-9a-f]{7,40})(?![0-9a-fA-F])")
 COMMIT_CITATION_RE = re.compile(
     r"\b(?:as|commit|commits)\s+`?([0-9a-f]{7,40})`?(?![0-9a-fA-F])", re.IGNORECASE
 )
+
+# --- the upstream-pin record in docs/sources.md (M8-C21) ---------------------
+#
+# A full vcs hash: exactly 40 hex characters.  A short form is never accepted
+# in sources.md; the record must name the artifact unambiguously, and the row's
+# short citation is matched against it by prefix.
+PIN_HASH_RE = re.compile(r"(?<![0-9a-fA-F])([0-9a-f]{40})(?![0-9a-fA-F])")
+# A content digest: exactly 64 hex characters (a SHA-256).
+PIN_DIGEST_RE = re.compile(r"(?<![0-9a-fA-F])[0-9a-f]{64}(?![0-9a-fA-F])")
+# The digest must be labelled, so an unexplained 64-hex blob cannot stand in
+# for "we hashed the artifact".  crates.io checksums are SHA-256 of the
+# published .crate and are written in sources.md as "checksum".
+PIN_DIGEST_LABEL_RE = re.compile(r"sha-?256|checksum", re.IGNORECASE)
+URL_RE = re.compile(r"https?://[^\s<>()\[\]`]+")
+
+
+def recorded_upstream_pins(sources_text: str) -> "set[str]":
+    """Full 40-character hashes docs/sources.md records as pinned artifacts.
+
+    All three must appear on the same line of sources.md, which is one record:
+
+      * the full 40-character hash,
+      * a URL that itself contains that hash -- this is what makes the record
+        name a repository, a commit and a path rather than a bare number, and
+      * a labelled SHA-256 content digest (64 hex characters).
+
+    An entry missing the URL or missing the digest records less than the rule
+    requires and yields no pin, so the citation that depends on it fails.
+    """
+    pins: "set[str]" = set()
+    for line in sources_text.splitlines():
+        if not PIN_DIGEST_RE.search(line):
+            continue
+        if not PIN_DIGEST_LABEL_RE.search(line):
+            continue
+        urls = URL_RE.findall(line)
+        if not urls:
+            continue
+        for match in PIN_HASH_RE.finditer(line):
+            token = match.group(1)
+            if any(token in url for url in urls):
+                pins.add(token)
+    return pins
+
+
+def is_recorded_pin(token: str, pins: "set[str]") -> bool:
+    """True when the cited short hash is a prefix of a recorded full pin."""
+    lowered = token.lower()
+    return any(pin.startswith(lowered) for pin in pins)
 
 
 def die(message: str) -> "None":
@@ -152,11 +219,76 @@ def row_is_verified(line: str) -> bool:
     return False
 
 
-def scan(gates: "set[str]", verbose: bool) -> "list[str]":
+def row_findings(
+    rel: str,
+    lineno: int,
+    line: str,
+    gates: "set[str]",
+    pins: "set[str]",
+    ancestry,
+) -> "tuple[list[str], int, int, int]":
+    """Findings for one verified row, plus (gate, commit, upstream-pin) counts.
+
+    `ancestry` is the token -> True/False/None resolver, injected so the rule
+    can be exercised against fixtures without inventing git objects.
+    """
+    findings: "list[str]" = []
+    gate_citations = 0
+    hash_citations = 0
+    pin_citations = 0
+    for match in GATE_RE.finditer(line):
+        token = match.group(1)
+        gate_citations += 1
+        if token not in gates:
+            findings.append(
+                f"{rel}:{lineno}: verified row cites unknown harness gate "
+                f"'{token}' (not a main.rs command nor in m7-harness-verify.sh)"
+            )
+    cited_as_commit = {
+        match.group(1).lower() for match in COMMIT_CITATION_RE.finditer(line)
+    }
+    for match in HASH_RE.finditer(line):
+        token = match.group(1)
+        verdict = ancestry(token)
+        if verdict is None:
+            if token.lower() in cited_as_commit:
+                # Written as a commit citation but git cannot resolve it.
+                # Either it is an upstream artifact this repository pins and
+                # records in docs/sources.md, which is legitimate evidence
+                # (M8-C21), or it is a promotion resting on a worker's own SHA
+                # after its worktree was removed, or on a branch that was
+                # squashed away: evidence that reads as history but is not in
+                # it.  Only the sources.md record separates the two.
+                if is_recorded_pin(token, pins):
+                    pin_citations += 1
+                    continue
+                hash_citations += 1
+                findings.append(
+                    f"{rel}:{lineno}: verified row cites commit '{token}' "
+                    f"which git cannot resolve to any commit, and docs/sources.md "
+                    f"records no pinned upstream artifact with that hash (a pin "
+                    f"needs the full 40-character hash in a URL beside a labelled "
+                    f"SHA-256 digest)"
+                )
+            continue  # otherwise a digest or fingerprint, not a history claim
+        hash_citations += 1
+        if verdict is False:
+            # A hash git DOES resolve is a claim about this repository's
+            # history and is judged as one.  Being listed in sources.md does
+            # not launder a non-ancestor local commit.
+            findings.append(
+                f"{rel}:{lineno}: verified row cites commit '{token}' which is "
+                f"a real commit but NOT an ancestor of HEAD"
+            )
+    return findings, gate_citations, hash_citations, pin_citations
+
+
+def scan(gates: "set[str]", pins: "set[str]", verbose: bool) -> "list[str]":
     findings: "list[str]" = []
     rows_scanned = 0
     gate_citations = 0
     hash_citations = 0
+    pin_citations = 0
     for path in DOCS:
         rel = os.path.relpath(path, REPO_ROOT)
         text = read_text(path)
@@ -166,44 +298,19 @@ def scan(gates: "set[str]", verbose: bool) -> "list[str]":
             if not row_is_verified(line):
                 continue
             rows_scanned += 1
-            for match in GATE_RE.finditer(line):
-                token = match.group(1)
-                gate_citations += 1
-                if token not in gates:
-                    findings.append(
-                        f"{rel}:{lineno}: verified row cites unknown harness gate "
-                        f"'{token}' (not a main.rs command nor in m7-harness-verify.sh)"
-                    )
-            cited_as_commit = {
-                match.group(1).lower() for match in COMMIT_CITATION_RE.finditer(line)
-            }
-            for match in HASH_RE.finditer(line):
-                token = match.group(1)
-                verdict = commit_ancestry(token)
-                if verdict is None:
-                    if token.lower() in cited_as_commit:
-                        # Written as a commit citation but git cannot resolve it.
-                        # This is how a promotion ends up resting on a worker's
-                        # own SHA after its worktree is removed, or on a branch
-                        # that was squashed away: the evidence reads as history
-                        # but no longer exists in it.
-                        hash_citations += 1
-                        findings.append(
-                            f"{rel}:{lineno}: verified row cites commit '{token}' "
-                            f"which git cannot resolve to any commit"
-                        )
-                    continue  # otherwise a digest or fingerprint, not a history claim
-                hash_citations += 1
-                if verdict is False:
-                    findings.append(
-                        f"{rel}:{lineno}: verified row cites commit '{token}' which is "
-                        f"a real commit but NOT an ancestor of HEAD"
-                    )
+            row, gate_n, hash_n, pin_n = row_findings(
+                rel, lineno, line, gates, pins, commit_ancestry
+            )
+            findings.extend(row)
+            gate_citations += gate_n
+            hash_citations += hash_n
+            pin_citations += pin_n
     if verbose:
         sys.stderr.write(
             f"m7-evidence-guard: scanned {rows_scanned} verified rows, "
             f"{gate_citations} gate citations, {hash_citations} confirmed commit "
-            f"citations; {len(gates)} known gates\n"
+            f"citations, {pin_citations} upstream-pin citations; "
+            f"{len(gates)} known gates, {len(pins)} recorded upstream pins\n"
         )
     return findings
 
@@ -216,13 +323,17 @@ def main(argv: "list[str]") -> int:
     if git("rev-parse", "--git-dir").returncode != 0:
         die("not a git repository")
     gates = known_gates()
-    findings = scan(gates, verbose)
+    pins = recorded_upstream_pins(read_text(SOURCES))
+    findings = scan(gates, pins, verbose)
     if findings:
         sys.stderr.write("m7-evidence-guard: FAIL\n")
         for finding in findings:
             sys.stderr.write(f"  {finding}\n")
         return 1
-    sys.stderr.write("m7-evidence-guard: PASS (no unverified-gate or non-ancestor-commit promotions)\n")
+    sys.stderr.write(
+        "m7-evidence-guard: PASS (no unverified-gate, non-ancestor-commit or "
+        "unrecorded-upstream-pin promotions)\n"
+    )
     return 0
 
 
