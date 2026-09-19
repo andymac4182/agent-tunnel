@@ -7,6 +7,8 @@ members = [
     "crates/tunnel-client",
     "crates/tunnel-cluster",
     "crates/tunnel-core",
+    "crates/tunnel-cua",
+    "crates/tunnel-cua-fixture",
     "crates/tunnel-fs-core",
     "crates/tunnel-fs-host",
     "crates/tunnel-fs-ninep",

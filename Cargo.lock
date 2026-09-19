@@ -3567,6 +3567,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "tunnel-cua"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "toml",
+ "tunnel-http-bridge",
+ "tunnel-http-forward",
+]
+
+[[package]]
+name = "tunnel-cua-fixture"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "tokio",
+ "tunnel-cua",
+]
+
+[[package]]
 name = "tunnel-fs-core"
 version = "0.1.0"
 

@@ -1,0 +1,32 @@
+[package]
+name = "tunnel-cua"
+description = "The computer.v1 http-forward/1 profile: schema, pre-dispatch validation, read-only operation allowlist, loopback endpoint policy, capability intersection and backend outcome classification"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# **This crate does no I/O and takes no dependency capable of synthesising
+# input or capturing a screen.** That is not a comment: `tests/host_untouched.rs`
+# reads this manifest and refuses anything outside the allowlist below, and it
+# reads the workspace `Cargo.lock` for a denylist of input/capture crates.
+# `docs/tasks.md` M5-C03 records why — Lane A must be checkable by reading the
+# dependency graph rather than by reading code.
+#
+# `serde_json` only, plus the codec whose `Profile` parameter this crate
+# instantiates. It deliberately does **not** depend on `tunnel-acp`, whose
+# strict JSON scanner is the closest sibling of `json.rs` here: that crate pulls
+# the pinned ACP SDK into the graph of everything that touches CUA, which would
+# make this crate's own dependency assertion weaker for no gain.
+[dependencies]
+serde = { workspace = true }
+serde_json = "1.0"
+tunnel-http-bridge = { path = "../tunnel-http-bridge" }
+tunnel-http-forward = { path = "../tunnel-http-forward" }
+
+[dev-dependencies]
+toml = { workspace = true }
+
+[lints]
+workspace = true
