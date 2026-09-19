@@ -362,8 +362,12 @@ pub fn spawn(
         // leaks it, which is the exact hole the sentinel exists to close.
         //
         // **And it is a stated trade, not a free win.** On the path where the
-        // token never arrives — the write fails, the pipe is already gone —
-        // the sentinel sees a bare end of file and *fires*; in this late
+        // token never arrives — the write fails, the pipe is already gone, or
+        // (the commonest route on *this* crate) a torn-down runtime drops the
+        // supervisor task future without running it, so `Deadman::drop` closes
+        // the pipe with no token, possibly after tokio's orphan reaper has
+        // already reaped the `kill_on_drop(true)` leader — the sentinel sees a
+        // bare end of file and *fires*; in this late
         // ordering that firing lands after the group has been reaped, when the
         // id may already be free, whereas an early stand-down would have fired
         // while the group was still alive and therefore still unreusable. The

@@ -634,7 +634,10 @@ pub async fn run_supervise(workspace: &Path) {
     if std::fs::write(&temporary, format!("{wrapper} {helper} {armed}")).is_ok() {
         let _ = std::fs::rename(&temporary, workspace.join(SUPERVISE_REPORT));
     }
-    // Hold the handle so nothing drops it, and wait to be killed.
+    // The binding is the point: it holds the handle alive across the park so
+    // nothing drops it, and this process waits to be killed. There is no
+    // `drop` after the park -- `pending` never resolves, so anything written
+    // below it would be unreachable and would only read as though it ran.
+    let _handle = handle;
     std::future::pending::<()>().await;
-    drop(handle);
 }
