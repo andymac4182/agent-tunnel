@@ -1749,9 +1749,23 @@ was gone and had nobody to be failed to. Here the consumer is still connected,
 and it was receiving a close with **no code at all**: `close_session` drains a
 session's streams by cancelling `closed`, which carries no reset reason, so the
 consumer pump sent `Close(None)`. That is the sibling of **M4-25**, which fixed
-the same codeless close for a revoked grant. The fix defaults that path to
-`DeviceOffline`, after the peer-reset resolution so a revocation still closes
-1008 and before the framing verdict which outranks everything.
+the same codeless close for a revoked grant.
+
+The fix derives the code from the **cause**, not from the fact of
+cancellation — which is the distinction review forced, and the same one M4-25
+turned on. `close_session` is reached from roughly **thirty** reasons, and
+almost none of them mean the device went away: `SHUTDOWN` fences every session
+when the *relay* stops, and an authority outage, an owner fence, a rotation or
+recovery failure and a device framing fault are each something else. Keying off
+cancellation alone would have told those consumers "the device is not
+connected" on exactly the opposite ground to the one 1012 is justified by. So
+the actor publishes a typed `StreamTeardownCause` whose only variant is
+`DeviceGone`, published only for `CONTROL_CLOSED` — the single caller that
+means the device's own control session ended — and every other reason publishes
+nothing and keeps the close it already had. Publication precedes
+`closed.cancel()`, the same ordering invariant M4-25 established; the
+resolution still runs after the peer-reset resolution so a revocation closes
+1008, and before the framing verdict which outranks everything.
 
 **Observed, not pinned.** One run at this tip: emit cursor **7 → 8** against a
 receive cursor held at **10**, epoch **1 → 2** in the catalog and **1 → 2** in
