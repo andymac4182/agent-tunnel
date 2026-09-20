@@ -90,8 +90,13 @@
 //! without an answer, so the outcome is [`tunnel_fs_core::Outcome::Unknown`].
 //! Had the held tag come back as an `Rlerror`, the outcome would be
 //! `Outcome::Failed` — settled, and a caller told that may assume no side
-//! effect occurred, which would be false.  The validator holds both the
-//! identity and `!is_settled()`, the second read out of the library.
+//! effect occurred, which would be false.  The validator holds the identity
+//! rule.  It does **not** also assert `!is_settled()`: that rule was removed
+//! as not load-bearing, because the identity rule admits only
+//! `Outcome::Unknown` and the library already says that value is unsettled,
+//! so it could never be the rule that rejected anything.  The library
+//! property is held directly, and defeated in both directions, by
+//! `an_unknown_outcome_is_not_settled_and_a_failed_one_is`.
 //!
 //! # Why the restart is a real process restart
 //!
@@ -1496,8 +1501,10 @@ async fn exercise(
     // The classification, derived rather than asserted.  The journal says the
     // mutation was performed, so it was dispatched; the exchange carried no
     // answer, so whether the effect applied was never reported.  That is
-    // exactly `Outcome::Unknown`, and `Outcome::is_settled` — read out of the
-    // library — says a caller may not assume it away.
+    // exactly `Outcome::Unknown`.  `Outcome::is_settled` — read out of the
+    // library — says a caller may not assume it away; that property is held
+    // by its own unit test rather than by a validator rule, because a rule
+    // here could never be the one to reject anything.
     evidence.held_call_outcome = Some(if !evidence.held_effect_present_before_kill {
         Outcome::NotStarted
     } else if evidence.pending_call_errored {
