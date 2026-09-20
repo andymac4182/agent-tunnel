@@ -3298,8 +3298,8 @@ GATE9_EPOCH_CASES: list[tuple[str, list[Edit]]] = [
         [
             (
                 HARNESS_EPOCH,
-                "            evidence.request_outstanding_at_change"
-                " && evidence.change.request_outstanding_at_change(),",
+                "            evidence.request_outstanding_at_change\n"
+                "                && evidence.change.request_outstanding_at_change(),",
                 "            true,",
             )
         ],

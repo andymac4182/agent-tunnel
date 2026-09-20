@@ -398,7 +398,8 @@ pub fn validate_fs_epoch_change_evidence(evidence: &FsEpochChangeEvidence) -> Re
             "the relay had received no answer to that record when the control session was \
              replaced: the 9P exchange was outstanding across the epoch change"
                 .into(),
-            evidence.request_outstanding_at_change && evidence.change.request_outstanding_at_change(),
+            evidence.request_outstanding_at_change
+                && evidence.change.request_outstanding_at_change(),
         ),
         (
             "a stream was identified for the held exchange".into(),
@@ -469,8 +470,7 @@ pub fn validate_fs_epoch_change_evidence(evidence: &FsEpochChangeEvidence) -> Re
         // The contract clause: no fid is restored across a control-session
         // reconnect.  First its "require fresh version/attach" half.
         (
-            "a replacement session that spoke before its own Tattach was closed, not served"
-                .into(),
+            "a replacement session that spoke before its own Tattach was closed, not served".into(),
             !evidence.pre_attach_probe_answered,
         ),
         (
@@ -1346,7 +1346,9 @@ mod tests {
             }),
             ("no stream was identified", |e| e.change.stream_id = 0),
             // The event itself.
-            ("the epoch did not advance", |e| e.epoch_after = e.epoch_before),
+            ("the epoch did not advance", |e| {
+                e.epoch_after = e.epoch_before
+            }),
             ("the epoch went backwards", |e| e.epoch_after = 0),
             ("no epoch was observed before the change", |e| {
                 e.epoch_before = 0;
@@ -1395,12 +1397,9 @@ mod tests {
             ("no device epoch was observed before the change", |e| {
                 e.device_epoch_before = 0;
             }),
-            (
-                "the device's view disagreed with the catalog's",
-                |e| {
-                    e.device_epoch_after = e.epoch_after + 1;
-                },
-            ),
+            ("the device's view disagreed with the catalog's", |e| {
+                e.device_epoch_after = e.epoch_after + 1;
+            }),
             ("the owner was never released between connectors", |e| {
                 e.owner_released_between = false;
             }),
