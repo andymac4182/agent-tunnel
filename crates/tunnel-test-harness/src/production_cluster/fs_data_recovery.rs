@@ -891,7 +891,7 @@ async fn exercise(
         }
     };
     proxy
-        .pause(ProxyDirection::ClientToTarget, connection.clone())
+        .pause(ProxyDirection::ClientToTarget, connection)
         .await?;
 
     // 3. Fix the owner's cursors for this stream **while paused**, so the
@@ -957,7 +957,7 @@ async fn exercise(
             if Instant::now() >= deadline {
                 // Release before failing so cleanup is not wedged.
                 let _ = proxy
-                    .resume(ProxyDirection::ClientToTarget, connection.clone())
+                    .resume(ProxyDirection::ClientToTarget, connection)
                     .await;
                 return Err(HarnessError::Process(
                     "the held Tread was never observed dispatched and unanswered at the owner"
@@ -974,7 +974,7 @@ async fn exercise(
     //    candidate prepared in advance — and the paused bytes are **never**
     //    released, so the `Rread` the device had already produced dies inside
     //    the failed carrier.  The control socket is untouched.
-    proxy.close(connection.clone()).await?;
+    proxy.close(connection).await?;
 
     // The connector's bounded retained recovery installs a replacement.
     //
