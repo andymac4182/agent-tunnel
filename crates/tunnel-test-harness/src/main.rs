@@ -1977,7 +1977,7 @@ async fn main() -> ExitCode {
                         &evidence,
                     )?;
                     println!(
-                        "M4 filesystem consumer loss passed: relays={} owner={} subprotocol={} msize={} dialect={} prefix_bytes={} stream_id={} emitted={}->{} recv_contiguous={}->{} request_outstanding_at_loss={} loss_polls={} abandoned_tag={} lost_stream_deregistered={} device_session_survived={} session_id_stable={} epoch={}->{} second_session_msize={} stale_file_fid_refused={} stale_file_fid_errno={:?} stale_attach_fid_refused={} stale_attach_fid_errno={:?} second_session_attached={} second_session_bytes={}/{} second_session_checksum_matches={} second_session_messages={} second_session_getattr_size={} attach_count={}",
+                        "M4 filesystem consumer loss passed: relays={} owner={} subprotocol={} msize={} dialect={} prefix_bytes={} stream_id={} emitted={}->{} recv_contiguous={}->{} request_outstanding_at_loss={} loss_polls={} abandoned_tag={} lost_stream_deregistered={} device_session_survived={} session_id_stable={} epoch={}->{} pre_attach_probe_close_code={:?} pre_attach_probe_answered={} second_session_msize={} stale_file_fid_refused={} stale_file_fid_errno={:?} stale_attach_fid_refused={} stale_attach_fid_errno={:?} second_session_attached={} second_session_bytes={}/{} second_session_checksum_matches={} second_session_messages={} second_session_getattr_size={} attach_count={}",
                         evidence.relay_count,
                         evidence.owner_node,
                         evidence.selected_subprotocol,
@@ -1997,6 +1997,8 @@ async fn main() -> ExitCode {
                         evidence.session_id_stable,
                         evidence.epoch_before,
                         evidence.epoch_after,
+                        evidence.pre_attach_probe_close_code,
+                        evidence.pre_attach_probe_answered,
                         evidence.second_session_msize,
                         evidence.stale_file_fid_refused,
                         evidence.stale_file_fid_errno,

@@ -58,12 +58,29 @@
 //! that tidied itself up proves nothing about a fid.  What is asserted is that
 //! the lost stream is **deregistered** at the owner, that the device's tunnel
 //! session **survives** the loss of one consumer, and then — the contract
-//! clause proper — that a **second** consumer session on the same export
-//! restores no fids: the same fid numbers the lost session had bound answer
-//! `Rlerror` before that session's own `Tattach`, and answer it because they
-//! are not allocated in that session rather than because the export is broken,
-//! which the same session then shows by attaching, walking and reading the
-//! whole file back with an exact checksum.
+//! clause proper — that a **replacement** consumer session on the same export
+//! restores no fids.
+//!
+//! That last part is driven in two pieces, because the session machine checks
+//! them in that order and a single probe would conflate them:
+//!
+//! * **"require fresh version/attach"** — a replacement session that names the
+//!   lost session's file fid *before* attaching is **closed** with the
+//!   profile's protocol violation rather than served.  `SessionError` checks
+//!   `BeforeAttach` before it consults the fid table, so this probe gets its
+//!   own throwaway session and runs first.
+//! * **"restores no fids"** — a replacement session that *has* attached, on a
+//!   root fid of its own, then finds the lost session's fid numbers unbound:
+//!   they answer `Rlerror` with the errno for a fid that is not allocated in
+//!   this session.  Attaching on a *different* root number is what makes this
+//!   probe mean anything — a session that attached on the lost session's own
+//!   attach fid would be answering from its own binding.
+//!
+//! That session then shows the refusals were fid scoping and not a broken
+//! export, by walking, opening and reading the whole file back with an exact
+//! checksum — binding the lost session's file-fid *number* freshly as it does
+//! so, which is the other half of the contract: the number is reusable once
+//! the session that held it is gone.
 //!
 //! The reuse of the *same fid numbers* is deliberate and is the whole force of
 //! the case: if fids leaked across consumer sessions, fid 1 would still be
@@ -127,14 +144,32 @@ const MIN_READ_MESSAGES: usize = 10;
 /// that the fid serves normally first.
 const PREFIX_READS: usize = 3;
 
-/// The fid numbers the lost session binds, and which the second session then
-/// probes **before** its own `Tattach`.
+/// The fid numbers the lost session binds, and which the replacement session
+/// then probes.
 ///
-/// The second session deliberately reuses these exact numbers: the contract
-/// clause is that no fid is restored across a consumer reconnect, and reusing
-/// the numbers is what makes a leak observable instead of merely unlikely.
+/// The replacement session deliberately reuses these exact numbers: the
+/// contract clause is that no fid is restored across a consumer reconnect, and
+/// reusing the numbers is what makes a leak observable instead of merely
+/// unlikely.
 const ATTACH_FID: u32 = 0;
 const FILE_FID: u32 = 1;
+
+/// The root fid the replacement session attaches on.
+///
+/// Deliberately **not** [`ATTACH_FID`]: the replacement session has to hold a
+/// working root while it probes the lost session's fid numbers, and if it
+/// attached on [`ATTACH_FID`] then a probe of that number would be answering
+/// from this session's own binding rather than showing the absence of the lost
+/// one.
+const SECOND_ROOT_FID: u32 = 5;
+
+/// The close code a session that speaks before `Tattach` is ended with.
+///
+/// `SessionError::BeforeAttach` answers `Close(ProtocolViolation)`, which is
+/// the 9P profile's 1002.  This is the "require fresh version/attach" half of
+/// the contract clause, and it is checked **before** the fid table is, which
+/// is why the fid probes below have to run on an attached session.
+const PROTOCOL_VIOLATION_CLOSE: u16 = 1002;
 
 /// How long the owner claim may take to land in the catalog.
 const OWNER_WAIT: Duration = Duration::from_secs(30);
@@ -214,10 +249,17 @@ pub struct FsConsumerLossEvidence {
 
     // The contract clause proper, driven on a **second** consumer session that
     // reuses the same fid numbers.
+    /// A replacement session that speaks **before** its own `Tattach` is
+    /// closed rather than served: the contract requires a fresh
+    /// version/attach, and this is that half of it.  The close code observed.
+    pub pre_attach_probe_close_code: Option<u16>,
+    /// And it was closed rather than answered: no `Rgetattr`, no `Rlerror`.
+    pub pre_attach_probe_answered: bool,
+
     /// The second session reached 9P on its own terms.
     pub second_session_msize: u32,
-    /// Whether probing the lost session's file fid, before any `Tattach` in
-    /// the second session, was refused rather than answered.
+    /// Whether probing the lost session's file fid, on an **attached**
+    /// replacement session, was refused rather than answered.
     pub stale_file_fid_refused: bool,
     /// The errno that refusal carried.  A fid that is not allocated in this
     /// session, not a host error.
@@ -310,6 +352,17 @@ pub fn validate_fs_consumer_loss_evidence(evidence: &FsConsumerLossEvidence) -> 
             evidence.epoch_after == evidence.epoch_before,
         ),
         // The contract clause: no fid is restored across a consumer reconnect.
+        // First its "require fresh version/attach" half.
+        (
+            "a replacement session that spoke before its own Tattach was closed, \
+             not served"
+                .into(),
+            !evidence.pre_attach_probe_answered,
+        ),
+        (
+            "that close was the profile's protocol violation".into(),
+            evidence.pre_attach_probe_close_code == Some(PROTOCOL_VIOLATION_CLOSE),
+        ),
         (
             "the second consumer session reached 9P on its own terms".into(),
             evidence.second_session_msize > 0
@@ -848,11 +901,41 @@ async fn exercise(
     // Session two: the contract clause.  No fid is restored across a consumer
     // reconnect, and the same fid numbers are reused so a leak would show.
     // ---------------------------------------------------------------------
+    // First, the "require fresh version/attach" half of the clause, on its own
+    // throwaway session: a replacement session that names the lost session's
+    // file fid *before* attaching is closed rather than served.  This probe
+    // needs its own session precisely because it ends it, and it is run first
+    // so the fid probes below cannot be confused with it: `BeforeAttach` is
+    // checked before the fid table is, so a pre-attach probe could never
+    // distinguish "that fid is not allocated here" from "you have not
+    // attached", which is why the fid probes run on an attached session.
+    {
+        let (mut probe, _, _) = open_session(&target, &ca, &token).await?;
+        probe
+            .send(Message::Tgetattr {
+                fid: FILE_FID,
+                request_mask: GETATTR_BASIC,
+            })
+            .await?;
+        match probe.recv_event().await? {
+            wire::Event::Close(code) => evidence.pre_attach_probe_close_code = code,
+            wire::Event::Frame(_) => evidence.pre_attach_probe_answered = true,
+            wire::Event::Ended => evidence.pre_attach_probe_close_code = None,
+        }
+    }
+
     let (mut second, second_msize, _) = open_session(&target, &ca, &token).await?;
     evidence.second_session_msize = second_msize;
 
-    // Before any Tattach in this session: the lost session's file fid must not
-    // be bound here.
+    // This session attaches on its **own** root fid, so it holds a working
+    // root while it probes the lost session's fid numbers.  Attaching on
+    // ATTACH_FID instead would make a probe of that number answer from this
+    // session's binding rather than show the absence of the lost one.
+    second.attach(SECOND_ROOT_FID).await?;
+    evidence.attach_count += 1;
+    evidence.second_session_attached = true;
+
+    // The lost session's file fid must not be bound here.
     match second.getattr(FILE_FID, GETATTR_BASIC).await? {
         Message::Rgetattr(_) => {
             return Err(HarnessError::Process(
@@ -882,13 +965,11 @@ async fn exercise(
         }
     }
 
-    // The second session establishes its own root, and the export answers
-    // normally on it: the refusals above are fid scoping, not a broken export.
-    second.attach(ATTACH_FID).await?;
-    evidence.attach_count += 1;
-    evidence.second_session_attached = true;
-
-    match second.walk(ATTACH_FID, FILE_FID, &["big.bin"]).await? {
+    // The export answers normally on this session's own root, so the refusals
+    // above are fid scoping and not a broken export.  Binding FILE_FID here,
+    // fresh, is also the other half of the contract: the *number* is reusable
+    // once the session that held it is gone.
+    match second.walk(SECOND_ROOT_FID, FILE_FID, &["big.bin"]).await? {
         Message::Rwalk { .. } => {}
         other => return Err(unexpected("Rwalk", &other)),
     }
@@ -954,6 +1035,8 @@ mod tests {
             session_id_stable: true,
             epoch_before: 1,
             epoch_after: 1,
+            pre_attach_probe_close_code: Some(PROTOCOL_VIOLATION_CLOSE),
+            pre_attach_probe_answered: false,
             second_session_msize: 65_536,
             stale_file_fid_refused: true,
             stale_file_fid_errno: Some(UNKNOWN_FID_ERRNO),
@@ -1010,6 +1093,15 @@ mod tests {
             }),
             ("losing a consumer changed the epoch", |e| e.epoch_after = 2),
             // The contract clause.
+            ("a pre-attach probe was served rather than closed", |e| {
+                e.pre_attach_probe_answered = true;
+            }),
+            ("a pre-attach probe closed for the wrong reason", |e| {
+                e.pre_attach_probe_close_code = Some(1011);
+            }),
+            ("a pre-attach probe closed with no code", |e| {
+                e.pre_attach_probe_close_code = None;
+            }),
             ("the second session never reached 9P", |e| {
                 e.second_session_msize = 0;
             }),
