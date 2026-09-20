@@ -1916,8 +1916,8 @@ GATE4_CASES: list[tuple[str, list[Edit]]] = [
             (
                 RELAY_ACTOR,
                 """            let publishes_invalidation = matches!(
-                Self::authorization_failure_code(reason),
-                "AUTHORIZATION_EXPIRED" | "AUTHORIZATION_CHANGED"
+                reason,
+                "authorization expired" | "authorization changed" | "grant unavailable"
             );
             let discarded = if publishes_invalidation {
                 stream.http.as_mut().map_or(0, |http| {
@@ -1938,21 +1938,22 @@ GATE4_CASES: list[tuple[str, list[Edit]]] = [
     # session's whole life, which is a slow denial of service rather than a
     # wrong close code -- so it needs its own case, because the close-code
     # guard above stays green without it.
-    # M4-25, the half review caught: only the two **invalidation** reasons may
-    # publish a reset.  The other six call sites are availability failures --
-    # the relay could not reach the catalog, the owner, the device credential
-    # or the control channel -- and closing the consumer 1008 for those tells
-    # it its grant is dead and to stop retrying, turning a transient outage
-    # into a revocation.  Deleting the gate is the regression this stack
-    # briefly shipped, so it gets a case of its own.
+    # M4-25, the half review caught: only the three reasons that are the
+    # authority *answering* that the authorization is gone may publish a
+    # reset.  The others are failures to reach an authority -- a catalog read
+    # that returned Err, a control send that failed, a challenge mismatch --
+    # and closing the consumer 1008 for those tells it its grant is dead and
+    # to stop retrying, turning a transient outage into a revocation.
+    # Deleting the gate is the regression this stack briefly shipped, so it
+    # gets a case of its own.
     (
         "publish a reset only for an invalidation, never for an unavailable authority",
         [
             (
                 RELAY_ACTOR,
                 """            let publishes_invalidation = matches!(
-                Self::authorization_failure_code(reason),
-                "AUTHORIZATION_EXPIRED" | "AUTHORIZATION_CHANGED"
+                reason,
+                "authorization expired" | "authorization changed" | "grant unavailable"
             );""",
                 "            let publishes_invalidation = true;",
             )

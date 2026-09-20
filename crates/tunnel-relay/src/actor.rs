@@ -11107,34 +11107,50 @@ impl RelayActor {
             // comment on the `peer_reset` clone warns about exactly this
             // downgrade.
             //
-            // **Only the invalidation classes publish it.**  This function
-            // has eight call sites and only two of them are authorization
-            // invalidations: `"authorization expired"` and `"authorization
-            // changed"`.  The other six — `"authorization unavailable"`,
-            // `"grant unavailable"`, `"owner unavailable"`, `"device
-            // authorization unavailable"`, `"control unavailable"` and a
-            // challenge mismatch — are **availability** failures, where the
-            // relay could not reach an authority rather than learn that the
-            // grant is gone.
+            // **Only an authoritative "the authorization is gone" publishes
+            // it.**  This function has eight call sites and they are not one
+            // kind of event.  Three are the authority answering that the
+            // authorization is gone, and `docs/filesystem-api.md` and
+            // `http/fs.rs:633-651` name exactly these three as the 1008
+            // class -- an expired snapshot, a moved revision and a revoked
+            // grant:
             //
-            // The distinction is not invented here: `authorization_failure_code`
-            // above already separates the two families, and this block sends
-            // the connector that exact code a few lines up.  Publishing
-            // `AUTHORIZATION_EXPIRED` for all eight would tell the connector
-            // `OWNER_UNAVAILABLE` on the control channel while telling the
-            // consumer its authorization expired on the socket, and 1008 is
-            // the code a consumer branches on to conclude its grant is dead
-            // and **stop retrying**.  A transient catalog outage must not be
-            // reported as a revocation.
+            //   * `"authorization expired"` - the snapshot's remaining
+            //     lifetime reached zero;
+            //   * `"authorization changed"` - revision, digest, owner epoch
+            //     or credential no longer match what was challenged;
+            //   * `"grant unavailable"` - the catalog read **succeeded** and
+            //     returned no grant, which is what a revoked grant looks
+            //     like.  This is the one `verify-m4-fs-real-path` drives.
             //
-            // So the availability family publishes nothing and keeps the
-            // behaviour it already had: the consumer exits through
-            // `closed.cancelled()` and `session_close_for_reset(None)` maps
-            // it to **1011**, the retryable "the relay lost it" signal.
+            // The rest are **not verdicts about the authorization** and must
+            // not be dressed up as one.  `"authorization unavailable"` is a
+            // catalog read that returned `Err` and `"control unavailable"` is
+            // the relay failing to queue its own confirmation: in both the
+            // relay could not obtain an answer.  A challenge mismatch is a
+            // protocol failure.  `"owner unavailable"` and `"device
+            // authorization unavailable"` are absences this code has no test
+            // for, so they keep the behaviour they already had rather than
+            // acquiring a new one on an argument nobody has measured.
             //
-            // Within the invalidation family the wire carries one reason for
-            // the whole class — an expired snapshot, a revoked grant and a
-            // moved revision alike — so both map to `AUTHORIZATION_EXPIRED`.
+            // Why the direction matters: 1008 is what a consumer branches on
+            // to conclude its grant is dead and **stop retrying**, so
+            // publishing it for a transient catalog outage would turn an
+            // outage into a revocation -- the same class as `2aefebc fix:
+            // report an unreachable catalog as unavailable, not as a bad
+            // credential`.  Everything not listed above therefore publishes
+            // nothing and keeps its pre-existing close: the ingress exits
+            // through `closed.cancelled()` and `session_close_for_reset(None)`
+            // maps it to **1011**, which is retryable.
+            //
+            // Note that the `*_UNAVAILABLE` suffix in
+            // `authorization_failure_code` does **not** track this split --
+            // `GRANT_UNAVAILABLE` is an authoritative absence while
+            // `AUTHORIZATION_UNAVAILABLE` is a failed read -- so the match is
+            // on the reason itself and is exhaustive by construction.
+            //
+            // Within the 1008 class the wire carries one reason for the whole
+            // class, so all three map to `AUTHORIZATION_EXPIRED`.
             // `accept_reset` is idempotent on the first reason, so a
             // connector RESET that did land first still wins.
             //
@@ -11143,8 +11159,8 @@ impl RelayActor {
             // `inbound_data`: `accept_reset` drops the undelivered chunks and
             // reports their size, and the charge is the caller's to release.
             let publishes_invalidation = matches!(
-                Self::authorization_failure_code(reason),
-                "AUTHORIZATION_EXPIRED" | "AUTHORIZATION_CHANGED"
+                reason,
+                "authorization expired" | "authorization changed" | "grant unavailable"
             );
             let discarded = if publishes_invalidation {
                 stream.http.as_mut().map_or(0, |http| {
@@ -17881,13 +17897,15 @@ mod stream_identity_tests {
         );
     }
 
-    /// An **availability** failure must not be dressed up as a revocation.
+    /// A failure to *reach* an authority must not be dressed up as a
+    /// revocation.
     ///
-    /// Six of `invalidate_stream_challenge`'s eight call sites report that
-    /// the relay could not reach an authority — the catalog, the owner, the
-    /// device credential or the control channel — not that the grant is
-    /// gone.  `authorization_failure_code` already separates those into the
-    /// `*_UNAVAILABLE` family and the connector is told exactly that code.
+    /// Only three of `invalidate_stream_challenge`'s eight call sites are the
+    /// authority answering that the authorization is gone, and those three
+    /// are exactly the 1008 class the contract names.  The reasons below are
+    /// not verdicts about the authorization at all: a catalog read that
+    /// returned `Err`, the relay failing to queue its own confirmation, a
+    /// challenge mismatch, and two absences no test covers.
     ///
     /// If the consumer socket were closed **1008** for them it would read
     /// that as "your authorization is dead" and stop retrying, so a transient
@@ -17895,11 +17913,15 @@ mod stream_identity_tests {
     /// publishing no reason at all, which leaves the ingress exiting through
     /// `closed.cancelled()` and `session_close_for_reset(None)` mapping it to
     /// **1011** — retryable, and what they did before M4-25.
+    ///
+    /// `"grant unavailable"` is deliberately **not** in this list despite its
+    /// name: there the catalog read succeeded and returned no grant, which is
+    /// a revoked grant, and the contract puts it in the 1008 class.  It is
+    /// covered by `verify-m4-fs-real-path`.
     #[tokio::test]
     async fn an_unavailable_authority_does_not_close_the_consumer_as_a_revocation() {
         for reason in [
             "authorization unavailable",
-            "grant unavailable",
             "owner unavailable",
             "device authorization unavailable",
             "control unavailable",
@@ -18027,11 +18049,11 @@ mod stream_identity_tests {
             );
             assert!(
                 registration.peer_reset.borrow().is_none(),
-                "{reason} is an availability failure, not a revocation: publishing a reset \
-                 reason here closes the consumer 1008 and tells it to stop retrying"
+                "{reason} is not a verdict that the authorization is gone: publishing a \
+                 reset reason here closes the consumer 1008 and tells it to stop retrying"
             );
-            // And the connector is told the unavailability, which is the
-            // discrimination this rule mirrors rather than invents.
+            // And the connector is not told this expired either, so the two
+            // channels agree about what happened.
             assert_ne!(
                 actor.sessions[&key.scope()].streams[&stream_id].authorization_failure_code,
                 Some("AUTHORIZATION_EXPIRED"),
