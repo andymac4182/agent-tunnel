@@ -100,6 +100,15 @@ fn supervised_hanging(workspace: &Path, hang: Option<&str>) -> BackendProcess {
 /// Kills every pid it is given when it goes out of scope, however the test
 /// left — including through a panic above the cleanup. This file starts
 /// processes, so nothing may be cleaned up only on the happy path.
+///
+/// **It must track the backend's in-group helper as well as the backend**, and
+/// that is not belt and braces. On the ordinary path the group kill reaches the
+/// helper and there is nothing left to clean up — but the `m5c4` deletion suite
+/// defeats exactly that property, and a run with the in-group guard defeated
+/// leaves one helper per supervised backend alive with nothing tracking it.
+/// Eight of them survived a full guard run before this tracked the helper, and
+/// a harness that leaks processes when its own guards are defeated is a harness
+/// that leaks processes on every red.
 struct PidGuard(Vec<u32>);
 
 impl PidGuard {
@@ -109,6 +118,17 @@ impl PidGuard {
 
     fn watch(&mut self, pid: u32) {
         self.0.push(pid);
+    }
+
+    /// Also track the in-group helper the supervised backend started, reading
+    /// the pid it published. A helper that never published one is not tracked
+    /// and cannot be: there is no pid to kill.
+    async fn watch_helper(&mut self, workspace: &Path) {
+        let published =
+            tunnel_cua_fixture::process::read_published(&workspace.join(HELPER_PID_FILE)).await;
+        if let Ok(pid) = published.parse::<u32>() {
+            self.0.push(pid);
+        }
     }
 }
 
@@ -227,6 +247,7 @@ async fn a_supervised_backend_starts_on_loopback_and_is_not_working_until_probed
     assert_eq!(supervisor.health(), Health::NotStarted);
     let endpoint = supervisor.start().await.expect("it started");
     guard.watch(supervisor.pid().expect("a pid"));
+    guard.watch_helper(workspace.path()).await;
 
     assert!(
         endpoint.address().ip().is_loopback(),
@@ -268,6 +289,7 @@ async fn a_describe_can_never_report_a_running_backend_as_working() {
     let mut supervisor = Supervisor::new(supervised(workspace.path()));
     let endpoint = supervisor.start().await.expect("it started");
     guard.watch(supervisor.pid().expect("a pid"));
+    guard.watch_helper(workspace.path()).await;
 
     let dispatcher = dispatcher_for(endpoint).await;
     let request = validate_request(&body("describe", json!({})), LIMIT).expect("valid");
@@ -320,6 +342,7 @@ async fn a_restart_mid_operation_is_unknown_and_the_click_does_not_land_twice() 
     let mut supervisor = Supervisor::new(supervised_hanging(workspace.path(), Some("left_click")));
     let endpoint = supervisor.start().await.expect("it started");
     guard.watch(supervisor.pid().expect("a pid"));
+    guard.watch_helper(workspace.path()).await;
     let first_generation = supervisor.generation();
 
     let session = facade(&state, dispatcher_for(endpoint).await, &desktop);
@@ -351,6 +374,7 @@ async fn a_restart_mid_operation_is_unknown_and_the_click_does_not_land_twice() 
     let (invalidation, restarted) = supervisor.restart(state.as_ref()).await;
     let new_endpoint = restarted.expect("the replacement backend started");
     guard.watch(supervisor.pid().expect("a pid"));
+    guard.watch_helper(workspace.path()).await;
 
     let outcome = click.await.expect("the click task finished");
 
@@ -448,6 +472,7 @@ async fn a_capture_identity_from_before_a_restart_is_unknown_afterwards() {
     let mut supervisor = Supervisor::new(supervised(workspace.path()));
     let endpoint = supervisor.start().await.expect("it started");
     guard.watch(supervisor.pid().expect("a pid"));
+    guard.watch_helper(workspace.path()).await;
 
     let session = facade(&state, dispatcher_for(endpoint).await, &desktop);
     let (_lease, stale_capture) = capture_then_lease(&session).await;
@@ -455,6 +480,7 @@ async fn a_capture_identity_from_before_a_restart_is_unknown_afterwards() {
     let (_, restarted) = supervisor.restart(state.as_ref()).await;
     let new_endpoint = restarted.expect("the replacement started");
     guard.watch(supervisor.pid().expect("a pid"));
+    guard.watch_helper(workspace.path()).await;
 
     // Re-acquire the lease, so the refusal below is about the capture and not
     // about the lease: one refusal at a time, or the test proves the wrong one.
@@ -500,12 +526,14 @@ async fn a_capture_taken_after_a_restart_never_reuses_a_pre_restart_identity() {
     let mut supervisor = Supervisor::new(supervised(workspace.path()));
     let endpoint = supervisor.start().await.expect("it started");
     guard.watch(supervisor.pid().expect("a pid"));
+    guard.watch_helper(workspace.path()).await;
     let session = facade(&state, dispatcher_for(endpoint).await, &desktop);
     let (_lease, before) = capture_then_lease(&session).await;
 
     let (_, restarted) = supervisor.restart(state.as_ref()).await;
     let new_endpoint = restarted.expect("the replacement started");
     guard.watch(supervisor.pid().expect("a pid"));
+    guard.watch_helper(workspace.path()).await;
 
     let session = facade(&state, dispatcher_for(new_endpoint).await, &desktop);
     let (_lease, after) = capture_then_lease(&session).await;
