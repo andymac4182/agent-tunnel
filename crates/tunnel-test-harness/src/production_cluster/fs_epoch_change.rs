@@ -447,7 +447,13 @@ pub fn validate_fs_epoch_change_evidence(evidence: &FsEpochChangeEvidence) -> Re
             evidence.pending_call_closed,
         ),
         (
-            "that failure carried the profile's close code for a backend that went away".into(),
+            // The observed code is named in the rule so a failing run says
+            // which code it saw rather than only that it was wrong.
+            format!(
+                "that failure carried the profile's close code for a backend that went away \
+                 (expected {DEVICE_GONE_CLOSE}, observed {:?})",
+                evidence.pending_call_close_code
+            ),
             evidence.pending_call_close_code == Some(DEVICE_GONE_CLOSE),
         ),
         (
