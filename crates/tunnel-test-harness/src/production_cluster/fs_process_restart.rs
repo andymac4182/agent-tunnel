@@ -205,7 +205,7 @@ use super::fs_wire as wire;
 use wire::{NinepClient, Target, UpgradeFailure, errno_of, unexpected};
 
 use super::{
-    CLEANUP_TIMEOUT, ProductionCluster, RunningHarness, STARTUP_TIMEOUT, client_binary_path,
+    ProductionCluster, RunningHarness, STARTUP_TIMEOUT, client_binary_path,
     finish_scenario_with_cleanup, push_cleanup_error,
 };
 use crate::acceptance::helpers::write_device_profile;
