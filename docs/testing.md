@@ -1874,9 +1874,21 @@ was first written as thirteen validator rules beside the antecedent
 conjunction, and the guard suite reported every one of them still green: the
 conjunction already rejects every run they would have rejected. They are gone,
 and the property moved to where it can be defeated — the conjunction is one
-conjunct per line, the suite deletes each conjunct separately, and each of
-those turns the gate's per-conjunct unit test red as well as its mutation
-table.
+conjunct per line, the suite's last **fourteen** cases delete one conjunct
+each, and each of those turns the gate's per-conjunct unit test red as well as
+its mutation table.
+
+The conjunction is written as an **array** rather than as a `&&` chain, and
+that is load-bearing: as a chain the head conjunct carries no `&&`, so it did
+not match the suite's single edit shape and was the one conjunct that could not
+be defeated — the same unfalsifiable-rule problem, reappearing at the one line
+the edit shape could not reach. Two further corrections came with it.
+`stream_id_stable` was one fact under two names — `stream.is_some()` for a
+stream found *by* that id — and is replaced by `sole_consumer_stream_at_owner`,
+counted from the stream table's length so the two are orthogonal. And
+`stream_not_terminal` is new, because a present-but-terminal stream satisfies
+every other ordered-state conjunct; on a mode B run it reads **true**, which is
+what rules a dead stream out as that mode's explanation.
 
 ### Shared dataset and native semantics
 

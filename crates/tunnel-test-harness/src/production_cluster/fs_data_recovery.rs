@@ -288,6 +288,15 @@ pub struct FsDataRecoveryEvidence {
     /// And the **owner's** own record of why: a lost data transport, not a
     /// lost control socket.  Read from the relay snapshot so the two endpoints
     /// have to agree about what failed.
+    ///
+    /// **This one is latched from a poll, so a `None` here can be the harness
+    /// rather than the product.**  `rotation_recovery_reason` is *live* state
+    /// the rotation state machine clears when the episode closes, and the latch
+    /// below samples at the poll interval — so an episode that opens and closes
+    /// inside one window leaves this `None` and fails the run on a rule the
+    /// product did not break.  If this rule alone ever fails while every other
+    /// qualifier holds, suspect that race before attributing it to M4-29; no
+    /// run has yet shown it.
     pub owner_recovery_reason: Option<String>,
     /// The recovery released exactly the carrier that died and installed
     /// exactly the carrier that replaced it.
@@ -320,9 +329,17 @@ pub struct FsDataRecoveryEvidence {
     /// The stream is not in a terminal state.
     ///
     /// A stream can be **present and finished**, and every other
-    /// ordered-stream-state bit here is satisfied by one, so without this the
-    /// gate's dominant observed failure would surface as a scenario deadline
-    /// rather than as a named rule.  See M4-29 mode A.
+    /// ordered-stream-state bit here is satisfied by one, so without this a
+    /// retained-but-dead stream would pass the antecedent.  `terminal` is
+    /// published on the owner's stream snapshot and was previously never read.
+    ///
+    /// **What it turned out to be worth, stated as measured rather than as
+    /// predicted.**  It does *not* name M4-29 mode A: that mode fails earlier,
+    /// at the connector's own recovery wait, before this block runs at all, and
+    /// it is named there.  What this rules out is a terminal stream as the
+    /// explanation for **mode B** — observed `true` on a mode B run, so in that
+    /// mode the owner's stream is registered, sole, non-terminal and fully
+    /// quiesced, and still answers nothing.
     pub stream_not_terminal: bool,
 
     // ---- The clause proper, on the operation. ----
@@ -347,6 +364,15 @@ pub struct FsDataRecoveryEvidence {
     pub post_recovery_tag_correlated: bool,
     /// `Tattach` count across the whole run.  Exactly one: the relay neither
     /// duplicates `Tattach` nor reconstructs fids.
+    ///
+    /// **Assigned by the code path rather than counted off the wire**, as it is
+    /// in gates 7 to 10: this gate sends one `Tattach` and records one, so the
+    /// rule asserts that the gate never *asks* for a second, not that the
+    /// transport never carried one.  The claim it supports is still the
+    /// contract's — a fid that answers after the failure was not re-established
+    /// by a fresh attach, because no fresh attach was sent — but the wire-level
+    /// version of it would need the client to count sends, which no fs gate
+    /// does.
     pub attach_count: usize,
 }
 
@@ -1133,7 +1159,9 @@ async fn exercise(
                 evidence.operation_id_stable =
                     stream.is_some_and(|stream| stream.operation_id == operation_id_before);
                 // 4. And it is not finished.  A stream can be present and
-                //    terminal, which satisfies (1) to (3) and is M4-29 mode A.
+                //    terminal, which satisfies (1) to (3); on a mode B run this
+                //    reads true, which is what rules a dead stream out as that
+                //    mode's explanation.
                 evidence.stream_not_terminal = stream.is_some_and(|stream| !stream.terminal);
                 break;
             }
