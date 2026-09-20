@@ -319,6 +319,89 @@ because no release commit of ours governs them:
 [native platform crates](https://github.com/trycua/cua/blob/bd4c10020cd7cac07c0d19b0f53ba4b007fbcb15/libs/cua-driver/rust/README.md).
 The platform limits they support are unverified against any released artifact.
 
+### Supervising the backend
+
+The device **supervises** the CUA backend rather than merely pointing at a
+configured endpoint: it starts it, stops it, restarts it, and probes whether it
+can act. `crates/tunnel-cua-export` is that supervisor, and the three things it
+does are separated on purpose.
+
+**Lifecycle.** The backend is started in its own process group, and every end of
+its life the device lives to see signals that whole group with `SIGKILL`, so a
+wrapper (`uvx`, a shell script, a Python launcher) cannot leave the real backend
+or its workers running. The backend publishes the loopback address it bound and
+the device reads it back and puts it through the loopback check, so the policy is
+enforced against the process that is actually listening rather than against a
+configured number; a backend that publishes a routable or wildcard address is
+killed rather than advertised. The address file is removed before every start, so
+a dead generation's port is never handed out.
+
+**Containment, at the honesty this profile needs.** An escaped descendant of a
+CUA backend is a process that can move the mouse and type on a real desktop, so
+the two halves must not be conflated.
+
+- **Trigger** — whether anything sends the group signal at all — **is closed.** A
+  `SIGKILL`, a `process::exit` or a crash of the device runs **no `Drop`**, so
+  without a sentinel even an ordinary **in-group** worker is orphaned. Each
+  supervised backend is therefore watched by a `tunnel-deadman` sentinel: a
+  sibling process, in a process group of its own, holding the read end of a pipe
+  the device holds the write end of. When the device dies for any reason the
+  kernel closes that descriptor, the sentinel wakes on end of file and signals
+  the group. It is stood down only after the backend has been killed and reaped,
+  and the stand-down is counted from the sentinel's own exit status rather than
+  from the device having asked.
+- **Reach** — which processes a group signal can touch — is **not closed on
+  macOS, and the sentinel does not close it.** The sentinel sends the same group
+  signal from a different process, and `killpg`'s delivery set does not mention
+  the sender. `cgroup v2` closes it on Linux and a job object closes it on
+  Windows; macOS has neither in-process. **Stated plainly, because for CUA it
+  matters more than it did for MCP or ACP: a supervised CUA backend on macOS
+  cannot be contained if it detaches.** A descendant that calls `setsid`, calls
+  `setpgid` or double-forks survives the device's death, and on macOS that is an
+  operator constraint — run the backend under the intended OS user, and isolate
+  it in a VM or a container where the residue matters.
+
+**The sentinel is a separate executable (`tunnel-deadman`) and must be installed
+alongside the device binary**, or named by `TUNNEL_DEADMAN_BIN`. Without it the
+device supervises exactly as it did before and leaks the backend's process group
+on every crash, with nothing to distinguish that from correct operation — so a
+missing sentinel warns once on stderr, `tunnel_deadman::availability()` answers
+before any backend is started, and `tunnel-client doctor` reports
+`process_containment: degraded / PROCESS_CONTAINMENT_SENTINEL_MISSING`. It is a
+degradation, not a refusal: it changes neither the verdict nor the exit code.
+
+**Health is a probe, not a config echo.** `version` answering, or `/commands`
+listing, proves the HTTP server is up — **not** that the automation backend can
+act. A CUA backend can be present, listening and answering while being unable to
+move a pointer, because macOS gates accessibility and screen recording behind
+grants the process may not hold. The device therefore reports a backend as
+working only on a **dispatched, succeeded, read-only, OS-gated** operation:
+`get_screen_size` or `get_cursor_position`, **never a click**. A running process
+is reported as running, which is a different answer and never permits a
+dispatch. Capture authority is read separately, from the `version` response, and
+absence is `Unknown` rather than denied — the released 0.3.46 server omits
+`desktop_capture_authorized` on the supported 0.22.x SDK, so refusing on absence
+would refuse capture on every correctly permissioned host.
+
+**A restart invalidates the input lease and every outstanding capture identity,
+and fails in-flight operations as `unknown`, never as retryable.** This is the
+sharpest rule in the profile. A supervisor that restarts a hung backend has
+destroyed the only witness to what that backend had already done, so an operation
+that had reached it has an outcome nobody can establish. Reporting that as *not
+dispatched* is the trap: the caller retries, and the click lands twice. Two
+layers enforce it, and both are needed because a consumer that ignores the first
+still meets the second — the in-flight operation is told `unknown` and is not
+retryable for any operation, and every lease and capture identity is dropped, so
+a retry is refused **above the dispatch boundary** and never reaches the backend
+at all. Neither registry reuses an identifier after a restart: a reissued capture
+id would let a stale click resolve against a different image, pass the bounds
+check, and be dispatched at coordinates nobody picked.
+
+**Not covered.** A backend killed mid-drag may have left a button down or a
+modifier held on the target OS session, and nothing in this repository observes
+that; the restart says what it does not know about the *operation*, not about the
+desktop's state. See `docs/tasks.md` M5-C08 and M5-C09.
+
 ## Integration acceptance gates
 
 1. **Contract CI:** pin just-bash, compile `TunnelFileSystem` against its public

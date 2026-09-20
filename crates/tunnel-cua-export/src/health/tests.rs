@@ -53,6 +53,39 @@ fn describe_can_never_report_a_working_backend() {
 }
 
 #[test]
+fn a_non_probe_that_was_never_dispatched_is_still_reported_as_not_a_probe() {
+    // **Added because the deletion harness found the allowlist check
+    // non-load-bearing, and the finding was right.** For a *dispatched*
+    // `describe`, `ProbeEvidence::from_probe` refuses on its own and the
+    // verdict is `NotAProbe` either way, so deleting the check changed
+    // nothing any test could see.
+    //
+    // The input it uniquely decides is this one: a non-probe operation that
+    // never reached the backend. Without the check that reads as
+    // `ProbeNotDispatched` -- a fact about the host -- when it is really a
+    // caller offering the wrong operation. The two have entirely different
+    // remedies, which is why they are different arms, and this is the case
+    // that keeps the distinction real.
+    let echo = request("describe", json!({}));
+    assert_eq!(
+        assess(&echo, &Dispatch::NotDispatched(NotDispatched::NotReached)),
+        Health::Unhealthy(Unhealthy::NotAProbe),
+        "offering describe as a probe is a caller's bug, not a backend that \
+         could not be reached"
+    );
+    // And the control: the same dispatch with a real probe *is* a fact about
+    // the host, so the check discriminates rather than answering NotAProbe to
+    // everything.
+    assert_eq!(
+        assess(
+            &request("screen_info", json!({})),
+            &Dispatch::NotDispatched(NotDispatched::NotReached)
+        ),
+        Health::Unhealthy(Unhealthy::ProbeNotDispatched(NotDispatched::NotReached))
+    );
+}
+
+#[test]
 fn a_capture_is_not_a_probe_and_neither_is_any_operation_that_mutates() {
     // `capture` is read-only but is refused as a probe: a probe runs on every
     // supervision cycle and must be cheap. Everything that synthesises input
