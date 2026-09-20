@@ -3156,8 +3156,8 @@ GATE8_LOSS_CASES: list[tuple[str, list[Edit]]] = [
         [
             (
                 HARNESS_LOSS,
-                "            evidence.second_session_msize > 0\n"
-                "                && evidence.second_session_msize <= OFFERED_MSIZE,",
+                "            evidence.second_session_msize > 0"
+                " && evidence.second_session_msize <= OFFERED_MSIZE,",
                 "            true,",
             )
         ],

@@ -365,8 +365,7 @@ pub fn validate_fs_consumer_loss_evidence(evidence: &FsConsumerLossEvidence) -> 
         ),
         (
             "the second consumer session reached 9P on its own terms".into(),
-            evidence.second_session_msize > 0
-                && evidence.second_session_msize <= OFFERED_MSIZE,
+            evidence.second_session_msize > 0 && evidence.second_session_msize <= OFFERED_MSIZE,
         ),
         (
             "the lost session's file fid was not restored into the second session".into(),
@@ -450,7 +449,9 @@ pub async fn verify() -> Result<FsConsumerLossEvidence> {
     let options = HarnessOptions::from_env()?.fs_services(true);
     let mut harness = timeout(STARTUP_TIMEOUT, Harness::start(options))
         .await
-        .map_err(|_| HarnessError::Timeout("fs consumer loss harness startup timed out".into()))??;
+        .map_err(|_| {
+            HarnessError::Timeout("fs consumer loss harness startup timed out".into())
+        })??;
     let mut cluster = match ProductionCluster::start(&mut harness).await {
         Ok(cluster) => cluster,
         Err(error) => {
@@ -875,18 +876,17 @@ async fn exercise(
         let deadline = Instant::now() + WAIT;
         loop {
             let snapshot = owner_snapshot(cluster).await?;
-            if let Ok(owner) = session_of(&snapshot, session_id) {
-                if !owner
+            if let Ok(owner) = session_of(&snapshot, session_id)
+                && !owner
                     .streams
                     .iter()
                     .any(|stream| stream.stream_id == stream_id)
-                {
-                    evidence.lost_stream_deregistered = true;
-                    evidence.device_session_survived = true;
-                    evidence.session_id_stable = owner.session_id == session_id;
-                    evidence.epoch_after = owner.epoch;
-                    break;
-                }
+            {
+                evidence.lost_stream_deregistered = true;
+                evidence.device_session_survived = true;
+                evidence.session_id_stable = owner.session_id == session_id;
+                evidence.epoch_after = owner.epoch;
+                break;
             }
             if Instant::now() >= deadline {
                 return Err(HarnessError::Timeout(
