@@ -77,7 +77,7 @@ use crate::{
 mod http_stream;
 pub(crate) use http_stream::{
     FS_STREAM_OPERATION, HTTP_FORWARD_STREAM_OPERATION, HttpPeerReset, HttpRead,
-    HttpStreamRegistration,
+    HttpStreamRegistration, StreamTeardownCause,
 };
 use http_stream::{HttpMaintenance, HttpStreamState};
 
@@ -119,6 +119,15 @@ const OWNER_FORGET_FAILURE_TIMEOUT: Duration = Duration::from_secs(5);
 // below, making this an explicit total-entry bound of at most 2 * N.
 const RETAINED_ECHO_STREAM_FACTOR: usize = 2;
 const AUTHORITY_UNAVAILABLE: &str = "AUTHORITY_UNAVAILABLE";
+/// Typed session close reason when the **device's own control socket closed**.
+///
+/// Named rather than spelled inline because it is the single reason that
+/// means "the device went away": `close_session` matches on it to publish
+/// [`StreamTeardownCause::DeviceGone`], and an ingress may report a backend
+/// that went away only for this one. Every other reason reaching
+/// `close_session` — shutdown, an authority outage, an owner fence, a
+/// rotation or recovery failure, a device framing fault — publishes nothing.
+const CONTROL_CLOSED_REASON: &str = "CONTROL_CLOSED";
 /// Typed session close reason when a CANCEL for a pending operation cannot
 /// enter the bounded control queue.  docs/protocol.md: failure to deliver a
 /// cancellation fences the session (EC-038).
@@ -4891,6 +4900,7 @@ impl RelayActor {
                     Ok(HttpStreamRegistration {
                         base: registration,
                         peer_reset: watchers.peer_reset,
+                        terminal: watchers.terminal,
                         result_status: watchers.result_status,
                         freeze: watchers.freeze,
                     }),
@@ -12634,7 +12644,7 @@ impl RelayActor {
         if !matches {
             return;
         }
-        self.close_session(&key, "CONTROL_CLOSED").await;
+        self.close_session(&key, CONTROL_CLOSED_REASON).await;
     }
 
     async fn disconnect_data(&mut self, carrier: CarrierKey) {
@@ -13018,7 +13028,24 @@ impl RelayActor {
                 execution: "unknown",
             });
         }
+        // Why this session ended, for an ingress that must name a reason to
+        // its consumer.  Only a cause an ingress can state *accurately* is
+        // published: `close_session` is reached from roughly thirty distinct
+        // reasons and almost none of them mean the device went away, so
+        // everything else publishes nothing and keeps the close it already
+        // had.  See `StreamTeardownCause`.
+        //
+        // Published **before** `closed.cancel()` below, which is the ordering
+        // invariant M4-25 established for the authorization reset: the ingress
+        // is woken by that cancellation and reads the slot on its way out.
+        let terminal_cause =
+            (reason == CONTROL_CLOSED_REASON).then_some(StreamTeardownCause::DeviceGone);
         for (_, mut stream) in session.streams.drain() {
+            if let Some(cause) = terminal_cause
+                && let Some(http) = stream.http.as_ref()
+            {
+                http.publish_terminal_cause(cause);
+            }
             stream.closed.cancel();
             // An HTTP stream whose record was deferred (a terminal still
             // pending behind a freeze) or never taken is recorded once here,

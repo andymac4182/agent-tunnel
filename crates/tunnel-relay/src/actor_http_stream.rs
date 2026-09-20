@@ -57,6 +57,29 @@ pub(crate) struct HttpPeerReset {
     pub(crate) after_fin: bool,
 }
 
+/// Why the **owner actor** tore a stream down, for an ingress that has to
+/// name a reason to its consumer.
+///
+/// This is deliberately **not** a general mirror of `close_session`'s reason
+/// string.  A session is torn down for roughly thirty distinct reasons —
+/// relay shutdown, an authority outage, an owner fence, a rotation or
+/// recovery failure, a queue that refused a frame, a device framing fault —
+/// and almost none of them mean "the device went away".  Reporting them all
+/// as one thing is how a close code becomes a lie.
+///
+/// So only the causes an ingress can state **accurately** are carried, and
+/// every other reason publishes nothing and keeps whatever close it already
+/// had.  A new variant belongs here only with evidence for the claim it
+/// would let an ingress make.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum StreamTeardownCause {
+    /// The **device's own control session ended**: `close_session` was
+    /// reached from `disconnect_control`.  The relay is healthy and the
+    /// device it was proxying to is not, which is the one case an ingress may
+    /// report as a backend that went away.
+    DeviceGone,
+}
+
 /// One ordered read result.
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum HttpRead {
@@ -111,6 +134,9 @@ pub(crate) struct HttpStreamState {
     local_fin: bool,
     local_reset: Option<u16>,
     reset_tx: watch::Sender<Option<HttpPeerReset>>,
+    /// Why the owner actor tore this stream down, when it is a cause an
+    /// ingress may accurately report.  See [`StreamTeardownCause`].
+    terminal_tx: watch::Sender<Option<StreamTeardownCause>>,
     status_tx: watch::Sender<Option<ResultDetail>>,
     freeze_tx: PauseController,
     recorded: bool,
@@ -128,6 +154,9 @@ pub(crate) struct HttpStreamState {
 /// The watchers an HTTP ingress task receives with its registration.
 pub(crate) struct HttpStreamWatchers {
     pub(crate) peer_reset: watch::Receiver<Option<HttpPeerReset>>,
+    /// Why the owner actor tore this stream down, when it is a cause an
+    /// ingress may accurately report.
+    pub(crate) terminal: watch::Receiver<Option<StreamTeardownCause>>,
     pub(crate) result_status: watch::Receiver<Option<ResultDetail>>,
     /// Paused while this owner's writer is frozen for rotation or recovery.
     pub(crate) freeze: PauseSignal,
@@ -137,6 +166,9 @@ pub(crate) struct HttpStreamWatchers {
 pub(crate) struct HttpStreamRegistration {
     pub(crate) base: ConsumerStreamRegistration,
     pub(crate) peer_reset: watch::Receiver<Option<HttpPeerReset>>,
+    /// Why the owner actor tore this stream down, when it is a cause an
+    /// ingress may accurately report.
+    pub(crate) terminal: watch::Receiver<Option<StreamTeardownCause>>,
     pub(crate) result_status: watch::Receiver<Option<ResultDetail>>,
     pub(crate) freeze: PauseSignal,
 }
@@ -162,6 +194,7 @@ pub(crate) struct HttpMaintenance {
 impl HttpStreamState {
     pub(crate) fn new(frozen: bool) -> (Self, HttpStreamWatchers) {
         let (reset_tx, reset_rx) = watch::channel(None);
+        let (terminal_tx, terminal_rx) = watch::channel(None);
         let (status_tx, status_rx) = watch::channel(None);
         let freeze_tx = PauseController::new(frozen);
         let freeze_rx = freeze_tx.signal();
@@ -181,6 +214,7 @@ impl HttpStreamState {
                 local_fin: false,
                 local_reset: None,
                 reset_tx,
+                terminal_tx,
                 status_tx,
                 freeze_tx,
                 recorded: false,
@@ -194,6 +228,7 @@ impl HttpStreamState {
             },
             HttpStreamWatchers {
                 peer_reset: reset_rx,
+                terminal: terminal_rx,
                 result_status: status_rx,
                 freeze: freeze_rx,
             },
@@ -320,6 +355,27 @@ impl HttpStreamState {
     pub(crate) fn accept_fin(&mut self) {
         self.peer_fin = true;
         self.wake_reader();
+    }
+
+    /// Publish why the owner actor is tearing this stream down, so an ingress
+    /// that must name a reason to its consumer can name the right one.
+    ///
+    /// **Must be called before the stream's `closed` token is cancelled.**
+    /// That ordering is the same invariant M4-25 established for the
+    /// authorization reset: an ingress woken by the cancellation reads this
+    /// slot on its way out, so publishing afterwards would race the reader and
+    /// silently degrade the close it produces.
+    ///
+    /// The first cause wins, matching [`Self::accept_reset`]: a connector
+    /// RESET that already explained the stream keeps its explanation.
+    pub(crate) fn publish_terminal_cause(&self, cause: StreamTeardownCause) {
+        self.terminal_tx.send_if_modified(|slot| {
+            if slot.is_some() {
+                return false;
+            }
+            *slot = Some(cause);
+            true
+        });
     }
 
     /// Accept the connector RESET: undelivered bytes are discarded (their

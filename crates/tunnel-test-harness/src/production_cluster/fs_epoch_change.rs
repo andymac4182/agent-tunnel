@@ -1394,6 +1394,22 @@ mod tests {
                 e.device_epoch_before = 7;
                 e.device_epoch_after = 6;
             }),
+            // The device twin of the two catalog mutations above, and for the
+            // same reason: the mutations either side of it are also caught by
+            // the agreement rule at `device_epoch_after == epoch_after`, which
+            // would leave the device *inequality* masked and not load-bearing.
+            // Holding the catalog epoch at 1 -> 2 and the device's after-value
+            // at 2 keeps agreement satisfied and `device_epoch_before > 0`
+            // true, so the strict increase is the only rule left to reject it.
+            (
+                "the device's epoch did not advance, with the catalog agreeing",
+                |e| {
+                    e.epoch_before = 1;
+                    e.epoch_after = 2;
+                    e.device_epoch_before = 7;
+                    e.device_epoch_after = 2;
+                },
+            ),
             ("no device epoch was observed before the change", |e| {
                 e.device_epoch_before = 0;
             }),

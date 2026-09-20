@@ -1776,7 +1776,7 @@ increase" true of nothing. The operation held across the change is a **read**:
 no write and no `Tflush` has been held across an epoch change. The session runs
 against the **owning** relay, because gate 4 admits a filesystem session only
 there, so nothing here crosses the relay-to-relay peer hop. Nothing here is
-driven by the shared TypeScript client. The `CarrierEvent::Fin | Closed`
+driven by the shared TypeScript client. The `CarrierEvent::Fin` / `CarrierEvent::Closed`
 sibling of the path M4-28 fixed is **not** changed and **not** measured; it is
 recorded on that row rather than altered without evidence.
 
