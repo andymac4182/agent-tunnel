@@ -11107,20 +11107,52 @@ impl RelayActor {
             // comment on the `peer_reset` clone warns about exactly this
             // downgrade.
             //
-            // `AUTHORIZATION_EXPIRED` is the wire's single reason for the
-            // whole class — an expired snapshot, a revoked grant and a moved
-            // revision alike — and every caller of this function reaches it
-            // through an authorization outcome, so there is no reason to
-            // discriminate here.  `accept_reset` is idempotent on the first
-            // reason, so a connector RESET that did land first still wins.
+            // **Only the invalidation classes publish it.**  This function
+            // has eight call sites and only two of them are authorization
+            // invalidations: `"authorization expired"` and `"authorization
+            // changed"`.  The other six — `"authorization unavailable"`,
+            // `"grant unavailable"`, `"owner unavailable"`, `"device
+            // authorization unavailable"`, `"control unavailable"` and a
+            // challenge mismatch — are **availability** failures, where the
+            // relay could not reach an authority rather than learn that the
+            // grant is gone.
+            //
+            // The distinction is not invented here: `authorization_failure_code`
+            // above already separates the two families, and this block sends
+            // the connector that exact code a few lines up.  Publishing
+            // `AUTHORIZATION_EXPIRED` for all eight would tell the connector
+            // `OWNER_UNAVAILABLE` on the control channel while telling the
+            // consumer its authorization expired on the socket, and 1008 is
+            // the code a consumer branches on to conclude its grant is dead
+            // and **stop retrying**.  A transient catalog outage must not be
+            // reported as a revocation.
+            //
+            // So the availability family publishes nothing and keeps the
+            // behaviour it already had: the consumer exits through
+            // `closed.cancelled()` and `session_close_for_reset(None)` maps
+            // it to **1011**, the retryable "the relay lost it" signal.
+            //
+            // Within the invalidation family the wire carries one reason for
+            // the whole class — an expired snapshot, a revoked grant and a
+            // moved revision alike — so both map to `AUTHORIZATION_EXPIRED`.
+            // `accept_reset` is idempotent on the first reason, so a
+            // connector RESET that did land first still wins.
             //
             // The discarded bytes are returned to the session budget on the
             // same turn, exactly as the ordered RESET path does at
             // `inbound_data`: `accept_reset` drops the undelivered chunks and
             // reports their size, and the charge is the caller's to release.
-            let discarded = stream.http.as_mut().map_or(0, |http| {
-                http.accept_reset(tunnel_protocol::reset_reason::AUTHORIZATION_EXPIRED)
-            });
+            let publishes_invalidation = matches!(
+                Self::authorization_failure_code(reason),
+                "AUTHORIZATION_EXPIRED" | "AUTHORIZATION_CHANGED"
+            );
+            let discarded = if publishes_invalidation {
+                stream.http.as_mut().map_or(0, |http| {
+                    http.accept_reset(tunnel_protocol::reset_reason::AUTHORIZATION_EXPIRED)
+                })
+            } else {
+                0
+            };
             release_m2_bytes(&session.queue_budget, stream, discarded);
             stream.closed.cancel();
         }
@@ -17847,6 +17879,165 @@ mod stream_identity_tests {
             !observed.after_fin,
             "the connector sent no FIN before this invalidation"
         );
+    }
+
+    /// An **availability** failure must not be dressed up as a revocation.
+    ///
+    /// Six of `invalidate_stream_challenge`'s eight call sites report that
+    /// the relay could not reach an authority — the catalog, the owner, the
+    /// device credential or the control channel — not that the grant is
+    /// gone.  `authorization_failure_code` already separates those into the
+    /// `*_UNAVAILABLE` family and the connector is told exactly that code.
+    ///
+    /// If the consumer socket were closed **1008** for them it would read
+    /// that as "your authorization is dead" and stop retrying, so a transient
+    /// catalog outage would present as a revocation.  These must keep
+    /// publishing no reason at all, which leaves the ingress exiting through
+    /// `closed.cancelled()` and `session_close_for_reset(None)` mapping it to
+    /// **1011** — retryable, and what they did before M4-25.
+    #[tokio::test]
+    async fn an_unavailable_authority_does_not_close_the_consumer_as_a_revocation() {
+        for reason in [
+            "authorization unavailable",
+            "grant unavailable",
+            "owner unavailable",
+            "device authorization unavailable",
+            "control unavailable",
+            super::CHALLENGE_MISMATCH_REASON,
+        ] {
+            let now = Utc::now();
+            let tenant_id = Uuid::from_u128(641);
+            let device_id = Uuid::from_u128(642);
+            let principal_id = Uuid::from_u128(643);
+            let service_id = Uuid::from_u128(644);
+            let identity = DeviceIdentity {
+                tenant_id,
+                device_id,
+                owner_user_id: principal_id,
+                credential_id: Uuid::from_u128(645),
+                spki_fingerprint: "fs-unavailable-spki".to_owned(),
+                credential_not_before: now - Duration::minutes(1),
+                expires_at: now + Duration::minutes(1),
+                credential_revoked_at: None,
+                device_active: true,
+                credential_active: true,
+                device_version: 1,
+                owner_epoch: 1,
+                last_seen_at: Some(now),
+            };
+            let consumer = AuthenticatedConsumer {
+                tenant_id,
+                principal_id,
+            };
+            let grant = GrantSnapshot {
+                tenant_id,
+                principal_id,
+                device_id,
+                service_id,
+                revision: 1,
+                permissions: PermissionSet {
+                    operations: BTreeSet::from([crate::FS_SESSION_OPERATION.to_owned()]),
+                },
+                constraints: serde_json::json!({}),
+                valid_until: now + Duration::minutes(1),
+                read_started_at: now,
+            };
+            let key = SessionKey {
+                tenant_id,
+                device_id,
+                session_id: format!("fs-unavailable-{}", reason.replace(' ', "-")),
+                epoch: 1,
+            };
+            let (mut actor, mut control) = admitted_control_actor(identity, key.clone());
+            let (data_tx, _data_rx) = mpsc::channel(actor.options.limits.max_queue_messages);
+            let session = actor.sessions.get_mut(&key.scope()).expect("test session");
+            session.profile = super::RuntimeProfile::M2;
+            session.data_tx = Some(data_tx.clone());
+            session.active_carrier = Some(DataCarrier {
+                context: CarrierContext::new(
+                    key.session_id.clone(),
+                    key.epoch,
+                    1,
+                    "fs-unavailable-data".to_owned(),
+                ),
+                tx: data_tx,
+            });
+            let (open_tx, open_rx) = oneshot::channel();
+            actor.open_consumer_stream(
+                consumer,
+                device_id,
+                service_id,
+                grant.clone(),
+                now + Duration::minutes(1),
+                None,
+                super::StreamAdmissionReply::Fs {
+                    response: open_tx,
+                    capabilities: "read,list".to_owned(),
+                },
+            );
+            let registration = open_rx
+                .await
+                .expect("open response")
+                .expect("fs stream admitted");
+            drop(control.rx.try_recv().expect("OPEN queued"));
+            let stream_id = registration.base.stream_id;
+            let challenge_id = "fs-unavailable-challenge";
+            let started_at_ms = super::monotonic_millis();
+            {
+                let stream = actor
+                    .sessions
+                    .get_mut(&key.scope())
+                    .expect("test session")
+                    .streams
+                    .get_mut(&stream_id)
+                    .expect("admitted stream");
+                stream.open_pending = false;
+                stream.authorization_in_flight = true;
+                stream.authorization_started_at_ms = Some(started_at_ms);
+                stream.authorization_deadline_ms = Some(started_at_ms + 2_000);
+                stream.challenge_id = Some(challenge_id.to_owned());
+            }
+            actor.invalidate_stream_challenge(
+                &key,
+                &DeviceChallenge {
+                    message_id: "fs-unavailable-auth".to_owned(),
+                    stream_id,
+                    service_id: service_id.to_string(),
+                    challenge_id: challenge_id.to_owned(),
+                    nonce: "fs-unavailable-nonce".to_owned(),
+                    permission_digest: super::wire::permission_digest(
+                        &grant,
+                        &service_id.to_string(),
+                    ),
+                    grant_revision: grant.revision,
+                    received_at: std::time::Instant::now(),
+                    lifetime: std::time::Duration::from_secs(2),
+                },
+                reason,
+            );
+            // The stream still goes terminal and the consumer is still
+            // released — only the *code* it closes with differs.
+            assert!(
+                actor.sessions[&key.scope()].streams[&stream_id].terminal,
+                "{reason}: the stream is still terminal"
+            );
+            assert!(
+                registration.base.closed.is_cancelled(),
+                "{reason}: the consumer registration is still cancelled"
+            );
+            assert!(
+                registration.peer_reset.borrow().is_none(),
+                "{reason} is an availability failure, not a revocation: publishing a reset \
+                 reason here closes the consumer 1008 and tells it to stop retrying"
+            );
+            // And the connector is told the unavailability, which is the
+            // discrimination this rule mirrors rather than invents.
+            assert_ne!(
+                actor.sessions[&key.scope()].streams[&stream_id].authorization_failure_code,
+                Some("AUTHORIZATION_EXPIRED"),
+                "{reason}: the connector is not told this expired either"
+            );
+        }
     }
 
     /// The reset a refused challenge publishes must not be charged twice:

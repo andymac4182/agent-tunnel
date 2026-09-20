@@ -1915,9 +1915,17 @@ GATE4_CASES: list[tuple[str, list[Edit]]] = [
         [
             (
                 RELAY_ACTOR,
-                """            let discarded = stream.http.as_mut().map_or(0, |http| {
-                http.accept_reset(tunnel_protocol::reset_reason::AUTHORIZATION_EXPIRED)
-            });
+                """            let publishes_invalidation = matches!(
+                Self::authorization_failure_code(reason),
+                "AUTHORIZATION_EXPIRED" | "AUTHORIZATION_CHANGED"
+            );
+            let discarded = if publishes_invalidation {
+                stream.http.as_mut().map_or(0, |http| {
+                    http.accept_reset(tunnel_protocol::reset_reason::AUTHORIZATION_EXPIRED)
+                })
+            } else {
+                0
+            };
             release_m2_bytes(&session.queue_budget, stream, discarded);
 """,
                 "",
@@ -1930,6 +1938,26 @@ GATE4_CASES: list[tuple[str, list[Edit]]] = [
     # session's whole life, which is a slow denial of service rather than a
     # wrong close code -- so it needs its own case, because the close-code
     # guard above stays green without it.
+    # M4-25, the half review caught: only the two **invalidation** reasons may
+    # publish a reset.  The other six call sites are availability failures --
+    # the relay could not reach the catalog, the owner, the device credential
+    # or the control channel -- and closing the consumer 1008 for those tells
+    # it its grant is dead and to stop retrying, turning a transient outage
+    # into a revocation.  Deleting the gate is the regression this stack
+    # briefly shipped, so it gets a case of its own.
+    (
+        "publish a reset only for an invalidation, never for an unavailable authority",
+        [
+            (
+                RELAY_ACTOR,
+                """            let publishes_invalidation = matches!(
+                Self::authorization_failure_code(reason),
+                "AUTHORIZATION_EXPIRED" | "AUTHORIZATION_CHANGED"
+            );""",
+                "            let publishes_invalidation = true;",
+            )
+        ],
+    ),
     (
         "return the bytes the invalidation discarded to the session budget",
         [
@@ -2663,6 +2691,23 @@ EXPECT_GREEN: frozenset[str] = frozenset(
         # pre-check is provably defence in depth, so its green is a documented
         # green like the others; the citation is the code rather than a row.
         "the count check before a counted payload is copied",
+        # The two gate-7 freeze-sample guards.  `verify-m4-fs-rotation`
+        # asserts the in-flight condition as a **composite**: at a frozen
+        # phase, with a rotation attempt active, the connector's immutable
+        # fence for the filesystem stream exceeds that stream's contiguous
+        # receive cursor.  The composite rule already requires both
+        # conjuncts, so deleting either one alone leaves the composite
+        # asserting it and nothing can go red.  That is defence in depth
+        # behind a guard that refuses first, which is exactly what this set
+        # is for -- and it is why the honest word for these two is
+        # **documented green**, not "unusable": the guards were successfully
+        # deleted and nothing went red, which is a finding about the rules
+        # and not an infrastructure refusal.
+        #
+        # If either is ever wanted as an independent rule, narrow it so it
+        # reddens alone rather than leaving it here.
+        "the owner was actually frozen when it was sampled",
+        "a rotation attempt was active at the sample",
     }
 )
 
@@ -2707,6 +2752,10 @@ class Suite:
 # claim never rested on.
 #
 # **Two of the twenty-one are masked, and this says so rather than hiding it.**
+# Both are declared in `EXPECT_GREEN` above, which is the mechanism for exactly
+# this claim: their green is the documented finding, so the suite reports them
+# on their own line and exits 0 rather than treating a defeated-but-green guard
+# as an unusable outcome.
 # "the owner was actually frozen when it was sampled" and "a rotation attempt
 # was active at the sample" are each **still green** when defeated alone, at
 # 19 of 21 red.  They are not load-bearing on their own because the composite
