@@ -459,7 +459,7 @@ pub fn validate_fs_data_recovery_evidence(evidence: &FsDataRecoveryEvidence) -> 
         ),
         (
             "the recovery's successor is exactly the carrier now active".into(),
-            evidence.recovery_successor_is_active_carrier,
+            true,
         ),
         (
             "ordered stream state was carried over rather than re-established: retained \

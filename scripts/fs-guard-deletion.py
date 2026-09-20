@@ -2436,6 +2436,7 @@ HARNESS_ROTATION = HARNESS / "src" / "production_cluster" / "fs_rotation.rs"
 HARNESS_LOSS = HARNESS / "src" / "production_cluster" / "fs_consumer_loss.rs"
 HARNESS_EPOCH = HARNESS / "src" / "production_cluster" / "fs_epoch_change.rs"
 HARNESS_RESTART = HARNESS / "src" / "production_cluster" / "fs_process_restart.rs"
+HARNESS_RECOVERY = HARNESS / "src" / "production_cluster" / "fs_data_recovery.rs"
 
 # Gate 6's end-to-end half is a **cluster** gate: it needs Redis, three relays,
 # a device connector and `node`, and it takes minutes.  That is not a shape this
@@ -4133,6 +4134,435 @@ GATE10_RESTART_CASES: list[tuple[str, list[Edit]]] = [
     ),
 ]
 
+# ---------------------------------------------------------------------------
+# `gate11-data-recovery` — the validator of the gate that holds a 9P read
+# outstanding while the device's data socket is destroyed at the transport and
+# the product's own retained recovery replaces it.  Like `gate7-rotation`,
+# `gate8-consumer-loss`, `gate9-epoch-change` and `gate10-process-restart` this
+# is a harness-side validator, so each case defeats one rule and the suite's
+# own unit tests must go red.
+#
+# Two groups here have no counterpart in the other four, and are why this gate
+# is its own suite rather than a case inside gate 7:
+#
+#   * the **failure-not-rotation** rules, which are what separate the event the
+#     contract licenses from the clean attempt gate 7 drives — a different
+#     physical carrier, a strictly greater generation, a completed-rotation
+#     count that does not move, and the dead socket's absence at the proxy;
+#   * the **same-owner qualifier** rules, which are the *antecedent* of the
+#     contract clause rather than part of it.  The profile permits preserving a
+#     filesystem session across a failed data socket "only while the same
+#     control owner and all ordered stream state are retained", so a gate that
+#     observed a surviving fid without them would have recorded the violation
+#     and called it the contract.  Each conjunct is separately load-bearing,
+#     which the gate's own second unit test defeats one at a time.
+# ---------------------------------------------------------------------------
+
+GATE11_RECOVERY_TEST = [
+    "cargo",
+    "test",
+    "--offline",
+    "-p",
+    "tunnel-test-harness",
+    "--lib",
+    "--locked",
+    "production_cluster::fs_data_recovery",
+]
+
+GATE11_RECOVERY_CASES: list[tuple[str, list[Edit]]] = [
+    (
+        'the production cluster ran three relays',
+        [
+            (
+                HARNESS_RECOVERY,
+                '            evidence.relay_count == 3,',
+                "            true,",
+            )
+        ],
+    ),
+    (
+        'the owning relay was identified',
+        [
+            (
+                HARNESS_RECOVERY,
+                '            !evidence.owner_node.is_empty(),',
+                "            true,",
+            )
+        ],
+    ),
+    (
+        'the server selected the filesystem subprotocol',
+        [
+            (
+                HARNESS_RECOVERY,
+                '            evidence.selected_subprotocol == SUBPROTOCOL,',
+                "            true,",
+            )
+        ],
+    ),
+    (
+        'Tversion negotiated the 9P2000.L dialect',
+        [
+            (
+                HARNESS_RECOVERY,
+                '            evidence.negotiated_dialect == DIALECT,',
+                "            true,",
+            )
+        ],
+    ),
+    (
+        'Tversion negotiated a bounded msize',
+        [
+            (
+                HARNESS_RECOVERY,
+                '            evidence.negotiated_msize > 0 && evidence.negotiated_msize <= OFFERED_MSIZE,',
+                "            true,",
+            )
+        ],
+    ),
+    (
+        'the fid served a real read before anything was perturbed',
+        [
+            (
+                HARNESS_RECOVERY,
+                '            evidence.prefix_bytes > 0,',
+                "            true,",
+            )
+        ],
+    ),
+    (
+        '',
+        [
+            (
+                HARNESS_RECOVERY,
+                '            evidence.failure.emitted_at_failure > evidence.failure.emitted_before,',
+                "            true,",
+            )
+        ],
+    ),
+    (
+        '',
+        [
+            (
+                HARNESS_RECOVERY,
+                '            evidence.request_outstanding_at_failure\n                && evidence.failure.request_outstanding_at_failure(),',
+                "            true,",
+            )
+        ],
+    ),
+    (
+        'the held exchange ran on a registered consumer stream',
+        [
+            (
+                HARNESS_RECOVERY,
+                '            evidence.failure.stream_id > 0,',
+                "            true,",
+            )
+        ],
+    ),
+    (
+        'the data carrier really was replaced: a different physical connection',
+        [
+            (
+                HARNESS_RECOVERY,
+                '            !evidence.connection_id_before.is_empty()\n                && !evidence.connection_id_after.is_empty()\n                && evidence.connection_id_after != evidence.connection_id_before,',
+                "            true,",
+            )
+        ],
+    ),
+    (
+        'the replacement carrier took a strictly greater generation',
+        [
+            (
+                HARNESS_RECOVERY,
+                '            evidence.generation_after > evidence.generation_before,',
+                "            true,",
+            )
+        ],
+    ),
+    (
+        '',
+        [
+            (
+                HARNESS_RECOVERY,
+                '            evidence.rotations_completed_before == 0 && evidence.rotations_completed_after == 0,',
+                "            true,",
+            )
+        ],
+    ),
+    (
+        'the failed data socket was gone at the transport, not only in diagnostics',
+        [
+            (
+                HARNESS_RECOVERY,
+                '            evidence.failed_connection_closed_at_proxy,',
+                "            true,",
+            )
+        ],
+    ),
+    (
+        'a replacement device data socket was dialled through the proxy',
+        [
+            (
+                HARNESS_RECOVERY,
+                '            evidence.replacement_connection_observed_at_proxy,',
+                "            true,",
+            )
+        ],
+    ),
+    (
+        '',
+        [
+            (
+                HARNESS_RECOVERY,
+                '            evidence.catalog_owner_session_stable,',
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the catalog's owner epoch did not move across the failure",
+        [
+            (
+                HARNESS_RECOVERY,
+                '            evidence.catalog_epoch_after == evidence.catalog_epoch_before,',
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the owning relay's own session identity was unchanged across the failure",
+        [
+            (
+                HARNESS_RECOVERY,
+                '            evidence.owner_session_id_stable,',
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the owning relay's epoch did not move across the failure",
+        [
+            (
+                HARNESS_RECOVERY,
+                '            evidence.owner_epoch_after == evidence.owner_epoch_before,',
+                "            true,",
+            )
+        ],
+    ),
+    (
+        'the control socket was never replaced: only the data socket failed',
+        [
+            (
+                HARNESS_RECOVERY,
+                '            evidence.control_carrier_unchanged,',
+                "            true,",
+            )
+        ],
+    ),
+    (
+        'the connector entered a bounded retained recovery rather than a fresh session',
+        [
+            (
+                HARNESS_RECOVERY,
+                '            evidence.recovery_attempted,',
+                "            true,",
+            )
+        ],
+    ),
+    (
+        '',
+        [
+            (
+                HARNESS_RECOVERY,
+                '            evidence.owner_recovery_reason.as_deref() == Some(OLD_TRANSPORT_LOST),',
+                "            true,",
+            )
+        ],
+    ),
+    (
+        'the recovery released exactly the carrier that failed',
+        [
+            (
+                HARNESS_RECOVERY,
+                '            evidence.recovery_released_failed_carrier,',
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the recovery's successor is exactly the carrier now active",
+        [
+            (
+                HARNESS_RECOVERY,
+                '            evidence.recovery_successor_is_active_carrier,',
+                "            true,",
+            )
+        ],
+    ),
+    (
+        '',
+        [
+            (
+                HARNESS_RECOVERY,
+                '            evidence.replayed_frames_after > evidence.replayed_frames_before,',
+                "            true,",
+            )
+        ],
+    ),
+    (
+        'the consumer stream kept its stream id across the carrier change',
+        [
+            (
+                HARNESS_RECOVERY,
+                '            evidence.stream_id_stable,',
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the consumer stream kept the relay's stable logical operation identity",
+        [
+            (
+                HARNESS_RECOVERY,
+                '            evidence.operation_id_stable,',
+                "            true,",
+            )
+        ],
+    ),
+    (
+        'the consumer stream was never deregistered across the failure',
+        [
+            (
+                HARNESS_RECOVERY,
+                '            evidence.stream_remained_registered,',
+                "            true,",
+            )
+        ],
+    ),
+    (
+        '',
+        [
+            (
+                HARNESS_RECOVERY,
+                '            evidence.same_owner_contract_qualifiers_held(),',
+                "            true,",
+            )
+        ],
+    ),
+    (
+        '',
+        [
+            (
+                HARNESS_RECOVERY,
+                '            evidence.held_reply_was_rread,',
+                "            true,",
+            )
+        ],
+    ),
+    (
+        'it carried the tag that was outstanding across the failure',
+        [
+            (
+                HARNESS_RECOVERY,
+                '            evidence.held_reply_tag_matched,',
+                "            true,",
+            )
+        ],
+    ),
+    (
+        'that reply carried data rather than an empty read',
+        [
+            (
+                HARNESS_RECOVERY,
+                '            evidence.held_reply_bytes > 0,',
+                "            true,",
+            )
+        ],
+    ),
+    (
+        'the whole file was read on one fid across the failure',
+        [
+            (
+                HARNESS_RECOVERY,
+                '            evidence.transfer_bytes == evidence.transfer_expected_bytes\n                && evidence.transfer_expected_bytes == RECOVERY_FILE_BYTES,',
+                "            true,",
+            )
+        ],
+    ),
+    (
+        '',
+        [
+            (
+                HARNESS_RECOVERY,
+                '            evidence.transfer_checksum_matches,',
+                "            true,",
+            )
+        ],
+    ),
+    (
+        'that transfer spanned many Rread messages rather than one',
+        [
+            (
+                HARNESS_RECOVERY,
+                '            evidence.transfer_messages >= MIN_READ_MESSAGES,',
+                "            true,",
+            )
+        ],
+    ),
+    (
+        'the fid opened before the failure still answered afterwards',
+        [
+            (
+                HARNESS_RECOVERY,
+                '            evidence.fid_survived_getattr,',
+                "            true,",
+            )
+        ],
+    ),
+    (
+        'and still named the same file',
+        [
+            (
+                HARNESS_RECOVERY,
+                '            evidence.fid_survived_getattr_size == RECOVERY_FILE_BYTES as u64,',
+                "            true,",
+            )
+        ],
+    ),
+    (
+        'the attach fid established before the failure still walked',
+        [
+            (
+                HARNESS_RECOVERY,
+                '            evidence.attach_fid_survived_walk,',
+                "            true,",
+            )
+        ],
+    ),
+    (
+        'a tag allocated after the recovery correlated on the replacement carrier',
+        [
+            (
+                HARNESS_RECOVERY,
+                '            evidence.post_recovery_tag_correlated,',
+                "            true,",
+            )
+        ],
+    ),
+    (
+        'exactly one Tattach across the run: no fid was reconstructed',
+        [
+            (
+                HARNESS_RECOVERY,
+                '            evidence.attach_count == 1,',
+                "            true,",
+            )
+        ],
+    ),
+]
+
+
 SUITES: list[Suite] = [
     Suite("gate2", [CRATE], CARGO_TEST, GATE2_CASES),
     Suite(
@@ -4175,6 +4605,12 @@ SUITES: list[Suite] = [
         [HARNESS / "src"],
         GATE10_RESTART_TEST,
         GATE10_RESTART_CASES,
+    ),
+    Suite(
+        "gate11-data-recovery",
+        [HARNESS / "src"],
+        GATE11_RECOVERY_TEST,
+        GATE11_RECOVERY_CASES,
     ),
 ]
 

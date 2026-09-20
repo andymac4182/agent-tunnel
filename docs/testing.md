@@ -1794,6 +1794,78 @@ driven by the shared TypeScript client. The `CarrierEvent::Fin` / `CarrierEvent:
 sibling of the path M4-28 fixed is **not** changed and **not** measured; it is
 recorded on that row rather than altered without evidence.
 
+### Implementation gate 11: a 9P session across a failed data socket's replacement (`verify-m4-fs-data-recovery`)
+
+The gate is `verify-m4-fs-data-recovery`, implemented in
+`crates/tunnel-test-harness/src/production_cluster/fs_data_recovery.rs` and run
+by hand. It is deliberately **not** registered in
+[`scripts/m4-harness-verify.sh`](../scripts/m4-harness-verify.sh): it is red,
+and what it reproduces is filed as **M4-29**. It runs on the same real
+three-relay production cluster, the same authoritative Redis catalog and the
+same consumer WSS sockets, on its own seeded `data-recovery` export.
+
+It covers M4-06's **"data-only recovery"** clause, and that clause is the one
+event in [protocol.md](protocol.md)'s filesystem paragraph whose contract points
+*towards* retention rather than away from it: "Replacement of a failed data
+socket may preserve the filesystem session only while the same control owner
+and all ordered stream state are retained." Gates 8, 9 and 10 each drive an
+event from the preceding sentence and each therefore prove a fid does **not**
+survive. Gate 7 drives a *scheduled* rotation, which is a clean attempt and not
+a failure at all. This gate drives the second sentence's own event, which
+nothing had ever driven with a filesystem session attached.
+
+**It is a failure, not a rotation, and that is asserted.** The device data
+socket is destroyed at the harness TCP proxy — no rotation handshake, no
+`ROTATE_*` exchange, no candidate prepared in advance, no chance to quiesce.
+The rotation policy is left at its default 300-second interval and the scenario
+is bounded far below it, so the owner's `rotations_completed` is **0 either
+side** and the generation change can only be the failure's. The dead carrier's
+connection id differs from the replacement's, the failed connection is gone at
+the proxy and a replacement was dialled through it, and the owner labels the
+episode a lost **data** transport, derived through
+`tunnel_relay::recovery_reason_name` rather than pinned — `ControlLost` is gate
+9's event, and there a fid must not survive.
+
+**The failure is concurrent with a 9P exchange.** The construction is gate 8's,
+proven from the owner's own per-stream cursors rather than from timing: with the
+connector→relay direction paused, the cursors are fixed *while paused*, one
+`Tread` is sent whose reply is never read, and the socket is destroyed at the
+instant the emit cursor has advanced while the receive cursor has not. The
+paused bytes are **never released** — the connection is gone — so the `Rread`
+the device had already produced dies inside the failed carrier. A reply the
+consumer later reads is therefore one the transport carried over, not one that
+was merely late.
+
+**The trap is inverted, so retention is not assumed either.** The sentence
+licenses preservation *conditionally*, so a gate that merely observed a
+surviving fid would prove nothing: a fid surviving an event that had also moved
+the control owner or lost ordered stream state would be the violation. Both
+qualifiers are therefore asserted as an explicit antecedent, and each conjunct
+is separately load-bearing — the catalog's owner token and the owning relay
+agreeing on an unchanged session identity and epoch, a control socket that was
+never replaced, a recovery that released exactly the carrier that died and
+installed exactly the one that replaced it, `total_replayed_frames` advancing,
+and a stream that kept both its id and the relay's stable `operation_id`. A
+unit test defeats each conjunct on its own so none can rot into a field nothing
+reads.
+
+**The assertions are on the operation.** The held tag comes back as an `Rread`
+carrying data on the fid that was open before the socket died; the whole file is
+read on that one fid across the failure with an exact checksum over many
+messages; the fid still answers `Tgetattr` at the same size; the attach fid
+still walks; a tag allocated after the recovery correlates; and exactly **one**
+`Tattach` is sent all run.
+
+**What it found.** When the recovery completes, all of that holds — the contract
+is satisfied. But the gate is red **8 of 8** at the tip that introduced it, in
+two modes: the retained recovery going terminal with a candidate attached and a
+replay staged, and the recovery completing but the session then answering
+nothing further while the owner shows the stream fully quiesced. The control
+that makes this filesystem-specific is `verify-m7-i08-recovery-attempts`, the
+product's own retained-recovery gate on the echo adapter, which exits 0 at the
+same tip on the same host. `python3 scripts/fs-guard-deletion.py --suite
+gate11-data-recovery` covers the validator's rules.
+
 ### Shared dataset and native semantics
 
 Build one synthetic mount dataset and access that same authorized mount through Files SDK, Mastra, just-bash, and AI SDK tools concurrently. A file created through one writable view must be readable byte-for-byte through every other view; rename/remove must be visible without undocumented persistent caching. Compare native directory and metadata results after normalizing only documented differences. AI SDK FilesV4 uploads are also visible as ordinary files in their configured upload directory, while its native methods accept only its own references. Use real relay/device processes and sockets; preserve a separate fast mocked suite for error translation and upstream contract fixtures.
