@@ -25,17 +25,40 @@
 //!    supervision cycle, and it would make the fixture's effect ledger a
 //!    record of this crate's polling rather than of consumer intent.
 //!
-//! # It is not this module's opinion that enforces (2)
+//! # What the evidence type does and does not establish
 //!
-//! [`Health::Working`] carries a [`ProbeEvidence`], and that type is
-//! constructible **only** from a dispatched, succeeded request whose operation
-//! is `screen_info` or `cursor_position`. So `assess` cannot report a working
-//! backend from a `describe`, from a `version`, or from a `/commands`
-//! listing — not because it checks for them, but because there is no value it
-//! could build. An operation outside the pair is
-//! [`Unhealthy::NotAProbe`], which is a different answer from a probe that
-//! ran and failed, and deliberately so: the first is a bug in the caller and
-//! the second is a fact about the host.
+//! **This is a tightening, not a proof, and the first framing of it was an
+//! overclaim that review had to compile a counterexample to dislodge.** It is
+//! written out in full because the same mistake is available to every future
+//! reader of [`ProbeEvidence`], and `tunnel_cua::capability` already labels its
+//! half correctly.
+//!
+//! [`Health::Working`] carries a [`ProbeEvidence`], and that type can only be
+//! *obtained* by pairing a [`Request`] whose operation is `screen_info` or
+//! `cursor_position` with a [`Dispatch`] that is `Dispatched(Ok(..))`. What
+//! that establishes is **which operation the caller offered and what the caller
+//! says came back** — not that a backend was reached, and not that anything
+//! succeeded. `Dispatch` and `Completion` are public enums with public
+//! payloads, so `Dispatch::Dispatched(Completion::Ok(json!({})))` is a value
+//! any caller in any crate can write down. Review did exactly that and obtained
+//! `Health::Working` with no probe, no process and no supervisor. So the
+//! earlier claim here — "not because it checks for them, but because there is
+//! no value it could build" — was false, and is retracted.
+//!
+//! **The half that does hold, and it is the half the trap is about.** A
+//! genuine [`Request`] for `describe` or a `version` reading can **never**
+//! yield [`Health::Working`], whatever dispatch it is paired with: `version` is
+//! not a `computer.v1` operation at all, so no `Request` for it exists, and
+//! `describe` is refused by operation. The echo-substitution trap — a config
+//! echo standing in for a probe — is therefore closed **against accident**,
+//! which is what it is: a mistake, not an attack. It is not closed against a
+//! caller that fabricates a dispatch, and nothing in a type can close that,
+//! because the caller of `assess` is the same component that performed the
+//! exchange.
+//!
+//! An operation outside the pair is [`Unhealthy::NotAProbe`], which is a
+//! different answer from a probe that ran and failed, and deliberately so: the
+//! first is a bug in the caller and the second is a fact about the host.
 //!
 //! # Capture authority is read separately, and absent is not denied
 //!
@@ -149,11 +172,21 @@ pub enum Unhealthy {
 
 /// Read a health verdict from one probe exchange.
 ///
+/// **Crate-private on purpose.** The public route is
+/// [`crate::Supervisor::assess`], which additionally refuses to return a
+/// working verdict for a backend that is not running. This function does not,
+/// and cannot: it sees no process. Review obtained `Health::Working` from it
+/// with nothing running at all, which is correct behaviour for a function that
+/// only classifies an exchange — and exactly why it must not be the public
+/// surface, since `supervisor`'s "a working verdict implies a running process"
+/// is only true of the gated route.
+///
 /// `request` is the **validated request that produced `dispatch`**, not a
 /// label the caller supplies alongside it. That is the same tightening
 /// [`ProbeEvidence::from_probe`] documents: it narrows a mislabelled probe to
 /// a caller deliberately pairing one request with another request's dispatch,
 /// which the types cannot prevent, so it is a tightening rather than a proof.
+/// See this module's header for what that does and does not establish.
 ///
 /// # The direction this fails in
 ///
@@ -162,7 +195,7 @@ pub enum Unhealthy {
 /// supervisor whose job is to decide whether a process may drive a desktop
 /// has no business guessing in the permissive direction.
 #[must_use]
-pub fn assess(request: &Request, dispatch: &Dispatch) -> Health {
+pub(crate) fn assess(request: &Request, dispatch: &Dispatch) -> Health {
     if !PROBE_OPERATIONS.contains(&request.operation()) {
         return Health::Unhealthy(Unhealthy::NotAProbe);
     }

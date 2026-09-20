@@ -24,6 +24,23 @@
 //! click lands twice. The restart tells us nothing about whether the click
 //! happened; that is precisely what makes it [`Completion::Unknown`].
 //!
+//! # Layer 1 is a decision, and it is not yet on the dispatch path
+//!
+//! **Said plainly, because the branch's own measurement makes it easy to
+//! assume otherwise.** [`restart_outcome`] has no production caller. Nothing
+//! in `tunnel-cua-fixture`'s dispatch client consults it, so the outcome a
+//! real restart-mid-operation produces today comes from the **transport**
+//! layer noticing the connection die — `Completion::Unknown(TransportLost)` —
+//! and not from `Unknown(BackendRestarted)`.
+//!
+//! The *contract* still holds on that path, which is why this is a gap in
+//! attribution rather than in behaviour: `TransportLost` is equally
+//! `Dispatched`, equally `Unknown`, and equally non-retryable for every
+//! operation. What is missing is the **named reason**, and with it the ability
+//! of a diagnostic to say *why* the outcome is unknown. Wiring it needs the
+//! dispatcher to observe the backend generation across an exchange and compare
+//! it afterwards; that is `docs/tasks.md` M5-C10, and it is open.
+//!
 //! # Two halves, and both are needed
 //!
 //! * [`restart_outcome`] decides what the **in-flight** operation is told. It
@@ -132,9 +149,10 @@ pub enum InFlight {
 /// assert!(!lost.retry_is_safe());
 /// assert!(!lost.retry_is_safe_for(Operation::Click));
 ///
-/// // A request that never landed is genuinely free to send again -- but not
-/// // automatically, for an operation that synthesises input, because the
-/// // consumer cannot tell this from a rotation freeze (M3-15).
+/// // A request that never landed is genuinely free to send again, for a read
+/// // and for an input operation alike. M3-15's narrower rule applies to
+/// // `NotDispatched::PeerUnavailable` -- the relay's ambiguous answer -- and
+/// // a restart is not that: it is a fact this device observed itself.
 /// let never = restart_outcome(InFlight::NotReached);
 /// assert!(never.retry_is_safe());
 /// assert!(never.retry_is_safe_for(Operation::Capture));
@@ -159,7 +177,17 @@ pub const fn restart_outcome(stage: InFlight) -> Dispatch {
 /// clean invalidation for one that freed nothing.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Invalidation {
-    /// The generation the device is now on.
+    /// **The generation whose state this invalidation dropped** — that is, the
+    /// backend that has just died, not the one that replaces it.
+    ///
+    /// Corrected after review: this said "the generation the device is now
+    /// on", which is off by one on the only path that has two. A supervisor
+    /// stops before it starts, so the value it stamps is the generation it is
+    /// leaving; the replacement's number does not exist yet when `stop` runs.
+    /// The dying generation is also the more useful of the two here, because
+    /// it is the one the dropped leases and captures were minted against.
+    /// Nothing asserted it, which is why the wrong reading survived; see
+    /// `an_invalidation_is_stamped_with_the_generation_that_died`.
     pub generation: BackendGeneration,
     /// Every target whose exclusive input lease was dropped.
     pub leases_released: Vec<TargetSession>,
@@ -179,8 +207,12 @@ impl Invalidation {
     }
 }
 
-/// Invalidate every piece of cross-exchange input authority, and advance the
-/// generation.
+/// Invalidate every piece of cross-exchange input authority, stamping the
+/// generation whose state is being dropped.
+///
+/// It does **not** advance anything: the caller decides what generation this
+/// belonged to and passes it in. An earlier summary said "advance the
+/// generation", which described a side effect this function has never had.
 ///
 /// **Both registries, in one call, with no way to do one and not the other.**
 /// Splitting them would be the defect: a lease dropped without its captures

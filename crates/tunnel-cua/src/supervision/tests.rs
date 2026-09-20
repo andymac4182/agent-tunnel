@@ -194,6 +194,26 @@ fn restarting_an_idle_backend_frees_nothing_and_says_so() {
 }
 
 #[test]
+fn an_invalidation_is_stamped_with_the_generation_that_died() {
+    // **The assertion whose absence let a wrong doc line survive review.**
+    // `invalidate` stamps what it is handed and advances nothing, and a
+    // supervisor hands it the generation it is leaving, because it stops
+    // before it starts. So the number here is the backend that just died --
+    // which is also the one the dropped leases and captures were minted
+    // against.
+    let mut leases = InputLeases::new();
+    let mut captures = Captures::new();
+    let dying = BackendGeneration::INITIAL.next();
+    let invalidation = invalidate(&mut leases, &mut captures, dying);
+    assert_eq!(invalidation.generation, dying);
+    assert_eq!(
+        invalidation.generation.value(),
+        1,
+        "the generation that died, not the 2 the device goes on to"
+    );
+}
+
+#[test]
 fn a_generation_that_has_not_started_is_distinguishable_from_the_first_one() {
     assert!(!BackendGeneration::INITIAL.has_started());
     assert!(BackendGeneration::INITIAL.next().has_started());

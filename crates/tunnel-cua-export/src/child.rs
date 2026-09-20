@@ -13,9 +13,7 @@
 //! * The child is started in **its own process group**, and every end of its
 //!   life this process lives to see signals the whole group with `SIGKILL`,
 //!   through `rustix`, so a wrapper (`uvx`, a shell script, a Python launcher)
-//!   cannot leave the real backend or its helpers running. The group is
-//!   signalled while the leader is still unreaped, so the group id cannot have
-//!   been reissued.
+//!   cannot leave the real backend or its helpers running.
 //! * stdin is a pipe the supervisor holds, so a wrapper that drains stdin sees
 //!   end of file when the supervisor goes away. stdout and stderr are drained
 //!   so the child cannot block on them, and **only their byte counts are
@@ -36,8 +34,35 @@
 //! descendant that called `setsid`, called `setpgid` or double-forked escapes
 //! it exactly as it escapes the supervisor. For a CUA backend that residue is
 //! a process that can move the mouse and type, so it is stated plainly in
-//! `docs/cua.md` and in `docs/tasks.md` M5-C08 rather than left to be inferred
+//! `docs/integrations.md` and in `docs/tasks.md` M5-C08 rather than left to be inferred
 //! from an absence.
+//!
+//! # One of the two group signals lands after the leader is reaped
+//!
+//! **Stated as residue, the way the stand-down trade below is, rather than as
+//! a blanket claim the code does not meet.** An earlier draft of this header
+//! said the group "is signalled while the leader is still unreaped, so the
+//! group id cannot have been reissued". That is true of only *one* of the two
+//! `kill_group` calls in [`spawn`]:
+//!
+//! * On the **kill** branch the group is signalled first, before
+//!   `start_kill`/`wait`, so that one is genuinely pre-reap and POSIX keeps the
+//!   group id from being reissued while a member lives.
+//! * The `kill_group` **after** the `select!` runs on both paths, after
+//!   `child.wait()` has reaped the leader. On the natural-exit path it is the
+//!   **only** group signal there is, and by then the leader's pid — which is
+//!   also the group id — has been released and may in principle have been
+//!   recycled.
+//!
+//! So a post-reap `killpg` at a recyclable group id is real. It is kept
+//! because the alternative is worse: dropping it would leave a naturally
+//! exited wrapper's helpers unsignalled, which is the whole case the group
+//! kill exists for. The window is the scheduling gap between the reap and the
+//! next line, and it needs a full wrap of the host's pid space to bite.
+//! Closing it properly wants a handle that stays valid across the reap —
+//! `pidfd` on Linux — and **macOS has no equivalent**, which is the same
+//! reason `docs/tasks.md` M3-18 exists for the sentinel's version of this
+//! race. It is recorded there rather than claimed away here.
 //!
 //! # The stand-down ordering, and the trade it makes
 //!
@@ -216,8 +241,10 @@ pub fn spawn(
             _ = child.wait() => {}
             () = asked_to_kill(&mut kill_rx) => {
                 supervisor_counters.killed.fetch_add(1, Ordering::Relaxed);
-                // Signal the group while its leader is still unreaped, so the
-                // group id cannot have been reissued to another process.
+                // **This one** is pre-reap: the leader is still unreaped, so
+                // POSIX keeps the group id from being reissued and the signal
+                // reaches only members of this group. The one after the
+                // `select!` has no such guarantee -- see the module docs.
                 let _ = kill_group(pid);
                 let _ = child.start_kill();
                 let _ = child.wait().await;
@@ -225,6 +252,14 @@ pub fn spawn(
         }
         drop(stdin);
         // Whatever ended the leader, no member of its group may outlive it.
+        //
+        // **This signal lands after the leader has been reaped**, and on the
+        // natural-exit path it is the only one sent. The group id is therefore
+        // a released pid and is in principle recyclable. Kept anyway, because
+        // dropping it would leave a naturally exited wrapper's helpers
+        // unsignalled -- the case the group kill exists for -- and the race
+        // needs a full pid-space wrap inside a scheduling gap. Recorded in the
+        // module docs and in M3-18, not claimed away.
         if kill_group(pid) {
             supervisor_counters
                 .group_kills

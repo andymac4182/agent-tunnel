@@ -300,14 +300,7 @@ async fn a_probe_cannot_report_a_backend_that_is_gone_as_working() {
     let mut supervisor = Supervisor::new(publishing(workspace.path(), "127.0.0.1:9"));
     supervisor.start().await.expect("started");
 
-    let body = serde_json::json!({
-        "version": tunnel_cua::SCHEMA_VERSION,
-        "operation": "screen_info",
-        "params": {},
-    })
-    .to_string();
-    let request =
-        tunnel_cua::schema::validate_request(body.as_bytes(), 64 << 10).expect("a valid probe");
+    let request = probe_request();
     let succeeded = tunnel_cua::outcome::Dispatch::Dispatched(tunnel_cua::outcome::Completion::Ok(
         serde_json::json!({"width": 1, "height": 1}),
     ));
@@ -325,11 +318,71 @@ async fn a_probe_cannot_report_a_backend_that_is_gone_as_working() {
 }
 
 #[test]
-fn a_health_verdict_cannot_be_reached_without_ending_up_at_the_probe() {
-    // A compile-level observation written as a test so it is not lost: the
-    // only public route from this module to `Health::Working` is `assess`,
-    // which takes a `Request` and a `Dispatch`. `health()` takes neither.
+fn no_lifecycle_verdict_permits_a_dispatch() {
+    // **Renamed to what it checks.** It used to be called
+    // `a_health_verdict_cannot_be_reached_without_ending_up_at_the_probe` and
+    // described itself as "a compile-level observation written as a test",
+    // which was a claim about constructibility that these three assertions do
+    // not test and that is in any case false: review built a `Health::Working`
+    // from a fabricated `Dispatch`. What is true, and is all this checks, is
+    // that none of the three arms `Supervisor::health` returns permits a
+    // dispatch.
     assert!(!Health::Started.permits_dispatch());
     assert!(!Health::NotStarted.permits_dispatch());
     assert!(!Health::Exited.permits_dispatch());
+}
+
+#[test]
+fn a_working_verdict_is_fabricable_and_that_is_recorded_rather_than_claimed_away() {
+    // **The counterexample review compiled, kept as a test so the claim
+    // cannot drift back.** `Dispatch` and `Completion` are public enums with
+    // public payloads, so a caller can write down a dispatched success that
+    // never happened, hand it to the crate-private classifier with a genuine
+    // probe request, and obtain a working verdict with no process anywhere.
+    //
+    // This is not a defect to fix in a type: the caller of `assess` is the
+    // same component that performs the exchange, so nothing it could be
+    // handed would be independent of it. It is recorded so that the crate's
+    // documentation says "a tightening against mistakes" and not "impossible".
+    let request = probe_request();
+    let never_happened = tunnel_cua::outcome::Dispatch::Dispatched(
+        tunnel_cua::outcome::Completion::Ok(serde_json::json!({})),
+    );
+    let fabricated = crate::health::assess(&request, &never_happened);
+    assert!(
+        fabricated.permits_dispatch(),
+        "the fabricated verdict is accepted, which is the finding"
+    );
+    assert!(fabricated.evidence().is_some());
+
+    // **And the half that does hold**: a genuine `describe` request cannot be
+    // made to yield one, whatever dispatch it is paired with. That is the
+    // config-echo trap, and it is closed against accident.
+    let echo = tunnel_cua::schema::validate_request(
+        serde_json::json!({
+            "version": tunnel_cua::SCHEMA_VERSION,
+            "operation": "describe",
+            "params": {},
+        })
+        .to_string()
+        .as_bytes(),
+        64 << 10,
+    )
+    .expect("a valid describe");
+    assert!(!crate::health::assess(&echo, &never_happened).permits_dispatch());
+}
+
+/// A validated `screen_info` request, for tests that need a genuine probe.
+fn probe_request() -> tunnel_cua::schema::Request {
+    tunnel_cua::schema::validate_request(
+        serde_json::json!({
+            "version": tunnel_cua::SCHEMA_VERSION,
+            "operation": "screen_info",
+            "params": {},
+        })
+        .to_string()
+        .as_bytes(),
+        64 << 10,
+    )
+    .expect("a valid probe")
 }

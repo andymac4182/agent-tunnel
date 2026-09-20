@@ -3,12 +3,23 @@
 //!
 //! # The join is one-directional, on purpose
 //!
-//! A running process can never be reported as working — [`Supervisor::health`]
+//! A running process is never *reported* as working — [`Supervisor::health`]
 //! returns [`Health::Started`] until a probe has answered, and only
-//! [`Supervisor::assess`] can move it on. A working verdict, by contrast,
-//! necessarily implies a running process, because the probe had to reach one.
-//! That asymmetry is the whole separation: it is why "the backend is up" can
-//! never be quietly substituted for "the backend can act".
+//! [`Supervisor::assess`] can move it on. In the other direction, a working
+//! verdict **from this type** implies a running process, because
+//! [`Supervisor::assess`] checks the lifecycle first and returns
+//! [`Health::Exited`] for a backend that has gone whatever the probe said.
+//! That asymmetry is the separation: it is why "the backend is up" cannot be
+//! quietly substituted for "the backend can act".
+//!
+//! **The second half is a property of this route, not of the [`Health`] type.**
+//! `crate::health::assess` is crate-private precisely because it cannot make
+//! that check — it sees no process — and review obtained a `Working` verdict
+//! from it with nothing running. Nor is either half proof against a caller
+//! that fabricates a dispatch: `Dispatch` and `Completion` are public enums
+//! with public payloads, so a `Dispatched(Ok(..))` that never happened is a
+//! value anyone can write. This is a tightening against mistakes. See
+//! [`crate::health`]'s header.
 //!
 //! # Why the invalidation cannot be skipped
 //!
@@ -154,14 +165,15 @@ impl Supervisor {
 
     /// The lifecycle verdict, with **no probe involved**.
     ///
-    /// It can return exactly three of [`Health`]'s five arms --
+    /// It returns exactly three of [`Health`]'s five arms --
     /// [`Health::NotStarted`], [`Health::Started`] and [`Health::Exited`] --
-    /// and **there is no path through it to [`Health::Working`]**. That is the
-    /// separation made structural: the lifecycle half cannot produce a working
-    /// verdict however it is called, because it has no [`ProbeEvidence`] and
-    /// no way to make one. Moving past `Started` requires
-    /// [`Supervisor::assess`], which requires a dispatch, which requires the
-    /// backend to have answered.
+    /// and **this function never returns [`Health::Working`]**: it is handed no
+    /// [`ProbeEvidence`] and constructs none, so there is nothing for it to
+    /// return one from. That is a statement about this function's three
+    /// literal return values, which is all it was ever entitled to be; an
+    /// earlier draft phrased it as "no path to `Working`", which reads as a
+    /// claim about the *type* and is false — see [`crate::health`]'s header.
+    /// Moving past `Started` requires [`Supervisor::assess`].
     ///
     /// [`ProbeEvidence`]: tunnel_cua::capability::ProbeEvidence
     #[must_use]
@@ -176,9 +188,17 @@ impl Supervisor {
 
     /// Fold a probe exchange into a verdict.
     ///
+    /// **The public route, and the only one that checks the lifecycle.**
     /// Returns [`Health::Exited`] whatever the probe said if the process is
     /// gone: a probe answered by something other than the supervised process
-    /// must not report the supervised process as working.
+    /// -- a stale reply, or a different process that took the port -- must not
+    /// report the supervised process as working. `crate::health::assess` makes
+    /// no such check and is crate-private for that reason.
+    ///
+    /// It does **not** establish that the exchange really happened; the
+    /// `dispatch` argument is whatever the caller passes. See
+    /// [`crate::health`]'s header for what the evidence type does and does not
+    /// establish.
     #[must_use]
     pub fn assess(
         &self,

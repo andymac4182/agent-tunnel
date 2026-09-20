@@ -109,32 +109,71 @@ fn supervised_hanging(workspace: &Path, hang: Option<&str>) -> BackendProcess {
 /// Eight of them survived a full guard run before this tracked the helper, and
 /// a harness that leaks processes when its own guards are defeated is a harness
 /// that leaks processes on every red.
-struct PidGuard(Vec<u32>);
+struct PidGuard {
+    pids: Vec<u32>,
+    /// Workspaces whose `helper.pid` is re-read **at drop**.
+    ///
+    /// **This is the half that survives a panic before any explicit
+    /// registration.** Every `watch` call in this file sits after
+    /// `start().await.expect(..)`, so an `Err` from `start` panics with
+    /// nothing registered — the same leak class as the eight survivors, on the
+    /// one path the earlier fix left open. Normally the supervisor's own
+    /// kill-and-reap on a failed start cleans up, but the helper is a
+    /// **grandchild** and is only reached because that kill is a *group* kill
+    /// — and the `m5c4` suite exists to defeat exactly the group-kill and
+    /// in-group guards. Reading the file at drop needs no earlier call to have
+    /// happened.
+    workspaces: Vec<PathBuf>,
+}
 
 impl PidGuard {
     fn new() -> Self {
-        Self(Vec::new())
+        Self {
+            pids: Vec::new(),
+            workspaces: Vec::new(),
+        }
     }
 
     fn watch(&mut self, pid: u32) {
-        self.0.push(pid);
+        self.pids.push(pid);
+    }
+
+    /// Re-read this workspace's `helper.pid` at drop, whatever else happens.
+    ///
+    /// Registered **before** the backend is started, so a start that fails —
+    /// or an assertion that panics before any explicit `watch` — still cleans
+    /// up whatever helper got as far as publishing a pid.
+    fn watch_workspace(&mut self, workspace: &Path) {
+        self.workspaces.push(workspace.to_path_buf());
     }
 
     /// Also track the in-group helper the supervised backend started, reading
-    /// the pid it published. A helper that never published one is not tracked
-    /// and cannot be: there is no pid to kill.
+    /// the pid it published now rather than at drop.
+    ///
+    /// Kept alongside [`PidGuard::watch_workspace`] rather than replaced by
+    /// it: this one **waits** for the pid to appear, so it closes the window in
+    /// which a helper exists and has not yet published, which a drop-time read
+    /// would miss.
     async fn watch_helper(&mut self, workspace: &Path) {
         let published =
             tunnel_cua_fixture::process::read_published(&workspace.join(HELPER_PID_FILE)).await;
         if let Ok(pid) = published.parse::<u32>() {
-            self.0.push(pid);
+            self.pids.push(pid);
         }
     }
 }
 
 impl Drop for PidGuard {
     fn drop(&mut self) {
-        for pid in &self.0 {
+        let mut pids = self.pids.clone();
+        for workspace in &self.workspaces {
+            let published =
+                std::fs::read_to_string(workspace.join(HELPER_PID_FILE)).unwrap_or_default();
+            if let Ok(pid) = published.trim().parse::<u32>() {
+                pids.push(pid);
+            }
+        }
+        for pid in pids {
             let _ = std::process::Command::new("/bin/kill")
                 .args(["-9", &pid.to_string()])
                 .stderr(std::process::Stdio::null())
@@ -242,6 +281,7 @@ async fn capture_then_lease(facade: &SessionFacade) -> (tunnel_cua::lease::Lease
 async fn a_supervised_backend_starts_on_loopback_and_is_not_working_until_probed() {
     let workspace = tempfile::tempdir().expect("workspace");
     let mut guard = PidGuard::new();
+    guard.watch_workspace(workspace.path());
     let mut supervisor = Supervisor::new(supervised(workspace.path()));
 
     assert_eq!(supervisor.health(), Health::NotStarted);
@@ -286,6 +326,7 @@ async fn a_describe_can_never_report_a_running_backend_as_working() {
     // still refused as a probe.
     let workspace = tempfile::tempdir().expect("workspace");
     let mut guard = PidGuard::new();
+    guard.watch_workspace(workspace.path());
     let mut supervisor = Supervisor::new(supervised(workspace.path()));
     let endpoint = supervisor.start().await.expect("it started");
     guard.watch(supervisor.pid().expect("a pid"));
@@ -339,6 +380,7 @@ async fn a_restart_mid_operation_is_unknown_and_the_click_does_not_land_twice() 
 
     // The backend hangs on `left_click`: it records the effect and then never
     // answers, which is the hung backend a supervisor exists to restart.
+    guard.watch_workspace(workspace.path());
     let mut supervisor = Supervisor::new(supervised_hanging(workspace.path(), Some("left_click")));
     let endpoint = supervisor.start().await.expect("it started");
     guard.watch(supervisor.pid().expect("a pid"));
@@ -389,8 +431,18 @@ async fn a_restart_mid_operation_is_unknown_and_the_click_does_not_land_twice() 
         !outcome.retry_is_safe_for(Operation::Click),
         "an input operation that reached the backend is never retryable: {outcome:?}"
     );
-    assert!(
-        matches!(outcome, Dispatch::Dispatched(Completion::Unknown(_))),
+    // **The reason, not just the arm.** `matches!(.., Unknown(_))` cannot tell
+    // `TransportLost` from `BackendRestarted`, and this branch produces the
+    // former: `restart_outcome` has no production caller yet (M5-C10), so what
+    // ends this exchange is the transport noticing the connection die, not the
+    // supervisor naming the restart. Asserting the exact reason keeps the test
+    // honest about which mechanism it measured -- and will fail loudly, rather
+    // than pass quietly, on the day M5-C10 wires the other one in.
+    assert_eq!(
+        outcome,
+        Dispatch::Dispatched(Completion::Unknown(
+            tunnel_cua::outcome::UnknownReason::TransportLost
+        )),
         "got {outcome:?}"
     );
 
@@ -416,12 +468,17 @@ async fn a_restart_mid_operation_is_unknown_and_the_click_does_not_land_twice() 
             LIMIT,
         )
         .await;
-    assert!(
-        matches!(
-            retried,
-            Dispatch::NotDispatched(NotDispatched::InputAuthority(InputRefusal::Lease(_)))
-        ),
-        "the retry is refused above the dispatch boundary: {retried:?}"
+    assert_eq!(
+        retried,
+        Dispatch::NotDispatched(NotDispatched::InputAuthority(InputRefusal::Lease(
+            tunnel_cua::lease::LeaseRefusal::NotHeld
+        ))),
+        // **The exact refusal, not any lease refusal.** `NotHeld` is the one
+        // that means the restart dropped the holding; `HeldByAnotherSession`
+        // or `GrantRevoked` would each mean something else entirely happened,
+        // and a wildcard would report all three as this test passing.
+        "the retry is refused above the dispatch boundary, because the restart \
+         dropped the lease: {retried:?}"
     );
 
     // **The effect count, read from the journal, across both generations.**
@@ -469,6 +526,7 @@ async fn a_capture_identity_from_before_a_restart_is_unknown_afterwards() {
     let state = DeviceState::new();
     let desktop = TargetSession::new("desktop-0");
 
+    guard.watch_workspace(workspace.path());
     let mut supervisor = Supervisor::new(supervised(workspace.path()));
     let endpoint = supervisor.start().await.expect("it started");
     guard.watch(supervisor.pid().expect("a pid"));
@@ -523,6 +581,7 @@ async fn a_capture_taken_after_a_restart_never_reuses_a_pre_restart_identity() {
     let state = DeviceState::new();
     let desktop = TargetSession::new("desktop-0");
 
+    guard.watch_workspace(workspace.path());
     let mut supervisor = Supervisor::new(supervised(workspace.path()));
     let endpoint = supervisor.start().await.expect("it started");
     guard.watch(supervisor.pid().expect("a pid"));
@@ -650,6 +709,41 @@ async fn the_journal_records_the_same_effects_the_in_memory_ledger_does() {
         "synthetic".len()
     );
     backend.stop();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_helper_pid_is_published_before_the_address() {
+    // **The ordering `PidGuard::watch_helper` silently depends on.** It is
+    // called right after `start()` returns, which happens as soon as the
+    // address appears; if the helper published later, the read would time out
+    // and the helper would go untracked -- restoring exactly the leak the
+    // guard exists to close, with no test noticing. Reordering the two lines
+    // in `run_backend` must therefore turn something red, and this is it.
+    let workspace = tempfile::tempdir().expect("workspace");
+    let mut guard = PidGuard::new();
+    guard.watch_workspace(workspace.path());
+    let mut supervisor = Supervisor::new(supervised(workspace.path()));
+    supervisor.start().await.expect("it started");
+    guard.watch(supervisor.pid().expect("a pid"));
+
+    // `start()` has returned, so the address is published. The helper's pid
+    // must already be there -- read it without waiting.
+    let helper = std::fs::read_to_string(workspace.path().join(HELPER_PID_FILE))
+        .unwrap_or_default()
+        .trim()
+        .to_owned();
+    assert!(
+        helper.parse::<u32>().is_ok(),
+        "the helper pid must be published before the address, so a supervisor \
+         that has an endpoint has a helper to clean up; found {helper:?}"
+    );
+
+    supervisor.stop(state_for_stop().as_ref()).await;
+}
+
+/// A throwaway device state, for a stop whose invalidation is not under test.
+fn state_for_stop() -> Arc<DeviceState> {
+    DeviceState::new()
 }
 
 /// Wait, bounded, for the journal to record `wanted` clicks. Returns the count

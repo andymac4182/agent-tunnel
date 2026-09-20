@@ -20,7 +20,7 @@ tunnel-cua = { path = "../tunnel-cua" }
 # containment -- the group kill happening at all when this process is
 # `SIGKILL`ed -- and deliberately **not** the **reach** half. For a CUA backend
 # that distinction is the difference between a leaked helper and a process that
-# can type on a real desktop, so `docs/cua.md` states it in shipped
+# can type on a real desktop, so `docs/integrations.md` states it in shipped
 # documentation. See `docs/tasks.md` M3-09, M8-C07 and M5-C08.
 tunnel-deadman = { path = "../tunnel-deadman" }
 

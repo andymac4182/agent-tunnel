@@ -13,12 +13,21 @@
 //!   *works*.
 //! * [`health`] is **health**, and it is a probe rather than a config echo.
 //!   Its only route to a working verdict runs through
-//!   [`tunnel_cua::capability::ProbeEvidence`], which is constructible solely
-//!   from a **dispatched, succeeded, read-only, OS-gated** operation.
+//!   [`tunnel_cua::capability::ProbeEvidence`], which requires a
+//!   **read-only, OS-gated** operation paired with a dispatched success.
 //!
-//! [`supervisor`] joins them, and the join is one-directional: a running
-//! process can never be reported as working, while a working verdict
-//! necessarily implies a running process.
+//! [`supervisor`] joins them, and on the [`Supervisor`] route the join is
+//! one-directional: a running process is never *reported* as working, and a
+//! working verdict there implies a running process, because
+//! [`Supervisor::assess`] refuses one for a backend that has gone.
+//!
+//! **What that is not.** It is a tightening against mistakes, not a proof
+//! against fabrication. `Dispatch` and `Completion` are public enums with
+//! public payloads, so a caller can write down a dispatched success that never
+//! happened and obtain `Health::Working` from it — review compiled exactly that
+//! counterexample against an earlier draft of this crate, which claimed the
+//! stronger thing. See [`health`]'s header for the half that does hold, which
+//! is the half the config-echo trap is actually about.
 //!
 //! # Why the health half cannot be an echo
 //!

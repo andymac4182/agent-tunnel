@@ -326,10 +326,13 @@ configured endpoint: it starts it, stops it, restarts it, and probes whether it
 can act. `crates/tunnel-cua-export` is that supervisor, and the three things it
 does are separated on purpose.
 
-**Lifecycle.** The backend is started in its own process group, and every end of
-its life the device lives to see signals that whole group with `SIGKILL`, so a
-wrapper (`uvx`, a shell script, a Python launcher) cannot leave the real backend
-or its workers running. The backend publishes the loopback address it bound and
+**Lifecycle.** The backend is started in its own process group. On every end of
+its life that the device lives to see, the device signals that whole group with
+`SIGKILL`, so a wrapper (`uvx`, a shell script, a Python launcher) cannot leave
+the real backend or its workers running. One of the two signals is sent after
+the leader has been reaped — on a natural exit it is the only one — so it
+targets a group id that is in principle recyclable; that residue is recorded
+rather than claimed away. The backend publishes the loopback address it bound and
 the device reads it back and puts it through the loopback check, so the policy is
 enforced against the process that is actually listening rather than against a
 configured number; a backend that publishes a routable or wildcard address is

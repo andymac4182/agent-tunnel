@@ -1300,25 +1300,6 @@ CASES_C4: list[tuple[str, list[Edit], bool]] = [
         False,
     ),
     (
-        # A probe answered by something other than the supervised process must
-        # not report the supervised process as working. Without this a
-        # succeeded probe against a *dead* backend -- a stale answer, or a
-        # different process that took the port -- reads as a working one.
-        "a probe cannot report a backend that is gone as working",
-        [
-            (
-                EXPORT_SUPERVISOR,
-                """        let lifecycle = self.health();
-        if !lifecycle.process_is_running() {
-            return lifecycle;
-        }
-""",
-                "",
-            )
-        ],
-        False,
-    ),
-    (
         # Only `Working` permits a dispatch. Widen it to `Started` and a
         # backend that has proven nothing is allowed to act.
         "nothing but probe evidence permits an operation to be dispatched",
@@ -1388,6 +1369,49 @@ CASES_C4: list[tuple[str, list[Edit], bool]] = [
     }
     let spawned = spawned
         .arg(HELPER_MODE)""",
+            )
+        ],
+        False,
+    ),
+    (
+        # The publish ordering `PidGuard::watch_helper` depends on. Publish the
+        # address first and a supervisor that has an endpoint may have no
+        # helper pid yet, so the guard's bounded read times out, the helper
+        # goes untracked, and the leak the guard exists to close is silently
+        # restored.
+        "the helper pid is published before the address a supervisor waits on",
+        [
+            (
+                FIXTURE_PROCESS,
+                """    let _ = read_published(helper_pid_file).await;
+    let Ok(backend) = FixtureBackend::start_with(Ledger::with_journal(journal.to_path_buf())).await
+    else {
+        return;
+    };""",
+                """    let Ok(backend) = FixtureBackend::start_with(Ledger::with_journal(journal.to_path_buf())).await
+    else {
+        return;
+    };""",
+            )
+        ],
+        False,
+    ),
+    (
+        # The supervisor route's lifecycle check. Without it a succeeded probe
+        # answered by something other than the supervised process -- a stale
+        # reply, or whatever took the port -- reports a dead backend as
+        # working. This is the public route; the free classifier is
+        # crate-private precisely because it cannot make this check.
+        "a probe cannot report a backend that is gone as working",
+        [
+            (
+                EXPORT_SUPERVISOR,
+                """        let lifecycle = self.health();
+        if !lifecycle.process_is_running() {
+            return lifecycle;
+        }
+""",
+                "",
             )
         ],
         False,
