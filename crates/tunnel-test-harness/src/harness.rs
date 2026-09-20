@@ -730,6 +730,22 @@ pub const FS_GATE_SERVICES: &[FsGateService] = &[
         host_supported: true,
     },
     FsGateService {
+        // The export a 9P session holds a **mutation** on while the
+        // connector's real operating-system process is killed, and which a
+        // replacement session then re-opens against the replacement process.
+        // Its own export for the reason every row above is one, and for one
+        // more: this gate's journal is the export's own host directory, and an
+        // export shared with another case would let that case's effects be
+        // counted as this one's.  It is also the only fs gate export that
+        // needs `fs:write` — the event's whole point is an *ambiguous
+        // mutation*, and a read cannot be ambiguous.
+        label: "process-restart",
+        display_name: "Synthetic filesystem export whose connector process is killed mid-mutation",
+        operations: &["fs:connect", "fs:read", "fs:write", "fs:list"],
+        case_sensitivity: Some("insensitive-preserving"),
+        host_supported: true,
+    },
+    FsGateService {
         label: "unsupported-host",
         display_name: "Synthetic filesystem export on an unsupported host",
         operations: &["fs:connect", "fs:read", "fs:list"],
