@@ -2019,6 +2019,68 @@ async fn main() -> ExitCode {
                 )),
             }
         }
+        [command] if command == "verify-m4-fs-epoch-change" => {
+            match tokio::time::timeout(
+                Duration::from_secs(360),
+                tunnel_test_harness::production_cluster::verify_fs_epoch_change(),
+            )
+            .await
+            {
+                Ok(result) => result.and_then(|evidence| {
+                    // Re-validate at the command boundary so a validator
+                    // regression cannot silently pass the command.
+                    tunnel_test_harness::production_cluster::validate_fs_epoch_change_evidence(
+                        &evidence,
+                    )?;
+                    println!(
+                        "M4 filesystem control-epoch change passed: relays={} owner={} subprotocol={} msize={} dialect={} prefix_bytes={} stream_id={} emitted={}->{} recv_contiguous={}->{} request_outstanding_at_change={} change_polls={} held_tag={} epoch={}->{} device_epoch={}->{} session_id_changed={} owner_released_between={} second_connector_active={} pending_call_closed={} pending_call_close_code={:?} pending_call_answered={} held_stream_deregistered={} pre_attach_probe_close_code={:?} pre_attach_probe_answered={} second_session_msize={} stale_file_fid_refused={} stale_file_fid_errno={:?} stale_attach_fid_refused={} stale_attach_fid_errno={:?} second_session_attached={} second_session_bytes={}/{} second_session_checksum_matches={} second_session_messages={} second_session_getattr_size={} attach_count={}",
+                        evidence.relay_count,
+                        evidence.owner_node,
+                        evidence.selected_subprotocol,
+                        evidence.negotiated_msize,
+                        evidence.negotiated_dialect,
+                        evidence.prefix_bytes,
+                        evidence.change.stream_id,
+                        evidence.change.emitted_before,
+                        evidence.change.emitted_at_change,
+                        evidence.change.recv_contiguous_before,
+                        evidence.change.recv_contiguous_at_change,
+                        evidence.request_outstanding_at_change,
+                        evidence.change_polls,
+                        evidence.held_tag,
+                        evidence.epoch_before,
+                        evidence.epoch_after,
+                        evidence.device_epoch_before,
+                        evidence.device_epoch_after,
+                        evidence.session_id_before != evidence.session_id_after,
+                        evidence.owner_released_between,
+                        evidence.second_connector_active,
+                        evidence.pending_call_closed,
+                        evidence.pending_call_close_code,
+                        evidence.pending_call_answered,
+                        evidence.held_stream_deregistered,
+                        evidence.pre_attach_probe_close_code,
+                        evidence.pre_attach_probe_answered,
+                        evidence.second_session_msize,
+                        evidence.stale_file_fid_refused,
+                        evidence.stale_file_fid_errno,
+                        evidence.stale_attach_fid_refused,
+                        evidence.stale_attach_fid_errno,
+                        evidence.second_session_attached,
+                        evidence.second_session_bytes,
+                        evidence.second_session_expected_bytes,
+                        evidence.second_session_checksum_matches,
+                        evidence.second_session_messages,
+                        evidence.second_session_getattr_size,
+                        evidence.attach_count,
+                    );
+                    Ok(())
+                }),
+                Err(_) => Err(HarnessError::Timeout(
+                    "verify-m4-fs-epoch-change exceeded its bounded deadline".into(),
+                )),
+            }
+        }
         [command] if command == "verify-m4-fs-client-e2e" => {
             match tokio::time::timeout(
                 Duration::from_secs(600),

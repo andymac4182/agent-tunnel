@@ -716,6 +716,20 @@ pub const FS_GATE_SERVICES: &[FsGateService] = &[
         host_supported: true,
     },
     FsGateService {
+        // The export a 9P session holds while the device's **control session**
+        // is replaced and the owner claim takes a strictly greater epoch, and
+        // which a **third** consumer session then re-opens under that new
+        // epoch.  Its own export for the same reason `consumer-loss` above is
+        // one: the gate turns on the replacement session finding the earlier
+        // session's fid numbers unbound, and a shared grant would let a fid
+        // answering here be credited to another case's session.
+        label: "epoch-change",
+        display_name: "Synthetic filesystem export held across a control-epoch change",
+        operations: &["fs:connect", "fs:read", "fs:list"],
+        case_sensitivity: Some("insensitive-preserving"),
+        host_supported: true,
+    },
+    FsGateService {
         label: "unsupported-host",
         display_name: "Synthetic filesystem export on an unsupported host",
         operations: &["fs:connect", "fs:read", "fs:list"],

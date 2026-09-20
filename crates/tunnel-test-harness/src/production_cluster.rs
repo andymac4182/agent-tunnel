@@ -140,6 +140,11 @@ pub use http_forward_real_path::{
 /// decode with gate 3's own `decode_exact`, and one copy of that is better than
 /// two that could drift apart.
 mod fs_consumer_loss;
+/// Gate 9's module: the same construction as gate 8's, held across a
+/// **control-epoch change** instead of a consumer loss.  It is its own module
+/// rather than a case inside gate 8 because the event it drives replaces the
+/// device connector, which gate 8's fixture deliberately keeps alive.
+mod fs_epoch_change;
 mod fs_real_path;
 mod fs_rotation;
 mod fs_wire;
@@ -147,6 +152,10 @@ mod fs_write_path;
 pub use fs_consumer_loss::{
     FsConsumerLossEvidence, LossObservation, validate_fs_consumer_loss_evidence,
     verify as verify_fs_consumer_loss,
+};
+pub use fs_epoch_change::{
+    EpochChangeObservation, FsEpochChangeEvidence, validate_fs_epoch_change_evidence,
+    verify as verify_fs_epoch_change,
 };
 pub use fs_real_path::{
     FsRealPathEvidence, validate_fs_real_path_evidence, verify as verify_fs_real_path,
