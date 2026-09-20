@@ -39,4 +39,7 @@ gate "M4 filesystem gate 7: a live 9P session across a real scheduled rotation, 
 gate "M4 filesystem gate 8: a 9P session lost with a request outstanding, and a replacement session that restores no fids" \
   cargo run --locked -p tunnel-test-harness -- verify-m4-fs-consumer-loss
 
+gate "M4 filesystem gate 9: a 9P session held across a real control-epoch change, with the exchange in flight" \
+  cargo run --locked -p tunnel-test-harness -- verify-m4-fs-epoch-change
+
 echo "m4-harness-verify: implemented M4 harness suite passed" >&2

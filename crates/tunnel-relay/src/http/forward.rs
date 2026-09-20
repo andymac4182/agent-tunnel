@@ -402,6 +402,9 @@ pub(crate) fn actor_carriers(
     let HttpStreamRegistration {
         base,
         mut peer_reset,
+        // http-forward states its own terminal reasons through RESET and
+        // RESULT_STATUS; it has no close code to derive from a teardown cause.
+        terminal: _,
         result_status,
         freeze,
     } = registration;

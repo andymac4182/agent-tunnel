@@ -72,6 +72,7 @@ use tunnel_fs_provider::{Record, RecordDecoder, default_limits};
 
 use tokio_util::sync::CancellationToken;
 
+use crate::actor::StreamTeardownCause;
 use crate::http::forward::actor_carriers;
 use crate::routing::{OwnerRoute, OwnerScope};
 use tunnel_http_bridge::{CarrierEvent, CarrierReader as _, CarrierWriter as _};
@@ -707,6 +708,12 @@ async fn pump(
     // this the consumer would see a close with no code where the contract
     // requires 1008.
     let mut peer_reset = registration.peer_reset.clone();
+    // Why the actor tore this stream down, on the same out-of-band footing
+    // as `peer_reset` above and for the same reason: a stream the actor
+    // closes ends this loop through `closed.cancelled()`, so a cause
+    // published in that same turn has to be readable here rather than
+    // delivered in order.
+    let mut terminal_cause = registration.terminal.clone();
     let (mut writer, mut reader, signal_task, _freeze) = actor_carriers(&handle, registration);
 
     let (mut sink, mut stream) = socket.split();
@@ -836,6 +843,41 @@ async fn pump(
         && let Some(observed) = peer_reset.borrow_and_update().as_ref()
     {
         close_with = Some(session_close_for_reset(Some(observed.reason)));
+    }
+    // The actor tore this stream down and said **why**.
+    //
+    // `docs/protocol.md` requires that across a control-session reconnect the
+    // profile "terminate that filesystem session, **fail pending calls
+    // explicitly** and create a fresh 9P session". A close with no code is a
+    // termination that is not explicit: the caller cannot tell a device that
+    // went away from a relay that broke, and an outstanding tag's outcome is
+    // left unnamed. That was M4-28.
+    //
+    // The code is derived from the **cause**, never from the bare fact that
+    // the stream was cancelled. `close_session` is reached from roughly thirty
+    // distinct reasons — relay shutdown, an authority outage, an owner fence,
+    // a rotation or recovery failure, a device framing fault — and almost none
+    // of them mean the device went away. Keying off cancellation alone would
+    // tell a consumer "the device is not connected" when the relay was what
+    // stopped, which is the error class M4-25 was filed for. So the actor
+    // publishes a cause only where it can name one accurately, and every other
+    // reason arrives here as `None` and keeps exactly the close it had before.
+    //
+    // `DeviceOffline` is the code for a device that went away on its own
+    // documented grounds: it is "the code the contract reserves for shutdown,
+    // because the export's backend is the thing that went away", while 1011
+    // "would report it as an unexpected relay failure" when the relay is
+    // healthy and the device is not.
+    //
+    // This runs **after** the peer-reset resolution above, so a revocation
+    // still closes 1008 (M4-25) rather than being downgraded, and before the
+    // framing verdict below, which outranks everything.
+    if close_with.is_none()
+        && let Some(cause) = *terminal_cause.borrow_and_update()
+    {
+        close_with = Some(match cause {
+            StreamTeardownCause::DeviceGone => SessionErrorCode::DeviceOffline,
+        });
     }
     // A framing violation the consumer committed wins over every other reason
     // this loop stopped: the close code is what tells the peer its own frame was

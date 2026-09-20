@@ -1610,9 +1610,9 @@ revoked filesystem session without the contractual `1008`, so
 this gate's own evidence touches revocation.
 
 **What this gate does not prove.** Only **rotation**, of M4-06's five transport
-events. Consumer loss is now gate 8 below; epoch change and device process
-restart are still uncovered on the filesystem path, and revocation is covered
-by gate 4 and not here. The session runs against the **owning** relay, because
+events. Consumer loss is now gate 8 below and epoch change gate 9; device
+process restart is still uncovered on the filesystem path, and revocation is
+covered by gate 4 and not here. The session runs against the **owning** relay, because
 gate 4 admits a filesystem session only there, so the rotation crossed the
 device data socket and not the relay-to-relay peer hop. Nothing here is driven
 by the shared TypeScript client. Nothing here covers a **write** spanning a
@@ -1682,14 +1682,117 @@ pre-attach probe closed with **1002**, **786,432 of 786,432** bytes over **13**
 tip agreed on them, but nothing depends on that.
 
 **What this gate does not prove.** Only **consumer loss**, of the three events
-M4-06 still named as uncovered. **Epoch change** and **device process restart**
-remain uncovered on the filesystem path. The loss is of the consumer's own
+M4-06 still named as uncovered. Epoch change is now gate 9 below; **device
+process restart** remains uncovered on the filesystem path. The loss is of the consumer's own
 WebSocket, so nothing here faults the device carrier or the control socket, and
 the "data-only recovery" clause of the same-owner contract — a replacement of a
 *failed* data socket — is still untested. The session runs against the
 **owning** relay, because gate 4 admits a filesystem session only there.
 Nothing here is driven by the shared TypeScript client, and the outstanding
 operation is a **read**: no write and no `Tflush` has been lost mid-exchange.
+
+### Implementation gate 9: a 9P session across a control-epoch change (`verify-m4-fs-epoch-change`)
+
+The gate is `verify-m4-fs-epoch-change`, registered in
+[`scripts/m4-harness-verify.sh`](../scripts/m4-harness-verify.sh) beside gates
+4, 5, 6, 7 and 8 and implemented in
+`crates/tunnel-test-harness/src/production_cluster/fs_epoch_change.rs`. It runs
+on the same real three-relay production cluster, the same authoritative Redis
+catalog and the same consumer WSS sockets, on its own seeded `epoch-change`
+export so that a fid answering in the replacement session cannot be credited to
+another case's grant.
+
+It covers M4-06's **control-epoch change** clause.
+[filesystem-api.md](filesystem-api.md) names that event in the same sentence as
+gate 8's — "Consumer loss, control-epoch change, grant expiry, or process
+restart invalidates the filesystem session" — and [protocol.md](protocol.md)
+says what "invalidates" obliges: across a **control-session reconnect** the
+profile "restores no fids … terminate that filesystem session, fail pending
+calls explicitly and create a fresh 9P session". The **same-owner** sentence
+licenses retention for exactly one event, replacement of a *failed data socket*
+while **the same control owner** is retained, and a control-session reconnect
+is the event that destroys that qualifier. So this gate, like gate 8 and unlike
+gate 7, proves a fid does **not** survive.
+
+**The epoch is genuinely acquired, not simulated.** Nothing here writes an
+epoch number. `tunnel-client` has no automatic reconnect — its documented
+policy is to "close control and data and require a fresh session" — so the gate
+stops the connector, waits for the authoritative catalog to report the owner
+**released**, and starts a second connector on the same device identity and the
+same export. Both the catalog's owner token and the device's own `WELCOME`
+must show a strictly greater epoch, and the two must agree. That second
+assertion is what separates an epoch change the device **sees** from one it
+does not: a revocation or an owner-lease loss advances the durable epoch while
+the device's live session keeps its stale one and is closed with a reason
+rather than a new epoch, which is a different contract and not this gate.
+
+**The change is concurrent with a 9P exchange, not sequential with it.** The
+construction is gate 8's and is proven from the owner's own per-stream cursors
+rather than from timing: with the device socket's connector→relay direction
+paused, the cursors are fixed *while paused*, one `Tread` is sent whose reply is
+never read, and the control session is replaced at the instant the owner shows
+the emit cursor advanced while the receive cursor has not.
+
+**The assertions are on the operation.** The pending call is **failed
+explicitly** with a close code rather than left hanging or answered; the held
+stream is deregistered at the owner; a replacement session naming the earlier
+file fid *before* attaching is closed with the profile's protocol violation;
+a replacement session that *has* attached, on a root fid of its own, finds both
+reused fid numbers refused with the errno for a fid not allocated in this
+session; and that session then reads the whole file back on its own fid with an
+exact checksum, so the refusals are fid scoping and neither a broken export nor
+a replacement connector that never served it.
+
+**This gate found a defect, recorded as M4-28.** "Fail pending calls
+explicitly" is the one obligation gate 8 could not test, because its consumer
+was gone and had nobody to be failed to. Here the consumer is still connected,
+and it was receiving a close with **no code at all**: `close_session` drains a
+session's streams by cancelling `closed`, which carries no reset reason, so the
+consumer pump sent `Close(None)`. That is the sibling of **M4-25**, which fixed
+the same codeless close for a revoked grant.
+
+The fix derives the code from the **cause**, not from the fact of
+cancellation — which is the distinction review forced, and the same one M4-25
+turned on. `close_session` is reached from roughly **thirty** reasons, and
+almost none of them mean the device went away: `SHUTDOWN` fences every session
+when the *relay* stops, and an authority outage, an owner fence, a rotation or
+recovery failure and a device framing fault are each something else. Keying off
+cancellation alone would have told those consumers "the device is not
+connected" on exactly the opposite ground to the one 1012 is justified by. So
+the actor publishes a typed `StreamTeardownCause` whose only variant is
+`DeviceGone`, published only for `CONTROL_CLOSED` — the single caller that
+means the device's own control session ended — and every other reason publishes
+nothing and keeps the close it already had. Publication precedes
+`closed.cancel()`, the same ordering invariant M4-25 established; the
+resolution still runs after the peer-reset resolution so a revocation closes
+1008, and before the framing verdict which outranks everything.
+
+**Observed, not pinned.** One run at this tip: emit cursor **7 → 8** against a
+receive cursor held at **10**, epoch **1 → 2** in the catalog and **1 → 2** in
+the device's own `WELCOME`, the held call closed with **1012**, both stale fids
+refused with errno **22**, the pre-attach probe closed with **1002**,
+**786,432 of 786,432** bytes over **13** `Rread` messages with an exact
+checksum, and exactly **two** `Tattach` across the run. The gate asserts the
+*inequalities* and the codes *derived* from `FsErrorCode::Einval` and
+`SessionErrorCode::close_code()`, never these figures.
+
+**Guards.** `python3 scripts/fs-guard-deletion.py --suite gate9-epoch-change`
+is **28 of 28** red at this tip, with **one** further case reported as
+`DOCUMENTED GREEN` and never counted as a red test: "the relay had dispatched a
+record toward the device", shared by name with gate 8 and subsumed by the
+composite in-flight rule beside it for the same reason.
+
+**What this gate does not prove.** Only **control-epoch change**, of the two
+events M4-06 still named as uncovered. **Device process restart remains
+uncovered**: it needs the append-only journal pattern from M5 chunk 4, because
+an in-memory ledger dies with the process and makes "the count did not
+increase" true of nothing. The operation held across the change is a **read**:
+no write and no `Tflush` has been held across an epoch change. The session runs
+against the **owning** relay, because gate 4 admits a filesystem session only
+there, so nothing here crosses the relay-to-relay peer hop. Nothing here is
+driven by the shared TypeScript client. The `CarrierEvent::Fin` / `CarrierEvent::Closed`
+sibling of the path M4-28 fixed is **not** changed and **not** measured; it is
+recorded on that row rather than altered without evidence.
 
 ### Shared dataset and native semantics
 
