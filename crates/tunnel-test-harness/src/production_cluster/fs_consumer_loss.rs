@@ -169,7 +169,14 @@ const SECOND_ROOT_FID: u32 = 5;
 /// the 9P profile's 1002.  This is the "require fresh version/attach" half of
 /// the contract clause, and it is checked **before** the fid table is, which
 /// is why the fid probes below have to run on an attached session.
-const PROTOCOL_VIOLATION_CLOSE: u16 = 1002;
+const PROTOCOL_VIOLATION_CLOSE: u16 =
+    match tunnel_fs_core::SessionErrorCode::ProtocolViolation.close_code() {
+        Some(code) => code,
+        // Unreachable: `close_code()` returns `Some` for this variant. Derived
+        // rather than pinned so the profile's mapping stays the single source,
+        // exactly as `UNKNOWN_FID_ERRNO` above derives its errno.
+        None => panic!("ProtocolViolation must carry a close code"),
+    };
 
 /// How long the owner claim may take to land in the catalog.
 const OWNER_WAIT: Duration = Duration::from_secs(30);

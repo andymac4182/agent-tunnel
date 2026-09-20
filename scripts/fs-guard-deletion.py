@@ -3020,9 +3020,9 @@ GATE7_ROTATION_CASES: list[tuple[str, list[Edit]]] = [
 # reconnect, so a rule whose deletion leaves the table green would be a rule
 # that clause never rested on.
 #
-# **One of the twenty is masked, and this says so rather than hiding it.**
+# **One of the twenty-three is masked, and this says so rather than hiding it.**
 # "the relay had dispatched a record toward the device" is **still green** when
-# defeated alone, at 19 of 20 red.  It is not load-bearing on its own because
+# defeated alone, at 22 of 23 red.  It is not load-bearing on its own because
 # the composite rule below it already subsumes it:
 # `request_outstanding_at_loss()` returns false unless `emitted_at_loss >
 # emitted_before` **and** the receive cursor is unmoved, so the composite
