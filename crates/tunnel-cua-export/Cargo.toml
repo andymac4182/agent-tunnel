@@ -1,0 +1,53 @@
+[package]
+name = "tunnel-cua-export"
+description = "Device-side CUA supervision: the backend's lifecycle with a parent-death sentinel, a health probe that must exercise an OS-gated capability, and a restart that invalidates the input lease and every capture identity"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# **Lane A budget, checked rather than asserted.** `tunnel-cua/tests/host_untouched.rs`
+# reads this manifest and refuses anything outside its allowlist. This crate
+# owns processes and a clock; it owns no HTTP client, which is why the health
+# probe is a **trait** the caller implements rather than an exchange written
+# here. That is not only tidiness: a probe implemented in this crate would give
+# it a socket, and the only backend Lane A may speak to is the fixture.
+[dependencies]
+tokio = { version = "1.48", features = ["fs", "io-util", "macros", "process", "rt", "sync", "time"] }
+tunnel-cua = { path = "../tunnel-cua" }
+# The parent-death sentinel. It closes the **trigger** half of process-group
+# containment -- the group kill happening at all when this process is
+# `SIGKILL`ed -- and deliberately **not** the **reach** half. For a CUA backend
+# that distinction is the difference between a leaked helper and a process that
+# can type on a real desktop, so `docs/integrations.md` states it in shipped
+# documentation. See `docs/tasks.md` M3-09, M8-C07 and M5-C08.
+tunnel-deadman = { path = "../tunnel-deadman" }
+
+[target.'cfg(unix)'.dependencies]
+# Safe process-group signalling, exactly as `tunnel-mcp-export` and
+# `tunnel-acp-export` do it, so this crate keeps `forbid(unsafe_code)`.
+rustix = { version = "1.1", default-features = false, features = ["process", "std"] }
+
+# The end-to-end supervision tests live in `tunnel-cua-fixture/tests`, because
+# only the crate that defines the fixture binary can exec it. That is the same
+# arrangement `tunnel-mcp-fixture` and `tunnel-acp-fixture` already use.
+[dev-dependencies]
+# Tests only: a probe's dispatch payload is JSON, and this crate deliberately
+# does not parse one in production -- the health verdict is read from a typed
+# `Dispatch`, never from a body.
+serde_json = "1.0"
+tempfile = "3.21"
+tokio = { version = "1.48", features = [
+    "fs",
+    "io-util",
+    "macros",
+    "process",
+    "rt",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }
+
+[lints]
+workspace = true

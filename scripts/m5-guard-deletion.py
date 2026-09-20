@@ -16,6 +16,19 @@ here:
   carry-forward with its staleness, target and bounds rules, the display-scale
   conversion, the narrower retry rule for operations that synthesise input,
   and the redaction that keeps typed text out of every diagnostic.
+* `m5c4` -- supervising the backend: the parent-death sentinel and its
+  stand-down, the group kill, the restart invalidation of the input lease and
+  the capture identities, the non-reuse of both counters, the classification of
+  an operation in flight across a restart, the probe-not-echo health rule, and
+  the loopback and staleness checks the supervisor applies to the address a
+  backend publishes.
+
+  **It is the one suite here that carries a mandatory pre-build**, because its
+  tests `exec` two binaries from two packages: `tunnel-cua-fixture` and
+  `tunnel-deadman`. See `Suite.build` and task row M3-19. Its second case is
+  defeated in `crates/tunnel-deadman`, a package `cargo test -p
+  tunnel-cua-fixture` builds no binary of, so without the rebuild it would
+  report `still green` for the entire mechanism.
 
 It follows `scripts/acp-guard-deletion.py` and `scripts/fs-guard-deletion.py`,
 **including their refusals, none of which may be removed**:
@@ -68,7 +81,17 @@ MARKER = CRATE / "src" / "marker.rs"
 LEASE = CRATE / "src" / "lease.rs"
 CAPTURE = CRATE / "src" / "capture.rs"
 FIXTURE_LIB = FIXTURE / "src" / "lib.rs"
+FIXTURE_PROCESS = FIXTURE / "src" / "process.rs"
 CLIENT = FIXTURE / "src" / "client.rs"
+
+# Chunk 4.
+EXPORT = REPO / "crates" / "tunnel-cua-export"
+DEADMAN = REPO / "crates" / "tunnel-deadman"
+SUPERVISION = CRATE / "src" / "supervision.rs"
+EXPORT_CHILD = EXPORT / "src" / "child.rs"
+EXPORT_HEALTH = EXPORT / "src" / "health.rs"
+EXPORT_SUPERVISOR = EXPORT / "src" / "supervisor.rs"
+DEADMAN_LIB = DEADMAN / "src" / "lib.rs"
 
 # --no-fail-fast so every red test is named. Without it cargo stops after the
 # first failing binary, and a case witnessed by tests in two binaries reports
@@ -1052,6 +1075,341 @@ CASES_C3: list[tuple[str, list[Edit], bool]] = [
 
 
 
+#: `cargo test -p <pkg>` builds a package's `[[bin]]` as a plain executable
+#: only when that package has integration tests, and it builds **no binary
+#: belonging to another package at all** (M3-19). Chunk 4's tests `exec` both
+#: the fixture binary and the sentinel, so both are rebuilt before every case.
+C4_CARGO_TEST = [
+    "cargo",
+    "test",
+    "-p",
+    "tunnel-cua",
+    "-p",
+    "tunnel-cua-export",
+    "-p",
+    "tunnel-cua-fixture",
+    "--locked",
+    "--no-fail-fast",
+]
+
+C4_BUILD = [
+    "cargo",
+    "build",
+    "--locked",
+    "-p",
+    "tunnel-deadman",
+    "-p",
+    "tunnel-cua-fixture",
+    "--bins",
+]
+
+
+# --------------------------------------------------------------- chunk 4
+#: Supervising the backend. Every rule chunk 4 adds, defeated one at a time.
+#:
+#: Two of these live outside `crates/tunnel-cua*` -- one in
+#: `crates/tunnel-deadman` -- which is why this suite carries `C4_BUILD`.
+CASES_C4: list[tuple[str, list[Edit], bool]] = [
+    # ------------------------------------------------- the sentinel is armed
+    (
+        # Arming at all. Without this the CUA supervisor supervises exactly as
+        # it did before, and the backend's process group survives the device
+        # being SIGKILLed -- for CUA, a process that can still drive a desktop.
+        "every supervised CUA backend is watched by a parent-death sentinel",
+        [
+            (
+                EXPORT_CHILD,
+                "    let deadman = tunnel_deadman::Deadman::arm(pid);",
+                "    let deadman: Option<tunnel_deadman::Deadman> = None;",
+            )
+        ],
+        False,
+    ),
+    (
+        # The whole mechanism, one crate down. The sentinel still starts, still
+        # watches and still exits -- and signals nothing, so the group it was
+        # watching outlives the supervisor. Defeated in `tunnel-deadman`
+        # precisely to exercise the M3-19 rebuild: `cargo test -p
+        # tunnel-cua-fixture` builds no binary of that package, so without
+        # `C4_BUILD` this case reports `still green` for the entire mechanism.
+        "a bare end of file makes the sentinel kill the watched backend's group",
+        [(DEADMAN_LIB, "    kill_group(leader);\n    EXIT_FIRED", "    EXIT_FIRED")],
+        False,
+    ),
+    (
+        # The supervisor's own group kill on the orderly path. Without it the
+        # backend's in-group helper -- the worker that never reads stdin --
+        # outlives the backend it belongs to.
+        "the supervisor signals the backend's whole process group, not only its leader",
+        [
+            (
+                EXPORT_CHILD,
+                """        if kill_group(pid) {
+            supervisor_counters
+                .group_kills
+                .fetch_add(1, Ordering::Relaxed);
+        }""",
+                "",
+            )
+        ],
+        False,
+    ),
+    (
+        # The backend must lead a group of its own. Without this it shares the
+        # device's group, and the group kill above would signal the device.
+        "a supervised backend is started as the leader of its own process group",
+        [(EXPORT_CHILD, "    command.process_group(0);", "")],
+        False,
+    ),
+    # ----------------------------------------------- the restart invalidation
+    (
+        # **The restart contract, half one.** Without the lease invalidation a
+        # consumer keeps exclusive input authority over a backend that no
+        # longer exists, and its retry passes the lease check.
+        "a supervised restart drops every input lease",
+        [
+            (
+                LEASE,
+                """    pub fn invalidate_all(&mut self) -> Vec<TargetSession> {
+        let freed: Vec<TargetSession> = self.held.keys().cloned().collect();
+        self.held.clear();
+        freed
+    }""",
+                """    pub fn invalidate_all(&mut self) -> Vec<TargetSession> {
+        Vec::new()
+    }""",
+            )
+        ],
+        False,
+    ),
+    (
+        # **The restart contract, half two.** Without the capture invalidation
+        # a consumer clicks at coordinates picked from an image the dead
+        # backend produced, on a screen nobody has looked at since.
+        "a supervised restart forgets every capture identity",
+        [
+            (
+                CAPTURE,
+                """    pub fn invalidate_all(&mut self) -> usize {
+        let forgotten = self.by_id.len();
+        self.by_id.clear();
+        self.current.clear();
+        forgotten
+    }""",
+                """    pub fn invalidate_all(&mut self) -> usize {
+        0
+    }""",
+            )
+        ],
+        False,
+    ),
+    (
+        # The monotonic capture counter. Reset it and the first capture after a
+        # restart reissues id 1, so a stale click resolves against a *different
+        # image*, passes the bounds check, and is dispatched at coordinates
+        # nobody picked. This is the failure that looks most like success.
+        "a capture identity is never reissued after a restart",
+        [
+            (
+                CAPTURE,
+                """        let forgotten = self.by_id.len();
+        self.by_id.clear();""",
+                """        let forgotten = self.by_id.len();
+        self.next = 0;
+        self.by_id.clear();""",
+            )
+        ],
+        False,
+    ),
+    (
+        # The same rule for leases: a reissued lease id would let a
+        # pre-restart grant pass `release`.
+        "a lease id is never reissued after a restart",
+        [
+            (
+                LEASE,
+                """        let freed: Vec<TargetSession> = self.held.keys().cloned().collect();
+        self.held.clear();""",
+                """        let freed: Vec<TargetSession> = self.held.keys().cloned().collect();
+        self.next = 0;
+        self.held.clear();""",
+            )
+        ],
+        False,
+    ),
+    (
+        # **The trap itself.** Reclassify an operation that reached the backend
+        # as not dispatched, and the supervisor becomes the route by which a
+        # caller is told to retry a click that may already have landed.
+        "an operation in flight across a restart is unknown, never not-dispatched",
+        [
+            (
+                SUPERVISION,
+                """        InFlight::ReachedBackend => {
+            Dispatch::Dispatched(Completion::Unknown(UnknownReason::BackendRestarted))
+        }""",
+                """        InFlight::ReachedBackend => Dispatch::NotDispatched(NotDispatched::NotReached),""",
+            )
+        ],
+        False,
+    ),
+    (
+        # Both registries in one call. Splitting them is the defect: a lease
+        # dropped without its captures leaves a consumer able to re-acquire and
+        # click at coordinates from a dead backend's image.
+        "a restart invalidates both registries, never one of them",
+        [
+            (
+                SUPERVISION,
+                "        captures_forgotten: captures.invalidate_all(),",
+                "        captures_forgotten: 0,",
+            )
+        ],
+        False,
+    ),
+    (
+        # The invalidation must happen on **every** end of the backend's life,
+        # not only on a deliberate restart: a backend that crashed leaves
+        # exactly the same stale authority behind.
+        "stopping a backend invalidates as much as restarting one",
+        [
+            (
+                EXPORT_SUPERVISOR,
+                "        authority.invalidate(self.generation)",
+                "        Invalidation::default()",
+            )
+        ],
+        False,
+    ),
+    # ----------------------------------------------- health is a probe, not an echo
+    (
+        # **The anti-echo rule.** Let any operation stand as a probe and
+        # `describe` -- answered entirely from device state, with no bytes sent
+        # -- can report that a backend the OS has permitted nothing can act.
+        "only an OS-gated read-only operation may stand as a health probe",
+        [
+            (
+                EXPORT_HEALTH,
+                """    if !PROBE_OPERATIONS.contains(&request.operation()) {
+        return Health::Unhealthy(Unhealthy::NotAProbe);
+    }
+""",
+                "",
+            )
+        ],
+        False,
+    ),
+    (
+        # Only `Working` permits a dispatch. Widen it to `Started` and a
+        # backend that has proven nothing is allowed to act.
+        "nothing but probe evidence permits an operation to be dispatched",
+        [
+            (
+                EXPORT_HEALTH,
+                "        matches!(self, Self::Working(_))",
+                "        matches!(self, Self::Working(_) | Self::Started)",
+            )
+        ],
+        False,
+    ),
+    # --------------------------------------------- the endpoint the backend published
+    (
+        # The loopback policy, applied to the process that is actually
+        # listening. Without it a backend that bound a routable address is
+        # handed to consumers.
+        "the address a backend publishes goes through the loopback check",
+        [
+            (
+                EXPORT_SUPERVISOR,
+                "            return BackendEndpoint::new(address).map_err(StartError::Endpoint);",
+                "            return Ok(BackendEndpoint::new(address).unwrap_or_else(|_| {\n                BackendEndpoint::new(std::net::SocketAddr::from(([127, 0, 0, 1], 1)))\n                    .expect(\"loopback\")\n            }));",
+            )
+        ],
+        False,
+    ),
+    (
+        # The stale address. Without the removal before the spawn, a restart
+        # whose new backend is slow to bind reads the dead backend's port --
+        # or whatever bound it next, which on loopback is any local process.
+        "the previous generation's address file is removed before every start",
+        [
+            (
+                EXPORT_SUPERVISOR,
+                "        let _ = tokio::fs::remove_file(&self.process.address_file).await;",
+                "",
+            )
+        ],
+        False,
+    ),
+    # ------------------------------------------------------- the fixture's own guards
+    (
+        # The journal is what makes an effect count survive a restart. Without
+        # it every cross-restart count reads zero and "the count did not
+        # increase" is true of nothing.
+        "the effect journal records what the backend was asked to do",
+        [(FIXTURE_LIB, "        self.append(&entry);", "")],
+        False,
+    ),
+    (
+        # The in-group helper must stay in the backend's group. Put it in a
+        # group of its own and the "trigger" measurement silently becomes a
+        # "reach" measurement: the helper would survive for the wrong reason
+        # and the sentinel would be blamed for not reaching it.
+        "the in-group helper really is in the supervised backend's group",
+        [
+            (
+                FIXTURE_PROCESS,
+                """    let spawned = std::process::Command::new(executable)
+        .arg(HELPER_MODE)""",
+                """    let mut spawned = std::process::Command::new(executable);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        spawned.process_group(0);
+    }
+    let spawned = spawned
+        .arg(HELPER_MODE)""",
+            )
+        ],
+        False,
+    ),
+    (
+        # The supervisor route's lifecycle check. Without it a succeeded probe
+        # answered by something other than the supervised process -- a stale
+        # reply, or whatever took the port -- reports a dead backend as
+        # working. This is the public route; the free classifier is
+        # crate-private precisely because it cannot make this check.
+        "a probe cannot report a backend that is gone as working",
+        [
+            (
+                EXPORT_SUPERVISOR,
+                """        let lifecycle = self.health();
+        if !lifecycle.process_is_running() {
+            return lifecycle;
+        }
+""",
+                "",
+            )
+        ],
+        False,
+    ),
+    (
+        # The escaping descendant must actually escape. A fixture that failed
+        # to detach would be killed by the plain group signal and every reach
+        # measurement built on it would be vacuous.
+        "the detaching descendant really does leave the backend's process group",
+        [
+            (
+                FIXTURE_PROCESS,
+                "        DetachRoute::Setsid => rustix::process::setsid().is_ok(),",
+                "        DetachRoute::Setsid => false,",
+            )
+        ],
+        False,
+    ),
+]
+
+
 @dataclass
 class Suite:
     name: str
@@ -1059,11 +1417,21 @@ class Suite:
     cargo_test: list[str]
     cases: list[tuple[str, list[Edit], bool]] = field(default_factory=list)
     cwd: Path = REPO
+    #: Binaries to rebuild before each case. See M3-19 and the `m5c4` note in
+    #: this module's documentation.
+    build: list[str] = field(default_factory=list)
 
 
 SUITES: list[Suite] = [
     Suite("m5c2", [CRATE, FIXTURE], CARGO_TEST, CASES),
     Suite("m5c3", [CRATE, FIXTURE], CARGO_TEST, CASES_C3),
+    Suite(
+        "m5c4",
+        [CRATE, EXPORT, FIXTURE, DEADMAN],
+        C4_CARGO_TEST,
+        CASES_C4,
+        build=C4_BUILD,
+    ),
 ]
 
 #: Cases whose green result is itself the measurement. Empty today, and kept
@@ -1084,6 +1452,23 @@ def run_tests(suite: Suite) -> tuple[str, list[str]]:
 
     A build that did not compile is **never** reported as a red test.
     """
+    if suite.build:
+        # M3-19: rebuild every binary these tests will `exec`, transitively,
+        # before running them. A failure here is a build failure for the case,
+        # never a red test -- the same refusal the test run itself makes.
+        try:
+            built = subprocess.run(
+                suite.build,
+                cwd=suite.cwd,
+                env=cargo_env(),
+                capture_output=True,
+                text=True,
+                timeout=900,
+            )
+        except subprocess.TimeoutExpired:
+            return "NOT EVIDENCE (timed out)", []
+        if built.returncode != 0:
+            return "BUILD FAILED", []
     try:
         done = subprocess.run(
             suite.cargo_test,
@@ -1091,7 +1476,7 @@ def run_tests(suite: Suite) -> tuple[str, list[str]]:
             env=cargo_env(),
             capture_output=True,
             text=True,
-            timeout=600,
+            timeout=900,
         )
     except subprocess.TimeoutExpired:
         return "NOT EVIDENCE (timed out)", []
@@ -1144,7 +1529,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--list", action="store_true", help="print case names and exit")
     parser.add_argument("--case", help="run only cases whose name contains this text")
-    parser.add_argument("--suite", help="run only this suite (m5c2 or m5c3)")
+    parser.add_argument("--suite", help="run only this suite (m5c2, m5c3 or m5c4)")
     arguments = parser.parse_args()
 
     suites = SUITES

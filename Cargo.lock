@@ -3581,12 +3581,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "tunnel-cua-export"
+version = "0.1.0"
+dependencies = [
+ "rustix",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tunnel-cua",
+ "tunnel-deadman",
+]
+
+[[package]]
 name = "tunnel-cua-fixture"
 version = "0.1.0"
 dependencies = [
+ "rustix",
  "serde_json",
+ "tempfile",
  "tokio",
  "tunnel-cua",
+ "tunnel-cua-export",
+ "tunnel-deadman",
 ]
 
 [[package]]

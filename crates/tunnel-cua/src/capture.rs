@@ -331,6 +331,30 @@ impl Captures {
         Ok(identity)
     }
 
+    /// Forget **every** capture identity, and report how many were forgotten.
+    ///
+    /// What a **supervised backend restart** does. Every identity this device
+    /// issued describes an image produced by a backend that is gone: the
+    /// screen it was read from may have changed while the backend was being
+    /// replaced, and nothing observed it. A coordinate picked from such an
+    /// image is a coordinate on a screen nobody can vouch for, which is
+    /// exactly the condition [`CaptureRefusal`] exists to refuse.
+    ///
+    /// **`next` is deliberately not reset, and that is load-bearing.** A
+    /// consumer holding a pre-restart [`CaptureId`] must get
+    /// [`CaptureRefusal::Unknown`] from [`Captures::resolve`] — not a
+    /// *different image that happens to have been given the same number*. If
+    /// the counter restarted, the first capture after a restart would reissue
+    /// id 1, a stale click would resolve against it, pass the bounds check,
+    /// and be dispatched at coordinates picked from an image nobody is
+    /// looking at. Monotonicity is what makes "unknown" mean unknown.
+    pub fn invalidate_all(&mut self) -> usize {
+        let forgotten = self.by_id.len();
+        self.by_id.clear();
+        self.current.clear();
+        forgotten
+    }
+
     /// The current capture for one display, if any.
     #[must_use]
     pub fn current(&self, target: &TargetSession, display: u32) -> Option<&CaptureIdentity> {
