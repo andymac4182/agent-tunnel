@@ -602,7 +602,12 @@ pub(crate) fn phase_name(phase: RotationPhase) -> String {
 /// Map the protocol's closed recovery enum to a bounded diagnostic label.
 /// Keep the mapping here so no internal error text or unbounded reason can
 /// cross the runtime snapshot boundary.
-pub(crate) const fn recovery_reason_name(reason: RecoveryReason) -> &'static str {
+///
+/// It is `pub` because it is the *only* way a caller can name the label the
+/// snapshot publishes without writing the string out again: an acceptance gate
+/// that must distinguish a lost **data** transport from a lost control socket
+/// derives the value here rather than pinning `"old_transport_lost"`.
+pub const fn recovery_reason_name(reason: RecoveryReason) -> &'static str {
     match reason {
         RecoveryReason::Deadline => "deadline",
         RecoveryReason::OldTransportLost => "old_transport_lost",
