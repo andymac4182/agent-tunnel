@@ -723,9 +723,11 @@ async fn run(
     .await;
     if scenario.is_err() {
         // Payload-free: identifiers, labels and counters only.
+        // Payload-free: the connector's own bounded status record, which names
+        // the recovery attempt, its carriers and its deadlines.
         eprintln!(
-            "fs data recovery device phase: {:?}",
-            client.status_snapshot().phase
+            "fs data recovery device status: {:?}",
+            client.status_snapshot()
         );
         eprintln!("fs data recovery partial evidence: {evidence:?}");
     }
@@ -1013,9 +1015,21 @@ async fn exercise(
     proxy.close(connection.clone()).await?;
 
     // The connector's bounded retained recovery installs a replacement.
+    //
+    // The owner's `rotation_recovery_reason` is **live** state: the rotation
+    // state machine clears it once the episode closes, so it is latched here
+    // while the recovery is in progress rather than read after the fact.  That
+    // is why this wait polls both endpoints rather than only the connector.
     {
         let deadline = Instant::now() + RECOVERY_WAIT;
         loop {
+            if evidence.owner_recovery_reason.is_none()
+                && let Ok(snapshot) = owner_snapshot(cluster).await
+                && let Ok(owner) = session_of(&snapshot, session_id)
+                && let Some(reason) = owner.rotation_recovery_reason
+            {
+                evidence.owner_recovery_reason = Some(reason.to_owned());
+            }
             let device = client.status_snapshot();
             if device.phase == "active"
                 && device.recovery_attempt.is_some()
@@ -1074,8 +1088,6 @@ async fn exercise(
                 evidence.connection_id_after = owner.active_connection_id.clone();
                 evidence.rotations_completed_after = owner.rotations_completed;
                 evidence.replayed_frames_after = owner.total_replayed_frames;
-                evidence.owner_recovery_reason =
-                    owner.rotation_recovery_reason.map(ToOwned::to_owned);
                 let stream = owner
                     .streams
                     .iter()
