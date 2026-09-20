@@ -34,6 +34,9 @@ of `docs/filesystem-api.md`.  Two suites live here:
 * `gate8-consumer-loss` — the validator of the gate that loses a 9P consumer
   with a request outstanding and then proves a replacement session restores no
   fids.  Measured the same way, and for the same reason.
+* `gate10-process-restart` — the validator of the gate that holds a 9P
+  mutation outstanding while the connector's real process is killed, and reads
+  the effect count back out of a journal that outlives it.
 
 A guard whose deletion leaves every test green is **not** load-bearing on its
 own, and this script prints that outcome rather than hiding it: several of the
@@ -2432,6 +2435,7 @@ HARNESS_E2E = HARNESS / "src" / "production_cluster" / "fs_client_e2e.rs"
 HARNESS_ROTATION = HARNESS / "src" / "production_cluster" / "fs_rotation.rs"
 HARNESS_LOSS = HARNESS / "src" / "production_cluster" / "fs_consumer_loss.rs"
 HARNESS_EPOCH = HARNESS / "src" / "production_cluster" / "fs_epoch_change.rs"
+HARNESS_RESTART = HARNESS / "src" / "production_cluster" / "fs_process_restart.rs"
 
 # Gate 6's end-to-end half is a **cluster** gate: it needs Redis, three relays,
 # a device connector and `node`, and it takes minutes.  That is not a shape this
@@ -2651,16 +2655,21 @@ EXPECT_GREEN: frozenset[str] = frozenset(
         # end-of-directory refusal beside it, so no test can distinguish them;
         # what it bounds is the *work* a resume may demand, not the answer.
         "a resume cookie is bounded by the traversal budget",
-        # gate8 **and gate9**, which share this case name because they share
-        # the construction.  The composite in-flight rule beside it already
+        # gate8, gate9 **and gate10**, which share this case name because they
+        # share the construction.  The composite in-flight rule beside it already
         # subsumes this one: `request_outstanding_at_loss()` — and gate 9's
         # `request_outstanding_at_change()` — is false unless the emit cursor
         # advanced **and** the receive cursor did not, so the composite
         # rejects the very mutation this rule would have caught.  It is kept
         # because it names the violated condition precisely when a run fails,
         # and the predicate's own clause is held directly by the two cases
-        # that defeat the predicate itself, which both suites carry.
+        # that defeat the predicate itself, which all three suites carry.
         "the relay had dispatched a record toward the device",
+        # gate10's spelling of the same rule.  Its composite,
+        # `request_outstanding_at_kill()`, subsumes it for the same reason, and
+        # `the_in_flight_predicate_needs_both_halves` defeats the predicate in
+        # each direction directly.
+        "the relay had dispatched a 9P record toward the device when the process was killed",
         # gate2.  Task row **M4-08** explains all nine in those words: "each
         # `O_NOFOLLOW` and its sibling identity check mask one another and are
         # proven in pairs, and the three mount-boundary checks mask one another
@@ -3604,6 +3613,538 @@ GATE9_EPOCH_CASES: list[tuple[str, list[Edit]]] = [
     ),
 ]
 
+# ---------------------------------------------------------------------------
+# `gate10-process-restart` — the validator of the gate that holds a 9P
+# **mutation** outstanding while the connector's real operating-system process
+# is killed and replaced.  Like `gate7-rotation`, `gate8-consumer-loss` and
+# `gate9-epoch-change` this is a harness-side validator, so each case defeats
+# one rule and the suite's own unit tests must go red.
+#
+# Three groups here have no counterpart in gate 9 and are why this gate exists
+# as its own suite rather than as a case inside that one:
+#
+#   * the **journal** rules, which are what make the held call's outcome
+#     measurable at all — an in-memory count dies with the process, so without
+#     a record taken from the host directory "the count did not increase" would
+#     be true of nothing;
+#   * the **outcome** rules, which hold that an ambiguous mutation classifies
+#     as `Outcome::Unknown` and that `Unknown` is not settled, read out of the
+#     library rather than restated here; and
+#   * the **process** rules, which are what make the event a restart of a real
+#     operating-system process — a recorded pid that exited on a signal, and a
+#     replacement under a different one — rather than an in-process handle
+#     being dropped and remade, which is gate 9.
+# ---------------------------------------------------------------------------
+
+GATE10_RESTART_TEST = [
+    "cargo",
+    "test",
+    "--offline",
+    "-p",
+    "tunnel-test-harness",
+    "--lib",
+    "--locked",
+    "production_cluster::fs_process_restart",
+]
+
+GATE10_RESTART_CASES: list[tuple[str, list[Edit]]] = [
+    (
+        "the production cluster ran three relays",
+        [
+            (
+                HARNESS_RESTART,
+                "            evidence.relay_count == 3,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the owning relay was identified",
+        [
+            (
+                HARNESS_RESTART,
+                "            !evidence.owner_node.is_empty(),",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the server selected the filesystem subprotocol",
+        [
+            (
+                HARNESS_RESTART,
+                "            evidence.selected_subprotocol == SUBPROTOCOL,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "Tversion negotiated the 9P2000.L dialect",
+        [
+            (
+                HARNESS_RESTART,
+                "            evidence.negotiated_dialect == DIALECT,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "Tversion negotiated a bounded msize",
+        [
+            (
+                HARNESS_RESTART,
+                "            evidence.negotiated_msize > 0 && evidence.negotiated_msize <= OFFERED_MSIZE,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the session served a real read before anything was perturbed",
+        [
+            (
+                HARNESS_RESTART,
+                "            evidence.prefix_bytes > 0,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the mutation path worked before the held mutation was issued",
+        [
+            (
+                HARNESS_RESTART,
+                "            evidence.journal_entries_before_held == 1,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the relay had dispatched a 9P record toward the device when the process was killed",
+        [
+            (
+                HARNESS_RESTART,
+                "            evidence.restart.emitted_at_kill > evidence.restart.emitted_before,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the relay had received no answer to that record when the process was killed: the 9P mutation was outstanding across the restart",
+        [
+            (
+                HARNESS_RESTART,
+                "            evidence.request_outstanding_at_kill && evidence.restart.request_outstanding_at_kill(),",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "a stream was identified for the held exchange",
+        [
+            (
+                HARNESS_RESTART,
+                "            evidence.restart.stream_id > 0,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the held mutation had reached the device and been performed before the process was killed, so the lost answer is an unknown and not a refusal that never dispatched",
+        [
+            (
+                HARNESS_RESTART,
+                "            evidence.held_effect_present_before_kill,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the journal, read from the host directory, held both effects at the kill",
+        [
+            (
+                HARNESS_RESTART,
+                "            evidence.journal_entries_before_kill == EXPECTED_JOURNAL_ENTRIES,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "a first connector process was identified",
+        [
+            (
+                HARNESS_RESTART,
+                "            evidence.first_pid > 0,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the first connector process exited",
+        [
+            (
+                HARNESS_RESTART,
+                "            evidence.first_process_exited,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the first connector process was killed rather than stopped gracefully",
+        [
+            (
+                HARNESS_RESTART,
+                "            evidence.first_process_killed_by_signal,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the replacement is a different process",
+        [
+            (
+                HARNESS_RESTART,
+                "            evidence.second_pid > 0 && evidence.second_pid != evidence.first_pid,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the replacement process served the device",
+        [
+            (
+                HARNESS_RESTART,
+                "            evidence.second_process_active,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the owner was released between the two processes",
+        [
+            (
+                HARNESS_RESTART,
+                "            evidence.owner_released_between,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the replacement claim took a strictly greater epoch",
+        [
+            (
+                HARNESS_RESTART,
+                "            evidence.epoch_after > evidence.epoch_before,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "an epoch was actually observed before the restart",
+        [
+            (
+                HARNESS_RESTART,
+                "            evidence.epoch_before > 0,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the device session identity changed across the restart",
+        [
+            (
+                HARNESS_RESTART,
+                "            !evidence.session_id_before.is_empty()\n"
+                "                && !evidence.session_id_after.is_empty()\n"
+                "                && evidence.session_id_before != evidence.session_id_after,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the pending call was failed rather than left hanging",
+        [
+            (
+                HARNESS_RESTART,
+                "            evidence.pending_call_closed,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the pending call was failed explicitly, with a close code",
+        [
+            (
+                HARNESS_RESTART,
+                "            evidence.pending_call_close_code == Some(DEVICE_GONE_CLOSE),",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the pending call was not served a normal reply from a session the contract invalidates",
+        [
+            (
+                HARNESS_RESTART,
+                "            !evidence.pending_call_answered,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "a mutation the journal proves was performed was not reported to the caller as an error, which is a settled outcome a caller may resubmit after",
+        [
+            (
+                HARNESS_RESTART,
+                "            !evidence.pending_call_errored,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the held mutation classifies as an unknown outcome",
+        [
+            (
+                HARNESS_RESTART,
+                "            evidence.held_call_outcome == Some(Outcome::Unknown),",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "that classification is one the caller may not assume away: an unknown outcome is not settled, so it is not retryable",
+        [
+            (
+                HARNESS_RESTART,
+                "            evidence\n"
+                "                .held_call_outcome\n"
+                "                .is_some_and(|outcome| !outcome.is_settled()),",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the held exchange's stream was deregistered at the owner",
+        [
+            (
+                HARNESS_RESTART,
+                "            evidence.held_stream_deregistered,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "a replacement session that speaks before attaching is closed with the profile's protocol violation",
+        [
+            (
+                HARNESS_RESTART,
+                "            evidence.pre_attach_probe_close_code == Some(PROTOCOL_VIOLATION_CLOSE),",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "that session was closed rather than served",
+        [
+            (
+                HARNESS_RESTART,
+                "            !evidence.pre_attach_probe_answered,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the replacement session negotiated a bounded msize",
+        [
+            (
+                HARNESS_RESTART,
+                "            evidence.second_session_msize > 0 && evidence.second_session_msize <= OFFERED_MSIZE,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the replacement session established its own root",
+        [
+            (
+                HARNESS_RESTART,
+                "            evidence.second_session_attached,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the earlier session's file fid is unbound after the restart",
+        [
+            (
+                HARNESS_RESTART,
+                "            evidence.stale_file_fid_refused,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the stale file fid refusal carried the errno for a fid this session never allocated",
+        [
+            (
+                HARNESS_RESTART,
+                "            evidence.stale_file_fid_errno == Some(UNKNOWN_FID_ERRNO),",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the earlier session's attach fid is unbound after the restart",
+        [
+            (
+                HARNESS_RESTART,
+                "            evidence.stale_attach_fid_refused,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the stale attach fid refusal carried the errno for a fid this session never allocated",
+        [
+            (
+                HARNESS_RESTART,
+                "            evidence.stale_attach_fid_errno == Some(UNKNOWN_FID_ERRNO),",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the fid the outstanding mutation was issued on is unbound after the restart",
+        [
+            (
+                HARNESS_RESTART,
+                "            evidence.stale_journal_fid_refused,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the stale mutation fid refusal carried the errno for a fid this session never allocated",
+        [
+            (
+                HARNESS_RESTART,
+                "            evidence.stale_journal_fid_errno == Some(UNKNOWN_FID_ERRNO),",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "a caller that retries the mutation anyway is refused above the dispatch boundary",
+        [
+            (
+                HARNESS_RESTART,
+                "            evidence.retry_refused_above_dispatch,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "that retry was refused for its fid and never reached the provider",
+        [
+            (
+                HARNESS_RESTART,
+                "            evidence.retry_refusal_errno == Some(UNKNOWN_FID_ERRNO),",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the refused retry moved no effect",
+        [
+            (
+                HARNESS_RESTART,
+                "            evidence.journal_entries_after_retry == evidence.journal_entries_before_kill,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the effect happened exactly once across both process generations",
+        [
+            (
+                HARNESS_RESTART,
+                "            evidence.journal_entries_final == EXPECTED_JOURNAL_ENTRIES,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the held effect appears exactly once",
+        [
+            (
+                HARNESS_RESTART,
+                "            evidence.held_effect_exactly_once,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the replacement session's own view of the journal agrees with the host's",
+        [
+            (
+                HARNESS_RESTART,
+                "            evidence.journal_entries_over_ninep == evidence.journal_entries_final,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the replacement session read the whole file back",
+        [
+            (
+                HARNESS_RESTART,
+                "            evidence.second_session_bytes == evidence.second_session_expected_bytes\n"
+                "                && evidence.second_session_expected_bytes == RESTART_FILE_BYTES,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the bytes it read match byte for byte",
+        [
+            (
+                HARNESS_RESTART,
+                "            evidence.second_session_checksum_matches,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "that transfer needed many messages rather than one",
+        [
+            (
+                HARNESS_RESTART,
+                "            evidence.second_session_messages > MIN_READ_MESSAGES,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the file is the size it always was",
+        [
+            (
+                HARNESS_RESTART,
+                "            evidence.second_session_getattr_size == RESTART_FILE_BYTES as u64,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "exactly one Tattach per attached session, and never a reconstructed one",
+        [
+            (
+                HARNESS_RESTART,
+                "            evidence.attach_count == 2,",
+                "            true,",
+            )
+        ],
+    ),
+]
+
 SUITES: list[Suite] = [
     Suite("gate2", [CRATE], CARGO_TEST, GATE2_CASES),
     Suite(
@@ -3640,6 +4181,12 @@ SUITES: list[Suite] = [
         [HARNESS / "src"],
         GATE9_EPOCH_TEST,
         GATE9_EPOCH_CASES,
+    ),
+    Suite(
+        "gate10-process-restart",
+        [HARNESS / "src"],
+        GATE10_RESTART_TEST,
+        GATE10_RESTART_CASES,
     ),
 ]
 
@@ -3785,8 +4332,8 @@ def main() -> int:
         "--suite",
         help=(
             "run only this suite (gate2, gate3, gate4, gate5, "
-            "gate6-adapters, gate6-e2e, gate7-rotation, gate8-consumer-loss or "
-            "gate9-epoch-change); "
+            "gate6-adapters, gate6-e2e, gate7-rotation, gate8-consumer-loss, "
+            "gate9-epoch-change or gate10-process-restart); "
             "default is all"
         ),
     )

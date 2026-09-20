@@ -337,6 +337,10 @@ const PENDING_CALL_WAIT: Duration = Duration::from_secs(30);
 const POLL: Duration = Duration::from_millis(20);
 /// The whole scenario's bound.
 const SCENARIO_TIMEOUT: Duration = Duration::from_secs(300);
+/// How long a connector process is given to exit on its own before cleanup
+/// kills it.  A connector never exits on its own, so this is a floor on the
+/// cleanup cost rather than a real grace, and it is short for that reason.
+const STOP_GRACE: Duration = Duration::from_secs(2);
 
 /// What the owner recorded about the stream the session was held on.
 ///
@@ -638,11 +642,20 @@ pub fn validate_fs_process_restart_evidence(evidence: &FsProcessRestartEvidence)
             evidence.pending_call_close_code == Some(DEVICE_GONE_CLOSE),
         ),
         (
-            "the pending call was not answered from a session the contract invalidates".into(),
+            "the pending call was not served a normal reply from a session the contract \
+             invalidates"
+                .into(),
             !evidence.pending_call_answered,
         ),
         // The trap, in its exact form.
         (
+            // Load-bearing against a **derivation** regression, which is the
+            // only way this state can arise: an `Rlerror` on the held tag is
+            // classified as `Outcome::Failed` a few lines below, so evidence
+            // that records the error and an `Unknown` alongside it is evidence
+            // whose classifier has stopped agreeing with what it saw.  The
+            // classification rules cannot catch that, because they only see the
+            // classification.
             "a mutation the journal proves was performed was not reported to the caller as an \
              error, which is a settled outcome a caller may resubmit after"
                 .into(),
@@ -688,7 +701,9 @@ pub fn validate_fs_process_restart_evidence(evidence: &FsProcessRestartEvidence)
             evidence.stale_file_fid_refused,
         ),
         (
-            "that refusal carried the errno for a fid this session never allocated".into(),
+            "the stale file fid refusal carried the errno for a fid this session never \
+             allocated"
+                .into(),
             evidence.stale_file_fid_errno == Some(UNKNOWN_FID_ERRNO),
         ),
         (
@@ -696,7 +711,9 @@ pub fn validate_fs_process_restart_evidence(evidence: &FsProcessRestartEvidence)
             evidence.stale_attach_fid_refused,
         ),
         (
-            "that refusal carried the errno for a fid this session never allocated".into(),
+            "the stale attach fid refusal carried the errno for a fid this session never \
+             allocated"
+                .into(),
             evidence.stale_attach_fid_errno == Some(UNKNOWN_FID_ERRNO),
         ),
         (
@@ -704,7 +721,9 @@ pub fn validate_fs_process_restart_evidence(evidence: &FsProcessRestartEvidence)
             evidence.stale_journal_fid_refused,
         ),
         (
-            "that refusal carried the errno for a fid this session never allocated".into(),
+            "the stale mutation fid refusal carried the errno for a fid this session never \
+             allocated"
+                .into(),
             evidence.stale_journal_fid_errno == Some(UNKNOWN_FID_ERRNO),
         ),
         // The control.
@@ -1130,9 +1149,14 @@ async fn run(
 
     // The first process is killed inside `exercise`; a bounded reap here covers
     // the paths that failed before reaching that point.
-    let stop_first = timeout(CLEANUP_TIMEOUT, first.shutdown(CLEANUP_TIMEOUT)).await;
+    //
+    // `ManagedProcess::shutdown` waits `grace` for the child to exit **on its
+    // own** before killing it, and a connector never does, so the grace is
+    // deliberately short: the whole call is then bounded by that plus the
+    // forced reap, and there is nothing here for an outer deadline to race.
+    let stop_first = first.shutdown(STOP_GRACE).await;
     let stop_second = match second_process {
-        Some(process) => Some(timeout(CLEANUP_TIMEOUT, process.shutdown(CLEANUP_TIMEOUT)).await),
+        Some(process) => Some(process.shutdown(STOP_GRACE).await),
         None => None,
     };
     scenario?;
@@ -1141,13 +1165,10 @@ async fn run(
     // here.
     let _ = stop_first;
     match stop_second {
-        None | Some(Ok(Ok(_))) => Ok(evidence),
-        Some(Ok(Err(error))) => Err(HarnessError::Process(format!(
+        None | Some(Ok(_)) => Ok(evidence),
+        Some(Err(error)) => Err(HarnessError::Process(format!(
             "replacement connector process stop: {error}"
         ))),
-        Some(Err(_)) => Err(HarnessError::Timeout(
-            "replacement connector process stop timed out".into(),
-        )),
     }
 }
 
@@ -1441,8 +1462,16 @@ async fn exercise(
             // and an `Rlerror` is recorded *as such*, because telling a caller
             // that a performed mutation failed is the specific trap this gate
             // exists to exclude.
-            evidence.pending_call_answered = true;
-            evidence.pending_call_errored = matches!(frame.message, Message::Rlerror { .. });
+            // The two are **disjoint**, not nested: an `Rlerror` is recorded
+            // as an error and nothing else, a normal reply as an answer and
+            // nothing else.  Recording an error as both would make the
+            // error rule unreachable behind the answered rule, and a rule that
+            // can never be the one to reject anything is not load-bearing.
+            if matches!(frame.message, Message::Rlerror { .. }) {
+                evidence.pending_call_errored = true;
+            } else {
+                evidence.pending_call_answered = true;
+            }
         }
         Ok(Ok(wire::Event::Ended)) => {
             // The socket ended without a code: that is not "explicitly".
@@ -1873,9 +1902,18 @@ mod tests {
             ("the effect had not happened before the kill", |e| {
                 e.held_effect_present_before_kill = false;
             }),
-            ("the journal did not hold both effects at the kill", |e| {
-                e.journal_entries_before_kill = 1;
-            }),
+            // The retry rule compares against this field, so a mutation that
+            // moved it alone would be rejected by that rule instead and would
+            // leave this one masked.  Both move together, so the named rule is
+            // the only one left to reject it.
+            (
+                "the journal did not hold both effects at the kill, with the retry count \
+                 consistent",
+                |e| {
+                    e.journal_entries_before_kill = 1;
+                    e.journal_entries_after_retry = 1;
+                },
+            ),
             // The event itself.
             ("no first process was identified", |e| e.first_pid = 0),
             ("the first process never exited", |e| {
@@ -1933,14 +1971,17 @@ mod tests {
             // mean something.  A single field would let one rule mask the other
             // two.
             (
+                // The error alone, with the classification left as it is.  That
+                // is the derivation regression the rule exists for, and with
+                // `answered` and `errored` disjoint no other rule can reject
+                // it, so the named rule is load-bearing rather than shadowed.
                 "a performed mutation was reported to the caller as an error",
+                |e| e.pending_call_errored = true,
+            ),
+            (
+                "a performed mutation was reported as an error and classified to match",
                 |e| {
                     e.pending_call_errored = true;
-                    // Hold every other field consistent with that report, so
-                    // the named rule is the only one that can reject it: a
-                    // caller told `Rlerror` classifies the outcome as `Failed`,
-                    // and an answered call is an answered call.
-                    e.pending_call_answered = true;
                     e.held_call_outcome = Some(Outcome::Failed);
                 },
             ),
