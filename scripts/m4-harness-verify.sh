@@ -36,4 +36,7 @@ gate "M4 filesystem gate 6: the real TypeScript client against real relay and de
 gate "M4 filesystem gate 7: a live 9P session across a real scheduled rotation, with the exchange in flight" \
   cargo run --locked -p tunnel-test-harness -- verify-m4-fs-rotation
 
+gate "M4 filesystem gate 8: a 9P session lost with a request outstanding, and a replacement session that restores no fids" \
+  cargo run --locked -p tunnel-test-harness -- verify-m4-fs-consumer-loss
+
 echo "m4-harness-verify: implemented M4 harness suite passed" >&2

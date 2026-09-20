@@ -29,6 +29,9 @@ of `docs/filesystem-api.md`.  Two suites live here:
 * `gate7-rotation` — the validator of the gate that carries a live 9P session
   across a real scheduled data-socket rotation.  Measured the same way as
   `gate6-e2e`, and for the same reason: the gate is a cluster run.
+* `gate8-consumer-loss` — the validator of the gate that loses a 9P consumer
+  with a request outstanding and then proves a replacement session restores no
+  fids.  Measured the same way, and for the same reason.
 
 A guard whose deletion leaves every test green is **not** load-bearing on its
 own, and this script prints that outcome rather than hiding it: several of the
@@ -2425,6 +2428,7 @@ GATE6_CASES: list[tuple[str, list[Edit]]] = [
 HARNESS = REPO / "crates" / "tunnel-test-harness"
 HARNESS_E2E = HARNESS / "src" / "production_cluster" / "fs_client_e2e.rs"
 HARNESS_ROTATION = HARNESS / "src" / "production_cluster" / "fs_rotation.rs"
+HARNESS_LOSS = HARNESS / "src" / "production_cluster" / "fs_consumer_loss.rs"
 
 # Gate 6's end-to-end half is a **cluster** gate: it needs Redis, three relays,
 # a device connector and `node`, and it takes minutes.  That is not a shape this
@@ -2644,6 +2648,14 @@ EXPECT_GREEN: frozenset[str] = frozenset(
         # end-of-directory refusal beside it, so no test can distinguish them;
         # what it bounds is the *work* a resume may demand, not the answer.
         "a resume cookie is bounded by the traversal budget",
+        # gate8.  The composite in-flight rule beside it already subsumes this
+        # one: `request_outstanding_at_loss()` is false unless the emit cursor
+        # advanced **and** the receive cursor did not, so the composite
+        # rejects the very mutation this rule would have caught.  It is kept
+        # because it names the violated condition precisely when a run fails,
+        # and the predicate's own clause is held directly by the two cases
+        # that defeat `request_outstanding_at_loss()` itself.
+        "the relay had dispatched a record toward the device",
         # gate2.  Task row **M4-08** explains all nine in those words: "each
         # `O_NOFOLLOW` and its sibling identity check mask one another and are
         # proven in pairs, and the three mount-boundary checks mask one another
@@ -2991,6 +3003,263 @@ GATE7_ROTATION_CASES: list[tuple[str, list[Edit]]] = [
     ),
 ]
 
+# `gate8-consumer-loss` — the validator of the gate that loses a 9P consumer
+# with a request outstanding.  Like `gate6-e2e` and `gate7-rotation` this is a
+# cluster run that cannot be repeated once per case, so what is measured is its
+# **rule list** against the mutation table in the same file.  The edits replace
+# a condition with `true` for the same reason: the rule list is a fixed-length
+# array and removing an entry stops the crate compiling, which this script
+# refuses to call a red test.
+#
+# This gate's claim has three parts, and the cases are ordered by them.  First,
+# that the loss was **concurrent** with a 9P exchange rather than sequential
+# with it.  Second, that the session was **cleaned up** — the lost stream gone,
+# the device's own session untouched.  Third, and the part the contract turns
+# on, that a replacement session **restores no fids**: `docs/protocol.md` says
+# the first filesystem profile restores no fids across a consumer WebSocket
+# reconnect, so a rule whose deletion leaves the table green would be a rule
+# that clause never rested on.
+#
+# **One of the twenty-three is masked, and this says so rather than hiding it.**
+# "the relay had dispatched a record toward the device" is **still green** when
+# defeated alone, at 22 of 23 red.  It is not load-bearing on its own because
+# the composite rule below it already subsumes it:
+# `request_outstanding_at_loss()` returns false unless `emitted_at_loss >
+# emitted_before` **and** the receive cursor is unmoved, so the composite
+# rejects the very mutation this rule would have caught.  It is kept because it
+# names the violated condition precisely when a run fails, which a composite
+# cannot; the predicate's own unit test holds that clause directly.  It is
+# declared in `EXPECT_GREEN` above, which is the mechanism for exactly this
+# claim, so the suite reports it on its own line and exits 0 rather than
+# treating a defeated-but-green guard as an unusable outcome.
+GATE8_LOSS_TEST = [
+    "cargo",
+    "test",
+    "--offline",
+    "-p",
+    "tunnel-test-harness",
+    "--lib",
+    "--locked",
+    "production_cluster::fs_consumer_loss",
+]
+
+GATE8_LOSS_CASES: list[tuple[str, list[Edit]]] = [
+    # 1. The concurrency claim.
+    (
+        "the loss was concurrent with the exchange, not merely nearby",
+        [
+            (
+                HARNESS_LOSS,
+                "            evidence.request_outstanding_at_loss"
+                " && evidence.loss.request_outstanding_at_loss(),",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the relay had dispatched a record toward the device",
+        [
+            (
+                HARNESS_LOSS,
+                "            evidence.loss.emitted_at_loss > evidence.loss.emitted_before,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the predicate requires the request to have been dispatched",
+        [
+            (
+                HARNESS_LOSS,
+                "        self.emitted_at_loss > self.emitted_before",
+                "        true",
+            )
+        ],
+    ),
+    (
+        "the predicate requires no answer to have been received",
+        [
+            (
+                HARNESS_LOSS,
+                "            && self.recv_contiguous_at_loss == self.recv_contiguous_before",
+                "",
+            )
+        ],
+    ),
+    (
+        "a stream was identified at the loss",
+        [(HARNESS_LOSS, "            evidence.loss.stream_id > 0,", "            true,")],
+    ),
+    (
+        "the fid served a real read before anything was perturbed",
+        [(HARNESS_LOSS, "            evidence.prefix_bytes > 0,", "            true,")],
+    ),
+    # 2. Session cleanup.
+    (
+        "the lost consumer's stream was deregistered",
+        [
+            (
+                HARNESS_LOSS,
+                "            evidence.lost_stream_deregistered,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the device's own session survived the loss of one consumer",
+        [
+            (
+                HARNESS_LOSS,
+                "            evidence.device_session_survived,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the device session kept its identity",
+        [(HARNESS_LOSS, "            evidence.session_id_stable,", "            true,")],
+    ),
+    (
+        "losing a consumer did not change the epoch",
+        [
+            (
+                HARNESS_LOSS,
+                "            evidence.epoch_after == evidence.epoch_before,",
+                "            true,",
+            )
+        ],
+    ),
+    # 3. The contract clause: no fid is restored across a consumer reconnect.
+    (
+        "a pre-attach probe was closed rather than served",
+        [
+            (
+                HARNESS_LOSS,
+                "            !evidence.pre_attach_probe_answered,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "that close was the profile's protocol violation",
+        [
+            (
+                HARNESS_LOSS,
+                "            evidence.pre_attach_probe_close_code"
+                " == Some(PROTOCOL_VIOLATION_CLOSE),",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the replacement session reached 9P on its own terms",
+        [
+            (
+                HARNESS_LOSS,
+                "            evidence.second_session_msize > 0"
+                " && evidence.second_session_msize <= OFFERED_MSIZE,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the lost session's file fid was not restored",
+        [
+            (
+                HARNESS_LOSS,
+                "            evidence.stale_file_fid_refused,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the file fid was refused as a fid this session does not hold",
+        [
+            (
+                HARNESS_LOSS,
+                "            evidence.stale_file_fid_errno == Some(UNKNOWN_FID_ERRNO),",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the lost session's attach fid was not restored",
+        [
+            (
+                HARNESS_LOSS,
+                "            evidence.stale_attach_fid_refused,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the attach fid was refused as a fid this session does not hold",
+        [
+            (
+                HARNESS_LOSS,
+                "            evidence.stale_attach_fid_errno == Some(UNKNOWN_FID_ERRNO),",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the replacement session established its own root",
+        [
+            (
+                HARNESS_LOSS,
+                "            evidence.second_session_attached,",
+                "            true,",
+            )
+        ],
+    ),
+    # The export is undamaged, so the refusals above are fid scoping.
+    (
+        "the replacement session read the whole file back",
+        [
+            (
+                HARNESS_LOSS,
+                "            evidence.second_session_bytes == evidence.second_session_expected_bytes\n"
+                "                && evidence.second_session_expected_bytes == LOSS_FILE_BYTES,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "that transfer's checksum matched",
+        [
+            (
+                HARNESS_LOSS,
+                "            evidence.second_session_checksum_matches,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "that transfer spanned many messages",
+        [
+            (
+                HARNESS_LOSS,
+                "            evidence.second_session_messages >= MIN_READ_MESSAGES,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the file was undamaged by the lost session",
+        [
+            (
+                HARNESS_LOSS,
+                "            evidence.second_session_getattr_size == LOSS_FILE_BYTES as u64,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "each session attached exactly once",
+        [(HARNESS_LOSS, "            evidence.attach_count == 2,", "            true,")],
+    ),
+]
+
 SUITES: list[Suite] = [
     Suite("gate2", [CRATE], CARGO_TEST, GATE2_CASES),
     Suite(
@@ -3015,6 +3284,12 @@ SUITES: list[Suite] = [
         [HARNESS / "src"],
         GATE7_ROTATION_TEST,
         GATE7_ROTATION_CASES,
+    ),
+    Suite(
+        "gate8-consumer-loss",
+        [HARNESS / "src"],
+        GATE8_LOSS_TEST,
+        GATE8_LOSS_CASES,
     ),
 ]
 
@@ -3160,7 +3435,8 @@ def main() -> int:
         "--suite",
         help=(
             "run only this suite (gate2, gate3, gate4, gate5, "
-            "gate6-adapters, gate6-e2e or gate7-rotation); default is all"
+            "gate6-adapters, gate6-e2e, gate7-rotation or gate8-consumer-loss); "
+            "default is all"
         ),
     )
     arguments = parser.parse_args()

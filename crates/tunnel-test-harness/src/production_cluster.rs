@@ -133,16 +133,21 @@ pub use http_forward_real_path::{
     HttpForwardRealPathEvidence, validate_http_forward_real_path_evidence,
     verify as verify_http_forward_real_path,
 };
-mod fs_real_path;
 /// The shared 9P consumer both M4 filesystem gates speak the wire with.
 ///
 /// It was gate 4's private module until gate 5 needed the same client: there is
 /// no shipped Rust consumer, so both gates encode with gate 3's own `Frame` and
 /// decode with gate 3's own `decode_exact`, and one copy of that is better than
 /// two that could drift apart.
+mod fs_consumer_loss;
+mod fs_real_path;
 mod fs_rotation;
 mod fs_wire;
 mod fs_write_path;
+pub use fs_consumer_loss::{
+    FsConsumerLossEvidence, LossObservation, validate_fs_consumer_loss_evidence,
+    verify as verify_fs_consumer_loss,
+};
 pub use fs_real_path::{
     FsRealPathEvidence, validate_fs_real_path_evidence, verify as verify_fs_real_path,
 };

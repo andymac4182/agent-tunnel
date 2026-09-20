@@ -703,6 +703,19 @@ pub const FS_GATE_SERVICES: &[FsGateService] = &[
         host_supported: true,
     },
     FsGateService {
+        // The export a 9P session is lost on with a request outstanding, and
+        // which a **second** consumer session then re-opens.  It is its own
+        // export for the reason every row above is one: the whole point of
+        // the gate is that the second session's fid numbers are unbound, and
+        // if another case shared this grant a fid answered here could be
+        // credited to that case's session rather than to this one's.
+        label: "consumer-loss",
+        display_name: "Synthetic filesystem export whose consumer is lost mid-exchange",
+        operations: &["fs:connect", "fs:read", "fs:list"],
+        case_sensitivity: Some("insensitive-preserving"),
+        host_supported: true,
+    },
+    FsGateService {
         label: "unsupported-host",
         display_name: "Synthetic filesystem export on an unsupported host",
         operations: &["fs:connect", "fs:read", "fs:list"],
