@@ -213,13 +213,17 @@ pub async fn run_backend(
     // it does not know the backend starts a helper at all.
     let _ = tokio::fs::remove_file(helper_pid_file).await;
     spawn_in_group_helper(helper_pid_file);
-    // **The helper's pid is published before the address, and that ordering
-    // is load-bearing**, not incidental: a supervisor that has an endpoint
-    // therefore has a helper pid too, so a test which reads the address and
-    // then reads `helper.pid` never races one against the other. Asserted in
-    // `tests/supervision.rs::the_helper_pid_is_published_before_the_address`
-    // rather than left as a comment, because reordering these two lines
-    // silently restores the leak the `PidGuard` exists to close.
+    // Wait for the helper to publish before the address goes out, so a
+    // supervisor that has an endpoint has a helper pid too.
+    //
+    // **This narrows a race; it does not close one, and it is not
+    // load-bearing.** An earlier comment claimed it was, and a guard case
+    // written to defend it came back `still green`: the helper publishes
+    // within microseconds here, so removing this wait changes nothing
+    // observable. The pid is not lost even if it did, because
+    // `PidGuard::watch_workspace` re-reads `helper.pid` at drop. Kept because
+    // it makes the ordinary path deterministic, not because anything depends
+    // on it.
     let _ = read_published(helper_pid_file).await;
     let Ok(backend) = FixtureBackend::start_with(Ledger::with_journal(journal.to_path_buf())).await
     else {

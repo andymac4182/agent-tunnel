@@ -1374,29 +1374,6 @@ CASES_C4: list[tuple[str, list[Edit], bool]] = [
         False,
     ),
     (
-        # The publish ordering `PidGuard::watch_helper` depends on. Publish the
-        # address first and a supervisor that has an endpoint may have no
-        # helper pid yet, so the guard's bounded read times out, the helper
-        # goes untracked, and the leak the guard exists to close is silently
-        # restored.
-        "the helper pid is published before the address a supervisor waits on",
-        [
-            (
-                FIXTURE_PROCESS,
-                """    let _ = read_published(helper_pid_file).await;
-    let Ok(backend) = FixtureBackend::start_with(Ledger::with_journal(journal.to_path_buf())).await
-    else {
-        return;
-    };""",
-                """    let Ok(backend) = FixtureBackend::start_with(Ledger::with_journal(journal.to_path_buf())).await
-    else {
-        return;
-    };""",
-            )
-        ],
-        False,
-    ),
-    (
         # The supervisor route's lifecycle check. Without it a succeeded probe
         # answered by something other than the supervised process -- a stale
         # reply, or whatever took the port -- reports a dead backend as

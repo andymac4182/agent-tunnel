@@ -711,40 +711,18 @@ async fn the_journal_records_the_same_effects_the_in_memory_ledger_does() {
     backend.stop();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_helper_pid_is_published_before_the_address() {
-    // **The ordering `PidGuard::watch_helper` silently depends on.** It is
-    // called right after `start()` returns, which happens as soon as the
-    // address appears; if the helper published later, the read would time out
-    // and the helper would go untracked -- restoring exactly the leak the
-    // guard exists to close, with no test noticing. Reordering the two lines
-    // in `run_backend` must therefore turn something red, and this is it.
-    let workspace = tempfile::tempdir().expect("workspace");
-    let mut guard = PidGuard::new();
-    guard.watch_workspace(workspace.path());
-    let mut supervisor = Supervisor::new(supervised(workspace.path()));
-    supervisor.start().await.expect("it started");
-    guard.watch(supervisor.pid().expect("a pid"));
-
-    // `start()` has returned, so the address is published. The helper's pid
-    // must already be there -- read it without waiting.
-    let helper = std::fs::read_to_string(workspace.path().join(HELPER_PID_FILE))
-        .unwrap_or_default()
-        .trim()
-        .to_owned();
-    assert!(
-        helper.parse::<u32>().is_ok(),
-        "the helper pid must be published before the address, so a supervisor \
-         that has an endpoint has a helper to clean up; found {helper:?}"
-    );
-
-    supervisor.stop(state_for_stop().as_ref()).await;
-}
-
-/// A throwaway device state, for a stop whose invalidation is not under test.
-fn state_for_stop() -> Arc<DeviceState> {
-    DeviceState::new()
-}
+// **There is deliberately no test that the helper pid is published before the
+// address.** One was written, and a guard case with it; the deletion harness
+// reported the case `still green`, and it was right for a reason worth keeping.
+//
+// The ordering narrows a race -- it does not close one -- and on this host the
+// helper publishes within microseconds, so removing the wait leaves every
+// observable behaviour unchanged. More to the point, `PidGuard::watch_workspace`
+// re-reads `helper.pid` **at drop**, so a `watch_helper` that timed out no
+// longer loses the pid: the ordering is not load-bearing any more, because the
+// fix for the failing-start path subsumed it. Keeping a green case would have
+// been a guard that measures nothing, which is exactly what that harness exists
+// to catch.
 
 /// Wait, bounded, for the journal to record `wanted` clicks. Returns the count
 /// it last saw, so a failure reports what it found rather than only that it
