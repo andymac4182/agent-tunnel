@@ -88,6 +88,7 @@ PROVIDER_RECORD = PROVIDER / "src" / "record.rs"
 METADATA = CRATE / "src" / "metadata.rs"
 RELAY = REPO / "crates" / "tunnel-relay"
 RELAY_FS = RELAY / "src" / "http" / "fs.rs"
+RELAY_ACTOR = RELAY / "src" / "actor.rs"
 CLIENT = REPO / "crates" / "tunnel-client"
 CLIENT_FS = CLIENT / "src" / "fs_export.rs"
 
@@ -1898,6 +1899,44 @@ GATE4_CASES: list[tuple[str, list[Edit]]] = [
         } else if !name.trim().is_empty() {
             set = set.with(Capability::Read);
         }""",
+            )
+        ],
+    ),
+    # M4-25.  The contract requires an authorization invalidation to close the
+    # consumer session with 1008, and the consumer learns that code from the
+    # stream's reset watch alone: once `invalidate_stream_challenge` cancels
+    # the registration, the connector's own RESET can never be delivered in
+    # order.  Deleting the publication leaves `pump` exiting through
+    # `closed.cancelled()` with nothing to map and the socket closing
+    # codeless -- which is exactly what `verify-m4-fs-real-path` measured as
+    # `revoked_session_close_code=None` before this fix.
+    (
+        "publish the authorization reset before cancelling the consumer",
+        [
+            (
+                RELAY_ACTOR,
+                """            let discarded = stream.http.as_mut().map_or(0, |http| {
+                http.accept_reset(tunnel_protocol::reset_reason::AUTHORIZATION_EXPIRED)
+            });
+            release_m2_bytes(&session.queue_budget, stream, discarded);
+""",
+                "",
+            )
+        ],
+    ),
+    # The other half of the same rule: `accept_reset` discards the stream's
+    # undelivered device->owner bytes, and their charge is the caller's to
+    # return.  Dropping the release leaks the session queue budget for the
+    # session's whole life, which is a slow denial of service rather than a
+    # wrong close code -- so it needs its own case, because the close-code
+    # guard above stays green without it.
+    (
+        "return the bytes the invalidation discarded to the session budget",
+        [
+            (
+                RELAY_ACTOR,
+                "            release_m2_bytes(&session.queue_budget, stream, discarded);",
+                "            let _ = discarded;",
             )
         ],
     ),

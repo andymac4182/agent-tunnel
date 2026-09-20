@@ -11090,6 +11090,38 @@ impl RelayActor {
                     execution: "unknown",
                 }));
             }
+            // Publish the invalidation on the stream's own reset watch
+            // **before** cancelling `closed`.
+            //
+            // A consumer ingress task (`http/fs.rs::pump`,
+            // `http/forward.rs`) selects on `closed.cancelled()` and on this
+            // watch, and maps the observed reason to a close code.  The
+            // connector's own `AUTHORIZATION_EXPIRED` RESET can never arrive
+            // in order here: this stream is terminal and its consumer
+            // registration is cancelled on the next line, so the ordered
+            // delivery path never runs again.  Without publishing the reason
+            // ourselves the ingress task exits through `closed.cancelled()`
+            // with nothing to map and closes the socket **codeless**, where
+            // `http/fs.rs:633-651` and `docs/filesystem-api.md` require
+            // **1008** for every authorization invalidation.  That file's
+            // comment on the `peer_reset` clone warns about exactly this
+            // downgrade.
+            //
+            // `AUTHORIZATION_EXPIRED` is the wire's single reason for the
+            // whole class — an expired snapshot, a revoked grant and a moved
+            // revision alike — and every caller of this function reaches it
+            // through an authorization outcome, so there is no reason to
+            // discriminate here.  `accept_reset` is idempotent on the first
+            // reason, so a connector RESET that did land first still wins.
+            //
+            // The discarded bytes are returned to the session budget on the
+            // same turn, exactly as the ordered RESET path does at
+            // `inbound_data`: `accept_reset` drops the undelivered chunks and
+            // reports their size, and the charge is the caller's to release.
+            let discarded = stream.http.as_mut().map_or(0, |http| {
+                http.accept_reset(tunnel_protocol::reset_reason::AUTHORIZATION_EXPIRED)
+            });
+            release_m2_bytes(&session.queue_budget, stream, discarded);
             stream.closed.cancel();
         }
         if transitioned
@@ -17662,6 +17694,308 @@ mod stream_identity_tests {
         let session = &actor.sessions[&key.scope()];
         assert!(!session.streams[&admitted.stream_id].terminal_fin_failure);
         assert!(session.terminal_fin_failure_deadline.is_none());
+    }
+
+    /// A refused challenge on a **live** filesystem stream must reach the
+    /// consumer as an authorization invalidation, not as a bare cancellation.
+    ///
+    /// `docs/filesystem-api.md` and `http/fs.rs:633-651` require an
+    /// authorization invalidation — an expired snapshot, a revoked grant and
+    /// a moved revision alike — to close the consumer session with **1008**.
+    /// The consumer ingress task learns the code from exactly one place: the
+    /// stream's reset watch, which it reads out of band because the
+    /// connector's own RESET can never be delivered in order once this
+    /// function cancels the registration.  If the reason is not published
+    /// here, `pump` exits through `closed.cancelled()` with nothing to map
+    /// and the socket ends **codeless**.
+    ///
+    /// This was M4-25, and it was reachable only after M4-22 let a
+    /// filesystem stream refresh at all: before that no fs stream ever
+    /// challenged, so revocation was always observed through the connector's
+    /// own grant deadline, whose `expire_stream` does emit the reason.
+    #[tokio::test]
+    async fn an_invalidated_fs_stream_challenge_publishes_the_authorization_reset() {
+        let now = Utc::now();
+        let tenant_id = Uuid::from_u128(621);
+        let device_id = Uuid::from_u128(622);
+        let principal_id = Uuid::from_u128(623);
+        let service_id = Uuid::from_u128(624);
+        let identity = DeviceIdentity {
+            tenant_id,
+            device_id,
+            owner_user_id: principal_id,
+            credential_id: Uuid::from_u128(625),
+            spki_fingerprint: "fs-invalidation-spki".to_owned(),
+            credential_not_before: now - Duration::minutes(1),
+            expires_at: now + Duration::minutes(1),
+            credential_revoked_at: None,
+            device_active: true,
+            credential_active: true,
+            device_version: 1,
+            owner_epoch: 1,
+            last_seen_at: Some(now),
+        };
+        let consumer = AuthenticatedConsumer {
+            tenant_id,
+            principal_id,
+        };
+        let grant = GrantSnapshot {
+            tenant_id,
+            principal_id,
+            device_id,
+            service_id,
+            revision: 1,
+            permissions: PermissionSet {
+                operations: BTreeSet::from([crate::FS_SESSION_OPERATION.to_owned()]),
+            },
+            constraints: serde_json::json!({}),
+            valid_until: now + Duration::minutes(1),
+            read_started_at: now,
+        };
+        let key = SessionKey {
+            tenant_id,
+            device_id,
+            session_id: "fs-invalidation".to_owned(),
+            epoch: 1,
+        };
+        let (mut actor, mut control) = admitted_control_actor(identity, key.clone());
+        let (data_tx, _data_rx) = mpsc::channel(actor.options.limits.max_queue_messages);
+        let session = actor.sessions.get_mut(&key.scope()).expect("test session");
+        session.profile = super::RuntimeProfile::M2;
+        session.data_tx = Some(data_tx.clone());
+        session.active_carrier = Some(DataCarrier {
+            context: CarrierContext::new(
+                key.session_id.clone(),
+                key.epoch,
+                1,
+                "fs-invalidation-data".to_owned(),
+            ),
+            tx: data_tx,
+        });
+        let (open_tx, open_rx) = oneshot::channel();
+        actor.open_consumer_stream(
+            consumer,
+            device_id,
+            service_id,
+            grant.clone(),
+            now + Duration::minutes(1),
+            None,
+            super::StreamAdmissionReply::Fs {
+                response: open_tx,
+                capabilities: "read,list".to_owned(),
+            },
+        );
+        let registration = open_rx
+            .await
+            .expect("open response")
+            .expect("fs stream admitted");
+        drop(control.rx.try_recv().expect("OPEN queued"));
+        let stream_id = registration.base.stream_id;
+        // The connector raised a refresh challenge on a live stream — the
+        // path M4-22's fix made reachable for filesystem streams.
+        let challenge_id = "fs-invalidation-challenge";
+        let started_at_ms = super::monotonic_millis();
+        {
+            let stream = actor
+                .sessions
+                .get_mut(&key.scope())
+                .expect("test session")
+                .streams
+                .get_mut(&stream_id)
+                .expect("admitted stream");
+            stream.open_pending = false;
+            stream.authorization_in_flight = true;
+            stream.authorization_started_at_ms = Some(started_at_ms);
+            stream.authorization_deadline_ms = Some(started_at_ms + 2_000);
+            stream.challenge_id = Some(challenge_id.to_owned());
+        }
+        assert!(
+            registration.peer_reset.borrow().is_none(),
+            "no reset before the challenge is answered"
+        );
+        actor.invalidate_stream_challenge(
+            &key,
+            &DeviceChallenge {
+                message_id: "fs-invalidation-auth".to_owned(),
+                stream_id,
+                service_id: service_id.to_string(),
+                challenge_id: challenge_id.to_owned(),
+                nonce: "fs-invalidation-nonce".to_owned(),
+                permission_digest: super::wire::permission_digest(&grant, &service_id.to_string()),
+                grant_revision: grant.revision,
+                received_at: std::time::Instant::now(),
+                lifetime: std::time::Duration::from_secs(2),
+            },
+            "authorization expired",
+        );
+        // The stream is terminal and the consumer registration is cancelled —
+        // that much was already true and is not what this guard protects.
+        assert!(actor.sessions[&key.scope()].streams[&stream_id].terminal);
+        assert!(registration.base.closed.is_cancelled());
+        // The reason must be readable by the time the cancellation is, or the
+        // consumer's socket closes with no code where 1008 is required.
+        let observed = *registration.peer_reset.borrow();
+        let observed = observed.expect(
+            "an invalidated challenge must publish a reset reason before cancelling the consumer",
+        );
+        assert_eq!(
+            observed.reason,
+            tunnel_protocol::reset_reason::AUTHORIZATION_EXPIRED,
+            "the wire carries one reason for the whole authorization class, and it maps to 1008"
+        );
+        assert!(
+            !observed.after_fin,
+            "the connector sent no FIN before this invalidation"
+        );
+    }
+
+    /// The reset a refused challenge publishes must not be charged twice:
+    /// `accept_reset` discards the stream's undelivered bytes and the caller
+    /// owes their charge back to the session budget on the same turn, exactly
+    /// as the ordered RESET path at `inbound_data` does.  Releasing nothing
+    /// leaks the queue budget for the session's whole life; releasing without
+    /// bounding it against `budget_bytes` under-counts the budget instead.
+    #[tokio::test]
+    async fn an_invalidated_fs_stream_challenge_returns_its_discarded_bytes() {
+        let now = Utc::now();
+        let tenant_id = Uuid::from_u128(631);
+        let device_id = Uuid::from_u128(632);
+        let principal_id = Uuid::from_u128(633);
+        let service_id = Uuid::from_u128(634);
+        let identity = DeviceIdentity {
+            tenant_id,
+            device_id,
+            owner_user_id: principal_id,
+            credential_id: Uuid::from_u128(635),
+            spki_fingerprint: "fs-invalidation-bytes-spki".to_owned(),
+            credential_not_before: now - Duration::minutes(1),
+            expires_at: now + Duration::minutes(1),
+            credential_revoked_at: None,
+            device_active: true,
+            credential_active: true,
+            device_version: 1,
+            owner_epoch: 1,
+            last_seen_at: Some(now),
+        };
+        let consumer = AuthenticatedConsumer {
+            tenant_id,
+            principal_id,
+        };
+        let grant = GrantSnapshot {
+            tenant_id,
+            principal_id,
+            device_id,
+            service_id,
+            revision: 1,
+            permissions: PermissionSet {
+                operations: BTreeSet::from([crate::FS_SESSION_OPERATION.to_owned()]),
+            },
+            constraints: serde_json::json!({}),
+            valid_until: now + Duration::minutes(1),
+            read_started_at: now,
+        };
+        let key = SessionKey {
+            tenant_id,
+            device_id,
+            session_id: "fs-invalidation-bytes".to_owned(),
+            epoch: 1,
+        };
+        let (mut actor, mut control) = admitted_control_actor(identity, key.clone());
+        let (data_tx, _data_rx) = mpsc::channel(actor.options.limits.max_queue_messages);
+        let session = actor.sessions.get_mut(&key.scope()).expect("test session");
+        session.profile = super::RuntimeProfile::M2;
+        session.data_tx = Some(data_tx.clone());
+        session.active_carrier = Some(DataCarrier {
+            context: CarrierContext::new(
+                key.session_id.clone(),
+                key.epoch,
+                1,
+                "fs-invalidation-bytes-data".to_owned(),
+            ),
+            tx: data_tx,
+        });
+        let (open_tx, open_rx) = oneshot::channel();
+        actor.open_consumer_stream(
+            consumer,
+            device_id,
+            service_id,
+            grant.clone(),
+            now + Duration::minutes(1),
+            None,
+            super::StreamAdmissionReply::Fs {
+                response: open_tx,
+                capabilities: "read,list".to_owned(),
+            },
+        );
+        let registration = open_rx
+            .await
+            .expect("open response")
+            .expect("fs stream admitted");
+        if let ControlOutbound::Text(mut text) = control.rx.try_recv().expect("OPEN queued") {
+            text.release();
+        }
+        let stream_id = registration.base.stream_id;
+        let challenge_id = "fs-invalidation-bytes-challenge";
+        let started_at_ms = super::monotonic_millis();
+        // Device→owner bytes buffered and charged, waiting for the reader.
+        const BUFFERED: &[u8] = b"nine-p-reply-bytes-in-flight";
+        let charged_before = {
+            let session = actor.sessions.get_mut(&key.scope()).expect("test session");
+            let stream = session
+                .streams
+                .get_mut(&stream_id)
+                .expect("admitted stream");
+            stream.open_pending = false;
+            stream.authorization_in_flight = true;
+            stream.authorization_started_at_ms = Some(started_at_ms);
+            stream.authorization_deadline_ms = Some(started_at_ms + 2_000);
+            stream.challenge_id = Some(challenge_id.to_owned());
+            assert!(
+                stream
+                    .http
+                    .as_mut()
+                    .expect("an fs stream carries raw bidirectional state")
+                    .accept_data(BUFFERED, super::wire::M2_INITIAL_WINDOW_BYTES),
+                "the window admits this much"
+            );
+            assert!(session.queue_budget.reserve_data(BUFFERED.len()));
+            stream.budget_bytes = stream.budget_bytes.saturating_add(BUFFERED.len());
+            session.queue_budget.used()
+        };
+        assert!(charged_before >= BUFFERED.len());
+        actor.invalidate_stream_challenge(
+            &key,
+            &DeviceChallenge {
+                message_id: "fs-invalidation-bytes-auth".to_owned(),
+                stream_id,
+                service_id: service_id.to_string(),
+                challenge_id: challenge_id.to_owned(),
+                nonce: "fs-invalidation-bytes-nonce".to_owned(),
+                permission_digest: super::wire::permission_digest(&grant, &service_id.to_string()),
+                grant_revision: grant.revision,
+                received_at: std::time::Instant::now(),
+                lifetime: std::time::Duration::from_secs(2),
+            },
+            "authorization expired",
+        );
+        // The invalidation itself queues a control message, which carries its
+        // own charge until it is sent.  Drain and release it so what remains
+        // is the stream's data charge alone.
+        while let Ok(outbound) = control.rx.try_recv() {
+            if let ControlOutbound::Text(mut text) = outbound {
+                text.release();
+            }
+        }
+        let session = &actor.sessions[&key.scope()];
+        assert_eq!(
+            session.streams[&stream_id].budget_bytes, 0,
+            "the discarded bytes must leave the stream's own charge"
+        );
+        assert_eq!(
+            session.queue_budget.used(),
+            charged_before - BUFFERED.len(),
+            "and must be released to the session budget on the same turn"
+        );
     }
 
     #[tokio::test]
