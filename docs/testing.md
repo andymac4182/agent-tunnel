@@ -1602,6 +1602,13 @@ returns false unless the attempt is active **and** the phase is frozen. They
 are kept for the error message they give a failing run, and the two cases that
 defeat the predicate's own clauses are what hold those conditions.
 
+**Suite status.** This gate passes, but `scripts/m4-harness-verify.sh` as a
+whole does **not** at the tip that introduced it: the connector fix this gate
+depends on (M4-22) reaches a latent relay defect, **M4-25**, that closes a
+revoked filesystem session without the contractual `1008`, so
+`verify-m4-fs-real-path` is red 3 of 3. The two must land together. Nothing in
+this gate's own evidence touches revocation.
+
 **What this gate does not prove.** Only **rotation**, of M4-06's five transport
 events. Consumer loss, epoch change and device process restart are still
 uncovered on the filesystem path; revocation is covered by gate 4 and not here.
