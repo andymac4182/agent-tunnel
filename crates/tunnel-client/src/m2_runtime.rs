@@ -4664,9 +4664,13 @@ impl M2Actor {
             let Some(stream) = self.streams.get(&stream_id) else {
                 continue;
             };
+            // This must name exactly the operations the selection above
+            // names.  A stream selected for refresh and then dropped here has
+            // its challenge built and discarded on every tick, so its grant
+            // is never renewed and it expires mid-use (docs/tasks.md M4-22).
             if !matches!(
                 stream.operation.as_str(),
-                "echo_stream" | HTTP_FORWARD_OPERATION
+                "echo_stream" | HTTP_FORWARD_OPERATION | FS_STREAM_OPERATION
             ) || !stream.auth.confirmed
                 || stream.auth.refresh_in_flight
                 || stream.auth.invalidated
@@ -4723,9 +4727,12 @@ impl M2Actor {
             let Some(stream) = self.streams.get(&stream_id) else {
                 continue;
             };
+            // Same closed operation list as the selection and re-validation
+            // in `refresh_authorizations`: a deferred filesystem refresh that
+            // is dropped here never reaches the relay (docs/tasks.md M4-22).
             if !matches!(
                 stream.operation.as_str(),
-                "echo_stream" | HTTP_FORWARD_OPERATION
+                "echo_stream" | HTTP_FORWARD_OPERATION | FS_STREAM_OPERATION
             ) || !stream.auth.confirmed
                 || stream.auth.refresh_in_flight
                 || stream.auth.invalidated
@@ -9417,6 +9424,130 @@ mod tests {
             );
         }
         assert_eq!(actor.control_queue.budget.current(), 0);
+    }
+
+    /// A filesystem stream's authorization refresh must actually be sent.
+    ///
+    /// `refresh_authorizations` selects `FS_STREAM_OPERATION` alongside
+    /// `echo_stream` and `HTTP_FORWARD_OPERATION`, builds the challenge, and
+    /// then re-validates the stream before queueing it.  When that second
+    /// match omitted the filesystem operation the challenge was built and
+    /// silently dropped every tick, so a filesystem session could never renew
+    /// its grant and expired at its admission deadline while it was still in
+    /// use.  This is the regression test for docs/tasks.md row **M4-22**.
+    #[tokio::test]
+    async fn filesystem_stream_authorization_refresh_is_queued() {
+        let (mut actor, _active_key, _carrier_receiver, mut control_receiver) =
+            test_actor_with_control_capacity(M2_CARRIER_QUEUE_FRAMES, 16);
+        let operation_deadline =
+            DualDeadline::new(Instant::now(), SystemTime::now(), Duration::from_secs(60))
+                .expect("test operation deadline");
+        let mut stream = test_stream();
+        stream.operation = FS_STREAM_OPERATION.to_owned();
+        stream.sequence = StreamState::new(1, 1_024).expect("test stream sequence");
+        stream.auth.confirmed = true;
+        stream.auth.refresh_in_flight = false;
+        stream.auth.operation_deadline = operation_deadline;
+        actor.streams.insert(1, stream);
+
+        actor
+            .refresh_authorizations()
+            .await
+            .expect("refreshing a filesystem stream must not fail");
+
+        let mut challenged = BTreeSet::new();
+        while let Ok(item) = control_receiver.try_recv() {
+            let Message::Text(text) = &item.message else {
+                continue;
+            };
+            if let ControlMessage::AuthorizationChallenge(challenge) =
+                decode_control(text.as_bytes()).expect("queued challenge should decode")
+            {
+                challenged.insert(challenge.stream_id);
+            }
+        }
+        assert!(
+            challenged.contains(&1),
+            "a filesystem stream's refresh challenge must reach the control queue, \
+             otherwise the session expires at its admission deadline and cannot renew"
+        );
+        assert!(
+            actor
+                .streams
+                .get(&1)
+                .expect("the filesystem stream remains established")
+                .auth
+                .refresh_in_flight,
+            "the filesystem stream must be marked in flight once its challenge queued"
+        );
+    }
+
+    /// The deferred half of the same rule: a filesystem refresh that hit
+    /// bounded control-queue pressure must still be sent once a slot frees.
+    /// `flush_pending_authorization_refreshes` re-validates the operation the
+    /// same way, and omitted the filesystem operation for the same reason.
+    /// Also docs/tasks.md row **M4-22**.
+    #[tokio::test]
+    async fn deferred_filesystem_authorization_refresh_is_flushed() {
+        let (mut actor, _active_key, _carrier_receiver, mut control_receiver) =
+            test_actor_with_control_capacity(M2_CARRIER_QUEUE_FRAMES, 16);
+        let operation_deadline =
+            DualDeadline::new(Instant::now(), SystemTime::now(), Duration::from_secs(60))
+                .expect("test operation deadline");
+        let mut stream = test_stream();
+        stream.operation = FS_STREAM_OPERATION.to_owned();
+        stream.sequence = StreamState::new(1, 1_024).expect("test stream sequence");
+        stream.auth.confirmed = true;
+        stream.auth.refresh_in_flight = false;
+        stream.auth.operation_deadline = operation_deadline;
+        actor.streams.insert(1, stream);
+
+        let auth_deadline =
+            DualDeadline::new(Instant::now(), SystemTime::now(), Duration::from_secs(5))
+                .expect("test auth deadline");
+        let challenge = AuthorizationChallenge::new(
+            message_id(),
+            actor.session.session_id.clone(),
+            actor.session.epoch,
+            1,
+            "challenge".to_owned(),
+            "nonce".to_owned(),
+            "echo".to_owned(),
+            "permission".to_owned(),
+            1,
+        );
+        actor.pending_authorization_refreshes.insert(
+            1,
+            PendingAuthorizationRefresh {
+                challenge,
+                auth_deadline,
+            },
+        );
+
+        actor
+            .flush_pending_authorization_refreshes(Instant::now(), SystemTime::now())
+            .await
+            .expect("flushing a deferred filesystem refresh must not fail");
+
+        let mut challenged = BTreeSet::new();
+        while let Ok(item) = control_receiver.try_recv() {
+            let Message::Text(text) = &item.message else {
+                continue;
+            };
+            if let ControlMessage::AuthorizationChallenge(challenge) =
+                decode_control(text.as_bytes()).expect("queued challenge should decode")
+            {
+                challenged.insert(challenge.stream_id);
+            }
+        }
+        assert!(
+            challenged.contains(&1),
+            "a deferred filesystem refresh must be queued once control capacity frees"
+        );
+        assert!(
+            actor.pending_authorization_refreshes.is_empty(),
+            "the deferred filesystem refresh must not be left pending forever"
+        );
     }
 
     #[tokio::test]
