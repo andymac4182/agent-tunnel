@@ -1532,11 +1532,81 @@ never spoken to a relay, and the one that has reached its framework as stand-in
 error classes with the same constructor shapes the offline suites use — so
 "registered with the real thing that consumes it" (task row M4-14) and "driven
 against real relay and device sockets" (this row) are two facts proven
-separately rather than one fact proven once. No filesystem session has been held
-across a scheduled data-socket rotation, no grant has been revoked under a live
-*client* session, a consumer still reaches only the owning relay, and the
+separately rather than one fact proven once. No grant has been revoked under a
+live *client* session, a consumer still reaches only the owning relay, and the
 shared dataset across all four views, two adapters borrowing one client, clocks
-and budgets are exactly as gate 6 left them.
+and budgets are exactly as gate 6 left them. A filesystem session **has** now
+been held across a scheduled data-socket rotation, but by the harness's own 9P
+client and not by the shared TypeScript client: that is gate 7 below.
+
+### Implementation gate 7: a live 9P session across a real rotation (`verify-m4-fs-rotation`)
+
+The gate is `verify-m4-fs-rotation`, registered in
+[`scripts/m4-harness-verify.sh`](../scripts/m4-harness-verify.sh) beside gates
+4, 5 and 6 and implemented in
+`crates/tunnel-test-harness/src/production_cluster/fs_rotation.rs`. It runs on
+the same real three-relay production cluster, the same authoritative Redis
+catalog and the same consumer WSS sockets, on its own seeded `rotation` export
+so that a fid surviving a rotation cannot be credited to another case's grant.
+
+It exists because [protocol.md](protocol.md) states that "9P fids, request tags
+and negotiated session state … remain intact through scheduled data socket
+rotation", that "the relay neither duplicates `Tattach` nor reconstructs fids
+during cutover", and that compatibility tests must cover "reads/writes spanning
+rotations" — and until this gate the four filesystem cluster gates contained
+**no occurrence** of `rotat`, `epoch` or `restart` in 6,029 lines.
+
+**The rotation is concurrent with a 9P exchange, not sequential with it.** A
+rotation between two quiet exchanges would prove nothing, so the gate holds one
+`Rread` in flight across the freeze:
+
+* The fid is opened and serves three full-`msize` reads first, so a later
+  failure cannot be blamed on a session that never worked.
+* Once the carrier has settled, the **device data socket's connector→relay**
+  bytes are paused at the harness TCP proxy. The control socket and the
+  rotation candidate are untouched, so the attempt itself is unmodified.
+* One `Tread` is sent and its reply deliberately not read. The request crosses
+  on the still-flowing relay→connector direction, the device performs it, and
+  the connector sequences the `Rread` into the paused socket.
+* At `ROTATE_QUIESCE` the owner fixes the attempt's immutable per-direction
+  fences. The connector's fence for this stream therefore covers a frame the
+  owner has not received, so the owner cannot prove its drain and stays frozen
+  until the bytes are released — well inside the overlap deadline.
+
+The concurrency proof is drawn from the owner's own rotation state machine
+rather than from a timestamp: at a frozen phase with the attempt active,
+`connector_fence_sequences[stream]` is strictly greater than that stream's
+`recv_contiguous_connector_to_relay`. Measured at this tip: fence **12**
+against cursor **10**, phase `quiescing`, candidate generation 2 over old
+generation 1.
+
+**The assertions are on the operation, not on liveness.** That a session still
+exists proves nothing. Measured at this tip: the held tag **7** came back as an
+`Rread` of **65,525** bytes carrying the tag that was outstanding across the
+freeze; the transfer delivered **1,572,864 of 1,572,864** bytes over **25**
+`Rread` messages on one fid with an exact FNV-1a checksum; rotations completed
+**0 → 1**, active generation **1 → 2**, epoch **1 → 1**, **zero** replayed
+frames and no deadline-forced retirement; the fid opened before the rotation
+still answered `Tgetattr` with the same size after it, the attach fid still
+walked, and exactly **one** `Tattach` was sent in the whole run.
+
+**Guards.** `python3 scripts/fs-guard-deletion.py --suite gate7-rotation` is
+**19 of 21** red at this tip. The two exceptions are recorded rather than
+hidden: "the owner was actually frozen when it was sampled" and "a rotation
+attempt was active at the sample" are each still green when defeated alone,
+because the composite in-flight rule already subsumes both — the predicate
+returns false unless the attempt is active **and** the phase is frozen. They
+are kept for the error message they give a failing run, and the two cases that
+defeat the predicate's own clauses are what hold those conditions.
+
+**What this gate does not prove.** Only **rotation**, of M4-06's five transport
+events. Consumer loss, epoch change and device process restart are still
+uncovered on the filesystem path; revocation is covered by gate 4 and not here.
+The session runs against the **owning** relay, because gate 4 admits a
+filesystem session only there, so the rotation crossed the device data socket
+and not the relay-to-relay peer hop. Nothing here is driven by the shared
+TypeScript client. Nothing here covers a **write** spanning a rotation, and
+nothing here exercises `Tflush` across one.
 
 ### Shared dataset and native semantics
 

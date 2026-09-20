@@ -33,4 +33,7 @@ gate "M4 filesystem gate 5: write grants, the hard-link write rule, an interrupt
 gate "M4 filesystem gate 6: the real TypeScript client against real relay and device sockets" \
   cargo run --locked -p tunnel-test-harness -- verify-m4-fs-client-e2e
 
+gate "M4 filesystem gate 7: a live 9P session across a real scheduled rotation, with the exchange in flight" \
+  cargo run --locked -p tunnel-test-harness -- verify-m4-fs-rotation
+
 echo "m4-harness-verify: implemented M4 harness suite passed" >&2

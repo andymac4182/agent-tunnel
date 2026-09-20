@@ -2666,6 +2666,17 @@ class Suite:
 # sequential with it, and that the *operation* survived rather than merely the
 # session.  A rule whose deletion leaves the table green would be a rule the
 # claim never rested on.
+#
+# **Two of the twenty-one are masked, and this says so rather than hiding it.**
+# "the owner was actually frozen when it was sampled" and "a rotation attempt
+# was active at the sample" are each **still green** when defeated alone, at
+# 19 of 21 red.  They are not load-bearing on their own because the composite
+# rule above them already subsumes both: `exchange_in_flight_at_freeze()`
+# returns false unless `attempt_active` is set **and** the phase is one of
+# `FROZEN_PHASES`, so the composite rejects every mutation these two would
+# have caught.  They are kept because they name the violated condition
+# precisely when a run fails, which a composite cannot; the two cases below
+# that defeat the predicate's own clauses are what hold those conditions.
 GATE7_ROTATION_TEST = [
     "cargo",
     "test",
