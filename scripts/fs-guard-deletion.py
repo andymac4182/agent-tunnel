@@ -2671,6 +2671,11 @@ EXPECT_GREEN: frozenset[str] = frozenset(
         # `the_in_flight_predicate_needs_both_halves` defeats the predicate in
         # each direction directly.
         "the relay had dispatched a 9P record toward the device when the process was killed",
+        # gate11's spelling of the same rule.  Its composite,
+        # `request_outstanding_at_failure()`, subsumes it for the same reason,
+        # and `the_in_flight_predicate_needs_both_halves` defeats the predicate
+        # in each direction directly.
+        "the relay had dispatched a 9P record toward the device when the data socket failed",
         # gate2.  Task row **M4-08** explains all nine in those words: "each
         # `O_NOFOLLOW` and its sibling identity check mask one another and are
         # proven in pairs, and the three mount-boundary checks mask one another

@@ -1864,7 +1864,19 @@ nothing further while the owner shows the stream fully quiesced. The control
 that makes this filesystem-specific is `verify-m7-i08-recovery-attempts`, the
 product's own retained-recovery gate on the echo adapter, which exits 0 at the
 same tip on the same host. `python3 scripts/fs-guard-deletion.py --suite
-gate11-data-recovery` covers the validator's rules.
+gate11-data-recovery` reports **37 of 38** deletions red, with one case
+reported as `DOCUMENTED GREEN` — the composite-masked in-flight half that gates
+8, 9 and 10 each carry for the same reason, held directly in both directions by
+`the_in_flight_predicate_needs_both_halves`.
+
+**Thirteen rules were removed rather than exempted.** The same-owner qualifier
+was first written as thirteen validator rules beside the antecedent
+conjunction, and the guard suite reported every one of them still green: the
+conjunction already rejects every run they would have rejected. They are gone,
+and the property moved to where it can be defeated — the conjunction is one
+conjunct per line, the suite deletes each conjunct separately, and each of
+those turns the gate's per-conjunct unit test red as well as its mutation
+table.
 
 ### Shared dataset and native semantics
 

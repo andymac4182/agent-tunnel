@@ -375,6 +375,15 @@ pub fn validate_fs_data_recovery_evidence(evidence: &FsDataRecoveryEvidence) -> 
         ),
         // The concurrency rules.  Without these the gate would prove only that
         // a socket died somewhere near a filesystem session.
+        // This half is **documented green**, not load-bearing, and it is kept
+        // rather than removed.  The composite rule immediately below subsumes
+        // it: `request_outstanding_at_failure()` is false unless the emit
+        // cursor advanced **and** the receive cursor did not, so the composite
+        // already rejects every run this rule would have.  It is kept because
+        // it names the violated condition precisely when a run fails, and the
+        // predicate's own clause is held directly — in **both** directions — by
+        // `the_in_flight_predicate_needs_both_halves` below.  Gates 8, 9 and 10
+        // each carry the same case for the same reason.
         (
             "the relay had dispatched a 9P record toward the device when the data socket \
              failed"
@@ -1396,6 +1405,39 @@ mod tests {
                 "a same-owner qualifier did not defeat the antecedent: {label}"
             );
         }
+    }
+
+    /// The in-flight predicate is a conjunction, and neither half may be
+    /// dropped.  The validator's "the relay had dispatched a 9P record" rule is
+    /// subsumed by this predicate, so this is where that clause is actually
+    /// defeated — in both directions, rather than being taken on trust because
+    /// a rule beside it happens to say the same words.
+    #[test]
+    fn the_in_flight_predicate_needs_both_halves() {
+        let outstanding = FailureObservation {
+            stream_id: 1,
+            emitted_before: 7,
+            emitted_at_failure: 8,
+            recv_contiguous_before: 10,
+            recv_contiguous_at_failure: 10,
+        };
+        assert!(outstanding.request_outstanding_at_failure());
+        // Nothing was dispatched: the emit cursor never moved.
+        assert!(
+            !FailureObservation {
+                emitted_at_failure: outstanding.emitted_before,
+                ..outstanding.clone()
+            }
+            .request_outstanding_at_failure()
+        );
+        // It was dispatched and answered: the receive cursor moved too.
+        assert!(
+            !FailureObservation {
+                recv_contiguous_at_failure: outstanding.recv_contiguous_before + 1,
+                ..outstanding.clone()
+            }
+            .request_outstanding_at_failure()
+        );
     }
 
     /// The recovery reason is derived from the library rather than pinned, and
