@@ -14,8 +14,16 @@
 //!
 //! It proves that **no crate on the denylist appears anywhere in this
 //! workspace's `Cargo.lock`**, that no such crate is in the transitive closure
-//! of either M5 crate, and that the two M5 crates declare only dependencies
-//! from a small explicit allowlist. Those are real, mechanical properties.
+//! of any M5 crate, and that the M5 crates declare only dependencies from a
+//! small explicit allowlist. Those are real, mechanical properties.
+//!
+//! Chunk 4 added a third crate, `tunnel-cua-export`, which owns processes.
+//! **That widens the scope of this file rather than escaping it**: a crate
+//! that can spawn a child is exactly where a real automation dependency would
+//! be most tempting, so it gets its own budget below, and the budget
+//! deliberately contains no HTTP client -- the health probe is a trait the
+//! caller implements, so Lane A's rule that the fixture is the only backend
+//! stays checkable from the manifest.
 //!
 //! It does **not** prove that no code anywhere could ever touch a host: a
 //! process can shell out, and `std` can open a device node. What it removes is
@@ -230,14 +238,14 @@ fn closure(root: &str) -> BTreeSet<String> {
     seen
 }
 
-/// The same denylist, narrowed to what either M5 crate can actually reach.
+/// The same denylist, narrowed to what any M5 crate can actually reach.
 ///
 /// Stronger than the workspace-wide scan for the scope that matters: a crate
 /// arriving anywhere in the workspace is a warning, and a crate arriving in
 /// *this* closure is the defect itself.
 #[test]
-fn neither_m5_crate_can_reach_a_crate_capable_of_input_or_capture() {
-    for root in ["tunnel-cua", "tunnel-cua-fixture"] {
+fn no_m5_crate_can_reach_a_crate_capable_of_input_or_capture() {
+    for root in ["tunnel-cua", "tunnel-cua-export", "tunnel-cua-fixture"] {
         let reachable = closure(root);
         assert!(
             reachable.contains(root),
@@ -399,15 +407,41 @@ const M5_ALLOWED_DEPENDENCIES: &[(&str, &[&str])] = &[
         ],
     ),
     (
+        // The supervisor owns processes and a clock. `rustix` is the safe
+        // process-group signalling every export in this workspace uses, and
+        // `tunnel-deadman` is the parent-death sentinel. **No HTTP client**:
+        // the health probe is a trait the caller implements, so this crate
+        // cannot be pointed at a backend at all. `serde_json` is a
+        // dev-dependency only -- a probe payload in a test -- because the
+        // production path reads a typed `Dispatch`, never a body.
+        "tunnel-cua-export",
+        &[
+            "rustix",
+            "serde_json",
+            "tempfile",
+            "tokio",
+            "tunnel-cua",
+            "tunnel-deadman",
+        ],
+    ),
+    (
         // The fixture binds a loopback socket, so it gets a runtime -- and
         // nothing else. In particular **not** `tunnel-http-bridge`.
         "tunnel-cua-fixture",
-        &["serde_json", "tokio", "tunnel-cua"],
+        &[
+            "rustix",
+            "serde_json",
+            "tempfile",
+            "tokio",
+            "tunnel-cua",
+            "tunnel-cua-export",
+            "tunnel-deadman",
+        ],
     ),
 ];
 
 #[test]
-fn the_two_m5_crates_declare_only_allowlisted_dependencies() {
+fn the_m5_crates_declare_only_allowlisted_dependencies() {
     let root = workspace_root();
     for (crate_name, allowed) in M5_ALLOWED_DEPENDENCIES {
         let manifest = root.join("crates").join(crate_name).join("Cargo.toml");
@@ -433,9 +467,14 @@ fn the_two_m5_crates_declare_only_allowlisted_dependencies() {
     // declarations -- under the old flat union the fixture could have taken
     // `tunnel-http-bridge` unnoticed, and now it cannot.
     let pure = M5_ALLOWED_DEPENDENCIES[0].1;
-    let fixture = M5_ALLOWED_DEPENDENCIES[1].1;
+    let export = M5_ALLOWED_DEPENDENCIES[1].1;
+    let fixture = M5_ALLOWED_DEPENDENCIES[2].1;
     assert!(pure.contains(&"tunnel-http-bridge") && !fixture.contains(&"tunnel-http-bridge"));
     assert!(fixture.contains(&"tokio") && !pure.contains(&"tokio"));
+    // The supervisor gets the sentinel and the pure crate does not; the pure
+    // crate gets the codec and the supervisor does not. Three budgets, not one.
+    assert!(export.contains(&"tunnel-deadman") && !pure.contains(&"tunnel-deadman"));
+    assert!(!export.contains(&"tunnel-http-bridge"));
 }
 
 /// Neither M5 crate declares a feature that could turn one of these on later.
@@ -446,9 +485,9 @@ fn the_two_m5_crates_declare_only_allowlisted_dependencies() {
 /// B does arrive it will need this test changed, deliberately, with an
 /// argument.
 #[test]
-fn neither_m5_crate_declares_any_optional_feature_yet() {
+fn no_m5_crate_declares_any_optional_feature_yet() {
     let root = workspace_root();
-    for crate_name in ["tunnel-cua", "tunnel-cua-fixture"] {
+    for crate_name in ["tunnel-cua", "tunnel-cua-export", "tunnel-cua-fixture"] {
         let manifest = root.join("crates").join(crate_name).join("Cargo.toml");
         let text = std::fs::read_to_string(&manifest).expect("a readable manifest");
         let document: toml::Value = toml::from_str(&text).expect("the manifest is TOML");
