@@ -290,6 +290,40 @@ async fn stopping_a_backend_that_already_died_still_invalidates() {
     assert_eq!(again.leases_released, vec![desktop]);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_probe_cannot_report_a_backend_that_is_gone_as_working() {
+    // A probe's answer says something about **whatever answered it**, which
+    // after a stop is not the supervised process: a stale reply, or a
+    // different process that took the port. The lifecycle verdict wins, and
+    // it must, or "working" would stop meaning "this backend works".
+    let workspace = tempfile::tempdir().expect("workspace");
+    let mut supervisor = Supervisor::new(publishing(workspace.path(), "127.0.0.1:9"));
+    supervisor.start().await.expect("started");
+
+    let body = serde_json::json!({
+        "version": tunnel_cua::SCHEMA_VERSION,
+        "operation": "screen_info",
+        "params": {},
+    })
+    .to_string();
+    let request =
+        tunnel_cua::schema::validate_request(body.as_bytes(), 64 << 10).expect("a valid probe");
+    let succeeded = tunnel_cua::outcome::Dispatch::Dispatched(tunnel_cua::outcome::Completion::Ok(
+        serde_json::json!({"width": 1, "height": 1}),
+    ));
+    assert!(
+        supervisor.assess(&request, &succeeded).permits_dispatch(),
+        "while it is running, a succeeded probe is a working verdict"
+    );
+
+    supervisor.stop(&Registries::default()).await;
+    assert_eq!(
+        supervisor.assess(&request, &succeeded),
+        Health::Exited,
+        "the very same succeeded probe must not report a stopped backend as working"
+    );
+}
+
 #[test]
 fn a_health_verdict_cannot_be_reached_without_ending_up_at_the_probe() {
     // A compile-level observation written as a test so it is not lost: the
