@@ -1610,13 +1610,86 @@ revoked filesystem session without the contractual `1008`, so
 this gate's own evidence touches revocation.
 
 **What this gate does not prove.** Only **rotation**, of M4-06's five transport
-events. Consumer loss, epoch change and device process restart are still
-uncovered on the filesystem path; revocation is covered by gate 4 and not here.
-The session runs against the **owning** relay, because gate 4 admits a
-filesystem session only there, so the rotation crossed the device data socket
-and not the relay-to-relay peer hop. Nothing here is driven by the shared
-TypeScript client. Nothing here covers a **write** spanning a rotation, and
-nothing here exercises `Tflush` across one.
+events. Consumer loss is now gate 8 below; epoch change and device process
+restart are still uncovered on the filesystem path, and revocation is covered
+by gate 4 and not here. The session runs against the **owning** relay, because
+gate 4 admits a filesystem session only there, so the rotation crossed the
+device data socket and not the relay-to-relay peer hop. Nothing here is driven
+by the shared TypeScript client. Nothing here covers a **write** spanning a
+rotation, and nothing here exercises `Tflush` across one.
+
+### Implementation gate 8: a 9P session lost mid-exchange (`verify-m4-fs-consumer-loss`)
+
+The gate is `verify-m4-fs-consumer-loss`, registered in
+[`scripts/m4-harness-verify.sh`](../scripts/m4-harness-verify.sh) beside gates
+4, 5, 6 and 7 and implemented in
+`crates/tunnel-test-harness/src/production_cluster/fs_consumer_loss.rs`. It
+runs on the same real three-relay production cluster, the same authoritative
+Redis catalog and the same consumer WSS sockets, on its own seeded
+`consumer-loss` export so that a fid answering in the replacement session
+cannot be credited to another case's grant.
+
+It covers M4-06's **consumer loss** clause, and its contract is the *opposite*
+of gate 7's. [protocol.md](protocol.md) states both in one paragraph: fids and
+tags "remain intact through scheduled data socket rotation", but "the first
+filesystem profile restores no fids across a consumer WebSocket reconnect …
+terminate that filesystem session, fail pending calls explicitly and create a
+fresh 9P session". The **same-owner** sentence — "replacement of a failed data
+socket may preserve the filesystem session only while the same control owner
+and all ordered stream state are retained" — licenses retention for exactly one
+event, and a consumer reconnect is not it. A gate that asserted fid survival
+here would be asserting the violation.
+
+**The loss is concurrent with a 9P exchange, not sequential with it.** A
+consumer that goes away between two settled exchanges would prove nothing, so
+the gate loses one with a request outstanding and proves it from the owner's
+own per-stream cursors rather than from timing. Once the carrier has settled,
+the device data socket's connector→relay direction is paused at the harness
+proxy; the owner's `last_emitted_relay_to_connector` and
+`recv_contiguous_connector_to_relay` for the stream are fixed *while paused*;
+one `Tread` is sent whose reply is never read; and the consumer is abandoned at
+the instant the owner shows the emit cursor advanced while the receive cursor
+has not — the relay had dispatched a 9P record toward the device and had
+received no answer to it. The paused bytes are released *after* the loss, so
+the device's `Rread` really does arrive at a relay whose consumer is gone.
+
+**The assertions are on the protocol objects, not on liveness.** The lost
+stream is deregistered at the owner; the device's own tunnel session survives
+the loss of one consumer with its identity and epoch unchanged. The contract
+clause proper is then driven in two pieces, in the order the session machine
+checks them, because a single probe would conflate them. A replacement session
+that names the lost session's file fid *before* attaching is **closed** with
+the profile's protocol violation rather than served — `SessionError::
+BeforeAttach` answers `Close(ProtocolViolation)` and is consulted before the
+fid table, which is the "require fresh version/attach" half. A replacement
+session that *has* attached, on a root fid of its own, then finds both of the
+lost session's fid numbers unbound, refused with the errno for a fid that is
+not allocated in this session. That session then walks, opens and reads the
+whole file back with an exact checksum — binding the lost file-fid *number*
+freshly as it does so, which is the other half of the contract: the number is
+reusable once the session that held it is gone.
+
+Reusing the *same fid numbers* is what gives the case its force: if fids leaked
+across consumer sessions, that fid would still be bound to the file and would
+answer.
+
+**Observed, not pinned.** One run at this tip: emit cursor **7 → 8** against a
+receive cursor held at **10**, both stale fids refused with errno **22**, the
+pre-attach probe closed with **1002**, **786,432 of 786,432** bytes over **13**
+`Rread` messages with an exact checksum, epoch **1 → 1**, and exactly **two**
+`Tattach` across the run. The gate asserts the *inequality* and the errno
+*derived* from `FsErrorCode::Einval`, never these figures; three runs at this
+tip agreed on them, but nothing depends on that.
+
+**What this gate does not prove.** Only **consumer loss**, of the three events
+M4-06 still named as uncovered. **Epoch change** and **device process restart**
+remain uncovered on the filesystem path. The loss is of the consumer's own
+WebSocket, so nothing here faults the device carrier or the control socket, and
+the "data-only recovery" clause of the same-owner contract — a replacement of a
+*failed* data socket — is still untested. The session runs against the
+**owning** relay, because gate 4 admits a filesystem session only there.
+Nothing here is driven by the shared TypeScript client, and the outstanding
+operation is a **read**: no write and no `Tflush` has been lost mid-exchange.
 
 ### Shared dataset and native semantics
 
