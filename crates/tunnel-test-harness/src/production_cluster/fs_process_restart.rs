@@ -662,16 +662,18 @@ pub fn validate_fs_process_restart_evidence(evidence: &FsProcessRestartEvidence)
             !evidence.pending_call_errored,
         ),
         (
+            // **The whole clause, in one rule.**  A second rule asserting
+            // `!is_settled()` on this field was written here first and removed:
+            // the deletion guard showed it was not load-bearing, because
+            // `Outcome::Unknown` is the only value this rule admits and the
+            // library already says that value is not settled.  A rule that can
+            // never be the one to reject anything proves less than it claims,
+            // so the library property is held **directly** instead, by
+            // `an_unknown_outcome_is_not_settled_and_a_failed_one_is`, which
+            // defeats it in both directions and would fail first on the day
+            // `Outcome` stopped ordering these the way this gate reads it.
             "the held mutation classifies as an unknown outcome".into(),
             evidence.held_call_outcome == Some(Outcome::Unknown),
-        ),
-        (
-            "that classification is one the caller may not assume away: an unknown outcome is not \
-             settled, so it is not retryable"
-                .into(),
-            evidence
-                .held_call_outcome
-                .is_some_and(|outcome| !outcome.is_settled()),
         ),
         (
             "the held exchange's stream was deregistered at the owner".into(),

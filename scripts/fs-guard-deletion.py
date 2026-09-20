@@ -3911,18 +3911,6 @@ GATE10_RESTART_CASES: list[tuple[str, list[Edit]]] = [
         ],
     ),
     (
-        "that classification is one the caller may not assume away: an unknown outcome is not settled, so it is not retryable",
-        [
-            (
-                HARNESS_RESTART,
-                "            evidence\n"
-                "                .held_call_outcome\n"
-                "                .is_some_and(|outcome| !outcome.is_settled()),",
-                "            true,",
-            )
-        ],
-    ),
-    (
         "the held exchange's stream was deregistered at the owner",
         [
             (
