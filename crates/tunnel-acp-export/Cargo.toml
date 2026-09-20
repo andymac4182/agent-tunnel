@@ -21,6 +21,10 @@ serde_json = "1.0"
 tokio = { version = "1.48", features = ["io-util", "macros", "process", "rt", "sync", "time"] }
 tokio-util = { version = "0.7", default-features = false }
 tunnel-acp = { path = "../tunnel-acp" }
+# The parent-death sentinel.  It closes the *trigger* half of process-group
+# containment — the group kill running at all when this process is SIGKILLed —
+# and deliberately not the *reach* half.  See `docs/tasks.md` M3-09 and M8-C07.
+tunnel-deadman = { path = "../tunnel-deadman" }
 tunnel-http-bridge = { path = "../tunnel-http-bridge" }
 tunnel-http-forward = { path = "../tunnel-http-forward" }
 

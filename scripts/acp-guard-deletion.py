@@ -21,6 +21,12 @@ here:
   explicit interruptions and the saturation threshold.  Its guards are
   validator rules, so defeating one stops that rule rejecting its own
   falsification and the gate's `every_claim_can_fail_on_its_own` names it.
+* `m8c7` — the **parent-death sentinel** on the ACP path (M8-C07's trigger
+  half): arming it at all, the sentinel firing on a bare end of file, the
+  orderly stand-down, and the two fixture guards that keep the probe's helper
+  in the group and its escaping descendant out of it.  It is the one suite
+  here that carries a mandatory pre-build, because its tests `exec` two
+  binaries from two packages (see `Suite.build` and task row M3-19).
 * `m8c2` — the pure lifecycle in `crates/tunnel-acp/src/lifecycle.rs`, the
   supervisor in `crates/tunnel-acp-export` and the synthetic agent in
   `crates/tunnel-acp-fixture`: id scoping, resolve-exactly-once, the bounds,
@@ -600,6 +606,22 @@ class Suite:
     cargo_test: list[str]
     cases: list[tuple[str, list[Edit], bool]] = field(default_factory=list)
     cwd: Path = REPO
+    #: A command that must succeed **before** this suite's tests run.
+    #:
+    #: **Task row M3-19, and it may not be removed to make a suite faster.**
+    #: A suite whose tests `exec` a binary does not merely link the code under
+    #: test.  `cargo test -p <pkg>` builds a package's `[[bin]]` as a plain
+    #: executable only when that package has integration tests of its own, and
+    #: it builds **no binary belonging to another package at all** — so a case
+    #: that edits some *other* crate is run against whatever executable
+    #: happened to be lying in the target directory.  That is not a
+    #: hypothetical: the M3 suite's first run reported the sentinel's group
+    #: kill as `still green` — a guard that is the entire mechanism, defeated,
+    #: with nothing going red — because the deleted code was never rebuilt.
+    #: A harness that silently tests a stale artifact is worse than no harness.
+    #:
+    #: Suites whose tests exec nothing leave this empty.
+    build: list[str] = field(default_factory=list)
 
 
 # ------------------------------------------------------------- m8c2: chunk 2
@@ -2294,6 +2316,146 @@ C5_CASES: list[tuple[str, list[Edit], bool]] = [
 ]
 
 
+# --------------------------------------------------------------- M8 chunk 7
+#
+# The **parent-death sentinel** on the ACP path (task row M8-C07's trigger
+# half), witnessed by `crates/tunnel-acp-fixture/tests/process_residue.rs`.
+#
+# Every case here is defeated in a crate whose binary the tests `exec` — the
+# sentinel itself, or the fixture that hosts the probe — so this suite carries
+# the mandatory `build` step M3-19 exists for.  Without it the deleted code is
+# never rebuilt and a defeated guard reports `still green`.
+#
+# **One guard deliberately has no case here: the sentinel not widening the
+# group kill's reach.**  There is nothing to delete that would close the reach,
+# because no code in this repository closes it; the escaping-descendant test
+# records a survival, and a deletion harness measures guards that hold a rule,
+# not the absence of a mechanism.  M8-C07 and M3-09 carry the reach hole
+# instead, and this comment exists so its absence is not read as an oversight.
+
+DEADMAN = REPO / "crates" / "tunnel-deadman"
+DEADMAN_LIB = DEADMAN / "src" / "lib.rs"
+FIXTURE_LIB = FIXTURE / "src" / "lib.rs"
+
+C7_CARGO_TEST = [
+    "cargo",
+    "test",
+    "-p",
+    "tunnel-acp-fixture",
+    "--test",
+    "process_residue",
+    "--locked",
+    "--no-fail-fast",
+]
+
+#: Rebuilt before every case: the sentinel the supervisor spawns, and the
+#: fixture binary that is both the `supervise` probe and its wrapper.  See
+#: `Suite.build`.
+C7_BUILD = [
+    "cargo",
+    "build",
+    "--locked",
+    "-p",
+    "tunnel-deadman",
+    "-p",
+    "tunnel-acp-fixture",
+    "--bins",
+]
+
+C7_CASES: list[tuple[str, list[Edit], bool]] = [
+    (
+        # Arming at all.  Without this the ACP export supervises children
+        # exactly as it did before this chunk, and every group it owns
+        # survives the device being SIGKILLed.  This case is the red half of
+        # M8-C07's red-then-green.
+        "every ACP stdio child is watched by a parent-death sentinel",
+        [
+            (
+                CHILD,
+                "    let deadman = group.and_then(tunnel_deadman::Deadman::arm);",
+                "    let deadman: Option<tunnel_deadman::Deadman> = None;",
+            )
+        ],
+        False,
+    ),
+    (
+        # The whole mechanism, one crate down.  The sentinel still starts,
+        # still watches and still exits -- and signals nothing, so the group it
+        # was watching outlives the supervisor.  It is defeated in
+        # `tunnel-deadman` rather than in the export precisely to exercise the
+        # M3-19 rebuild: `cargo test -p tunnel-acp-fixture` builds no binary of
+        # that package, so without `C7_BUILD` this case reports `still green`.
+        "a bare end of file makes the sentinel kill the watched ACP process group",
+        [(DEADMAN_LIB, "    kill_group(leader);\n    EXIT_FIRED", "    EXIT_FIRED")],
+        False,
+    ),
+    (
+        # The orderly path.  Dropping the handle instead of standing the
+        # sentinel down still closes the pipe, but with **no token**, so the
+        # sentinel reads a bare end of file and fires -- a redundant group
+        # SIGKILL sent after this supervisor has already killed and reaped that
+        # group, which is the one moment at which the id may genuinely have
+        # been freed.  (The token-failure path `tunnel-deadman`'s module docs
+        # name; it is not an argument about the stand-down's *ordering*, which
+        # guards a crash window instead.)  The counter reads the sentinel's
+        # exit status, so it is how a test sees "stood down" from "fired and
+        # nobody noticed".
+        "an orderly ACP shutdown stands the sentinel down rather than letting it fire",
+        [
+            (
+                CHILD,
+                "            if tokio::task::spawn_blocking(move || deadman.stand_down())\n                .await\n                .unwrap_or(false)\n            {\n                supervisor_counters\n                    .deadman_stood_down\n                    .fetch_add(1, Ordering::Relaxed);\n            }",
+                "            drop(deadman);",
+            )
+        ],
+        False,
+    ),
+    (
+        # Not a product guard: a fixture guard.  If the helper the probe
+        # publishes stops staying in the wrapper's process group, the two
+        # SIGKILL measurements stop being about the group signal being sent and
+        # become about something else -- while staying green.  Putting it in a
+        # group of its own is the cheapest way to defeat that, and it must
+        # redden rather than quietly weaken the pair.
+        "the probe's helper is in the supervised child's group, not a group of its own",
+        [
+            (
+                FIXTURE_LIB,
+                """        let spawned = std::process::Command::new(executable)
+            .arg(HELPER_MODE)
+            .arg(helper_pid_file)""",
+                """        let mut command = std::process::Command::new(executable);
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt as _;
+            command.process_group(0);
+        }
+        let spawned = command
+            .arg(HELPER_MODE)
+            .arg(helper_pid_file)""",
+            )
+        ],
+        False,
+    ),
+    (
+        # The other fixture guard, the mirror of the M3 suite's.  If the
+        # descendant stops actually leaving the group, the plain group kill
+        # reaches it and the reach measurement becomes a measurement of
+        # nothing.  The `setsid` marker and the assertion on it are what stop
+        # that.
+        "an ACP descendant that failed to detach is refused, not measured",
+        [
+            (
+                FIXTURE_LIB,
+                "    let escaped = rustix::process::setsid().is_ok();",
+                "    let escaped = false;",
+            )
+        ],
+        False,
+    ),
+]
+
+
 SUITES: list[Suite] = [
     Suite("m8c1", [CRATE], CARGO_TEST, CASES),
     Suite("m8c2", [CRATE, EXPORT, FIXTURE], C2_CARGO_TEST, C2_CASES),
@@ -2301,6 +2463,7 @@ SUITES: list[Suite] = [
     Suite("m8c3-relay", [RELAY_CRATE], C3_RELAY_TEST, C3_RELAY_CASES),
     Suite("m8c4", [CRATE, EXPORT, FIXTURE], C4_CARGO_TEST, C4_CASES),
     Suite("m8c5", [HARNESS_CRATE], C5_CARGO_TEST, C5_CASES),
+    Suite("m8c7", [DEADMAN, EXPORT, FIXTURE], C7_CARGO_TEST, C7_CASES, build=C7_BUILD),
 ]
 
 
@@ -2317,6 +2480,23 @@ def run_tests(suite: Suite) -> tuple[str, list[str]]:
 
     A build that did not compile is **never** reported as a red test.
     """
+    if suite.build:
+        # M3-19: rebuild every binary these tests will `exec`, transitively,
+        # before running them.  A failure here is a build failure for the
+        # case, never a red test — the same refusal the test run itself makes.
+        try:
+            built = subprocess.run(
+                suite.build,
+                cwd=suite.cwd,
+                env=cargo_env(),
+                capture_output=True,
+                text=True,
+                timeout=600,
+            )
+        except subprocess.TimeoutExpired:
+            return "NOT EVIDENCE (timed out)", []
+        if built.returncode != 0:
+            return "BUILD FAILED", []
     try:
         done = subprocess.run(
             suite.cargo_test,
@@ -2389,7 +2569,8 @@ def main() -> int:
     parser.add_argument("--list", action="store_true", help="print case names and exit")
     parser.add_argument("--case", help="run only cases whose name contains this text")
     parser.add_argument(
-        "--suite", help="run only this suite (m8c1, m8c2, m8c3, m8c3-relay, m8c4, m8c5)"
+        "--suite",
+        help="run only this suite (m8c1, m8c2, m8c3, m8c3-relay, m8c4, m8c5, m8c7)",
     )
     arguments = parser.parse_args()
 

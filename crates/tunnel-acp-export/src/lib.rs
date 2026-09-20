@@ -25,12 +25,21 @@
 //!   in this crate's tests carries `tunnel-principal-binding: None`. That is
 //!   the M3-01/M3-02 precedent exactly, and it is recorded rather than left for
 //!   a reader to infer.
-//! * **No process-tree containment.** The group kill reaches the child's
-//!   process group. A descendant that calls `setsid`, calls `setpgid` or
-//!   double-forks leaves that group and is **not** killed — the inherited hole
-//!   `docs/tasks.md` records as M3-09. `tunnel-acp-fixture` ships a descendant
-//!   that deliberately escapes and survives, and the test that runs it
-//!   measures the survival rather than asserting containment.
+//! * **No process-tree containment — and that is the *reach* half only.**
+//!   Group containment has two independent halves and this crate closes
+//!   exactly one of them. **Reach**: which processes a group signal can touch.
+//!   The group kill reaches the child's process group; a descendant that calls
+//!   `setsid`, calls `setpgid` or double-forks has left that group and is
+//!   **not** killed, by anything here. That is the inherited hole
+//!   `docs/tasks.md` records as M3-09, it needs a kernel boundary (cgroup v2,
+//!   a job object, a sandbox or VM) that macOS does not offer in-process, and
+//!   `tunnel-acp-fixture` ships a descendant that deliberately escapes and
+//!   survives so the test measures the survival rather than asserting a
+//!   containment that does not exist. **Trigger**: whether anything sends the
+//!   signal at all. That half *is* closed, by the [`tunnel_deadman`] sentinel
+//!   — see [`child`] — and it is closed for in-group members only, because a
+//!   sentinel sends the same group signal from a different process and
+//!   therefore inherits the same reach.
 //! * **No per-OS coverage.** Process groups and `SIGKILL` are Unix-only, and
 //!   macOS is the only host any of this has run on. Nothing here was exercised
 //!   on Linux or Windows.
