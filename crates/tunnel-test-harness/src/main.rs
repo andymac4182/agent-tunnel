@@ -1963,6 +1963,60 @@ async fn main() -> ExitCode {
                 )),
             }
         }
+        [command] if command == "verify-m4-fs-consumer-loss" => {
+            match tokio::time::timeout(
+                Duration::from_secs(360),
+                tunnel_test_harness::production_cluster::verify_fs_consumer_loss(),
+            )
+            .await
+            {
+                Ok(result) => result.and_then(|evidence| {
+                    // Re-validate at the command boundary so a validator
+                    // regression cannot silently pass the command.
+                    tunnel_test_harness::production_cluster::validate_fs_consumer_loss_evidence(
+                        &evidence,
+                    )?;
+                    println!(
+                        "M4 filesystem consumer loss passed: relays={} owner={} subprotocol={} msize={} dialect={} prefix_bytes={} stream_id={} emitted={}->{} recv_contiguous={}->{} request_outstanding_at_loss={} loss_polls={} abandoned_tag={} lost_stream_deregistered={} device_session_survived={} session_id_stable={} epoch={}->{} second_session_msize={} stale_file_fid_refused={} stale_file_fid_errno={:?} stale_attach_fid_refused={} stale_attach_fid_errno={:?} second_session_attached={} second_session_bytes={}/{} second_session_checksum_matches={} second_session_messages={} second_session_getattr_size={} attach_count={}",
+                        evidence.relay_count,
+                        evidence.owner_node,
+                        evidence.selected_subprotocol,
+                        evidence.negotiated_msize,
+                        evidence.negotiated_dialect,
+                        evidence.prefix_bytes,
+                        evidence.loss.stream_id,
+                        evidence.loss.emitted_before,
+                        evidence.loss.emitted_at_loss,
+                        evidence.loss.recv_contiguous_before,
+                        evidence.loss.recv_contiguous_at_loss,
+                        evidence.request_outstanding_at_loss,
+                        evidence.loss_polls,
+                        evidence.abandoned_tag,
+                        evidence.lost_stream_deregistered,
+                        evidence.device_session_survived,
+                        evidence.session_id_stable,
+                        evidence.epoch_before,
+                        evidence.epoch_after,
+                        evidence.second_session_msize,
+                        evidence.stale_file_fid_refused,
+                        evidence.stale_file_fid_errno,
+                        evidence.stale_attach_fid_refused,
+                        evidence.stale_attach_fid_errno,
+                        evidence.second_session_attached,
+                        evidence.second_session_bytes,
+                        evidence.second_session_expected_bytes,
+                        evidence.second_session_checksum_matches,
+                        evidence.second_session_messages,
+                        evidence.second_session_getattr_size,
+                        evidence.attach_count,
+                    );
+                    Ok(())
+                }),
+                Err(_) => Err(HarnessError::Timeout(
+                    "verify-m4-fs-consumer-loss exceeded its bounded deadline".into(),
+                )),
+            }
+        }
         [command] if command == "verify-m4-fs-client-e2e" => {
             match tokio::time::timeout(
                 Duration::from_secs(600),

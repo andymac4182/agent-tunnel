@@ -140,9 +140,14 @@ mod fs_real_path;
 /// no shipped Rust consumer, so both gates encode with gate 3's own `Frame` and
 /// decode with gate 3's own `decode_exact`, and one copy of that is better than
 /// two that could drift apart.
+mod fs_consumer_loss;
 mod fs_rotation;
 mod fs_wire;
 mod fs_write_path;
+pub use fs_consumer_loss::{
+    FsConsumerLossEvidence, LossObservation, validate_fs_consumer_loss_evidence,
+    verify as verify_fs_consumer_loss,
+};
 pub use fs_real_path::{
     FsRealPathEvidence, validate_fs_real_path_evidence, verify as verify_fs_real_path,
 };
