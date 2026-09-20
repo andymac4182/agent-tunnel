@@ -399,6 +399,29 @@ impl InputLeases {
         freed
     }
 
+    /// Drop **every** lease, whoever holds it, and report which targets were
+    /// freed.
+    ///
+    /// What a **supervised backend restart** does. It is deliberately the
+    /// bluntest of the three: `reconcile_grant` and `release_all_for_session`
+    /// both ask *whose* lease this is, and a restart does not care. The
+    /// backend that was holding the target OS session's input down is gone;
+    /// every lease held against it now describes a process that no longer
+    /// exists, and a lease that outlived its backend would let the next
+    /// operation through on the strength of an exclusivity nothing is
+    /// enforcing any more.
+    ///
+    /// **This is the half of the restart contract that is not about
+    /// retryability.** `restart_outcome` decides what the *in-flight*
+    /// operation is told; this decides what every *later* operation must
+    /// re-establish. Both are needed: a caller that ignores the first still
+    /// meets the second.
+    pub fn invalidate_all(&mut self) -> Vec<TargetSession> {
+        let freed: Vec<TargetSession> = self.held.keys().cloned().collect();
+        self.held.clear();
+        freed
+    }
+
     /// Which session holds `target`, if any.
     #[must_use]
     pub fn holder(&self, target: &TargetSession) -> Option<SessionId> {

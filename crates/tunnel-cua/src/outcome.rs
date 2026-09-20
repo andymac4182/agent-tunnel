@@ -284,6 +284,23 @@ pub enum UnknownReason {
     SuccessAbsent,
     /// The transport was lost after the request was fully written.
     TransportLost,
+    /// **The supervisor restarted the backend while this operation was in
+    /// flight past the dispatch boundary.**
+    ///
+    /// The whole reason `docs/tasks.md` M5-C08 exists. A supervisor that
+    /// restarts a hung backend has destroyed the only witness to what the
+    /// backend had already done, so an operation that had reached it has an
+    /// outcome nobody can now establish. Reporting that as
+    /// [`NotDispatched`] would be the "unknown outcome read as not
+    /// dispatched" trap arriving through the *supervisor* rather than
+    /// through the response parser: the caller would retry, and the click
+    /// would land twice.
+    ///
+    /// An operation that had **not** reached the backend when the restart
+    /// happened is [`NotDispatched::NotReached`] and is genuinely retryable.
+    /// The two are separated by
+    /// [`crate::supervision::restart_outcome`], never guessed.
+    BackendRestarted,
     /// The exchange deadline expired after the request was fully written.
     DeadlineExpired,
     /// An HTTP status this profile has not reasoned about. Fails towards
