@@ -20,11 +20,18 @@ publish.workspace = true
 # `data:` event -- and a library would fight every one of them. It also keeps
 # the dependency surface this crate is judged on down to `tokio` and
 # `serde_json`.
+[[bin]]
+name = "tunnel-cua-fixture"
+path = "src/main.rs"
+
 [dependencies]
 serde_json = "1.0"
 tokio = { version = "1.48", features = [
+    "fs",
+    "io-std",
     "io-util",
     "macros",
+    "process",
     "net",
     "rt",
     "rt-multi-thread",
@@ -32,6 +39,21 @@ tokio = { version = "1.48", features = [
     "time",
 ] }
 tunnel-cua = { path = "../tunnel-cua" }
+# The supervisor under test. The end-to-end supervision evidence lives here
+# rather than in the export crate because only the crate that defines the
+# fixture binary can exec it.
+tunnel-cua-export = { path = "../tunnel-cua-export" }
+
+[target.'cfg(unix)'.dependencies]
+# `setsid` and `getpgrp` for the escaping descendant, safely, so this crate
+# stays `forbid(unsafe_code)`.
+rustix = { version = "1.1", default-features = false, features = ["process", "std"] }
+
+[dev-dependencies]
+tempfile = "3.21"
+# The sentinel, so a test can point the supervisor at it -- and, in the
+# control, deliberately at nothing.
+tunnel-deadman = { path = "../tunnel-deadman" }
 
 [lints]
 workspace = true

@@ -39,11 +39,31 @@
 //! | [`Fault::SuccessFalse`] | 1 | dispatched, failed |
 //! | [`Fault::TruncateAfterLedger`] | **1** | dispatched, **unknown** |
 //! | [`Fault::DropAfterLedger`] | **1** | dispatched, **unknown** |
+//! | [`Fault::HangAfterLedger`] | **1** | dispatched, **unknown** (once something ends it) |
 //! | [`Fault::PreDispatchRejection`] | **0** | **not dispatched** |
 //! | [`Fault::Unavailable`] | **0** | **not dispatched** |
 //!
-//! The two rows with zero entries and the two with one entry are what make the
-//! distinction checkable rather than asserted.
+//! The two rows with zero entries and the three with one entry are what make
+//! the distinction checkable rather than asserted.
+//!
+//! [`Fault::HangAfterLedger`] is chunk 4's addition and is the only one whose
+//! outcome is decided by something **outside** this fixture: the exchange is
+//! left outstanding, so a supervisor restarting the backend is what ends it.
+//! That is what makes "the supervisor restarted a hung backend and the click
+//! did not land twice" measurable, and it is why the ledger can carry a
+//! **journal** -- a count that survives the restart is the only kind that can
+//! answer the question.
+//!
+//! # The process helpers
+//!
+//! Chunk 4 also gives this crate a binary. `tunnel-cua-fixture backend` is the
+//! supervised backend itself, publishing its loopback address and starting an
+//! **in-group helper** -- the shape that makes a process-group kill worth
+//! having, a worker that does not read stdin and has no way to notice the
+//! supervisor going away. `detach-host` starts a descendant that deliberately
+//! **leaves** the group, and `supervise` is a real supervisor in a process a
+//! test can `SIGKILL`. `crates/tunnel-cua-fixture/tests/process_residue.rs`
+//! is what reads the process table.
 //!
 //! # The click counter counts **effects**, not dispatches
 //!
@@ -70,6 +90,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 pub mod client;
+pub mod process;
 
 /// The backend's `/cmd` path, as the pin records it.
 pub const CMD_PATH: &str = "/cmd";
@@ -91,6 +112,13 @@ pub const IMAGE_SEED: u32 = 0x5EED_0001;
 pub const CURSOR: (u32, u32) = (17, 23);
 /// The version string this fixture reports.
 pub const FIXTURE_VERSION: &str = "0.3.46-synthetic";
+/// The longest a [`Fault::HangAfterLedger`] exchange is held open.
+///
+/// Finite so a fixture process nobody restarts still exits. Long enough that
+/// no test could mistake the timeout for the restart: a hang that ended on
+/// its own inside a test would make the restart look like the cause of an
+/// outcome it did not produce.
+pub const HANG_LIFETIME: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// One thing the backend was asked to do, recorded at the moment it was
 /// accepted — **before** any fault is applied.
@@ -152,9 +180,30 @@ pub fn pointer_clicks_for(command: &str) -> u32 {
 }
 
 /// The authoritative record of what the backend was asked to do.
+///
+/// # The journal, and why a supervised restart needs one
+///
+/// An in-memory ledger dies with the backend process. That is fine for every
+/// test that does not restart one, and **useless for the test that matters
+/// most in chunk 4**: "the supervisor restarted a hung backend and the click
+/// did not land twice" is a claim about a count that spans two backend
+/// processes. A fresh in-memory ledger after a restart reads zero, so the
+/// count would trivially not have increased and the measurement would be of
+/// nothing at all.
+///
+/// So a ledger can be given a **journal**: an append-only file, written by
+/// the backend process at the same moment the in-memory entry is recorded —
+/// which is **before** any fault is applied, exactly as the in-memory record
+/// is. [`Ledger::journal_entries`] reads it back, so a test counts effects
+/// across every generation of the backend rather than only the surviving one.
+///
+/// It stores a **count** of typed characters and never the text, like the
+/// in-memory entry, because a file on disk is at least as much of a
+/// diagnostic as a panic message.
 #[derive(Clone, Debug, Default)]
 pub struct Ledger {
     entries: Arc<Mutex<Vec<LedgerEntry>>>,
+    journal: Option<Arc<std::path::PathBuf>>,
 }
 
 impl Ledger {
@@ -163,11 +212,94 @@ impl Ledger {
         Self::default()
     }
 
+    /// A ledger that also appends every entry to `journal`.
+    #[must_use]
+    pub fn with_journal(journal: std::path::PathBuf) -> Self {
+        Self {
+            entries: Arc::default(),
+            journal: Some(Arc::new(journal)),
+        }
+    }
+
     fn record(&self, entry: LedgerEntry) {
+        // The journal is written **first**. If the process is killed between
+        // the two, the durable record over-reports rather than under-reports,
+        // and over-reporting is the safe direction for a count whose job is to
+        // catch a duplicated effect.
+        self.append(&entry);
         self.entries
             .lock()
             .expect("the ledger mutex is never poisoned by fixture code")
             .push(entry);
+    }
+
+    fn append(&self, entry: &LedgerEntry) {
+        use std::io::Write as _;
+        let Some(journal) = &self.journal else { return };
+        let (x, y) = match entry.point {
+            Some((x, y)) => (x.to_string(), y.to_string()),
+            None => ("-".to_owned(), "-".to_owned()),
+        };
+        let display = entry
+            .display
+            .map_or_else(|| "-".to_owned(), |value| value.to_string());
+        let line = format!(
+            "{}\t{display}\t{x}\t{y}\t{}\t{}\n",
+            entry.command, entry.pointer_clicks, entry.typed_characters
+        );
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(journal.as_path())
+        {
+            let _ = file.write_all(line.as_bytes());
+            let _ = file.flush();
+        }
+    }
+
+    /// Read a journal back, in order.
+    ///
+    /// A missing file is an empty journal: a backend that was never started
+    /// recorded nothing, which is a real answer rather than an error.
+    ///
+    /// # Panics
+    /// If a line in the journal is malformed. That is the fixture writing
+    /// something it cannot read, which must never be silently skipped: a
+    /// dropped line is a missed effect, and a missed effect is precisely the
+    /// defect this journal exists to catch.
+    #[must_use]
+    pub fn journal_entries(journal: &std::path::Path) -> Vec<LedgerEntry> {
+        let text = std::fs::read_to_string(journal).unwrap_or_default();
+        text.lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| {
+                let fields: Vec<&str> = line.split('\t').collect();
+                assert_eq!(fields.len(), 6, "malformed journal line: {line:?}");
+                let number = |field: &str| field.parse::<u32>().ok();
+                LedgerEntry {
+                    command: fields[0].to_owned(),
+                    display: number(fields[1]),
+                    point: number(fields[2]).zip(number(fields[3])),
+                    pointer_clicks: number(fields[4])
+                        .expect("the journal always writes a click count"),
+                    typed_characters: fields[5]
+                        .parse()
+                        .expect("the journal always writes a typed-character count"),
+                }
+            })
+            .collect()
+    }
+
+    /// **How many pointer clicks every generation of this backend performed**,
+    /// read from a journal rather than from memory.
+    ///
+    /// The cross-restart answer to "did the click happen once?".
+    #[must_use]
+    pub fn journal_pointer_clicks(journal: &std::path::Path) -> u32 {
+        Self::journal_entries(journal)
+            .iter()
+            .map(|entry| entry.pointer_clicks)
+            .sum()
     }
 
     /// Every entry, in order.
@@ -259,6 +391,22 @@ pub enum Fault {
     /// Record the ledger entry, then answer 200 with a framed payload that has
     /// **no `success` member at all**. Absent is not true.
     SuccessAbsent,
+    /// Record the ledger entry, then **answer nothing and hold the connection
+    /// open** until [`HANG_LIFETIME`] expires.
+    ///
+    /// The hung backend a supervisor exists to restart. It is deliberately
+    /// different from [`Fault::DropAfterLedger`]: that one ends the exchange
+    /// itself, so the outcome is decided before any supervisor could act. This
+    /// one leaves the exchange outstanding, so a restart is what ends it, and
+    /// the effect the backend already performed is recorded in the journal
+    /// before the restart happens. That ordering is the whole point -- a fault
+    /// injected before the ledger entry would make "the effect happened once"
+    /// unmeasurable.
+    ///
+    /// The lifetime is bounded so a fixture process that nobody restarts still
+    /// exits: an unbounded hang would leave a process behind on every failed
+    /// test run.
+    HangAfterLedger,
     /// Record the ledger entry, then answer 200 with a framed payload that
     /// **looks like a successful capture** but whose `success` is `false` —
     /// the `{"success": True, **result}` shape the pin records, after the
@@ -426,9 +574,19 @@ impl FixtureBackend {
     /// # Errors
     /// If the loopback bind fails.
     pub async fn start() -> std::io::Result<Self> {
+        Self::start_with(Ledger::new()).await
+    }
+
+    /// Bind to `127.0.0.1:0` and start serving, recording into `ledger`.
+    ///
+    /// Used by the supervised `backend` mode, whose ledger carries a journal
+    /// so effects can be counted across a restart.
+    ///
+    /// # Errors
+    /// If the loopback bind fails.
+    pub async fn start_with(ledger: Ledger) -> std::io::Result<Self> {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
         let address = listener.local_addr()?;
-        let ledger = Ledger::new();
         let faults = Faults::new();
         let capture_authority = CaptureAuthorityKnob::default();
         let capture_scale = CaptureScaleKnob::default();
@@ -641,6 +799,13 @@ async fn handle_cmd(
             .await
         }
         Fault::SuccessAbsent => framed(stream, json!({"width": SCREEN_WIDTH})).await,
+        Fault::HangAfterLedger => {
+            // The entry exists; the answer never comes. Whatever ends this
+            // connection -- a supervisor killing the backend, or the bound
+            // lifetime -- the command was already dispatched.
+            tokio::time::sleep(HANG_LIFETIME).await;
+            stream.shutdown().await
+        }
         Fault::ResultOverridesEnvelope => {
             // `{"success": True, **result}` with a result carrying its own
             // `success`: on the wire there is one member, and it is the

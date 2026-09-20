@@ -9,8 +9,19 @@
 //! lives beside the fixture because the fixture is the only backend it is
 //! allowed to talk to.
 //!
-//! **Supervision is still not here.** No lifecycle, no health probe, no
-//! deadman, no restart. M3-09/M8-C07 remain open blockers.
+//! **Supervision arrived in chunk 4 and is still not *here*.** The lifecycle,
+//! the health probe and the deadman are `tunnel-cua-export`; what this file
+//! gained is the one place they meet this state: [`DeviceState`] implements
+//! [`tunnel_cua_export::supervisor::InputAuthority`], so a supervised restart
+//! drops every lease and forgets every capture identity through
+//! [`tunnel_cua::supervision::invalidate`].
+//!
+//! A restarted backend is a **new endpoint**, so a session driving it needs a
+//! new [`SessionFacade`] built on the same [`DeviceState`]. There is
+//! deliberately no `retarget`: a facade that could be pointed at a different
+//! backend in place would be a facade whose outstanding operations changed
+//! meaning underneath them, and "which backend was this dispatched to" is
+//! exactly the question a restart makes load-bearing.
 //!
 //! **The ordering is the contract.** Every check below the comment marked
 //! `dispatch boundary` may produce a [`Completion`]; every check above it may
@@ -367,6 +378,47 @@ impl DeviceState {
             .lock()
             .expect("the lease mutex is never poisoned by fixture code")
             .reconcile_grant(session, revision)
+    }
+
+    /// How many capture identities this device is holding.
+    ///
+    /// For a test that must read the registry rather than infer its size from
+    /// a refusal.
+    #[must_use]
+    pub fn capture_count(&self) -> usize {
+        self.captures
+            .lock()
+            .expect("the capture mutex is never poisoned by fixture code")
+            .len()
+    }
+}
+
+/// **The restart contract, wired to the device's own registries.**
+///
+/// This is the whole production shape of the M5-C08 decision: a supervised
+/// restart hands the device state to
+/// [`tunnel_cua::supervision::invalidate`], which drops every input lease and
+/// forgets every capture identity in one call. There is no implementation of
+/// this trait that keeps a lease, and
+/// [`tunnel_cua_export::Supervisor::restart`] takes it as a required argument,
+/// so a restart cannot happen without one.
+impl tunnel_cua_export::supervisor::InputAuthority for DeviceState {
+    fn invalidate(
+        &self,
+        generation: tunnel_cua::supervision::BackendGeneration,
+    ) -> tunnel_cua::supervision::Invalidation {
+        // Both locks, in the same order everything else in this file takes
+        // them, and released before the call returns. Nothing is dispatched
+        // while they are held.
+        let mut leases = self
+            .leases
+            .lock()
+            .expect("the lease mutex is never poisoned by fixture code");
+        let mut captures = self
+            .captures
+            .lock()
+            .expect("the capture mutex is never poisoned by fixture code");
+        tunnel_cua::supervision::invalidate(&mut leases, &mut captures, generation)
     }
 }
 
