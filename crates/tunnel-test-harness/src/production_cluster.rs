@@ -145,6 +145,11 @@ mod fs_consumer_loss;
 /// rather than a case inside gate 8 because the event it drives replaces the
 /// device connector, which gate 8's fixture deliberately keeps alive.
 mod fs_epoch_change;
+/// M4 filesystem gate 10.  Its own module rather than a case inside gate 9
+/// because the event it drives is the death of a real operating-system
+/// process, which needs a child-process connector and a journal that outlives
+/// it — neither of which gate 9's in-process fixture has.
+mod fs_process_restart;
 mod fs_real_path;
 mod fs_rotation;
 mod fs_wire;
@@ -156,6 +161,10 @@ pub use fs_consumer_loss::{
 pub use fs_epoch_change::{
     EpochChangeObservation, FsEpochChangeEvidence, validate_fs_epoch_change_evidence,
     verify as verify_fs_epoch_change,
+};
+pub use fs_process_restart::{
+    FsProcessRestartEvidence, ProcessRestartObservation, validate_fs_process_restart_evidence,
+    verify as verify_fs_process_restart,
 };
 pub use fs_real_path::{
     FsRealPathEvidence, validate_fs_real_path_evidence, verify as verify_fs_real_path,

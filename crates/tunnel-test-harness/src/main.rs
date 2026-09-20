@@ -2081,6 +2081,87 @@ async fn main() -> ExitCode {
                 )),
             }
         }
+        [command] if command == "verify-m4-fs-process-restart" => {
+            match tokio::time::timeout(
+                Duration::from_secs(360),
+                tunnel_test_harness::production_cluster::verify_fs_process_restart(),
+            )
+            .await
+            {
+                Ok(result) => result.and_then(|evidence| {
+                    // Re-validate at the command boundary so a validator
+                    // regression cannot silently pass the command.
+                    tunnel_test_harness::production_cluster::validate_fs_process_restart_evidence(
+                        &evidence,
+                    )?;
+                    println!(
+                        "M4 filesystem connector process restart passed: relays={} owner={} subprotocol={} msize={} dialect={} prefix_bytes={} journal_entries_before_held={} stream_id={} emitted={}->{} recv_contiguous={}->{} request_outstanding_at_kill={} restart_polls={} held_tag={} held_effect_present_before_kill={} journal_entries_before_kill={} journal_polls={} pid={}->{} first_process_exited={} first_process_killed_by_signal={} second_process_active={} epoch={}->{} session_id_changed={} owner_released_between={} pending_call_closed={} pending_call_close_code={:?} pending_call_answered={} pending_call_errored={} held_call_outcome={:?} held_call_settled={:?} held_stream_deregistered={} pre_attach_probe_close_code={:?} pre_attach_probe_answered={} second_session_msize={} stale_file_fid_refused={} stale_file_fid_errno={:?} stale_attach_fid_refused={} stale_attach_fid_errno={:?} stale_journal_fid_refused={} stale_journal_fid_errno={:?} retry_refused_above_dispatch={} retry_refusal_errno={:?} journal_entries_after_retry={} second_session_attached={} journal_entries_over_ninep={} journal_entries_final={} held_effect_exactly_once={} second_session_bytes={}/{} second_session_checksum_matches={} second_session_messages={} second_session_getattr_size={} attach_count={}",
+                        evidence.relay_count,
+                        evidence.owner_node,
+                        evidence.selected_subprotocol,
+                        evidence.negotiated_msize,
+                        evidence.negotiated_dialect,
+                        evidence.prefix_bytes,
+                        evidence.journal_entries_before_held,
+                        evidence.restart.stream_id,
+                        evidence.restart.emitted_before,
+                        evidence.restart.emitted_at_kill,
+                        evidence.restart.recv_contiguous_before,
+                        evidence.restart.recv_contiguous_at_kill,
+                        evidence.request_outstanding_at_kill,
+                        evidence.restart_polls,
+                        evidence.held_tag,
+                        evidence.held_effect_present_before_kill,
+                        evidence.journal_entries_before_kill,
+                        evidence.journal_polls,
+                        evidence.first_pid,
+                        evidence.second_pid,
+                        evidence.first_process_exited,
+                        evidence.first_process_killed_by_signal,
+                        evidence.second_process_active,
+                        evidence.epoch_before,
+                        evidence.epoch_after,
+                        evidence.session_id_before != evidence.session_id_after,
+                        evidence.owner_released_between,
+                        evidence.pending_call_closed,
+                        evidence.pending_call_close_code,
+                        evidence.pending_call_answered,
+                        evidence.pending_call_errored,
+                        evidence.held_call_outcome,
+                        evidence
+                            .held_call_outcome
+                            .map(tunnel_fs_core::Outcome::is_settled),
+                        evidence.held_stream_deregistered,
+                        evidence.pre_attach_probe_close_code,
+                        evidence.pre_attach_probe_answered,
+                        evidence.second_session_msize,
+                        evidence.stale_file_fid_refused,
+                        evidence.stale_file_fid_errno,
+                        evidence.stale_attach_fid_refused,
+                        evidence.stale_attach_fid_errno,
+                        evidence.stale_journal_fid_refused,
+                        evidence.stale_journal_fid_errno,
+                        evidence.retry_refused_above_dispatch,
+                        evidence.retry_refusal_errno,
+                        evidence.journal_entries_after_retry,
+                        evidence.second_session_attached,
+                        evidence.journal_entries_over_ninep,
+                        evidence.journal_entries_final,
+                        evidence.held_effect_exactly_once,
+                        evidence.second_session_bytes,
+                        evidence.second_session_expected_bytes,
+                        evidence.second_session_checksum_matches,
+                        evidence.second_session_messages,
+                        evidence.second_session_getattr_size,
+                        evidence.attach_count,
+                    );
+                    Ok(())
+                }),
+                Err(_) => Err(HarnessError::Timeout(
+                    "verify-m4-fs-process-restart exceeded its bounded deadline".into(),
+                )),
+            }
+        }
         [command] if command == "verify-m4-fs-client-e2e" => {
             match tokio::time::timeout(
                 Duration::from_secs(600),
