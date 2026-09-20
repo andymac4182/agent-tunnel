@@ -418,74 +418,24 @@ pub fn validate_fs_data_recovery_evidence(evidence: &FsDataRecoveryEvidence) -> 
             "a replacement device data socket was dialled through the proxy".into(),
             evidence.replacement_connection_observed_at_proxy,
         ),
-        // Qualifier one: "the same control owner ... retained".
+        // The two qualifiers, as **one** rule rather than as a rule each.
+        //
+        // The contract licenses retention "only while" both hold, so a run in
+        // which a fid survived without them would be the violation rather than
+        // the clause.  Stating each conjunct here *as well* was tried and
+        // removed: the guard-deletion suite reported all thirteen **still
+        // green** when defeated, because this conjunction already rejects every
+        // run they would have rejected, so none of them could ever be the rule
+        // that failed a run.  They are not exempted as documented-green — they
+        // are gone, and the property is held where it can actually be defeated:
+        // `same_owner_contract_qualifiers_held` is one conjunct per line, each
+        // separately deletable by the guard suite, and
+        // `every_same_owner_qualifier_defeats_the_antecedent_on_its_own` fails
+        // if any conjunct stops mattering.
         (
-            "the authoritative catalog's owner token named the same session across the \
-             failure"
-                .into(),
-            evidence.catalog_owner_session_stable,
-        ),
-        (
-            "the catalog's owner epoch did not move across the failure".into(),
-            evidence.catalog_epoch_after == evidence.catalog_epoch_before,
-        ),
-        (
-            "the owning relay's own session identity was unchanged across the failure".into(),
-            evidence.owner_session_id_stable,
-        ),
-        (
-            "the owning relay's epoch did not move across the failure".into(),
-            evidence.owner_epoch_after == evidence.owner_epoch_before,
-        ),
-        (
-            "the control socket was never replaced: only the data socket failed".into(),
-            evidence.control_carrier_unchanged,
-        ),
-        // Qualifier two: "all ordered stream state ... retained".
-        (
-            "the connector entered a bounded retained recovery rather than a fresh session"
-                .into(),
-            evidence.recovery_attempted,
-        ),
-        (
-            "the owner recorded that recovery as a lost data transport, not a lost control \
-             socket"
-                .into(),
-            evidence.owner_recovery_reason.as_deref() == Some(OLD_TRANSPORT_LOST),
-        ),
-        (
-            "the recovery released exactly the carrier that failed".into(),
-            evidence.recovery_released_failed_carrier,
-        ),
-        (
-            "the recovery's successor is exactly the carrier now active".into(),
-            evidence.recovery_successor_is_active_carrier,
-        ),
-        (
-            "ordered stream state was carried over rather than re-established: retained \
-             frames were replayed onto the replacement carrier"
-                .into(),
-            evidence.replayed_frames_after > evidence.replayed_frames_before,
-        ),
-        (
-            "the consumer stream kept its stream id across the carrier change".into(),
-            evidence.stream_id_stable,
-        ),
-        (
-            "the consumer stream kept the relay's stable logical operation identity".into(),
-            evidence.operation_id_stable,
-        ),
-        (
-            "the consumer stream was never deregistered across the failure".into(),
-            evidence.stream_remained_registered,
-        ),
-        // The antecedent, stated once as a conjunction.  The contract licenses
-        // retention **only while** both qualifiers hold, so a run in which a
-        // fid survived without them would be the violation rather than the
-        // clause, and the rules below would then be asserting the wrong thing.
-        (
-            "both same-owner qualifiers held, so the contract licenses preserving this \
-             filesystem session"
+            "the same control owner and all ordered stream state were retained, which is \
+             the only condition under which the profile permits preserving this filesystem \
+             session across a failed data socket"
                 .into(),
             evidence.same_owner_contract_qualifiers_held(),
         ),
