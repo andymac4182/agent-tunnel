@@ -1900,6 +1900,69 @@ async fn main() -> ExitCode {
                 )),
             }
         }
+        [command] if command == "verify-m4-fs-rotation" => {
+            match tokio::time::timeout(
+                Duration::from_secs(360),
+                tunnel_test_harness::production_cluster::verify_fs_rotation(),
+            )
+            .await
+            {
+                Ok(result) => result.and_then(|evidence| {
+                    // Re-validate at the command boundary so a validator
+                    // regression cannot silently pass the command.
+                    tunnel_test_harness::production_cluster::validate_fs_rotation_evidence(
+                        &evidence,
+                    )?;
+                    println!(
+                        "M4 filesystem rotation passed: relays={} owner={} subprotocol={} msize={} dialect={} prefix_bytes={} freeze_phase={} freeze_attempt_active={} freeze_connector_fence={:?} freeze_relay_recv_contiguous={} freeze_relay_fence={:?} freeze_old_generation={} freeze_candidate_generation={:?} freeze_writer_barriers={:?} exchange_in_flight_at_freeze={} freeze_polls={} held_tag={} held_reply_tag_matched={} held_reply_was_rread={} held_reply_bytes={} transfer_bytes={}/{} transfer_checksum_matches={} transfer_messages={} rotations_completed={}->{} generation={}->{} epoch={}->{} total_replayed_frames={} deadline_forced_retirement={} rotation_recovery_reason={:?} session_id_stable={} epoch_stable={} fid_survived_getattr={} fid_survived_getattr_size={} attach_fid_survived_walk={} post_rotation_tag_correlated={} attach_count={}",
+                        evidence.relay_count,
+                        evidence.owner_node,
+                        evidence.selected_subprotocol,
+                        evidence.negotiated_msize,
+                        evidence.negotiated_dialect,
+                        evidence.prefix_bytes,
+                        evidence.freeze.phase,
+                        evidence.freeze.attempt_active,
+                        evidence.freeze.connector_fence,
+                        evidence.freeze.relay_recv_contiguous,
+                        evidence.freeze.relay_fence,
+                        evidence.freeze.old_generation,
+                        evidence.freeze.candidate_generation,
+                        evidence.freeze.writer_barriers_flushed,
+                        evidence.exchange_in_flight_at_freeze,
+                        evidence.freeze_polls,
+                        evidence.held_tag,
+                        evidence.held_reply_tag_matched,
+                        evidence.held_reply_was_rread,
+                        evidence.held_reply_bytes,
+                        evidence.transfer_bytes,
+                        evidence.transfer_expected_bytes,
+                        evidence.transfer_checksum_matches,
+                        evidence.transfer_messages,
+                        evidence.rotations_completed_before,
+                        evidence.rotations_completed_after,
+                        evidence.generation_before,
+                        evidence.generation_after,
+                        evidence.epoch_before,
+                        evidence.epoch_after,
+                        evidence.total_replayed_frames,
+                        evidence.deadline_forced_retirement,
+                        evidence.rotation_recovery_reason,
+                        evidence.session_id_stable,
+                        evidence.epoch_stable,
+                        evidence.fid_survived_getattr,
+                        evidence.fid_survived_getattr_size,
+                        evidence.attach_fid_survived_walk,
+                        evidence.post_rotation_tag_correlated,
+                        evidence.attach_count,
+                    );
+                    Ok(())
+                }),
+                Err(_) => Err(HarnessError::Timeout(
+                    "verify-m4-fs-rotation exceeded its bounded deadline".into(),
+                )),
+            }
+        }
         [command] if command == "verify-m4-fs-client-e2e" => {
             match tokio::time::timeout(
                 Duration::from_secs(600),

@@ -26,6 +26,9 @@ of `docs/filesystem-api.md`.  Two suites live here:
   and its not-evidence check is a module that failed to load rather than a
   crate that failed to build.  It needs no install: the suite is the offline
   one, which runs with `node_modules` deleted.
+* `gate7-rotation` — the validator of the gate that carries a live 9P session
+  across a real scheduled data-socket rotation.  Measured the same way as
+  `gate6-e2e`, and for the same reason: the gate is a cluster run.
 
 A guard whose deletion leaves every test green is **not** load-bearing on its
 own, and this script prints that outcome rather than hiding it: several of the
@@ -2353,6 +2356,7 @@ GATE6_CASES: list[tuple[str, list[Edit]]] = [
 
 HARNESS = REPO / "crates" / "tunnel-test-harness"
 HARNESS_E2E = HARNESS / "src" / "production_cluster" / "fs_client_e2e.rs"
+HARNESS_ROTATION = HARNESS / "src" / "production_cluster" / "fs_rotation.rs"
 
 # Gate 6's end-to-end half is a **cluster** gate: it needs Redis, three relays,
 # a device connector and `node`, and it takes minutes.  That is not a shape this
@@ -2649,6 +2653,244 @@ class Suite:
     cwd: Path = REPO
 
 
+# `gate7-rotation` — the validator of the gate that carries a live 9P session
+# across a real scheduled data-socket rotation.  Like `gate6-e2e` this is a
+# cluster run that cannot be repeated once per case, so what is measured is its
+# **rule list** against the mutation table in the same file.  The edits replace
+# a condition with `true` for the same reason: the rule list is a fixed-length
+# array and removing an entry stops the crate compiling, which this script
+# refuses to call a red test.
+#
+# The first three cases are the ones that matter most.  This gate's whole claim
+# is that the rotation was **concurrent** with a 9P exchange rather than
+# sequential with it, and that the *operation* survived rather than merely the
+# session.  A rule whose deletion leaves the table green would be a rule the
+# claim never rested on.
+GATE7_ROTATION_TEST = [
+    "cargo",
+    "test",
+    "--offline",
+    "-p",
+    "tunnel-test-harness",
+    "--lib",
+    "--locked",
+    "production_cluster::fs_rotation",
+]
+
+GATE7_ROTATION_CASES: list[tuple[str, list[Edit]]] = [
+    (
+        "the rotation was concurrent with the exchange, not merely nearby",
+        [
+            (
+                HARNESS_ROTATION,
+                "            evidence.exchange_in_flight_at_freeze"
+                " && evidence.freeze.exchange_in_flight_at_freeze(),",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the owner was actually frozen when it was sampled",
+        [
+            (
+                HARNESS_ROTATION,
+                "            FROZEN_PHASES.contains(&evidence.freeze.phase.as_str()),",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "a rotation attempt was active at the sample",
+        [
+            (
+                HARNESS_ROTATION,
+                "            evidence.freeze.attempt_active,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the held reply carried the tag that was outstanding across the freeze",
+        [
+            (
+                HARNESS_ROTATION,
+                "            evidence.held_reply_tag_matched,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the held reply was an Rread rather than an error",
+        [
+            (
+                HARNESS_ROTATION,
+                "            evidence.held_reply_was_rread,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the transfer spanning the rotation delivered every byte exactly once",
+        [
+            (
+                HARNESS_ROTATION,
+                "            evidence.transfer_bytes == evidence.transfer_expected_bytes\n"
+                "                && evidence.transfer_expected_bytes == ROTATION_FILE_BYTES,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the transfer's checksum matched",
+        [
+            (
+                HARNESS_ROTATION,
+                "            evidence.transfer_checksum_matches,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the transfer spanned many Rread messages rather than one",
+        [
+            (
+                HARNESS_ROTATION,
+                "            evidence.transfer_messages >= MIN_READ_MESSAGES,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "a scheduled rotation actually completed",
+        [
+            (
+                HARNESS_ROTATION,
+                "            evidence.rotations_completed_after > evidence.rotations_completed_before,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the active data generation advanced",
+        [
+            (
+                HARNESS_ROTATION,
+                "            evidence.generation_after > evidence.generation_before,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "a clean rotation replayed no frames",
+        [
+            (
+                HARNESS_ROTATION,
+                "            evidence.total_replayed_frames == 0,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the rotation was not forced into recovery",
+        [
+            (
+                HARNESS_ROTATION,
+                "            !evidence.deadline_forced_retirement"
+                " && evidence.rotation_recovery_reason.is_none(),",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the same-owner contract: the session identity was unchanged",
+        [
+            (
+                HARNESS_ROTATION,
+                "            evidence.session_id_stable,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the same-owner contract: the epoch was unchanged",
+        [
+            (HARNESS_ROTATION, "            evidence.epoch_stable,", "            true,")
+        ],
+    ),
+    (
+        "the fid opened before the rotation still answered after it",
+        [
+            (
+                HARNESS_ROTATION,
+                "            evidence.fid_survived_getattr,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "that fid still named the same file",
+        [
+            (
+                HARNESS_ROTATION,
+                "            evidence.fid_survived_getattr_size == ROTATION_FILE_BYTES as u64,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the attach fid established before the rotation still walked after it",
+        [
+            (
+                HARNESS_ROTATION,
+                "            evidence.attach_fid_survived_walk,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the relay did not reconstruct the session: exactly one Tattach",
+        [
+            (
+                HARNESS_ROTATION,
+                "            evidence.attach_count == 1,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "a tag allocated after the rotation correlated correctly",
+        [
+            (
+                HARNESS_ROTATION,
+                "            evidence.post_rotation_tag_correlated,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the in-flight predicate requires an unreceived record",
+        [
+            (
+                HARNESS_ROTATION,
+                "            && self\n"
+                "                .connector_fence\n"
+                "                .is_some_and(|fence| fence > self.relay_recv_contiguous)",
+                "",
+            )
+        ],
+    ),
+    (
+        "the in-flight predicate requires a frozen phase",
+        [
+            (
+                HARNESS_ROTATION,
+                "            && FROZEN_PHASES.contains(&self.phase.as_str())",
+                "",
+            )
+        ],
+    ),
+]
+
 SUITES: list[Suite] = [
     Suite("gate2", [CRATE], CARGO_TEST, GATE2_CASES),
     Suite(
@@ -2668,6 +2910,12 @@ SUITES: list[Suite] = [
         cwd=CLIENT_PKG,
     ),
     Suite("gate6-e2e", [HARNESS / "src"], GATE6_E2E_TEST, GATE6_E2E_CASES),
+    Suite(
+        "gate7-rotation",
+        [HARNESS / "src"],
+        GATE7_ROTATION_TEST,
+        GATE7_ROTATION_CASES,
+    ),
 ]
 
 
@@ -2811,8 +3059,8 @@ def main() -> int:
     parser.add_argument(
         "--suite",
         help=(
-            "run only this suite (gate2, gate3, gate4, gate5 or "
-            "gate6-adapters); default is all"
+            "run only this suite (gate2, gate3, gate4, gate5, "
+            "gate6-adapters, gate6-e2e or gate7-rotation); default is all"
         ),
     )
     arguments = parser.parse_args()

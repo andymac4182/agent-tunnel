@@ -617,6 +617,18 @@ pub const FS_GATE_SERVICES: &[FsGateService] = &[
         host_supported: true,
     },
     FsGateService {
+        // The export a live 9P session is held on across a real scheduled
+        // data-socket rotation.  It is its own export for the same reason
+        // every other row here is: nothing else in any gate disturbs this
+        // grant, so a fid that survives a rotation on it cannot be credited
+        // to another case's revision change or revocation.
+        label: "rotation",
+        display_name: "Synthetic filesystem export held across a rotation",
+        operations: &["fs:connect", "fs:read", "fs:list"],
+        case_sensitivity: Some("insensitive-preserving"),
+        host_supported: true,
+    },
+    FsGateService {
         // Implementation gate 5's own export: every capability, so the write
         // grant is the relay's decision rather than the device's, and every
         // mutating primitive the profile defines is reachable on it.
