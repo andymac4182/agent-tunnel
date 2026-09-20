@@ -37,6 +37,10 @@ of `docs/filesystem-api.md`.  Two suites live here:
 * `gate10-process-restart` — the validator of the gate that holds a 9P
   mutation outstanding while the connector's real process is killed, and reads
   the effect count back out of a journal that outlives it.
+* `gate11-data-recovery` — the validator of the gate that holds a 9P read
+  outstanding while the device's data socket is destroyed at the transport and
+  the product's own retained recovery replaces it.  Measured the same way, and
+  for the same reason.
 
 A guard whose deletion leaves every test green is **not** load-bearing on its
 own, and this script prints that outcome rather than hiding it: several of the
@@ -4167,10 +4171,18 @@ GATE10_RESTART_CASES: list[tuple[str, list[Edit]]] = [
 # `still green` when defeated: the antecedent conjunction already rejects every
 # run they would have rejected, so none of them could ever be the rule that
 # failed a run.  They were removed rather than exempted as documented-green, and
-# the property moved to where it can be defeated — the last thirteen cases here
-# delete one conjunct of `same_owner_contract_qualifiers_held` each, and the
+# the property moved to where it can be defeated — the last **fourteen** cases
+# here delete one conjunct of `same_owner_contract_qualifiers_held` each, and the
 # gate's own `every_same_owner_qualifier_defeats_the_antecedent_on_its_own` is
 # what goes red.
+#
+# That antecedent is written as an **array** rather than as a `&&` chain, and
+# this suite is the reason.  As a chain the head conjunct carries no `&&`, so it
+# did not match the single edit shape these cases key on and was the one
+# conjunct the suite could not defeat — the unfalsifiable-rule problem the
+# thirteen removals were meant to cure, reappearing at the one line the edit
+# shape could not reach.  Every element of the array has an identical shape, so
+# the head is reached like the rest.
 # ---------------------------------------------------------------------------
 
 GATE11_RECOVERY_TEST = [
@@ -4290,52 +4302,60 @@ GATE11_RECOVERY_CASES: list[tuple[str, list[Edit]]] = [
         [(HARNESS_RECOVERY, '            evidence.attach_count == 1,', '            true,')],
     ),
     (
+        "the same-owner antecedent's conjunct: self.catalog_owner_session_stable",
+        [(HARNESS_RECOVERY, '            self.catalog_owner_session_stable,', '            true,')],
+    ),
+    (
         "the same-owner antecedent's conjunct: self.catalog_epoch_after == self.catalog_epoch_before",
-        [(HARNESS_RECOVERY, '            && self.catalog_epoch_after == self.catalog_epoch_before', '            && true')],
+        [(HARNESS_RECOVERY, '            self.catalog_epoch_after == self.catalog_epoch_before,', '            true,')],
     ),
     (
         "the same-owner antecedent's conjunct: self.owner_session_id_stable",
-        [(HARNESS_RECOVERY, '            && self.owner_session_id_stable', '            && true')],
+        [(HARNESS_RECOVERY, '            self.owner_session_id_stable,', '            true,')],
     ),
     (
         "the same-owner antecedent's conjunct: self.owner_epoch_after == self.owner_epoch_before",
-        [(HARNESS_RECOVERY, '            && self.owner_epoch_after == self.owner_epoch_before', '            && true')],
+        [(HARNESS_RECOVERY, '            self.owner_epoch_after == self.owner_epoch_before,', '            true,')],
     ),
     (
         "the same-owner antecedent's conjunct: self.control_carrier_unchanged",
-        [(HARNESS_RECOVERY, '            && self.control_carrier_unchanged', '            && true')],
+        [(HARNESS_RECOVERY, '            self.control_carrier_unchanged,', '            true,')],
     ),
     (
         "the same-owner antecedent's conjunct: self.recovery_attempted",
-        [(HARNESS_RECOVERY, '            && self.recovery_attempted', '            && true')],
+        [(HARNESS_RECOVERY, '            self.recovery_attempted,', '            true,')],
     ),
     (
         "the same-owner antecedent's conjunct: self.owner_recovery_reason.as_deref() == Some(OLD_TRANSPORT_LOST)",
-        [(HARNESS_RECOVERY, '            && self.owner_recovery_reason.as_deref() == Some(OLD_TRANSPORT_LOST)', '            && true')],
+        [(HARNESS_RECOVERY, '            self.owner_recovery_reason.as_deref() == Some(OLD_TRANSPORT_LOST),', '            true,')],
     ),
     (
         "the same-owner antecedent's conjunct: self.recovery_released_failed_carrier",
-        [(HARNESS_RECOVERY, '            && self.recovery_released_failed_carrier', '            && true')],
+        [(HARNESS_RECOVERY, '            self.recovery_released_failed_carrier,', '            true,')],
     ),
     (
         "the same-owner antecedent's conjunct: self.recovery_successor_is_active_carrier",
-        [(HARNESS_RECOVERY, '            && self.recovery_successor_is_active_carrier', '            && true')],
+        [(HARNESS_RECOVERY, '            self.recovery_successor_is_active_carrier,', '            true,')],
     ),
     (
         "the same-owner antecedent's conjunct: self.replayed_frames_after > self.replayed_frames_before",
-        [(HARNESS_RECOVERY, '            && self.replayed_frames_after > self.replayed_frames_before', '            && true')],
-    ),
-    (
-        "the same-owner antecedent's conjunct: self.stream_id_stable",
-        [(HARNESS_RECOVERY, '            && self.stream_id_stable', '            && true')],
+        [(HARNESS_RECOVERY, '            self.replayed_frames_after > self.replayed_frames_before,', '            true,')],
     ),
     (
         "the same-owner antecedent's conjunct: self.operation_id_stable",
-        [(HARNESS_RECOVERY, '            && self.operation_id_stable', '            && true')],
+        [(HARNESS_RECOVERY, '            self.operation_id_stable,', '            true,')],
     ),
     (
         "the same-owner antecedent's conjunct: self.stream_remained_registered",
-        [(HARNESS_RECOVERY, '            && self.stream_remained_registered', '            && true')],
+        [(HARNESS_RECOVERY, '            self.stream_remained_registered,', '            true,')],
+    ),
+    (
+        "the same-owner antecedent's conjunct: self.sole_consumer_stream_at_owner",
+        [(HARNESS_RECOVERY, '            self.sole_consumer_stream_at_owner,', '            true,')],
+    ),
+    (
+        "the same-owner antecedent's conjunct: self.stream_not_terminal",
+        [(HARNESS_RECOVERY, '            self.stream_not_terminal,', '            true,')],
     ),
 ]
 
@@ -4534,7 +4554,8 @@ def main() -> int:
         help=(
             "run only this suite (gate2, gate3, gate4, gate5, "
             "gate6-adapters, gate6-e2e, gate7-rotation, gate8-consumer-loss, "
-            "gate9-epoch-change or gate10-process-restart); "
+            "gate9-epoch-change, gate10-process-restart or "
+            "gate11-data-recovery); "
             "default is all"
         ),
     )

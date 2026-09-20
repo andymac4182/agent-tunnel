@@ -173,6 +173,16 @@ const WAIT: Duration = Duration::from_secs(30);
 /// Comfortably above the protocol's own recovery episode budget, so a run that
 /// exceeds it is a product failure and not a tight harness bound.
 const RECOVERY_WAIT: Duration = Duration::from_secs(60);
+/// A bound on any single 9P round trip **after** the recovery.
+///
+/// Every exchange past the carrier replacement gets its own deadline rather
+/// than sharing the scenario's.  [`SCENARIO_TIMEOUT`] fires in `verify`, which
+/// *drops* the scenario future, so the status-and-evidence dump in `run` never
+/// executes and a hang reports with no evidence attached — and a session that
+/// answers nothing after the recovery is M4-29 mode B, the case whose evidence
+/// matters most.  Generous enough that only a session that has genuinely
+/// stopped answering trips it.
+const POST_RECOVERY_REPLY: Duration = Duration::from_secs(30);
 /// The poll interval for every bounded wait here.
 const POLL: Duration = Duration::from_millis(20);
 /// The whole scenario's bound.
@@ -288,13 +298,32 @@ pub struct FsDataRecoveryEvidence {
     /// failure does not.
     pub replayed_frames_before: u64,
     pub replayed_frames_after: u64,
-    /// The consumer stream kept its logical identity across the carrier
-    /// change: same stream id, and the relay's own stable operation identity
-    /// unchanged.
-    pub stream_id_stable: bool,
+    /// The consumer stream kept the relay's own stable logical operation
+    /// identity, which is defined to survive carrier generations.
     pub operation_id_stable: bool,
-    /// The stream was never deregistered at the owner across the failure.
+    /// The stream this session ran on was never deregistered at the owner: a
+    /// stream bearing **this** id is still there after the failure.
     pub stream_remained_registered: bool,
+    /// And it is the session's **only** consumer stream.
+    ///
+    /// Deliberately **not** derived from the same lookup as
+    /// [`Self::stream_remained_registered`].  An earlier revision recorded a
+    /// "stream id stable" bit that was literally `stream.is_some()` for a
+    /// stream found *by* matching that id, so the two could never disagree in
+    /// any run the gate can produce — a duplicated fact wearing two names,
+    /// which is what the thirteen removed rules were removed for.  Counted
+    /// independently, the two are orthogonal and together say something
+    /// neither says alone: retention, rather than a deregister followed by a
+    /// re-register under a fresh id, which would leave this true and
+    /// `stream_remained_registered` false.
+    pub sole_consumer_stream_at_owner: bool,
+    /// The stream is not in a terminal state.
+    ///
+    /// A stream can be **present and finished**, and every other
+    /// ordered-stream-state bit here is satisfied by one, so without this the
+    /// gate's dominant observed failure would surface as a scenario deadline
+    /// rather than as a named rule.  See M4-29 mode A.
+    pub stream_not_terminal: bool,
 
     // ---- The clause proper, on the operation. ----
     /// The held reply came back on the **same consumer session**, carrying the
@@ -325,21 +354,35 @@ impl FsDataRecoveryEvidence {
     /// Whether both qualifiers the same-owner sentence names actually held for
     /// this run.  Fid retention is licensed **only while** they do, so this is
     /// the antecedent of the contract clause and not a summary of it.
+    ///
+    /// **Written as an array rather than as a `&&` chain, and that is
+    /// load-bearing.**  As a chain, the *head* conjunct carries no `&&` and so
+    /// does not match the one edit shape the guard-deletion suite keys on: it
+    /// was the single conjunct the suite could not defeat, which is exactly the
+    /// unfalsifiable-rule problem the thirteen removed rules were removed for,
+    /// reappearing at the one line the edit shape could not reach.  Every
+    /// element here has an identical shape, so all fourteen are deletable by
+    /// the same case, and `every_same_owner_qualifier_defeats_the_antecedent_on_its_own`
+    /// fails if any of them stops mattering.
     #[must_use]
     pub fn same_owner_contract_qualifiers_held(&self) -> bool {
-        self.catalog_owner_session_stable
-            && self.catalog_epoch_after == self.catalog_epoch_before
-            && self.owner_session_id_stable
-            && self.owner_epoch_after == self.owner_epoch_before
-            && self.control_carrier_unchanged
-            && self.recovery_attempted
-            && self.owner_recovery_reason.as_deref() == Some(OLD_TRANSPORT_LOST)
-            && self.recovery_released_failed_carrier
-            && self.recovery_successor_is_active_carrier
-            && self.replayed_frames_after > self.replayed_frames_before
-            && self.stream_id_stable
-            && self.operation_id_stable
-            && self.stream_remained_registered
+        let qualifiers = [
+            self.catalog_owner_session_stable,
+            self.catalog_epoch_after == self.catalog_epoch_before,
+            self.owner_session_id_stable,
+            self.owner_epoch_after == self.owner_epoch_before,
+            self.control_carrier_unchanged,
+            self.recovery_attempted,
+            self.owner_recovery_reason.as_deref() == Some(OLD_TRANSPORT_LOST),
+            self.recovery_released_failed_carrier,
+            self.recovery_successor_is_active_carrier,
+            self.replayed_frames_after > self.replayed_frames_before,
+            self.operation_id_stable,
+            self.stream_remained_registered,
+            self.sole_consumer_stream_at_owner,
+            self.stream_not_terminal,
+        ];
+        qualifiers.into_iter().all(|held| held)
     }
 }
 
@@ -508,6 +551,20 @@ pub fn validate_fs_data_recovery_evidence(evidence: &FsDataRecoveryEvidence) -> 
         }
     }
     Ok(())
+}
+
+/// Await one post-recovery 9P round trip under [`POST_RECOVERY_REPLY`],
+/// naming the step rather than letting it expire against the scenario budget.
+///
+/// # Errors
+/// A `HarnessError::Timeout` naming `step`, or the exchange's own error.
+async fn bounded<F>(step: &str, exchange: F) -> Result<Message>
+where
+    F: std::future::Future<Output = Result<Message>>,
+{
+    timeout(POST_RECOVERY_REPLY, exchange)
+        .await
+        .map_err(|_| HarnessError::Timeout(format!("{step} was never answered (M4-29 mode B)")))?
 }
 
 /// Deterministic synthetic content: byte `i` is `(i % 251)`.
@@ -1030,9 +1087,16 @@ async fn exercise(
         evidence.failed_connection_closed_at_proxy =
             !open.iter().any(|entry| entry.id == connection);
         let control = client.status_snapshot().control_local_addr;
-        evidence.replacement_connection_observed_at_proxy = open
-            .iter()
-            .any(|entry| entry.id != connection && Some(entry.source_addr) != control);
+        // The replacement must be a **new** connection — an id the proxy
+        // allocated after the one that died — and the device must again be
+        // holding exactly two sockets, control plus one data.  Without both,
+        // this would also be satisfied by the surviving control connection or
+        // by a leftover carrier, and would stop saying "a replacement was
+        // dialled" at all.
+        evidence.replacement_connection_observed_at_proxy = open.len() == 2
+            && open
+                .iter()
+                .any(|entry| entry.id > connection && Some(entry.source_addr) != control);
     }
 
     // The owner's view of the replacement, and both halves of the qualifier
@@ -1051,14 +1115,26 @@ async fn exercise(
                 evidence.connection_id_after = owner.active_connection_id.clone();
                 evidence.rotations_completed_after = owner.rotations_completed;
                 evidence.replayed_frames_after = owner.total_replayed_frames;
+                // Three **independent** facts about the owner's stream table,
+                // deliberately not three readings of one lookup.
                 let stream = owner
                     .streams
                     .iter()
                     .find(|stream| stream.stream_id == stream_id);
+                // 1. A stream bearing this id is still there: never
+                //    deregistered.
                 evidence.stream_remained_registered = stream.is_some();
-                evidence.stream_id_stable = stream.is_some();
+                // 2. It is the session's only consumer stream.  Counted from
+                //    the table's length rather than from the lookup above, so a
+                //    deregister followed by a re-register under a fresh id
+                //    leaves this true while (1) goes false.
+                evidence.sole_consumer_stream_at_owner = owner.streams.len() == 1;
+                // 3. It carries the same stable logical operation identity.
                 evidence.operation_id_stable =
                     stream.is_some_and(|stream| stream.operation_id == operation_id_before);
+                // 4. And it is not finished.  A stream can be present and
+                //    terminal, which satisfies (1) to (3) and is M4-29 mode A.
+                evidence.stream_not_terminal = stream.is_some_and(|stream| !stream.terminal);
                 break;
             }
             if Instant::now() >= deadline {
@@ -1090,7 +1166,24 @@ async fn exercise(
     // consumer session**.  This is the operation-level assertion the clause
     // turns on: the tag that crossed the failure must come back, carrying
     // data, on the fid that was open before it.
-    let held = session.recv_frame().await?;
+    //
+    // **Bounded here rather than left to the scenario deadline.**  Everything
+    // from this point on is a 9P round trip on the replacement carrier, and
+    // M4-29 mode B is precisely a session that answers none of them.  The
+    // scenario timeout in `verify` *drops* this future when it fires, so the
+    // caller's status-and-evidence dump never runs and the whole failure
+    // reports as "exceeded its bounded deadline" with nothing attached.  A
+    // timeout per step keeps the failure attributable to a named step and lets
+    // that dump execute.
+    let held = timeout(POST_RECOVERY_REPLY, session.recv_frame())
+        .await
+        .map_err(|_| {
+            HarnessError::Timeout(
+                "the reply outstanding when the data socket failed never arrived on the \
+                 replacement carrier (M4-29 mode B)"
+                    .into(),
+            )
+        })??;
     evidence.held_reply_tag_matched = held.tag == held_tag;
     match held.message {
         Message::Rread { data } => {
@@ -1105,11 +1198,21 @@ async fn exercise(
     }
 
     // Finish the transfer on the **same fid**, across the carrier change.
+    // Each read is bounded for the reason the held reply above is.
     loop {
-        match session
-            .read(FILE_FID, transferred.len() as u64, READ_COUNT)
-            .await?
-        {
+        let reply = timeout(
+            POST_RECOVERY_REPLY,
+            session.read(FILE_FID, transferred.len() as u64, READ_COUNT),
+        )
+        .await
+        .map_err(|_| {
+            HarnessError::Timeout(format!(
+                "a post-recovery Tread on the retained fid was never answered after \
+                 {} of {RECOVERY_FILE_BYTES} bytes (M4-29 mode B)",
+                transferred.len()
+            ))
+        })??;
+        match reply {
             Message::Rread { data } => {
                 if data.is_empty() {
                     break;
@@ -1127,7 +1230,12 @@ async fn exercise(
 
     // The fid opened before the failure still answers after it, and still
     // names the same file.
-    match session.getattr(FILE_FID, GETATTR_BASIC).await? {
+    match bounded(
+        "a Tgetattr on the fid retained across the failure",
+        session.getattr(FILE_FID, GETATTR_BASIC),
+    )
+    .await?
+    {
         Message::Rgetattr(attributes) => {
             evidence.fid_survived_getattr = true;
             evidence.fid_survived_getattr_size = attributes.size;
@@ -1137,7 +1245,12 @@ async fn exercise(
 
     // The attach fid established before the failure still walks, with no
     // second Tattach anywhere in this run.
-    match session.walk(ATTACH_FID, POST_FID, &["big.bin"]).await? {
+    match bounded(
+        "a Twalk from the attach fid retained across the failure",
+        session.walk(ATTACH_FID, POST_FID, &["big.bin"]),
+    )
+    .await?
+    {
         Message::Rwalk { .. } => evidence.attach_fid_survived_walk = true,
         other => return Err(unexpected("Rwalk", &other)),
     }
@@ -1145,7 +1258,12 @@ async fn exercise(
     // A tag allocated after the recovery correlates correctly.  `call` refuses
     // a reply whose tag is not the one it sent, so a clean Rclunk here is the
     // correlation.
-    match session.clunk(POST_FID).await? {
+    match bounded(
+        "a Tclunk on a fid allocated after the recovery",
+        session.clunk(POST_FID),
+    )
+    .await?
+    {
         Message::Rclunk => evidence.post_recovery_tag_correlated = true,
         other => return Err(unexpected("Rclunk", &other)),
     }
@@ -1197,9 +1315,10 @@ mod tests {
             recovery_successor_is_active_carrier: true,
             replayed_frames_before: 0,
             replayed_frames_after: 1,
-            stream_id_stable: true,
             operation_id_stable: true,
             stream_remained_registered: true,
+            sole_consumer_stream_at_owner: true,
+            stream_not_terminal: true,
             held_reply_tag_matched: true,
             held_reply_was_rread: true,
             held_reply_bytes: 65_525,
@@ -1314,12 +1433,17 @@ mod tests {
             ("no retained frames were replayed", |e| {
                 e.replayed_frames_after = e.replayed_frames_before;
             }),
-            ("the stream id changed", |e| e.stream_id_stable = false),
             ("the logical operation identity changed", |e| {
                 e.operation_id_stable = false;
             }),
             ("the stream was deregistered", |e| {
                 e.stream_remained_registered = false;
+            }),
+            ("the session gained a second consumer stream", |e| {
+                e.sole_consumer_stream_at_owner = false;
+            }),
+            ("the retained stream was terminal", |e| {
+                e.stream_not_terminal = false;
             }),
             // The clause proper.
             ("the held reply never came back", |e| {
@@ -1402,9 +1526,10 @@ mod tests {
             ("replayed frames", |e| {
                 e.replayed_frames_after = e.replayed_frames_before;
             }),
-            ("stream id", |e| e.stream_id_stable = false),
             ("operation id", |e| e.operation_id_stable = false),
             ("registration", |e| e.stream_remained_registered = false),
+            ("sole stream", |e| e.sole_consumer_stream_at_owner = false),
+            ("not terminal", |e| e.stream_not_terminal = false),
         ];
         for (label, mutate) in conjuncts {
             let mut evidence = passing();

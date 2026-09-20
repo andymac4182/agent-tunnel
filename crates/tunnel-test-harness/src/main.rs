@@ -2033,7 +2033,7 @@ async fn main() -> ExitCode {
                         &evidence,
                     )?;
                     println!(
-                        "M4 filesystem data-socket recovery passed: relays={} owner={} subprotocol={} msize={} dialect={} prefix_bytes={} stream_id={} emitted={}->{} recv_contiguous={}->{} request_outstanding_at_failure={} failure_polls={} held_tag={} connection_id={}->{} generation={}->{} rotations_completed={}->{} failed_connection_closed_at_proxy={} replacement_connection_observed_at_proxy={} catalog_owner_session_stable={} catalog_epoch={}->{} owner_session_id_stable={} owner_epoch={}->{} control_carrier_unchanged={} recovery_attempted={} owner_recovery_reason={:?} recovery_released_failed_carrier={} recovery_successor_is_active_carrier={} replayed_frames={}->{} stream_id_stable={} operation_id_stable={} stream_remained_registered={} same_owner_qualifiers_held={} held_reply_tag_matched={} held_reply_was_rread={} held_reply_bytes={} transfer_bytes={}/{} transfer_messages={} transfer_checksum_matches={} fid_survived_getattr={} fid_survived_getattr_size={} attach_fid_survived_walk={} post_recovery_tag_correlated={} attach_count={}",
+                        "M4 filesystem data-socket recovery passed: relays={} owner={} subprotocol={} msize={} dialect={} prefix_bytes={} stream_id={} emitted={}->{} recv_contiguous={}->{} request_outstanding_at_failure={} failure_polls={} held_tag={} connection_id={}->{} generation={}->{} rotations_completed={}->{} failed_connection_closed_at_proxy={} replacement_connection_observed_at_proxy={} catalog_owner_session_stable={} catalog_epoch={}->{} owner_session_id_stable={} owner_epoch={}->{} control_carrier_unchanged={} recovery_attempted={} owner_recovery_reason={:?} recovery_released_failed_carrier={} recovery_successor_is_active_carrier={} replayed_frames={}->{} operation_id_stable={} stream_remained_registered={} sole_consumer_stream_at_owner={} stream_not_terminal={} same_owner_qualifiers_held={} held_reply_tag_matched={} held_reply_was_rread={} held_reply_bytes={} transfer_bytes={}/{} transfer_messages={} transfer_checksum_matches={} fid_survived_getattr={} fid_survived_getattr_size={} attach_fid_survived_walk={} post_recovery_tag_correlated={} attach_count={}",
                         evidence.relay_count,
                         evidence.owner_node,
                         evidence.selected_subprotocol,
@@ -2069,9 +2069,10 @@ async fn main() -> ExitCode {
                         evidence.recovery_successor_is_active_carrier,
                         evidence.replayed_frames_before,
                         evidence.replayed_frames_after,
-                        evidence.stream_id_stable,
                         evidence.operation_id_stable,
                         evidence.stream_remained_registered,
+                        evidence.sole_consumer_stream_at_owner,
+                        evidence.stream_not_terminal,
                         evidence.same_owner_contract_qualifiers_held(),
                         evidence.held_reply_tag_matched,
                         evidence.held_reply_was_rread,
