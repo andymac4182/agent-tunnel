@@ -1576,9 +1576,12 @@ rotation between two quiet exchanges would prove nothing, so the gate holds one
 The concurrency proof is drawn from the owner's own rotation state machine
 rather than from a timestamp: at a frozen phase with the attempt active,
 `connector_fence_sequences[stream]` is strictly greater than that stream's
-`recv_contiguous_connector_to_relay`. Measured at this tip: fence **12**
+`recv_contiguous_connector_to_relay`. That **inequality** is the assertion;
+the sequence numbers themselves depend on how many frames the transfer had
+already used and are not fixed run to run. One run at this tip: fence **12**
 against cursor **10**, phase `quiescing`, candidate generation 2 over old
-generation 1.
+generation 1. (A second run at the same tip showed fence 13 against the same
+cursor, which is why the gate asserts the inequality and not the values.)
 
 **The assertions are on the operation, not on liveness.** That a session still
 exists proves nothing. Measured at this tip: the held tag **7** came back as an
