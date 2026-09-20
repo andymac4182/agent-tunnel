@@ -161,7 +161,8 @@ const POST_FID: u32 = 2;
 /// the value back out of the library rather than writing the string here.  The
 /// distinction matters: `ControlLost` is gate 9's event, and there a fid must
 /// **not** survive.
-const OLD_TRANSPORT_LOST: &str = tunnel_relay::recovery_reason_name(RecoveryReason::OldTransportLost);
+const OLD_TRANSPORT_LOST: &str =
+    tunnel_relay::recovery_reason_name(RecoveryReason::OldTransportLost);
 
 /// How long the owner claim may take to land in the catalog.
 const OWNER_WAIT: Duration = Duration::from_secs(30);
@@ -538,7 +539,9 @@ pub async fn verify() -> Result<FsDataRecoveryEvidence> {
     let options = HarnessOptions::from_env()?.fs_services(true);
     let mut harness = timeout(STARTUP_TIMEOUT, Harness::start(options))
         .await
-        .map_err(|_| HarnessError::Timeout("fs data recovery harness startup timed out".into()))??;
+        .map_err(|_| {
+            HarnessError::Timeout("fs data recovery harness startup timed out".into())
+        })??;
     let mut cluster = match ProductionCluster::start(&mut harness).await {
         Ok(cluster) => cluster,
         Err(error) => {
@@ -1039,7 +1042,8 @@ async fn exercise(
         loop {
             let snapshot = owner_snapshot(cluster).await?;
             let owner = session_of(&snapshot, session_id)?;
-            if owner.phase == "active" && owner.active_connection_id != evidence.connection_id_before
+            if owner.phase == "active"
+                && owner.active_connection_id != evidence.connection_id_before
             {
                 evidence.owner_session_id_stable = owner.session_id == session_id;
                 evidence.owner_epoch_after = owner.epoch;
@@ -1294,8 +1298,9 @@ mod tests {
             // so this mutation is the exact confusion the rule exists to
             // refuse rather than an arbitrary wrong string.
             ("the recovery was a lost control socket instead", |e| {
-                e.owner_recovery_reason =
-                    Some(tunnel_relay::recovery_reason_name(RecoveryReason::ControlLost).to_owned());
+                e.owner_recovery_reason = Some(
+                    tunnel_relay::recovery_reason_name(RecoveryReason::ControlLost).to_owned(),
+                );
             }),
             ("the recovery reported no reason at all", |e| {
                 e.owner_recovery_reason = None;
@@ -1327,10 +1332,13 @@ mod tests {
             ("the transfer was short", |e| {
                 e.transfer_bytes = RECOVERY_FILE_BYTES - 1;
             }),
-            ("the expected length was moved to match a short transfer", |e| {
-                e.transfer_bytes = RECOVERY_FILE_BYTES - 1;
-                e.transfer_expected_bytes = RECOVERY_FILE_BYTES - 1;
-            }),
+            (
+                "the expected length was moved to match a short transfer",
+                |e| {
+                    e.transfer_bytes = RECOVERY_FILE_BYTES - 1;
+                    e.transfer_expected_bytes = RECOVERY_FILE_BYTES - 1;
+                },
+            ),
             ("the checksum did not match", |e| {
                 e.transfer_checksum_matches = false;
             }),
@@ -1381,8 +1389,9 @@ mod tests {
             ("control carrier", |e| e.control_carrier_unchanged = false),
             ("recovery attempted", |e| e.recovery_attempted = false),
             ("recovery reason", |e| {
-                e.owner_recovery_reason =
-                    Some(tunnel_relay::recovery_reason_name(RecoveryReason::ControlLost).to_owned());
+                e.owner_recovery_reason = Some(
+                    tunnel_relay::recovery_reason_name(RecoveryReason::ControlLost).to_owned(),
+                );
             }),
             ("released carrier", |e| {
                 e.recovery_released_failed_carrier = false;
