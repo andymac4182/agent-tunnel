@@ -70,6 +70,19 @@
 //! [`outcome::Completion`], one arm of which is `Unknown` — and `Unknown` is
 //! **not** retryable. Conflating the two is the trap `docs/tasks.md` M5-04
 //! exists for.
+//!
+//! # Chunk 4 adds one pure module, and the process half is elsewhere
+//!
+//! [`supervision`] is what a **supervised backend restart** does to the state
+//! above: it advances a generation, drops every input lease and forgets every
+//! capture identity, and it decides what an operation in flight across the
+//! restart is told. That decision is the M5-04 trap arriving through the
+//! supervisor rather than through the response parser, so it lives in this
+//! pure crate with the rest of the ordering.
+//!
+//! The lifecycle itself — spawning the backend, killing it, arming the
+//! parent-death sentinel, probing its health — is `tunnel-cua-export`, which
+//! is where the processes are. Nothing in *this* crate starts anything.
 
 pub mod capability;
 pub mod capture;
@@ -81,6 +94,7 @@ pub mod operation;
 pub mod outcome;
 pub mod plan;
 pub mod schema;
+pub mod supervision;
 
 pub use operation::Operation;
 

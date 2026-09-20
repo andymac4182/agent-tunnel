@@ -8,6 +8,7 @@ members = [
     "crates/tunnel-cluster",
     "crates/tunnel-core",
     "crates/tunnel-cua",
+    "crates/tunnel-cua-export",
     "crates/tunnel-cua-fixture",
     "crates/tunnel-deadman",
     "crates/tunnel-fs-core",
