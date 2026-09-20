@@ -29,6 +29,8 @@ of `docs/filesystem-api.md`.  Two suites live here:
 * `gate7-rotation` — the validator of the gate that carries a live 9P session
   across a real scheduled data-socket rotation.  Measured the same way as
   `gate6-e2e`, and for the same reason: the gate is a cluster run.
+* `gate9-epoch-change` — the validator of the gate that holds a 9P session
+  across a real control-epoch change with a request outstanding.
 * `gate8-consumer-loss` — the validator of the gate that loses a 9P consumer
   with a request outstanding and then proves a replacement session restores no
   fids.  Measured the same way, and for the same reason.
@@ -2429,6 +2431,7 @@ HARNESS = REPO / "crates" / "tunnel-test-harness"
 HARNESS_E2E = HARNESS / "src" / "production_cluster" / "fs_client_e2e.rs"
 HARNESS_ROTATION = HARNESS / "src" / "production_cluster" / "fs_rotation.rs"
 HARNESS_LOSS = HARNESS / "src" / "production_cluster" / "fs_consumer_loss.rs"
+HARNESS_EPOCH = HARNESS / "src" / "production_cluster" / "fs_epoch_change.rs"
 
 # Gate 6's end-to-end half is a **cluster** gate: it needs Redis, three relays,
 # a device connector and `node`, and it takes minutes.  That is not a shape this
@@ -2648,13 +2651,15 @@ EXPECT_GREEN: frozenset[str] = frozenset(
         # end-of-directory refusal beside it, so no test can distinguish them;
         # what it bounds is the *work* a resume may demand, not the answer.
         "a resume cookie is bounded by the traversal budget",
-        # gate8.  The composite in-flight rule beside it already subsumes this
-        # one: `request_outstanding_at_loss()` is false unless the emit cursor
+        # gate8 **and gate9**, which share this case name because they share
+        # the construction.  The composite in-flight rule beside it already
+        # subsumes this one: `request_outstanding_at_loss()` — and gate 9's
+        # `request_outstanding_at_change()` — is false unless the emit cursor
         # advanced **and** the receive cursor did not, so the composite
         # rejects the very mutation this rule would have caught.  It is kept
         # because it names the violated condition precisely when a run fails,
         # and the predicate's own clause is held directly by the two cases
-        # that defeat `request_outstanding_at_loss()` itself.
+        # that defeat the predicate itself, which both suites carry.
         "the relay had dispatched a record toward the device",
         # gate2.  Task row **M4-08** explains all nine in those words: "each
         # `O_NOFOLLOW` and its sibling identity check mask one another and are
@@ -3260,6 +3265,345 @@ GATE8_LOSS_CASES: list[tuple[str, list[Edit]]] = [
     ),
 ]
 
+# ---------------------------------------------------------------------------
+# `gate9-epoch-change` — the validator of the gate that holds a 9P session
+# across a real control-epoch change with a request outstanding.  Like
+# `gate7-rotation` and `gate8-consumer-loss` this is a harness-side validator,
+# so each case defeats one rule and the suite's own unit tests must go red.
+#
+# Two rules here have no counterpart in gate 8 and are the reason this gate
+# exists as its own suite rather than as a case inside that one:
+#
+#   * the **epoch** rules, which are what make the event an epoch change at
+#     all rather than a connector that happened to restart; and
+#   * "the pending call was failed explicitly", which gate 8 could not test
+#     because its consumer was gone and had nobody to be failed to.
+# ---------------------------------------------------------------------------
+
+GATE9_EPOCH_TEST = [
+    "cargo",
+    "test",
+    "--offline",
+    "-p",
+    "tunnel-test-harness",
+    "--lib",
+    "--locked",
+    "production_cluster::fs_epoch_change",
+]
+
+GATE9_EPOCH_CASES: list[tuple[str, list[Edit]]] = [
+    # 1. The concurrency claim.
+    (
+        "the change was concurrent with the exchange, not merely nearby",
+        [
+            (
+                HARNESS_EPOCH,
+                "            evidence.request_outstanding_at_change"
+                " && evidence.change.request_outstanding_at_change(),",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the relay had dispatched a record toward the device",
+        [
+            (
+                HARNESS_EPOCH,
+                "            evidence.change.emitted_at_change"
+                " > evidence.change.emitted_before,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "a stream was identified for the held exchange",
+        [
+            (
+                HARNESS_EPOCH,
+                "            evidence.change.stream_id > 0,",
+                "            true,",
+            )
+        ],
+    ),
+    # 2. The event itself.  A gate that did not hold these would prove only
+    #    that a connector restarted near a filesystem session.
+    (
+        "the owner claim took a strictly greater epoch",
+        [
+            (
+                HARNESS_EPOCH,
+                "            evidence.epoch_after > evidence.epoch_before,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "an epoch was actually observed before the change",
+        [
+            (
+                HARNESS_EPOCH,
+                "            evidence.epoch_before > 0,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the device session identity changed",
+        [
+            (
+                HARNESS_EPOCH,
+                "            !evidence.session_id_before.is_empty()\n"
+                "                && !evidence.session_id_after.is_empty()\n"
+                "                && evidence.session_id_before != evidence.session_id_after,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the device itself was told a strictly greater epoch",
+        [
+            (
+                HARNESS_EPOCH,
+                "            evidence.device_epoch_after > evidence.device_epoch_before\n"
+                "                && evidence.device_epoch_before > 0,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the device's own view agrees with the catalog's",
+        [
+            (
+                HARNESS_EPOCH,
+                "            evidence.device_epoch_after == evidence.epoch_after,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the owner was released between the two connectors",
+        [
+            (
+                HARNESS_EPOCH,
+                "            evidence.owner_released_between,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the replacement connector reached active",
+        [
+            (
+                HARNESS_EPOCH,
+                "            evidence.second_connector_active,",
+                "            true,",
+            )
+        ],
+    ),
+    # 3. The clause's own obligation: fail pending calls explicitly.  This is
+    #    the rule M4-28 was found by; without these three a codeless close
+    #    would pass again.
+    (
+        "the pending call was failed explicitly rather than left hanging",
+        [
+            (
+                HARNESS_EPOCH,
+                "            evidence.pending_call_closed,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "that failure carried the profile's close code",
+        [
+            (
+                HARNESS_EPOCH,
+                "            evidence.pending_call_close_code == Some(DEVICE_GONE_CLOSE),",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the held Tread was not answered across the epoch change",
+        [
+            (
+                HARNESS_EPOCH,
+                "            !evidence.pending_call_answered,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the held exchange's stream was deregistered",
+        [
+            (
+                HARNESS_EPOCH,
+                "            evidence.held_stream_deregistered,",
+                "            true,",
+            )
+        ],
+    ),
+    # 4. The contract clause proper: no fid is restored.
+    (
+        "a pre-attach probe was closed rather than served",
+        [
+            (
+                HARNESS_EPOCH,
+                "            !evidence.pre_attach_probe_answered,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "that close was the profile's protocol violation",
+        [
+            (
+                HARNESS_EPOCH,
+                "            evidence.pre_attach_probe_close_code"
+                " == Some(PROTOCOL_VIOLATION_CLOSE),",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the replacement session reached 9P on its own terms",
+        [
+            (
+                HARNESS_EPOCH,
+                "            evidence.second_session_msize > 0"
+                " && evidence.second_session_msize <= OFFERED_MSIZE,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the earlier session's file fid was not restored",
+        [
+            (
+                HARNESS_EPOCH,
+                "            evidence.stale_file_fid_refused,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the file fid refusal named an unallocated fid",
+        [
+            (
+                HARNESS_EPOCH,
+                "            evidence.stale_file_fid_errno == Some(UNKNOWN_FID_ERRNO),",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the earlier session's attach fid was not restored",
+        [
+            (
+                HARNESS_EPOCH,
+                "            evidence.stale_attach_fid_refused,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the attach fid refusal named an unallocated fid",
+        [
+            (
+                HARNESS_EPOCH,
+                "            evidence.stale_attach_fid_errno == Some(UNKNOWN_FID_ERRNO),",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the replacement session established its own root",
+        [
+            (
+                HARNESS_EPOCH,
+                "            evidence.second_session_attached,",
+                "            true,",
+            )
+        ],
+    ),
+    # 5. The export is undamaged, so the refusals above are fid scoping and
+    #    not a replacement connector that never served this export.
+    (
+        "the replacement session read the whole file back",
+        [
+            (
+                HARNESS_EPOCH,
+                "            evidence.second_session_bytes"
+                " == evidence.second_session_expected_bytes\n"
+                "                && evidence.second_session_expected_bytes == EPOCH_FILE_BYTES,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "that transfer's checksum matched",
+        [
+            (
+                HARNESS_EPOCH,
+                "            evidence.second_session_checksum_matches,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "that transfer spanned many Rread messages",
+        [
+            (
+                HARNESS_EPOCH,
+                "            evidence.second_session_messages >= MIN_READ_MESSAGES,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the file was undamaged by the held session",
+        [
+            (
+                HARNESS_EPOCH,
+                "            evidence.second_session_getattr_size == EPOCH_FILE_BYTES as u64,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "each attached session attached exactly once",
+        [
+            (
+                HARNESS_EPOCH,
+                "            evidence.attach_count == 2,",
+                "            true,",
+            )
+        ],
+    ),
+    # 6. The predicate's own clauses, which is what holds the composite rule
+    #    above when the emit-cursor case is subsumed by it.
+    (
+        "the predicate requires the request to have been dispatched",
+        [
+            (
+                HARNESS_EPOCH,
+                "        self.emitted_at_change > self.emitted_before",
+                "        true",
+            )
+        ],
+    ),
+    (
+        "the predicate requires the reply not to have arrived",
+        [
+            (
+                HARNESS_EPOCH,
+                "            && self.recv_contiguous_at_change == self.recv_contiguous_before",
+                "",
+            )
+        ],
+    ),
+]
+
 SUITES: list[Suite] = [
     Suite("gate2", [CRATE], CARGO_TEST, GATE2_CASES),
     Suite(
@@ -3290,6 +3634,12 @@ SUITES: list[Suite] = [
         [HARNESS / "src"],
         GATE8_LOSS_TEST,
         GATE8_LOSS_CASES,
+    ),
+    Suite(
+        "gate9-epoch-change",
+        [HARNESS / "src"],
+        GATE9_EPOCH_TEST,
+        GATE9_EPOCH_CASES,
     ),
 ]
 
@@ -3435,7 +3785,8 @@ def main() -> int:
         "--suite",
         help=(
             "run only this suite (gate2, gate3, gate4, gate5, "
-            "gate6-adapters, gate6-e2e, gate7-rotation or gate8-consumer-loss); "
+            "gate6-adapters, gate6-e2e, gate7-rotation, gate8-consumer-loss or "
+            "gate9-epoch-change); "
             "default is all"
         ),
     )

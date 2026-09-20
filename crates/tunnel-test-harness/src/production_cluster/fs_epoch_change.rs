@@ -1352,6 +1352,29 @@ mod tests {
                 e.epoch_before = 0;
                 e.epoch_after = 1;
             }),
+            // The two mutations above are also caught by the device/catalog
+            // agreement rule, which would leave the catalog-epoch rules
+            // themselves masked and not load-bearing.  These two move every
+            // *other* epoch field into a consistent state, so the named rule
+            // is the only one left to reject them.
+            (
+                "the catalog epoch did not advance, with both views consistent",
+                |e| {
+                    e.epoch_before = 5;
+                    e.epoch_after = 2;
+                    e.device_epoch_before = 1;
+                    e.device_epoch_after = 2;
+                },
+            ),
+            (
+                "no catalog epoch before the change, with both views consistent",
+                |e| {
+                    e.epoch_before = 0;
+                    e.epoch_after = 2;
+                    e.device_epoch_before = 1;
+                    e.device_epoch_after = 2;
+                },
+            ),
             ("the session identity did not change", |e| {
                 e.session_id_after = e.session_id_before.clone();
             }),
