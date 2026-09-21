@@ -5853,16 +5853,6 @@ GATE14_RENAME_RESTART_CASES: list[tuple[str, list[Edit]]] = [
         ],
     ),
     (
-        "the two refusals read differently on the same errno instrument, so the retry's value says where it was refused rather than merely being consistent with the claim",
-        [
-            (
-                HARNESS_RENAME_RESTART,
-                '            evidence.errno_instrument_discriminates(),',
-                '            true,',
-            )
-        ],
-    ),
-    (
         'the replacement session negotiated a bounded msize',
         [
             (

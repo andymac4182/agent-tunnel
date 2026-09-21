@@ -29,12 +29,23 @@
 //! That reasoning was re-derived here rather than inherited, and it does not
 //! survive contact with either gate's instrument.  **Counting names in a host
 //! directory cannot see a rename at all.**  Gate 10's journal is
-//! `journal_entries`, whose rules are counts — the row records them as "2
-//! entries before the kill, 2 after the retry, 2 at the end".  A rename within
-//! one directory removes one name and creates one name, so the count is
-//! **invariant across the very operation being measured**.  An instrument that
-//! reads identically before and after the event is not the same evidence
-//! shape as this gate's; it is no evidence at all.  This gate measures the
+//! `journal_entries`, and *every* rule it feeds is a `usize` from that
+//! listing's `.len()` — read out of `fs_process_restart.rs` rather than from
+//! the row's summary of it:
+//!
+//! ```text
+//! journal_entries_before_held == 1
+//! journal_entries_before_kill == EXPECTED_JOURNAL_ENTRIES
+//! journal_entries_after_retry == journal_entries_before_kill
+//! journal_entries_final       == EXPECTED_JOURNAL_ENTRIES
+//! journal_entries_over_ninep  == journal_entries_final
+//! ```
+//!
+//! There is no per-name rule anywhere in gate 10.  A rename within one
+//! directory removes one name and creates one name, so it holds **all five of
+//! those fixed**: the count is invariant across the very operation being
+//! measured.  An instrument that reads identically before and after the event
+//! is not the same evidence shape as this gate's; it is no evidence at all.  This gate measures the
 //! namespace **per name**, and it records the count beside it precisely so
 //! that the blindness is a measured fact of the run rather than an assertion
 //! in a comment: see [`FsRenameRestartEvidence::entry_count_instrument_was_blind`].
@@ -953,17 +964,26 @@ pub fn validate_fs_rename_restart_evidence(evidence: &FsRenameRestartEvidence) -
             evidence.retry_refusal_errno == Some(UNKNOWN_FID_ERRNO),
         ),
         // **The positive control that makes the errno above proof of origin.**
+        //
+        // **A companion rule asserting that the two refusals *differ* was
+        // written here and then removed, on gate 10's and gate 11's
+        // precedent.**  It could never be the rule that rejected a run: the
+        // rule above requires the control to read `ABSENT_SOURCE_ERRNO` and
+        // the retry rule requires `UNKNOWN_FID_ERRNO`, and those two constants
+        // are different values — so whenever both of those rules hold, the
+        // difference holds automatically, and whenever it fails one of them
+        // has already failed.  The property is held where it can be defeated
+        // instead: `the_absent_source_errno_is_distinct_from_the_unknown_fid_errno`
+        // defeats the premise directly out of the library, and
+        // `an_errno_channel_that_cannot_discriminate_fails_the_gate` defeats
+        // the helper.  `errno_instrument_discriminates()` is kept as a helper
+        // because the evidence line prints it, which is worth more to a reader
+        // than a rule that cannot speak.
         (
             "the same rename on a valid fid reached the host and was refused for an absent source"
                 .into(),
             evidence.absent_source_control_refused
                 && evidence.absent_source_control_errno == Some(ABSENT_SOURCE_ERRNO),
-        ),
-        (
-            "the two refusals read differently on the same errno instrument, so the retry's value \
-             says where it was refused rather than merely being consistent with the claim"
-                .into(),
-            evidence.errno_instrument_discriminates(),
         ),
         // The refusals were fid scoping and not a broken export.
         (
@@ -2426,18 +2446,51 @@ mod tests {
     #[test]
     fn every_rule_rejects_its_own_mutation() {
         type Mutation = (&'static str, fn(&mut FsRenameRestartEvidence));
-        let mutations: [Mutation; 24] = [
+        let mutations: [Mutation; 45] = [
             ("relay count", |e| e.relay_count = 2),
             ("owner node", |e| e.owner_node = String::new()),
             ("subprotocol", |e| e.selected_subprotocol = "other".into()),
             ("dialect", |e| e.negotiated_dialect = "9P2000".into()),
             ("msize", |e| e.negotiated_msize = 0),
             ("prefix reads", |e| e.prefix_bytes = 0),
-            ("emit cursor", |e| e.restart.emitted_at_kill = 4),
-            ("receive cursor", |e| e.restart.recv_contiguous_at_kill = 5),
+            ("journal discrimination", |e| {
+                e.held_namespace_before_send = NamespaceState::AfterRename;
+            }),
+            ("inode instrument discrimination", |e| {
+                // Both control inodes move to the held file's, so the *control*
+                // pair still agrees with itself and only the discrimination
+                // rule is left to reject the run.
+                e.control_source_inode = e.source_inode_before;
+                e.control_destination_inode = e.source_inode_before;
+            }),
+            ("the control rename's own inode", |e| {
+                e.control_destination_inode = Some(9_999);
+            }),
+            // The dispatched-record rule is deliberately absent: it is
+            // subsumed by the composite below, is declared in the suite's
+            // `EXPECT_GREEN`, and cannot be isolated from it — any evidence
+            // that defeats it defeats the composite too.
+            ("the composite in-flight predicate", |e| {
+                e.request_outstanding_at_kill = false;
+            }),
             ("stream id", |e| e.restart.stream_id = 0),
-            ("held namespace", |e| {
+            ("the held rename reached the device", |e| {
+                // Every namespace field moves together, so the *later* samples
+                // still agree with the pre-kill one and only this rule fails.
                 e.held_namespace_before_kill = NamespaceState::BeforeRename;
+                e.held_namespace_after_restart = NamespaceState::BeforeRename;
+                e.held_namespace_after_retry = NamespaceState::BeforeRename;
+                e.held_namespace_after_control = NamespaceState::BeforeRename;
+                e.namespace_over_ninep = NamespaceState::BeforeRename;
+            }),
+            ("the held rename preserved its inode", |e| {
+                e.destination_inode_after = Some(9_999);
+            }),
+            ("a forbidden intermediate state", |e| {
+                e.forbidden_intermediate_observed = true;
+            }),
+            ("the entry count stood still", |e| {
+                e.entry_count_after = EXPECTED_ENTRY_COUNT + 1;
             }),
             ("first pid", |e| e.first_pid = 0),
             ("first exit", |e| e.first_process_exited = false),
@@ -2445,17 +2498,51 @@ mod tests {
                 e.first_process_killed_by_signal = false;
             }),
             ("second pid", |e| e.second_pid = e.first_pid),
+            ("the replacement served the device", |e| {
+                e.second_process_active = false;
+            }),
             ("owner release", |e| e.owner_released_between = false),
-            ("epoch", |e| e.epoch_after = e.epoch_before),
+            ("epoch advance", |e| e.epoch_after = e.epoch_before),
+            ("an epoch was observed at all", |e| e.epoch_before = 0),
             ("session identity", |e| {
                 e.session_id_after = e.session_id_before.clone();
             }),
             ("pending close", |e| e.pending_call_closed = false),
             ("close code", |e| e.pending_call_close_code = None),
             ("pending answered", |e| e.pending_call_answered = true),
-            ("stale fid", |e| e.stale_source_fid_refused = false),
+            ("pending errored", |e| e.pending_call_errored = true),
+            ("the held outcome", |e| {
+                e.held_call_outcome = Some(Outcome::Failed);
+            }),
+            ("stream deregistration", |e| {
+                e.held_stream_deregistered = false
+            }),
+            ("the namespace after the retry", |e| {
+                e.held_namespace_after_retry = NamespaceState::BeforeRename;
+            }),
+            ("stale fid refusal", |e| e.stale_source_fid_refused = false),
+            ("stale fid errno", |e| {
+                e.stale_source_fid_errno = Some(ABSENT_SOURCE_ERRNO);
+            }),
             ("retry refusal", |e| e.retry_refused_above_dispatch = false),
+            ("retry errno", |e| e.retry_refusal_errno = Some(99)),
+            ("the absent-source control", |e| {
+                e.absent_source_control_refused = false;
+            }),
+            ("replacement msize", |e| e.second_session_msize = 0),
+            ("replacement attach", |e| e.second_session_attached = false),
+            ("replacement transfer", |e| e.second_session_bytes = 0),
+            ("replacement message count", |e| {
+                e.second_session_messages = 1
+            }),
             ("renamed content", |e| e.renamed_content_matches = false),
+            ("renamed size", |e| e.second_session_getattr_size = 0),
+            ("the export's own namespace view", |e| {
+                e.namespace_over_ninep = NamespaceState::BeforeRename;
+            }),
+            ("the source name walk", |e| {
+                e.source_name_walk_refused = false
+            }),
             ("attach count", |e| e.attach_count = 3),
         ];
         for (label, mutate) in mutations {
