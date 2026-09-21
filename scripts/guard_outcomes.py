@@ -25,7 +25,8 @@ ones that were forgotten.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
+from pathlib import Path
 
 #: The only outcomes that count as a usable result.
 #:
@@ -74,3 +75,82 @@ def unusable(results: Iterable[tuple[str, str, str]]) -> list[str]:
         for suite, case, outcome in results
         if not is_usable(outcome)
     ]
+
+
+#: A selected case, reduced to the only three things a preflight needs:
+#: ``(suite name, case name, edits)``, where each edit is ``(path, old, new)``.
+#: The four harnesses carry different per-case payloads -- `fs-` selects
+#: 3-tuples, `m5-`, `acp-` and `m3-` select 4-tuples with an
+#: ``expect_build_failure`` flag -- so each normalises to this on the way in
+#: rather than this module learning all four selection shapes.
+Selection = tuple[str, str, Sequence[tuple[Path, str, str]]]
+
+
+def check_anchors(
+    harness: str,
+    selected: Iterable[Selection],
+    extra_problems: Iterable[str] = (),
+) -> int:
+    """Resolve every selected case's guard text against the tree, and stop.
+
+    **Why this is here rather than copied into each harness (task row M4-27).**
+    The per-case refusal inside every deletion loop already fails the run and
+    names the case -- but only for the cases a given invocation selects, and
+    only after paying a `cargo test` per case, so a formatter pass that rewraps
+    several anchors at once is not reported until the run walks to each one,
+    and a full run is measured in hours.  This moves that existing refusal from
+    hour three to second one.  It changes no outcome and no count.
+
+    The row that asks for it says why it is shared: "the preflight belongs in
+    the shared shape all four harnesses use, so a mistake in it blocks every
+    M3, M4, M5 and M8 guard run at once".  Four copies would be four places for
+    the next fix to be applied to three of -- which is the same rot the
+    allowlist above exists to refuse, and the reason `USABLE_OUTCOMES` is not
+    copied four times either.
+
+    Returns 0 when every anchor resolves to exactly one occurrence, and 1
+    otherwise, having listed **all** mismatches rather than stopping at the
+    first -- one formatter pass rewraps several anchors, and reporting them one
+    run at a time is the cost this exists to remove.
+    """
+    # An empty selection must refuse rather than report a clean sweep of
+    # nothing.  `--check-anchors --case no-such-case` used to print "checked 0
+    # anchors ... every anchor resolves" and exit 0: a check that can pass
+    # because it measured nothing proves less than it claims, and it is owed by
+    # a flag whose entire job is to be trusted when it says nothing is wrong.
+    selected = list(selected)
+    if not selected:
+        print(
+            f"{harness}: --check-anchors selected no cases, so it checked "
+            "nothing; a clean result over an empty selection is not evidence",
+            flush=True,
+        )
+        return 1
+
+    problems = 0
+    checked = 0
+    for suite_name, case_name, edits in selected:
+        for path, old, _ in edits:
+            checked += 1
+            occurrences = path.read_text().count(old)
+            if occurrences != 1:
+                problems += 1
+                kind = (
+                    "STALLED: guard text not found"
+                    if occurrences == 0
+                    else f"AMBIGUOUS: {occurrences} occurrences"
+                )
+                print(f"[{suite_name}] {case_name}: {kind} in {path}", flush=True)
+    for problem in extra_problems:
+        problems += 1
+        print(f"{harness}: {problem}", flush=True)
+    print(
+        f"{harness}: checked {checked} anchors across "
+        f"{len({suite_name for suite_name, _, _ in selected})} suite(s)",
+        flush=True,
+    )
+    if problems:
+        print(f"{harness}: {problems} anchor problem(s)", flush=True)
+        return 1
+    print(f"{harness}: every anchor resolves to exactly one occurrence", flush=True)
+    return 0

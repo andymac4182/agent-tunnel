@@ -12,13 +12,21 @@ pinned here.
 
 from __future__ import annotations
 
+import contextlib
+import io
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from guard_outcomes import USABLE_OUTCOMES, is_usable, unusable  # noqa: E402
+from guard_outcomes import (  # noqa: E402
+    USABLE_OUTCOMES,
+    check_anchors,
+    is_usable,
+    unusable,
+)
 
 
 def check(condition: bool, message: str) -> None:
@@ -72,14 +80,146 @@ def main() -> int:
     check("NOTHING went red" in listed[0], "the green is explained, not just echoed")
 
     every_module_filter_is_anchored()
+    the_preflight_refuses_a_stalled_anchor()
+    the_preflight_refuses_an_ambiguous_anchor()
+    the_preflight_refuses_an_empty_selection()
+    the_preflight_accepts_an_anchor_that_resolves_once()
+    the_preflight_lists_every_mismatch_not_just_the_first()
     every_guard_anchor_resolves_to_exactly_one_occurrence()
 
     print("test_guard_outcomes: PASS")
     return 0
 
 
+def run_preflight(selection) -> tuple[int, str]:
+    """`check_anchors` over a synthetic selection, with its output captured."""
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = check_anchors("test-harness", selection)
+    return code, out.getvalue()
+
+
+@contextlib.contextmanager
+def anchor_file(body: str):
+    """A throwaway file to resolve a synthetic anchor against.
+
+    Synthetic only: the preflight fixtures must never depend on the repository's
+    real guard text, or they would go red whenever a guard is legitimately
+    rewritten and stop testing the preflight at all.
+    """
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "guarded.rs"
+        path.write_text(body)
+        yield path
+
+
+def the_preflight_refuses_a_stalled_anchor() -> None:
+    """Zero matches is STALLED, and it fails the run (M4-27).
+
+    This is the direction the harness could not previously hold: it was
+    checked by hand in `m4c32` and nothing stopped it from rotting back.
+    """
+    with anchor_file("fn keep() {}\n") as path:
+        code, output = run_preflight(
+            [("suite1", "a guard whose anchor a formatter rewrapped",
+              [(path, "fn gone()", "")])]
+        )
+    check(code == 1, f"a stalled anchor must fail the run, got exit {code}")
+    check("STALLED: guard text not found" in output,
+          f"a stalled anchor must be named STALLED, got {output!r}")
+    check("a guard whose anchor a formatter rewrapped" in output,
+          f"the stalled case must be named, got {output!r}")
+
+
+def the_preflight_refuses_an_ambiguous_anchor() -> None:
+    """More than one match is AMBIGUOUS, and it fails the run (M4-27).
+
+    `str.replace(old, new, 1)` edits the FIRST match, so an ambiguous anchor
+    measures some other guard and reports a red for it under this case's name.
+    The count matters as well as the refusal: "2 occurrences" is what tells
+    the reader the anchor is shared rather than missing.
+    """
+    with anchor_file("let x = 1;\nlet x = 1;\n") as path:
+        code, output = run_preflight(
+            [("suite1", "a guard whose text is not unique",
+              [(path, "let x = 1;", "")])]
+        )
+    check(code == 1, f"an ambiguous anchor must fail the run, got exit {code}")
+    check("AMBIGUOUS: 2 occurrences" in output,
+          f"an ambiguous anchor must be named with its count, got {output!r}")
+
+
+def the_preflight_refuses_an_empty_selection() -> None:
+    """A selection of nothing must refuse, not report a clean sweep (M4-27).
+
+    `--check-anchors --case no-such-case` used to print "checked 0 anchors ...
+    every anchor resolves" and exit 0.  A check that passes because it measured
+    nothing proves less than it claims, which is the one defect this whole file
+    exists to refuse -- so it is pinned here rather than trusted to stay fixed.
+    """
+    code, output = run_preflight([])
+    check(code == 1, f"an empty selection must refuse, got exit {code}")
+    check("not evidence" in output,
+          f"the refusal must say why it refused, got {output!r}")
+    check("every anchor resolves" not in output,
+          f"an empty selection must never claim a clean sweep, got {output!r}")
+
+
+def the_preflight_accepts_an_anchor_that_resolves_once() -> None:
+    """The green direction, so the three refusals above are not vacuous.
+
+    Without this a `check_anchors` that returned 1 unconditionally would pass
+    every refusal fixture, and they would prove nothing about the preflight.
+    """
+    with anchor_file("let x = 1;\n") as path:
+        code, output = run_preflight(
+            [("suite1", "a guard that resolves", [(path, "let x = 1;", "")])]
+        )
+    check(code == 0, f"a unique anchor must pass, got exit {code}: {output!r}")
+    check("checked 1 anchors" in output,
+          f"the pass must say how much it checked, got {output!r}")
+
+
+def the_preflight_lists_every_mismatch_not_just_the_first() -> None:
+    """All mismatches at once, which is the entire point of a preflight.
+
+    One `cargo fmt` rewraps several anchors together -- the m5c2 and m5c3
+    shape.  A preflight that stopped at the first would still cost one full
+    run per stalled anchor, which is the cost this row exists to remove, so
+    "reports all of them" is a rule and not an implementation detail.
+    """
+    with anchor_file("fn keep() {}\nlet x = 1;\nlet x = 1;\n") as path:
+        code, output = run_preflight(
+            [
+                ("suite1", "stalled one", [(path, "fn gone()", "")]),
+                ("suite1", "stalled two", [(path, "fn also_gone()", "")]),
+                ("suite2", "ambiguous one", [(path, "let x = 1;", "")]),
+            ]
+        )
+    check(code == 1, f"mismatches must fail the run, got exit {code}")
+    for name in ("stalled one", "stalled two", "ambiguous one"):
+        check(name in output, f"{name!r} must be listed, got {output!r}")
+    check("3 anchor problem(s)" in output,
+          f"all three mismatches must be counted, got {output!r}")
+    check("across 2 suite(s)" in output,
+          f"both suites must be reported, got {output!r}")
+
+
 EXPECTED_MODULE_FILTERS = 8
-EXPECTED_GUARD_ANCHORS = 427
+
+#: The floor each harness's `--check-anchors` must clear, so a run that
+#: selected almost nothing cannot pass as a clean sweep.  Measured on
+#: `m4c33-guard-preflight` off `154ac5d`: fs 427 anchors / 13 suites,
+#: acp 148 / 7, m5 82 / 3, m3 5 / 2.  These are floors, not equalities --
+#: adding a guard case must not break this file -- but a drop means either a
+#: deleted case, which belongs in a task row, or a selection that stopped
+#: selecting, which is the vacuity trap.
+EXPECTED_GUARD_ANCHORS = {
+    "fs-guard-deletion.py": 427,
+    "acp-guard-deletion.py": 148,
+    "m5-guard-deletion.py": 82,
+    "m3-guard-deletion.py": 5,
+}
 
 
 def every_module_filter_is_anchored() -> None:
@@ -132,34 +272,42 @@ def every_guard_anchor_resolves_to_exactly_one_occurrence() -> None:
     without a space -- display-only, but it makes the suite's output stop
     matching the rule the gate prints when it fails, and a name is not a
     dictionary word, so nothing downstream of the join can detect it.
+
+    **All four harnesses, not just `fs-` (M4-27).**  The preflight was landed
+    in `fs-guard-deletion.py` alone, and holding only that one here would be a
+    standing rule that covers a quarter of what it appears to: `m5-`, `acp-`
+    and `m3-` could lose the flag entirely and this file would stay green.
     """
-    script = Path(__file__).resolve().parent / "fs-guard-deletion.py"
-    result = subprocess.run(
-        [sys.executable, str(script), "--check-anchors"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    check(
-        result.returncode == 0,
-        "fs-guard-deletion --check-anchors failed:\n"
-        f"{result.stdout}{result.stderr}",
-    )
-    # The same vacuity trap as the filter scan above: a `--check-anchors` that
-    # silently selected nothing would exit 0 and prove nothing, so require the
-    # run to say how much it actually looked at.
-    check(
-        "checked " in result.stdout and " anchors across " in result.stdout,
-        "--check-anchors did not report how many anchors it checked, so its "
-        f"exit code is not evidence: {result.stdout!r}",
-    )
-    checked = int(result.stdout.split("checked ", 1)[1].split(" anchors", 1)[0])
-    check(
-        checked >= EXPECTED_GUARD_ANCHORS,
-        f"expected at least {EXPECTED_GUARD_ANCHORS} anchors to be checked, "
-        f"found {checked} -- the scan selected almost nothing, so its silence "
-        "is not evidence",
-    )
+    directory = Path(__file__).resolve().parent
+    for script_name, floor in sorted(EXPECTED_GUARD_ANCHORS.items()):
+        script = directory / script_name
+        check(script.exists(), f"{script_name} is missing")
+        result = subprocess.run(
+            [sys.executable, str(script), "--check-anchors"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        check(
+            result.returncode == 0,
+            f"{script_name} --check-anchors failed:\n"
+            f"{result.stdout}{result.stderr}",
+        )
+        # The same vacuity trap as the filter scan above: a `--check-anchors`
+        # that silently selected nothing would exit 0 and prove nothing, so
+        # require the run to say how much it actually looked at.
+        check(
+            "checked " in result.stdout and " anchors across " in result.stdout,
+            f"{script_name} --check-anchors did not report how many anchors it "
+            f"checked, so its exit code is not evidence: {result.stdout!r}",
+        )
+        checked = int(result.stdout.split("checked ", 1)[1].split(" anchors", 1)[0])
+        check(
+            checked >= floor,
+            f"{script_name}: expected at least {floor} anchors to be checked, "
+            f"found {checked} -- the scan selected almost nothing, so its "
+            "silence is not evidence",
+        )
 
 
 if __name__ == "__main__":

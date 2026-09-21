@@ -94,6 +94,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from guard_outcomes import check_anchors as shared_check_anchors  # noqa: E402
 from guard_outcomes import unusable as unusable_outcomes  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
@@ -5589,49 +5590,17 @@ def check_anchors(selected: list[tuple[Suite, str, list[Edit]]]) -> int:
     closes for a *selected* case stays open for an unselected one.
 
     Checking costs no build, so CI can run it over every suite every time.
-    """
-    # An empty selection must refuse rather than report a clean sweep of
-    # nothing.  `--check-anchors --case no-such-case` used to print "checked 0
-    # anchors ... every anchor resolves" and exit 0, which is the exact
-    # vacuity this script refuses for the module-filter scan and for its own
-    # ambiguous-anchor case -- and it is owed by a flag whose entire job is to
-    # be trusted when it says nothing is wrong.
-    if not selected:
-        print(
-            "fs-guard-deletion: --check-anchors selected no cases, so it "
-            "checked nothing; a clean result over an empty selection is not "
-            "evidence",
-            flush=True,
-        )
-        return 1
 
-    problems = 0
-    checked = 0
-    for suite, name, edits in selected:
-        for path, old, _ in edits:
-            checked += 1
-            occurrences = path.read_text().count(old)
-            if occurrences != 1:
-                problems += 1
-                kind = (
-                    "STALLED: guard text not found"
-                    if occurrences == 0
-                    else f"AMBIGUOUS: {occurrences} occurrences"
-                )
-                print(f"[{suite.name}] {name}: {kind} in {path}", flush=True)
-    for glued in glued_case_names():
-        problems += 1
-        print(f"glued case name: {glued}", flush=True)
-    print(
-        f"fs-guard-deletion: checked {checked} anchors across "
-        f"{len({suite.name for suite, _, _ in selected})} suite(s)",
-        flush=True,
+    The resolution and the empty-selection refusal live in
+    `scripts/guard_outcomes.py` so all four harnesses share one copy (M4-27);
+    what stays here is this harness's own extra rule, the glued case name,
+    which no other harness has.
+    """
+    return shared_check_anchors(
+        "fs-guard-deletion",
+        ((suite.name, name, edits) for suite, name, edits in selected),
+        (f"glued case name: {glued}" for glued in glued_case_names()),
     )
-    if problems:
-        print(f"fs-guard-deletion: {problems} anchor problem(s)", flush=True)
-        return 1
-    print("fs-guard-deletion: every anchor resolves to exactly one occurrence")
-    return 0
 
 
 def main() -> int:

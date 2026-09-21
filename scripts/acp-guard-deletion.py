@@ -98,6 +98,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from guard_outcomes import check_anchors as shared_check_anchors  # noqa: E402
 from guard_outcomes import unusable as unusable_outcomes  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
@@ -2564,9 +2565,31 @@ def require_clean_tree(suites: list[Suite]) -> None:
                 )
 
 
+def check_anchors(selected: list[tuple[Suite, str, list[Edit], bool]]) -> int:
+    """Resolve every selected case's guard text, and stop (M4-27).
+
+    The resolution, the STALLED/AMBIGUOUS split and the empty-selection
+    refusal all live in `scripts/guard_outcomes.py`, shared with the other
+    three harnesses; this only drops the per-case `expect_build_failure` flag,
+    which an anchor check has no use for.
+    """
+    return shared_check_anchors(
+        "acp-guard-deletion",
+        ((suite.name, name, edits) for suite, name, edits, _ in selected),
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--list", action="store_true", help="print case names and exit")
+    parser.add_argument(
+        "--check-anchors",
+        action="store_true",
+        help=(
+            "check every case's guard text without building anything, and exit "
+            "non-zero if any anchor is missing or ambiguous"
+        ),
+    )
     parser.add_argument("--case", help="run only cases whose name contains this text")
     parser.add_argument(
         "--suite",
@@ -2589,10 +2612,20 @@ def main() -> int:
         for suite, name, _, _ in selected:
             print(f"{suite.name}: {name}")
         return 0
+    if arguments.check_anchors:
+        return check_anchors(selected)
     if not selected:
         sys.exit(f"acp-guard-deletion: no case matches {arguments.case!r}")
 
     require_clean_tree(suites)
+
+    # **Preflight (M4-27).**  Resolve every selected case's anchors before any
+    # case executes, and fail closed listing *all* mismatches at once.  The
+    # per-case refusal in the loop below already fails the run and names
+    # itself, so this changes no outcome and no count -- it moves an existing
+    # refusal from the end of a multi-hour run to its first second.
+    if check_anchors(selected) != 0:
+        return 1
 
     results: list[tuple[str, str, str, list[str]]] = []
     for suite, name, edits, expect_build_failure in selected:
