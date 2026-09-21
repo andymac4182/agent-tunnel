@@ -1790,6 +1790,18 @@ checksum, and exactly **two** `Tattach` across the run. The gate asserts the
 *inequalities* and the codes *derived* from `FsErrorCode::Einval` and
 `SessionErrorCode::close_code()`, never these figures.
 
+**A coverage check that is deliberately not in the registry.**
+`scripts/m4-gate9-ordering.sh` runs this gate N times and reports which
+socket-loss ordering each run took, failing if any run fails and exiting
+**3** — neither pass nor fail — when a set never exercised one of the two.
+It is **on-demand only** and must stay that way: exit 3 is expected on a
+correct tree, so a registry running it would go intermittently red for
+something that is not a defect. The per-run rule inside the gate is the
+part that belongs here, and it is here. Three post-fix sets of 20 took the
+data-first ordering 11, 8 and 2 times, so the default N is 40 rather than
+20: at the low end of that spread a 20-run set misses the ordering about
+one time in eight.
+
 **Guards.** `python3 scripts/fs-guard-deletion.py --suite gate9-epoch-change`
 is **28 of 28** red at this tip, with **one** further case reported as
 `DOCUMENTED GREEN` and never counted as a red test: "the relay had dispatched a

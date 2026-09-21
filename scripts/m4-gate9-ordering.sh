@@ -20,12 +20,34 @@ set -eu
 #      `held_session_teardown_reason` evidence rather than from a relay log.
 #
 # Rule 2 is a coverage check, not a contract: which ordering a run takes is a
-# scheduling race, so on a host that always schedules one way this exits 3 and
-# says the set proved nothing about the other ordering -- which is a different
-# verdict from a failure, and is reported as one.  Raise RUNS rather than
-# treating a 3 as a pass.
+# scheduling race, so a set can legitimately never see one of them.  That is
+# exit 3 -- a third verdict, neither pass nor fail.
 #
-# Usage: scripts/m4-gate9-ordering.sh [runs]   (default 12)
+# WHAT TO DO ON EXIT 3: re-run with a larger RUNS.  Do **not** treat it as a
+# failure, and do not treat it as a pass: the tree is fine and the set simply
+# did not cover the ordering it was run to cover, so it answers nothing.  A 1
+# means something is actually wrong.
+#
+# WHAT THIS IS FOR, AND WHAT IT IS NOT.  It is an **on-demand** check, run by a
+# person closing a row that turns on this behaviour.  It is deliberately NOT
+# wired into `m4-harness-verify.sh` or any other registry, and must not be:
+# exit 3 is expected on a correct tree, so a registry that ran this would go
+# intermittently red for a reason that is not a defect -- which is precisely
+# the instrument-unreliability defect M4-35 exists to have removed.  The
+# per-run rule inside gate 9 is the part that belongs in the registry, and it
+# is already there.
+#
+# CHOOSING RUNS.  The default is deliberate rather than round.  Three post-fix
+# sets of 20 took the data-first ordering 11, 8 and 2 times -- a factor of five
+# on one host with one binary -- so the rate is not merely low, it is unstable,
+# and the low end is what a default has to survive.  At the lowest observed
+# rate (2 in 20) a 20-run set misses that ordering about one time in eight,
+# which is far too often for the default of a script whose whole purpose is to
+# cover it; 40 runs cut that to roughly one in sixty.  So the default is 40 and
+# a smaller N is a spot check you opt into, rather than the other way round.
+# Budget about a minute per run.
+#
+# Usage: scripts/m4-gate9-ordering.sh [runs]   (default 40; see CHOOSING RUNS)
 
 if [ -z "${TEST_REDIS_URL:-}" ]; then
   echo "m4-gate9-ordering: TEST_REDIS_URL is required for a disposable Redis primary." >&2
@@ -36,7 +58,7 @@ if [ -z "${TUNNEL_CATALOG_REDIS_URL:-}" ]; then
   export TUNNEL_CATALOG_REDIS_URL
 fi
 
-RUNS=${1:-12}
+RUNS=${1:-40}
 control=0
 reverse=0
 other=0
@@ -91,7 +113,8 @@ if [ "$unattributed" -ne 0 ]; then
   exit 1
 fi
 if [ "$control" -eq 0 ] || [ "$reverse" -eq 0 ]; then
-  echo "m4-gate9-ordering: every run took the same ordering, so this set proves nothing about the other one. Not a failure; raise the run count." >&2
+  echo "m4-gate9-ordering: every one of ${RUNS} runs took the same ordering, so this set covers nothing about the other one." >&2
+  echo "m4-gate9-ordering: this is NOT a failure and NOT a pass -- the tree is fine and the set answers nothing. Re-run with a larger run count (try $((RUNS * 2)))." >&2
   exit 3
 fi
 
