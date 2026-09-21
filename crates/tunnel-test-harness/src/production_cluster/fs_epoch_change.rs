@@ -1593,9 +1593,11 @@ mod tests {
     ///
     /// Which of the device's two sockets the relay notices losing first is a
     /// scheduling race, so a gate that passed only for `CONTROL_CLOSED` would
-    /// be red on a legitimate interleaving -- 8 of 20 runs took the data-first
-    /// ordering in the post-fix set on the
-    /// measuring host.  The mutation list above can only say what must be
+    /// be red on a legitimate interleaving.  The split is not stable even on
+    /// one host: three post-fix sets of 20 took the data-first ordering 11, 8
+    /// and 2 times, which is why this rule accepts either, why the coverage
+    /// check lives in a run set rather than in a run, and why no rate is
+    /// claimed for it.  The mutation list above can only say what must be
     /// rejected; this says what must be accepted, which is the half a reader
     /// would otherwise have to infer from silence.  M4-35.
     #[test]
