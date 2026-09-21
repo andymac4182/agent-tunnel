@@ -13082,8 +13082,30 @@ impl RelayActor {
         // which is precisely the class M4-28's narrowing removed. It is
         // widened to the *fact* the string is ambiguous about: the carrier's
         // sender is closed, so the socket task that held its receiver is
-        // finished and the device's transport is provably gone. A budget
-        // refusal leaves that sender open and still publishes nothing.
+        // finished and the device's transport is provably gone.
+        //
+        // What that test does and does not guarantee, stated rather than left
+        // to be inferred. It reads the **current state** at teardown, not the
+        // trigger, and it can only err in the safe direction:
+        //
+        //  * A budget refusal while the device is up leaves the sender open,
+        //    so nothing is published and the consumer keeps the close it had.
+        //    That is the case this discrimination exists for.
+        //  * A budget refusal followed closely by a genuine socket close
+        //    publishes `DeviceGone`, and that is **correct**: a closed sender
+        //    means the task owning its receiver has finished, so the device's
+        //    transport really is gone at the moment the consumer is told, and
+        //    1012 is true of the world then whichever failure tripped the
+        //    teardown first.
+        //  * `try_send` also fails when the queue is merely **full**, so a
+        //    carrier that is lost but whose sender has not yet observed the
+        //    closure publishes nothing. That is a *miss*, never a false 1012 —
+        //    the consumer keeps its prior close, exactly as before M4-35.
+        //
+        // The set that publishes is therefore closed and two named reasons
+        // wide, never a predicate over reason strings: a reason added upstream
+        // later matches neither arm and **defaults to publishing nothing**,
+        // which is the safe default and the one M4-28 was re-cut to get.
         //
         // A **third** ordering is possible and is deliberately not covered: if
         // the carrier loss is processed as a `disconnect_data` first, the

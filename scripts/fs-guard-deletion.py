@@ -3527,6 +3527,26 @@ GATE9_EPOCH_CASES: list[tuple[str, list[Edit]]] = [
             )
         ],
     ),
+    # M4-35.  The close-code rule above is satisfiable by *any* teardown that
+    # happens to carry 1012, which is how a gate can go green without having
+    # measured the event it is named for.  This rule says the held session
+    # ended because the device's own transport did, by either of its two
+    # sockets -- and it is also the field a run set is read off, so that
+    # "twenty green runs" can be distinguished from "twenty runs that never
+    # took the ordering which used to fail".
+    (
+        "the held session ended because the device's own transport did",
+        [
+            (
+                HARNESS_EPOCH,
+                """            matches!(
+                evidence.held_session_teardown_reason.as_deref(),
+                Some(CONTROL_CLOSED_TEARDOWN | REVERSE_CHANNEL_TEARDOWN)
+            ),""",
+                "            true,",
+            )
+        ],
+    ),
     (
         "the held Tread was not answered across the epoch change",
         [
