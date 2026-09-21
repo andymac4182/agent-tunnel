@@ -1864,7 +1864,7 @@ nothing further while the owner shows the stream fully quiesced. The control
 that makes this filesystem-specific is `verify-m7-i08-recovery-attempts`, the
 product's own retained-recovery gate on the echo adapter, which exits 0 at the
 same tip on the same host. `python3 scripts/fs-guard-deletion.py --suite
-gate11-data-recovery` reports **37 of 37** deletions red, with one case
+gate11-data-recovery` reports **39 of 39** deletions red, with one case
 reported as `DOCUMENTED GREEN` — the composite-masked in-flight half that gates
 8, 9 and 10 each carry for the same reason, held directly in both directions by
 `the_in_flight_predicate_needs_both_halves`.
