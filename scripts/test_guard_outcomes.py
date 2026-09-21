@@ -76,6 +76,9 @@ def main() -> int:
     return 0
 
 
+EXPECTED_MODULE_FILTERS = 7
+
+
 def every_module_filter_is_anchored() -> None:
     """Every `production_cluster::<module>` test filter must end in `::`.
 
@@ -90,15 +93,23 @@ def every_module_filter_is_anchored() -> None:
     This is the rule, held where it cannot rot back.
     """
     script = (Path(__file__).resolve().parent / "fs-guard-deletion.py").read_text()
-    unanchored = [
-        line.strip()
-        for line in script.splitlines()
-        if '"production_cluster::' in line and not line.strip().endswith('::",')
-    ]
+    seen = [line.strip() for line in script.splitlines() if '"production_cluster::' in line]
+    unanchored = [line for line in seen if not line.endswith('::",')]
     check(
         not unanchored,
         "these module filters are prefixes and will capture another gate's "
         f"cases: {unanchored}",
+    )
+    # Without this the check passes vacuously: it matches on one literal
+    # spelling, so reformatting the filters -- single quotes, a line break --
+    # makes `seen` empty and `unanchored` empty with it, and a de-anchored
+    # filter sails through.  A guard that cannot tell "all anchored" from
+    # "found nothing to look at" is the shape this file exists to refuse.
+    check(
+        len(seen) >= EXPECTED_MODULE_FILTERS,
+        f"expected at least {EXPECTED_MODULE_FILTERS} module filters to "
+        f"inspect, found {len(seen)} -- the scan matched nothing, so its "
+        "silence is not evidence",
     )
 
 
