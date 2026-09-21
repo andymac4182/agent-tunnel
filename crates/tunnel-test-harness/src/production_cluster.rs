@@ -159,6 +159,12 @@ mod fs_epoch_change;
 /// it — neither of which gate 9's in-process fixture has.
 mod fs_process_restart;
 mod fs_real_path;
+/// Gate 14: the same process failure holding a **`Trename`**, whose effect is
+/// a **namespace** effect at two names and the one baseline operation
+/// `docs/filesystem-api.md` grants backend atomicity — so unlike gate 13's
+/// torn write, its intermediate states are **forbidden** rather than
+/// permitted, and unlike gate 10's create it has an intermediate state at all.
+mod fs_rename_restart;
 mod fs_rotation;
 /// M4 filesystem gate 12: the **write** and **`Tflush`** halves of M4-06's
 /// rotation clause.  Its own module rather than a case inside gate 7 because
@@ -194,6 +200,11 @@ pub use fs_process_restart::{
 };
 pub use fs_real_path::{
     FsRealPathEvidence, validate_fs_real_path_evidence, verify as verify_fs_real_path,
+};
+pub use fs_rename_restart::{
+    FsRenameRestartEvidence, NamespaceState, RenameRestartObservation,
+    classify_held_outcome as classify_held_rename_outcome, classify_namespace,
+    validate_fs_rename_restart_evidence, verify as verify_fs_rename_restart,
 };
 pub use fs_rotation::{
     FreezeObservation, FsRotationEvidence, validate_fs_rotation_evidence,

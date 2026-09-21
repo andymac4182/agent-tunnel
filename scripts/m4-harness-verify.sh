@@ -51,4 +51,7 @@ gate "M4 filesystem gate 12: a Twrite and a Tflush held across two real schedule
 gate "M4 filesystem gate 13: a Twrite held across a real connector process failure, classified as an unknown outcome the caller may not retry" \
   cargo run --locked -p tunnel-test-harness -- verify-m4-fs-write-restart
 
+gate "M4 filesystem gate 14: a Trename held across that same process failure, whose namespace effect is measured per name, proven native by its inode, and whose refusal is discriminated from a host refusal by errno" \
+  cargo run --locked -p tunnel-test-harness -- verify-m4-fs-rename-restart
+
 echo "m4-harness-verify: implemented M4 harness suite passed" >&2

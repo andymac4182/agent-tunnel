@@ -20,19 +20,33 @@
 //! pairing — **a write, across a process failure** — was named by the contract
 //! and exercised by no gate.  This is that pairing.
 //!
-//! ## Why a `Twrite` and not a `Trename`
+//! ## Why a `Twrite` first, and the `Trename` argument **corrected**
 //!
-//! The clause offers both, and one of them would have been a second copy of
-//! gate 10.  `docs/filesystem-api.md` says so outright: "Native in-filesystem
-//! rename is the only baseline single namespace operation with backend
-//! atomicity."  A `Trename`'s effect is therefore a **namespace** effect that
-//! either happened or did not — structurally the same evidence shape as gate
-//! 10's directory entry, down to counting names in a host directory.  A
-//! `Twrite`'s effect is **bytes at an offset**, and the same document puts it
-//! on the other side of the line: operations that "may partially apply", with
-//! "plain close/write acknowledgment does not mean fsync".  So the write is
-//! the half of the clause that is not already covered by shape, and it is the
-//! one this gate drives.
+//! The clause offers both.  A `Twrite`'s effect is **bytes at an offset**, and
+//! `docs/filesystem-api.md` puts it on the permissive side of the line:
+//! operations that "may partially apply", with "plain close/write
+//! acknowledgment does not mean fsync".  That made it the operation with the
+//! least covered contract, and it is the one this gate drives.
+//!
+//! **This module originally argued further, that a `Trename` would have been
+//! a second copy of gate 10 — "structurally the same evidence shape as gate
+//! 10's directory entry, down to counting names in a host directory".  That
+//! argument was wrong, and it is corrected here rather than quietly dropped,
+//! because it was the stated reason the rename half went undriven.**  Gate
+//! 10's journal rules are five *counts* and one **one-sided** per-name rule;
+//! a rename inside one directory removes one name and creates one, so the
+//! counts are **invariant across the very operation being measured**, and
+//! `held_effect_exactly_once` only ever looks at the name that *appears* —
+//! it would see a destination arrive and say nothing about the source still
+//! being there.  And the backend
+//! atomicity invoked to dismiss the rename is what makes it worth driving:
+//! it is a promise, the only one in the baseline, and a promise can be
+//! violated.  Where this gate must *admit* a torn region because the contract
+//! permits partial application, a rename's intermediate states are
+//! **forbidden** — and "do not substitute copy/delete" is measurable on an
+//! inode, which nothing here measures.
+//!
+//! `production_cluster::fs_rename_restart` is gate 14 and drives that half.
 //!
 //! # What is genuinely new here: the lossless assumption does not hold
 //!
@@ -142,7 +156,7 @@
 //! traffic cannot move it.)
 //!
 //! The errno is **corroboration, not proof of origin**, and is recorded as
-//! such: `tunnel_fs_host::policy::code_for` maps every errno it does not
+//! such: `tunnel_fs_host::policy::code_from_errno` maps every errno it does not
 //! recognise to `Einval`, and the host write path returns `Einval` directly,
 //! so the value alone is equally consistent with a refusal that *did* reach
 //! the host.  What it does establish is the shape of the refusal — a
@@ -474,11 +488,20 @@ pub struct FsWriteRestartEvidence {
     /// The errno that refusal carried.
     ///
     /// This is the errno a session-level unknown-fid refusal carries, and it
-    /// is **corroboration, not proof of origin**: `policy::code_for` maps any
-    /// errno it does not recognise to `Einval` as well, and the host write
-    /// path returns `Einval` directly, so this value alone does not establish
-    /// that the retry stopped above the provider.  What establishes that is
-    /// [`Self::host_mtime_unchanged_across_retry`].
+    /// is **corroboration, not proof of origin**: `policy::code_from_errno`
+    /// maps any errno it does not recognise to `Einval` as well, and the host
+    /// write path returns `Einval` directly, so this value alone does not
+    /// establish that the retry stopped above the provider.  What establishes
+    /// that is [`Self::host_mtime_unchanged_across_retry`].
+    ///
+    /// **This limit is specific to a `Twrite`, and gate 14 escapes it.**  The
+    /// fold above is only a fold of the errnos `code_from_errno` does *not*
+    /// recognise; `Errno::NOENT` it maps to a distinct `FsErrorCode::Enoent`.
+    /// A rename is not idempotent, so a retried rename that reached the host
+    /// finds no source and reads back differently from one refused above the
+    /// dispatch boundary — which is why
+    /// `production_cluster::fs_rename_restart` can carry this claim on the
+    /// errno itself and this gate cannot.
     pub retry_refusal_errno: Option<u32>,
     /// The held region after that retry.  Must still equal
     /// [`Self::held_region_before_kill`].
