@@ -72,10 +72,19 @@ pub trait InputAuthority {
 ///
 /// **Shared by clone, published by exactly one writer.** The supervisor is the
 /// only holder that ever calls [`LifecycleEpochHandle::disturb`]; every other
-/// holder reads. The store is `Release` and the loads `Acquire` because what
-/// must be ordered is not the counter against itself but the counter against
-/// the kill that follows it, and against the socket error the dispatcher then
-/// observes.
+/// holder reads.
+///
+/// The store is `Release` and the loads `Acquire`, which is the conservative
+/// choice rather than a load-bearing one, and **the earlier note here
+/// overclaimed what it buys.** Rust's memory model orders this store against
+/// other Rust memory operations; it does not order it against a `kill`
+/// syscall in another process's address space. What actually makes the
+/// ordering work is program order — `disturb()` is executed before `kill()` is
+/// issued — and the operating system, which is the edge that carries the
+/// socket close to the dispatcher. `Relaxed` would almost certainly be
+/// sufficient for a single `u64` counter read for equality; the stronger
+/// ordering is kept because it costs nothing measurable here and because a
+/// future reader adding a second field would be right to expect it.
 ///
 /// # This is not a clock and not a lock
 ///
@@ -87,6 +96,17 @@ pub trait InputAuthority {
 /// the pessimistic reading, and
 /// [`tunnel_cua::supervision::attribute_restart`] keeps it from ever being
 /// the more retryable one.
+///
+/// # It advances on every stop, including the ones that never restart
+///
+/// [`Supervisor::stop`] advances it unconditionally, so a bare stop, a
+/// `restart` whose `start` fails, and a stop with nothing running all rename
+/// an in-flight `Unknown(_)` to `BackendRestarted`. Each of those really did
+/// take the backend away underneath the exchange, so the verdict is right and
+/// only the word overstates the sequel; **retryability is identical on every
+/// one of those paths**, so it cannot produce a second click. Advancing only
+/// on a *successful* restart would reintroduce the race this type exists to
+/// remove. See `attribute_restart`'s own documentation.
 #[derive(Clone, Debug, Default)]
 pub struct LifecycleEpochHandle(Arc<AtomicU64>);
 

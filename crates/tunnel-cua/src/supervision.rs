@@ -287,7 +287,14 @@ impl LifecycleEpoch {
         self.0
     }
 
-    /// The next epoch. Called once per supervisor-driven disturbance.
+    /// The next epoch.
+    ///
+    /// **Not what the supervisor advances the live counter with** — that is a
+    /// `fetch_add` on the shared handle, because the counter is read
+    /// concurrently and a read-modify-write through this type would not be
+    /// atomic. This exists so a test can construct a *changed* epoch without
+    /// a supervisor, and so `before.next()` reads as "some later epoch"
+    /// rather than as a magic number; every attribution test uses it.
     #[must_use]
     pub const fn next(self) -> Self {
         Self(self.0 + 1)
@@ -308,11 +315,37 @@ impl LifecycleEpoch {
 /// guessed: an answer of [`NotDispatched::NotReached`] is
 /// [`InFlight::NotReached`], and an [`Completion::Unknown`] is
 /// [`InFlight::ReachedBackend`]. Feeding those to [`restart_outcome`] returns
-/// the same `Dispatch` arm it was given, so **re-attribution cannot widen
-/// retryability** — not by policy, but because there is no input for which it
-/// produces a more retryable answer than it received.
-/// `attribution_never_changes_what_a_retry_is_allowed_to_do` measures that
-/// over every reason and every operation rather than asserting it here.
+/// the same `Dispatch` arm it was given, so re-attribution does not widen
+/// retryability.
+///
+/// **That holds by the composition of two measured functions, not by
+/// construction of this one.** This function delegates the mapping to
+/// [`restart_outcome`], so the property is a fact about the two bodies
+/// agreeing: mutating `restart_outcome`'s `ReachedBackend` arm to
+/// `NotDispatched` — which is `m5-guard-deletion.py`'s `m5c4` case *an
+/// operation in flight across a restart is unknown, never not-dispatched* —
+/// would widen retryability through here too. What pins it is
+/// `attribution_never_changes_what_a_retry_is_allowed_to_do`, which measures
+/// every reason against every operation, not the shape of the match below.
+///
+/// # A stop that never restarted anything is still named a restart
+///
+/// [`LifecycleEpoch`] advances at the top of the supervisor's `stop`, so
+/// three paths advance it without a completed restart: a bare `stop()`, a
+/// `restart()` whose `start()` fails, and a `stop()` called when nothing was
+/// running. An exchange in flight across any of them is renamed
+/// `BackendRestarted`.
+///
+/// **That is a diagnostic-name inaccuracy and nothing more, which is why it is
+/// tolerated rather than fixed.** Every one of those paths really did take the
+/// backend away underneath the exchange, so `Unknown` is the correct verdict;
+/// only the word "restarted" overstates what followed. It cannot cause a
+/// double click, because the rename moves `Unknown(_)` to `Unknown(
+/// BackendRestarted)` and leaves `NotReached` alone, and both
+/// [`Dispatch::retry_is_safe`] and [`Dispatch::retry_is_safe_for`] are
+/// unchanged by either. Narrowing the name would need the epoch to advance
+/// only on a *successful* restart, which reintroduces exactly the race
+/// [`LifecycleEpoch`] exists to remove.
 ///
 /// # What is deliberately left alone
 ///

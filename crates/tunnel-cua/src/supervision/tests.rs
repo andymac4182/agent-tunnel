@@ -388,16 +388,19 @@ fn attribution_never_changes_what_a_retry_is_allowed_to_do() {
             }
         }
     }
-    // The count is asserted so a future refactor that empties `inputs` --
-    // making every loop body unreachable -- fails here instead of passing as
-    // a check that checked nothing.
+    // **A literal, because the obvious form of this assertion cannot fail.**
+    // This first read `assert_eq!(checked, 2 * inputs.len() * Operation::ALL
+    // .len())`, which is exactly the thing it was written to prevent: empty
+    // `inputs` and both sides go to zero together, so the check agrees with
+    // itself over a loop that never ran. 432 is 18 transport answers x 12
+    // operations x 2 epoch relations, and it is written out so that dropping
+    // an input, an operation or the undisturbed arm fails here rather than
+    // quietly shrinking the cross-product.
     assert_eq!(
         checked,
-        2 * inputs.len() * Operation::ALL.len(),
-        "the cross-product did not run in full"
-    );
-    assert!(
-        checked >= 400,
-        "MEASURED attribution cross-product: {checked}"
+        432,
+        "the cross-product did not run in full: {} inputs x {} operations x 2",
+        inputs.len(),
+        Operation::ALL.len()
     );
 }

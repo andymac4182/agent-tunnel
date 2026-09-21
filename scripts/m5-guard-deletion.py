@@ -23,12 +23,22 @@ here:
   the loopback and staleness checks the supervisor applies to the address a
   backend publishes.
 
-  **It is the one suite here that carries a mandatory pre-build**, because its
-  tests `exec` two binaries from two packages: `tunnel-cua-fixture` and
-  `tunnel-deadman`. See `Suite.build` and task row M3-19. Its second case is
-  defeated in `crates/tunnel-deadman`, a package `cargo test -p
-  tunnel-cua-fixture` builds no binary of, so without the rebuild it would
-  report `still green` for the entire mechanism.
+  **It carries a mandatory pre-build**, because its tests `exec` two binaries
+  from two packages: `tunnel-cua-fixture` and `tunnel-deadman`. See
+  `Suite.build` and task row M3-19. Its second case is defeated in
+  `crates/tunnel-deadman`, a package `cargo test -p tunnel-cua-fixture` builds
+  no binary of, so without the rebuild it would report `still green` for the
+  entire mechanism.
+
+* `m5c5` -- restart attribution: the lifecycle epoch that makes a supervised
+  restart reach a consumer as a restart rather than as a lost connection, the
+  ordering that makes it fire at all, and the refusals that keep attribution
+  from widening retryability or overwriting a definitive answer.
+
+  **It carries the same pre-build as `m5c4`, for the same reason**: two of its
+  cases are witnessed only by `tunnel-cua-fixture`'s integration tests, which
+  `exec` the fixture binary. Without the rebuild both would report `still
+  green`.
 
 It follows `scripts/acp-guard-deletion.py` and `scripts/fs-guard-deletion.py`,
 **including their refusals, none of which may be removed**:
@@ -1411,6 +1421,139 @@ CASES_C4: list[tuple[str, list[Edit], bool]] = [
 ]
 
 
+# --------------------------------------------------------------- chunk 5
+#: Restart attribution: the wiring that makes `restart_outcome` reachable from
+#: the dispatch path (task row M5-C10).
+#:
+#: **Why these are here rather than in a report.** Chunk 5 first held these
+#: five mutations red by hand and cited the tally in its PR body, which is the
+#: defect M4-27 was reopened for: a failure mode nobody but the author can
+#: re-run is not evidence. Each is now a case.
+#:
+#: The `.watching()` call sites in `tests/supervision.rs` are deliberately
+#: **not** cases: this harness defeats guards in the *product*, and editing a
+#: test to remove its own coverage measures nothing about behaviour. The
+#: product-side equivalent is the last case here, which makes `watching`
+#: accept the handle and drop it -- exactly what an unwired dispatcher does.
+#:
+#: Shares `m5c4`'s build and test set: the restart attribution is witnessed by
+#: `tunnel-cua-fixture`'s integration tests, which `exec` the fixture binary.
+CASES_C5: list[tuple[str, list[Edit], bool]] = [
+    (
+        # **The one that would be a double click.** Widening an in-flight
+        # unknown to `NotDispatched` tells the caller to retry a click that may
+        # already have landed -- the M5-04 trap, arriving through attribution
+        # rather than through the supervisor itself.
+        "attribution never widens what a retry is allowed to do",
+        [
+            (
+                SUPERVISION,
+                """        Dispatch::Dispatched(Completion::Unknown(_)) => restart_outcome(InFlight::ReachedBackend),
+        Dispatch::NotDispatched(NotDispatched::NotReached) => restart_outcome(InFlight::NotReached),""",
+                """        Dispatch::Dispatched(Completion::Unknown(_)) => {
+            Dispatch::NotDispatched(NotDispatched::NotReached)
+        }
+        Dispatch::NotDispatched(NotDispatched::NotReached) => restart_outcome(InFlight::NotReached),""",
+            )
+        ],
+        False,
+    ),
+    (
+        # The row's whole point: with attribution inert the contract still
+        # holds -- `TransportLost` is equally dispatched, unknown and
+        # non-retryable -- and only the *named reason* is lost. A test that
+        # asserted the arm alone would stay green here, which is why the
+        # assertions this defeats compare the reason.
+        "a restart reaches the consumer as a restart, not as a lost connection",
+        [
+            (
+                SUPERVISION,
+                """    match &transport {
+        Dispatch::Dispatched(Completion::Unknown(_)) => restart_outcome(InFlight::ReachedBackend),
+        Dispatch::NotDispatched(NotDispatched::NotReached) => restart_outcome(InFlight::NotReached),
+        _ => transport,
+    }""",
+                "    transport",
+            )
+        ],
+        False,
+    ),
+    (
+        # Without the equality guard every exchange is reported as a restart,
+        # including the overwhelming majority that ran while the supervisor did
+        # nothing at all. A diagnostic that names every failure a restart is
+        # worth less than one that names none.
+        "an exchange the supervisor never disturbed keeps the transport's own answer",
+        [
+            (
+                SUPERVISION,
+                """    if before == after {
+        return transport;
+    }""",
+                "    let _ = (before, after);",
+            )
+        ],
+        False,
+    ),
+    (
+        # Attribution must not destroy information. Rewriting `Dispatched(_)`
+        # wholesale turns a backend's definitive `Ok` into `Unknown` because
+        # something restarted afterwards, which is strictly worse than not
+        # attributing at all.
+        "a definitive answer survives a restart that happened around it",
+        [
+            (
+                SUPERVISION,
+                "        Dispatch::Dispatched(Completion::Unknown(_)) => restart_outcome(InFlight::ReachedBackend),",
+                "        Dispatch::Dispatched(_) => restart_outcome(InFlight::ReachedBackend),",
+            )
+        ],
+        False,
+    ),
+    (
+        # **The ordering, and it is the whole outcome rather than a narrow
+        # race.** The epoch must advance before the kill: an exchange against
+        # the dying backend reads its "after" value the instant the socket
+        # closes, which is at the kill and not at the replacement's spawn.
+        # Moving this one line below the kill leaves every restart-killed
+        # exchange reported as `TransportLost`. It is also why
+        # `BackendGeneration`, which advances later still, cannot be used here.
+        "the lifecycle epoch advances before the kill, not after it",
+        [
+            (
+                EXPORT_SUPERVISOR,
+                """        self.epoch.disturb();
+        if let Some(running) = self.running.take() {
+            running.child.kill();
+            running.child.wait_exited().await;
+        }""",
+                """        if let Some(running) = self.running.take() {
+            running.child.kill();
+            running.child.wait_exited().await;
+        }
+        self.epoch.disturb();""",
+            )
+        ],
+        True,
+    ),
+    (
+        # The product-side form of "the dispatcher is not watching": `watching`
+        # takes the handle and drops it, leaving the detached default. This is
+        # what makes the watched/unwatched pair in `tests/supervision.rs`
+        # evidence -- the epoch really is what decides, and a dispatcher that
+        # takes no handle really does fall back to the transport's own reason.
+        "a dispatcher handed a lifecycle epoch actually keeps it",
+        [
+            (
+                CLIENT,
+                "        self.epoch = epoch;",
+                "        let _ = epoch;",
+            )
+        ],
+        True,
+    ),
+]
+
 @dataclass
 class Suite:
     name: str
@@ -1431,6 +1574,13 @@ SUITES: list[Suite] = [
         [CRATE, EXPORT, FIXTURE, DEADMAN],
         C4_CARGO_TEST,
         CASES_C4,
+        build=C4_BUILD,
+    ),
+    Suite(
+        "m5c5",
+        [CRATE, EXPORT, FIXTURE],
+        C4_CARGO_TEST,
+        CASES_C5,
         build=C4_BUILD,
     ),
 ]
@@ -1552,7 +1702,7 @@ def main() -> int:
         ),
     )
     parser.add_argument("--case", help="run only cases whose name contains this text")
-    parser.add_argument("--suite", help="run only this suite (m5c2, m5c3 or m5c4)")
+    parser.add_argument("--suite", help="run only this suite (m5c2, m5c3, m5c4 or m5c5)")
     arguments = parser.parse_args()
 
     suites = SUITES
