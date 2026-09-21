@@ -2504,3 +2504,93 @@ async fn session_teardown_records_an_http_stream_with_a_deferred_terminal() {
     assert!(records[0].reset_deferred_by_freeze);
     assert_eq!(records[0].release, "reset");
 }
+
+// ---------------------------------------------------------------------------
+// M4-35: which teardowns may be reported to a filesystem consumer as "the
+// backend went away".
+//
+// A connector that stops closes both of its sockets, and which loss the relay
+// notices first is a race the relay does not control.  Control first is
+// `CONTROL_CLOSED`; data first is a frame that fails to queue, which tears the
+// session down as `REVERSE_CHANNEL_UNAVAILABLE`.  Both are the same event and
+// must reach the consumer as the same close code — a codeless close roughly a
+// quarter of the time was gate 9's intermittent failure.
+//
+// The dangerous half is the second, because `REVERSE_CHANNEL_UNAVAILABLE` is
+// *also* how a queue budget refusal arrives: the relay declining to buffer
+// more while the device is perfectly healthy.  Reporting that as 1012 is
+// exactly the defect M4-28's narrowing removed.  So these cases pin the
+// discrimination rather than the reason string — the last two are the ones
+// that go red if a later change widens the gate back to the string, or
+// loosens it to the bare fact of a dead carrier.
+// ---------------------------------------------------------------------------
+
+/// The event gate 9 measures, reached through the control socket.
+#[tokio::test]
+async fn a_closed_control_session_publishes_the_device_gone_cause() {
+    let mut fixture = FreezeFixture::new("teardown-control-closed", false);
+    let watchers = attach_http(&mut fixture);
+    let key = fixture.key.clone();
+    fixture.actor.close_session(&key, "CONTROL_CLOSED").await;
+    assert_eq!(
+        *watchers.terminal.borrow(),
+        Some(super::StreamTeardownCause::DeviceGone),
+        "the device's control session ended"
+    );
+}
+
+/// The same event, reached through the data socket instead: the carrier's
+/// receiver is gone, so the device's transport is provably not there.
+#[tokio::test]
+async fn a_dead_data_carrier_publishes_the_device_gone_cause() {
+    let mut fixture = FreezeFixture::new("teardown-carrier-dead", false);
+    let watchers = attach_http(&mut fixture);
+    // The device's data socket task is finished: its receiver is gone, so the
+    // session's sender reports itself closed.
+    fixture.old_rx.close();
+    let key = fixture.key.clone();
+    fixture
+        .actor
+        .close_session(&key, "REVERSE_CHANNEL_UNAVAILABLE")
+        .await;
+    assert_eq!(
+        *watchers.terminal.borrow(),
+        Some(super::StreamTeardownCause::DeviceGone),
+        "the device's data carrier ended"
+    );
+}
+
+/// The refusal that wears the same reason string.  The carrier is alive and
+/// the **relay's** queue budget declined the bytes, so no consumer may be told
+/// the device is not connected.
+#[tokio::test]
+async fn a_live_carrier_refusing_a_frame_publishes_no_cause() {
+    let mut fixture = FreezeFixture::new("teardown-carrier-live", false);
+    let watchers = attach_http(&mut fixture);
+    let key = fixture.key.clone();
+    fixture
+        .actor
+        .close_session(&key, "REVERSE_CHANNEL_UNAVAILABLE")
+        .await;
+    assert_eq!(
+        *watchers.terminal.borrow(),
+        None,
+        "a budget refusal is the relay, not the device"
+    );
+}
+
+/// A dead carrier is not on its own a licence to report a backend that went
+/// away: the relay stopping fences every session, and the device is fine.
+#[tokio::test]
+async fn a_dead_carrier_under_another_reason_publishes_no_cause() {
+    let mut fixture = FreezeFixture::new("teardown-carrier-dead-shutdown", false);
+    let watchers = attach_http(&mut fixture);
+    fixture.old_rx.close();
+    let key = fixture.key.clone();
+    fixture.actor.close_session(&key, "SHUTDOWN").await;
+    assert_eq!(
+        *watchers.terminal.borrow(),
+        None,
+        "the relay stopped, and the device went nowhere"
+    );
+}

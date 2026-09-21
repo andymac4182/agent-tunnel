@@ -1990,6 +1990,57 @@ GATE4_CASES: list[tuple[str, list[Edit]]] = [
             )
         ],
     ),
+    # M4-35.  A connector that stops closes both of its sockets, and which
+    # loss the relay notices first is a race it does not control: control
+    # first is `CONTROL_CLOSED`, data first is a frame that fails to queue and
+    # tears the session down as `REVERSE_CHANNEL_UNAVAILABLE`.  Gating the
+    # publication on the control reason alone is M4-28's fix as it landed, and
+    # it left the same event reaching the consumer as a codeless close in
+    # roughly one gate-9 run in four.  This restores that gate.
+    (
+        "publish the device-gone cause when the data socket is the half that went first",
+        [
+            (
+                RELAY_ACTOR,
+                """        let terminal_cause = (reason == CONTROL_CLOSED_REASON
+            || (reason == REVERSE_CHANNEL_UNAVAILABLE_REASON && data_carrier_closed))
+            .then_some(StreamTeardownCause::DeviceGone);""",
+                """        let terminal_cause =
+            (reason == CONTROL_CLOSED_REASON).then_some(StreamTeardownCause::DeviceGone);""",
+            )
+        ],
+    ),
+    # The half that keeps 1012 meaning what it means, and the reason the fix
+    # above is not a reason-string match.  `queue_data` returns the same
+    # failure when the session's own queue budget refuses the bytes -- the
+    # relay declining to buffer while the device is perfectly healthy -- so
+    # keying on the string alone would tell that consumer "the device is not
+    # connected" on exactly the opposite ground.  That is the defect M4-28's
+    # narrowing removed, and this case is what stops it coming back.
+    (
+        "publish it only for a carrier that is gone, never for a queue that refused",
+        [
+            (
+                RELAY_ACTOR,
+                """            || (reason == REVERSE_CHANNEL_UNAVAILABLE_REASON && data_carrier_closed))""",
+                """            || reason == REVERSE_CHANNEL_UNAVAILABLE_REASON)""",
+            )
+        ],
+    ),
+    # The other direction of the same discrimination: a dead carrier is not on
+    # its own a licence to name the device.  A relay that stops fences every
+    # session it holds, and its carriers die with it while every one of those
+    # devices is fine.  The reason has to qualify too.
+    (
+        "keep a dead carrier from naming the device under every other reason",
+        [
+            (
+                RELAY_ACTOR,
+                """            || (reason == REVERSE_CHANNEL_UNAVAILABLE_REASON && data_carrier_closed))""",
+                """            || data_carrier_closed)""",
+            )
+        ],
+    ),
 ]
 
 

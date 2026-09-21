@@ -121,13 +121,26 @@ const RETAINED_ECHO_STREAM_FACTOR: usize = 2;
 const AUTHORITY_UNAVAILABLE: &str = "AUTHORITY_UNAVAILABLE";
 /// Typed session close reason when the **device's own control socket closed**.
 ///
-/// Named rather than spelled inline because it is the single reason that
-/// means "the device went away": `close_session` matches on it to publish
+/// Named rather than spelled inline because it is one of the two teardowns
+/// that mean "the device went away": `close_session` matches on it to publish
 /// [`StreamTeardownCause::DeviceGone`], and an ingress may report a backend
-/// that went away only for this one. Every other reason reaching
-/// `close_session` — shutdown, an authority outage, an owner fence, a
-/// rotation or recovery failure, a device framing fault — publishes nothing.
+/// that went away only for those. Every other reason reaching `close_session`
+/// — shutdown, an authority outage, an owner fence, a rotation or recovery
+/// failure, a device framing fault — publishes nothing.
 const CONTROL_CLOSED_REASON: &str = "CONTROL_CLOSED";
+/// Typed session close reason when a frame could not be put on the device's
+/// data carrier.
+///
+/// Named for the same reason as `CONTROL_CLOSED_REASON` and used with more
+/// care, because **this string does not by itself mean the device went away**.
+/// `queue_data` returns the same failure for two unrelated events: the
+/// session's own queue budget refused the bytes, which is the *relay*
+/// declining to buffer more while the device is perfectly healthy; and the
+/// carrier's receiver is gone, which is the device's data socket having
+/// ended. Only the second is a backend that went away, and `close_session`
+/// separates them by asking the sender directly rather than by reading this
+/// string. See M4-35.
+const REVERSE_CHANNEL_UNAVAILABLE_REASON: &str = "REVERSE_CHANNEL_UNAVAILABLE";
 /// Typed session close reason when a CANCEL for a pending operation cannot
 /// enter the bounded control queue.  docs/protocol.md: failure to deliver a
 /// cancellation fences the session (EC-038).
@@ -11379,7 +11392,7 @@ impl RelayActor {
                             execution: "unknown",
                         });
                     }
-                    self.protocol_failure(&key, "REVERSE_CHANNEL_UNAVAILABLE")
+                    self.protocol_failure(&key, REVERSE_CHANNEL_UNAVAILABLE_REASON)
                         .await;
                     return;
                 }
@@ -12002,20 +12015,20 @@ impl RelayActor {
         if let Some((data_tx, budget, bytes)) = queue
             && queue_data(&data_tx, &budget, bytes).is_err()
         {
-            self.protocol_failure(&key, "REVERSE_CHANNEL_UNAVAILABLE")
+            self.protocol_failure(&key, REVERSE_CHANNEL_UNAVAILABLE_REASON)
                 .await;
             return;
         }
         if let Some((data_tx, budget, bytes)) = window_queue
             && queue_data(&data_tx, &budget, bytes).is_err()
         {
-            self.protocol_failure(&key, "REVERSE_CHANNEL_UNAVAILABLE")
+            self.protocol_failure(&key, REVERSE_CHANNEL_UNAVAILABLE_REASON)
                 .await;
             return;
         }
         if let Some((data_tx, budget, bytes)) = reset_queue {
             if queue_data(&data_tx, &budget, bytes).is_err() {
-                self.protocol_failure(&key, "REVERSE_CHANNEL_UNAVAILABLE")
+                self.protocol_failure(&key, REVERSE_CHANNEL_UNAVAILABLE_REASON)
                     .await;
                 return;
             }
@@ -12987,6 +13000,17 @@ impl RelayActor {
             return;
         }
         session.closed = true;
+        // Whether the device's own data carrier had already gone by the time
+        // this teardown ran.  A closed sender means the socket task that owned
+        // the receiver is finished — the device's transport is not there any
+        // more — while a sender still open means the carrier was alive and the
+        // teardown had some other cause.  It is the difference between a
+        // reason that *names* the reverse channel and a reverse channel that
+        // is actually gone, and M4-35 turns on exactly that distinction.
+        let data_carrier_closed = session
+            .data_tx
+            .as_ref()
+            .is_some_and(mpsc::Sender::is_closed);
         tracing::info!(
             tenant_id = %session.identity.tenant_id,
             device_id = %key.device_id,
@@ -12994,6 +13018,7 @@ impl RelayActor {
             epoch = key.epoch,
             reason = %reason,
             phase = "session_closed",
+            data_carrier_closed,
         );
         let rejected = wire::rejected(
             &wire::random_token(),
@@ -13038,8 +13063,30 @@ impl RelayActor {
         // Published **before** `closed.cancel()` below, which is the ordering
         // invariant M4-25 established for the authorization reset: the ingress
         // is woken by that cancellation and reads the slot on its way out.
-        let terminal_cause =
-            (reason == CONTROL_CLOSED_REASON).then_some(StreamTeardownCause::DeviceGone);
+        //
+        // Two teardowns qualify, and the second is narrower than its reason
+        // string. A connector that stops closes **both** of its sockets, and
+        // which loss the relay notices first is a race: when control loses
+        // first this is `CONTROL_CLOSED`; when the data socket loses first a
+        // frame bound for the device fails to queue and the session is torn
+        // down as `REVERSE_CHANNEL_UNAVAILABLE` instead, so the very same
+        // event reached the consumer as a codeless close roughly a quarter of
+        // the time. That was M4-35, and it is attributed rather than guessed:
+        // over 24 instrumented runs of gate 9 every failure carried this
+        // reason, every pass carried `CONTROL_CLOSED`, and the pump exited
+        // through `closed.cancelled()` in all 24.
+        //
+        // The gate is **not** widened to the reason string, because
+        // `REVERSE_CHANNEL_UNAVAILABLE` is also how a queue budget refusal
+        // arrives — the relay declining to buffer while the device is healthy,
+        // which is precisely the class M4-28's narrowing removed. It is
+        // widened to the *fact* the string is ambiguous about: the carrier's
+        // sender is closed, so the socket task that held its receiver is
+        // finished and the device's transport is provably gone. A budget
+        // refusal leaves that sender open and still publishes nothing.
+        let terminal_cause = (reason == CONTROL_CLOSED_REASON
+            || (reason == REVERSE_CHANNEL_UNAVAILABLE_REASON && data_carrier_closed))
+            .then_some(StreamTeardownCause::DeviceGone);
         for (_, mut stream) in session.streams.drain() {
             if let Some(cause) = terminal_cause
                 && let Some(http) = stream.http.as_ref()

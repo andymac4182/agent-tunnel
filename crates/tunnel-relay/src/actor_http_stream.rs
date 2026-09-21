@@ -73,10 +73,21 @@ pub(crate) struct HttpPeerReset {
 /// would let an ingress make.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum StreamTeardownCause {
-    /// The **device's own control session ended**: `close_session` was
-    /// reached from `disconnect_control`.  The relay is healthy and the
-    /// device it was proxying to is not, which is the one case an ingress may
+    /// The **device's own transport ended**.  The relay is healthy and the
+    /// device it was proxying to is not, which is the one thing an ingress may
     /// report as a backend that went away.
+    ///
+    /// Two teardowns qualify, and they are the two halves of a single event: a
+    /// connector that stops closes both of its sockets, and whichever loss the
+    /// relay notices first decides the reason.  Control first is
+    /// `CONTROL_CLOSED`, from `disconnect_control`.  Data first is a frame
+    /// that fails to queue, which tears the session down as
+    /// `REVERSE_CHANNEL_UNAVAILABLE` — but **only** with the carrier's sender
+    /// actually closed, because that same reason is how a queue budget
+    /// refusal arrives, and a budget refusal is the relay declining to buffer
+    /// while the device is fine.  Reading the reason string alone would put
+    /// that refusal in here; reading the sender does not.  M4-35 measured the
+    /// race at roughly one gate-9 run in four.
     DeviceGone,
 }
 
