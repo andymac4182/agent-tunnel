@@ -1462,10 +1462,15 @@ async fn exercise(
     //    run, is what rules that out; without it the carrier rests on a
     //    premise established once by hand and never re-checked.
     //
-    //    Granularity cannot mask the advance: the seed write happened before
-    //    a config write, a process spawn, an owner claim and a session open,
-    //    so the two samples are far apart in wall-clock terms and not two
-    //    writes inside one coarse timestamp tick.
+    //    Timestamp granularity is very unlikely to mask the advance: the seed
+    //    write happened before a config write, a process spawn, an owner claim
+    //    and a session open, so the two samples are far apart in wall-clock
+    //    terms rather than two writes inside one tick.  On a filesystem with
+    //    a coarse (1-2 second) mtime that is an argument about elapsed time
+    //    and not a guarantee -- so if this rule ever fails on such a host,
+    //    read it as a false red from granularity before reading it as a
+    //    finding.  The hosts this gate runs on have nanosecond mtime, where
+    //    the question does not arise.
     evidence.host_mtime_before_prefix_write = read_host_mtime(target_path);
     match session
         .call(Message::Twrite {
