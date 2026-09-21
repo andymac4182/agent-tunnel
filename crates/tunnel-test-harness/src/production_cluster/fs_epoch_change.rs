@@ -478,19 +478,9 @@ pub fn validate_fs_epoch_change_evidence(evidence: &FsEpochChangeEvidence) -> Re
             evidence.pending_call_closed,
         ),
         (
-            // The observed code is named in the rule so a failing run says
-            // which code it saw rather than only that it was wrong.
-            format!(
-                "that failure carried the profile's close code for a backend that went away \
-                 (expected {DEVICE_GONE_CLOSE}, observed {:?})",
-                evidence.pending_call_close_code
-            ),
-            evidence.pending_call_close_code == Some(DEVICE_GONE_CLOSE),
-        ),
-        (
             // Which ordering this run took is named in the rule so a run set
             // can be read off the gate's own output.  The rule itself is what
-            // stops the close-code rule above from being satisfiable by a
+            // stops the close-code rule below from being satisfiable by a
             // teardown that is not this event at all: both spellings mean the
             // device's own transport ended, and anything else reaching here —
             // a relay shutdown, an authority outage, an owner fence — would
@@ -499,6 +489,21 @@ pub fn validate_fs_epoch_change_evidence(evidence: &FsEpochChangeEvidence) -> Re
             // particular one of the two: which socket is lost first is a
             // scheduling race, and demanding one would make this gate flaky
             // on a legitimate interleaving.
+            //
+            // **This rule runs before the close-code rule, and the order is
+            // load-bearing.** The validator stops at the first failing rule,
+            // so whichever of the two is checked first is the one a red run
+            // reports.  A *third* teardown ordering exists and is deliberately
+            // left unclosed (M4-35): when `disconnect_data` lands first the
+            // session's sender is already gone, the next frame tears it down
+            // as `DEVICE_OFFLINE`, and nothing is published — so that run also
+            // closes the consumer codeless.  With the close-code rule first,
+            // such a run would fail as `expected 1012, observed None`, which
+            // is **byte-identical to the signature M4-35 closed**, and the
+            // next worker would reopen a row that is correctly closed.  Put
+            // the ordering rule first and the same run says
+            // `observed Some("DEVICE_OFFLINE")` instead, which names the
+            // unclosed path rather than impersonating the closed one.
             format!(
                 "the held session ended because the device's own transport did, by either \
                  socket (observed {:?})",
@@ -508,6 +513,16 @@ pub fn validate_fs_epoch_change_evidence(evidence: &FsEpochChangeEvidence) -> Re
                 evidence.held_session_teardown_reason.as_deref(),
                 Some(CONTROL_CLOSED_TEARDOWN | REVERSE_CHANNEL_TEARDOWN)
             ),
+        ),
+        (
+            // The observed code is named in the rule so a failing run says
+            // which code it saw rather than only that it was wrong.
+            format!(
+                "that failure carried the profile's close code for a backend that went away \
+                 (expected {DEVICE_GONE_CLOSE}, observed {:?})",
+                evidence.pending_call_close_code
+            ),
+            evidence.pending_call_close_code == Some(DEVICE_GONE_CLOSE),
         ),
         (
             "the held Tread was not answered across the epoch change: a session the contract \
@@ -1578,7 +1593,8 @@ mod tests {
     ///
     /// Which of the device's two sockets the relay notices losing first is a
     /// scheduling race, so a gate that passed only for `CONTROL_CLOSED` would
-    /// be red on a legitimate interleaving about a third of the time on the
+    /// be red on a legitimate interleaving -- 8 of 20 runs took the data-first
+    /// ordering in the post-fix set on the
     /// measuring host.  The mutation list above can only say what must be
     /// rejected; this says what must be accepted, which is the half a reader
     /// would otherwise have to infer from silence.  M4-35.
@@ -1590,6 +1606,37 @@ mod tests {
             validate_fs_epoch_change_evidence(&evidence)
                 .unwrap_or_else(|error| panic!("`{reason}` must be accepted: {error}"));
         }
+    }
+
+    /// The **third**, deliberately unclosed teardown ordering must report
+    /// itself, not impersonate the one M4-35 closed.
+    ///
+    /// When `disconnect_data` lands before any frame is queued, the session's
+    /// sender is already gone, the next frame tears it down as
+    /// `DEVICE_OFFLINE`, and nothing is published — so the consumer closes
+    /// codeless and `pending_call_close_code` is `None`, which is **exactly**
+    /// the shape M4-35 was raised for. The validator stops at the first
+    /// failing rule, so the rule order decides which of the two a red run
+    /// reports, and reporting the close code would send the next worker to
+    /// reopen a row that is correctly closed. This pins the order by pinning
+    /// the message: the failure must name the teardown, and must not be the
+    /// `expected 1012` one.
+    #[test]
+    fn the_unclosed_teardown_ordering_names_itself_rather_than_the_closed_signature() {
+        let mut evidence = passing();
+        evidence.held_session_teardown_reason = Some("DEVICE_OFFLINE".into());
+        evidence.pending_call_close_code = None;
+        let error = validate_fs_epoch_change_evidence(&evidence)
+            .expect_err("a teardown this gate does not cover must fail");
+        let reported = error.to_string();
+        assert!(
+            reported.contains("DEVICE_OFFLINE"),
+            "the failure must name the teardown it actually saw, got: {reported}"
+        );
+        assert!(
+            !reported.contains("expected 1012"),
+            "an unclosed ordering must not wear the closed signature, got: {reported}"
+        );
     }
 
     /// The concurrency predicate itself, independent of the rule list: it must

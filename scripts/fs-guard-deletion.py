@@ -1996,7 +1996,7 @@ GATE4_CASES: list[tuple[str, list[Edit]]] = [
     # tears the session down as `REVERSE_CHANNEL_UNAVAILABLE`.  Gating the
     # publication on the control reason alone is M4-28's fix as it landed, and
     # it left the same event reaching the consumer as a codeless close in
-    # roughly one gate-9 run in four.  This restores that gate.
+    # 7 of 24 measured gate-9 runs.  This restores that gate.
     (
         "publish the device-gone cause when the data socket is the half that went first",
         [

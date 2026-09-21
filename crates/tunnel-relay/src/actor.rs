@@ -13070,8 +13070,9 @@ impl RelayActor {
         // first this is `CONTROL_CLOSED`; when the data socket loses first a
         // frame bound for the device fails to queue and the session is torn
         // down as `REVERSE_CHANNEL_UNAVAILABLE` instead, so the very same
-        // event reached the consumer as a codeless close roughly a quarter of
-        // the time. That was M4-35, and it is attributed rather than guessed:
+        // event reached the consumer as a codeless close in 7 of 24
+        // measured runs. That was M4-35, and it is attributed rather than
+        // guessed:
         // over 24 instrumented runs of gate 9 every failure carried this
         // reason, every pass carried `CONTROL_CLOSED`, and the pump exited
         // through `closed.cancelled()` in all 24.

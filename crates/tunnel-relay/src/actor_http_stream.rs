@@ -87,7 +87,7 @@ pub(crate) enum StreamTeardownCause {
     /// refusal arrives, and a budget refusal is the relay declining to buffer
     /// while the device is fine.  Reading the reason string alone would put
     /// that refusal in here; reading the sender does not.  M4-35 measured the
-    /// race at roughly one gate-9 run in four.
+    /// race at 7 red in 24 gate-9 runs on the measuring host.
     DeviceGone,
 }
 
