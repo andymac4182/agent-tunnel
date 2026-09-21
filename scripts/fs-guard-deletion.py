@@ -4950,7 +4950,7 @@ GATE13_WRITE_RESTART_CASES: list[tuple[str, list[Edit]]] = [
         ],
     ),
     (
-        "the host file discriminated a written region from an untouched one, in bothdirections, before the event",
+        "the host file discriminated a written region from an untouched one, in both directions, before the event",
         [
             (
                 HARNESS_WRITE_RESTART,
@@ -4970,7 +4970,7 @@ GATE13_WRITE_RESTART_CASES: list[tuple[str, list[Edit]]] = [
         ],
     ),
     (
-        "the relay had received no answer to that record when the process was killed: theTwrite was outstanding across the restart",
+        "the relay had received no answer to that record when the process was killed: the Twrite was outstanding across the restart",
         [
             (
                 HARNESS_WRITE_RESTART,
@@ -4990,7 +4990,7 @@ GATE13_WRITE_RESTART_CASES: list[tuple[str, list[Edit]]] = [
         ],
     ),
     (
-        "the held write had reached the device before the process was killed, so the lostanswer is an unknown and not a refusal that never dispatched",
+        "the held write had reached the device before the process was killed, so the lost answer is an unknown and not a refusal that never dispatched",
         [
             (
                 HARNESS_WRITE_RESTART,
@@ -5122,7 +5122,7 @@ GATE13_WRITE_RESTART_CASES: list[tuple[str, list[Edit]]] = [
         ],
     ),
     (
-        "a write the host file proves reached the device was not reported to the caller as anerror, which is a settled outcome a caller may resubmit after",
+        "a write the host file proves reached the device was not reported to the caller as an error, which is a settled outcome a caller may resubmit after",
         [
             (
                 HARNESS_WRITE_RESTART,
