@@ -33,9 +33,12 @@
 //! 10's directory entry, down to counting names in a host directory".  That
 //! argument was wrong, and it is corrected here rather than quietly dropped,
 //! because it was the stated reason the rename half went undriven.**  Gate
-//! 10's journal rules are *counts*; a rename inside one directory removes one
-//! name and creates one, so a count is **invariant across the very operation
-//! being measured** and cannot see a rename at all.  And the backend
+//! 10's journal rules are five *counts* and one **one-sided** per-name rule;
+//! a rename inside one directory removes one name and creates one, so the
+//! counts are **invariant across the very operation being measured**, and
+//! `held_effect_exactly_once` only ever looks at the name that *appears* —
+//! it would see a destination arrive and say nothing about the source still
+//! being there.  And the backend
 //! atomicity invoked to dismiss the rename is what makes it worth driving:
 //! it is a promise, the only one in the baseline, and a promise can be
 //! violated.  Where this gate must *admit* a torn region because the contract

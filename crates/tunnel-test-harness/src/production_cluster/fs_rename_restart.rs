@@ -27,11 +27,10 @@
 //! down to counting names in a host directory."
 //!
 //! That reasoning was re-derived here rather than inherited, and it does not
-//! survive contact with either gate's instrument.  **Counting names in a host
-//! directory cannot see a rename at all.**  Gate 10's journal is
-//! `journal_entries`, and *every* rule it feeds is a `usize` from that
-//! listing's `.len()` — read out of `fs_process_restart.rs` rather than from
-//! the row's summary of it:
+//! survive contact with either gate's instrument — though the first version
+//! of *this* paragraph overstated the case and is corrected here.  **Five of
+//! gate 10's six journal rules are counts, and the sixth is one-sided.**
+//! Read out of `fs_process_restart.rs` rather than from the row's summary:
 //!
 //! ```text
 //! journal_entries_before_held == 1
@@ -39,13 +38,25 @@
 //! journal_entries_after_retry == journal_entries_before_kill
 //! journal_entries_final       == EXPECTED_JOURNAL_ENTRIES
 //! journal_entries_over_ninep  == journal_entries_final
+//! held_effect_exactly_once                      // per name, not a count
 //! ```
 //!
-//! There is no per-name rule anywhere in gate 10.  A rename within one
-//! directory removes one name and creates one name, so it holds **all five of
-//! those fixed**: the count is invariant across the very operation being
-//! measured.  An instrument that reads identically before and after the event
-//! is not the same evidence shape as this gate's; it is no evidence at all.  This gate measures the
+//! A rename within one directory removes one name and creates one, so it
+//! holds all five counts fixed: they are invariant across the very operation
+//! being measured.  The sixth, `held_effect_exactly_once`, *is* per name — it
+//! filters the final listing for `HELD_ENTRY` and requires exactly one — so
+//! the honest claim is not "gate 10 has no per-name rule" but that its one
+//! per-name rule **only ever looks at the name that appears**.
+//!
+//! That is what a rename needs and does not get.  A rename is **two-sided**:
+//! a name appears *and* a name vanishes, and backend atomicity is a promise
+//! about the two together.  Gate 10's rule would see the destination arrive
+//! and would say nothing at all about the source still being there — so
+//! [`NamespaceState::BothPresent`], the exact state a copy-then-unlink leaves
+//! behind, satisfies it.  This gate's classifier reads **both** names and
+//! rejects that state.  The gap the sixth rule does not close is the whole
+//! reason this module exists, and it leaves the inode rule, the errno-origin
+//! control and the forbidden-intermediate rule without any counterpart.  This gate measures the
 //! namespace **per name**, and it records the count beside it precisely so
 //! that the blindness is a measured fact of the run rather than an assertion
 //! in a comment: see [`FsRenameRestartEvidence::entry_count_instrument_was_blind`].
@@ -111,20 +122,34 @@
 //! name-addressed form because that is the only one that can present the host
 //! with a source that is absent.
 //!
-//! ## The rename is proven **native**, not emulated
+//! ## The rename is proven native **over the wire and across the kill**
 //!
-//! "Do not substitute copy/delete" is an obligation no gate has ever
-//! measured, and it is measurable: a `renameat` moves a **name** and leaves
-//! the **inode** alone, while a copy-then-delete produces a new inode.  So
-//! [`FsRenameRestartEvidence::rename_preserved_the_inode`] reads the source's
-//! inode before the held rename and the destination's after it, and requires
-//! them equal.  Its instrument is controlled the same way everything else
-//! here is: two genuinely different files must report two different inodes
+//! "Do not substitute copy/delete" is measurable because a `renameat` moves a
+//! **name** and leaves the **inode** alone, while a copy-then-unlink produces
+//! a new one.  So [`FsRenameRestartEvidence::rename_preserved_the_inode`]
+//! reads the source's inode before the held rename and the destination's
+//! after it, and requires them equal.  Its instrument is controlled the way
+//! everything else here is: two genuinely different files must report two
+//! different inodes
 //! ([`FsRenameRestartEvidence::inode_instrument_discriminates`]), so a reader
 //! that returned a constant cannot satisfy the rule by standing still.
 //!
-//! This is the rule that would redden if anyone ever reimplemented rename as
-//! a copy and an unlink, which is the substitution the contract names.
+//! **This is not the first time that substitution has been measured, and an
+//! earlier draft of this paragraph claimed it was.**  `identity_survives_a_rename`
+//! in `crates/tunnel-fs-host/tests/identity_and_aliasing.rs` already drives
+//! `ExportRoot::rename` and asserts `Identity::is_same_file`, which is
+//! `device == device && inode == inode`, plus an equal `qid_path`.  At the
+//! host crate, on a direct call, the property is covered.
+//!
+//! What this gate adds is the part that unit test cannot reach, and the claim
+//! is narrowed to exactly that: the same property **over the 9P wire, through
+//! the relay, across a `SIGKILL` of the connector's process, and read from
+//! the export's own host directory by the harness rather than through the
+//! code under test**.  The unit test calls the function and asks the function
+//! what happened; this asks the filesystem, after the process that called it
+//! is gone.  A rename reimplemented as a copy and an unlink would redden both
+//! — and only this one would also catch it being reimplemented somewhere
+//! between the consumer session and `ExportRoot`.
 //!
 //! ## The ambiguity is two-valued, and the post-state is self-describing
 //!

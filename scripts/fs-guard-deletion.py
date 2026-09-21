@@ -5430,16 +5430,29 @@ GATE13_WRITE_RESTART_CASES: list[tuple[str, list[Edit]]] = [
 # `gate13-write-restart`, and the reason was re-derived rather than inherited
 # from the note that deferred this clause.  That note held a `Trename` to be
 # "structurally the same evidence shape as gate 10's directory entry, down to
-# counting names in a host directory".  **A count cannot see a rename at all**:
-# a rename inside one directory removes one name and creates one, so gate 10's
-# count-based journal reads identically either side of the operation being
-# measured.  This suite therefore carries cases no other gate has:
+# counting names in a host directory".  **Five of gate 10's six journal rules
+# are counts, and a count cannot see a rename**: a rename inside one directory
+# removes one name and creates one, so all five read identically either side
+# of the operation being measured.  The sixth, `held_effect_exactly_once`, is
+# per name — but it is **one-sided**, filtering the final listing for the one
+# entry that should *appear*.  A rename is two-sided, so that rule would see
+# the destination arrive and say nothing about the source still being there:
+# `BothPresent`, the state a copy-then-unlink leaves behind, satisfies it.
+# (An earlier version of this comment said gate 10 had no per-name rule at
+# all.  It has one; it does not have a two-sided one.)  This suite therefore
+# carries cases no other gate has:
 #
 #   * `the held rename moved a name and left the inode alone ...`, which is
 #     `docs/filesystem-api.md`'s "do not substitute copy/delete" measured
 #     rather than trusted — a `renameat` moves a name and keeps the inode, and
-#     a copy-then-unlink does not.  It is the only rule in any gate that can
-#     redden if a rename stops being native;
+#     a copy-then-unlink does not.  It is **not** the first measurement of
+#     that property: `identity_survives_a_rename` in
+#     `crates/tunnel-fs-host/tests/identity_and_aliasing.rs` asserts
+#     `Identity::is_same_file` across a direct `ExportRoot::rename`.  What is
+#     new is the reading taken **over the 9P wire, across a SIGKILL of the
+#     connector process, from the export's own host directory** — the unit
+#     test asks the function what it did, this asks the filesystem after the
+#     caller is dead;
 #   * `no sample ever read the namespace in a state backend atomicity
 #     forbids ...`, the **inverse** of gate 13's position on the same event.
 #     Gate 13 must *admit* a torn region because the contract permits partial
@@ -5447,8 +5460,7 @@ GATE13_WRITE_RESTART_CASES: list[tuple[str, list[Edit]]] = [
 #     document grants backend atomicity, so its intermediate states are
 #     forbidden rather than tolerated;
 #   * `the same rename on a valid fid reached the host and was refused for an
-#     absent source` together with `the two refusals read differently on the
-#     same errno instrument ...`.  Gate 13 had to record that its `Einval` was
+#     absent source`.  Gate 13 had to record that its `Einval` was
 #     merely *consistent* with a refusal above the dispatch boundary, because
 #     `policy::code_from_errno` folds every unrecognised errno into `Einval`
 #     too, and it carried the claim on an `mtime` instead.  `Errno::NOENT` is
