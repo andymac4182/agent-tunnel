@@ -56,6 +56,11 @@ pub struct Dispatcher {
     endpoint: BackendEndpoint,
     permitted: BTreeSet<Operation>,
     deadline: Duration,
+    /// The supervisor's lifecycle epoch, if this dispatcher was given one.
+    ///
+    /// Detached by default, so a dispatcher talking to a backend nobody
+    /// supervises attributes nothing and the transport's own reason survives.
+    epoch: tunnel_cua_export::supervisor::LifecycleEpochHandle,
 }
 
 /// The default per-exchange deadline. Finite; there is no unlimited value.
@@ -73,7 +78,24 @@ impl Dispatcher {
             endpoint,
             permitted,
             deadline: DEFAULT_DEADLINE,
+            epoch: tunnel_cua_export::supervisor::LifecycleEpochHandle::detached(),
         }
+    }
+
+    /// Watch a supervisor's lifecycle epoch, so an exchange that fails across
+    /// a supervised restart is reported as a restart rather than as a lost
+    /// connection.
+    ///
+    /// **This is the production caller `docs/tasks.md` M5-C10 says
+    /// [`tunnel_cua::supervision::restart_outcome`] lacked.** Without it the
+    /// contract still held -- `TransportLost` is equally `Dispatched`, equally
+    /// `Unknown` and equally non-retryable -- but the named reason never
+    /// reached a consumer, so a diagnostic could not tell "the backend was
+    /// replaced under you" from "the network went away".
+    #[must_use]
+    pub fn watching(mut self, epoch: tunnel_cua_export::supervisor::LifecycleEpochHandle) -> Self {
+        self.epoch = epoch;
+        self
     }
 
     /// Build one from the three negotiation inputs.
@@ -189,13 +211,23 @@ impl Dispatcher {
     }
 
     async fn send(&self, payload: &Value) -> Dispatch {
-        match tokio::time::timeout(self.deadline, self.exchange(payload)).await {
+        // **Read before a single byte is written**, so the comparison below
+        // spans the whole exchange. Reading it after the write would leave the
+        // request-writing window unwatched, which is exactly the window a
+        // restart-killed click occupies.
+        let before = self.epoch.read();
+        let transport = match tokio::time::timeout(self.deadline, self.exchange(payload)).await {
             // The deadline expired. We had already begun writing, so the
             // outcome is unknown rather than not dispatched.
             Err(_) => Dispatch::Dispatched(Completion::Unknown(UnknownReason::DeadlineExpired)),
             Ok(Err(stage)) => stage.into_dispatch(),
             Ok(Ok((status, body))) => classify_backend_response(status, &body),
-        }
+        };
+        // The attribution is a pure function of the two readings and the
+        // transport's own answer; this line owns none of the policy. It cannot
+        // widen retryability -- `attribution_never_changes_what_a_retry_is_
+        // allowed_to_do` measures that over the full cross-product.
+        tunnel_cua::supervision::attribute_restart(before, self.epoch.read(), transport)
     }
 
     /// One HTTP/1.1 exchange against the fixture.

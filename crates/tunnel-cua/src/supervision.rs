@@ -237,5 +237,107 @@ pub fn invalidate(
     }
 }
 
+// ------------------------------------------------------- restart attribution
+
+/// A counter that advances **before** the supervisor does anything that can
+/// disturb a backend an exchange is already talking to.
+///
+/// # Why this is not [`BackendGeneration`]
+///
+/// The obvious reading of `docs/tasks.md` M5-C10 — "read the backend
+/// generation before the request is written and compare after" — is **racy,
+/// and re-deriving it rather than inheriting it is the only reason this type
+/// exists.** [`BackendGeneration`] advances inside the supervisor's *start*,
+/// which on a restart happens strictly after the old child has been killed
+/// and reaped. An exchange against that child observes its socket close at
+/// the kill, so it reads its "after" value in the window between the kill and
+/// the replacement's spawn — where the generation has **not** yet advanced.
+/// Attribution driven off [`BackendGeneration`] would therefore report
+/// `TransportLost` or `BackendRestarted` depending on which of two unrelated
+/// tasks won a race, which is the flaky-evidence shape `AGENTS.md` forbids.
+///
+/// A lifecycle epoch fixes the ordering by announcing the disturbance before
+/// causing it: the supervisor advances this at the top of `stop`, ahead of the
+/// kill, so **every** exchange that could see the socket die has already been
+/// guaranteed to observe a changed epoch afterwards. The comparison is
+/// equality only; the magnitude and the number of advances per restart carry
+/// no meaning.
+///
+/// # What it does not cover
+///
+/// A backend that dies on its own, with no supervisor call, advances nothing,
+/// and an exchange across that death is reported `TransportLost` — which is
+/// the honest answer, because no restart happened. The epoch names *supervisor
+/// action*, not *backend death*.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct LifecycleEpoch(u64);
+
+impl LifecycleEpoch {
+    /// The epoch before the supervisor has disturbed anything.
+    pub const INITIAL: Self = Self(0);
+
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    #[must_use]
+    pub const fn value(self) -> u64 {
+        self.0
+    }
+
+    /// The next epoch. Called once per supervisor-driven disturbance.
+    #[must_use]
+    pub const fn next(self) -> Self {
+        Self(self.0 + 1)
+    }
+}
+
+/// Re-attribute a transport-level answer to the supervisor, when — and only
+/// when — the supervisor disturbed the backend across this exchange.
+///
+/// This is the production route [`restart_outcome`] previously lacked
+/// (`docs/tasks.md` M5-C10). `before` is read immediately before the request
+/// is written, `after` immediately after the exchange resolves, and
+/// `transport` is whatever the transport concluded on its own.
+///
+/// # It changes the reason and never the arm
+///
+/// The stage is **read out of the transport's own answer** rather than
+/// guessed: an answer of [`NotDispatched::NotReached`] is
+/// [`InFlight::NotReached`], and an [`Completion::Unknown`] is
+/// [`InFlight::ReachedBackend`]. Feeding those to [`restart_outcome`] returns
+/// the same `Dispatch` arm it was given, so **re-attribution cannot widen
+/// retryability** — not by policy, but because there is no input for which it
+/// produces a more retryable answer than it received.
+/// `attribution_never_changes_what_a_retry_is_allowed_to_do` measures that
+/// over every reason and every operation rather than asserting it here.
+///
+/// # What is deliberately left alone
+///
+/// * [`Completion::Ok`] and [`Completion::Failed`] — one backend gave a
+///   definitive answer on a connection that survived to deliver it. Rewriting
+///   a known outcome to `Unknown` because something restarted *afterwards*
+///   would destroy information, which is the opposite of this row's point.
+/// * Every other [`NotDispatched`] arm — `BackendRejected`,
+///   `BackendUnavailable` and the input-authority refusals each name a more
+///   specific cause than "a restart happened", and each is already correct.
+///   `BackendUnavailable` in particular is an answer the backend *sent*.
+#[must_use]
+pub fn attribute_restart(
+    before: LifecycleEpoch,
+    after: LifecycleEpoch,
+    transport: Dispatch,
+) -> Dispatch {
+    if before == after {
+        return transport;
+    }
+    match &transport {
+        Dispatch::Dispatched(Completion::Unknown(_)) => restart_outcome(InFlight::ReachedBackend),
+        Dispatch::NotDispatched(NotDispatched::NotReached) => restart_outcome(InFlight::NotReached),
+        _ => transport,
+    }
+}
+
 #[cfg(test)]
 mod tests;

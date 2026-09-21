@@ -387,7 +387,17 @@ async fn a_restart_mid_operation_is_unknown_and_the_click_does_not_land_twice() 
     guard.watch_helper(workspace.path()).await;
     let first_generation = supervisor.generation();
 
-    let session = facade(&state, dispatcher_for(endpoint).await, &desktop);
+    // **Watching the supervisor's lifecycle epoch** -- the M5-C10 wiring. The
+    // companion test below runs this same scenario with a dispatcher that is
+    // not watching, and gets `TransportLost`; that pair is what shows the
+    // attribution comes from the epoch rather than from anything else here.
+    let session = facade(
+        &state,
+        dispatcher_for(endpoint)
+            .await
+            .watching(supervisor.lifecycle_epoch()),
+        &desktop,
+    );
     let (lease, capture) = capture_then_lease(&session).await;
     assert_eq!(state.holder(&desktop), Some(SessionId::new(1)));
 
@@ -432,16 +442,17 @@ async fn a_restart_mid_operation_is_unknown_and_the_click_does_not_land_twice() 
         "an input operation that reached the backend is never retryable: {outcome:?}"
     );
     // **The reason, not just the arm.** `matches!(.., Unknown(_))` cannot tell
-    // `TransportLost` from `BackendRestarted`, and this branch produces the
-    // former: `restart_outcome` has no production caller yet (M5-C10), so what
-    // ends this exchange is the transport noticing the connection die, not the
-    // supervisor naming the restart. Asserting the exact reason keeps the test
-    // honest about which mechanism it measured -- and will fail loudly, rather
-    // than pass quietly, on the day M5-C10 wires the other one in.
+    // `TransportLost` from `BackendRestarted`. This branch now produces the
+    // latter: the dispatcher is watching the supervisor's lifecycle epoch, so
+    // `tunnel_cua::supervision::attribute_restart` re-attributes the
+    // transport's answer to the restart that caused it. That is M5-C10, and
+    // the reason the expectation here moved is that the wiring landed, not
+    // that the assertion was relaxed -- the arm and the retryability asserted
+    // above are unchanged.
     assert_eq!(
         outcome,
         Dispatch::Dispatched(Completion::Unknown(
-            tunnel_cua::outcome::UnknownReason::TransportLost
+            tunnel_cua::outcome::UnknownReason::BackendRestarted
         )),
         "got {outcome:?}"
     );
@@ -511,6 +522,81 @@ async fn a_restart_mid_operation_is_unknown_and_the_click_does_not_land_twice() 
     // The old lease grant is not merely unusable, it is unknown to the
     // registry: releasing it fails rather than silently succeeding.
     assert!(session.release_input_lease(&lease).is_err());
+
+    supervisor.stop(state.as_ref()).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_same_restart_is_only_named_a_restart_by_a_dispatcher_that_watches() {
+    // **The discriminating control for M5-C10.** Byte for byte the scenario
+    // above, with one difference: this dispatcher never took the supervisor's
+    // lifecycle epoch. It therefore reports `TransportLost`.
+    //
+    // Without this pair, `BackendRestarted` above would be consistent with
+    // attribution that fires on any lost connection, supervisor or not -- and
+    // the run would look identical. This is the case that could only have
+    // produced `BackendRestarted` if the epoch were not what decides, so it is
+    // what makes the other assertion evidence rather than decoration. It is
+    // also the shape a real unsupervised dispatcher has, so the honest answer
+    // for it really is the transport's.
+    let workspace = tempfile::tempdir().expect("workspace");
+    let journal = workspace.path().join(JOURNAL_FILE);
+    let mut guard = PidGuard::new();
+    let state = DeviceState::new();
+    let desktop = TargetSession::new("desktop-0");
+
+    guard.watch_workspace(workspace.path());
+    let mut supervisor = Supervisor::new(supervised_hanging(workspace.path(), Some("left_click")));
+    let endpoint = supervisor.start().await.expect("it started");
+    guard.watch(supervisor.pid().expect("a pid"));
+    guard.watch_helper(workspace.path()).await;
+
+    // No `.watching(...)`. That is the whole difference.
+    let session = facade(&state, dispatcher_for(endpoint).await, &desktop);
+    let (_lease, capture) = capture_then_lease(&session).await;
+
+    let session = Arc::new(session);
+    let click_session = Arc::clone(&session);
+    let click_body = body(
+        "click",
+        json!({"capture": capture, "x": 10, "y": 12, "button": "left"}),
+    );
+    let click = tokio::spawn(async move { click_session.handle(&click_body, LIMIT).await });
+
+    let clicked = wait_for_clicks(&journal, 1).await;
+    assert_eq!(
+        clicked, 1,
+        "the click reached the backend before the restart"
+    );
+
+    let (_invalidation, restarted) = supervisor.restart(state.as_ref()).await;
+    restarted.expect("the replacement backend started");
+    guard.watch(supervisor.pid().expect("a pid"));
+    guard.watch_helper(workspace.path()).await;
+
+    let outcome = click.await.expect("the click task finished");
+
+    // The contract is identical -- dispatched, unknown, never retryable --
+    // which is precisely why M5-C10 was a gap in *attribution* and not in
+    // behaviour. Only the named reason differs.
+    assert!(outcome.reached_the_backend(), "{outcome:?}");
+    assert!(!outcome.retry_is_safe(), "{outcome:?}");
+    assert!(!outcome.retry_is_safe_for(Operation::Click), "{outcome:?}");
+    assert_eq!(
+        outcome,
+        Dispatch::Dispatched(Completion::Unknown(
+            tunnel_cua::outcome::UnknownReason::TransportLost
+        )),
+        "an unwatched dispatcher has nothing to attribute the restart to, so \
+         the transport's own reason must survive: {outcome:?}"
+    );
+
+    let clicks = Ledger::journal_pointer_clicks(&journal);
+    eprintln!(
+        "MEASURED unwatched restart mid-click: pointer clicks {clicks}, \
+         outcome {outcome:?}"
+    );
+    assert_eq!(clicks, 1, "still exactly one click across the restart");
 
     supervisor.stop(state.as_ref()).await;
 }
