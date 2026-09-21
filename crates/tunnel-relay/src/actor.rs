@@ -13084,6 +13084,15 @@ impl RelayActor {
         // sender is closed, so the socket task that held its receiver is
         // finished and the device's transport is provably gone. A budget
         // refusal leaves that sender open and still publishes nothing.
+        //
+        // A **third** ordering is possible and is deliberately not covered: if
+        // the carrier loss is processed as a `disconnect_data` first, the
+        // session's sender is already `None` and the next frame takes the
+        // `DEVICE_OFFLINE` teardown above instead. That reason plainly means
+        // the device went away, but it appeared in **none** of M4-35's 44
+        // instrumented runs, and adding it would be exactly the fix-without-
+        // evidence this gate exists to refuse. Recorded on M4-35 rather than
+        // silently included or silently ignored.
         let terminal_cause = (reason == CONTROL_CLOSED_REASON
             || (reason == REVERSE_CHANNEL_UNAVAILABLE_REASON && data_carrier_closed))
             .then_some(StreamTeardownCause::DeviceGone);
