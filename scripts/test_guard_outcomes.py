@@ -85,17 +85,18 @@ def main() -> int:
     the_preflight_refuses_an_empty_selection()
     the_preflight_accepts_an_anchor_that_resolves_once()
     the_preflight_lists_every_mismatch_not_just_the_first()
+    a_harness_local_problem_still_fails_the_preflight()
     every_guard_anchor_resolves_to_exactly_one_occurrence()
 
     print("test_guard_outcomes: PASS")
     return 0
 
 
-def run_preflight(selection) -> tuple[int, str]:
+def run_preflight(selection, extra_problems=()) -> tuple[int, str]:
     """`check_anchors` over a synthetic selection, with its output captured."""
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
-        code = check_anchors("test-harness", selection)
+        code = check_anchors("test-harness", selection, extra_problems)
     return code, out.getvalue()
 
 
@@ -256,6 +257,40 @@ def every_module_filter_is_anchored() -> None:
     )
 
 
+def a_harness_local_problem_still_fails_the_preflight() -> None:
+    """`extra_problems` must count and fail, not merely print.
+
+    **This is the one seam the M4-27 refactor created, and it was unpinned.**
+    Moving the preflight into `guard_outcomes.py` left `fs-guard-deletion.py`'s
+    own glued-case-name rule on the far side of a module boundary, passed in as
+    `extra_problems`.  Deleting that loop outright leaves every other fixture in
+    this file green and `--check-anchors` reporting 427/13 exactly as before,
+    because no glued name exists in the tree for the real run to catch -- so the
+    rule would fail open with nothing to say so.  A refactor's new seam is
+    precisely where a fixture is owed.
+
+    The selection here resolves cleanly, so the only thing that can fail the run
+    is the extra problem, and the counted total must include it.
+    """
+    with anchor_file("let x = 1;\n") as path:
+        code, output = run_preflight(
+            [("suite1", "a case whose anchor is fine", [(path, "let x = 1;", "")])],
+            ["glued case name: line 12: 'refuses' + 'anambiguous'..."],
+        )
+    check(code == 1, f"a harness-local problem must fail the run, got exit {code}")
+    check("glued case name" in output, f"the problem must be named, got {output!r}")
+    check(
+        "1 anchor problem(s)" in output,
+        f"the harness-local problem must be counted, not merely printed, got "
+        f"{output!r}",
+    )
+    check(
+        "every anchor resolves" not in output,
+        f"a run with a harness-local problem must not claim a clean sweep, got "
+        f"{output!r}",
+    )
+
+
 def the_flag_short_circuits_before_anything_is_edited(script: Path) -> None:
     """`--check-anchors` must return before the harness touches the tree.
 
@@ -330,9 +365,14 @@ def every_guard_anchor_resolves_to_exactly_one_occurrence() -> None:
             capture_output=True,
             text=True,
             check=False,
-            # Defence in depth behind the static check above: a `--check-anchors`
-            # that ever reaches the deletion loop must not be allowed to run for
-            # hours from inside a unit test.
+            # **This bounds duration, NOT damage, and must not be read as a
+            # second line of defence.**  `subprocess.run(timeout=)` kills the
+            # child, and killing a deletion harness mid-case pre-empts its
+            # `restore()` -- which is exactly the damage M4-34 describes, not a
+            # defence against it.  If a run ever reaches this timeout the tree
+            # has already been edited and may be left with a guard defeated in
+            # it.  The static check above is the only thing preventing that;
+            # this merely stops a unit test hanging for hours afterwards.
             timeout=300,
         )
         check(
