@@ -455,10 +455,16 @@ pub fn validate_fs_rotation_write_evidence(evidence: &FsRotationWriteEvidence) -
             "the host directory showed the held write performed before the freeze".into(),
             evidence.held_write_performed_before_freeze(),
         ),
-        (
-            "the held write's effect was whole rather than torn".into(),
-            evidence.held_region_before_freeze != RegionState::Torn,
-        ),
+        // A rule reading `held_region_before_freeze != RegionState::Torn` stood
+        // here and was **removed rather than declared green**, which is gate
+        // 10's precedent and is recorded in M4-06.  It was genuinely dead:
+        // `held_write_performed_before_freeze()` is `== RegionState::Written`,
+        // which already excludes `Torn`, `Untouched` and `Unreadable`, so the
+        // torn rule could never be the rule that failed a run.  Its property —
+        // that a partly applied write is a **third** answer and is never folded
+        // into either extreme — is held where it can be defeated, by
+        // `a_partly_applied_write_is_torn_and_is_neither_of_the_others`, which
+        // checks all four classifications directly.
         // The operation-level rules for the write half.
         (
             "the reply held across the first rotation carried the tag that was outstanding".into(),
@@ -594,6 +600,22 @@ pub fn validate_fs_rotation_write_evidence(evidence: &FsRotationWriteEvidence) -
         }
     }
     Ok(())
+}
+
+/// The ambiguity classification, in one place.
+///
+/// A mutation is ambiguous exactly when the journal showed its effect **and**
+/// the exchange carried no answer — the flush paragraph's "a write or rename
+/// outcome becomes ambiguous after a transport or process failure".  Both
+/// halves matter: an effect nobody saw is an undispatched request, which is
+/// settled and retryable, and an effect that was answered is settled the other
+/// way.
+///
+/// It is a function rather than an expression written out at the call site so
+/// that `ambiguity_is_derived_from_the_journal_and_the_answer_together` defeats
+/// the derivation the run actually uses.
+fn classify_ambiguity(evidence: &FsRotationWriteEvidence) -> bool {
+    evidence.held_write_performed_before_freeze() && !evidence.held_write_answered
 }
 
 /// Deterministic synthetic payload with the high bit always set.
@@ -1184,8 +1206,7 @@ async fn exercise(
     // Derived from what the wire and the host directory actually did, not
     // asserted: the effect was performed, and an answer either arrived or did
     // not.  Across a lossless scheduled rotation it must arrive.
-    evidence.held_write_ambiguous =
-        evidence.held_write_performed_before_freeze() && !evidence.held_write_answered;
+    evidence.held_write_ambiguous = classify_ambiguity(evidence);
 
     evidence.rotations_completed_after_write =
         wait_rotation_completed(cluster, session_id, evidence.rotations_completed_before).await?;
@@ -1492,6 +1513,8 @@ mod tests {
             ("the host directory never showed the write performed", |e| {
                 e.held_region_before_freeze = RegionState::Untouched;
             }),
+            // Still rejected, now by `held_write_performed_before_freeze()`
+            // rather than by a rule of its own.
             ("the write's effect was torn", |e| {
                 e.held_region_before_freeze = RegionState::Torn;
             }),
@@ -1717,13 +1740,16 @@ mod tests {
     /// The ambiguity classification is **derived** from two facts and must
     /// move with both of them.  A field that were merely asserted false would
     /// pass this gate on a run where the answer was lost.
+    ///
+    /// This drives [`classify_ambiguity`] itself — the same function the run
+    /// uses — rather than re-spelling its expression here, which is how a
+    /// derivation and the test that is supposed to defeat it drift apart.
     #[test]
     fn ambiguity_is_derived_from_the_journal_and_the_answer_together() {
         let performed_and_answered = passing();
         assert!(performed_and_answered.held_write_performed_before_freeze());
         assert!(
-            !(performed_and_answered.held_write_performed_before_freeze()
-                && !performed_and_answered.held_write_answered),
+            !classify_ambiguity(&performed_and_answered),
             "a performed and answered write is not ambiguous"
         );
 
@@ -1732,8 +1758,7 @@ mod tests {
             ..passing()
         };
         assert!(
-            performed_unanswered.held_write_performed_before_freeze()
-                && !performed_unanswered.held_write_answered,
+            classify_ambiguity(&performed_unanswered),
             "an effect the journal saw whose answer never arrived is exactly the \
              ambiguous case the flush paragraph names"
         );
@@ -1748,6 +1773,10 @@ mod tests {
             "a write the journal never saw is not an ambiguous one, and a gate \
              that read it as ambiguous would be measuring a refusal that never \
              dispatched"
+        );
+        assert!(
+            !classify_ambiguity(&never_performed),
+            "an undispatched write is not ambiguous however its answer went"
         );
     }
 
