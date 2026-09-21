@@ -36,11 +36,15 @@
 //!
 //! [`attribute_restart`] closes it (`docs/tasks.md` M5-C10), and the way it
 //! does so is not the way that row's acceptance described. **That wording —
-//! observe the [`BackendGeneration`] across an exchange — is racy and would
-//! never have fired**, because that counter advances inside the supervisor's
-//! *start*, strictly after the old child is killed, while the exchange reads
-//! its "after" value the instant the socket closes. [`LifecycleEpoch`] exists
-//! for exactly that reason and carries the argument in full.
+//! observe the [`BackendGeneration`] across an exchange — is racy**, because
+//! that counter advances inside the supervisor's *start*, strictly after the
+//! old child is killed, while the exchange reads its "after" value the instant
+//! the socket closes. What was measured is the equivalent ordering on
+//! [`LifecycleEpoch`]: advancing it below the kill instead of above lost the
+//! attribution in **3 of 3 runs**. That is the observed rate, not a proof that
+//! the race can never be won — and a mechanism that depends on winning it
+//! would be the wrong shape regardless. [`LifecycleEpoch`] carries the
+//! argument in full.
 //!
 //! # Two halves, and both are needed
 //!
