@@ -226,10 +226,17 @@ EXPECTED_MODULE_FILTERS = 9
 #: across 13 suites: four cases were added after that measurement without this
 #: floor or the M4-06 row's roll-up following them.  A floor four short of the
 #: truth still passes, which is exactly how it stops being a floor -- so it is
-#: raised here to what gate 14's tip actually reports, **486 across 14
-#: suites**, and re-measured rather than incremented.
+#: re-measured here rather than incremented, to what gate 14's tip actually
+#: reports: **485 across 14 suites**.
+#:
+#: It was briefly set to 486 and this file caught it: gate 14 removed one
+#: guard case after that reading, and the floor -- being an *at least* -- is
+#: the one figure in this repository that fails loudly when it is set above
+#: the truth rather than below it.  That is the whole point of it, and the
+#: correction was taken by re-running `--check-anchors`, not by subtracting
+#: one.
 EXPECTED_GUARD_ANCHORS = {
-    "fs-guard-deletion.py": 486,
+    "fs-guard-deletion.py": 485,
     "acp-guard-deletion.py": 148,
     "m5-guard-deletion.py": 82,
     "m3-guard-deletion.py": 5,
