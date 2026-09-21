@@ -84,9 +84,12 @@ checking the crate out again, which would discard uncommitted work there.
 from __future__ import annotations
 
 import argparse
+import ast
+import io
 import os
 import subprocess
 import sys
+import tokenize
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -5112,7 +5115,7 @@ GATE13_WRITE_RESTART_CASES: list[tuple[str, list[Edit]]] = [
         ],
     ),
     (
-        "the pending call was not served a normal reply from a session the contractinvalidates",
+        "the pending call was not served a normal reply from a session the contract invalidates",
         [
             (
                 HARNESS_WRITE_RESTART,
@@ -5152,7 +5155,7 @@ GATE13_WRITE_RESTART_CASES: list[tuple[str, list[Edit]]] = [
         ],
     ),
     (
-        "the bytes the kill left behind were neither completed nor rolled back by therestart or by a caller's retry",
+        "the bytes the kill left behind were neither completed nor rolled back by the restart or by a caller's retry",
         [
             (
                 HARNESS_WRITE_RESTART,
@@ -5192,11 +5195,22 @@ GATE13_WRITE_RESTART_CASES: list[tuple[str, list[Edit]]] = [
         ],
     ),
     (
-        "that retry was refused for its fid and never reached the provider",
+        "that retry carried the errno a session-level unknown-fid refusal carries",
         [
             (
                 HARNESS_WRITE_RESTART,
                 "            evidence.retry_refusal_errno == Some(UNKNOWN_FID_ERRNO),",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the retry never reached the host, proven by a modification time the "
+        "bytes cannot carry",
+        [
+            (
+                HARNESS_WRITE_RESTART,
+                "            evidence.host_mtime_unchanged_across_retry,",
                 "            true,",
             )
         ],
@@ -5503,9 +5517,108 @@ def require_clean_tree(suites: list[Suite]) -> None:
                 )
 
 
+def glued_case_names() -> list[str]:
+    """Case names that two adjacent string literals joined without a space.
+
+    Every case name in this file is written as an implicitly concatenated
+    string across several source lines, and a missing trailing space on one of
+    them silently produces a name like "by therestart".  That is display-only
+    -- the anchors are separate strings and stay correct -- but the suite's
+    output then no longer matches the rule the gate prints when it fails, which
+    is exactly the sort of quiet mismatch this script exists to refuse
+    elsewhere.
+
+    Detected by tokenising this file rather than by inspecting the joined
+    names: once Python has folded the pieces together the boundary is gone, and
+    a name is not a dictionary word, so no amount of reading the result can
+    tell "therestart" from a deliberate identifier.
+    """
+    source = Path(__file__).read_text()
+    skip = (
+        tokenize.NL,
+        tokenize.NEWLINE,
+        tokenize.COMMENT,
+        tokenize.INDENT,
+        tokenize.DEDENT,
+    )
+    tokens = [
+        token
+        for token in tokenize.generate_tokens(io.StringIO(source).readline)
+        if token.type not in skip
+    ]
+    glued: list[str] = []
+    for first, second in zip(tokens, tokens[1:]):
+        if first.type != tokenize.STRING or second.type != tokenize.STRING:
+            continue
+        try:
+            left = ast.literal_eval(first.string)
+            right = ast.literal_eval(second.string)
+        except (ValueError, SyntaxError):
+            continue
+        if not isinstance(left, str) or not isinstance(right, str):
+            continue
+        if not left or not right:
+            continue
+        if left[-1].isalnum() and right[0].isalnum():
+            glued.append(
+                f"line {first.start[0]}: ...{left[-30:]!r} + {right[:30]!r}..."
+            )
+    return glued
+
+
+def check_anchors(selected: list[tuple[Suite, str, list[Edit]]]) -> int:
+    """Resolve every selected case's guard text against the tree, and stop.
+
+    This is the standing form of a check that otherwise only ever runs as a
+    side effect of a full build: the deletion loop refuses a missing or
+    ambiguous anchor, but only for the cases a given invocation actually
+    selects, and only after paying for a `cargo test` per case.  A guard whose
+    anchor has rotted in a suite nobody happened to run is therefore invisible
+    until someone runs it -- so the same defect class the ambiguity refusal
+    closes for a *selected* case stays open for an unselected one.
+
+    Checking costs no build, so CI can run it over every suite every time.
+    """
+    problems = 0
+    checked = 0
+    for suite, name, edits in selected:
+        for path, old, _ in edits:
+            checked += 1
+            occurrences = path.read_text().count(old)
+            if occurrences != 1:
+                problems += 1
+                print(
+                    f"[{suite.name}] {name}: anchor resolves to {occurrences} "
+                    f"occurrences in {path}",
+                    flush=True,
+                )
+    for glued in glued_case_names():
+        problems += 1
+        print(f"glued case name: {glued}", flush=True)
+    print(
+        f"fs-guard-deletion: checked {checked} anchors across "
+        f"{len({suite.name for suite, _, _ in selected})} suite(s)",
+        flush=True,
+    )
+    if problems:
+        print(f"fs-guard-deletion: {problems} anchor problem(s)", flush=True)
+        return 1
+    print("fs-guard-deletion: every anchor resolves to exactly one occurrence")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--list", action="store_true", help="print case names and exit")
+    parser.add_argument(
+        "--check-anchors",
+        action="store_true",
+        help=(
+            "check every case's guard text without building anything, and exit "
+            "non-zero if any anchor is missing or ambiguous or any case name "
+            "was glued together by implicit string concatenation"
+        ),
+    )
     parser.add_argument("--case", help="run only cases whose name contains this text")
     parser.add_argument(
         "--suite",
@@ -5538,6 +5651,8 @@ def main() -> int:
         for suite, name, _ in selected:
             print(f"{suite.name}: {name}")
         return 0
+    if arguments.check_anchors:
+        return check_anchors(selected)
     if not selected:
         sys.exit(f"fs-guard-deletion: no case matches {arguments.case!r}")
 

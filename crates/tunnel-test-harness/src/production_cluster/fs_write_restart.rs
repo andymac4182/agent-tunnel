@@ -165,7 +165,7 @@
 //! carries a path, a name or file content.
 
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use tokio::time::{sleep, timeout};
 use tunnel_fs_core::Outcome;
@@ -447,12 +447,39 @@ pub struct FsWriteRestartEvidence {
     /// Whether re-issuing the held `Twrite` on the fid it was originally
     /// issued on is refused *above* the dispatch boundary.
     pub retry_refused_above_dispatch: bool,
-    /// The errno that refusal carried.  It must be the unknown-fid errno: a
-    /// refusal from the host would mean the retry reached the provider.
+    /// The errno that refusal carried.
+    ///
+    /// This is the errno a session-level unknown-fid refusal carries, and it
+    /// is **corroboration, not proof of origin**: `policy::code_for` maps any
+    /// errno it does not recognise to `Einval` as well, and the host write
+    /// path returns `Einval` directly, so this value alone does not establish
+    /// that the retry stopped above the provider.  What establishes that is
+    /// [`Self::host_mtime_unchanged_across_retry`].
     pub retry_refusal_errno: Option<u32>,
     /// The held region after that retry.  Must still equal
     /// [`Self::held_region_before_kill`].
     pub held_region_after_retry: RegionState,
+    /// Whether the target file's modification time is the **same instant**
+    /// before and after the retry.
+    ///
+    /// This is the rule that actually carries "the retry never reached the
+    /// provider", and it is the one measurement that can: the bytes cannot,
+    /// because a `Twrite` names an explicit offset and a resubmission of the
+    /// identical frame is byte-for-byte idempotent, and the errno cannot,
+    /// because the host can produce `Einval` too.  An `mtime` is neither.  A
+    /// write that reached `tunnel-fs-host` calls `pwrite`, and `pwrite`
+    /// advances `mtime` whether or not it changed a single byte -- so a
+    /// resubmission that got through is visible here precisely in the case
+    /// the byte comparison is blind to.
+    ///
+    /// Sampled around the retry alone, not across the restart: the reads the
+    /// replacement session performs do not touch `mtime`, but a `Twrite` that
+    /// landed would.
+    pub host_mtime_unchanged_across_retry: bool,
+    /// The two samples behind [`Self::host_mtime_unchanged_across_retry`],
+    /// carried so a failure names the instants rather than only the verdict.
+    pub host_mtime_before_retry: Option<SystemTime>,
+    pub host_mtime_after_retry: Option<SystemTime>,
 
     // ---- The whole-file image. ----
     pub image_bytes: usize,
@@ -743,8 +770,14 @@ pub fn validate_fs_write_restart_evidence(evidence: &FsWriteRestartEvidence) -> 
             evidence.retry_refused_above_dispatch,
         ),
         (
-            "that retry was refused for its fid and never reached the provider".into(),
+            "that retry carried the errno a session-level unknown-fid refusal carries".into(),
             evidence.retry_refusal_errno == Some(UNKNOWN_FID_ERRNO),
+        ),
+        (
+            "the retry left the target file's modification time untouched, so it never reached \
+             the host at all"
+                .into(),
+            evidence.host_mtime_unchanged_across_retry,
         ),
         // The whole-file image: nothing landed anywhere it should not have.
         (
@@ -809,6 +842,15 @@ pub fn validate_fs_write_restart_evidence(evidence: &FsWriteRestartEvidence) -> 
 /// generations.
 fn read_host_image(path: &Path) -> Vec<u8> {
     std::fs::read(path).unwrap_or_default()
+}
+
+/// The target file's modification time, or `None` if it cannot be read.
+///
+/// `None` is deliberately *not* treated as "unchanged" by the caller: two
+/// unreadable samples compare equal, and a rule that passes because the
+/// measurement failed twice is exactly the shape this gate refuses elsewhere.
+fn read_host_mtime(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).ok()?.modified().ok()
 }
 
 /// The expected whole-file image **outside** the held region: filler
@@ -1641,17 +1683,38 @@ async fn exercise(
     // The trap in its operational form.  A consumer that read the lost answer
     // as "it never happened" would resubmit, and the question is whether
     // anything below it would let that reach the provider.  It does not: the
-    // fid is not allocated in this session, so the session machine refuses the
-    // write *above* the dispatch boundary with the unknown-fid errno — not an
-    // errno the host could have produced, which would mean the retry got
-    // through.
+    // fid is not allocated in this session, so the session state machine —
+    // which runs in the *connector* process, inside `tunnel_fs_provider`'s
+    // `accept`, before a request is ever queued toward the host — refuses the
+    // write above the dispatch boundary.
     //
-    // The errno is what carries this, and not the bytes: a `Twrite` names an
-    // explicit offset, so a resubmission of the identical frame would be
-    // byte-for-byte idempotent and invisible in the host file.  The region
-    // comparison below still earns its place against the cases that are *not*
-    // idempotent — a replay at a different offset, or a torn region quietly
-    // completed — and the whole-file image covers the rest.
+    // **What proves that, and what does not.**  Not the errno: `Einval` is
+    // also what `tunnel_fs_host::policy` maps every errno it does not
+    // recognise to, and what the host write path returns directly, so the
+    // value is consistent with the refusal having come from the host instead.
+    // Not the bytes either: a `Twrite` names an explicit offset, so a
+    // resubmission of the identical frame is byte-for-byte idempotent and
+    // invisible in a comparison of the file's contents.
+    //
+    // The file's **modification time** is neither.  A write that reached the
+    // host calls `pwrite`, and `pwrite` advances `mtime` whether or not it
+    // changed a byte — so the one case the byte comparison is blind to is
+    // exactly the case `mtime` reports.  Sampling it either side of the retry
+    // turns "it cannot have reached the host" from an argument about the code
+    // into a measurement of the effect surface.  (Reads do not touch `mtime`,
+    // so the replacement session's own traffic cannot move it.)
+    //
+    // Not the relay's emit cursor, which would have been the obvious place to
+    // look: the relay is a byte pump for this message — it decodes only to
+    // check framing and keeps no fid table — so the frame really does cross
+    // relay→connector, and `last_emitted_relay_to_connector` advances for a
+    // refused write exactly as for an accepted one.  The cursor cannot
+    // discriminate here, and asserting that it does not move would be false.
+    //
+    // The region comparison below still earns its place against the cases that
+    // are *not* idempotent — a replay at a different offset, or a torn region
+    // quietly completed — and the whole-file image covers the rest.
+    evidence.host_mtime_before_retry = read_host_mtime(target_path);
     match second
         .call(Message::Twrite {
             fid: FILE_FID,
@@ -1670,6 +1733,13 @@ async fn exercise(
             evidence.retry_refusal_errno = errno_of(&other);
         }
     }
+    evidence.host_mtime_after_retry = read_host_mtime(target_path);
+    // Both samples must have been readable *and* equal.  Two `None`s compare
+    // equal, which would let a failed measurement pass as a held rule.
+    evidence.host_mtime_unchanged_across_retry = matches!(
+        (evidence.host_mtime_before_retry, evidence.host_mtime_after_retry),
+        (Some(before), Some(after)) if before == after
+    );
     let host_image = read_host_image(target_path);
     evidence.held_region_after_retry = classify_region(&host_image, HELD_OFFSET, &held_payload);
     evidence.image_bytes = host_image.len();
@@ -1728,6 +1798,12 @@ async fn exercise(
 mod tests {
     use super::*;
 
+    /// A fixed instant for the fixtures: the rule is about the two samples
+    /// being the *same* instant, never about which instant it is.
+    fn fixed_mtime() -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)
+    }
+
     fn passing() -> FsWriteRestartEvidence {
         FsWriteRestartEvidence {
             relay_count: 3,
@@ -1773,6 +1849,9 @@ mod tests {
             stale_file_fid_errno: Some(UNKNOWN_FID_ERRNO),
             retry_refused_above_dispatch: true,
             retry_refusal_errno: Some(UNKNOWN_FID_ERRNO),
+            host_mtime_unchanged_across_retry: true,
+            host_mtime_before_retry: Some(fixed_mtime()),
+            host_mtime_after_retry: Some(fixed_mtime()),
             held_region_after_retry: RegionState::Written,
             image_bytes: TARGET_FILE_BYTES,
             image_expected_bytes: TARGET_FILE_BYTES,
@@ -1995,6 +2074,55 @@ mod tests {
         assert!(HELD_PAYLOAD_BYTES < READ_COUNT as usize);
     }
 
+    /// The mtime rule must be defeated by a *failed measurement*, not only by
+    /// a moved timestamp.
+    ///
+    /// `Option<SystemTime>` has an equality that says `None == None`, so the
+    /// obvious spelling -- compare the two samples -- reports "unchanged" when
+    /// the file could not be stat'd at either end.  That is the shape this
+    /// gate refuses everywhere else: a rule that holds because nothing was
+    /// measured is not evidence, and it would hold for a run in which the
+    /// export had vanished entirely.
+    #[test]
+    fn an_unmeasured_mtime_is_not_an_unchanged_mtime() {
+        // Both samples missing: equal as `Option`s, and still not evidence.
+        let mut evidence = passing();
+        evidence.host_mtime_before_retry = None;
+        evidence.host_mtime_after_retry = None;
+        assert_eq!(
+            evidence.host_mtime_before_retry, evidence.host_mtime_after_retry,
+            "the trap only exists because these compare equal",
+        );
+        evidence.host_mtime_unchanged_across_retry = matches!(
+            (evidence.host_mtime_before_retry, evidence.host_mtime_after_retry),
+            (Some(before), Some(after)) if before == after
+        );
+        assert!(
+            !evidence.host_mtime_unchanged_across_retry,
+            "two unreadable samples must not report an unchanged mtime",
+        );
+        validate_fs_write_restart_evidence(&evidence)
+            .expect_err("an unmeasured mtime must fail the rule");
+
+        // One side missing, either side.
+        for (before, after) in [(Some(fixed_mtime()), None), (None, Some(fixed_mtime()))] {
+            let mut evidence = passing();
+            evidence.host_mtime_before_retry = before;
+            evidence.host_mtime_after_retry = after;
+            evidence.host_mtime_unchanged_across_retry = matches!(
+                (before, after),
+                (Some(b), Some(a)) if b == a
+            );
+            validate_fs_write_restart_evidence(&evidence)
+                .expect_err("a half-measured mtime must fail the rule");
+        }
+
+        // And the positive direction: two readable, equal samples hold it.
+        let evidence = passing();
+        assert!(evidence.host_mtime_unchanged_across_retry);
+        validate_fs_write_restart_evidence(&evidence).expect("passing evidence");
+    }
+
     #[test]
     fn validator_accepts_exact_bounds_and_rejects_every_single_mutation() {
         validate_fs_write_restart_evidence(&passing()).expect("passing evidence");
@@ -2170,8 +2298,20 @@ mod tests {
                 e.retry_refused_above_dispatch = false;
             }),
             (
-                "the retry was refused by the host rather than above the dispatch boundary",
+                "the retry carried an errno no session-level unknown-fid refusal carries",
                 |e| e.retry_refusal_errno = Some(tunnel_fs_core::FsErrorCode::Eexist.errno()),
+            ),
+            // The rule that actually carries "it never reached the host": a
+            // resubmission that got through advances `mtime` even when it
+            // rewrites byte-for-byte identical content, which is the one case
+            // every comparison of the file's *bytes* is blind to.
+            (
+                "the retry reached the host and rewrote the identical bytes, which the byte \
+                 comparisons cannot see but the modification time can",
+                |e| {
+                    e.host_mtime_unchanged_across_retry = false;
+                    e.host_mtime_after_retry = Some(fixed_mtime() + Duration::from_millis(1));
+                },
             ),
             // The whole-file image.
             ("the host file changed length", |e| {

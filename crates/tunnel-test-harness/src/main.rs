@@ -2335,7 +2335,7 @@ async fn main() -> ExitCode {
                         &evidence,
                     )?;
                     println!(
-                        "M4 filesystem write restart passed: relays={} owner={} subprotocol={} msize={} dialect={} prefix_bytes={} held_region_before_send={} prefix_region_after_write={} prefix_acknowledged_bytes={} stream={} emitted={}->{} recv_contiguous={}->{} request_outstanding_at_kill={} restart_polls={} held_tag={} held_region_before_kill={} torn_observed_before_kill={} journal_polls={} first_pid={} first_process_exited={} first_process_killed_by_signal={} second_pid={} second_process_active={} epoch={}->{} session={}->{} owner_released_between={} pending_call_closed={} pending_call_close_code={:?} pending_call_answered={} pending_call_errored={} held_call_outcome={:?} held_stream_deregistered={} held_region_after_restart={} stale_file_fid_refused={} stale_file_fid_errno={:?} retry_refused_above_dispatch={} retry_refusal_errno={:?} held_region_after_retry={} image_bytes={}/{} image_outside_held_region_matches={} second_session_msize={} second_session_attached={} held_region_over_ninep={} ninep_image_matches_host={} second_session_bytes={}/{} second_session_messages={} second_session_getattr_size={} attach_count={}",
+                        "M4 filesystem write restart passed: relays={} owner={} subprotocol={} msize={} dialect={} prefix_bytes={} held_region_before_send={} prefix_region_after_write={} prefix_acknowledged_bytes={} stream={} emitted={}->{} recv_contiguous={}->{} request_outstanding_at_kill={} restart_polls={} held_tag={} held_region_before_kill={} torn_observed_before_kill={} journal_polls={} first_pid={} first_process_exited={} first_process_killed_by_signal={} second_pid={} second_process_active={} epoch={}->{} session={}->{} owner_released_between={} pending_call_closed={} pending_call_close_code={:?} pending_call_answered={} pending_call_errored={} held_call_outcome={:?} held_stream_deregistered={} held_region_after_restart={} stale_file_fid_refused={} stale_file_fid_errno={:?} retry_refused_above_dispatch={} retry_refusal_errno={:?} host_mtime_unchanged_across_retry={} held_region_after_retry={} image_bytes={}/{} image_outside_held_region_matches={} second_session_msize={} second_session_attached={} held_region_over_ninep={} ninep_image_matches_host={} second_session_bytes={}/{} second_session_messages={} second_session_getattr_size={} attach_count={}",
                         evidence.relay_count,
                         evidence.owner_node,
                         evidence.selected_subprotocol,
@@ -2377,6 +2377,7 @@ async fn main() -> ExitCode {
                         evidence.stale_file_fid_errno,
                         evidence.retry_refused_above_dispatch,
                         evidence.retry_refusal_errno,
+                        evidence.host_mtime_unchanged_across_retry,
                         evidence.held_region_after_retry.as_str(),
                         evidence.image_bytes,
                         evidence.image_expected_bytes,
