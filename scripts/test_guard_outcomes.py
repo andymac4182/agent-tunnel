@@ -70,8 +70,36 @@ def main() -> int:
     check("a guard that is not load-bearing" in listed[0], "the case is named")
     check("NOTHING went red" in listed[0], "the green is explained, not just echoed")
 
+    every_module_filter_is_anchored()
+
     print("test_guard_outcomes: PASS")
     return 0
+
+
+def every_module_filter_is_anchored() -> None:
+    """Every `production_cluster::<module>` test filter must end in `::`.
+
+    Without the anchor a filter is a **prefix** of any module whose name
+    extends it, and cargo's filter is a substring match -- so that suite
+    silently selects another gate's cases and measures rules that are not its
+    own.  That happened: `production_cluster::fs_rotation` began selecting
+    gate 12's six cases the moment `fs_rotation_write` existed.
+
+    Fixing the one collision would leave the class open, because the next
+    module named as an extension of an existing one re-creates it in silence.
+    This is the rule, held where it cannot rot back.
+    """
+    script = (Path(__file__).resolve().parent / "fs-guard-deletion.py").read_text()
+    unanchored = [
+        line.strip()
+        for line in script.splitlines()
+        if '"production_cluster::' in line and not line.strip().endswith('::",')
+    ]
+    check(
+        not unanchored,
+        "these module filters are prefixes and will capture another gate's "
+        f"cases: {unanchored}",
+    )
 
 
 if __name__ == "__main__":

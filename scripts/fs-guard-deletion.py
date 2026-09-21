@@ -2466,7 +2466,7 @@ GATE6_E2E_TEST = [
     "tunnel-test-harness",
     "--lib",
     "--locked",
-    "production_cluster::fs_client_e2e",
+    "production_cluster::fs_client_e2e::",
 ]
 
 GATE6_E2E_CASES: list[tuple[str, list[Edit]]] = [
@@ -2826,6 +2826,12 @@ GATE7_ROTATION_TEST = [
     # cases were also selected by gate 7's suite.  That is the ambiguity this
     # script refuses at the level of guard *text*, arriving one level up at
     # the level of the test *filter*: a gate must measure its own rules.
+    #
+    # **Every module filter in this file carries the `::` for that reason, not
+    # only this one.**  Only this filter had an actual collision; the others
+    # were one module name away from the same defect, and the next module named
+    # as an extension of an existing one would have re-created it silently.
+    # `every_module_filter_is_anchored` holds the rule so it cannot rot back.
     "production_cluster::fs_rotation::",
 ]
 
@@ -3080,7 +3086,7 @@ GATE8_LOSS_TEST = [
     "tunnel-test-harness",
     "--lib",
     "--locked",
-    "production_cluster::fs_consumer_loss",
+    "production_cluster::fs_consumer_loss::",
 ]
 
 GATE8_LOSS_CASES: list[tuple[str, list[Edit]]] = [
@@ -3323,7 +3329,7 @@ GATE9_EPOCH_TEST = [
     "tunnel-test-harness",
     "--lib",
     "--locked",
-    "production_cluster::fs_epoch_change",
+    "production_cluster::fs_epoch_change::",
 ]
 
 GATE9_EPOCH_CASES: list[tuple[str, list[Edit]]] = [
@@ -3670,7 +3676,7 @@ GATE10_RESTART_TEST = [
     "tunnel-test-harness",
     "--lib",
     "--locked",
-    "production_cluster::fs_process_restart",
+    "production_cluster::fs_process_restart::",
 ]
 
 GATE10_RESTART_CASES: list[tuple[str, list[Edit]]] = [
@@ -4209,7 +4215,7 @@ GATE11_RECOVERY_TEST = [
     "tunnel-test-harness",
     "--lib",
     "--locked",
-    "production_cluster::fs_data_recovery",
+    "production_cluster::fs_data_recovery::",
 ]
 
 GATE11_RECOVERY_CASES: list[tuple[str, list[Edit]]] = [

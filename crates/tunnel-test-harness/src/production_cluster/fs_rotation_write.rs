@@ -84,9 +84,20 @@
 //! [`FsRotationWriteEvidence::held_write_ambiguous`] is
 //! `journal showed the effect && no answer arrived`, and the validator
 //! requires it to be **false** — a clean scheduled rotation must leave no
-//! ambiguous write behind.  Had the answer been lost the derivation would flip
-//! and the gate would fail, which is what makes the rule defeatable rather than
-//! decorative.  Mapping this run's success onto an `Outcome` variant would be a
+//! ambiguous write behind.
+//!
+//! **That flip is reachable in a real run, and making it so took care.**  The
+//! held reply is read under [`HELD_REPLY_WAIT`] rather than with a bare `?`,
+//! because every way an answer can be lost — a close, an ended socket, or a
+//! reply that never comes — would otherwise return a transport error, or hang
+//! to the scenario deadline, *before* the derivation ever executed.  The rule
+//! would then be one that could never name a failure.  On any of those paths
+//! `held_write_answered` stays false, the derivation runs, and the ambiguity
+//! rule fires; and it is placed **first** among the write's operation-level
+//! rules, above "the held write was answered" and the three reply rules, all
+//! of which a lost answer also falsifies, so that the most specific
+//! description of the failure is the one that speaks.  Mapping this run's
+//! success onto an `Outcome` variant would be a
 //! misuse: `Outcome` spells `NotStarted`, `Failed`, `Partial` and `Unknown`,
 //! and none of them means "performed and acknowledged".
 //!
@@ -217,6 +228,12 @@ const OWNER_WAIT: Duration = Duration::from_secs(30);
 const WAIT: Duration = Duration::from_secs(30);
 /// A bounded wait for the host directory to show an effect.
 const JOURNAL_WAIT: Duration = Duration::from_secs(30);
+/// How long the reply held across the first rotation may take to arrive.
+///
+/// It has its own bound rather than riding the scenario deadline because an
+/// answer that never comes is **evidence** here, not a hang: on expiry the gate
+/// records the write as unanswered and lets the derivation classify it.
+const HELD_REPLY_WAIT: Duration = Duration::from_secs(30);
 /// The poll interval for every bounded wait here.
 const POLL: Duration = Duration::from_millis(20);
 /// The whole scenario's bound.  Two scheduled rotations rather than one, so
@@ -465,6 +482,21 @@ pub fn validate_fs_rotation_write_evidence(evidence: &FsRotationWriteEvidence) -
         // into either extreme — is held where it can be defeated, by
         // `a_partly_applied_write_is_torn_and_is_neither_of_the_others`, which
         // checks all four classifications directly.
+        // The derived classification, **first among the write's
+        // operation-level rules and deliberately so**.  A lost answer makes
+        // every rule below this one false as well — no tag matched, no
+        // `Rwrite`, no byte count — so if any of them came first, the run that
+        // this gate exists to characterise would be reported as a missing tag
+        // rather than as the ambiguity it is.  The most specific description
+        // of the failure has to be the one that speaks.
+        (
+            "a clean scheduled rotation left no ambiguous write".into(),
+            !evidence.held_write_ambiguous,
+        ),
+        (
+            "the held write was answered".into(),
+            evidence.held_write_answered,
+        ),
         // The operation-level rules for the write half.
         (
             "the reply held across the first rotation carried the tag that was outstanding".into(),
@@ -477,16 +509,6 @@ pub fn validate_fs_rotation_write_evidence(evidence: &FsRotationWriteEvidence) -
         (
             "the Rwrite acknowledged exactly the bytes the Twrite carried".into(),
             evidence.held_write_acknowledged_bytes == HELD_PAYLOAD_BYTES,
-        ),
-        (
-            "the held write was answered".into(),
-            evidence.held_write_answered,
-        ),
-        // The derived classification.  A lossless scheduled rotation must not
-        // leave a mutation whose outcome a caller cannot settle.
-        (
-            "a clean scheduled rotation left no ambiguous write".into(),
-            !evidence.held_write_ambiguous,
         ),
         (
             "the held write's effect was still whole after the rotation committed".into(),
@@ -1192,17 +1214,35 @@ async fn exercise(
         .resume(ProxyDirection::ClientToTarget, connection)
         .await?;
 
-    // The reply that was outstanding across the freeze.
-    let held = session.recv_frame().await?;
-    evidence.held_write_reply_tag_matched = held.tag == evidence.held_write_tag;
-    match held.message {
-        Message::Rwrite { count } => {
+    // The reply that was outstanding across the freeze, read under its own
+    // bound.
+    //
+    // **Every way the answer can be lost has to reach the derivation below
+    // rather than return a transport error here**, and that is why this is not
+    // a bare `recv_frame().await?`.  A close, an ended socket or a reply that
+    // simply never comes is precisely the case the flush paragraph calls
+    // ambiguous — the journal already showed the effect — and a `?` would
+    // report it as a broken socket, or hang to the scenario deadline, before
+    // `classify_ambiguity` ever ran.  The ambiguity rule could then never be
+    // the rule that named a failure, which is the shape this repository keeps
+    // catching: a rule that cannot speak.
+    //
+    // A reply that arrives and is *not* an `Rwrite` — an `Rlerror`, say — is
+    // still an **answer**: settled, not ambiguous.  It is recorded as answered
+    // with `held_write_reply_was_rwrite` false, so the `Rwrite` rule names it
+    // rather than this one.
+    if let Ok(Ok(held)) = timeout(HELD_REPLY_WAIT, session.recv_frame()).await {
+        evidence.held_write_reply_tag_matched = held.tag == evidence.held_write_tag;
+        evidence.held_write_answered = true;
+        if let Message::Rwrite { count } = held.message {
             evidence.held_write_reply_was_rwrite = true;
             evidence.held_write_acknowledged_bytes = count as usize;
-            evidence.held_write_answered = true;
         }
-        other => return Err(unexpected("the held Rwrite", &other)),
     }
+    // Every other path — the socket failed, the socket ended, or nothing
+    // arrived inside the bound — leaves `held_write_answered` false on purpose.
+    // That is the lost answer, and it is what makes the derivation below
+    // reachable in a real run instead of only in a unit test.
     // Derived from what the wire and the host directory actually did, not
     // asserted: the effect was performed, and an answer either arrived or did
     // not.  Across a lossless scheduled rotation it must arrive.
@@ -1269,14 +1309,35 @@ async fn exercise(
         .await?;
 
     // Read until the `Rflush` and every pipelined read have been answered, and
-    // no further.  Bounding it this way rather than by a fixed count leaves
-    // the socket in step either way, so a failure is reported by the rule it
-    // violated instead of by the next reply landing on the wrong tag.
+    // no further.  Bounding it by the outstanding set rather than by a fixed
+    // count leaves the socket in step either way, so a failure is reported by
+    // the rule it violated instead of by the next reply landing on the wrong
+    // tag.
+    //
+    // **The pipelined replies are counted as they arrive, not read off
+    // `pending.len()` before the loop.**  That earlier spelling could only ever
+    // report [`FLUSH_PIPELINE_DEPTH`], because the loop cannot exit while
+    // `pending` is non-empty — so the rule that checks it was comparing the
+    // setup constant with itself, and a genuinely cancelled pipelined read
+    // would have surfaced as a scenario timeout rather than as the rule that
+    // names it.  The deadline below exists for the same reason as
+    // [`HELD_REPLY_WAIT`]: a reply that never comes is evidence, so the drain
+    // gives up and lets the count speak.
     let mut seen_rflush = false;
     let mut replies_after = 0_usize;
-    let expected_pipeline = pending.len();
+    let mut pipeline_replies = 0_usize;
+    let drain_deadline = Instant::now() + HELD_REPLY_WAIT;
     while !seen_rflush || !pending.is_empty() {
-        let frame = session.recv_frame().await?;
+        let remaining = drain_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let frame = match timeout(remaining, session.recv_frame()).await {
+            Ok(Ok(frame)) => frame,
+            // A close, an ended socket or nothing at all: stop draining and
+            // report what was actually answered.
+            Ok(Err(_)) | Err(_) => break,
+        };
         if frame.tag == evidence.flush_tag {
             if !matches!(frame.message, Message::Rflush) {
                 return Err(unexpected("Rflush", &frame.message));
@@ -1287,7 +1348,9 @@ async fn exercise(
             if seen_rflush {
                 replies_after += 1;
             }
-        } else if !pending.remove(&frame.tag) {
+        } else if pending.remove(&frame.tag) {
+            pipeline_replies += 1;
+        } else {
             return Err(HarnessError::Process(
                 "a reply arrived for a tag that was never sent".into(),
             ));
@@ -1295,7 +1358,7 @@ async fn exercise(
     }
     evidence.rflush_observed = seen_rflush;
     evidence.flushed_replies_after_rflush = replies_after;
-    evidence.flush_pipeline_replies = expected_pipeline;
+    evidence.flush_pipeline_replies = pipeline_replies;
 
     evidence.rotations_completed_after_flush = wait_rotation_completed(
         cluster,
@@ -1540,6 +1603,18 @@ mod tests {
             ("the rotation left an ambiguous write", |e| {
                 e.held_write_ambiguous = true;
             }),
+            // The shape a real lost answer actually produces, now that the
+            // held reply is read under a bound: nothing arrived, so every
+            // reply field is empty and the derivation flipped.  The ambiguity
+            // rule is ordered ahead of all of them so that it is the rule that
+            // names this, and not "no tag matched".
+            ("the answer was lost, as a whole run would report it", |e| {
+                e.held_write_answered = false;
+                e.held_write_reply_tag_matched = false;
+                e.held_write_reply_was_rwrite = false;
+                e.held_write_acknowledged_bytes = 0;
+                e.held_write_ambiguous = true;
+            }),
             ("the write's effect was gone after the rotation", |e| {
                 e.held_region_after_rotation = RegionState::Untouched;
             }),
@@ -1777,6 +1852,39 @@ mod tests {
         assert!(
             !classify_ambiguity(&never_performed),
             "an undispatched write is not ambiguous however its answer went"
+        );
+    }
+
+    /// A lost answer must be **named** by the ambiguity rule, not merely
+    /// rejected by whichever rule happens to come first.
+    ///
+    /// A lost answer falsifies five rules at once — the derivation, "the held
+    /// write was answered", and the three reply rules — so ordering is what
+    /// decides which one a failing run reports.  Before this was fixed the
+    /// derivation could not be reached in a real run at all, and the rule
+    /// could never have been the one that spoke.  This pins the order, in the
+    /// only way a caller sees it: the message.
+    #[test]
+    fn a_lost_answer_is_reported_as_ambiguity_and_not_as_a_missing_tag() {
+        let lost = FsRotationWriteEvidence {
+            held_write_answered: false,
+            held_write_reply_tag_matched: false,
+            held_write_reply_was_rwrite: false,
+            held_write_acknowledged_bytes: 0,
+            held_write_ambiguous: true,
+            ..passing()
+        };
+        let message = validate_fs_rotation_write_evidence(&lost)
+            .expect_err("a lost answer must be rejected")
+            .to_string();
+        assert!(
+            message.contains("left no ambiguous write"),
+            "a lost answer must be reported as the ambiguity it is, not as a \
+             consequence of it; got: {message}"
+        );
+        assert!(
+            !message.contains("carried the tag that was outstanding"),
+            "the tag rule must not shadow the ambiguity rule; got: {message}"
         );
     }
 
