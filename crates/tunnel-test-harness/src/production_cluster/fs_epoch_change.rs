@@ -162,6 +162,22 @@ const DEVICE_GONE_CLOSE: u16 = match tunnel_fs_core::SessionErrorCode::DeviceOff
     None => panic!("DeviceOffline must carry a close code"),
 };
 
+/// The two teardown reasons that mean the device's **own transport** ended,
+/// which are the two halves of one event.
+///
+/// A connector that stops closes both of its sockets, and the relay may notice
+/// either loss first.  Control first closes the session as `CONTROL_CLOSED`;
+/// data first is a frame that fails to queue toward the device and closes it
+/// as `REVERSE_CHANNEL_UNAVAILABLE`.  This gate must accept **either**,
+/// because which one happens is a scheduling race — but it must accept only
+/// these two, because any other reason would mean the gate had measured some
+/// different failure and reported it as an epoch change.  M4-35.
+const CONTROL_CLOSED_TEARDOWN: &str = "CONTROL_CLOSED";
+/// The data-socket half of [`CONTROL_CLOSED_TEARDOWN`].  Roughly a third of
+/// runs on the measuring host took this ordering, and before M4-35 every one
+/// of those closed the consumer with no code at all.
+const REVERSE_CHANNEL_TEARDOWN: &str = "REVERSE_CHANNEL_UNAVAILABLE";
+
 /// The close code a session that speaks before `Tattach` is ended with.
 ///
 /// `SessionError::BeforeAttach` answers `Close(ProtocolViolation)`, the 9P
@@ -316,6 +332,20 @@ pub struct FsEpochChangeEvidence {
     /// change.  It must not be: a reply served from a session the contract
     /// says is invalidated would be the violation.
     pub pending_call_answered: bool,
+    /// **Which of the two socket-loss orderings this run took**, read from the
+    /// owner's own retained terminal event rather than from a log.
+    ///
+    /// A connector that stops closes both of its sockets and the relay may
+    /// notice either first: control first is `CONTROL_CLOSED`, data first is a
+    /// frame that fails to queue and closes the session as
+    /// `REVERSE_CHANNEL_UNAVAILABLE`.  M4-28 published its typed cause for the
+    /// first only, so the second reached this consumer codeless — and the gate
+    /// had no way to say which ordering a green run had exercised, which is
+    /// what let a fix look deterministic on one run each way.  Recording it
+    /// makes a run set checkable: 20 greens that never took the data-first
+    /// ordering would prove nothing about it, and `scripts/m4-gate9-ordering.sh`
+    /// is what turns that into a verdict.
+    pub held_session_teardown_reason: Option<String>,
 
     /// The first session's stream is deregistered at the owner.
     pub held_stream_deregistered: bool,
@@ -446,6 +476,43 @@ pub fn validate_fs_epoch_change_evidence(evidence: &FsEpochChangeEvidence) -> Re
         (
             "the pending call was failed explicitly rather than left hanging".into(),
             evidence.pending_call_closed,
+        ),
+        (
+            // Which ordering this run took is named in the rule so a run set
+            // can be read off the gate's own output.  The rule itself is what
+            // stops the close-code rule below from being satisfiable by a
+            // teardown that is not this event at all: both spellings mean the
+            // device's own transport ended, and anything else reaching here —
+            // a relay shutdown, an authority outage, an owner fence — would
+            // mean the gate had measured some other failure and called it an
+            // epoch change.  It deliberately does **not** require a
+            // particular one of the two: which socket is lost first is a
+            // scheduling race, and demanding one would make this gate flaky
+            // on a legitimate interleaving.
+            //
+            // **This rule runs before the close-code rule, and the order is
+            // load-bearing.** The validator stops at the first failing rule,
+            // so whichever of the two is checked first is the one a red run
+            // reports.  A *third* teardown ordering exists and is deliberately
+            // left unclosed (M4-35): when `disconnect_data` lands first the
+            // session's sender is already gone, the next frame tears it down
+            // as `DEVICE_OFFLINE`, and nothing is published — so that run also
+            // closes the consumer codeless.  With the close-code rule first,
+            // such a run would fail as `expected 1012, observed None`, which
+            // is **byte-identical to the signature M4-35 closed**, and the
+            // next worker would reopen a row that is correctly closed.  Put
+            // the ordering rule first and the same run says
+            // `observed Some("DEVICE_OFFLINE")` instead, which names the
+            // unclosed path rather than impersonating the closed one.
+            format!(
+                "the held session ended because the device's own transport did, by either \
+                 socket (observed {:?})",
+                evidence.held_session_teardown_reason
+            ),
+            matches!(
+                evidence.held_session_teardown_reason.as_deref(),
+                Some(CONTROL_CLOSED_TEARDOWN | REVERSE_CHANNEL_TEARDOWN)
+            ),
         ),
         (
             // The observed code is named in the rule so a failing run says
@@ -1127,6 +1194,18 @@ async fn exercise(
             };
             if gone {
                 evidence.held_stream_deregistered = true;
+                // Which socket the relay noticed losing first, taken from the
+                // owner's own retained terminal event for this exact session
+                // and epoch.  Structured evidence, not a log line: a run set
+                // can then be checked for whether it ever exercised the
+                // ordering that used to fail.
+                evidence.held_session_teardown_reason = snapshot
+                    .session_terminal_events
+                    .iter()
+                    .find(|event| {
+                        event.session_id == session_id && event.epoch == evidence.epoch_before
+                    })
+                    .map(|event| event.reason.to_string());
                 break;
             }
             if Instant::now() >= deadline {
@@ -1298,6 +1377,7 @@ mod tests {
             pending_call_closed: true,
             pending_call_close_code: Some(DEVICE_GONE_CLOSE),
             pending_call_answered: false,
+            held_session_teardown_reason: Some(CONTROL_CLOSED_TEARDOWN.into()),
             held_stream_deregistered: true,
             pre_attach_probe_close_code: Some(PROTOCOL_VIOLATION_CLOSE),
             pre_attach_probe_answered: false,
@@ -1435,6 +1515,20 @@ mod tests {
             ("the held Tread was answered across the epoch change", |e| {
                 e.pending_call_answered = true;
             }),
+            // The ordering evidence.  Its rule accepts either socket, so the
+            // mutations that must reject are a *third* reason and no reason
+            // at all: the first would be some other failure reported as an
+            // epoch change, the second a run that never established the
+            // event happened for the reason this gate is about.
+            (
+                "the held session ended for something other than the device's transport",
+                |e| {
+                    e.held_session_teardown_reason = Some("SHUTDOWN".into());
+                },
+            ),
+            ("no teardown reason was ever observed", |e| {
+                e.held_session_teardown_reason = None;
+            }),
             ("the held stream was never deregistered", |e| {
                 e.held_stream_deregistered = false;
             }),
@@ -1492,6 +1586,59 @@ mod tests {
                 "mutation `{name}` must be rejected: no rule here is decorative"
             );
         }
+    }
+
+    /// The ordering the gate must **tolerate**, asserted rather than left to
+    /// the absence of a mutation.
+    ///
+    /// Which of the device's two sockets the relay notices losing first is a
+    /// scheduling race, so a gate that passed only for `CONTROL_CLOSED` would
+    /// be red on a legitimate interleaving.  The split is not stable even on
+    /// one host: three post-fix sets of 20 took the data-first ordering 11, 8
+    /// and 2 times, which is why this rule accepts either, why the coverage
+    /// check lives in a run set rather than in a run, and why no rate is
+    /// claimed for it.  The mutation list above can only say what must be
+    /// rejected; this says what must be accepted, which is the half a reader
+    /// would otherwise have to infer from silence.  M4-35.
+    #[test]
+    fn either_socket_losing_first_is_the_same_event_to_this_gate() {
+        for reason in [CONTROL_CLOSED_TEARDOWN, REVERSE_CHANNEL_TEARDOWN] {
+            let mut evidence = passing();
+            evidence.held_session_teardown_reason = Some(reason.into());
+            validate_fs_epoch_change_evidence(&evidence)
+                .unwrap_or_else(|error| panic!("`{reason}` must be accepted: {error}"));
+        }
+    }
+
+    /// The **third**, deliberately unclosed teardown ordering must report
+    /// itself, not impersonate the one M4-35 closed.
+    ///
+    /// When `disconnect_data` lands before any frame is queued, the session's
+    /// sender is already gone, the next frame tears it down as
+    /// `DEVICE_OFFLINE`, and nothing is published — so the consumer closes
+    /// codeless and `pending_call_close_code` is `None`, which is **exactly**
+    /// the shape M4-35 was raised for. The validator stops at the first
+    /// failing rule, so the rule order decides which of the two a red run
+    /// reports, and reporting the close code would send the next worker to
+    /// reopen a row that is correctly closed. This pins the order by pinning
+    /// the message: the failure must name the teardown, and must not be the
+    /// `expected 1012` one.
+    #[test]
+    fn the_unclosed_teardown_ordering_names_itself_rather_than_the_closed_signature() {
+        let mut evidence = passing();
+        evidence.held_session_teardown_reason = Some("DEVICE_OFFLINE".into());
+        evidence.pending_call_close_code = None;
+        let error = validate_fs_epoch_change_evidence(&evidence)
+            .expect_err("a teardown this gate does not cover must fail");
+        let reported = error.to_string();
+        assert!(
+            reported.contains("DEVICE_OFFLINE"),
+            "the failure must name the teardown it actually saw, got: {reported}"
+        );
+        assert!(
+            !reported.contains("expected 1012"),
+            "an unclosed ordering must not wear the closed signature, got: {reported}"
+        );
     }
 
     /// The concurrency predicate itself, independent of the rule list: it must

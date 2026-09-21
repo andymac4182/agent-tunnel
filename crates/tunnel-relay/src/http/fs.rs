@@ -684,6 +684,52 @@ fn close_frame(code: SessionErrorCode) -> Option<axum::extract::ws::CloseFrame> 
         })
 }
 
+/// Which arm ended the device→consumer pump.
+///
+/// A diagnostic identifier, not a protocol value: it never reaches the wire and
+/// never carries typed text. It exists because three of the pump's exits leave
+/// the close code as `None`, and without naming the arm an intermittent codeless
+/// close cannot be attributed to one of them from outside the process — which is
+/// exactly where M4-35 started.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PumpExit {
+    /// The actor cancelled this stream — `close_session`, a revocation, or a
+    /// relay shutdown. The cause watch, if the actor published one, is readable.
+    ActorCancelled,
+    /// The consumer's own socket ended, so there is nothing left to forward.
+    InboundDone,
+    /// The consumer's grant reached its expiry while the session was live.
+    GrantExpired,
+    /// The device's carrier ended with no record of why: a FIN or a close on
+    /// the owner's logical stream, which is what a connector that stops its
+    /// process leaves behind.
+    CarrierFin,
+    /// The device's carrier was reset, in order or out of band.
+    CarrierReset,
+    /// The device sent an explicit close record.
+    DeviceClose,
+    /// The device's record framing was refused.
+    CarrierFraming,
+    /// Writing a forwarded message to the consumer failed.
+    ConsumerSendFailed,
+}
+
+impl PumpExit {
+    /// The bounded identifier this arm is logged as.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ActorCancelled => "actor_cancelled",
+            Self::InboundDone => "inbound_done",
+            Self::GrantExpired => "grant_expired",
+            Self::CarrierFin => "carrier_fin",
+            Self::CarrierReset => "carrier_reset",
+            Self::DeviceClose => "device_close",
+            Self::CarrierFraming => "carrier_framing",
+            Self::ConsumerSendFailed => "consumer_send_failed",
+        }
+    }
+}
+
 /// Move bytes between the consumer WebSocket and the owner's logical stream.
 async fn pump(
     socket: WebSocket,
@@ -775,21 +821,41 @@ async fn pump(
     // Device → consumer.
     let mut decoder = RecordDecoder::new();
     let mut close_with: Option<SessionErrorCode> = None;
+    // 9P messages forwarded to the consumer before the pump stopped. A counter,
+    // never a byte of what was forwarded.
+    let mut forwarded: u64 = 0;
     let expires_in = (consumer_expires_at - Utc::now())
         .to_std()
         .unwrap_or_default();
     let expires = tokio::time::sleep(expires_in);
     tokio::pin!(expires);
+    // Which arm ended the device→consumer pump, as a bounded identifier.
+    //
+    // Three of this loop's exits leave `close_with` as `None`, and a close with
+    // no code is indistinguishable at the consumer from any other. M4-28 was
+    // closed on a mechanism nobody could attribute to an arm, and M4-35 then
+    // reported the same signature intermittently: with no record of which arm
+    // ran, a two-in-four race is unattributable from the outside. This is the
+    // record. It carries an identifier, a phase and counters and never a byte
+    // of forwarded traffic.
+    let mut exit_arm = PumpExit::CarrierFin;
     loop {
         let event = tokio::select! {
             biased;
-            () = closed.cancelled() => break,
+            () = closed.cancelled() => {
+                exit_arm = PumpExit::ActorCancelled;
+                break;
+            }
             // The consumer's side ended — cleanly, or on a framing violation
             // this loop must report. Either way there is nothing left to
             // forward, so the session ends here rather than waiting for the
             // device to notice.
-            () = inbound_done.cancelled() => break,
+            () = inbound_done.cancelled() => {
+                exit_arm = PumpExit::InboundDone;
+                break;
+            }
             () = &mut expires => {
+                exit_arm = PumpExit::GrantExpired;
                 close_with = Some(SessionErrorCode::AuthExpired);
                 break;
             }
@@ -798,6 +864,7 @@ async fn pump(
         match event {
             CarrierEvent::Data(bytes) => {
                 if decoder.push(&bytes).is_err() {
+                    exit_arm = PumpExit::CarrierFraming;
                     close_with = Some(SessionErrorCode::ProtocolViolation);
                     break;
                 }
@@ -806,17 +873,21 @@ async fn pump(
                     match decoder.next_record() {
                         Ok(Some(Record::Message(message))) => {
                             if sink.send(Message::Binary(message.into())).await.is_err() {
+                                exit_arm = PumpExit::ConsumerSendFailed;
                                 ended = true;
                                 break;
                             }
+                            forwarded = forwarded.saturating_add(1);
                         }
                         Ok(Some(Record::Close(code))) => {
+                            exit_arm = PumpExit::DeviceClose;
                             close_with = Some(code);
                             ended = true;
                             break;
                         }
                         Ok(None) => break,
                         Err(_) => {
+                            exit_arm = PumpExit::CarrierFraming;
                             close_with = Some(SessionErrorCode::ProtocolViolation);
                             ended = true;
                             break;
@@ -827,8 +898,12 @@ async fn pump(
                     break;
                 }
             }
-            CarrierEvent::Fin | CarrierEvent::Closed => break,
+            CarrierEvent::Fin | CarrierEvent::Closed => {
+                exit_arm = PumpExit::CarrierFin;
+                break;
+            }
             CarrierEvent::Reset(_) => {
+                exit_arm = PumpExit::CarrierReset;
                 close_with = Some(session_close_for_reset(reader.last_reset_reason()));
                 break;
             }
@@ -872,9 +947,11 @@ async fn pump(
     // This runs **after** the peer-reset resolution above, so a revocation
     // still closes 1008 (M4-25) rather than being downgraded, and before the
     // framing verdict below, which outranks everything.
+    let mut cause_present = false;
     if close_with.is_none()
         && let Some(cause) = *terminal_cause.borrow_and_update()
     {
+        cause_present = true;
         close_with = Some(match cause {
             StreamTeardownCause::DeviceGone => SessionErrorCode::DeviceOffline,
         });
@@ -886,6 +963,20 @@ async fn pump(
         close_with = Some(violation);
     }
     signal_task.abort();
+    // The attribution record for this session's close: which arm stopped the
+    // pump, whether a cause was readable when it did, and what code the
+    // consumer is about to be given. Identifiers, phases and counters only.
+    tracing::debug!(
+        device_id = %key.device_id,
+        session_id = %key.session_id,
+        epoch = key.epoch,
+        stream_id,
+        phase = "fs_pump_exit",
+        exit_arm = exit_arm.as_str(),
+        forwarded,
+        cause_present = cause_present,
+        close_code = ?close_with.and_then(SessionErrorCode::close_code),
+    );
     let frame = close_with.and_then(close_frame);
     let _ = sink.send(Message::Close(frame)).await;
     let _ = sink.close().await;

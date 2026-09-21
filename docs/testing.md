@@ -1760,9 +1760,23 @@ recovery failure and a device framing fault are each something else. Keying off
 cancellation alone would have told those consumers "the device is not
 connected" on exactly the opposite ground to the one 1012 is justified by. So
 the actor publishes a typed `StreamTeardownCause` whose only variant is
-`DeviceGone`, published only for `CONTROL_CLOSED` — the single caller that
-means the device's own control session ended — and every other reason publishes
-nothing and keeps the close it already had. Publication precedes
+`DeviceGone`, and every other reason publishes nothing and keeps the close it
+already had.
+
+**Which teardowns qualify, corrected at M4-35.** M4-28 published for
+`CONTROL_CLOSED` alone, and that left the same event arriving codeless
+intermittently: a connector that stops closes **both** of its sockets, and
+which loss the relay notices first is a race. Control first is
+`CONTROL_CLOSED`; **data first** is a frame that fails to queue toward the
+device, which tears the session down as `REVERSE_CHANNEL_UNAVAILABLE` instead.
+Over **24** instrumented runs of this gate every failure carried the second
+reason and every pass the first, at **7 red**. The gate is widened to that
+second teardown but **not** to its reason string: `queue_data` returns the same
+failure when the session's own queue **budget** refuses the bytes, which is the
+relay declining to buffer while the device is healthy. So the publication is
+gated on the *fact* the string is ambiguous about — the carrier's sender is
+closed, so the socket task holding its receiver is finished — and a budget
+refusal still publishes nothing. Publication precedes
 `closed.cancel()`, the same ordering invariant M4-25 established; the
 resolution still runs after the peer-reset resolution so a revocation closes
 1008, and before the framing verdict which outranks everything.
@@ -1775,6 +1789,18 @@ refused with errno **22**, the pre-attach probe closed with **1002**,
 checksum, and exactly **two** `Tattach` across the run. The gate asserts the
 *inequalities* and the codes *derived* from `FsErrorCode::Einval` and
 `SessionErrorCode::close_code()`, never these figures.
+
+**A coverage check that is deliberately not in the registry.**
+`scripts/m4-gate9-ordering.sh` runs this gate N times and reports which
+socket-loss ordering each run took, failing if any run fails and exiting
+**3** — neither pass nor fail — when a set never exercised one of the two.
+It is **on-demand only** and must stay that way: exit 3 is expected on a
+correct tree, so a registry running it would go intermittently red for
+something that is not a defect. The per-run rule inside the gate is the
+part that belongs here, and it is here. Three post-fix sets of 20 took the
+data-first ordering 11, 8 and 2 times, so the default N is 40 rather than
+20: at the low end of that spread a 20-run set misses the ordering about
+one time in eight.
 
 **Guards.** `python3 scripts/fs-guard-deletion.py --suite gate9-epoch-change`
 is **28 of 28** red at this tip, with **one** further case reported as
@@ -1791,8 +1817,10 @@ no write and no `Tflush` has been held across an epoch change. The session runs
 against the **owning** relay, because gate 4 admits a filesystem session only
 there, so nothing here crosses the relay-to-relay peer hop. Nothing here is
 driven by the shared TypeScript client. The `CarrierEvent::Fin` / `CarrierEvent::Closed`
-sibling of the path M4-28 fixed is **not** changed and **not** measured; it is
-recorded on that row rather than altered without evidence.
+sibling of the path M4-28 fixed is **not** changed, and is now **measured as
+not taken**: across **24** instrumented runs of this gate the consumer pump
+left through `closed.cancelled()` every time and through that arm never, so
+giving it a close code would still be a fix without evidence. See M4-35.
 
 ### Implementation gate 11: a 9P session across a failed data socket's replacement (`verify-m4-fs-data-recovery`)
 

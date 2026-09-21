@@ -2192,7 +2192,7 @@ async fn main() -> ExitCode {
                         &evidence,
                     )?;
                     println!(
-                        "M4 filesystem control-epoch change passed: relays={} owner={} subprotocol={} msize={} dialect={} prefix_bytes={} stream_id={} emitted={}->{} recv_contiguous={}->{} request_outstanding_at_change={} change_polls={} held_tag={} epoch={}->{} device_epoch={}->{} session_id_changed={} owner_released_between={} second_connector_active={} pending_call_closed={} pending_call_close_code={:?} pending_call_answered={} held_stream_deregistered={} pre_attach_probe_close_code={:?} pre_attach_probe_answered={} second_session_msize={} stale_file_fid_refused={} stale_file_fid_errno={:?} stale_attach_fid_refused={} stale_attach_fid_errno={:?} second_session_attached={} second_session_bytes={}/{} second_session_checksum_matches={} second_session_messages={} second_session_getattr_size={} attach_count={}",
+                        "M4 filesystem control-epoch change passed: relays={} owner={} subprotocol={} msize={} dialect={} prefix_bytes={} stream_id={} emitted={}->{} recv_contiguous={}->{} request_outstanding_at_change={} change_polls={} held_tag={} epoch={}->{} device_epoch={}->{} session_id_changed={} owner_released_between={} second_connector_active={} pending_call_closed={} pending_call_close_code={:?} pending_call_answered={} held_session_teardown_reason={:?} held_stream_deregistered={} pre_attach_probe_close_code={:?} pre_attach_probe_answered={} second_session_msize={} stale_file_fid_refused={} stale_file_fid_errno={:?} stale_attach_fid_refused={} stale_attach_fid_errno={:?} second_session_attached={} second_session_bytes={}/{} second_session_checksum_matches={} second_session_messages={} second_session_getattr_size={} attach_count={}",
                         evidence.relay_count,
                         evidence.owner_node,
                         evidence.selected_subprotocol,
@@ -2217,6 +2217,7 @@ async fn main() -> ExitCode {
                         evidence.pending_call_closed,
                         evidence.pending_call_close_code,
                         evidence.pending_call_answered,
+                        evidence.held_session_teardown_reason,
                         evidence.held_stream_deregistered,
                         evidence.pre_attach_probe_close_code,
                         evidence.pre_attach_probe_answered,
