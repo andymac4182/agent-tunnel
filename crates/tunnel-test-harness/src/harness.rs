@@ -642,6 +642,23 @@ pub const FS_GATE_SERVICES: &[FsGateService] = &[
         host_supported: true,
     },
     FsGateService {
+        // Gate 13's export: the one a **`Twrite`** is held across a real
+        // process failure on.  It carries `fs:write` for the reason
+        // `process-restart` does — an ambiguous mutation is the whole point,
+        // and a read cannot be ambiguous — and it is its own export for the
+        // reason every row here is, with one that bites harder than usual:
+        // this gate's journal is a *region of a file in this export's own
+        // host directory*, so bytes another case's session could have written
+        // would not merely be confusing, they would be read as this gate's
+        // held write.
+        label: "write-restart",
+        display_name: "Synthetic writable filesystem export whose connector process is killed \
+                       mid-write",
+        operations: &["fs:connect", "fs:read", "fs:write", "fs:list"],
+        case_sensitivity: Some("insensitive-preserving"),
+        host_supported: true,
+    },
+    FsGateService {
         // Implementation gate 5's own export: every capability, so the write
         // grant is the relay's decision rather than the device's, and every
         // mutating primitive the profile defines is reachable on it.

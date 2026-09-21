@@ -169,6 +169,13 @@ mod fs_rotation;
 mod fs_rotation_write;
 mod fs_wire;
 mod fs_write_path;
+/// M4 filesystem gate 13: the **write across a process failure** half of
+/// M4-06's flush clause.  Its own module rather than a case inside gate 10
+/// because gate 10's held operation is a `Tlcreate`, whose effect is a
+/// directory entry and so either happened or did not, and this one holds a
+/// `Twrite`, whose effect is bytes at an offset and **may have applied
+/// partially** — which the contract permits and no other gate classifies.
+mod fs_write_restart;
 pub use fs_consumer_loss::{
     FsConsumerLossEvidence, LossObservation, validate_fs_consumer_loss_evidence,
     verify as verify_fs_consumer_loss,
@@ -198,6 +205,10 @@ pub use fs_rotation_write::{
 };
 pub use fs_write_path::{
     FsWritePathEvidence, validate_fs_write_path_evidence, verify as verify_fs_write_path,
+};
+pub use fs_write_restart::{
+    FsWriteRestartEvidence, WriteRestartObservation, classify_held_outcome,
+    validate_fs_write_restart_evidence, verify as verify_fs_write_restart,
 };
 /// Gate 6's end-to-end half: the real `@agent-tunnel/client`, run by `node`,
 /// against this cluster's real relay and device sockets.

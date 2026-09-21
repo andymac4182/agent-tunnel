@@ -12,6 +12,7 @@ pinned here.
 
 from __future__ import annotations
 
+import subprocess
 import sys
 from pathlib import Path
 
@@ -71,12 +72,14 @@ def main() -> int:
     check("NOTHING went red" in listed[0], "the green is explained, not just echoed")
 
     every_module_filter_is_anchored()
+    every_guard_anchor_resolves_to_exactly_one_occurrence()
 
     print("test_guard_outcomes: PASS")
     return 0
 
 
-EXPECTED_MODULE_FILTERS = 7
+EXPECTED_MODULE_FILTERS = 8
+EXPECTED_GUARD_ANCHORS = 427
 
 
 def every_module_filter_is_anchored() -> None:
@@ -110,6 +113,52 @@ def every_module_filter_is_anchored() -> None:
         f"expected at least {EXPECTED_MODULE_FILTERS} module filters to "
         f"inspect, found {len(seen)} -- the scan matched nothing, so its "
         "silence is not evidence",
+    )
+
+
+def every_guard_anchor_resolves_to_exactly_one_occurrence() -> None:
+    """Hold `fs-guard-deletion.py --check-anchors` as a standing rule.
+
+    The deletion loop already refuses an anchor that matches zero times or
+    more than once -- but only for the cases a given invocation selects, and
+    only after paying a `cargo test` for each.  So the same defect the
+    ambiguity refusal closes for a *selected* case stayed open for an
+    unselected one: a guard whose anchor had rotted in a suite nobody happened
+    to run was invisible until someone ran it, and the full script does not
+    fit in one session.  `--check-anchors` resolves every anchor in every
+    suite against the tree and builds nothing, so it can run here every time.
+
+    It also refuses a case name that two adjacent string literals joined
+    without a space -- display-only, but it makes the suite's output stop
+    matching the rule the gate prints when it fails, and a name is not a
+    dictionary word, so nothing downstream of the join can detect it.
+    """
+    script = Path(__file__).resolve().parent / "fs-guard-deletion.py"
+    result = subprocess.run(
+        [sys.executable, str(script), "--check-anchors"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    check(
+        result.returncode == 0,
+        "fs-guard-deletion --check-anchors failed:\n"
+        f"{result.stdout}{result.stderr}",
+    )
+    # The same vacuity trap as the filter scan above: a `--check-anchors` that
+    # silently selected nothing would exit 0 and prove nothing, so require the
+    # run to say how much it actually looked at.
+    check(
+        "checked " in result.stdout and " anchors across " in result.stdout,
+        "--check-anchors did not report how many anchors it checked, so its "
+        f"exit code is not evidence: {result.stdout!r}",
+    )
+    checked = int(result.stdout.split("checked ", 1)[1].split(" anchors", 1)[0])
+    check(
+        checked >= EXPECTED_GUARD_ANCHORS,
+        f"expected at least {EXPECTED_GUARD_ANCHORS} anchors to be checked, "
+        f"found {checked} -- the scan selected almost nothing, so its silence "
+        "is not evidence",
     )
 
 

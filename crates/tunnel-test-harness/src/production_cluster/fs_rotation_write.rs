@@ -174,7 +174,7 @@ const READ_COUNT: u32 = OFFERED_MSIZE - tunnel_fs_ninep::COUNTED_REPLY_OVERHEAD;
 /// and "the payload landed" can never be confused.  That disjointness is the
 /// whole basis of this gate's outside-the-connector classification and is held
 /// directly by `payload_and_filler_can_never_be_confused`.
-const FILLER_BYTE: u8 = 0x00;
+pub(super) const FILLER_BYTE: u8 = 0x00;
 
 /// The seeded size of the file both writes land in.
 ///
@@ -647,7 +647,7 @@ fn classify_ambiguity(evidence: &FsRotationWriteEvidence) -> bool {
 /// dropped or duplicated block changes the checksum; the high bit is what
 /// makes every byte differ from [`FILLER_BYTE`], which is the property
 /// [`classify_region`] depends on.
-fn payload_bytes(len: usize) -> Vec<u8> {
+pub(super) fn payload_bytes(len: usize) -> Vec<u8> {
     (0..len).map(|index| ((index % 251) as u8) | 0x80).collect()
 }
 
@@ -666,7 +666,7 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 ///
 /// Three answers, not two: a partially applied write is [`RegionState::Torn`]
 /// and is never folded into either of the others.
-fn classify_region(image: &[u8], offset: u64, payload: &[u8]) -> RegionState {
+pub(super) fn classify_region(image: &[u8], offset: u64, payload: &[u8]) -> RegionState {
     let Ok(start) = usize::try_from(offset) else {
         return RegionState::Unreadable;
     };
