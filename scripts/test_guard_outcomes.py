@@ -76,7 +76,7 @@ def main() -> int:
     return 0
 
 
-EXPECTED_MODULE_FILTERS = 7
+EXPECTED_MODULE_FILTERS = 8
 
 
 def every_module_filter_is_anchored() -> None:

@@ -48,4 +48,7 @@ gate "M4 filesystem gate 10: a 9P mutation outstanding while the connector's rea
 gate "M4 filesystem gate 12: a Twrite and a Tflush held across two real scheduled rotations, classified from the export's own host directory" \
   cargo run --locked -p tunnel-test-harness -- verify-m4-fs-rotation-write
 
+gate "M4 filesystem gate 13: a Twrite held across a real connector process failure, classified as an unknown outcome the caller may not retry" \
+  cargo run --locked -p tunnel-test-harness -- verify-m4-fs-write-restart
+
 echo "m4-harness-verify: implemented M4 harness suite passed" >&2

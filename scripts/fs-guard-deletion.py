@@ -37,6 +37,11 @@ of `docs/filesystem-api.md`.  Two suites live here:
 * `gate10-process-restart` — the validator of the gate that holds a 9P
   mutation outstanding while the connector's real process is killed, and reads
   the effect count back out of a journal that outlives it.
+* `gate13-write-restart` — the validator of the gate that holds a **`Twrite`**
+  outstanding while the connector's real process is killed, and classifies the
+  bytes it left behind from the export's own host file.  Its region predicate
+  admits a **torn** write, which the contract permits and gate 10's
+  directory-entry effect cannot express.
 * `gate11-data-recovery` — the validator of the gate that holds a 9P read
   outstanding while the device's data socket is destroyed at the transport and
   the product's own retained recovery replaces it.  Measured the same way, and
@@ -2444,6 +2449,9 @@ HARNESS_RECOVERY = HARNESS / "src" / "production_cluster" / "fs_data_recovery.rs
 HARNESS_ROTATION_WRITE = (
     HARNESS / "src" / "production_cluster" / "fs_rotation_write.rs"
 )
+HARNESS_WRITE_RESTART = (
+    HARNESS / "src" / "production_cluster" / "fs_write_restart.rs"
+)
 
 # Gate 6's end-to-end half is a **cluster** gate: it needs Redis, three relays,
 # a device connector and `node`, and it takes minutes.  That is not a shape this
@@ -4837,6 +4845,467 @@ GATE12_ROTATION_WRITE_CASES: list[tuple[str, list[Edit]]] = [
 ]
 
 
+
+# `gate13-write-restart` — the validator of the gate that holds a **`Twrite`**
+# outstanding while the connector's real operating-system process is killed and
+# replaced.  Like every gate from `gate7-rotation` on this is a cluster run that
+# cannot be repeated once per case, so what is measured is its **rule list**
+# against the mutation table in the same file, and the edits replace a condition
+# with `true` because the rule list is a fixed-length array whose entries cannot
+# be removed without stopping the crate compiling.
+#
+# This suite exists apart from `gate10-process-restart` for the reason the
+# module does.  Gate 10's held operation is a `Tlcreate`, whose effect is a
+# directory entry: it happened or it did not.  This one's is a `Twrite`, whose
+# effect is bytes at an offset and which `docs/filesystem-api.md` explicitly
+# permits to **apply partially**.  So the cases that carry this gate are the
+# ones gate 10 has no vocabulary for:
+#
+#   * `the held write had reached the device ...`, whose predicate admits
+#     `Written` **and** `Torn`.  Tightening it to `Written` would assert a
+#     promise the contract withholds, and
+#     `a_torn_held_region_is_accepted_by_every_rule_that_reads_it` is the unit
+#     test that goes red if anyone does;
+#   * `the bytes the kill left behind were neither completed nor rolled back
+#     ...`, which is "does not blindly resubmit the operation in the new
+#     session" observed on the effect surface rather than on a reply; and
+#   * `the held write classifies as an unknown outcome`, where the caller's
+#     entitlement is the same for a torn region as for a whole one because
+#     `Outcome::Partial` is defined in terms of an *acknowledged* effect and
+#     this caller was acknowledged nothing.
+#
+# No `!is_settled()` companion rule is listed here because none is written:
+# that is the rule gate 10 removed as unable to fail, and the library property
+# is held directly by `an_unknown_outcome_is_not_settled_and_a_failed_one_is`.
+GATE13_WRITE_RESTART_TEST = [
+    "cargo",
+    "test",
+    "--offline",
+    "-p",
+    "tunnel-test-harness",
+    "--lib",
+    "--locked",
+    "production_cluster::fs_write_restart::",
+]
+
+GATE13_WRITE_RESTART_CASES: list[tuple[str, list[Edit]]] = [
+    (
+        "the production cluster ran three relays",
+        [
+            (
+                HARNESS_WRITE_RESTART,
+                "            evidence.relay_count == 3,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the owning relay was identified",
+        [
+            (
+                HARNESS_WRITE_RESTART,
+                "            !evidence.owner_node.is_empty(),",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the server selected the filesystem subprotocol",
+        [
+            (
+                HARNESS_WRITE_RESTART,
+                "            evidence.selected_subprotocol == SUBPROTOCOL,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "Tversion negotiated the 9P2000.L dialect",
+        [
+            (
+                HARNESS_WRITE_RESTART,
+                "            evidence.negotiated_dialect == DIALECT,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "Tversion negotiated a bounded msize",
+        [
+            (
+                HARNESS_WRITE_RESTART,
+                "            evidence.negotiated_msize > 0 && evidence.negotiated_msize <= OFFERED_MSIZE,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the session served a real read before anything was perturbed",
+        [
+            (
+                HARNESS_WRITE_RESTART,
+                "            evidence.prefix_bytes > 0,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the host file discriminated a written region from an untouched one, in bothdirections, before the event",
+        [
+            (
+                HARNESS_WRITE_RESTART,
+                "            evidence.journal_discriminated_both_directions(),",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the relay had dispatched a 9P record toward the device when the process was killed",
+        [
+            (
+                HARNESS_WRITE_RESTART,
+                "            evidence.restart.emitted_at_kill > evidence.restart.emitted_before,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the relay had received no answer to that record when the process was killed: theTwrite was outstanding across the restart",
+        [
+            (
+                HARNESS_WRITE_RESTART,
+                "            evidence.request_outstanding_at_kill && evidence.restart.request_outstanding_at_kill(),",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "a stream was identified for the held exchange",
+        [
+            (
+                HARNESS_WRITE_RESTART,
+                "            evidence.restart.stream_id > 0,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the held write had reached the device before the process was killed, so the lostanswer is an unknown and not a refusal that never dispatched",
+        [
+            (
+                HARNESS_WRITE_RESTART,
+                "            evidence.held_write_reached_the_device(),",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "a first connector process was identified",
+        [
+            (
+                HARNESS_WRITE_RESTART,
+                "            evidence.first_pid > 0,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the first connector process exited",
+        [
+            (
+                HARNESS_WRITE_RESTART,
+                "            evidence.first_process_exited,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the first connector process was killed rather than stopped gracefully",
+        [
+            (
+                HARNESS_WRITE_RESTART,
+                "            evidence.first_process_killed_by_signal,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the replacement is a different process",
+        [
+            (
+                HARNESS_WRITE_RESTART,
+                "            evidence.second_pid > 0 && evidence.second_pid != evidence.first_pid,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the replacement process served the device",
+        [
+            (
+                HARNESS_WRITE_RESTART,
+                "            evidence.second_process_active,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the owner was released between the two processes",
+        [
+            (
+                HARNESS_WRITE_RESTART,
+                "            evidence.owner_released_between,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the replacement claim took a strictly greater epoch",
+        [
+            (
+                HARNESS_WRITE_RESTART,
+                "            evidence.epoch_after > evidence.epoch_before,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "an epoch was actually observed before the restart",
+        [
+            (
+                HARNESS_WRITE_RESTART,
+                "            evidence.epoch_before > 0,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the device session identity changed across the restart",
+        [
+            (
+                HARNESS_WRITE_RESTART,
+                "            !evidence.session_id_before.is_empty()\n"
+                "                && !evidence.session_id_after.is_empty()\n"
+                "                && evidence.session_id_before != evidence.session_id_after,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the pending call was failed rather than left hanging",
+        [
+            (
+                HARNESS_WRITE_RESTART,
+                "            evidence.pending_call_closed,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the pending call was failed explicitly, with a close code",
+        [
+            (
+                HARNESS_WRITE_RESTART,
+                "            evidence.pending_call_close_code == Some(DEVICE_GONE_CLOSE),",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the pending call was not served a normal reply from a session the contractinvalidates",
+        [
+            (
+                HARNESS_WRITE_RESTART,
+                "            !evidence.pending_call_answered,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "a write the host file proves reached the device was not reported to the caller as anerror, which is a settled outcome a caller may resubmit after",
+        [
+            (
+                HARNESS_WRITE_RESTART,
+                "            !evidence.pending_call_errored,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the held write classifies as an unknown outcome",
+        [
+            (
+                HARNESS_WRITE_RESTART,
+                "            evidence.held_call_outcome == Some(Outcome::Unknown),",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the held exchange's stream was deregistered at the owner",
+        [
+            (
+                HARNESS_WRITE_RESTART,
+                "            evidence.held_stream_deregistered,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the bytes the kill left behind were neither completed nor rolled back by therestart or by a caller's retry",
+        [
+            (
+                HARNESS_WRITE_RESTART,
+                "            evidence.region_unchanged_since_the_kill(),",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the earlier session's file fid is unbound after the restart",
+        [
+            (
+                HARNESS_WRITE_RESTART,
+                "            evidence.stale_file_fid_refused,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the stale file fid refusal carried the errno for a fid this session never allocated",
+        [
+            (
+                HARNESS_WRITE_RESTART,
+                "            evidence.stale_file_fid_errno == Some(UNKNOWN_FID_ERRNO),",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "a caller that retries the write anyway is refused above the dispatch boundary",
+        [
+            (
+                HARNESS_WRITE_RESTART,
+                "            evidence.retry_refused_above_dispatch,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "that retry was refused for its fid and never reached the provider",
+        [
+            (
+                HARNESS_WRITE_RESTART,
+                "            evidence.retry_refusal_errno == Some(UNKNOWN_FID_ERRNO),",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the host file was exactly its seeded length",
+        [
+            (
+                HARNESS_WRITE_RESTART,
+                "            evidence.image_bytes == evidence.image_expected_bytes\n"
+                "                && evidence.image_expected_bytes == TARGET_FILE_BYTES,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "no byte outside the held region changed",
+        [
+            (
+                HARNESS_WRITE_RESTART,
+                "            evidence.image_outside_held_region_matches,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the replacement session negotiated a bounded msize",
+        [
+            (
+                HARNESS_WRITE_RESTART,
+                "            evidence.second_session_msize > 0 && evidence.second_session_msize <= OFFERED_MSIZE,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the replacement session established its own root",
+        [
+            (
+                HARNESS_WRITE_RESTART,
+                "            evidence.second_session_attached,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the replacement session read the whole file back",
+        [
+            (
+                HARNESS_WRITE_RESTART,
+                "            evidence.second_session_bytes == evidence.second_session_expected_bytes\n"
+                "                && evidence.second_session_expected_bytes == TARGET_FILE_BYTES,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "that transfer needed many messages rather than one",
+        [
+            (
+                HARNESS_WRITE_RESTART,
+                "            evidence.second_session_messages > MIN_READ_MESSAGES,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the export's own view of the file is byte for byte the host's",
+        [
+            (
+                HARNESS_WRITE_RESTART,
+                "            evidence.ninep_image_matches_host,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the export classifies the held region exactly as the host does",
+        [
+            (
+                HARNESS_WRITE_RESTART,
+                "            evidence.held_region_over_ninep == evidence.held_region_before_kill,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the file is the size it always was",
+        [
+            (
+                HARNESS_WRITE_RESTART,
+                "            evidence.second_session_getattr_size == TARGET_FILE_BYTES as u64,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "exactly one Tattach per attached session, and never a reconstructed one",
+        [
+            (
+                HARNESS_WRITE_RESTART,
+                "            evidence.attach_count == 2,",
+                "            true,",
+            )
+        ],
+    ),
+]
+
+
 SUITES: list[Suite] = [
     Suite("gate2", [CRATE], CARGO_TEST, GATE2_CASES),
     Suite(
@@ -4891,6 +5360,12 @@ SUITES: list[Suite] = [
         [HARNESS / "src"],
         GATE12_ROTATION_WRITE_TEST,
         GATE12_ROTATION_WRITE_CASES,
+    ),
+    Suite(
+        "gate13-write-restart",
+        [HARNESS / "src"],
+        GATE13_WRITE_RESTART_TEST,
+        GATE13_WRITE_RESTART_CASES,
     ),
 ]
 
@@ -5037,8 +5512,9 @@ def main() -> int:
         help=(
             "run only this suite (gate2, gate3, gate4, gate5, "
             "gate6-adapters, gate6-e2e, gate7-rotation, gate8-consumer-loss, "
-            "gate9-epoch-change, gate10-process-restart or "
-            "gate11-data-recovery); "
+            "gate9-epoch-change, gate10-process-restart, "
+            "gate11-data-recovery, gate12-rotation-write or "
+            "gate13-write-restart); "
             "default is all"
         ),
     )

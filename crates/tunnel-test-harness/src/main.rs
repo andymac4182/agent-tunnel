@@ -2321,6 +2321,83 @@ async fn main() -> ExitCode {
                 )),
             }
         }
+        [command] if command == "verify-m4-fs-write-restart" => {
+            match tokio::time::timeout(
+                Duration::from_secs(360),
+                tunnel_test_harness::production_cluster::verify_fs_write_restart(),
+            )
+            .await
+            {
+                Ok(result) => result.and_then(|evidence| {
+                    // Re-validate at the command boundary so a validator
+                    // regression cannot silently pass the command.
+                    tunnel_test_harness::production_cluster::validate_fs_write_restart_evidence(
+                        &evidence,
+                    )?;
+                    println!(
+                        "M4 filesystem write restart passed: relays={} owner={} subprotocol={} msize={} dialect={} prefix_bytes={} held_region_before_send={} prefix_region_after_write={} prefix_acknowledged_bytes={} stream={} emitted={}->{} recv_contiguous={}->{} request_outstanding_at_kill={} restart_polls={} held_tag={} held_region_before_kill={} torn_observed_before_kill={} journal_polls={} first_pid={} first_process_exited={} first_process_killed_by_signal={} second_pid={} second_process_active={} epoch={}->{} session={}->{} owner_released_between={} pending_call_closed={} pending_call_close_code={:?} pending_call_answered={} pending_call_errored={} held_call_outcome={:?} held_stream_deregistered={} held_region_after_restart={} stale_file_fid_refused={} stale_file_fid_errno={:?} retry_refused_above_dispatch={} retry_refusal_errno={:?} held_region_after_retry={} image_bytes={}/{} image_outside_held_region_matches={} second_session_msize={} second_session_attached={} held_region_over_ninep={} ninep_image_matches_host={} second_session_bytes={}/{} second_session_messages={} second_session_getattr_size={} attach_count={}",
+                        evidence.relay_count,
+                        evidence.owner_node,
+                        evidence.selected_subprotocol,
+                        evidence.negotiated_msize,
+                        evidence.negotiated_dialect,
+                        evidence.prefix_bytes,
+                        evidence.held_region_before_send.as_str(),
+                        evidence.prefix_region_after_write.as_str(),
+                        evidence.prefix_acknowledged_bytes,
+                        evidence.restart.stream_id,
+                        evidence.restart.emitted_before,
+                        evidence.restart.emitted_at_kill,
+                        evidence.restart.recv_contiguous_before,
+                        evidence.restart.recv_contiguous_at_kill,
+                        evidence.request_outstanding_at_kill,
+                        evidence.restart_polls,
+                        evidence.held_tag,
+                        evidence.held_region_before_kill.as_str(),
+                        evidence.torn_observed_before_kill,
+                        evidence.journal_polls,
+                        evidence.first_pid,
+                        evidence.first_process_exited,
+                        evidence.first_process_killed_by_signal,
+                        evidence.second_pid,
+                        evidence.second_process_active,
+                        evidence.epoch_before,
+                        evidence.epoch_after,
+                        evidence.session_id_before,
+                        evidence.session_id_after,
+                        evidence.owner_released_between,
+                        evidence.pending_call_closed,
+                        evidence.pending_call_close_code,
+                        evidence.pending_call_answered,
+                        evidence.pending_call_errored,
+                        evidence.held_call_outcome.map(tunnel_fs_core::Outcome::as_str),
+                        evidence.held_stream_deregistered,
+                        evidence.held_region_after_restart.as_str(),
+                        evidence.stale_file_fid_refused,
+                        evidence.stale_file_fid_errno,
+                        evidence.retry_refused_above_dispatch,
+                        evidence.retry_refusal_errno,
+                        evidence.held_region_after_retry.as_str(),
+                        evidence.image_bytes,
+                        evidence.image_expected_bytes,
+                        evidence.image_outside_held_region_matches,
+                        evidence.second_session_msize,
+                        evidence.second_session_attached,
+                        evidence.held_region_over_ninep.as_str(),
+                        evidence.ninep_image_matches_host,
+                        evidence.second_session_bytes,
+                        evidence.second_session_expected_bytes,
+                        evidence.second_session_messages,
+                        evidence.second_session_getattr_size,
+                        evidence.attach_count,
+                    );
+                    Ok(())
+                }),
+                Err(_) => Err(HarnessError::Timeout(
+                    "verify-m4-fs-write-restart exceeded its bounded deadline".into(),
+                )),
+            }
+        }
         [command] if command == "verify-m4-fs-client-e2e" => {
             match tokio::time::timeout(
                 Duration::from_secs(600),
