@@ -1346,9 +1346,16 @@ async fn exercise(
 mod tests {
     use super::*;
 
-    /// Exactly the evidence the real run produced at this tip, so the
-    /// validator's bounds are calibrated against a measured gate rather than
-    /// against numbers chosen to satisfy them.
+    /// Exactly the evidence `verify-m4-fs-rotation-write` printed on a real
+    /// run at this tip, so the validator's bounds are calibrated against a
+    /// measured gate rather than against numbers chosen to satisfy them.
+    ///
+    /// **The cursor and fence numbers here are a transcript, not a property.**
+    /// They vary run to run — gate 7 was corrected for pinning one run's
+    /// "fence 12 against cursor 10" as though it were a rule — so nothing in
+    /// the validator reads them as values.  What is asserted is the
+    /// inequality, through
+    /// [`FreezeObservation::exchange_in_flight_at_freeze`].
     fn passing() -> FsRotationWriteEvidence {
         FsRotationWriteEvidence {
             relay_count: 3,
@@ -1364,16 +1371,16 @@ mod tests {
                 stream_id: 1,
                 phase: "quiescing".into(),
                 attempt_active: true,
-                connector_fence: Some(9),
-                relay_recv_contiguous: 8,
+                connector_fence: Some(6),
+                relay_recv_contiguous: 5,
                 relay_fence: None,
                 old_generation: 1,
                 candidate_generation: Some(2),
                 writer_barriers_flushed: [false, true],
             },
             write_exchange_in_flight_at_freeze: true,
-            write_freeze_polls: 131,
-            held_write_tag: 4,
+            write_freeze_polls: 286,
+            held_write_tag: 5,
             held_write_reply_tag_matched: true,
             held_write_reply_was_rwrite: true,
             held_write_acknowledged_bytes: HELD_PAYLOAD_BYTES,
@@ -1385,17 +1392,17 @@ mod tests {
             image_checksum_matches: true,
             flush_freeze: FreezeObservation {
                 stream_id: 1,
-                phase: "draining".into(),
+                phase: "quiescing".into(),
                 attempt_active: true,
-                connector_fence: Some(21),
-                relay_recv_contiguous: 15,
+                connector_fence: Some(8),
+                relay_recv_contiguous: 6,
                 relay_fence: None,
                 old_generation: 2,
                 candidate_generation: Some(3),
                 writer_barriers_flushed: [false, true],
             },
             flush_exchange_in_flight_at_freeze: true,
-            flush_freeze_polls: 96,
+            flush_freeze_polls: 294,
             flush_tag: 15,
             flushed_victim_tag: 14,
             rflush_observed: true,
