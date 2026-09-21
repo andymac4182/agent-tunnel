@@ -1963,6 +1963,90 @@ async fn main() -> ExitCode {
                 )),
             }
         }
+        [command] if command == "verify-m4-fs-rotation-write" => {
+            match tokio::time::timeout(
+                Duration::from_secs(480),
+                tunnel_test_harness::production_cluster::verify_fs_rotation_write(),
+            )
+            .await
+            {
+                Ok(result) => result.and_then(|evidence| {
+                    // Re-validate at the command boundary so a validator
+                    // regression cannot silently pass the command.
+                    tunnel_test_harness::production_cluster::validate_fs_rotation_write_evidence(
+                        &evidence,
+                    )?;
+                    println!(
+                        "M4 filesystem rotation write passed: relays={} owner={} subprotocol={} msize={} dialect={} held_region_before_send={} prefix_region_after_write={} prefix_acknowledged_bytes={} held_region_before_freeze={} write_freeze_phase={} write_freeze_attempt_active={} write_freeze_connector_fence={:?} write_freeze_relay_recv_contiguous={} write_freeze_relay_fence={:?} write_freeze_old_generation={} write_freeze_candidate_generation={:?} write_freeze_writer_barriers={:?} write_exchange_in_flight_at_freeze={} write_freeze_polls={} held_write_tag={} held_write_reply_tag_matched={} held_write_reply_was_rwrite={} held_write_acknowledged_bytes={} held_write_answered={} held_write_ambiguous={} held_region_after_rotation={} image_bytes={}/{} image_checksum_matches={} flush_freeze_phase={} flush_freeze_attempt_active={} flush_freeze_connector_fence={:?} flush_freeze_relay_recv_contiguous={} flush_freeze_relay_fence={:?} flush_freeze_old_generation={} flush_freeze_candidate_generation={:?} flush_freeze_writer_barriers={:?} flush_exchange_in_flight_at_freeze={} flush_freeze_polls={} flush_tag={} flushed_victim_tag={} rflush_observed={} flushed_victim_reply_observed={} flushed_replies_after_rflush={} flush_pipeline_replies={} rotations_completed={}->{}->{} generation={}->{} epoch={}->{} total_replayed_frames={} deadline_forced_retirement={} rotation_recovery_reason={:?} session_id_stable={} epoch_stable={} fid_survived_read={} fid_read_back_matches_payload={} post_rotation_tag_correlated={} attach_count={}",
+                        evidence.relay_count,
+                        evidence.owner_node,
+                        evidence.selected_subprotocol,
+                        evidence.negotiated_msize,
+                        evidence.negotiated_dialect,
+                        evidence.held_region_before_send.as_str(),
+                        evidence.prefix_region_after_write.as_str(),
+                        evidence.prefix_acknowledged_bytes,
+                        evidence.held_region_before_freeze.as_str(),
+                        evidence.write_freeze.phase,
+                        evidence.write_freeze.attempt_active,
+                        evidence.write_freeze.connector_fence,
+                        evidence.write_freeze.relay_recv_contiguous,
+                        evidence.write_freeze.relay_fence,
+                        evidence.write_freeze.old_generation,
+                        evidence.write_freeze.candidate_generation,
+                        evidence.write_freeze.writer_barriers_flushed,
+                        evidence.write_exchange_in_flight_at_freeze,
+                        evidence.write_freeze_polls,
+                        evidence.held_write_tag,
+                        evidence.held_write_reply_tag_matched,
+                        evidence.held_write_reply_was_rwrite,
+                        evidence.held_write_acknowledged_bytes,
+                        evidence.held_write_answered,
+                        evidence.held_write_ambiguous,
+                        evidence.held_region_after_rotation.as_str(),
+                        evidence.image_bytes,
+                        evidence.image_expected_bytes,
+                        evidence.image_checksum_matches,
+                        evidence.flush_freeze.phase,
+                        evidence.flush_freeze.attempt_active,
+                        evidence.flush_freeze.connector_fence,
+                        evidence.flush_freeze.relay_recv_contiguous,
+                        evidence.flush_freeze.relay_fence,
+                        evidence.flush_freeze.old_generation,
+                        evidence.flush_freeze.candidate_generation,
+                        evidence.flush_freeze.writer_barriers_flushed,
+                        evidence.flush_exchange_in_flight_at_freeze,
+                        evidence.flush_freeze_polls,
+                        evidence.flush_tag,
+                        evidence.flushed_victim_tag,
+                        evidence.rflush_observed,
+                        evidence.flushed_victim_reply_observed,
+                        evidence.flushed_replies_after_rflush,
+                        evidence.flush_pipeline_replies,
+                        evidence.rotations_completed_before,
+                        evidence.rotations_completed_after_write,
+                        evidence.rotations_completed_after_flush,
+                        evidence.generation_before,
+                        evidence.generation_after,
+                        evidence.epoch_before,
+                        evidence.epoch_after,
+                        evidence.total_replayed_frames,
+                        evidence.deadline_forced_retirement,
+                        evidence.rotation_recovery_reason,
+                        evidence.session_id_stable,
+                        evidence.epoch_stable,
+                        evidence.fid_survived_read,
+                        evidence.fid_read_back_matches_payload,
+                        evidence.post_rotation_tag_correlated,
+                        evidence.attach_count,
+                    );
+                    Ok(())
+                }),
+                Err(_) => Err(HarnessError::Timeout(
+                    "verify-m4-fs-rotation-write exceeded its bounded deadline".into(),
+                )),
+            }
+        }
         [command] if command == "verify-m4-fs-consumer-loss" => {
             match tokio::time::timeout(
                 Duration::from_secs(360),

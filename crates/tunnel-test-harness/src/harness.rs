@@ -629,6 +629,19 @@ pub const FS_GATE_SERVICES: &[FsGateService] = &[
         host_supported: true,
     },
     FsGateService {
+        // Gate 12's export: the one a **mutation** and a **`Tflush`** are held
+        // across a real scheduled rotation on.  It carries `fs:write` where
+        // `rotation` does not, and it is its own export for the same reason
+        // every other row here is: gate 7 holds a read on `rotation` in the
+        // same suite, and bytes that appear in this export's host directory
+        // must not be creditable to that session.
+        label: "rotation-write",
+        display_name: "Synthetic writable filesystem export held across a rotation",
+        operations: &["fs:connect", "fs:read", "fs:write", "fs:list"],
+        case_sensitivity: Some("insensitive-preserving"),
+        host_supported: true,
+    },
+    FsGateService {
         // Implementation gate 5's own export: every capability, so the write
         // grant is the relay's decision rather than the device's, and every
         // mutating primitive the profile defines is reachable on it.
