@@ -289,6 +289,16 @@ const JOURNAL_WAIT: Duration = Duration::from_secs(30);
 /// rather than hang to the scenario deadline.  That is gate 12's rule for when
 /// a read must be bounded, and it applies here for the same reason.
 const PENDING_CALL_WAIT: Duration = Duration::from_secs(30);
+/// The status the public consumer route answers while the cluster has not
+/// finished admitting a device session.
+///
+/// Derived, not pinned: it is the status the relay's own not-ready outcome
+/// carries, read out of the crate rather than written here as a literal.
+const CLUSTER_NOT_READY_STATUS: u16 = http::StatusCode::SERVICE_UNAVAILABLE.as_u16();
+/// How long the replacement session waits out that not-ready window.
+///
+/// A **setup** bound, not an evidence bound: see [`open_session_when_ready`].
+const READY_WAIT: Duration = Duration::from_secs(30);
 /// The poll interval for every bounded wait here.
 const POLL: Duration = Duration::from_millis(20);
 /// The whole scenario's bound.
@@ -943,6 +953,50 @@ async fn open_session(
     Ok((session, msize, selected))
 }
 
+/// Open one consumer 9P session, waiting out the cluster's own not-ready
+/// window.
+///
+/// **This is setup, not evidence, and it is deliberately narrow.**  The owner
+/// claim landing in the catalog and the replacement device session reaching
+/// `active` at the owner are not the same instant as the public consumer route
+/// being willing to upgrade onto it, and a second run of this gate caught the
+/// gap: the replacement session's upgrade was refused
+/// [`CLUSTER_NOT_READY_STATUS`] while every cluster fact the gate had already
+/// recorded said the restart had completed.  That is a race in the *gate's*
+/// sequencing, not a finding about the product, and reporting it as a finding
+/// would be evidence that proves something other than what it claims.
+///
+/// Only [`CLUSTER_NOT_READY_STATUS`] is retried, and only until
+/// [`READY_WAIT`] expires — every other status fails immediately and the
+/// expiry fails naming the status, so a route that is genuinely refusing this
+/// consumer can never be waited into silence.
+async fn open_session_when_ready(
+    target: &Target,
+    ca: &[u8],
+    token: &str,
+) -> Result<(NinepClient, u32, String)> {
+    let deadline = Instant::now() + READY_WAIT;
+    loop {
+        match NinepClient::connect(target, ca, token, Some(SUBPROTOCOL)).await {
+            Ok(mut session) => {
+                let selected = session.selected_subprotocol().to_owned();
+                let (msize, dialect) = session.version(OFFERED_MSIZE).await?;
+                let _ = dialect;
+                return Ok((session, msize, selected));
+            }
+            Err(UpgradeFailure::Status { status, .. })
+                if status == CLUSTER_NOT_READY_STATUS && Instant::now() < deadline => {}
+            Err(UpgradeFailure::Status { status, .. }) => {
+                return Err(HarnessError::Http(format!(
+                    "the filesystem upgrade was refused with HTTP status {status}"
+                )));
+            }
+            Err(UpgradeFailure::Harness(error)) => return Err(error),
+        }
+        sleep(POLL).await;
+    }
+}
+
 /// Wait for the catalog to report an owner claim for this device whose epoch is
 /// strictly greater than `floor`, and return its epoch and session id.
 async fn wait_owner_epoch_above(
@@ -1556,7 +1610,7 @@ async fn exercise(
     // Session two: the contract clause, against the **new process**, on a
     // session that reuses the same fid numbers so a leak would show.
     // ---------------------------------------------------------------------
-    let (mut second, second_msize, _) = open_session(&target, &ca, &token).await?;
+    let (mut second, second_msize, _) = open_session_when_ready(&target, &ca, &token).await?;
     evidence.second_session_msize = second_msize;
 
     // This session attaches on its **own** root fid, so it holds a working root
