@@ -24,22 +24,23 @@
 //! click lands twice. The restart tells us nothing about whether the click
 //! happened; that is precisely what makes it [`Completion::Unknown`].
 //!
-//! # Layer 1 is a decision, and it is not yet on the dispatch path
+//! # Layer 1 is now on the dispatch path — and what it took to get there
 //!
-//! **Said plainly, because the branch's own measurement makes it easy to
-//! assume otherwise.** [`restart_outcome`] has no production caller. Nothing
-//! in `tunnel-cua-fixture`'s dispatch client consults it, so the outcome a
-//! real restart-mid-operation produces today comes from the **transport**
-//! layer noticing the connection die — `Completion::Unknown(TransportLost)` —
-//! and not from `Unknown(BackendRestarted)`.
+//! [`restart_outcome`] spent one chunk as a decision nothing consulted, so a
+//! real restart-mid-operation was answered by the **transport** noticing the
+//! connection die — `Completion::Unknown(TransportLost)` — rather than by the
+//! supervisor naming the restart. The contract held throughout, which is why
+//! that was a gap in *attribution* and not in behaviour: `TransportLost` is
+//! equally `Dispatched`, equally `Unknown`, and equally non-retryable for
+//! every operation. What was missing was the **named reason**.
 //!
-//! The *contract* still holds on that path, which is why this is a gap in
-//! attribution rather than in behaviour: `TransportLost` is equally
-//! `Dispatched`, equally `Unknown`, and equally non-retryable for every
-//! operation. What is missing is the **named reason**, and with it the ability
-//! of a diagnostic to say *why* the outcome is unknown. Wiring it needs the
-//! dispatcher to observe the backend generation across an exchange and compare
-//! it afterwards; that is `docs/tasks.md` M5-C10, and it is open.
+//! [`attribute_restart`] closes it (`docs/tasks.md` M5-C10), and the way it
+//! does so is not the way that row's acceptance described. **That wording —
+//! observe the [`BackendGeneration`] across an exchange — is racy and would
+//! never have fired**, because that counter advances inside the supervisor's
+//! *start*, strictly after the old child is killed, while the exchange reads
+//! its "after" value the instant the socket closes. [`LifecycleEpoch`] exists
+//! for exactly that reason and carries the argument in full.
 //!
 //! # Two halves, and both are needed
 //!
