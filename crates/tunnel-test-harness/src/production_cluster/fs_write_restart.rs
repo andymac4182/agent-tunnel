@@ -132,12 +132,35 @@
 //! reading the host file can distinguish one application from two**.  The
 //! region-stability rules above cannot see an idempotent same-offset replay.
 //!
-//! What *is* proven about the retry is stronger than a byte comparison anyway:
-//! the resubmitted `Twrite` is refused **above the dispatch boundary**, with
-//! the errno for a fid this session never allocated rather than anything the
-//! host could have produced, so it never reached the provider at all.  And a
-//! frame replayed at any *other* offset — the realistic way a restart could
-//! duplicate an effect — is caught by `image_outside_held_region_matches`,
+//! What carries the retry instead is the file's **modification time**, which
+//! is not idempotent under that rewrite.  A write that reached the host calls
+//! `pwrite`, and `pwrite` advances `mtime` whether or not it changed a byte —
+//! so the one case the byte comparisons are blind to is exactly the case
+//! `mtime` reports.  Sampled either side of the retry and required to be the
+//! same instant, it says the resubmission produced **no effect at the host at
+//! all**.  (Reads do not touch `mtime`, so the replacement session's own
+//! traffic cannot move it.)
+//!
+//! The errno is **corroboration, not proof of origin**, and is recorded as
+//! such: `tunnel_fs_host::policy::code_for` maps every errno it does not
+//! recognise to `Einval`, and the host write path returns `Einval` directly,
+//! so the value alone is equally consistent with a refusal that *did* reach
+//! the host.  What it does establish is the shape of the refusal — a
+//! session-level unknown-fid answer — alongside the stale-fid probe above it
+//! and the fresh walk below, which together show the fid scoping is real and
+//! not a replacement process that never served this root.
+//!
+//! The relay's per-stream emit cursor is deliberately **not** used here, and
+//! the reason is worth recording because it is the obvious place to look: the
+//! fid table lives in the *connector* process, and the relay decodes a 9P
+//! message only far enough to check that it is one whole in-bounds frame,
+//! keeping no fid state of its own.  So an unbound-fid `Twrite` really does
+//! cross relay→connector, and `last_emitted_relay_to_connector` advances for
+//! it exactly as for an accepted write.  A rule asserting that cursor did not
+//! move would simply be false.
+//!
+//! And a frame replayed at any *other* offset — the realistic way a restart
+//! could duplicate an effect — is caught by `image_outside_held_region_matches`,
 //! which compares every byte outside the held region against the exact
 //! expected image.
 //!
@@ -742,6 +765,21 @@ pub fn validate_fs_write_restart_evidence(evidence: &FsWriteRestartEvidence) -> 
             // be the rule that rejected anything.  The library property is
             // held directly instead, by
             // `an_unknown_outcome_is_not_settled_and_a_failed_one_is`.
+            //
+            // That same "could this rule ever reject a real run?" test, applied
+            // honestly, does **not** clear every rule in this list. A handful of
+            // flags — `first_process_exited`, `owner_released_between`,
+            // `second_process_active` — are assigned unconditionally, because
+            // the `await?` that precedes each one has already failed the run if
+            // the thing did not happen. Their rules can only redden when a unit
+            // test synthesizes a `false` no live run produces. They are kept,
+            // because an evidence line that states the fact is worth more to a
+            // reader than one that leaves it implied, and because they are
+            // genuinely enforced, just one line earlier — but they are
+            // *restatements of an upstream `?`*, not independent measurements,
+            // and should not be counted as though they were. The rule directly
+            // below this comment, and the mtime rule, are the other kind: they
+            // read a value the run could really have produced differently.
             "the held write classifies as an unknown outcome".into(),
             evidence.held_call_outcome == Some(Outcome::Unknown),
         ),
