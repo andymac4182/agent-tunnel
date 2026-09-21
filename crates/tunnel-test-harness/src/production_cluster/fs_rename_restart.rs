@@ -1385,14 +1385,26 @@ async fn run(
     // same root, so the only thing that changes across the event is which
     // process is running.
     //
-    // **`delete` is in this list and that was re-derived, not copied from gate
-    // 13.**  `tunnel_fs_core::capability` requires a rename to hold **both**
-    // `Write` and `Delete` — it creates a name at the destination and removes
-    // one at the source — so gate 13's `["read", "write", "list"]` would have
-    // this gate's held operation refused before it ever dispatched, and the
-    // gate would be measuring a permission denial rather than an ambiguity.
+    // **`delete` and `atomicRename` are both here, and both were re-derived
+    // from the code rather than copied from gate 13's config.**  A rename is
+    // gated twice over, and missing either gate would have this gate's held
+    // operation refused before it ever dispatched — so the run would be
+    // measuring a permission denial rather than an ambiguity:
+    //
+    // * `tunnel_fs_core::capability` requires `Primitive::Rename` to hold
+    //   **both** `Write` and `Delete`, because it creates a name at the
+    //   destination and removes one at the source.  Gate 13's
+    //   `["read", "write", "list"]` does not.
+    // * `ExportRoot::rename_checked` opens with `authorize(Primitive::Rename)`,
+    //   which additionally requires the **`atomicRename` feature**.  Features
+    //   default to none and are opt-in, and — the trap worth naming —
+    //   `FsExportSettings` documents that "a name this build does not know is
+    //   ignored rather than refused", so a misspelling here does not fail
+    //   loudly at config load; it silently leaves the feature off and surfaces
+    //   much later as an `ENOTSUP` on the held operation.  The spelling is
+    //   taken from `capability::Feature::AtomicRename`'s own `as_str`.
     let config_text = format!(
-        "{existing}\n[exports.{service}]\ntype = \"fs\"\n\n[exports.{service}.fs]\nroot = {root}\ncapabilities = [\"read\", \"write\", \"list\", \"delete\"]\n",
+        "{existing}\n[exports.{service}]\ntype = \"fs\"\n\n[exports.{service}.fs]\nroot = {root}\ncapabilities = [\"read\", \"write\", \"list\", \"delete\"]\nfeatures = [\"atomicRename\"]\n",
         existing = std::fs::read_to_string(&profile.config_path).map_err(HarnessError::Io)?,
         service = toml_string(&service.to_string()),
         root = toml_string(&directory.path().to_string_lossy()),
@@ -1936,10 +1948,22 @@ async fn exercise(
     // `Trenameat` is the name-addressed form of the operation the retry above
     // issued by fid.  `tunnel_fs_provider` dispatches `Trename` and
     // `Trenameat` to the *same* `perform_rename`, which calls the same
-    // `ExportRoot::rename_checked` and the same `rustix::fs::renameat`, so
-    // this reading is taken on the same instrument and the same host path —
-    // it is the only form that can present the host with a source that is
-    // absent, which is exactly the state the held rename created.
+    // `ExportRoot::rename_checked`, so this reading is taken on the same
+    // instrument and the same host path — and it is the only form that can
+    // present the host with a source that is **absent**, which is exactly the
+    // state the held rename created.
+    //
+    // **Where inside the host it is refused was re-derived, and the answer is
+    // stated rather than guessed at.**  `rename_checked` calls
+    // `inspect_removable` on the source before it reaches
+    // `rustix::fs::renameat`, and that helper's first act is a `statat`.  So
+    // an absent source is refused at the inspection rather than at the rename
+    // itself.  It makes no difference to this rule and it is recorded anyway:
+    // both are **host syscalls**, both map their errno through the one
+    // `policy::code_from_errno` (`host_error` and `mutation_error` differ only
+    // in the `Outcome` they carry, not in the code), and what this control
+    // establishes is that the call **reached the host at all** — which is
+    // precisely what the retry above must not have done.
     //
     // It must also mutate nothing, and the namespace sample after it is what
     // holds that.
