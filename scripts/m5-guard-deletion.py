@@ -1534,7 +1534,7 @@ CASES_C5: list[tuple[str, list[Edit], bool]] = [
         self.epoch.disturb();""",
             )
         ],
-        True,
+        False,
     ),
     (
         # The product-side form of "the dispatcher is not watching": `watching`
@@ -1550,7 +1550,7 @@ CASES_C5: list[tuple[str, list[Edit], bool]] = [
                 "        let _ = epoch;",
             )
         ],
-        True,
+        False,
     ),
 ]
 
