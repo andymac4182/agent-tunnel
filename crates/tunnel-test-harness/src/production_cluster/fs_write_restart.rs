@@ -152,9 +152,10 @@
 //!
 //! The relay's per-stream emit cursor is deliberately **not** used here, and
 //! the reason is worth recording because it is the obvious place to look: the
-//! fid table lives in the *connector* process, and the relay decodes a 9P
-//! message only far enough to check that it is one whole in-bounds frame,
-//! keeping no fid state of its own.  So an unbound-fid `Twrite` really does
+//! fid table lives in the *connector* process.  The relay does decode the
+//! message — `decode_exact` parses the body and could read the fid — but it
+//! **discards the result**, using the call only as a framing and size check,
+//! and holds no fid state of its own anywhere.  So an unbound-fid `Twrite` really does
 //! cross relay→connector, and `last_emitted_relay_to_connector` advances for
 //! it exactly as for an accepted write.  A rule asserting that cursor did not
 //! move would simply be false.
@@ -482,6 +483,23 @@ pub struct FsWriteRestartEvidence {
     /// The held region after that retry.  Must still equal
     /// [`Self::held_region_before_kill`].
     pub held_region_after_retry: RegionState,
+    /// **The positive control for the modification-time instrument.**
+    ///
+    /// Whether the acknowledged prefix write — a write that demonstrably
+    /// lands, on the same file, in the same run, read through the same
+    /// `std::fs::metadata().modified()` — moved the clock **strictly
+    /// forward**.
+    ///
+    /// Without this, [`Self::host_mtime_unchanged_across_retry`] is a rule
+    /// whose passing direction is "nothing moved", which is indistinguishable
+    /// from "nothing *can* move here": a filesystem mounted `noatime`-style
+    /// for mtime, a coarse or frozen clock, or a metadata path that simply
+    /// does not observe `pwrite` would all satisfy it while proving nothing.
+    /// That premise was originally established by a one-off check outside the
+    /// tree, which is not evidence about *this* run.  This field is.
+    pub prefix_write_advanced_mtime: bool,
+    pub host_mtime_before_prefix_write: Option<SystemTime>,
+    pub host_mtime_after_prefix_write: Option<SystemTime>,
     /// Whether the target file's modification time is the **same instant**
     /// before and after the retry.
     ///
@@ -663,6 +681,19 @@ pub fn validate_fs_write_restart_evidence(evidence: &FsWriteRestartEvidence) -> 
                 .into(),
             evidence.journal_discriminated_both_directions(),
         ),
+        // **The positive control for the modification-time instrument**, held
+        // beside the journal's two directions because it is the same kind of
+        // thing: the journal rules out a region classifier that could only
+        // ever say "untouched", and this rules out a clock that could only
+        // ever say "unchanged".  The rule that carries the retry passes on
+        // equality, so without this the instrument is never shown to move at
+        // all in the run it is evidence for.
+        (
+            "an acknowledged write moved the host file's modification time, so the instrument \
+             the retry rule reads can move at all"
+                .into(),
+            evidence.prefix_write_advanced_mtime,
+        ),
         // The concurrency rules.  Without these the gate would prove only that
         // a process restarted somewhere near a filesystem session.
         (
@@ -769,9 +800,12 @@ pub fn validate_fs_write_restart_evidence(evidence: &FsWriteRestartEvidence) -> 
             // That same "could this rule ever reject a real run?" test, applied
             // honestly, does **not** clear every rule in this list. A handful of
             // flags — `first_process_exited`, `owner_released_between`,
-            // `second_process_active` — are assigned unconditionally, because
-            // the `await?` that precedes each one has already failed the run if
-            // the thing did not happen. Their rules can only redden when a unit
+            // `second_process_active`, `held_stream_deregistered` and
+            // `second_session_attached` — are assigned unconditionally,
+            // because the `await?` that precedes each one has already failed
+            // the run if the thing did not happen (the deregistration loop
+            // exits only `true` or `Err`, and the attach flag follows an
+            // `attach().await?`). Their rules can only redden when a unit
             // test synthesizes a `false` no live run produces. They are kept,
             // because an evidence line that states the fact is worth more to a
             // reader than one that leaves it implied, and because they are
@@ -889,6 +923,29 @@ fn read_host_image(path: &Path) -> Vec<u8> {
 /// measurement failed twice is exactly the shape this gate refuses elsewhere.
 fn read_host_mtime(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).ok()?.modified().ok()
+}
+
+/// Whether two modification-time samples are the **same readable instant**.
+///
+/// The production expression, called both by the run and by the tests, so a
+/// test cannot pass against a copy of the logic that the run no longer uses.
+///
+/// Requiring both samples readable is the whole point: `Option`'s equality
+/// says `None == None`, so the obvious spelling reports "unchanged" for a file
+/// that could not be stat'd at either end — including one that has vanished
+/// entirely — and a rule that holds because nothing was measured is not
+/// evidence.
+fn mtime_unchanged(before: Option<SystemTime>, after: Option<SystemTime>) -> bool {
+    matches!((before, after), (Some(before), Some(after)) if before == after)
+}
+
+/// Whether two modification-time samples show the clock **strictly advance**.
+///
+/// The positive control's expression, and the mirror of [`mtime_unchanged`]:
+/// both ends readable, and `after` strictly later.  Equal is a failure here,
+/// because equal is exactly what a frozen instrument reports.
+fn mtime_advanced(before: Option<SystemTime>, after: Option<SystemTime>) -> bool {
+    matches!((before, after), (Some(before), Some(after)) if after > before)
 }
 
 /// The expected whole-file image **outside** the held region: filler
@@ -1393,6 +1450,23 @@ async fn exercise(
     //    performed before anything is perturbed, whose bytes the harness then
     //    reads straight out of the export's own host file.  A journal that
     //    could only ever say "untouched" is ruled out here.
+    //
+    //    **This write is also the positive control for the modification-time
+    //    instrument**, which is why its mtime is sampled either side.  The
+    //    rule that carries "the retry never reached the host" passes when two
+    //    samples are *equal*, and equal is exactly what a frozen or
+    //    non-advancing clock reports — so on its own it would hold just as
+    //    firmly if `mtime` never moved on this filesystem, for this inode, or
+    //    through `std::fs::metadata().modified()` at all.  A write that
+    //    demonstrably lands, measured with the same instrument in the same
+    //    run, is what rules that out; without it the carrier rests on a
+    //    premise established once by hand and never re-checked.
+    //
+    //    Granularity cannot mask the advance: the seed write happened before
+    //    a config write, a process spawn, an owner claim and a session open,
+    //    so the two samples are far apart in wall-clock terms and not two
+    //    writes inside one coarse timestamp tick.
+    evidence.host_mtime_before_prefix_write = read_host_mtime(target_path);
     match session
         .call(Message::Twrite {
             fid: FILE_FID,
@@ -1404,6 +1478,11 @@ async fn exercise(
         Message::Rwrite { count } => evidence.prefix_acknowledged_bytes = count as usize,
         other => return Err(unexpected("Rwrite", &other)),
     }
+    evidence.host_mtime_after_prefix_write = read_host_mtime(target_path);
+    evidence.prefix_write_advanced_mtime = mtime_advanced(
+        evidence.host_mtime_before_prefix_write,
+        evidence.host_mtime_after_prefix_write,
+    );
     evidence.prefix_region_after_write = classify_region(
         &read_host_image(target_path),
         PREFIX_OFFSET,
@@ -1743,8 +1822,9 @@ async fn exercise(
     // so the replacement session's own traffic cannot move it.)
     //
     // Not the relay's emit cursor, which would have been the obvious place to
-    // look: the relay is a byte pump for this message — it decodes only to
-    // check framing and keeps no fid table — so the frame really does cross
+    // look: the relay decodes this message and throws the result away, using
+    // the call only as a framing and size check, and keeps no fid table of its
+    // own — so it cannot refuse an unbound fid, the frame really does cross
     // relay→connector, and `last_emitted_relay_to_connector` advances for a
     // refused write exactly as for an accepted one.  The cursor cannot
     // discriminate here, and asserting that it does not move would be false.
@@ -1772,11 +1852,9 @@ async fn exercise(
         }
     }
     evidence.host_mtime_after_retry = read_host_mtime(target_path);
-    // Both samples must have been readable *and* equal.  Two `None`s compare
-    // equal, which would let a failed measurement pass as a held rule.
-    evidence.host_mtime_unchanged_across_retry = matches!(
-        (evidence.host_mtime_before_retry, evidence.host_mtime_after_retry),
-        (Some(before), Some(after)) if before == after
+    evidence.host_mtime_unchanged_across_retry = mtime_unchanged(
+        evidence.host_mtime_before_retry,
+        evidence.host_mtime_after_retry,
     );
     let host_image = read_host_image(target_path);
     evidence.held_region_after_retry = classify_region(&host_image, HELD_OFFSET, &held_payload);
@@ -1887,9 +1965,12 @@ mod tests {
             stale_file_fid_errno: Some(UNKNOWN_FID_ERRNO),
             retry_refused_above_dispatch: true,
             retry_refusal_errno: Some(UNKNOWN_FID_ERRNO),
+            prefix_write_advanced_mtime: true,
+            host_mtime_before_prefix_write: Some(fixed_mtime()),
+            host_mtime_after_prefix_write: Some(fixed_mtime() + Duration::from_secs(1)),
             host_mtime_unchanged_across_retry: true,
-            host_mtime_before_retry: Some(fixed_mtime()),
-            host_mtime_after_retry: Some(fixed_mtime()),
+            host_mtime_before_retry: Some(fixed_mtime() + Duration::from_secs(1)),
+            host_mtime_after_retry: Some(fixed_mtime() + Duration::from_secs(1)),
             held_region_after_retry: RegionState::Written,
             image_bytes: TARGET_FILE_BYTES,
             image_expected_bytes: TARGET_FILE_BYTES,
@@ -2131,9 +2212,9 @@ mod tests {
             evidence.host_mtime_before_retry, evidence.host_mtime_after_retry,
             "the trap only exists because these compare equal",
         );
-        evidence.host_mtime_unchanged_across_retry = matches!(
-            (evidence.host_mtime_before_retry, evidence.host_mtime_after_retry),
-            (Some(before), Some(after)) if before == after
+        evidence.host_mtime_unchanged_across_retry = mtime_unchanged(
+            evidence.host_mtime_before_retry,
+            evidence.host_mtime_after_retry,
         );
         assert!(
             !evidence.host_mtime_unchanged_across_retry,
@@ -2147,10 +2228,7 @@ mod tests {
             let mut evidence = passing();
             evidence.host_mtime_before_retry = before;
             evidence.host_mtime_after_retry = after;
-            evidence.host_mtime_unchanged_across_retry = matches!(
-                (before, after),
-                (Some(b), Some(a)) if b == a
-            );
+            evidence.host_mtime_unchanged_across_retry = mtime_unchanged(before, after);
             validate_fs_write_restart_evidence(&evidence)
                 .expect_err("a half-measured mtime must fail the rule");
         }
@@ -2159,6 +2237,55 @@ mod tests {
         let evidence = passing();
         assert!(evidence.host_mtime_unchanged_across_retry);
         validate_fs_write_restart_evidence(&evidence).expect("passing evidence");
+    }
+
+    /// The positive control must reject the readings a broken instrument
+    /// gives, which is the whole reason it exists.
+    ///
+    /// `mtime_advanced` is the production expression, called here rather than
+    /// re-typed, so narrowing or widening it in the run cannot leave this
+    /// green.
+    #[test]
+    fn the_mtime_control_rejects_a_clock_that_did_not_move() {
+        let base = fixed_mtime();
+
+        // A frozen clock: the write landed, the instant did not change.  This
+        // is precisely the reading that would make the retry rule vacuous.
+        assert!(!mtime_advanced(Some(base), Some(base)));
+
+        // Going backwards is not an advance either.
+        assert!(!mtime_advanced(
+            Some(base + Duration::from_secs(1)),
+            Some(base)
+        ));
+
+        // An unreadable sample at either end is not an advance, for the same
+        // reason two `None`s are not an "unchanged": nothing was measured.
+        assert!(!mtime_advanced(None, Some(base)));
+        assert!(!mtime_advanced(Some(base), None));
+        assert!(!mtime_advanced(None, None));
+
+        // Only a real, readable, strictly forward step counts.
+        assert!(mtime_advanced(
+            Some(base),
+            Some(base + Duration::from_nanos(1))
+        ));
+
+        // And the validator reads it: a frozen instrument fails the gate even
+        // though every byte-level rule still holds.
+        let mut evidence = passing();
+        evidence.prefix_write_advanced_mtime = false;
+        evidence.host_mtime_after_prefix_write = evidence.host_mtime_before_prefix_write;
+        validate_fs_write_restart_evidence(&evidence)
+            .expect_err("a clock that never moved must fail the gate");
+
+        // The two rules are independent: the control can hold while the retry
+        // rule fails, and the failure must still be reported.
+        let mut evidence = passing();
+        evidence.host_mtime_unchanged_across_retry = false;
+        assert!(evidence.prefix_write_advanced_mtime);
+        validate_fs_write_restart_evidence(&evidence)
+            .expect_err("a moved mtime across the retry must fail the gate");
     }
 
     #[test]
@@ -2189,6 +2316,17 @@ mod tests {
             ("the prefix write acknowledged the wrong count", |e| {
                 e.prefix_acknowledged_bytes = PREFIX_PAYLOAD_BYTES - 1;
             }),
+            // The positive control: a clock that never moved even for a write
+            // that demonstrably landed.  This is the reading a frozen or
+            // non-advancing instrument produces, and it must fail here --
+            // otherwise the retry rule's "unchanged" proves nothing.
+            (
+                "the mtime instrument never moved for a write that landed",
+                |e| {
+                    e.prefix_write_advanced_mtime = false;
+                    e.host_mtime_after_prefix_write = e.host_mtime_before_prefix_write;
+                },
+            ),
             // The concurrency rules.
             ("the write was never dispatched", |e| {
                 e.restart.emitted_at_kill = e.restart.emitted_before;

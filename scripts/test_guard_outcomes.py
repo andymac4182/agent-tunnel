@@ -79,7 +79,7 @@ def main() -> int:
 
 
 EXPECTED_MODULE_FILTERS = 8
-EXPECTED_GUARD_ANCHORS = 426
+EXPECTED_GUARD_ANCHORS = 427
 
 
 def every_module_filter_is_anchored() -> None:

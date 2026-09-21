@@ -5205,6 +5205,17 @@ GATE13_WRITE_RESTART_CASES: list[tuple[str, list[Edit]]] = [
         ],
     ),
     (
+        "an acknowledged write moved the modification time, so the instrument "
+        "the retry rule reads is not frozen",
+        [
+            (
+                HARNESS_WRITE_RESTART,
+                "            evidence.prefix_write_advanced_mtime,",
+                "            true,",
+            )
+        ],
+    ),
+    (
         "the retry never reached the host, proven by a modification time the "
         "bytes cannot carry",
         [
@@ -5579,6 +5590,21 @@ def check_anchors(selected: list[tuple[Suite, str, list[Edit]]]) -> int:
 
     Checking costs no build, so CI can run it over every suite every time.
     """
+    # An empty selection must refuse rather than report a clean sweep of
+    # nothing.  `--check-anchors --case no-such-case` used to print "checked 0
+    # anchors ... every anchor resolves" and exit 0, which is the exact
+    # vacuity this script refuses for the module-filter scan and for its own
+    # ambiguous-anchor case -- and it is owed by a flag whose entire job is to
+    # be trusted when it says nothing is wrong.
+    if not selected:
+        print(
+            "fs-guard-deletion: --check-anchors selected no cases, so it "
+            "checked nothing; a clean result over an empty selection is not "
+            "evidence",
+            flush=True,
+        )
+        return 1
+
     problems = 0
     checked = 0
     for suite, name, edits in selected:
@@ -5587,11 +5613,12 @@ def check_anchors(selected: list[tuple[Suite, str, list[Edit]]]) -> int:
             occurrences = path.read_text().count(old)
             if occurrences != 1:
                 problems += 1
-                print(
-                    f"[{suite.name}] {name}: anchor resolves to {occurrences} "
-                    f"occurrences in {path}",
-                    flush=True,
+                kind = (
+                    "STALLED: guard text not found"
+                    if occurrences == 0
+                    else f"AMBIGUOUS: {occurrences} occurrences"
                 )
+                print(f"[{suite.name}] {name}: {kind} in {path}", flush=True)
     for glued in glued_case_names():
         problems += 1
         print(f"glued case name: {glued}", flush=True)
@@ -5657,6 +5684,16 @@ def main() -> int:
         sys.exit(f"fs-guard-deletion: no case matches {arguments.case!r}")
 
     require_clean_tree(suites)
+
+    # **Preflight (M4-27).**  Resolve every selected case's anchors before any
+    # case executes, and fail closed listing *all* mismatches at once.  The
+    # per-case refusal inside the loop below already fails the run and names
+    # itself, so this changes no outcome and no count -- it moves an existing
+    # refusal from hour three to second one, which matters because a formatter
+    # pass rewraps several anchors at a time and a full run is measured in
+    # hours.
+    if check_anchors(selected) != 0:
+        return 1
 
     results: list[tuple[str, str, str, list[str]]] = []
     for suite, name, edits in selected:
