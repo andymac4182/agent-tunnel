@@ -2441,6 +2441,37 @@ mod tests {
         assert!(validate_fs_rename_restart_evidence(&evidence).is_err());
     }
 
+    /// Each **reading** of the count must matter on its own.
+    ///
+    /// The guard-deletion suite found this missing: with only the test above,
+    /// deleting the `entry_count_before` conjunct changed no test outcome,
+    /// because the mutation moved the *after* reading and the surviving
+    /// conjunct rejected it anyway.  That is the same masking this module
+    /// fixes everywhere else, at the one array that had no per-element defeat
+    /// test -- the journal directions and the unchanged stages each already
+    /// had one, and this array did not.
+    #[test]
+    fn every_entry_count_reading_defeats_the_blindness_rule_on_its_own() {
+        type Defeat = fn(&mut FsRenameRestartEvidence);
+        let defeats: [(&str, Defeat); 2] = [
+            ("the reading before the rename", |evidence| {
+                evidence.entry_count_before = EXPECTED_ENTRY_COUNT + 1;
+            }),
+            ("the reading after the rename", |evidence| {
+                evidence.entry_count_after = EXPECTED_ENTRY_COUNT + 1;
+            }),
+        ];
+        for (label, defeat) in defeats {
+            let mut evidence = passing();
+            defeat(&mut evidence);
+            assert!(
+                !evidence.entry_count_instrument_was_blind(),
+                "{label} must defeat the blindness rule on its own"
+            );
+            assert!(validate_fs_rename_restart_evidence(&evidence).is_err());
+        }
+    }
+
     /// Every rule in the validator must be defeasible by some mutation of the
     /// evidence, and each mutation must be rejected.
     #[test]
