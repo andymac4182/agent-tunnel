@@ -2019,6 +2019,81 @@ async fn main() -> ExitCode {
                 )),
             }
         }
+        [command] if command == "verify-m4-fs-data-recovery" => {
+            match tokio::time::timeout(
+                Duration::from_secs(360),
+                tunnel_test_harness::production_cluster::verify_fs_data_recovery(),
+            )
+            .await
+            {
+                Ok(result) => result.and_then(|evidence| {
+                    // Re-validate at the command boundary so a validator
+                    // regression cannot silently pass the command.
+                    tunnel_test_harness::production_cluster::validate_fs_data_recovery_evidence(
+                        &evidence,
+                    )?;
+                    println!(
+                        "M4 filesystem data-socket recovery passed: relays={} owner={} subprotocol={} msize={} dialect={} prefix_bytes={} stream_id={} emitted={}->{} recv_contiguous={}->{} request_outstanding_at_failure={} failure_polls={} held_tag={} connection_id={}->{} generation={}->{} rotations_completed={}->{} failed_connection_closed_at_proxy={} replacement_connection_observed_at_proxy={} catalog_owner_session_stable={} catalog_epoch={}->{} owner_session_id_stable={} owner_epoch={}->{} control_carrier_unchanged={} recovery_attempted={} owner_recovery_reason={:?} recovery_released_failed_carrier={} recovery_successor_is_active_carrier={} replayed_frames={}->{} operation_id_stable={} stream_remained_registered={} sole_consumer_stream_at_owner={} stream_not_terminal={} same_owner_qualifiers_held={} held_reply_tag_matched={} held_reply_was_rread={} held_reply_bytes={} transfer_bytes={}/{} transfer_messages={} transfer_checksum_matches={} fid_survived_getattr={} fid_survived_getattr_size={} attach_fid_survived_walk={} post_recovery_tag_correlated={} attach_count={}",
+                        evidence.relay_count,
+                        evidence.owner_node,
+                        evidence.selected_subprotocol,
+                        evidence.negotiated_msize,
+                        evidence.negotiated_dialect,
+                        evidence.prefix_bytes,
+                        evidence.failure.stream_id,
+                        evidence.failure.emitted_before,
+                        evidence.failure.emitted_at_failure,
+                        evidence.failure.recv_contiguous_before,
+                        evidence.failure.recv_contiguous_at_failure,
+                        evidence.request_outstanding_at_failure,
+                        evidence.failure_polls,
+                        evidence.held_tag,
+                        evidence.connection_id_before,
+                        evidence.connection_id_after,
+                        evidence.generation_before,
+                        evidence.generation_after,
+                        evidence.rotations_completed_before,
+                        evidence.rotations_completed_after,
+                        evidence.failed_connection_closed_at_proxy,
+                        evidence.replacement_connection_observed_at_proxy,
+                        evidence.catalog_owner_session_stable,
+                        evidence.catalog_epoch_before,
+                        evidence.catalog_epoch_after,
+                        evidence.owner_session_id_stable,
+                        evidence.owner_epoch_before,
+                        evidence.owner_epoch_after,
+                        evidence.control_carrier_unchanged,
+                        evidence.recovery_attempted,
+                        evidence.owner_recovery_reason,
+                        evidence.recovery_released_failed_carrier,
+                        evidence.recovery_successor_is_active_carrier,
+                        evidence.replayed_frames_before,
+                        evidence.replayed_frames_after,
+                        evidence.operation_id_stable,
+                        evidence.stream_remained_registered,
+                        evidence.sole_consumer_stream_at_owner,
+                        evidence.stream_not_terminal,
+                        evidence.same_owner_contract_qualifiers_held(),
+                        evidence.held_reply_tag_matched,
+                        evidence.held_reply_was_rread,
+                        evidence.held_reply_bytes,
+                        evidence.transfer_bytes,
+                        evidence.transfer_expected_bytes,
+                        evidence.transfer_messages,
+                        evidence.transfer_checksum_matches,
+                        evidence.fid_survived_getattr,
+                        evidence.fid_survived_getattr_size,
+                        evidence.attach_fid_survived_walk,
+                        evidence.post_recovery_tag_correlated,
+                        evidence.attach_count,
+                    );
+                    Ok(())
+                }),
+                Err(_) => Err(HarnessError::Timeout(
+                    "verify-m4-fs-data-recovery exceeded its bounded deadline".into(),
+                )),
+            }
+        }
         [command] if command == "verify-m4-fs-epoch-change" => {
             match tokio::time::timeout(
                 Duration::from_secs(360),

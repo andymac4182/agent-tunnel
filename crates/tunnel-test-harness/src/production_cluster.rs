@@ -140,6 +140,14 @@ pub use http_forward_real_path::{
 /// decode with gate 3's own `decode_exact`, and one copy of that is better than
 /// two that could drift apart.
 mod fs_consumer_loss;
+/// M4 filesystem gate 11: the same construction as gate 8's, held across the
+/// **replacement of a failed data socket** — the one event in the profile's
+/// paragraph whose contract points towards retention rather than away from it.
+/// Its own module rather than a case inside gate 7 because gate 7 drives a
+/// *scheduled* rotation, which is a clean attempt; this one destroys the
+/// carrier with no handshake at all, and the two differ in what they are
+/// allowed to assert.
+mod fs_data_recovery;
 /// Gate 9's module: the same construction as gate 8's, held across a
 /// **control-epoch change** instead of a consumer loss.  It is its own module
 /// rather than a case inside gate 8 because the event it drives replaces the
@@ -157,6 +165,10 @@ mod fs_write_path;
 pub use fs_consumer_loss::{
     FsConsumerLossEvidence, LossObservation, validate_fs_consumer_loss_evidence,
     verify as verify_fs_consumer_loss,
+};
+pub use fs_data_recovery::{
+    FailureObservation, FsDataRecoveryEvidence, validate_fs_data_recovery_evidence,
+    verify as verify_fs_data_recovery,
 };
 pub use fs_epoch_change::{
     EpochChangeObservation, FsEpochChangeEvidence, validate_fs_epoch_change_evidence,

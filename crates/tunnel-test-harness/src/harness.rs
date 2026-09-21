@@ -746,6 +746,21 @@ pub const FS_GATE_SERVICES: &[FsGateService] = &[
         host_supported: true,
     },
     FsGateService {
+        // The export a 9P session holds a read on while the device's **data**
+        // socket is destroyed at the transport, and which the *same* session
+        // then keeps using across the replacement carrier.  Its own export for
+        // the reason every row above is one, and for one more: this is the
+        // only fs gate whose contract points *towards* fid retention, so a fid
+        // answering here must be creditable to this session alone — a shared
+        // grant would leave "the fid survived" ambiguous with "another case's
+        // session answered".
+        label: "data-recovery",
+        display_name: "Synthetic filesystem export held across a failed data socket's replacement",
+        operations: &["fs:connect", "fs:read", "fs:list"],
+        case_sensitivity: Some("insensitive-preserving"),
+        host_supported: true,
+    },
+    FsGateService {
         label: "unsupported-host",
         display_name: "Synthetic filesystem export on an unsupported host",
         operations: &["fs:connect", "fs:read", "fs:list"],

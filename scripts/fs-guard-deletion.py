@@ -37,6 +37,10 @@ of `docs/filesystem-api.md`.  Two suites live here:
 * `gate10-process-restart` — the validator of the gate that holds a 9P
   mutation outstanding while the connector's real process is killed, and reads
   the effect count back out of a journal that outlives it.
+* `gate11-data-recovery` — the validator of the gate that holds a 9P read
+  outstanding while the device's data socket is destroyed at the transport and
+  the product's own retained recovery replaces it.  Measured the same way, and
+  for the same reason.
 
 A guard whose deletion leaves every test green is **not** load-bearing on its
 own, and this script prints that outcome rather than hiding it: several of the
@@ -2436,6 +2440,7 @@ HARNESS_ROTATION = HARNESS / "src" / "production_cluster" / "fs_rotation.rs"
 HARNESS_LOSS = HARNESS / "src" / "production_cluster" / "fs_consumer_loss.rs"
 HARNESS_EPOCH = HARNESS / "src" / "production_cluster" / "fs_epoch_change.rs"
 HARNESS_RESTART = HARNESS / "src" / "production_cluster" / "fs_process_restart.rs"
+HARNESS_RECOVERY = HARNESS / "src" / "production_cluster" / "fs_data_recovery.rs"
 
 # Gate 6's end-to-end half is a **cluster** gate: it needs Redis, three relays,
 # a device connector and `node`, and it takes minutes.  That is not a shape this
@@ -2670,6 +2675,11 @@ EXPECT_GREEN: frozenset[str] = frozenset(
         # `the_in_flight_predicate_needs_both_halves` defeats the predicate in
         # each direction directly.
         "the relay had dispatched a 9P record toward the device when the process was killed",
+        # gate11's spelling of the same rule.  Its composite,
+        # `request_outstanding_at_failure()`, subsumes it for the same reason,
+        # and `the_in_flight_predicate_needs_both_halves` defeats the predicate
+        # in each direction directly.
+        "the relay had dispatched a 9P record toward the device when the data socket failed",
         # gate2.  Task row **M4-08** explains all nine in those words: "each
         # `O_NOFOLLOW` and its sibling identity check mask one another and are
         # proven in pairs, and the three mount-boundary checks mask one another
@@ -4133,6 +4143,223 @@ GATE10_RESTART_CASES: list[tuple[str, list[Edit]]] = [
     ),
 ]
 
+# ---------------------------------------------------------------------------
+# `gate11-data-recovery` — the validator of the gate that holds a 9P read
+# outstanding while the device's data socket is destroyed at the transport and
+# the product's own retained recovery replaces it.  Like `gate7-rotation`,
+# `gate8-consumer-loss`, `gate9-epoch-change` and `gate10-process-restart` this
+# is a harness-side validator, so each case defeats one rule and the suite's
+# own unit tests must go red.
+#
+# Two groups here have no counterpart in the other four, and are why this gate
+# is its own suite rather than a case inside gate 7:
+#
+#   * the **failure-not-rotation** rules, which are what separate the event the
+#     contract licenses from the clean attempt gate 7 drives — a different
+#     physical carrier, a strictly greater generation, a completed-rotation
+#     count that does not move, and the dead socket's absence at the proxy;
+#   * the **same-owner qualifier** rules, which are the *antecedent* of the
+#     contract clause rather than part of it.  The profile permits preserving a
+#     filesystem session across a failed data socket "only while the same
+#     control owner and all ordered stream state are retained", so a gate that
+#     observed a surviving fid without them would have recorded the violation
+#     and called it the contract.  Each conjunct is separately load-bearing,
+#     which the gate's own second unit test defeats one at a time.
+#
+# Those qualifier rules are **not** stated twice.  Writing each one as its own
+# validator rule *as well* was tried, and this suite reported all thirteen
+# `still green` when defeated: the antecedent conjunction already rejects every
+# run they would have rejected, so none of them could ever be the rule that
+# failed a run.  They were removed rather than exempted as documented-green, and
+# the property moved to where it can be defeated — the last **fourteen** cases
+# here delete one conjunct of `same_owner_contract_qualifiers_held` each, and the
+# gate's own `every_same_owner_qualifier_defeats_the_antecedent_on_its_own` is
+# what goes red.
+#
+# That antecedent is written as an **array** rather than as a `&&` chain, and
+# this suite is the reason.  As a chain the head conjunct carries no `&&`, so it
+# did not match the single edit shape these cases key on and was the one
+# conjunct the suite could not defeat — the unfalsifiable-rule problem the
+# thirteen removals were meant to cure, reappearing at the one line the edit
+# shape could not reach.  Every element of the array has an identical shape, so
+# the head is reached like the rest.
+# ---------------------------------------------------------------------------
+
+GATE11_RECOVERY_TEST = [
+    "cargo",
+    "test",
+    "--offline",
+    "-p",
+    "tunnel-test-harness",
+    "--lib",
+    "--locked",
+    "production_cluster::fs_data_recovery",
+]
+
+GATE11_RECOVERY_CASES: list[tuple[str, list[Edit]]] = [
+    (
+        'the production cluster ran three relays',
+        [(HARNESS_RECOVERY, '            evidence.relay_count == 3,', '            true,')],
+    ),
+    (
+        'the owning relay was identified',
+        [(HARNESS_RECOVERY, '            !evidence.owner_node.is_empty(),', '            true,')],
+    ),
+    (
+        'the server selected the filesystem subprotocol',
+        [(HARNESS_RECOVERY, '            evidence.selected_subprotocol == SUBPROTOCOL,', '            true,')],
+    ),
+    (
+        'Tversion negotiated the 9P2000.L dialect',
+        [(HARNESS_RECOVERY, '            evidence.negotiated_dialect == DIALECT,', '            true,')],
+    ),
+    (
+        'Tversion negotiated a bounded msize',
+        [(HARNESS_RECOVERY, '            evidence.negotiated_msize > 0 && evidence.negotiated_msize <= OFFERED_MSIZE,', '            true,')],
+    ),
+    (
+        'the fid served a real read before anything was perturbed',
+        [(HARNESS_RECOVERY, '            evidence.prefix_bytes > 0,', '            true,')],
+    ),
+    (
+        'the relay had dispatched a 9P record toward the device when the data socket failed',
+        [(HARNESS_RECOVERY, '            evidence.failure.emitted_at_failure > evidence.failure.emitted_before,', '            true,')],
+    ),
+    (
+        'the relay had received no answer to that record when the data socket failed: the 9P exchange was outstanding across the failure',
+        [(HARNESS_RECOVERY, '            evidence.request_outstanding_at_failure\n                && evidence.failure.request_outstanding_at_failure(),', '            true,')],
+    ),
+    (
+        'the held exchange ran on a registered consumer stream',
+        [(HARNESS_RECOVERY, '            evidence.failure.stream_id > 0,', '            true,')],
+    ),
+    (
+        'the data carrier really was replaced: a different physical connection',
+        [(HARNESS_RECOVERY, '            !evidence.connection_id_before.is_empty()\n                && !evidence.connection_id_after.is_empty()\n                && evidence.connection_id_after != evidence.connection_id_before,', '            true,')],
+    ),
+    (
+        'the replacement carrier took a strictly greater generation',
+        [(HARNESS_RECOVERY, '            evidence.generation_after > evidence.generation_before,', '            true,')],
+    ),
+    (
+        "no scheduled rotation completed: the generation change was the failure's, not the timer's",
+        [(HARNESS_RECOVERY, '            evidence.rotations_completed_before == 0 && evidence.rotations_completed_after == 0,', '            true,')],
+    ),
+    (
+        'the failed data socket was gone at the transport, not only in diagnostics',
+        [(HARNESS_RECOVERY, '            evidence.failed_connection_closed_at_proxy,', '            true,')],
+    ),
+    (
+        'a replacement device data socket was dialled through the proxy',
+        [(HARNESS_RECOVERY, '            evidence.replacement_connection_observed_at_proxy,', '            true,')],
+    ),
+    (
+        'the same control owner and all ordered stream state were retained, which is the only condition under which the profile permits preserving this filesystem session across a failed data socket',
+        [(HARNESS_RECOVERY, '            evidence.same_owner_contract_qualifiers_held(),', '            true,')],
+    ),
+    (
+        'the reply outstanding when the socket died came back on the same consumer session',
+        [(HARNESS_RECOVERY, '            evidence.held_reply_was_rread,', '            true,')],
+    ),
+    (
+        'it carried the tag that was outstanding across the failure',
+        [(HARNESS_RECOVERY, '            evidence.held_reply_tag_matched,', '            true,')],
+    ),
+    (
+        'that reply carried data rather than an empty read',
+        [(HARNESS_RECOVERY, '            evidence.held_reply_bytes > 0,', '            true,')],
+    ),
+    (
+        'the whole file was read on one fid across the failure',
+        [(HARNESS_RECOVERY, '            evidence.transfer_bytes == evidence.transfer_expected_bytes\n                && evidence.transfer_expected_bytes == RECOVERY_FILE_BYTES,', '            true,')],
+    ),
+    (
+        "that transfer's checksum matched the synthetic content: no byte was lost, duplicated or reordered across the failure",
+        [(HARNESS_RECOVERY, '            evidence.transfer_checksum_matches,', '            true,')],
+    ),
+    (
+        'that transfer spanned many Rread messages rather than one',
+        [(HARNESS_RECOVERY, '            evidence.transfer_messages >= MIN_READ_MESSAGES,', '            true,')],
+    ),
+    (
+        'the fid opened before the failure still answered afterwards',
+        [(HARNESS_RECOVERY, '            evidence.fid_survived_getattr,', '            true,')],
+    ),
+    (
+        'and still named the same file',
+        [(HARNESS_RECOVERY, '            evidence.fid_survived_getattr_size == RECOVERY_FILE_BYTES as u64,', '            true,')],
+    ),
+    (
+        'the attach fid established before the failure still walked',
+        [(HARNESS_RECOVERY, '            evidence.attach_fid_survived_walk,', '            true,')],
+    ),
+    (
+        'a tag allocated after the recovery correlated on the replacement carrier',
+        [(HARNESS_RECOVERY, '            evidence.post_recovery_tag_correlated,', '            true,')],
+    ),
+    (
+        'exactly one Tattach across the run: no fid was reconstructed',
+        [(HARNESS_RECOVERY, '            evidence.attach_count == 1,', '            true,')],
+    ),
+    (
+        "the same-owner antecedent's conjunct: self.catalog_owner_session_stable",
+        [(HARNESS_RECOVERY, '            self.catalog_owner_session_stable,', '            true,')],
+    ),
+    (
+        "the same-owner antecedent's conjunct: self.catalog_epoch_after == self.catalog_epoch_before",
+        [(HARNESS_RECOVERY, '            self.catalog_epoch_after == self.catalog_epoch_before,', '            true,')],
+    ),
+    (
+        "the same-owner antecedent's conjunct: self.owner_session_id_stable",
+        [(HARNESS_RECOVERY, '            self.owner_session_id_stable,', '            true,')],
+    ),
+    (
+        "the same-owner antecedent's conjunct: self.owner_epoch_after == self.owner_epoch_before",
+        [(HARNESS_RECOVERY, '            self.owner_epoch_after == self.owner_epoch_before,', '            true,')],
+    ),
+    (
+        "the same-owner antecedent's conjunct: self.control_carrier_unchanged",
+        [(HARNESS_RECOVERY, '            self.control_carrier_unchanged,', '            true,')],
+    ),
+    (
+        "the same-owner antecedent's conjunct: self.recovery_attempted",
+        [(HARNESS_RECOVERY, '            self.recovery_attempted,', '            true,')],
+    ),
+    (
+        "the same-owner antecedent's conjunct: self.owner_recovery_reason.as_deref() == Some(OLD_TRANSPORT_LOST)",
+        [(HARNESS_RECOVERY, '            self.owner_recovery_reason.as_deref() == Some(OLD_TRANSPORT_LOST),', '            true,')],
+    ),
+    (
+        "the same-owner antecedent's conjunct: self.recovery_released_failed_carrier",
+        [(HARNESS_RECOVERY, '            self.recovery_released_failed_carrier,', '            true,')],
+    ),
+    (
+        "the same-owner antecedent's conjunct: self.recovery_successor_is_active_carrier",
+        [(HARNESS_RECOVERY, '            self.recovery_successor_is_active_carrier,', '            true,')],
+    ),
+    (
+        "the same-owner antecedent's conjunct: self.replayed_frames_after > self.replayed_frames_before",
+        [(HARNESS_RECOVERY, '            self.replayed_frames_after > self.replayed_frames_before,', '            true,')],
+    ),
+    (
+        "the same-owner antecedent's conjunct: self.operation_id_stable",
+        [(HARNESS_RECOVERY, '            self.operation_id_stable,', '            true,')],
+    ),
+    (
+        "the same-owner antecedent's conjunct: self.stream_remained_registered",
+        [(HARNESS_RECOVERY, '            self.stream_remained_registered,', '            true,')],
+    ),
+    (
+        "the same-owner antecedent's conjunct: self.sole_consumer_stream_at_owner",
+        [(HARNESS_RECOVERY, '            self.sole_consumer_stream_at_owner,', '            true,')],
+    ),
+    (
+        "the same-owner antecedent's conjunct: self.stream_not_terminal",
+        [(HARNESS_RECOVERY, '            self.stream_not_terminal,', '            true,')],
+    ),
+]
+
+
 SUITES: list[Suite] = [
     Suite("gate2", [CRATE], CARGO_TEST, GATE2_CASES),
     Suite(
@@ -4175,6 +4402,12 @@ SUITES: list[Suite] = [
         [HARNESS / "src"],
         GATE10_RESTART_TEST,
         GATE10_RESTART_CASES,
+    ),
+    Suite(
+        "gate11-data-recovery",
+        [HARNESS / "src"],
+        GATE11_RECOVERY_TEST,
+        GATE11_RECOVERY_CASES,
     ),
 ]
 
@@ -4321,7 +4554,8 @@ def main() -> int:
         help=(
             "run only this suite (gate2, gate3, gate4, gate5, "
             "gate6-adapters, gate6-e2e, gate7-rotation, gate8-consumer-loss, "
-            "gate9-epoch-change or gate10-process-restart); "
+            "gate9-epoch-change, gate10-process-restart or "
+            "gate11-data-recovery); "
             "default is all"
         ),
     )
