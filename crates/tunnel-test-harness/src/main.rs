@@ -2401,6 +2401,91 @@ async fn main() -> ExitCode {
                 )),
             }
         }
+        [command] if command == "verify-m4-fs-rename-restart" => {
+            match tokio::time::timeout(
+                Duration::from_secs(360),
+                tunnel_test_harness::production_cluster::verify_fs_rename_restart(),
+            )
+            .await
+            {
+                Ok(result) => result.and_then(|evidence| {
+                    // Re-validate at the command boundary so a validator
+                    // regression cannot silently pass the command.
+                    tunnel_test_harness::production_cluster::validate_fs_rename_restart_evidence(
+                        &evidence,
+                    )?;
+                    println!(
+                        "M4 filesystem rename restart passed: relays={} owner={} subprotocol={} msize={} dialect={} prefix_bytes={} held_namespace_before_send={} control_namespace={}->{} source_inode_before={:?} destination_inode_after={:?} rename_preserved_the_inode={} inode_instrument_discriminates={} entry_count={}->{} stream={} emitted={}->{} recv_contiguous={}->{} request_outstanding_at_kill={} restart_polls={} held_tag={} held_namespace_before_kill={} journal_polls={} forbidden_intermediate_observed={} first_pid={} first_process_exited={} first_process_killed_by_signal={} second_pid={} second_process_active={} epoch={}->{} session={}->{} owner_released_between={} pending_call_closed={} pending_call_close_code={:?} pending_call_answered={} pending_call_errored={} held_call_outcome={:?} held_stream_deregistered={} held_namespace_after_restart={} stale_source_fid_refused={} stale_source_fid_errno={:?} retry_refused_above_dispatch={} retry_refusal_errno={:?} held_namespace_after_retry={} absent_source_control_refused={} absent_source_control_errno={:?} errno_instrument_discriminates={} held_namespace_after_control={} second_session_msize={} second_session_attached={} second_session_bytes={}/{} second_session_messages={} renamed_content_matches={} second_session_getattr_size={} namespace_over_ninep={} source_name_walk_refused={} attach_count={}",
+                        evidence.relay_count,
+                        evidence.owner_node,
+                        evidence.selected_subprotocol,
+                        evidence.negotiated_msize,
+                        evidence.negotiated_dialect,
+                        evidence.prefix_bytes,
+                        evidence.held_namespace_before_send.as_str(),
+                        evidence.control_namespace_before.as_str(),
+                        evidence.control_namespace_after.as_str(),
+                        evidence.source_inode_before,
+                        evidence.destination_inode_after,
+                        evidence.rename_preserved_the_inode(),
+                        evidence.inode_instrument_discriminates(),
+                        evidence.entry_count_before,
+                        evidence.entry_count_after,
+                        evidence.restart.stream_id,
+                        evidence.restart.emitted_before,
+                        evidence.restart.emitted_at_kill,
+                        evidence.restart.recv_contiguous_before,
+                        evidence.restart.recv_contiguous_at_kill,
+                        evidence.request_outstanding_at_kill,
+                        evidence.restart_polls,
+                        evidence.held_tag,
+                        evidence.held_namespace_before_kill.as_str(),
+                        evidence.journal_polls,
+                        evidence.forbidden_intermediate_observed,
+                        evidence.first_pid,
+                        evidence.first_process_exited,
+                        evidence.first_process_killed_by_signal,
+                        evidence.second_pid,
+                        evidence.second_process_active,
+                        evidence.epoch_before,
+                        evidence.epoch_after,
+                        evidence.session_id_before,
+                        evidence.session_id_after,
+                        evidence.owner_released_between,
+                        evidence.pending_call_closed,
+                        evidence.pending_call_close_code,
+                        evidence.pending_call_answered,
+                        evidence.pending_call_errored,
+                        evidence.held_call_outcome.map(tunnel_fs_core::Outcome::as_str),
+                        evidence.held_stream_deregistered,
+                        evidence.held_namespace_after_restart.as_str(),
+                        evidence.stale_source_fid_refused,
+                        evidence.stale_source_fid_errno,
+                        evidence.retry_refused_above_dispatch,
+                        evidence.retry_refusal_errno,
+                        evidence.held_namespace_after_retry.as_str(),
+                        evidence.absent_source_control_refused,
+                        evidence.absent_source_control_errno,
+                        evidence.errno_instrument_discriminates(),
+                        evidence.held_namespace_after_control.as_str(),
+                        evidence.second_session_msize,
+                        evidence.second_session_attached,
+                        evidence.second_session_bytes,
+                        evidence.second_session_expected_bytes,
+                        evidence.second_session_messages,
+                        evidence.renamed_content_matches,
+                        evidence.second_session_getattr_size,
+                        evidence.namespace_over_ninep.as_str(),
+                        evidence.source_name_walk_refused,
+                        evidence.attach_count,
+                    );
+                    Ok(())
+                }),
+                Err(_) => Err(HarnessError::Timeout(
+                    "verify-m4-fs-rename-restart exceeded its bounded deadline".into(),
+                )),
+            }
+        }
         [command] if command == "verify-m4-fs-client-e2e" => {
             match tokio::time::timeout(
                 Duration::from_secs(600),

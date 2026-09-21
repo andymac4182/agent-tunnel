@@ -206,7 +206,12 @@ def the_preflight_lists_every_mismatch_not_just_the_first() -> None:
           f"both suites must be reported, got {output!r}")
 
 
-EXPECTED_MODULE_FILTERS = 8
+#: Raised 8 -> 9 by gate 14 (`production_cluster::fs_rename_restart::`).  This
+#: is the anti-vacuity floor for the anchoring scan -- what stops that rule
+#: passing when it has matched *nothing* -- and not itself what covers gate 14,
+#: since `every_module_filter_is_anchored` already inspects gate 14's filter
+#: along with the rest.
+EXPECTED_MODULE_FILTERS = 9
 
 #: The floor each harness's `--check-anchors` must clear, so a run that
 #: selected almost nothing cannot pass as a clean sweep.  Measured on
@@ -215,8 +220,16 @@ EXPECTED_MODULE_FILTERS = 8
 #: adding a guard case must not break this file -- but a drop means either a
 #: deleted case, which belongs in a task row, or a selection that stopped
 #: selecting, which is the vacuity trap.
+#:
+#: **Re-measured on `m4c35-trename-restart`, and the fs floor had gone slack.**
+#: The 427 above was already stale at `a8b30a1`, which really carries **431**
+#: across 13 suites: four cases were added after that measurement without this
+#: floor or the M4-06 row's roll-up following them.  A floor four short of the
+#: truth still passes, which is exactly how it stops being a floor -- so it is
+#: raised here to what gate 14's tip actually reports, **486 across 14
+#: suites**, and re-measured rather than incremented.
 EXPECTED_GUARD_ANCHORS = {
-    "fs-guard-deletion.py": 427,
+    "fs-guard-deletion.py": 486,
     "acp-guard-deletion.py": 148,
     "m5-guard-deletion.py": 82,
     "m3-guard-deletion.py": 5,

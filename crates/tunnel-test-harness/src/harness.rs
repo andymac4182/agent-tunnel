@@ -659,6 +659,30 @@ pub const FS_GATE_SERVICES: &[FsGateService] = &[
         host_supported: true,
     },
     FsGateService {
+        // Gate 14's export: the one a **`Trename`** is held across a real
+        // process failure on.
+        //
+        // **It carries `fs:delete` where `write-restart` does not, and that is
+        // not tidiness.**  `tunnel_fs_core::capability` requires a rename to
+        // hold both `Write` and `Delete` — it creates a name at the
+        // destination and removes one at the source — so on gate 13's grant
+        // the held operation would be refused before it ever dispatched and
+        // the gate would be measuring a permission denial rather than an
+        // ambiguity.
+        //
+        // It is its own export for the reason every row here is, with the one
+        // that bit hardest for gate 13 biting here too: this gate's journal is
+        // the *set of names in this export's own host directory*, so a name
+        // another case's session created or moved would not merely be
+        // confusing, it would be read as this gate's held rename.
+        label: "rename-restart",
+        display_name: "Synthetic writable filesystem export whose connector process is killed \
+                       mid-rename",
+        operations: &["fs:connect", "fs:read", "fs:write", "fs:list", "fs:delete"],
+        case_sensitivity: Some("insensitive-preserving"),
+        host_supported: true,
+    },
+    FsGateService {
         // Implementation gate 5's own export: every capability, so the write
         // grant is the relay's decision rather than the device's, and every
         // mutating primitive the profile defines is reachable on it.

@@ -42,6 +42,16 @@ of `docs/filesystem-api.md`.  Two suites live here:
   bytes it left behind from the export's own host file.  Its region predicate
   admits a **torn** write, which the contract permits and gate 10's
   directory-entry effect cannot express.
+* `gate14-rename-restart` — the validator of the gate that holds a
+  **`Trename`** outstanding across that same real process kill.  Its evidence
+  is the export root's namespace read **per name**, because a count of names
+  is invariant across a rename in one directory and so cannot see the
+  operation at all; and where gate 13 must *admit* its intermediate state, a
+  rename is the one baseline operation `docs/filesystem-api.md` grants backend
+  atomicity, so this validator **forbids** both of its intermediate states,
+  measures that the inode survived — "do not substitute copy/delete" — and
+  discriminates a refusal above the dispatch boundary from one the host made,
+  which gate 13 recorded that it could not.
 * `gate11-data-recovery` — the validator of the gate that holds a 9P read
   outstanding while the device's data socket is destroyed at the transport and
   the product's own retained recovery replaces it.  Measured the same way, and
@@ -2506,6 +2516,9 @@ HARNESS_ROTATION_WRITE = (
 )
 HARNESS_WRITE_RESTART = (
     HARNESS / "src" / "production_cluster" / "fs_write_restart.rs"
+)
+HARNESS_RENAME_RESTART = (
+    HARNESS / "src" / "production_cluster" / "fs_rename_restart.rs"
 )
 
 # Gate 6's end-to-end half is a **cluster** gate: it needs Redis, three relays,
@@ -5403,6 +5416,625 @@ GATE13_WRITE_RESTART_CASES: list[tuple[str, list[Edit]]] = [
 ]
 
 
+
+
+# `gate14-rename-restart` — the validator of the gate that holds a **`Trename`**
+# outstanding while the connector's real operating-system process is killed and
+# replaced.  Like every gate from `gate7-rotation` on this is a cluster run that
+# cannot be repeated once per case, so what is measured is its **rule list**
+# against the mutation table in the same file, and the edits replace a condition
+# with `true` because the rule list is a fixed-length array whose entries cannot
+# be removed without stopping the crate compiling.
+#
+# This suite exists apart from `gate10-process-restart` and
+# `gate13-write-restart`, and the reason was re-derived rather than inherited
+# from the note that deferred this clause.  That note held a `Trename` to be
+# "structurally the same evidence shape as gate 10's directory entry, down to
+# counting names in a host directory".  **A count cannot see a rename at all**:
+# a rename inside one directory removes one name and creates one, so gate 10's
+# count-based journal reads identically either side of the operation being
+# measured.  This suite therefore carries cases no other gate has:
+#
+#   * `the held rename moved a name and left the inode alone ...`, which is
+#     `docs/filesystem-api.md`'s "do not substitute copy/delete" measured
+#     rather than trusted — a `renameat` moves a name and keeps the inode, and
+#     a copy-then-unlink does not.  It is the only rule in any gate that can
+#     redden if a rename stops being native;
+#   * `no sample ever read the namespace in a state backend atomicity
+#     forbids ...`, the **inverse** of gate 13's position on the same event.
+#     Gate 13 must *admit* a torn region because the contract permits partial
+#     application for a write; a rename is the one baseline operation the same
+#     document grants backend atomicity, so its intermediate states are
+#     forbidden rather than tolerated;
+#   * `the same rename on a valid fid reached the host and was refused for an
+#     absent source` together with `the two refusals read differently on the
+#     same errno instrument ...`.  Gate 13 had to record that its `Einval` was
+#     merely *consistent* with a refusal above the dispatch boundary, because
+#     `policy::code_from_errno` folds every unrecognised errno into `Einval`
+#     too, and it carried the claim on an `mtime` instead.  `Errno::NOENT` is
+#     **not** folded — it maps to a distinct `FsErrorCode::Enoent` — and a
+#     rename is not idempotent, so the identical operation reaching the host
+#     reads differently from one refused above it.  Those two cases are what
+#     make this gate's errno proof of origin rather than corroboration; and
+#   * `a count of the export root's names was the same either side of the
+#     rename ...`, which records the blindness of gate 10's instrument as a
+#     measurement of this run rather than as an assertion in a comment.
+#
+# `the relay had dispatched a 9P record toward the device when the process was
+# killed` is shared by name with gate 10 and gate 13 because it is the same
+# construction, and it is declared in `EXPECT_GREEN` for the same reason: the
+# composite `request_outstanding_at_kill()` beside it is false unless the emit
+# cursor advanced **and** the receive cursor did not, so it subsumes this rule.
+# It is kept because it names the violated condition precisely when a run fails.
+#
+# No `!is_settled()` companion rule is listed here because none is written:
+# that is the rule gate 10 removed as unable to fail, and the library property
+# is held directly by `an_unknown_outcome_is_not_settled_and_a_failed_one_is`.
+GATE14_RENAME_RESTART_TEST = [
+    "cargo",
+    "test",
+    "--offline",
+    "-p",
+    "tunnel-test-harness",
+    "--lib",
+    "--locked",
+    "production_cluster::fs_rename_restart::",
+]
+
+GATE14_RENAME_RESTART_CASES: list[tuple[str, list[Edit]]] = [
+    (
+        'the production cluster ran three relays',
+        [
+            (
+                HARNESS_RENAME_RESTART,
+                '            evidence.relay_count == 3,',
+                '            true,',
+            )
+        ],
+    ),
+    (
+        'the owning relay was identified',
+        [
+            (
+                HARNESS_RENAME_RESTART,
+                '            !evidence.owner_node.is_empty(),',
+                '            true,',
+            )
+        ],
+    ),
+    (
+        'the server selected the filesystem subprotocol',
+        [
+            (
+                HARNESS_RENAME_RESTART,
+                '            evidence.selected_subprotocol == SUBPROTOCOL,',
+                '            true,',
+            )
+        ],
+    ),
+    (
+        'Tversion negotiated the 9P2000.L dialect',
+        [
+            (
+                HARNESS_RENAME_RESTART,
+                '            evidence.negotiated_dialect == DIALECT,',
+                '            true,',
+            )
+        ],
+    ),
+    (
+        'Tversion negotiated a bounded msize',
+        [
+            (
+                HARNESS_RENAME_RESTART,
+                '            evidence.negotiated_msize > 0 && evidence.negotiated_msize <= OFFERED_MSIZE,',
+                '            true,',
+            )
+        ],
+    ),
+    (
+        'the session served a real read before anything was perturbed',
+        [
+            (
+                HARNESS_RENAME_RESTART,
+                '            evidence.prefix_bytes > 0,',
+                '            true,',
+            )
+        ],
+    ),
+    (
+        'the host namespace discriminated a performed rename from an unperformed one, in both directions, before the event',
+        [
+            (
+                HARNESS_RENAME_RESTART,
+                '            evidence.journal_discriminated_both_directions(),',
+                '            true,',
+            )
+        ],
+    ),
+    (
+        'two different files reported two different inodes, so the instrument the atomicity rule reads can discriminate at all',
+        [
+            (
+                HARNESS_RENAME_RESTART,
+                '            evidence.inode_instrument_discriminates(),',
+                '            true,',
+            )
+        ],
+    ),
+    (
+        'a normally acknowledged rename moved a name and left the inode alone',
+        [
+            (
+                HARNESS_RENAME_RESTART,
+                '            evidence.control_rename_preserved_the_inode(),',
+                '            true,',
+            )
+        ],
+    ),
+    (
+        'the relay had dispatched a 9P record toward the device when the process was killed',
+        [
+            (
+                HARNESS_RENAME_RESTART,
+                '            evidence.restart.emitted_at_kill > evidence.restart.emitted_before,',
+                '            true,',
+            )
+        ],
+    ),
+    (
+        'the relay had received no answer to that record when the process was killed: the Trename was outstanding across the restart',
+        [
+            (
+                HARNESS_RENAME_RESTART,
+                '            evidence.request_outstanding_at_kill && evidence.restart.request_outstanding_at_kill(),',
+                '            true,',
+            )
+        ],
+    ),
+    (
+        'a stream was identified for the held exchange',
+        [
+            (
+                HARNESS_RENAME_RESTART,
+                '            evidence.restart.stream_id > 0,',
+                '            true,',
+            )
+        ],
+    ),
+    (
+        'the held rename had reached the device before the process was killed, so the lost answer is an unknown and not a refusal that never dispatched',
+        [
+            (
+                HARNESS_RENAME_RESTART,
+                '            evidence.held_namespace_before_kill == NamespaceState::AfterRename,',
+                '            true,',
+            )
+        ],
+    ),
+    (
+        'the held rename moved a name and left the inode alone, so it was a native rename and not a copy and an unlink',
+        [
+            (
+                HARNESS_RENAME_RESTART,
+                '            evidence.rename_preserved_the_inode(),',
+                '            true,',
+            )
+        ],
+    ),
+    (
+        'no sample ever read the namespace in a state backend atomicity forbids: both names present, or neither',
+        [
+            (
+                HARNESS_RENAME_RESTART,
+                '            !evidence.forbidden_intermediate_observed,',
+                '            true,',
+            )
+        ],
+    ),
+    (
+        "a count of the export root's names was the same either side of the rename, which is why a count-based journal cannot be this gate's evidence",
+        [
+            (
+                HARNESS_RENAME_RESTART,
+                '            evidence.entry_count_instrument_was_blind(),',
+                '            true,',
+            )
+        ],
+    ),
+    (
+        'a first connector process was identified',
+        [
+            (
+                HARNESS_RENAME_RESTART,
+                '            evidence.first_pid > 0,',
+                '            true,',
+            )
+        ],
+    ),
+    (
+        'the first connector process exited',
+        [
+            (
+                HARNESS_RENAME_RESTART,
+                '            evidence.first_process_exited,',
+                '            true,',
+            )
+        ],
+    ),
+    (
+        'the first connector process was killed rather than stopped gracefully',
+        [
+            (
+                HARNESS_RENAME_RESTART,
+                '            evidence.first_process_killed_by_signal,',
+                '            true,',
+            )
+        ],
+    ),
+    (
+        'the replacement is a different process',
+        [
+            (
+                HARNESS_RENAME_RESTART,
+                '            evidence.second_pid > 0 && evidence.second_pid != evidence.first_pid,',
+                '            true,',
+            )
+        ],
+    ),
+    (
+        'the replacement process served the device',
+        [
+            (
+                HARNESS_RENAME_RESTART,
+                '            evidence.second_process_active,',
+                '            true,',
+            )
+        ],
+    ),
+    (
+        'the owner was released between the two processes',
+        [
+            (
+                HARNESS_RENAME_RESTART,
+                '            evidence.owner_released_between,',
+                '            true,',
+            )
+        ],
+    ),
+    (
+        'the replacement claim took a strictly greater epoch',
+        [
+            (
+                HARNESS_RENAME_RESTART,
+                '            evidence.epoch_after > evidence.epoch_before,',
+                '            true,',
+            )
+        ],
+    ),
+    (
+        'an epoch was actually observed before the restart',
+        [
+            (
+                HARNESS_RENAME_RESTART,
+                '            evidence.epoch_before > 0,',
+                '            true,',
+            )
+        ],
+    ),
+    (
+        'the device session identity changed across the restart',
+        [
+            (
+                HARNESS_RENAME_RESTART,
+                '            !evidence.session_id_before.is_empty()\n                && !evidence.session_id_after.is_empty()\n                && evidence.session_id_before != evidence.session_id_after,',
+                '            true,',
+            )
+        ],
+    ),
+    (
+        'the pending call was failed rather than left hanging',
+        [
+            (
+                HARNESS_RENAME_RESTART,
+                '            evidence.pending_call_closed,',
+                '            true,',
+            )
+        ],
+    ),
+    (
+        'the pending call was failed explicitly, with a close code',
+        [
+            (
+                HARNESS_RENAME_RESTART,
+                '            evidence.pending_call_close_code == Some(DEVICE_GONE_CLOSE),',
+                '            true,',
+            )
+        ],
+    ),
+    (
+        'the pending call was not served a normal reply from a session the contract invalidates',
+        [
+            (
+                HARNESS_RENAME_RESTART,
+                '            !evidence.pending_call_answered,',
+                '            true,',
+            )
+        ],
+    ),
+    (
+        'a rename the host namespace proves reached the device was not reported to the caller as an error, which is a settled outcome a caller may resubmit after',
+        [
+            (
+                HARNESS_RENAME_RESTART,
+                '            !evidence.pending_call_errored,',
+                '            true,',
+            )
+        ],
+    ),
+    (
+        'the held rename classifies as an unknown outcome',
+        [
+            (
+                HARNESS_RENAME_RESTART,
+                '            evidence.held_call_outcome == Some(Outcome::Unknown),',
+                '            true,',
+            )
+        ],
+    ),
+    (
+        "the held exchange's stream was deregistered at the owner",
+        [
+            (
+                HARNESS_RENAME_RESTART,
+                '            evidence.held_stream_deregistered,',
+                '            true,',
+            )
+        ],
+    ),
+    (
+        "the namespace the kill left behind was neither completed, reverted nor re-applied by the restart, by a caller's retry or by the errno control",
+        [
+            (
+                HARNESS_RENAME_RESTART,
+                '            evidence.namespace_unchanged_since_the_kill(),',
+                '            true,',
+            )
+        ],
+    ),
+    (
+        "the earlier session's source fid is unbound after the restart",
+        [
+            (
+                HARNESS_RENAME_RESTART,
+                '            evidence.stale_source_fid_refused,',
+                '            true,',
+            )
+        ],
+    ),
+    (
+        'the stale source fid refusal carried the errno for a fid this session never allocated',
+        [
+            (
+                HARNESS_RENAME_RESTART,
+                '            evidence.stale_source_fid_errno == Some(UNKNOWN_FID_ERRNO),',
+                '            true,',
+            )
+        ],
+    ),
+    (
+        'a caller that retries the rename anyway is refused above the dispatch boundary',
+        [
+            (
+                HARNESS_RENAME_RESTART,
+                '            evidence.retry_refused_above_dispatch,',
+                '            true,',
+            )
+        ],
+    ),
+    (
+        'that retry carried the errno a session-level unknown-fid refusal carries',
+        [
+            (
+                HARNESS_RENAME_RESTART,
+                '            evidence.retry_refusal_errno == Some(UNKNOWN_FID_ERRNO),',
+                '            true,',
+            )
+        ],
+    ),
+    (
+        'the same rename on a valid fid reached the host and was refused for an absent source',
+        [
+            (
+                HARNESS_RENAME_RESTART,
+                '            evidence.absent_source_control_refused\n                && evidence.absent_source_control_errno == Some(ABSENT_SOURCE_ERRNO),',
+                '            true,',
+            )
+        ],
+    ),
+    (
+        "the two refusals read differently on the same errno instrument, so the retry's value says where it was refused rather than merely being consistent with the claim",
+        [
+            (
+                HARNESS_RENAME_RESTART,
+                '            evidence.errno_instrument_discriminates(),',
+                '            true,',
+            )
+        ],
+    ),
+    (
+        'the replacement session negotiated a bounded msize',
+        [
+            (
+                HARNESS_RENAME_RESTART,
+                '            evidence.second_session_msize > 0 && evidence.second_session_msize <= OFFERED_MSIZE,',
+                '            true,',
+            )
+        ],
+    ),
+    (
+        'the replacement session established its own root',
+        [
+            (
+                HARNESS_RENAME_RESTART,
+                '            evidence.second_session_attached,',
+                '            true,',
+            )
+        ],
+    ),
+    (
+        'the replacement session read the renamed file back whole',
+        [
+            (
+                HARNESS_RENAME_RESTART,
+                '            evidence.second_session_bytes == evidence.second_session_expected_bytes\n                && evidence.second_session_expected_bytes == FILE_BYTES,',
+                '            true,',
+            )
+        ],
+    ),
+    (
+        'that transfer needed many messages rather than one',
+        [
+            (
+                HARNESS_RENAME_RESTART,
+                '            evidence.second_session_messages > MIN_READ_MESSAGES,',
+                '            true,',
+            )
+        ],
+    ),
+    (
+        'the renamed file holds exactly the bytes the source held, so the name moved and the content came with it',
+        [
+            (
+                HARNESS_RENAME_RESTART,
+                '            evidence.renamed_content_matches,',
+                '            true,',
+            )
+        ],
+    ),
+    (
+        'the file is the size it always was',
+        [
+            (
+                HARNESS_RENAME_RESTART,
+                '            evidence.second_session_getattr_size == FILE_BYTES as u64,',
+                '            true,',
+            )
+        ],
+    ),
+    (
+        "the export's own directory view classifies the namespace exactly as the host does",
+        [
+            (
+                HARNESS_RENAME_RESTART,
+                '            evidence.namespace_over_ninep == evidence.held_namespace_before_kill,',
+                '            true,',
+            )
+        ],
+    ),
+    (
+        "the source name is gone from inside the export too, not merely from the host's view",
+        [
+            (
+                HARNESS_RENAME_RESTART,
+                '            evidence.source_name_walk_refused,',
+                '            true,',
+            )
+        ],
+    ),
+    (
+        'exactly one Tattach per attached session, and never a reconstructed one',
+        [
+            (
+                HARNESS_RENAME_RESTART,
+                '            evidence.attach_count == 2,',
+                '            true,',
+            )
+        ],
+    ),
+    (
+        'the `journal_discriminated_both_directions` conjunct `held_namespace_before_send`',
+        [
+            (
+                HARNESS_RENAME_RESTART,
+                '            self.held_namespace_before_send == NamespaceState::BeforeRename,',
+                '            true,',
+            )
+        ],
+    ),
+    (
+        'the `journal_discriminated_both_directions` conjunct `control_namespace_before`',
+        [
+            (
+                HARNESS_RENAME_RESTART,
+                '            self.control_namespace_before == NamespaceState::BeforeRename,',
+                '            true,',
+            )
+        ],
+    ),
+    (
+        'the `journal_discriminated_both_directions` conjunct `control_namespace_after`',
+        [
+            (
+                HARNESS_RENAME_RESTART,
+                '            self.control_namespace_after == NamespaceState::AfterRename,',
+                '            true,',
+            )
+        ],
+    ),
+    (
+        'the `namespace_unchanged_since_the_kill` conjunct `held_namespace_after_restart`',
+        [
+            (
+                HARNESS_RENAME_RESTART,
+                '            self.held_namespace_after_restart == self.held_namespace_before_kill,',
+                '            true,',
+            )
+        ],
+    ),
+    (
+        'the `namespace_unchanged_since_the_kill` conjunct `held_namespace_after_retry`',
+        [
+            (
+                HARNESS_RENAME_RESTART,
+                '            self.held_namespace_after_retry == self.held_namespace_before_kill,',
+                '            true,',
+            )
+        ],
+    ),
+    (
+        'the `namespace_unchanged_since_the_kill` conjunct `held_namespace_after_control`',
+        [
+            (
+                HARNESS_RENAME_RESTART,
+                '            self.held_namespace_after_control == self.held_namespace_before_kill,',
+                '            true,',
+            )
+        ],
+    ),
+    (
+        'the `entry_count_instrument_was_blind` conjunct `entry_count_before`',
+        [
+            (
+                HARNESS_RENAME_RESTART,
+                '            self.entry_count_before == EXPECTED_ENTRY_COUNT,',
+                '            true,',
+            )
+        ],
+    ),
+    (
+        'the `entry_count_instrument_was_blind` conjunct `entry_count_after`',
+        [
+            (
+                HARNESS_RENAME_RESTART,
+                '            self.entry_count_after == EXPECTED_ENTRY_COUNT,',
+                '            true,',
+            )
+        ],
+    ),
+]
+
+
 SUITES: list[Suite] = [
     Suite("gate2", [CRATE], CARGO_TEST, GATE2_CASES),
     Suite(
@@ -5463,6 +6095,12 @@ SUITES: list[Suite] = [
         [HARNESS / "src"],
         GATE13_WRITE_RESTART_TEST,
         GATE13_WRITE_RESTART_CASES,
+    ),
+    Suite(
+        "gate14-rename-restart",
+        [HARNESS / "src"],
+        GATE14_RENAME_RESTART_TEST,
+        GATE14_RENAME_RESTART_CASES,
     ),
 ]
 
@@ -5693,8 +6331,8 @@ def main() -> int:
             "run only this suite (gate2, gate3, gate4, gate5, "
             "gate6-adapters, gate6-e2e, gate7-rotation, gate8-consumer-loss, "
             "gate9-epoch-change, gate10-process-restart, "
-            "gate11-data-recovery, gate12-rotation-write or "
-            "gate13-write-restart); "
+            "gate11-data-recovery, gate12-rotation-write, "
+            "gate13-write-restart or gate14-rename-restart); "
             "default is all"
         ),
     )
