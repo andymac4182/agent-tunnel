@@ -24,22 +24,27 @@
 //! click lands twice. The restart tells us nothing about whether the click
 //! happened; that is precisely what makes it [`Completion::Unknown`].
 //!
-//! # Layer 1 is a decision, and it is not yet on the dispatch path
+//! # Layer 1 is now on the dispatch path — and what it took to get there
 //!
-//! **Said plainly, because the branch's own measurement makes it easy to
-//! assume otherwise.** [`restart_outcome`] has no production caller. Nothing
-//! in `tunnel-cua-fixture`'s dispatch client consults it, so the outcome a
-//! real restart-mid-operation produces today comes from the **transport**
-//! layer noticing the connection die — `Completion::Unknown(TransportLost)` —
-//! and not from `Unknown(BackendRestarted)`.
+//! [`restart_outcome`] spent one chunk as a decision nothing consulted, so a
+//! real restart-mid-operation was answered by the **transport** noticing the
+//! connection die — `Completion::Unknown(TransportLost)` — rather than by the
+//! supervisor naming the restart. The contract held throughout, which is why
+//! that was a gap in *attribution* and not in behaviour: `TransportLost` is
+//! equally `Dispatched`, equally `Unknown`, and equally non-retryable for
+//! every operation. What was missing was the **named reason**.
 //!
-//! The *contract* still holds on that path, which is why this is a gap in
-//! attribution rather than in behaviour: `TransportLost` is equally
-//! `Dispatched`, equally `Unknown`, and equally non-retryable for every
-//! operation. What is missing is the **named reason**, and with it the ability
-//! of a diagnostic to say *why* the outcome is unknown. Wiring it needs the
-//! dispatcher to observe the backend generation across an exchange and compare
-//! it afterwards; that is `docs/tasks.md` M5-C10, and it is open.
+//! [`attribute_restart`] closes it (`docs/tasks.md` M5-C10), and the way it
+//! does so is not the way that row's acceptance described. **That wording —
+//! observe the [`BackendGeneration`] across an exchange — is racy**, because
+//! that counter advances inside the supervisor's *start*, strictly after the
+//! old child is killed, while the exchange reads its "after" value the instant
+//! the socket closes. What was measured is the equivalent ordering on
+//! [`LifecycleEpoch`]: advancing it below the kill instead of above lost the
+//! attribution in **3 of 3 runs**. That is the observed rate, not a proof that
+//! the race can never be won — and a mechanism that depends on winning it
+//! would be the wrong shape regardless. [`LifecycleEpoch`] carries the
+//! argument in full.
 //!
 //! # Two halves, and both are needed
 //!
@@ -234,6 +239,141 @@ pub fn invalidate(
         generation,
         leases_released: leases.invalidate_all(),
         captures_forgotten: captures.invalidate_all(),
+    }
+}
+
+// ------------------------------------------------------- restart attribution
+
+/// A counter that advances **before** the supervisor does anything that can
+/// disturb a backend an exchange is already talking to.
+///
+/// # Why this is not [`BackendGeneration`]
+///
+/// The obvious reading of `docs/tasks.md` M5-C10 — "read the backend
+/// generation before the request is written and compare after" — is **racy,
+/// and re-deriving it rather than inheriting it is the only reason this type
+/// exists.** [`BackendGeneration`] advances inside the supervisor's *start*,
+/// which on a restart happens strictly after the old child has been killed
+/// and reaped. An exchange against that child observes its socket close at
+/// the kill, so it reads its "after" value in the window between the kill and
+/// the replacement's spawn — where the generation has **not** yet advanced.
+/// Attribution driven off [`BackendGeneration`] would therefore report
+/// `TransportLost` or `BackendRestarted` depending on which of two unrelated
+/// tasks won a race, which is the flaky-evidence shape `AGENTS.md` forbids.
+///
+/// A lifecycle epoch fixes the ordering by announcing the disturbance before
+/// causing it: the supervisor advances this at the top of `stop`, ahead of the
+/// kill, so **every** exchange that could see the socket die has already been
+/// guaranteed to observe a changed epoch afterwards. The comparison is
+/// equality only; the magnitude and the number of advances per restart carry
+/// no meaning.
+///
+/// # What it does not cover
+///
+/// A backend that dies on its own, with no supervisor call, advances nothing,
+/// and an exchange across that death is reported `TransportLost` — which is
+/// the honest answer, because no restart happened. The epoch names *supervisor
+/// action*, not *backend death*.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct LifecycleEpoch(u64);
+
+impl LifecycleEpoch {
+    /// The epoch before the supervisor has disturbed anything.
+    pub const INITIAL: Self = Self(0);
+
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    #[must_use]
+    pub const fn value(self) -> u64 {
+        self.0
+    }
+
+    /// The next epoch.
+    ///
+    /// **Not what the supervisor advances the live counter with** — that is a
+    /// `fetch_add` on the shared handle, because the counter is read
+    /// concurrently and a read-modify-write through this type would not be
+    /// atomic. This exists so a test can construct a *changed* epoch without
+    /// a supervisor, and so `before.next()` reads as "some later epoch"
+    /// rather than as a magic number; every attribution test uses it.
+    #[must_use]
+    pub const fn next(self) -> Self {
+        Self(self.0 + 1)
+    }
+}
+
+/// Re-attribute a transport-level answer to the supervisor, when — and only
+/// when — the supervisor disturbed the backend across this exchange.
+///
+/// This is the production route [`restart_outcome`] previously lacked
+/// (`docs/tasks.md` M5-C10). `before` is read immediately before the request
+/// is written, `after` immediately after the exchange resolves, and
+/// `transport` is whatever the transport concluded on its own.
+///
+/// # It changes the reason and never the arm
+///
+/// The stage is **read out of the transport's own answer** rather than
+/// guessed: an answer of [`NotDispatched::NotReached`] is
+/// [`InFlight::NotReached`], and an [`Completion::Unknown`] is
+/// [`InFlight::ReachedBackend`]. Feeding those to [`restart_outcome`] returns
+/// the same `Dispatch` arm it was given, so re-attribution does not widen
+/// retryability.
+///
+/// **That holds by the composition of two measured functions, not by
+/// construction of this one.** This function delegates the mapping to
+/// [`restart_outcome`], so the property is a fact about the two bodies
+/// agreeing: mutating `restart_outcome`'s `ReachedBackend` arm to
+/// `NotDispatched` — which is `m5-guard-deletion.py`'s `m5c4` case *an
+/// operation in flight across a restart is unknown, never not-dispatched* —
+/// would widen retryability through here too. What pins it is
+/// `attribution_never_changes_what_a_retry_is_allowed_to_do`, which measures
+/// every reason against every operation, not the shape of the match below.
+///
+/// # A stop that never restarted anything is still named a restart
+///
+/// [`LifecycleEpoch`] advances at the top of the supervisor's `stop`, so
+/// three paths advance it without a completed restart: a bare `stop()`, a
+/// `restart()` whose `start()` fails, and a `stop()` called when nothing was
+/// running. An exchange in flight across any of them is renamed
+/// `BackendRestarted`.
+///
+/// **That is a diagnostic-name inaccuracy and nothing more, which is why it is
+/// tolerated rather than fixed.** Every one of those paths really did take the
+/// backend away underneath the exchange, so `Unknown` is the correct verdict;
+/// only the word "restarted" overstates what followed. It cannot cause a
+/// double click, because the rename moves `Unknown(_)` to `Unknown(
+/// BackendRestarted)` and leaves `NotReached` alone, and both
+/// [`Dispatch::retry_is_safe`] and [`Dispatch::retry_is_safe_for`] are
+/// unchanged by either. Narrowing the name would need the epoch to advance
+/// only on a *successful* restart, which reintroduces exactly the race
+/// [`LifecycleEpoch`] exists to remove.
+///
+/// # What is deliberately left alone
+///
+/// * [`Completion::Ok`] and [`Completion::Failed`] — one backend gave a
+///   definitive answer on a connection that survived to deliver it. Rewriting
+///   a known outcome to `Unknown` because something restarted *afterwards*
+///   would destroy information, which is the opposite of this row's point.
+/// * Every other [`NotDispatched`] arm — `BackendRejected`,
+///   `BackendUnavailable` and the input-authority refusals each name a more
+///   specific cause than "a restart happened", and each is already correct.
+///   `BackendUnavailable` in particular is an answer the backend *sent*.
+#[must_use]
+pub fn attribute_restart(
+    before: LifecycleEpoch,
+    after: LifecycleEpoch,
+    transport: Dispatch,
+) -> Dispatch {
+    if before == after {
+        return transport;
+    }
+    match &transport {
+        Dispatch::Dispatched(Completion::Unknown(_)) => restart_outcome(InFlight::ReachedBackend),
+        Dispatch::NotDispatched(NotDispatched::NotReached) => restart_outcome(InFlight::NotReached),
+        _ => transport,
     }
 }
 

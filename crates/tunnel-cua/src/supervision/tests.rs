@@ -233,3 +233,182 @@ fn a_capture_id_from_another_device_is_still_unknown_after_a_restart() {
         CaptureRefusal::Unknown
     );
 }
+
+// ------------------------------------------------------- restart attribution
+
+/// Every `UnknownReason` the transport layer can conclude on its own, so the
+/// attribution cases below are a cross-product rather than one representative.
+const TRANSPORT_UNKNOWNS: [UnknownReason; 8] = [
+    UnknownReason::Truncated,
+    UnknownReason::FramingAbsent,
+    UnknownReason::Unparseable,
+    UnknownReason::SuccessAbsent,
+    UnknownReason::TransportLost,
+    UnknownReason::BackendRestarted,
+    UnknownReason::DeadlineExpired,
+    UnknownReason::UnexpectedStatus { status: 500 },
+];
+
+/// Answers that must survive attribution untouched, each with why.
+fn answers_attribution_must_not_rewrite() -> Vec<Dispatch> {
+    use crate::lease::LeaseRefusal;
+    use crate::outcome::{FailureCode, InputRefusal};
+    vec![
+        // A backend answered definitively on a connection that lived long
+        // enough to deliver it.
+        Dispatch::Dispatched(Completion::Ok(serde_json::json!({}))),
+        Dispatch::Dispatched(Completion::Failed {
+            code: FailureCode::BackendReported,
+        }),
+        Dispatch::Dispatched(Completion::Failed {
+            code: FailureCode::PermissionDenied,
+        }),
+        // Each of these names a more specific cause than "a restart happened".
+        Dispatch::NotDispatched(NotDispatched::BackendRejected { status: 400 }),
+        Dispatch::NotDispatched(NotDispatched::BackendUnavailable),
+        Dispatch::NotDispatched(NotDispatched::NotPermitted),
+        Dispatch::NotDispatched(NotDispatched::EndpointRefused),
+        Dispatch::NotDispatched(NotDispatched::PeerUnavailable),
+        Dispatch::NotDispatched(NotDispatched::InputAuthority(InputRefusal::Lease(
+            LeaseRefusal::NotHeld,
+        ))),
+    ]
+}
+
+#[test]
+fn an_undisturbed_exchange_keeps_the_transports_own_answer() {
+    // **The control that makes every other case in this file mean something.**
+    // If attribution rewrote an untouched exchange, the tests below could not
+    // tell "the epoch changed" from "attribution always rewrites".
+    let epoch = LifecycleEpoch::new(7);
+    for reason in TRANSPORT_UNKNOWNS {
+        let transport = Dispatch::Dispatched(Completion::Unknown(reason));
+        assert_eq!(
+            attribute_restart(epoch, epoch, transport.clone()),
+            transport,
+            "an equal epoch must change nothing, including for {reason:?}"
+        );
+    }
+    for answer in answers_attribution_must_not_rewrite() {
+        assert_eq!(
+            attribute_restart(epoch, epoch, answer.clone()),
+            answer,
+            "an equal epoch must change nothing, including for {answer:?}"
+        );
+    }
+}
+
+#[test]
+fn a_disturbed_exchange_that_reached_the_backend_is_named_a_restart() {
+    // The row M5-C10 exists for: the named reason, not merely the arm.
+    let before = LifecycleEpoch::INITIAL;
+    let after = before.next();
+    for reason in TRANSPORT_UNKNOWNS {
+        let attributed = attribute_restart(
+            before,
+            after,
+            Dispatch::Dispatched(Completion::Unknown(reason)),
+        );
+        assert_eq!(
+            attributed,
+            Dispatch::Dispatched(Completion::Unknown(UnknownReason::BackendRestarted)),
+            "an unknown outcome across a supervisor disturbance is a restart, \
+             whatever the transport called it; {reason:?} was not re-attributed"
+        );
+    }
+}
+
+#[test]
+fn a_disturbed_exchange_that_never_reached_the_backend_stays_retryable() {
+    // The other half of the stage mapping. A request that was never written
+    // is retryable whether or not the supervisor restarted anything, and
+    // `restart_outcome` is what says so -- this is not a pass-through.
+    let before = LifecycleEpoch::INITIAL;
+    let after = before.next();
+    let attributed = attribute_restart(
+        before,
+        after,
+        Dispatch::NotDispatched(NotDispatched::NotReached),
+    );
+    assert_eq!(
+        attributed,
+        Dispatch::NotDispatched(NotDispatched::NotReached)
+    );
+    assert!(attributed.retry_is_safe_for(Operation::Click));
+}
+
+#[test]
+fn a_disturbed_exchange_keeps_every_definitive_answer_it_was_given() {
+    // Attribution must not destroy information. An `Ok` rewritten to
+    // `Unknown` because something restarted afterwards would be strictly
+    // worse than not attributing at all.
+    let before = LifecycleEpoch::INITIAL;
+    let after = before.next();
+    for answer in answers_attribution_must_not_rewrite() {
+        assert_eq!(
+            attribute_restart(before, after, answer.clone()),
+            answer,
+            "a definitive answer must survive a restart that happened around \
+             it: {answer:?}"
+        );
+    }
+}
+
+#[test]
+fn attribution_never_changes_what_a_retry_is_allowed_to_do() {
+    // **The rule M5-C10's acceptance names: attribution must not widen
+    // retryability.** Measured over every `UnknownReason`, plus representative
+    // answers from the arms attribution must leave alone, crossed with every
+    // operation in both epoch relations -- rather than argued from the shape
+    // of the match.
+    //
+    // **Not an exhaustive enumeration of `Dispatch`, and does not claim to
+    // be.** The schema, operation, lease and capture refusals,
+    // `AnsweredLocally`, and `Failed { Unsupported }` are absent; every one of
+    // them reaches `_ => transport` and is returned untouched, so none can
+    // affect retryability. What the 432 pins is that the set actually measured
+    // did not shrink.
+    let before = LifecycleEpoch::INITIAL;
+    let mut inputs: Vec<Dispatch> = TRANSPORT_UNKNOWNS
+        .into_iter()
+        .map(|reason| Dispatch::Dispatched(Completion::Unknown(reason)))
+        .collect();
+    inputs.push(Dispatch::NotDispatched(NotDispatched::NotReached));
+    inputs.extend(answers_attribution_must_not_rewrite());
+
+    let mut checked = 0usize;
+    for after in [before, before.next()] {
+        for transport in &inputs {
+            let attributed = attribute_restart(before, after, transport.clone());
+            assert_eq!(
+                attributed.retry_is_safe(),
+                transport.retry_is_safe(),
+                "attribution changed blanket retryability of {transport:?}"
+            );
+            for operation in Operation::ALL {
+                assert_eq!(
+                    attributed.retry_is_safe_for(operation),
+                    transport.retry_is_safe_for(operation),
+                    "attribution changed retryability of {transport:?} for \
+                     {operation:?}"
+                );
+                checked += 1;
+            }
+        }
+    }
+    // **A literal, because the obvious form of this assertion cannot fail.**
+    // This first read `assert_eq!(checked, 2 * inputs.len() * Operation::ALL
+    // .len())`, which is exactly the thing it was written to prevent: empty
+    // `inputs` and both sides go to zero together, so the check agrees with
+    // itself over a loop that never ran. 432 is 18 transport answers x 12
+    // operations x 2 epoch relations, and it is written out so that dropping
+    // an input, an operation or the undisturbed arm fails here rather than
+    // quietly shrinking the cross-product.
+    assert_eq!(
+        checked,
+        432,
+        "the cross-product did not run in full: {} inputs x {} operations x 2",
+        inputs.len(),
+        Operation::ALL.len()
+    );
+}

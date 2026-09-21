@@ -40,10 +40,11 @@
 //! process, or to whatever bound it next.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use tunnel_cua::endpoint::{BackendEndpoint, EndpointError};
-use tunnel_cua::supervision::{BackendGeneration, Invalidation};
+use tunnel_cua::supervision::{BackendGeneration, Invalidation, LifecycleEpoch};
 
 use crate::child::{BackendChild, ChildCounters, SpawnError, spawn};
 use crate::config::{ADDRESS_POLL, BackendProcess};
@@ -64,6 +65,77 @@ pub trait InputAuthority {
     /// Drop every input lease and forget every capture identity, stamping the
     /// new generation, and report what was freed.
     fn invalidate(&self, generation: BackendGeneration) -> Invalidation;
+}
+
+/// A [`LifecycleEpoch`] a dispatcher can read while the supervisor owning it
+/// is busy elsewhere.
+///
+/// **Shared by clone, published by exactly one writer.** The supervisor is the
+/// only holder that ever calls [`LifecycleEpochHandle::disturb`]; every other
+/// holder reads.
+///
+/// The store is `Release` and the loads `Acquire`, which is the conservative
+/// choice rather than a load-bearing one, and **the earlier note here
+/// overclaimed what it buys.** Rust's memory model orders this store against
+/// other Rust memory operations; it does not order it against a `kill`
+/// syscall in another process's address space. What actually makes the
+/// ordering work is program order — `disturb()` is executed before `kill()` is
+/// issued — and the operating system, which is the edge that carries the
+/// socket close to the dispatcher. `Relaxed` would almost certainly be
+/// sufficient for a single `u64` counter read for equality; the stronger
+/// ordering is kept because it costs nothing measurable here and because a
+/// future reader adding a second field would be right to expect it.
+///
+/// # This is not a clock and not a lock
+///
+/// A dispatcher reading a changed epoch learns that the supervisor *began* a
+/// disturbance somewhere across its exchange. It does not learn when, and it
+/// must not: an exchange that failed for an unrelated reason during a restart
+/// is still correctly attributed to the restart, because after a restart
+/// nobody can establish which of the two it was. Attribution is deliberately
+/// the pessimistic reading, and
+/// [`tunnel_cua::supervision::attribute_restart`] keeps it from ever being
+/// the more retryable one.
+///
+/// # It advances on every stop, including the ones that never restart
+///
+/// [`Supervisor::stop`] advances it unconditionally, so a bare stop, a
+/// `restart` whose `start` fails, and a stop with nothing running all rename
+/// an in-flight `Unknown(_)` to `BackendRestarted`. Each of those really did
+/// take the backend away underneath the exchange, so the verdict is right and
+/// only the word overstates the sequel; **retryability is identical on every
+/// one of those paths**, so it cannot produce a second click. Advancing only
+/// on a *successful* restart would reintroduce the race this type exists to
+/// remove. See `attribute_restart`'s own documentation.
+#[derive(Clone, Debug, Default)]
+pub struct LifecycleEpochHandle(Arc<AtomicU64>);
+
+impl LifecycleEpochHandle {
+    /// A detached handle that nothing advances.
+    ///
+    /// For a dispatcher built without a supervisor — a fixture talking to a
+    /// backend it did not spawn. Its epoch never changes, so attribution is a
+    /// no-op and the transport's own reason survives, which is the honest
+    /// answer when there is no supervisor to blame.
+    #[must_use]
+    pub fn detached() -> Self {
+        Self::default()
+    }
+
+    /// The current epoch.
+    #[must_use]
+    pub fn read(&self) -> LifecycleEpoch {
+        LifecycleEpoch::new(self.0.load(Ordering::Acquire))
+    }
+
+    /// Announce that the supervisor is about to disturb the backend.
+    ///
+    /// **Called before the disturbance, never after**, which is the entire
+    /// correctness argument; see [`LifecycleEpoch`]'s own documentation for
+    /// why the [`BackendGeneration`] counter cannot be used in its place.
+    fn disturb(&self) {
+        self.0.fetch_add(1, Ordering::Release);
+    }
 }
 
 /// Why a backend could not be started.
@@ -105,6 +177,7 @@ pub struct Supervisor {
     process: BackendProcess,
     counters: Arc<ChildCounters>,
     generation: BackendGeneration,
+    epoch: LifecycleEpochHandle,
     running: Option<Running>,
 }
 
@@ -122,8 +195,20 @@ impl Supervisor {
             process,
             counters: Arc::new(ChildCounters::default()),
             generation: BackendGeneration::INITIAL,
+            epoch: LifecycleEpochHandle::detached(),
             running: None,
         }
+    }
+
+    /// A handle on this supervisor's lifecycle epoch, for a dispatcher that
+    /// must attribute a failed exchange to a restart.
+    ///
+    /// Handed out by clone so the dispatcher can read it while the supervisor
+    /// is inside `restart`. A dispatcher that never takes one attributes
+    /// nothing, which is why this is the seam rather than a global.
+    #[must_use]
+    pub fn lifecycle_epoch(&self) -> LifecycleEpochHandle {
+        self.epoch.clone()
     }
 
     /// The counters, for a diagnostic or a test that must read what happened
@@ -252,6 +337,22 @@ impl Supervisor {
     /// on the paths it drove would leave exactly the crashed-backend case
     /// uncovered.
     pub async fn stop(&mut self, authority: &dyn InputAuthority) -> Invalidation {
+        // **Before the kill, and unconditionally.** Every exchange that could
+        // see this backend's socket die must be guaranteed to read a changed
+        // epoch afterwards, and an exchange racing us reads its "after" value
+        // the instant the socket closes -- which is here, not at the
+        // replacement's spawn. Advancing after the kill leaves a window in
+        // which a restart-killed exchange still reports `TransportLost`:
+        // measured, and it is not a narrow race but the whole outcome --
+        // moving this one line below the kill fails
+        // `a_restart_mid_operation_is_unknown_and_the_click_does_not_land_twice`
+        // in 3 of 3 runs -- the measured figure, not a proof that the race can
+        // never be won. That is also why `BackendGeneration`, which advances
+        // later still (at the replacement's spawn), cannot be used here.
+        // Unconditional because a backend that died on its own is stopped
+        // through here too, and the exchange it killed is no less disturbed
+        // for the supervisor having arrived second.
+        self.epoch.disturb();
         if let Some(running) = self.running.take() {
             running.child.kill();
             running.child.wait_exited().await;
