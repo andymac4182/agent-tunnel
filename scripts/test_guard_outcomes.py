@@ -256,6 +256,48 @@ def every_module_filter_is_anchored() -> None:
     )
 
 
+def the_flag_short_circuits_before_anything_is_edited(script: Path) -> None:
+    """`--check-anchors` must return before the harness touches the tree.
+
+    **Found by red-testing this file, and anticipated by nobody (M4-34).**
+    Deleting only the two dispatch lines from a harness -- leaving the argparse
+    flag in place, which is exactly what a careless edit does -- makes
+    `--check-anchors` a *silently ignored* flag: argparse still accepts it, so
+    the harness falls straight through into `require_clean_tree` and the
+    deletion loop and runs the entire multi-hour destructive suite.  It does
+    not fail; it does the most expensive and most dangerous possible thing.
+
+    That is not hypothetical: it happened here, from inside this test file,
+    which then had to be killed mid-case and left a defeated guard in
+    `crates/tunnel-cua/src/outcome.rs` because the kill pre-empted `restore()`
+    -- the M4-32 shape, reached through a unit test rather than a concurrent
+    edit.
+
+    So the dispatch is pinned in the source, and pinned *before* the subprocess
+    runs: if this check fails, no subprocess is started and nothing is edited.
+    Order is the rule, not merely presence -- a dispatch placed after
+    `require_clean_tree` would still edit the tree first.
+    """
+    text = script.read_text()
+    dispatch = "if arguments.check_anchors:"
+    check(
+        dispatch in text,
+        f"{script.name} no longer dispatches on --check-anchors, so the flag "
+        "would be silently ignored and the full destructive suite would run",
+    )
+    check(
+        "return check_anchors(selected)" in text,
+        f"{script.name} accepts --check-anchors but does not return the "
+        "preflight's exit code",
+    )
+    guard = "require_clean_tree(suites)"
+    check(
+        guard in text and text.index(dispatch) < text.index(guard),
+        f"{script.name} dispatches --check-anchors only after it has begun "
+        "editing the tree; the flag must short-circuit first",
+    )
+
+
 def every_guard_anchor_resolves_to_exactly_one_occurrence() -> None:
     """Hold `fs-guard-deletion.py --check-anchors` as a standing rule.
 
@@ -282,11 +324,16 @@ def every_guard_anchor_resolves_to_exactly_one_occurrence() -> None:
     for script_name, floor in sorted(EXPECTED_GUARD_ANCHORS.items()):
         script = directory / script_name
         check(script.exists(), f"{script_name} is missing")
+        the_flag_short_circuits_before_anything_is_edited(script)
         result = subprocess.run(
             [sys.executable, str(script), "--check-anchors"],
             capture_output=True,
             text=True,
             check=False,
+            # Defence in depth behind the static check above: a `--check-anchors`
+            # that ever reaches the deletion loop must not be allowed to run for
+            # hours from inside a unit test.
+            timeout=300,
         )
         check(
             result.returncode == 0,
