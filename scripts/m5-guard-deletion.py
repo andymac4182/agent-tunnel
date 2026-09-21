@@ -1433,7 +1433,7 @@ CASES_C4: list[tuple[str, list[Edit], bool]] = [
 #: The `.watching()` call sites in `tests/supervision.rs` are deliberately
 #: **not** cases: this harness defeats guards in the *product*, and editing a
 #: test to remove its own coverage measures nothing about behaviour. The
-#: product-side equivalent is the last case here, which makes `watching`
+#: dispatcher-side equivalent is the last case here, which makes `watching`
 #: accept the handle and drop it -- exactly what an unwired dispatcher does.
 #:
 #: Shares `m5c4`'s build and test set: the restart attribution is witnessed by
@@ -1537,7 +1537,8 @@ CASES_C5: list[tuple[str, list[Edit], bool]] = [
         False,
     ),
     (
-        # The product-side form of "the dispatcher is not watching": `watching`
+        # The dispatcher-side form of "the dispatcher is not watching":
+        # `watching`
         # takes the handle and drops it, leaving the detached default. This is
         # what makes the watched/unwatched pair in `tests/supervision.rs`
         # evidence -- the epoch really is what decides, and a dispatcher that

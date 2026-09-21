@@ -346,7 +346,8 @@ impl Supervisor {
         // measured, and it is not a narrow race but the whole outcome --
         // moving this one line below the kill fails
         // `a_restart_mid_operation_is_unknown_and_the_click_does_not_land_twice`
-        // on every run. That is also why `BackendGeneration`, which advances
+        // in 3 of 3 runs -- the measured figure, not a proof that the race can
+        // never be won. That is also why `BackendGeneration`, which advances
         // later still (at the replacement's spawn), cannot be used here.
         // Unconditional because a backend that died on its own is stopped
         // through here too, and the exchange it killed is no less disturbed

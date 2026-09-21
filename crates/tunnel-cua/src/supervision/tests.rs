@@ -357,9 +357,17 @@ fn a_disturbed_exchange_keeps_every_definitive_answer_it_was_given() {
 #[test]
 fn attribution_never_changes_what_a_retry_is_allowed_to_do() {
     // **The rule M5-C10's acceptance names: attribution must not widen
-    // retryability.** Measured over every transport answer this module can
-    // receive crossed with every operation, in both epoch relations, rather
-    // than argued from the shape of the match.
+    // retryability.** Measured over every `UnknownReason`, plus representative
+    // answers from the arms attribution must leave alone, crossed with every
+    // operation in both epoch relations -- rather than argued from the shape
+    // of the match.
+    //
+    // **Not an exhaustive enumeration of `Dispatch`, and does not claim to
+    // be.** The schema, operation, lease and capture refusals,
+    // `AnsweredLocally`, and `Failed { Unsupported }` are absent; every one of
+    // them reaches `_ => transport` and is returned untouched, so none can
+    // affect retryability. What the 432 pins is that the set actually measured
+    // did not shrink.
     let before = LifecycleEpoch::INITIAL;
     let mut inputs: Vec<Dispatch> = TRANSPORT_UNKNOWNS
         .into_iter()
