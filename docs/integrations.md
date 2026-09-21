@@ -400,10 +400,35 @@ at all. Neither registry reuses an identifier after a restart: a reissued captur
 id would let a stale click resolve against a different image, pass the bounds
 check, and be dispatched at coordinates nobody picked.
 
-**Not covered.** A backend killed mid-drag may have left a button down or a
-modifier held on the target OS session, and nothing in this repository observes
-that; the restart says what it does not know about the *operation*, not about the
-desktop's state. See `docs/tasks.md` M5-C08 and M5-C09.
+**Declared, not resolved.** A backend killed mid-drag may have left a button
+down, one killed mid-hotkey a modifier held, one killed mid-type a prefix
+entered. Nothing in this repository observes any of that, and nothing here
+repairs it. What a restart now does is **say so**: every `Invalidation` carries a
+`DesktopResidue` naming which kinds of input state the departed backend may have
+left asserted on the target, folded over every operation that synthesises input,
+because the device keeps no register of what was in flight. It is stamped
+unconditionally — including on a restart that freed no lease and no capture,
+since the device's own registries are not a witness to the desktop, and the agent
+who inherits a held button holds no lease at the moment of the restart at all.
+
+**Why it is a declaration rather than a release sweep**, which is the decision
+this profile is making and not a shortfall. The pinned 0.3.46 command registry
+this repository has read carries no button-up, key-up or held-key primitive (the
+platform table above records the same limit for the Cua Driver backend), so the
+only way to force a release through it is *more synthesised input* — a `drag`
+onto itself, a `hotkey` re-press — each an unauthorized effect on somebody's
+desktop and the same harm as the double click the restart rules exist to
+prevent. It would also be the supervisor synthesising input, which M5's health
+probe is forbidden from doing for exactly that reason. Nor can the device read
+the residue away: the one pointer-adjacent read the profile carries is
+`cursor_position`, which reports **where** the pointer is and never whether a
+button is down. So `DesktopResidue` offers a union and no difference, no `clear`
+and no `observe` — there is no observation available that could justify one.
+
+**Still open, and it needs a VM.** Whether the pinned server releases held input
+on client disconnect or process exit is unmeasured; if it does, the declaration
+can be narrowed with dated evidence. That measurement cannot be taken on a
+loopback fixture. See `docs/tasks.md` M5-C08, M5-C09 and M5-C09a.
 
 ## Integration acceptance gates
 

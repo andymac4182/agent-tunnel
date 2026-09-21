@@ -191,6 +191,196 @@ fn restarting_an_idle_backend_frees_nothing_and_says_so() {
     assert!(!invalidation.freed_anything());
     assert!(invalidation.leases_released.is_empty());
     assert_eq!(invalidation.captures_forgotten, 0);
+    // **And it still declares the residue.** "Nothing was held" is a fact
+    // about this device's registries; it is not a witness to the desktop. See
+    // `a_restart_that_freed_nothing_still_declares_what_it_cannot_see`.
+    assert_eq!(invalidation.residue(), RESTART_RESIDUE);
+}
+
+// -------------------------------------------- what a restart cannot see (C09)
+
+/// The whole map, both directions, with the partition pinned by absolute
+/// count rather than by anything derived from the map under test.
+///
+/// An emptied `Operation::ALL` would make a "for every operation" loop
+/// vacuously true; the three `assert_eq!`s on literal counts are what stop
+/// that, and the first of them is the positive control for the other two.
+#[test]
+fn every_operation_declares_what_an_interruption_of_it_can_leave_unobserved() {
+    assert_eq!(
+        Operation::ALL.len(),
+        12,
+        "the operation table this partition is measured over"
+    );
+
+    let mut declares_something = Vec::new();
+    let mut declares_nothing = Vec::new();
+    for operation in Operation::ALL {
+        if interruption_residue(operation).is_empty() {
+            declares_nothing.push(operation);
+        } else {
+            declares_something.push(operation);
+        }
+    }
+
+    assert_eq!(
+        declares_nothing,
+        vec![
+            Operation::Describe,
+            Operation::Capture,
+            Operation::ScreenInfo,
+            Operation::CursorPosition,
+            Operation::Move,
+        ],
+        "the four reads synthesise no input at all, and `move`'s entire \
+         effect is a pointer position `cursor_position` reports"
+    );
+    assert_eq!(declares_nothing.len(), 5);
+    assert_eq!(
+        declares_something,
+        vec![
+            Operation::Click,
+            Operation::DoubleClick,
+            Operation::Drag,
+            Operation::Scroll,
+            Operation::TypeText,
+            Operation::PressKey,
+            Operation::Hotkey,
+        ]
+    );
+    assert_eq!(declares_something.len(), 7);
+
+    // A read that manufactured a residue would make the declaration
+    // meaningless, so this direction is asserted as hard as the other.
+    for operation in Operation::READ_ONLY {
+        assert_eq!(
+            interruption_residue(operation),
+            DesktopResidue::NONE,
+            "{} synthesises no input",
+            operation.name()
+        );
+    }
+}
+
+/// The kinds are not interchangeable, and collapsing any two would lose the
+/// distinction a consumer acts on.
+#[test]
+fn a_held_button_and_a_held_key_are_different_declarations() {
+    let button = interruption_residue(Operation::Click);
+    assert!(button.pointer_button_may_be_down());
+    assert!(!button.key_may_be_held());
+    assert!(!button.effect_may_be_partial());
+
+    let key = interruption_residue(Operation::PressKey);
+    assert!(key.key_may_be_held());
+    assert!(!key.pointer_button_may_be_down());
+    assert_eq!(interruption_residue(Operation::Hotkey), key);
+
+    assert_ne!(button, key);
+
+    // A drag is the only operation carrying both kinds: it presses, travels
+    // and releases, so it can end with the button down *and* half done.
+    let drag = interruption_residue(Operation::Drag);
+    assert!(drag.pointer_button_may_be_down());
+    assert!(drag.effect_may_be_partial());
+    assert!(!drag.key_may_be_held());
+
+    // Partial delivery without anything left asserted.
+    for operation in [Operation::Scroll, Operation::TypeText] {
+        let residue = interruption_residue(operation);
+        assert_eq!(residue, DesktopResidue::PARTIAL_EFFECT);
+        assert!(!residue.pointer_button_may_be_down());
+        assert!(!residue.key_may_be_held());
+    }
+}
+
+/// The restart declaration is the fold over the input operations, and carries
+/// every kind any of them can leave.
+#[test]
+fn a_restart_declares_every_kind_an_input_operation_can_leave() {
+    let folded = Operation::INPUT
+        .into_iter()
+        .map(interruption_residue)
+        .fold(DesktopResidue::NONE, DesktopResidue::union);
+    assert_eq!(RESTART_RESIDUE, folded);
+    assert_eq!(Operation::INPUT.len(), 8, "the set the fold ran over");
+
+    assert!(RESTART_RESIDUE.pointer_button_may_be_down());
+    assert!(RESTART_RESIDUE.key_may_be_held());
+    assert!(RESTART_RESIDUE.effect_may_be_partial());
+    assert!(!RESTART_RESIDUE.is_empty());
+}
+
+/// **The positive control for every assertion above.**
+///
+/// `DesktopResidue` can express "nothing", and five of the twelve operations
+/// and an un-restarted `Invalidation` do express it — so a restart declaring
+/// all three kinds is a decision this code made, not a constant of the type
+/// that could not have come out otherwise.
+#[test]
+fn the_residue_type_can_express_nothing_which_is_what_makes_the_rest_a_choice() {
+    assert!(DesktopResidue::NONE.is_empty());
+    assert!(DesktopResidue::default().is_empty());
+    assert_eq!(DesktopResidue::default(), DesktopResidue::NONE);
+    assert!(interruption_residue(Operation::Move).is_empty());
+    assert!(interruption_residue(Operation::Capture).is_empty());
+
+    // A `Default` invalidation is "no restart happened", not "a restart
+    // happened and the desktop is clean". Nothing produces the second.
+    assert!(Invalidation::default().residue().is_empty());
+
+    assert!(
+        !DesktopResidue::NONE
+            .union(DesktopResidue::KEY_HELD)
+            .is_empty()
+    );
+    assert_eq!(
+        DesktopResidue::NONE.union(DesktopResidue::NONE),
+        DesktopResidue::NONE
+    );
+}
+
+/// A restart that freed nothing declares exactly as much as one that freed
+/// everything.
+///
+/// The device's registries are not a witness to the desktop: a lease released
+/// just before the kill empties them and says nothing about what the backend
+/// was part-way through, and the agent who inherits a held button holds no
+/// lease at the moment of the restart at all.
+#[test]
+fn a_restart_that_freed_nothing_still_declares_what_it_cannot_see() {
+    let mut idle_leases = InputLeases::new();
+    let mut idle_captures = Captures::new();
+    let idle = invalidate(
+        &mut idle_leases,
+        &mut idle_captures,
+        BackendGeneration::INITIAL.next(),
+    );
+
+    let mut busy_leases = InputLeases::new();
+    let mut busy_captures = Captures::new();
+    let target = target("desktop-0");
+    busy_leases
+        .acquire(&target, SessionId::new(1), GrantRevision::new(0))
+        .expect("the target is free");
+    busy_captures
+        .record(&target, 0, 128, 96, 100)
+        .expect("geometry");
+    let busy = invalidate(
+        &mut busy_leases,
+        &mut busy_captures,
+        BackendGeneration::INITIAL.next(),
+    );
+
+    // The positive control: these two invalidations really are different, so
+    // the equality below is not two copies of the same empty answer.
+    assert!(!idle.freed_anything());
+    assert!(busy.freed_anything());
+    assert_eq!(busy.leases_released, vec![target]);
+    assert_eq!(busy.captures_forgotten, 1);
+
+    assert_eq!(idle.residue(), busy.residue());
+    assert_eq!(idle.residue(), RESTART_RESIDUE);
 }
 
 #[test]

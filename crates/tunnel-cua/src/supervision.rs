@@ -68,13 +68,40 @@
 //!
 //! It does not claim the in-flight operation's effect did or did not happen.
 //! That is unknowable after the backend is gone, and saying so is the whole
-//! point. It also does not claim the *target OS session* returned to any
-//! particular state: a backend killed mid-drag may have left a button down,
-//! and nothing in this repository can observe that. See `docs/tasks.md`
-//! M5-C09.
+//! point.
+//!
+//! # The third half: what a restart cannot see (`docs/tasks.md` M5-C09)
+//!
+//! [`restart_outcome`] and [`Invalidation`] are both statements about *this
+//! device's* bookkeeping. Neither says anything about the target OS session,
+//! and the silence was readable as a claim. [`DesktopResidue`] ends the
+//! silence without resolving it: a restart now **declares** which kinds of
+//! input state the departed backend may have left asserted on the target,
+//! because it cannot observe them and cannot put them back.
+//!
+//! **It is a declaration and never a repair, and that is a decision with a
+//! safety argument, not a shortfall.** A "release everything" sweep would be
+//! the supervisor synthesising input — the thing M5's health probe is
+//! forbidden from doing, for the reason that a click nobody asked for is the
+//! same harm as a click that landed twice. It is also **inexpressible against
+//! the pinned surface**: `tunnel_cua_fixture::REGISTERED_COMMANDS` mirrors the
+//! 0.3.46 registry this repository has read, and it carries no button-up,
+//! key-up or held-key primitive; `docs/integrations.md`'s platform table
+//! records the same limit for the Cua Driver backend. The only way to force a
+//! release through that registry is *more synthesised input* — a `drag` onto
+//! itself, a `hotkey` re-press — each of which is an unauthorized effect on
+//! somebody's desktop.
+//!
+//! Nor can the device read the residue away. The one pointer-adjacent read the
+//! profile carries is `cursor_position`, which reports **where** the pointer
+//! is and never **whether a button is down**; the fixture's answer is
+//! `{success, x, y}` and the registry has nothing else. So there is no
+//! observation that could clear a declared residue, and this module
+//! deliberately offers no operation that removes one.
 
 use crate::capture::Captures;
 use crate::lease::{InputLeases, TargetSession};
+use crate::operation::Operation;
 use crate::outcome::{Completion, Dispatch, NotDispatched, UnknownReason};
 
 /// Which generation of the supervised backend a piece of device-side state
@@ -173,6 +200,183 @@ pub const fn restart_outcome(stage: InFlight) -> Dispatch {
     }
 }
 
+// ------------------------------------------- what a restart cannot see (C09)
+
+/// Input state a backend may have left asserted on the **target OS session**,
+/// and that nothing on this device can observe.
+///
+/// # What is in scope, and why the boundary is where it is
+///
+/// A residue kind is carried only when both halves hold: the operation
+/// synthesises input that can be interrupted **part-way**, and this device has
+/// **no read that would settle it**. "Every input changes the world" is true
+/// and useless; what a later agent inherits as a *stuck input device* is the
+/// thing worth declaring, because it silently re-interprets everything that
+/// agent does next — a `move` with a button still down is a drag.
+///
+/// The boundary excludes one input operation, which is the point of having a
+/// map rather than a flag: see [`interruption_residue`] on [`Operation::Move`].
+///
+/// # There is no way to take a kind away
+///
+/// This type has a [`DesktopResidue::union`] and no difference, no `clear` and
+/// no `observe`. That is deliberate and it is the honest limit stated as an
+/// API: nothing in this repository can establish that a declared residue is
+/// gone, so nothing in this repository may offer to say so. A future chunk
+/// that measures a real backend on a VM (`docs/tasks.md` M5-C09a) would be
+/// entitled to add one; reading is not.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub struct DesktopResidue {
+    pointer_button: bool,
+    key_held: bool,
+    partial_effect: bool,
+}
+
+impl DesktopResidue {
+    /// Nothing unobservable can have been left behind.
+    ///
+    /// **Not the same as "the desktop is unchanged."** A completed click
+    /// changed the desktop and leaves no residue, because the change is the
+    /// consumer's own intended effect rather than an input this device left
+    /// asserted.
+    pub const NONE: Self = Self {
+        pointer_button: false,
+        key_held: false,
+        partial_effect: false,
+    };
+
+    /// A pointer button may still be down.
+    pub const POINTER_BUTTON: Self = Self {
+        pointer_button: true,
+        ..Self::NONE
+    };
+
+    /// A key or modifier may still be held.
+    pub const KEY_HELD: Self = Self {
+        key_held: true,
+        ..Self::NONE
+    };
+
+    /// An effect may have been applied in part: some of a string typed, some
+    /// of a scroll delta delivered, a drag carried half way.
+    pub const PARTIAL_EFFECT: Self = Self {
+        partial_effect: true,
+        ..Self::NONE
+    };
+
+    /// Everything either of these declares.
+    #[must_use]
+    pub const fn union(self, other: Self) -> Self {
+        Self {
+            pointer_button: self.pointer_button || other.pointer_button,
+            key_held: self.key_held || other.key_held,
+            partial_effect: self.partial_effect || other.partial_effect,
+        }
+    }
+
+    /// Whether this declares nothing at all.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        !self.pointer_button && !self.key_held && !self.partial_effect
+    }
+
+    #[must_use]
+    pub const fn pointer_button_may_be_down(self) -> bool {
+        self.pointer_button
+    }
+
+    #[must_use]
+    pub const fn key_may_be_held(self) -> bool {
+        self.key_held
+    }
+
+    #[must_use]
+    pub const fn effect_may_be_partial(self) -> bool {
+        self.partial_effect
+    }
+}
+
+/// What an interruption of this operation may have left on the target that
+/// this device cannot see.
+///
+/// The four read-only operations synthesise no input at all, so an
+/// interruption of one cannot leave any, and each declares
+/// [`DesktopResidue::NONE`]. **A read that manufactured a residue would make
+/// the declaration meaningless** — if everything declares everything, a
+/// consumer learns nothing from being told.
+///
+/// # [`Operation::Move`] is the input operation that declares nothing
+///
+/// It asserts no button and no key, and its entire effect *is* the pointer
+/// position — which `cursor_position` reports. So a `move` interrupted
+/// half-way leaves the pointer somewhere the device can simply go and read.
+/// It is the one place the profile's read surface actually covers an input
+/// operation, and carrying it in the map rather than special-casing "input"
+/// is what keeps this from being `mutates_target` under another name.
+///
+/// **The counter-argument, recorded rather than dismissed:** a `move` across a
+/// desktop that *already* has a button down is a drag, so a move can have an
+/// effect far beyond its position. That effect is attributable to the prior
+/// residue, not to the move, which is exactly why the prior residue must be
+/// declared — and it is the strongest reason this row could not be closed with
+/// a prose note.
+#[must_use]
+pub const fn interruption_residue(operation: Operation) -> DesktopResidue {
+    match operation {
+        // Reads. No input is synthesised, so an interruption leaves none.
+        Operation::Describe
+        | Operation::Capture
+        | Operation::ScreenInfo
+        | Operation::CursorPosition => DesktopResidue::NONE,
+        // See this function's own documentation: the pointer's position is
+        // the whole effect, and the profile can read it.
+        Operation::Move => DesktopResidue::NONE,
+        // A press whose matching release the backend may not have reached.
+        // `double_click` is one dispatch with two click effects, which makes
+        // its interior strictly more interruptible, not less.
+        Operation::Click | Operation::DoubleClick => DesktopResidue::POINTER_BUTTON,
+        // Both, and the only operation that carries both: a drag is a press,
+        // a traversal and a release, so it can end with the button down *and*
+        // the gesture carried part of the way.
+        Operation::Drag => DesktopResidue::POINTER_BUTTON.union(DesktopResidue::PARTIAL_EFFECT),
+        // Discrete deltas, some of which may have been delivered. Nothing is
+        // left asserted, and nothing reads how far it got.
+        Operation::Scroll => DesktopResidue::PARTIAL_EFFECT,
+        // A prefix of the string may have been typed. **Which prefix is not
+        // recorded, here or anywhere**: the payload is keystrokes and
+        // `crate::schema::Keystrokes` keeps it out of every diagnostic. The
+        // declaration is that *some* prefix may exist, never what it was.
+        Operation::TypeText => DesktopResidue::PARTIAL_EFFECT,
+        // A key or chord whose release the backend may not have reached. Kept
+        // distinct from `POINTER_BUTTON` because the two are cleared by
+        // different things and inherited differently: a held modifier
+        // re-interprets every later keystroke, a held button every later move.
+        Operation::PressKey | Operation::Hotkey => DesktopResidue::KEY_HELD,
+    }
+}
+
+/// The residue a restart declares, folded from [`interruption_residue`] over
+/// every operation that synthesises input.
+///
+/// **Conservative on purpose, and derived rather than restated.** This device
+/// does not record which operation was in flight when the supervisor killed
+/// the backend — there is no in-flight register anywhere in `tunnel-cua` — so
+/// a restart cannot narrow the declaration to the operation that was actually
+/// running. Folding the map is what keeps this honest as the map changes: an
+/// operation added with a new residue kind widens this automatically, where a
+/// hand-written constant would quietly not.
+pub const RESTART_RESIDUE: DesktopResidue = restart_residue();
+
+const fn restart_residue() -> DesktopResidue {
+    let mut residue = DesktopResidue::NONE;
+    let mut index = 0;
+    while index < Operation::INPUT.len() {
+        residue = residue.union(interruption_residue(Operation::INPUT[index]));
+        index += 1;
+    }
+    residue
+}
+
 /// What one restart took away.
 ///
 /// Returned by [`invalidate`] so a supervisor reports the real counts rather
@@ -198,6 +402,18 @@ pub struct Invalidation {
     pub leases_released: Vec<TargetSession>,
     /// How many capture identities were forgotten.
     pub captures_forgotten: usize,
+    /// **What this restart may have left on the target, and cannot see.**
+    ///
+    /// The other two fields say what the device took away from itself; this
+    /// one says what it could not take away from the desktop. It rides on the
+    /// same value for the same reason both registries ride on one call: a
+    /// supervisor that could report the invalidation without the declaration
+    /// would report the reassuring half alone.
+    ///
+    /// Always [`RESTART_RESIDUE`] when [`invalidate`] produced it, and
+    /// [`DesktopResidue::NONE`] on a [`Default`] value, which represents no
+    /// restart having happened rather than a clean one.
+    pub residue: DesktopResidue,
 }
 
 impl Invalidation {
@@ -209,6 +425,12 @@ impl Invalidation {
     #[must_use]
     pub fn freed_anything(&self) -> bool {
         !self.leases_released.is_empty() || self.captures_forgotten > 0
+    }
+
+    /// What this restart may have left on the target and cannot see.
+    #[must_use]
+    pub const fn residue(&self) -> DesktopResidue {
+        self.residue
     }
 }
 
@@ -230,6 +452,19 @@ impl Invalidation {
 /// — a restart, a stop, and a crash it noticed — not only on a deliberate
 /// restart. A backend that died on its own invalidates exactly as much as one
 /// the supervisor replaced.
+///
+/// # The declaration is unconditional, and that is the sharp part
+///
+/// [`RESTART_RESIDUE`] is stamped whatever the registries held, including on
+/// the idle restart that frees nothing. Conditioning it on
+/// [`Invalidation::freed_anything`] is the tempting narrowing and it is wrong
+/// twice over: the device's own bookkeeping is **not a witness to the
+/// desktop** — a lease released a microsecond before the kill leaves the
+/// registry empty and says nothing about what the backend was mid-way through
+/// — and the residue that matters most is precisely the one inherited by a
+/// *later* agent, who holds no lease at the moment of the restart. A device
+/// that said "nothing was held, so the desktop is clean" would be making the
+/// exact claim this row exists to stop.
 pub fn invalidate(
     leases: &mut InputLeases,
     captures: &mut Captures,
@@ -239,6 +474,7 @@ pub fn invalidate(
         generation,
         leases_released: leases.invalidate_all(),
         captures_forgotten: captures.invalidate_all(),
+        residue: RESTART_RESIDUE,
     }
 }
 
