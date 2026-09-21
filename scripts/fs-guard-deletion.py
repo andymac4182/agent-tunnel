@@ -2441,6 +2441,9 @@ HARNESS_LOSS = HARNESS / "src" / "production_cluster" / "fs_consumer_loss.rs"
 HARNESS_EPOCH = HARNESS / "src" / "production_cluster" / "fs_epoch_change.rs"
 HARNESS_RESTART = HARNESS / "src" / "production_cluster" / "fs_process_restart.rs"
 HARNESS_RECOVERY = HARNESS / "src" / "production_cluster" / "fs_data_recovery.rs"
+HARNESS_ROTATION_WRITE = (
+    HARNESS / "src" / "production_cluster" / "fs_rotation_write.rs"
+)
 
 # Gate 6's end-to-end half is a **cluster** gate: it needs Redis, three relays,
 # a device connector and `node`, and it takes minutes.  That is not a shape this
@@ -2463,7 +2466,7 @@ GATE6_E2E_TEST = [
     "tunnel-test-harness",
     "--lib",
     "--locked",
-    "production_cluster::fs_client_e2e",
+    "production_cluster::fs_client_e2e::",
 ]
 
 GATE6_E2E_CASES: list[tuple[str, list[Edit]]] = [
@@ -2660,6 +2663,14 @@ EXPECT_GREEN: frozenset[str] = frozenset(
         # end-of-directory refusal beside it, so no test can distinguish them;
         # what it bounds is the *work* a resume may demand, not the answer.
         "a resume cookie is bounded by the traversal budget",
+        # gate12's two, on gate7's recorded precedent and for its reason: the
+        # composite in-flight rule beside each of these already subsumes it,
+        # because `exchange_in_flight_at_freeze()` is false unless
+        # `attempt_active` is set **and** the phase is one of `FROZEN_PHASES`.
+        # Both are kept because they name the violated condition precisely
+        # when a run fails, which a composite cannot.
+        "a rotation attempt was active when the owner was sampled for the write",
+        "a rotation attempt was active when the owner was sampled for the flush",
         # gate8, gate9 **and gate10**, which share this case name because they
         # share the construction.  The composite in-flight rule beside it already
         # subsumes this one: `request_outstanding_at_loss()` — and gate 9's
@@ -2810,7 +2821,18 @@ GATE7_ROTATION_TEST = [
     "tunnel-test-harness",
     "--lib",
     "--locked",
-    "production_cluster::fs_rotation",
+    # The trailing `::` is load-bearing: without it this filter is a
+    # **prefix** of `production_cluster::fs_rotation_write`, so gate 12's six
+    # cases were also selected by gate 7's suite.  That is the ambiguity this
+    # script refuses at the level of guard *text*, arriving one level up at
+    # the level of the test *filter*: a gate must measure its own rules.
+    #
+    # **Every module filter in this file carries the `::` for that reason, not
+    # only this one.**  Only this filter had an actual collision; the others
+    # were one module name away from the same defect, and the next module named
+    # as an extension of an existing one would have re-created it silently.
+    # `every_module_filter_is_anchored` holds the rule so it cannot rot back.
+    "production_cluster::fs_rotation::",
 ]
 
 GATE7_ROTATION_CASES: list[tuple[str, list[Edit]]] = [
@@ -3064,7 +3086,7 @@ GATE8_LOSS_TEST = [
     "tunnel-test-harness",
     "--lib",
     "--locked",
-    "production_cluster::fs_consumer_loss",
+    "production_cluster::fs_consumer_loss::",
 ]
 
 GATE8_LOSS_CASES: list[tuple[str, list[Edit]]] = [
@@ -3307,7 +3329,7 @@ GATE9_EPOCH_TEST = [
     "tunnel-test-harness",
     "--lib",
     "--locked",
-    "production_cluster::fs_epoch_change",
+    "production_cluster::fs_epoch_change::",
 ]
 
 GATE9_EPOCH_CASES: list[tuple[str, list[Edit]]] = [
@@ -3654,7 +3676,7 @@ GATE10_RESTART_TEST = [
     "tunnel-test-harness",
     "--lib",
     "--locked",
-    "production_cluster::fs_process_restart",
+    "production_cluster::fs_process_restart::",
 ]
 
 GATE10_RESTART_CASES: list[tuple[str, list[Edit]]] = [
@@ -4193,7 +4215,7 @@ GATE11_RECOVERY_TEST = [
     "tunnel-test-harness",
     "--lib",
     "--locked",
-    "production_cluster::fs_data_recovery",
+    "production_cluster::fs_data_recovery::",
 ]
 
 GATE11_RECOVERY_CASES: list[tuple[str, list[Edit]]] = [
@@ -4360,6 +4382,461 @@ GATE11_RECOVERY_CASES: list[tuple[str, list[Edit]]] = [
 ]
 
 
+
+# `gate12-rotation-write` — the validator of the gate that holds a **Twrite**
+# across one real scheduled rotation and a **Tflush** across the next.  Like
+# `gate7-rotation` this is a cluster run that cannot be repeated once per case,
+# so what is measured is its **rule list** against the mutation table in the
+# same file.  The edits replace a condition with `true` for the same reason:
+# the rule list is a fixed-length array and removing an entry stops the crate
+# compiling, which this script refuses to call a red test.
+#
+# The cases that matter most are the ones that make this gate a *write* gate
+# rather than a second read gate: that the host directory discriminated a
+# written region from an untouched one **in both directions and before the
+# event**, that it showed the write performed before the freeze, and that a
+# clean scheduled rotation left no ambiguous write.  Without those the gate
+# would prove only that a rotation happened near a mutation.
+#
+# **Two of the forty-one are masked, and this says so rather than hiding it**,
+# on exactly gate 7's recorded precedent and for the same reason: the two
+# `attempt_active` rules are each still green when defeated alone, because the
+# composite rule beside each of them already subsumes it —
+# `exchange_in_flight_at_freeze()` returns false unless `attempt_active` is set
+# **and** the phase is one of `FROZEN_PHASES`.  They are kept because they name
+# the violated condition precisely when a run fails, which a composite cannot.
+#
+# A rule reading `held_region_before_freeze != RegionState::Torn` was
+# **removed** rather than listed here: `held_write_performed_before_freeze()`
+# is `== RegionState::Written`, so the torn rule could never have failed a run.
+# Its property is held by `a_partly_applied_write_is_torn_and_is_neither_of_
+# the_others`, which defeats all four classifications directly, and the removal
+# is recorded in M4-06.
+GATE12_ROTATION_WRITE_TEST = [
+    "cargo",
+    "test",
+    "--offline",
+    "-p",
+    "tunnel-test-harness",
+    "--lib",
+    "--locked",
+    "production_cluster::fs_rotation_write::",
+]
+
+GATE12_ROTATION_WRITE_CASES: list[tuple[str, list[Edit]]] = [
+    (
+        "the production cluster ran three relays",
+        [
+            (
+                HARNESS_ROTATION_WRITE,
+                "            evidence.relay_count == 3,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the owning relay was identified",
+        [
+            (
+                HARNESS_ROTATION_WRITE,
+                "            !evidence.owner_node.is_empty(),",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the server selected the filesystem subprotocol",
+        [
+            (
+                HARNESS_ROTATION_WRITE,
+                "            evidence.selected_subprotocol == SUBPROTOCOL,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "Tversion negotiated the 9P2000.L dialect",
+        [
+            (
+                HARNESS_ROTATION_WRITE,
+                "            evidence.negotiated_dialect == DIALECT,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "Tversion negotiated a bounded msize",
+        [
+            (
+                HARNESS_ROTATION_WRITE,
+                "            evidence.negotiated_msize > 0 && evidence.negotiated_msize <= OFFERED_MSIZE,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the host directory discriminated a written region from an untouched one, in both directions, before the event",
+        [
+            (
+                HARNESS_ROTATION_WRITE,
+                "            evidence.journal_discriminated_both_directions(),",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "a rotation attempt was active when the owner was sampled for the write",
+        [
+            (
+                HARNESS_ROTATION_WRITE,
+                "            evidence.write_freeze.attempt_active,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the connector's fence covered a record the owner had not received: the Twrite was in flight when the first attempt's fences were fixed",
+        [
+            (
+                HARNESS_ROTATION_WRITE,
+                "            evidence.write_exchange_in_flight_at_freeze\n                && evidence.write_freeze.exchange_in_flight_at_freeze(),",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the first attempt named a candidate generation above the old one",
+        [
+            (
+                HARNESS_ROTATION_WRITE,
+                "            evidence\n                .write_freeze\n                .candidate_generation\n                .is_some_and(|candidate| candidate > evidence.write_freeze.old_generation),",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the host directory showed the held write performed before the freeze",
+        [
+            (
+                HARNESS_ROTATION_WRITE,
+                "            evidence.held_write_performed_before_freeze(),",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the reply held across the first rotation carried the tag that was outstanding",
+        [
+            (
+                HARNESS_ROTATION_WRITE,
+                "            evidence.held_write_reply_tag_matched,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the reply held across the first rotation was an Rwrite",
+        [
+            (
+                HARNESS_ROTATION_WRITE,
+                "            evidence.held_write_reply_was_rwrite,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the Rwrite acknowledged exactly the bytes the Twrite carried",
+        [
+            (
+                HARNESS_ROTATION_WRITE,
+                "            evidence.held_write_acknowledged_bytes == HELD_PAYLOAD_BYTES,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the held write was answered",
+        [
+            (
+                HARNESS_ROTATION_WRITE,
+                "            evidence.held_write_answered,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "a clean scheduled rotation left no ambiguous write",
+        [
+            (
+                HARNESS_ROTATION_WRITE,
+                "            !evidence.held_write_ambiguous,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the held write's effect was still whole after the rotation committed",
+        [
+            (
+                HARNESS_ROTATION_WRITE,
+                "            evidence.held_region_after_rotation == RegionState::Written,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the host file was exactly its seeded length",
+        [
+            (
+                HARNESS_ROTATION_WRITE,
+                "            evidence.image_bytes == evidence.image_expected_bytes\n                && evidence.image_expected_bytes == TARGET_FILE_BYTES,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "no byte outside the two written regions changed",
+        [
+            (
+                HARNESS_ROTATION_WRITE,
+                "            evidence.image_checksum_matches,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "a rotation attempt was active when the owner was sampled for the flush",
+        [
+            (
+                HARNESS_ROTATION_WRITE,
+                "            evidence.flush_freeze.attempt_active,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the connector's fence covered a record the owner had not received: the flush exchange was in flight when the second attempt's fences were fixed",
+        [
+            (
+                HARNESS_ROTATION_WRITE,
+                "            evidence.flush_exchange_in_flight_at_freeze\n                && evidence.flush_freeze.exchange_in_flight_at_freeze(),",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the second attempt named a candidate generation above the old one",
+        [
+            (
+                HARNESS_ROTATION_WRITE,
+                "            evidence\n                .flush_freeze\n                .candidate_generation\n                .is_some_and(|candidate| candidate > evidence.flush_freeze.old_generation),",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the flush held across the second rotation was answered on its own tag",
+        [
+            (
+                HARNESS_ROTATION_WRITE,
+                "            evidence.rflush_observed,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the flush named a victim other than itself",
+        [
+            (
+                HARNESS_ROTATION_WRITE,
+                "            evidence.flushed_victim_tag != evidence.flush_tag,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the flushed tag was never answered at all, across the rotation",
+        [
+            (
+                HARNESS_ROTATION_WRITE,
+                "            !evidence.flushed_victim_reply_observed,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "no reply for the flushed tag followed its Rflush",
+        [
+            (
+                HARNESS_ROTATION_WRITE,
+                "            evidence.flushed_replies_after_rflush == 0,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the flush cancelled its victim and nothing else: every pipelined read queued ahead of it was still answered",
+        [
+            (
+                HARNESS_ROTATION_WRITE,
+                "            evidence.flush_pipeline_replies == FLUSH_PIPELINE_DEPTH,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "a scheduled rotation completed while the write was held",
+        [
+            (
+                HARNESS_ROTATION_WRITE,
+                "            evidence.rotations_completed_after_write > evidence.rotations_completed_before,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "a second scheduled rotation completed while the flush was held",
+        [
+            (
+                HARNESS_ROTATION_WRITE,
+                "            evidence.rotations_completed_after_flush > evidence.rotations_completed_after_write,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the active data generation advanced",
+        [
+            (
+                HARNESS_ROTATION_WRITE,
+                "            evidence.generation_after > evidence.generation_before,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "a clean rotation replayed no frames",
+        [
+            (
+                HARNESS_ROTATION_WRITE,
+                "            evidence.total_replayed_frames == 0,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "neither rotation was forced into recovery by its deadline",
+        [
+            (
+                HARNESS_ROTATION_WRITE,
+                "            !evidence.deadline_forced_retirement && evidence.rotation_recovery_reason.is_none(),",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the session identity was unchanged across both rotations",
+        [
+            (
+                HARNESS_ROTATION_WRITE,
+                "            evidence.session_id_stable,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the session epoch was unchanged across both rotations",
+        [
+            (
+                HARNESS_ROTATION_WRITE,
+                "            evidence.epoch_stable,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the fid opened before the rotations still answered after them",
+        [
+            (
+                HARNESS_ROTATION_WRITE,
+                "            evidence.fid_survived_read,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "that fid read the held write's bytes back",
+        [
+            (
+                HARNESS_ROTATION_WRITE,
+                "            evidence.fid_read_back_matches_payload,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the relay did not reconstruct the session: exactly one Tattach was sent",
+        [
+            (
+                HARNESS_ROTATION_WRITE,
+                "            evidence.attach_count == 1,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "a tag allocated after the rotations correlated correctly",
+        [
+            (
+                HARNESS_ROTATION_WRITE,
+                "            evidence.post_rotation_tag_correlated,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the journal's negative direction: the region was untouched before the write",
+        [
+            (
+                HARNESS_ROTATION_WRITE,
+                "            self.held_region_before_send == RegionState::Untouched,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the journal's positive direction: a prefix write read back written",
+        [
+            (
+                HARNESS_ROTATION_WRITE,
+                "            self.prefix_region_after_write == RegionState::Written,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the prefix write's acknowledged count",
+        [
+            (
+                HARNESS_ROTATION_WRITE,
+                "            self.prefix_acknowledged_bytes == PREFIX_PAYLOAD_BYTES,",
+                "            true,",
+            )
+        ],
+    ),
+    (
+        "the ambiguity derivation needs the journal",
+        [
+            (
+                HARNESS_ROTATION_WRITE,
+                "    evidence.held_write_performed_before_freeze() && !evidence.held_write_answered\n",
+                "    !evidence.held_write_answered\n",
+            )
+        ],
+    ),
+]
+
+
 SUITES: list[Suite] = [
     Suite("gate2", [CRATE], CARGO_TEST, GATE2_CASES),
     Suite(
@@ -4408,6 +4885,12 @@ SUITES: list[Suite] = [
         [HARNESS / "src"],
         GATE11_RECOVERY_TEST,
         GATE11_RECOVERY_CASES,
+    ),
+    Suite(
+        "gate12-rotation-write",
+        [HARNESS / "src"],
+        GATE12_ROTATION_WRITE_TEST,
+        GATE12_ROTATION_WRITE_CASES,
     ),
 ]
 

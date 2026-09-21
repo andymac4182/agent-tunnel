@@ -160,6 +160,13 @@ mod fs_epoch_change;
 mod fs_process_restart;
 mod fs_real_path;
 mod fs_rotation;
+/// M4 filesystem gate 12: the **write** and **`Tflush`** halves of M4-06's
+/// rotation clause.  Its own module rather than a case inside gate 7 because
+/// gate 7 holds a *read*, whose whole effect is its answer, and this one holds
+/// a *mutation*, which may have applied whether or not it is answered — so it
+/// needs a writable export, a host-directory journal read from outside the
+/// connector, and a classification gate 7 has no vocabulary for.
+mod fs_rotation_write;
 mod fs_wire;
 mod fs_write_path;
 pub use fs_consumer_loss::{
@@ -184,6 +191,10 @@ pub use fs_real_path::{
 pub use fs_rotation::{
     FreezeObservation, FsRotationEvidence, validate_fs_rotation_evidence,
     verify as verify_fs_rotation,
+};
+pub use fs_rotation_write::{
+    FsRotationWriteEvidence, RegionState, validate_fs_rotation_write_evidence,
+    verify as verify_fs_rotation_write,
 };
 pub use fs_write_path::{
     FsWritePathEvidence, validate_fs_write_path_evidence, verify as verify_fs_write_path,

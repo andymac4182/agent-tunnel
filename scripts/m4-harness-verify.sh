@@ -45,4 +45,7 @@ gate "M4 filesystem gate 9: a 9P session held across a real control-epoch change
 gate "M4 filesystem gate 10: a 9P mutation outstanding while the connector's real process is killed and replaced" \
   cargo run --locked -p tunnel-test-harness -- verify-m4-fs-process-restart
 
+gate "M4 filesystem gate 12: a Twrite and a Tflush held across two real scheduled rotations, classified from the export's own host directory" \
+  cargo run --locked -p tunnel-test-harness -- verify-m4-fs-rotation-write
+
 echo "m4-harness-verify: implemented M4 harness suite passed" >&2

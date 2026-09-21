@@ -70,8 +70,47 @@ def main() -> int:
     check("a guard that is not load-bearing" in listed[0], "the case is named")
     check("NOTHING went red" in listed[0], "the green is explained, not just echoed")
 
+    every_module_filter_is_anchored()
+
     print("test_guard_outcomes: PASS")
     return 0
+
+
+EXPECTED_MODULE_FILTERS = 7
+
+
+def every_module_filter_is_anchored() -> None:
+    """Every `production_cluster::<module>` test filter must end in `::`.
+
+    Without the anchor a filter is a **prefix** of any module whose name
+    extends it, and cargo's filter is a substring match -- so that suite
+    silently selects another gate's cases and measures rules that are not its
+    own.  That happened: `production_cluster::fs_rotation` began selecting
+    gate 12's six cases the moment `fs_rotation_write` existed.
+
+    Fixing the one collision would leave the class open, because the next
+    module named as an extension of an existing one re-creates it in silence.
+    This is the rule, held where it cannot rot back.
+    """
+    script = (Path(__file__).resolve().parent / "fs-guard-deletion.py").read_text()
+    seen = [line.strip() for line in script.splitlines() if '"production_cluster::' in line]
+    unanchored = [line for line in seen if not line.endswith('::",')]
+    check(
+        not unanchored,
+        "these module filters are prefixes and will capture another gate's "
+        f"cases: {unanchored}",
+    )
+    # Without this the check passes vacuously: it matches on one literal
+    # spelling, so reformatting the filters -- single quotes, a line break --
+    # makes `seen` empty and `unanchored` empty with it, and a de-anchored
+    # filter sails through.  A guard that cannot tell "all anchored" from
+    # "found nothing to look at" is the shape this file exists to refuse.
+    check(
+        len(seen) >= EXPECTED_MODULE_FILTERS,
+        f"expected at least {EXPECTED_MODULE_FILTERS} module filters to "
+        f"inspect, found {len(seen)} -- the scan matched nothing, so its "
+        "silence is not evidence",
+    )
 
 
 if __name__ == "__main__":
