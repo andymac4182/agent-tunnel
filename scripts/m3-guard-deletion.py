@@ -463,14 +463,37 @@ DOCTOR_CASES: list[Case] = [
 #: the same M3-19 reason as the others: it edits `tunnel-test-harness`, and
 #: only a `cargo test -p tunnel-test-harness` invocation rebuilds it.
 #:
-#: **Why the rule is witnessed through a free function rather than through the
-#: gate it protects.**  The behaviour these cases defend is a wait inside
-#: `resign_membership_now`, and the condition it waits for occurs in roughly
-#: four per cent of re-signs.  A case witnessed by `verify-m3-mcp-isolation`
-#: would therefore be green almost every time **with the rule deleted**, which
-#: is the M5-C11 shape this whole family of harnesses exists to refuse: a case
-#: whose defeat and whose success look the same.  `pin_publication_outstanding`
-#: is the rule's decision, extracted so each clause can be made red on demand.
+#: **Why the rule is witnessed through scripted relays rather than through the
+#: gate it protects.**  The condition the wait exists for is rare in every
+#: population M3-25 measured, and those populations differ, so each is named
+#: rather than rounded into one figure: 1 M3-04 red in 26 baseline isolation
+#: re-signs (3.8%); 2 engagements in 109 post-fix re-signs across three gates
+#: (1.8%), both in cloud-client and none in the 59 isolation re-signs.  A case
+#: witnessed by `verify-m3-mcp-isolation` would therefore be green almost every
+#: time **with the rule deleted** -- the M5-C11 shape this whole family of
+#: harnesses exists to refuse: a case whose defeat and whose success look the
+#: same.
+#:
+#: **Decision and application are witnessed separately, and the second was
+#: missing.**  The first three cases defeat `pin_publication_outstanding`, the
+#: rule's *decision*.  Their witnesses call that function (or the wait loop)
+#: directly, so none of them could see whether the wait was ever *applied*:
+#: the Fable review of `3cf2c1e` measured that deleting the call site, or
+#: making the bound proceed instead of failing, still left this suite at three
+#: of three.  The call site now lives in `settle_resign` -- moved out of
+#: `resign_membership_now`, which needs a Redis-backed cluster and so no unit
+#: test could reach -- and the last two cases defeat the application, each
+#: witnessed by a test that drives the path it defeats.
+#:
+#: **Still not witnessed here, and said rather than implied:** the single line
+#: in `resign_membership_now` that calls `settle_resign`.  Replacing it with a
+#: literal skips convergence and the pin wait together, and only the cluster
+#: gates would notice.  Convergence was never unit-witnessed before this suite
+#: existed; the pin wait no longer adds to that surface.
+#:
+#: Several filters, not one prefix, because the witnesses do not share one.
+#: libtest accepts any number of filters after `--`, and runs a test that
+#: matches any of them.
 PIN_WAIT_TEST = [
     "cargo",
     "test",
@@ -479,7 +502,12 @@ PIN_WAIT_TEST = [
     "--locked",
     "--lib",
     "--no-fail-fast",
+    "--",
     "production_cluster::tests::pin_",
+    "production_cluster::tests::a_resign_waits_until_the_emptied_pin_set_is_reinstalled",
+    "production_cluster::tests::a_converged_resign_still_waits_for_its_pin_set",
+    "production_cluster::tests::only_a_pin_set_this_resign_emptied_is_waited_for",
+    "production_cluster::tests::a_pin_set_that_never_returns_fails_the_resign_at_the_bound",
 ]
 
 PIN_WAIT_CASES: list[Case] = [
@@ -530,6 +558,57 @@ PIN_WAIT_CASES: list[Case] = [
             {
                 "production_cluster::tests::"
                 "pin_set_absent_before_the_resign_is_not_outstanding"
+            }
+        ),
+    ),
+    Case(
+        # The APPLICATION: the line that applies the pin wait once record
+        # versions have converged.  Defeated, a converged re-sign returns
+        # immediately -- exactly the pre-fix behaviour, and exactly the moment
+        # `verify-m3-mcp-isolation` dispatched into an empty pin set.  The
+        # rule's decision is untouched, so the three cases above cannot see
+        # this; that is the gap the Fable review of `3cf2c1e` measured.
+        "a re-sign whose record versions converged still waits for its pin set",
+        [
+            (
+                HARNESS_CLUSTER,
+                "            return wait_for_pins_over(relays, installed_before, "
+                "budgets.pins, budgets.pins_poll)\n                .await;",
+                "            return {\n"
+                "                let _ = installed_before;\n"
+                "                Ok((0, 0))\n"
+                "            };",
+            )
+        ],
+        frozenset(
+            {"production_cluster::tests::a_converged_resign_still_waits_for_its_pin_set"}
+        ),
+    ),
+    Case(
+        # The bound FAILS rather than proceeds.  Defeated, a pin set that
+        # never comes back is waited for until the budget runs out and then
+        # reported as success -- which re-creates the condition at the one
+        # moment it is known to be present, and turns a diagnosable timeout
+        # into the original defect.
+        "a pin set that never comes back fails the re-sign at the bound",
+        [
+            (
+                HARNESS_CLUSTER,
+                "            return Err(HarnessError::Timeout(format!(\n"
+                '                "verified peer pins were not reinstalled on {} of {} '
+                'running relays \\\n'
+                '                 within {} ms after a membership re-sign",\n'
+                "                owing.len(),\n"
+                "                relays.iter().filter(|relay| relay.is_running()).count(),\n"
+                "                budget.as_millis(),\n"
+                "            )));",
+                "            return Ok((widest, started.elapsed().as_millis()));",
+            )
+        ],
+        frozenset(
+            {
+                "production_cluster::tests::"
+                "a_pin_set_that_never_returns_fails_the_resign_at_the_bound"
             }
         ),
     ),

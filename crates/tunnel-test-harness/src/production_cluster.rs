@@ -426,18 +426,33 @@ const MEMBERSHIP_RESIGN_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 /// How long a completed re-sign waits for every relay's verified pin set to be
 /// installed again before it gives up.
 ///
-/// `wait_for_pin_availability` retries the failed-closed publication itself
-/// rather than waiting on `peer_refresh_loop`'s tick, so this budget covers
-/// only the time the membership runtime needs to report `Ready` again after
-/// the reconcile it raced.
+/// `wait_for_pins_over` retries the failed-closed publication itself rather
+/// than waiting on `peer_refresh_loop`'s tick, so this budget covers only the
+/// time the membership runtime needs to report `Ready` again after the
+/// reconcile it raced.
 ///
 /// **It is bounded on purpose, and the bound is not cosmetic.** A wait that
 /// blocked forever would convert an intermittent red in one gate into a hung
 /// run, which is strictly worse: it costs the whole suite instead of one gate.
-/// At the bound the wait fails with a message naming pins and the re-sign, and
-/// carrying none of `PEER_UNAVAILABLE`, `not_dispatched` or
-/// `transport_pins_unavailable` -- so a timeout here cannot be mistaken for the
-/// M3-04 / M7-C83 signature it exists to prevent (M3-25's discriminator).
+/// At the bound the re-sign **fails** rather than proceeding, because
+/// proceeding would re-create the condition at the one moment it is known to
+/// be present.
+///
+/// **What is and is not shown about telling a bound timeout apart from the
+/// M3-04 / M7-C83 signature.**  Shown, by a test: the timeout's own message
+/// carries none of `PEER_UNAVAILABLE`, `not_dispatched` or
+/// `transport_pins_unavailable`.  **Not shown:** that the gate's failure output
+/// does.  M3-25's discriminator is `transport_pins_unavailable` inside
+/// `peer_path_forensics`' `recent=[...]`, which the gate's failure handler
+/// prints, and a peer dial made during the wait -- background traffic in
+/// `rotation-span`, for instance -- could record that tuple there even though
+/// the failure itself was this timeout.  So a triager should read this message
+/// first, not the tuple.
+///
+/// **The 30 s is undefended.**  It matches the convergence deadline it follows
+/// (`RESIGN_BUDGETS.convergence`) for consistency; nothing about pin
+/// republication latency was measured to choose it.  Observed engaged waits are
+/// tens of milliseconds, and no real run has reached the bound.
 const PIN_AVAILABILITY_TIMEOUT: Duration = Duration::from_secs(30);
 /// Poll spacing while waiting for a re-signed pin set to come back.
 const PIN_AVAILABILITY_POLL: Duration = Duration::from_millis(25);
@@ -5052,48 +5067,25 @@ impl ProductionCluster {
         }
         self.membership_resign_inputs.next_record_version = version.saturating_add(1);
         let nodes = self.membership_resign_inputs.nodes.len();
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            let converged = self
-                .relays
-                .iter()
-                .filter(|relay| relay.running.is_some())
-                .all(|relay| {
-                    let snapshot = relay.membership.snapshot();
-                    snapshot.memberships.len() >= nodes
-                        && snapshot
-                            .memberships
-                            .iter()
-                            .all(|membership| membership.record_version >= version)
-                });
-            if converged {
-                // Record-version convergence is not dispatch capability: the
-                // invalidation this re-sign just caused may have emptied a
-                // relay's verified pin set, and a gate that dispatches now
-                // would be refused `transport_pins_unavailable` (M7-C89).
-                let (relays_waited, waited_ms) = self
-                    .wait_for_pin_availability(&installed_before, PIN_AVAILABILITY_TIMEOUT)
-                    .await?;
-                // Emitted on EVERY re-sign, including the ones that waited for
-                // nothing, so "the wait was not needed" and "the wait never
-                // ran" do not look alike (M5-C11).  Identifiers and counters
-                // only.
-                eprintln!(
-                    "production cluster: membership re-sign version={version} \
-                     pin_wait_ms={waited_ms} relays_waited={relays_waited}"
-                );
-                return Ok(version);
-            }
-            if Instant::now() >= deadline {
-                return Err(HarnessError::Timeout(format!(
-                    "membership version {version} did not reach every relay"
-                )));
-            }
-            for relay in self.relays.iter().filter(|relay| relay.running.is_some()) {
-                relay.membership.notify_membership_changed();
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
+        // Convergence on record version, then the pin wait it gates (M7-C89);
+        // see `settle_resign` for why the two live together and what is still
+        // not unit-witnessed.
+        let (relays_waited, waited_ms) = settle_resign(
+            &self.relays,
+            &installed_before,
+            nodes,
+            version,
+            RESIGN_BUDGETS,
+        )
+        .await?;
+        // Emitted on EVERY re-sign, including the ones that waited for
+        // nothing, so "the wait was not needed" and "the wait never ran" do
+        // not look alike (M5-C11).  Identifiers and counters only.
+        eprintln!(
+            "production cluster: membership re-sign version={version} \
+             pin_wait_ms={waited_ms} relays_waited={relays_waited}"
+        );
+        Ok(version)
     }
 
     async fn start_membership_resigning(&mut self) -> Result<()> {
@@ -5163,49 +5155,6 @@ impl ProductionCluster {
             }
             sleep(Duration::from_millis(50)).await;
         }
-    }
-
-    /// Wait until every running relay can dispatch to a peer again: no
-    /// failed-closed pin publication is outstanding, and every relay whose
-    /// verified pin set was installed before this re-sign has it installed
-    /// again.  Returns how many relays were still owing at the widest point
-    /// and how long the wait took.
-    ///
-    /// **This is not [`Self::wait_for_peer_readiness`], and the difference is
-    /// the whole reason this exists (M3-25, and the M7-C83 dispatch window it
-    /// explains).**  The membership invalidation callback empties the pin set
-    /// *synchronously* when the runtime is momentarily not `Ready`, but the
-    /// peer runtime only learns of it on the next `peer_refresh_loop` tick, up
-    /// to five seconds later, because `withdraw_peer_trust` is reached only
-    /// from that tick.  For that whole window `peer_runtime.is_ready()` still
-    /// reports the previous pass's state, so a wait on it returns *at once*
-    /// while every peer dial would be refused `transport_pins_unavailable`.
-    /// A wait whose success and whose measuring-nothing look identical is the
-    /// M5-C11 defect class; this one reads the pin set itself, which cannot be
-    /// stale, and retries the pending publication here rather than waiting for
-    /// a tick to notice it.
-    ///
-    /// **Why here rather than in each gate.**  Two sibling gates already
-    /// defend themselves by probing the hop functionally after a re-sign --
-    /// `http_forward_rotation.rs` requires `200 pong` from two ingresses and
-    /// `mcp_cloud_client.rs` requires two consecutive device answers, its
-    /// comment naming the flap outright ("one can race a readiness flap").
-    /// Those probes are **broader than this wait and must stay**: they catch
-    /// anything that breaks the hop, where this catches one named cause.  But
-    /// adding a third per-gate workaround would leave the next caller to
-    /// rediscover the same thing, so the guarantee belongs to the re-sign.
-    async fn wait_for_pin_availability(
-        &self,
-        installed_before: &[bool],
-        budget: Duration,
-    ) -> Result<(usize, u128)> {
-        wait_for_pins_over(
-            &self.relays,
-            installed_before,
-            budget,
-            PIN_AVAILABILITY_POLL,
-        )
-        .await
     }
 
     /// Join every running relay's bounded `last_by_stage` peer-fault view with
@@ -6008,7 +5957,7 @@ impl CheckpointAuthority for FixtureCheckpointAuthority {
 
 /// Whether one relay still owes a completed re-sign its verified pin set.
 ///
-/// Split out of [`ProductionCluster::wait_for_pin_availability`] so the rule
+/// Split out of [`wait_for_pins_over`] so the rule
 /// can be witnessed without standing up a three-relay cluster: a rule whose
 /// only witness is a forty-second cluster gate is a rule nothing can cheaply
 /// defeat, and `scripts/m3-guard-deletion.py` has to be able to make each
@@ -6033,12 +5982,15 @@ fn pin_publication_outstanding(
 ///
 /// A trait rather than a direct read of [`ProductionRelay`] so the wait —
 /// including its bound — can be driven against a scripted double.  The
-/// condition it waits for occurs in roughly two per cent of re-signs (measured:
-/// 2 engagements in 111), so a campaign is *expected* to end without
-/// exercising it even when the wait works perfectly, and an arm that probably
-/// cannot demonstrate its own subject is not evidence.  The double makes the
-/// window deterministic and lets the timeout branch be asserted at all; nothing
-/// else ever reaches it.
+/// condition it waits for is rare in every population M3-25 measured, and the
+/// populations differ, so each is named: 1 M3-04 red in 26 baseline isolation
+/// re-signs (3.8%); 2 engagements in 109 post-fix re-signs across three gates
+/// (1.8%), both in `verify-m3-mcp-cloud-client` and none in the 59 isolation
+/// re-signs.  A campaign is therefore *expected* to end without exercising the
+/// window in the gate that fails on it, even when the wait works perfectly,
+/// and an arm that probably cannot demonstrate its own subject is not
+/// evidence.  The double makes the window deterministic and lets the timeout
+/// branch be asserted at all; nothing else ever reaches it.
 trait PinWaitRelay {
     fn node_id(&self) -> String;
     fn is_running(&self) -> bool;
@@ -6080,7 +6032,126 @@ impl PinWaitRelay for ProductionRelay {
     }
 }
 
-/// Wait until no running relay still owes this re-sign its verified pin set.
+/// What [`settle_resign`] needs from a relay beyond its pin state: whether its
+/// verifier holds the re-signed version for every node yet, and a way to prod
+/// it to look.
+trait ResignRelay: PinWaitRelay {
+    fn holds_version(&self, nodes: usize, version: u64) -> bool;
+    fn nudge(&self);
+}
+
+impl ResignRelay for ProductionRelay {
+    fn holds_version(&self, nodes: usize, version: u64) -> bool {
+        let snapshot = self.membership.snapshot();
+        snapshot.memberships.len() >= nodes
+            && snapshot
+                .memberships
+                .iter()
+                .all(|membership| membership.record_version >= version)
+    }
+
+    fn nudge(&self) {
+        self.membership.notify_membership_changed();
+    }
+}
+
+/// The four time limits a re-sign settles under.  A struct so
+/// [`settle_resign`] stays under clippy's argument ceiling, and so the
+/// production values are one named constant rather than four loose ones.
+#[derive(Clone, Copy)]
+struct ResignBudgets {
+    convergence: Duration,
+    convergence_poll: Duration,
+    pins: Duration,
+    pins_poll: Duration,
+}
+
+const RESIGN_BUDGETS: ResignBudgets = ResignBudgets {
+    convergence: Duration::from_secs(30),
+    convergence_poll: Duration::from_millis(50),
+    pins: PIN_AVAILABILITY_TIMEOUT,
+    pins_poll: PIN_AVAILABILITY_POLL,
+};
+
+/// Wait for a published re-sign to take effect: first until every running
+/// relay's verifier holds the new record version for every node, then until
+/// no running relay still owes the re-sign its verified pin set.  Returns the
+/// widest number of relays seen owing pins and how long that second wait took.
+///
+/// **Why the two waits live together here, and not in `resign_membership_now`
+/// (M3-25, the Fable review of `3cf2c1e`).**  Convergence on record version is
+/// not dispatch capability: the invalidation the re-sign causes can empty a
+/// relay's pin set synchronously while the peer runtime only notices on its
+/// next refresh tick, so a gate dispatching at convergence is refused
+/// `transport_pins_unavailable`.  The line that applies the pin wait *after*
+/// convergence is therefore the rule's whole application -- and while it sat
+/// inside `resign_membership_now`, which needs a Redis-backed three-relay
+/// cluster, no unit test could reach it: deleting it left the guard suite
+/// reporting three of three.  Moving the sequence here, generic over
+/// [`ResignRelay`], puts that line where a scripted relay can drive it and a
+/// guard case can be witnessed against it.
+///
+/// **What is still not unit-witnessed, stated rather than implied:** the one
+/// line in `resign_membership_now` that calls this function.  Replacing that
+/// call with a literal would skip convergence and the pin wait together, and
+/// only the cluster gates would notice.  Convergence was never unit-witnessed
+/// before this change either; the pin wait no longer adds anything to that
+/// surface.
+async fn settle_resign<R: ResignRelay>(
+    relays: &[R],
+    installed_before: &[bool],
+    nodes: usize,
+    version: u64,
+    budgets: ResignBudgets,
+) -> Result<(usize, u128)> {
+    let deadline = Instant::now() + budgets.convergence;
+    loop {
+        let converged = relays
+            .iter()
+            .filter(|relay| relay.is_running())
+            .all(|relay| relay.holds_version(nodes, version));
+        if converged {
+            return wait_for_pins_over(relays, installed_before, budgets.pins, budgets.pins_poll)
+                .await;
+        }
+        if Instant::now() >= deadline {
+            return Err(HarnessError::Timeout(format!(
+                "membership version {version} did not reach every relay"
+            )));
+        }
+        for relay in relays.iter().filter(|relay| relay.is_running()) {
+            relay.nudge();
+        }
+        sleep(budgets.convergence_poll).await;
+    }
+}
+
+/// Wait until no running relay still owes this re-sign its verified pin set:
+/// no failed-closed publication is outstanding, and every relay whose pin set
+/// was installed before the re-sign has it installed again.
+///
+/// **This is not `ProductionCluster::wait_for_peer_readiness`, and the
+/// difference is the whole reason it exists (M3-25, and the M7-C83 dispatch
+/// window it explains).**  The membership invalidation callback empties the
+/// pin set *synchronously* when the runtime is momentarily not `Ready`, but the
+/// peer runtime only learns of it on the next `peer_refresh_loop` tick, up to
+/// five seconds later, because `withdraw_peer_trust` is reached only from that
+/// tick.  For that whole window `peer_runtime.is_ready()` still reports the
+/// previous pass's state, so a wait on it returns *at once* while every peer
+/// dial would be refused `transport_pins_unavailable`.  A wait whose success
+/// and whose measuring-nothing look identical is the M5-C11 defect class; this
+/// one reads the pin set itself, which cannot be stale, and retries the pending
+/// publication here rather than waiting for a tick to notice it.
+///
+/// **Why in the re-sign rather than in each gate.**  Two sibling gates already
+/// defend themselves by probing the hop functionally after a re-sign --
+/// `http_forward_rotation.rs` requires `200 pong` from two ingresses and
+/// `mcp_cloud_client.rs` requires two consecutive device answers, its comment
+/// naming the flap outright ("one can race a readiness flap").  **Those probes
+/// are broader than this wait and must stay**: they catch anything that breaks
+/// the hop, where this catches one named cause.  But a third per-gate
+/// workaround would leave the next caller to rediscover the same thing, so the
+/// guarantee belongs to the re-sign.
 ///
 /// Returns the widest number of relays seen owing and how long the wait took.
 /// At the bound it returns [`HarnessError::Timeout`] rather than proceeding:
@@ -7266,20 +7337,27 @@ mod tests {
         is_peer_recovery_response, redacted_admission_failure, validate_production_evidence,
         validate_redis_partition_evidence,
     };
-    use super::{PinWaitRelay, pin_publication_outstanding, wait_for_pins_over};
+    use super::{
+        PinWaitRelay, ResignBudgets, ResignRelay, pin_publication_outstanding, settle_resign,
+        wait_for_pins_over,
+    };
     use crate::acceptance_test_support::{assert_failed, assert_rejected};
     use std::cell::Cell;
     use std::time::Duration;
 
     /// A relay whose pin state is scripted rather than raced for.
     ///
-    /// **Why this exists at all.** The condition `wait_for_pins_over` waits for
-    /// occurs in about two per cent of re-signs -- measured, 2 engagements in
-    /// 111 across the post-fix campaign -- so a campaign is *more likely than
-    /// not* to finish without ever exercising it, even if the wait is perfect.
-    /// A green campaign would then be indistinguishable from the wait being a
-    /// no-op. This makes the window deterministic, so the claim can be
-    /// asserted in both directions instead of hoped for.
+    /// **Why this exists at all.** The condition these waits exist for is
+    /// rare, in every population measured for M3-25: 1 M3-04 red in 26
+    /// baseline isolation re-signs (3.8%); 2 engagements in 109 post-fix
+    /// re-signs across three gates (1.8%), **both of them in
+    /// `verify-m3-mcp-cloud-client` and none in the 59 isolation re-signs**;
+    /// and 1 engagement in 16 isolation re-signs in the `cfr` confirmation
+    /// set. So a campaign is more likely than not to finish without exercising
+    /// the window in the gate that fails on it, even if the wait is perfect,
+    /// and a green campaign is then indistinguishable from the wait being a
+    /// no-op. This makes the window deterministic, so the claim can be asserted
+    /// in both directions instead of hoped for.
     struct ScriptedRelay {
         /// Polls remaining before the pending publication succeeds.  `None`
         /// means it never does, which is the only way to reach the bound.
@@ -7287,6 +7365,9 @@ mod tests {
         polls: Cell<u32>,
         pending: Cell<bool>,
         empty: Cell<bool>,
+        /// Nudges before this relay's verifier holds the re-signed version.
+        converges_after: u32,
+        nudges: Cell<u32>,
     }
 
     impl ScriptedRelay {
@@ -7296,6 +7377,8 @@ mod tests {
                 polls: Cell::new(0),
                 pending: Cell::new(true),
                 empty: Cell::new(true),
+                converges_after: 0,
+                nudges: Cell::new(0),
             }
         }
 
@@ -7305,6 +7388,8 @@ mod tests {
                 polls: Cell::new(0),
                 pending: Cell::new(true),
                 empty: Cell::new(true),
+                converges_after: 0,
+                nudges: Cell::new(0),
             }
         }
 
@@ -7317,6 +7402,8 @@ mod tests {
                 polls: Cell::new(0),
                 pending: Cell::new(false),
                 empty: Cell::new(true),
+                converges_after: 0,
+                nudges: Cell::new(0),
             }
         }
     }
@@ -7350,6 +7437,23 @@ mod tests {
         }
     }
 
+    impl ResignRelay for ScriptedRelay {
+        fn holds_version(&self, _nodes: usize, _version: u64) -> bool {
+            self.nudges.get() >= self.converges_after
+        }
+
+        fn nudge(&self) {
+            self.nudges.set(self.nudges.get() + 1);
+        }
+    }
+
+    const FAST_BUDGETS: ResignBudgets = ResignBudgets {
+        convergence: Duration::from_secs(5),
+        convergence_poll: Duration::from_millis(1),
+        pins: Duration::from_secs(5),
+        pins_poll: Duration::from_millis(1),
+    };
+
     /// **The forced window, and the half the campaign could not supply.** A
     /// relay whose publication failed closed and needs three retries before it
     /// lands: the wait must not return until it has, and must report that it
@@ -7378,23 +7482,66 @@ mod tests {
         );
     }
 
-    /// The other direction: with the rule defeated the same scripted relay is
-    /// released **immediately, with its pin set still empty** -- which is the
-    /// state `verify-m3-mcp-isolation` then dispatched into (M3-04 / M7-C83).
-    /// Without this the test above cannot distinguish a wait that works from a
-    /// condition that never occurred.
+    /// **The rule's application, not its decision: a converged re-sign still
+    /// waits.**  This drives [`settle_resign`] -- the function holding the one
+    /// line that applies the pin wait *after* record-version convergence -- with
+    /// a relay whose verifier converges after two nudges and whose pin set needs
+    /// three retries to come back.  Convergence on record version is exactly
+    /// the moment the pre-fix code returned, so a `settle_resign` that returned
+    /// at convergence would come back here with the pin set still empty.
+    ///
+    /// Added after the Fable review of `3cf2c1e` measured that deleting the
+    /// wait's call site left the guard suite at three of three: every existing
+    /// witness exercised `pin_publication_outstanding` or `wait_for_pins_over`
+    /// directly, so none of them could see whether the wait was *called*.
+    #[tokio::test]
+    async fn a_converged_resign_still_waits_for_its_pin_set() {
+        let mut relay = ScriptedRelay::recovering(3);
+        relay.converges_after = 2;
+        let relays = [relay];
+        let (waited_for, _elapsed) = settle_resign(&relays, &[true], 3, 2, FAST_BUDGETS)
+            .await
+            .expect("converges, then gets its pin set back, inside the budgets");
+        assert!(
+            relays[0].nudges.get() >= 2,
+            "returned before the verifier converged: {} nudges",
+            relays[0].nudges.get()
+        );
+        assert_eq!(
+            waited_for, 1,
+            "a converged re-sign reported no relay owing pins, so the pin wait did not run"
+        );
+        assert!(
+            !relays[0].pins_empty(),
+            "a converged re-sign returned with the pin set still empty"
+        );
+        assert!(
+            relays[0].polls.get() >= 3,
+            "returned before the publication could land: {} polls",
+            relays[0].polls.get()
+        );
+    }
+
     /// The `installed_before` guard, exercised as a **pair on one state**: the
     /// same deliberately-withdrawn relay, released when it had no pin set
-    /// before the re-sign and waited for when it did.  Two opposite outcomes
-    /// from one input change is what makes this a discriminating test rather
-    /// than a demonstration that some call returns `Ok`.
+    /// before the re-sign and still being waited for when it did.  Two
+    /// opposite outcomes from one input change is what makes this a
+    /// discriminating test rather than a demonstration that some call returns
+    /// `Ok`.
     ///
-    /// A first draft of this asserted the exclusion using a relay with a
-    /// publication still pending, and **failed** -- correctly: the rule's first
-    /// clause is independent of `installed_before`, so a pending publication is
+    /// The second half deliberately does **not** rely on the bound's `Err`: it
+    /// asserts the wait is *still pending* after a short interval, well inside
+    /// a long budget.  Were it to read the bound instead, the guard case that
+    /// defeats the bound would redden this test as well as its own witness, and
+    /// one rule could be credited by another's failure.
+    ///
+    /// A first draft asserted the exclusion using a relay with a publication
+    /// still pending, and **failed** -- correctly: the rule's first clause is
+    /// independent of `installed_before`, so a pending publication is
     /// outstanding whoever it belongs to. The failure was the test's premise
     /// being wrong, not the rule, and it is recorded because a test that had
-    /// passed there would have been asserting the rule was weaker than it is.
+    /// passed there would have been asserting the rule was weaker than it is
+    /// (M5-C11 instance twenty-seven).
     #[tokio::test]
     async fn only_a_pin_set_this_resign_emptied_is_waited_for() {
         let released = [ScriptedRelay::deliberately_withdrawn()];
@@ -7417,19 +7564,22 @@ mod tests {
         );
 
         // Same relay, same everything, `installed_before: true`.  Now the wait
-        // must refuse to release -- and since nothing will ever republish, it
-        // must hit the bound rather than return.
+        // must refuse to release: 60 ms into a 5 s budget it is still waiting.
         let waited = [ScriptedRelay::deliberately_withdrawn()];
-        wait_for_pins_over(
-            &waited,
-            &[true],
+        let outcome = tokio::time::timeout(
             Duration::from_millis(60),
-            Duration::from_millis(1),
+            wait_for_pins_over(
+                &waited,
+                &[true],
+                Duration::from_secs(5),
+                Duration::from_millis(1),
+            ),
         )
-        .await
-        .expect_err(
+        .await;
+        assert!(
+            outcome.is_err(),
             "a pin set that WAS installed before the re-sign and is now empty must be \
-             waited for, not released",
+             waited for, not released; the wait finished with {outcome:?}"
         );
     }
 
@@ -7437,9 +7587,15 @@ mod tests {
     ///
     /// A publication that never lands must fail the re-sign rather than let it
     /// proceed: proceeding would re-create the defect at the one moment it is
-    /// known to be present. The message must also be distinguishable from that
-    /// defect by M3-25's own discriminator, or a timeout here would be
-    /// miscounted as an M3-04 / M7-C83 sighting.
+    /// known to be present.
+    ///
+    /// **What this shows about telling a bound timeout from M3-04, and what it
+    /// does not.**  It shows the timeout's own message carries none of
+    /// `PEER_UNAVAILABLE`, `not_dispatched` or `transport_pins_unavailable`.
+    /// It does **not** show the gate's failure output is free of them: the
+    /// gate's failure handler prints `peer_path_forensics`, and a peer dial made
+    /// during the wait could record `transport_pins_unavailable` there even when
+    /// the failure was this timeout.
     #[tokio::test]
     async fn a_pin_set_that_never_returns_fails_the_resign_at_the_bound() {
         let relays = [ScriptedRelay::never_recovers()];
@@ -7463,7 +7619,7 @@ mod tests {
         ] {
             assert!(
                 !rendered.contains(foreign),
-                "a bound timeout must not carry the M3-04 discriminator {foreign}: {rendered}"
+                "the bound's own message must not carry {foreign}: {rendered}"
             );
         }
     }
