@@ -34,12 +34,14 @@ that is **not the build machine**.  Every check here therefore runs against the
                 for it *beside the running executable*, and its absence is a
                 `degraded` doctor result and a one-line warning -- not an
                 error.  A bundle that omits it ships a client whose process
-                containment is silently off.  The check replays that
+                containment is off, announced only by a one-line warning the
+                first time an export arms a sentinel.  The check replays that
                 resolution rule and then **executes** the result, because
                 `resolve_sentinel` accepts any `is_file()`: a decoy of the
                 right name makes the product itself report the sentinel
-                present.  It does not ask `doctor`, which cannot answer on an
-                unprovisioned bundle (docs/tasks.md M6-C07).
+                present.  It does not ask `doctor`: on an unprovisioned bundle
+                `doctor` computes the capability checks and then discards them
+                along with the rest of its result (docs/tasks.md M6-C07).
   `cli`         `--help`, `--version`, both `check-config` forms and
                 `check-serve-config` on every bundled `*-relay.toml`,
                 executed from the unpacked bundle and asserting **content**,
@@ -131,6 +133,11 @@ MIN_BUNDLE_FILES = 10
 MIN_EXECUTABLES = 3
 MIN_NOTICE_CRATES = 300
 MIN_EXAMPLES = 2
+# Measured at ec663a7: 628 licence files totalling 3,145,598 bytes across the
+# 342 registry crates that ship one.  The floor is an order of magnitude below
+# that, which is still far above anything a NOTICE reduced to identifiers
+# could reach -- the failure this floor exists to catch.
+MIN_EMBEDDED_LICENCE_BYTES = 300_000
 
 # The binaries a tester needs, and why each is here.
 #
@@ -202,6 +209,28 @@ def sha256_file(path: Path) -> str:
 
 def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def stranger_env(workdir: Path) -> dict[str, str]:
+    """The environment a recipient's shell would not hand these binaries.
+
+    `PATH` is narrowed to the system directories and every `CARGO_*`/`RUST*`
+    variable is dropped, so a bundled binary cannot reach this checkout's
+    toolchain, target directory or registry cache.  `cargo_is_unreachable`
+    below turns that into a measurement rather than a claim: an earlier
+    version of this file *printed* "no cargo, no target/" while inheriting
+    the caller's `PATH` and checking neither.
+    """
+    return {
+        "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+        "HOME": str(workdir),
+        "TMPDIR": str(workdir),
+    }
+
+
+def cargo_is_unreachable(env: dict[str, str]) -> bool:
+    """True when `cargo` cannot be found on the environment's own PATH."""
+    return shutil.which("cargo", path=env["PATH"]) is None
 
 
 def run(command: list[str], cwd: Path | None = None, env: dict | None = None,
@@ -301,6 +330,9 @@ def generate_notices(metadata: dict, lock_sha: str, lock_text: str) -> str:
 
     with_text = 0
     without_text: list[str] = []
+
+
+    undecodable: list[str] = []
     body: list[str] = []
     for package in third_party:
         directory = Path(package["manifest_path"]).parent
@@ -311,9 +343,25 @@ def generate_notices(metadata: dict, lock_sha: str, lock_text: str) -> str:
         if files:
             with_text += 1
             for entry in files:
-                body.append(
-                    f"    text: {entry.name} sha256={sha256_file(entry)}"
-                )
+                label = f"{package['name']} {package['version']} {entry.name}"
+                body.append(f"    text: {entry.name} sha256={sha256_file(entry)}")
+                raw = entry.read_bytes()
+                try:
+                    text = raw.decode("utf-8")
+                except UnicodeDecodeError:
+                    # Recorded rather than mangled.  Embedding replacement
+                    # characters would produce a licence text that is not the
+                    # licence text, which is worse than saying so.
+                    undecodable.append(label)
+                    body.append("    text: not UTF-8; see the crate's own package")
+                    continue
+                if TEXT_END in text or TEXT_BEGIN in text:
+                    # A licence file containing this file's own delimiter would
+                    # corrupt the crate-set parse silently.  Refuse instead.
+                    raise ValueError(f"{label} contains a NOTICE delimiter")
+                body.append(f"{TEXT_BEGIN} {label}")
+                body.append(text.rstrip("\n"))
+                body.append(f"{TEXT_END} {label}")
         else:
             without_text.append(f"{package['name']} {package['version']}")
             # Recorded explicitly rather than omitted.  A crate silently
@@ -321,6 +369,15 @@ def generate_notices(metadata: dict, lock_sha: str, lock_text: str) -> str:
             # identical in a hand-written notices file; here they do not.
             body.append("    text: none shipped in the published crate")
         body.append("")
+
+    # **The header's figures are recomputed from the assembled body by the same
+    # function the checker uses, rather than accumulated while writing it.**
+    # Two counters that measure almost-the-same thing drift -- the first draft
+    # recorded raw file bytes here and line bytes in the checker, and the
+    # 53-byte disagreement made the check fail on a correct NOTICE. Deriving
+    # both from one function means the header cannot claim a quantity nothing
+    # can reproduce.
+    embedded_files, embedded_bytes = notice_embedded_texts("\n".join(body))
 
     header = [
         "THIRD-PARTY NOTICES",
@@ -335,7 +392,16 @@ def generate_notices(metadata: dict, lock_sha: str, lock_text: str) -> str:
         f"registry_crates: {len(third_party)}",
         f"registry_crates_with_licence_text: {with_text}",
         f"registry_crates_without_licence_text: {len(without_text)}",
+        f"embedded_licence_texts: {embedded_files}",
+        f"embedded_licence_bytes: {embedded_bytes}",
+        f"undecodable_licence_files: {len(undecodable)}",
         f"local_crates: {len(vendored)}",
+        "",
+        "The full text of every licence file the crates ship is embedded below,",
+        "between BEGIN/END LICENCE TEXT delimiters and byte-exact.  This file is",
+        "the licence notice that accompanies the binaries in this bundle, not an",
+        "index to one: a SHA-256 lets a checker confirm nothing drifted and gives",
+        "the recipient nothing they can read.",
         "",
         "Crates with no licence file in the published package are listed with their",
         "declared SPDX expression only.  That is a statement about what the crate",
@@ -382,6 +448,25 @@ def generate_notices(metadata: dict, lock_sha: str, lock_text: str) -> str:
 
 UNRESOLVED_RULE = "-" * 70
 
+# Delimiters around each embedded licence text.
+#
+# **The texts are embedded, not summarised, and that is the point of the file.**
+# MIT, the BSD family and Apache-2.0 all require the copyright notice and the
+# licence text to accompany a binary distribution.  A digest lets a *checker*
+# confirm nothing drifted; it discharges nothing owed to the person receiving
+# the bundle, who cannot reconstruct a licence from its SHA-256.  An earlier
+# version of this file recorded only SPDX ids and digests, which made the
+# `notices` check green against a deliverable that did not do what notices
+# exist for.
+#
+# Explicit delimiters rather than indentation, so the text is byte-exact:
+# reflowing or indenting a licence is editing it.  `notice_crate_set` skips
+# everything between them, and generation refuses outright if a licence file
+# contains one of these markers, because that would corrupt the crate-set
+# parse silently rather than loudly.
+TEXT_BEGIN = "----- BEGIN LICENCE TEXT:"
+TEXT_END = "----- END LICENCE TEXT:"
+
 
 def notice_unresolved_set(text: str) -> set[tuple[str, str]]:
     """Recover the declared lockfile-minus-resolved-graph delta from a NOTICE.
@@ -409,13 +494,46 @@ def notice_crate_set(text: str) -> set[tuple[str, str]]:
     """
     _, _, body = text.partition("=" * 70)
     crates = set()
+    inside_text = False
     for raw in body.splitlines():
-        if not raw or raw.startswith(" "):
+        # Embedded licence texts are arbitrary prose and routinely contain
+        # two-word lines at column 0.  Without this the parse would invent
+        # crates out of licence wording, so the delimiters are load-bearing
+        # rather than decorative.
+        if raw.startswith(TEXT_BEGIN):
+            inside_text = True
+            continue
+        if raw.startswith(TEXT_END):
+            inside_text = False
+            continue
+        if inside_text or not raw or raw.startswith(" "):
             continue
         parts = raw.split()
         if len(parts) == 2:
             crates.add((parts[0], parts[1]))
     return crates
+
+
+def notice_embedded_texts(text: str) -> tuple[int, int]:
+    """Return (number of embedded licence texts, total bytes of their content).
+
+    Counted from the delimiters rather than trusted from the header, because a
+    header figure nothing recomputes is the failure this whole file is about.
+    """
+    count = 0
+    total = 0
+    inside = False
+    for raw in text.splitlines():
+        if raw.startswith(TEXT_BEGIN):
+            inside = True
+            count += 1
+            continue
+        if raw.startswith(TEXT_END):
+            inside = False
+            continue
+        if inside:
+            total += len(raw.encode("utf-8")) + 1
+    return count, total
 
 
 # --------------------------------------------------------------------------
@@ -626,11 +744,40 @@ def check_notices(bundle: Path) -> Result:
                       summary=f"only {len(actual)} crates notified, floor {MIN_NOTICE_CRATES}",
                       witness="floor")
 
+    # **The licence texts themselves, counted from the delimiters rather than
+    # read off the header.** This is the assertion whose absence made an
+    # earlier version of this check green against a NOTICE that carried only
+    # SPDX ids and digests -- a file that satisfies a drift check and
+    # discharges nothing owed to the recipient.
+    embedded, embedded_bytes = notice_embedded_texts(text)
+    claimed = int(fields.get("embedded_licence_texts", "-1"))
+    claimed_bytes = int(fields.get("embedded_licence_bytes", "-1"))
+    if embedded != claimed or embedded_bytes < claimed_bytes:
+        return Result("notices", False,
+                      summary=f"NOTICE header claims {claimed} texts / "
+                              f"{claimed_bytes} bytes, body carries {embedded} / "
+                              f"{embedded_bytes}",
+                      witness="embedded-text-count-mismatch")
+    with_text = int(fields.get("registry_crates_with_licence_text", "-1"))
+    if embedded < with_text:
+        return Result("notices", False,
+                      summary=f"{with_text} crates ship licence text but only "
+                              f"{embedded} texts are embedded",
+                      witness="licence-text-missing")
+    if embedded_bytes < MIN_EMBEDDED_LICENCE_BYTES:
+        return Result("notices", False,
+                      summary=f"{embedded_bytes} bytes of licence text embedded, "
+                              f"floor {MIN_EMBEDDED_LICENCE_BYTES}",
+                      witness="licence-text-floor")
+
     without = int(fields.get("registry_crates_without_licence_text", "-1"))
     result = Result("notices", True,
                     summary=f"{len(actual)} registry crates, re-derived from the "
                             f"bundled lockfile and identical")
     result.note(f"floor {MIN_NOTICE_CRATES}; lock digest {lock_sha[:12]} matches the header")
+    result.note(f"{embedded} licence texts embedded byte-exact, {embedded_bytes} bytes "
+                f"(floor {MIN_EMBEDDED_LICENCE_BYTES}); counted from the delimiters, "
+                f"not read off the header")
     result.note(f"{without} crate(s) ship no licence text and are listed as such by name")
     result.note(f"{len(locked)} lockfile crates = {len(actual)} notified + "
                 f"{len(declared_unresolved)} declared outside the resolved graph; "
@@ -639,14 +786,16 @@ def check_notices(bundle: Path) -> Result:
 
 
 def check_assets(bundle: Path) -> Result:
-    """Required runtime assets, asked of the CLI rather than inferred from ls.
+    """Required runtime assets, resolved the product's way and then executed.
 
     `ls bin/tunnel-deadman` proves a file is present.  It does not prove the
-    running client can *find* it: `tunnel_deadman::sentinel_path()` resolves
+    running client can *find* it: `tunnel_deadman::resolve_sentinel` resolves
     the sentinel relative to `std::env::current_exe()`, so a bundle whose
     layout puts the client somewhere else would pass a file-existence check
-    and still ship degraded containment.  So this asks `tunnel-client doctor`
-    and requires the `PROCESS_CONTAINMENT_SENTINEL_PRESENT` code.
+    and still ship degraded containment.  So this replays that resolution rule
+    and then runs the binary it finds.  It does **not** invoke `doctor`; see
+    the comment at the sentinel block below for why that surface cannot answer
+    here, and `docs/tasks.md` row M6-C07 for the defect.
     """
     # `tunnel-deadman` is deliberately **not** in this generic existence loop.
     # Its absence has a different meaning and a different fix from a missing
@@ -675,11 +824,15 @@ def check_assets(bundle: Path) -> Result:
     # then executing the result.
     #
     # **Why not `tunnel-client doctor`, which is the surface that reports
-    # containment.** It cannot be reached from an unpacked bundle: `doctor`
-    # validates configuration and credentials before it runs any capability
-    # check, so on a bundle nobody has provisioned it exits `CREDENTIAL_MISSING`
-    # (3) with `result: null` and reports no capability at all.  Measured, not
-    # assumed -- see docs/tasks.md row M6-C07.  A check written against doctor
+    # containment.** Its answer cannot be read from an unpacked bundle.
+    # `doctor` *does* compute the capability checks -- `inspect` builds
+    # `process_containment` before it even attempts to load the configuration
+    # -- and then **discards the whole result** whenever any error is present
+    # (`doctor.rs:183`, `result: if ok { Some(result) } else { None }`).  On a
+    # bundle nobody has provisioned that means exit 3, `CREDENTIAL_MISSING`,
+    # and `result: null`: the capability was measured and thrown away, which
+    # is a different defect from never running it and is the one recorded in
+    # docs/tasks.md row M6-C07.  A check written against doctor
     # would therefore have been red for every bundle regardless of whether the
     # sentinel was there, which is the mirror image of a check that is green
     # regardless.
@@ -696,7 +849,8 @@ def check_assets(bundle: Path) -> Result:
     if not sentinel.is_file():
         return Result("assets", False,
                       summary="no tunnel-deadman beside the bundled client; process "
-                              "containment would be silently degraded",
+                              "containment would be degraded, announced only by a "
+                              "one-line warning at arm time",
                       witness="sentinel-missing")
 
     with tempfile.TemporaryDirectory() as workdir:
@@ -724,17 +878,29 @@ def check_assets(bundle: Path) -> Result:
                 return Result("assets", False,
                               summary=f"the bundled sentinel answered {label} with exit "
                                       f"{completed.returncode}, not the sentinel's 2; "
-                                      f"this file is not tunnel-deadman",
+                                      f"it is not a working tunnel-deadman",
                               witness="sentinel-not-the-sentinel")
 
     result = Result("assets", True,
                     summary=f"{len(BUNDLE_BINARIES)} binaries, {len(examples)} config "
                             f"examples, LICENSE; the sentinel resolves beside the "
-                            f"client and executes as tunnel-deadman")
+                            f"client and runs, answering both usage probes as "
+                            f"tunnel-deadman does")
     result.note("resolution replays tunnel_deadman::resolve_sentinel; both usage "
                 "probes exited 2 from a cwd outside the bundle and the repository")
-    result.note("doctor is not used here: it exits CREDENTIAL_MISSING before any "
-                "capability check on an unprovisioned bundle (M6-C07)")
+    # **The limit of this check, stated rather than left to be assumed from the
+    # summary.**  Exit 2 on both usage probes rules out an absent, unexecutable
+    # or wrong-architecture file; it does not rule out some *other* program
+    # that also exits 2.  Identity of the bytes is `checksums` and
+    # `provenance`, which bind bin/tunnel-deadman to a recorded digest, and the
+    # `a decoy that also exits 2` control measures exactly this boundary --
+    # `assets` green, `checksums` red -- so the layering is demonstrated
+    # instead of claimed.
+    result.note("behaviour only: exit 2 on both probes does not identify the bytes; "
+                "checksums and provenance bind those, and a control measures the seam")
+    result.note("doctor is not used here: on an unprovisioned bundle it computes "
+                "the capability checks and then discards them with the rest of the "
+                "result, exiting CREDENTIAL_MISSING with result:null (M6-C07)")
     return result
 
 
@@ -751,12 +917,24 @@ CLI_PROBES = (
 def check_cli(bundle: Path) -> Result:
     with tempfile.TemporaryDirectory() as workdir:
         work = Path(workdir)
+        env = stranger_env(work)
+        # Measured, not asserted.  The point of the scrubbed environment is
+        # that the bundled binaries cannot reach this checkout's toolchain; if
+        # `cargo` were still on the narrowed PATH the scrub would be doing
+        # nothing and the note printed at the end would be a claim about a
+        # condition nobody checked.
+        if not cargo_is_unreachable(env):
+            return Result("cli", False,
+                          summary=f"cargo is still reachable on the narrowed PATH "
+                                  f"{env['PATH']!r}; the clean-environment claim "
+                                  f"would be untested",
+                          witness="environment-not-scrubbed")
         for name, args, needle in CLI_PROBES:
             binary = bundle / "bin" / name
             if not binary.is_file():
                 return Result("cli", False, summary=f"{name} absent",
                               witness="binary-missing")
-            completed = run([str(binary)] + args, cwd=work)
+            completed = run([str(binary)] + args, cwd=work, env=env)
             if completed.returncode != 0:
                 return Result("cli", False,
                               summary=f"{name} {' '.join(args)} exited "
@@ -773,7 +951,7 @@ def check_cli(bundle: Path) -> Result:
         client = bundle / "bin" / "tunnel-client"
         config = bundle / "examples" / "m1-client.toml"
         completed = run([str(client), "config", "check", "--config", str(config)],
-                        cwd=work)
+                        cwd=work, env=env)
         if completed.returncode != 0:
             return Result("cli", False,
                           summary=f"config check on the bundled example exited "
@@ -783,7 +961,7 @@ def check_cli(bundle: Path) -> Result:
 
         relay = bundle / "bin" / "tunnel-relay"
         completed = run([str(relay), "check-config",
-                         str(bundle / "examples" / "relay.toml")], cwd=work)
+                         str(bundle / "examples" / "relay.toml")], cwd=work, env=env)
         if completed.returncode != 0:
             return Result("cli", False,
                           summary=f"relay check-config on the bundled example exited "
@@ -807,7 +985,7 @@ def check_cli(bundle: Path) -> Result:
                           witness="serving-example-missing")
         for example in serving:
             completed = run([str(relay), "check-serve-config", "--config", str(example)],
-                            cwd=work)
+                            cwd=work, env=env)
             if completed.returncode != 0:
                 return Result("cli", False,
                               summary=f"relay check-serve-config on {example.name} exited "
@@ -827,11 +1005,27 @@ def check_cli(bundle: Path) -> Result:
                             f"and {len(serving)} serving dry run(s), all from the "
                             f"unpacked bundle")
     result.note("each probe asserts an expected substring, not exit status alone")
-    result.note("run with cwd in a temporary directory; no cargo, no target/")
+    result.note("run with cwd in a temporary directory, PATH narrowed to the system "
+                "directories and every CARGO_*/RUST* variable dropped; cargo proven "
+                "unfindable on that PATH before the probes ran")
     return result
 
 
-SYSTEM_PREFIXES = ("/usr/lib/", "/System/", "@rpath/", "/lib/", "/usr/local/lib/")
+# **Exactly the directories macOS ships and protects, and nothing else.**
+#
+# An earlier version also accepted `@rpath/` and `/usr/local/lib/`, and neither
+# belongs here.  `@rpath` is not a location at all: it resolves through the
+# binary's own `LC_RPATH` entries, which a Cargo build can and does point at
+# `target/`, so accepting it would wave through precisely the build-tree
+# dependency this check exists to catch.  `/usr/local/lib` is where Homebrew
+# installs, so a dependency there is present on the build machine and absent
+# on a clean one -- the same failure wearing an absolute path.
+#
+# Neither appeared in this bundle (all 9 dependencies are `/usr/lib` or
+# `/System`), so removing them changed no result here.  They were removed
+# because the classifier's stated rule and its actual rule differed, which is
+# the defect one level up from the one it checks for.
+SYSTEM_PREFIXES = ("/usr/lib/", "/System/")
 
 
 def check_portability(bundle: Path) -> Result:
@@ -1017,6 +1211,75 @@ def control_notices_stale_lockfile(bundle: Path) -> tuple[bool, str]:
         return expect_red("notices", copy, "lock-digest-mismatch")
 
 
+def control_notices_texts_stripped(bundle: Path) -> tuple[bool, str]:
+    """A NOTICE reduced to identifiers and digests must not pass.
+
+    **This is the control for the defect the first version of this file
+    shipped.** Removing every embedded licence text leaves a NOTICE whose
+    crate set still matches the lockfile exactly, whose header still matches
+    its lockfile digest, and whose every other assertion still holds -- a
+    perfectly consistent index to licences the recipient does not have. It
+    must go red for the texts being gone, and for nothing else.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        copy = copy_bundle(bundle, Path(tmp))
+        path = copy / NOTICE
+        kept = []
+        inside = False
+        for line in path.read_text().splitlines():
+            if line.startswith(TEXT_BEGIN):
+                inside = True
+                continue
+            if line.startswith(TEXT_END):
+                inside = False
+                continue
+            if not inside:
+                kept.append(line)
+        path.write_text("\n".join(kept) + "\n")
+        return expect_red("notices", copy, "embedded-text-count-mismatch")
+
+
+def control_notices_text_floor_is_not_vacuous(bundle: Path) -> tuple[bool, str]:
+    """A NOTICE whose header agrees with a gutted body must still fail.
+
+    The previous control leaves the header claiming texts the body lacks, so
+    it is caught by the count comparison.  This one keeps header and body
+    *consistent* at one tiny text, which defeats that comparison and must be
+    caught by the byte floor instead -- otherwise a NOTICE could shrink to
+    nothing as long as it was honest about it.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        copy = copy_bundle(bundle, Path(tmp))
+        path = copy / NOTICE
+        kept = []
+        inside = False
+        dropped = 0
+        for line in path.read_text().splitlines():
+            if line.startswith(TEXT_BEGIN):
+                inside = True
+                dropped += 1
+                if dropped > 1:
+                    continue
+            elif line.startswith(TEXT_END):
+                if dropped > 1:
+                    inside = False
+                    continue
+                inside = False
+            elif inside and dropped > 1:
+                continue
+            kept.append(line)
+        text = "\n".join(kept) + "\n"
+        embedded, embedded_bytes = notice_embedded_texts(text)
+        text = re.sub(r"^embedded_licence_texts: .*$",
+                      f"embedded_licence_texts: {embedded}", text, flags=re.M)
+        text = re.sub(r"^embedded_licence_bytes: .*$",
+                      f"embedded_licence_bytes: {embedded_bytes}", text, flags=re.M)
+        text = re.sub(r"^registry_crates_with_licence_text: .*$",
+                      "registry_crates_with_licence_text: 1", text, flags=re.M)
+        path.write_text(text)
+        return expect_red("notices", copy, "licence-text-floor")
+
+
 def control_notices_false_unresolved_claim(bundle: Path) -> tuple[bool, str]:
     """A crate cannot be both notified and declared out of the resolved graph.
 
@@ -1058,7 +1321,9 @@ def control_assets_sentinel_removed(bundle: Path) -> tuple[bool, str]:
         if not cli.ok:
             return False, (f"{detail}; but cli also went red ({cli.summary}), so this "
                            f"control no longer isolates the silent-degradation case")
-        return True, f"{detail}; cli stayed green, confirming the degradation is silent"
+        return True, (f"{detail}; cli stayed green: the degradation is invisible to "
+                      f"help, version and both config checks, and surfaces only as a "
+                      f"one-line stderr warning when an export first arms a sentinel")
 
 
 def control_assets_sentinel_is_a_decoy(bundle: Path) -> tuple[bool, str]:
@@ -1078,6 +1343,41 @@ def control_assets_sentinel_is_a_decoy(bundle: Path) -> tuple[bool, str]:
         decoy.write_text("#!/bin/sh\nexit 0\n")
         decoy.chmod(decoy.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
         return expect_red("assets", copy, "sentinel-not-the-sentinel")
+
+
+def control_assets_decoy_that_exits_two(bundle: Path) -> tuple[bool, str]:
+    """Measure the seam between behaviour and identity, rather than claim it.
+
+    `assets` probes behaviour, so a decoy that also exits 2 passes it.  That is
+    a real limit and the honest thing to do with it is to *demonstrate* where
+    it is covered: this control requires `assets` to stay **green** on such a
+    decoy and `checksums` to go **red**, because the digest binds the bytes.
+
+    Written this way the control fails if either half stops holding -- if
+    `assets` ever started catching this it would be over-claiming, and if
+    `checksums` stopped catching it the decoy would ship.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        copy = copy_bundle(bundle, Path(tmp))
+        decoy = copy / "bin" / "tunnel-deadman"
+        decoy.unlink()
+        decoy.write_text("#!/bin/sh\nexit 2\n")
+        decoy.chmod(decoy.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+        behaviour = CHECKS["assets"](copy)
+        if not behaviour.ok:
+            return False, (f"assets went red on a decoy that exits 2 "
+                           f"({behaviour.summary}); this control documents that it "
+                           f"does not, so either the check or this note is now wrong")
+        identity = CHECKS["checksums"](copy)
+        if identity.ok:
+            return False, "checksums stayed green on a substituted binary"
+        if identity.witness != "digest-mismatch":
+            return False, (f"checksums went red with witness {identity.witness!r}, "
+                           f"not the digest mismatch that proves the bytes are bound")
+        return True, ("assets green (behaviour matches) and checksums red with "
+                      "'digest-mismatch' (bytes do not): the seam is where it is "
+                      "documented to be")
 
 
 def control_cli_content_not_exit_status(bundle: Path) -> tuple[bool, str]:
@@ -1141,14 +1441,33 @@ def control_portability_non_system_dependency(bundle: Path) -> tuple[bool, str]:
     which is the rule the check turns on.  Both directions are exercised: a
     system path is accepted and a target/ path is not.
     """
-    good = "/usr/lib/libSystem.B.dylib"
-    bad = "/Users/someone/repo/target/release/deps/libthing.dylib"
-    if not good.startswith(SYSTEM_PREFIXES):
-        return False, f"classifier rejected the system path {good}"
-    if bad.startswith(SYSTEM_PREFIXES):
-        return False, f"classifier accepted the build-tree path {bad}"
-    return True, ("classifier accepts /usr/lib and rejects a target/ path; the "
-                  "check turns on exactly this rule")
+    accept = [
+        "/usr/lib/libSystem.B.dylib",
+        "/System/Library/Frameworks/Security.framework/Versions/A/Security",
+    ]
+    # Each of these is a dependency that works on the build machine and is
+    # missing or attacker-controlled on a clean one.  `@rpath` and
+    # `/usr/local/lib` are in this list because the classifier used to accept
+    # them.
+    reject = [
+        "/Users/someone/repo/target/release/deps/libthing.dylib",
+        "@rpath/libthing.dylib",
+        "@executable_path/../lib/libthing.dylib",
+        "@loader_path/libthing.dylib",
+        "/usr/local/lib/libssl.3.dylib",
+        "/opt/homebrew/lib/libssl.3.dylib",
+        "/Users/someone/.cargo/registry/src/libthing.dylib",
+    ]
+    for path in accept:
+        if not path.startswith(SYSTEM_PREFIXES):
+            return False, f"classifier rejected the system path {path}"
+    for path in reject:
+        if path.startswith(SYSTEM_PREFIXES):
+            return False, f"classifier accepted the non-system path {path}"
+    return True, (f"{len(accept)} system paths accepted and {len(reject)} rejected, "
+                  f"including @rpath, @executable_path, @loader_path, /usr/local/lib "
+                  f"and /opt/homebrew, which resolve off the build machine or not at "
+                  f"all on a clean one")
 
 
 def control_lockfile_parser_is_not_universal(bundle: Path) -> tuple[bool, str]:
@@ -1170,6 +1489,19 @@ def control_lockfile_parser_is_not_universal(bundle: Path) -> tuple[bool, str]:
                   "package -> 1 crate")
 
 
+# Two entries below are **unit probes, not witness controls**, and the
+# distinction is recorded here because collapsing it overstates the suite.
+# A witness control defeats a mechanism in a real bundle and requires the
+# corresponding check to go red naming the witness it planted.  A unit probe
+# invokes no check at all: it exercises a pure function's rule in both
+# directions.  Both are worth running; only the first is evidence that a check
+# can fail.  `--self-test` counts and labels them separately, so a reader
+# cannot take 17 witness controls from a suite that has 15.
+UNIT_PROBES = {
+    "the lockfile parser is not universal",
+    "the dynamic-dependency classifier's rule",
+}
+
 CONTROLS: dict[str, list[tuple[str, object]]] = {
     "checksums": [
         ("a flipped byte in a bundled file", control_checksum_flipped_byte),
@@ -1183,6 +1515,8 @@ CONTROLS: dict[str, list[tuple[str, object]]] = {
     ],
     "notices": [
         ("a crate dropped from NOTICE", control_notices_dropped_crate),
+        ("every licence text stripped out", control_notices_texts_stripped),
+        ("a gutted but self-consistent NOTICE", control_notices_text_floor_is_not_vacuous),
         ("a NOTICE stale against its lockfile", control_notices_stale_lockfile),
         ("a crate declared out of the graph and notified", control_notices_false_unresolved_claim),
         ("the lockfile parser is not universal", control_lockfile_parser_is_not_universal),
@@ -1190,6 +1524,7 @@ CONTROLS: dict[str, list[tuple[str, object]]] = {
     "assets": [
         ("the tunnel-deadman sentinel removed", control_assets_sentinel_removed),
         ("a decoy file of the sentinel's name", control_assets_sentinel_is_a_decoy),
+        ("a decoy that also exits 2", control_assets_decoy_that_exits_two),
     ],
     "cli": [
         ("a binary that exits 0 printing nothing", control_cli_content_not_exit_status),
@@ -1198,7 +1533,7 @@ CONTROLS: dict[str, list[tuple[str, object]]] = {
         ("no serving example at all", control_cli_serving_example_must_exist),
     ],
     "portability": [
-        ("a build-tree dynamic dependency", control_portability_non_system_dependency),
+        ("the dynamic-dependency classifier's rule", control_portability_non_system_dependency),
     ],
 }
 
@@ -1436,17 +1771,30 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         return 2
     selected = [args.check] if args.check else list(CONTROLS)
     failures = 0
-    total = 0
+    witness_total = 0
+    probe_total = 0
     for check in selected:
         print(f"--- {check} ---")
         for label, control in CONTROLS[check]:
-            total += 1
+            is_probe = label in UNIT_PROBES
+            if is_probe:
+                probe_total += 1
+            else:
+                witness_total += 1
             ok, detail = control(bundle)
             if not ok:
                 failures += 1
-            print(f"  {'ok    ' if ok else 'FAILED'}  {label}: {detail}")
-    print(f"\n{total - failures}/{total} controls proved their check can fail "
-          f"for the reason they name")
+            kind = "probe " if is_probe else "control"
+            print(f"  {'ok    ' if ok else 'FAILED'}  [{kind}] {label}: {detail}")
+    total = witness_total + probe_total
+    # Reported as two numbers on purpose.  A single "17 of 17 controls" would
+    # credit the suite with two entries that never invoke a check, which is a
+    # message stating something the code did not measure -- the shape
+    # docs/tasks.md M5-C11 exists to track.
+    print(f"\n{total - failures}/{total} passed: {witness_total} witness control(s) "
+          f"that defeat a mechanism and require the named check to go red with the "
+          f"witness they plant, and {probe_total} unit probe(s) that exercise a pure "
+          f"function's rule in both directions and invoke no check")
     return 0 if failures == 0 else 1
 
 
