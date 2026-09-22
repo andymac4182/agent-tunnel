@@ -110,6 +110,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from guard_outcomes import AppliedCase  # noqa: E402
 from guard_outcomes import check_anchors as shared_check_anchors  # noqa: E402
 from guard_outcomes import classify_outcome  # noqa: E402
+from guard_outcomes import forbid_writes_for_this_process  # noqa: E402
 from guard_outcomes import install_interrupt_restore  # noqa: E402
 from guard_outcomes import load_witness_debt  # noqa: E402
 from guard_outcomes import read_only_entry  # noqa: E402
@@ -6419,6 +6420,19 @@ def main() -> int:
         ),
     )
     arguments = parser.parse_args()
+
+    # **M4-36, and this is the load-bearing line.**  Write capability is
+    # dropped here, on the strength of the flag alone, *before* any dispatch.
+    # The read-only entry below still wraps its own barrier, but that one only
+    # covers code reached through it -- and the bypass this guards against is
+    # a dispatch that is never reached: nested under the preceding `if
+    # arguments.list:` block it is present, correctly ordered and unreachable,
+    # and `main()` falls through to the deletion loop. Taking the capability
+    # away up here makes the destructive path the one that never had it
+    # removed, so a lost dispatch raises on its first mutation instead of
+    # deleting guards for hours and exiting 0.
+    if arguments.check_anchors:
+        forbid_writes_for_this_process()
 
     suites = [
         suite

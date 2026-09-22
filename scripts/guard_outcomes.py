@@ -726,9 +726,38 @@ class NoWriteCapability:
     deletion loop reachable and watching this raise.
     """
 
+    #: How many barriers are currently installed.  The scope nests: a
+    #: `--check-anchors` run installs one for the whole process at
+    #: argument-parse time and `read_only_entry` installs another inside it,
+    #: and the inner one must not restore the real primitives on the way out.
+    _depth = 0
+
+    #: The instance holding the real primitives while the barrier is up, so a
+    #: caller that installed one irreversibly can still be unwound.  Only
+    #: `scripts/test_guard_outcomes.py` does that: a harness process that
+    #: asked for `--check-anchors` has no later work that may write, but the
+    #: test file does, and leaving the barrier up would make every later test
+    #: pass or fail for a reason unrelated to what it asserts.
+    _holder: NoWriteCapability | None = None
+
+    @classmethod
+    def release_all(cls) -> None:
+        """Restore the real primitives, whatever the nesting depth."""
+        holder = cls._holder
+        cls._depth = 0
+        if holder is not None:
+            holder._installed = True
+            cls._depth = 1
+            holder.__exit__()
+
     def __enter__(self) -> NoWriteCapability:
         import subprocess as _subprocess
 
+        self._installed = NoWriteCapability._depth == 0
+        NoWriteCapability._depth += 1
+        if not self._installed:
+            return self
+        NoWriteCapability._holder = self
         self._saved = {
             "write_text": Path.write_text,
             "open": Path.open,
@@ -765,12 +794,46 @@ class NoWriteCapability:
         return self
 
     def __exit__(self, *_exc: object) -> bool:
+        NoWriteCapability._depth -= 1
+        if not getattr(self, "_installed", False):
+            return False
+        NoWriteCapability._holder = None
         Path.write_text = self._saved["write_text"]
         Path.open = self._saved["open"]
         Path.unlink = self._saved["unlink"]
         os.replace = self._saved["replace"]
         self._subprocess.run = self._saved["run"]
         return False
+
+
+
+def forbid_writes_for_this_process() -> None:
+    """Drop write capability for the rest of this process, permanently.
+
+    **Why `read_only_entry` alone was not enough, and this is the fix (M4-36,
+    reopened on review).**  `NoWriteCapability` inside `read_only_entry` bars
+    writes only for code reached *through* that entry.  The bypass this row
+    records does not go through it: nesting the `if arguments.check_anchors:`
+    block under the preceding `if arguments.list:` block leaves the dispatch
+    present, correctly ordered and **unreachable**, so `main()` falls through
+    to the deletion loop.  Reproduced against the fixed tree before this
+    function existed: `--check-anchors` on `m3-guard-deletion` ran all **12**
+    cases through the deletion loop with `read_only_entry` entered **zero**
+    times.  A barrier bolted onto a branch protects nothing when the branch is
+    what was lost.
+
+    So capability is taken away at **argument-parse time**, before any
+    dispatch, on the strength of the flag alone.  The destructive path is then
+    the one that never had the capability removed, rather than the one that
+    escaped a check -- which is what "read-only-ness is a property of the call
+    graph" has to mean if a lost dispatch is the failure being guarded.  A
+    bypassed dispatch now raises `WriteAttempted` on the deletion loop's first
+    mutation instead of running the suite to completion and exiting 0.
+
+    There is no matching release: a process that has asked for `--check-anchors`
+    has no later work that may write.
+    """
+    NoWriteCapability().__enter__()
 
 
 def read_only_entry(
