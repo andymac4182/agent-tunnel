@@ -78,6 +78,14 @@
 //! `tunnel-client doctor` reports `process_containment` as a **degradation,
 //! not a refusal** — it changes neither the verdict nor the exit code.
 //!
+//! The third layer was, until M6-C07, only nominally a layer: `doctor`
+//! discarded its whole result whenever any error was present, so on an
+//! unprovisioned machine — every fresh install, and the only kind an outside
+//! tester has — the containment report was computed and thrown away. It is
+//! reported on every path now. Worth stating because "three visibility layers
+//! carry it" was a claim about visibility that nothing measured, and one of
+//! the three was not carrying it.
+//!
 //! # Restart is the trap that bites
 //!
 //! A supervised restart must invalidate the input lease and every outstanding
