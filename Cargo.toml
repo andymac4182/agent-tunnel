@@ -32,6 +32,17 @@ resolver = "3"
 # M6-C04 recorded at length that the word had none, so any claim to have built
 # for "every advertised target" was a claim about a set the claimant chose.
 #
+# **The set is the one `.github/workflows/release.yml` already builds and
+# `site/docs/downloads.html` already advertises, by owner decision (M6-C11):
+# the release workflow is the authoritative packaging path, and this manifest
+# was brought into agreement with it rather than the reverse.**  It is not a
+# coincidence that `scripts/package_release.py` accepts exactly these four --
+# that script reads this table and no longer carries its own tuple, and
+# `scripts/m6-release-checks.py --check packaging` fails if the workflow's
+# matrix and this list ever diverge.  `aarch64-unknown-linux-gnu` was briefly
+# declared here and removed: nothing builds it, and declaring a target no
+# packaging path produces was the defect rather than the fix.
+#
 # It lives here, in the root manifest, rather than in a dedicated file, for one
 # reason that is a measurement rather than a preference: **a `[workspace.metadata]`
 # table has two independent readers.**  `scripts/m6-release-artifact.py` and
@@ -52,8 +63,9 @@ resolver = "3"
 [workspace.metadata.release]
 advertised-targets = [
     "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-pc-windows-msvc",
     "x86_64-unknown-linux-gnu",
-    "aarch64-unknown-linux-gnu",
 ]
 # The owner explicitly requested publication and the repository is public.
 # `scripts/m6-release-checks.py --check visibility` compares GitHub's live

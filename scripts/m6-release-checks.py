@@ -1081,6 +1081,117 @@ def check_secrets(repo: Path | None = None) -> Result:
 
 
 # --------------------------------------------------------------------------
+# Check: packaging
+#
+# **Why this exists, and it is not tidiness.** Until now three places named
+# the advertised target set and nothing reconciled them: a literal tuple in
+# `scripts/package_release.py`, the `matrix.include` list in
+# `.github/workflows/release.yml`, and the public downloads page's prose.
+# docs/tasks.md row M6-C11 recorded that second packaging path and asked which
+# is authoritative. The owner's answer is that **the release workflow is**, so
+# `[workspace.metadata.release] advertised-targets` was brought into agreement
+# with it, `package_release.py` now reads that table, and this check makes the
+# agreement structural rather than a coincidence waiting to drift.
+#
+# **It runs locally and deliberately so.** GitHub Actions billing has blocked
+# this repository since 2026-09-11, so `release.yml` has not executed at all
+# and cannot be the thing that notices a divergence. This check reads the
+# workflow as text on the machine running it.
+#
+# A triple-shaped literal, so a tuple reintroduced into the packager is seen
+# whatever it is named. `x86_64-pc-windows-msvc`, `aarch64-apple-darwin`, etc.
+TRIPLE_LITERAL = re.compile(r"\b(?:x86_64|aarch64|i686|armv7|riscv64gc|s390x|powerpc64le)-[a-z0-9_]+-[a-z0-9_.-]+\b")
+# `target: <triple>` inside the workflow's build matrix.
+WORKFLOW_MATRIX_TARGET = re.compile(r"(?m)^\s*target:\s*([A-Za-z0-9_][A-Za-z0-9_.-]*)\s*$")
+PACKAGER = "scripts/package_release.py"
+RELEASE_WORKFLOW = ".github/workflows/release.yml"
+
+
+def packaging_verdict(declared: list[str], matrix: list[str],
+                      packager_source: str) -> tuple[bool, list[str]]:
+    """Compare the declaration against the workflow matrix and the packager.
+
+    Pure, so `--self-test` can drive it in both directions with recorded
+    inputs. A comparison that only ever sees agreeing inputs is a comparison
+    nobody has tested, which is the defect this whole file is about.
+    """
+    notes: list[str] = []
+    ok = True
+    declared_set, matrix_set = sorted(set(declared)), sorted(set(matrix))
+    if not matrix_set:
+        notes.append(
+            f"  FAIL: no `target:` entries found in {RELEASE_WORKFLOW}. Either the "
+            "workflow stopped declaring a matrix or this check's pattern no longer "
+            "matches it; an empty matrix must never compare equal to anything."
+        )
+        return False, notes
+    if declared_set != matrix_set:
+        missing = [t for t in matrix_set if t not in declared_set]
+        extra = [t for t in declared_set if t not in matrix_set]
+        notes.append(
+            f"  FAIL: the workflow matrix and the declaration disagree. Built but not "
+            f"declared: {missing or 'none'}. Declared but not built: {extra or 'none'}. "
+            "The release workflow is the authoritative packaging path (M6-C11), so the "
+            "declaration follows it, not the reverse."
+        )
+        ok = False
+    else:
+        notes.append(
+            f"  {len(declared_set)} advertised targets, and {RELEASE_WORKFLOW}'s matrix "
+            f"builds exactly those: {declared_set}"
+        )
+
+    literals = sorted(set(TRIPLE_LITERAL.findall(packager_source)))
+    if literals:
+        notes.append(
+            f"  FAIL: {PACKAGER} carries target-triple literals {literals}. It must read "
+            "`advertised-targets` from the manifest; a second copy is the defect M6-C11 "
+            "was filed for and M5-C11 catalogues."
+        )
+        ok = False
+    else:
+        notes.append(f"  {PACKAGER} carries no target-triple literal; it derives the set")
+    return ok, notes
+
+
+def check_packaging() -> Result:
+    result = Result("packaging")
+    try:
+        declared = declared_targets()
+    except ValueError as error:
+        result.ran = False
+        result.reason = f"no advertised-target declaration to compare against: {error}"
+        return result
+
+    workflow = REPO / RELEASE_WORKFLOW
+    packager = REPO / PACKAGER
+    for path in (workflow, packager):
+        if not path.is_file():
+            result.ran = False
+            result.reason = (
+                f"{path.relative_to(REPO)} is missing, so the second packaging path "
+                "could not be read. That is not a pass: it is the file this check exists "
+                "to reconcile against."
+            )
+            return result
+
+    matrix = WORKFLOW_MATRIX_TARGET.findall(workflow.read_text(encoding="utf-8"))
+    result.note(f"  declared: [workspace.metadata.release] advertised-targets = {declared}")
+    ok, notes = packaging_verdict(declared, matrix, packager.read_text(encoding="utf-8"))
+    for line in notes:
+        result.note(line)
+    result.note(
+        "  NOTE: this check reads the workflow as text. It has never run on a hosted "
+        "runner -- Actions billing has blocked this repository since 2026-09-11 -- so "
+        "agreement here is agreement between two files, not evidence that the matrix "
+        "builds. `site/docs/downloads.html` states the platforms in prose and is NOT "
+        "machine-compared; that residue is recorded on M6-C11."
+    )
+    result.passed = ok
+    return result
+
+
+# --------------------------------------------------------------------------
 # Check: repository visibility (read-only)
 # --------------------------------------------------------------------------
 def declared_visibility() -> str:
@@ -1102,20 +1213,33 @@ def declared_visibility() -> str:
     a second copy of a declaration is this repository's recurring defect
     (M5-C11).
     """
-    text = (REPO / "Cargo.toml").read_text(encoding="utf-8")
-    table = tomllib.loads(text).get("workspace", {}).get("metadata", {}).get("release")
-    if table is None:
-        raise ValueError(
-            "root Cargo.toml carries no [workspace.metadata.release] table, so no "
-            "visibility is declared and there is nothing to compare GitHub against"
-        )
-    declared = table.get("repository-visibility")
+    declared = release_table().get("repository-visibility")
     if declared not in VISIBILITY_VALUES:
         raise ValueError(
             f"`repository-visibility` is {declared!r}; it must be one of "
             f"{sorted(VISIBILITY_VALUES)}"
         )
     return declared
+
+
+def release_table() -> dict:
+    """`[workspace.metadata.release]`, the single referent this gate reads."""
+    table = tomllib.loads((REPO / "Cargo.toml").read_text(encoding="utf-8"))
+    release = table.get("workspace", {}).get("metadata", {}).get("release")
+    if release is None:
+        raise ValueError("root Cargo.toml carries no [workspace.metadata.release] table")
+    return release
+
+
+def declared_targets() -> list[str]:
+    """The advertised set. Raises rather than defaulting, for the same reason
+    `declared_visibility` does: a default is a second source of truth."""
+    targets = release_table().get("advertised-targets")
+    if not isinstance(targets, list) or not targets:
+        raise ValueError("`advertised-targets` must be a non-empty list")
+    if not all(isinstance(t, str) for t in targets):
+        raise ValueError("`advertised-targets` must be a list of strings")
+    return sorted(targets)
 
 
 def observed_visibility(payload: dict) -> str | None:
@@ -1775,6 +1899,103 @@ def control_digest_allowlist_cannot_hide_another_secret() -> tuple[bool, str]:
     )
 
 
+def control_packaging_matrix_divergence_is_caught() -> tuple[bool, str]:
+    """A workflow matrix that disagrees with the declaration must go red.
+
+    Driven with recorded inputs in four directions, because this check's whole
+    value is that it fires when two files drift apart, and the live repository
+    only ever shows it the agreeing case. An empty matrix is included because
+    a pattern that stopped matching would otherwise compare equal to nothing
+    and pass -- the "scanned nothing" shape of M5-C11.
+    """
+    declared = declared_targets()
+    clean = (REPO / PACKAGER).read_text(encoding="utf-8")
+    cases = [
+        ("identical", declared, True),
+        ("one target dropped from the matrix", declared[:-1], False),
+        ("an extra target built but not declared", declared + ["i686-unknown-linux-gnu"], False),
+        ("an empty matrix", [], False),
+    ]
+    for label, matrix, want in cases:
+        got, notes = packaging_verdict(declared, matrix, clean)
+        if got != want:
+            return False, (
+                f"case {label!r}: verdict {got}, expected {want}. Notes: "
+                f"{[n.strip() for n in notes]}"
+            )
+    return True, (
+        f"the comparison accepts the live {len(declared)}-target matrix and rejects a "
+        "dropped target, an undeclared extra, and an empty matrix -- so a matrix that "
+        "no longer parses cannot pass by matching nothing"
+    )
+
+
+def control_packaging_a_second_copy_of_the_set_is_caught() -> tuple[bool, str]:
+    """A target-triple literal reintroduced into the packager must go red.
+
+    This is the control for the defect the change removed: `package_release.py`
+    used to carry `TARGETS = (...)` as a literal tuple beside the workflow's
+    matrix, with nothing reconciling them (M6-C11). Reverting that must be
+    caught rather than merely discouraged by a comment.
+    """
+    declared = declared_targets()
+    clean = (REPO / PACKAGER).read_text(encoding="utf-8")
+    clean_ok, clean_notes = packaging_verdict(declared, declared, clean)
+    if not clean_ok:
+        return False, (
+            "the real packager does not pass its own check, so a red below would not "
+            f"be attributable to the planted literal: {[n.strip() for n in clean_notes]}"
+        )
+    planted = clean + '\nTARGETS = ("x86_64-unknown-linux-gnu", "aarch64-apple-darwin")\n'
+    planted_ok, planted_notes = packaging_verdict(declared, declared, planted)
+    if planted_ok:
+        return False, (
+            "a literal target tuple appended to the packager's source did NOT turn the "
+            "check red. The literal scan cannot fire."
+        )
+    if not any("target-triple literals" in note for note in planted_notes):
+        return False, f"it went red for another reason: {[n.strip() for n in planted_notes]}"
+    return True, (
+        "the real `scripts/package_release.py` passes with 0 triple literals, and the "
+        "same source with a two-triple `TARGETS` tuple appended goes red naming the "
+        "literals it found -- so the packager reading the manifest is asserted, not "
+        "assumed"
+    )
+
+
+def control_packaging_reads_the_manifest_not_a_tuple() -> tuple[bool, str]:
+    """The packager's accepted set must follow the declaration.
+
+    The scan above proves no literal is present; this proves the value the
+    packager actually uses comes from the manifest, by importing it and
+    comparing against an independent read of the same table.
+    """
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("m6_package_release", REPO / PACKAGER)
+    if spec is None or spec.loader is None:
+        return False, f"could not load {PACKAGER}, so this control DID NOT RUN"
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["m6_package_release"] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception as error:  # noqa: BLE001 - a broken import is a failed control
+        return False, f"{PACKAGER} could not be imported, so this control DID NOT RUN: {error}"
+    accepted = sorted(module.advertised_targets())
+    declared = declared_targets()
+    if accepted != declared:
+        return False, (
+            f"the packager accepts {accepted} while the manifest declares {declared}"
+        )
+    if not hasattr(module, "advertised_targets"):
+        return False, "the packager no longer exposes a manifest reader"
+    return True, (
+        f"`package_release.advertised_targets()` returns exactly the {len(declared)} "
+        "triples an independent read of [workspace.metadata.release] gives, so the "
+        "packager and this gate resolve the same declaration rather than two copies"
+    )
+
+
 def control_visibility_classifier_goes_both_ways() -> tuple[bool, str]:
     """The check must redden when reality disagrees with the declaration.
 
@@ -1920,6 +2141,20 @@ CONTROLS: dict[str, list[tuple[str, object]]] = {
             control_digest_allowlist_cannot_hide_another_secret,
         ),
     ],
+    "packaging": [
+        (
+            "a workflow matrix that disagrees with the declaration",
+            control_packaging_matrix_divergence_is_caught,
+        ),
+        (
+            "a target tuple reintroduced into the packager",
+            control_packaging_a_second_copy_of_the_set_is_caught,
+        ),
+        (
+            "the packager resolves the manifest, not a copy",
+            control_packaging_reads_the_manifest_not_a_tuple,
+        ),
+    ],
     "visibility": [
         (
             "observed and declared are compared in all eight cells",
@@ -1935,6 +2170,7 @@ CONTROLS: dict[str, list[tuple[str, object]]] = {
 
 CHECKS = {
     "deps": check_deps,
+    "packaging": check_packaging,
     "provenance": check_provenance,
     "secrets": check_secrets,
     "visibility": check_visibility,

@@ -122,6 +122,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import shutil
 import stat
@@ -265,31 +266,54 @@ def declared_targets(manifest: Path | None = None) -> list[str]:
     return sorted(raw)
 
 
-def cargo_declared_targets(manifest: Path | None = None) -> list[str] | None:
+def classify_cargo_metadata(returncode: int, stdout: str) -> tuple[list[str] | None, str]:
+    """Turn one `cargo metadata` invocation into a set and a **status**.
+
+    **Split out, and the statuses kept distinct, because collapsing them was a
+    real defect.**  The first version of this returned a bare `None` for four
+    different conditions -- cargo missing, cargo exiting non-zero, JSON that
+    would not parse, and a table that is not a list of triples -- and
+    `check_targets` reported all four as "cargo could not be reached".  The
+    last two are the second reader **disagreeing**, reported as the second
+    reader being **absent**, which is the more forgiving of the two readings
+    and the wrong one.  A reader that answers something else has not failed to
+    run; it has contradicted the declaration.
+
+    Pure, so `--self-test` can drive every status from recorded input without
+    a cargo on the machine.
+    """
+    if returncode != 0:
+        return None, "cargo-failed"
+    try:
+        metadata = json.loads(stdout)
+    except json.JSONDecodeError:
+        return None, "unparseable-json"
+    if not isinstance(metadata, dict):
+        return None, "unparseable-json"
+    table = (metadata.get("metadata") or {}).get("release")
+    if not isinstance(table, dict):
+        return None, "no-release-table"
+    raw = table.get("advertised-targets")
+    if not isinstance(raw, list):
+        return None, "targets-not-a-list"
+    return sorted(str(t) for t in raw), "ok"
+
+
+def cargo_declared_targets(manifest: Path | None = None) -> tuple[list[str] | None, str]:
     """The same table, read by cargo instead of by this script.
 
-    `None` means cargo could not be reached or could not answer, which is
-    reported as a note rather than folded into a pass -- a reader that did not
-    run agrees with everything.
+    Returns `(targets, status)`.  `check_targets` treats the statuses
+    differently and deliberately: cargo absent or failing means the second
+    reader **did not run**, which is not a pass; cargo answering with
+    something other than the declaration means it **disagrees**, which is a
+    failure with a witness.
     """
     root = (manifest or (REPO / MANIFEST)).parent
     if shutil.which("cargo") is None:
-        return None
+        return None, "cargo-absent"
     completed = run(["cargo", "metadata", "--no-deps", "--format-version", "1",
                      "--offline"], cwd=root, timeout=300)
-    if completed.returncode != 0:
-        return None
-    try:
-        metadata = json.loads(completed.stdout)
-    except json.JSONDecodeError:
-        return None
-    table = (metadata.get("metadata") or {}).get("release")
-    if not isinstance(table, dict):
-        return None
-    raw = table.get("advertised-targets")
-    if not isinstance(raw, list):
-        return None
-    return sorted(str(t) for t in raw)
+    return classify_cargo_metadata(completed.returncode, completed.stdout)
 
 
 def rustc_known_targets() -> set[str] | None:
@@ -1358,34 +1382,65 @@ def check_targets(bundle: Path, manifest: Path | None = None) -> Result:
             witness="advertised-set-mismatch")
 
     result = Result("targets", True, summary="")
-    by_cargo = cargo_declared_targets(manifest)
-    if by_cargo is None:
-        result.note("NOTE: cargo could not be reached, so the second reader of this "
-                    "declaration DID NOT RUN; only tomllib and the bundle were compared")
-    elif by_cargo != declared:
+
+    # **The second reader is required, not optional.**  An earlier version
+    # demoted its absence to a NOTE and still printed `ok` and exited 0, so
+    # the whole "two independent readers" property could be silently absent --
+    # and `check_cli` in this very file constructs an environment where
+    # `cargo` is deliberately unfindable, which is exactly how such a hole
+    # gets exercised by accident.  A check that keeps passing when half its
+    # mechanism is missing is the shape docs/tasks.md M5-C11 exists for.
+    by_cargo, status = cargo_declared_targets(manifest)
+    if status in ("cargo-absent", "cargo-failed"):
+        reason = {
+            "cargo-absent": "`cargo` is not on PATH",
+            "cargo-failed": "`cargo metadata` exited non-zero",
+        }[status]
+        return Result(
+            "targets", False, ran=False,
+            summary=(f"{reason}, so the second reader of this declaration DID NOT RUN. "
+                     "Only tomllib and the bundle could be compared, and a reader that "
+                     "did not run agrees with everything, so this is reported as DID "
+                     "NOT RUN rather than folded into a pass."))
+    if status != "ok":
+        detail = {
+            "unparseable-json": "`cargo metadata` produced output this check could not parse",
+            "no-release-table": "`cargo metadata` reports no [workspace.metadata.release] table",
+            "targets-not-a-list": "`cargo metadata` reports `advertised-targets` as something other than a list",
+        }[status]
+        return Result(
+            "targets", False,
+            summary=(f"{detail}, while tomllib reads {declared} from the same file. "
+                     "That is the second reader DISAGREEING, not the second reader being "
+                     "absent, and the two must not be reported as the same thing."),
+            witness="second-reader-disagrees")
+    if by_cargo != declared:
         return Result(
             "targets", False,
             summary=f"tomllib reads {declared} from the manifest and `cargo metadata` "
                     f"reads {by_cargo} from the same table",
             witness="advertised-set-mismatch")
-    else:
-        result.note(f"two independent readers agree: tomllib and `cargo metadata` both "
-                    f"return {len(declared)} triples from [workspace.metadata.release]")
+    result.note(f"two independent readers agree: tomllib and `cargo metadata` both "
+                f"return {len(declared)} triples from [workspace.metadata.release]")
 
+    # Same rule as the second reader above: unreachable is DID NOT RUN, not a
+    # note beside a green.
     known = rustc_known_targets()
     if known is None:
-        result.note("NOTE: rustc could not be reached, so the declared triples were "
-                    "NOT checked against a real target list")
-    else:
-        unknown = [t for t in declared if t not in known]
-        if unknown:
-            return Result(
-                "targets", False,
-                summary=f"declared but unknown to rustc {len(known)}-target list: {unknown}",
-                witness="advertised-target-unknown")
-        result.note(f"all {len(declared)} declared triples appear in rustc's "
-                    f"{len(known)}-target list, so none is a typo that would only "
-                    "surface at build time")
+        return Result(
+            "targets", False, ran=False,
+            summary=("`rustc --print target-list` could not be read, so the declared "
+                     "triples were NOT checked against a real target list. Reported as "
+                     "DID NOT RUN rather than noted beside a pass."))
+    unknown = [t for t in declared if t not in known]
+    if unknown:
+        return Result(
+            "targets", False,
+            summary=f"declared but unknown to rustc {len(known)}-target list: {unknown}",
+            witness="advertised-target-unknown")
+    result.note(f"all {len(declared)} declared triples appear in rustc's "
+                f"{len(known)}-target list, so none is a typo that would only "
+                "surface at build time")
 
     bundle_target = fields.get("target", "")
     if bundle_target not in declared:
@@ -1928,12 +1983,46 @@ def control_lockfile_parser_is_not_universal(bundle: Path) -> tuple[bool, str]:
 # --------------------------------------------------------------------------
 # Controls for `targets`.
 #
-# The triples written below are the ONLY triples in this file outside the
-# declaration's own reader, and every one of them is a value the check must
-# **reject**.  None of them is a second copy of the advertised set.
+# The triples written below are the only triples in this file outside the
+# declaration's own reader.  **Most, not all, are values the check must
+# reject**: `NOT_A_REAL_TRIPLE` and `UNDECLARED_TRIPLE` are, but the probes
+# below also use `aarch64-apple-darwin` as an *accepted* value -- in the
+# duplicate and bare-string parser cases, and as one of the two sets the
+# cargo-reader probe declares in its throwaway workspace.  The earlier
+# wording here said every one of them was a rejected value, which was simply
+# not true of three of them.
+#
+# What matters is the weaker and actually-true property: **none of them is a
+# second copy of the advertised set**, and nothing outside this controls
+# section reads any of them.  The check and the reader resolve the manifest.
 # --------------------------------------------------------------------------
 NOT_A_REAL_TRIPLE = "aarch64-unknown-moonos"
-UNDECLARED_TRIPLE = "x86_64-pc-windows-msvc"
+#: A real rustc target that is deliberately NOT advertised.  It was
+#: `x86_64-pc-windows-msvc` until the owner's M6-C11 decision put that triple
+#: **into** the declared set, at which point three controls here silently
+#: stopped testing what they named -- the one that should have reddened for
+#: `target-not-advertised` reddened for `advertised-set-mismatch` instead, and
+#: only the witness rule caught it.  `assert_undeclared` below turns that from
+#: a thing that happened into a thing that fails loudly.
+UNDECLARED_TRIPLE = "i686-unknown-linux-gnu"
+
+
+def assert_undeclared() -> str | None:
+    """Return an error if `UNDECLARED_TRIPLE` has become advertised.
+
+    Every control that plants an "outside the set" value depends on this
+    constant actually being outside the set.  When the declared set changes
+    under it, those controls do not fail -- they quietly test something else.
+    """
+    try:
+        declared = declared_targets()
+    except DeclarationError as error:
+        return f"the declaration could not be read, so the control cannot apply: {error}"
+    if UNDECLARED_TRIPLE in declared:
+        return (f"UNDECLARED_TRIPLE {UNDECLARED_TRIPLE!r} is now in the advertised set "
+                f"{declared}. This control no longer plants an undeclared triple and is "
+                "testing something other than what it names. Pick another triple.")
+    return None
 
 
 def rewrite_provenance(bundle: Path, key: str, value: str | None) -> bool:
@@ -1984,6 +2073,9 @@ def control_targets_bundle_target_is_not_advertised(bundle: Path) -> tuple[bool,
     bundle for any triple at all was "a release artifact" and nothing could
     say otherwise.
     """
+    broken = assert_undeclared()
+    if broken:
+        return False, broken
     with tempfile.TemporaryDirectory() as tmp:
         copy = copy_bundle(bundle, Path(tmp))
         if not rewrite_provenance(copy, "target", UNDECLARED_TRIPLE):
@@ -2018,6 +2110,9 @@ def control_targets_manifest_edit_reddens_a_shipped_bundle(bundle: Path) -> tupl
     goes red.  The bundle here is the real, unmodified artifact; only a
     throwaway copy of the manifest moves.
     """
+    broken = assert_undeclared()
+    if broken:
+        return False, broken
     with tempfile.TemporaryDirectory() as tmp:
         manifest = temp_manifest(
             Path(tmp),
@@ -2134,6 +2229,9 @@ def control_targets_cargo_is_a_live_second_reader(bundle: Path) -> tuple[bool, s
     # set: what matters is only that the two lists differ, so cargo can be
     # shown following a change rather than agreeing with a fixed answer.  The
     # second deliberately includes a triple that is NOT advertised.
+    broken = assert_undeclared()
+    if broken:
+        return False, broken
     first = ["aarch64-apple-darwin"]
     second = ["aarch64-apple-darwin", UNDECLARED_TRIPLE]
     with tempfile.TemporaryDirectory() as tmp:
@@ -2153,15 +2251,15 @@ def control_targets_cargo_is_a_live_second_reader(bundle: Path) -> tuple[bool, s
                 encoding="utf-8")
 
         declare(first)
-        by_cargo_first = cargo_declared_targets(manifest)
+        by_cargo_first, status_first = cargo_declared_targets(manifest)
         by_toml_first = declared_targets(manifest)
         declare(second)
-        by_cargo_second = cargo_declared_targets(manifest)
+        by_cargo_second, status_second = cargo_declared_targets(manifest)
 
-    if by_cargo_first is None or by_cargo_second is None:
-        return False, ("`cargo metadata` did not answer for the throwaway workspace, so "
-                       "the second reader DID NOT RUN and `None` would have been folded "
-                       "into a note rather than measured")
+    if status_first != "ok" or status_second != "ok":
+        return False, ("`cargo metadata` did not answer for the throwaway workspace "
+                       f"(statuses {status_first!r}, {status_second!r}), so the second "
+                       "reader DID NOT RUN and this probe measured nothing")
     if by_cargo_first != sorted(first) or by_toml_first != sorted(first):
         return False, (f"the two readers disagreed on a manifest declaring {first}: "
                        f"cargo={by_cargo_first} tomllib={by_toml_first}")
@@ -2174,7 +2272,85 @@ def control_targets_cargo_is_a_live_second_reader(bundle: Path) -> tuple[bool, s
                   "second reader is live rather than a stub that agrees with everything")
 
 
+def control_targets_absent_second_reader_is_not_a_pass(bundle: Path) -> tuple[bool, str]:
+    """With `cargo` unfindable, `targets` must NOT report ok.
+
+    **This control exists because the check used to pass in exactly this
+    state.**  `cargo_declared_targets` returned `None`, the check demoted it
+    to a NOTE, and the head line still read `ok` with exit 0 -- so the "two
+    independent readers" property could be entirely absent from a green run.
+    `check_cli` in this same file deliberately narrows `PATH` until `cargo` is
+    unfindable, so this is a state the gate constructs on purpose elsewhere.
+
+    The required result is `ran=False` -- DID NOT RUN, which `cmd_verify`
+    turns into exit 2 -- and not merely "not ok": a check that could not run
+    is not a red either, and conflating the two is the same collapse one level
+    down.
+    """
+    saved = os.environ.get("PATH", "")
+    try:
+        # A PATH with no cargo on it.  An empty string would make `which`
+        # fall back to a default path on some platforms, so use a real
+        # directory that certainly holds no cargo.
+        with tempfile.TemporaryDirectory() as empty:
+            os.environ["PATH"] = empty
+            if shutil.which("cargo") is not None:
+                return False, "cargo is still findable, so the control did not apply"
+            result = check_targets(bundle)
+    finally:
+        os.environ["PATH"] = saved
+    if result.ok:
+        return False, ("targets reported ok with `cargo` unfindable, so the second "
+                       "reader can be silently absent from a green run")
+    if result.ran:
+        return False, (f"targets went red rather than DID NOT RUN ({result.summary}); an "
+                       "unreachable reader is an inability to check, not a failed check")
+    if "DID NOT RUN" not in result.summary:
+        return False, f"it did not say so: {result.summary}"
+    return True, ("with `cargo` unfindable, targets reports DID NOT RUN -- which "
+                  "cmd_verify turns into exit 2, never a pass -- instead of printing ok "
+                  "with the missing second reader demoted to a note")
+
+
+def control_targets_second_reader_disagreement_is_not_absence(bundle: Path) -> tuple[bool, str]:
+    """Four cargo conditions must not all read as "could not be reached".
+
+    A unit probe over `classify_cargo_metadata`, because the four conditions
+    cannot all be produced from a real cargo on demand.  The distinction is
+    the point: cargo exiting non-zero is the reader **not running**, while
+    cargo answering with no release table is the reader **disagreeing**, and
+    the first version of this code reported both as absence -- the more
+    forgiving reading of the two.
+    """
+    good = json.dumps({"metadata": {"release": {"advertised-targets": ["a-b-c"]}}})
+    cases = [
+        ("non-zero exit", 1, good, None, "cargo-failed"),
+        ("unparseable output", 0, "not json at all", None, "unparseable-json"),
+        ("a JSON scalar", 0, "42", None, "unparseable-json"),
+        ("no release table", 0, json.dumps({"metadata": {}}), None, "no-release-table"),
+        ("null metadata", 0, json.dumps({"metadata": None}), None, "no-release-table"),
+        ("targets not a list", 0,
+         json.dumps({"metadata": {"release": {"advertised-targets": "a-b-c"}}}),
+         None, "targets-not-a-list"),
+        ("a real answer", 0, good, ["a-b-c"], "ok"),
+    ]
+    seen = set()
+    for label, code, out, want_targets, want_status in cases:
+        targets, status = classify_cargo_metadata(code, out)
+        if status != want_status:
+            return False, f"{label}: status {status!r}, expected {want_status!r}"
+        if targets != want_targets:
+            return False, f"{label}: targets {targets!r}, expected {want_targets!r}"
+        seen.add(status)
+    if len(seen) < 4:
+        return False, f"only {len(seen)} distinct statuses were produced: {sorted(seen)}"
+    return True, (f"{len(cases)} recorded cargo outcomes map to {len(seen)} distinct "
+                  f"statuses {sorted(seen)}, so a reader that answered something other "
+                  "than the declaration is never reported as a reader that was absent")
+
+
 UNIT_PROBES = {
+    "four cargo outcomes are four statuses, not one",
     "the lockfile parser is not universal",
     "the dynamic-dependency classifier's rule",
     "the declaration parser refuses junk in five shapes",
@@ -2222,6 +2398,10 @@ CONTROLS: dict[str, list[tuple[str, object]]] = {
          control_targets_declaration_parser_rejects_junk),
         ("cargo metadata is a live second reader of the declaration",
          control_targets_cargo_is_a_live_second_reader),
+        ("cargo unfindable: the check must not report ok",
+         control_targets_absent_second_reader_is_not_a_pass),
+        ("four cargo outcomes are four statuses, not one",
+         control_targets_second_reader_disagreement_is_not_absence),
     ],
     "cli": [
         ("a binary that exits 0 printing nothing", control_cli_content_not_exit_status),

@@ -11,8 +11,41 @@ import tomllib
 import zipfile
 from pathlib import Path
 
-TARGETS = ("x86_64-unknown-linux-gnu", "aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-pc-windows-msvc")
+ROOT = Path(__file__).resolve().parents[1]
 BINARIES = ("tunnel-client", "tunnel-relay", "tunnel-deadman")
+
+
+def advertised_targets(root=ROOT):
+    """The advertised set, read from the workspace manifest.
+
+    **This used to be a literal tuple here, and that was the defect.** The
+    same four triples were spelled out in this file, in
+    `.github/workflows/release.yml`'s matrix and (as prose) on the public
+    downloads page, with nothing reconciling them -- docs/tasks.md row M6-C11.
+    They now come from `[workspace.metadata.release] advertised-targets` in
+    the root `Cargo.toml`, which is the single referent for the word
+    "advertised", and `scripts/m6-release-checks.py --check packaging` fails
+    if the workflow matrix and that list ever diverge.
+
+    It raises rather than falling back to a default: a default would be a
+    second source of truth wearing a fallback's clothes, and this function
+    exists precisely so there is only one.
+    """
+    table = tomllib.loads((root / "Cargo.toml").read_text())
+    release = table.get("workspace", {}).get("metadata", {}).get("release")
+    if release is None:
+        raise ValueError("root Cargo.toml declares no [workspace.metadata.release] table")
+    targets = release.get("advertised-targets")
+    if not isinstance(targets, list) or not targets:
+        raise ValueError("[workspace.metadata.release] advertised-targets must be a non-empty list")
+    if not all(isinstance(target, str) for target in targets):
+        raise ValueError("advertised-targets must be a list of strings")
+    return tuple(sorted(targets))
+
+
+#: Kept as a module-level name because `scripts/test_package_release.py`
+#: imports it, but it is now *derived* rather than declared.
+TARGETS = advertised_targets()
 
 
 def version(root, sha, run):
@@ -25,7 +58,10 @@ def version(root, sha, run):
 
 
 def package(root, target, sha, run, output, metadata):
-    if target not in TARGETS:
+    # Read from the manifest under `root` rather than from the module-level
+    # TARGETS, so a caller packaging a different checkout is checked against
+    # *that* checkout's declaration.
+    if target not in advertised_targets(root):
         raise ValueError("unsupported target")
     tag = version(root, sha, run)
     output.mkdir(parents=True, exist_ok=True)
