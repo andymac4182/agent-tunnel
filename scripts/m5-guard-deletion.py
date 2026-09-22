@@ -40,6 +40,23 @@ here:
   `exec` the fixture binary. Without the rebuild both would report `still
   green`.
 
+* `m5c6` -- what a restart cannot see: the per-operation map of input state a
+  backend may have left asserted on the target, the restart's unconditional
+  declaration of it, and the two narrowings that would turn that declaration
+  back into silence.
+
+  **These cases defeat declarations, not repairs.** Nothing in this chunk
+  releases a held button or key. That is a policy decision rather than a
+  limit of the backend: the pinned 0.3.46 registry does carry `mouse_up` and
+  `key_up`, and the device declines to issue them because a `mouse_up` is a
+  *drop* and a `key_up` is synthesised input outside any lease. See
+  `docs/tasks.md` M5-C09.
+
+  A device that declared nothing would behave **identically** against the
+  backend -- same requests, same outcomes, same journal -- so no behavioural
+  test can tell the two apart and a guard suite is the only thing that can.
+  It carries `m5c4`'s pre-build, for `m5c4`'s reason.
+
 It follows `scripts/acp-guard-deletion.py` and `scripts/fs-guard-deletion.py`,
 **including their refusals, none of which may be removed**:
 
@@ -1555,6 +1572,119 @@ CASES_C5: list[tuple[str, list[Edit], bool]] = [
     ),
 ]
 
+#: Chunk 6 -- what a restart cannot see. Shares `m5c4`'s build and test set:
+#: two of these cases are witnessed end to end by
+#: `tunnel-cua-fixture/tests/supervision.rs`, which `exec`s the fixture binary.
+#:
+#: **Every case here defeats a *declaration*, not a repair.** Nothing in this
+#: chunk releases a held button or key -- a decision, not an impossibility;
+#: the pinned registry carries `mouse_up` and `key_up` and the device declines
+#: to issue them. So what these cases measure is whether the device still
+#: admits what it has chosen not to resolve. A silent device and an honest one
+#: behave identically against the backend, which is exactly why only a guard
+#: suite can tell them apart.
+CASES_C6: list[tuple[str, list[Edit], bool]] = [
+    (
+        # The declaration the restart makes, deleted outright. A supervisor
+        # that reports only what it took away from itself reports the
+        # reassuring half of a restart alone.
+        "a restart declares what it could not observe about the target",
+        [
+            (
+                SUPERVISION,
+                "        residue: RESTART_RESIDUE,",
+                "        residue: DesktopResidue::NONE,",
+            )
+        ],
+        False,
+    ),
+    (
+        # **The tempting narrowing, and the wrong one.** The device's own
+        # registries are not a witness to the desktop: a lease released just
+        # before the kill empties them, and the agent who inherits a held
+        # button holds no lease at the moment of the restart at all. A device
+        # that said "nothing was held, so the desktop is clean" would be
+        # making the claim this whole row exists to stop -- and it would still
+        # pass every test that restarts a *busy* backend, which is why the
+        # idle restart is asserted in the same breath.
+        "the declaration does not narrow to what the device happened to hold",
+        [
+            (
+                SUPERVISION,
+                """    Invalidation {
+        generation,
+        leases_released: leases.invalidate_all(),
+        captures_forgotten: captures.invalidate_all(),
+        residue: RESTART_RESIDUE,
+    }""",
+                """    let mut invalidation = Invalidation {
+        generation,
+        leases_released: leases.invalidate_all(),
+        captures_forgotten: captures.invalidate_all(),
+        residue: RESTART_RESIDUE,
+    };
+    if !invalidation.freed_anything() {
+        invalidation.residue = DesktopResidue::NONE;
+    }
+    invalidation""",
+            )
+        ],
+        False,
+    ),
+    (
+        # A drag is the one operation that can end with the button still down
+        # *and* the gesture carried half way. Declaring nothing for it is the
+        # single most consequential silence in the map, because a later
+        # `move` against a held button is a drag nobody asked for.
+        #
+        # **This case does not move `RESTART_RESIDUE`, and that is expected.**
+        # `Click` still contributes `POINTER_BUTTON` to the fold, so the
+        # restart declaration is unchanged and
+        # `a_restart_declares_every_kind_an_input_operation_can_leave` stays
+        # green. What reddens is the per-operation map, which is the rule
+        # under test here. Do not "fix" this by asserting the fold.
+        "an interrupted drag declares the button it may have left down",
+        [
+            (
+                SUPERVISION,
+                "        Operation::Drag => DesktopResidue::POINTER_BUTTON.union(DesktopResidue::PARTIAL_EFFECT),",
+                "        Operation::Drag => DesktopResidue::NONE,",
+            )
+        ],
+        False,
+    ),
+    (
+        # If everything declares everything, a consumer learns nothing from
+        # being told. The reads synthesise no input, so a residue on one is
+        # not caution -- it is noise that devalues the real declarations.
+        "an operation that synthesises no input declares no residue",
+        [
+            (
+                SUPERVISION,
+                """        | Operation::CursorPosition => DesktopResidue::NONE,""",
+                """        | Operation::CursorPosition => DesktopResidue::POINTER_BUTTON,""",
+            )
+        ],
+        False,
+    ),
+    (
+        # The kinds are inherited differently and cleared by different things:
+        # a held modifier re-interprets every later keystroke, a held button
+        # every later move. Collapsing them keeps the declaration non-empty --
+        # so a test that only asked "is something declared" would stay green.
+        "a held key and a held button stay different declarations",
+        [
+            (
+                SUPERVISION,
+                "        Operation::PressKey | Operation::Hotkey => DesktopResidue::KEY_HELD,",
+                "        Operation::PressKey | Operation::Hotkey => DesktopResidue::POINTER_BUTTON,",
+            )
+        ],
+        False,
+    ),
+]
+
+
 @dataclass
 class Suite:
     name: str
@@ -1582,6 +1712,13 @@ SUITES: list[Suite] = [
         [CRATE, EXPORT, FIXTURE],
         C4_CARGO_TEST,
         CASES_C5,
+        build=C4_BUILD,
+    ),
+    Suite(
+        "m5c6",
+        [CRATE, EXPORT, FIXTURE],
+        C4_CARGO_TEST,
+        CASES_C6,
         build=C4_BUILD,
     ),
 ]
@@ -1703,7 +1840,7 @@ def main() -> int:
         ),
     )
     parser.add_argument("--case", help="run only cases whose name contains this text")
-    parser.add_argument("--suite", help="run only this suite (m5c2, m5c3, m5c4 or m5c5)")
+    parser.add_argument("--suite", help="run only this suite (m5c2, m5c3, m5c4, m5c5 or m5c6)")
     arguments = parser.parse_args()
 
     suites = SUITES

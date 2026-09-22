@@ -400,10 +400,53 @@ at all. Neither registry reuses an identifier after a restart: a reissued captur
 id would let a stale click resolve against a different image, pass the bounds
 check, and be dispatched at coordinates nobody picked.
 
-**Not covered.** A backend killed mid-drag may have left a button down or a
-modifier held on the target OS session, and nothing in this repository observes
-that; the restart says what it does not know about the *operation*, not about the
-desktop's state. See `docs/tasks.md` M5-C08 and M5-C09.
+**Declared, not resolved.** A backend killed mid-drag may have left a button
+down, one killed mid-hotkey a modifier held, one killed mid-type a prefix
+entered. Nothing in this repository observes any of that, and nothing here
+repairs it — **by decision, not by impossibility**; see below. What a restart now
+does is **say so**: every `Invalidation` carries a
+`DesktopResidue` naming which kinds of input state the departed backend may have
+left asserted on the target, folded over every operation that synthesises input,
+because the device keeps no register of what was in flight. It is stamped
+unconditionally — including on a restart that freed no lease and no capture,
+since the device's own registries are not a witness to the desktop, and the agent
+who inherits a held button holds no lease at the moment of the restart at all.
+
+**A release sweep is available and is refused, which is a policy decision.** The
+pinned 0.3.46 registry **does** carry the primitives a sweep would need:
+`main.py` L431-441, at the release commit this section already links and whose
+digest `scripts/m5-cua-refetch.sh` pins, registers `mouse_down`, `mouse_up`,
+`key_down` and `key_up`. The platform table above records that *one* backend —
+Computer Server with the Cua Driver backend — stubs all four
+(`handlers/cua_driver.py` L348, L355, L484, L489); that is one row of six and is
+not a registry-wide limit. Nothing here may say a sweep is inexpressible.
+
+It is refused on its merits instead. A `mouse_up` is not a neutral release: it is
+a **drop**, completing whatever drag the dead backend began, wherever the pointer
+now happens to sit. A `key_up` on a modifier is synthesised input issued outside
+any lease, on behalf of no authorized caller. Both would mean the supervisor
+synthesising input, which M5's health probe is forbidden from doing and for this
+exact reason, and both would require widening `ALLOWED_COMMANDS` in
+`crates/tunnel-http-forward/src/cua_pin.rs` — an allowlist, not a capability
+claim, and not a thing to widen for a recovery nobody has measured the need for.
+So the device declares and does not repair.
+
+`DesktopResidue` therefore offers a union and no difference, no `clear` and no
+`observe`: **no read `computer.v1` allowlists reports held input**, and a release
+is input this supervisor refuses to issue. `cursor_position` reports where the
+pointer is and never whether a button is down. The registry does conditionally
+expose `get_desktop_state` (`main.py` L466-467, implemented at
+`handlers/cua_driver.py` L584); it is a pass-through to the `cua-driver` SDK, so
+**whether its payload carries held-button or modifier state is unread here** and
+is an open question rather than a settled negative.
+
+**Still open, and it needs a VM.** Two measurements would earn a narrower
+contract, and neither can be taken on a loopback fixture: whether the pinned
+server releases held input on client disconnect or process exit, and what
+`get_desktop_state` actually reports. With `mouse_up` and `key_up` genuinely
+available, an *authorized* recovery sweep is a real future option that such a
+measurement could justify — it is deferred, not ruled out. See `docs/tasks.md`
+M5-C08, M5-C09 and M5-C09a.
 
 ## Integration acceptance gates
 
