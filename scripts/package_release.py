@@ -11,8 +11,66 @@ import tomllib
 import zipfile
 from pathlib import Path
 
-TARGETS = ("x86_64-unknown-linux-gnu", "aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-pc-windows-msvc")
+ROOT = Path(__file__).resolve().parents[1]
 BINARIES = ("tunnel-client", "tunnel-relay", "tunnel-deadman")
+
+
+TRIPLE_RE = re.compile(r"[0-9a-z_]+(?:-[0-9a-z_.]+){2,3}")
+
+
+def advertised_targets(root=ROOT):
+    """The advertised set, read from the workspace manifest.
+
+    **This used to be a literal tuple here, and that was the defect.** The
+    same four triples were spelled out in this file, in
+    `.github/workflows/release.yml`'s matrix and (as prose) on the public
+    downloads page, with nothing reconciling them -- docs/tasks.md row M6-C11.
+    They now come from `[workspace.metadata.release] advertised-targets` in
+    the root `Cargo.toml`, which is the single **authority** for the word
+    "advertised", and `scripts/m6-release-checks.py --check packaging` fails
+    if the workflow matrix, `site/releases.js`'s array or that list ever
+    diverge.
+
+    **Two literal copies remain, and calling the manifest "the single
+    referent" obscured them (docs/tasks.md M6-C18).** The workflow matrix is
+    evaluated before any script runs and `site/releases.js` executes in a
+    browser, so neither can read this table when it needs it; both keep a
+    copy and both are machine-compared to it. This function has no copy at
+    all -- it reads the table directly, which is why it is the one place the
+    `packaging` check asserts carries no triple literal.
+
+    It raises rather than falling back to a default: a default would be a
+    second source of truth wearing a fallback's clothes, and this function
+    exists precisely so there is only one.
+    """
+    table = tomllib.loads((root / "Cargo.toml").read_text())
+    release = table.get("workspace", {}).get("metadata", {}).get("release")
+    if release is None:
+        raise ValueError("root Cargo.toml declares no [workspace.metadata.release] table")
+    targets = release.get("advertised-targets")
+    if not isinstance(targets, list) or not targets:
+        raise ValueError("[workspace.metadata.release] advertised-targets must be a non-empty list")
+    if not all(isinstance(target, str) for target in targets):
+        raise ValueError("advertised-targets must be a list of strings")
+    # The same acceptance rule as `m6-release-artifact.declared_targets`, and
+    # for the same reason it has one: an empty, repeating or non-triple
+    # declaration must be refused by every reader of it. These were three
+    # parsers with three different rules -- this one and the checks script
+    # accepted `["a","a","linux"]` while the artifact gate refused it, so the
+    # packaging path would have published against a declaration the local gate
+    # rejects. docs/tasks.md M6-C20.
+    duplicates = sorted({t for t in targets if targets.count(t) > 1})
+    if duplicates:
+        raise ValueError(f"advertised-targets repeats {duplicates}")
+    malformed = [t for t in targets if not TRIPLE_RE.fullmatch(t)]
+    if malformed:
+        raise ValueError(f"advertised-targets are not target triples: {malformed}")
+    return tuple(sorted(targets))
+
+
+#: Kept as a module-level name because `scripts/test_package_release.py`
+#: imports it, but it is now *derived* rather than declared.
+TARGETS = advertised_targets()
 
 
 def version(root, sha, run):
@@ -25,7 +83,10 @@ def version(root, sha, run):
 
 
 def package(root, target, sha, run, output, metadata):
-    if target not in TARGETS:
+    # Read from the manifest under `root` rather than from the module-level
+    # TARGETS, so a caller packaging a different checkout is checked against
+    # *that* checkout's declaration.
+    if target not in advertised_targets(root):
         raise ValueError("unsupported target")
     tag = version(root, sha, run)
     output.mkdir(parents=True, exist_ok=True)

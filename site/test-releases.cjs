@@ -1,8 +1,19 @@
 const assert = require('node:assert/strict');
 const path = require('node:path');
 const { chromium } = require('playwright');
+const fs = require('node:fs');
 const repo = 'https://github.com/andymac4182/agentuplink/releases/download/';
-const targets = ['x86_64-unknown-linux-gnu', 'aarch64-apple-darwin', 'x86_64-apple-darwin', 'x86_64-pc-windows-msvc'];
+// Derived from releases.js, never copied. A fixture carrying its own copy of
+// the list under test regenerates itself when that list changes, so the test
+// keeps passing while the thing it tests drifts -- which is the defect
+// docs/tasks.md M6-C18 was filed for, in the test suite rather than the site.
+// The declaration itself is bound to [workspace.metadata.release] by
+// `scripts/m6-release-checks.py --check packaging`.
+const source = fs.readFileSync(path.join(__dirname, 'releases.js'), 'utf8');
+const found = source.match(/^\s*const\s+targets\s*=\s*\[([^\]]*)\]\s*;/m);
+if (!found) throw new Error('could not read `const targets` from releases.js; the fixture must derive from the file under test, never assume a list');
+const targets = found[1].split(',').map(t => t.trim().replace(/^['"]|['"]$/g, '')).filter(Boolean);
+if (targets.length === 0) throw new Error('releases.js declares an empty target list; a fixture built from it would assert nothing');
 function release(run) {
   const tag = `v0.1.0-main.${run}.aaaaaaaaaaaa`;
   return { tag_name: tag, draft: false, assets: targets.flatMap(target => {
@@ -26,7 +37,7 @@ function release(run) {
       await page.setContent('<div data-release-info>Loading</div>');
       await page.addScriptTag({ path: path.join(__dirname, 'releases.js') });
       await page.waitForFunction(text => document.body.innerText.includes(text), expected);
-      if (name === 'latest complete') assert.equal(await page.locator('li a').count(), 8);
+      if (name === 'latest complete') assert.equal(await page.locator('li a').count(), targets.length * 2);
       await page.close();
       console.log(`PASS ${name}`);
     }
