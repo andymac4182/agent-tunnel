@@ -294,36 +294,57 @@ DEADMAN_CASES: list[Case] = [
     ),
     # ------------------------------------------------------------- M6-C08
     Case(
-        # **The defect the row measured.**  Without the mode test, a
+        # **The defect the row measured.**  Without the execute test, a
         # zero-byte 0644 file named `tunnel-deadman` resolves as usable and
         # `doctor` reports `PROCESS_CONTAINMENT_SENTINEL_PRESENT` for an
-        # installation that contains nothing.  Note the edit keeps the
-        # regular-file half, so this case defeats the execute-bit rule
-        # *alone* and cannot be credited to the other one.
-        "a file of the sentinel's name with no execute bit is not a sentinel",
+        # installation that contains nothing.  The edit keeps the
+        # regular-file half, so this defeats the execute rule *alone* and
+        # cannot be credited to the other one.
+        "a file of the sentinel's name this process cannot execute is not a sentinel",
         [
             (
                 DEADMAN_LIB,
-                "        .is_ok_and(|metadata| metadata.is_file() "
-                "&& metadata.permissions().mode() & 0o111 != 0)",
-                "        .is_ok_and(|metadata| metadata.is_file())",
+                "        && rustix::fs::access(path, rustix::fs::Access::EXEC_OK).is_ok()",
+                "",
             )
         ],
         frozenset({"tests::a_zero_byte_decoy_wearing_the_sentinels_name_is_not_a_sentinel"}),
     ),
     Case(
-        # The other half, defeated on its own for the same reason.  A
-        # directory carries execute bits meaning "searchable", so the mode
-        # test alone accepts a directory named `tunnel-deadman`.  The old
-        # `is_file()` rule got this right by accident; it has to keep getting
-        # it right on purpose.
-        "a directory carrying execute bits is not a sentinel",
+        # **`access(EXEC_OK)` rather than a mode-bit test, defeated on its
+        # own** -- the Fable review's finding.  Substituting the obvious
+        # `mode() & 0o111 != 0` leaves every other case in this suite green:
+        # it accepts the zero-byte 0644 decoy's opposite, a file whose
+        # execute bit is set for a class this process is not in.  A rule that
+        # answers "somebody may execute this" where the caller asked "may I"
+        # reports containment present for a sentinel that cannot be run.
+        "the execute test asks whether this process may execute, not whether anybody may",
         [
             (
                 DEADMAN_LIB,
-                "        .is_ok_and(|metadata| metadata.is_file() "
-                "&& metadata.permissions().mode() & 0o111 != 0)",
-                "        .is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)",
+                "        && rustix::fs::access(path, rustix::fs::Access::EXEC_OK).is_ok()",
+                "        && {\n"
+                "            use std::os::unix::fs::PermissionsExt as _;\n"
+                "            std::fs::metadata(path)\n"
+                "                .is_ok_and(|m| m.permissions().mode() & 0o111 != 0)\n"
+                "        }",
+            )
+        ],
+        frozenset({"tests::a_sentinel_this_process_may_not_execute_is_not_a_sentinel"}),
+    ),
+    Case(
+        # The other half, defeated on its own for the same reason.  A
+        # directory carries execute bits meaning "searchable" and
+        # `access(EXEC_OK)` succeeds on one, so the execute test alone
+        # accepts a directory named `tunnel-deadman`.  The old `is_file()`
+        # rule got this right by accident; it has to keep getting it right on
+        # purpose.
+        "a directory the process may search is not a sentinel",
+        [
+            (
+                DEADMAN_LIB,
+                "    std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file())\n",
+                "    true\n",
             )
         ],
         frozenset({"tests::a_directory_wearing_the_sentinels_name_is_not_a_sentinel"}),
@@ -351,9 +372,17 @@ DEADMAN_CASES: list[Case] = [
     Case(
         # Returning on the first unusable candidate is what the old rule did
         # -- it returned on the first `is_file()` -- and it would let a decoy
-        # in `deps` hide the real sentinel one directory up, turning every
-        # containment measurement in `process_residue.rs` into a measurement
-        # of nothing while they stayed green.
+        # in `deps` hide the real sentinel one directory up.
+        #
+        # **What that costs, corrected by the Fable review.**  Not a silent
+        # green: `process_residue.rs` hands the resolved path to its probe
+        # through `SENTINEL_PATH_ENV` and asserts `armed == "1"` before
+        # measuring anything, so an unspawnable candidate fails that
+        # assertion with its own message.  The cost is that the failure reads
+        # as a broken mechanism when the mechanism is fine and the wrong file
+        # was chosen -- worth fixing, and worth describing accurately.  It
+        # also needs a hand-placed file: cargo puts no `tunnel-deadman` in
+        # `deps/`.
         "an unusable candidate does not shadow a usable one further along the search",
         [
             (

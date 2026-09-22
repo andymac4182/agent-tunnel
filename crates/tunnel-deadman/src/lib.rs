@@ -159,7 +159,7 @@ impl Deadman {
                 return None;
             }
         };
-        let mut command = Command::new(executable);
+        let mut command = Command::new(&executable);
         command
             .arg(leader.to_string())
             .stdin(Stdio::piped())
@@ -172,9 +172,21 @@ impl Deadman {
             use std::os::unix::process::CommandExt as _;
             command.process_group(0);
         }
-        let Ok(sentinel) = command.spawn() else {
-            warn_sentinel_missing();
-            return None;
+        // **A spawn can still fail after resolution said `Usable`**, and this
+        // is deliberately not `warn_sentinel_missing()`.  Resolution asks the
+        // kernel for execute *permission*; it does not ask whether `execve`
+        // will accept the bytes, so an `ENOEXEC` file, a bad interpreter line
+        // or a permission that changed between the two calls all land here
+        // with a real `tunnel-deadman` sitting at that path.  Telling that
+        // operator to install one is the advice M6-C08 added a third status
+        // to stop giving.  The path and the OS error are both named, because
+        // they are the whole content of the diagnostic.
+        let sentinel = match command.spawn() {
+            Ok(sentinel) => sentinel,
+            Err(error) => {
+                warn_sentinel_unspawnable(&executable, &error);
+                return None;
+            }
         };
         Some(Self { sentinel })
     }
@@ -253,19 +265,23 @@ pub fn availability() -> Availability {
 /// What [`availability`] found.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Availability {
-    /// A regular, executable file of the sentinel's name is where one is
-    /// expected, so a sentinel can be spawned and children will be watched.
+    /// A regular file of the sentinel's name is where one is expected, and
+    /// the kernel says this process may execute it.
     ///
     /// **This is not an identity check and must not be reported as one.**  It
-    /// establishes that the candidate is a regular file this process may
-    /// execute; it does not establish that the file *is* `tunnel-deadman`.
-    /// An executable script of the right name passes.  See
+    /// establishes that the candidate is a regular file `access(EXEC_OK)`
+    /// permits; it does not establish that the file *is* `tunnel-deadman`,
+    /// and it does not establish that spawning it will succeed — an
+    /// executable script of the right name passes, and so does a file whose
+    /// contents `execve` will reject with `ENOEXEC`.  A spawn can still fail
+    /// after this answer, which is why [`Deadman::arm`] has its own
+    /// diagnostic for that case rather than treating it as absence.  See
     /// [`resolve_sentinel`] for why the runtime stops here and where the
     /// stronger check lives.
     Armable,
-    /// A Unix host where the resolved location **holds a file** that cannot be
-    /// executed as a sentinel: not a regular file, or a regular file with no
-    /// execute bit for anybody.
+    /// A Unix host where the resolved location **holds a file** this process
+    /// cannot execute as a sentinel: not a regular file, or one the kernel
+    /// refuses execute permission on.
     ///
     /// Distinct from [`SentinelMissing`](Self::SentinelMissing) because the
     /// operator's fix differs.  "Missing" means install the sentinel;
@@ -301,6 +317,29 @@ fn warn_sentinel_unusable(path: &Path) {
              up if this process is killed or crashes. Replace it with the real \
              `{SENTINEL_BIN}` binary (a working one exits 2 when run with no \
              arguments).",
+            path.display()
+        );
+    });
+}
+
+/// Warn once per process that a resolved sentinel could not be spawned.
+///
+/// The third of three, and it exists because resolution answering `Usable` is
+/// a statement about permission rather than a promise that `execve` will
+/// accept the file.  Folding this into [`warn_sentinel_missing`] would hand
+/// the "install one alongside the device binary" advice to an operator whose
+/// `tunnel-deadman` is present and permitted, which is the exact mistake
+/// M6-C08 added a third status to avoid.
+fn warn_sentinel_unspawnable(path: &Path, error: &std::io::Error) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        eprintln!(
+            "tunnel-deadman: {} resolved as a sentinel but could not be started \
+             ({error}): supervised child process groups will NOT be cleaned up if \
+             this process is killed or crashes. The file is present and executable, \
+             so this is not a missing install: check that it is the real \
+             `{SENTINEL_BIN}` binary for this architecture (a working one exits 2 \
+             when run with no arguments).",
             path.display()
         );
     });
@@ -366,11 +405,30 @@ enum Resolution {
 /// asserting that a *bundle* is self-contained, where a symlink is a bundle
 /// that will break when it is moved; this is asking whether a sentinel can be
 /// spawned *here, now*, and a symlink to a real sentinel spawns perfectly.
+/// # Why `access` and not a mode-bit test
+///
+/// The obvious spelling is `mode() & 0o111 != 0`, and it answers a **different
+/// question than the caller is asking**: "some execute bit is set somewhere",
+/// not "this process may execute it".  The gap is reachable, not theoretical
+/// — the Fable review measured it. The real sentinel's own bytes, mode
+/// `0o010` (group-execute only) and owned by the running user, pass a
+/// mode-bit test while `execve` returns `EACCES`. That would report
+/// containment present for a sentinel this process cannot run, which is the
+/// defect this rule exists to close, one bit narrower.
+///
+/// `access(EXEC_OK)` asks the kernel the question directly and gets ACLs and
+/// mount flags with it. **One limit, stated rather than left to be found:**
+/// it resolves against the **real** uid and gid, not the effective ones, so
+/// a setuid process could be told it may not execute a file it in fact may.
+/// No `tunnel-` binary is setuid, and the failure direction is to
+/// under-report rather than over-report, which is the safe one here.
+///
+/// The regular-file test stays and is not redundant: a **directory** carries
+/// execute bits meaning "searchable", and `access(EXEC_OK)` succeeds on one.
 #[cfg(unix)]
 fn is_executable_regular_file(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt as _;
-    std::fs::metadata(path)
-        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+    std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file())
+        && rustix::fs::access(path, rustix::fs::Access::EXEC_OK).is_ok()
 }
 
 #[cfg(not(unix))]
@@ -467,6 +525,17 @@ fn resolve_sentinel(explicit: Option<&std::ffi::OsStr>, executable: &Path) -> Re
     // would have.  If nothing usable turns up, the remembered candidate is
     // the answer, because "there is a file there and it is not runnable" is
     // a better report than "there is nothing there".
+    //
+    // **What the old rule's consequence actually was, corrected by the Fable
+    // review after a first draft overstated it.**  It is a wrong-candidate
+    // bug, not a silent-green one: `process_residue.rs` passes the resolved
+    // path to its probe through `SENTINEL_PATH_ENV` and asserts `armed ==
+    // "1"` *before* measuring anything, so an unspawnable candidate fails
+    // that assertion with the message written for exactly that case.  Loud
+    // red, reading as a broken mechanism rather than a missing fixture --
+    // itself an M5-C11 shape, and worth fixing -- but nothing would have gone
+    // quietly green.  It also needs a hand-placed file: cargo never writes a
+    // `tunnel-deadman` into `deps/`.
     let mut rejected: Option<PathBuf> = None;
     for candidate in candidates {
         match classify(candidate) {
@@ -623,6 +692,50 @@ mod tests {
         // The end-to-end consequence, on the value the operator reads: not
         // merely "not Armable" but the state that says which problem it is.
         assert_ne!(resolved, Resolution::Absent);
+    }
+
+    /// **The case that separates "some execute bit is set" from "this process
+    /// may execute it"**, found by the Fable review against a first draft
+    /// that tested `mode() & 0o111 != 0`.
+    ///
+    /// Mode `0o010` is group-execute only. On a file owned by the running
+    /// user, the owner class is consulted and denies, so `execve` returns
+    /// `EACCES` — while a mode-bit test sees a set execute bit and reports
+    /// the sentinel present. That is the row's own defect one bit narrower:
+    /// a surface telling an operator containment is present for a sentinel
+    /// this process cannot run.
+    ///
+    /// Written with the real sentinel's byte pattern rather than a stub,
+    /// because the point is that **only the permission differs**.
+    #[test]
+    #[cfg(unix)]
+    fn a_sentinel_this_process_may_not_execute_is_not_a_sentinel() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().expect("directory");
+        let denied = directory.path().join(SENTINEL_BIN);
+        std::fs::write(&denied, b"#!/bin/sh\nexit 2\n").expect("write");
+        std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o010)).expect("chmod");
+
+        // The instrument first: if this file were somehow executable, the
+        // assertion below would pass for the wrong reason. Running as root
+        // would do it, and root ignores permission bits entirely.
+        if rustix::fs::access(&denied, rustix::fs::Access::EXEC_OK).is_ok() {
+            eprintln!(
+                "SKIPPED a_sentinel_this_process_may_not_execute_is_not_a_sentinel: DID \
+                 NOT RUN -- this process may execute a mode 0o010 file (running as root?), \
+                 so the case it is written for does not exist here"
+            );
+            return;
+        }
+
+        assert_eq!(
+            resolve_sentinel(None, &directory.path().join("tunnel-client")),
+            Resolution::Unusable(denied),
+            "a mode-bit test would accept this: the execute bit IS set, just not for \
+             the class this process falls in. The rule must ask whether this process \
+             may execute the file, not whether anybody may."
+        );
     }
 
     /// The distinction the new status exists for.
