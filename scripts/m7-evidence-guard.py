@@ -295,10 +295,29 @@ def row_identifier(cells: "list[str]") -> str:
     return match.group(1) if match else (first[:24] or "?")
 
 
-def table_shape_findings(rel: str, text: str) -> "tuple[list[str], int, int]":
+# The one section where a run of table rows with no separator is NOT reported.
+#
+# docs/tasks.md's completion history is an append-only log that has been written
+# in TWO formats: 305 pipe-delimited rows and 39 markdown bullets, interleaved.
+# Each bullet ends the table above it, so most of that section's rows are
+# orphans.  It is a real defect and it is recorded as M4-41 -- it is exempted
+# here rather than swept because converting a bullet into a row means inventing
+# its Item and Event cells, and a guard that invented evidence would be a
+# stranger defect than the one it fixed.
+#
+# The exemption is one named section, it is COUNTED, and the count is printed on
+# every verbose run, because an exemption nobody measures is how a guard's scope
+# quietly becomes nothing.  scripts/test_table_shape.py pins the count so the
+# section cannot grow new orphans unnoticed.
+EXEMPT_SECTION = "Completion history"
+
+
+def table_shape_findings(
+    rel: str, text: str
+) -> "tuple[list[str], int, int, int]":
     """Findings for rows whose cell count differs from their table's header.
 
-    Returns (findings, tables_seen, rows_checked).
+    Returns (findings, tables_seen, rows_checked, exempt_rows).
 
     The authority for a table's width is its OWN separator row (`|---|---|...`),
     which is what a markdown renderer uses and what the header therefore
@@ -314,35 +333,79 @@ def table_shape_findings(rel: str, text: str) -> "tuple[list[str], int, int]":
     findings: "list[str]" = []
     tables_seen = 0
     rows_checked = 0
-    declared: "int | None" = None
-    header_line = 0
+    exempt_rows = 0
+
+    # Work in BLOCKS of consecutive pipe-leading lines rather than streaming
+    # line by line and carrying a `declared` width across gaps.
+    #
+    # Why: a blank line inside a table ends that table.  The next pipe-leading
+    # line begins a NEW block, and a block with no separator on its second line
+    # is not a table at all -- a renderer lays it out as a paragraph of
+    # pipe-delimited text.  A streaming walk skips those rows (there is no
+    # width to judge them against) and reports nothing, so a table sliced in
+    # half by a stray blank line reads as clean.  That was true of this very
+    # function when it was first written: three blank lines inside the M4 table
+    # in docs/tasks.md hid 29 rows from it, and the only reason it was noticed
+    # is that adding a row to that table did not move the scanned-row figure.
+    # Rows no separator governs are now a finding, not a silence.
+    blocks: "list[tuple[str, list[tuple[int, str]]]]" = []
+    current: "list[tuple[int, str]]" = []
+    section = ""
+    block_section = ""
     for lineno, line in enumerate(text.splitlines(), start=1):
-        if not line.strip().startswith("|"):
-            declared = None
-            header_line = 0
+        if line.strip().startswith("|"):
+            if not current:
+                block_section = section
+            current.append((lineno, line))
             continue
-        cells = split_cells(line)
-        if is_separator(line):
-            declared = len(cells)
+        if current:
+            blocks.append((block_section, current))
+            current = []
+        if line.startswith("#"):
+            section = line.lstrip("#").strip()
+    if current:
+        blocks.append((block_section, current))
+
+    for block_section, block in blocks:
+        header_line, header = block[0]
+        if len(block) >= 2 and is_separator(block[1][1]):
+            declared = len(split_cells(block[1][1]))
             tables_seen += 1
-            continue
-        if declared is None:
-            # The header row itself: it precedes the separator, so it has not
-            # been given a width to be judged against yet.  Its own width is
-            # what the separator is expected to repeat, and a header/separator
-            # disagreement is reported when the next row is judged.
-            header_line = lineno
-            continue
-        rows_checked += 1
-        if len(cells) != declared:
-            findings.append(
-                f"{rel}:{lineno}: row '{row_identifier(cells)}' splits into "
-                f"{len(cells)} cells but its table (header at {rel}:{header_line}) "
-                f"declares {declared}; an unescaped '|' -- often inside an inline "
-                f"code span, where backticks do NOT protect it -- adds a column. "
-                f"Write it as '\\|'."
-            )
-    return findings, tables_seen, rows_checked
+            header_cells = len(split_cells(header))
+            if header_cells != declared:
+                findings.append(
+                    f"{rel}:{header_line}: the header row has {header_cells} "
+                    f"cells but its separator declares {declared}"
+                )
+            body = block[2:]
+        else:
+            # No separator: a renderer does not see a table here.
+            declared = None
+            body = block
+        for lineno, line in body:
+            cells = split_cells(line)
+            rows_checked += 1
+            if declared is None and block_section == EXEMPT_SECTION:
+                # Counted, never silent, never fatal.  See EXEMPT_SECTION.
+                exempt_rows += 1
+            elif declared is None:
+                findings.append(
+                    f"{rel}:{lineno}: row '{row_identifier(cells)}' is not "
+                    f"governed by any header/separator -- the run of table rows "
+                    f"starting at {rel}:{header_line} has no '|---|' separator "
+                    f"row, so a markdown renderer lays these out as a paragraph "
+                    f"of pipe-delimited text and not as a table. A blank line "
+                    f"inside a table is the usual cause."
+                )
+            elif len(cells) != declared:
+                findings.append(
+                    f"{rel}:{lineno}: row '{row_identifier(cells)}' splits into "
+                    f"{len(cells)} cells but its table (header at {rel}:{header_line}) "
+                    f"declares {declared}; an unescaped '|' -- often inside an inline "
+                    f"code span, where backticks do NOT protect it -- adds a column. "
+                    f"Write it as '\\|'."
+                )
+    return findings, tables_seen, rows_checked, exempt_rows
 
 
 def row_is_verified(line: str) -> bool:
@@ -436,14 +499,16 @@ def scan(gates: "set[str]", pins: "set[str]", verbose: bool) -> "list[str]":
     tables_seen = 0
     shape_rows = 0
     shape_findings = 0
+    exempt_rows = 0
     for path in DOCS:
         rel = os.path.relpath(path, REPO_ROOT)
         text = read_text(path)
-        shape, tables_n, shape_n = table_shape_findings(rel, text)
+        shape, tables_n, shape_n, exempt_n = table_shape_findings(rel, text)
         findings.extend(shape)
         shape_findings += len(shape)
         tables_seen += tables_n
         shape_rows += shape_n
+        exempt_rows += exempt_n
         for lineno, line in enumerate(text.splitlines(), start=1):
             if not is_table_row(line) or is_separator(line):
                 continue
@@ -481,7 +546,8 @@ def scan(gates: "set[str]", pins: "set[str]", verbose: bool) -> "list[str]":
             f"citations, {pin_citations} upstream-pin citations; "
             f"{len(gates)} known gates, {len(pins)} recorded upstream pins; "
             f"table shape: {shape_rows} rows in {tables_seen} tables checked, "
-            f"{shape_findings} cell-count findings\n"
+            f"{shape_findings} findings, {exempt_rows} rows exempt "
+            f"(the '{EXEMPT_SECTION}' log, M4-41)\n"
         )
     return findings
 
