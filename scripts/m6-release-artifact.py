@@ -344,8 +344,9 @@ def generate_notices(metadata: dict, lock_sha: str, lock_text: str) -> str:
             with_text += 1
             for entry in files:
                 label = f"{package['name']} {package['version']} {entry.name}"
-                body.append(f"    text: {entry.name} sha256={sha256_file(entry)}")
                 raw = entry.read_bytes()
+                digest = sha256_bytes(raw)
+                body.append(f"    text: {entry.name} sha256={digest}")
                 try:
                     text = raw.decode("utf-8")
                 except UnicodeDecodeError:
@@ -359,8 +360,19 @@ def generate_notices(metadata: dict, lock_sha: str, lock_text: str) -> str:
                     # A licence file containing this file's own delimiter would
                     # corrupt the crate-set parse silently.  Refuse instead.
                     raise ValueError(f"{label} contains a NOTICE delimiter")
-                body.append(f"{TEXT_BEGIN} {label}")
-                body.append(text.rstrip("\n"))
+                # **The digest travels in the marker, so the block is bound
+                # to it.** The check hashes the reconstructed content and
+                # compares. Without that, blocks of the right length and
+                # wrong content pass -- the count and the byte total would be
+                # unchanged, and "byte-exact" would again be a word rather
+                # than a measurement.
+                #
+                # The text is embedded **verbatim**: no rstrip, no reflow.
+                # Trimming a licence is editing it, and the trailing newlines
+                # an earlier version removed are exactly what made the digest
+                # unverifiable.
+                body.append(f"{TEXT_BEGIN} {label} sha256={digest}")
+                body.append(text)
                 body.append(f"{TEXT_END} {label}")
         else:
             without_text.append(f"{package['name']} {package['version']}")
@@ -514,26 +526,71 @@ def notice_crate_set(text: str) -> set[tuple[str, str]]:
     return crates
 
 
+def read_exact(path: Path) -> str:
+    """Read a file without newline translation.
+
+    **`Path.read_text()` cannot be used on the NOTICE.** Python opens text
+    files in universal-newline mode, which rewrites `\\r\\n` and lone `\\r` to
+    `\\n` on the way in.  Two of the 628 embedded licences contain carriage
+    returns -- `generic-array` 0.14.7 and `nu-ansi-term` 0.50.3 -- so reading
+    the NOTICE as text silently deleted 20 and 22 bytes from them and made
+    their digests fail.  That is a real corruption of a licence text, and it
+    was invisible until the digests were bound: the block count and the byte
+    total were both still consistent with themselves.
+    """
+    return path.read_bytes().decode("utf-8")
+
+
+def write_exact(path: Path, text: str) -> None:
+    """Write a file without newline translation, for the same reason."""
+    path.write_bytes(text.encode("utf-8"))
+
+
+def notice_licence_blocks(text: str) -> list[tuple[str, str, str]]:
+    """Return (label, declared sha256, exact content) for each embedded text.
+
+    **The reconstruction is exact, and that is what lets the digest bind.**
+    Each block is written as the BEGIN line, then the licence file's decoded
+    text verbatim, then the END line, all joined with newlines.  Splitting the
+    document on newlines therefore yields the file's own lines between the two
+    markers, and re-joining them with newlines reproduces the file's text
+    byte-for-byte -- including a trailing newline, which survives as a final
+    empty element.  An earlier version wrote `text.rstrip("\\n")` here, which
+    silently dropped trailing newlines from 34 of the 628 files and made the
+    word "byte-exact" false for them.
+    """
+    blocks: list[tuple[str, str, str]] = []
+    label = digest = None
+    collected: list[str] = []
+    for line in text.split("\n"):
+        if line.startswith(TEXT_BEGIN):
+            match = re.match(rf"{re.escape(TEXT_BEGIN)} (.*) sha256=([0-9a-f]{{64}})$",
+                             line)
+            if match:
+                label, digest = match.group(1), match.group(2)
+            else:
+                label, digest = line[len(TEXT_BEGIN):].strip(), ""
+            collected = []
+            continue
+        if line.startswith(TEXT_END):
+            if label is not None:
+                blocks.append((label, digest or "", "\n".join(collected)))
+            label = digest = None
+            collected = []
+            continue
+        if label is not None:
+            collected.append(line)
+    return blocks
+
+
 def notice_embedded_texts(text: str) -> tuple[int, int]:
     """Return (number of embedded licence texts, total bytes of their content).
 
     Counted from the delimiters rather than trusted from the header, because a
     header figure nothing recomputes is the failure this whole file is about.
     """
-    count = 0
-    total = 0
-    inside = False
-    for raw in text.splitlines():
-        if raw.startswith(TEXT_BEGIN):
-            inside = True
-            count += 1
-            continue
-        if raw.startswith(TEXT_END):
-            inside = False
-            continue
-        if inside:
-            total += len(raw.encode("utf-8")) + 1
-    return count, total
+    blocks = notice_licence_blocks(text)
+    return len(blocks), sum(len(content.encode("utf-8")) for _, _, content in blocks)
 
 
 # --------------------------------------------------------------------------
@@ -546,7 +603,7 @@ def read_sums(bundle: Path) -> dict[str, str] | None:
     if not path.is_file():
         return None
     sums = {}
-    for line in path.read_text().splitlines():
+    for line in read_exact(path).splitlines():
         if not line.strip():
             continue
         digest, _, name = line.partition("  ")
@@ -623,7 +680,7 @@ def check_provenance(bundle: Path) -> Result:
     if not path.is_file():
         return Result("provenance", False, summary=f"no {PROVENANCE} in bundle",
                       witness="provenance-file-missing")
-    fields = parse_fields(path.read_text())
+    fields = parse_fields(read_exact(path))
 
     absent = [key for key in PROVENANCE_REQUIRED if not fields.get(key)]
     if absent:
@@ -645,7 +702,7 @@ def check_provenance(bundle: Path) -> Result:
     # digests of the bytes actually sitting in this bundle.  Without this the
     # provenance block is a description of some other build.
     recorded = {}
-    for line in path.read_text().splitlines():
+    for line in read_exact(path).splitlines():
         match = re.match(r"^\s+binary\s+(\S+)\s+sha256=([0-9a-f]{64})$", line)
         if match:
             recorded[match.group(1)] = match.group(2)
@@ -695,7 +752,7 @@ def check_notices(bundle: Path) -> Result:
                       summary=f"no {LOCKFILE} in bundle; NOTICE is unverifiable",
                       witness="lockfile-missing")
 
-    text = notice.read_text()
+    text = read_exact(notice)
     fields = parse_fields(text)
 
     lock_sha = sha256_file(lock)
@@ -749,10 +806,35 @@ def check_notices(bundle: Path) -> Result:
     # earlier version of this check green against a NOTICE that carried only
     # SPDX ids and digests -- a file that satisfies a drift check and
     # discharges nothing owed to the recipient.
-    embedded, embedded_bytes = notice_embedded_texts(text)
+    blocks = notice_licence_blocks(text)
+    embedded = len(blocks)
+    embedded_bytes = sum(len(content.encode("utf-8")) for _, _, content in blocks)
+
+    # **Each block hashed against the digest in its own marker.** Counting
+    # blocks and summing their length says nothing about what is *in* them: a
+    # NOTICE whose 628 texts were replaced by filler of the same length would
+    # satisfy both figures. This is what makes "byte-exact" a measurement, and
+    # it is the reason the digests are emitted at all -- an unbound digest is
+    # decoration.
+    unbound = [label for label, digest, _ in blocks if not digest]
+    if unbound:
+        return Result("notices", False,
+                      summary=f"{len(unbound)} embedded text(s) carry no digest to "
+                              f"check against: {unbound[:3]}",
+                      witness="licence-text-unbound")
+    corrupt = [label for label, digest, content in blocks
+               if sha256_bytes(content.encode("utf-8")) != digest]
+    if corrupt:
+        return Result("notices", False,
+                      summary=f"{len(corrupt)} embedded licence text(s) do not match "
+                              f"their recorded digest: {corrupt[:3]}",
+                      witness="licence-text-digest-mismatch")
+
     claimed = int(fields.get("embedded_licence_texts", "-1"))
     claimed_bytes = int(fields.get("embedded_licence_bytes", "-1"))
-    if embedded != claimed or embedded_bytes < claimed_bytes:
+    # `!=` on both, not `<` on the byte total: a header that *under*-claims is
+    # as wrong as one that over-claims, and `<` let it through.
+    if embedded != claimed or embedded_bytes != claimed_bytes:
         return Result("notices", False,
                       summary=f"NOTICE header claims {claimed} texts / "
                               f"{claimed_bytes} bytes, body carries {embedded} / "
@@ -775,9 +857,10 @@ def check_notices(bundle: Path) -> Result:
                     summary=f"{len(actual)} registry crates, re-derived from the "
                             f"bundled lockfile and identical")
     result.note(f"floor {MIN_NOTICE_CRATES}; lock digest {lock_sha[:12]} matches the header")
-    result.note(f"{embedded} licence texts embedded byte-exact, {embedded_bytes} bytes "
-                f"(floor {MIN_EMBEDDED_LICENCE_BYTES}); counted from the delimiters, "
-                f"not read off the header")
+    result.note(f"{embedded} licence texts embedded, {embedded_bytes} bytes "
+                f"(floor {MIN_EMBEDDED_LICENCE_BYTES}); each block reconstructed from "
+                f"the delimiters and hashed against its own recorded digest, so "
+                f"byte-exact is measured rather than asserted")
     result.note(f"{without} crate(s) ship no licence text and are listed as such by name")
     result.note(f"{len(locked)} lockfile crates = {len(actual)} notified + "
                 f"{len(declared_unresolved)} declared outside the resolved graph; "
@@ -1167,8 +1250,8 @@ def control_provenance_forged_commit(bundle: Path) -> tuple[bool, str]:
     with tempfile.TemporaryDirectory() as tmp:
         copy = copy_bundle(bundle, Path(tmp))
         path = copy / PROVENANCE
-        path.write_text(re.sub(r"^commit: .*$", "commit: not-a-commit",
-                               path.read_text(), flags=re.M))
+        write_exact(path, re.sub(r"^commit: .*$", "commit: not-a-commit",
+                               read_exact(path), flags=re.M))
         return expect_red("provenance", copy, "commit-malformed")
 
 
@@ -1176,8 +1259,8 @@ def control_provenance_wrong_toolchain(bundle: Path) -> tuple[bool, str]:
     with tempfile.TemporaryDirectory() as tmp:
         copy = copy_bundle(bundle, Path(tmp))
         path = copy / PROVENANCE
-        path.write_text(re.sub(r"^rustc_version: .*$", "rustc_version: rustc 1.90.0",
-                               path.read_text(), flags=re.M))
+        write_exact(path, re.sub(r"^rustc_version: .*$", "rustc_version: rustc 1.90.0",
+                               read_exact(path), flags=re.M))
         return expect_red("provenance", copy, "toolchain-mismatch")
 
 
@@ -1190,7 +1273,7 @@ def control_notices_dropped_crate(bundle: Path) -> tuple[bool, str]:
     with tempfile.TemporaryDirectory() as tmp:
         copy = copy_bundle(bundle, Path(tmp))
         path = copy / NOTICE
-        lines = path.read_text().splitlines(keepends=True)
+        lines = read_exact(path).splitlines(keepends=True)
         rule = next(i for i, line in enumerate(lines) if line.startswith("=" * 70))
         # Drop the first body entry: its name line and its indented detail.
         start = rule + 2
@@ -1198,7 +1281,7 @@ def control_notices_dropped_crate(bundle: Path) -> tuple[bool, str]:
         while end < len(lines) and (lines[end].startswith(" ") or not lines[end].strip()):
             end += 1
         del lines[start:end]
-        path.write_text("".join(lines))
+        write_exact(path, "".join(lines))
         return expect_red("notices", copy, "crate-set-mismatch")
 
 
@@ -1226,7 +1309,7 @@ def control_notices_texts_stripped(bundle: Path) -> tuple[bool, str]:
         path = copy / NOTICE
         kept = []
         inside = False
-        for line in path.read_text().splitlines():
+        for line in read_exact(path).splitlines():
             if line.startswith(TEXT_BEGIN):
                 inside = True
                 continue
@@ -1235,7 +1318,7 @@ def control_notices_texts_stripped(bundle: Path) -> tuple[bool, str]:
                 continue
             if not inside:
                 kept.append(line)
-        path.write_text("\n".join(kept) + "\n")
+        write_exact(path, "\n".join(kept) + "\n")
         return expect_red("notices", copy, "embedded-text-count-mismatch")
 
 
@@ -1254,7 +1337,7 @@ def control_notices_text_floor_is_not_vacuous(bundle: Path) -> tuple[bool, str]:
         kept = []
         inside = False
         dropped = 0
-        for line in path.read_text().splitlines():
+        for line in read_exact(path).splitlines():
             if line.startswith(TEXT_BEGIN):
                 inside = True
                 dropped += 1
@@ -1276,8 +1359,68 @@ def control_notices_text_floor_is_not_vacuous(bundle: Path) -> tuple[bool, str]:
                       f"embedded_licence_bytes: {embedded_bytes}", text, flags=re.M)
         text = re.sub(r"^registry_crates_with_licence_text: .*$",
                       "registry_crates_with_licence_text: 1", text, flags=re.M)
-        path.write_text(text)
+        write_exact(path, text)
         return expect_red("notices", copy, "licence-text-floor")
+
+
+def control_notices_text_replaced_by_filler(bundle: Path) -> tuple[bool, str]:
+    """Same-length filler in place of a real licence must not pass.
+
+    **This is the hole the count and the byte total cannot see.** Replacing a
+    block's content with filler of exactly the same length leaves the number
+    of blocks and the total byte count untouched, so before the digests were
+    bound this produced a green `notices` over a NOTICE carrying no licence at
+    all.  The control preserves the length deliberately, so it fails if the
+    check ever falls back to measuring size.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        copy = copy_bundle(bundle, Path(tmp))
+        path = copy / NOTICE
+        text = read_exact(path)
+        blocks = notice_licence_blocks(text)
+        if not blocks:
+            return False, "the bundled NOTICE embeds no licence texts to tamper with"
+        _, _, content = blocks[0]
+        filler = "".join("x" if c != "\n" else "\n" for c in content)
+        if filler == content:
+            return False, "filler is identical to the original content"
+        replaced = text.replace(content, filler, 1)
+        if replaced == text:
+            return False, "could not substitute the first licence block"
+        write_exact(path, replaced)
+
+        after = notice_licence_blocks(replaced)
+        if len(after) != len(blocks):
+            return False, f"the substitution changed the block count ({len(blocks)} -> {len(after)})"
+        before_bytes = sum(len(c.encode()) for _, _, c in blocks)
+        after_bytes = sum(len(c.encode()) for _, _, c in after)
+        if before_bytes != after_bytes:
+            return False, (f"the substitution changed the byte total "
+                           f"({before_bytes} -> {after_bytes}); this control is only "
+                           f"meaningful while both figures are preserved")
+        ok, detail = expect_red("notices", copy, "licence-text-digest-mismatch")
+        if not ok:
+            return ok, detail
+        return True, (f"{detail}; block count and byte total both unchanged, so only "
+                      f"the digest could have caught it")
+
+
+def control_notices_unbound_text_is_refused(bundle: Path) -> tuple[bool, str]:
+    """A block whose marker carries no digest must be refused, not skipped.
+
+    Without this, stripping `sha256=` from a marker would quietly exempt that
+    block from the only check that looks inside it.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        copy = copy_bundle(bundle, Path(tmp))
+        path = copy / NOTICE
+        text = read_exact(path)
+        stripped = re.sub(rf"^({re.escape(TEXT_BEGIN)} .*) sha256=[0-9a-f]{{64}}$",
+                          r"\1", text, count=1, flags=re.M)
+        if stripped == text:
+            return False, "no BEGIN marker carried a digest to strip"
+        write_exact(path, stripped)
+        return expect_red("notices", copy, "licence-text-unbound")
 
 
 def control_notices_false_unresolved_claim(bundle: Path) -> tuple[bool, str]:
@@ -1290,13 +1433,13 @@ def control_notices_false_unresolved_claim(bundle: Path) -> tuple[bool, str]:
     with tempfile.TemporaryDirectory() as tmp:
         copy = copy_bundle(bundle, Path(tmp))
         path = copy / NOTICE
-        text = path.read_text()
+        text = read_exact(path)
         notified = sorted(notice_crate_set(text))
         if not notified:
             return False, "the bundled NOTICE notifies no crates at all"
         name, version = notified[0]
         head, rule, rest = text.partition(UNRESOLVED_RULE)
-        path.write_text(f"{head}{rule}\n  {name} {version}{rest}")
+        write_exact(path, f"{head}{rule}\n  {name} {version}{rest}")
         return expect_red("notices", copy, "unresolved-declaration-bogus")
 
 
@@ -1404,6 +1547,44 @@ def control_cli_config_check_is_real(bundle: Path) -> tuple[bool, str]:
         copy = copy_bundle(bundle, Path(tmp))
         (copy / "examples" / "m1-client.toml").write_text("this is not = valid toml [[\n")
         return expect_red("cli", copy, "config-check-failed")
+
+
+def control_cli_environment_scrub_is_checked(bundle: Path) -> tuple[bool, str]:
+    """The environment guard must itself be exercised.
+
+    `environment-not-scrubbed` was the one witness in this file with no
+    control: the guard was shown to work by hand and never by the suite, which
+    is the same "unexercised is untested" argument the rest of this file makes
+    about everything else.
+
+    The control replaces `stranger_env` with one whose PATH contains a
+    directory holding an executable named `cargo`, which is exactly the state
+    the guard exists to refuse, and requires `cli` to go red naming it.
+    """
+    global stranger_env
+    with tempfile.TemporaryDirectory() as tmp:
+        fake_bin = Path(tmp) / "bin"
+        fake_bin.mkdir()
+        cargo = fake_bin / "cargo"
+        cargo.write_text("#!/bin/sh\nexit 0\n")
+        cargo.chmod(cargo.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+        original = stranger_env
+
+        def leaky(workdir: Path) -> dict[str, str]:
+            env = original(workdir)
+            env["PATH"] = f"{fake_bin}:{env['PATH']}"
+            return env
+
+        stranger_env = leaky
+        try:
+            # Sanity: the replacement really does make cargo reachable, or the
+            # control would be testing nothing.
+            if cargo_is_unreachable(stranger_env(Path(tmp))):
+                return False, "the planted cargo is still unreachable; control is vacuous"
+            return expect_red("cli", bundle, "environment-not-scrubbed")
+        finally:
+            stranger_env = original
 
 
 def control_cli_serving_dry_run_is_real(bundle: Path) -> tuple[bool, str]:
@@ -1516,6 +1697,8 @@ CONTROLS: dict[str, list[tuple[str, object]]] = {
     "notices": [
         ("a crate dropped from NOTICE", control_notices_dropped_crate),
         ("every licence text stripped out", control_notices_texts_stripped),
+        ("one text replaced by same-length filler", control_notices_text_replaced_by_filler),
+        ("a text block with no digest to bind it", control_notices_unbound_text_is_refused),
         ("a gutted but self-consistent NOTICE", control_notices_text_floor_is_not_vacuous),
         ("a NOTICE stale against its lockfile", control_notices_stale_lockfile),
         ("a crate declared out of the graph and notified", control_notices_false_unresolved_claim),
@@ -1529,6 +1712,7 @@ CONTROLS: dict[str, list[tuple[str, object]]] = {
     "cli": [
         ("a binary that exits 0 printing nothing", control_cli_content_not_exit_status),
         ("a corrupted configuration example", control_cli_config_check_is_real),
+        ("cargo reachable on the probe PATH", control_cli_environment_scrub_is_checked),
         ("a corrupted serving example", control_cli_serving_dry_run_is_real),
         ("no serving example at all", control_cli_serving_example_must_exist),
     ],
@@ -1553,7 +1737,7 @@ def cmd_notices(args: argparse.Namespace) -> int:
     lock_text = (REPO / LOCKFILE).read_text()
     lock_sha = sha256_file(REPO / LOCKFILE)
     text = generate_notices(metadata, lock_sha, lock_text)
-    Path(args.out).write_text(text)
+    write_exact(Path(args.out), text)
     crates = len(notice_crate_set(text))
     print(f"wrote {args.out}: {crates} registry crates, lock {lock_sha[:12]}")
     if crates < MIN_NOTICE_CRATES:
