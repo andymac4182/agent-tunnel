@@ -232,6 +232,119 @@ def is_separator(line: str) -> bool:
     return bool(re.match(r"^\s*\|[\s:|-]+\|?\s*$", line))
 
 
+# --- table shape (M4-33) -----------------------------------------------------
+#
+# THE CELL BOUNDARY RULE, STATED ONCE AND USED BY EVERYTHING BELOW.
+#
+# A cell boundary is a `|` character that is NOT immediately preceded by a
+# backslash.  That is GFM's rule and it has two consequences that matter here:
+#
+#   * a `|` inside an inline code span is STILL a boundary.  Backticks do not
+#     protect it.  This is the entire defect M4-33 records: a row writing
+#     `git ls-tree -r HEAD | wc -l` renders one column wider than its table.
+#   * `\|` is NOT a boundary, which is why one backslash is the whole fix.
+#
+# Note what this rule does NOT claim: it is not a general markdown parser.  It
+# does not handle a literal backslash before a real delimiter (`...\\|`), which
+# does not occur in these documents and would be a defect if it did.  It is
+# deliberately the narrow rule that decides cell counts, and nothing more.
+
+
+def split_cells(line: str) -> "list[str]":
+    """Split one markdown table row into its cells.
+
+    Boundaries are `|` not preceded by a backslash.  One leading and one
+    trailing boundary pipe are row delimiters and are removed before splitting,
+    so `| a | b |` is two cells and not four.
+    """
+    stripped = line.strip()
+    bounds = [
+        i
+        for i, ch in enumerate(stripped)
+        if ch == "|" and (i == 0 or stripped[i - 1] != "\\")
+    ]
+    if not bounds:
+        return [stripped]
+    start = 0
+    end = len(stripped)
+    if bounds[0] == 0:
+        start = 1
+        bounds = bounds[1:]
+    if bounds and bounds[-1] == end - 1:
+        end -= 1
+        bounds = bounds[:-1]
+    cells: "list[str]" = []
+    prev = start
+    for i in bounds:
+        cells.append(stripped[prev:i])
+        prev = i + 1
+    cells.append(stripped[prev:end])
+    return [cell.strip() for cell in cells]
+
+
+def row_identifier(cells: "list[str]") -> str:
+    """The row's own name, for a finding a reader can act on.
+
+    A bare line number is not actionable in a 800-line tracker that is edited
+    by several workers at once; the row id is what the reader searches for.
+    """
+    if not cells:
+        return "?"
+    first = cells[0].strip()
+    match = re.match(r"^\**\[?[ xX]?\]?\**\s*([A-Za-z0-9][A-Za-z0-9.-]*)", first)
+    return match.group(1) if match else (first[:24] or "?")
+
+
+def table_shape_findings(rel: str, text: str) -> "tuple[list[str], int, int]":
+    """Findings for rows whose cell count differs from their table's header.
+
+    Returns (findings, tables_seen, rows_checked).
+
+    The authority for a table's width is its OWN separator row (`|---|---|...`),
+    which is what a markdown renderer uses and what the header therefore
+    declares.  Each table is judged against its own separator, so the 4-column
+    milestone summary and the 6-column task tables coexist without either being
+    measured against the other -- the mistake that produced the 23-row figure
+    M4-33 records as wrong.
+
+    Every data row is checked, not only verified ones.  Eleven of the thirteen
+    rows this rule was written for are `open` or `implemented`; a rule scoped to
+    verified rows would have reported almost none of them.
+    """
+    findings: "list[str]" = []
+    tables_seen = 0
+    rows_checked = 0
+    declared: "int | None" = None
+    header_line = 0
+    for lineno, line in enumerate(text.splitlines(), start=1):
+        if not line.strip().startswith("|"):
+            declared = None
+            header_line = 0
+            continue
+        cells = split_cells(line)
+        if is_separator(line):
+            declared = len(cells)
+            tables_seen += 1
+            continue
+        if declared is None:
+            # The header row itself: it precedes the separator, so it has not
+            # been given a width to be judged against yet.  Its own width is
+            # what the separator is expected to repeat, and a header/separator
+            # disagreement is reported when the next row is judged.
+            header_line = lineno
+            continue
+        rows_checked += 1
+        if len(cells) != declared:
+            findings.append(
+                f"{rel}:{lineno}: row '{row_identifier(cells)}' splits into "
+                f"{len(cells)} cells but its table (header at {rel}:{header_line}) "
+                f"declares {declared}; an unescaped '|' -- often inside an inline "
+                f"code span, where backticks do NOT protect it -- adds a column. "
+                f"Write it as '\\|'."
+            )
+    return findings, tables_seen, rows_checked
+
+
 def row_is_verified(line: str) -> bool:
     """A row is verified only when its status *column* says so.
 
@@ -320,9 +433,17 @@ def scan(gates: "set[str]", pins: "set[str]", verbose: bool) -> "list[str]":
     gate_citations = 0
     hash_citations = 0
     pin_citations = 0
+    tables_seen = 0
+    shape_rows = 0
+    shape_findings = 0
     for path in DOCS:
         rel = os.path.relpath(path, REPO_ROOT)
         text = read_text(path)
+        shape, tables_n, shape_n = table_shape_findings(rel, text)
+        findings.extend(shape)
+        shape_findings += len(shape)
+        tables_seen += tables_n
+        shape_rows += shape_n
         for lineno, line in enumerate(text.splitlines(), start=1):
             if not is_table_row(line) or is_separator(line):
                 continue
@@ -336,12 +457,31 @@ def scan(gates: "set[str]", pins: "set[str]", verbose: bool) -> "list[str]":
             gate_citations += gate_n
             hash_citations += hash_n
             pin_citations += pin_n
+    # A scan that matched nothing is not a pass.  If the tables move, are
+    # renamed or lose their separator rows, every rule in this guard silently
+    # stops applying while the exit code stays 0 -- the failure mode M5-C11
+    # collects.  Both scopes must have found work to do.
+    if tables_seen == 0 or shape_rows == 0:
+        die(
+            f"table-shape scan matched nothing ({tables_seen} tables, "
+            f"{shape_rows} rows) across {len(DOCS)} documents; the tables have "
+            f"moved or their separator rows are gone, and the guard is not "
+            f"guarding"
+        )
+    if rows_scanned == 0:
+        die(
+            "no verified rows matched across "
+            f"{len(DOCS)} documents; the status wording changed and the "
+            "gate/commit rules are silently inapplicable"
+        )
     if verbose:
         sys.stderr.write(
             f"m7-evidence-guard: scanned {rows_scanned} verified rows, "
             f"{gate_citations} gate citations, {hash_citations} confirmed commit "
             f"citations, {pin_citations} upstream-pin citations; "
-            f"{len(gates)} known gates, {len(pins)} recorded upstream pins\n"
+            f"{len(gates)} known gates, {len(pins)} recorded upstream pins; "
+            f"table shape: {shape_rows} rows in {tables_seen} tables checked, "
+            f"{shape_findings} cell-count findings\n"
         )
     return findings
 
