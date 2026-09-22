@@ -80,6 +80,62 @@ fn click(capture: u64, x: u32, y: u32) -> Vec<u8> {
     request_body("click", json!({"capture": capture, "x": x, "y": y}))
 }
 
+/// **A drag's recorded point comes out of the `path` the adapter now sends.**
+///
+/// Found by the `m5c7` guard suite, which reported its sixth case -- pointing
+/// the fixture's reader at `start_path` instead of `path` -- as `still green`:
+/// the fixture read a drag's start point and **nothing asserted it**. A
+/// fixture that recorded the wrong coordinate for a drag, or none at all,
+/// would have passed every test in this crate, and the ledger is what every
+/// dispatch test judges against. `docs/tasks.md` M5-C15 records the gap.
+///
+/// `drag`'s endpoints are `path[0]` and `path[1]` because that is what the
+/// pinned `drag(path: List[Tuple[int, int]], ...)` declares -- see
+/// `tunnel_http_forward::cua_pin::COMMAND_PARAMETERS`. The old
+/// `start_x`/`start_y` spelling was discarded whole by the released
+/// dispatcher, so this test also pins the reader to the corrected wire shape.
+#[tokio::test]
+async fn a_drag_records_the_start_of_its_path_through_the_display_scale() {
+    let backend = FixtureBackend::start().await.unwrap();
+    backend.capture_scale().set(200);
+    let (_state, agent, _idle) = two_agents(&backend);
+    agent.acquire_input_lease().expect("the target is free");
+    let identity = capture(&agent).await;
+
+    agent
+        .handle(
+            &request_body(
+                "drag",
+                json!({"capture": identity, "x": 100, "y": 80, "to_x": 120, "to_y": 60}),
+            ),
+            LIMIT,
+        )
+        .await;
+    assert_eq!(
+        backend.ledger().points(),
+        vec![(50, 40)],
+        "the drag's recorded point must be path[0], converted through the \
+         capture's 2x display scale"
+    );
+
+    // **The control.** The same drag through a 1x capture arrives unchanged,
+    // so the assertion above is reading the path and the scale rather than a
+    // constant that happens to match.
+    backend.capture_scale().set(100);
+    let unscaled = capture(&agent).await;
+    agent
+        .handle(
+            &request_body(
+                "drag",
+                json!({"capture": unscaled, "x": 100, "y": 80, "to_x": 120, "to_y": 60}),
+            ),
+            LIMIT,
+        )
+        .await;
+    assert_eq!(backend.ledger().points(), vec![(50, 40), (100, 80)]);
+    backend.stop();
+}
+
 /// **The click counter, and the control that shows it counts effects.**
 ///
 /// One `click` exchange leaves one ledger entry and **one** click. One

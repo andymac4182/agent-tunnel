@@ -627,15 +627,26 @@ impl SessionFacade {
             // the outcome is unchanged; what is withheld is the identity.
             return dispatch;
         };
-        // **An absent scale is read as 1x, and that is the one default here
-        // that could be wrong in an expensive direction.** It is the only
-        // workable choice -- refusing on absence would make `capture` unusable
-        // against any backend that does not emit the member, and no released
-        // source has been read to say whether 0.3.46 does. But if a real 2x
-        // backend omits it, every coordinate is wrong by a factor of two,
-        // which is precisely the failure the conversion exists to prevent,
-        // arriving through the *reading* rather than the arithmetic. Recorded
-        // as `docs/tasks.md` M5-C06 rather than left as a quiet `unwrap_or`.
+        // **An absent scale is read as 1x, and the released source has now
+        // been read: 0.3.46 never sends the member.** M5-C06 left this line
+        // saying no source had been read; one has. `scale_percent` appears
+        // nowhere in the pinned sdist, and no backend's `screenshot` returns
+        // it -- macOS, Linux, Windows and Android return
+        // `{success, image_data, format}`, VNC omits `format` too.
+        //
+        // That would make this default wrong by a factor of two on a real 2x
+        // display -- except that it is **unreachable against a released
+        // backend**, because `width` and `height` are not returned either and
+        // the `let else` above takes the early return first. No identity is
+        // issued, so every later coordinate is refused rather than landing in
+        // the wrong place: the safe direction, reached by accident. The 1x
+        // default is therefore exercised only against this fixture, which
+        // emits all three members.
+        //
+        // Deriving a real scale needs two commands (decoded image width over
+        // `get_screen_size` width) and must not be built before a real
+        // backend is probed. Recorded as `docs/tasks.md` M5-C14, which
+        // carries the measurement; M5-C06 is closed.
         let scale = number("scale_percent").unwrap_or(tunnel_cua::capture::IDENTITY_SCALE_PERCENT);
         let Ok(identity) = self
             .state

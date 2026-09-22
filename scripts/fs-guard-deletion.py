@@ -87,8 +87,11 @@ numbers in task rows M4-08 and M4-09 rest on them:
    arm, and the `Rflush` membership case's text appears in `cancel_flush` too.
    Both are anchored now, and the check caught the second one itself.
 
-The working tree must be clean before running: every case is restored by
-checking the crate out again, which would discard uncommitted work there.
+The working tree must be clean before running.  Not because a restore would
+discard uncommitted work -- since M5-C07 each case is restored by writing back
+the exact bytes it recorded, so it no longer would -- but because a case
+applied on top of an uncommitted edit cannot be told apart from it, and the
+run would then credit a guard on the strength of somebody else's change.
 """
 
 from __future__ import annotations
@@ -104,7 +107,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from guard_outcomes import AppliedCase  # noqa: E402
 from guard_outcomes import check_anchors as shared_check_anchors  # noqa: E402
+from guard_outcomes import install_interrupt_restore  # noqa: E402
+from guard_outcomes import refuse_resident_mutation  # noqa: E402
 from guard_outcomes import unusable as unusable_outcomes  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
@@ -6212,13 +6218,15 @@ def run_tests(suite: Suite) -> tuple[str, list[str]]:
     return "RED", failures
 
 
-def restore(suite: Suite) -> None:
-    subprocess.run(
-        ["git", "checkout", "--"]
-        + [str(crate.relative_to(REPO)) for crate in suite.crates],
-        cwd=REPO,
-        check=True,
-    )
+# **The `git checkout --` restore that used to live here is gone (M5-C07).**
+# It was replaced by `guard_outcomes.AppliedCase`, which writes back the exact
+# bytes it recorded before mutating.  Deleted rather than left unused on
+# purpose: it checked out whole crate directories, so any other uncommitted
+# work under them was discarded with the mutation -- the M4-32 mechanism -- and
+# a dead helper spelling exactly that is an invitation to call it again.  It is
+# not a rule being removed to go green: no case reaches it any more, and the
+# tree-cleanliness contract it served is now held by `AppliedCase.restore` plus
+# the journal that `refuse_resident_mutation` reads.
 
 
 def require_clean_tree(suites: list[Suite]) -> None:
@@ -6235,8 +6243,12 @@ def require_clean_tree(suites: list[Suite]) -> None:
             if changed:
                 sys.exit(
                     "fs-guard-deletion: refusing to run with uncommitted changes "
-                    f"under {relative}; each case is restored by checking the "
-                    "crate out again, which would discard them."
+                    f"under {relative}; a case applied on top of them could not "
+                    "be told apart from them, and the run would report a guard "
+                    "as load-bearing on the strength of somebody else's edit. "
+                    "Each case is restored by writing back the exact bytes it "
+                    "recorded (M5-C07), so these changes would survive a run -- "
+                    "but the evidence would not be trustworthy."
                 )
 
 
@@ -6315,6 +6327,9 @@ def check_anchors(selected: list[tuple[Suite, str, list[Edit]]]) -> int:
 
 
 def main() -> int:
+    # M5-C07: make `SIGTERM`/`SIGHUP` raise, so the per-case `AppliedCase`
+    # context manager restores on the way out instead of being skipped.
+    install_interrupt_restore()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--list", action="store_true", help="print case names and exit")
     parser.add_argument(
@@ -6363,6 +6378,16 @@ def main() -> int:
     if not selected:
         sys.exit(f"fs-guard-deletion: no case matches {arguments.case!r}")
 
+    # **M5-C07, before anything is edited.**  `require_clean_tree`
+    # below refuses on a dirty tree, which already stops a second run
+    # stacking on a resident mutation -- but it can only say
+    # "something is uncommitted", about a tree the operator may
+    # believe they dirtied themselves.  This names the harness, suite,
+    # case and files a previous interrupted run left mutated, because
+    # a resident mutation is a guard deleted from the product and not
+    # a tidying job.  Placed *after* the `--check-anchors` dispatch so
+    # read-only mode stays a pure anchor check (M4-34, M4-36).
+    refuse_resident_mutation("fs-guard-deletion", REPO)
     require_clean_tree(suites)
 
     # **Preflight (M4-27).**  Resolve every selected case's anchors before any
@@ -6377,33 +6402,30 @@ def main() -> int:
 
     results: list[tuple[str, str, str, list[str]]] = []
     for suite, name, edits in selected:
-        problem = None
-        for path, old, new in edits:
-            text = path.read_text()
-            occurrences = text.count(old)
-            if occurrences == 0:
-                problem = "guard text not found"
-                break
-            if occurrences > 1:
-                # Refusing is the whole point: `str.replace(old, new, 1)` would
-                # silently edit the FIRST match, so a case whose text is not
-                # unique measures some other guard — and reports a red for it
-                # under this case's name.  That happened: the `Rlcreate`
-                # generation case's text was also the opening of the `Rlopen`
-                # arm, so it deleted the `Rlopen` guard a second time and the
-                # real `Rlcreate` guard had never been deleted at all.  A count
-                # inflated that way is false evidence, and false evidence is
-                # worse than a missing case.
-                problem = f"guard text is ambiguous: {occurrences} occurrences"
-                break
-            path.write_text(text.replace(old, new, 1))
-        if problem is not None:
-            restore(suite)
-            results.append((suite.name, name, f"COULD NOT DELETE: {problem}", []))
-            print(f"[{suite.name}] {name}: {problem}", flush=True)
-            continue
-        outcome, failures = run_tests(suite)
-        restore(suite)
+        # **M5-C07.**  The apply/test/restore cycle runs inside a context
+        # manager, so the restore happens on *every* way out of this block --
+        # a refusal, an exception, a `KeyboardInterrupt`, or the `SystemExit`
+        # that `install_interrupt_restore` turns a `SIGTERM` into.  It
+        # restores the exact recorded original bytes rather than running `git
+        # checkout --` over the crate, which would discard any other
+        # uncommitted work under that path.  That matters most here: M4-32's
+        # instance was **this** harness, whose 42-case suite erased doc-comment
+        # edits made to `fs_write_restart.rs` while it ran.
+        #
+        # The ambiguity refusal `AppliedCase.apply` makes is the one this
+        # harness learned the hard way, and the incident is kept here because
+        # it is this suite's: the `Rlcreate` generation case's text was also
+        # the opening of the `Rlopen` arm, so it deleted the `Rlopen` guard a
+        # second time and the real `Rlcreate` guard had never been deleted at
+        # all.  A count inflated that way is false evidence, and false evidence
+        # is worse than a missing case.
+        with AppliedCase("fs-guard-deletion", REPO, suite.name, name) as applied:
+            problem = applied.apply_all(edits)
+            if problem is not None:
+                results.append((suite.name, name, f"COULD NOT DELETE: {problem}", []))
+                print(f"[{suite.name}] {name}: {problem}", flush=True)
+                continue
+            outcome, failures = run_tests(suite)
         if name in EXPECT_GREEN:
             outcome = (
                 "DOCUMENTED GREEN"

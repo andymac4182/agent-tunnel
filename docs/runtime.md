@@ -86,7 +86,7 @@ Data-socket rotation every 300 seconds and certificate renewal are independent. 
 
 ## Proposed CLI surface
 
-Keep the existing binary name `tunnel-client`. `tunnel-client check-config [PATH]` and help are implemented today; current errors exit 1. The following is the future command contract, not runnable examples of delivered features.
+Keep the existing binary name `tunnel-client`. `check-config [PATH]`, `config check`, `credentials create`, `credentials import`, `connect` and `doctor` are implemented today, and they select the exit statuses in the client exit-code table below. `status`, `enroll`, `credentials renew`, `disconnect` and `doctor --network` are **not** implemented; `--network` is rejected rather than ignored. The following is the command contract, and the unimplemented rows are not runnable examples of delivered features.
 
 | Command | Defined behavior |
 | --- | --- |
@@ -109,20 +109,33 @@ Configuration includes a device endpoint URL, credential reference, server trust
 
 Remote agents may invoke only locally configured exports. The CLI has no remotely supplied executable path, arbitrary shell command, or generic TCP proxy mode. A named ACP export selects a fixed local agent and approved launch configuration; [acp.md](acp.md) specifies request handling and permissions. ACP is an application service carried by the data channel; it cannot become a tunnel-control command.
 
-Proposed stable exit codes:
+### Client exit codes
 
-| Code | Meaning |
-| --- | --- |
-| 0 | Requested operation succeeded; foreground connect completed an orderly stop |
-| 1 | Unexpected internal failure |
-| 2 | Invalid invocation or configuration |
-| 3 | Missing, invalid, expired, or untrusted credentials / authorization denied |
-| 4 | Network or service unavailable / supervisor absent |
-| 5 | Deadline exceeded |
-| 6 | Operation outcome unknown or incomplete drain requiring reconciliation |
-| 130 | Interrupted before an orderly completion could be recorded |
+These are the exit statuses `tunnel-client` selects, and they are implemented rather than proposed. `Cause::exit_code` in `crates/tunnel-client/src/main.rs` is the authority.
 
-Do not change the implemented bootstrap exit behavior until CLI parsing and its compatibility tests are added. Reconnectable network errors during `connect` remain supervised and visible rather than exiting immediately; permanent trust/configuration errors exit without an infinite retry loop.
+**`Cause::exit_code` is the authority for everything except two paths, which are named here because "the authority" would otherwise be wrong.** `doctor` computes its own statuses in `crates/tunnel-client/src/doctor.rs` (`0`, `2`, `3`) and returns from `main` before the async command runner, so it never reaches `Cause`; and a failure to install the process crypto provider returns a bare `ExitCode::FAILURE` (`1`) with a message and **no diagnostic code**, because it happens before argument parsing and before any `--json` contract exists. Both are consistent with the table below; neither is derived from it.
+
+**This table is a copy, and nothing checks it against the code.** No guard compares this Markdown to that function, so it can fall behind exactly the way the chaos gate's own copy of the vocabulary did before M0-03 replaced it with an import. What *is* checked mechanically: `tunnel_client::CLI_DIAGNOSTIC_EXIT_CODES` is the single definition of the set of statuses, `every_exit_status_is_in_the_published_vocabulary` fails if any cause maps outside it, `the_cli_and_the_library_publish_the_same_diagnostic_code` pins `Cause::code` against `ClientError::code`, and `scripts/m0-guard-exit-codes.py` holds each individual mapping to its meaning with a named witness test. A reviewer changing a status must edit this table by hand.
+
+| Code | Meaning | Diagnostic codes that select it | What the operator does |
+| --- | --- | --- | --- |
+| 0 | Requested operation succeeded; foreground `connect` completed an orderly stop | — | nothing |
+| 1 | Unexpected internal failure | `PROTOCOL_ERROR`, `SUPERVISOR_FAILED`, `SIGNAL_ERROR`, and the codeless crypto-provider bail-out | report it; this is a defect or a version skew |
+| 2 | Invalid invocation or configuration; nothing was attempted | `INVALID_INVOCATION`, `CONFIG_ERROR`, `INVALID_CONFIG`; also `doctor`'s own `INVALID_CONFIG` | fix the command line or the profile |
+| 3 | Missing, invalid, expired, or untrusted credentials / authorization denied | `CREDENTIAL_ERROR`, `AUTHORIZATION_STALE`; also `doctor`'s `CREDENTIAL_*` family | run `doctor`; re-enroll or re-authorize |
+| 4 | Network or service unavailable; the relay could not be reached or closed the session | `TRANSPORT_ERROR`, `SESSION_CLOSED` | check reachability, then retry |
+| 5 | Deadline exceeded | `DEADLINE_EXCEEDED` | check latency, or raise the bounded deadline |
+| 6 | Operation outcome unknown or incomplete drain requiring reconciliation | *(no producer today — see below)* | query the authorized operation status; never replay the mutation |
+| 7 | Refused before dispatch: the device owner slot is already held, or a bounded local budget was exhausted. No session work started | `OWNER_BUSY`, `RESOURCE_EXHAUSTED` | stop the other connector, or wait and retry |
+| 130 | Interrupted before an orderly completion could be recorded | `CANCELLED` | re-run; an orderly `Ctrl-C` stop exits `0` instead |
+
+`7` was added by task row M0-03. Before it, `OWNER_BUSY` and `RESOURCE_EXHAUSTED` fell through a `_ => 1` arm and were reported as "unexpected internal failure" — together with `CANCELLED`, `AUTHORIZATION_STALE`, `PROTOCOL_ERROR` and `SUPERVISOR_FAILED`, six live causes sharing one status. A refused-before-dispatch outcome is neither a network failure (`4`) nor a defect (`1`): nothing is wrong, something else holds the slot.
+
+**Exit `6` is documented and unreachable.** No path in `tunnel-client` constructs an ambiguous-outcome cause today, so nothing can produce `6`. It is listed here because the ambiguous-mutation contract is a design requirement and the code is reserved for it; it is deliberately absent from the `Cause` enum, because an enum variant nothing constructs is a surface that reads as covered and is not. Closing the gap means giving the ambiguous-outcome path a producer, not adding the variant.
+
+The **relay** does not use this table. `tunnel-relay` still exits `0` or `1` per its bootstrap behavior; see the dry-run section below. Wiring the relay to this vocabulary waits for relay CLI parsing and its compatibility tests.
+
+Reconnectable network errors during `connect` remain supervised and visible rather than exiting immediately; permanent trust/configuration errors exit without an infinite retry loop.
 
 ### Relay configuration dry run
 
@@ -132,7 +145,7 @@ The command is inert and deterministic. It reads the one configuration file name
 
 It takes no flag other than `--config PATH`. A dry run that could select a different authority file, namespace or trust path than `serve` would prove nothing about the deployment, so no override exists.
 
-Exit codes follow the relay's implemented bootstrap behavior: `0` when the configuration is valid, `1` with a redacted field-level reason on stderr when it is not or when the file cannot be read. The proposed table above is not yet wired into the relay; per the paragraph above, that change waits for relay CLI parsing and its compatibility tests. The relay's legacy `check-config [PATH]` stays a `tunnel_core::RelayConfig` check and is not evidence for a serving document.
+Exit codes follow the relay's implemented bootstrap behavior: `0` when the configuration is valid, `1` with a redacted field-level reason on stderr when it is not or when the file cannot be read. The client exit-code table above is not wired into the relay; that change waits for relay CLI parsing and its compatibility tests. The relay's legacy `check-config [PATH]` stays a `tunnel_core::RelayConfig` check and is not evidence for a serving document.
 
 `--json` emits versioned JSON on stdout and logs on stderr. Finite commands emit one result object; `connect --json` emits newline-delimited lifecycle events. Each result contains `schema_version`, `command`, `ok`, and either `result` or `error { code, message, retryable, operation_id? }`. Never interleave human progress text with JSON. `retryable` permits retrying safe admission/connection work, not replaying an ambiguous mutation.
 

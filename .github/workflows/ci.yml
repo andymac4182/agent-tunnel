@@ -66,6 +66,69 @@ jobs:
             cargo +1.95.0 run --locked -p tunnel-relay -- check-serve-config --config "${example}"
           done
 
+  release-checks:
+    name: M6-04 dependency, licence and secret checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out full history
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+          # **`fetch-depth: 0` is load-bearing, not tidiness.** The secret scan
+          # walks every blob reachable from every ref. Under the default
+          # shallow checkout `git rev-list --objects --all` returns one
+          # commit's objects, so the scan would report zero findings over
+          # almost nothing and look exactly like a clean history. The script's
+          # own blob floor fails the job in that case rather than passing, but
+          # the floor is the backstop; this is the fix.
+          fetch-depth: 0
+      - name: Install Rust 1.95.0
+        run: rustup toolchain install 1.95.0 --profile minimal
+      - name: Install cargo-deny 0.19.6
+        # Pinned, and `--locked`: the deny.toml schema was read out of this
+        # exact version's own `init` template. The script asserts the version
+        # and fails rather than running an unknown one, because a renamed
+        # config key that is silently ignored would make the policy pass over
+        # nothing.
+        run: cargo +1.95.0 install --locked cargo-deny@0.19.6
+      - name: Populate the cargo registry cache
+        # **Load-bearing, and its absence made this job known-broken rather
+        # than merely unexercised.** The checks invoke cargo-deny with
+        # `--offline` by default. On a fresh runner CARGO_HOME is empty, so
+        # `cargo metadata` fails with "no matching package", cargo-deny emits
+        # no summary record, and `deps` fails. `fetch` also extracts the crate
+        # sources cargo-deny reads LICENSE text from when it resolves a
+        # licence by file rather than by manifest field, so this covers both
+        # needs. Alternatively pass `--no-offline` to the script.
+        run: cargo +1.95.0 fetch --locked
+      - name: Prove the checks can still fail
+        # **Runs before the checks themselves, deliberately.** Each control
+        # plants a synthetic case and requires the corresponding check to go
+        # red. A green gate whose controls were never run is the defect class
+        # docs/tasks.md row M5-C11 tracks; running them first means a broken
+        # scanner fails the job instead of quietly passing it.
+        run: python3 scripts/m6-release-checks.py --self-test
+      - name: Dependency, licence, provenance, secret and visibility checks
+        env:
+          # `GET /repos/{owner}/{repo}` needs only `metadata: read`, which the
+          # automatic `github.token` always carries, so the visibility check
+          # runs here rather than being skipped.
+          #
+          # **It was skipped, and the stated reason was wrong.** The comment
+          # claimed the check needed a token the job did not have. The effect
+          # was worse than the inaccuracy: visibility is the gate's only
+          # currently-red check, so omitting it made the automated form of the
+          # gate go green on a repository that fails the gate -- an automation
+          # that cannot report the one problem it exists to catch.
+          #
+          # This job is therefore expected to FAIL while the repository is
+          # public (docs/tasks.md M6-C01). That is the correct behaviour and
+          # must not be "fixed" by dropping the check again; it goes green when
+          # the owner restores privacy.
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/m6-release-checks.py
+
   m1-acceptance:
     name: M1 real-socket acceptance (Redis)
     runs-on: ubuntu-latest

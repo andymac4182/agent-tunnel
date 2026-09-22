@@ -22,8 +22,12 @@
 //!    `docs/integrations.md`, so the allowlist and the document cannot drift
 //!    apart silently.
 //! 3. The digests are re-fetched and re-hashed by `scripts/m5-cua-refetch.sh`,
-//!    which downloads both files from PyPI and compares. That script is what
+//!    which downloads all four artifacts and compares. That script is what
 //!    the verification pass runs; this module is what it compares against.
+//! 4. [`COMMAND_PARAMETERS`] is re-derived from the re-fetched
+//!    `handlers/base.py` by `scripts/m5-cua-param-parity.py`, which the same
+//!    script invokes. Without it that table would be a transcription this
+//!    repository checks against itself, which is what M5-C06 was filed about.
 //!
 //! [`http-forward/1`]: https://github.com/andymac4182/agent-tunnel/blob/main/docs/http-forwarding.md
 
@@ -164,6 +168,192 @@ pub const WEBSOCKET_DEFERRAL_RECORDED_AS: &str = "`/ws` is deferred";
 /// surface. No separate driver profile is pinned or planned.
 pub const DRIVER_EXTRA_REQUIREMENT: &str = "cua-driver>=0.22.2,<0.23.0";
 
+/// SHA-256 of `computer_server/handlers/base.py`, the abstract handler
+/// contract every concrete backend implements and the file
+/// [`COMMAND_PARAMETERS`] is transcribed from. Verified identical in the
+/// sdist and at [`RELEASE_COMMIT`], the same two ways [`MAIN_PY_SHA256`] is.
+///
+/// It is pinned separately from `main.py` because the two answer different
+/// questions: `main.py` says which command *names* dispatch, `base.py` says
+/// what *parameters* each of them takes. M5-C06 existed because only the
+/// first had been read.
+pub const BASE_PY_SHA256: &str = "4c9aa3926032950ed5fd34b752e29f656090d08096c933e18f0cbbb2af64d169";
+
+/// One allowlisted command's parameter schema, transcribed from the pinned
+/// artifact.
+///
+/// **Why this table has teeth.** The released `/cmd` handler dispatches with
+/// `filtered_params = {k: v for k, v in params.items() if k in sig.parameters}`
+/// (`main.py`, the `generate_response` closure). A parameter name the handler
+/// does not declare is **silently discarded** — no error, no warning, no
+/// 400 — and the command then runs with that argument's default, or raises a
+/// `TypeError` that arrives as `{"success": false}` inside a 200. So an
+/// unknown *command* is loud and an unknown *parameter* is not, which is
+/// exactly the asymmetry that made a half-pin dangerous.
+pub struct CommandParameters {
+    /// The canonical command name, which must appear in [`ALLOWED_COMMANDS`].
+    pub command: &'static str,
+    /// Parameters with no default: omitting one raises `TypeError` upstream.
+    pub required: &'static [&'static str],
+    /// Parameters with a default. Omitting one is safe; misspelling one is
+    /// silently ignored, which is why they are pinned too.
+    pub optional: &'static [&'static str],
+}
+
+/// The parameter schema of every member of [`ALLOWED_COMMANDS`], read from
+/// `computer_server/handlers/base.py` at [`BASE_PY_SHA256`] — and, for
+/// `version`, from the `main.py` registry lambda, which takes none.
+///
+/// `scripts/m5-cua-refetch.sh` re-fetches that file, re-hashes it, parses the
+/// signatures out of it and compares them against this table, so the table is
+/// pinned against the upstream source rather than against itself.
+///
+/// **Two recorded caveats, neither of which this table smooths over:**
+///
+/// 1. `scroll`'s `x` and `y` are scroll **amounts**, not a cursor position.
+///    All six backends treat them that way, though they do not share a body:
+///    macOS, Linux and Windows call `self.mouse.scroll(x, y)`; VNC repeats
+///    arrow-key presses `abs(y)` (then `abs(x)`) times, because Apple's
+///    `_VZVNCServer` does not translate RFB buttons 4-7 into wheel events;
+///    Android swipes from the screen centre to `(centre_x + x, centre_y - y)`;
+///    and the Cua Driver handler maps the sign to a direction and the
+///    magnitude to a count. `main.py`'s own `_scroll_direction_handler`
+///    delegates vertically to `scroll_down(clicks)`/`scroll_up(clicks)` and
+///    horizontally to `scroll(x_amount * clicks, 0)` with
+///    `x_amount = -300` for left and `300` for right. There is no way to
+///    scroll *at a point*: the pinned registry exposes no such parameter on
+///    any backend.
+/// 2. The VNC backend narrows `screenshot` to `screenshot(self)` — no
+///    `format`, no `quality`. Sending either is silently dropped there. This
+///    table records the abstract contract; a backend may accept a subset, so
+///    only `required` is safe to rely on across all six backends.
+pub const COMMAND_PARAMETERS: &[CommandParameters] = &[
+    CommandParameters {
+        command: "version",
+        required: &[],
+        optional: &[],
+    },
+    CommandParameters {
+        command: "screenshot",
+        required: &[],
+        optional: &["format", "quality"],
+    },
+    CommandParameters {
+        command: "get_screen_size",
+        required: &[],
+        optional: &[],
+    },
+    CommandParameters {
+        command: "get_cursor_position",
+        required: &[],
+        optional: &[],
+    },
+    CommandParameters {
+        command: "left_click",
+        required: &[],
+        optional: &["x", "y"],
+    },
+    CommandParameters {
+        command: "right_click",
+        required: &[],
+        optional: &["x", "y"],
+    },
+    CommandParameters {
+        command: "double_click",
+        required: &[],
+        optional: &["x", "y"],
+    },
+    CommandParameters {
+        command: "move_cursor",
+        required: &["x", "y"],
+        optional: &[],
+    },
+    CommandParameters {
+        command: "drag",
+        required: &["path"],
+        optional: &["button", "duration"],
+    },
+    CommandParameters {
+        command: "scroll",
+        required: &["x", "y"],
+        optional: &[],
+    },
+    CommandParameters {
+        command: "type_text",
+        required: &["text"],
+        optional: &[],
+    },
+    CommandParameters {
+        command: "press_key",
+        required: &["key"],
+        optional: &[],
+    },
+    CommandParameters {
+        command: "hotkey",
+        required: &["keys"],
+        optional: &[],
+    },
+    CommandParameters {
+        command: "get_accessibility_tree",
+        required: &[],
+        optional: &[],
+    },
+];
+
+/// Parameter names this repository once sent that the pinned source does not
+/// declare, **and whose loss changed what the command did**.
+///
+/// Each was silently discarded by the released dispatcher; none produced an
+/// error anywhere. `drag` lost every endpoint it had and would have raised a
+/// `TypeError` for the missing `path`; `scroll` kept `x`/`y` — but those are
+/// wheel *amounts* upstream, so it scrolled by the cursor coordinate and
+/// dropped the real deltas, silently and wrongly.
+///
+/// Recorded so the correction cannot be quietly undone, and so a reader who
+/// finds one of these names in a diff knows it is a regression rather than a
+/// new idea. `docs/tasks.md` M5-C06 has the measurement.
+pub const PARAMETERS_NEVER_TO_SEND: &[(&str, &str)] = &[
+    ("drag", "start_x"),
+    ("drag", "start_y"),
+    ("drag", "end_x"),
+    ("drag", "end_y"),
+    ("scroll", "dx"),
+    ("scroll", "dy"),
+];
+
+/// Parameter names the adapter sends **knowing** the released dispatcher
+/// discards them, because discarding them changes nothing the command does.
+///
+/// This is deliberately a separate list from [`PARAMETERS_NEVER_TO_SEND`], and
+/// the distinction is the whole point of having read the source rather than
+/// the command names alone:
+///
+/// * A discarded name that *changes the action* is a correctness defect and
+///   must be removed — `drag`'s endpoints, `scroll`'s deltas.
+/// * A discarded name that changes *nothing* is a **capability gap**. No
+///   pinned backend declares `display` on `screenshot` or `get_screen_size`;
+///   upstream captures whatever `ImageGrab.grab()` returns and reports one
+///   screen size, with or without the member. Removing the member would not
+///   give the consumer a display selection, so removing it buys nothing —
+///   while the Lane A fixture does vary its synthetic image by display, and
+///   that variation is what `a_byte_count_would_not_have_caught_the_wrong_display`
+///   uses to show a marker check catching what a length check cannot.
+///
+/// So the member stays on the wire, the gap is named here instead of being
+/// hidden by a silent omission, and the consumer-visible half — that a
+/// non-zero `display` is accepted and cannot be honoured by any pinned
+/// backend — is `docs/tasks.md` M5-C12.
+pub const PARAMETERS_KNOWINGLY_DISCARDED: &[(&str, &str)] =
+    &[("screenshot", "display"), ("get_screen_size", "display")];
+
+/// Look up one allowlisted command's pinned parameter schema.
+#[must_use]
+pub fn parameters_for(command: &str) -> Option<&'static CommandParameters> {
+    COMMAND_PARAMETERS
+        .iter()
+        .find(|entry| entry.command == command)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,7 +367,7 @@ mod tests {
 
     #[test]
     fn every_recorded_digest_is_a_lowercase_sha256_and_they_are_distinct() {
-        for digest in [WHEEL_SHA256, SDIST_SHA256, MAIN_PY_SHA256] {
+        for digest in [WHEEL_SHA256, SDIST_SHA256, MAIN_PY_SHA256, BASE_PY_SHA256] {
             assert!(
                 is_lower_hex(digest, 64),
                 "not a lowercase sha-256: {digest}"
@@ -188,6 +378,9 @@ mod tests {
         assert_ne!(WHEEL_SHA256, SDIST_SHA256);
         assert_ne!(WHEEL_SHA256, MAIN_PY_SHA256);
         assert_ne!(SDIST_SHA256, MAIN_PY_SHA256);
+        assert_ne!(BASE_PY_SHA256, MAIN_PY_SHA256);
+        assert_ne!(BASE_PY_SHA256, WHEEL_SHA256);
+        assert_ne!(BASE_PY_SHA256, SDIST_SHA256);
     }
 
     #[test]
@@ -232,6 +425,108 @@ mod tests {
             assert!(
                 !ALLOWED_COMMANDS.contains(&refused),
                 "{refused} is a host-surface command and must stay out of the allowlist"
+            );
+        }
+    }
+
+    #[test]
+    fn every_allowlisted_command_has_exactly_one_pinned_parameter_schema() {
+        // The pairing is what makes the pin a pin: a command name added to
+        // the allowlist without reading its signature, or a schema left
+        // behind by a command that was removed, both fail here.
+        assert_eq!(
+            COMMAND_PARAMETERS.len(),
+            ALLOWED_COMMANDS.len(),
+            "the parameter table and the command allowlist have drifted apart"
+        );
+        // A literal, not `ALLOWED_COMMANDS.len()` on both sides: two tables
+        // that shrank together would otherwise agree with each other.
+        assert_eq!(COMMAND_PARAMETERS.len(), 14);
+
+        for command in ALLOWED_COMMANDS {
+            assert!(
+                parameters_for(command).is_some(),
+                "{command} is allowlisted with no pinned parameter schema"
+            );
+        }
+        for entry in COMMAND_PARAMETERS {
+            assert!(
+                ALLOWED_COMMANDS.contains(&entry.command),
+                "{} has a parameter schema but is not allowlisted",
+                entry.command
+            );
+        }
+    }
+
+    #[test]
+    fn no_pinned_parameter_is_both_required_and_optional_or_repeated() {
+        let mut total = 0_usize;
+        for entry in COMMAND_PARAMETERS {
+            let mut names: Vec<&str> = entry
+                .required
+                .iter()
+                .chain(entry.optional.iter())
+                .copied()
+                .collect();
+            total += names.len();
+            let before = names.len();
+            names.sort_unstable();
+            names.dedup();
+            assert_eq!(
+                before,
+                names.len(),
+                "{} repeats a parameter name across required/optional",
+                entry.command
+            );
+        }
+        // Non-vacuity: without this the loop above is satisfied by a table of
+        // fourteen commands that all take nothing, which is precisely the
+        // "looks pinned and is not" shape M5-C06 was filed about.
+        // 2 (screenshot) + 2+2+2 (the three clicks) + 2 (move_cursor)
+        // + 3 (drag) + 2 (scroll) + 1+1+1 (text, key, keys) = 18.
+        assert_eq!(total, 18, "the pinned parameter names were counted wrong");
+    }
+
+    #[test]
+    fn the_two_discard_lists_are_disjoint_and_neither_is_empty() {
+        // The distinction between them is load-bearing: one names parameters
+        // that must be removed, the other names one that is deliberately
+        // still sent. A name in both would make the pair meaningless.
+        for (command, refused) in PARAMETERS_NEVER_TO_SEND {
+            assert!(
+                !PARAMETERS_KNOWINGLY_DISCARDED.contains(&(command, refused)),
+                "{refused} on {command} is in both discard lists"
+            );
+        }
+        assert_eq!(PARAMETERS_NEVER_TO_SEND.len(), 6);
+        assert_eq!(PARAMETERS_KNOWINGLY_DISCARDED.len(), 2);
+    }
+
+    #[test]
+    fn the_parameters_never_to_send_are_genuinely_absent_from_their_command() {
+        for (command, refused) in PARAMETERS_NEVER_TO_SEND
+            .iter()
+            .chain(PARAMETERS_KNOWINGLY_DISCARDED.iter())
+        {
+            let entry = parameters_for(command)
+                .unwrap_or_else(|| panic!("{command} is not an allowlisted command"));
+            assert!(
+                !entry.required.contains(refused) && !entry.optional.contains(refused),
+                "{refused} is recorded as never-to-send on {command}, \
+                 yet the pinned schema declares it"
+            );
+        }
+
+        // **Positive control for the assertion above.** Every name in that
+        // list is absent, so the loop would read exactly the same against a
+        // schema that declared nothing at all. These three names *are*
+        // declared, and would fail the same check — which is what makes the
+        // absences above evidence rather than a vacuous pass.
+        for (command, present) in [("drag", "path"), ("scroll", "x"), ("screenshot", "format")] {
+            let entry = parameters_for(command).expect("allowlisted");
+            assert!(
+                entry.required.contains(&present) || entry.optional.contains(&present),
+                "{present} should be declared on {command}; the control is broken"
             );
         }
     }
