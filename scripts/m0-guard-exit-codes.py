@@ -2,10 +2,21 @@
 """Defeat one operator-surface guard at a time, run the tests it should
 protect, and restore it.
 
-This is the red-then-green evidence behind M0-03's exit-code vocabulary.
-The guards live in `crates/tunnel-client/src/main.rs` and are witnessed by
-that binary's unit tests plus the real-process fixtures in
-`crates/tunnel-client/tests/exit_codes_cli.rs`.
+This is the red-then-green evidence behind two of M0-03's client operator
+surfaces: the exit-code vocabulary the row was opened for, and the `doctor`
+report (M6-C07).  The guards live in `crates/tunnel-client/src/main.rs` and
+`crates/tunnel-client/src/doctor.rs` and are witnessed by that binary's unit
+tests plus the real-process fixtures in
+`crates/tunnel-client/tests/exit_codes_cli.rs` and
+`crates/tunnel-client/tests/doctor_cli.rs`.
+
+**The filename says exit codes and the harness now covers more than that.**
+Kept here rather than split into a second file because the witness suite is
+the same one -- `cargo test -p tunnel-client` builds and runs every target
+both surfaces are witnessed by -- and a harness that names a different
+package than the tests it runs is the M3-19 failure this whole family of
+scripts exists to avoid.  A second file would have had to duplicate the
+suite definition to avoid duplicating nothing.
 
 **What the row is about.** `CliError::exit_code` used to match `&'static str`
 with a `_ => 1` arm.  Six live causes had no entry in that table, so they
@@ -89,6 +100,7 @@ CLIENT = REPO / "crates" / "tunnel-client"
 
 MAIN = CLIENT / "src" / "main.rs"
 LIB = CLIENT / "src" / "lib.rs"
+DOCTOR = CLIENT / "src" / "doctor.rs"
 
 #: The whole client suite.  It is seconds long, and the guards here are
 #: witnessed by both the binary's unit tests and the process fixtures, which
@@ -307,7 +319,84 @@ CASES: list[Case] = [
         ],
         frozenset({"tests::every_exit_status_is_in_the_published_vocabulary"}),
     ),
+    # ------------------------------------------------- the doctor's report
+    Case(
+        # **M6-C07, and the surface an outside tester reads first.**  `doctor`
+        # computes `supervisor_ipc` and `process_containment` before it even
+        # attempts to load the configuration, and used to throw the whole
+        # `DoctorResult` away whenever an error was present -- so a machine
+        # nobody had provisioned yet, which is every fresh install, got
+        # `result: null` and could not read the one surface that says whether
+        # process containment is available.
+        #
+        # **This edit isolates "on a failing run" rather than blanking the
+        # checks outright.**  Blanking them unconditionally would also redden
+        # the success fixtures, and a case that reddens the happy path proves
+        # nothing about the failing one.  The `..result` update syntax keeps
+        # every other check intact, so the only thing the witnesses can be
+        # reacting to is the capability report going missing on error.
+        "a failing run still reports the host capability checks",
+        [
+            (
+                DOCTOR,
+                "            ok,\n            result,\n            error,",
+                "            ok,\n"
+                "            result: if ok {\n"
+                "                result\n"
+                "            } else {\n"
+                "                DoctorResult {\n"
+                "                    supervisor_ipc: CapabilityCheck {\n"
+                '                        status: "not_run",\n'
+                '                        code: "NOT_RUN",\n'
+                "                    },\n"
+                "                    process_containment: CapabilityCheck {\n"
+                '                        status: "not_run",\n'
+                '                        code: "NOT_RUN",\n'
+                "                    },\n"
+                "                    ..result\n"
+                "                }\n"
+                "            },\n"
+                "            error,",
+            )
+        ],
+        # Both layers, deliberately.  The unit test proves the in-process
+        # shape; the four process fixtures prove it survives serialization to
+        # the stdout an actual tester reads, which is the only place the
+        # defect was ever visible.  Naming one layer would let the other be
+        # deleted without this case noticing.
+        frozenset(
+            {
+                "doctor::tests::"
+                "invalid_configuration_is_exit_two_and_does_not_inspect_credentials",
+                "doctor_binary_rejects_invalid_configuration_with_exit_two",
+                "doctor_binary_redacts_missing_credential_and_returns_exit_three",
+                "doctor_binary_returns_exit_three_for_permissive_private_key",
+                "doctor_binary_returns_exit_three_for_permissive_credential_directory",
+            }
+        ),
+    ),
     # ------------------------------------------------- totality, by compiler
+    Case(
+        # **The structural half of M6-C07, and the reason the fix was a type
+        # change rather than a value change.**  `DoctorOutput::result` is not
+        # an `Option`: `DoctorResult` already carries a per-check `not_run`
+        # status, so "this check did not run" is expressible inside the
+        # struct, and an outer `Option` is a second, coarser way to say the
+        # same thing whose only additional power is to discard the checks
+        # that *did* run.  Restoring the `Option` makes `inspection()` fail to
+        # type-check, so the original `if ok { Some(result) } else { None }`
+        # cannot be reintroduced by editing a value.  Reported as a compiler
+        # refusal and never counted as a red test.
+        "the doctor's result cannot be made optional again",
+        [
+            (
+                DOCTOR,
+                "    pub(crate) result: DoctorResult,",
+                "    pub(crate) result: Option<DoctorResult>,",
+            )
+        ],
+        expect_build_failure=True,
+    ),
     Case(
         # The rule that replaced the string table.  Removing an arm leaves
         # the match non-exhaustive and the crate does not build.  Reported

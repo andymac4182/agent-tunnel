@@ -39,9 +39,12 @@ that is **not the build machine**.  Every check here therefore runs against the
                 resolution rule and then **executes** the result, because
                 `resolve_sentinel` accepts any `is_file()`: a decoy of the
                 right name makes the product itself report the sentinel
-                present.  It does not ask `doctor`: on an unprovisioned bundle
-                `doctor` computes the capability checks and then discards them
-                along with the rest of its result (docs/tasks.md M6-C07).
+                present.  It does not ask `doctor`, whose containment answer
+                comes from that same `is_file()` and so reports a decoy as
+                present (docs/tasks.md M6-C08).  `doctor` *can* now be read on
+                an unprovisioned bundle -- it reports its checks alongside the
+                error instead of discarding them (M6-C07) -- but reading it
+                here would inherit the weaker rule.
   `cli`         `--help`, `--version`, both `check-config` forms and
                 `check-serve-config` on every bundled `*-relay.toml`,
                 executed from the unpacked bundle and asserting **content**,
@@ -907,18 +910,25 @@ def check_assets(bundle: Path) -> Result:
     # then executing the result.
     #
     # **Why not `tunnel-client doctor`, which is the surface that reports
-    # containment.** Its answer cannot be read from an unpacked bundle.
-    # `doctor` *does* compute the capability checks -- `inspect` builds
-    # `process_containment` before it even attempts to load the configuration
-    # -- and then **discards the whole result** whenever any error is present
-    # (`doctor.rs:183`, `result: if ok { Some(result) } else { None }`).  On a
-    # bundle nobody has provisioned that means exit 3, `CREDENTIAL_MISSING`,
-    # and `result: null`: the capability was measured and thrown away, which
-    # is a different defect from never running it and is the one recorded in
-    # docs/tasks.md row M6-C07.  A check written against doctor
-    # would therefore have been red for every bundle regardless of whether the
-    # sentinel was there, which is the mirror image of a check that is green
-    # regardless.
+    # containment.**  When this check was written, doctor's answer could not
+    # be read from an unpacked bundle at all: `inspect` built
+    # `process_containment` before it even attempted to load the
+    # configuration and then discarded the whole result whenever any error
+    # was present, so a bundle nobody had provisioned gave exit 3,
+    # `CREDENTIAL_MISSING`, and `result: null`.  A check written against
+    # doctor would have been red for every bundle regardless of whether the
+    # sentinel was there -- the mirror image of a check that is green
+    # regardless.  **That is fixed (M6-C07): `DoctorOutput::result` is no
+    # longer an `Option` and the checks are reported on every path.**
+    #
+    # This check still does not ask doctor, and the reason is now a different
+    # and better one.  Doctor's containment answer comes from
+    # `availability()`, which is satisfied by `resolve_sentinel`'s bare
+    # `is_file()` -- so doctor reports `SENTINEL_PRESENT` for a zero-byte
+    # decoy.  Asking doctor would be asking a question this check already
+    # knows how to answer more strongly, and would make the release gate
+    # inherit a product defect instead of catching it.  The remaining
+    # `is_file()` weakness has its own row.
     #
     # So this replays `tunnel_deadman::resolve_sentinel`'s no-explicit-path
     # branch -- `SENTINEL_BIN` beside the running executable -- and then does
@@ -981,9 +991,12 @@ def check_assets(bundle: Path) -> Result:
     # instead of claimed.
     result.note("behaviour only: exit 2 on both probes does not identify the bytes; "
                 "checksums and provenance bind those, and a control measures the seam")
-    result.note("doctor is not used here: on an unprovisioned bundle it computes "
-                "the capability checks and then discards them with the rest of the "
-                "result, exiting CREDENTIAL_MISSING with result:null (M6-C07)")
+    result.note("doctor is not used here: its containment answer comes from "
+                "resolve_sentinel's bare is_file(), so it reports the sentinel "
+                "present for a decoy this check rejects (M6-C08). It can now be "
+                "read on an unprovisioned bundle -- it reports the checks "
+                "alongside the error rather than discarding them (M6-C07) -- but "
+                "reading it would inherit the weaker rule")
     return result
 
 
@@ -1776,9 +1789,11 @@ def cmd_bundle(args: argparse.Namespace) -> int:
     (out / "bin").mkdir(parents=True)
     (out / "examples").mkdir()
 
-    # Binaries.  tunnel-deadman is not in the parity bundle (it packages
-    # client, relay and harness only), so it is taken from the parity build's
-    # own target directory -- the same build, same source copy.
+    # Binaries.  The parity bundle packages tunnel-deadman since M6-C06; the
+    # fallback to the parity build's own target directory -- the same build,
+    # same source copy -- is kept so a receipt produced before that fix still
+    # bundles, and so the sentinel is never silently dropped if a future
+    # assembler's list changes again.
     target_root = receipt.parent / "cargo-target" / args.profile
     digests = {}
     for name in BUNDLE_BINARIES:
@@ -1793,13 +1808,15 @@ def cmd_bundle(args: argparse.Namespace) -> int:
         digests[name] = sha256_file(destination)
 
     # Cross-check against the receipt for every binary the receipt attests.
-    # **`tunnel-deadman` is not one of them**: the parity script packages
-    # client, relay and harness only (docs/tasks.md M6-C06), so the sentinel
-    # comes from the same build's target directory and is attested by this
-    # bundle's own digest rather than by the receipt.  That distinction is
-    # written into PROVENANCE.txt instead of being papered over, because a
-    # provenance file that claims uniform receipt coverage it does not have is
-    # worse than one that states the gap.
+    # **`tunnel-deadman` is one of them since M6-C06**, which closed the gap
+    # this comment used to record: the parity script packaged client, relay
+    # and harness only, so the sentinel came from the same build's target
+    # directory and was attested by this bundle's own digest rather than by
+    # the receipt.  The set is still computed from the receipt rather than
+    # assumed, and PROVENANCE.txt still names it, because a provenance file
+    # that claims uniform receipt coverage it does not have is worse than one
+    # that states the gap -- and a receipt predating M6-C06 still produces the
+    # narrower set.
     receipt_attested = []
     for name, digest in sorted(digests.items()):
         recorded = receipt_field(receipt_text, f"binary_{name}_sha256")

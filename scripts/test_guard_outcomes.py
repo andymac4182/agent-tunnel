@@ -90,6 +90,7 @@ def main() -> int:
     the_preflight_accepts_an_anchor_that_resolves_once()
     the_preflight_lists_every_mismatch_not_just_the_first()
     a_harness_local_problem_still_fails_the_preflight()
+    every_mutation_harness_is_registered()
     every_guard_anchor_resolves_to_exactly_one_occurrence()
 
     # M5-C07, behavioural first and source-text last.
@@ -253,6 +254,19 @@ EXPECTED_GUARD_ANCHORS = {
     # suite dropping out.
     "m5-guard-deletion.py": 100,
     "m3-guard-deletion.py": 5,
+    # **Two harnesses that were never in this registry at all**, added by the
+    # m6c3 worker (M6-C06/M6-C07).  Absence here is quieter than a stale
+    # floor: every rule this file holds over a guard harness -- the
+    # `--check-anchors` short circuit, `AppliedCase`, `install_interrupt_
+    # restore`, `refuse_resident_mutation`, the banned rewrite spellings --
+    # was simply not applied to them.  Measured at `38d857b`:
+    # m0 13 anchors across 2 suites, m6 2 across 2.
+    #
+    # m6's two is small because most of its cases plant inputs rather than
+    # edit code, and that is the honest figure: a floor set to the number of
+    # *cases* would pass while the anchored ones rotted.
+    "m0-guard-exit-codes.py": 13,
+    "m6-guard-client-bundle-sentinel.py": 2,
 }
 
 
@@ -363,6 +377,74 @@ def the_flag_short_circuits_before_anything_is_edited(script: Path) -> None:
         guard in text and text.index(dispatch) < text.index(guard),
         f"{script.name} dispatches --check-anchors only after it has begun "
         "editing the tree; the flag must short-circuit first",
+    )
+
+
+#: The two files that use `AppliedCase` without being mutation harnesses: the
+#: module that defines it, and this file, which tests it.  Named rather than
+#: pattern-matched, and their continued existence is asserted below, so a
+#: rename cannot silently widen the harness set to include them -- or, worse,
+#: narrow it by making the discovery below match nothing at all.
+NOT_HARNESSES = {"guard_outcomes.py", "test_guard_outcomes.py"}
+
+
+def every_mutation_harness_is_registered() -> None:
+    """Discover mutation harnesses, and refuse an unregistered one.
+
+    **The class behind an instance this file already had.**  Every rule below
+    -- the `--check-anchors` short circuit, `AppliedCase`, the interrupt
+    restore, the resident-mutation refusal, the banned rewrite spellings, the
+    anchor floor -- is applied only to the harnesses named in
+    `EXPECTED_GUARD_ANCHORS`.  Nothing checked that the names were *all* of
+    them.  `m0-guard-exit-codes.py` was created and went unregistered, so for
+    the hours it existed this file held none of its rules over it and said
+    nothing; `m6-guard-client-bundle-sentinel.py` would have been the second.
+    Both were caught by a person noticing, which is not a mechanism.
+
+    **Discovery is behavioural, not by filename.**  A glob such as
+    `*-guard-*.py` happens to match the six harnesses today and is evaded by
+    the next sensible name -- `m7-evidence-guard.py` already misses it, and a
+    harness called `m9_guard.py` would too.  What actually makes a file a
+    mutation harness is that it edits product bodies through `AppliedCase`,
+    so that is what is matched.
+
+    **It refuses; it does not auto-register.**  Adding a discovered harness to
+    the floor dictionary with a default of 0 would satisfy this check while
+    reinstating the vacuity it exists to prevent: a floor of 0 passes over a
+    harness that selected nothing.  A new harness has to be measured and
+    written down by the person adding it, and until then this file is red.
+    """
+    directory = Path(__file__).resolve().parent
+    for name in sorted(NOT_HARNESSES):
+        check(
+            (directory / name).exists(),
+            f"{name} is named as a non-harness but does not exist; the "
+            "discovery below would silently change shape",
+        )
+    discovered = {
+        path.name
+        for path in sorted(directory.glob("*.py"))
+        if path.name not in NOT_HARNESSES
+        and "from guard_outcomes import AppliedCase" in path.read_text()
+    }
+    check(
+        bool(discovered),
+        "no mutation harness was discovered at all; the detection above has "
+        "stopped matching and every rule in this file is now held over nothing",
+    )
+    unregistered = sorted(discovered - set(EXPECTED_GUARD_ANCHORS))
+    check(
+        not unregistered,
+        "mutation harness(es) not in EXPECTED_GUARD_ANCHORS, so none of this "
+        f"file's rules are held over them: {unregistered}. Run each with "
+        "--check-anchors and record the measured figure; do not default it to "
+        "0, which passes over a harness that selected nothing.",
+    )
+    stale = sorted(set(EXPECTED_GUARD_ANCHORS) - discovered)
+    check(
+        not stale,
+        "EXPECTED_GUARD_ANCHORS names harness(es) that no longer use "
+        f"AppliedCase, or no longer exist: {stale}",
     )
 
 

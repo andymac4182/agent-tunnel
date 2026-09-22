@@ -214,8 +214,62 @@ def main() -> int:
         "recorded_upstream_pins and on task row M8-C21",
     )
 
+    the_status_predicate_is_exercised_in_both_directions()
+
     print("test_evidence_guard_pins: PASS")
     return 0
+
+
+def the_status_predicate_is_exercised_in_both_directions() -> None:
+    """`row_is_verified` and `status_column`, driven rather than inspected.
+
+    **Why this exists (M6-C10, second round).**  The widened predicate reads a
+    `Status` column located from the table's own header, and rejects cells
+    that claim verification in a negated or in-progress form.  Measured
+    against the real documents, the negation list excludes exactly **2** rows
+    and every entry other than `in progress` excludes **none** -- the awaiting
+    spellings in use say "verification", not "verified", so they never reach
+    it.  A list that currently cannot fire is indistinguishable from one that
+    is broken, and the repository already holds journal cells reading "not
+    verified" that would be admitted the day such a cell appeared in a table
+    with a `Status` column.  So the rule is driven here instead of being
+    trusted because the suite is green.
+    """
+    header = "| ID | Task | Status | Owner | Acceptance or evidence | Completed at |"
+    other = "| Milestone | Current state | Gate statement | Completed at |"
+    journal = "| At | Item | Event | Evidence or scope |"
+    check(guard.status_column(header) == 2, "the task table's Status column is index 2")
+    check(guard.status_column(other) is None, "the milestone table has no Status column")
+    check(guard.status_column(journal) is None, "the journal table has no Status column")
+
+    def status(cell: str) -> str:
+        return f"| M0-00 | [x] a task | {cell} | owner | evidence | — |"
+
+    for cell in ("verified local", "verified (local; with a parenthetical)",
+                 "implemented (verified local)", "re-verified local",
+                 "first verified local at declared scope"):
+        check(
+            guard.row_is_verified(status(cell), 2),
+            f"a status claiming verification must be in scope: {cell!r}",
+        )
+    for cell in ("implemented awaiting verification", "in progress",
+                 "in progress (exit codes verified local; the rest planned)",
+                 "not verified", "unverified", "planned", "open"):
+        check(
+            not guard.row_is_verified(status(cell), 2),
+            f"a status not claiming verification must stay out of scope: {cell!r}",
+        )
+
+    # The exact-match half still holds a row whose table has no Status column,
+    # which is what keeps the widening from ever removing a row from scope.
+    check(
+        guard.row_is_verified("| M1 / tunnel | verified local | prose | — |", None),
+        "the exact-match rule must still hold a row with no Status column",
+    )
+    check(
+        not guard.row_is_verified("| M1 / tunnel | in progress | prose | — |", None),
+        "a row with no Status column and no exact match stays out of scope",
+    )
 
 
 if __name__ == "__main__":

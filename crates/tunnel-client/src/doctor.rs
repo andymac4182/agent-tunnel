@@ -28,7 +28,18 @@ pub(crate) struct DoctorOutput {
     pub(crate) schema_version: u8,
     pub(crate) command: &'static str,
     pub(crate) ok: bool,
-    pub(crate) result: Option<DoctorResult>,
+    /// The capability and credential checks, **always present**.
+    ///
+    /// This is deliberately not an `Option`. `DoctorResult` already carries a
+    /// per-check `not_run` status, so "this check did not run" is expressible
+    /// inside the struct; an outer `Option` is a second, coarser way to say
+    /// the same thing, and the coarser one discards the checks that *did*
+    /// run. It previously did exactly that on every failing run, which hid
+    /// `process_containment` -- a check about the host, not the
+    /// configuration -- from precisely the unprovisioned machines whose
+    /// operator needs it (M6-C07). Making the field non-optional means that
+    /// discard cannot be reintroduced without a compile error.
+    pub(crate) result: DoctorResult,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) error: Option<DoctorError>,
 }
@@ -173,6 +184,13 @@ pub(crate) fn inspect(path: &Path, now: SystemTime) -> DoctorInspection {
     inspection(result, error, exit_code)
 }
 
+/// Pair one `DoctorResult` with the error and exit code it produced.
+///
+/// `ok` is derived from `error` so the two can never disagree. The result is
+/// reported whether or not the run failed: every leaf of `DoctorResult` is a
+/// `&'static str` status or code, a permission mode, a certificate count or a
+/// unix timestamp, so no path, endpoint or credential body can appear in it
+/// and withholding it protects nothing.
 fn inspection(result: DoctorResult, error: Option<DoctorError>, exit_code: u8) -> DoctorInspection {
     let ok = error.is_none();
     DoctorInspection {
@@ -180,7 +198,7 @@ fn inspection(result: DoctorResult, error: Option<DoctorError>, exit_code: u8) -
             schema_version: SCHEMA_VERSION,
             command: "doctor",
             ok,
-            result: if ok { Some(result) } else { None },
+            result,
             error,
         },
         exit_code: if ok { 0 } else { exit_code },
@@ -747,11 +765,7 @@ mod tests {
         );
         assert!(inspection.output.ok);
         assert_eq!(inspection.exit_code, 0);
-        let result = inspection
-            .output
-            .result
-            .as_ref()
-            .expect("successful doctor inspection has a result");
+        let result = &inspection.output.result;
         assert_eq!(result.supervisor_ipc.status, "not_implemented");
         assert_eq!(result.credential_key_match.status, "ok");
         let json = serde_json::to_string(&inspection.output).expect("doctor serializes");
@@ -795,11 +809,7 @@ mod tests {
             &fixture.config,
             UNIX_EPOCH + Duration::from_secs(1_800_000_000),
         );
-        let mut result = inspection
-            .output
-            .result
-            .clone()
-            .expect("successful doctor inspection has a result");
+        let mut result = inspection.output.result.clone();
         result.process_containment = missing;
         assert!(
             first_credential_failure(&result).is_none(),
@@ -882,8 +892,50 @@ mod tests {
             inspection.output.error.as_ref().map(|error| error.code),
             Some("INVALID_CONFIG")
         );
-        assert!(inspection.output.result.is_none());
+        // The result is **reported**, not discarded (M6-C07). What this test
+        // is named for -- that an unparseable configuration does not go on to
+        // read credential files -- is now asserted directly, per check,
+        // instead of being inferred from a `result: null` that proved only
+        // that nothing was said. `not_run` is a distinct status from
+        // `failed`, so "was not attempted" and "was attempted and failed" do
+        // not collapse into each other here.
+        let result = &inspection.output.result;
+        assert_eq!(result.config.status, "failed");
+        assert_eq!(result.config.code, Some("INVALID_CONFIG"));
+        assert_eq!(result.credential_key_match.status, "not_run");
+        assert_eq!(result.permissions.status, "not_run");
+        assert_eq!(result.permissions.private_key.status, "not_run");
+        assert_eq!(result.permissions.credential_directory.status, "not_run");
+        assert_eq!(result.expiry.status, "not_run");
+        assert_eq!(result.expiry.client_certificate.status, "not_run");
+        assert_eq!(result.expiry.server_ca.status, "not_run");
+
+        // The capability checks are about the host, not the configuration, so
+        // an unparseable configuration is no reason to withhold them -- and
+        // an unprovisioned machine is exactly where an operator needs them.
+        assert_eq!(result.supervisor_ipc.code, "SUPERVISOR_IPC_NOT_IMPLEMENTED");
+        assert!(
+            result
+                .process_containment
+                .code
+                .starts_with("PROCESS_CONTAINMENT_"),
+            "containment must be reported on a failing run, got {:?}",
+            result.process_containment.code
+        );
+
         let json = serde_json::to_string(&inspection.output).expect("doctor serializes");
+        // Without these two, the redaction assertions below would pass on an
+        // empty object. They were near-vacuous while `result` was null: the
+        // only serialized object was the static error, which never contained
+        // a path or an endpoint in the first place.
+        assert!(
+            json.contains("\"process_containment\""),
+            "the failing-run report must carry the capability checks: {json}"
+        );
+        assert!(
+            json.contains("\"not_run\""),
+            "the failing-run report must distinguish not-run from failed: {json}"
+        );
         assert!(!json.contains("secret-key.pem"));
         assert!(!json.contains("relay.example.test"));
     }
