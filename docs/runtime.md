@@ -111,7 +111,9 @@ Remote agents may invoke only locally configured exports. The CLI has no remotel
 
 ### Client exit codes
 
-These are the exit statuses `tunnel-client` selects, and they are implemented rather than proposed. `Cause::exit_code` in `crates/tunnel-client/src/main.rs` is the authority; this table is a copy of it, and the two are kept together by the guard cases in `scripts/m0-guard-exit-codes.py`.
+These are the exit statuses `tunnel-client` selects, and they are implemented rather than proposed. `Cause::exit_code` in `crates/tunnel-client/src/main.rs` is the authority.
+
+**This table is a copy, and nothing checks it against the code.** No guard compares this Markdown to that function, so it can fall behind exactly the way the chaos gate's own copy of the vocabulary did before M0-03 replaced it with an import. What *is* checked mechanically: `tunnel_client::CLI_DIAGNOSTIC_EXIT_CODES` is the single definition of the set of statuses, `every_exit_status_is_in_the_published_vocabulary` fails if any cause maps outside it, and `scripts/m0-guard-exit-codes.py` holds the individual mappings to their meanings. A reviewer changing a status must edit this table by hand.
 
 | Code | Meaning | Diagnostic codes that select it | What the operator does |
 | --- | --- | --- | --- |
