@@ -977,6 +977,54 @@ mod tests {
         assert_eq!(internal, 1, "unexpected internal failure");
     }
 
+    /// Every status this binary can produce must be in the vocabulary the
+    /// library publishes, because other crates classify against that.
+    ///
+    /// The production-cluster chaos gate buckets a connector's pre-readiness
+    /// exit, and it used to hold its own copy of the list beside a comment
+    /// naming `CliError::exit_code` as the source. Adding `7` and `130` here
+    /// made that copy wrong, and nothing could have said so: a comment is
+    /// not a link. The copy is gone, and this is the assertion that keeps
+    /// the remaining one honest in the other direction — a cause mapped to
+    /// an unpublished status fails here rather than at a release gate.
+    #[test]
+    fn every_exit_status_is_in_the_published_vocabulary() {
+        let causes = [
+            Cause::InvalidInvocation,
+            Cause::ConfigError,
+            Cause::InvalidConfig,
+            Cause::CredentialError,
+            Cause::AuthorizationStale,
+            Cause::TransportError,
+            Cause::SessionClosed,
+            Cause::DeadlineExceeded,
+            Cause::OwnerBusy,
+            Cause::ResourceExhausted,
+            Cause::Cancelled,
+            Cause::ProtocolError,
+            Cause::SupervisorFailed,
+            Cause::SignalError,
+        ];
+        for cause in causes {
+            let status = cause.exit_code();
+            assert!(
+                tunnel_client::CLI_DIAGNOSTIC_EXIT_CODES.contains(&status),
+                "{cause:?} exits {status}, which is not in \
+                 CLI_DIAGNOSTIC_EXIT_CODES; add it there and to the table in \
+                 docs/runtime.md, or classify the cause differently"
+            );
+        }
+        // The list above is a hand-written enumeration and could fall behind
+        // the enum. It cannot fall behind silently: `Cause::code` is an
+        // exhaustive match, so a new variant breaks the build there first,
+        // and the codes below pin this list's size and contents against the
+        // set of published codes.
+        let codes: std::collections::BTreeSet<&str> =
+            causes.iter().map(|cause| cause.code()).collect();
+        assert_eq!(causes.len(), 14, "one entry per Cause variant");
+        assert_eq!(codes.len(), 14, "every cause publishes a distinct code");
+    }
+
     /// Exit `1` is reserved. Anything else landing there is the regression
     /// this row exists to stop.
     #[test]

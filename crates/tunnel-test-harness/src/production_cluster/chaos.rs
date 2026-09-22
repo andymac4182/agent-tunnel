@@ -349,19 +349,27 @@ const CLASS_VOCABULARY: [InterruptionClass; 7] = [
     InterruptionClass::Unclassified,
 ];
 
-/// The `tunnel-client` CLI's exit codes are a closed, documented vocabulary
-/// (`crates/tunnel-client/src/main.rs`, `CliError::exit_code`): 1 other,
-/// 2 invocation/config, 3 credential, 4 transport or supervisor-absent,
-/// 5 deadline exceeded, 6 outcome unknown.  A pre-readiness exit carrying one
-/// of those codes is a classified interruption.  Anything else — a signal death
-/// with no exit code, or a success exit that should not have happened before
-/// readiness — matches no bucket and blocks release.
-const CLIENT_EXIT_CODES: [i32; 6] = [1, 2, 3, 4, 5, 6];
-
 /// Map a pre-readiness CLI exit onto the closed vocabulary.
+///
+/// The accepted statuses come from `tunnel_client::CLI_DIAGNOSTIC_EXIT_CODES`
+/// and are **not restated here**.  This function used to carry its own
+/// `[1, 2, 3, 4, 5, 6]` literal beside a comment naming `CliError::exit_code`
+/// as its source; when M0-03 added `7` and `130` to that mapping, the literal
+/// went on quietly classifying two real interruptions as `Unclassified`,
+/// which blocks release.  A comment is not a link, and nothing could have
+/// reported the drift.
+///
+/// Anything outside that set — a signal death with no exit code, or a success
+/// exit that should not have happened before readiness — matches no bucket and
+/// blocks release.
 fn classify_client_exit(code: Option<i32>) -> InterruptionClass {
     match code {
-        Some(code) if CLIENT_EXIT_CODES.contains(&code) => InterruptionClass::ClientExitBeforeReady,
+        Some(code)
+            if u8::try_from(code)
+                .is_ok_and(|code| tunnel_client::CLI_DIAGNOSTIC_EXIT_CODES.contains(&code)) =>
+        {
+            InterruptionClass::ClientExitBeforeReady
+        }
         _ => InterruptionClass::Unclassified,
     }
 }
@@ -1579,14 +1587,29 @@ mod tests {
 
     #[test]
     fn a_pre_readiness_cli_exit_is_classified_only_for_typed_exit_codes() {
-        // The CLI's documented exit codes are a closed vocabulary.
-        for code in [1, 2, 3, 4, 5, 6] {
+        // Driven from the connector's own exported vocabulary, not a copy of
+        // it: a code added there must be classified here without an edit.
+        for code in tunnel_client::CLI_DIAGNOSTIC_EXIT_CODES {
             assert_eq!(
-                classify_client_exit(Some(code)),
+                classify_client_exit(Some(i32::from(code))),
                 InterruptionClass::ClientExitBeforeReady,
                 "exit code {code} is a typed CLI diagnostic"
             );
         }
+        // The two statuses M0-03 added. Named explicitly as well as covered
+        // by the loop above, because this test previously asserted that `7`
+        // was *unclassified* — a pin that would have silently outlived the
+        // change that made it wrong, had the loop been the only coverage.
+        assert_eq!(
+            classify_client_exit(Some(7)),
+            InterruptionClass::ClientExitBeforeReady,
+            "a connector refused before dispatch is a classified interruption"
+        );
+        assert_eq!(
+            classify_client_exit(Some(130)),
+            InterruptionClass::ClientExitBeforeReady,
+            "an interrupted connector is a classified interruption"
+        );
         // A signal death carries no exit code, and a success exit before
         // readiness is not a diagnostic at all.  Neither is classified.
         assert_eq!(classify_client_exit(None), InterruptionClass::Unclassified);
@@ -1594,8 +1617,14 @@ mod tests {
             classify_client_exit(Some(0)),
             InterruptionClass::Unclassified
         );
+        // Still outside the vocabulary, so the classifier is not merely
+        // accepting everything.
         assert_eq!(
-            classify_client_exit(Some(7)),
+            classify_client_exit(Some(9)),
+            InterruptionClass::Unclassified
+        );
+        assert_eq!(
+            classify_client_exit(Some(-1)),
             InterruptionClass::Unclassified
         );
     }

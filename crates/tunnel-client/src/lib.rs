@@ -62,6 +62,27 @@ pub use config::{
 pub use credentials::{CsrOutput, ImportedCredential};
 pub use tokio_util::sync::CancellationToken as ConnectCancellation;
 
+/// Every process exit status `tunnel-client` can produce to report a
+/// failure, as a closed set. Success (`0`) is deliberately absent: it is not
+/// a diagnostic, and a caller that treats it as one cannot tell a completed
+/// run from one that never started.
+///
+/// **This lives here, in the library, because it had been copied.** The
+/// production-cluster chaos gate classifies a connector's pre-readiness exit
+/// against this vocabulary, and it held its own `[1, 2, 3, 4, 5, 6]` literal
+/// with a comment pointing at `CliError::exit_code` — a cross-crate
+/// invariant that nothing checked. When task row M0-03 gave `OWNER_BUSY` and
+/// `RESOURCE_EXHAUSTED` exit `7` and `CANCELLED` exit `130`, that literal
+/// silently began classifying two real interruptions as `Unclassified`,
+/// which blocks release. One copy, imported by both, is what stops the next
+/// one.
+///
+/// `6` is listed and is not currently reachable; see the exit-code table in
+/// `docs/runtime.md`. Listing it is safe in the direction that matters: this
+/// is the set a classifier may *accept*, so an unreachable member costs
+/// nothing, while a missing member misclassifies a real exit.
+pub const CLI_DIAGNOSTIC_EXIT_CODES: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 130];
+
 /// The M1 failure policy. A later caller can explicitly create a fresh
 /// session; the library never reconnects or replays an operation itself.
 pub const M1_TRANSPORT_FAILURE_POLICY: &str =

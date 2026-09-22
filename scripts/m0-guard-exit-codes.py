@@ -224,6 +224,27 @@ CASES: list[tuple[str, list[Edit], bool]] = [
         ],
         False,
     ),
+    # ------------------------------------------------ the shared vocabulary
+    (
+        # The cross-crate rule, and the one this row got wrong before a
+        # reviewer would have.  `CLI_DIAGNOSTIC_EXIT_CODES` is what the
+        # production-cluster chaos gate classifies a connector's
+        # pre-readiness exit against.  A cause mapped to a status outside it
+        # is classified `Unclassified`, which blocks release -- and until
+        # this row the gate held its *own copy* of the list, so the drift
+        # was invisible on both sides.  Mapping to an unpublished status
+        # must fail in the connector's own tests, not at a release gate
+        # hours later.
+        "an exit status outside the published vocabulary is refused",
+        [
+            (
+                MAIN,
+                "            Self::OwnerBusy | Self::ResourceExhausted => 7,",
+                "            Self::OwnerBusy | Self::ResourceExhausted => 9,",
+            )
+        ],
+        False,
+    ),
     # ------------------------------------------------- totality, by compiler
     (
         # The rule that replaced the string table.  Removing an arm leaves
@@ -264,7 +285,48 @@ class Suite:
     cwd: Path = REPO
 
 
-SUITES: list[Suite] = [Suite("m0c03-exit-codes", [CLIENT], CARGO_TEST, CASES)]
+#: A second suite, for the rule whose witness lives in the production-cluster
+#: harness rather than in the connector.  It is separate because it names a
+#: different package: `cargo test -p tunnel-client` builds no test target of
+#: `tunnel-test-harness`, so a case edited into the classifier would be run
+#: against nothing at all and reported as `still green` -- the M3-19 failure.
+HARNESS = REPO / "crates" / "tunnel-test-harness"
+CHAOS = HARNESS / "src" / "production_cluster" / "chaos.rs"
+
+HARNESS_TEST = [
+    "cargo",
+    "test",
+    "-p",
+    "tunnel-test-harness",
+    "--lib",
+    "--locked",
+    "--no-fail-fast",
+    "production_cluster::chaos::tests::a_pre_readiness",
+]
+
+HARNESS_CASES: list[tuple[str, list[Edit], bool]] = [
+    (
+        # The other half of the cross-crate rule.  A classifier that accepts
+        # every status classifies a signal death and a spurious success as
+        # interruptions, which is worse than the drift it replaced: the gate
+        # would report a clean run through exactly the failures it exists to
+        # catch.  The `Some(9)` and `Some(-1)` assertions are what stop it.
+        "the exit classifier does not accept every status",
+        [
+            (
+                CHAOS,
+                "            if u8::try_from(code)\n                .is_ok_and(|code| tunnel_client::CLI_DIAGNOSTIC_EXIT_CODES.contains(&code)) =>",
+                "            if u8::try_from(code).is_ok_and(|_| true) =>",
+            )
+        ],
+        False,
+    ),
+]
+
+SUITES: list[Suite] = [
+    Suite("m0c03-exit-codes", [CLIENT], CARGO_TEST, CASES),
+    Suite("m0c03-classifier", [HARNESS], HARNESS_TEST, HARNESS_CASES),
+]
 
 #: Cases whose green result is itself the measurement.  Empty today, and kept
 #: so a future case that needs one has the mechanism rather than inventing it.
@@ -371,7 +433,7 @@ def main() -> int:
         ),
     )
     parser.add_argument("--case", help="run only cases whose name contains this text")
-    parser.add_argument("--suite", help="run only this suite (m0c03-exit-codes)")
+    parser.add_argument("--suite", help="run only this suite (m0c03-exit-codes, m0c03-classifier)")
     arguments = parser.parse_args()
 
     suites = SUITES
