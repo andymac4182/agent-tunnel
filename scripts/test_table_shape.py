@@ -237,6 +237,52 @@ def main() -> int:
         f"exempted: {exempt} exempt, {findings}",
     )
 
+    # --- the status-column split must be split_cells, not a bare split -----
+    #
+    # M4-40, half discharged.  `status_column` and `row_is_verified` take a
+    # Status index from the header and read that cell.  With a bare-pipe split
+    # an escaped pipe ANYWHERE LEFT OF the Status column shifts every later
+    # index, so the predicate reads a fragment of Task prose and calls it a
+    # status.  On the real M4-33 row the naive split gives 18 cells and index 2
+    # lands mid-sentence.
+    #
+    # This was invisible in every outcome: the exact-match `or` fallback still
+    # found a bare `verified local` among the fragments, so the guard's verdict
+    # was right for the wrong reason on that row.  A test written against the
+    # verdict would pass with the defect present, which is why this one asserts
+    # the SELECTED CELL.
+    escaped = (
+        r"| M4-33 | [x] Rows carry an unescaped `\|` in their cell. "
+        r"| verified local | tooling | prose | — |"
+    )
+    index = guard.status_column(HEADER)
+    check(index == 2, f"the Status column of the real header is index 2, got {index}")
+    check(
+        guard.split_cells(escaped)[index] == "verified local",
+        f"index {index} must select the Status cell, got "
+        f"{guard.split_cells(escaped)[index]!r}",
+    )
+    naive = [c.strip() for c in escaped.strip().strip("|").split("|")]
+    check(
+        naive[index] != "verified local",
+        "this fixture is supposed to DEMONSTRATE the naive split going wrong; "
+        "if a bare split now selects the right cell the fixture has lost its "
+        "escaped pipe and is no longer testing anything",
+    )
+    # And the predicate itself must read that cell, with the exact-match
+    # fallback removed from the picture so it cannot mask the result.
+    saved_claims = guard.NOT_A_VERIFIED_CLAIM
+    try:
+        masked = escaped.replace("| verified local |", "| implemented (verified local) |")
+        check(
+            guard.row_is_verified(masked, index),
+            "the Status cell says 'implemented (verified local)', which no "
+            "exact match can reach, so this passes only if the index selected "
+            "the right cell -- it is the fallback-free form of the case above",
+        )
+    finally:
+        guard.NOT_A_VERIFIED_CLAIM = saved_claims
+
     # --- a scan that matches nothing must be FATAL, not a pass --------------
     # The adjective tell: ask which line fails if the scan found no tables at
     # all.  Before this, none did -- the guard printed PASS.
