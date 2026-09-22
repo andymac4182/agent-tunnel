@@ -6,9 +6,15 @@ Scope, stated before anything else
 This script produces and checks a release bundle for **one** target triple --
 the one it is run on.  It makes no claim about any other OS or architecture.
 `docs/testing.md`'s release-artifact gate asks for "every advertised
-OS/architecture"; what "advertised" resolves to, and which targets this host
-can actually link, are recorded in docs/tasks.md row M6-C04.  A bundle this
-script produces is evidence for its own `target` field and for nothing else.
+OS/architecture".  **"Advertised" now resolves to exactly one place**:
+`[workspace.metadata.release] advertised-targets` in the root `Cargo.toml`,
+declared by the owner.  This file contains no copy of that set -- it reads it,
+and the `targets` check requires the manifest, `cargo metadata` and the set a
+bundle froze into its `PROVENANCE.txt` to agree.  A bundle this script produces
+is still evidence for its own `target` field and for nothing else, and
+`targets` says so by naming, in every green run, the declared triples the
+bundle does **not** cover.  Which of those triples this host can link and
+execute, and by what route, is docs/tasks.md row M6-C13.
 
 What the gate is actually for
 -----------------------------
@@ -54,6 +60,14 @@ that is **not the build machine**.  Every check here therefore runs against the
                 own comment records that an example failing relay startup
                 would otherwise ship green -- and it carries its own witness
                 so a control corrupting a client example cannot credit it.
+  `targets`     Which advertised set this bundle is one member of, read from
+                the owner's declaration rather than from anything in this
+                file, and cross-read by `cargo metadata` so a fault in this
+                script's parser cannot hide.  A green result always names the
+                declared targets this bundle does not cover, because "the
+                bundle is sound" and "the set is covered" are different claims
+                and conflating them is what M6-01 could not do for want of a
+                declared set.
   `portability` Every bundled executable's dynamic dependencies resolve to
                 system paths.  An artifact that links back to a path inside
                 the build tree works only beside `target/`, which is exactly
@@ -115,6 +129,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -169,6 +184,122 @@ SHA256SUMS = "SHA256SUMS"
 PROVENANCE = "PROVENANCE.txt"
 NOTICE = "NOTICE"
 LOCKFILE = "Cargo.lock"
+
+# --------------------------------------------------------------------------
+# The advertised target set.
+#
+# **There is no list of triples anywhere in this file.**  The set lives in
+# `[workspace.metadata.release] advertised-targets` in the root `Cargo.toml`
+# and is read from there, because a second copy here is precisely the defect
+# docs/tasks.md row M5-C11 catalogues -- two readers that agree until someone
+# edits one of them.  The only triples that appear in this file are inside
+# controls, as synthetic values that must be *rejected*.
+#
+# Two independent readers parse that table -- `tomllib` below, and `cargo`
+# itself via `cargo metadata` -- and `check_targets` requires them to agree
+# with each other and with the set a bundle froze into its `PROVENANCE.txt`.
+# --------------------------------------------------------------------------
+MANIFEST = "Cargo.toml"
+PROVENANCE_TARGET_SET = "advertised_targets"
+
+# A target triple's shape, asserted rather than assumed: a declaration of
+# `"linux"` or `""` would otherwise sail through every set comparison below
+# while meaning nothing to rustc.
+TRIPLE_RE = re.compile(r"[0-9a-z_]+(?:-[0-9a-z_.]+){2,3}")
+
+
+class DeclarationError(Exception):
+    """The declaration is absent or malformed.  Carries its own witness."""
+
+    def __init__(self, witness: str, message: str) -> None:
+        super().__init__(message)
+        self.witness = witness
+
+
+def declared_release_table(manifest: Path) -> dict:
+    if not manifest.is_file():
+        raise DeclarationError("advertised-set-missing", f"no manifest at {manifest}")
+    try:
+        data = tomllib.loads(manifest.read_text(encoding="utf-8"))
+    except tomllib.TOMLDecodeError as error:
+        raise DeclarationError("advertised-set-malformed",
+                               f"{manifest} is not valid TOML: {error}") from error
+    table = data.get("workspace", {}).get("metadata", {}).get("release")
+    if table is None:
+        raise DeclarationError(
+            "advertised-set-missing",
+            f"{manifest} carries no [workspace.metadata.release] table, so the "
+            "advertised set has no referent")
+    return table
+
+
+def declared_targets(manifest: Path | None = None) -> list[str]:
+    """The advertised set, read from the one place that declares it.
+
+    Raises `DeclarationError` rather than returning a default.  A default
+    would be a second source of truth wearing a fallback's clothes, and the
+    whole point of this function is that there is exactly one.
+    """
+    table = declared_release_table(manifest or (REPO / MANIFEST))
+    raw = table.get("advertised-targets")
+    if raw is None:
+        raise DeclarationError(
+            "advertised-set-missing",
+            "[workspace.metadata.release] declares no `advertised-targets`")
+    if not isinstance(raw, list) or not all(isinstance(t, str) for t in raw):
+        raise DeclarationError("advertised-set-malformed",
+                               f"`advertised-targets` is {type(raw).__name__}, not a list of strings")
+    if not raw:
+        raise DeclarationError(
+            "advertised-set-malformed",
+            "`advertised-targets` is empty.  An empty set makes every bundle "
+            "cover all of it, which is the vacuous pass this check exists to refuse")
+    duplicates = sorted({t for t in raw if raw.count(t) > 1})
+    if duplicates:
+        raise DeclarationError("advertised-set-malformed",
+                               f"`advertised-targets` repeats {duplicates}")
+    malformed = [t for t in raw if not TRIPLE_RE.fullmatch(t)]
+    if malformed:
+        raise DeclarationError("advertised-set-malformed",
+                               f"not target triples: {malformed}")
+    return sorted(raw)
+
+
+def cargo_declared_targets(manifest: Path | None = None) -> list[str] | None:
+    """The same table, read by cargo instead of by this script.
+
+    `None` means cargo could not be reached or could not answer, which is
+    reported as a note rather than folded into a pass -- a reader that did not
+    run agrees with everything.
+    """
+    root = (manifest or (REPO / MANIFEST)).parent
+    if shutil.which("cargo") is None:
+        return None
+    completed = run(["cargo", "metadata", "--no-deps", "--format-version", "1",
+                     "--offline"], cwd=root, timeout=300)
+    if completed.returncode != 0:
+        return None
+    try:
+        metadata = json.loads(completed.stdout)
+    except json.JSONDecodeError:
+        return None
+    table = (metadata.get("metadata") or {}).get("release")
+    if not isinstance(table, dict):
+        return None
+    raw = table.get("advertised-targets")
+    if not isinstance(raw, list):
+        return None
+    return sorted(str(t) for t in raw)
+
+
+def rustc_known_targets() -> set[str] | None:
+    """Every triple rustc will accept, or `None` if rustc is unreachable."""
+    if shutil.which("rustc") is None:
+        return None
+    completed = run(["rustc", "--print", "target-list"], cwd=REPO)
+    if completed.returncode != 0:
+        return None
+    return {line.strip() for line in completed.stdout.splitlines() if line.strip()}
 
 
 # --------------------------------------------------------------------------
@@ -1175,11 +1306,111 @@ def check_portability(bundle: Path) -> Result:
     return result
 
 
+# --------------------------------------------------------------------------
+# Check: targets
+#
+# The other six checks answer "is this bundle sound?".  This one answers the
+# question that made M6-01 unclosable: **which set is this bundle one of, and
+# does everything that reads that set still agree about it?**
+#
+# Three readers of one declaration, compared against each other:
+#
+#   (1) this script's `tomllib` parse of `[workspace.metadata.release]`;
+#   (2) `cargo metadata`'s view of the same table -- a reader this script did
+#       not write, so a fault in (1) cannot hide behind it;
+#   (3) the set the bundler froze into `PROVENANCE.txt` at build time.
+#
+# (3) is what makes a *divergence over time* visible rather than only a
+# divergence right now: a bundle assembled against a three-triple set and
+# checked after someone edited the manifest to two reddens, naming both sets.
+# That is the control asked for by "fails if the declared set and whatever the
+# tooling actually uses ever diverge".
+#
+# The check deliberately does **not** pass merely because the bundle's own
+# triple is declared.  It always reports the declared targets this bundle does
+# not cover, so a green `targets` can never be read as the set being covered.
+# --------------------------------------------------------------------------
+def check_targets(bundle: Path, manifest: Path | None = None) -> Result:
+    path = bundle / PROVENANCE
+    if not path.is_file():
+        return Result("targets", False, summary=f"no {PROVENANCE} in bundle",
+                      witness="provenance-file-missing")
+    fields = parse_fields(read_exact(path))
+
+    try:
+        declared = declared_targets(manifest)
+    except DeclarationError as error:
+        return Result("targets", False, summary=str(error), witness=error.witness)
+
+    recorded_raw = fields.get(PROVENANCE_TARGET_SET, "")
+    if not recorded_raw:
+        return Result(
+            "targets", False,
+            summary=f"{PROVENANCE} records no `{PROVENANCE_TARGET_SET}` field, so this "
+                    "bundle does not say which set it was assembled against",
+            witness="advertised-set-missing")
+    recorded = sorted(t for t in (p.strip() for p in recorded_raw.split(",")) if t)
+    if recorded != declared:
+        return Result(
+            "targets", False,
+            summary=f"the bundle was assembled against {recorded} and the manifest now "
+                    f"declares {declared}",
+            witness="advertised-set-mismatch")
+
+    result = Result("targets", True, summary="")
+    by_cargo = cargo_declared_targets(manifest)
+    if by_cargo is None:
+        result.note("NOTE: cargo could not be reached, so the second reader of this "
+                    "declaration DID NOT RUN; only tomllib and the bundle were compared")
+    elif by_cargo != declared:
+        return Result(
+            "targets", False,
+            summary=f"tomllib reads {declared} from the manifest and `cargo metadata` "
+                    f"reads {by_cargo} from the same table",
+            witness="advertised-set-mismatch")
+    else:
+        result.note(f"two independent readers agree: tomllib and `cargo metadata` both "
+                    f"return {len(declared)} triples from [workspace.metadata.release]")
+
+    known = rustc_known_targets()
+    if known is None:
+        result.note("NOTE: rustc could not be reached, so the declared triples were "
+                    "NOT checked against a real target list")
+    else:
+        unknown = [t for t in declared if t not in known]
+        if unknown:
+            return Result(
+                "targets", False,
+                summary=f"declared but unknown to rustc {len(known)}-target list: {unknown}",
+                witness="advertised-target-unknown")
+        result.note(f"all {len(declared)} declared triples appear in rustc's "
+                    f"{len(known)}-target list, so none is a typo that would only "
+                    "surface at build time")
+
+    bundle_target = fields.get("target", "")
+    if bundle_target not in declared:
+        return Result(
+            "targets", False,
+            summary=f"this bundle's target {bundle_target!r} is not in the advertised "
+                    f"set {declared}",
+            witness="target-not-advertised")
+
+    uncovered = [t for t in declared if t != bundle_target]
+    result.summary = (f"{bundle_target} is 1 of {len(declared)} advertised targets; "
+                      f"{len(uncovered)} NOT covered by this bundle: {uncovered}")
+    result.note("this bundle is evidence for its own target and for no other. "
+                "M6-01 closes when every declared target has a bundle that passes "
+                "these checks on a host that can execute it -- see M6-C13 for the "
+                "build route for the two Linux triples")
+    return result
+
+
 CHECKS = {
     "checksums": check_checksums,
     "provenance": check_provenance,
     "notices": check_notices,
     "assets": check_assets,
+    "targets": check_targets,
     "cli": check_cli,
     "portability": check_portability,
 }
@@ -1211,8 +1442,8 @@ def copy_bundle(bundle: Path, destination: Path) -> Path:
     return target
 
 
-def expect_red(check: str, bundle: Path, expected_witness: str) -> tuple[bool, str]:
-    result = CHECKS[check](bundle)
+def expect_red(check: str, bundle: Path, expected_witness: str, **kwargs) -> tuple[bool, str]:
+    result = CHECKS[check](bundle, **kwargs)
     if result.ok:
         return False, (f"{check} stayed GREEN with its mechanism defeated "
                        f"({result.summary})")
@@ -1694,9 +1925,260 @@ def control_lockfile_parser_is_not_universal(bundle: Path) -> tuple[bool, str]:
 # directions.  Both are worth running; only the first is evidence that a check
 # can fail.  `--self-test` counts and labels them separately, so a reader
 # cannot take 17 witness controls from a suite that has 15.
+# --------------------------------------------------------------------------
+# Controls for `targets`.
+#
+# The triples written below are the ONLY triples in this file outside the
+# declaration's own reader, and every one of them is a value the check must
+# **reject**.  None of them is a second copy of the advertised set.
+# --------------------------------------------------------------------------
+NOT_A_REAL_TRIPLE = "aarch64-unknown-moonos"
+UNDECLARED_TRIPLE = "x86_64-pc-windows-msvc"
+
+
+def rewrite_provenance(bundle: Path, key: str, value: str | None) -> bool:
+    """Set `key` in a copied bundle's PROVENANCE.txt, or drop it when None.
+
+    Returns False when the key was not there to rewrite, so a control whose
+    mutation silently did nothing fails as a broken control instead of
+    reporting whatever the untouched bundle happened to say.
+    """
+    path = bundle / PROVENANCE
+    lines = read_exact(path).splitlines()
+    out: list[str] = []
+    seen = False
+    for line in lines:
+        if line.startswith(f"{key}:"):
+            seen = True
+            if value is None:
+                continue
+            out.append(f"{key}: {value}")
+        else:
+            out.append(line)
+    if not seen:
+        return False
+    write_exact(path, "\n".join(out) + "\n")
+    # SHA256SUMS now disagrees, which is `checksums`' business and not this
+    # check's; `targets` reads PROVENANCE directly, exactly as it does in a
+    # real run.
+    return True
+
+
+def temp_manifest(tmp: Path, transform) -> Path:
+    """A throwaway copy of the real workspace manifest, mutated by `transform`.
+
+    The declaration is never edited in place.  Mutating a copy is what lets a
+    control ask "what happens when the manifest changes under a bundle that
+    already shipped?" without writing to the repository.
+    """
+    text = (REPO / MANIFEST).read_text(encoding="utf-8")
+    manifest = tmp / MANIFEST
+    manifest.write_text(transform(text), encoding="utf-8")
+    return manifest
+
+
+def control_targets_bundle_target_is_not_advertised(bundle: Path) -> tuple[bool, str]:
+    """A bundle for a triple outside the declared set must not pass.
+
+    This is the case the declaration exists to make checkable: before it, a
+    bundle for any triple at all was "a release artifact" and nothing could
+    say otherwise.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        copy = copy_bundle(bundle, Path(tmp))
+        if not rewrite_provenance(copy, "target", UNDECLARED_TRIPLE):
+            return False, "PROVENANCE.txt has no `target:` line; the control did not apply"
+        return expect_red("targets", copy, "target-not-advertised")
+
+
+def control_targets_frozen_set_diverges_from_manifest(bundle: Path) -> tuple[bool, str]:
+    """The set the bundle froze must still equal the set now declared.
+
+    Defeated from the bundle's side: a bundle assembled against a narrower set
+    than the one the manifest declares today is exactly the artifact that
+    would otherwise be presented as covering the current commitment.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        copy = copy_bundle(bundle, Path(tmp))
+        declared = declared_targets()
+        narrowed = ",".join(declared[:-1])
+        if not narrowed:
+            return False, "the declared set has fewer than two triples; nothing to narrow"
+        if not rewrite_provenance(copy, PROVENANCE_TARGET_SET, narrowed):
+            return False, (f"PROVENANCE.txt has no `{PROVENANCE_TARGET_SET}:` line; the "
+                           "control did not apply")
+        return expect_red("targets", copy, "advertised-set-mismatch")
+
+
+def control_targets_manifest_edit_reddens_a_shipped_bundle(bundle: Path) -> tuple[bool, str]:
+    """The same divergence from the *declaration's* side, the bundle untouched.
+
+    This is the control the requirement names: the declared set and what the
+    tooling actually shipped are compared, and an edit to one of them alone
+    goes red.  The bundle here is the real, unmodified artifact; only a
+    throwaway copy of the manifest moves.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        manifest = temp_manifest(
+            Path(tmp),
+            lambda text: text.replace(
+                "advertised-targets = [",
+                f'advertised-targets = [\n    "{UNDECLARED_TRIPLE}",',
+                1),
+        )
+        if declared_targets(manifest) == declared_targets():
+            return False, ("the mutated manifest declares the same set as the real one; "
+                           "the control did not apply")
+        return expect_red("targets", bundle, "advertised-set-mismatch", manifest=manifest)
+
+
+def control_targets_no_declaration_is_not_a_pass(bundle: Path) -> tuple[bool, str]:
+    """Deleting the declaration must fail, not fall back to a default.
+
+    The state this repository was in until this change -- no referent for
+    "advertised" anywhere (M6-C04) -- must read as a failure rather than as a
+    check with nothing to compare.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        manifest = temp_manifest(
+            Path(tmp),
+            lambda text: re.sub(r"(?ms)^\[workspace\.metadata\.release\].*?(?=^\[)", "", text),
+        )
+        if "[workspace.metadata.release]" in manifest.read_text(encoding="utf-8"):
+            return False, "the release table survived the control's edit; it did not apply"
+        return expect_red("targets", bundle, "advertised-set-missing", manifest=manifest)
+
+
+def control_targets_unknown_triple_is_refused(bundle: Path) -> tuple[bool, str]:
+    """A declared triple rustc does not know must fail here, not at build time.
+
+    Both sides are moved together -- the manifest declares the bogus triple
+    *and* the bundle's frozen set is rewritten to agree -- so the set
+    comparison passes and the control actually reaches the rustc check it
+    names.  Moving only the manifest would redden with
+    `advertised-set-mismatch` and credit this control with a mechanism it
+    never exercised.
+    """
+    known = rustc_known_targets()
+    if known is None:
+        return False, "rustc is unreachable, so this control DID NOT RUN"
+    if NOT_A_REAL_TRIPLE in known:
+        return False, f"{NOT_A_REAL_TRIPLE} is a real rustc target; pick another"
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        manifest = temp_manifest(
+            root,
+            lambda text: text.replace(
+                "advertised-targets = [",
+                f'advertised-targets = [\n    "{NOT_A_REAL_TRIPLE}",',
+                1),
+        )
+        copy = copy_bundle(bundle, root)
+        if not rewrite_provenance(copy, PROVENANCE_TARGET_SET,
+                                  ",".join(declared_targets(manifest))):
+            return False, "could not rewrite the frozen set; the control did not apply"
+        return expect_red("targets", copy, "advertised-target-unknown", manifest=manifest)
+
+
+def control_targets_declaration_parser_rejects_junk(bundle: Path) -> tuple[bool, str]:
+    """`declared_targets` in both directions -- a unit probe, not a witness control.
+
+    It invokes no check.  It exists because every set comparison above is
+    vacuous if the parser accepts an empty list: an empty advertised set makes
+    every bundle cover all of it.
+    """
+    cases: list[tuple[str, str]] = [
+        ("advertised-targets = []", "advertised-set-malformed"),
+        ('advertised-targets = ["aarch64-apple-darwin", "aarch64-apple-darwin"]',
+         "advertised-set-malformed"),
+        ('advertised-targets = ["linux"]', "advertised-set-malformed"),
+        ('advertised-targets = "aarch64-apple-darwin"', "advertised-set-malformed"),
+        ("# no key at all", "advertised-set-missing"),
+    ]
+    with tempfile.TemporaryDirectory() as tmp:
+        for index, (replacement, expected) in enumerate(cases):
+            manifest = Path(tmp) / f"case{index}.toml"
+            manifest.write_text(
+                "[workspace]\nmembers = []\n\n[workspace.metadata.release]\n"
+                + replacement + "\n",
+                encoding="utf-8")
+            try:
+                got = declared_targets(manifest)
+            except DeclarationError as error:
+                if error.witness != expected:
+                    return False, (f"case {index} raised witness {error.witness!r}, "
+                                   f"expected {expected!r}")
+                continue
+            return False, f"case {index} was ACCEPTED as {got}; it must be refused"
+        # And the real declaration must still be accepted, so the parser is not
+        # simply refusing everything.
+        accepted = declared_targets()
+    return True, (f"the parser refuses an empty list, a duplicate, a non-triple, a bare "
+                  f"string and a missing key with the right witness in each of "
+                  f"{len(cases)} cases, and still accepts the real declaration's "
+                  f"{len(accepted)} triples")
+
+
+def control_targets_cargo_is_a_live_second_reader(bundle: Path) -> tuple[bool, str]:
+    """`cargo metadata` really reads this table -- a unit probe, not a control.
+
+    The claim "two independent readers" is worthless if the second one is
+    stubbed or silently returning `None`.  A throwaway workspace is built with
+    a declaration, read with both readers, then the declaration is changed and
+    read again: cargo must follow the change.  It is a probe because it
+    invokes no check.
+    """
+    if shutil.which("cargo") is None:
+        return False, "cargo is not installed, so this probe DID NOT RUN"
+    # Arbitrary values for a throwaway workspace, not a copy of the declared
+    # set: what matters is only that the two lists differ, so cargo can be
+    # shown following a change rather than agreeing with a fixed answer.  The
+    # second deliberately includes a triple that is NOT advertised.
+    first = ["aarch64-apple-darwin"]
+    second = ["aarch64-apple-darwin", UNDECLARED_TRIPLE]
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "member" / "src").mkdir(parents=True)
+        (root / "member" / "src" / "lib.rs").write_text("", encoding="utf-8")
+        (root / "member" / MANIFEST).write_text(
+            '[package]\nname = "member"\nversion = "0.0.0"\nedition = "2021"\n',
+            encoding="utf-8")
+        manifest = root / MANIFEST
+
+        def declare(targets: list[str]) -> None:
+            body = ",\n    ".join(f'"{t}"' for t in targets)
+            manifest.write_text(
+                '[workspace]\nmembers = ["member"]\nresolver = "2"\n\n'
+                f"[workspace.metadata.release]\nadvertised-targets = [\n    {body},\n]\n",
+                encoding="utf-8")
+
+        declare(first)
+        by_cargo_first = cargo_declared_targets(manifest)
+        by_toml_first = declared_targets(manifest)
+        declare(second)
+        by_cargo_second = cargo_declared_targets(manifest)
+
+    if by_cargo_first is None or by_cargo_second is None:
+        return False, ("`cargo metadata` did not answer for the throwaway workspace, so "
+                       "the second reader DID NOT RUN and `None` would have been folded "
+                       "into a note rather than measured")
+    if by_cargo_first != sorted(first) or by_toml_first != sorted(first):
+        return False, (f"the two readers disagreed on a manifest declaring {first}: "
+                       f"cargo={by_cargo_first} tomllib={by_toml_first}")
+    if by_cargo_second != sorted(second):
+        return False, (f"the declaration changed to {second} and cargo still reads "
+                       f"{by_cargo_second}; it is not reading this table live")
+    return True, ("`cargo metadata --no-deps` returns exactly what "
+                  "[workspace.metadata.release] declares in a throwaway workspace, and "
+                  "follows the declaration when it changes from 1 triple to 2 -- so the "
+                  "second reader is live rather than a stub that agrees with everything")
+
+
 UNIT_PROBES = {
     "the lockfile parser is not universal",
     "the dynamic-dependency classifier's rule",
+    "the declaration parser refuses junk in five shapes",
+    "cargo metadata is a live second reader of the declaration",
 }
 
 CONTROLS: dict[str, list[tuple[str, object]]] = {
@@ -1724,6 +2206,22 @@ CONTROLS: dict[str, list[tuple[str, object]]] = {
         ("the tunnel-deadman sentinel removed", control_assets_sentinel_removed),
         ("a decoy file of the sentinel's name", control_assets_sentinel_is_a_decoy),
         ("a decoy that also exits 2", control_assets_decoy_that_exits_two),
+    ],
+    "targets": [
+        ("a bundle built for a triple outside the declared set",
+         control_targets_bundle_target_is_not_advertised),
+        ("the set frozen into the bundle narrowed after the fact",
+         control_targets_frozen_set_diverges_from_manifest),
+        ("the declaration edited under an unmodified shipped bundle",
+         control_targets_manifest_edit_reddens_a_shipped_bundle),
+        ("the declaration deleted entirely",
+         control_targets_no_declaration_is_not_a_pass),
+        ("a declared triple rustc does not know",
+         control_targets_unknown_triple_is_refused),
+        ("the declaration parser refuses junk in five shapes",
+         control_targets_declaration_parser_rejects_junk),
+        ("cargo metadata is a live second reader of the declaration",
+         control_targets_cargo_is_a_live_second_reader),
     ],
     "cli": [
         ("a binary that exits 0 printing nothing", control_cli_content_not_exit_status),
@@ -1855,6 +2353,20 @@ def cmd_bundle(args: argparse.Namespace) -> int:
             print(f"receipt {key}={receipt_field(receipt_text, key)!r} is not the "
                   f"requested {expected!r}", file=sys.stderr)
             return 2
+    # The advertised set is frozen into the bundle, read from the one place
+    # that declares it.  Freezing it is what lets `verify --check targets`
+    # notice a *later* edit to the manifest rather than only a disagreement
+    # between two readers of the same current file.  A bundle that cannot
+    # name the set it was assembled against is refused here rather than
+    # written and caught downstream.
+    try:
+        advertised = declared_targets()
+    except DeclarationError as error:
+        print(f"refusing to bundle: {error} "
+              f"([workspace.metadata.release] in {MANIFEST} is the declaration)",
+              file=sys.stderr)
+        return 2
+
     rustc = run(["rustc", "--version"], cwd=REPO).stdout.strip()
     cargo = run(["cargo", "--version"], cwd=REPO).stdout.strip()
     target = run(["rustc", "-vV"], cwd=REPO).stdout
@@ -1877,6 +2389,7 @@ def cmd_bundle(args: argparse.Namespace) -> int:
         f"workspace_lockfile_sha256: {receipt_field(receipt_text, 'workspace_lockfile_sha256')}",
         f"receipt_sha256: {sha256_file(receipt)}",
         f"target: {receipt_field(receipt_text, 'rustc_host') or triple}",
+        f"{PROVENANCE_TARGET_SET}: {','.join(advertised)}",
         f"profile: {receipt_field(receipt_text, 'build_profile')}",
         f"rustc_version: {receipt_field(receipt_text, 'rustc_version') or rustc}",
         f"cargo_version: {receipt_field(receipt_text, 'cargo_version') or cargo}",
@@ -1893,7 +2406,11 @@ def cmd_bundle(args: argparse.Namespace) -> int:
     lines += [
         "",
         "This bundle is evidence for the `target` above and for no other OS or",
-        "architecture.  See docs/tasks.md row M6-C04 for what remains and why.",
+        "architecture.  `advertised_targets` above is the set the owner declared",
+        f"in [workspace.metadata.release] of the workspace {MANIFEST}, copied here",
+        "so that `verify --check targets` can detect a later edit to it; this",
+        "bundle covers exactly one member of that set.  See docs/tasks.md rows",
+        "M6-01 and M6-C13 for what remains and why.",
         "",
     ]
     (out / PROVENANCE).write_text("\n".join(lines))

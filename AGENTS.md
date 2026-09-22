@@ -15,7 +15,7 @@
 - Keep handlers thin, state machines explicit, and actor queues bounded. Diagnostics must expose identifiers, phases and counters without payloads or credentials.
 - Avoid unsafe code in current crates. Any future platform-specific unsafe boundary requires a narrow documented abstraction and focused review.
 - Use synthetic test data and dedicated desktop VMs. Do not exercise computer control against a user's active desktop as a side effect of tests.
-- Do not commit secrets or unredacted payloads. The repository must remain private unless the user explicitly requests publication.
+- **This repository is public, by the owner's explicit decision, and the secrets rule is therefore stricter rather than looser.** Never commit secrets or unredacted payloads. In a public repository a committed secret is *unrecoverable*: it is world-readable from the moment it is pushed, and deleting it, rewriting history or making the repository private afterwards undoes none of that, because anything already cloned, cached, forked or indexed stays out. Treat any credential that reaches this history as disclosed and **rotate it**; removing it is not remediation. The declared expectation lives in `[workspace.metadata.release] repository-visibility` in the root `Cargo.toml`, and `scripts/m6-release-checks.py --check visibility` fails if GitHub's live answer disagrees with it in either direction.
 
 - Use gpt-5.6-luna subagents with max reasoning for most implementation work unless the user changes this preference.
 - Redis is the only authoritative catalog and coordination store. Preserve atomic tenant-scoped authorization, revocation, and owner fencing; never add a PostgreSQL dependency. Durable catalog keys must survive deployment-incarnation changes.

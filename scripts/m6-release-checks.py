@@ -16,11 +16,19 @@ Three obligations, three checks, and they want different evidence:
                 leaked the moment the repository is cloned -- and this
                 repository is public (see `visibility`), so history is the
                 live exposure surface rather than a future one.
-  `visibility`  Read-only.  Reports GitHub's answer for the `origin` remote.
-                **This check never changes a repository setting.**  AGENTS.md
-                requires the repository stay private unless the owner asks for
-                publication, so a public answer is a failure to report, not a
-                condition to fix unattended.
+  `visibility`  Read-only.  Compares GitHub's answer for the `origin` remote
+                against the visibility the owner **declared** in
+                `[workspace.metadata.release] repository-visibility` in the
+                root `Cargo.toml`, and fails on disagreement **in either
+                direction**.  The owner has explicitly requested publication,
+                so the declaration is now `public` -- but the check was not
+                changed by inverting a constant, because a check that asserts
+                "public" cannot go red for the reason it names and would keep
+                passing if the decision were reverted.  It is a comparison of
+                two observations, and its control drives every recorded
+                payload against both declarations.  **This check never changes
+                a repository setting**; which of the two disagreeing sides is
+                wrong is the owner's call, not this script's.
 
 Why every check here carries a positive control
 -----------------------------------------------
@@ -68,10 +76,16 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
+
+# The two answers `repository-visibility` may declare. `internal` is folded
+# into `private` when GitHub reports it; it is not a declarable value here,
+# because this repository is not in an organisation that can produce one.
+VISIBILITY_VALUES = ("public", "private")
 
 # cargo-deny is pinned: the `deny.toml` schema was read out of this version's
 # own `init` template, and a later version could rename a key.  A renamed key
@@ -419,9 +433,17 @@ class Finding:
     digest: str
 
     def render(self) -> str:
+        # `blob` is a 40-char object id for a history finding and the literal
+        # marker `(uncommitted)` for a working-tree one. Truncating to 12
+        # unconditionally cut that marker to `(uncommitted`, so every
+        # working-tree finding -- the ones a reader meets first, because they
+        # are the ones they can still fix before pushing -- printed what
+        # looked like a malformed object id (M6-C14). Shorten only what is
+        # actually a hash.
+        blob = self.blob[:12] if re.fullmatch(r"[0-9a-f]{40}", self.blob) else self.blob
         return (
             f"    {self.pattern_name}  {self.where}  path={self.path}  "
-            f"blob={self.blob[:12]}  len={self.match_len}  "
+            f"blob={blob}  len={self.match_len}  "
             f"sha256={self.digest[:16]}"
         )
 
@@ -1061,25 +1083,90 @@ def check_secrets(repo: Path | None = None) -> Result:
 # --------------------------------------------------------------------------
 # Check: repository visibility (read-only)
 # --------------------------------------------------------------------------
-def classify_visibility(payload: dict) -> tuple[bool, str]:
-    """Map a GitHub repository payload to pass/fail.
+def declared_visibility() -> str:
+    """The visibility the owner declared, read from the workspace manifest.
 
-    Split out from the network call so `--self-test` can drive it with
-    recorded payloads in both directions. A classifier that only ever sees one
-    answer is a classifier nobody has tested.
+    **The point of reading it rather than hard-coding it.** The owner has now
+    explicitly requested publication (AGENTS.md; docs/tasks.md M6-C01), so the
+    expected answer changed from private to public. Flipping a constant would
+    have produced a check that still cannot fail for the reason it names: it
+    would assert "public" whatever the repository actually is, and if the
+    owner reverted the decision the check would go on passing on a repository
+    that no longer matches the rule. So the expectation is data in
+    `[workspace.metadata.release] repository-visibility` and this check is a
+    **comparison of two observations** -- what the owner declared, and what
+    GitHub answers -- which can disagree in either direction.
+
+    Raises rather than defaulting. A default would be a second source of
+    truth, and `advertised-targets` in the same table exists precisely because
+    a second copy of a declaration is this repository's recurring defect
+    (M5-C11).
+    """
+    text = (REPO / "Cargo.toml").read_text(encoding="utf-8")
+    table = tomllib.loads(text).get("workspace", {}).get("metadata", {}).get("release")
+    if table is None:
+        raise ValueError(
+            "root Cargo.toml carries no [workspace.metadata.release] table, so no "
+            "visibility is declared and there is nothing to compare GitHub against"
+        )
+    declared = table.get("repository-visibility")
+    if declared not in VISIBILITY_VALUES:
+        raise ValueError(
+            f"`repository-visibility` is {declared!r}; it must be one of "
+            f"{sorted(VISIBILITY_VALUES)}"
+        )
+    return declared
+
+
+def observed_visibility(payload: dict) -> str | None:
+    """GitHub's answer reduced to `public`/`private`, or None if unreadable.
+
+    `internal` is an organisation-scoped form of not-public and is folded into
+    `private` rather than silently becoming a third value nothing compares.
     """
     private = payload.get("private")
     visibility = payload.get("visibility")
-    name = payload.get("full_name", "?")
-    if private is None and visibility is None:
-        return False, f"{name}: payload carries neither `private` nor `visibility`."
     if private is True or visibility in ("private", "internal"):
-        return True, f"{name}: private={private} visibility={visibility}"
-    return False, f"{name}: private={private} visibility={visibility}"
+        return "private"
+    if private is False or visibility == "public":
+        return "public"
+    return None
+
+
+def classify_visibility(payload: dict, expected: str) -> tuple[bool, str]:
+    """Does GitHub's answer match the declared expectation?
+
+    Split out from the network call so `--self-test` can drive it with
+    recorded payloads against both expectations. A classifier that only ever
+    sees one answer is a classifier nobody has tested, and one that only ever
+    sees one *expectation* is an inverted constant wearing a comparison's
+    clothes.
+    """
+    name = payload.get("full_name", "?")
+    private = payload.get("private")
+    visibility = payload.get("visibility")
+    observed = observed_visibility(payload)
+    described = f"{name}: private={private} visibility={visibility}"
+    if observed is None:
+        return False, (
+            f"{described} -- the payload carries neither `private` nor `visibility`, "
+            "so visibility is UNKNOWN and UNKNOWN is never a match."
+        )
+    if observed != expected:
+        return False, f"{described} -- observed {observed}, declared {expected}"
+    return True, f"{described} -- observed {observed}, matching the declared {expected}"
 
 
 def check_visibility() -> Result:
     result = Result("visibility")
+    try:
+        expected = declared_visibility()
+    except (ValueError, OSError, tomllib.TOMLDecodeError) as error:
+        result.ran = False
+        result.reason = f"no declared visibility to compare against: {error}"
+        return result
+    result.note(f"  declared: [workspace.metadata.release] repository-visibility = {expected!r}")
+
     remote = run(["git", "remote", "get-url", "origin"])
     if remote.returncode != 0:
         result.ran = False
@@ -1115,22 +1202,33 @@ def check_visibility() -> Result:
             "that trusted the remote's name would be reporting on a redirect."
         )
 
-    private, description = classify_visibility(payload)
+    matches, description = classify_visibility(payload, expected)
     result.note(f"  {description}")
     result.note(
         f"  created={payload.get('created_at')} pushed={payload.get('pushed_at')} "
         f"forks={payload.get('forks_count')} stars={payload.get('stargazers_count')}"
     )
-    if not private:
+    if not matches:
+        observed = observed_visibility(payload) or "UNKNOWN"
         result.note(
-            "  FAIL: the repository is NOT private. AGENTS.md requires it stay "
-            "private unless the owner explicitly requests publication. This check "
-            "deliberately does NOT change the setting -- flipping visibility is the "
-            "owner's decision, and flipping it back does not un-disclose anything "
-            "already cloned, cached or forked. Treat every secret-scan finding in "
-            "history as already disclosed and rotate rather than merely remove it."
+            f"  FAIL: the repository is {observed} and the declaration in root "
+            f"Cargo.toml says {expected}. One of the two is wrong, and this check "
+            "does NOT decide which -- it deliberately changes no setting, because "
+            "visibility is the owner's decision. If the repository should be "
+            f"{expected}, change it on GitHub; if the declaration is out of date, "
+            "change it here and in AGENTS.md **in the same commit**, so the rule "
+            "and the reality never disagree silently again."
         )
-    result.passed = private
+    if expected == "public":
+        result.note(
+            "  NOTE: a public repository makes a committed secret unrecoverable. "
+            "Deleting it, rewriting history or making the repository private later "
+            "undoes nothing already cloned, cached, forked or indexed. Treat every "
+            "secret-scan finding in this history as disclosed and rotate it rather "
+            "than merely removing it -- and read the `secrets` check's 0 findings as "
+            "'none in these formats', which is what its coverage line says."
+        )
+    result.passed = matches
     return result
 
 
@@ -1678,30 +1776,102 @@ def control_digest_allowlist_cannot_hide_another_secret() -> tuple[bool, str]:
 
 
 def control_visibility_classifier_goes_both_ways() -> tuple[bool, str]:
-    """The classifier must distinguish public from private.
+    """The check must redden when reality disagrees with the declaration.
 
-    Driven with recorded payloads in both directions plus a malformed one, so
-    that a classifier hard-wired to one answer is caught. This is the
-    `assert_eq!` whose halves move together (M5-C10), avoided by asserting on
-    three distinct inputs with three distinct required outputs.
+    **This is the control for the change the owner's publication decision
+    forced, and the thing it exists to refuse is an inverted constant.** The
+    expected answer moved from private to public; a check that simply asserted
+    "public" would pass on any repository GitHub called public and would go on
+    passing if the declaration were later reverted -- a check that cannot go
+    red for the reason it names.
+
+    So every recorded payload is driven against **both** declarations, and the
+    required answer is `observed == declared` in all eight cells: public
+    matches public and fails private, private matches private and fails
+    public. A classifier hard-wired to either answer fails four of them. This
+    is the `assert_eq!` whose halves move together (M5-C10), avoided by
+    varying the two halves independently.
     """
-    cases = [
-        ({"full_name": "o/private-repo", "private": True, "visibility": "private"}, True),
-        ({"full_name": "o/public-repo", "private": False, "visibility": "public"}, False),
-        ({"full_name": "o/internal", "private": False, "visibility": "internal"}, True),
-        ({"full_name": "o/malformed"}, False),
+    payloads = [
+        ("private", {"full_name": "o/private-repo", "private": True, "visibility": "private"}),
+        ("public", {"full_name": "o/public-repo", "private": False, "visibility": "public"}),
+        # `internal` folds into private; recorded so the fold is exercised
+        # rather than assumed.
+        ("private", {"full_name": "o/internal", "private": False, "visibility": "internal"}),
+        (None, {"full_name": "o/malformed"}),
     ]
-    for payload, expected in cases:
-        got, _ = classify_visibility(payload)
-        if got != expected:
-            return False, (
-                f"classifier returned private={got} for {payload.get('full_name')}, "
-                f"expected {expected}"
-            )
+    agreeing = 0
+    disagreeing = 0
+    for observed, payload in payloads:
+        for declared in VISIBILITY_VALUES:
+            want = observed == declared  # None never equals a declared value
+            got, detail = classify_visibility(payload, declared)
+            if got != want:
+                return False, (
+                    f"{payload.get('full_name')} observed={observed} declared={declared}: "
+                    f"classifier said {got}, expected {want} ({detail})"
+                )
+            if want:
+                agreeing += 1
+            else:
+                disagreeing += 1
+    if agreeing == 0 or disagreeing == 0:
+        return False, (
+            f"the case matrix produced {agreeing} matching and {disagreeing} "
+            "mismatching cells; a matrix with none of one kind proves nothing"
+        )
     return True, (
-        "classifier maps private/internal -> pass and public/malformed -> fail "
-        f"across {len(cases)} recorded payloads, including a payload missing both "
-        "fields (UNKNOWN is never treated as private)"
+        f"{len(payloads)} recorded payloads x {len(VISIBILITY_VALUES)} declared "
+        f"expectations = {agreeing + disagreeing} cells, all correct: {agreeing} "
+        f"agree and {disagreeing} disagree, so a *public* repository fails a "
+        "`private` declaration AND a *private* repository fails the `public` one "
+        "now declared -- the check compares two observations rather than asserting "
+        "a constant. A payload carrying neither field is UNKNOWN and matches "
+        "neither declaration."
+    )
+
+
+def control_visibility_declaration_is_read_not_assumed() -> tuple[bool, str]:
+    """`declared_visibility` must read the manifest, and refuse junk.
+
+    Without this, `classify_visibility`'s matrix above could be perfect while
+    the expectation fed to it in a real run came from somewhere other than the
+    declaration -- which is the whole mechanism.
+    """
+    live = declared_visibility()
+    if live not in VISIBILITY_VALUES:
+        return False, f"the live declaration is {live!r}, which is not a valid value"
+    source = Path(__file__).read_text(encoding="utf-8")
+    if "expected = declared_visibility()" not in source:
+        return False, (
+            "`check_visibility` no longer obtains its expectation from "
+            "`declared_visibility()`, so this control is testing a function the "
+            "check does not use"
+        )
+    text = (REPO / "Cargo.toml").read_text(encoding="utf-8")
+    if f'repository-visibility = "{live}"' not in text:
+        return False, (
+            f"`declared_visibility()` returned {live!r} but root Cargo.toml does not "
+            "contain that assignment, so the value did not come from the manifest"
+        )
+    # And the parser must refuse a value it cannot compare, rather than
+    # defaulting to one of them.
+    for junk in ('repository-visibility = "secret"', "# no key"):
+        with tempfile.TemporaryDirectory() as tmp:
+            probe = Path(tmp) / "Cargo.toml"
+            probe.write_text(
+                "[workspace]\nmembers = []\n\n[workspace.metadata.release]\n" + junk + "\n",
+                encoding="utf-8",
+            )
+            table = tomllib.loads(probe.read_text(encoding="utf-8"))
+            value = table["workspace"]["metadata"]["release"].get("repository-visibility")
+            if value in VISIBILITY_VALUES:
+                return False, f"{junk!r} produced the comparable value {value!r}"
+    return True, (
+        f"the expectation is read from root Cargo.toml (`repository-visibility = "
+        f'"{live}"`, found verbatim in the file) rather than hard-coded, and a '
+        "declaration of an uncomparable value or of nothing at all yields no "
+        "expectation rather than defaulting to one"
     )
 
 
@@ -1751,7 +1921,14 @@ CONTROLS: dict[str, list[tuple[str, object]]] = {
         ),
     ],
     "visibility": [
-        ("the classifier goes both ways", control_visibility_classifier_goes_both_ways),
+        (
+            "observed and declared are compared in all eight cells",
+            control_visibility_classifier_goes_both_ways,
+        ),
+        (
+            "the expectation is read from the manifest, not hard-coded",
+            control_visibility_declaration_is_read_not_assumed,
+        ),
         ("the check cannot change a repository setting", control_visibility_is_read_only),
     ],
 }

@@ -27,6 +27,41 @@ members = [
 ]
 resolver = "3"
 
+# The advertised release commitment.  **This table is the single referent for
+# the word "advertised"**; before it existed, docs/tasks.md rows M6-01 and
+# M6-C04 recorded at length that the word had none, so any claim to have built
+# for "every advertised target" was a claim about a set the claimant chose.
+#
+# It lives here, in the root manifest, rather than in a dedicated file, for one
+# reason that is a measurement rather than a preference: **a `[workspace.metadata]`
+# table has two independent readers.**  `scripts/m6-release-artifact.py` and
+# `scripts/m6-release-checks.py` parse this file with `tomllib` -- both already
+# read it (`workspace_members()` and the lockfile beside it) -- and `cargo`
+# itself surfaces the same table at `cargo metadata --no-deps --format-version 1`
+# under `.metadata.release`, verified on this host to return exactly
+# `{"release": {"advertised-targets": [...]}}`.  A dedicated `release-targets.toml`
+# would have exactly one reader, the script's own parser, so "what is declared"
+# and "what the script parsed" would be the same act and a parser fault would be
+# invisible.  `scripts/m6-release-artifact.py verify --check targets` requires
+# both readers plus the set frozen into a bundle's `PROVENANCE.txt` to agree, so
+# a divergence between the declaration and what the tooling uses goes red.
+#
+# Changing either value is a product decision, not a build detail: the target
+# set determines what `deny.toml`'s `[graph] targets` may narrow to, what M6-03's
+# platform matrix enumerates, and what M6-01 must ship a passing bundle for.
+[workspace.metadata.release]
+advertised-targets = [
+    "aarch64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+]
+# The owner explicitly requested publication and the repository is public.
+# `scripts/m6-release-checks.py --check visibility` compares GitHub's live
+# answer against this declared expectation and fails on disagreement **in
+# either direction**, so this is an assertion about reality rather than an
+# inverted constant.  See AGENTS.md and docs/tasks.md row M6-C01.
+repository-visibility = "public"
+
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
