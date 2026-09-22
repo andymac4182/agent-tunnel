@@ -362,8 +362,12 @@ def require_clean_tree(suites: list[Suite]) -> None:
             if changed:
                 sys.exit(
                     "m3-guard-deletion: refusing to run with uncommitted changes "
-                    f"under {relative}; each case is restored by checking the "
-                    "crate out again, which would discard them."
+                    f"under {relative}; a case applied on top of them could not "
+                    "be told apart from them, and the run would report a guard "
+                    "as load-bearing on the strength of somebody else's edit. "
+                    "Each case is restored by writing back the exact bytes it "
+                    "recorded (M5-C07), so these changes would survive a run -- "
+                    "but the evidence would not be trustworthy."
                 )
 
 
@@ -450,18 +454,25 @@ def main() -> int:
         # uncommitted work under that path (M4-32).  This harness is the one
         # M4-36 bypassed into running its whole destructive suite under
         # `--check-anchors`, so an interrupted case here is not hypothetical.
-        with AppliedCase("m3-guard-deletion", REPO, suite.name, name) as applied:
-            problem = applied.apply_all(edits)
-            if problem is not None:
-                results.append((suite.name, name, f"COULD NOT APPLY: {problem}", []))
-                print(f"[{suite.name}] {name}: {problem}", flush=True)
-                # No sweep here, matching the behaviour this replaces: the
-                # refusal happens before `run_tests`, so no fixture of this
-                # case has started and there is nothing to sweep.
-                continue
-            outcome, failures = run_tests(suite)
-        # After the restore, so a sweep never races a file write.
-        sweep_residue()
+        #
+        # The residue sweep is in a `finally` for the same reason the restore
+        # is in a context manager: this suite's cases deliberately defeat
+        # process cleanup, so an *interrupted* case is exactly the one whose
+        # fixtures are most likely to have outlived it.  Leaving the sweep
+        # after the `with` block meant an interrupt skipped it -- the tree
+        # stayed clean, but descendants with a 180-second lifetime were left
+        # running on the developer's machine.  It is inside the `try` so it
+        # also runs after the restore rather than racing it.
+        try:
+            with AppliedCase("m3-guard-deletion", REPO, suite.name, name) as applied:
+                problem = applied.apply_all(edits)
+                if problem is not None:
+                    results.append((suite.name, name, f"COULD NOT APPLY: {problem}", []))
+                    print(f"[{suite.name}] {name}: {problem}", flush=True)
+                    continue
+                outcome, failures = run_tests(suite)
+        finally:
+            sweep_residue()
         if name in EXPECT_GREEN:
             outcome = (
                 "DOCUMENTED GREEN"

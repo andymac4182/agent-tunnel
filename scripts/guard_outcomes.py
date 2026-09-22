@@ -260,6 +260,14 @@ def recover_mutations(repo: Path) -> int:
     repair anything silently.  An interrupted run is a fact worth a human
     reading it, and a harness that quietly fixed the tree and carried on would
     make the incident invisible -- which is the whole complaint of M5-C07.
+
+    **It writes the recorded originals back without checking that each file
+    still holds the mutation**, so an edit made to one of those files *after*
+    the interrupted run would be clobbered.  That is accepted rather than
+    guarded: the refusal this answers says in terms not to trust the tree, so
+    "read the refusal, then edit the named files, then recover" is not a
+    sequence anybody is being invited into.  A caller who has already edited
+    those files should revert from `HEAD` and delete the journal by hand.
     """
     journal = mutation_journal(repo)
     try:
@@ -290,6 +298,16 @@ def install_interrupt_restore() -> None:
     `kill`, a hangup from a supervising shell, or a test harness's
     `subprocess.run(timeout=)` would skip every `finally` in the program.  That
     is the M4-34 incident exactly.
+
+    **`SIGHUP` is installed unconditionally, which overrides an inherited
+    `SIG_IGN`.**  So a run launched under `nohup` -- which ignores `SIGHUP`
+    precisely so it survives a lost terminal -- will now exit on hangup
+    instead of continuing.  That is deliberate and is the safe direction for
+    *this* program: exiting runs the restore, whereas surviving a hangup with
+    a mutation applied and nobody watching is the M5-C07 incident with a
+    longer fuse.  Nothing in this repository `nohup`s a guard suite, and the
+    note is here so the next reader does not have to re-derive why a
+    backgrounded run died cleanly.
     """
 
     def raise_on_signal(number: int, _frame: object) -> None:
@@ -327,24 +345,41 @@ class AppliedCase:
         return self
 
     def _write_journal(self) -> None:
-        mutation_journal(self.repo).write_text(
-            json.dumps(
-                {
-                    "harness": self.harness,
-                    "suite": self.suite,
-                    "case": self.case,
-                    "pid": os.getpid(),
-                    "files": [
-                        {
-                            "path": str(path.relative_to(self.repo)),
-                            "original": original,
-                        }
-                        for path, original in self.originals
-                    ],
-                },
-                indent=2,
-            )
+        """Write the journal **atomically**.
+
+        This is rewritten on every `apply`, and a multi-edit case rewrites it
+        with the earlier files' originals already in it -- `acp-` has a
+        two-edit case and `fs-` an eight-edit one.  A bare truncate-then-write
+        `SIGKILL`ed between the truncate and the write would leave an *empty*
+        journal and lose the originals recorded for the earlier edits: the
+        refusal would still fire, so the tree would not be trusted, but
+        "recoverable byte for byte" would be false in exactly the window this
+        class exists to cover.  `os.replace` is atomic within a filesystem, so
+        the journal on disk is always either the previous complete record or
+        the new one.  A `SIGKILL` during the temporary write leaves the older
+        complete journal in place and the not-yet-mutated file unmutated,
+        which is the safe direction.
+        """
+        journal = mutation_journal(self.repo)
+        payload = json.dumps(
+            {
+                "harness": self.harness,
+                "suite": self.suite,
+                "case": self.case,
+                "pid": os.getpid(),
+                "files": [
+                    {
+                        "path": str(path.relative_to(self.repo)),
+                        "original": original,
+                    }
+                    for path, original in self.originals
+                ],
+            },
+            indent=2,
         )
+        temporary = journal.with_name(journal.name + ".tmp")
+        temporary.write_text(payload)
+        os.replace(temporary, journal)
 
     def apply(self, path: Path, old: str, new: str) -> str | None:
         """Record the original and mutate, or return why it could not.
@@ -385,7 +420,12 @@ class AppliedCase:
         while self.originals:
             path, original = self.originals.pop()
             path.write_text(original)
-        mutation_journal(self.repo).unlink(missing_ok=True)
+        journal = mutation_journal(self.repo)
+        journal.unlink(missing_ok=True)
+        # A `SIGKILL` during an atomic journal write can leave the temporary
+        # behind. Harmless -- `os.replace` never ran, so the journal proper is
+        # the older complete record -- but it should not accumulate.
+        journal.with_name(journal.name + ".tmp").unlink(missing_ok=True)
 
     def __exit__(
         self,

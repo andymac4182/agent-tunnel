@@ -2047,8 +2047,12 @@ def require_clean_tree(suites: list[Suite]) -> None:
             if changed:
                 sys.exit(
                     "m5-guard-deletion: refusing to run with uncommitted changes "
-                    f"under {relative}; each case is restored by checking the "
-                    "crate out again, which would discard them."
+                    f"under {relative}; a case applied on top of them could not "
+                    "be told apart from them, and the run would report a guard "
+                    "as load-bearing on the strength of somebody else's edit. "
+                    "Each case is restored by writing back the exact bytes it "
+                    "recorded (M5-C07), so these changes would survive a run -- "
+                    "but the evidence would not be trustworthy."
                 )
 
 
