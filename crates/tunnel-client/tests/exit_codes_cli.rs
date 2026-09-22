@@ -10,10 +10,10 @@
 //! that, because it never runs the binary.
 //!
 //! So these tests invoke the built binary and read the real exit status.
-//! They also check the redaction boundary on the *error* path specifically:
-//! an error surface prints internal state by construction, and a failure
-//! report that named the relay host or the private-key path would leak
-//! exactly the two things the configuration keeps private.
+//! They also hold the redaction boundary on the *error* path, which is where
+//! internal state is printed by construction -- but only where a violation is
+//! reachable; see the note above `assert_transport_message_is_bounded` for
+//! what was removed and why.
 
 #![cfg(unix)]
 
@@ -108,47 +108,35 @@ fn diagnostic(output: &Output) -> Value {
     serde_json::from_str(line).expect("parse tunnel-client JSON diagnostic")
 }
 
-/// The error surface must not name the private-key file, any credential
-/// body, or the relay endpoint. Asserted over the whole process output, not
-/// only the parsed JSON, so a stray `eprintln!` cannot slip past it.
-///
-/// **What this covers, measured rather than assumed.** These are *absence*
-/// assertions, and an absence assertion over a value the code could never
-/// emit is green over an empty domain -- the M5-C11 defect. So this
-/// fixture's error path was probed with both of the connector's redaction
-/// layers defeated at once (`sanitize_error` returning its input, and
-/// `ClientError::safe_message`'s generic transport arm appending `detail`).
-/// The worst output it then produces is
-/// `websocket handshake failed: IO error: Connection refused (os error 61)`
-/// -- **no path, no certificate, no endpoint**. Every entry below is
-/// therefore belt and braces on this path and none of them can redden here.
-///
-/// `assert_transport_message_is_bounded` is the assertion that *can* redden,
-/// and it is what the redaction case in `scripts/m0-guard-exit-codes.py`
-/// drives. This list stays because these tests will grow commands whose
-/// error paths do handle paths and endpoints, and because it costs nothing
-/// -- but it is not evidence, and nothing should count it as any.
-fn assert_redacted(output: &Output) {
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    for secret in [
-        "secret-credential-key.pem",
-        "BEGIN PRIVATE KEY",
-        "BEGIN CERTIFICATE",
-        "client-cert.pem",
-        "server-ca.pem",
-        "127.0.0.1",
-    ] {
-        assert!(
-            !stdout.contains(secret),
-            "stdout leaked {secret:?}: {stdout}"
-        );
-        assert!(
-            !stderr.contains(secret),
-            "stderr leaked {secret:?}: {stderr}"
-        );
-    }
-}
+// **There is deliberately no `assert_redacted` here, and its absence is the
+// point.**
+//
+// An earlier draft of this file swept the process output for the fixture's
+// private-key filename, its PEM bodies and its relay endpoint. Every one of
+// those assertions was green over an empty domain: the error path was probed
+// with *both* of the connector's redaction layers defeated at once
+// (`sanitize_error` returning its input, and `ClientError::safe_message`'s
+// generic transport arm appending `detail`), and the worst output it can
+// produce is
+// `websocket handshake failed: IO error: Connection refused (os error 61)` --
+// no path, no certificate, no endpoint. Nothing in this binary's failing
+// `connect` path handles those values at all, so nothing could ever have put
+// them there.
+//
+// They were kept for one round with a comment saying so. That was the wrong
+// call, and it is worth naming: this same branch filed M5-C11 instance
+// thirteen for a test that was green over an empty domain, and then added a
+// fresh instance of exactly that shape one file over. A comment admitting a
+// check cannot fail does not make it evidence, it makes it a check nobody
+// will re-examine -- and a later reader counting "redaction assertions" finds
+// six and stops. Deleted rather than annotated. When a command lands whose
+// error path genuinely handles a path or an endpoint, the assertion belongs
+// with that command, where defeating the redaction reddens it.
+//
+// `assert_transport_message_is_bounded` below is what remains, and it is the
+// real thing: the redaction case in `scripts/m0-guard-exit-codes.py` names it
+// as its required witness and the harness refuses the case if anything else
+// reddens instead.
 
 /// A transport diagnostic must be the bounded scope label and nothing else.
 ///
@@ -183,7 +171,6 @@ fn an_unknown_subcommand_exits_two_and_prints_usage() {
         stderr.contains("Usage:"),
         "an invalid invocation must show the usage it violated: {stderr}"
     );
-    assert_redacted(&output);
 }
 
 #[test]
@@ -238,5 +225,4 @@ fn a_refused_relay_connection_exits_four_and_names_the_transport() {
         "a refused connection is safe to retry once the relay returns"
     );
     assert_transport_message_is_bounded(&report);
-    assert_redacted(&output);
 }

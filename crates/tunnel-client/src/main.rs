@@ -924,8 +924,8 @@ mod tests {
             seen.insert(expected_code);
         }
         // `SupervisorPanicked` is the twelfth variant and is covered by
-        // `supervisor_failure_is_the_only_internal_connector_exit` below,
-        // which also states why it is the one that may stay at `1`.
+        // `only_protocol_and_supervisor_failures_exit_one` below, which also
+        // states why it is one of the two that may stay at `1`.
         assert_eq!(
             CliError::from_client(ClientError::SupervisorPanicked).exit_code(),
             1,
@@ -1025,11 +1025,13 @@ mod tests {
         assert_eq!(codes.len(), 14, "every cause publishes a distinct code");
     }
 
-    /// Exit `1` is reserved. Anything else landing there is the regression
-    /// this row exists to stop.
-    #[test]
-    fn supervisor_failure_is_the_only_internal_connector_exit() {
-        let internal: Vec<&'static str> = [
+    /// One of every `ClientError` variant, for tests that must sweep them.
+    ///
+    /// Hand-written, and it cannot fall behind silently: `Cause::from_client`
+    /// is an exhaustive match, so a new variant breaks the build there before
+    /// any test runs, and the sweeps below pin this list's length.
+    fn every_client_error() -> Vec<ClientError> {
+        vec![
             ClientError::Config(tunnel_client::RuntimeConfigError::Invalid("s")),
             ClientError::Credential(tunnel_client::credentials::CredentialError::KeyMismatch(
                 "s".to_owned(),
@@ -1048,11 +1050,47 @@ mod tests {
             ClientError::Cancelled,
             ClientError::SupervisorPanicked,
         ]
-        .into_iter()
-        .map(CliError::from_client)
-        .filter(|error| error.exit_code() == 1)
-        .map(|error| error.code())
-        .collect();
+    }
+
+    /// The CLI and the library must publish the **same** diagnostic string
+    /// for the same failure.
+    ///
+    /// `ClientError::code` is `pub` and still consumed by the library itself
+    /// and by the production-cluster harness. `Cause::code` is a second,
+    /// hand-maintained table of the same eleven strings, introduced by this
+    /// row: before it, the CLI called `error.code()` and there was one table.
+    /// Two tables with no assertion between them is precisely the pattern
+    /// this row removed from the chaos gate one crate over -- a copy beside
+    /// a comment -- and it would drift the same way, leaving `--json` output
+    /// and harness messages naming the same failure differently.
+    ///
+    /// `Cause` deliberately has three variants with no `ClientError`
+    /// counterpart (`ConfigError`, `SessionClosed`, `SignalError`), which is
+    /// why this is an assertion rather than a derivation.
+    #[test]
+    fn the_cli_and_the_library_publish_the_same_diagnostic_code() {
+        let errors = every_client_error();
+        assert_eq!(errors.len(), 12, "one entry per ClientError variant");
+        for error in errors {
+            let described = format!("{error:?}");
+            assert_eq!(
+                Cause::from_client(&error).code(),
+                error.code(),
+                "the CLI and the library disagree about the code for {described}"
+            );
+        }
+    }
+
+    /// Exit `1` is reserved for a protocol violation and a failed supervisor.
+    /// Anything else landing there is the regression this row exists to stop.
+    #[test]
+    fn only_protocol_and_supervisor_failures_exit_one() {
+        let internal: Vec<&'static str> = every_client_error()
+            .into_iter()
+            .map(CliError::from_client)
+            .filter(|error| error.exit_code() == 1)
+            .map(|error| error.code())
+            .collect();
         assert_eq!(
             internal,
             vec!["PROTOCOL_ERROR", "SUPERVISOR_FAILED"],

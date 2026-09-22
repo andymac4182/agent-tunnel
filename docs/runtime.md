@@ -113,14 +113,16 @@ Remote agents may invoke only locally configured exports. The CLI has no remotel
 
 These are the exit statuses `tunnel-client` selects, and they are implemented rather than proposed. `Cause::exit_code` in `crates/tunnel-client/src/main.rs` is the authority.
 
-**This table is a copy, and nothing checks it against the code.** No guard compares this Markdown to that function, so it can fall behind exactly the way the chaos gate's own copy of the vocabulary did before M0-03 replaced it with an import. What *is* checked mechanically: `tunnel_client::CLI_DIAGNOSTIC_EXIT_CODES` is the single definition of the set of statuses, `every_exit_status_is_in_the_published_vocabulary` fails if any cause maps outside it, and `scripts/m0-guard-exit-codes.py` holds the individual mappings to their meanings. A reviewer changing a status must edit this table by hand.
+**`Cause::exit_code` is the authority for everything except two paths, which are named here because "the authority" would otherwise be wrong.** `doctor` computes its own statuses in `crates/tunnel-client/src/doctor.rs` (`0`, `2`, `3`) and returns from `main` before the async command runner, so it never reaches `Cause`; and a failure to install the process crypto provider returns a bare `ExitCode::FAILURE` (`1`) with a message and **no diagnostic code**, because it happens before argument parsing and before any `--json` contract exists. Both are consistent with the table below; neither is derived from it.
+
+**This table is a copy, and nothing checks it against the code.** No guard compares this Markdown to that function, so it can fall behind exactly the way the chaos gate's own copy of the vocabulary did before M0-03 replaced it with an import. What *is* checked mechanically: `tunnel_client::CLI_DIAGNOSTIC_EXIT_CODES` is the single definition of the set of statuses, `every_exit_status_is_in_the_published_vocabulary` fails if any cause maps outside it, `the_cli_and_the_library_publish_the_same_diagnostic_code` pins `Cause::code` against `ClientError::code`, and `scripts/m0-guard-exit-codes.py` holds each individual mapping to its meaning with a named witness test. A reviewer changing a status must edit this table by hand.
 
 | Code | Meaning | Diagnostic codes that select it | What the operator does |
 | --- | --- | --- | --- |
 | 0 | Requested operation succeeded; foreground `connect` completed an orderly stop | — | nothing |
-| 1 | Unexpected internal failure | `PROTOCOL_ERROR`, `SUPERVISOR_FAILED`, `SIGNAL_ERROR` | report it; this is a defect or a version skew |
-| 2 | Invalid invocation or configuration; nothing was attempted | `INVALID_INVOCATION`, `CONFIG_ERROR`, `INVALID_CONFIG` | fix the command line or the profile |
-| 3 | Missing, invalid, expired, or untrusted credentials / authorization denied | `CREDENTIAL_ERROR`, `AUTHORIZATION_STALE` | run `doctor`; re-enroll or re-authorize |
+| 1 | Unexpected internal failure | `PROTOCOL_ERROR`, `SUPERVISOR_FAILED`, `SIGNAL_ERROR`, and the codeless crypto-provider bail-out | report it; this is a defect or a version skew |
+| 2 | Invalid invocation or configuration; nothing was attempted | `INVALID_INVOCATION`, `CONFIG_ERROR`, `INVALID_CONFIG`; also `doctor`'s own `INVALID_CONFIG` | fix the command line or the profile |
+| 3 | Missing, invalid, expired, or untrusted credentials / authorization denied | `CREDENTIAL_ERROR`, `AUTHORIZATION_STALE`; also `doctor`'s `CREDENTIAL_*` family | run `doctor`; re-enroll or re-authorize |
 | 4 | Network or service unavailable; the relay could not be reached or closed the session | `TRANSPORT_ERROR`, `SESSION_CLOSED` | check reachability, then retry |
 | 5 | Deadline exceeded | `DEADLINE_EXCEEDED` | check latency, or raise the bounded deadline |
 | 6 | Operation outcome unknown or incomplete drain requiring reconciliation | *(no producer today — see below)* | query the authorized operation status; never replay the mutation |

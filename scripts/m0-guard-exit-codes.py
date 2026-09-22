@@ -28,7 +28,11 @@ enum matched exhaustively.
   silent green -- which is the original defect returning.
 * Every other case edits a *value* the compiler cannot check -- which number
   a cause maps to, which string it publishes, whether a transport detail is
-  appended to a message -- and must turn a named test red.
+  appended to a message -- and must turn **the test it names** red.  Each
+  such case declares `expected_red`, and a run in which those tests are not
+  among the failures reports `RED (wrong witness)`, which is not a usable
+  outcome and fails the run.  This is stricter than the other four harnesses
+  here, which accept any named failure; see `Case` for the measured reason.
 
 **One rule is deliberately not here.**  Exit `6` (`OUTCOME_UNKNOWN`) is
 documented in `docs/runtime.md` and has no producer in this binary, so there
@@ -45,6 +49,12 @@ It follows `scripts/m3-guard-deletion.py`, `scripts/acp-guard-deletion.py`,
 2. A case whose `old` text is not unique in its file is refused outright
    rather than applied to the first match.
 3. A run that timed out returns `NOT EVIDENCE (timed out)`, not `RED (hung)`.
+
+and adds a fourth of its own:
+
+4. A red test that is not the one the case named is `RED (wrong witness)`,
+   and a value case that names no test at all is refused before any file is
+   edited.
 
 The classification of those outcomes lives in `scripts/guard_outcomes.py`,
 shared with the other harnesses, and is an allow list: everything that is not
@@ -112,9 +122,40 @@ CARGO_BUILD_BINARIES = [
 # An edit is (file, exact text to remove or replace, replacement).
 Edit = tuple[Path, str, str]
 
-CASES: list[tuple[str, list[Edit], bool]] = [
+
+@dataclass(frozen=True)
+class Case:
+    """One defeated guard, and the test that must notice.
+
+    **`expected_red` is the reason this is a class and not the 3-tuple the
+    other four harnesses use.**  Those harnesses classify a case as `RED` on
+    *any* named failing test, so a case can be green-lit by a test that has
+    nothing to do with the rule it claims to prove.  That is not theoretical
+    here: the redaction case below was first written with a single edit and
+    reported `RED` -- against an unrelated `m2_runtime` rotation test, while
+    the fixture it existed for stayed green.  It was caught only because the
+    wrong witness happened to be *visibly* unrelated.  A wrong witness that
+    reddens something plausible is invisible, and a tally of such cases reads
+    exactly like a tally of real ones.
+
+    So every value case names the test(s) that must be among the failures.
+    If they are not, the outcome is `RED (wrong witness)`, which is not in
+    `guard_outcomes.USABLE_OUTCOMES` and therefore fails the run.  A value
+    case with no declared witness is refused before anything is edited.
+
+    `expect_build_failure` cases declare none: a build failure names no test,
+    and requiring one would be incoherent.
+    """
+
+    name: str
+    edits: list[Edit]
+    expected_red: frozenset[str] = frozenset()
+    expect_build_failure: bool = False
+
+
+CASES: list[Case] = [
     # ------------------------------------------- the distinctions themselves
-    (
+    Case(
         # The headline case.  This *is* the old behaviour: before this row,
         # `OWNER_BUSY` fell through `_ => 1`.  A tester who started a second
         # connector saw "unexpected internal failure" and had no way to learn
@@ -127,17 +168,24 @@ CASES: list[tuple[str, list[Edit], bool]] = [
                 "            Self::OwnerBusy | Self::ResourceExhausted => 1,",
             )
         ],
-        False,
+        # The rule is that a held owner slot is not an internal failure, so
+        # the witnesses are the two tests that say exactly that.
+        frozenset(
+            {
+                "tests::causes_needing_different_actions_do_not_share_an_exit_code",
+                "tests::owner_busy_cli_diagnostic_is_terminal_and_actionable",
+            }
+        ),
     ),
-    (
+    Case(
         # Also the old behaviour.  An interrupted session is the single most
         # common non-success outcome a foreground `connect` has, and it was
         # indistinguishable from a crash.
         "an interrupted session is not reported as an internal failure",
         [(MAIN, "            Self::Cancelled => 130,", "            Self::Cancelled => 1,")],
-        False,
+        frozenset({"tests::causes_needing_different_actions_do_not_share_an_exit_code"}),
     ),
-    (
+    Case(
         # A stale authorization is an authorization decision, not a bug.  The
         # documented meaning of `3` is "untrusted credentials / authorization
         # denied"; putting this at `1` tells an operator to file a defect
@@ -150,9 +198,9 @@ CASES: list[tuple[str, list[Edit], bool]] = [
                 "            Self::CredentialError => 3,\n            Self::AuthorizationStale => 1,",
             )
         ],
-        False,
+        frozenset({"tests::causes_needing_different_actions_do_not_share_an_exit_code"}),
     ),
-    (
+    Case(
         # The one non-doctor status any fixture in this repository can reach
         # on a real process.  Defeating it is what proves
         # `a_refused_relay_connection_exits_four_and_names_the_transport` can
@@ -167,10 +215,16 @@ CASES: list[tuple[str, list[Edit], bool]] = [
                 "            Self::TransportError | Self::SessionClosed => 1,",
             )
         ],
-        False,
+        # **The witness is the process fixture, and declaring it is the whole
+        # point of this case.**  The same edit also reddens the unit test
+        # `every_client_error_variant_maps_to_an_actionable_exit_code`, so
+        # without a declared witness this case would report `RED` even if the
+        # process fixture were deleted -- and the `ExitCode::from` plumbing,
+        # which nothing else witnesses, would be uncovered and look covered.
+        frozenset({"a_refused_relay_connection_exits_four_and_names_the_transport"}),
     ),
     # ------------------------------------------------ the published vocabulary
-    (
+    Case(
         # The exit code is what a script reads; the code string is what a
         # human and a log search read.  They are separate surfaces and both
         # have to be pinned, or a mapping can be "fixed" in one and left
@@ -183,10 +237,18 @@ CASES: list[tuple[str, list[Edit], bool]] = [
                 '            Self::OwnerBusy => "SUPERVISOR_FAILED",',
             )
         ],
-        False,
+        # The code string, not the number: the test that asserts
+        # `code() == "OWNER_BUSY"`, plus the cross-crate parity assertion
+        # this edit also breaks.
+        frozenset(
+            {
+                "tests::owner_busy_cli_diagnostic_is_terminal_and_actionable",
+                "tests::the_cli_and_the_library_publish_the_same_diagnostic_code",
+            }
+        ),
     ),
     # -------------------------------------------------------- the redaction
-    (
+    Case(
         # **Redaction is the hard constraint on these surfaces.**  An error
         # message's whole job is to describe internal state, so it is exactly
         # where a backend error escapes.
@@ -222,10 +284,10 @@ CASES: list[tuple[str, list[Edit], bool]] = [
                 '            Self::Transport { scope, detail } => format!("{scope} failed: {detail}"),',
             ),
         ],
-        False,
+        frozenset({"a_refused_relay_connection_exits_four_and_names_the_transport"}),
     ),
     # ------------------------------------------------ the shared vocabulary
-    (
+    Case(
         # The cross-crate rule, and the one this row got wrong before a
         # reviewer would have.  `CLI_DIAGNOSTIC_EXIT_CODES` is what the
         # production-cluster chaos gate classifies a connector's
@@ -243,10 +305,10 @@ CASES: list[tuple[str, list[Edit], bool]] = [
                 "            Self::OwnerBusy | Self::ResourceExhausted => 9,",
             )
         ],
-        False,
+        frozenset({"tests::every_exit_status_is_in_the_published_vocabulary"}),
     ),
     # ------------------------------------------------- totality, by compiler
-    (
+    Case(
         # The rule that replaced the string table.  Removing an arm leaves
         # the match non-exhaustive and the crate does not build.  Reported
         # separately and never counted as a red test.
@@ -258,9 +320,9 @@ CASES: list[tuple[str, list[Edit], bool]] = [
                 "",
             )
         ],
-        True,
+        expect_build_failure=True,
     ),
-    (
+    Case(
         # The same rule for the classification of connector errors.  A new
         # `ClientError` variant cannot reach the CLI unclassified.
         "every connector error must be classified or the crate does not compile",
@@ -271,7 +333,7 @@ CASES: list[tuple[str, list[Edit], bool]] = [
                 "",
             )
         ],
-        True,
+        expect_build_failure=True,
     ),
 ]
 
@@ -281,7 +343,7 @@ class Suite:
     name: str
     crates: list[Path]
     cargo_test: list[str]
-    cases: list[tuple[str, list[Edit], bool]] = field(default_factory=list)
+    cases: list[Case] = field(default_factory=list)
     cwd: Path = REPO
 
 
@@ -304,8 +366,8 @@ HARNESS_TEST = [
     "production_cluster::chaos::tests::a_pre_readiness",
 ]
 
-HARNESS_CASES: list[tuple[str, list[Edit], bool]] = [
-    (
+HARNESS_CASES: list[Case] = [
+    Case(
         # The other half of the cross-crate rule.  A classifier that accepts
         # every status classifies a signal death and a spurious success as
         # interruptions, which is worse than the drift it replaced: the gate
@@ -319,7 +381,12 @@ HARNESS_CASES: list[tuple[str, list[Edit], bool]] = [
                 "            if u8::try_from(code).is_ok_and(|_| true) =>",
             )
         ],
-        False,
+        frozenset(
+            {
+                "production_cluster::chaos::tests::"
+                "a_pre_readiness_cli_exit_is_classified_only_for_typed_exit_codes"
+            }
+        ),
     ),
 ]
 
@@ -410,12 +477,38 @@ def require_clean_tree(suites: list[Suite]) -> None:
                 )
 
 
-def check_anchors(selected: list[tuple[Suite, str, list[Edit], bool]]) -> int:
+def check_anchors(selected: list[tuple[Suite, Case]]) -> int:
     """Resolve every selected case's guard text, and stop (M4-27)."""
     return shared_check_anchors(
         "m0-guard-exit-codes",
-        ((suite.name, name, edits) for suite, name, edits, _ in selected),
+        ((suite.name, case.name, case.edits) for suite, case in selected),
     )
+
+
+def require_declared_witnesses(selected: list[tuple[Suite, Case]]) -> None:
+    """Refuse a value case that names no test, before anything is edited.
+
+    Without this the `expected_red` mechanism is opt-in, and a case added
+    with the field omitted would silently fall back to the "any red will do"
+    behaviour this harness exists to reject -- the mechanism's own version of
+    the defect it guards.
+    """
+    problems = [
+        f"[{suite.name}] {case.name}"
+        for suite, case in selected
+        if not case.expect_build_failure and not case.expected_red
+    ] + [
+        f"[{suite.name}] {case.name} (compiler refusal may not declare a witness)"
+        for suite, case in selected
+        if case.expect_build_failure and case.expected_red
+    ]
+    if problems:
+        sys.exit(
+            "m0-guard-exit-codes: every value case must name the test(s) that "
+            "must redden, and a compiler-refusal case must name none; a case "
+            "classified RED by an unrelated failure is not evidence for the "
+            "rule it claims. Offending case(s): " + ", ".join(problems)
+        )
 
 
 def main() -> int:
@@ -442,14 +535,15 @@ def main() -> int:
         if not suites:
             sys.exit(f"m0-guard-exit-codes: no suite named {arguments.suite!r}")
     selected = [
-        (suite, name, edits, expect_build_failure)
+        (suite, case)
         for suite in suites
-        for name, edits, expect_build_failure in suite.cases
-        if not arguments.case or arguments.case in name
+        for case in suite.cases
+        if not arguments.case or arguments.case in case.name
     ]
     if arguments.list:
-        for suite, name, _, _ in selected:
-            print(f"{suite.name}: {name}")
+        for suite, case in selected:
+            witnesses = ", ".join(sorted(case.expected_red)) or "(compiler refusal)"
+            print(f"{suite.name}: {case.name} -> {witnesses}")
         return 0
     if arguments.check_anchors:
         return check_anchors(selected)
@@ -461,6 +555,7 @@ def main() -> int:
     # `--check-anchors` dispatch so read-only mode stays a pure anchor check
     # (M4-34, M4-36).
     refuse_resident_mutation("m0-guard-exit-codes", REPO)
+    require_declared_witnesses(selected)
     require_clean_tree(suites)
 
     # Preflight (M4-27): resolve every selected case's anchors before any
@@ -469,9 +564,10 @@ def main() -> int:
         return 1
 
     results: list[tuple[str, str, str, list[str]]] = []
-    for suite, name, edits, expect_build_failure in selected:
+    for suite, case in selected:
+        name = case.name
         with AppliedCase("m0-guard-exit-codes", REPO, suite.name, name) as applied:
-            problem = applied.apply_all(edits)
+            problem = applied.apply_all(case.edits)
             if problem is not None:
                 results.append((suite.name, name, f"COULD NOT APPLY: {problem}", []))
                 print(f"[{suite.name}] {name}: {problem}", flush=True)
@@ -483,7 +579,7 @@ def main() -> int:
                 if outcome == "still green"
                 else f"EXPECTED A DOCUMENTED GREEN, GOT: {outcome}"
             )
-        elif expect_build_failure:
+        elif case.expect_build_failure:
             outcome = (
                 "REFUSED BY COMPILER"
                 if outcome == "BUILD FAILED"
@@ -491,6 +587,20 @@ def main() -> int:
             )
         elif outcome == "BUILD FAILED":
             outcome = "BUILD FAILED (not evidence)"
+        elif outcome == "RED":
+            # **The witness check.**  `RED` means *something* failed; it does
+            # not mean the rule this case names was the thing that noticed.
+            # An outcome spelt this way is absent from
+            # `guard_outcomes.USABLE_OUTCOMES`, so it fails the run rather
+            # than being counted.
+            missing = sorted(case.expected_red - set(failures))
+            if missing:
+                outcome = (
+                    "RED (wrong witness): expected "
+                    + ", ".join(missing)
+                    + " to redden, got "
+                    + (", ".join(failures) if failures else "nothing")
+                )
         results.append((suite.name, name, outcome, failures))
         print(
             f"[{suite.name}] {name}: {outcome} {failures if failures else ''}".rstrip(),
@@ -509,7 +619,10 @@ def main() -> int:
         compiler = sum(1 for row in rows if row[2] == "REFUSED BY COMPILER")
         documented = sum(1 for row in rows if row[2] == "DOCUMENTED GREEN")
         measurable = len(rows) - compiler - documented
-        print(f"\n{suite.name}: {red} of {measurable} defeated guards turned a test red")
+        print(
+            f"\n{suite.name}: {red} of {measurable} defeated guards turned "
+            "the test they named red"
+        )
         if documented:
             print(
                 f"{suite.name}: {documented} guard(s) reported separately as a documented green"
