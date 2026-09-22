@@ -87,10 +87,16 @@ CARGO_DENY_VERSION = "0.19.6"
 #                         crates -- a broken manifest path, a `targets` list
 #                         that excluded everything -- would still print
 #                         "licenses ok".
-#   HISTORY_BLOBS_FLOOR   711 commits at 6fad2fb yielded the blob count below.
-#                         A history scan that walked one commit, or that
-#                         silently got an empty `rev-list`, would report zero
-#                         findings just as loudly as a clean history does.
+#   HISTORY_BLOBS_FLOOR   At 6fad2fb, `git rev-list --all --count` is 779 and
+#                         the scan reads 4,144 blobs. (`--all`, not HEAD: HEAD
+#                         alone is 711 commits, and the 68 commits of
+#                         difference are exactly the branch and tag history a
+#                         HEAD-only scan would miss.) A scan that walked one
+#                         commit, or silently got an empty `rev-list`, would
+#                         report zero findings just as loudly as a clean
+#                         history does; a `--depth 1` clone yields 689 blobs,
+#                         which is below this floor and is proved to fail by
+#                         `control_shallow_history_fails_the_blob_floor`.
 CRATES_FLOOR = 300
 HISTORY_BLOBS_FLOOR = 1500
 
@@ -243,9 +249,12 @@ class Finding:
     """A secret-scan hit. **Never holds the matched bytes.**
 
     `digest` is a SHA-256 of the match, which lets two hits be compared and a
-    remediation be confirmed without the plaintext ever reaching a log, a
-    task row or a commit message. `preview` is the pattern's fixed prefix
-    only, never the variable part.
+    remediation be confirmed without the plaintext ever reaching a log, a task
+    row or a commit message. `match_len` is the only other thing derived from
+    the secret, and a length is not a disclosure. There is deliberately no
+    preview field: a "first few characters" preview is exactly how a prefixed
+    credential (`ghp_`, `sk-ant-`, `AKIA`) gets partially published by a tool
+    whose whole purpose was to stop that.
     """
 
     pattern_name: str
@@ -622,7 +631,7 @@ def history_blobs(repo: Path) -> list[tuple[str, str]]:
     return out
 
 
-def check_secrets(repo: Path | None = None, quiet: bool = False) -> Result:
+def check_secrets(repo: Path | None = None) -> Result:
     repo = repo or REPO
     result = Result("secrets")
     candidates = history_blobs(repo)
@@ -1039,7 +1048,7 @@ def control_history_scan_finds_a_deleted_secret() -> tuple[bool, str]:
                 (repo / "config.toml").unlink()
                 subprocess.run(["git", "add", "-A"], **base)
                 subprocess.run(["git", "commit", "-qm", "remove the credential"], **base)
-            return check_secrets(repo=repo, quiet=True)
+            return check_secrets(repo=repo)
 
         dirty = build(True)
         clean = build(False)
@@ -1105,7 +1114,7 @@ def control_shallow_history_fails_the_blob_floor() -> tuple[bool, str]:
         # drive the comparison the way the real run would: scan the shallow
         # clone and require its blob count to be under the floor.
         blobs_line = ""
-        result = check_secrets(repo=clone, quiet=True)
+        result = check_secrets(repo=clone)
         for line in result.lines:
             if line.strip().startswith("history:"):
                 blobs_line = line.strip()
