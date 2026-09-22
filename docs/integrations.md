@@ -259,15 +259,31 @@ display scale and target identity into subsequent actions, and reject stale or
 mismatched capture coordinates. Preserve upstream permission-denied or unsupported
 results; do not silently escalate scope, change backend, or steal focus.
 
-**The command names above are pinned; the parameter names are not.** M5-01 read
+**Both the command names and the parameter names above are pinned.** M5-01 read
 the released registry and recorded which commands 0.3.46 accepts, which is what
-`tunnel_http_forward::cua_pin::ALLOWED_COMMANDS` carries. It did not record each
-command's parameter schema, and no backend has been probed, so the `x`/`y`,
-`start_x`/`end_x`, `dx`/`dy`, `text`, `key` and `keys` members the adapter sends
-are this repository's choice rather than a measurement. They are exercised only
-against the Lane A fixture, which accepts what it is sent. M5-C06 owns
-reconciling them against a real backend, and the table's own "validate
-backend-specific coordinate and delta semantics" is the same warning.
+`tunnel_http_forward::cua_pin::ALLOWED_COMMANDS` carries. M5-C06 then read
+`computer_server/handlers/base.py` — pinned separately as
+`cua_pin::BASE_PY_SHA256` — and recorded each command's parameter schema in
+`cua_pin::COMMAND_PARAMETERS`, which `scripts/m5-cua-refetch.sh` re-derives from
+the re-fetched source rather than comparing against itself.
+
+Reading it corrected two spellings this repository had chosen and shipped.
+`drag` takes `path: List[Tuple[int, int]]`, not the `start_x`/`start_y`/
+`end_x`/`end_y` members the adapter used to send, which exist on no backend.
+`scroll` takes `x`/`y` as wheel **amounts**, not a position, so the `dx`/`dy`
+members were discarded and the cursor coordinate was scrolled by instead — the
+silent half, and the reason a pinned command name with unpinned parameter names
+is a half-pin. The released dispatcher drops any member its handler does not
+declare, with no error and no log.
+
+What is **not** measured is any real backend: nothing has been probed, and the
+table's own "validate backend-specific coordinate and delta semantics" still
+stands as a warning about semantics rather than names. `display` is still sent
+on `screenshot` and `get_screen_size` knowing no backend declares it
+(`cua_pin::PARAMETERS_KNOWINGLY_DISCARDED`, consumer-visible half in M5-C12);
+`scroll`'s validated-but-inexpressible point is M5-C13; and the response side —
+`scale_percent`, `width` and `height`, none of which the released server sends —
+is M5-C14.
 
 ### Authentication and platform limits
 

@@ -211,10 +211,18 @@ pub struct CommandParameters {
 /// **Two recorded caveats, neither of which this table smooths over:**
 ///
 /// 1. `scroll`'s `x` and `y` are scroll **amounts**, not a cursor position.
-///    Upstream `scroll(self, x: int, y: int)` calls `self.mouse.scroll(x, y)`
-///    directly, and `main.py`'s own `_scroll_direction_handler` invokes it as
-///    `scroll(0, -100 * clicks)`. There is no way to scroll *at a point*: the
-///    pinned registry exposes no such parameter on any backend.
+///    All six backends treat them that way, though they do not share a body:
+///    macOS, Linux and Windows call `self.mouse.scroll(x, y)`; VNC repeats
+///    arrow-key presses `abs(y)` (then `abs(x)`) times, because Apple's
+///    `_VZVNCServer` does not translate RFB buttons 4-7 into wheel events;
+///    Android swipes from the screen centre to `(centre_x + x, centre_y - y)`;
+///    and the Cua Driver handler maps the sign to a direction and the
+///    magnitude to a count. `main.py`'s own `_scroll_direction_handler`
+///    delegates vertically to `scroll_down(clicks)`/`scroll_up(clicks)` and
+///    horizontally to `scroll(x_amount * clicks, 0)` with
+///    `x_amount = -300` for left and `300` for right. There is no way to
+///    scroll *at a point*: the pinned registry exposes no such parameter on
+///    any backend.
 /// 2. The VNC backend narrows `screenshot` to `screenshot(self)` — no
 ///    `format`, no `quality`. Sending either is silently dropped there. This
 ///    table records the abstract contract; a backend may accept a subset, so
