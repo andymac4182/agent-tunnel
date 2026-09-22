@@ -5199,52 +5199,13 @@ impl ProductionCluster {
         installed_before: &[bool],
         budget: Duration,
     ) -> Result<(usize, u128)> {
-        let started = Instant::now();
-        let deadline = started + budget;
-        let mut widest = 0usize;
-        loop {
-            let mut owing = Vec::new();
-            for (index, relay) in self.relays.iter().enumerate() {
-                if relay.running.is_none() {
-                    continue;
-                }
-                // Retry a publication that failed closed, rather than waiting
-                // for the refresh tick to get round to it.
-                if relay
-                    .pin_publication_pending
-                    .load(std::sync::atomic::Ordering::SeqCst)
-                    && matches!(relay.membership.readiness(), MembershipReadiness::Ready)
-                    && publish_verified_pins(&relay.membership, &relay.pins).is_ok()
-                {
-                    relay
-                        .pin_publication_pending
-                        .store(false, std::sync::atomic::Ordering::SeqCst);
-                }
-                if pin_publication_outstanding(
-                    installed_before.get(index).copied().unwrap_or(false),
-                    relay
-                        .pin_publication_pending
-                        .load(std::sync::atomic::Ordering::SeqCst),
-                    relay.pins.snapshot().is_empty(),
-                ) {
-                    owing.push(relay.node_id.clone());
-                }
-            }
-            widest = widest.max(owing.len());
-            if owing.is_empty() {
-                return Ok((widest, started.elapsed().as_millis()));
-            }
-            if Instant::now() >= deadline {
-                return Err(HarnessError::Timeout(format!(
-                    "verified peer pins were not reinstalled on {} of {} running relays \
-                     within {} ms after a membership re-sign",
-                    owing.len(),
-                    self.relays.iter().filter(|r| r.running.is_some()).count(),
-                    budget.as_millis(),
-                )));
-            }
-            sleep(PIN_AVAILABILITY_POLL).await;
-        }
+        wait_for_pins_over(
+            &self.relays,
+            installed_before,
+            budget,
+            PIN_AVAILABILITY_POLL,
+        )
+        .await
     }
 
     /// Join every running relay's bounded `last_by_stage` peer-fault view with
@@ -6066,6 +6027,105 @@ fn pin_publication_outstanding(
     pins_empty: bool,
 ) -> bool {
     publication_pending || (installed_before && pins_empty)
+}
+
+/// The four things [`wait_for_pins_over`] needs from a relay.
+///
+/// A trait rather than a direct read of [`ProductionRelay`] so the wait —
+/// including its bound — can be driven against a scripted double.  The
+/// condition it waits for occurs in roughly two per cent of re-signs (measured:
+/// 2 engagements in 111), so a campaign is *expected* to end without
+/// exercising it even when the wait works perfectly, and an arm that probably
+/// cannot demonstrate its own subject is not evidence.  The double makes the
+/// window deterministic and lets the timeout branch be asserted at all; nothing
+/// else ever reaches it.
+trait PinWaitRelay {
+    fn node_id(&self) -> String;
+    fn is_running(&self) -> bool;
+    /// Retry a publication that failed closed, if one is pending and the
+    /// runtime will accept it now.  Observable only through the accessors.
+    fn retry_pending_publication(&self);
+    fn publication_pending(&self) -> bool;
+    fn pins_empty(&self) -> bool;
+}
+
+impl PinWaitRelay for ProductionRelay {
+    fn node_id(&self) -> String {
+        self.node_id.clone()
+    }
+
+    fn is_running(&self) -> bool {
+        self.running.is_some()
+    }
+
+    fn retry_pending_publication(&self) {
+        if self
+            .pin_publication_pending
+            .load(std::sync::atomic::Ordering::SeqCst)
+            && matches!(self.membership.readiness(), MembershipReadiness::Ready)
+            && publish_verified_pins(&self.membership, &self.pins).is_ok()
+        {
+            self.pin_publication_pending
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn publication_pending(&self) -> bool {
+        self.pin_publication_pending
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn pins_empty(&self) -> bool {
+        self.pins.snapshot().is_empty()
+    }
+}
+
+/// Wait until no running relay still owes this re-sign its verified pin set.
+///
+/// Returns the widest number of relays seen owing and how long the wait took.
+/// At the bound it returns [`HarnessError::Timeout`] rather than proceeding:
+/// proceeding would re-create the exact condition this exists to prevent, at
+/// the one moment it is known to be present.
+async fn wait_for_pins_over<R: PinWaitRelay>(
+    relays: &[R],
+    installed_before: &[bool],
+    budget: Duration,
+    poll: Duration,
+) -> Result<(usize, u128)> {
+    let started = Instant::now();
+    let deadline = started + budget;
+    let mut widest = 0usize;
+    loop {
+        let mut owing = Vec::new();
+        for (index, relay) in relays.iter().enumerate() {
+            if !relay.is_running() {
+                continue;
+            }
+            // Retry here rather than waiting for `peer_refresh_loop`'s tick.
+            relay.retry_pending_publication();
+            if pin_publication_outstanding(
+                installed_before.get(index).copied().unwrap_or(false),
+                relay.publication_pending(),
+                relay.pins_empty(),
+            ) {
+                owing.push(relay.node_id());
+            }
+        }
+        widest = widest.max(owing.len());
+        if owing.is_empty() {
+            return Ok((widest, started.elapsed().as_millis()));
+        }
+        if Instant::now() >= deadline {
+            return Err(HarnessError::Timeout(format!(
+                "verified peer pins were not reinstalled on {} of {} running relays \
+                 within {} ms after a membership re-sign",
+                owing.len(),
+                relays.iter().filter(|relay| relay.is_running()).count(),
+                budget.as_millis(),
+            )));
+        }
+        sleep(poll).await;
+    }
 }
 
 fn publish_verified_pins(membership: &MembershipRuntime, pins: &SharedPeerPins) -> Result<()> {
@@ -7206,8 +7266,207 @@ mod tests {
         is_peer_recovery_response, redacted_admission_failure, validate_production_evidence,
         validate_redis_partition_evidence,
     };
-    use super::pin_publication_outstanding;
+    use super::{PinWaitRelay, pin_publication_outstanding, wait_for_pins_over};
     use crate::acceptance_test_support::{assert_failed, assert_rejected};
+    use std::cell::Cell;
+    use std::time::Duration;
+
+    /// A relay whose pin state is scripted rather than raced for.
+    ///
+    /// **Why this exists at all.** The condition `wait_for_pins_over` waits for
+    /// occurs in about two per cent of re-signs -- measured, 2 engagements in
+    /// 111 across the post-fix campaign -- so a campaign is *more likely than
+    /// not* to finish without ever exercising it, even if the wait is perfect.
+    /// A green campaign would then be indistinguishable from the wait being a
+    /// no-op. This makes the window deterministic, so the claim can be
+    /// asserted in both directions instead of hoped for.
+    struct ScriptedRelay {
+        /// Polls remaining before the pending publication succeeds.  `None`
+        /// means it never does, which is the only way to reach the bound.
+        recovers_after: Option<u32>,
+        polls: Cell<u32>,
+        pending: Cell<bool>,
+        empty: Cell<bool>,
+    }
+
+    impl ScriptedRelay {
+        fn recovering(after: u32) -> Self {
+            Self {
+                recovers_after: Some(after),
+                polls: Cell::new(0),
+                pending: Cell::new(true),
+                empty: Cell::new(true),
+            }
+        }
+
+        fn never_recovers() -> Self {
+            Self {
+                recovers_after: None,
+                polls: Cell::new(0),
+                pending: Cell::new(true),
+                empty: Cell::new(true),
+            }
+        }
+
+        /// A pin set withdrawn **on purpose** and held: empty, with no
+        /// publication pending and none coming.  This is the key-revocation
+        /// fixtures' state, and the one `installed_before` exists to excuse.
+        fn deliberately_withdrawn() -> Self {
+            Self {
+                recovers_after: None,
+                polls: Cell::new(0),
+                pending: Cell::new(false),
+                empty: Cell::new(true),
+            }
+        }
+    }
+
+    impl PinWaitRelay for ScriptedRelay {
+        fn node_id(&self) -> String {
+            "scripted".to_owned()
+        }
+
+        fn is_running(&self) -> bool {
+            true
+        }
+
+        fn retry_pending_publication(&self) {
+            let seen = self.polls.get() + 1;
+            self.polls.set(seen);
+            if let Some(after) = self.recovers_after
+                && seen >= after
+            {
+                self.pending.set(false);
+                self.empty.set(false);
+            }
+        }
+
+        fn publication_pending(&self) -> bool {
+            self.pending.get()
+        }
+
+        fn pins_empty(&self) -> bool {
+            self.empty.get()
+        }
+    }
+
+    /// **The forced window, and the half the campaign could not supply.** A
+    /// relay whose publication failed closed and needs three retries before it
+    /// lands: the wait must not return until it has, and must report that it
+    /// waited. `relays_waited >= 1` is the part a no-op cannot fake.
+    #[tokio::test]
+    async fn a_resign_waits_until_the_emptied_pin_set_is_reinstalled() {
+        let relays = [ScriptedRelay::recovering(3)];
+        let (waited_for, _elapsed) = wait_for_pins_over(
+            &relays,
+            &[true],
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+        )
+        .await
+        .expect("the pin set is reinstalled well inside the budget");
+        assert_eq!(waited_for, 1, "the wait did not report a relay owing pins");
+        assert!(!relays[0].pins_empty(), "returned with an empty pin set");
+        assert!(
+            !relays[0].publication_pending(),
+            "returned with a publication still pending"
+        );
+        assert!(
+            relays[0].polls.get() >= 3,
+            "returned before the publication could land: {} polls",
+            relays[0].polls.get()
+        );
+    }
+
+    /// The other direction: with the rule defeated the same scripted relay is
+    /// released **immediately, with its pin set still empty** -- which is the
+    /// state `verify-m3-mcp-isolation` then dispatched into (M3-04 / M7-C83).
+    /// Without this the test above cannot distinguish a wait that works from a
+    /// condition that never occurred.
+    /// The `installed_before` guard, exercised as a **pair on one state**: the
+    /// same deliberately-withdrawn relay, released when it had no pin set
+    /// before the re-sign and waited for when it did.  Two opposite outcomes
+    /// from one input change is what makes this a discriminating test rather
+    /// than a demonstration that some call returns `Ok`.
+    ///
+    /// A first draft of this asserted the exclusion using a relay with a
+    /// publication still pending, and **failed** -- correctly: the rule's first
+    /// clause is independent of `installed_before`, so a pending publication is
+    /// outstanding whoever it belongs to. The failure was the test's premise
+    /// being wrong, not the rule, and it is recorded because a test that had
+    /// passed there would have been asserting the rule was weaker than it is.
+    #[tokio::test]
+    async fn only_a_pin_set_this_resign_emptied_is_waited_for() {
+        let released = [ScriptedRelay::deliberately_withdrawn()];
+        let (waited_for, _elapsed) = wait_for_pins_over(
+            &released,
+            &[false],
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+        )
+        .await
+        .expect("a pin set withdrawn before the re-sign must not be waited for");
+        assert_eq!(
+            waited_for, 0,
+            "reported a relay owing pins the rule excludes"
+        );
+        assert!(
+            released[0].pins_empty(),
+            "the point of this half is that the wait released while the pin set was \
+             STILL EMPTY; if it is no longer empty this test measures nothing"
+        );
+
+        // Same relay, same everything, `installed_before: true`.  Now the wait
+        // must refuse to release -- and since nothing will ever republish, it
+        // must hit the bound rather than return.
+        let waited = [ScriptedRelay::deliberately_withdrawn()];
+        wait_for_pins_over(
+            &waited,
+            &[true],
+            Duration::from_millis(60),
+            Duration::from_millis(1),
+        )
+        .await
+        .expect_err(
+            "a pin set that WAS installed before the re-sign and is now empty must be \
+             waited for, not released",
+        );
+    }
+
+    /// What happens **at** the bound, rather than merely that it is reached.
+    ///
+    /// A publication that never lands must fail the re-sign rather than let it
+    /// proceed: proceeding would re-create the defect at the one moment it is
+    /// known to be present. The message must also be distinguishable from that
+    /// defect by M3-25's own discriminator, or a timeout here would be
+    /// miscounted as an M3-04 / M7-C83 sighting.
+    #[tokio::test]
+    async fn a_pin_set_that_never_returns_fails_the_resign_at_the_bound() {
+        let relays = [ScriptedRelay::never_recovers()];
+        let error = wait_for_pins_over(
+            &relays,
+            &[true],
+            Duration::from_millis(80),
+            Duration::from_millis(1),
+        )
+        .await
+        .expect_err("a publication that never lands must not be reported as success");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("were not reinstalled") && rendered.contains("re-sign"),
+            "the bound must name pins and the re-sign: {rendered}"
+        );
+        for foreign in [
+            "PEER_UNAVAILABLE",
+            "not_dispatched",
+            "transport_pins_unavailable",
+        ] {
+            assert!(
+                !rendered.contains(foreign),
+                "a bound timeout must not carry the M3-04 discriminator {foreign}: {rendered}"
+            );
+        }
+    }
 
     /// A publication that failed closed is outstanding whatever the pin set
     /// currently looks like: the retry has not happened yet, so the set on
