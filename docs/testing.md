@@ -188,8 +188,8 @@ pipe inside an inline code span still splits the row, so `` `a | b` `` must be
 written `` `a \| b` ``. `--verbose` reports the rows and tables checked, the
 findings, and the number of rows **exempt** — the `Completion history` log,
 whose mixed bullet/row formatting is tracked as M4-41. An exempt row is one no
-rule examines, so the count is printed every run and bounded in both directions
-by `scripts/test_table_shape.py`.
+rule examines, so the count is printed on every `--verbose` run and bounded in
+both directions by `scripts/test_table_shape.py`.
 
 The scan is fatal (exit 2) when it matches no tables, no rows, or no verified
 rows: a guard whose success and whose non-execution look identical is not

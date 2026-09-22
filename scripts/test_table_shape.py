@@ -240,26 +240,50 @@ def main() -> int:
     # --- a scan that matches nothing must be FATAL, not a pass --------------
     # The adjective tell: ask which line fails if the scan found no tables at
     # all.  Before this, none did -- the guard printed PASS.
-    with tempfile.TemporaryDirectory() as tmp:
-        empty = Path(tmp) / "no-tables.md"
-        empty.write_text("# A document with prose and no tables at all.\n", encoding="utf-8")
-        saved = guard.DOCS
-        guard.DOCS = [str(empty)]
-        try:
-            guard.scan(set(), set(), False)
-        except SystemExit as exit_code:
-            check(
-                exit_code.code == 2,
-                f"an empty scan must exit 2 (environment error), got {exit_code.code}",
-            )
-        else:
-            sys.exit(
-                "test_table_shape: a scan that matched NO tables and NO rows "
-                "returned normally; a check whose success and whose "
-                "non-execution look identical is not evidence"
-            )
-        finally:
-            guard.DOCS = saved
+    #
+    # There are THREE fatal conditions and each gets its own fixture.  Review
+    # caught one red case standing for all three, which would have left the
+    # zero-verified-rows `die` with nothing that could turn it red: a fatality
+    # nobody can trigger is the same fail-open one level in.
+    #
+    # The second fixture is the load-bearing one.  Its table is well-formed and
+    # full of rows -- it is only the *status wording* that matches nothing, so
+    # the shape rules are perfectly happy and the gate and ancestry rules apply
+    # to zero rows.  That is exactly the shape of the silent failure: a guard
+    # that still prints its verbose line, still reports tables and rows, and
+    # has quietly stopped checking any evidence at all.
+    fatal_fixtures = {
+        "no tables at all": "# A document with prose and no tables at all.\n",
+        "tables and rows, but NO verified row": (
+            HEADER
+            + "\n"
+            + SEPARATOR
+            + "\n| M5-C13 | [ ] A task. | planned | a worker | prose | — |\n"
+            + "| M5-C14 | [ ] Another. | in progress | a worker | prose | — |\n"
+        ),
+    }
+    for label, body in fatal_fixtures.items():
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = Path(tmp) / "fixture.md"
+            fixture.write_text(body, encoding="utf-8")
+            saved = guard.DOCS
+            guard.DOCS = [str(fixture)]
+            try:
+                guard.scan(set(), set(), False)
+            except SystemExit as exit_code:
+                check(
+                    exit_code.code == 2,
+                    f"the '{label}' scan must exit 2 (environment error), got "
+                    f"{exit_code.code}",
+                )
+            else:
+                sys.exit(
+                    f"test_table_shape: the '{label}' scan returned normally; a "
+                    f"check whose success and whose non-execution look identical "
+                    f"is not evidence"
+                )
+            finally:
+                guard.DOCS = saved
 
     print(
         f"test_table_shape: PASS ({total_rows} rows in {total_tables} tables "
