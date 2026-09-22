@@ -660,6 +660,86 @@ async fn a_capture_identity_from_before_a_restart_is_unknown_afterwards() {
     supervisor.stop(state.as_ref()).await;
 }
 
+/// **`docs/tasks.md` M5-C09, on the production path.** A real supervisor over
+/// a real backend process returns an `Invalidation` that *declares* what it
+/// could not observe about the target, alongside what it took away from the
+/// device.
+///
+/// The two restarts are the whole measurement, and either alone would be
+/// worthless:
+///
+/// * the **busy** one held a lease and a capture, so `freed_anything()` is
+///   true and the invalidation is not an empty value;
+/// * the **idle** one held nothing, so `freed_anything()` is false — and it
+///   declares exactly the same residue. A device that narrowed the
+///   declaration to what its own registries happened to hold would pass the
+///   first and fail here, which is the point: the registries are not a
+///   witness to the desktop.
+///
+/// Nothing here releases a button or a key, and nothing tries: the pinned
+/// registry carries no primitive that could, and forcing one would mean the
+/// supervisor synthesising input. See `tunnel_cua::supervision`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_supervised_restart_declares_what_it_cannot_observe_about_the_target() {
+    use tunnel_cua::supervision::RESTART_RESIDUE;
+
+    let workspace = tempfile::tempdir().expect("workspace");
+    let mut guard = PidGuard::new();
+    let state = DeviceState::new();
+    let desktop = TargetSession::new("desktop-0");
+
+    guard.watch_workspace(workspace.path());
+    let mut supervisor = Supervisor::new(supervised(workspace.path()));
+    let endpoint = supervisor.start().await.expect("it started");
+    guard.watch(supervisor.pid().expect("a pid"));
+    guard.watch_helper(workspace.path()).await;
+
+    let session = facade(&state, dispatcher_for(endpoint).await, &desktop);
+    let (_lease, _capture) = capture_then_lease(&session).await;
+
+    let (busy, restarted) = supervisor.restart(state.as_ref()).await;
+    let new_endpoint = restarted.expect("the replacement started");
+    guard.watch(supervisor.pid().expect("a pid"));
+    guard.watch_helper(workspace.path()).await;
+
+    assert!(
+        busy.freed_anything(),
+        "the control: this restart really did take something away"
+    );
+    assert_eq!(busy.leases_released, vec![desktop.clone()]);
+    assert_eq!(busy.captures_forgotten, 1);
+
+    let residue = busy.residue();
+    assert!(
+        residue.pointer_button_may_be_down(),
+        "a backend killed mid-click or mid-drag may have left a button down"
+    );
+    assert!(
+        residue.key_may_be_held(),
+        "a backend killed mid-hotkey may have left a modifier held"
+    );
+    assert!(
+        residue.effect_may_be_partial(),
+        "a backend killed mid-type may have typed a prefix"
+    );
+    assert_eq!(residue, RESTART_RESIDUE);
+
+    // A second restart with nothing held. The device now knows less about
+    // itself and exactly as much about the desktop.
+    drop(session);
+    let _ = new_endpoint;
+    let idle = supervisor.stop(state.as_ref()).await;
+    assert!(
+        !idle.freed_anything(),
+        "the second control: this one took nothing away"
+    );
+    assert_eq!(
+        idle.residue(),
+        busy.residue(),
+        "the declaration does not narrow because the registries were empty"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_capture_taken_after_a_restart_never_reuses_a_pre_restart_identity() {
     let workspace = tempfile::tempdir().expect("workspace");
