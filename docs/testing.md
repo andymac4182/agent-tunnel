@@ -178,6 +178,28 @@ cannot resolve to a commit (digests, blob ids, squashed short hashes) and
 gate fragments embedded in a longer path or log filename are ignored, so only
 real citations are checked. The guard never writes to the docs.
 
+It also asserts the **shape** of those tables (M4-33), over every data row and
+not only the verified ones. A row fails when its cell count differs from the
+count its own table's separator row declares, and a run of table rows with no
+separator at all fails as well — a blank line inside a table ends it, and the
+rows below render as a paragraph of pipe-delimited text rather than as a table.
+Cell boundaries are `|` not preceded by a backslash, which is GFM's rule: a
+pipe inside an inline code span still splits the row, so `` `a | b` `` must be
+written `` `a \| b` ``. `--verbose` reports the rows and tables checked, the
+findings, and the number of rows **exempt** — the `Completion history` log,
+whose mixed bullet/row formatting is tracked as M4-41. An exempt row is one no
+rule examines, so the count is printed on every `--verbose` run and bounded in
+both directions by `scripts/test_table_shape.py`.
+
+The scan is fatal (exit 2) when it matches no tables, no rows, or no verified
+rows: a guard whose success and whose non-execution look identical is not
+evidence.
+
+```sh
+python3 scripts/test_table_shape.py      # the shape rule, red fixtures included
+python3 scripts/test_evidence_guard_pins.py
+```
+
 ### Concurrent same-identifier tenants and the duplicate-owner race
 
 `verify-m7-production` keeps both tenants' device sessions online at the
