@@ -111,6 +111,7 @@ def main() -> int:
     the_read_only_entry_holds_no_write_capability()
     a_deletion_loop_reachable_from_read_only_mode_is_refused()
     a_lost_check_anchors_dispatch_cannot_delete_anything()
+    an_unbalanced_exit_cannot_disable_the_write_barrier()
 
     # M4-23 / M4-24: a red must be the case's own red.
     a_red_from_a_foreign_test_is_not_credited()
@@ -1454,14 +1455,17 @@ def a_lost_check_anchors_dispatch_cannot_delete_anything() -> None:
     import importlib.util
 
     directory = Path(__file__).resolve().parent
-    exercised = 0
-    reached = 0
+    unexercised: list[str] = []
+    not_reached: list[str] = []
     for script_name in sorted(EXPECTED_GUARD_ANCHORS):
         original = (directory / script_name).read_text()
         bypassed = _plant_nested_dispatch(original)
         if bypassed is None:
+            # Named and failed below, never silently skipped: a harness whose
+            # shape this fixture cannot recognise is exactly a harness whose
+            # capability drop may have moved out of reach.
+            unexercised.append(script_name)
             continue
-        exercised += 1
 
         module_name = script_name.removesuffix(".py")
         spec = importlib.util.spec_from_file_location(
@@ -1533,8 +1537,9 @@ def a_lost_check_anchors_dispatch_cannot_delete_anything() -> None:
             "Read-only mode must be a capability taken away at parse time, "
             "not a branch a lost dispatch can skip (M4-36).",
         )
-        if tally["attempted"]:
-            reached += 1
+        if not tally["attempted"]:
+            not_reached.append(script_name)
+        else:
             # It reached the deletion loop, so what stopped it must be the
             # missing capability and not some unrelated refusal -- a control
             # that reddens for a sibling's reason proves nothing (M4-43).
@@ -1545,21 +1550,102 @@ def a_lost_check_anchors_dispatch_cannot_delete_anything() -> None:
                 f"stopped it; refusal was {refused!r}",
             )
 
+    # **Exact, not a floor, and review is why (M4-43).**  This used to require
+    # `exercised >= 5` and `reached >= 4` -- one below the populations of 6
+    # and 5 -- so exactly one harness could drop out of either set and the
+    # fixture still passed. Review planted an `m3` with **both** `if
+    # arguments.check_anchors:` blocks nested under `if arguments.list:`, the
+    # capability drop as well as the dispatch. The planter matches the
+    # dispatch at indent 4, so it returned None, the harness was skipped, and
+    # the fixture reported PASS while that harness's `--check-anchors` landed
+    # 12 mutations. An excluded set that is never measured is the defect this
+    # file keeps finding in itself.
     check(
-        exercised >= 5,
-        f"the nested-dispatch bypass was only applied to {exercised} harness(es); "
-        "the shape this fixture recognises has changed and it is now testing "
-        "almost nothing",
+        not unexercised,
+        "the nested-dispatch bypass could not be planted in "
+        f"{', '.join(unexercised)}, so those harness(es) were never measured. "
+        "Their `--check-anchors` dispatch or capability drop is no longer at "
+        "the top level of main(), which is the shape of the very bypass this "
+        "fixture exists to catch (M4-36).",
     )
-    # A harness may legitimately refuse before the loop for another reason --
-    # `m6-guard-client-bundle-sentinel` requires a built `--client-bin` -- but
-    # if *none* reached the loop, this fixture proved nothing about the
-    # barrier, only that the runs stopped somewhere.
+    # Exactly one harness may stop before the deletion loop, and it is named:
+    # `m6-guard-client-bundle-sentinel` refuses without a built
+    # `--client-bin`, so the loop is unreachable for it here. Any other
+    # harness failing to reach the loop means this fixture proved nothing
+    # about the barrier for it.
     check(
-        reached >= 4,
-        f"only {reached} harness(es) actually reached the deletion loop under "
-        "the bypass, so this fixture is no longer exercising the write "
-        "barrier it exists to prove",
+        not_reached == ["m6-guard-client-bundle-sentinel.py"],
+        "the harnesses that did not reach the deletion loop under the bypass "
+        f"were {not_reached}; exactly one is excused, "
+        "m6-guard-client-bundle-sentinel.py (no --client-bin). Any other "
+        "harness here was not tested against the write barrier.",
+    )
+
+
+def an_unbalanced_exit_cannot_disable_the_write_barrier() -> None:
+    """The barrier must survive an `__exit__` with no matching `__enter__`.
+
+    **Found on review, measured before it was fixed.**  `__exit__` used to
+    decrement the nesting depth unconditionally, so `__enter__(); __exit__();
+    __exit__()` left `_depth == -1`. The next `__enter__` then saw a non-zero
+    depth, took itself to be nested inside a barrier that did not exist, and
+    installed nothing -- so `forbid_writes_for_this_process()` returned with
+    the process still able to write. Nothing shipped calls `__exit__`
+    unbalanced, but a `finally` after a failed `__enter__` would.
+
+    Two shapes are checked, each for its own reason: a stray second exit on
+    the same instance (the depth must not go negative, and a later barrier
+    must install), and an exit on a never-entered instance while another
+    holds the barrier (it must not lift it). Each asserts the refusal names
+    `Path.write_text`, so neither is satisfied by a sibling barrier (M4-43).
+
+    **Defeating it.**  Restore the unconditional decrement in `__exit__` and
+    the first shape fails with the write landing.
+    """
+    import guard_outcomes
+
+    target = Path(tempfile.mkdtemp()) / "product.rs"
+
+    def write_is_refused() -> str | None:
+        try:
+            target.write_text("mutated")
+        except WriteAttempted as refusal:
+            return str(refusal)
+        return None
+
+    try:
+        stray = NoWriteCapability()
+        stray.__enter__()
+        stray.__exit__()
+        stray.__exit__()
+        check(
+            NoWriteCapability._depth == 0,
+            "an unmatched __exit__ drove the write barrier's depth to "
+            f"{NoWriteCapability._depth}; below zero, the next barrier "
+            "believes it is nested and installs nothing",
+        )
+        guard_outcomes.forbid_writes_for_this_process()
+        refused = write_is_refused()
+        check(
+            refused is not None and "Path.write_text" in refused,
+            "after a stray __exit__, forbid_writes_for_this_process() left "
+            f"the process able to write (refusal {refused!r}): --check-anchors "
+            "would then be read-only in name only (M4-36)",
+        )
+
+        never_entered = NoWriteCapability()
+        never_entered.__exit__()
+        refused = write_is_refused()
+        check(
+            refused is not None and "Path.write_text" in refused,
+            "an __exit__ on a never-entered barrier lifted the barrier another "
+            f"instance holds (refusal {refused!r})",
+        )
+    finally:
+        _restore_write_capability()
+    check(
+        not target.exists(),
+        "a write landed while the barrier was supposed to be held",
     )
 
 

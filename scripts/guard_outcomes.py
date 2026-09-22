@@ -747,6 +747,7 @@ class NoWriteCapability:
         cls._depth = 0
         if holder is not None:
             holder._installed = True
+            holder._active = True
             cls._depth = 1
             holder.__exit__()
 
@@ -755,6 +756,7 @@ class NoWriteCapability:
 
         self._installed = NoWriteCapability._depth == 0
         NoWriteCapability._depth += 1
+        self._active = True
         if not self._installed:
             return self
         NoWriteCapability._holder = self
@@ -794,6 +796,18 @@ class NoWriteCapability:
         return self
 
     def __exit__(self, *_exc: object) -> bool:
+        # **Only an instance with an outstanding `__enter__` may unwind
+        # (found on review).**  This used to decrement unconditionally, so
+        # `__enter__(); __exit__(); __exit__()` left `_depth == -1`, after
+        # which the next `__enter__` saw a non-zero depth, installed nothing,
+        # and `forbid_writes_for_this_process()` left the process able to
+        # write. A `finally` after a failed `__enter__`, or a stray second
+        # exit, is enough to reach that. Now an unmatched exit is a no-op: it
+        # can neither drive the depth negative nor lift a barrier some other
+        # instance is holding.
+        if not getattr(self, "_active", False):
+            return False
+        self._active = False
         NoWriteCapability._depth -= 1
         if not getattr(self, "_installed", False):
             return False
