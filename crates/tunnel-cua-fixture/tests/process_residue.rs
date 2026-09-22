@@ -84,13 +84,65 @@ fn fixture_binary() -> PathBuf {
     binary
 }
 
-fn sentinel_binary() -> PathBuf {
-    let binary = beside_this_binary(tunnel_deadman::SENTINEL_BIN);
-    assert!(
-        binary.is_file(),
-        "the sentinel binary must be built; run the workspace test command, not a bare -p run"
-    );
-    binary
+/// The two places [`tunnel_deadman::sentinel_path`] looks, read straight off
+/// the filesystem.
+///
+/// Deliberately **not** expressed in terms of that function: this is the
+/// independent side of [`the_skip_cannot_hide_a_helper_that_is_on_disk`], and
+/// an `assert_eq!` whose two sides are computed by the same code is task row
+/// M5-C10 -- both sides move together and the check cannot fail.
+fn helper_is_on_disk() -> bool {
+    let mut directory = std::env::current_exe().expect("test binary path");
+    directory.pop();
+    if directory.join(tunnel_deadman::SENTINEL_BIN).is_file() {
+        return true;
+    }
+    // A test binary lives in `target/<profile>/deps`, so the parent is the
+    // other candidate -- the same two-place search, spelled out here.
+    directory.file_name().is_some_and(|name| name == "deps")
+        && directory
+            .parent()
+            .is_some_and(|above| above.join(tunnel_deadman::SENTINEL_BIN).is_file())
+}
+
+/// The sentinel helper's path, or `None` having reported that this test **did
+/// not run** and why (task row M5-C11).
+///
+/// A package-scoped run -- `cargo test -p tunnel-cua -p tunnel-cua-fixture` --
+/// builds no binary of `crates/tunnel-deadman`, so the helper these tests
+/// `exec` is **absent rather than broken**. Asserting `armed == 1` against an
+/// absent helper fails identically whether the fixture is missing or the
+/// arming code regressed, so a reader taking a package-scoped baseline before
+/// their own change cannot tell a missing fixture from a real regression.
+/// `AGENTS.md`'s rule that green is not evidence unless the check could have
+/// gone red has an exact converse here: **red is not evidence unless the check
+/// actually ran.**
+///
+/// Deliberately not a `#[cfg]` guard, which M5-C11 records as rejected: a
+/// guard makes the coverage vanish silently, which is the same defect one
+/// level up. A skip that could hide a helper that *is* present would be that
+/// defect again, and is guarded by
+/// [`the_skip_cannot_hide_a_helper_that_is_on_disk`].
+fn sentinel_or_skip(test: &str) -> Option<PathBuf> {
+    match tunnel_deadman::availability() {
+        tunnel_deadman::Availability::Armable => Some(
+            tunnel_deadman::sentinel_path()
+                .expect("availability() reported Armable, so a path resolves"),
+        ),
+        absent => {
+            eprintln!(
+                "SKIPPED {test}: DID NOT RUN ({absent:?}) -- no `{bin}` executable \
+                 beside this test binary and no {env} set, so no parent-death \
+                 sentinel can be armed and this test would measure nothing. This \
+                 is a missing fixture, NOT a broken mechanism: build the helper \
+                 beside the tests (`cargo build -p tunnel-deadman --bins`) or run \
+                 the workspace test command. Task row M5-C11.",
+                bin = tunnel_deadman::SENTINEL_BIN,
+                env = tunnel_deadman::SENTINEL_PATH_ENV,
+            );
+            None
+        }
+    }
 }
 
 /// `(pgid, state)` from the process table, or `None` when the pid is gone.
@@ -229,7 +281,9 @@ async fn measure_escape(name: &str, child: BackendChild, counters: &ChildCounter
     assert_eq!(
         armed, 1,
         "the parent-death sentinel was armed, so this measures the NEW mechanism \
-         and not merely the old one"
+         and not merely the old one -- and the caller's skip already established \
+         that the helper resolves, so a zero here is the arming code regressing \
+         rather than an absent fixture (M5-C11)"
     );
     let (pgid, state) = row.expect(
         "MEASUREMENT (M5-C08): the escaping descendant was expected to survive. If it did \
@@ -248,6 +302,11 @@ async fn measure_escape(name: &str, child: BackendChild, counters: &ChildCounter
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_setsid_descendant_of_the_backend_escapes_even_with_the_sentinel_armed() {
+    if sentinel_or_skip("a_setsid_descendant_of_the_backend_escapes_even_with_the_sentinel_armed")
+        .is_none()
+    {
+        return;
+    }
     let workspace = tempfile::tempdir().expect("workspace");
     let (child, counters, pid) = detaching_backend(workspace.path(), DetachRoute::Setsid).await;
     let _guard = PidGuard::watch(&pid);
@@ -272,6 +331,13 @@ async fn a_setsid_descendant_of_the_backend_escapes_even_with_the_sentinel_armed
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_double_forked_descendant_of_the_backend_escapes_even_with_the_sentinel_armed() {
+    if sentinel_or_skip(
+        "a_double_forked_descendant_of_the_backend_escapes_even_with_the_sentinel_armed",
+    )
+    .is_none()
+    {
+        return;
+    }
     let workspace = tempfile::tempdir().expect("workspace");
     let (child, counters, pid) = detaching_backend(workspace.path(), DetachRoute::Daemon).await;
     let _guard = PidGuard::watch(&pid);
@@ -286,6 +352,57 @@ async fn a_double_forked_descendant_of_the_backend_escapes_even_with_the_sentine
     );
 
     measure_escape("double-fork escape", child, &counters, &pid).await;
+}
+
+// --------------------------- skip control: the skip cannot hide a helper
+
+/// **The guard on the skip itself (task row M5-C11).**
+///
+/// [`sentinel_or_skip`] removes an ambiguity by *not running* four tests when
+/// the helper is absent. That buys a new hazard, and it is the one the row
+/// names: if the skip ever decided "absent" while the helper was in fact
+/// present, all four would skip and the coverage would vanish **silently** --
+/// which is precisely the failure mode that makes a `#[cfg]` guard the
+/// rejected option there. A skip that could never be reached, or that
+/// swallowed a genuine arming regression, is the same defect one level up.
+///
+/// So this compares the skip's own decision against the filesystem, read by
+/// [`helper_is_on_disk`], which does not call
+/// [`tunnel_deadman::sentinel_path`] -- the two sides are computed
+/// independently, so this is not an `assert_eq!` whose halves move together
+/// (M5-C10).
+///
+/// **It is reachable and falsifiable in both modes**, which is what makes it a
+/// positive control rather than another unfalsifiable check: in a
+/// package-scoped run it asserts `false == false`, in a workspace run
+/// `true == true`, and it goes red the moment those disagree. It reports the
+/// pair it measured, so a green result also reports that it ran.
+#[test]
+fn the_skip_cannot_hide_a_helper_that_is_on_disk() {
+    if std::env::var_os(tunnel_deadman::SENTINEL_PATH_ENV).is_some() {
+        // An explicit path overrides the beside-the-binary search, so the
+        // filesystem side below is not the question being answered. Named
+        // rather than silent, for the same reason as the skip itself.
+        eprintln!(
+            "SKIPPED the_skip_cannot_hide_a_helper_that_is_on_disk: DID NOT RUN \
+             -- {env} is set, which overrides the beside-the-binary resolution \
+             this control compares against. Task row M5-C11.",
+            env = tunnel_deadman::SENTINEL_PATH_ENV,
+        );
+        return;
+    }
+    let on_disk = helper_is_on_disk();
+    let resolved = sentinel_or_skip("the_skip_cannot_hide_a_helper_that_is_on_disk").is_some();
+    eprintln!("MEASURED skip control: helper on disk {on_disk}, skip resolved it {resolved}");
+    assert_eq!(
+        on_disk, resolved,
+        "the skip's decision must track whether the helper is actually there. \
+         `on disk true, resolved false` means the four sentinel tests are \
+         skipping while the helper is present -- the coverage has vanished \
+         silently, which is the defect M5-C11 exists to stop. `on disk false, \
+         resolved true` means the skip can never be reached and the four tests \
+         will fail on an absent fixture as though the mechanism were broken."
+    );
 }
 
 // ------------------------------- reach control: an in-group helper does die
@@ -352,11 +469,19 @@ async fn the_group_kill_reaches_the_backends_in_group_helper() {
 /// supposed to clean up.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_sigkilled_supervisor_still_kills_the_backends_group() {
+    // This one already refused with a named reason -- it asserted the helper
+    // was a file before spawning -- but a refusal is still a red test that
+    // never ran. M5-C11: it skips for the same reason as the rest, and the
+    // resolved path is what the probe is pointed at.
+    let Some(sentinel) = sentinel_or_skip("a_sigkilled_supervisor_still_kills_the_backends_group")
+    else {
+        return;
+    };
     let workspace = tempfile::tempdir().expect("workspace");
     let mut probe = std::process::Command::new(fixture_binary())
         .arg(SUPERVISE_MODE)
         .arg(workspace.path())
-        .env(tunnel_deadman::SENTINEL_PATH_ENV, sentinel_binary())
+        .env(tunnel_deadman::SENTINEL_PATH_ENV, sentinel)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -497,6 +622,11 @@ async fn without_a_sentinel_a_sigkilled_supervisor_leaks_the_backends_group() {
 /// moment at which the id genuinely may have been freed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_orderly_shutdown_stands_the_sentinel_down_instead_of_firing_it() {
+    if sentinel_or_skip("an_orderly_shutdown_stands_the_sentinel_down_instead_of_firing_it")
+        .is_none()
+    {
+        return;
+    }
     let workspace = tempfile::tempdir().expect("workspace");
     let helper_pid_file = workspace.path().join(HELPER_PID_FILE);
     let process = BackendProcess::new(
@@ -516,7 +646,14 @@ async fn an_orderly_shutdown_stands_the_sentinel_down_instead_of_firing_it() {
     let helper = read_published(&helper_pid_file).await;
     let mut guard = PidGuard::watch(&helper);
     guard.also(&child.pid().to_string());
-    assert_eq!(counters.deadman_armed.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        counters.deadman_armed.load(Ordering::Relaxed),
+        1,
+        // The skip above already established that the helper resolves, so a
+        // zero here is the arming code and not a missing fixture (M5-C11).
+        "the helper resolved, so the sentinel was armable: a zero here is the \
+         arming code regressing, not an absent fixture"
+    );
 
     child.kill();
     child.wait_exited().await;

@@ -109,7 +109,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from guard_outcomes import AppliedCase  # noqa: E402
 from guard_outcomes import check_anchors as shared_check_anchors  # noqa: E402
+from guard_outcomes import install_interrupt_restore  # noqa: E402
+from guard_outcomes import refuse_resident_mutation  # noqa: E402
 from guard_outcomes import unusable as unusable_outcomes  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
@@ -1854,6 +1857,49 @@ CASES_C7: list[tuple[str, list[Edit], bool]] = [
 ]
 
 
+# --------------------------------------------------------------- chunk 8
+#: The guard on the **skip** that chunk 8 adds (task row M5-C11).
+#:
+#: `crates/tunnel-cua-fixture/tests/process_residue.rs` no longer asserts
+#: `armed == 1` when the `tunnel-deadman` helper is absent -- it reports that
+#: the test did not run, and why, because `armed == 1` fails identically
+#: whether the helper is missing or the arming code regressed.  That buys a
+#: new hazard, which is the one M5-C11 names: a skip that decided "absent"
+#: while the helper was present would make all four measurements vanish
+#: **silently**, which is the same defect one level up and the reason a
+#: `#[cfg]` guard is recorded there as rejected.
+#:
+#: `the_skip_cannot_hide_a_helper_that_is_on_disk` is the positive control for
+#: that, and this case is what shows the control is load-bearing rather than
+#: decorative: defeat `availability()` into always reporting the helper
+#: missing -- the exact regression that would silently skip everything -- and
+#: the control must go red.
+#:
+#: **`C4_BUILD` is load-bearing for this suite, not boilerplate.** The control
+#: compares the skip's decision against the filesystem, so with no
+#: `tunnel-deadman` binary beside the tests it correctly asserts
+#: `false == false` and this case would report `still green` over a rule that
+#: was never exercised.  The helper must be built for the case to be able to
+#: fail at all.
+CASES_C8: list[tuple[str, list[Edit], bool]] = [
+    (
+        "a present sentinel helper cannot be reported as missing",
+        [
+            (
+                DEADMAN_LIB,
+                """    if sentinel_path().is_some() {
+        Availability::Armable
+    } else {
+        Availability::SentinelMissing
+    }""",
+                "    Availability::SentinelMissing",
+            )
+        ],
+        False,
+    ),
+]
+
+
 @dataclass
 class Suite:
     name: str
@@ -1899,6 +1945,16 @@ SUITES: list[Suite] = [
         [CRATE, FORWARD, FIXTURE],
         C7_CARGO_TEST,
         CASES_C7,
+        build=C4_BUILD,
+    ),
+    # Chunk 8 defeats `availability()` in `tunnel-deadman`, so that crate is
+    # in the restore set; the control it must turn red lives in
+    # `tunnel-cua-fixture`, which `C4_CARGO_TEST` runs.
+    Suite(
+        "m5c8",
+        [CRATE, EXPORT, FIXTURE, DEADMAN],
+        C4_CARGO_TEST,
+        CASES_C8,
         build=C4_BUILD,
     ),
 ]
@@ -1966,13 +2022,15 @@ def run_tests(suite: Suite) -> tuple[str, list[str]]:
     return "RED", failures
 
 
-def restore(suite: Suite) -> None:
-    subprocess.run(
-        ["git", "checkout", "--"]
-        + [str(crate.relative_to(REPO)) for crate in suite.crates],
-        cwd=REPO,
-        check=True,
-    )
+# **The `git checkout --` restore that used to live here is gone (M5-C07).**
+# It was replaced by `guard_outcomes.AppliedCase`, which writes back the exact
+# bytes it recorded before mutating.  Deleted rather than left unused on
+# purpose: it checked out whole crate directories, so any other uncommitted
+# work under them was discarded with the mutation -- the M4-32 mechanism -- and
+# a dead helper spelling exactly that is an invitation to call it again.  It is
+# not a rule being removed to go green: no case reaches it any more, and the
+# tree-cleanliness contract it served is now held by `AppliedCase.restore` plus
+# the journal that `refuse_resident_mutation` reads.
 
 
 def require_clean_tree(suites: list[Suite]) -> None:
@@ -1989,8 +2047,12 @@ def require_clean_tree(suites: list[Suite]) -> None:
             if changed:
                 sys.exit(
                     "m5-guard-deletion: refusing to run with uncommitted changes "
-                    f"under {relative}; each case is restored by checking the "
-                    "crate out again, which would discard them."
+                    f"under {relative}; a case applied on top of them could not "
+                    "be told apart from them, and the run would report a guard "
+                    "as load-bearing on the strength of somebody else's edit. "
+                    "Each case is restored by writing back the exact bytes it "
+                    "recorded (M5-C07), so these changes would survive a run -- "
+                    "but the evidence would not be trustworthy."
                 )
 
 
@@ -2009,6 +2071,9 @@ def check_anchors(selected: list[tuple[Suite, str, list[Edit], bool]]) -> int:
 
 
 def main() -> int:
+    # M5-C07: make `SIGTERM`/`SIGHUP` raise, so the per-case `AppliedCase`
+    # context manager restores on the way out instead of being skipped.
+    install_interrupt_restore()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--list", action="store_true", help="print case names and exit")
     parser.add_argument(
@@ -2022,7 +2087,7 @@ def main() -> int:
     parser.add_argument("--case", help="run only cases whose name contains this text")
     parser.add_argument(
         "--suite",
-        help="run only this suite (m5c2, m5c3, m5c4, m5c5, m5c6 or m5c7)",
+        help="run only this suite (m5c2, m5c3, m5c4, m5c5, m5c6, m5c7 or m5c8)",
     )
     arguments = parser.parse_args()
 
@@ -2046,6 +2111,15 @@ def main() -> int:
     if not selected:
         sys.exit(f"m5-guard-deletion: no case matches {arguments.case!r}")
 
+    # **M5-C07, before anything is edited.**  `require_clean_tree` below
+    # refuses on a dirty tree, which already stops a second run stacking on a
+    # resident mutation -- but it can only say "something is uncommitted",
+    # about a tree the operator may believe they dirtied themselves.  This
+    # names the harness, suite, case and files a previous interrupted run left
+    # mutated, because a resident mutation is a guard deleted from the product
+    # and not a tidying job.  Placed *after* the `--check-anchors` dispatch so
+    # read-only mode stays a pure anchor check (M4-34, M4-36).
+    refuse_resident_mutation("m5-guard-deletion", REPO)
     require_clean_tree(suites)
 
     # **Preflight (M4-27).**  Resolve every selected case's anchors before any
@@ -2059,24 +2133,20 @@ def main() -> int:
 
     results: list[tuple[str, str, str, list[str]]] = []
     for suite, name, edits, expect_build_failure in selected:
-        problem = None
-        for path, old, new in edits:
-            text = path.read_text()
-            occurrences = text.count(old)
-            if occurrences == 0:
-                problem = "guard text not found"
-                break
-            if occurrences > 1:
-                problem = f"guard text is ambiguous: {occurrences} occurrences"
-                break
-            path.write_text(text.replace(old, new, 1))
-        if problem is not None:
-            restore(suite)
-            results.append((suite.name, name, f"COULD NOT APPLY: {problem}", []))
-            print(f"[{suite.name}] {name}: {problem}", flush=True)
-            continue
-        outcome, failures = run_tests(suite)
-        restore(suite)
+        # **M5-C07.**  The apply/test/restore cycle runs inside a context
+        # manager, so the restore happens on *every* way out of this block --
+        # a refusal, an exception, a `KeyboardInterrupt`, or the `SystemExit`
+        # that `install_interrupt_restore` turns a `SIGTERM` into.  It
+        # restores the exact recorded original bytes rather than running `git
+        # checkout --` over the crate, which would discard any other
+        # uncommitted work under that path (M4-32).
+        with AppliedCase("m5-guard-deletion", REPO, suite.name, name) as applied:
+            problem = applied.apply_all(edits)
+            if problem is not None:
+                results.append((suite.name, name, f"COULD NOT APPLY: {problem}", []))
+                print(f"[{suite.name}] {name}: {problem}", flush=True)
+                continue
+            outcome, failures = run_tests(suite)
         if name in EXPECT_GREEN:
             outcome = (
                 "DOCUMENTED GREEN"

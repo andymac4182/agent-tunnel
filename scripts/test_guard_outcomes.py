@@ -23,8 +23,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from guard_outcomes import (  # noqa: E402
     USABLE_OUTCOMES,
+    AppliedCase,
     check_anchors,
     is_usable,
+    mutation_journal,
+    recover_mutations,
+    refuse_resident_mutation,
     unusable,
 )
 
@@ -87,6 +91,12 @@ def main() -> int:
     the_preflight_lists_every_mismatch_not_just_the_first()
     a_harness_local_problem_still_fails_the_preflight()
     every_guard_anchor_resolves_to_exactly_one_occurrence()
+
+    # M5-C07, behavioural first and source-text last.
+    an_interrupted_case_restores_the_tree_on_the_way_out()
+    a_sigterm_mid_case_restores_the_tree()
+    a_sigkilled_run_leaves_a_journal_that_names_the_case()
+    every_harness_mutates_through_the_interrupt_safe_context()
 
     print("test_guard_outcomes: PASS")
     return 0
@@ -238,7 +248,10 @@ EXPECTED_MODULE_FILTERS = 9
 EXPECTED_GUARD_ANCHORS = {
     "fs-guard-deletion.py": 485,
     "acp-guard-deletion.py": 148,
-    "m5-guard-deletion.py": 82,
+    # Measured at the m5c8 tip: 100 anchors across 7 suites. The floor stood
+    # at 82 and had gone stale across three chunks, so it no longer noticed a
+    # suite dropping out.
+    "m5-guard-deletion.py": 100,
     "m3-guard-deletion.py": 5,
 }
 
@@ -414,6 +427,226 @@ def every_guard_anchor_resolves_to_exactly_one_occurrence() -> None:
             f"{script_name}: expected at least {floor} anchors to be checked, "
             f"found {checked} -- the scan selected almost nothing, so its "
             "silence is not evidence",
+        )
+
+
+# --------------------------------------------------------------------------
+# Interrupt-safe mutation (task row M5-C07)
+# --------------------------------------------------------------------------
+
+ORIGINAL = "fn guard() -> bool {\n    real_check()\n}\n"
+MUTATED = "fn guard() -> bool {\n    true\n}\n"
+
+
+@contextlib.contextmanager
+def scratch_repo():
+    """A throwaway `repo` holding one product file, for the cases below.
+
+    Deliberately **not** this repository: the whole subject here is a harness
+    that mutates a tree, and M4-32's instance was a guard suite editing a tree
+    somebody else was working in.  A test of that must not do it.
+    """
+    with tempfile.TemporaryDirectory() as directory:
+        repo = Path(directory)
+        product = repo / "guard.rs"
+        product.write_text(ORIGINAL)
+        yield repo, product
+
+
+def an_interrupted_case_restores_the_tree_on_the_way_out() -> None:
+    """A `KeyboardInterrupt` mid-case must still restore (M5-C07).
+
+    This is the row's own incident, twice over: a run killed between the edit
+    and the restore left the mutation in the working tree, and the next
+    `git add -A` committed a defeated guard under a `docs:` subject.
+
+    **The positive control is in the same case and is the load-bearing half.**
+    "The file matches the original afterwards" is satisfied just as well by a
+    mutation that never happened, so this asserts *inside* the `with` block
+    that the file really was mutated and the journal really existed.  Without
+    that, a broken `apply` would make this case pass.
+    """
+    with scratch_repo() as (repo, product):
+        journal = mutation_journal(repo)
+        try:
+            with AppliedCase("test", repo, "suite", "case") as applied:
+                problem = applied.apply(product, "real_check()", "true")
+                check(problem is None, f"the edit should apply, got {problem!r}")
+                # Positive control: the mutation is real and journalled.
+                check(
+                    product.read_text() == MUTATED,
+                    "the guard was NOT actually mutated, so a clean tree "
+                    "afterwards would prove nothing",
+                )
+                check(journal.exists(), "a journal must exist while a case is applied")
+                raise KeyboardInterrupt("as a long chain being interrupted does")
+        except KeyboardInterrupt:
+            pass
+        check(
+            product.read_text() == ORIGINAL,
+            "an interrupted case left the mutation resident in the product",
+        )
+        check(
+            not journal.exists(),
+            "the journal must be gone once the restore has completed",
+        )
+
+
+def a_sigterm_mid_case_restores_the_tree() -> None:
+    """`SIGTERM` must reach the restore, not bypass it (M5-C07).
+
+    `SIGINT` already raises, but the default `SIGTERM` disposition terminates
+    without unwinding, so every `finally` in the program would be skipped --
+    which is how M4-34's `subprocess.run(timeout=)` left a mutation in
+    `crates/tunnel-cua/src/outcome.rs`.  This runs a real child, signals it for
+    real, and reads the tree afterwards, because the `signal.signal` call that
+    makes it work is exactly the kind of thing a source-text check cannot
+    verify.
+    """
+    with scratch_repo() as (repo, product):
+        child_source = repo / "child.py"
+        child_source.write_text(
+            "import sys, time\n"
+            f"sys.path.insert(0, {str(Path(__file__).resolve().parent)!r})\n"
+            "from guard_outcomes import AppliedCase, install_interrupt_restore\n"
+            "from pathlib import Path\n"
+            "install_interrupt_restore()\n"
+            f"repo = Path({str(repo)!r})\n"
+            "try:\n"
+            "    with AppliedCase('test', repo, 'suite', 'case') as applied:\n"
+            "        applied.apply(repo / 'guard.rs', 'real_check()', 'true')\n"
+            "        print('APPLIED', flush=True)\n"
+            "        time.sleep(30)\n"
+            "except BaseException:\n"
+            "    pass\n"
+        )
+        child = subprocess.Popen(
+            [sys.executable, str(child_source)],
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            # Wait for the mutation to be on disk before signalling, so this
+            # cannot accidentally signal a process that had not edited
+            # anything -- which would make the case pass vacuously.
+            assert child.stdout is not None
+            check(
+                child.stdout.readline().strip() == "APPLIED",
+                "the child did not report applying its edit",
+            )
+            check(
+                product.read_text() == MUTATED,
+                "the child's mutation is not on disk, so signalling it would "
+                "prove nothing",
+            )
+            child.terminate()
+            child.wait(timeout=30)
+        finally:
+            if child.poll() is None:  # pragma: no cover - defensive
+                child.kill()
+                child.wait(timeout=10)
+        check(
+            product.read_text() == ORIGINAL,
+            "a SIGTERM mid-case left the mutation resident: the signal "
+            "bypassed the restore",
+        )
+        check(
+            not mutation_journal(repo).exists(),
+            "a SIGTERM mid-case left the journal behind",
+        )
+
+
+def a_sigkilled_run_leaves_a_journal_that_names_the_case() -> None:
+    """The layer for the signal that cannot be handled at all (M5-C07).
+
+    `SIGKILL` runs nothing, so no `finally` and no handler can help -- the
+    mutation *is* resident afterwards.  What must not happen is the next run
+    starting on top of it, or the tree merely looking clean.  The journal is
+    the evidence, and `refuse_resident_mutation` is what reads it.
+
+    Paired with its positive control: the refusal must **not** fire when no
+    journal exists, or it would be an unconditional refusal that proves
+    nothing by firing.
+    """
+    with scratch_repo() as (repo, product):
+        # No journal: the refusal must return quietly.  Without this the case
+        # below cannot distinguish "refused because a journal exists" from
+        # "refuses always".
+        refuse_resident_mutation("test-harness", repo)
+
+        # Now simulate the kill: apply, and never restore.
+        applied = AppliedCase("m5-guard-deletion", repo, "m5c4", "a named case")
+        problem = applied.apply(product, "real_check()", "true")
+        check(problem is None, f"the edit should apply, got {problem!r}")
+        check(product.read_text() == MUTATED, "the mutation must be resident")
+
+        journal = mutation_journal(repo)
+        check(journal.exists(), "a SIGKILL must leave the journal behind")
+
+        try:
+            refuse_resident_mutation("m5-guard-deletion", repo)
+        except SystemExit as refusal:
+            message = str(refusal)
+        else:  # pragma: no cover - the refusal is the point
+            sys.exit(
+                "test_guard_outcomes: a resident mutation did NOT stop the "
+                "next run, which is the whole defect of M5-C07"
+            )
+        for expected in ("m5c4", "a named case", "guard.rs", "M5-C07"):
+            check(
+                expected in message,
+                f"the refusal must name {expected!r} rather than only saying "
+                f"the tree is dirty; got: {message}",
+            )
+
+        # And the recorded original is recoverable byte for byte.
+        check(recover_mutations(repo) == 0, "recovery should succeed")
+        check(
+            product.read_text() == ORIGINAL,
+            "recovery must restore the exact original bytes",
+        )
+        check(not journal.exists(), "recovery must remove the journal")
+
+
+def every_harness_mutates_through_the_interrupt_safe_context() -> None:
+    """All four harnesses, or the fix covers a quarter of what it appears to.
+
+    M5-C07 names the same pattern in `acp-`, `fs-`, `m3-` and `m5-`, so this
+    holds every one of them to it.
+
+    **This is a source-text check, which M4-36 records as the weakest kind of
+    guard**: it sees spelling, not reachability, and it cannot see a harness
+    that imports `AppliedCase` and then mutates around it.  It is here for the
+    thing the behavioural cases above cannot cover -- a *fifth* harness, or a
+    regression in one of the three this chunk did not exercise end to end --
+    and not as the primary defence.  The bare `write_text`/`git checkout`
+    refusals below are what make it more than a presence check: they fail if
+    the old path comes back alongside the new one.
+    """
+    directory = Path(__file__).resolve().parent
+    for script_name in sorted(EXPECTED_GUARD_ANCHORS):
+        source = (directory / script_name).read_text()
+        for required in (
+            "from guard_outcomes import AppliedCase",
+            "install_interrupt_restore()",
+            "refuse_resident_mutation(",
+            "with AppliedCase(",
+        ):
+            check(
+                required in source,
+                f"{script_name} does not use {required!r}: an interrupted run "
+                "can leave a guard deleted from the product (M5-C07)",
+            )
+        # The two spellings whose return would reinstate the defect.
+        check(
+            "path.write_text(text.replace(" not in source,
+            f"{script_name} mutates a file outside AppliedCase, so an "
+            "interrupt can leave that edit resident (M5-C07)",
+        )
+        check(
+            '["git", "checkout", "--"]' not in source,
+            f"{script_name} restores with `git checkout --`, which discards "
+            "every other uncommitted change under the crate (M4-32)",
         )
 
 
