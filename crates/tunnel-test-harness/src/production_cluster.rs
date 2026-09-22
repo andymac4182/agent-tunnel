@@ -6136,12 +6136,14 @@ async fn settle_resign<R: ResignRelay>(
 /// pin set *synchronously* when the runtime is momentarily not `Ready`, but the
 /// peer runtime only learns of it on the next `peer_refresh_loop` tick, up to
 /// five seconds later, because `withdraw_peer_trust` is reached only from that
-/// tick.  For that whole window `peer_runtime.is_ready()` still reports the
-/// previous pass's state, so a wait on it returns *at once* while every peer
-/// dial would be refused `transport_pins_unavailable`.  A wait whose success
-/// and whose measuring-nothing look identical is the M5-C11 defect class; this
-/// one reads the pin set itself, which cannot be stale, and retries the pending
-/// publication here rather than waiting for a tick to notice it.
+/// tick.  Before M7-C89 `peer_runtime.is_ready()` did not read the pin set,
+/// so for that whole window it still reported the previous pass's state and a
+/// wait on it returned *at once* while every peer dial would be refused
+/// `transport_pins_unavailable`.  It reads the pin set now, so a readiness
+/// wait would no longer return early -- but it would still wait out the tick,
+/// because nothing but the tick retries a failed-closed publication.  This
+/// one reads the pin set itself and retries the pending publication here,
+/// which is both the faster and the more direct instrument.
 ///
 /// **Why in the re-sign rather than in each gate.**  Two sibling gates already
 /// defend themselves by probing the hop functionally after a re-sign --
