@@ -2066,6 +2066,34 @@ def temp_manifest(tmp: Path, transform) -> Path:
     return manifest
 
 
+def standalone_manifest(tmp: Path, targets: list[str]) -> Path:
+    """A minimal workspace manifest `cargo metadata` can actually load.
+
+    `temp_manifest` copies the real root manifest, which still carries
+    `[workspace] members`.  Those member directories do not exist beside a
+    throwaway copy, so cargo fails to load it (exit 101, "failed to load
+    manifest for workspace member") and `check_targets` reports the second
+    reader as DID NOT RUN.  A control whose rule fires *before* the second
+    reader is unaffected; a control whose rule fires *after* it -- the rustc
+    known-triple test -- can never be reached that way.  That was
+    docs/tasks.md M6-C17.
+
+    `members = []` is a real, loadable virtual workspace, so both readers
+    answer and the rule is reachable.  Not copying the real declaration
+    costs nothing here: a control for this rule must declare a triple that
+    is deliberately wrong, so it was never exercising the real set.  The
+    real declaration is covered by the set-comparison controls above and by
+    the live `targets` check.
+    """
+    body = ",\n    ".join(f'"{t}"' for t in targets)
+    manifest = tmp / MANIFEST
+    manifest.write_text(
+        '[workspace]\nmembers = []\nresolver = "2"\n\n'
+        f"[workspace.metadata.release]\nadvertised-targets = [\n    {body},\n]\n",
+        encoding="utf-8")
+    return manifest
+
+
 def control_targets_bundle_target_is_not_advertised(bundle: Path) -> tuple[bool, str]:
     """A bundle for a triple outside the declared set must not pass.
 
@@ -2161,18 +2189,57 @@ def control_targets_unknown_triple_is_refused(bundle: Path) -> tuple[bool, str]:
         return False, f"{NOT_A_REAL_TRIPLE} is a real rustc target; pick another"
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
-        manifest = temp_manifest(
-            root,
-            lambda text: text.replace(
-                "advertised-targets = [",
-                f'advertised-targets = [\n    "{NOT_A_REAL_TRIPLE}",',
-                1),
-        )
         copy = copy_bundle(bundle, root)
-        if not rewrite_provenance(copy, PROVENANCE_TARGET_SET,
-                                  ",".join(declared_targets(manifest))):
-            return False, "could not rewrite the frozen set; the control did not apply"
-        return expect_red("targets", copy, "advertised-target-unknown", manifest=manifest)
+        bundle_target = parse_fields(read_exact(copy / PROVENANCE)).get("target", "")
+        if bundle_target not in known:
+            return False, (f"the bundle's own target {bundle_target!r} is not in rustc's "
+                           "target list; the control cannot attribute a red to the "
+                           "bogus triple")
+
+        def frozen(targets: list[str]) -> str | None:
+            """Declare `targets` and freeze the same set into the bundle copy."""
+            declared = sorted(targets)
+            written = standalone_manifest(ws, declared)
+            if declared_targets(written) != declared:
+                return "the standalone manifest did not read back as declared"
+            if not rewrite_provenance(copy, PROVENANCE_TARGET_SET, ",".join(declared)):
+                return "could not rewrite the frozen set; the control did not apply"
+            return None
+
+        # The negative arm first: the same construction, with every declared
+        # triple real.  It must go GREEN.  Without this, a red below could be
+        # coming from the standalone manifest itself -- an unloadable
+        # workspace, a set the bundle does not match -- rather than from the
+        # rule this control names, which is exactly the failure mode M6-C17
+        # was.
+        ws = root / "ws-known"
+        ws.mkdir()
+        broken = frozen([bundle_target])
+        if broken:
+            return False, broken
+        control = check_targets(copy, manifest=ws / MANIFEST)
+        if not control.ran:
+            return False, (f"the all-known control arm DID NOT RUN ({control.summary}); "
+                           "the second reader must answer for this construction or the "
+                           "rule below is unreachable")
+        if not control.ok:
+            return False, (f"the all-known control arm went red ({control.witness}: "
+                           f"{control.summary}); a red in the test arm could not then be "
+                           "attributed to the unknown triple")
+
+        # The test arm: identical but for one triple rustc does not know.
+        ws = root / "ws-bogus"
+        ws.mkdir()
+        broken = frozen([bundle_target, NOT_A_REAL_TRIPLE])
+        if broken:
+            return False, broken
+        ok, detail = expect_red("targets", copy, "advertised-target-unknown",
+                                manifest=ws / MANIFEST)
+        if not ok:
+            return False, detail
+        return True, (f"{detail}; and the same construction declaring only "
+                      f"{bundle_target} goes green, so the red is attributable to "
+                      f"{NOT_A_REAL_TRIPLE} and not to the throwaway workspace")
 
 
 def control_targets_declaration_parser_rejects_junk(bundle: Path) -> tuple[bool, str]:
