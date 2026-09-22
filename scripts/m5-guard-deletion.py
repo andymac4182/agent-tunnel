@@ -46,10 +46,15 @@ here:
   back into silence.
 
   **These cases defeat declarations, not repairs.** Nothing in this chunk
-  releases a held button or key: the pinned 0.3.46 registry carries no
-  primitive that could, and forcing one would mean the supervisor synthesising
-  input. A device that declared nothing would behave identically against the
-  backend, so a guard suite is the only thing that can tell the two apart.
+  releases a held button or key. That is a policy decision rather than a
+  limit of the backend: the pinned 0.3.46 registry does carry `mouse_up` and
+  `key_up`, and the device declines to issue them because a `mouse_up` is a
+  *drop* and a `key_up` is synthesised input outside any lease. See
+  `docs/tasks.md` M5-C09.
+
+  A device that declared nothing would behave **identically** against the
+  backend -- same requests, same outcomes, same journal -- so no behavioural
+  test can tell the two apart and a guard suite is the only thing that can.
   It carries `m5c4`'s pre-build, for `m5c4`'s reason.
 
 It follows `scripts/acp-guard-deletion.py` and `scripts/fs-guard-deletion.py`,
@@ -1572,11 +1577,12 @@ CASES_C5: list[tuple[str, list[Edit], bool]] = [
 #: `tunnel-cua-fixture/tests/supervision.rs`, which `exec`s the fixture binary.
 #:
 #: **Every case here defeats a *declaration*, not a repair.** Nothing in this
-#: chunk releases a held button or key -- the pinned registry has no primitive
-#: that could, and forcing one would be the supervisor synthesising input --
-#: so what these cases measure is whether the device still admits what it
-#: cannot see. A silent device and an honest one behave identically against
-#: the backend, which is exactly why only a guard suite can tell them apart.
+#: chunk releases a held button or key -- a decision, not an impossibility;
+#: the pinned registry carries `mouse_up` and `key_up` and the device declines
+#: to issue them. So what these cases measure is whether the device still
+#: admits what it has chosen not to resolve. A silent device and an honest one
+#: behave identically against the backend, which is exactly why only a guard
+#: suite can tell them apart.
 CASES_C6: list[tuple[str, list[Edit], bool]] = [
     (
         # The declaration the restart makes, deleted outright. A supervisor
@@ -1630,6 +1636,13 @@ CASES_C6: list[tuple[str, list[Edit], bool]] = [
         # *and* the gesture carried half way. Declaring nothing for it is the
         # single most consequential silence in the map, because a later
         # `move` against a held button is a drag nobody asked for.
+        #
+        # **This case does not move `RESTART_RESIDUE`, and that is expected.**
+        # `Click` still contributes `POINTER_BUTTON` to the fold, so the
+        # restart declaration is unchanged and
+        # `a_restart_declares_every_kind_an_input_operation_can_leave` stays
+        # green. What reddens is the per-operation map, which is the rule
+        # under test here. Do not "fix" this by asserting the fold.
         "an interrupted drag declares the button it may have left down",
         [
             (

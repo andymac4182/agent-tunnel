@@ -79,25 +79,39 @@
 //! input state the departed backend may have left asserted on the target,
 //! because it cannot observe them and cannot put them back.
 //!
-//! **It is a declaration and never a repair, and that is a decision with a
-//! safety argument, not a shortfall.** A "release everything" sweep would be
-//! the supervisor synthesising input — the thing M5's health probe is
-//! forbidden from doing, for the reason that a click nobody asked for is the
-//! same harm as a click that landed twice. It is also **inexpressible against
-//! the pinned surface**: `tunnel_cua_fixture::REGISTERED_COMMANDS` mirrors the
-//! 0.3.46 registry this repository has read, and it carries no button-up,
-//! key-up or held-key primitive; `docs/integrations.md`'s platform table
-//! records the same limit for the Cua Driver backend. The only way to force a
-//! release through that registry is *more synthesised input* — a `drag` onto
-//! itself, a `hotkey` re-press — each of which is an unauthorized effect on
-//! somebody's desktop.
+//! **It is a declaration and never a repair. That is a policy decision, not a
+//! limit of the backend, and the distinction was got wrong once here.** An
+//! earlier draft of this header said a release sweep was *inexpressible*
+//! against the pinned surface. It is not: `computer-server`'s `main.py`
+//! registers `mouse_down`, `mouse_up`, `key_down` and `key_up` at the release
+//! commit `scripts/m5-cua-refetch.sh` pins and re-hashes. The mistake was
+//! reading `tunnel_cua_fixture::REGISTERED_COMMANDS` as a mirror of that
+//! registry — its own comment calls it a **superset of what this profile
+//! dispatches**, a statement about our allowlist — and generalising
+//! `docs/integrations.md`'s platform-table row for the *Cua Driver backend*,
+//! which stubs those four, into a registry-wide limit.
 //!
-//! Nor can the device read the residue away. The one pointer-adjacent read the
-//! profile carries is `cursor_position`, which reports **where** the pointer
-//! is and never **whether a button is down**; the fixture's answer is
-//! `{success, x, y}` and the registry has nothing else. So there is no
-//! observation that could clear a declared residue, and this module
-//! deliberately offers no operation that removes one.
+//! The sweep is declined on its merits instead. A `mouse_up` is not a neutral
+//! release but a **drop**: it completes whatever drag the dead backend began,
+//! wherever the pointer now sits. A `key_up` on a modifier is synthesised
+//! input issued outside any lease, for no authorized caller. Both are the
+//! supervisor synthesising input, which M5's health probe is forbidden from
+//! doing for the reason that a click nobody asked for is the same harm as a
+//! click that landed twice, and both would mean widening
+//! `tunnel_http_forward`'s `ALLOWED_COMMANDS` — an allowlist, not a capability
+//! claim.
+//!
+//! Nor does the device read the residue away, and the reason is scoped to what
+//! was actually read. **No read `computer.v1` allowlists reports held input**:
+//! `cursor_position` reports *where* the pointer is and never *whether a
+//! button is down*, and the fixture's answer is `{success, x, y}`. The upstream
+//! registry does conditionally expose `get_desktop_state`, a pass-through to
+//! the `cua-driver` SDK whose payload shape **this repository has not
+//! established**; whether it carries held-input state is open, and is part of
+//! `docs/tasks.md` M5-C09a. So this module offers a union and no difference,
+//! no `clear` and no `observe` — because no allowlisted read reports it and a
+//! release is input this supervisor refuses to issue, not because observation
+//! is impossible.
 
 use crate::capture::Captures;
 use crate::lease::{InputLeases, TargetSession};
@@ -220,11 +234,13 @@ pub const fn restart_outcome(stage: InFlight) -> Dispatch {
 /// # There is no way to take a kind away
 ///
 /// This type has a [`DesktopResidue::union`] and no difference, no `clear` and
-/// no `observe`. That is deliberate and it is the honest limit stated as an
-/// API: nothing in this repository can establish that a declared residue is
-/// gone, so nothing in this repository may offer to say so. A future chunk
+/// no `observe`. That is deliberate, and the justification is narrower than
+/// "nothing could ever observe it": **no read `computer.v1` allowlists reports
+/// held input**, and a release is synthesised input this supervisor refuses to
+/// issue (see this module's header). Whether the upstream `get_desktop_state`
+/// reports held-button or modifier state is unestablished here. A future chunk
 /// that measures a real backend on a VM (`docs/tasks.md` M5-C09a) would be
-/// entitled to add one; reading is not.
+/// entitled to add a difference; reading this file is not.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub struct DesktopResidue {
     pointer_button: bool,
@@ -320,6 +336,16 @@ impl DesktopResidue {
 /// residue, not to the move, which is exactly why the prior residue must be
 /// declared — and it is the strongest reason this row could not be closed with
 /// a prose note.
+///
+/// **And that argument is only contained because [`RESTART_RESIDUE`] is the
+/// fold over the whole of [`Operation::INPUT`].** A restart during an in-flight
+/// `move` still declares `POINTER_BUTTON`, contributed by
+/// [`Operation::Click`] and [`Operation::Drag`], so the empty answer here is
+/// never the one a consumer acts on. If `docs/tasks.md` M5-C09a ever narrows
+/// the declaration to the operation *actually* in flight, this arm must stop
+/// being empty: at that point `move` has to declare that a **prior** residue
+/// is un-cleared, or the narrowing reintroduces exactly the silence this row
+/// closed.
 #[must_use]
 pub const fn interruption_residue(operation: Operation) -> DesktopResidue {
     match operation {
