@@ -253,7 +253,10 @@ EXPECTED_GUARD_ANCHORS = {
     # at 82 and had gone stale across three chunks, so it no longer noticed a
     # suite dropping out.
     "m5-guard-deletion.py": 100,
-    "m3-guard-deletion.py": 5,
+    # Was 5. Measured at the m6c4 tip: 11 anchors across 3 suites -- the six
+    # M6-C08 resolution rules and the `m6c08-doctor` suite for the surface
+    # that reports them.
+    "m3-guard-deletion.py": 11,
     # **Two harnesses that were never in this registry at all**, added by the
     # m6c3 worker (M6-C06/M6-C07).  Absence here is quieter than a stale
     # floor: every rule this file holds over a guard harness -- the

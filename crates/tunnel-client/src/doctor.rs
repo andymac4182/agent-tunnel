@@ -78,6 +78,25 @@ pub(crate) struct DoctorResult {
     /// cleanup, not a reason to refuse to run, and an operator who cannot
     /// install the sentinel is better off with a warned-about device than no
     /// device. It never changes `ok` or the exit code.
+    ///
+    /// # What `..._SENTINEL_PRESENT` claims, exactly (M6-C08)
+    ///
+    /// It claims a **regular, executable file of the sentinel's name** is at
+    /// the resolved location. It does **not** claim that file is the
+    /// sentinel, and no code here establishes that: an executable script
+    /// named `tunnel-deadman` produces this same `ok`. The identity question
+    /// is answered at bundle-assembly time, by executing the candidate and
+    /// requiring the sentinel's exit 2
+    /// (`scripts/client-bundle-sentinel.sh`, `scripts/m6-release-artifact.py`),
+    /// which this surface deliberately does not do -- it reads a path and
+    /// starts nothing, and running an unknown binary found beside the client
+    /// would be a worse property than the one it checked.
+    ///
+    /// Until M6-C08, any `is_file()` satisfied this: a zero-byte, mode 0644
+    /// decoy reported `ok` / `..._SENTINEL_PRESENT` while containment was
+    /// wholly absent. That is now `degraded` / `..._SENTINEL_UNUSABLE`, kept
+    /// distinct from `..._SENTINEL_MISSING` because the operator's fix
+    /// differs.
     pub(crate) process_containment: CapabilityCheck,
 }
 
@@ -512,6 +531,14 @@ fn containment_check(availability: tunnel_deadman::Availability) -> CapabilityCh
             status: "ok",
             code: "PROCESS_CONTAINMENT_SENTINEL_PRESENT",
         },
+        // A file of the sentinel's name is there and cannot be executed
+        // (M6-C08). Degraded like `SentinelMissing` -- containment is equally
+        // absent -- but a **distinct code**, because the two need different
+        // actions and the missing code's advice is wrong for this state.
+        tunnel_deadman::Availability::SentinelUnusable => CapabilityCheck {
+            status: "degraded",
+            code: "PROCESS_CONTAINMENT_SENTINEL_UNUSABLE",
+        },
         tunnel_deadman::Availability::SentinelMissing => CapabilityCheck {
             status: "degraded",
             code: "PROCESS_CONTAINMENT_SENTINEL_MISSING",
@@ -791,6 +818,18 @@ mod tests {
         let missing = containment_check(tunnel_deadman::Availability::SentinelMissing);
         assert_eq!(missing.status, "degraded");
         assert_eq!(missing.code, "PROCESS_CONTAINMENT_SENTINEL_MISSING");
+        // M6-C08: a file wearing the sentinel's name is degraded like a
+        // missing one -- containment is equally absent -- but must carry its
+        // own code. Folded into the missing code, an operator staring at a
+        // `tunnel-deadman` would be told to install one.
+        let unusable = containment_check(tunnel_deadman::Availability::SentinelUnusable);
+        assert_eq!(unusable.status, "degraded");
+        assert_eq!(unusable.code, "PROCESS_CONTAINMENT_SENTINEL_UNUSABLE");
+        assert_ne!(
+            unusable.code, missing.code,
+            "an unusable sentinel and an absent one need different fixes, so they \
+             may not share a code"
+        );
         assert_eq!(
             containment_check(tunnel_deadman::Availability::Armable).status,
             "ok"

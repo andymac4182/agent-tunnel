@@ -85,9 +85,12 @@ DEADMAN = REPO / "crates" / "tunnel-deadman"
 EXPORT = REPO / "crates" / "tunnel-mcp-export"
 FIXTURE = REPO / "crates" / "tunnel-mcp-fixture"
 
+CLIENT = REPO / "crates" / "tunnel-client"
+
 DEADMAN_LIB = DEADMAN / "src" / "lib.rs"
 CHILD = EXPORT / "src" / "child.rs"
 FIXTURE_LIB = FIXTURE / "src" / "lib.rs"
+DOCTOR = CLIENT / "src" / "doctor.rs"
 
 # Only the containment measurements: the rest of this fixture crate's suite is
 # the M3-02 end-to-end work and says nothing about these guards.  --no-fail-fast
@@ -136,9 +139,38 @@ CARGO_BUILD_BINARIES = [
 # An edit is (file, exact text to remove or replace, replacement).
 Edit = tuple[Path, str, str]
 
-CASES: list[tuple[str, list[Edit], bool]] = [
+
+@dataclass(frozen=True)
+class Case:
+    """One defeated guard, and the test that must notice.
+
+    **`expected_red` is why this is a class rather than the 3-tuple this file
+    used to carry**, and the mechanism is lifted from
+    `scripts/m0-guard-exit-codes.py` rather than reinvented.  Without it a
+    case is classified `RED` on *any* named failing test, so a case can be
+    green-lit by a failure that has nothing to do with the rule it claims to
+    prove -- and a tally of such cases reads exactly like a tally of real
+    ones.  That is the M5-C11 defect class applied to the evidence itself: the
+    run's success and its measuring nothing look identical.
+
+    Every value case therefore names the test(s) that must be among the
+    failures.  If they are not, the outcome is `RED (wrong witness)`, which is
+    absent from `guard_outcomes.USABLE_OUTCOMES` and fails the run.  A value
+    case with no declared witness is refused before anything is edited.
+
+    `expect_build_failure` cases declare none: a build failure names no test,
+    and requiring one would be incoherent.
+    """
+
+    name: str
+    edits: list[Edit]
+    expected_red: frozenset[str] = frozenset()
+    expect_build_failure: bool = False
+
+
+CASES: list[Case] = [
     # ------------------------------------------- the sentinel fires on EOF
-    (
+    Case(
         # The whole mechanism.  Without this line the sentinel still starts,
         # still watches and still exits — and the group it was watching
         # outlives the supervisor exactly as it did before this chunk.  This
@@ -146,9 +178,12 @@ CASES: list[tuple[str, list[Edit], bool]] = [
         # the measured leak is the one the row records.
         "a bare end of file makes the sentinel kill the watched process group",
         [(DEADMAN_LIB, "    kill_group(leader);\n    EXIT_FIRED", "    EXIT_FIRED")],
-        False,
+        # The rule is that the sentinel signals the group when the supervisor
+        # dies unexpectedly, so the witness is the measurement of exactly
+        # that: a SIGKILLed supervisor whose child's group is gone afterwards.
+        frozenset({"a_sigkilled_supervisor_still_kills_the_group"}),
     ),
-    (
+    Case(
         # Arming at spawn.  A sentinel armed late — or not at all — leaves a
         # window in which a device crash orphans the group.
         "every stdio child is watched by a parent-death sentinel",
@@ -159,9 +194,12 @@ CASES: list[tuple[str, list[Edit], bool]] = [
                 "    let deadman: Option<tunnel_deadman::Deadman> = None;",
             )
         ],
-        False,
+        # An unarmed supervisor leaks the group on a SIGKILL: the same
+        # measurement, reached because the sentinel that would have fired was
+        # never spawned at all.
+        frozenset({"a_sigkilled_supervisor_still_kills_the_group"}),
     ),
-    (
+    Case(
         # The orderly path.  Dropping the handle instead of standing the
         # sentinel down still closes the pipe, but with **no token**, so the
         # sentinel reads a bare end of file and fires — a redundant group
@@ -180,10 +218,12 @@ CASES: list[tuple[str, list[Edit], bool]] = [
                 "            drop(deadman);",
             )
         ],
-        False,
+        # The `deadman_stood_down` counter distinguishes "stood down" from
+        # "fired and nobody noticed", and exactly one test reads it.
+        frozenset({"an_orderly_shutdown_stands_the_sentinel_down_instead_of_firing_it"}),
     ),
     # ------------------------------------ the fixture's honesty about itself
-    (
+    Case(
         # Not a product guard: a fixture guard.  If the descendant stops
         # actually leaving the process group, the plain group kill reaches it
         # and every containment claim in `process_residue.rs` becomes a
@@ -198,7 +238,9 @@ CASES: list[tuple[str, list[Edit], bool]] = [
                 "        DetachRoute::Setsid => false,",
             )
         ],
-        False,
+        # The escape marker's own assertion: a descendant that did not detach
+        # must be refused rather than measured as containment.
+        frozenset({"a_setsid_descendant_escapes_the_group_kill"}),
     ),
 ]
 
@@ -208,7 +250,7 @@ class Suite:
     name: str
     crates: list[Path]
     cargo_test: list[str]
-    cases: list[tuple[str, list[Edit], bool]] = field(default_factory=list)
+    cases: list[Case] = field(default_factory=list)
     cwd: Path = REPO
 
 
@@ -226,8 +268,8 @@ DEADMAN_TEST = [
     "--no-fail-fast",
 ]
 
-DEADMAN_CASES: list[tuple[str, list[Edit], bool]] = [
-    (
+DEADMAN_CASES: list[Case] = [
+    Case(
         # The rule that makes a missing sentinel *detectable*.  Without it, a
         # configured path that names nothing resolves to a path anyway; `arm`
         # then fails at spawn instead of at resolution, and `availability` —
@@ -235,21 +277,155 @@ DEADMAN_CASES: list[tuple[str, list[Edit], bool]] = [
         # would tell an operator the installation is watched when it is not.
         # A packaging slip would then be invisible in the one place built to
         # show it.
+        #
+        # **Re-anchored at M6-C08.**  The guard used to read `return
+        # path.is_file().then_some(path);`; the explicit branch now delegates
+        # to `classify`, and taking the path on trust is spelt as returning
+        # `Usable` without classifying it.  The rule is unchanged.
         "a configured sentinel path that names no file resolves to no sentinel",
         [
             (
                 DEADMAN_LIB,
-                "        return path.is_file().then_some(path);",
-                "        return Some(path);",
+                "        return classify(PathBuf::from(explicit));",
+                "        return Resolution::Usable(PathBuf::from(explicit));",
             )
         ],
-        False,
+        frozenset({"tests::an_explicit_path_to_a_non_file_resolves_to_no_sentinel"}),
+    ),
+    # ------------------------------------------------------------- M6-C08
+    Case(
+        # **The defect the row measured.**  Without the mode test, a
+        # zero-byte 0644 file named `tunnel-deadman` resolves as usable and
+        # `doctor` reports `PROCESS_CONTAINMENT_SENTINEL_PRESENT` for an
+        # installation that contains nothing.  Note the edit keeps the
+        # regular-file half, so this case defeats the execute-bit rule
+        # *alone* and cannot be credited to the other one.
+        "a file of the sentinel's name with no execute bit is not a sentinel",
+        [
+            (
+                DEADMAN_LIB,
+                "        .is_ok_and(|metadata| metadata.is_file() "
+                "&& metadata.permissions().mode() & 0o111 != 0)",
+                "        .is_ok_and(|metadata| metadata.is_file())",
+            )
+        ],
+        frozenset({"tests::a_zero_byte_decoy_wearing_the_sentinels_name_is_not_a_sentinel"}),
+    ),
+    Case(
+        # The other half, defeated on its own for the same reason.  A
+        # directory carries execute bits meaning "searchable", so the mode
+        # test alone accepts a directory named `tunnel-deadman`.  The old
+        # `is_file()` rule got this right by accident; it has to keep getting
+        # it right on purpose.
+        "a directory carrying execute bits is not a sentinel",
+        [
+            (
+                DEADMAN_LIB,
+                "        .is_ok_and(|metadata| metadata.is_file() "
+                "&& metadata.permissions().mode() & 0o111 != 0)",
+                "        .is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)",
+            )
+        ],
+        frozenset({"tests::a_directory_wearing_the_sentinels_name_is_not_a_sentinel"}),
+    ),
+    Case(
+        # The distinct status itself.  Folding "a file is there and cannot be
+        # run" back into "nothing is there" restores a report that is true
+        # about containment and useless as advice: the operator is told to
+        # install a `tunnel-deadman` they are looking straight at.
+        "a file that is present and unusable is not reported as nothing being there",
+        [
+            (
+                DEADMAN_LIB,
+                "    } else {\n        Resolution::Unusable(path)\n    }\n}",
+                "    } else {\n        Resolution::Absent\n    }\n}",
+            )
+        ],
+        frozenset(
+            {
+                "tests::a_file_that_is_there_and_unusable_is_reported_apart_from_"
+                "nothing_being_there"
+            }
+        ),
+    ),
+    Case(
+        # Returning on the first unusable candidate is what the old rule did
+        # -- it returned on the first `is_file()` -- and it would let a decoy
+        # in `deps` hide the real sentinel one directory up, turning every
+        # containment measurement in `process_residue.rs` into a measurement
+        # of nothing while they stayed green.
+        "an unusable candidate does not shadow a usable one further along the search",
+        [
+            (
+                DEADMAN_LIB,
+                "            Resolution::Unusable(path) => rejected = rejected.or(Some(path)),",
+                "            Resolution::Unusable(path) => return Resolution::Unusable(path),",
+            )
+        ],
+        frozenset({"tests::a_decoy_in_deps_does_not_shadow_the_real_sentinel_above_it"}),
+    ),
+    Case(
+        # An explicit `TUNNEL_DEADMAN_BIN` that names an unusable file must
+        # not fall back to the search.  A fallback would resolve to some
+        # *other* file and report success -- the shape of M6-C08 itself, one
+        # level up: a configuration mistake reported as a working
+        # installation.
+        "an explicit sentinel path that is unusable does not fall back to the search",
+        [
+            (
+                DEADMAN_LIB,
+                "        return classify(PathBuf::from(explicit));",
+                "        let explicit = classify(PathBuf::from(explicit));\n"
+                "        if let Resolution::Usable(_) = explicit {\n"
+                "            return explicit;\n"
+                "        }",
+            )
+        ],
+        frozenset({"tests::an_explicit_unusable_path_does_not_fall_back_to_the_search"}),
+    ),
+]
+
+#: The doctor's own mapping, in its own suite because it lives in a different
+#: package and M3-19's rule is that a suite may only edit packages its own
+#: `cargo test` invocation rebuilds.
+DOCTOR_TEST = [
+    "cargo",
+    "test",
+    "-p",
+    "tunnel-client",
+    "--locked",
+    "--no-fail-fast",
+    "doctor::",
+]
+
+DOCTOR_CASES: list[Case] = [
+    Case(
+        # The product rule and the surface that reports it are separate
+        # guards, and only this one is about what an operator reads.  The
+        # resolution rule could be perfect and this mapping could still fold
+        # the two degraded states together, which is the state M6-C08 asked
+        # not to be left in.
+        "an unusable sentinel is reported with its own doctor code",
+        [
+            (
+                DOCTOR,
+                '            code: "PROCESS_CONTAINMENT_SENTINEL_UNUSABLE",',
+                '            code: "PROCESS_CONTAINMENT_SENTINEL_MISSING",',
+            )
+        ],
+        frozenset(
+            {
+                "doctor::tests::a_missing_parent_death_sentinel_is_reported_and_"
+                "does_not_fail_the_doctor"
+            }
+        ),
     ),
 ]
 
 SUITES: list[Suite] = [
     Suite("m3c09", [DEADMAN, EXPORT, FIXTURE], CARGO_TEST, CASES),
     Suite("m3c09-deadman", [DEADMAN], DEADMAN_TEST, DEADMAN_CASES),
+    Suite("m6c08-doctor", [CLIENT], DOCTOR_TEST, DOCTOR_CASES),
 ]
 
 #: Cases whose green result is itself the measurement.  Empty today, and kept
@@ -371,7 +547,7 @@ def require_clean_tree(suites: list[Suite]) -> None:
                 )
 
 
-def check_anchors(selected: list[tuple[Suite, str, list[Edit], bool]]) -> int:
+def check_anchors(selected: list[tuple[Suite, Case]]) -> int:
     """Resolve every selected case's guard text, and stop (M4-27).
 
     The resolution, the STALLED/AMBIGUOUS split and the empty-selection
@@ -381,8 +557,35 @@ def check_anchors(selected: list[tuple[Suite, str, list[Edit], bool]]) -> int:
     """
     return shared_check_anchors(
         "m3-guard-deletion",
-        ((suite.name, name, edits) for suite, name, edits, _ in selected),
+        ((suite.name, case.name, case.edits) for suite, case in selected),
     )
+
+
+def require_declared_witnesses(selected: list[tuple[Suite, Case]]) -> None:
+    """Refuse a value case that names no test, before anything is edited.
+
+    Without this the `expected_red` mechanism is opt-in, and a case added with
+    the field omitted silently falls back to the "any red will do" behaviour
+    it exists to reject -- the mechanism's own version of the defect it
+    guards.  Lifted from `scripts/m0-guard-exit-codes.py` along with the
+    mechanism, because the refusal is the half that makes it hold.
+    """
+    problems = [
+        f"[{suite.name}] {case.name}"
+        for suite, case in selected
+        if not case.expect_build_failure and not case.expected_red
+    ] + [
+        f"[{suite.name}] {case.name} (compiler refusal may not declare a witness)"
+        for suite, case in selected
+        if case.expect_build_failure and case.expected_red
+    ]
+    if problems:
+        sys.exit(
+            "m3-guard-deletion: every value case must name the test(s) that "
+            "must redden, and a compiler-refusal case must name none; a case "
+            "classified RED by an unrelated failure is not evidence for the "
+            "rule it claims. Offending case(s): " + ", ".join(problems)
+        )
 
 
 def main() -> int:
@@ -409,14 +612,15 @@ def main() -> int:
         if not suites:
             sys.exit(f"m3-guard-deletion: no suite named {arguments.suite!r}")
     selected = [
-        (suite, name, edits, expect_build_failure)
+        (suite, case)
         for suite in suites
-        for name, edits, expect_build_failure in suite.cases
-        if not arguments.case or arguments.case in name
+        for case in suite.cases
+        if not arguments.case or arguments.case in case.name
     ]
     if arguments.list:
-        for suite, name, _, _ in selected:
-            print(f"{suite.name}: {name}")
+        for suite, case in selected:
+            witnesses = ", ".join(sorted(case.expected_red)) or "(compiler refusal)"
+            print(f"{suite.name}: {case.name} -> {witnesses}")
         return 0
     if arguments.check_anchors:
         return check_anchors(selected)
@@ -433,6 +637,7 @@ def main() -> int:
     # a tidying job.  Placed *after* the `--check-anchors` dispatch so
     # read-only mode stays a pure anchor check (M4-34, M4-36).
     refuse_resident_mutation("m3-guard-deletion", REPO)
+    require_declared_witnesses(selected)
     require_clean_tree(suites)
 
     # **Preflight (M4-27).**  Resolve every selected case's anchors before any
@@ -444,7 +649,8 @@ def main() -> int:
         return 1
 
     results: list[tuple[str, str, str, list[str]]] = []
-    for suite, name, edits, expect_build_failure in selected:
+    for suite, case in selected:
+        name = case.name
         # **M5-C07.**  The apply/test/restore cycle runs inside a context
         # manager, so the restore happens on *every* way out of this block --
         # a refusal, an exception, a `KeyboardInterrupt`, or the `SystemExit`
@@ -465,7 +671,7 @@ def main() -> int:
         # also runs after the restore rather than racing it.
         try:
             with AppliedCase("m3-guard-deletion", REPO, suite.name, name) as applied:
-                problem = applied.apply_all(edits)
+                problem = applied.apply_all(case.edits)
                 if problem is not None:
                     results.append((suite.name, name, f"COULD NOT APPLY: {problem}", []))
                     print(f"[{suite.name}] {name}: {problem}", flush=True)
@@ -479,7 +685,7 @@ def main() -> int:
                 if outcome == "still green"
                 else f"EXPECTED A DOCUMENTED GREEN, GOT: {outcome}"
             )
-        elif expect_build_failure:
+        elif case.expect_build_failure:
             outcome = (
                 "REFUSED BY COMPILER"
                 if outcome == "BUILD FAILED"
@@ -487,6 +693,20 @@ def main() -> int:
             )
         elif outcome == "BUILD FAILED":
             outcome = "BUILD FAILED (not evidence)"
+        elif outcome == "RED":
+            # **The witness check.**  `RED` means *something* failed; it does
+            # not mean the rule this case names was the thing that noticed.
+            # An outcome spelt this way is absent from
+            # `guard_outcomes.USABLE_OUTCOMES`, so it fails the run rather
+            # than being counted as evidence for a rule it did not test.
+            missing = sorted(case.expected_red - set(failures))
+            if missing:
+                outcome = (
+                    "RED (wrong witness): expected "
+                    + ", ".join(missing)
+                    + " to redden, got "
+                    + (", ".join(failures) if failures else "nothing")
+                )
         results.append((suite.name, name, outcome, failures))
         print(
             f"[{suite.name}] {name}: {outcome} {failures if failures else ''}".rstrip(),

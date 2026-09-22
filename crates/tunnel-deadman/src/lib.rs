@@ -145,9 +145,19 @@ impl Deadman {
         if !cfg!(unix) {
             return None;
         }
-        let Some(executable) = sentinel_path() else {
-            warn_sentinel_missing();
-            return None;
+        let executable = match resolution() {
+            Resolution::Usable(path) => path,
+            // Named separately because the fix differs and the "install one
+            // alongside the device binary" advice is wrong here: there is
+            // already a `tunnel-deadman` at that path and it is the problem.
+            Resolution::Unusable(path) => {
+                warn_sentinel_unusable(&path);
+                return None;
+            }
+            Resolution::Absent => {
+                warn_sentinel_missing();
+                return None;
+            }
         };
         let mut command = Command::new(executable);
         command
@@ -233,18 +243,37 @@ pub fn availability() -> Availability {
     if !cfg!(unix) {
         return Availability::UnsupportedPlatform;
     }
-    if sentinel_path().is_some() {
-        Availability::Armable
-    } else {
-        Availability::SentinelMissing
+    match resolution() {
+        Resolution::Usable(_) => Availability::Armable,
+        Resolution::Unusable(_) => Availability::SentinelUnusable,
+        Resolution::Absent => Availability::SentinelMissing,
     }
 }
 
 /// What [`availability`] found.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Availability {
-    /// The sentinel executable is present; children will be watched.
+    /// A regular, executable file of the sentinel's name is where one is
+    /// expected, so a sentinel can be spawned and children will be watched.
+    ///
+    /// **This is not an identity check and must not be reported as one.**  It
+    /// establishes that the candidate is a regular file this process may
+    /// execute; it does not establish that the file *is* `tunnel-deadman`.
+    /// An executable script of the right name passes.  See
+    /// [`resolve_sentinel`] for why the runtime stops here and where the
+    /// stronger check lives.
     Armable,
+    /// A Unix host where the resolved location **holds a file** that cannot be
+    /// executed as a sentinel: not a regular file, or a regular file with no
+    /// execute bit for anybody.
+    ///
+    /// Distinct from [`SentinelMissing`](Self::SentinelMissing) because the
+    /// operator's fix differs.  "Missing" means install the sentinel;
+    /// "unusable" means something of that name is already there and is not a
+    /// usable sentinel, so installing one means replacing it -- and advice to
+    /// "install `tunnel-deadman` alongside the device binary" is actively
+    /// unhelpful to someone who is looking straight at a `tunnel-deadman`.
+    SentinelUnusable,
     /// A Unix host with no sentinel executable beside the running one and no
     /// [`SENTINEL_PATH_ENV`] pointing at one.  Containment silently reverts
     /// to the pre-sentinel behaviour.
@@ -257,6 +286,26 @@ pub enum Availability {
 ///
 /// Once, not per child: an export may supervise up to 64 children and a line
 /// per child would bury the fact rather than report it.
+/// Warn once per process that a file of the sentinel's name is in the way.
+///
+/// Separate from [`warn_sentinel_missing`] and separately `Once`-guarded: the
+/// two conditions need different actions, and a reader who has just been told
+/// to install a `tunnel-deadman` that is plainly sitting there learns nothing.
+/// The path is named because the whole difficulty is knowing *which* file.
+fn warn_sentinel_unusable(path: &Path) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        eprintln!(
+            "tunnel-deadman: {} is not a regular executable file, so it cannot be \
+             run as a sentinel: supervised child process groups will NOT be cleaned \
+             up if this process is killed or crashes. Replace it with the real \
+             `{SENTINEL_BIN}` binary (a working one exits 2 when run with no \
+             arguments).",
+            path.display()
+        );
+    });
+}
+
 fn warn_sentinel_missing() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
@@ -274,8 +323,78 @@ fn warn_sentinel_missing() {
 /// `target/<profile>/deps`, so the parent of `deps` is searched too.
 #[must_use]
 pub fn sentinel_path() -> Option<PathBuf> {
-    let executable = std::env::current_exe().ok()?;
+    match resolution() {
+        Resolution::Usable(path) => Some(path),
+        // A file that is there and cannot be executed is not a path to arm
+        // from.  It is reported through [`availability`] instead, which is
+        // the surface that can say *which* of the two it is.
+        Resolution::Unusable(_) | Resolution::Absent => None,
+    }
+}
+
+/// [`resolve_sentinel`] applied to this process's real inputs.
+fn resolution() -> Resolution {
+    let Ok(executable) = std::env::current_exe() else {
+        return Resolution::Absent;
+    };
     resolve_sentinel(std::env::var_os(SENTINEL_PATH_ENV).as_deref(), &executable)
+}
+
+/// What the search found at the place it was looking.
+///
+/// Three-valued rather than `Option<PathBuf>` because "nothing is there" and
+/// "something is there and it is not a sentinel" are different findings with
+/// different fixes, and collapsing them is exactly the defect row M6-C08
+/// records -- one direction of it.  The other direction was collapsing
+/// "something is there" into "a sentinel is there".
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum Resolution {
+    /// A regular file with an execute bit.  See [`Availability::Armable`] for
+    /// what this does and does not establish.
+    Usable(PathBuf),
+    /// An entry exists at the candidate location and cannot be executed.
+    Unusable(PathBuf),
+    /// Nothing exists at any candidate location.
+    Absent,
+}
+
+/// Whether `path` is something this process could execute as the sentinel.
+///
+/// **Deliberately follows symlinks**, unlike `scripts/client-bundle-
+/// sentinel.sh`, which rejects a symlinked sentinel outright.  The two are
+/// asking different questions and the divergence is intended: the script is
+/// asserting that a *bundle* is self-contained, where a symlink is a bundle
+/// that will break when it is moved; this is asking whether a sentinel can be
+/// spawned *here, now*, and a symlink to a real sentinel spawns perfectly.
+#[cfg(unix)]
+fn is_executable_regular_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable_regular_file(path: &Path) -> bool {
+    // No execute bit to read.  `availability` answers `UnsupportedPlatform`
+    // before reaching here and `arm` returns `None`, so this only keeps the
+    // resolution rule compiling and testable off Unix.
+    path.is_file()
+}
+
+/// Classify one candidate location.
+fn classify(path: PathBuf) -> Resolution {
+    // `symlink_metadata` answers "is there an entry here at all", which is
+    // what separates `Absent` from `Unusable` -- including for a dangling
+    // symlink, where `metadata` alone would report the same `NotFound` as an
+    // empty directory and lose the distinction.
+    if std::fs::symlink_metadata(&path).is_err() {
+        return Resolution::Absent;
+    }
+    if is_executable_regular_file(&path) {
+        Resolution::Usable(path)
+    } else {
+        Resolution::Unusable(path)
+    }
 }
 
 /// The resolution rule itself, with both inputs passed in.
@@ -284,26 +403,79 @@ pub fn sentinel_path() -> Option<PathBuf> {
 /// process environment — which, since the 2024 edition, is `unsafe`, and this
 /// crate forbids `unsafe`.  Testing it matters because the rule is what
 /// decides whether an installation is watched at all, and because an explicit
-/// path that names nothing must resolve to [`None`] rather than be taken on
-/// trust.
+/// path that names nothing must resolve to [`Resolution::Absent`] rather than
+/// be taken on trust.
+///
+/// # What this check establishes, and the ceiling it stops at (M6-C08)
+///
+/// The rule used to accept any `is_file()`, so a **zero-byte, mode 0644 file
+/// named `tunnel-deadman`** beside the client made `availability` answer
+/// `Armable` and `doctor` report `PROCESS_CONTAINMENT_SENTINEL_PRESENT`.
+/// That is worse than reporting containment missing: every arming attempt
+/// against that file fails, and the one surface built to show the problem
+/// announced the opposite.
+///
+/// The rule now requires a **regular file with an execute bit**.  That is a
+/// genuine narrowing -- it rejects the measured decoy and every
+/// non-executable or non-regular candidate -- and it is **all** it is.  It
+/// **cannot distinguish an executable script named `tunnel-deadman` from the
+/// real sentinel**, so `Armable` means "something spawnable of that name is
+/// there", never "containment is known to work".
+///
+/// **Why the runtime stops there rather than probing.**  The stronger check
+/// is behavioural: `tunnel-deadman` exits 2 on a wrong argument list, so
+/// running it distinguishes it from a file wearing its name.  The runtime
+/// does not do that, for two independent reasons:
+///
+/// * `tunnel-client doctor` documents that it "reads a path and starts
+///   nothing" (`crates/tunnel-client/src/doctor.rs`).  A probe here would
+///   make the diagnostic surface execute an unknown binary found beside
+///   itself, which is a worse property than the one it would be checking.
+/// * This runs on the resolution path taken before **every** supervised
+///   child, so a probe spends a process launch per arming -- and against an
+///   unknown binary, whose behaviour on being run is exactly what is in
+///   question.
+///
+/// So the behavioural probe stays where it is already paid for and where a
+/// failure is free to fix: assembly time, in
+/// `scripts/client-bundle-sentinel.sh` and `scripts/m6-release-artifact.py`.
+/// Those two and this rule are **not** in disagreement; they are answering
+/// different questions at different moments, and neither is an identity
+/// check.  Bytes are bound by checksum and provenance, not by either.
 #[must_use]
-fn resolve_sentinel(explicit: Option<&std::ffi::OsStr>, executable: &Path) -> Option<PathBuf> {
+fn resolve_sentinel(explicit: Option<&std::ffi::OsStr>, executable: &Path) -> Resolution {
     if let Some(explicit) = explicit {
-        let path = PathBuf::from(explicit);
-        return path.is_file().then_some(path);
+        // An explicit path is not a search.  It names one file, and if that
+        // file is unusable the answer is about *that* file: falling back to
+        // the beside-`current_exe` search would let a misconfigured override
+        // resolve to something else and report success, hiding the
+        // misconfiguration rather than reporting it.
+        return classify(PathBuf::from(explicit));
     }
-    let directory = executable.parent()?;
-    let beside = directory.join(SENTINEL_BIN);
-    if beside.is_file() {
-        return Some(beside);
+    let Some(directory) = executable.parent() else {
+        return Resolution::Absent;
+    };
+    let mut candidates = vec![directory.join(SENTINEL_BIN)];
+    if directory.file_name().is_some_and(|name| name == "deps")
+        && let Some(above) = directory.parent()
+    {
+        candidates.push(above.join(SENTINEL_BIN));
     }
-    if directory.file_name().is_some_and(|name| name == "deps") {
-        let above = directory.parent()?.join(SENTINEL_BIN);
-        if above.is_file() {
-            return Some(above);
+    // The first unusable candidate is remembered rather than returned, so a
+    // decoy beside a test binary cannot shadow the real sentinel one
+    // directory up -- the old rule returned on the first `is_file()` and
+    // would have.  If nothing usable turns up, the remembered candidate is
+    // the answer, because "there is a file there and it is not runnable" is
+    // a better report than "there is nothing there".
+    let mut rejected: Option<PathBuf> = None;
+    for candidate in candidates {
+        match classify(candidate) {
+            Resolution::Usable(path) => return Resolution::Usable(path),
+            Resolution::Unusable(path) => rejected = rejected.or(Some(path)),
+            Resolution::Absent => {}
         }
     }
-    None
+    rejected.map_or(Resolution::Absent, Resolution::Unusable)
 }
 
 /// The sentinel's body: read `stdin` to end of file, then decide.
@@ -365,17 +537,34 @@ mod tests {
         // this is the resolution rule underneath it.
         let directory = tempfile::tempdir().expect("directory");
         let absent = directory.path().join("not-a-sentinel");
-        assert!(resolve_sentinel(Some(absent.as_os_str()), Path::new("/usr/bin/device")).is_none());
+        assert_eq!(
+            resolve_sentinel(Some(absent.as_os_str()), Path::new("/usr/bin/device")),
+            Resolution::Absent
+        );
+    }
+
+    /// Write a file that could actually be executed, which since M6-C08 is
+    /// what the resolution rule requires.  A helper rather than three copies
+    /// so a future test cannot accidentally take the 0644 path the decoy
+    /// takes and look like it proved something about a usable sentinel.
+    fn write_executable(path: &Path) {
+        std::fs::write(path, b"#!/bin/sh\nexit 2\n").expect("write");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod +x");
+        }
     }
 
     #[test]
     fn an_explicit_path_to_a_real_file_is_taken_over_the_search() {
         let directory = tempfile::tempdir().expect("directory");
         let present = directory.path().join("some-sentinel");
-        std::fs::write(&present, b"#!/bin/sh\n").expect("write");
+        write_executable(&present);
         assert_eq!(
-            resolve_sentinel(Some(present.as_os_str()), Path::new("/usr/bin/device")).as_deref(),
-            Some(present.as_path())
+            resolve_sentinel(Some(present.as_os_str()), Path::new("/usr/bin/device")),
+            Resolution::Usable(present)
         );
     }
 
@@ -387,17 +576,172 @@ mod tests {
         let deps = directory.path().join("deps");
         std::fs::create_dir(&deps).expect("deps");
         let sentinel = directory.path().join(SENTINEL_BIN);
-        std::fs::write(&sentinel, b"#!/bin/sh\n").expect("write");
+        write_executable(&sentinel);
         assert_eq!(
-            resolve_sentinel(None, &deps.join("some_test-abc123")).as_deref(),
-            Some(sentinel.as_path())
+            resolve_sentinel(None, &deps.join("some_test-abc123")),
+            Resolution::Usable(sentinel)
         );
     }
 
     #[test]
     fn a_binary_with_no_sentinel_beside_it_resolves_to_none() {
         let directory = tempfile::tempdir().expect("directory");
-        assert!(resolve_sentinel(None, &directory.path().join("device")).is_none());
+        assert_eq!(
+            resolve_sentinel(None, &directory.path().join("device")),
+            Resolution::Absent
+        );
+    }
+
+    // ------------------------------------------------------------- M6-C08
+
+    /// **The measured defect, as a test.**
+    ///
+    /// A zero-byte, mode 0644 file named `tunnel-deadman` beside the client
+    /// made `availability()` answer `Armable` and `doctor` report
+    /// `PROCESS_CONTAINMENT_SENTINEL_PRESENT`, while every arming attempt
+    /// against it would fail.  The exact artefact from the row is rebuilt
+    /// here -- zero bytes, mode 0644 -- rather than a merely-similar one, so
+    /// this fails if the rule is relaxed back.
+    #[test]
+    fn a_zero_byte_decoy_wearing_the_sentinels_name_is_not_a_sentinel() {
+        let directory = tempfile::tempdir().expect("directory");
+        let decoy = directory.path().join(SENTINEL_BIN);
+        std::fs::write(&decoy, b"").expect("write");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&decoy, std::fs::Permissions::from_mode(0o644))
+                .expect("chmod");
+        }
+
+        let resolved = resolve_sentinel(None, &directory.path().join("tunnel-client"));
+        assert_eq!(
+            resolved,
+            Resolution::Unusable(decoy),
+            "a non-executable file of the sentinel's name must not resolve as usable"
+        );
+        // The end-to-end consequence, on the value the operator reads: not
+        // merely "not Armable" but the state that says which problem it is.
+        assert_ne!(resolved, Resolution::Absent);
+    }
+
+    /// The distinction the new status exists for.
+    ///
+    /// Asserted as an inequality against the *other* two answers rather than
+    /// only as an equality, because a rule that collapsed every candidate to
+    /// `Unusable` would satisfy an equality-only test.
+    #[test]
+    fn a_file_that_is_there_and_unusable_is_reported_apart_from_nothing_being_there() {
+        let occupied = tempfile::tempdir().expect("directory");
+        let decoy = occupied.path().join(SENTINEL_BIN);
+        std::fs::write(&decoy, b"not a sentinel").expect("write");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&decoy, std::fs::Permissions::from_mode(0o644))
+                .expect("chmod");
+        }
+        let empty = tempfile::tempdir().expect("directory");
+
+        let there = resolve_sentinel(None, &occupied.path().join("tunnel-client"));
+        let nothing = resolve_sentinel(None, &empty.path().join("tunnel-client"));
+        assert_eq!(there, Resolution::Unusable(decoy));
+        assert_eq!(nothing, Resolution::Absent);
+        assert_ne!(
+            there, nothing,
+            "a file that is present and unusable must not report as nothing being \
+             present: the two need different fixes"
+        );
+    }
+
+    /// A directory named `tunnel-deadman` is not a sentinel either.
+    ///
+    /// The old rule got this right by accident -- `is_file()` is false for a
+    /// directory -- and the mode check alone would get it wrong, because a
+    /// directory carries execute bits meaning "searchable".  So the regular-
+    /// file half of the check is load-bearing and is measured on its own.
+    #[test]
+    fn a_directory_wearing_the_sentinels_name_is_not_a_sentinel() {
+        let directory = tempfile::tempdir().expect("directory");
+        let masquerade = directory.path().join(SENTINEL_BIN);
+        std::fs::create_dir(&masquerade).expect("mkdir");
+        assert_eq!(
+            resolve_sentinel(None, &directory.path().join("tunnel-client")),
+            Resolution::Unusable(masquerade)
+        );
+    }
+
+    /// An unusable candidate beside the test binary must not shadow the real
+    /// sentinel one directory up.
+    ///
+    /// The old rule returned on the first `is_file()`, so a decoy in `deps`
+    /// would have hidden a working sentinel in `target/debug` and turned
+    /// every containment measurement into a measurement of nothing.
+    #[test]
+    fn a_decoy_in_deps_does_not_shadow_the_real_sentinel_above_it() {
+        let directory = tempfile::tempdir().expect("directory");
+        let deps = directory.path().join("deps");
+        std::fs::create_dir(&deps).expect("deps");
+        std::fs::write(deps.join(SENTINEL_BIN), b"").expect("decoy");
+        let real = directory.path().join(SENTINEL_BIN);
+        write_executable(&real);
+        assert_eq!(
+            resolve_sentinel(None, &deps.join("some_test-abc123")),
+            Resolution::Usable(real)
+        );
+    }
+
+    /// An explicit path is not a search, and an unusable one does not fall
+    /// back.
+    ///
+    /// Falling back would let a misconfigured `TUNNEL_DEADMAN_BIN` resolve to
+    /// some other file and report success, hiding the misconfiguration rather
+    /// than reporting it -- which is the shape of M6-C08 itself.  The
+    /// executable sentinel beside the binary is what a fallback would find,
+    /// so its presence is what makes this test able to fail.
+    #[test]
+    fn an_explicit_unusable_path_does_not_fall_back_to_the_search() {
+        let directory = tempfile::tempdir().expect("directory");
+        let beside = directory.path().join(SENTINEL_BIN);
+        write_executable(&beside);
+        let configured = directory.path().join("configured-sentinel");
+        std::fs::write(&configured, b"").expect("write");
+
+        assert_eq!(
+            resolve_sentinel(
+                Some(configured.as_os_str()),
+                &directory.path().join("tunnel-client")
+            ),
+            Resolution::Unusable(configured)
+        );
+    }
+
+    /// The ceiling, stated as a test so it is not quietly overstated later.
+    ///
+    /// An executable shell script named `tunnel-deadman` **passes** this
+    /// rule.  That is not a defect to fix here -- the runtime cannot tell
+    /// without executing the file, and `doctor` promises not to -- it is the
+    /// documented limit, and a reader who assumes `Armable` means "the real
+    /// sentinel" is wrong.  If someone later makes the runtime probe, this
+    /// test fails and the claim in the docs has to be revisited with it.
+    #[test]
+    fn the_rule_cannot_tell_an_executable_impostor_from_the_real_sentinel() {
+        let directory = tempfile::tempdir().expect("directory");
+        let impostor = directory.path().join(SENTINEL_BIN);
+        std::fs::write(&impostor, b"#!/bin/sh\nexit 0\n").expect("write");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&impostor, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod +x");
+        }
+        assert_eq!(
+            resolve_sentinel(None, &directory.path().join("tunnel-client")),
+            Resolution::Usable(impostor),
+            "the runtime check is a mode check, not an identity check; if this \
+             changed, the docs on `resolve_sentinel` and `doctor`'s \
+             `process_containment` must change with it"
+        );
     }
 
     #[test]
