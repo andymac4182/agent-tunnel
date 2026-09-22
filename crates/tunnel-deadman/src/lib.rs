@@ -717,9 +717,24 @@ mod tests {
         std::fs::write(&denied, b"#!/bin/sh\nexit 2\n").expect("write");
         std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o010)).expect("chmod");
 
-        // The instrument first: if this file were somehow executable, the
-        // assertion below would pass for the wrong reason. Running as root
-        // would do it, and root ignores permission bits entirely.
+        // **The instrument first, and it announces which way it went.**  If
+        // this process could execute the file, the assertion below would pass
+        // for the wrong reason -- root ignores permission bits entirely.  So
+        // the premise is checked and the test skips when it does not hold.
+        //
+        // **A skip must not be indistinguishable from a run**, which is the
+        // defect this whole row is about (M5-C11).  A bare `return` makes
+        // both outcomes the same green `ok` in the pass count, so a reader
+        // grepping a captured log for `SKIPPED` learns nothing and a check
+        // written on that grep cannot go red.  Both paths therefore print a
+        // named line, following `process_residue.rs`'s
+        // `the_skip_cannot_hide_a_helper_that_is_on_disk`.  Cargo captures
+        // stdout and stderr for a passing test, so the two lines are visible
+        // under `--nocapture`: **that is where the outcomes are told apart,
+        // and the pass count alone still does not distinguish them.**  Said
+        // here rather than left implied, because a comment claiming this test
+        // "reports that it ran" without that qualification would be one more
+        // statement about something nobody measured.
         if rustix::fs::access(&denied, rustix::fs::Access::EXEC_OK).is_ok() {
             eprintln!(
                 "SKIPPED a_sentinel_this_process_may_not_execute_is_not_a_sentinel: DID \
@@ -728,6 +743,12 @@ mod tests {
             );
             return;
         }
+        eprintln!(
+            "MEASURED a_sentinel_this_process_may_not_execute_is_not_a_sentinel: this \
+             process may NOT execute the mode 0o010 file, so the distinction between \
+             \"some execute bit is set\" and \"this process may execute\" is live and \
+             the assertion below is about it"
+        );
 
         assert_eq!(
             resolve_sentinel(None, &directory.path().join("tunnel-client")),
