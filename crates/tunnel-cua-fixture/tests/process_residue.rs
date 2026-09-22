@@ -129,6 +129,27 @@ fn sentinel_or_skip(test: &str) -> Option<PathBuf> {
             tunnel_deadman::sentinel_path()
                 .expect("availability() reported Armable, so a path resolves"),
         ),
+        // **A separate arm, because the remedy differs (M6-C08).** Folded
+        // into the arm below, a `tunnel-deadman` that is present and cannot
+        // be executed would be reported as "no executable beside this test
+        // binary; build the helper" -- advice that is wrong for a reader
+        // looking straight at the file, and that sends them to rebuild
+        // something already built. This is also the one skip reason that may
+        // be a real defect rather than a missing fixture, so it does not
+        // claim otherwise.
+        tunnel_deadman::Availability::SentinelUnusable => {
+            eprintln!(
+                "SKIPPED {test}: DID NOT RUN (SentinelUnusable) -- a `{bin}` is at the \
+                 resolved path but this process cannot execute it as a sentinel (not a \
+                 regular file, or execute permission denied), so no parent-death \
+                 sentinel can be armed and this test would measure nothing. Unlike a \
+                 missing helper this may be a real defect: check the file's type and \
+                 mode before assuming it is a fixture problem. Task rows M5-C11, \
+                 M6-C08.",
+                bin = tunnel_deadman::SENTINEL_BIN,
+            );
+            None
+        }
         absent => {
             eprintln!(
                 "SKIPPED {test}: DID NOT RUN ({absent:?}) -- no `{bin}` executable \

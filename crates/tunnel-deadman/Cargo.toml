@@ -15,7 +15,10 @@ path = "src/main.rs"
 
 [target.'cfg(unix)'.dependencies]
 # Safe process-group signalling; this crate is `forbid(unsafe_code)`.
-rustix = { version = "1.1", default-features = false, features = ["process", "std"] }
+# `fs` is for `access(EXEC_OK)` in the sentinel resolution rule (M6-C08): a
+# mode-bit test answers "some execute bit is set", which is not the question
+# the caller is asking. See `is_executable_regular_file`.
+rustix = { version = "1.1", default-features = false, features = ["fs", "process", "std"] }
 
 [dev-dependencies]
 tempfile = "3.21"

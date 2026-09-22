@@ -1887,10 +1887,15 @@ CASES_C8: list[tuple[str, list[Edit], bool]] = [
         [
             (
                 DEADMAN_LIB,
-                """    if sentinel_path().is_some() {
-        Availability::Armable
-    } else {
-        Availability::SentinelMissing
+                # **Re-anchored at M6-C08**, which replaced the two-valued
+                # `sentinel_path().is_some()` test with a three-valued
+                # `Resolution`.  The defeat is unchanged in substance: make
+                # `availability()` report the helper missing whatever is on
+                # disk, and the positive control must notice.
+                """    match resolution() {
+        Resolution::Usable(_) => Availability::Armable,
+        Resolution::Unusable(_) => Availability::SentinelUnusable,
+        Resolution::Absent => Availability::SentinelMissing,
     }""",
                 "    Availability::SentinelMissing",
             )
