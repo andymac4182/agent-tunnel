@@ -55,6 +55,24 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MAIN_RS = os.path.join(REPO_ROOT, "crates", "tunnel-test-harness", "src", "main.rs")
 HARNESS_VERIFY = os.path.join(REPO_ROOT, "scripts", "m7-harness-verify.sh")
 SOURCES = os.path.join(REPO_ROOT, "docs", "sources.md")
+#: **A hard-coded two-file list, and that is an unmeasured boundary rather
+#: than a decision anyone recorded** (M6-C10).  Other documents contain table
+#: rows that mention verification and which this guard therefore never reads.
+#: **Re-derived rather than taken from the review that raised it, and the
+#: review's figure did not reproduce**: it reported 7 such rows across
+#: testing.md, m7-verification.md, cluster.md and runtime.md.  Scanning every
+#: `docs/**/*.md` outside this list, **no row at all satisfies
+#: `row_is_verified`** -- none of those tables has a `Status` column and none
+#: holds a cell equal to "verified"/"verified local" -- and loosening to any
+#: table row with "verified" in any cell finds **3**: one each in
+#: `m7-verification.md`, `runtime.md` and `research/ai-sdk.md`.  **None of the
+#: three carries a hash that resolves to a commit, so there is no exposure
+#: today**, and none of those documents is a promotion surface, which is the
+#: argument for a list rather than a glob.  It is named here because "the
+#: guard checks the task rows" is the
+#: kind of claim that quietly becomes false when someone starts recording
+#: evidence in a fifth document, and the next reader should find the boundary
+#: written down instead of rediscovering it.
 DOCS = [
     os.path.join(REPO_ROOT, "docs", "m7-edge-cases.md"),
     os.path.join(REPO_ROOT, "docs", "tasks.md"),
@@ -232,50 +250,93 @@ def is_separator(line: str) -> bool:
     return bool(re.match(r"^\s*\|[\s:|-]+\|?\s*$", line))
 
 
-#: The status column, per document, measured rather than guessed: every cell
-#: this file used to match sits at `docs/tasks.md` column 2 (152 rows),
-#: `docs/m7-edge-cases.md` column 5 (98 rows), and `docs/tasks.md` column 1
-#: (2 rows -- the milestone summary table, which has its own shape).  Reading
-#: a *column* is what makes the prose test below safe: "verified" appears
-#: constantly in the notes column, and matching it there would put every row
-#: in scope for the wrong reason.
-STATUS_COLUMN = {"docs/tasks.md": 2, "docs/m7-edge-cases.md": 5}
-
 #: Status spellings that contain "verified" while claiming the opposite, or
 #: claiming it only in the future: "implemented awaiting verification", "not
-#: promoted; stays implemented awaiting verification".  An allow list of
-#: positive spellings was the obvious alternative and is the defect this
-#: change exists to remove -- a hand-maintained list of the acceptable ways
-#: to say "verified" rots exactly like the one M6-C09 was about.
-NOT_A_VERIFIED_CLAIM = ("awaiting", "not promoted", "unverified", "pending", "to be verified")
+#: promoted; stays implemented awaiting verification", a journal cell reading
+#: "not verified".  An allow list of positive spellings was the obvious
+#: alternative and is the defect this change exists to remove -- a
+#: hand-maintained list of the acceptable ways to say "verified" rots exactly
+#: like the one M6-C09 was about.
+#:
+#: **Which of these actually fire is measured, not assumed.**  At the commit
+#: that added this, `in progress` excludes exactly 2 rows (M0-03 and M6-01,
+#: whose status cells read "in progress (exit codes verified local; ...)" and
+#: "in progress (one target produced and verified; ...)" -- rows that name a
+#: verified *part* while the row itself is open).  **Every other entry
+#: excludes zero rows today**, because the awaiting spellings in use say
+#: "verification", not "verified", so they never reach this filter.  They are
+#: kept as a guard against a spelling that does not exist yet -- `docs/tasks.md`
+#: already contains journal cells reading "not verified", which are out of
+#: scope only because the journal table has no `Status` column, and would be
+#: admitted as verified the day such a cell appeared in a table that does.
+#: Saying "currently excludes nothing" is the point: a filter nobody has
+#: measured is indistinguishable from one that cannot fire.
+NOT_A_VERIFIED_CLAIM = (
+    "awaiting",
+    "in progress",
+    "not promoted",
+    "not verified",
+    "unverified",
+    "pending",
+    "to be verified",
+)
 
 
-def row_is_verified(line: str, rel: str = "") -> bool:
-    """A row is verified when its status *column* claims it.
+def status_column(header: str) -> "int | None":
+    """The index of a table's `Status` column, read from its own header.
+
+    **An earlier version of this fix took the index per *file* -- tasks.md 2,
+    m7-edge-cases.md 5 -- measured by counting where existing matches sat, and
+    claimed that reading a column rather than prose made the free-text test
+    below safe.  It did not** (M6-C10, second round).  `docs/tasks.md` holds
+    three differently-shaped tables, and column 2 is `Status` in the task
+    tables, `Gate statement` in the milestone summary, and `Event` in the
+    journal.  So the per-file index pointed at prose in two of the three, and
+    the milestone rows were kept out only by the accident that their gate
+    statements happen to contain the word "awaiting" -- delete that word from
+    one of them and an `in progress` row would have entered scope claiming
+    verification.  Both were over-inclusions, so no citation could slip
+    through, but the safety property the comment asserted was not there.
+
+    Reading the index from the header row is the property itself rather than a
+    measurement of its consequences: a table with no `Status` column has no
+    status column, and the milestone and journal tables say so in their own
+    headers (`Milestone | Current state | Gate statement | Completed at` and
+    `At | Item | Event | Evidence or scope`).  Rows in those tables are
+    matched only by the exact-equality rule, exactly as before this change.
+    """
+    cells = [cell.strip().lower() for cell in header.strip().strip("|").split("|")]
+    for index, cell in enumerate(cells):
+        if cell == "status":
+            return index
+    return None
+
+
+def row_is_verified(line: str, index: "int | None" = None) -> bool:
+    """A row is verified when its status column claims it.
 
     In docs/tasks.md the `[x]` checkbox only means the task item is checked;
-    the authoritative signal is the third data column (e.g. "verified local"
-    versus "implemented awaiting verification" or "in progress").  In
-    docs/m7-edge-cases.md the status column is a "Verified"/"Verified local"
-    cell.  Reading a status cell rather than prose keeps awaiting-verification
-    rows out of scope.
+    the authoritative signal is the `Status` column (e.g. "verified local"
+    versus "implemented awaiting verification" or "in progress").
 
-    **This used to require the cell to equal "verified" or "verified local"
-    exactly, and that silently excluded 52 rows that claim verification in
-    other words** (M6-C10) -- "first verified local" (16 rows), "first
-    verified local at declared scope" (11), "implemented (verified local)"
-    (4), "re-verified local" (4), and a long tail of one-offs including three
-    written by the chunk that found this.  None of their citations was ever
+    **This used to require that cell to equal "verified" or "verified local"
+    exactly, and that silently excluded rows claiming verification in other
+    words** (M6-C10) -- `first verified local`, `implemented (verified
+    local)`, `re-verified local`, and a tail of one-offs including three
+    written by the chunk that found it.  None of their citations was ever
     checked, and the guard reported a clean pass over 252 rows without ever
-    saying which 52 it had not looked at.  A row is now verified if the old
-    exact match holds **or** its status column claims verification in any
-    words, which is a strict widening: nothing the old rule caught is lost.
+    saying which ones it had not looked at.
+
+    A row is verified if the old exact match holds **or** its `Status` cell
+    claims verification in words that are not an awaiting/pending/negated
+    form.  The `or` is deliberate and makes the change a strict widening:
+    no row the old rule caught can leave scope, including the milestone-table
+    rows whose tables have no `Status` column at all.
     """
     cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
     for cell in cells:
         if cell.lower() in ("verified", "verified local"):
             return True
-    index = STATUS_COLUMN.get(rel)
     if index is None or len(cells) <= index:
         return False
     status = cells[index].lower()
@@ -355,10 +416,22 @@ def scan(gates: "set[str]", pins: "set[str]", verbose: bool) -> "list[str]":
     for path in DOCS:
         rel = os.path.relpath(path, REPO_ROOT)
         text = read_text(path)
-        for lineno, line in enumerate(text.splitlines(), start=1):
-            if not is_table_row(line) or is_separator(line):
+        lines = text.splitlines()
+        # The `Status` column index of the table currently being walked.  A
+        # header is a table row whose next line is the separator; anything
+        # that is not a table row ends the table, so a `Status` index can
+        # never leak from one table into the next.
+        index: "int | None" = None
+        for lineno, line in enumerate(lines, start=1):
+            if not is_table_row(line):
+                index = None
                 continue
-            if not row_is_verified(line, rel):
+            if is_separator(line):
+                continue
+            if lineno < len(lines) and is_separator(lines[lineno]):
+                index = status_column(line)
+                continue
+            if not row_is_verified(line, index):
                 continue
             rows_scanned += 1
             row, gate_n, hash_n, pin_n = row_findings(
