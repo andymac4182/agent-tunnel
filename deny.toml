@@ -1,0 +1,139 @@
+# cargo-deny policy for the agent-tunnel workspace (M6-04).
+#
+# This file is the machine-enforced half of the M6-04 dependency and licence
+# gate.  `scripts/m6-release-checks.py` runs it; that script also carries the
+# positive controls that prove this policy can still fail.  Read the script's
+# module docstring before changing anything here -- a narrowed allowlist and a
+# policy that scanned nothing produce very similar output, and the controls are
+# the only thing that tells them apart.
+#
+# Pinned tool: cargo-deny 0.19.6.  The config schema below was taken from that
+# binary's own `cargo deny init` template rather than from documentation, so a
+# schema change in a later version is expected to be a hard error rather than a
+# silently ignored key.  `scripts/m6-release-checks.py` asserts the version.
+
+[graph]
+# **Deliberately empty, which means every target rather than none.**  In
+# cargo-deny an empty `targets` list evaluates the union of all target
+# platforms.  That is the conservative choice for a licence gate and it is
+# load-bearing here: `r-efi` (triple-licensed, one branch LGPL-2.1-or-later)
+# enters the graph only through `getrandom`'s UEFI backend and is absent from
+# the host-target graph entirely.  Narrowing this list to the advertised
+# release targets would drop that crate out of scope and turn the interesting
+# case in this workspace into an unscanned one.
+targets = []
+all-features = false
+no-default-features = false
+
+[output]
+feature-depth = 1
+
+[advisories]
+# Advisories need a fetched RustSec database and are therefore *not* part of
+# the offline gate.  `scripts/m6-release-checks.py` reports the local
+# database's age and refuses to call the result clean when it is stale,
+# because an advisories run against a six-week-old database is green for
+# reasons that have nothing to do with the workspace.
+ignore = []
+
+[licenses]
+# **Fail-closed allowlist.**  Any SPDX expression that cannot be satisfied
+# from this list is an error, not a warning.  cargo-deny evaluates the whole
+# expression, so a crate offering `MIT OR Apache-2.0 OR LGPL-2.1-or-later`
+# passes on its MIT branch without LGPL ever being allowed.  That is why the
+# list below is the set of licences we accept, not the set of licences present
+# in the lockfile -- the two differ by exactly one entry and the difference is
+# the point.
+#
+# Measured at 6fad2fb: 361 crates in the graph, 13 distinct licences, 0
+# unlicensed.  Twelve of the thirteen are allowed below.  The thirteenth,
+# LGPL-2.1-or-later, is **not** allowed and is not excepted; see the note at
+# the end of this section.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-1-Clause",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.8
+
+# Per-crate exceptions.  **Empty, and that is a measured result rather than an
+# oversight.**  Every crate in the graph at 6fad2fb satisfies the allowlist
+# above from its own SPDX expression.  In particular:
+#
+#   r-efi 5.3.0 and 6.0.0 -- `MIT OR Apache-2.0 OR LGPL-2.1-or-later`.  The
+#   only copyleft branch anywhere in the graph.  No exception is required
+#   because the expression is a disjunction and MIT is allowed; the LGPL
+#   branch is never exercised.  Reverse-dependency path, re-derived with
+#   `cargo tree --locked --target all -i r-efi@<version> --edges all`:
+#     r-efi 6.0.0 <- getrandom 0.4.3 <- tempfile 3.27.0 <- tunnel-test-harness
+#     r-efi 5.3.0 <- getrandom 0.3.4 <- rand_core 0.9.5 <- rand 0.9.5
+#                 <- tungstenite 0.29.0 <- tokio-tungstenite 0.29.0
+#                 <- axum 0.8.9 <- tunnel-relay
+#   Both are UEFI-target backends of getrandom: `cargo tree --locked -i` on
+#   the host target prints "nothing to print" for both versions, so neither is
+#   linked into any advertised release binary.  It is in scope here only
+#   because `[graph] targets` is empty.
+#
+# If a future dependency does need an exception, record the reason here in the
+# same shape -- a bare entry with no reason is the failure this row exists to
+# prevent, one level up.
+exceptions = []
+
+[licenses.private]
+# **`false`, deliberately, and this is the second load-bearing setting.**
+# Every crate in this workspace carries `publish = false`, so `ignore = true`
+# would exclude all 24 workspace members from the licence check.  That is the
+# "scan that scanned nothing" shape: the gate would pass while never looking
+# at the code we actually ship.  `scripts/m6-release-checks.py` asserts the
+# workspace crates appear in the checked set.
+ignore = false
+registries = []
+
+[bans]
+# Duplicate versions are a warning, not an error: the graph at 6fad2fb carries
+# several legitimately (windows-sys 0.52/0.61, getrandom 0.3/0.4). Promoting
+# this to "deny" without first resolving those would make the gate fail for
+# reasons unrelated to a release decision.
+multiple-versions = "warn"
+# A `*` version requirement on a registry dependency is an error.
+wildcards = "deny"
+# Workspace-internal path dependencies carry a `*` requirement by
+# construction, so without this the 24 members deny each other and the check
+# fails for a reason that has nothing to do with provenance. **The key was
+# confirmed to be honoured rather than assumed**: `bans` goes FAILED -> ok when
+# it is added and back to FAILED (24 `error[wildcard]` entries, all workspace
+# members) when it is removed, so it is not a silently-ignored unknown key.
+allow-wildcard-paths = true
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+allow = []
+allow-workspace = false
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+# Provenance. Anything from an unknown registry or an unvetted git remote is
+# an error. The three patched crates (h3, h3-quinn, quinn-proto) are path
+# dependencies under vendor/ rather than git dependencies, so they are local
+# sources and are covered by the vendored-provenance check in
+# scripts/m6-release-checks.py instead of by this section.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
+
+[sources.allow-org]
+github = []
+gitlab = []
+bitbucket = []
