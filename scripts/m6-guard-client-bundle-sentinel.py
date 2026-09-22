@@ -19,11 +19,21 @@ narrower than any of their lists.
   These are probes of the rule, **not** coverage of any assembler, and are
   reported separately for that reason.  They exist because three of the
   rule's four witnesses are unreachable through `m7-local-artifact-verify.sh`
-  -- its own `validate_binary` rejects a missing, non-executable or symlinked
-  input first -- and a witness no case can reach is the defect recorded as
-  instance fourteen of `docs/tasks.md` row M5-C11.  Naming them here, in a
-  suite that says what it is, is the alternative to letting them look
-  exercised.
+  -- its `resolve_input_path` (called by `validate_binary`) rejects a
+  missing, symlinked or non-executable input at its own three `die` lines
+  before the shared rule ever sees the staged directory -- and a witness no
+  case can reach is the defect recorded as instance fourteen of
+  `docs/tasks.md` row M5-C11.  Naming them here, in a suite that says what it
+  is, is the alternative to letting them look exercised.
+
+  **Measured, because the Fable review read this claim as false** -- it read
+  `validate_binary` alone, which only checks `file -b` for Mach-O, and
+  concluded a non-executable input would reach the rule.  Passing a 0644
+  copy of the real `tunnel-deadman` as `--deadman-bin` answers
+  `m7-local-artifact-verify: binary is not executable: ...`, so the claim
+  holds and the reachability argument above stands.  The function that makes
+  it is now named here, so the next reader can check it in one hop instead of
+  two.
 
 **`scripts/m7-local-source-parity-build.sh` is not run here, and that is a
 stated gap rather than a silent one.**  Its assembly step is behind a full
