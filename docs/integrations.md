@@ -389,6 +389,21 @@ before any backend is started, and `tunnel-client doctor` reports
 `process_containment: degraded / PROCESS_CONTAINMENT_SENTINEL_MISSING`. It is a
 degradation, not a refusal: it changes neither the verdict nor the exit code.
 
+**A file of that name is not the same finding as no file, and is reported
+apart** (M6-C08). A `tunnel-deadman` that is not a regular file with an execute
+bit cannot be spawned, so containment is equally absent — but the remedy is to
+replace it rather than to install one, and being told to install a binary you
+are looking straight at is worse than being told nothing. That state is
+`degraded / PROCESS_CONTAINMENT_SENTINEL_UNUSABLE`, and the stderr warning names
+the offending path. **What this does not establish:** resolution is a mode
+check, not an identity check. It rejects a zero-byte or non-executable decoy and
+accepts an executable *script* named `tunnel-deadman`, so
+`PROCESS_CONTAINMENT_SENTINEL_PRESENT` means "something spawnable of that name
+is installed", never "containment is known to work". Proving the file really is
+the sentinel means running it, which `doctor` deliberately does not do — it
+reads a path and starts nothing. That probe lives at bundle-assembly time, where
+a process launch is affordable and a failure is free to fix.
+
 **Health is a probe, not a config echo.** `version` answering, or `/commands`
 listing, proves the HTTP server is up — **not** that the automation backend can
 act. A CUA backend can be present, listening and answering while being unable to
