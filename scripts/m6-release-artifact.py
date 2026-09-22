@@ -1783,9 +1783,11 @@ def cmd_bundle(args: argparse.Namespace) -> int:
     (out / "bin").mkdir(parents=True)
     (out / "examples").mkdir()
 
-    # Binaries.  tunnel-deadman is not in the parity bundle (it packages
-    # client, relay and harness only), so it is taken from the parity build's
-    # own target directory -- the same build, same source copy.
+    # Binaries.  The parity bundle packages tunnel-deadman since M6-C06; the
+    # fallback to the parity build's own target directory -- the same build,
+    # same source copy -- is kept so a receipt produced before that fix still
+    # bundles, and so the sentinel is never silently dropped if a future
+    # assembler's list changes again.
     target_root = receipt.parent / "cargo-target" / args.profile
     digests = {}
     for name in BUNDLE_BINARIES:
@@ -1800,13 +1802,15 @@ def cmd_bundle(args: argparse.Namespace) -> int:
         digests[name] = sha256_file(destination)
 
     # Cross-check against the receipt for every binary the receipt attests.
-    # **`tunnel-deadman` is not one of them**: the parity script packages
-    # client, relay and harness only (docs/tasks.md M6-C06), so the sentinel
-    # comes from the same build's target directory and is attested by this
-    # bundle's own digest rather than by the receipt.  That distinction is
-    # written into PROVENANCE.txt instead of being papered over, because a
-    # provenance file that claims uniform receipt coverage it does not have is
-    # worse than one that states the gap.
+    # **`tunnel-deadman` is one of them since M6-C06**, which closed the gap
+    # this comment used to record: the parity script packaged client, relay
+    # and harness only, so the sentinel came from the same build's target
+    # directory and was attested by this bundle's own digest rather than by
+    # the receipt.  The set is still computed from the receipt rather than
+    # assumed, and PROVENANCE.txt still names it, because a provenance file
+    # that claims uniform receipt coverage it does not have is worse than one
+    # that states the gap -- and a receipt predating M6-C06 still produces the
+    # narrower set.
     receipt_attested = []
     for name, digest in sorted(digests.items()):
         recorded = receipt_field(receipt_text, f"binary_{name}_sha256")

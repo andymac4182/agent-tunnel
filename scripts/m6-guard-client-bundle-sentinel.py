@@ -345,6 +345,33 @@ def check_anchors(selected: list[tuple[Suite, Case]]) -> int:
     )
 
 
+def require_clean_tree(suites: list[Suite]) -> None:
+    """Refuse to run over somebody else's uncommitted edit to the scripts.
+
+    The same rule the other harnesses hold over their crates, held here over
+    the two files a case may edit: a case applied on top of an uncommitted
+    change cannot be told apart from it, and the run would report the rule as
+    load-bearing on the strength of an edit it did not make.
+    """
+    del suites  # every suite in this harness edits the same two scripts
+    for path in (VERIFY, RULE, PARITY):
+        relative = str(path.relative_to(REPO))
+        changed = subprocess.run(
+            ["git", "status", "--porcelain", "--", relative],
+            cwd=REPO,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        if changed:
+            sys.exit(
+                f"{HARNESS}: refusing to run with uncommitted changes to "
+                f"{relative}; a case applied on top of them could not be told "
+                "apart from them, and the run would report the rule as "
+                "load-bearing on the strength of somebody else's edit."
+            )
+
+
 def require_declared_witnesses(selected: list[tuple[Suite, Case]]) -> None:
     """Refuse a red case that names no witness, before anything is edited."""
     problems = [
@@ -421,6 +448,7 @@ def main() -> int:
 
     refuse_resident_mutation(HARNESS, REPO)
     require_declared_witnesses(selected)
+    require_clean_tree(suites)
     if check_anchors(selected) != 0:
         return 1
 

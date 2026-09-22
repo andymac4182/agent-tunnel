@@ -253,6 +253,19 @@ EXPECTED_GUARD_ANCHORS = {
     # suite dropping out.
     "m5-guard-deletion.py": 100,
     "m3-guard-deletion.py": 5,
+    # **Two harnesses that were never in this registry at all**, added by the
+    # m6c3 worker (M6-C06/M6-C07).  Absence here is quieter than a stale
+    # floor: every rule this file holds over a guard harness -- the
+    # `--check-anchors` short circuit, `AppliedCase`, `install_interrupt_
+    # restore`, `refuse_resident_mutation`, the banned rewrite spellings --
+    # was simply not applied to them.  Measured at `38d857b`:
+    # m0 13 anchors across 2 suites, m6 2 across 2.
+    #
+    # m6's two is small because most of its cases plant inputs rather than
+    # edit code, and that is the honest figure: a floor set to the number of
+    # *cases* would pass while the anchored ones rotted.
+    "m0-guard-exit-codes.py": 13,
+    "m6-guard-client-bundle-sentinel.py": 2,
 }
 
 
