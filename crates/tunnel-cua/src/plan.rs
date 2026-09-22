@@ -583,9 +583,11 @@ mod tests {
         use tunnel_http_forward::cua_pin;
 
         let variants = one_of_every_params_variant();
-        // 11 variants, with `Click` present twice because the button chooses
-        // the command. Asserted as a literal: an empty list would otherwise
-        // satisfy every loop below without running once.
+        // `Params` has 12 variants; this list has 13 entries because `Click`
+        // appears twice -- the button chooses the command, so `left_click`
+        // and `right_click` are both reachable from one variant. Asserted as
+        // a literal: an empty list would otherwise satisfy every loop below
+        // without running once.
         assert_eq!(variants.len(), 13, "the variant list was edited");
 
         let mut checked_commands = BTreeSet::new();
