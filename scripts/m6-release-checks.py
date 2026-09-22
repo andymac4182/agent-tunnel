@@ -1142,11 +1142,23 @@ def site_array(source: str, pattern: re.Pattern[str]) -> list[str] | None:
     or reformatted array would let it compare equal to nothing -- the
     "scanned nothing" shape docs/tasks.md M5-C11 catalogues.
     """
-    found = pattern.search(source)
-    if found is None:
+    found = pattern.findall(source)
+    if len(found) != 1:
         return None
-    return [item.strip().strip("'\"") for item in found.group(1).split(",")
+    return [item.strip().strip("'\"") for item in found[0].split(",")
             if item.strip()]
+
+
+def site_array_count(source: str, pattern: re.Pattern[str]) -> int:
+    """How many declarations of the bound array the source contains.
+
+    Binding the *first* match was a real evasion: a second `const targets`
+    later in the file -- an inner-scope shadow -- is what the rendering code
+    would actually use there, and `search` never saw it, so `packaging` stayed
+    green over a file whose effective list was wrong. The binding is only
+    meaningful if there is exactly one thing to bind to.
+    """
+    return len(pattern.findall(source))
 
 
 def packaging_verdict(declared: list[str], matrix: list[str],
@@ -1200,7 +1212,18 @@ def packaging_verdict(declared: list[str], matrix: list[str],
     # workflow matrix above, handled the same way.
     site_targets = site_array(site_source, SITE_TARGETS_ARRAY)
     site_labels = site_array(site_source, SITE_LABELS_ARRAY)
-    if site_targets is None:
+    target_decls = site_array_count(site_source, SITE_TARGETS_ARRAY)
+    label_decls = site_array_count(site_source, SITE_LABELS_ARRAY)
+    if target_decls > 1 or label_decls > 1:
+        notes.append(
+            f"  FAIL: {SITE_RELEASES} declares `const targets` {target_decls} time(s) and "
+            f"`const labels` {label_decls} time(s); each must be declared exactly once. "
+            "A second declaration -- an inner-scope shadow -- is what the code in that "
+            "scope renders, so binding only the first would compare the wrong list and "
+            "could pass over a file that advertises something else."
+        )
+        ok = False
+    elif site_targets is None:
         notes.append(
             f"  FAIL: no `const targets = [...]` array found in {SITE_RELEASES}. Either "
             "the public advertisement stopped declaring one or this check's pattern no "
@@ -2099,7 +2122,15 @@ def control_packaging_site_list_divergence_is_caught() -> tuple[bool, str]:
          clean_site.replace("const targets =", "const releaseTargets ="), False),
         ("labels no longer paired with targets",
          site_with(declared, labels=["only one label"]), False),
+        ("a later shadowing `const targets` after the real one",
+         clean_site + "\n  const targets = ['i686-unknown-linux-gnu'];\n", False),
     ]
+    # Each red case must go red FOR ITS OWN REASON: a case that happened to be
+    # caught by a sibling rule would credit this control with a rule it never
+    # exercised.  The marker is a phrase only that rule's FAIL line contains.
+    reasons = {
+        "a later shadowing `const targets` after the real one": "each must be declared exactly once",
+    }
     for label, source, want in cases:
         got, case_notes = packaging_verdict(declared, declared, clean_packager, source)
         if got != want:
@@ -2107,11 +2138,19 @@ def control_packaging_site_list_divergence_is_caught() -> tuple[bool, str]:
                 f"case {label!r}: verdict {got}, expected {want}. Notes: "
                 f"{[n.strip() for n in case_notes]}"
             )
+        marker = reasons.get(label)
+        if marker and not any(marker in n for n in case_notes if "FAIL" in n):
+            return False, (
+                f"case {label!r} went red, but not for its own reason (expected a FAIL "
+                f"naming {marker!r}): {[n.strip() for n in case_notes if 'FAIL' in n]}"
+            )
     return True, (
         f"the comparison accepts the live {len(declared)}-target advertisement and "
         "rejects a dropped target, an offered-but-unbuilt extra, an empty array, an "
-        "array it can no longer find, and labels that no longer pair with their "
-        "targets -- so a renamed or emptied array cannot pass by matching nothing"
+        "array it can no longer find, labels that no longer pair with their "
+        "targets, and a later shadowing declaration (red for its own reason: "
+        "declared more than once) -- so a renamed, emptied or shadowed array "
+        "cannot pass by binding the wrong thing"
     )
 
 
