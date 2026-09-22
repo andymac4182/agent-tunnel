@@ -128,6 +128,33 @@ fn assert_redacted(report: &Value, output: &Output) {
     }
 }
 
+/// A failing run still reports the host capability checks (M6-C07).
+///
+/// `supervisor_ipc` and `process_containment` describe the machine, not the
+/// configuration, so a bad configuration or a missing credential is no reason
+/// to withhold them -- and an unprovisioned machine, where every one of these
+/// runs fails, is exactly the population that needs to read them. `result`
+/// was `null` on every failing path until M6-C07; asserting the two fields
+/// are populated, rather than merely that `result` is an object, is what
+/// makes this fail if the discard is reintroduced one layer down.
+fn assert_capabilities_reported(report: &Value) {
+    assert!(
+        report["result"].is_object(),
+        "a failing doctor run must still report its checks: {report}"
+    );
+    assert_eq!(
+        report["result"]["supervisor_ipc"]["code"],
+        "SUPERVISOR_IPC_NOT_IMPLEMENTED"
+    );
+    let containment = report["result"]["process_containment"]["code"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        containment.starts_with("PROCESS_CONTAINMENT_"),
+        "containment must be reported on a failing run, got {containment:?}"
+    );
+}
+
 #[test]
 fn doctor_binary_reports_private_fixture_success_and_pending_supervisor_ipc() {
     let fixture = Fixture::valid();
@@ -158,7 +185,8 @@ fn doctor_binary_returns_exit_three_for_permissive_private_key() {
     let report = report(&output);
     assert!(!report["ok"].as_bool().unwrap_or(true));
     assert_eq!(report["error"]["code"], "CREDENTIAL_PERMISSIONS");
-    assert_eq!(report["result"], Value::Null);
+    assert_capabilities_reported(&report);
+    assert_eq!(report["result"]["config"]["status"], "ok");
     assert_redacted(&report, &output);
 }
 
@@ -172,7 +200,8 @@ fn doctor_binary_returns_exit_three_for_permissive_credential_directory() {
     let report = report(&output);
     assert!(!report["ok"].as_bool().unwrap_or(true));
     assert_eq!(report["error"]["code"], "CREDENTIAL_PERMISSIONS");
-    assert_eq!(report["result"], Value::Null);
+    assert_capabilities_reported(&report);
+    assert_eq!(report["result"]["config"]["status"], "ok");
     assert_redacted(&report, &output);
 }
 
@@ -185,7 +214,8 @@ fn doctor_binary_redacts_missing_credential_and_returns_exit_three() {
     let report = report(&output);
     assert!(!report["ok"].as_bool().unwrap_or(true));
     assert_eq!(report["error"]["code"], "CREDENTIAL_MISSING");
-    assert_eq!(report["result"], Value::Null);
+    assert_capabilities_reported(&report);
+    assert_eq!(report["result"]["config"]["status"], "ok");
     assert_redacted(&report, &output);
 }
 
@@ -203,6 +233,17 @@ fn doctor_binary_rejects_invalid_configuration_with_exit_two() {
     let report = report(&output);
     assert!(!report["ok"].as_bool().unwrap_or(true));
     assert_eq!(report["error"]["code"], "INVALID_CONFIG");
-    assert_eq!(report["result"], Value::Null);
+    assert_capabilities_reported(&report);
+    // The configuration failed and the credential checks were therefore not
+    // attempted -- a distinction the report can now make, and which a null
+    // result could not.
+    assert_eq!(report["result"]["config"]["status"], "failed");
+    assert_eq!(report["result"]["config"]["code"], "INVALID_CONFIG");
+    assert_eq!(
+        report["result"]["credential_key_match"]["status"],
+        "not_run"
+    );
+    assert_eq!(report["result"]["permissions"]["status"], "not_run");
+    assert_eq!(report["result"]["expiry"]["status"], "not_run");
     assert_redacted(&report, &output);
 }

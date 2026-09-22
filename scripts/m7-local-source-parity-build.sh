@@ -144,6 +144,16 @@ caller_root=$(pwd -P)
 bounded_runner=$repo_root/scripts/m7-run-bounded.py
 preflight_timeout_seconds=10
 
+# The single shared statement of what a client bundle must contain beside the
+# client.  Shared as an assertion rather than as a binary list, because the
+# assemblers legitimately carry different binaries and what they must agree on
+# is narrower than any of their lists.  See the file's own header.
+client_bundle_sentinel_lib=$repo_root/scripts/client-bundle-sentinel.sh
+[ -f "$client_bundle_sentinel_lib" ] \
+    || die "missing $client_bundle_sentinel_lib; the client-bundle sentinel rule cannot be asserted"
+# shellcheck source=scripts/client-bundle-sentinel.sh
+. "$client_bundle_sentinel_lib"
+
 output_base=$repo_root/work/m7-local-source-parity-build
 profile=debug
 
@@ -468,6 +478,15 @@ copy_binary() {
 copy_binary tunnel-client
 copy_binary tunnel-relay
 copy_binary tunnel-test-harness
+# The sentinel is not an optional extra of this bundle: tunnel-deadman is
+# resolved relative to the client's own current_exe(), so omitting it here
+# shipped a client whose process containment was degraded (M6-C06).  The
+# workspace build above already produces it -- `cargo build --workspace
+# --bins` -- so the omission was in this list alone, and in the workspace
+# target directory the file is always sitting beside the client, which is
+# exactly the masking `docs/testing.md`'s release-artifact gate names.
+copy_binary tunnel-deadman
+assert_client_sentinel_beside "$bin_dir" m7-local-source-parity-build
 
 client_bundle=$bin_dir/tunnel-client
 client_help=$output_run/cli-help.txt

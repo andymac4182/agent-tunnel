@@ -907,18 +907,25 @@ def check_assets(bundle: Path) -> Result:
     # then executing the result.
     #
     # **Why not `tunnel-client doctor`, which is the surface that reports
-    # containment.** Its answer cannot be read from an unpacked bundle.
-    # `doctor` *does* compute the capability checks -- `inspect` builds
-    # `process_containment` before it even attempts to load the configuration
-    # -- and then **discards the whole result** whenever any error is present
-    # (`doctor.rs:183`, `result: if ok { Some(result) } else { None }`).  On a
-    # bundle nobody has provisioned that means exit 3, `CREDENTIAL_MISSING`,
-    # and `result: null`: the capability was measured and thrown away, which
-    # is a different defect from never running it and is the one recorded in
-    # docs/tasks.md row M6-C07.  A check written against doctor
-    # would therefore have been red for every bundle regardless of whether the
-    # sentinel was there, which is the mirror image of a check that is green
-    # regardless.
+    # containment.**  When this check was written, doctor's answer could not
+    # be read from an unpacked bundle at all: `inspect` built
+    # `process_containment` before it even attempted to load the
+    # configuration and then discarded the whole result whenever any error
+    # was present, so a bundle nobody had provisioned gave exit 3,
+    # `CREDENTIAL_MISSING`, and `result: null`.  A check written against
+    # doctor would have been red for every bundle regardless of whether the
+    # sentinel was there -- the mirror image of a check that is green
+    # regardless.  **That is fixed (M6-C07): `DoctorOutput::result` is no
+    # longer an `Option` and the checks are reported on every path.**
+    #
+    # This check still does not ask doctor, and the reason is now a different
+    # and better one.  Doctor's containment answer comes from
+    # `availability()`, which is satisfied by `resolve_sentinel`'s bare
+    # `is_file()` -- so doctor reports `SENTINEL_PRESENT` for a zero-byte
+    # decoy.  Asking doctor would be asking a question this check already
+    # knows how to answer more strongly, and would make the release gate
+    # inherit a product defect instead of catching it.  The remaining
+    # `is_file()` weakness has its own row.
     #
     # So this replays `tunnel_deadman::resolve_sentinel`'s no-explicit-path
     # branch -- `SENTINEL_BIN` beside the running executable -- and then does
