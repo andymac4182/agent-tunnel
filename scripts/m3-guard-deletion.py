@@ -91,6 +91,8 @@ DEADMAN_LIB = DEADMAN / "src" / "lib.rs"
 CHILD = EXPORT / "src" / "child.rs"
 FIXTURE_LIB = FIXTURE / "src" / "lib.rs"
 DOCTOR = CLIENT / "src" / "doctor.rs"
+HARNESS = REPO / "crates" / "tunnel-test-harness"
+HARNESS_CLUSTER = HARNESS / "src" / "production_cluster.rs"
 
 # Only the containment measurements: the rest of this fixture crate's suite is
 # the M3-02 end-to-end work and says nothing about these guards.  --no-fail-fast
@@ -451,10 +453,87 @@ DOCTOR_CASES: list[Case] = [
     ),
 ]
 
+#: The re-sign pin-availability rule (M3-25 / M7-C89), in its own suite for
+#: the same M3-19 reason as the others: it edits `tunnel-test-harness`, and
+#: only a `cargo test -p tunnel-test-harness` invocation rebuilds it.
+#:
+#: **Why the rule is witnessed through a free function rather than through the
+#: gate it protects.**  The behaviour these cases defend is a wait inside
+#: `resign_membership_now`, and the condition it waits for occurs in roughly
+#: four per cent of re-signs.  A case witnessed by `verify-m3-mcp-isolation`
+#: would therefore be green almost every time **with the rule deleted**, which
+#: is the M5-C11 shape this whole family of harnesses exists to refuse: a case
+#: whose defeat and whose success look the same.  `pin_publication_outstanding`
+#: is the rule's decision, extracted so each clause can be made red on demand.
+PIN_WAIT_TEST = [
+    "cargo",
+    "test",
+    "-p",
+    "tunnel-test-harness",
+    "--locked",
+    "--lib",
+    "--no-fail-fast",
+    "production_cluster::tests::pin_",
+]
+
+PIN_WAIT_CASES: list[Case] = [
+    Case(
+        # The pending clause.  Without it a re-sign stops waiting for a
+        # publication that failed closed and has not been retried, which is
+        # the exact state the M3-04 / M7-C83 dispatch window is.
+        "a failed-closed pin publication still pending is waited for",
+        [
+            (
+                HARNESS_CLUSTER,
+                "    publication_pending || (installed_before && pins_empty)",
+                "    installed_before && pins_empty",
+            )
+        ],
+        frozenset({"production_cluster::tests::pin_publication_pending_is_outstanding"}),
+    ),
+    Case(
+        # The emptied-set clause.  The pending flag says a publication was
+        # retried, not that it put anything back; dropping this clause lets a
+        # re-sign return with an empty pin set whose retry has already run.
+        "a pin set this re-sign emptied is waited for",
+        [
+            (
+                HARNESS_CLUSTER,
+                "    publication_pending || (installed_before && pins_empty)",
+                "    publication_pending",
+            )
+        ],
+        frozenset(
+            {"production_cluster::tests::pin_set_emptied_by_the_resign_is_outstanding"}
+        ),
+    ),
+    Case(
+        # The `installed_before` guard.  Without it the wait would demand a
+        # pin set back on a relay that deliberately has none, turning a
+        # key-revocation gate's held withdrawal into a 30-second hang -- a
+        # flaky red converted into a lost run, which is worse.
+        "a pin set deliberately withdrawn before the re-sign is not waited for",
+        [
+            (
+                HARNESS_CLUSTER,
+                "    publication_pending || (installed_before && pins_empty)",
+                "    publication_pending || pins_empty",
+            )
+        ],
+        frozenset(
+            {
+                "production_cluster::tests::"
+                "pin_set_absent_before_the_resign_is_not_outstanding"
+            }
+        ),
+    ),
+]
+
 SUITES: list[Suite] = [
     Suite("m3c09", [DEADMAN, EXPORT, FIXTURE], CARGO_TEST, CASES),
     Suite("m3c09-deadman", [DEADMAN], DEADMAN_TEST, DEADMAN_CASES),
     Suite("m6c08-doctor", [CLIENT], DOCTOR_TEST, DOCTOR_CASES),
+    Suite("m3c25-resign-pin-wait", [HARNESS], PIN_WAIT_TEST, PIN_WAIT_CASES),
 ]
 
 #: Cases whose green result is itself the measurement.  Empty today, and kept

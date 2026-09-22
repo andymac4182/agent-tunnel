@@ -423,6 +423,24 @@ const MEMBERSHIP_RESIGN_FAILURE_GRACE: Duration =
 /// Much shorter than the ordinary interval so a brief outage is ridden out
 /// within it rather than consuming whole scheduled rounds.
 const MEMBERSHIP_RESIGN_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+/// How long a completed re-sign waits for every relay's verified pin set to be
+/// installed again before it gives up.
+///
+/// `wait_for_pin_availability` retries the failed-closed publication itself
+/// rather than waiting on `peer_refresh_loop`'s tick, so this budget covers
+/// only the time the membership runtime needs to report `Ready` again after
+/// the reconcile it raced.
+///
+/// **It is bounded on purpose, and the bound is not cosmetic.** A wait that
+/// blocked forever would convert an intermittent red in one gate into a hung
+/// run, which is strictly worse: it costs the whole suite instead of one gate.
+/// At the bound the wait fails with a message naming pins and the re-sign, and
+/// carrying none of `PEER_UNAVAILABLE`, `not_dispatched` or
+/// `transport_pins_unavailable` -- so a timeout here cannot be mistaken for the
+/// M3-04 / M7-C83 signature it exists to prevent (M3-25's discriminator).
+const PIN_AVAILABILITY_TIMEOUT: Duration = Duration::from_secs(30);
+/// Poll spacing while waiting for a re-signed pin set to come back.
+const PIN_AVAILABILITY_POLL: Duration = Duration::from_millis(25);
 const REDIS_PARTITION_POLL: Duration = Duration::from_millis(25);
 const REDIS_RECOVERY_TIMEOUT: Duration = Duration::from_secs(15);
 const PUBLIC_HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -4991,6 +5009,15 @@ impl ProductionCluster {
                 .map_err(|error| {
                     HarnessError::Redis(format!("connecting membership re-signer: {error}"))
                 })?;
+        // Which relays hold a verified pin set *before* this re-sign.  The
+        // invalidation it is about to cause can empty one, and the wait below
+        // must not require a pin set back on a relay that never had one --
+        // otherwise a fixture holding a deliberate withdrawal would hang here.
+        let installed_before: Vec<bool> = self
+            .relays
+            .iter()
+            .map(|relay| relay.running.is_some() && !relay.pins.snapshot().is_empty())
+            .collect();
         let now = Utc::now();
         for (identity, peer_endpoint) in &inputs.nodes {
             let signed = self
@@ -5040,6 +5067,21 @@ impl ProductionCluster {
                             .all(|membership| membership.record_version >= version)
                 });
             if converged {
+                // Record-version convergence is not dispatch capability: the
+                // invalidation this re-sign just caused may have emptied a
+                // relay's verified pin set, and a gate that dispatches now
+                // would be refused `transport_pins_unavailable` (M7-C89).
+                let (relays_waited, waited_ms) = self
+                    .wait_for_pin_availability(&installed_before, PIN_AVAILABILITY_TIMEOUT)
+                    .await?;
+                // Emitted on EVERY re-sign, including the ones that waited for
+                // nothing, so "the wait was not needed" and "the wait never
+                // ran" do not look alike (M5-C11).  Identifiers and counters
+                // only.
+                eprintln!(
+                    "production cluster: membership re-sign version={version} \
+                     pin_wait_ms={waited_ms} relays_waited={relays_waited}"
+                );
                 return Ok(version);
             }
             if Instant::now() >= deadline {
@@ -5120,6 +5162,88 @@ impl ProductionCluster {
                 )));
             }
             sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Wait until every running relay can dispatch to a peer again: no
+    /// failed-closed pin publication is outstanding, and every relay whose
+    /// verified pin set was installed before this re-sign has it installed
+    /// again.  Returns how many relays were still owing at the widest point
+    /// and how long the wait took.
+    ///
+    /// **This is not [`Self::wait_for_peer_readiness`], and the difference is
+    /// the whole reason this exists (M3-25, and the M7-C83 dispatch window it
+    /// explains).**  The membership invalidation callback empties the pin set
+    /// *synchronously* when the runtime is momentarily not `Ready`, but the
+    /// peer runtime only learns of it on the next `peer_refresh_loop` tick, up
+    /// to five seconds later, because `withdraw_peer_trust` is reached only
+    /// from that tick.  For that whole window `peer_runtime.is_ready()` still
+    /// reports the previous pass's state, so a wait on it returns *at once*
+    /// while every peer dial would be refused `transport_pins_unavailable`.
+    /// A wait whose success and whose measuring-nothing look identical is the
+    /// M5-C11 defect class; this one reads the pin set itself, which cannot be
+    /// stale, and retries the pending publication here rather than waiting for
+    /// a tick to notice it.
+    ///
+    /// **Why here rather than in each gate.**  Two sibling gates already
+    /// defend themselves by probing the hop functionally after a re-sign --
+    /// `http_forward_rotation.rs` requires `200 pong` from two ingresses and
+    /// `mcp_cloud_client.rs` requires two consecutive device answers, its
+    /// comment naming the flap outright ("one can race a readiness flap").
+    /// Those probes are **broader than this wait and must stay**: they catch
+    /// anything that breaks the hop, where this catches one named cause.  But
+    /// adding a third per-gate workaround would leave the next caller to
+    /// rediscover the same thing, so the guarantee belongs to the re-sign.
+    async fn wait_for_pin_availability(
+        &self,
+        installed_before: &[bool],
+        budget: Duration,
+    ) -> Result<(usize, u128)> {
+        let started = Instant::now();
+        let deadline = started + budget;
+        let mut widest = 0usize;
+        loop {
+            let mut owing = Vec::new();
+            for (index, relay) in self.relays.iter().enumerate() {
+                if relay.running.is_none() {
+                    continue;
+                }
+                // Retry a publication that failed closed, rather than waiting
+                // for the refresh tick to get round to it.
+                if relay
+                    .pin_publication_pending
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    && matches!(relay.membership.readiness(), MembershipReadiness::Ready)
+                    && publish_verified_pins(&relay.membership, &relay.pins).is_ok()
+                {
+                    relay
+                        .pin_publication_pending
+                        .store(false, std::sync::atomic::Ordering::SeqCst);
+                }
+                if pin_publication_outstanding(
+                    installed_before.get(index).copied().unwrap_or(false),
+                    relay
+                        .pin_publication_pending
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    relay.pins.snapshot().is_empty(),
+                ) {
+                    owing.push(relay.node_id.clone());
+                }
+            }
+            widest = widest.max(owing.len());
+            if owing.is_empty() {
+                return Ok((widest, started.elapsed().as_millis()));
+            }
+            if Instant::now() >= deadline {
+                return Err(HarnessError::Timeout(format!(
+                    "verified peer pins were not reinstalled on {} of {} running relays \
+                     within {} ms after a membership re-sign",
+                    owing.len(),
+                    self.relays.iter().filter(|r| r.running.is_some()).count(),
+                    budget.as_millis(),
+                )));
+            }
+            sleep(PIN_AVAILABILITY_POLL).await;
         }
     }
 
@@ -5919,6 +6043,29 @@ impl CheckpointAuthority for FixtureCheckpointAuthority {
             CheckpointResponse::new(checkpoint.encoded_bytes().to_vec())
         })
     }
+}
+
+/// Whether one relay still owes a completed re-sign its verified pin set.
+///
+/// Split out of [`ProductionCluster::wait_for_pin_availability`] so the rule
+/// can be witnessed without standing up a three-relay cluster: a rule whose
+/// only witness is a forty-second cluster gate is a rule nothing can cheaply
+/// defeat, and `scripts/m3-guard-deletion.py` has to be able to make each
+/// clause red on its own.
+///
+/// Two clauses, and they are not the same test.  `publication_pending` is a
+/// publication that **failed closed** and has not been retried; it must be
+/// waited for whatever the pin set currently looks like.  The second clause
+/// covers a pin set that this re-sign emptied -- and is deliberately gated on
+/// `installed_before`, so a fixture holding a *deliberate* withdrawal (the
+/// key-revocation gates) is never made to wait for a pin set it removed on
+/// purpose.
+fn pin_publication_outstanding(
+    installed_before: bool,
+    publication_pending: bool,
+    pins_empty: bool,
+) -> bool {
+    publication_pending || (installed_before && pins_empty)
 }
 
 fn publish_verified_pins(membership: &MembershipRuntime, pins: &SharedPeerPins) -> Result<()> {
@@ -7059,7 +7206,33 @@ mod tests {
         is_peer_recovery_response, redacted_admission_failure, validate_production_evidence,
         validate_redis_partition_evidence,
     };
+    use super::pin_publication_outstanding;
     use crate::acceptance_test_support::{assert_failed, assert_rejected};
+
+    /// A publication that failed closed is outstanding whatever the pin set
+    /// currently looks like: the retry has not happened yet, so the set on
+    /// display may be about to be replaced.
+    #[test]
+    fn pin_publication_pending_is_outstanding() {
+        assert!(pin_publication_outstanding(false, true, false));
+    }
+
+    /// A pin set this re-sign emptied is outstanding even once the pending
+    /// flag has been cleared -- the flag says a publication was retried, not
+    /// that it put anything back.
+    #[test]
+    fn pin_set_emptied_by_the_resign_is_outstanding() {
+        assert!(pin_publication_outstanding(true, false, true));
+    }
+
+    /// A relay that had no pin set before the re-sign is **not** waited for.
+    /// The key-revocation fixtures withdraw pins deliberately and hold the
+    /// withdrawal; requiring a pin set back on such a relay would turn this
+    /// wait into a hang in exactly the gates that mean it.
+    #[test]
+    fn pin_set_absent_before_the_resign_is_not_outstanding() {
+        assert!(!pin_publication_outstanding(false, false, true));
+    }
 
     fn valid_evidence() -> ProductionClusterEvidence {
         ProductionClusterEvidence {
