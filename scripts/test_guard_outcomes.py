@@ -23,12 +23,20 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from guard_outcomes import (  # noqa: E402
     USABLE_OUTCOMES,
+    WITNESS_DEBT_FILE,
     AppliedCase,
+    WitnessDebt,
+    NoWriteCapability,
+    WriteAttempted,
     check_anchors,
+    classify_outcome,
     is_usable,
     mutation_journal,
+    read_only_entry,
     recover_mutations,
     refuse_resident_mutation,
+    require_declared_witnesses,
+    require_git_index,
     unusable,
 )
 
@@ -98,6 +106,25 @@ def main() -> int:
     a_sigterm_mid_case_restores_the_tree()
     a_sigkilled_run_leaves_a_journal_that_names_the_case()
     every_harness_mutates_through_the_interrupt_safe_context()
+
+    # M4-36: read-only mode is a capability, not two lines' position.
+    the_read_only_entry_holds_no_write_capability()
+    a_deletion_loop_reachable_from_read_only_mode_is_refused()
+    a_lost_check_anchors_dispatch_cannot_delete_anything()
+    an_unbalanced_exit_cannot_disable_the_write_barrier()
+
+    # M4-23 / M4-24: a red must be the case's own red.
+    a_red_from_a_foreign_test_is_not_credited()
+    an_undeclared_case_is_refused_before_anything_is_edited()
+    a_case_owed_a_witness_is_still_counted_and_never_silent()
+    the_witness_debt_ledger_matches_the_tree_and_is_pinned()
+
+    # M4-26: a lost git index must stop the run, not go unreported.
+    a_checkout_without_a_git_index_is_refused()
+
+    # The harness code between the shared module and the source-text
+    # checks, which nothing here used to execute.
+    every_harness_main_runs_to_its_summary()
 
     print("test_guard_outcomes: PASS")
     return 0
@@ -257,7 +284,13 @@ EXPECTED_GUARD_ANCHORS = {
     # M6-C08 resolution rules and the `m6c08-doctor` suite for the surface
     # that reports them. (11 before the Fable review, which added the
     # access-versus-mode-bit rule as a case of its own.)
-    "m3-guard-deletion.py": 12,
+    #
+    # Was 12. Re-measured on `m3c1-suite-stability` after merging PR #81:
+    # **15 anchors across 4 suites**, the three added being the
+    # `m3c25-resign-pin-wait` cases (M3-25 / M7-C89). Taken from what
+    # `--check-anchors` reports, not by adding three, and shown live by
+    # setting it to 16 first and watching this file fail.
+    "m3-guard-deletion.py": 15,
     # **Two harnesses that were never in this registry at all**, added by the
     # m6c3 worker (M6-C06/M6-C07).  Absence here is quieter than a stale
     # floor: every rule this file holds over a guard harness -- the
@@ -372,9 +405,11 @@ def the_flag_short_circuits_before_anything_is_edited(script: Path) -> None:
         "would be silently ignored and the full destructive suite would run",
     )
     check(
-        "return check_anchors(selected)" in text,
-        f"{script.name} accepts --check-anchors but does not return the "
-        "preflight's exit code",
+        "return read_only_entry(" in text,
+        f"{script.name} accepts --check-anchors but does not dispatch into "
+        "the shared read-only entry point, so read-only mode would be a "
+        "branch in main() rather than a path without write capability "
+        "(M4-36)",
     )
     guard = "require_clean_tree(suites)"
     check(
@@ -734,6 +769,890 @@ def every_harness_mutates_through_the_interrupt_safe_context() -> None:
             f"{script_name} restores with `git checkout --`, which discards "
             "every other uncommitted change under the crate (M4-32)",
         )
+
+
+# --------------------------------------------------------------------------
+# M4-36: read-only is a capability, not a spelling
+# --------------------------------------------------------------------------
+
+
+def the_read_only_entry_holds_no_write_capability() -> None:
+    """Every primitive a guard run mutates with must raise inside the entry.
+
+    **This is the check the source-text one could not express.**  M4-36 built
+    the bypass and measured it: nesting the `--check-anchors` dispatch under
+    the preceding `if arguments.list:` block leaves it present, correctly
+    ordered and unreachable, and `m3-guard-deletion.py --check-anchors` then
+    ran the whole destructive suite to completion in 76.8 s and exited 0 while
+    the static check reported PASS.  Ordering and spelling were both correct;
+    reachability was not, and nothing could see it.
+
+    So this asserts the substance instead: inside the read-only scope, a write
+    is not possible.
+
+    **Defeating it.**  Delete any one line from `NoWriteCapability.__enter__`
+    and the assertion for that primitive alone fails, with the write having
+    succeeded and the temporary file left holding "mutated". Each primitive is
+    checked separately, so a barrier that covered `Path.write_text` but not
+    `os.replace` fails on the `os.replace` case and cannot be credited by its
+    sibling -- which is the M4-23 defect, and this control must not reproduce
+    it while proving it.
+    """
+    import os
+
+    directory = Path(tempfile.mkdtemp())
+    product = directory / "product.rs"
+
+    # **Each attempt names the primitive whose refusal must have fired.**
+    # `Path.write_text` calls `Path.open(mode="w")` internally, so an
+    # assertion that merely required *something* to raise would be satisfied
+    # by the `Path.open` barrier when the `Path.write_text` one had been
+    # removed -- a control reddening for its sibling's reason, which is the
+    # M4-23 defect reproduced inside the fixture built to prove it. Found by
+    # defeating this check: deleting the `Path.write_text` line from
+    # `NoWriteCapability.__enter__` left the whole file passing. So the
+    # refusal's own message is matched.
+    attempts = {
+        "Path.write_text": (lambda: product.write_text("mutated"), "Path.write_text"),
+        "Path.open(w)": (lambda: product.open("w"), "with mode 'w'"),
+        "Path.unlink": (lambda: product.unlink(), "Path.unlink"),
+        "os.replace": (lambda: os.replace(product, directory / "moved.rs"), "os.replace"),
+        "subprocess.run": (
+            lambda: subprocess.run(["git", "checkout", "--", "."]),
+            "subprocess.run",
+        ),
+    }
+    for name, (attempt, expected_reason) in attempts.items():
+        product.write_text("ORIGINAL")
+        reason = ""
+        try:
+            with NoWriteCapability():
+                attempt()
+        except WriteAttempted as refusal:
+            reason = str(refusal)
+        check(
+            reason != "",
+            f"a read-only guard-harness entry point was able to call {name}: "
+            "read-only mode must be a path with no write capability, or a "
+            "bypassed dispatch runs the destructive suite and exits 0 (M4-36)",
+        )
+        check(
+            expected_reason in reason,
+            f"{name} was refused, but not by its own barrier: expected the "
+            f"refusal to name {expected_reason!r}, got {reason!r}. A control "
+            "that reddens for a sibling's reason proves nothing about the "
+            "rule it names (M4-23).",
+        )
+        check(
+            product.exists() and product.read_text() == "ORIGINAL",
+            f"{name} changed the tree from inside a read-only scope",
+        )
+        # The scope must also *end*: a barrier that leaked would break every
+        # later test in this file rather than failing here.
+        product.write_text("restored")
+        check(product.read_text() == "restored", f"{name} left the barrier installed")
+
+
+def a_deletion_loop_reachable_from_read_only_mode_is_refused() -> None:
+    """The bypass M4-36 built, reduced to its load-bearing step.
+
+    The bypass's harm is not that a dispatch was nested -- it is that the
+    *deletion loop* then ran.  So this makes exactly that reachable **from
+    `read_only_entry` itself**, by giving the entry an anchor resolver that
+    applies a real case through the real `AppliedCase`, which is what a
+    bypassed dispatch does on its first case.
+
+    It must raise, and the product file must be untouched.  Before this fix it
+    would have mutated the file and carried on to the next case -- for 427
+    anchors on `fs-guard-deletion`, editing the tree throughout.
+
+    **Defeating it.**  Drop the `NoWriteCapability` scope from
+    `read_only_entry` and the case is applied: the file reads empty and the
+    assertion below fails naming the mutation, rather than passing because
+    something else raised.
+    """
+    import guard_outcomes
+
+    directory = Path(tempfile.mkdtemp())
+    product = directory / "provider.rs"
+    ORIGINAL = "if queued.flushed { return; }\n"
+    product.write_text(ORIGINAL)
+
+    def deletion_loop(_harness, _selected, _extra=()):
+        with AppliedCase("test-harness", directory, "gate4", "a case") as applied:
+            applied.apply_all([(product, "if queued.flushed { return; }", "")])
+        return 0
+
+    saved = guard_outcomes.check_anchors
+    guard_outcomes.check_anchors = deletion_loop
+    raised = None
+    try:
+        read_only_entry("test-harness", [("gate4", "a case", [])])
+    except WriteAttempted as refusal:
+        raised = str(refusal)
+    finally:
+        guard_outcomes.check_anchors = saved
+
+    check(
+        raised is not None,
+        "the deletion loop ran from inside the read-only entry point without "
+        "raising: a successful destructive run then looks exactly like a "
+        "successful read-only one (M4-36)",
+    )
+    # **Which barrier fired is part of the claim (M4-43).**  This used to
+    # accept any `WriteAttempted`, so a refusal from `subprocess.run` or
+    # `os.replace` would have satisfied an assertion about the deletion loop's
+    # file write. `AppliedCase.apply` writes with `Path.write_text`, so that
+    # is the refusal this must see.
+    check(
+        "Path.write_text" in raised,
+        "the deletion loop was refused from inside the read-only entry, but "
+        f"not by the barrier on the write it makes; got {raised!r}",
+    )
+    check(
+        product.read_text() == ORIGINAL,
+        "a case was applied to the product from inside read-only mode",
+    )
+
+
+# --------------------------------------------------------------------------
+# M4-23 / M4-24: a red must be the case's own red
+# --------------------------------------------------------------------------
+
+
+def a_red_from_a_foreign_test_is_not_credited() -> None:
+    """The defect itself, as a classification.
+
+    M4-23's instance: `[gate4] release a descriptor only for its own
+    generation` was credited a red naming three `m7_startup.rs` tests about
+    membership state and a checkpoint, which have nothing to do with a
+    descriptor cache keyed by fid generation. Clean-tree controls passed 6 of
+    6, and the case's own deletion applied by hand passed 6 of 6.
+
+    **Defeating it.**  Hand `classify_outcome` the witness the case declares
+    instead of the foreign name and it returns plain `RED`, which is usable --
+    so this control distinguishes the two, rather than reddening on anything.
+    """
+    foreign = classify_outcome(
+        "RED",
+        ["serve_rejects_corrupt_membership_state_through_the_binary"],
+        documented_green=False,
+        expect_build_failure=False,
+        expected_red=frozenset({"a_stale_generation_is_refused"}),
+        owed_witness=False,
+    )
+    check(
+        not is_usable(foreign),
+        f"a red naming only a foreign test was credited as evidence: {foreign!r}",
+    )
+    check(
+        "wrong witness" in foreign and "a_stale_generation_is_refused" in foreign,
+        f"the refusal must name the witness that did not redden, got {foreign!r}",
+    )
+
+    own = classify_outcome(
+        "RED",
+        ["a_stale_generation_is_refused"],
+        documented_green=False,
+        expect_build_failure=False,
+        expected_red=frozenset({"a_stale_generation_is_refused"}),
+        owed_witness=False,
+    )
+    check(
+        own == "RED" and is_usable(own),
+        f"a red naming the case's own witness must be credited, got {own!r}",
+    )
+
+    # A witness among several unrelated failures is still the case's own red:
+    # the rule is that the declared test reddened, not that nothing else did.
+    mixed = classify_outcome(
+        "RED",
+        ["a_flake_elsewhere", "a_stale_generation_is_refused"],
+        documented_green=False,
+        expect_build_failure=False,
+        expected_red=frozenset({"a_stale_generation_is_refused"}),
+        owed_witness=False,
+    )
+    check(mixed == "RED", f"a witness alongside a flake must still count, got {mixed!r}")
+
+
+def an_undeclared_case_is_refused_before_anything_is_edited() -> None:
+    """The refusal that makes the mechanism more than opt-in.
+
+    **Defeating it.**  Give the case a witness, or name it in the debt ledger,
+    and the refusal does not fire -- so this fails for the absence of a
+    declaration specifically, and not because any call to it exits.
+    """
+    empty = WitnessDebt(())
+
+    def refuse(cases, debt=empty) -> str:
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                require_declared_witnesses("test-harness", cases, debt)
+        except SystemExit as stop:
+            return str(stop)
+        return ""
+
+    undeclared = refuse([("gate4", "a case", False, frozenset())])
+    check(
+        "a case" in undeclared and "names no witness" in undeclared,
+        f"an undeclared value case must be refused by name, got {undeclared!r}",
+    )
+
+    declared = refuse([("gate4", "a case", False, frozenset({"its_own_test"}))])
+    check(declared == "", f"a declared case must not be refused, got {declared!r}")
+
+    owed = refuse(
+        [("gate4", "a case", False, frozenset())],
+        WitnessDebt([("gate4", "a case")]),
+    )
+    check(owed == "", f"a case in the debt ledger must not be refused, got {owed!r}")
+
+    # A compiler refusal names no test, and must not be made to.
+    contradictory = refuse([("gate4", "a case", True, frozenset({"a_test"}))])
+    check(
+        "compiler refusal" in contradictory,
+        f"a compiler-refusal case with a witness must be refused, got {contradictory!r}",
+    )
+
+    # A case cannot both declare a witness and still be owed one, or the
+    # ledger would silently outlive the fix it tracks.
+    stale = refuse(
+        [("gate4", "a case", False, frozenset({"its_own_test"}))],
+        WitnessDebt([("gate4", "a case")]),
+    )
+    check(
+        "debt ledger" in stale,
+        f"a case in both the table and the ledger must be refused, got {stale!r}",
+    )
+
+
+def a_case_owed_a_witness_is_still_counted_and_never_silent() -> None:
+    """The ledger is a debt, not an exemption.
+
+    An owed case keeps the old unattributed classification -- it has to, or
+    every harness would refuse to run -- so the protection against the ledger
+    quietly becoming permanent is that its size is pinned below and can only
+    shrink.
+    """
+    owed = classify_outcome(
+        "RED",
+        ["something_unrelated"],
+        documented_green=False,
+        expect_build_failure=False,
+        expected_red=frozenset(),
+        owed_witness=True,
+    )
+    check(owed == "RED", f"an owed case keeps its classification, got {owed!r}")
+
+
+def the_witness_debt_ledger_matches_the_tree_and_is_pinned() -> None:
+    """The M4-24 figure, asserted rather than printed.
+
+    The ledger must name exactly the value cases that declare no witness --
+    no more, so a case cannot be exempted by being added to it, and no fewer,
+    so a harness cannot be made to refuse to run by a stale entry.
+
+    `PINNED_WITNESS_DEBT` is the measured reach of M4-23: 691 of the 745 guard
+    cases across the five harnesses were credited for a failure named after no
+    test in the repository. It may go **down** as cases are given measured
+    witnesses, and a rise fails this check.
+
+    **What this does not check, stated because an earlier version of M4-23's
+    row claimed it did (found on review).**  "May only shrink" holds. "A
+    shrink means a witness was earned" does **not**. A case leaves the owed
+    set by gaining a `WITNESSES` entry, but equally by being added to
+    `EXPECT_GREEN`, by being given `expect_build_failure`, or by being
+    deleted -- and this check cannot tell those apart. Measured: appending one
+    name to `fs-guard-deletion`'s `EXPECT_GREEN` struck **five** cases at once,
+    because that name recurs in five suites, and the only response was
+    `the witness debt fell from 691 to 686`.
+
+    The real protection is narrower and worth stating exactly. A **guessed**
+    `WITNESSES` entry fails closed at the next full run: the named test does
+    not redden, the case is classified `RED (wrong witness)`, and the run
+    exits non-zero. Reclassifying to `EXPECT_GREEN` fails closed only if the
+    guard is genuinely load-bearing, in which case the run reports
+    `EXPECTED A DOCUMENTED GREEN, GOT: RED`. So a wrong witness is caught by
+    running; a wrong exemption is caught only sometimes. The departure route
+    is therefore reported below rather than assumed.
+    """
+    import importlib.util
+    import json
+
+    #: Measured 2026-09-23 by driving each harness's own shipped classifier.
+    PINNED_WITNESS_DEBT = 691
+
+    directory = Path(__file__).resolve().parent
+    ledger = json.loads(WITNESS_DEBT_FILE.read_text())
+
+    def describe(case) -> tuple[str, bool, bool, frozenset[str]]:
+        """`(name, documented green, compiler refusal, declared witnesses)`.
+
+        The harnesses carry three case shapes -- a 2-tuple, a 3-tuple with an
+        `expect_build_failure` flag, and two different dataclasses -- and an
+        unrecognised one must fail here rather than be silently scored as
+        owing nothing, which would exempt a whole harness by accident.
+        """
+        if isinstance(case, tuple):
+            return (case[0], False, bool(len(case) > 2 and case[2]), frozenset())
+        name = getattr(case, "name", None)
+        check(name is not None, f"unrecognised case shape: {case!r}")
+        witness = getattr(case, "expected_red", None)
+        if witness is None:
+            # The `m6` harness spells a single witness as `expected_witness`.
+            single = getattr(case, "expected_witness", None)
+            witness = frozenset({single}) if single else frozenset()
+        return (
+            name,
+            bool(getattr(case, "expect_green", False)),
+            bool(getattr(case, "expect_build_failure", False)),
+            frozenset(witness),
+        )
+
+    total = 0
+    declared_witnesses = 0
+    for script_name in sorted(EXPECTED_GUARD_ANCHORS):
+        module_name = script_name.removesuffix(".py")
+        spec = importlib.util.spec_from_file_location(
+            module_name.replace("-", "_") + "_ledger", directory / script_name
+        )
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        expect_green = set(getattr(module, "EXPECT_GREEN", ()))
+        declared = getattr(module, "WITNESSES", {})
+        owed = set()
+        for suite in module.SUITES:
+            for case in suite.cases:
+                name, green, build_failure, witness = describe(case)
+                if name in expect_green or green or build_failure or witness:
+                    continue
+                if (suite.name, name) in declared:
+                    continue
+                owed.add((suite.name, name))
+        recorded = {(suite, name) for suite, name in ledger.get(module_name, [])}
+        check(
+            owed == recorded,
+            f"{script_name}: the witness-debt ledger does not match the tree. "
+            f"Missing from the ledger: {sorted(owed - recorded)}. Stale in the "
+            f"ledger: {sorted(recorded - owed)}. A case given a measured "
+            "witness must be struck from the ledger in the same change.",
+        )
+        # The harness's own `DEBT` is what its run-summary figure is computed
+        # from, so pin that object rather than only the file it came from: a
+        # harness that loaded the wrong entry would print a smaller number of
+        # unattributed reds than it actually had.
+        harness_debt = getattr(module, "DEBT", None)
+        if harness_debt is not None:
+            check(
+                len(harness_debt) == len(recorded),
+                f"{script_name}: the harness loaded {len(harness_debt)} debt "
+                f"entries but the ledger records {len(recorded)}, so the "
+                "'unattributed red(s)' figure it prints understates the "
+                "cases it credited without attribution (M4-23)",
+            )
+        total += len(recorded)
+        declared_witnesses += len(declared)
+
+    check(
+        total <= PINNED_WITNESS_DEBT,
+        f"the witness debt grew from {PINNED_WITNESS_DEBT} to {total}: a new "
+        "guard case must declare the test its guard owns (task row M4-23). "
+        "This figure may only go down.",
+    )
+    check(
+        total == PINNED_WITNESS_DEBT,
+        f"the witness debt fell from {PINNED_WITNESS_DEBT} to {total}, which "
+        f"is the intended direction. {declared_witnesses} case(s) across all "
+        "harnesses now carry a WITNESSES entry; if that number did not rise "
+        f"by {PINNED_WITNESS_DEBT - total}, the debt fell by reclassification "
+        "(EXPECT_GREEN, expect_build_failure, or deletion) rather than by a "
+        "witness being earned, and this check cannot tell those apart. "
+        "Lower the pin in this file and record the new figure in task row "
+        "M4-23, re-derived rather than adjusted, saying which route it took.",
+    )
+
+
+# --------------------------------------------------------------------------
+# M4-26: a harness that lost its git index must not report anything
+# --------------------------------------------------------------------------
+
+
+def a_checkout_without_a_git_index_is_refused() -> None:
+    """The blindness M4-26 records, refused instead of run.
+
+    With no index, `git status --porcelain -- <path>` reports tracked files as
+    untracked and `git diff -- crates/` -- the check M5-C07 prescribes before
+    every commit -- reports **clean**, because a file carrying a resident
+    mutation reads as untracked and there is nothing to compare against. So
+    the prescribed check reports clean precisely when the thing it exists to
+    catch has happened.
+
+    **Defeating it.**  The same repository with its index intact must not be
+    refused, so this fails for the missing index specifically. Both halves are
+    asserted, and the middle assertion reproduces the blindness itself: it
+    shows `git diff` reporting clean over a file that holds a mutation, which
+    is the reason a refusal is the only usable answer.
+    """
+    directory = Path(tempfile.mkdtemp())
+    run = lambda *args: subprocess.run(  # noqa: E731
+        ["git", *args], cwd=directory, capture_output=True, text=True, check=True
+    )
+    run("init", "-q")
+    run("config", "user.email", "t@example.invalid")
+    run("config", "user.name", "t")
+    product = directory / "provider.rs"
+    product.write_text("if queued.flushed { return; }\n")
+    run("add", "-A")
+    run("commit", "-qm", "initial")
+
+    # With an index, the check passes: the refusal is about the index and not
+    # about this being a temporary directory.
+    require_git_index("test-harness", directory)
+
+    # A resident mutation, of the kind an interrupted case leaves.
+    product.write_text("")
+
+    # The index goes, exactly as a kill during git's rename over it does.
+    (directory / ".git" / "index").unlink()
+
+    # The blindness, reproduced: the prescribed check reports clean over a
+    # file that is holding a deleted guard right now.
+    diff = subprocess.run(
+        ["git", "diff", "--", "."], cwd=directory, capture_output=True, text=True
+    ).stdout.strip()
+    check(
+        diff == "",
+        "this fixture no longer reproduces M4-26: `git diff` reported a change "
+        f"over a lost index, so the refusal below is guarding nothing. Got {diff!r}",
+    )
+
+    refused = ""
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            require_git_index("test-harness", directory)
+    except SystemExit as stop:
+        refused = str(stop)
+    check(
+        "no usable git index" in refused,
+        "a harness with no git index must refuse rather than run blind, with "
+        f"every check that would notice reporting clean (M4-26). Got {refused!r}",
+    )
+    check(
+        "git read-tree HEAD" in refused,
+        f"the refusal must say how to recover, got {refused!r}",
+    )
+
+
+def every_harness_main_runs_to_its_summary() -> None:
+    """Run each harness's `main()` end to end, with only the slow parts stubbed.
+
+    **The gap this closes was found the hard way, in this chunk.**  Adding the
+    unattributed-red summary line introduced a `NameError` in
+    `acp-guard-deletion` (no `HARNESS` binding) and a wrong label in
+    `fs-guard-deletion` (`HARNESS` there is a *crate path*, so the line would
+    have printed a directory). Every check in this file passed anyway, because
+    nothing here had ever executed a harness's `main()`: the tests covered the
+    shared module and the harnesses' source text, and the code between them
+    ran only during a multi-hour destructive run.
+
+    So this runs the real `main()` of every registered harness with
+    `AppliedCase`, `require_clean_tree`, `refuse_resident_mutation` and
+    `run_tests` stubbed -- nothing is edited and no `cargo` is started -- and
+    requires it to reach its summary. A crash anywhere on that path fails
+    here, in seconds, instead of at the end of a run measured in hours.
+
+    **Defeating it.**  Reintroduce the bare `{HARNESS}` in `acp-`'s summary
+    and this fails with the `NameError`; the source-text checks above do not.
+    """
+    import importlib.util
+
+    directory = Path(__file__).resolve().parent
+    for script_name in sorted(EXPECTED_GUARD_ANCHORS):
+        module_name = script_name.removesuffix(".py")
+        spec = importlib.util.spec_from_file_location(
+            module_name.replace("-", "_") + "_smoke", directory / script_name
+        )
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+
+        class NoOpApplied:
+            def __init__(self, *_a, **_k) -> None:
+                pass
+
+            def __enter__(self):
+                return self
+
+            def apply_all(self, _edits):
+                return None
+
+            def __exit__(self, *_e):
+                return False
+
+        module.AppliedCase = NoOpApplied
+        module.require_clean_tree = lambda *_a, **_k: None
+        module.refuse_resident_mutation = lambda *_a, **_k: None
+        module.check_anchors = lambda *_a, **_k: 0
+        if hasattr(module, "sweep_residue"):
+            module.sweep_residue = lambda *_a, **_k: None
+        # Every case's own witness, so the run reaches the summary rather than
+        # stopping on a wrong-witness refusal. The witness check itself is
+        # covered by `a_red_from_a_foreign_test_is_not_credited`.
+        witnesses = getattr(module, "WITNESSES", {})
+
+        def run_tests(suite, _module=module, _witnesses=witnesses):
+            names = sorted({w for group in _witnesses.values() for w in group})
+            for case in suite.cases:
+                declared = getattr(case, "expected_red", None)
+                if declared:
+                    names.extend(declared)
+            return ("RED", sorted(set(names)) or ["an_unattributed_failure"])
+
+        if hasattr(module, "run_tests"):
+            module.run_tests = run_tests
+
+        argv = sys.argv
+        sys.argv = [module_name]
+        captured = io.StringIO()
+        failure = None
+        refusal = None
+        try:
+            with contextlib.redirect_stdout(captured):
+                module.main()
+        except SystemExit as stop:
+            refusal = str(stop.code) if stop.code not in (None, 0) else None
+        except Exception as problem:  # noqa: BLE001 - reported, not swallowed
+            failure = problem
+        finally:
+            sys.argv = argv
+
+        check(
+            failure is None,
+            f"{script_name}: main() raised {failure!r} on a path no test in "
+            "this file had ever executed. A harness that crashes in its "
+            "summary does so after the whole destructive run has completed.",
+        )
+        output = captured.getvalue()
+        reached = "=== summary ===" in output or "case(s):" in output
+        # **The escape clause is narrowed to one message, and review is why
+        # (M4-43).**  It used to accept any refusal whose text contained the
+        # harness's own name -- and every `sys.exit` in every harness prefixes
+        # its name, so *any* pre-summary refusal satisfied it. With `DEBT`
+        # emptied so `require_witnesses` refuses before the loop, the clause
+        # returned True and every attribution check below was skipped: this
+        # test exists because a crash in the summary was invisible, and a
+        # harness refusing before its summary was equally invisible to it.
+        # Only `m6-guard-client-bundle-sentinel` may legitimately stop early,
+        # because it runs real assemblies and has no binary here, and only
+        # for that reason.
+        excused = (
+            script_name == "m6-guard-client-bundle-sentinel.py"
+            and refusal is not None
+            and "--client-bin is required" in refusal
+        )
+        check(
+            reached or excused,
+            f"{script_name}: main() neither reached its summary nor refused "
+            f"for the one excused reason; stdout {output[-200:]!r}, "
+            f"refusal {refusal!r}",
+        )
+        if not reached:
+            continue
+        if getattr(module, "DEBT", None) and len(module.DEBT):
+            check(
+                "red(s) were attributed to the test the case declares" in output,
+                f"{script_name} owes {len(module.DEBT)} witnesses but does not "
+                "report how many of its reds were credited without attribution, "
+                "so the debt is silent again (M4-23)",
+            )
+            check(
+                module_name in output.split("red(s) were attributed")[0].rsplit("\n", 1)[-1],
+                f"{script_name}: the attribution summary does not name the "
+                "harness it belongs to",
+            )
+
+
+def _plant_nested_dispatch(source: str) -> str | None:
+    """The M4-36 bypass, applied to a harness's source.
+
+    Moves the whole `if arguments.check_anchors:` block inside the preceding
+    `if arguments.list:` block, after its `return 0`.  The dispatch is then
+    **present**, **correctly ordered** relative to `require_clean_tree`, and
+    **unreachable** -- which is what makes every source-text check pass while
+    `main()` falls straight through to the deletion loop.
+    """
+    lines = source.splitlines(keepends=True)
+
+    def block_at(index: int) -> int:
+        """The line after the `if` block starting at `index`."""
+        end = index + 1
+        while end < len(lines) and (
+            not lines[end].strip() or lines[end].startswith("        ")
+        ):
+            end += 1
+        return end
+
+    # There are two `if arguments.check_anchors:` blocks: the capability drop
+    # at argument-parse time and the dispatch itself.  Only the **dispatch**
+    # moves -- the capability drop stays exactly where it is, so this fixture
+    # asserts that the drop is what saves the run when the dispatch is lost.
+    # Moving the drop instead would delete the fix and test nothing.
+    dispatch = None
+    listing = None
+    for index, line in enumerate(lines):
+        if line.rstrip() == "    if arguments.check_anchors:":
+            end = block_at(index)
+            if any("return read_only_entry(" in row for row in lines[index:end]):
+                dispatch = (index, end)
+        elif line.rstrip() == "    if arguments.list:":
+            listing = block_at(index)
+    if dispatch is None or listing is None or listing > dispatch[0]:
+        return None
+
+    start, end = dispatch
+    nested = [
+        "    " + row if row.strip() else row for row in lines[start:end]
+    ]
+    remaining = lines[:start] + lines[end:]
+    return "".join(remaining[:listing] + nested + remaining[listing:])
+
+
+def _restore_write_capability() -> None:
+    """Undo a `forbid_writes_for_this_process` this file provoked.
+
+    That call is deliberately irreversible in a harness process, which has no
+    later work that may write. This file *does*, so the fixtures below reset
+    the barrier explicitly rather than leaving every later test running
+    without write capability -- which would make them pass or fail for a
+    reason that has nothing to do with what they assert.
+    """
+    import guard_outcomes
+
+    guard_outcomes.NoWriteCapability.release_all()
+
+
+def a_lost_check_anchors_dispatch_cannot_delete_anything() -> None:
+    """The bypass M4-36 actually records, reproduced against every harness.
+
+    **This replaces a fixture that tested the wrong scenario, and the
+    correction came from independent review.**  The earlier fixture made the
+    deletion loop reachable *from inside* `read_only_entry` and watched the
+    barrier there refuse it. That is not what happened in the 76.8 s incident:
+    there the dispatch was never reached at all, so no barrier inside it could
+    fire. Driven against the then-current tree, the nested-dispatch bypass ran
+    all **12** of `m3-guard-deletion`'s cases through the deletion loop with
+    `read_only_entry` entered **zero** times and every shipped check passing.
+    A barrier bolted onto a branch protects nothing when the branch is what
+    was lost.
+
+    So the property asserted here is the one that survives losing the
+    dispatch: `--check-anchors` drops write capability at argument-parse time,
+    so a harness that falls through to the deletion loop raises on its first
+    mutation. The probe writes to a temporary file rather than a crate, so a
+    regression fails this test instead of editing the product.
+
+    **Defeating it.**  Remove the `forbid_writes_for_this_process()` call from
+    a harness's `main()` and that harness fails here, having completed cases
+    under a flag that must not edit anything. Removing the call from all six
+    fails on the first.
+    """
+    import importlib.util
+
+    directory = Path(__file__).resolve().parent
+    unexercised: list[str] = []
+    not_reached: list[str] = []
+    for script_name in sorted(EXPECTED_GUARD_ANCHORS):
+        original = (directory / script_name).read_text()
+        bypassed = _plant_nested_dispatch(original)
+        if bypassed is None:
+            # Named and failed below, never silently skipped: a harness whose
+            # shape this fixture cannot recognise is exactly a harness whose
+            # capability drop may have moved out of reach.
+            unexercised.append(script_name)
+            continue
+
+        module_name = script_name.removesuffix(".py")
+        spec = importlib.util.spec_from_file_location(
+            module_name.replace("-", "_") + "_bypassed", directory / script_name
+        )
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        # Executed with `__file__` pointing at the real script, so the
+        # harness's own REPO-relative constants still resolve.
+        exec(compile(bypassed, str(directory / script_name), "exec"), module.__dict__)
+
+        scratch = Path(tempfile.mkdtemp()) / "product.rs"
+        tally = {"attempted": 0, "completed": 0}
+
+        class Probe:
+            """The deletion loop's first write, aimed somewhere harmless.
+
+            `attempted` counts cases that reached the mutation; `completed`
+            counts those whose write actually landed. The difference is the
+            whole property: the loop may be *reached* when the dispatch is
+            lost, but no mutation may *succeed*.
+            """
+
+            def __init__(self, *_a, **_k) -> None:
+                pass
+
+            def __enter__(self):
+                return self
+
+            def apply_all(self, _edits):
+                tally["attempted"] += 1
+                scratch.write_text("a guard deleted under --check-anchors")
+                tally["completed"] += 1
+                return None
+
+            def __exit__(self, *_e):
+                return False
+
+        module.AppliedCase = Probe
+        module.require_clean_tree = lambda *_a, **_k: None
+        module.refuse_resident_mutation = lambda *_a, **_k: None
+        module.require_git_index = lambda *_a, **_k: None
+        module.check_anchors = lambda *_a, **_k: 0
+        if hasattr(module, "sweep_residue"):
+            module.sweep_residue = lambda *_a, **_k: None
+        if hasattr(module, "run_tests"):
+            module.run_tests = lambda *_a, **_k: ("RED", ["anything"])
+
+        argv = sys.argv
+        sys.argv = [module_name, "--check-anchors"]
+        refused = None
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                module.main()
+        except WriteAttempted as stop:
+            refused = str(stop)
+        except SystemExit:
+            pass
+        except Exception:  # noqa: BLE001 - a crash is not a refusal; asserted below
+            pass
+        finally:
+            sys.argv = argv
+            _restore_write_capability()
+
+        check(
+            not scratch.exists() and tally["completed"] == 0,
+            f"{script_name}: a --check-anchors run whose dispatch was nested "
+            f"out of reach completed {tally['completed']} mutation(s). "
+            "Read-only mode must be a capability taken away at parse time, "
+            "not a branch a lost dispatch can skip (M4-36).",
+        )
+        if not tally["attempted"]:
+            not_reached.append(script_name)
+        else:
+            # It reached the deletion loop, so what stopped it must be the
+            # missing capability and not some unrelated refusal -- a control
+            # that reddens for a sibling's reason proves nothing (M4-43).
+            check(
+                refused is not None and "write capability" in refused,
+                f"{script_name}: the deletion loop was reached under "
+                "--check-anchors and something other than the write barrier "
+                f"stopped it; refusal was {refused!r}",
+            )
+
+    # **Exact, not a floor, and review is why (M4-43).**  This used to require
+    # `exercised >= 5` and `reached >= 4` -- one below the populations of 6
+    # and 5 -- so exactly one harness could drop out of either set and the
+    # fixture still passed. Review planted an `m3` with **both** `if
+    # arguments.check_anchors:` blocks nested under `if arguments.list:`, the
+    # capability drop as well as the dispatch. The planter matches the
+    # dispatch at indent 4, so it returned None, the harness was skipped, and
+    # the fixture reported PASS while that harness's `--check-anchors` landed
+    # 12 mutations. An excluded set that is never measured is the defect this
+    # file keeps finding in itself.
+    check(
+        not unexercised,
+        "the nested-dispatch bypass could not be planted in "
+        f"{', '.join(unexercised)}, so those harness(es) were never measured. "
+        "Their `--check-anchors` dispatch or capability drop is no longer at "
+        "the top level of main(), which is the shape of the very bypass this "
+        "fixture exists to catch (M4-36).",
+    )
+    # Exactly one harness may stop before the deletion loop, and it is named:
+    # `m6-guard-client-bundle-sentinel` refuses without a built
+    # `--client-bin`, so the loop is unreachable for it here. Any other
+    # harness failing to reach the loop means this fixture proved nothing
+    # about the barrier for it.
+    check(
+        not_reached == ["m6-guard-client-bundle-sentinel.py"],
+        "the harnesses that did not reach the deletion loop under the bypass "
+        f"were {not_reached}; exactly one is excused, "
+        "m6-guard-client-bundle-sentinel.py (no --client-bin). Any other "
+        "harness here was not tested against the write barrier.",
+    )
+
+
+def an_unbalanced_exit_cannot_disable_the_write_barrier() -> None:
+    """The barrier must survive an `__exit__` with no matching `__enter__`.
+
+    **Found on review, measured before it was fixed.**  `__exit__` used to
+    decrement the nesting depth unconditionally, so `__enter__(); __exit__();
+    __exit__()` left `_depth == -1`. The next `__enter__` then saw a non-zero
+    depth, took itself to be nested inside a barrier that did not exist, and
+    installed nothing -- so `forbid_writes_for_this_process()` returned with
+    the process still able to write. Nothing shipped calls `__exit__`
+    unbalanced, but a `finally` after a failed `__enter__` would.
+
+    Two shapes are checked, each for its own reason: a stray second exit on
+    the same instance (the depth must not go negative, and a later barrier
+    must install), and an exit on a never-entered instance while another
+    holds the barrier (it must not lift it). Each asserts the refusal names
+    `Path.write_text`, so neither is satisfied by a sibling barrier (M4-43).
+
+    **Defeating it.**  Restore the unconditional decrement in `__exit__` and
+    the first shape fails with the write landing.
+    """
+    import guard_outcomes
+
+    target = Path(tempfile.mkdtemp()) / "product.rs"
+
+    def write_is_refused() -> str | None:
+        try:
+            target.write_text("mutated")
+        except WriteAttempted as refusal:
+            return str(refusal)
+        return None
+
+    try:
+        stray = NoWriteCapability()
+        stray.__enter__()
+        stray.__exit__()
+        stray.__exit__()
+        check(
+            NoWriteCapability._depth == 0,
+            "an unmatched __exit__ drove the write barrier's depth to "
+            f"{NoWriteCapability._depth}; below zero, the next barrier "
+            "believes it is nested and installs nothing",
+        )
+        guard_outcomes.forbid_writes_for_this_process()
+        refused = write_is_refused()
+        check(
+            refused is not None and "Path.write_text" in refused,
+            "after a stray __exit__, forbid_writes_for_this_process() left "
+            f"the process able to write (refusal {refused!r}): --check-anchors "
+            "would then be read-only in name only (M4-36)",
+        )
+
+        never_entered = NoWriteCapability()
+        never_entered.__exit__()
+        refused = write_is_refused()
+        check(
+            refused is not None and "Path.write_text" in refused,
+            "an __exit__ on a never-entered barrier lifted the barrier another "
+            f"instance holds (refusal {refused!r})",
+        )
+    finally:
+        _restore_write_capability()
+    check(
+        not target.exists(),
+        "a write landed while the barrier was supposed to be held",
+    )
 
 
 if __name__ == "__main__":

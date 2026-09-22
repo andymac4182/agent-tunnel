@@ -73,8 +73,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from guard_outcomes import AppliedCase  # noqa: E402
 from guard_outcomes import check_anchors as shared_check_anchors  # noqa: E402
+from guard_outcomes import forbid_writes_for_this_process  # noqa: E402
 from guard_outcomes import install_interrupt_restore  # noqa: E402
+from guard_outcomes import read_only_entry  # noqa: E402
 from guard_outcomes import refuse_resident_mutation  # noqa: E402
+from guard_outcomes import require_git_index  # noqa: E402
 from guard_outcomes import unusable as unusable_outcomes  # noqa: E402
 
 HARNESS = "m6-guard-client-bundle-sentinel"
@@ -332,12 +335,13 @@ def stage_rule_bundle(staging: Path, client: Path, deadman: Path, plant: str) ->
 # ------------------------------------------------------------------ the run
 
 
-def check_anchors(selected: list[tuple[Suite, Case]]) -> int:
-    """Resolve every selected case's guard text, and stop (M4-27).
 
-    The parity build's own copy line is anchored here even though no case
-    runs that script, so a rename or a reflow of the line this row added is
-    caught in a second rather than at the next release.
+def _anchor_extras() -> list[str]:
+    """Harness-local anchor problems, shared by the preflight and read-only mode.
+
+    The parity build's own copy line is anchored here even though no case runs
+    that script, so a rename or a reflow of the line is caught in a second
+    rather than at the next release.
     """
     extra: list[str] = []
     anchor = "copy_binary tunnel-deadman\n"
@@ -348,10 +352,20 @@ def check_anchors(selected: list[tuple[Suite, Case]]) -> int:
             f"{occurrences} occurrences of {anchor!r} in "
             f"{PARITY.relative_to(REPO)}, not 1"
         )
+    return extra
+
+
+def _anchor_selection(selected):
+    """Every selected case reduced to `(suite, case, edits)`."""
+    return [(suite.name, case.name, case.edits) for suite, case in selected]
+
+
+def check_anchors(selected: list[tuple[Suite, Case]]) -> int:
+    """Resolve every selected case's guard text, and stop (M4-27)."""
     return shared_check_anchors(
         HARNESS,
-        ((suite.name, case.name, case.edits) for suite, case in selected),
-        extra,
+        _anchor_selection(selected),
+        _anchor_extras(),
     )
 
 
@@ -416,6 +430,19 @@ def main() -> int:
     parser.add_argument("--check-anchors", action="store_true")
     arguments = parser.parse_args()
 
+    # **M4-36, and this is the load-bearing line.**  Write capability is
+    # dropped here, on the strength of the flag alone, *before* any dispatch.
+    # The read-only entry below still wraps its own barrier, but that one only
+    # covers code reached through it -- and the bypass this guards against is
+    # a dispatch that is never reached: nested under the preceding `if
+    # arguments.list:` block it is present, correctly ordered and unreachable,
+    # and `main()` falls through to the deletion loop. Taking the capability
+    # away up here makes the destructive path the one that never had it
+    # removed, so a lost dispatch raises on its first mutation instead of
+    # deleting guards for hours and exiting 0.
+    if arguments.check_anchors:
+        forbid_writes_for_this_process()
+
     install_interrupt_restore()
 
     suites = SUITES
@@ -435,7 +462,15 @@ def main() -> int:
             print(f"{suite.name}: {case.name} -> {witness}")
         return 0
     if arguments.check_anchors:
-        return check_anchors(selected)
+        # **M4-36.**  Read-only mode is a path without write capability, not a
+        # branch in `main()`: a deletion loop reachable from here raises on
+        # its first mutation instead of running the destructive suite to
+        # completion and exiting 0.
+        return read_only_entry(
+            HARNESS,
+            _anchor_selection(selected),
+            _anchor_extras(),
+        )
     if not selected:
         sys.exit(f"{HARNESS}: no case matches {arguments.case!r}")
 
@@ -456,6 +491,9 @@ def main() -> int:
         if not binary.is_file():
             sys.exit(f"{HARNESS}: not a file: {binary}")
 
+    # **M4-26.**  With no git index every check that would notice a resident
+    # mutation reports clean, so refuse rather than run blind.
+    require_git_index(HARNESS, REPO)
     refuse_resident_mutation(HARNESS, REPO)
     require_declared_witnesses(selected)
     require_clean_tree(suites)
@@ -481,6 +519,9 @@ def main() -> int:
                 outcome = classify(case, status, output)
         results.append((suite.name, case.name, outcome))
         print(f"[{suite.name}] {case.name}: {outcome}", flush=True)
+
+    # **M4-26, again.**  The index loss that matters happens mid-run.
+    require_git_index(HARNESS, REPO)
 
     print()
     problems = unusable_outcomes((suite, name, outcome) for suite, name, outcome in results)

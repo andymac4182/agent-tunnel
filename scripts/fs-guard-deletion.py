@@ -109,8 +109,14 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from guard_outcomes import AppliedCase  # noqa: E402
 from guard_outcomes import check_anchors as shared_check_anchors  # noqa: E402
+from guard_outcomes import classify_outcome  # noqa: E402
+from guard_outcomes import forbid_writes_for_this_process  # noqa: E402
 from guard_outcomes import install_interrupt_restore  # noqa: E402
+from guard_outcomes import load_witness_debt  # noqa: E402
+from guard_outcomes import read_only_entry  # noqa: E402
 from guard_outcomes import refuse_resident_mutation  # noqa: E402
+from guard_outcomes import require_declared_witnesses  # noqa: E402
+from guard_outcomes import require_git_index  # noqa: E402
 from guard_outcomes import unusable as unusable_outcomes  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
@@ -6301,6 +6307,66 @@ def glued_case_names() -> list[str]:
     return glued
 
 
+
+
+#: The test(s) each case's deleted guard must make redden, keyed by
+#: `(suite, case)`.
+#:
+#: **Empty, and deliberately so (task row M4-23).**  A witness is a
+#: measurement -- the test that actually reddens when *this* guard is deleted,
+#: one `cargo test` per case -- and it cannot be read off the case's text.
+#: Filling this in by writing a plausible test name beside each case would
+#: produce a harness that checks 447 guesses and reports them as attribution,
+#: which is the defect this mechanism exists to remove, with the added harm
+#: that the run would now *claim* to have been attributed.
+#:
+#: So every case here is named in `scripts/guard_witness_debt.json` instead,
+#: keeps the old unattributed classification, and is reported as owing a
+#: witness.  Moving a case out of that ledger and into this table is the unit
+#: of progress; the ledger can only shrink, and a case may not appear in both.
+WITNESSES: dict[tuple[str, str], frozenset[str]] = {}
+
+#: The pinned ledger, loaded once.
+DEBT = load_witness_debt('fs-guard-deletion')
+
+
+
+def require_witnesses(selected) -> None:
+    """Refuse a value case that neither names a witness nor owes one.
+
+    **The half that makes M4-23's fix hold.**  Without it the mechanism is
+    opt-in: a case added with no entry in `WITNESSES` would fall back silently
+    to "any red will do", which is the behaviour the mechanism exists to
+    reject.  With it, a new case must either declare the test its guard owns
+    or be added to `scripts/guard_witness_debt.json` by hand -- and the ledger
+    is asserted never to grow, so the second route is not a route.
+    """
+    require_declared_witnesses(
+        "fs-guard-deletion",
+        (
+            (
+                suite.name,
+                name,
+                False,
+                WITNESSES.get((suite.name, name), frozenset()),
+            )
+            for suite, name, edits in selected
+            if name not in EXPECT_GREEN
+        ),
+        DEBT,
+    )
+
+
+def _anchor_selection(selected):
+    """Every selected case reduced to `(suite, case, edits)`.
+
+    Shared by the preflight and by the read-only `--check-anchors` entry, so
+    the two cannot drift into checking different sets -- which is the class of
+    mistake M4-36 is about.
+    """
+    return [(suite.name, name, edits) for suite, name, edits in selected]
+
+
 def check_anchors(selected: list[tuple[Suite, str, list[Edit]]]) -> int:
     """Resolve every selected case's guard text against the tree, and stop.
 
@@ -6321,7 +6387,7 @@ def check_anchors(selected: list[tuple[Suite, str, list[Edit]]]) -> int:
     """
     return shared_check_anchors(
         "fs-guard-deletion",
-        ((suite.name, name, edits) for suite, name, edits in selected),
+        _anchor_selection(selected),
         (f"glued case name: {glued}" for glued in glued_case_names()),
     )
 
@@ -6355,6 +6421,19 @@ def main() -> int:
     )
     arguments = parser.parse_args()
 
+    # **M4-36, and this is the load-bearing line.**  Write capability is
+    # dropped here, on the strength of the flag alone, *before* any dispatch.
+    # The read-only entry below still wraps its own barrier, but that one only
+    # covers code reached through it -- and the bypass this guards against is
+    # a dispatch that is never reached: nested under the preceding `if
+    # arguments.list:` block it is present, correctly ordered and unreachable,
+    # and `main()` falls through to the deletion loop. Taking the capability
+    # away up here makes the destructive path the one that never had it
+    # removed, so a lost dispatch raises on its first mutation instead of
+    # deleting guards for hours and exiting 0.
+    if arguments.check_anchors:
+        forbid_writes_for_this_process()
+
     suites = [
         suite
         for suite in SUITES
@@ -6374,7 +6453,18 @@ def main() -> int:
             print(f"{suite.name}: {name}")
         return 0
     if arguments.check_anchors:
-        return check_anchors(selected)
+        # **M4-36.**  Read-only mode is a path without write capability,
+        # not a branch in `main()`.  `read_only_entry` resolves the
+        # anchors inside a scope in which `Path.write_text`, a writing
+        # `Path.open`, `Path.unlink`, `os.replace` and `subprocess.run`
+        # all raise, so a deletion loop that becomes reachable from here
+        # raises on its first mutation and names itself instead of
+        # running the destructive suite to completion and exiting 0.
+        return read_only_entry(
+            "fs-guard-deletion",
+            _anchor_selection(selected),
+            (f"glued case name: {glued}" for glued in glued_case_names()),
+        )
     if not selected:
         sys.exit(f"fs-guard-deletion: no case matches {arguments.case!r}")
 
@@ -6387,7 +6477,15 @@ def main() -> int:
     # a resident mutation is a guard deleted from the product and not
     # a tidying job.  Placed *after* the `--check-anchors` dispatch so
     # read-only mode stays a pure anchor check (M4-34, M4-36).
+    # **M4-26, before anything else.**  Git writes `index.lock` and renames
+    # it over `index`, so a process killed in that window loses the index --
+    # and with no index every check that would notice a resident mutation
+    # reports clean: `git status --porcelain` calls tracked files untracked,
+    # and `git diff -- crates/` compares against nothing. This refuses rather
+    # than running blind.
+    require_git_index("fs-guard-deletion", REPO)
     refuse_resident_mutation("fs-guard-deletion", REPO)
+    require_witnesses(selected)
     require_clean_tree(suites)
 
     # **Preflight (M4-27).**  Resolve every selected case's anchors before any
@@ -6426,12 +6524,17 @@ def main() -> int:
                 print(f"[{suite.name}] {name}: {problem}", flush=True)
                 continue
             outcome, failures = run_tests(suite)
-        if name in EXPECT_GREEN:
-            outcome = (
-                "DOCUMENTED GREEN"
-                if outcome == "still green"
-                else f"EXPECTED A DOCUMENTED GREEN, GOT: {outcome}"
-            )
+        # **M4-23.**  One shared classification rule, so the witness check
+        # cannot be present in some harnesses and absent from others -- which
+        # is exactly how this defect came to be true of three of the five.
+        outcome = classify_outcome(
+            outcome,
+            failures,
+            documented_green=name in EXPECT_GREEN,
+            expect_build_failure=False,
+            expected_red=WITNESSES.get((suite.name, name), frozenset()),
+            owed_witness=DEBT.owes(suite.name, name),
+        )
         results.append((suite.name, name, outcome, failures))
         print(
             f"[{suite.name}] {name}: {outcome} {failures if failures else ''}".rstrip(),
@@ -6464,6 +6567,38 @@ def main() -> int:
     # defeated and NOTHING went red, matched none of them, so a run in which
     # every guard stayed green printed "0 of N" and exited 0.  Now anything
     # that is not RED or REFUSED BY COMPILER fails closed and is named.
+    # **M4-23: the debt this run carried, said out loud.**  The defect this
+    # mechanism closes left "no trace in either the output or the tally" -- a
+    # corrupted outcome was byte-identical to a correct one. A case still
+    # owed a witness is classified the old way, so the only thing standing
+    # between that and silence is this line and the pin in
+    # `scripts/test_guard_outcomes.py`. It prints on every run, including a
+    # clean one, because a figure that appears only when it is bad is a
+    # figure nobody learns to read.
+    unattributed = sum(
+        1
+        for suite_name, name, outcome, _ in results
+        if outcome == "RED" and DEBT.owes(suite_name, name)
+    )
+    attributed = sum(
+        1
+        for suite_name, name, outcome, _ in results
+        if outcome == "RED" and not DEBT.owes(suite_name, name)
+    )
+    print(
+        f"\nfs-guard-deletion: {attributed} red(s) were attributed to the test the "
+        f"case declares; {unattributed} were credited to any failure in the "
+        "suite's surface, because those cases do not yet name a witness "
+        "(task row M4-23). An unattributed red is not evidence that this "
+        "guard is load-bearing."
+    )
+
+    # **M4-26, again.**  The index loss that matters happens *mid-run*: a
+    # check only at the start would certify an index that was gone by the
+    # end, and a count from a run whose index state was not confirmed is not
+    # a measurement.
+    require_git_index("fs-guard-deletion", REPO)
+
     unusable = unusable_outcomes(
         (suite_name, name, outcome) for suite_name, name, outcome, _ in results
     )

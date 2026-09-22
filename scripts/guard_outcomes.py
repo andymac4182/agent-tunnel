@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import subprocess
 import sys
 from collections.abc import Iterable, Sequence
 from pathlib import Path
@@ -438,6 +439,434 @@ class AppliedCase:
         # must still be reported.  This only guarantees the tree is clean
         # first.
         return False
+
+
+
+# --------------------------------------------------------------------------
+# Witness attribution (task rows M4-23, M4-24)
+# --------------------------------------------------------------------------
+#
+# `run_tests` in every harness returns `RED` on `returncode != 0` and collects
+# every `FAILED` line, with no attribution to the guard that was deleted.  So
+# a case is credited whenever *anything* in the suite's surface goes red --
+# `fs-guard-deletion`'s gate4 command alone spans four crates' entire test
+# surface -- and a case can pass while the test it exists for never ran, never
+# failed, or failed for an unrelated reason.
+#
+# **The reach was measured before this was written (M4-24), and it is not
+# positional.**  Driving each harness's own shipped classifier with a failure
+# named after no test in the repository, **691 of 745** guard cases were
+# credited for it: `fs` 447 of 475, `m5` 100 of 100, `acp` 144 of 146, and
+# `m3` and `m0` 0 of 12 each.  The two that refuse are the two that already
+# carried `expected_red`.  So the answer M4-24 asks for -- any case, or only
+# one position? -- is **neither of the two rivals it names**: every value case
+# in every harness lacking this mechanism is exposed, and position has nothing
+# to do with it.  The 54 that refuse do so because they are `EXPECT_GREEN`
+# (29) or a compiler refusal (1), which fail closed on any red at all, or
+# because they already declare a witness (24).
+#
+# The figure is `691` and not the `657` an earlier pass reported.  That pass
+# recovered each case's outcome by regex-splitting the harness's own log
+# lines, and 34 case names contain ": ", so a non-greedy split moved part of
+# the name into the outcome and scored those cases as refused.  Re-derived by
+# reading the `(suite, case, outcome)` triples the harness hands to
+# `unusable_outcomes`, it agrees to the case with an independent count of
+# value cases taken straight from the shipped case lists.
+#
+# The remedy is the one `m0-guard-exit-codes` and `m3-guard-deletion` already
+# ship, lifted here so there is one copy rather than five: a case names the
+# test that must redden, and a red without it is `RED (wrong witness)`, which
+# is absent from `USABLE_OUTCOMES` and fails the run.
+
+
+class WitnessDebt:
+    """Cases that predate the witness requirement, pinned so they can only shrink.
+
+    **Why this exists rather than 657 invented witnesses.**  A witness is the
+    test that reddens when *this* guard is deleted.  That is a measurement --
+    one `cargo test` per case, hours per harness -- and it cannot be read off
+    the case's text.  Writing a plausible-looking test name next to each case
+    would produce a harness that checks 657 guesses and reports them as
+    attribution, which is the M4-23 defect with a longer stride: the run's
+    success and its measuring nothing would still look identical, and would
+    now additionally *claim* to have been attributed.
+
+    So the undeclared cases are named, counted and frozen instead.  A case in
+    the ledger keeps the old "any red will do" classification and is reported
+    as such; a case **not** in the ledger and not declaring a witness is
+    refused before anything is edited.  New cases therefore cannot join the
+    debt, and a case given a real witness must be struck from the ledger,
+    so the figure this pins is monotonically decreasing by construction.
+    """
+
+    def __init__(self, undeclared: Iterable[tuple[str, str]]) -> None:
+        #: `(suite, case)` for every case still classified without attribution.
+        self.undeclared = frozenset(undeclared)
+
+    def owes(self, suite: str, case: str) -> bool:
+        return (suite, case) in self.undeclared
+
+    def __len__(self) -> int:
+        return len(self.undeclared)
+
+
+
+#: Where the pinned ledger of cases that predate the witness requirement lives.
+WITNESS_DEBT_FILE = Path(__file__).resolve().parent / "guard_witness_debt.json"
+
+
+def load_witness_debt(harness: str) -> WitnessDebt:
+    """The pinned ledger for `harness`, or an empty one if it owes nothing.
+
+    Read from a single JSON file rather than inlined into each harness so the
+    total is countable in one place and a test can assert it never grows.  A
+    harness with no entry owes nothing, which is the state every harness is
+    meant to reach.
+    """
+    try:
+        ledger = json.loads(WITNESS_DEBT_FILE.read_text())
+    except FileNotFoundError:
+        return WitnessDebt(())
+    return WitnessDebt(
+        (suite, case) for suite, case in ledger.get(harness, [])
+    )
+
+
+def require_declared_witnesses(
+    harness: str,
+    cases: Iterable[tuple[str, str, bool, frozenset[str]]],
+    debt: WitnessDebt,
+) -> None:
+    """Refuse, before anything is edited, a case that names no test it owns.
+
+    `cases` is `(suite, case, expect_build_failure, expected_red)`.
+
+    Without this the mechanism is opt-in, and a case added with the field
+    omitted falls back silently to the behaviour it exists to reject -- the
+    mechanism's own version of the defect it guards.  A compiler-refusal case
+    declares none: a build failure names no test, and requiring one would be
+    incoherent.
+    """
+    missing: list[str] = []
+    contradictory: list[str] = []
+    stale_debt: list[str] = []
+    for suite, case, expect_build_failure, expected_red in cases:
+        if expect_build_failure and expected_red:
+            contradictory.append(f"[{suite}] {case}")
+        elif expect_build_failure:
+            continue
+        elif expected_red and debt.owes(suite, case):
+            # A case cannot both declare a witness and be owed one.  Left
+            # unchecked the ledger would silently outlive the fix it tracks.
+            stale_debt.append(f"[{suite}] {case}")
+        elif not expected_red and not debt.owes(suite, case):
+            missing.append(f"[{suite}] {case}")
+    problems = (
+        [f"{entry} (names no witness)" for entry in missing]
+        + [f"{entry} (compiler refusal may not name a witness)" for entry in contradictory]
+        + [f"{entry} (declares a witness but is still in the debt ledger)" for entry in stale_debt]
+    )
+    if problems:
+        sys.exit(
+            f"{harness}: every value case must name the test(s) that must "
+            "redden when its guard is deleted. A case classified RED by an "
+            "unrelated failure is not evidence for the rule it claims (task "
+            "row M4-23). Offending case(s): " + ", ".join(problems)
+        )
+
+
+def classify_outcome(
+    outcome: str,
+    failures: Sequence[str],
+    *,
+    documented_green: bool,
+    expect_build_failure: bool,
+    expected_red: frozenset[str],
+    owed_witness: bool,
+) -> str:
+    """The one classification rule, shared by all five harnesses.
+
+    This was five near-identical inline blocks in five `main()` functions.
+    The witness check existed in two of them, which is precisely how M4-23
+    came to be true of the other three: a rule copied five times is a rule
+    fixed in two.
+    """
+    if documented_green:
+        return (
+            "DOCUMENTED GREEN"
+            if outcome == "still green"
+            else f"EXPECTED A DOCUMENTED GREEN, GOT: {outcome}"
+        )
+    if expect_build_failure:
+        return (
+            "REFUSED BY COMPILER"
+            if outcome == "BUILD FAILED"
+            else f"EXPECTED A COMPILER REFUSAL, GOT: {outcome}"
+        )
+    if outcome == "BUILD FAILED":
+        return "BUILD FAILED (not evidence)"
+    if outcome != "RED":
+        return outcome
+    if owed_witness:
+        # Unattributed by declaration, not by accident.  Still counted, so the
+        # ledger is a debt and not a silent exemption -- `UNATTRIBUTED` is
+        # printed beside it and the ledger's size is asserted elsewhere.
+        return "RED"
+    missing = sorted(expected_red - set(failures))
+    if missing:
+        # `RED` means *something* failed; it does not mean the rule this case
+        # names was what noticed.  This spelling is absent from
+        # `USABLE_OUTCOMES`, so it fails the run rather than being counted as
+        # evidence for a rule it did not test.
+        return (
+            "RED (wrong witness): expected "
+            + ", ".join(missing)
+            + " to redden, got "
+            + (", ".join(failures) if failures else "nothing")
+        )
+    return "RED"
+
+
+# --------------------------------------------------------------------------
+# The git index a harness needs in order to see anything (task row M4-26)
+# --------------------------------------------------------------------------
+
+
+def require_git_index(harness: str, repo: Path) -> None:
+    """Refuse to run, or to believe a completed run, without a git index.
+
+    Git writes `index.lock` and renames it over `index`, so a process killed
+    in that window loses the index outright -- and a guard harness under
+    concurrent-build memory pressure is the widest such window in this
+    repository.  With no index every check that would notice goes blind in the
+    same direction at once: `git status --porcelain -- <path>` reports tracked
+    files as untracked, and `git diff -- crates/` -- the check M5-C07
+    prescribes before every commit -- reports **clean**, because a file
+    carrying a resident mutation reads as untracked and `git diff` has nothing
+    to compare against.
+
+    So the prescribed check reports clean precisely when the thing it exists
+    to catch has happened.  This refuses instead, and it is called both before
+    a run and after it: the loss that matters happens *mid-run*, so a check
+    only at the start would certify an index that was gone by the end.
+
+    `AppliedCase.restore` writes back recorded bytes rather than running `git
+    checkout --`, so a lost index no longer stops the restore itself -- that
+    half of M4-26 was closed by M5-C07.  What remains is that nothing
+    *verifies* the index survived, and a count from a run whose index state
+    was not confirmed is not a measurement.
+    """
+    done = subprocess.run(
+        ["git", "ls-files"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+    )
+    tracked = len(done.stdout.splitlines()) if done.returncode == 0 else 0
+    if tracked == 0:
+        sys.exit(
+            f"{harness}: refusing to trust this run -- `git ls-files` in "
+            f"{repo} lists {tracked} tracked file(s), so this checkout has no "
+            "usable git index (task row M4-26). Every check that would notice "
+            "a resident mutation reports clean in this state: `git status "
+            "--porcelain` calls tracked files untracked and `git diff -- "
+            "crates/` compares against nothing.\n"
+            "  Recover with: git read-tree HEAD\n"
+            "  then re-run this harness from the start. Do not report any "
+            "figure from a run that saw this message: a count from a run "
+            "whose index state was not confirmed is not a measurement."
+        )
+
+
+# --------------------------------------------------------------------------
+# A read-only entry with no write capability (task row M4-36)
+# --------------------------------------------------------------------------
+#
+# `--check-anchors` used to be read-only by virtue of *where its two lines sat*
+# in `main()`.  M4-34 pinned that with a source-text assertion -- the dispatch
+# must be spelt this way and must appear before `require_clean_tree` -- and
+# M4-36 records what such a check cannot see.  Nesting the dispatch under the
+# preceding `if arguments.list:` block leaves it present, correctly ordered and
+# unreachable; `m3-guard-deletion.py --check-anchors` then ran the entire
+# destructive suite to completion in 76.8 s, deleting and restoring all five
+# guards, and exited 0, while `test_guard_outcomes.py` reported PASS.  Nothing
+# anywhere reported a problem, because a successful destructive run looks
+# exactly like a successful read-only one.
+#
+# The substance of the property is "this invocation must not be able to write",
+# and that is expressible directly rather than as a claim about two lines'
+# position: enter a scope in which the write primitives raise, resolve the
+# anchors, and leave.  A deletion loop that becomes reachable from this entry
+# does not run to completion and exit 0 -- it raises on its first mutation and
+# names itself.  That is the part the source-text check could not express, and
+# it is what `test_guard_outcomes.py` now fixtures.
+
+
+class WriteAttempted(RuntimeError):
+    """A read-only entry point tried to modify something."""
+
+
+class NoWriteCapability:
+    """A scope in which the primitives a guard run mutates with all raise.
+
+    Public because it is what `test_guard_outcomes.py` exercises directly:
+    the property M4-36 asks for is behavioural, so the fixture has to be able
+    to enter the same scope `read_only_entry` enters and attempt each write.
+
+    This covers the ways every harness in this repository changes the tree:
+    `Path.write_text` (`AppliedCase.apply` and `restore`), `Path.open` in any
+    writing mode, `os.replace` (the journal), `Path.unlink` (the journal
+    again), and `subprocess.run` (`cargo`, and any `git` that could write).
+
+    It is a capability barrier and not a sandbox: code that reached for
+    `os.write` on a raw descriptor would get through.  Nothing here does, and
+    the point is not to contain an adversary -- it is that the read-only entry
+    cannot *accidentally* acquire a write path, which is the failure M4-36
+    describes.  The fixture that proves it works does so by making the
+    deletion loop reachable and watching this raise.
+    """
+
+    #: How many barriers are currently installed.  The scope nests: a
+    #: `--check-anchors` run installs one for the whole process at
+    #: argument-parse time and `read_only_entry` installs another inside it,
+    #: and the inner one must not restore the real primitives on the way out.
+    _depth = 0
+
+    #: The instance holding the real primitives while the barrier is up, so a
+    #: caller that installed one irreversibly can still be unwound.  Only
+    #: `scripts/test_guard_outcomes.py` does that: a harness process that
+    #: asked for `--check-anchors` has no later work that may write, but the
+    #: test file does, and leaving the barrier up would make every later test
+    #: pass or fail for a reason unrelated to what it asserts.
+    _holder: NoWriteCapability | None = None
+
+    @classmethod
+    def release_all(cls) -> None:
+        """Restore the real primitives, whatever the nesting depth."""
+        holder = cls._holder
+        cls._depth = 0
+        if holder is not None:
+            holder._installed = True
+            holder._active = True
+            cls._depth = 1
+            holder.__exit__()
+
+    def __enter__(self) -> NoWriteCapability:
+        import subprocess as _subprocess
+
+        self._installed = NoWriteCapability._depth == 0
+        NoWriteCapability._depth += 1
+        self._active = True
+        if not self._installed:
+            return self
+        NoWriteCapability._holder = self
+        self._saved = {
+            "write_text": Path.write_text,
+            "open": Path.open,
+            "unlink": Path.unlink,
+            "replace": os.replace,
+            "run": _subprocess.run,
+        }
+        self._subprocess = _subprocess
+
+        def refuse(what: str):
+            def refused(*_args, **_kwargs):
+                raise WriteAttempted(
+                    f"a read-only guard-harness entry point called {what}; "
+                    "read-only mode is a path without write capability (task "
+                    "row M4-36), so this is a bypassed dispatch and not a "
+                    "slow run"
+                )
+
+            return refused
+
+        def guarded_open(self_path, mode="r", *args, **kwargs):
+            if any(flag in mode for flag in ("w", "a", "x", "+")):
+                raise WriteAttempted(
+                    f"a read-only guard-harness entry point opened "
+                    f"{self_path} with mode {mode!r} (task row M4-36)"
+                )
+            return self._saved["open"](self_path, mode, *args, **kwargs)
+
+        Path.write_text = refuse("Path.write_text")
+        Path.unlink = refuse("Path.unlink")
+        Path.open = guarded_open
+        os.replace = refuse("os.replace")
+        self._subprocess.run = refuse("subprocess.run")
+        return self
+
+    def __exit__(self, *_exc: object) -> bool:
+        # **Only an instance with an outstanding `__enter__` may unwind
+        # (found on review).**  This used to decrement unconditionally, so
+        # `__enter__(); __exit__(); __exit__()` left `_depth == -1`, after
+        # which the next `__enter__` saw a non-zero depth, installed nothing,
+        # and `forbid_writes_for_this_process()` left the process able to
+        # write. A `finally` after a failed `__enter__`, or a stray second
+        # exit, is enough to reach that. Now an unmatched exit is a no-op: it
+        # can neither drive the depth negative nor lift a barrier some other
+        # instance is holding.
+        if not getattr(self, "_active", False):
+            return False
+        self._active = False
+        NoWriteCapability._depth -= 1
+        if not getattr(self, "_installed", False):
+            return False
+        NoWriteCapability._holder = None
+        Path.write_text = self._saved["write_text"]
+        Path.open = self._saved["open"]
+        Path.unlink = self._saved["unlink"]
+        os.replace = self._saved["replace"]
+        self._subprocess.run = self._saved["run"]
+        return False
+
+
+
+def forbid_writes_for_this_process() -> None:
+    """Drop write capability for the rest of this process, permanently.
+
+    **Why `read_only_entry` alone was not enough, and this is the fix (M4-36,
+    reopened on review).**  `NoWriteCapability` inside `read_only_entry` bars
+    writes only for code reached *through* that entry.  The bypass this row
+    records does not go through it: nesting the `if arguments.check_anchors:`
+    block under the preceding `if arguments.list:` block leaves the dispatch
+    present, correctly ordered and **unreachable**, so `main()` falls through
+    to the deletion loop.  Reproduced against the fixed tree before this
+    function existed: `--check-anchors` on `m3-guard-deletion` ran all **12**
+    cases through the deletion loop with `read_only_entry` entered **zero**
+    times.  A barrier bolted onto a branch protects nothing when the branch is
+    what was lost.
+
+    So capability is taken away at **argument-parse time**, before any
+    dispatch, on the strength of the flag alone.  The destructive path is then
+    the one that never had the capability removed, rather than the one that
+    escaped a check -- which is what "read-only-ness is a property of the call
+    graph" has to mean if a lost dispatch is the failure being guarded.  A
+    bypassed dispatch now raises `WriteAttempted` on the deletion loop's first
+    mutation instead of running the suite to completion and exiting 0.
+
+    There is no matching release: a process that has asked for `--check-anchors`
+    has no later work that may write.
+    """
+    NoWriteCapability().__enter__()
+
+
+def read_only_entry(
+    harness: str,
+    selected: Iterable[Selection],
+    extra_problems: Iterable[str] = (),
+) -> int:
+    """Resolve every selected case's anchors, unable to write anything.
+
+    The read-only entry point M4-36 asks for.  All five harnesses dispatch
+    `--check-anchors` into this rather than calling `check_anchors` directly,
+    so read-only-ness is a property of the call graph -- this function holds
+    no write capability and neither does anything it calls -- instead of a
+    property of two lines' position in a `main()`.
+    """
+    selected = list(selected)
+    with NoWriteCapability():
+        return check_anchors(harness, selected, extra_problems)
+
 
 
 def _main() -> int:
