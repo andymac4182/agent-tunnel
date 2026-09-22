@@ -79,6 +79,20 @@ REPO = Path(__file__).resolve().parent.parent
 # catch, so the version is asserted rather than hoped for.
 CARGO_DENY_VERSION = "0.19.6"
 
+# Whether cargo-deny is invoked with `--offline`. Mutated once by `main()`
+# from `--no-offline`.
+#
+# **This was hard-coded, and that made the CI job known-broken rather than
+# merely unexercised.** On a fresh runner with an empty `CARGO_HOME`,
+# `--offline` makes `cargo metadata` fail with "no matching package", no
+# summary record is produced, and `deps` fails -- so the job as first written
+# could not have passed even had billing allowed it to run. The fix is in two
+# halves: CI now runs `cargo fetch --locked` first so the registry cache and
+# the extracted crate sources cargo-deny reads LICENSE files from are both
+# present, and the flag exists so a networked host can skip `--offline`
+# entirely.
+OFFLINE: list[str] = ["--offline"]
+
 # Floors.  Each is a measured figure at 6fad2fb minus headroom, and each
 # guards a specific "the check examined nothing" failure:
 #
@@ -105,7 +119,17 @@ HISTORY_BLOBS_FLOOR = 1500
 # registry checksum and has to be checked by hand.
 VENDORED = ("h3", "h3-quinn", "quinn-proto")
 
-MAX_BLOB_BYTES = 2_000_000
+# Size cap for a single blob, and exceeding it is a **FAIL**, not a skip.
+#
+# **Raised from 2,000,000, which was on course to silently drop the most
+# important file in the repository.** The largest blob in history is
+# `docs/tasks.md`, 1,373,974 bytes at b97a3bb and growing roughly 18 KB per
+# commit -- about 35 commits from crossing a 2 MB cap. The file most likely to
+# carry pasted evidence would have left the scan with a NOTE while the check
+# still passed. 64 MiB is far above anything this repository plausibly
+# commits, and if it is ever reached the run goes red and names the file
+# rather than quietly narrowing its own scope.
+MAX_BLOB_BYTES = 64 * 1024 * 1024
 
 
 # --------------------------------------------------------------------------
@@ -148,6 +172,7 @@ SECRET_PATTERNS: dict[str, re.Pattern[bytes]] = {
     ),
     "github-token": re.compile(rb"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36}\b"),
     "github-fine-grained-pat": re.compile(rb"\bgithub_pat_[A-Za-z0-9_]{60,}\b"),
+    "gitlab-pat": re.compile(rb"\bglpat-[A-Za-z0-9_\-]{20,}\b"),
     "slack-token": re.compile(rb"\bxox[baprs]-[0-9A-Za-z-]{10,}\b"),
     "google-api-key": re.compile(rb"\bAIza[0-9A-Za-z_\-]{35}\b"),
     "anthropic-api-key": re.compile(rb"\bsk-ant-[A-Za-z0-9_\-]{24,}\b"),
@@ -156,42 +181,112 @@ SECRET_PATTERNS: dict[str, re.Pattern[bytes]] = {
     "npm-token": re.compile(rb"\bnpm_[A-Za-z0-9]{36}\b"),
     "pypi-token": re.compile(rb"\bpypi-AgEIcHlwaS5vcmc[A-Za-z0-9_\-]{20,}\b"),
     "ssh-private-key-body": re.compile(_BEGIN + rb"OPENSSH PRIVATE KEY-----"),
-    # A URL carrying an inline password. The capture is deliberately narrow:
-    # a userinfo field with a non-empty password on a scheme this project
-    # actually uses. `redis://127.0.0.1:6379/` and `redis://:@host` do not
-    # match; a `redis://` URL with a `user:password@` authority does. (Spelled
-    # out in prose rather than shown, so this comment is not itself a match --
-    # see the note above about splitting literals.)
+    # A URL carrying an inline password, for a scheme this project uses.
+    # Matches whether or not a username is present, and requires the password
+    # to be non-empty. A URL with no userinfo at all, and one with an empty
+    # password, both do not match. (Spelled out in prose rather than shown, so
+    # this comment is not itself a match -- see the note above about splitting
+    # literals.)
+    #
+    # **The username is optional, and that was a real gap rather than a
+    # tightening.** The first version required a non-empty username, which
+    # excluded the `scheme://:password@host` form -- Redis's default-user ACL
+    # spelling, and therefore **the one credential shape this Redis-only
+    # project actually uses**. The comment at the time described the exclusion
+    # as only the empty-*password* case, so the gap was invisible from the
+    # source. A pattern that cannot match the project's own credential format
+    # is a check that cannot fail for the class that matters most here, and
+    # "0 findings" over it would have been true and misleading at once.
     "url-inline-password": re.compile(
-        rb"\b(?:redis|rediss|postgres|postgresql|mysql|amqp|mongodb)://"
-        rb"[A-Za-z0-9._%\-]+:[^\s:@/\"'<>]+@"
+        rb"\b(?:redis|rediss|postgres|postgresql|mysql|amqp|mongodb|https?|ssh|ftp)://"
+        rb"[A-Za-z0-9._%\-]*:[^\s:@/\"'<>]+@"
+    ),
+    # Redis's own config directive. In scope because Redis is the only
+    # authoritative store in this project, so this is a credential shape it
+    # would plausibly carry. Requires a non-empty value, so a commented-out or
+    # empty directive does not match.
+    "redis-requirepass": re.compile(rb"requirepass[ \t=]+[^\s\"'#]+"),
+    # A populated Authorization header. Bearer requires a long opaque token
+    # and Basic a base64-looking blob, so `Authorization: Bearer <token>` in
+    # prose or a placeholder like `Bearer TOKEN` does not match.
+    "http-auth-header": re.compile(
+        rb"[Aa]uthorization:\s*(?:Bearer\s+[A-Za-z0-9._\-]{20,}"
+        rb"|Basic\s+[A-Za-z0-9+/]{16,}={0,2})"
     ),
     "jwt": re.compile(rb"\beyJ[A-Za-z0-9_\-]{10,}\.eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\b"),
 }
 
-# Each fixture must be matched by its own named pattern and is used by
-# `--self-test`. These are synthetic strings assembled at run time from
-# fragments so that this source file does not itself contain anything a
-# third-party scanner would flag as a live credential.
-SECRET_CONTROL_FIXTURES: dict[str, bytes] = {
-    "pem-private-key": b"-----BEGIN " + b"RSA PRIVATE KEY-----\nMIIsynthetic\n",
-    "aws-access-key-id": b"AKIA" + b"IOSFODNN7EXAMPLE",
-    "aws-secret-access-key": b'aws_secret_access_key = "' + b"a" * 40 + b'"',
-    "github-token": b"ghp_" + b"0" * 36,
-    "github-fine-grained-pat": b"github_pat_" + b"A" * 60,
-    "slack-token": b"xoxb-" + b"1234567890-abcdefghij",
-    "google-api-key": b"AIza" + b"B" * 35,
-    "anthropic-api-key": b"sk-ant-" + b"C" * 30,
-    "openai-api-key": b"sk-" + b"D" * 40,
-    "stripe-live-key": b"sk_live_" + b"E" * 24,
-    "npm-token": b"npm_" + b"F" * 36,
-    "pypi-token": b"pypi-AgEIcHlwaS5vcmc" + b"G" * 25,
-    "ssh-private-key-body": b"-----BEGIN " + b"OPENSSH PRIVATE KEY-----",
-    "url-inline-password": b"redis://deploy:" + b"s3cr3tpassw0rd" + b"@cache.internal:6379/0",
+# **What this scanner does NOT cover, stated because "0 findings" is only
+# meaningful alongside its scope.** Every pattern above is anchored to a known
+# credential format -- a vendor prefix, a URL authority, a named config
+# directive or header. The scanner therefore does not detect:
+#
+#   - generic assignments (`password = "..."`, `api_key: ...`) beyond the
+#     specific AWS and Redis spellings above;
+#   - raw high-entropy strings, hex secrets or bare base64 blobs with no
+#     surrounding context;
+#   - credentials that were never committed here at all -- deployment
+#     secrets, relay identities and Redis credentials provisioned out of band.
+#
+# Those are deliberate omissions, not oversights: an entropy scanner over a
+# repository full of synthetic test keys, certificate fixtures and base64
+# protocol frames produces a finding list nobody reads, and an unread list is
+# indistinguishable from a clean one. But the consequence has to be said out
+# loud wherever a zero is reported, because "0 findings" reads as "no secrets"
+# and means "no secrets **in these formats**". `check_secrets` prints this
+# scope beside its count for exactly that reason.
+COVERAGE_LIMITS = (
+    "prefix-anchored vendor formats, URL authorities, Redis `requirepass` and "
+    "Authorization headers only -- NOT generic assignments, raw entropy/hex "
+    "blobs, or credentials never committed here"
+)
+
+# Each pattern's synthetic positive-control fixtures, used by `--self-test`.
+# These are assembled at run time from fragments so that this source file does
+# not itself contain anything a third-party scanner would flag as a live
+# credential.
+#
+# **A tuple per pattern, not a single fixture**, so that a pattern with more
+# than one real-world spelling is exercised in each of them. `url-inline-password`
+# is the reason: it has a form with a username and a form without, and only the
+# first was ever tested, which is precisely how the missing empty-username case
+# went unnoticed. A pattern with one spelling simply has a one-element tuple.
+SECRET_CONTROL_FIXTURES: dict[str, tuple[bytes, ...]] = {
+    "pem-private-key": (b"-----BEGIN " + b"RSA PRIVATE KEY-----\nMIIsynthetic\n",),
+    "aws-access-key-id": (b"AKIA" + b"IOSFODNN7EXAMPLE",),
+    "aws-secret-access-key": (b'aws_secret_access_key = "' + b"a" * 40 + b'"',),
+    "github-token": (b"ghp_" + b"0" * 36,),
+    "github-fine-grained-pat": (b"github_pat_" + b"A" * 60,),
+    "gitlab-pat": (b"glpat-" + b"H" * 20,),
+    "slack-token": (b"xoxb-" + b"1234567890-abcdefghij",),
+    "google-api-key": (b"AIza" + b"B" * 35,),
+    "anthropic-api-key": (b"sk-ant-" + b"C" * 30,),
+    "openai-api-key": (b"sk-" + b"D" * 40,),
+    "stripe-live-key": (b"sk_live_" + b"E" * 24,),
+    "npm-token": (b"npm_" + b"F" * 36,),
+    "pypi-token": (b"pypi-AgEIcHlwaS5vcmc" + b"G" * 25,),
+    "ssh-private-key-body": (b"-----BEGIN " + b"OPENSSH PRIVATE KEY-----",),
+    "url-inline-password": (
+        # With a username.
+        b"redis://deploy:" + b"s3cr3tpassw0rd" + b"@cache.internal:6379/0",
+        # **Without one -- Redis's default-user ACL form, the shape this
+        # project actually uses, and the one the pattern used to miss.**
+        b"rediss://:" + b"s3cr3tpassw0rd" + b"@cache.internal:6379/0",
+        # A non-Redis scheme, since the scheme list is now wider.
+        b"https://token:" + b"s3cr3tpassw0rd" + b"@git.internal/repo.git",
+    ),
+    "redis-requirepass": (
+        b"requirepass " + b"s3cr3tpassw0rd",
+        b"requirepass=" + b"s3cr3tpassw0rd",
+    ),
+    "http-auth-header": (
+        b"Authorization: Bearer " + b"I" * 24,
+        b"Authorization: Basic " + b"c3ludGhldGljOnBhc3N3b3Jk",
+    ),
     "jwt": (
         b"eyJhbGciOiJIUzI1NiJ9."
         b"eyJzdWIiOiJzeW50aGV0aWMifQ."
-        b"c3ludGhldGljc2lnbmF0dXJl"
+        b"c3ludGhldGljc2lnbmF0dXJl",
     ),
 }
 
@@ -215,10 +310,13 @@ class Allow:
     `path_regex` is an *additional* constraint, not the primary one.
 
     An exception without a reason is the thing M6-04 exists to prevent: a
-    suppression nobody can re-evaluate. `--self-test` asserts every entry has
-    a reason and that every entry still matches something in the repository,
-    so an entry that has stopped applying is reported as dead rather than
-    silently sitting there forever.
+    suppression nobody can re-evaluate. **`check_secrets` itself** asserts
+    every entry has a reason and that every entry still matched something in
+    the run just completed, so an entry that has stopped applying fails the
+    check rather than sitting there forever. (An earlier version of this
+    docstring credited `--self-test` with that; it does not, and saying so
+    would have sent a reader to the wrong place to find out whether dead
+    entries are caught at all.)
     """
 
     pattern_name: str
@@ -239,6 +337,43 @@ SECRET_ALLOWLIST: tuple[Allow, ...] = (
             "credentials. The host is `redis.example.test` -- the RFC 6761 reserved "
             "`.test` TLD, which cannot resolve to a real service. Reviewed 2026-09-22; "
             "the test needs a credential-shaped string to have anything to redact."
+        ),
+    ),
+    # The two entries below appeared when the scheme list was widened to cover
+    # an `https` URL with a `user:token@` authority -- a real leak vector,
+    # since that is how a git remote carries an embedded token. (Spelled out
+    # rather than shown: written literally, this comment is itself a match,
+    # which is exactly what the self-source control caught here.) Both hits
+    # below are the *opposite* of a
+    # credential: they are fixtures asserting that a URL carrying userinfo is
+    # REJECTED. Keeping the wider scheme and excusing these two exact values is
+    # the right trade; narrowing the pattern again would have dropped the leak
+    # vector to avoid two known-good strings.
+    Allow(
+        pattern_name="url-inline-password",
+        digest="fdda8961c7346f6e935394f6a3c69be76d6d8ff3f18251e3cb5c4f6b65f296e3",
+        path_regex=r"^crates/tunnel-mcp-export/src/config\.rs$",
+        reason=(
+            "One entry in a table of endpoint spellings a parser test feeds in; the "
+            "userinfo form sits beside `http://0.0.0.0:1/mcp` and "
+            "`http://example.invalid:1/mcp` as a case the parser must handle. The host "
+            "is loopback and the value is a placeholder, not a credential. Reviewed "
+            "2026-09-22."
+        ),
+    ),
+    Allow(
+        pattern_name="url-inline-password",
+        digest="fbddae166ead16d1dd67736b19403ab1ac0095e344f663573848af911a7ce273",
+        path_regex=r"membership_runtime\.rs$",
+        reason=(
+            "An `assert_eq!` requiring `ParsedAuthorityEndpoint::parse` on a URL with "
+            "userinfo to return `CheckpointAuthorityError::InvalidEndpoint` -- a test "
+            "that authority endpoints carrying credentials are refused. The host is "
+            "under the RFC 2606 reserved `.example` TLD. The path pattern is "
+            "deliberately unanchored because the same file is duplicated under `work/` "
+            "backup trees; the digest is what actually scopes this entry, and a "
+            "different credential in any of those copies still reports. Reviewed "
+            "2026-09-22."
         ),
     ),
 )
@@ -319,6 +454,35 @@ def cargo_deny_binary() -> str | None:
 # --------------------------------------------------------------------------
 # Check: dependencies and licences
 # --------------------------------------------------------------------------
+def crate_floor_verdict(examined: int) -> tuple[bool, str]:
+    """Decide whether `examined` crates clears the floor, and say so.
+
+    **Factored out of `check_deps` so a control can drive it with a collapsed
+    count.** It was not, and that was the defect: the control asserted
+    `CRATES_FLOOR > 0` and printed a hard-coded "361 measured at 6fad2fb",
+    which is a string literal rather than a measurement. A control that
+    compares a constant against zero cannot fail, so the floor -- whose entire
+    job is to notice a licence policy that examined nothing -- had no control
+    at all while appearing in the list of ten as though it did. That is
+    M5-C11's eleventh instance and the sharpest one yet, because it is the
+    M5-C11 shape *inside the controls written to prevent the M5-C11 shape*.
+
+    Returning the verdict and its text together is what makes it drivable:
+    the control calls this with a collapsed count and requires False, and with
+    the real count and requires True, so both branches are exercised against
+    the same function the real check uses.
+    """
+    if examined < CRATES_FLOOR:
+        return False, (
+            f"  FAIL: only {examined} crates were examined, below the {CRATES_FLOOR} "
+            "floor. Either the graph collapsed or the policy is pointed at the "
+            "wrong manifest. Re-measure the floor deliberately if the workspace "
+            "genuinely shrank -- M5-C11's ninth instance is a floor that decayed "
+            "into a check that could not fail."
+        )
+    return True, f"  crates whose licence was resolved: {examined} (floor {CRATES_FLOOR})"
+
+
 def check_deps() -> Result:
     result = Result("deps")
     binary = cargo_deny_binary()
@@ -334,7 +498,10 @@ def check_deps() -> Result:
     version = run([binary, "--version"])
     observed = version.stdout.strip()
     result.note(f"  cargo-deny: {observed}")
-    if f"cargo-deny {CARGO_DENY_VERSION}" not in observed:
+    # Anchored and terminated, not a substring: `"cargo-deny 0.19.6" in
+    # "cargo-deny 0.19.60"` is True, so the substring form would have accepted
+    # a different version as the pinned one.
+    if re.fullmatch(rf"cargo-deny {re.escape(CARGO_DENY_VERSION)}", observed) is None:
         result.passed = False
         result.note(
             f"  FAIL: deny.toml was written against cargo-deny {CARGO_DENY_VERSION}; "
@@ -350,7 +517,7 @@ def check_deps() -> Result:
         return result
 
     proc = run(
-        [binary, "deny", "--offline", "--format", "json", "check", "licenses", "bans", "sources"]
+        [binary, "deny", *OFFLINE, "--format", "json", "check", "licenses", "bans", "sources"]
     )
     summaries: dict[str, dict[str, int]] = {}
     for line in proc.stderr.splitlines() + proc.stdout.splitlines():
@@ -382,9 +549,18 @@ def check_deps() -> Result:
             ok = False
             continue
         errors = counts.get("errors", 0)
+        # `helps` is one record per crate whose licence was resolved, so it is
+        # a size only for the licences check. `bans` and `sources` report 0
+        # there even on a full graph, and printing "examined=0" beside them
+        # read as "examined nothing" -- the exact alarm this script exists to
+        # raise, fired spuriously, which trains a reader to ignore it.
+        size = (
+            f" crates_examined={counts.get('helps', 0)}"
+            if check_name == "licenses"
+            else " (this check reports no per-crate count)"
+        )
         result.note(
-            f"  {check_name}: errors={errors} warnings={counts.get('warnings', 0)} "
-            f"examined={counts.get('helps', 0)}"
+            f"  {check_name}: errors={errors} warnings={counts.get('warnings', 0)}{size}"
         )
         if errors:
             ok = False
@@ -393,21 +569,15 @@ def check_deps() -> Result:
     # record per crate whose licence was resolved, so it is the size of what
     # the policy actually looked at.
     examined = summaries.get("licenses", {}).get("helps", 0)
-    result.note(f"  crates whose licence was resolved: {examined} (floor {CRATES_FLOOR})")
-    if examined < CRATES_FLOOR:
-        result.note(
-            f"  FAIL: only {examined} crates were examined, below the {CRATES_FLOOR} "
-            "floor. Either the graph collapsed or the policy is pointed at the "
-            "wrong manifest. Re-measure the floor deliberately if the workspace "
-            "genuinely shrank -- M5-C11's ninth instance is a floor that decayed "
-            "into a check that could not fail."
-        )
+    floor_ok, floor_note = crate_floor_verdict(examined)
+    result.note(floor_note)
+    if not floor_ok:
         ok = False
 
     # The patched crates must be *in* the checked graph. If `[patch.crates-io]`
     # ever drops them, the licence policy would stop covering the three crates
     # whose provenance is least like a registry crate's.
-    listing = run([binary, "deny", "--offline", "list", "-l", "crate"])
+    listing = run([binary, "deny", *OFFLINE, "list", "-l", "crate"])
     listed = listing.stdout
     for crate in VENDORED:
         present = re.search(rf"(?m)^{re.escape(crate)}@", listed) is not None
@@ -570,6 +740,12 @@ def check_provenance() -> Result:
 # --------------------------------------------------------------------------
 # Check: secrets, over full history
 # --------------------------------------------------------------------------
+# Per-scan allowlist hit counts. **Reset at the top of every `check_secrets`
+# call**, because it is module-global and `--self-test` runs several scans in
+# one process: without the reset, counts from a control's throwaway repository
+# accumulate into the next scan's, so a dead entry in the real repository could
+# be kept alive by a hit from a temporary one. That would silently defeat the
+# dead-entry check, which is itself one of the guards here.
 ALLOWLIST_HITS: dict[int, int] = {}
 
 
@@ -634,6 +810,7 @@ def history_blobs(repo: Path) -> list[tuple[str, str]]:
 def check_secrets(repo: Path | None = None) -> Result:
     repo = repo or REPO
     result = Result("secrets")
+    ALLOWLIST_HITS.clear()
     candidates = history_blobs(repo)
 
     # Ask git for each object's type and size in one batch rather than one
@@ -674,13 +851,32 @@ def check_secrets(repo: Path | None = None) -> Result:
         timeout=300,
     ).stdout.strip()
 
+    largest = max(
+        ((kinds[sha][1], path) for sha, path in candidates if kinds.get(sha, ("", 0))[0] == "blob"),
+        default=(0, "(none)"),
+    )
     result.note(f"  history: {commits} commits, {len(blobs)} blobs scanned")
+    result.note(f"  coverage: {COVERAGE_LIMITS}")
+    # **Printed unconditionally, including the zero.** Previously nothing was
+    # printed when no blob exceeded the cap, so "nothing was skipped" was
+    # reported by silence -- and silence is also what a broken size
+    # computation would produce. The largest blob is named too, so the margin
+    # to the cap is visible before it is crossed rather than after.
+    result.note(
+        f"  blobs over the {MAX_BLOB_BYTES:,}-byte cap: {len(oversized)}; "
+        f"largest blob {largest[0]:,} bytes ({largest[1]})"
+    )
     if oversized:
         result.note(
-            f"  NOTE: {len(oversized)} blobs exceed {MAX_BLOB_BYTES} bytes and were "
-            "skipped by size. Listed so the gap is visible rather than implicit: "
+            f"  FAIL: {len(oversized)} blob(s) exceed the cap and were NOT scanned: "
             + ", ".join(sorted({p for _, p in oversized})[:5])
+            + ". This is a FAIL rather than a note because an unscanned blob is "
+            "exactly where a pasted credential would sit, and a gate that passes "
+            "while skipping its largest files reports a clean history it did not "
+            "measure. Raise MAX_BLOB_BYTES deliberately, or split the file."
         )
+        result.passed = False
+        return result
 
     findings: list[Finding] = []
     # Read the blobs in batches through one `git cat-file --batch`.
@@ -757,16 +953,34 @@ def check_secrets(repo: Path | None = None) -> Result:
         timeout=300,
     ).stdout.splitlines()
     worktree_scanned = 0
+    worktree_skipped: list[str] = []
     for line in tracked_untracked:
         rel = line[3:].strip().strip('"')
+        # **A rename entry is `R  old -> new`, and taking it whole produced a
+        # path that does not exist, which was then skipped in silence.** The
+        # renamed file -- the one most likely to have just been touched --
+        # went unscanned while the count still went up for everything else.
+        # Take the destination, which is the file actually on disk.
+        if " -> " in rel:
+            rel = rel.split(" -> ", 1)[1].strip().strip('"')
         candidate = repo / rel
-        if not candidate.is_file() or candidate.stat().st_size > MAX_BLOB_BYTES:
+        if not candidate.is_file():
+            # Deletions land here legitimately; anything else is recorded
+            # rather than dropped, so a parsing failure is visible.
+            worktree_skipped.append(rel)
+            continue
+        if candidate.stat().st_size > MAX_BLOB_BYTES:
+            worktree_skipped.append(f"{rel} (over cap)")
             continue
         worktree_scanned += 1
         findings.extend(
             scan_bytes(candidate.read_bytes(), "worktree", rel, "(uncommitted)")
         )
-    result.note(f"  working tree: {worktree_scanned} modified/untracked files scanned")
+    result.note(
+        f"  working tree: {worktree_scanned} modified/untracked files scanned, "
+        f"{len(worktree_skipped)} skipped (deleted or unreadable)"
+        + (f": {worktree_skipped[:5]}" if worktree_skipped else "")
+    )
 
     if len(blobs) < HISTORY_BLOBS_FLOOR and repo == REPO:
         result.note(
@@ -921,7 +1135,7 @@ def control_deps_fails_closed() -> tuple[bool, str]:
         if narrowed == text:
             return False, 'could not remove "MIT" from deny.toml; the control did not apply'
         config.write_text(narrowed, encoding="utf-8")
-        proc = run([binary, "deny", "--offline", "check", "licenses", "--config", str(config)])
+        proc = run([binary, "deny", *OFFLINE, "check", "licenses", "--config", str(config)])
         combined = proc.stdout + proc.stderr
         if "unexpected argument" in combined or "Usage: cargo-deny" in combined:
             return False, (
@@ -950,16 +1164,54 @@ def control_deps_fails_closed() -> tuple[bool, str]:
 
 
 def control_deps_empty_graph_would_not_pass() -> tuple[bool, str]:
-    """The crate floor must actually be able to fire.
+    """The crate floor must actually fire on a collapsed graph.
 
-    A floor is only a check while the figure it compares against can go below
-    it. Drive `check_deps`'s floor comparison directly with a collapsed count.
+    **Rewritten; the previous version could not fail.** It asserted
+    `CRATES_FLOOR > 0` and printed a hard-coded "361 measured at 6fad2fb" --
+    a string literal, not a measurement -- while its docstring claimed to
+    drive the comparison. See `crate_floor_verdict` for why that is M5-C11's
+    eleventh instance.
+
+    This version drives the real function three ways: a collapsed count (0,
+    as an empty or broken graph would give) must be rejected, the boundary
+    just below the floor must be rejected, and **the count cargo-deny
+    actually reports right now** must be accepted. The last one is measured
+    from the live graph rather than quoted, so if the workspace ever shrank
+    below the floor this control goes red and names the real figure instead of
+    a remembered one.
     """
-    if CRATES_FLOOR <= 0:
-        return False, f"CRATES_FLOOR is {CRATES_FLOOR}, which no graph can fall below"
+    collapsed_ok, _ = crate_floor_verdict(0)
+    boundary_ok, _ = crate_floor_verdict(CRATES_FLOOR - 1)
+    exact_ok, _ = crate_floor_verdict(CRATES_FLOOR)
+    if collapsed_ok:
+        return False, "a graph of 0 crates cleared the floor; the floor cannot fire"
+    if boundary_ok:
+        return False, f"{CRATES_FLOOR - 1} crates cleared a floor of {CRATES_FLOOR}"
+    if not exact_ok:
+        return False, f"{CRATES_FLOOR} crates did not clear a floor of {CRATES_FLOOR}"
+
+    # The live figure, measured rather than quoted.
+    binary = cargo_deny_binary()
+    if binary is None:
+        return False, "cargo-deny absent, so the live half of this control DID NOT RUN"
+    listing = run([binary, "deny", *OFFLINE, "list", "-l", "crate"])
+    if listing.returncode != 0:
+        return False, (
+            "`cargo deny list` failed, so this control could not measure the live "
+            f"graph: {listing.stderr.strip().splitlines()[:1]}"
+        )
+    live = len([line for line in listing.stdout.splitlines() if "@" in line])
+    live_ok, live_note = crate_floor_verdict(live)
+    if not live_ok:
+        return False, (
+            f"the live graph is {live} crates, which does NOT clear the floor of "
+            f"{CRATES_FLOOR}: {live_note.strip()}"
+        )
     return True, (
-        f"CRATES_FLOOR={CRATES_FLOOR} against 361 measured at 6fad2fb: the "
-        "comparison has headroom in both directions, so it can still fire."
+        f"`crate_floor_verdict` rejects 0 and {CRATES_FLOOR - 1}, accepts "
+        f"{CRATES_FLOOR}, and accepts the live graph of **{live}** crates measured "
+        "now from `cargo deny list` -- so the floor has headroom in both directions "
+        "and both branches were exercised against the function the check uses"
     )
 
 
@@ -977,12 +1229,22 @@ def control_every_secret_pattern_fires() -> tuple[bool, str]:
     if extra:
         return False, f"fixtures with no pattern: {extra}"
     silent = []
+    total = 0
     for name, pattern in SECRET_PATTERNS.items():
-        if not pattern.search(SECRET_CONTROL_FIXTURES[name]):
-            silent.append(name)
+        fixtures = SECRET_CONTROL_FIXTURES[name]
+        if not fixtures:
+            return False, f"{name} has an empty fixture tuple, so it is untested"
+        for index, fixture in enumerate(fixtures):
+            total += 1
+            if not pattern.search(fixture):
+                silent.append(f"{name}[{index}]")
     if silent:
         return False, f"patterns that did NOT match their own fixture: {silent}"
-    return True, f"all {len(SECRET_PATTERNS)} patterns matched their own synthetic fixture"
+    return True, (
+        f"all {len(SECRET_PATTERNS)} patterns matched every one of their "
+        f"{total} synthetic fixtures, including both the with-username and the "
+        "empty-username URL authority forms"
+    )
 
 
 def control_secret_patterns_are_not_universal() -> tuple[bool, str]:
@@ -1040,7 +1302,7 @@ def control_history_scan_finds_a_deleted_secret() -> tuple[bool, str]:
             subprocess.run(["git", "commit", "-qm", "first"], **base)
             if with_secret:
                 (repo / "config.toml").write_bytes(
-                    b'token = "' + SECRET_CONTROL_FIXTURES["github-token"] + b'"\n'
+                    b'token = "' + SECRET_CONTROL_FIXTURES["github-token"][0] + b'"\n'
                 )
                 subprocess.run(["git", "add", "-A"], **base)
                 subprocess.run(["git", "commit", "-qm", "second"], **base)
@@ -1129,10 +1391,91 @@ def control_shallow_history_fails_the_blob_floor() -> tuple[bool, str]:
             f"{HISTORY_BLOBS_FLOOR} floor, so the floor would not notice a shallow "
             "checkout. Raise it, or the CI job's fetch-depth is the only defence."
         )
+    # The full-depth figures are measured here too, rather than quoted. A
+    # remembered "4144 blobs" beside a live shallow figure is the same
+    # hard-coded-number defect the crate-floor control carried.
+    full_commits = subprocess.run(
+        ["git", "rev-list", "--all", "--count"],
+        cwd=str(REPO),
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=300,
+    ).stdout.strip()
+    full_blobs = len(history_blobs(REPO))
     return True, (
         f"a depth-1 clone has {commits} commit and {blobs} blobs, below the "
-        f"{HISTORY_BLOBS_FLOOR} floor (full depth: 779 commits, 4144 blobs), so a "
-        "shallow CI checkout fails the gate instead of reporting a clean history"
+        f"{HISTORY_BLOBS_FLOOR} floor; full depth right now is {full_commits} commits "
+        f"and {full_blobs} objects -- so a shallow CI checkout fails the gate instead "
+        "of reporting a clean history"
+    )
+
+
+def control_working_tree_branch_is_scanned() -> tuple[bool, str]:
+    """An uncommitted secret must be found, including through a rename.
+
+    The working-tree branch had **no control at all**, which is how its
+    rename-parsing bug survived: `git status --porcelain` writes a rename as
+    `R  old -> new`, the whole string was taken as a path, and the resulting
+    non-existent file was skipped in silence. The renamed file is the one
+    someone just touched, so that is a bad thing to skip quietly.
+
+    Three cases in one throwaway repository: an untracked file, a modified
+    tracked file, and a **renamed** tracked file, each carrying a distinct
+    synthetic credential. All three must be reported as `worktree`.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = Path(tmp) / "wt"
+        repo.mkdir()
+        base = {"cwd": str(repo), "capture_output": True, "text": True, "check": True, "timeout": 120}
+        subprocess.run(["git", "init", "-q", "-b", "main"], **base)
+        subprocess.run(["git", "config", "user.email", "control@example.invalid"], **base)
+        subprocess.run(["git", "config", "user.name", "M6-04 control"], **base)
+        (repo / "README.md").write_text("harmless\n", encoding="utf-8")
+        (repo / "tracked.toml").write_text("harmless = true\n", encoding="utf-8")
+        (repo / "to-rename.toml").write_text("harmless = true\n", encoding="utf-8")
+        subprocess.run(["git", "add", "-A"], **base)
+        subprocess.run(["git", "commit", "-qm", "clean base"], **base)
+
+        # Untracked.
+        (repo / "untracked.toml").write_bytes(
+            b'token = "' + SECRET_CONTROL_FIXTURES["gitlab-pat"][0] + b'"\n'
+        )
+        # Modified tracked.
+        (repo / "tracked.toml").write_bytes(
+            b'token = "' + SECRET_CONTROL_FIXTURES["npm-token"][0] + b'"\n'
+        )
+        # Renamed tracked, with a secret in the destination.
+        subprocess.run(["git", "mv", "to-rename.toml", "renamed.toml"], **base)
+        (repo / "renamed.toml").write_bytes(
+            b'url = "' + SECRET_CONTROL_FIXTURES["url-inline-password"][1] + b'"\n'
+        )
+        subprocess.run(["git", "add", "-A"], **base)
+
+        result = check_secrets(repo=repo)
+
+    if result.passed is not False:
+        return False, f"uncommitted secrets were not reported at all: {result.lines}"
+    found = " ".join(result.lines)
+    missing = [
+        name
+        for name, needle in (
+            ("untracked", "untracked.toml"),
+            ("modified", "tracked.toml"),
+            ("renamed", "renamed.toml"),
+        )
+        if needle not in found
+    ]
+    if missing:
+        return False, (
+            f"these working-tree cases were NOT reported: {missing}. Findings were: "
+            f"{[line.strip() for line in result.lines if 'worktree' in line]}"
+        )
+    return True, (
+        "an untracked file, a modified tracked file and a **renamed** tracked file "
+        "each carrying a different synthetic credential are all reported as "
+        "`worktree` findings -- the rename through its destination path, which the "
+        "`R old -> new` parsing bug used to drop silently"
     )
 
 
@@ -1158,8 +1501,8 @@ def control_scanner_does_not_match_its_own_source() -> tuple[bool, str]:
             "offending literal across a `+` rather than allowlisting this path."
         )
     return True, (
-        "none of the 15 patterns match this file's own source, so the scanner "
-        "scans itself for real and needs no exception for its own path"
+        f"none of the {len(SECRET_PATTERNS)} patterns match this file's own source, "
+        "so the scanner scans itself for real and needs no exception for its own path"
     )
 
 
@@ -1200,7 +1543,7 @@ def control_digest_allowlist_cannot_hide_another_secret() -> tuple[bool, str]:
 
     path = "crates/tunnel-relay/src/recovery.rs"
     suppressed = scan_bytes(allowed_bytes, "control", path, "control")
-    intruder = SECRET_CONTROL_FIXTURES[allow.pattern_name]
+    intruder = SECRET_CONTROL_FIXTURES[allow.pattern_name][0]
     if hashlib.sha256(intruder).hexdigest() == allow.digest:
         return False, "the intruder fixture happens to equal the allowlisted value"
     reported = scan_bytes(intruder, "control", path, "control")
@@ -1281,6 +1624,10 @@ CONTROLS: dict[str, list[tuple[str, object]]] = {
             control_shallow_history_fails_the_blob_floor,
         ),
         (
+            "uncommitted and renamed working-tree files are scanned",
+            control_working_tree_branch_is_scanned,
+        ),
+        (
             "the scanner does not match its own source",
             control_scanner_does_not_match_its_own_source,
         ),
@@ -1308,7 +1655,19 @@ def main() -> int:
     parser.add_argument("--check", action="append", choices=sorted(CHECKS), help="run only these")
     parser.add_argument("--self-test", action="store_true", help="run the positive controls")
     parser.add_argument("--list-checks", action="store_true")
+    parser.add_argument(
+        "--no-offline",
+        action="store_true",
+        help=(
+            "let cargo-deny reach the network. Default is --offline, which needs a "
+            "populated CARGO_HOME: run `cargo fetch --locked` first, or pass this."
+        ),
+    )
     args = parser.parse_args()
+
+    global OFFLINE
+    if args.no_offline:
+        OFFLINE = []
 
     if args.list_checks:
         for name in sorted(CHECKS):
