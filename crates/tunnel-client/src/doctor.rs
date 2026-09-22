@@ -81,10 +81,14 @@ pub(crate) struct DoctorResult {
     ///
     /// # What `..._SENTINEL_PRESENT` claims, exactly (M6-C08)
     ///
-    /// It claims a **regular, executable file of the sentinel's name** is at
-    /// the resolved location. It does **not** claim that file is the
-    /// sentinel, and no code here establishes that: an executable script
-    /// named `tunnel-deadman` produces this same `ok`. The identity question
+    /// It claims a **regular file of the sentinel's name** is at the resolved
+    /// location and that **this process** has execute permission on it, asked
+    /// of the kernel with `access(EXEC_OK)` rather than read off the mode
+    /// bits -- a file executable only by a class this process is not in is
+    /// rejected, and was not by the first draft of that rule. It does **not**
+    /// claim the file is the sentinel, nor that spawning it will succeed: an
+    /// executable script named `tunnel-deadman` produces this same `ok`, and
+    /// so does a file `execve` rejects with `ENOEXEC`. The identity question
     /// is answered at bundle-assembly time, by executing the candidate and
     /// requiring the sentinel's exit 2
     /// (`scripts/client-bundle-sentinel.sh`, `scripts/m6-release-artifact.py`),
