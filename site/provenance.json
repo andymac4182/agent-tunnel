@@ -1,11 +1,11 @@
 {
-  "reviewedOriginMain": "ec663a77a6fefc756ca8bf3bb9b52b54e336fa15",
-  "lastPublishedOriginMain": "ec663a77a6fefc756ca8bf3bb9b52b54e336fa15",
-  "lastReviewAt": "2026-09-22T17:16:02+10:00",
-  "lastReviewOutcome": "Reviewed e0a403b..ec663a7 client cause mappings, CLI tests and runtime documentation. Published client exit-code troubleshooting, reserved unreachable exit 6, doctor exception and separate relay 0/1 behavior. No runtime source merged or pushed.",
+  "reviewedOriginMain": "4d775a8fd31b0fc2bc95733053afff11d4cbcb0a",
+  "lastPublishedOriginMain": "4d775a8fd31b0fc2bc95733053afff11d4cbcb0a",
+  "lastReviewAt": "2026-09-22T18:17:01+10:00",
+  "lastReviewOutcome": "Reviewed ec663a7..4d775a8 release-bundle verifier and recorded packaging limitations. Published single-target evidence boundaries and doctor null-result/sentinel-presence caveats. No runtime changes, push or merge. Release workflow remains a separate pending branch change, not part of reviewed main.",
   "reviewedDate": "2026-09-22",
   "scope": "Setup, architecture, MCP, ACP, computer use, filesystems and support boundaries",
-  "verification": "Live Chrome homepage/support checks passed at 1440 and 390 pixels: source revision, client exit-code content, internal links, no horizontal overflow, light/dark modes. Runtime tests not rerun; upstream source and tests inspected, not promoted to new acceptance evidence.",
-  "verifiedAt": "2026-09-22T17:16:02+10:00",
-  "deploymentId": "dpl_9v4wyoQKe7dQW8DVykeVtSi2ojF1"
+  "verification": "Local and live Chrome verification passed at 1440, 1920, 390 and 320 pixels: homepage, brand lab, nine docs pages, links, images, light/dark/system themes and overflow. Live setup source revision confirmed. Upstream runtime and artifact acceptance not rerun; historical evidence not promoted to new acceptance.",
+  "verifiedAt": "2026-09-22T18:17:53+10:00",
+  "deploymentId": "dpl_5GNcLuLyAAdo3UHPpjXcSZzSxEBN"
 }
