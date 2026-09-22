@@ -36,15 +36,14 @@ that is **not the build machine**.  Every check here therefore runs against the
                 error.  A bundle that omits it ships a client whose process
                 containment is off, announced only by a one-line warning the
                 first time an export arms a sentinel.  The check replays that
-                resolution rule and then **executes** the result, because
-                `resolve_sentinel` accepts any `is_file()`: a decoy of the
-                right name makes the product itself report the sentinel
-                present.  It does not ask `doctor`, whose containment answer
-                comes from that same `is_file()` and so reports a decoy as
-                present (docs/tasks.md M6-C08).  `doctor` *can* now be read on
-                an unprovisioned bundle -- it reports its checks alongside the
-                error instead of discarding them (M6-C07) -- but reading it
-                here would inherit the weaker rule.
+                resolution rule and then **executes** the result, which is the
+                step the product deliberately does not take.  Since M6-C08 the
+                product requires a regular file with an execute bit, so it now
+                rejects a zero-byte decoy too; what it still cannot do is tell
+                an executable *script* of the right name from the sentinel,
+                because that needs running the file and `doctor` promises to
+                start nothing.  Executing it here is affordable and is the
+                whole point of checking at assembly time.
   `cli`         `--help`, `--version`, both `check-config` forms and
                 `check-serve-config` on every bundled `*-relay.toml`,
                 executed from the unpacked bundle and asserting **content**,
@@ -921,22 +920,26 @@ def check_assets(bundle: Path) -> Result:
     # regardless.  **That is fixed (M6-C07): `DoctorOutput::result` is no
     # longer an `Option` and the checks are reported on every path.**
     #
-    # This check still does not ask doctor, and the reason is now a different
-    # and better one.  Doctor's containment answer comes from
-    # `availability()`, which is satisfied by `resolve_sentinel`'s bare
-    # `is_file()` -- so doctor reports `SENTINEL_PRESENT` for a zero-byte
-    # decoy.  Asking doctor would be asking a question this check already
-    # knows how to answer more strongly, and would make the release gate
-    # inherit a product defect instead of catching it.  The remaining
-    # `is_file()` weakness has its own row.
+    # This check still does not ask doctor, and the reason has narrowed twice.
+    # It is no longer that doctor reports `SENTINEL_PRESENT` for a zero-byte
+    # decoy: **M6-C08 fixed that**, and `resolve_sentinel` now requires a
+    # regular file with an execute bit, reporting anything else as
+    # `PROCESS_CONTAINMENT_SENTINEL_UNUSABLE`.  So the product would now
+    # reject the same zero-byte decoy this check rejects.
+    #
+    # What remains is the reason that was always the real one.  The product's
+    # rule is a **mode** check and stops there deliberately -- doctor promises
+    # to read a path and start nothing, and the resolution path runs before
+    # every supervised child -- so it cannot tell an executable script named
+    # `tunnel-deadman` from the sentinel.  This check can, because assembly
+    # time is where a process launch is affordable.  Asking doctor would
+    # therefore still be asking a question this check answers more strongly.
     #
     # So this replays `tunnel_deadman::resolve_sentinel`'s no-explicit-path
     # branch -- `SENTINEL_BIN` beside the running executable -- and then does
-    # the thing the product does **not** do: it runs it.  `resolve_sentinel`
-    # accepts any `is_file()`, so a zero-byte or non-executable file of the
-    # right name makes `availability()` report `Armable` while every arming
-    # attempt fails.  Executing it is what tells a present file from a working
-    # sentinel.
+    # the thing the product deliberately does **not** do: it runs it.
+    # Executing it is what tells an executable file of the right name from a
+    # working sentinel.
     client = bundle / "bin" / "tunnel-client"
     sentinel = client.parent / "tunnel-deadman"
     if not sentinel.is_file():
@@ -991,12 +994,12 @@ def check_assets(bundle: Path) -> Result:
     # instead of claimed.
     result.note("behaviour only: exit 2 on both probes does not identify the bytes; "
                 "checksums and provenance bind those, and a control measures the seam")
-    result.note("doctor is not used here: its containment answer comes from "
-                "resolve_sentinel's bare is_file(), so it reports the sentinel "
-                "present for a decoy this check rejects (M6-C08). It can now be "
-                "read on an unprovisioned bundle -- it reports the checks "
-                "alongside the error rather than discarding them (M6-C07) -- but "
-                "reading it would inherit the weaker rule")
+    result.note("doctor is not used here: since M6-C08 its containment answer "
+                "requires a regular executable file, which rejects a zero-byte "
+                "decoy, but it is a mode check and cannot tell an executable "
+                "impostor from the sentinel -- it reads a path and starts "
+                "nothing by design. This check runs the file, which is the "
+                "stronger question and is only affordable at assembly time")
     return result
 
 
