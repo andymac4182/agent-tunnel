@@ -34,6 +34,14 @@ RELEASE_COMMIT="c07d287af35cf37cfcf94290c46db2720ec47822"
 MAIN_PY_URL="https://raw.githubusercontent.com/trycua/cua/${RELEASE_COMMIT}/libs/python/computer-server/computer_server/main.py"
 MAIN_PY_SHA256="a5986dfc5e43ab3baaa9fa2ab6740dea5d6155e0f32b3f6bb444c9cd8ac9c6e4"
 
+# computer_server/handlers/base.py, the abstract handler contract every
+# concrete backend implements. main.py says which command NAMES dispatch;
+# this file says what PARAMETERS each of them takes, and M5-C06 existed
+# because only the first had ever been read. Verified identical in the sdist
+# and at the release commit, the same two ways main.py is.
+BASE_PY_URL="https://raw.githubusercontent.com/trycua/cua/${RELEASE_COMMIT}/libs/python/computer-server/computer_server/handlers/base.py"
+BASE_PY_SHA256="4c9aa3926032950ed5fd34b752e29f656090d08096c933e18f0cbbb2af64d169"
+
 workdir="$(mktemp -d)"
 trap 'rm -rf "${workdir}"' EXIT
 
@@ -70,6 +78,7 @@ echo "Re-fetching pinned cua-computer-server ${VERSION} and re-hashing."
 check "wheel  " "${WHEEL_URL}" "${WHEEL_SHA256}" "wheel"
 check "sdist  " "${SDIST_URL}" "${SDIST_SHA256}" "sdist"
 check "main.py" "${MAIN_PY_URL}" "${MAIN_PY_SHA256}" "main.py"
+check "base.py" "${BASE_PY_URL}" "${BASE_PY_SHA256}" "base.py"
 
 if [ "${failures}" -ne 0 ]; then
   echo "${failures} pinned artifact(s) did not re-hash to the recorded digest." >&2
@@ -77,4 +86,23 @@ if [ "${failures}" -ne 0 ]; then
   exit 1
 fi
 
-echo "All 3 pinned artifacts re-hashed to their recorded digests."
+echo "All 4 pinned artifacts re-hashed to their recorded digests."
+
+# The digests above are provenance: they say the bytes are the pinned bytes.
+# This says what those bytes MEAN for the adapter -- it re-derives the
+# parameter table in cua_pin.rs from the signatures in the file just fetched.
+# Deliberately a separate step with its own exit status, not a `&&` onto the
+# hashing: an `&&`-chain through a check is how M5-C11's third instance
+# skipped a whole test run without saying so.
+echo
+parity_script="$(dirname "$0")/m5-cua-param-parity.py"
+if [ ! -x "${parity_script}" ] && [ ! -f "${parity_script}" ]; then
+  echo "FAIL: ${parity_script} is missing; the parameter pin was NOT re-derived." >&2
+  exit 1
+fi
+# `if !` rather than `cmd; status=$?`, because `set -e` would abort at the
+# failing command and the explanation below would never print.
+if ! python3 "${parity_script}" "${workdir}/base.py" "${workdir}/main.py"; then
+  echo "The parameter pin no longer matches the fetched upstream source." >&2
+  exit 1
+fi

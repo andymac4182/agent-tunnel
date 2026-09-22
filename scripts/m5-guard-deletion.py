@@ -57,6 +57,24 @@ here:
   test can tell the two apart and a guard suite is the only thing that can.
   It carries `m5c4`'s pre-build, for `m5c4`'s reason.
 
+* `m5c7` -- the parameter pin: the table of parameter names read out of the
+  pinned `handlers/base.py`, the payload builder checked against it, and the
+  one narrow exception for a parameter whose loss changes nothing.
+
+  **Its first two cases restore defects this repository actually shipped.**
+  The released `/cmd` dispatcher discards any parameter its handler does not
+  declare, with no error and no log, so a wrong name is not a failed request
+  -- it is a command that runs with the wrong arguments and reports success.
+  `drag` was sent four endpoint names that upstream has never declared, and
+  `scroll` was sent the cursor point under `x`/`y`, which upstream reads as
+  wheel amounts. Neither could fail against the Lane A fixture, which accepts
+  whatever it is sent; only a pin against the fetched source could catch
+  them, and `scripts/m5-cua-param-parity.py` is the half of that pin that
+  runs against upstream rather than against us.
+
+  It spans three crates, `tunnel-http-forward` included, because the table
+  lives beside the codec. It carries `m5c4`'s pre-build, for `m5c4`'s reason.
+
 It follows `scripts/acp-guard-deletion.py` and `scripts/fs-guard-deletion.py`,
 **including their refusals, none of which may be removed**:
 
@@ -120,6 +138,11 @@ EXPORT_CHILD = EXPORT / "src" / "child.rs"
 EXPORT_HEALTH = EXPORT / "src" / "health.rs"
 EXPORT_SUPERVISOR = EXPORT / "src" / "supervisor.rs"
 DEADMAN_LIB = DEADMAN / "src" / "lib.rs"
+
+# Chunk 7. The pinned CUA artifact table lives in the forwarding codec's
+# crate, beside the profile whose wire shape it defines.
+FORWARD = REPO / "crates" / "tunnel-http-forward"
+CUA_PIN = FORWARD / "src" / "cua_pin.rs"
 
 # --no-fail-fast so every red test is named. Without it cargo stops after the
 # first failing binary, and a case witnessed by tests in two binaries reports
@@ -1120,6 +1143,22 @@ C4_CARGO_TEST = [
     "--no-fail-fast",
 ]
 
+#: Chunk 7 spans `tunnel-http-forward` too, because the pinned parameter
+#: table lives there. Omitting it would leave both table cases reporting
+#: `still green` while the rule they defeat was never compiled.
+C7_CARGO_TEST = [
+    "cargo",
+    "test",
+    "-p",
+    "tunnel-cua",
+    "-p",
+    "tunnel-http-forward",
+    "-p",
+    "tunnel-cua-fixture",
+    "--locked",
+    "--no-fail-fast",
+]
+
 C4_BUILD = [
     "cargo",
     "build",
@@ -1684,6 +1723,136 @@ CASES_C6: list[tuple[str, list[Edit], bool]] = [
     ),
 ]
 
+#: Chunk 7 -- the parameter pin (M5-C06).
+#:
+#: The command names were already pinned; the parameter names were not. The
+#: released dispatcher drops any parameter its handler does not declare,
+#: silently, so the cost of a wrong name is a command that runs with the
+#: wrong arguments and answers `success`. These cases defeat the three things
+#: that now stop that: the pinned table read out of `handlers/base.py`, the
+#: payload builder that is checked against it, and the narrow escape hatch
+#: for a parameter whose loss changes nothing.
+#:
+#: **Two of them would have been green before this chunk**, which is the
+#: point: `a_payload_may_name_a_parameter_upstream_discards` and
+#: `the_scroll_deltas_may_be_dropped_for_the_cursor_point` reproduce exactly
+#: what the adapter shipped, and the suite is what makes them red.
+CASES_C7: list[tuple[str, list[Edit], bool]] = [
+    (
+        # The original defect, restored. `drag` upstream takes a `path`; the
+        # four-name spelling was discarded whole and the call then raised a
+        # TypeError for the missing required argument -- inside a 200.
+        "a payload may name a parameter upstream discards",
+        [
+            (
+                PLAN,
+                """            json!({"command": command, "params": {
+                "path": [[start_x, start_y], [end_x, end_y]],
+            }})""",
+                """            json!({"command": command, "params": {
+                "start_x": start_x, "start_y": start_y,
+                "end_x": end_x, "end_y": end_y,
+            }})""",
+            )
+        ],
+        False,
+    ),
+    (
+        # **The subtle half, and the reason a name check alone is not
+        # enough.** `x` and `y` ARE declared on `scroll`, so sending the
+        # cursor point under them passes every name assertion -- and scrolls
+        # by the coordinate while discarding the deltas. Only the payload's
+        # value is evidence here.
+        "the scroll deltas may be dropped for the cursor point",
+        [
+            (
+                PLAN,
+                """        Params::Scroll { dx, dy, .. } => {
+            json!({"command": command, "params": {"x": dx, "y": dy}})
+        }""",
+                """        Params::Scroll { point, dx, dy, .. } => {
+            let _ = (dx, dy);
+            let (x, y) = convert(*point);
+            json!({"command": command, "params": {"x": x, "y": y}})
+        }""",
+            )
+        ],
+        False,
+    ),
+    (
+        # The pinned table itself, moved off upstream. If the table can drift
+        # without a test noticing, the payload check is the adapter agreeing
+        # with the adapter.
+        "the pinned parameter table may disagree with the payload builder",
+        [
+            (
+                CUA_PIN,
+                """        command: "drag",
+        required: &["path"],""",
+                """        command: "drag",
+        required: &["start_x"],""",
+            )
+        ],
+        False,
+    ),
+    (
+        # The escape hatch, opened. A `knowingly discarded` list that anything
+        # may join is not an exception to the pin, it is the absence of one.
+        "the knowingly-discarded list may be widened to anything",
+        [
+            (
+                CUA_PIN,
+                """pub const PARAMETERS_KNOWINGLY_DISCARDED: &[(&str, &str)] =
+    &[("screenshot", "display"), ("get_screen_size", "display")];""",
+                """pub const PARAMETERS_KNOWINGLY_DISCARDED: &[(&str, &str)] = &[
+    ("screenshot", "display"),
+    ("get_screen_size", "display"),
+    ("drag", "start_x"),
+    ("drag", "start_y"),
+    ("drag", "end_x"),
+    ("drag", "end_y"),
+];""",
+            )
+        ],
+        False,
+    ),
+    (
+        # The lookup, defeated. Returning `None` makes every command look
+        # unpinned, which a check that skipped unknown commands would have
+        # read as nothing to do.
+        "the parameter lookup may answer for no command at all",
+        [
+            (
+                CUA_PIN,
+                """    COMMAND_PARAMETERS
+        .iter()
+        .find(|entry| entry.command == command)""",
+                """    COMMAND_PARAMETERS
+        .iter()
+        .find(|entry| entry.command == command && command.is_empty())""",
+            )
+        ],
+        False,
+    ),
+    (
+        # **The fixture side**, which is code under test rather than an
+        # assertion -- the same reason `m5c5`'s sixth case binds. A fixture
+        # still reading the old spelling would record no point for a drag,
+        # and the ledger is what every dispatch test judges against.
+        "the fixture may keep reading the old drag spelling",
+        [
+            (
+                FIXTURE_LIB,
+                """    let path_start = || {
+        let first = request.pointer("/params/path/0")?.as_array()?;""",
+                """    let path_start = || {
+        let first = request.pointer("/params/start_path/0")?.as_array()?;""",
+            )
+        ],
+        False,
+    ),
+]
+
 
 @dataclass
 class Suite:
@@ -1719,6 +1888,17 @@ SUITES: list[Suite] = [
         [CRATE, EXPORT, FIXTURE],
         C4_CARGO_TEST,
         CASES_C6,
+        build=C4_BUILD,
+    ),
+    # The parameter pin spans three crates: the table lives in
+    # `tunnel-http-forward`, the payload builder in `tunnel-cua`, and the
+    # ledger that judges a drag in `tunnel-cua-fixture`. A run that omitted
+    # `tunnel-http-forward` would report `still green` for both table cases.
+    Suite(
+        "m5c7",
+        [CRATE, FORWARD, FIXTURE],
+        C7_CARGO_TEST,
+        CASES_C7,
         build=C4_BUILD,
     ),
 ]
@@ -1840,7 +2020,10 @@ def main() -> int:
         ),
     )
     parser.add_argument("--case", help="run only cases whose name contains this text")
-    parser.add_argument("--suite", help="run only this suite (m5c2, m5c3, m5c4, m5c5 or m5c6)")
+    parser.add_argument(
+        "--suite",
+        help="run only this suite (m5c2, m5c3, m5c4, m5c5, m5c6 or m5c7)",
+    )
     arguments = parser.parse_args()
 
     suites = SUITES
