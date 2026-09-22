@@ -47,9 +47,134 @@ enum Command {
     },
 }
 
+/// Every terminal cause `tunnel-client` can report, as a closed set.
+///
+/// **This type exists because a string table could not be checked.** The
+/// previous mapping matched `&'static str` with a `_ => 1` arm, so a cause
+/// whose code was absent from the table silently became exit `1`,
+/// "unexpected internal failure". Eight distinct causes were landing there,
+/// including the two an operator is most likely to meet: another connector
+/// already owns the device (`OWNER_BUSY`), and an interrupted session
+/// (`CANCELLED`). Each needs a different action, and the exit code — the
+/// only thing a supervisor, a script or a tester reads before anything
+/// else — said the same thing about all of them.
+///
+/// Both `code` and `exit_code` below match this enum exhaustively and have
+/// **no fallback arm**, and `from_client` matches `ClientError` exhaustively
+/// for the same reason. A new failure cause therefore cannot compile until
+/// someone states which operator action it implies. That is the whole point:
+/// the old table's defect was not a wrong entry, it was that nothing could
+/// ever report a missing one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Cause {
+    InvalidInvocation,
+    ConfigError,
+    InvalidConfig,
+    CredentialError,
+    AuthorizationStale,
+    TransportError,
+    SessionClosed,
+    DeadlineExceeded,
+    OwnerBusy,
+    ResourceExhausted,
+    Cancelled,
+    ProtocolError,
+    SupervisorFailed,
+    SignalError,
+}
+
+impl Cause {
+    /// The stable diagnostic code published in `--json` output.
+    ///
+    /// These strings are the external vocabulary and are matched by
+    /// operators and scripts; they are not free to drift.
+    fn code(self) -> &'static str {
+        match self {
+            Self::InvalidInvocation => "INVALID_INVOCATION",
+            Self::ConfigError => "CONFIG_ERROR",
+            Self::InvalidConfig => "INVALID_CONFIG",
+            Self::CredentialError => "CREDENTIAL_ERROR",
+            Self::AuthorizationStale => "AUTHORIZATION_STALE",
+            Self::TransportError => "TRANSPORT_ERROR",
+            Self::SessionClosed => "SESSION_CLOSED",
+            Self::DeadlineExceeded => "DEADLINE_EXCEEDED",
+            Self::OwnerBusy => "OWNER_BUSY",
+            Self::ResourceExhausted => "RESOURCE_EXHAUSTED",
+            Self::Cancelled => "CANCELLED",
+            Self::ProtocolError => "PROTOCOL_ERROR",
+            Self::SupervisorFailed => "SUPERVISOR_FAILED",
+            Self::SignalError => "SIGNAL_ERROR",
+        }
+    }
+
+    /// The stable process exit code, per the table in `docs/runtime.md`.
+    ///
+    /// Causes share a code only when they imply the *same* operator action.
+    /// Where they imply different actions they are kept apart even though
+    /// that costs a table entry:
+    ///
+    /// * `2` — the invocation or the configuration document is wrong; fix
+    ///   local input. Nothing was attempted.
+    /// * `3` — the credential or the authorization behind it was refused.
+    ///   `AUTHORIZATION_STALE` belongs here and not in the generic bucket:
+    ///   the documented meaning is "untrusted credentials / authorization
+    ///   denied", and the fix is to re-authorize, not to retry.
+    /// * `4` — the relay or the network could not be reached, or closed the
+    ///   session. A retry is meaningful once reachability returns.
+    /// * `5` — a bounded deadline elapsed.
+    /// * `7` — the work was **refused before dispatch**: the device owner
+    ///   slot is already held, or a bounded local budget was exhausted. No
+    ///   session work started, so a later retry is safe. This is separated
+    ///   from `4` because nothing is wrong with the network and from `1`
+    ///   because nothing is wrong with the build: the operator's action is
+    ///   to stop the other connector, or to wait.
+    /// * `130` — interrupted before an orderly completion could be
+    ///   recorded. An orderly `Ctrl-C` stop exits `0`; this is the case
+    ///   where cancellation won the race against the drain.
+    /// * `1` — genuinely unexpected: a protocol violation, a failed
+    ///   supervisor, or a signal subsystem error. After this change `1`
+    ///   means what it says.
+    ///
+    /// Exit `6` (`OUTCOME_UNKNOWN`) stays documented in `docs/runtime.md`
+    /// and is deliberately **absent** here: no path in this binary can
+    /// currently produce it. A variant nothing constructs would be a
+    /// surface that looks covered and is not, so the gap is named in the
+    /// documentation instead of being faked in the type.
+    fn exit_code(self) -> u8 {
+        match self {
+            Self::InvalidInvocation | Self::ConfigError | Self::InvalidConfig => 2,
+            Self::CredentialError | Self::AuthorizationStale => 3,
+            Self::TransportError | Self::SessionClosed => 4,
+            Self::DeadlineExceeded => 5,
+            Self::OwnerBusy | Self::ResourceExhausted => 7,
+            Self::Cancelled => 130,
+            Self::ProtocolError | Self::SupervisorFailed | Self::SignalError => 1,
+        }
+    }
+
+    /// Classify a connector error. Exhaustive over `ClientError` on purpose:
+    /// a new variant there must be classified here or the binary does not
+    /// build.
+    fn from_client(error: &ClientError) -> Self {
+        match error {
+            ClientError::Config(_) => Self::InvalidConfig,
+            ClientError::Credential(_) => Self::CredentialError,
+            ClientError::Invalid(_) => Self::InvalidInvocation,
+            ClientError::Protocol(_) => Self::ProtocolError,
+            ClientError::Transport { .. } => Self::TransportError,
+            ClientError::OwnerBusy => Self::OwnerBusy,
+            ClientError::HandshakeTimeout => Self::DeadlineExceeded,
+            ClientError::AuthorizationExpired => Self::AuthorizationStale,
+            ClientError::QueueLimit | ClientError::OpenRetentionFull => Self::ResourceExhausted,
+            ClientError::Cancelled => Self::Cancelled,
+            ClientError::SupervisorPanicked => Self::SupervisorFailed,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct CliError {
-    code: &'static str,
+    cause: Cause,
     message: String,
     retryable: bool,
 }
@@ -57,7 +182,7 @@ struct CliError {
 impl CliError {
     fn usage(message: impl Into<String>) -> Self {
         Self {
-            code: "INVALID_INVOCATION",
+            cause: Cause::InvalidInvocation,
             message: message.into(),
             retryable: false,
         }
@@ -65,27 +190,18 @@ impl CliError {
 
     fn from_client(error: ClientError) -> Self {
         Self {
-            code: error.code(),
+            cause: Cause::from_client(&error),
             message: error.to_string(),
             retryable: error.retryable(),
         }
     }
 
+    fn code(&self) -> &'static str {
+        self.cause.code()
+    }
+
     fn exit_code(&self) -> u8 {
-        match self.code {
-            "INVALID_INVOCATION" | "CONFIG_ERROR" | "INVALID_CONFIG" => 2,
-            "CREDENTIAL_ERROR"
-            | "CREDENTIAL_MISSING"
-            | "CREDENTIAL_INVALID"
-            | "CREDENTIAL_KEY_MISMATCH"
-            | "CREDENTIAL_PERMISSIONS"
-            | "CREDENTIAL_EXPIRED"
-            | "CREDENTIAL_NOT_YET_VALID" => 3,
-            "TRANSPORT_ERROR" | "SUPERVISOR_ABSENT" => 4,
-            "DEADLINE_EXCEEDED" => 5,
-            "OUTCOME_UNKNOWN" => 6,
-            _ => 1,
-        }
+        self.cause.exit_code()
     }
 }
 
@@ -206,7 +322,7 @@ async fn run(command: Command) -> Result<(), CliError> {
             let runtime = load_runtime_config(&config)?;
             let csr_out = resolve_cli_path(&config, &csr_out);
             let output = create_csr(&runtime, csr_out).map_err(|error| CliError {
-                code: "CREDENTIAL_ERROR",
+                cause: Cause::CredentialError,
                 message: error.to_string(),
                 retryable: false,
             })?;
@@ -227,7 +343,7 @@ async fn run(command: Command) -> Result<(), CliError> {
             let server_ca = resolve_cli_path(&config, &server_ca);
             let output =
                 import_certificate(&runtime, certificate, server_ca).map_err(|error| CliError {
-                    code: "CREDENTIAL_ERROR",
+                    cause: Cause::CredentialError,
                     message: error.to_string(),
                     retryable: false,
                 })?;
@@ -271,12 +387,12 @@ fn run_legacy_check_config(path: Option<PathBuf>) -> Result<(), CliError> {
         }
         Some(path) => {
             let input = fs::read_to_string(path).map_err(|error| CliError {
-                code: "CONFIG_ERROR",
+                cause: Cause::ConfigError,
                 message: format!("could not read legacy configuration: {error}"),
                 retryable: false,
             })?;
             ClientConfig::parse(&input).map_err(|error| CliError {
-                code: "CONFIG_ERROR",
+                cause: Cause::ConfigError,
                 message: error.to_string(),
                 retryable: false,
             })?;
@@ -298,13 +414,13 @@ async fn run_connect(path: PathBuf, json: bool) -> Result<(), CliError> {
     let handlers = tunnel_client::http_forward::HttpHandlers::new()
         .with_mcp_exports(&config)
         .map_err(|error| CliError {
-            code: "CONFIG_ERROR",
+            cause: Cause::ConfigError,
             message: error.to_string(),
             retryable: false,
         })?
         .with_acp_exports(&config)
         .map_err(|error| CliError {
-            code: "CONFIG_ERROR",
+            cause: Cause::ConfigError,
             message: error.to_string(),
             retryable: false,
         })?;
@@ -357,7 +473,7 @@ async fn run_connect(path: PathBuf, json: bool) -> Result<(), CliError> {
     loop {
         tokio::select! {
             signal = tokio::signal::ctrl_c() => {
-                signal.map_err(|error| CliError { code: "SIGNAL_ERROR", message: error.to_string(), retryable: false })?;
+                signal.map_err(|error| CliError { cause: Cause::SignalError, message: error.to_string(), retryable: false })?;
                 cancellation.cancel();
                 let _ = handle.stop().await;
                 if json {
@@ -489,7 +605,7 @@ async fn stopped_connector_error(
     match retained_closed_reason(readiness) {
         Some(reason) => closed_session_error(reason, handle.stop().await),
         None => CliError {
-            code: "SUPERVISOR_FAILED",
+            cause: Cause::SupervisorFailed,
             message: fallback_message.to_owned(),
             retryable: false,
         },
@@ -499,7 +615,7 @@ async fn stopped_connector_error(
 fn closed_session_error(reason: String, stop_result: Result<(), ClientError>) -> CliError {
     match stop_result {
         Ok(()) => CliError {
-            code: "SESSION_CLOSED",
+            cause: Cause::SessionClosed,
             message: reason,
             retryable: true,
         },
@@ -517,14 +633,14 @@ fn diagnostic_command(command: &Command) -> Option<&'static str> {
 
 fn load_runtime_config(path: &Path) -> Result<ConnectConfig, CliError> {
     let config = ConnectConfig::load(path).map_err(|error| CliError {
-        code: "CONFIG_ERROR",
+        cause: Cause::ConfigError,
         message: error.to_string(),
         retryable: false,
     })?;
     let base = path.parent().unwrap_or_else(|| Path::new("."));
     let config = config.resolve_relative_to(base);
     config.validate().map_err(|error| CliError {
-        code: "CONFIG_ERROR",
+        cause: Cause::ConfigError,
         message: error.to_string(),
         retryable: false,
     })?;
@@ -690,7 +806,7 @@ fn print_error_json(command: &str, error: &CliError) {
         ok: false,
         result: None,
         error: Some(DiagnosticError {
-            code: error.code,
+            code: error.code(),
             message: &error.message,
             retryable: error.retryable,
         }),
@@ -745,45 +861,166 @@ mod tests {
             OsString::from("--json"),
         ])
         .expect_err("network doctor is outside this slice");
-        assert_eq!(error.code, "INVALID_INVOCATION");
+        assert_eq!(error.code(), "INVALID_INVOCATION");
         assert_eq!(error.exit_code(), 2);
     }
 
+    /// Pin the code and exit status of **every** `ClientError` variant.
+    ///
+    /// The test this replaces asserted the old string table mapped
+    /// `"CREDENTIAL_EXPIRED"` to `3` and `"TRANSPORT_ERROR"` to `4`. It was
+    /// green, and it proved nothing about this binary: `CREDENTIAL_EXPIRED`
+    /// is a **doctor** code, computed in `doctor.rs` against its own exit
+    /// constants, and no `ClientError` has ever produced it. The table entry
+    /// it exercised was dead, so the test could not redden for the failure
+    /// that was actually present — six live causes falling through to
+    /// `_ => 1`. See the M5-C11 list in `docs/tasks.md`.
+    ///
+    /// Every case below therefore starts from a constructed `ClientError`,
+    /// the value a real failure path hands the CLI, rather than from a code
+    /// string the test chose itself.
     #[test]
-    fn cli_exit_codes_distinguish_config_credentials_and_transport() {
+    fn every_client_error_variant_maps_to_an_actionable_exit_code() {
+        let cases: [(ClientError, &str, u8); 11] = [
+            (
+                ClientError::Config(tunnel_client::RuntimeConfigError::Invalid("synthetic")),
+                "INVALID_CONFIG",
+                2,
+            ),
+            (
+                ClientError::Credential(tunnel_client::credentials::CredentialError::KeyMismatch(
+                    "synthetic".to_owned(),
+                )),
+                "CREDENTIAL_ERROR",
+                3,
+            ),
+            (ClientError::Invalid("synthetic"), "INVALID_INVOCATION", 2),
+            (
+                ClientError::Protocol("synthetic".to_owned()),
+                "PROTOCOL_ERROR",
+                1,
+            ),
+            (
+                ClientError::Transport {
+                    scope: "control",
+                    detail: "synthetic".to_owned(),
+                },
+                "TRANSPORT_ERROR",
+                4,
+            ),
+            (ClientError::OwnerBusy, "OWNER_BUSY", 7),
+            (ClientError::HandshakeTimeout, "DEADLINE_EXCEEDED", 5),
+            (ClientError::AuthorizationExpired, "AUTHORIZATION_STALE", 3),
+            (ClientError::QueueLimit, "RESOURCE_EXHAUSTED", 7),
+            (ClientError::OpenRetentionFull, "RESOURCE_EXHAUSTED", 7),
+            (ClientError::Cancelled, "CANCELLED", 130),
+        ];
+        let mut seen = std::collections::BTreeSet::new();
+        for (error, expected_code, expected_exit) in cases {
+            let described = format!("{error:?}");
+            let cli = CliError::from_client(error);
+            assert_eq!(cli.code(), expected_code, "code for {described}");
+            assert_eq!(cli.exit_code(), expected_exit, "exit code for {described}");
+            seen.insert(expected_code);
+        }
+        // `SupervisorPanicked` is the twelfth variant and is covered by
+        // `supervisor_failure_is_the_only_internal_connector_exit` below,
+        // which also states why it is the one that may stay at `1`.
         assert_eq!(
-            CliError::usage("bad invocation").exit_code(),
-            2,
-            "invalid invocation"
+            CliError::from_client(ClientError::SupervisorPanicked).exit_code(),
+            1,
+            "a failed supervisor is genuinely internal"
         );
-        assert_eq!(
-            CliError {
-                code: "CREDENTIAL_EXPIRED",
-                message: String::new(),
-                retryable: false,
-            }
-            .exit_code(),
-            3,
-            "credential failure"
+        assert_eq!(seen.len(), 10, "ten distinct codes across eleven variants");
+    }
+
+    /// The point of the change: causes that need different operator actions
+    /// must not share an exit code, and `1` must mean "unexpected".
+    ///
+    /// Before this change all four of the values compared here were `1`, so
+    /// every one of these assertions fails on the old mapping. That is the
+    /// red half, and `scripts/m0-guard-exit-codes.py` reproduces it by
+    /// restoring the fallback arm in the product body.
+    #[test]
+    fn causes_needing_different_actions_do_not_share_an_exit_code() {
+        let owner_busy = CliError::from_client(ClientError::OwnerBusy).exit_code();
+        let cancelled = CliError::from_client(ClientError::Cancelled).exit_code();
+        let stale = CliError::from_client(ClientError::AuthorizationExpired).exit_code();
+        let internal = CliError::from_client(ClientError::SupervisorPanicked).exit_code();
+
+        assert_ne!(
+            owner_busy, internal,
+            "another connector holding the device is not an internal failure: \
+             the operator stops that connector"
         );
+        assert_ne!(
+            cancelled, internal,
+            "an interrupted session is not an internal failure: the operator \
+             re-runs it"
+        );
+        assert_ne!(
+            stale, internal,
+            "a stale authorization is not an internal failure: the operator \
+             re-authorizes"
+        );
+        assert_ne!(
+            owner_busy, cancelled,
+            "a held owner slot and an interruption need different actions"
+        );
+
+        // …and the separations are the documented ones, not merely *some*
+        // three different numbers. An `assert_ne!` triple is satisfied by any
+        // distinct values, including nonsense ones, so pin the table too.
+        assert_eq!(owner_busy, 7, "refused before dispatch");
+        assert_eq!(cancelled, 130, "interrupted before orderly completion");
+        assert_eq!(stale, 3, "authorization denied");
+        assert_eq!(internal, 1, "unexpected internal failure");
+    }
+
+    /// Exit `1` is reserved. Anything else landing there is the regression
+    /// this row exists to stop.
+    #[test]
+    fn supervisor_failure_is_the_only_internal_connector_exit() {
+        let internal: Vec<&'static str> = [
+            ClientError::Config(tunnel_client::RuntimeConfigError::Invalid("s")),
+            ClientError::Credential(tunnel_client::credentials::CredentialError::KeyMismatch(
+                "s".to_owned(),
+            )),
+            ClientError::Invalid("s"),
+            ClientError::Protocol("s".to_owned()),
+            ClientError::Transport {
+                scope: "control",
+                detail: "s".to_owned(),
+            },
+            ClientError::OwnerBusy,
+            ClientError::HandshakeTimeout,
+            ClientError::AuthorizationExpired,
+            ClientError::QueueLimit,
+            ClientError::OpenRetentionFull,
+            ClientError::Cancelled,
+            ClientError::SupervisorPanicked,
+        ]
+        .into_iter()
+        .map(CliError::from_client)
+        .filter(|error| error.exit_code() == 1)
+        .map(|error| error.code())
+        .collect();
         assert_eq!(
-            CliError {
-                code: "TRANSPORT_ERROR",
-                message: String::new(),
-                retryable: true,
-            }
-            .exit_code(),
-            4,
-            "transport failure"
+            internal,
+            vec!["PROTOCOL_ERROR", "SUPERVISOR_FAILED"],
+            "only a protocol violation and a failed supervisor may exit 1; \
+             anything else here has no operator action and needs its own code"
         );
     }
 
     #[test]
     fn owner_busy_cli_diagnostic_is_terminal_and_actionable() {
         let error = CliError::from_client(ClientError::OwnerBusy);
-        assert_eq!(error.code, "OWNER_BUSY");
+        assert_eq!(error.code(), "OWNER_BUSY");
         assert!(!error.retryable);
-        assert_eq!(error.exit_code(), 1);
+        // Was `1`. A held owner slot is not an internal failure: the
+        // operator stops the other connector. See `Cause::exit_code`.
+        assert_eq!(error.exit_code(), 7);
         assert!(
             error
                 .message
@@ -797,7 +1034,7 @@ mod tests {
     fn closed_session_preserves_the_supervisor_error() {
         let error =
             closed_session_error("closed: owner busy".to_owned(), Err(ClientError::OwnerBusy));
-        assert_eq!(error.code, "OWNER_BUSY");
+        assert_eq!(error.code(), "OWNER_BUSY");
         assert!(!error.retryable);
         assert!(
             error
@@ -809,7 +1046,7 @@ mod tests {
     #[test]
     fn closed_session_falls_back_only_after_a_clean_stop() {
         let error = closed_session_error("stopped".to_owned(), Ok(()));
-        assert_eq!(error.code, "SESSION_CLOSED");
+        assert_eq!(error.code(), "SESSION_CLOSED");
         assert!(error.retryable);
         assert_eq!(error.message, "stopped");
     }
@@ -859,7 +1096,7 @@ mod tests {
                 .to_owned(),
             }),
         );
-        assert_eq!(joined.code, "TRANSPORT_ERROR");
+        assert_eq!(joined.code(), "TRANSPORT_ERROR");
         assert!(joined.message.contains("recovery_attempt=3"));
         assert!(
             joined
@@ -870,11 +1107,11 @@ mod tests {
         // A supervisor that was already reaped reports a clean stop, and the
         // retained reason is then the diagnostic itself.
         let reaped = closed_session_error(reason, Ok(()));
-        assert_eq!(reaped.code, "SESSION_CLOSED");
+        assert_eq!(reaped.code(), "SESSION_CLOSED");
         assert!(reaped.message.contains("recovery_attempt=3"));
 
         for error in [joined, reaped] {
-            assert_ne!(error.code, "SUPERVISOR_FAILED");
+            assert_ne!(error.code(), "SUPERVISOR_FAILED");
             assert!(!error.message.contains("status publisher stopped"));
         }
     }
