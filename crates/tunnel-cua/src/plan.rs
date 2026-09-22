@@ -399,6 +399,17 @@ pub fn dispatch_command(operation: Operation, params: &Params) -> Option<&'stati
 /// operation that has coordinates would send raw pixels, which on a scaled
 /// display is a click at the wrong place with no error anywhere -- so the one
 /// caller that can supply it ([`plan`]) always does.
+///
+/// **Every member name below is pinned.** The released `/cmd` dispatcher
+/// discards any parameter its handler does not declare, without an error, so a
+/// name chosen here rather than read from upstream fails silently on a real
+/// backend and not at all against the fixture.
+/// [`tunnel_http_forward::cua_pin::COMMAND_PARAMETERS`] records what the
+/// pinned `handlers/base.py` declares, `tests::every_payload_uses_only_pinned_parameter_names`
+/// drives this function against that table, and `scripts/m5-cua-refetch.sh`
+/// re-derives the table from the re-fetched source. See `docs/tasks.md`
+/// M5-C06 for the six names this function used to send on `drag` and `scroll`
+/// that upstream silently dropped, and for the one it still sends knowingly.
 #[must_use]
 pub fn command_payload(command: &str, params: &Params, capture: Option<&CaptureIdentity>) -> Value {
     let convert = |point: Point| {
@@ -407,6 +418,15 @@ pub fn command_payload(command: &str, params: &Params, capture: Option<&CaptureI
         })
     };
     match params {
+        // **`display` is sent knowing the released dispatcher discards it**,
+        // and that is recorded rather than hidden: see
+        // `cua_pin::PARAMETERS_KNOWINGLY_DISCARDED`. No pinned backend
+        // declares it on `screenshot` or `get_screen_size`, but none offers
+        // any other way to choose a display either, so dropping the member
+        // would buy the consumer nothing while costing the Lane A fixture the
+        // only signal by which its synthetic captures differ. The
+        // consumer-visible half -- a non-zero `display` that no pinned
+        // backend can honour -- is M5-C12.
         Params::Capture { display } | Params::ScreenInfo { display } => {
             json!({"command": command, "params": {"display": display}})
         }
@@ -419,17 +439,27 @@ pub fn command_payload(command: &str, params: &Params, capture: Option<&CaptureI
             let (x, y) = convert(*point);
             json!({"command": command, "params": {"x": x, "y": y}})
         }
+        // Upstream `drag` takes a **path**: `List[Tuple[int, int]]`, with the
+        // button and duration defaulted. A two-point path is the faithful
+        // spelling of this operation's from/to, and both ends were already
+        // bounds-checked against the capture by `resolve_capture`.
         Params::Drag { from, to, .. } => {
             let (start_x, start_y) = convert(*from);
             let (end_x, end_y) = convert(*to);
             json!({"command": command, "params": {
-                "start_x": start_x, "start_y": start_y,
-                "end_x": end_x, "end_y": end_y,
+                "path": [[start_x, start_y], [end_x, end_y]],
             }})
         }
-        Params::Scroll { point, dx, dy, .. } => {
-            let (x, y) = convert(*point);
-            json!({"command": command, "params": {"x": x, "y": y, "dx": dx, "dy": dy}})
+        // **`scroll`'s `x`/`y` are amounts, not a position.** Upstream calls
+        // `self.mouse.scroll(x, y)` with them. Sending the cursor point as
+        // `x`/`y` and the deltas as `dx`/`dy` -- which is what this did --
+        // scrolled by the *coordinate* and discarded the deltas entirely.
+        // There is no parameter on any pinned backend that scrolls at a
+        // point; the point is still resolved and bounds-checked above,
+        // because the lease and capture authority are ours to enforce, but it
+        // cannot be expressed to the backend. Filed as M5-C13.
+        Params::Scroll { dx, dy, .. } => {
+            json!({"command": command, "params": {"x": dx, "y": dy}})
         }
         // **The one place `Keystrokes::as_str` is called.** It goes into a
         // request body and nowhere else; nothing formats it.
@@ -470,8 +500,8 @@ mod tests {
     use super::*;
     use crate::capture::{CaptureId, CaptureRefusal, IDENTITY_SCALE_PERCENT};
     use crate::lease::LeaseRefusal;
-    use crate::operation::{Deferral, Refusal};
-    use crate::schema::SchemaError;
+    use crate::operation::{Button, Deferral, Refusal};
+    use crate::schema::{Keystrokes, SchemaError};
 
     const SESSION: SessionId = SessionId::new(1);
     const OTHER: SessionId = SessionId::new(2);
@@ -489,6 +519,179 @@ mod tests {
 
     fn all() -> BTreeSet<Operation> {
         Operation::ALL.into_iter().collect()
+    }
+
+    /// One of every [`Params`] variant, in declaration order.
+    ///
+    /// The count is asserted as a literal by the test below rather than
+    /// derived from this function, so a variant dropped from here cannot
+    /// shrink the check along with the evidence.
+    fn one_of_every_params_variant() -> Vec<Params> {
+        let capture = CaptureId::new(1);
+        let point = Point::new(4, 5);
+        vec![
+            Params::Describe,
+            Params::Capture { display: 0 },
+            Params::ScreenInfo { display: 0 },
+            Params::CursorPosition,
+            Params::Click {
+                capture,
+                point,
+                button: Button::Left,
+            },
+            Params::Click {
+                capture,
+                point,
+                button: Button::Right,
+            },
+            Params::DoubleClick { capture, point },
+            Params::Move { capture, point },
+            Params::Drag {
+                capture,
+                from: point,
+                to: Point::new(9, 10),
+            },
+            Params::Scroll {
+                capture,
+                point,
+                dx: 0,
+                dy: -3,
+            },
+            Params::TypeText {
+                text: Keystrokes::new("abc"),
+            },
+            Params::PressKey {
+                key: Keystrokes::new("F13"),
+            },
+            Params::Hotkey {
+                keys: vec![Keystrokes::new("cmd"), Keystrokes::new("a")],
+            },
+        ]
+    }
+
+    /// **The pin M5-C06 asked for.** Every parameter name this adapter puts on
+    /// the wire is checked against
+    /// [`tunnel_http_forward::cua_pin::COMMAND_PARAMETERS`], which is
+    /// transcribed from the pinned `handlers/base.py` and re-derived from the
+    /// re-fetched upstream source by `scripts/m5-cua-refetch.sh`.
+    ///
+    /// This is not the adapter agreeing with itself: the table is a
+    /// transcription of an external artifact that this file has no hand in,
+    /// and the refetch script is what keeps the transcription honest.
+    #[test]
+    fn every_payload_uses_only_pinned_parameter_names() {
+        use tunnel_http_forward::cua_pin;
+
+        let variants = one_of_every_params_variant();
+        // 11 variants, with `Click` present twice because the button chooses
+        // the command. Asserted as a literal: an empty list would otherwise
+        // satisfy every loop below without running once.
+        assert_eq!(variants.len(), 13, "the variant list was edited");
+
+        let mut checked_commands = BTreeSet::new();
+        for params in &variants {
+            // `Describe` dispatches no command at all; it is answered locally.
+            let Some(command) = dispatch_command(operation_of(params), params) else {
+                continue;
+            };
+            let pinned = cua_pin::parameters_for(command)
+                .unwrap_or_else(|| panic!("{command} is dispatched but has no pinned schema"));
+
+            let payload = command_payload(command, params, None);
+            let sent = payload["params"]
+                .as_object()
+                .expect("every payload carries a params object");
+
+            for name in sent.keys() {
+                let declared = pinned.required.contains(&name.as_str())
+                    || pinned.optional.contains(&name.as_str());
+                // The only escape hatch, and it is itself a pinned list: a
+                // name whose discarding changes nothing the command does.
+                let knowingly_discarded =
+                    cua_pin::PARAMETERS_KNOWINGLY_DISCARDED.contains(&(command, name.as_str()));
+                assert!(
+                    declared || knowingly_discarded,
+                    "{command} is sent `{name}`, which the pinned upstream \
+                     signature does not declare and which is not recorded as \
+                     knowingly discarded -- it would vanish without an error"
+                );
+            }
+            for required in pinned.required {
+                assert!(
+                    sent.contains_key(*required),
+                    "{command} requires `{required}` upstream and the payload omits it"
+                );
+            }
+            checked_commands.insert(command);
+        }
+
+        // Non-vacuity, and the reason this is a literal rather than a length
+        // comparison: the loop above passes trivially if `dispatch_command`
+        // starts returning `None`. Nine distinct commands are reachable from
+        // the operation set (`left_click`, `right_click`, `double_click`,
+        // `move_cursor`, `drag`, `scroll`, `type_text`, `press_key`,
+        // `hotkey`) plus `screenshot`, `get_screen_size` and
+        // `get_cursor_position`.
+        assert_eq!(
+            checked_commands.len(),
+            12,
+            "fewer commands were exercised than expected: {checked_commands:?}"
+        );
+    }
+
+    /// The names the adapter used to send, each confirmed absent from the
+    /// payloads now built. Paired with the control below so an "absent"
+    /// assertion cannot pass by looking at nothing.
+    #[test]
+    fn no_payload_carries_a_parameter_the_released_dispatcher_would_discard() {
+        use tunnel_http_forward::cua_pin;
+
+        let mut rendered = String::new();
+        for params in &one_of_every_params_variant() {
+            if let Some(command) = dispatch_command(operation_of(params), params) {
+                let payload = command_payload(command, params, None);
+                for name in payload["params"].as_object().expect("params object").keys() {
+                    for (refused_command, refused) in cua_pin::PARAMETERS_NEVER_TO_SEND {
+                        assert!(
+                            !(command == *refused_command && name == refused),
+                            "{command} still sends the discarded parameter `{refused}`"
+                        );
+                    }
+                    rendered.push_str(name);
+                    rendered.push(' ');
+                }
+            }
+        }
+
+        // **Positive control.** The assertion above is equally silent over an
+        // empty set of payloads. These names are the ones the corrected
+        // builder does send, so seeing them proves the loop ran over real
+        // payloads rather than over nothing.
+        for present in ["path", "x", "y", "text", "key", "keys"] {
+            assert!(
+                rendered.split(' ').any(|name| name == present),
+                "the control name `{present}` never appeared; the loop scanned nothing"
+            );
+        }
+    }
+
+    /// The operation a `Params` belongs to. Test-only: production code always
+    /// has the validated [`Request`], which carries both.
+    fn operation_of(params: &Params) -> Operation {
+        match params {
+            Params::Describe => Operation::Describe,
+            Params::Capture { .. } => Operation::Capture,
+            Params::ScreenInfo { .. } => Operation::ScreenInfo,
+            Params::CursorPosition => Operation::CursorPosition,
+            Params::Click { .. } => Operation::Click,
+            Params::DoubleClick { .. } => Operation::DoubleClick,
+            Params::Move { .. } => Operation::Move,
+            Params::Drag { .. } => Operation::Drag,
+            Params::Scroll { .. } => Operation::Scroll,
+            Params::TypeText { .. } => Operation::TypeText,
+            Params::PressKey { .. } => Operation::PressKey,
+            Params::Hotkey { .. } => Operation::Hotkey,
+        }
     }
 
     /// A device with no lease and no capture: what a session looks like before
@@ -568,6 +771,12 @@ mod tests {
                 "capture",
                 "screenshot",
                 json!({"display": 3}),
+                // **`display` is accepted from the consumer and not sent.**
+                // No pinned backend declares it on `screenshot`, so it was
+                // discarded upstream and selects nothing there. It is still
+                // sent -- knowingly, and recorded as such -- because removing
+                // it would give the consumer no display selection either,
+                // while the fixture does use it. M5-C12.
                 json!({"command": "screenshot", "params": {"display": 3}}),
             ),
             (
@@ -632,13 +841,21 @@ mod tests {
                 "drag",
                 json!({"capture": c, "x": 1, "y": 2, "to_x": 5, "to_y": 6}),
                 "drag",
-                json!({"start_x": 1, "start_y": 2, "end_x": 5, "end_y": 6}),
+                // The pinned `drag(path: List[Tuple[int, int]], ...)`. The
+                // four-name spelling this used to assert was discarded whole
+                // by the released dispatcher -- M5-C06.
+                json!({"path": [[1, 2], [5, 6]]}),
             ),
             (
                 "scroll",
                 json!({"capture": c, "x": 1, "y": 2, "dx": 0, "dy": -3}),
                 "scroll",
-                json!({"x": 1, "y": 2, "dx": 0, "dy": -3}),
+                // **The deltas, under the names upstream declares.** `x`/`y`
+                // on `scroll` are wheel amounts; sending the point there and
+                // the deltas as `dx`/`dy` scrolled by `(1, 2)` and dropped
+                // `(0, -3)` entirely. The point is still validated against
+                // the capture, it simply cannot be expressed -- M5-C13.
+                json!({"x": 0, "y": -3}),
             ),
             (
                 "type_text",

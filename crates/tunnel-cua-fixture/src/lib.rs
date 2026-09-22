@@ -739,14 +739,26 @@ async fn handle_cmd(
             .and_then(Value::as_u64)
             .and_then(|value| u32::try_from(value).ok())
     };
-    // `drag` names its start point differently, so the recorded point is the
-    // one the command actually acts at in each case.
+    // **`drag` carries a path, not a pair of named endpoints.** The released
+    // signature is `drag(path: List[Tuple[int, int]], ...)` -- see
+    // `tunnel_http_forward::cua_pin::COMMAND_PARAMETERS` -- so the point this
+    // command acts at first is `path[0]`, and the old `start_x`/`start_y`
+    // spelling would have been discarded by the real dispatcher without a
+    // word. `scroll` deliberately has no point: upstream's `x`/`y` there are
+    // wheel amounts, so a scroll records no coordinate at all.
+    let path_start = || {
+        let first = request.pointer("/params/path/0")?.as_array()?;
+        let axis = |index: usize| {
+            first
+                .get(index)
+                .and_then(Value::as_u64)
+                .and_then(|value| u32::try_from(value).ok())
+        };
+        Some((axis(0)?, axis(1)?))
+    };
     let point = match (coordinate("x"), coordinate("y")) {
-        (Some(x), Some(y)) => Some((x, y)),
-        _ => match (coordinate("start_x"), coordinate("start_y")) {
-            (Some(x), Some(y)) => Some((x, y)),
-            _ => None,
-        },
+        (Some(x), Some(y)) if command != "scroll" => Some((x, y)),
+        _ => path_start(),
     };
     // A count, never the text. Nothing in this fixture stores typed text.
     let typed_characters = request

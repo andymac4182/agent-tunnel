@@ -41,6 +41,9 @@ fn sources_md_records_every_digest_this_pin_claims() {
         ("the wheel", cua_pin::WHEEL_SHA256),
         ("the sdist", cua_pin::SDIST_SHA256),
         ("main.py", cua_pin::MAIN_PY_SHA256),
+        // The parameter half of the pin. Recorded separately because it is a
+        // separate file answering a separate question -- M5-C06.
+        ("handlers/base.py", cua_pin::BASE_PY_SHA256),
     ] {
         assert!(
             sources.contains(digest),
@@ -48,6 +51,40 @@ fn sources_md_records_every_digest_this_pin_claims() {
              A pin that is only in code is a pin the verification pass cannot re-check."
         );
     }
+}
+
+/// The parameter pin is only a pin because something re-derives it from the
+/// artifact. If that wiring is removed, `COMMAND_PARAMETERS` degrades to a
+/// table agreeing with itself — which is the exact shape M5-C06 was filed
+/// about, one level up. So the wiring is asserted rather than assumed.
+#[test]
+fn the_refetch_script_still_re_derives_the_parameter_pin() {
+    let root = workspace_root();
+    let refetch = std::fs::read_to_string(root.join("scripts").join("m5-cua-refetch.sh"))
+        .expect("scripts/m5-cua-refetch.sh");
+
+    assert!(
+        refetch.contains("m5-cua-param-parity.py"),
+        "the refetch script no longer invokes the parameter-parity check, so \
+         COMMAND_PARAMETERS is no longer compared against upstream by anything"
+    );
+    assert!(
+        refetch.contains(cua_pin::BASE_PY_SHA256),
+        "the refetch script no longer re-hashes handlers/base.py, so the file \
+         the parameter table is read from is unpinned"
+    );
+    assert!(
+        root.join("scripts")
+            .join("m5-cua-param-parity.py")
+            .is_file(),
+        "scripts/m5-cua-param-parity.py is missing"
+    );
+
+    // Positive control: this test reads the real script, and these two lines
+    // have been in it since M5-01. Without them the three assertions above
+    // would pass identically against an empty string.
+    assert!(refetch.contains(cua_pin::MAIN_PY_SHA256));
+    assert!(refetch.contains(cua_pin::WHEEL_SHA256));
 }
 
 #[test]
