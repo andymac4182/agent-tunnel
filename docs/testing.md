@@ -2337,6 +2337,51 @@ The following are proposed experiment sizes and acceptance targets for the first
 
 Report expected errors caused by fault injection separately from unexplained failures. Count connection generations, active/draining sockets, per-direction fence/ACK gaps, quiesce/drain/commit/retirement durations, forced closes, peer queue bytes, lease/trust freshness, operation outcomes, unknown outcomes, retries, and denied requests. Preserve a small reproducible failure trace instead of uploading all payloads or continuous desktop recordings.
 
+## Dependency, licence and secret checks (`scripts/m6-release-checks.py`)
+
+The M6-04 release gate. Four checks, each of which can be selected alone with
+`--check <name>`:
+
+| Check | What it enforces | How it can fail |
+| --- | --- | --- |
+| `deps` | `cargo-deny` **0.19.6** against `deny.toml`: a fail-closed licence allowlist, `sources` provenance, and `bans`. | An SPDX expression that cannot be satisfied from the allowlist; a non-crates.io registry or git source; fewer than 300 crates resolved; a patched crate absent from the graph; fewer than 24 workspace members in the checked set; a cargo-deny version other than the pinned one. |
+| `provenance` | `Cargo.lock` integrity and the three `[patch.crates-io]` crates under `vendor/`. | A registry package with no checksum; any git source; a vendored crate with no LICENSE text, no `license` field, or no `UPSTREAM_PATCH.md`. |
+| `secrets` | 15 credential patterns across **every blob reachable from every ref**, plus the modified and untracked working tree. | Any match that is not an allowlisted digest; fewer than 1,500 blobs scanned; an allowlist entry with no reason or that matched nothing. |
+| `visibility` | The `origin` repository's GitHub visibility. **Read-only.** | The repository is not private. A missing token or `gh` reports DID NOT RUN, which is exit 2 and is *not* a pass. |
+
+Three properties are worth knowing before reading a green result:
+
+- **Licence policy scope is every target, not the release targets.** `[graph]
+  targets` in `deny.toml` is deliberately empty, which in cargo-deny means the
+  union of all platforms. The only crate in this workspace with a copyleft
+  branch (`r-efi`, `MIT OR Apache-2.0 OR LGPL-2.1-or-later`) reaches the graph
+  only through `getrandom`'s UEFI backend, so narrowing the target list would
+  remove the one interesting case from the scan.
+- **Secret findings are reported by SHA-256 digest, never by content.** A
+  finding names its pattern, path, blob and digest. Reviewed exceptions are
+  keyed on the digest of the matched bytes rather than on a path, so an
+  exception excuses one value and a different secret in the same file is still
+  reported.
+- **The advisories check is not part of this gate.** It needs a freshly
+  fetched RustSec database; `deps` prints the local database's age and the
+  words `NOT RUN` rather than folding a stale green into the pass. See M6-C03.
+
+`--self-test` runs the **ten positive controls**, each of which plants a
+synthetic case and requires the corresponding check to go red: the licence
+policy rejecting a licence removed from the allowlist (asserted on cargo-deny's
+rejection count and verdict, not merely on a non-zero exit); every secret
+pattern matching its own fixture and none matching benign text; a credential
+committed and then deleted still being found in history; a `--depth 1` clone
+falling below the blob floor; the scanner not matching its own source; and a
+digest exception not suppressing a different secret in the same file. The CI
+job runs `--self-test` **before** the checks, so a scanner that has stopped
+working fails the job instead of passing it quietly.
+
+Run the checks against a full-depth checkout. Under a shallow clone
+`git rev-list --objects --all` returns one commit's objects, and the history
+scan would report zero findings over almost nothing; the CI job sets
+`fetch-depth: 0` and the blob floor is the backstop.
+
 ## Gates by milestone
 
 | Milestone | Required evidence before completion |

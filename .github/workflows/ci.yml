@@ -66,6 +66,49 @@ jobs:
             cargo +1.95.0 run --locked -p tunnel-relay -- check-serve-config --config "${example}"
           done
 
+  release-checks:
+    name: M6-04 dependency, licence and secret checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out full history
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+          # **`fetch-depth: 0` is load-bearing, not tidiness.** The secret scan
+          # walks every blob reachable from every ref. Under the default
+          # shallow checkout `git rev-list --objects --all` returns one
+          # commit's objects, so the scan would report zero findings over
+          # almost nothing and look exactly like a clean history. The script's
+          # own blob floor fails the job in that case rather than passing, but
+          # the floor is the backstop; this is the fix.
+          fetch-depth: 0
+      - name: Install Rust 1.95.0
+        run: rustup toolchain install 1.95.0 --profile minimal
+      - name: Install cargo-deny 0.19.6
+        # Pinned, and `--locked`: the deny.toml schema was read out of this
+        # exact version's own `init` template. The script asserts the version
+        # and fails rather than running an unknown one, because a renamed
+        # config key that is silently ignored would make the policy pass over
+        # nothing.
+        run: cargo +1.95.0 install --locked cargo-deny@0.19.6
+      - name: Prove the checks can still fail
+        # **Runs before the checks themselves, deliberately.** Each control
+        # plants a synthetic case and requires the corresponding check to go
+        # red. A green gate whose controls were never run is the defect class
+        # docs/tasks.md row M5-C11 tracks; running them first means a broken
+        # scanner fails the job instead of quietly passing it.
+        run: python3 scripts/m6-release-checks.py --self-test
+      - name: Dependency, licence, provenance and secret checks
+        # `visibility` is excluded here and only here: it needs a GitHub token
+        # with repository-metadata scope, and a token-less run would report
+        # DID NOT RUN. It is a release-time and owner-facing check rather than
+        # a per-push one. Run it locally with
+        # `python3 scripts/m6-release-checks.py --check visibility`.
+        run: |
+          python3 scripts/m6-release-checks.py \
+            --check deps --check provenance --check secrets
+
   m1-acceptance:
     name: M1 real-socket acceptance (Redis)
     runs-on: ubuntu-latest
