@@ -232,22 +232,54 @@ def is_separator(line: str) -> bool:
     return bool(re.match(r"^\s*\|[\s:|-]+\|?\s*$", line))
 
 
-def row_is_verified(line: str) -> bool:
-    """A row is verified only when its status *column* says so.
+#: The status column, per document, measured rather than guessed: every cell
+#: this file used to match sits at `docs/tasks.md` column 2 (152 rows),
+#: `docs/m7-edge-cases.md` column 5 (98 rows), and `docs/tasks.md` column 1
+#: (2 rows -- the milestone summary table, which has its own shape).  Reading
+#: a *column* is what makes the prose test below safe: "verified" appears
+#: constantly in the notes column, and matching it there would put every row
+#: in scope for the wrong reason.
+STATUS_COLUMN = {"docs/tasks.md": 2, "docs/m7-edge-cases.md": 5}
 
-    In docs/tasks.md the `[x]` checkbox only means the task item is checked; the
-    authoritative signal is the third data column (e.g. "verified local" versus
-    "implemented awaiting verification" or "in progress").  In
-    docs/m7-edge-cases.md the status column is a bare "Verified"/"Verified local"
-    cell.  Matching a status cell (not a prose mention of the word) keeps
-    awaiting-verification rows out of scope.
+#: Status spellings that contain "verified" while claiming the opposite, or
+#: claiming it only in the future: "implemented awaiting verification", "not
+#: promoted; stays implemented awaiting verification".  An allow list of
+#: positive spellings was the obvious alternative and is the defect this
+#: change exists to remove -- a hand-maintained list of the acceptable ways
+#: to say "verified" rots exactly like the one M6-C09 was about.
+NOT_A_VERIFIED_CLAIM = ("awaiting", "not promoted", "unverified", "pending", "to be verified")
+
+
+def row_is_verified(line: str, rel: str = "") -> bool:
+    """A row is verified when its status *column* claims it.
+
+    In docs/tasks.md the `[x]` checkbox only means the task item is checked;
+    the authoritative signal is the third data column (e.g. "verified local"
+    versus "implemented awaiting verification" or "in progress").  In
+    docs/m7-edge-cases.md the status column is a "Verified"/"Verified local"
+    cell.  Reading a status cell rather than prose keeps awaiting-verification
+    rows out of scope.
+
+    **This used to require the cell to equal "verified" or "verified local"
+    exactly, and that silently excluded 52 rows that claim verification in
+    other words** (M6-C10) -- "first verified local" (16 rows), "first
+    verified local at declared scope" (11), "implemented (verified local)"
+    (4), "re-verified local" (4), and a long tail of one-offs including three
+    written by the chunk that found this.  None of their citations was ever
+    checked, and the guard reported a clean pass over 252 rows without ever
+    saying which 52 it had not looked at.  A row is now verified if the old
+    exact match holds **or** its status column claims verification in any
+    words, which is a strict widening: nothing the old rule caught is lost.
     """
     cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
     for cell in cells:
-        lowered = cell.lower()
-        if lowered in ("verified", "verified local"):
+        if cell.lower() in ("verified", "verified local"):
             return True
-    return False
+    index = STATUS_COLUMN.get(rel)
+    if index is None or len(cells) <= index:
+        return False
+    status = cells[index].lower()
+    return "verified" in status and not any(no in status for no in NOT_A_VERIFIED_CLAIM)
 
 
 def row_findings(
@@ -326,7 +358,7 @@ def scan(gates: "set[str]", pins: "set[str]", verbose: bool) -> "list[str]":
         for lineno, line in enumerate(text.splitlines(), start=1):
             if not is_table_row(line) or is_separator(line):
                 continue
-            if not row_is_verified(line):
+            if not row_is_verified(line, rel):
                 continue
             rows_scanned += 1
             row, gate_n, hash_n, pin_n = row_findings(
