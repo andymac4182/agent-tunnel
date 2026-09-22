@@ -1,11 +1,11 @@
 {
-  "reviewedOriginMain": "4d775a8fd31b0fc2bc95733053afff11d4cbcb0a",
-  "lastPublishedOriginMain": "4d775a8fd31b0fc2bc95733053afff11d4cbcb0a",
-  "lastReviewAt": "2026-09-22T18:17:01+10:00",
-  "lastReviewOutcome": "Reviewed ec663a7..4d775a8 release-bundle verifier and recorded packaging limitations. Published single-target evidence boundaries and doctor null-result/sentinel-presence caveats. No runtime changes, push or merge. Release workflow remains a separate pending branch change, not part of reviewed main.",
+  "reviewedOriginMain": "9d9bc32d8251f5cec8a1eb688ee357098bb1c1b6",
+  "lastPublishedOriginMain": "9d9bc32d8251f5cec8a1eb688ee357098bb1c1b6",
+  "lastReviewAt": "2026-09-22T20:16:43+10:00",
+  "lastReviewOutcome": "Reviewed main through 9d9bc32: doctor now preserves results on failure, sentinel bundle guards and evidence-table changes. Updated setup to distinguish current main from older null-result builds. Reviewed source and CLI assertions; no new runtime acceptance claim. Release workflow is now on main; release publication remains CI-gated.",
   "reviewedDate": "2026-09-22",
   "scope": "Setup, architecture, MCP, ACP, computer use, filesystems and support boundaries",
   "verification": "Local and live Chrome verification passed at 1440, 1920, 390 and 320 pixels: homepage, brand lab, nine docs pages, links, images, light/dark/system themes and overflow. Live setup source revision confirmed. Upstream runtime and artifact acceptance not rerun; historical evidence not promoted to new acceptance.",
-  "verifiedAt": "2026-09-22T18:17:53+10:00",
-  "deploymentId": "dpl_5GNcLuLyAAdo3UHPpjXcSZzSxEBN"
+  "verifiedAt": "2026-09-22T20:16:43+10:00",
+  "deploymentId": "dpl_8PoMUpMr81sK2So8Dj24iy3ePZRp"
 }
