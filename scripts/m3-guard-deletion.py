@@ -76,8 +76,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from guard_outcomes import AppliedCase  # noqa: E402
 from guard_outcomes import check_anchors as shared_check_anchors  # noqa: E402
+from guard_outcomes import classify_outcome  # noqa: E402
 from guard_outcomes import install_interrupt_restore  # noqa: E402
+from guard_outcomes import load_witness_debt  # noqa: E402
+from guard_outcomes import read_only_entry  # noqa: E402
 from guard_outcomes import refuse_resident_mutation  # noqa: E402
+from guard_outcomes import require_declared_witnesses  # noqa: E402
+from guard_outcomes import require_git_index  # noqa: E402
 from guard_outcomes import unusable as unusable_outcomes  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
@@ -576,6 +581,17 @@ def require_clean_tree(suites: list[Suite]) -> None:
                 )
 
 
+
+def _anchor_selection(selected):
+    """Every selected case reduced to `(suite, case, edits)`.
+
+    Shared by the preflight and by the read-only `--check-anchors` entry, so
+    the two cannot drift into checking different sets -- which is the class of
+    mistake M4-36 is about.
+    """
+    return [(suite.name, case.name, case.edits) for suite, case in selected]
+
+
 def check_anchors(selected: list[tuple[Suite, Case]]) -> int:
     """Resolve every selected case's guard text, and stop (M4-27).
 
@@ -586,35 +602,33 @@ def check_anchors(selected: list[tuple[Suite, Case]]) -> int:
     """
     return shared_check_anchors(
         "m3-guard-deletion",
-        ((suite.name, case.name, case.edits) for suite, case in selected),
+        _anchor_selection(selected),
     )
 
 
-def require_declared_witnesses(selected: list[tuple[Suite, Case]]) -> None:
+def require_witnesses(selected: list[tuple[Suite, Case]]) -> None:
     """Refuse a value case that names no test, before anything is edited.
 
-    Without this the `expected_red` mechanism is opt-in, and a case added with
-    the field omitted silently falls back to the "any red will do" behaviour
-    it exists to reject -- the mechanism's own version of the defect it
-    guards.  Lifted from `scripts/m0-guard-exit-codes.py` along with the
-    mechanism, because the refusal is the half that makes it hold.
+    The refusal is the half that makes the mechanism hold: without it
+    `expected_red` is opt-in, and a case added with the field omitted falls
+    back silently to the "any red will do" behaviour it exists to reject.
+
+    This harness's own copy of the rule moved into `guard_outcomes` when
+    M4-23 gave the other three harnesses the same mechanism -- one copy, so
+    the next fix cannot be applied to some of them and not the rest.
     """
-    problems = [
-        f"[{suite.name}] {case.name}"
-        for suite, case in selected
-        if not case.expect_build_failure and not case.expected_red
-    ] + [
-        f"[{suite.name}] {case.name} (compiler refusal may not declare a witness)"
-        for suite, case in selected
-        if case.expect_build_failure and case.expected_red
-    ]
-    if problems:
-        sys.exit(
-            "m3-guard-deletion: every value case must name the test(s) that "
-            "must redden, and a compiler-refusal case must name none; a case "
-            "classified RED by an unrelated failure is not evidence for the "
-            "rule it claims. Offending case(s): " + ", ".join(problems)
-        )
+    require_declared_witnesses(
+        'm3-guard-deletion',
+        (
+            (suite.name, case.name, case.expect_build_failure, case.expected_red)
+            for suite, case in selected
+        ),
+        DEBT,
+    )
+
+
+#: This harness owes no witnesses: every value case declares one.
+DEBT = load_witness_debt('m3-guard-deletion')
 
 
 def main() -> int:
@@ -652,7 +666,17 @@ def main() -> int:
             print(f"{suite.name}: {case.name} -> {witnesses}")
         return 0
     if arguments.check_anchors:
-        return check_anchors(selected)
+        # **M4-36.**  Read-only mode is a path without write capability,
+        # not a branch in `main()`.  `read_only_entry` resolves the
+        # anchors inside a scope in which `Path.write_text`, a writing
+        # `Path.open`, `Path.unlink`, `os.replace` and `subprocess.run`
+        # all raise, so a deletion loop that becomes reachable from here
+        # raises on its first mutation and names itself instead of
+        # running the destructive suite to completion and exiting 0.
+        return read_only_entry(
+            'm3-guard-deletion',
+            _anchor_selection(selected),
+        )
     if not selected:
         sys.exit(f"m3-guard-deletion: no case matches {arguments.case!r}")
 
@@ -665,8 +689,15 @@ def main() -> int:
     # a resident mutation is a guard deleted from the product and not
     # a tidying job.  Placed *after* the `--check-anchors` dispatch so
     # read-only mode stays a pure anchor check (M4-34, M4-36).
+    # **M4-26, before anything else.**  Git writes `index.lock` and renames
+    # it over `index`, so a process killed in that window loses the index --
+    # and with no index every check that would notice a resident mutation
+    # reports clean: `git status --porcelain` calls tracked files untracked,
+    # and `git diff -- crates/` compares against nothing. This refuses rather
+    # than running blind.
+    require_git_index("m3-guard-deletion", REPO)
     refuse_resident_mutation("m3-guard-deletion", REPO)
-    require_declared_witnesses(selected)
+    require_witnesses(selected)
     require_clean_tree(suites)
 
     # **Preflight (M4-27).**  Resolve every selected case's anchors before any
@@ -708,34 +739,20 @@ def main() -> int:
                 outcome, failures = run_tests(suite)
         finally:
             sweep_residue()
-        if name in EXPECT_GREEN:
-            outcome = (
-                "DOCUMENTED GREEN"
-                if outcome == "still green"
-                else f"EXPECTED A DOCUMENTED GREEN, GOT: {outcome}"
-            )
-        elif case.expect_build_failure:
-            outcome = (
-                "REFUSED BY COMPILER"
-                if outcome == "BUILD FAILED"
-                else f"EXPECTED A COMPILER REFUSAL, GOT: {outcome}"
-            )
-        elif outcome == "BUILD FAILED":
-            outcome = "BUILD FAILED (not evidence)"
-        elif outcome == "RED":
-            # **The witness check.**  `RED` means *something* failed; it does
-            # not mean the rule this case names was the thing that noticed.
-            # An outcome spelt this way is absent from
-            # `guard_outcomes.USABLE_OUTCOMES`, so it fails the run rather
-            # than being counted as evidence for a rule it did not test.
-            missing = sorted(case.expected_red - set(failures))
-            if missing:
-                outcome = (
-                    "RED (wrong witness): expected "
-                    + ", ".join(missing)
-                    + " to redden, got "
-                    + (", ".join(failures) if failures else "nothing")
-                )
+        # **M4-23.**  The witness check this harness has always carried,
+        # now the shared rule all five use.  `RED` means *something* failed;
+        # it does not mean the rule this case names was what noticed, and an
+        # outcome spelt `RED (wrong witness)` is absent from
+        # `guard_outcomes.USABLE_OUTCOMES`, so it fails the run rather than
+        # being counted as evidence for a rule it did not test.
+        outcome = classify_outcome(
+            outcome,
+            failures,
+            documented_green=name in EXPECT_GREEN,
+            expect_build_failure=case.expect_build_failure,
+            expected_red=case.expected_red,
+            owed_witness=False,
+        )
         results.append((suite.name, name, outcome, failures))
         print(
             f"[{suite.name}] {name}: {outcome} {failures if failures else ''}".rstrip(),
@@ -764,6 +781,12 @@ def main() -> int:
                 f"{suite.name}: {compiler} further guard(s) are enforced by the "
                 "compiler and are reported separately, never counted as a red test"
             )
+
+    # **M4-26, again.**  The index loss that matters happens *mid-run*: a
+    # check only at the start would certify an index that was gone by the
+    # end, and a count from a run whose index state was not confirmed is not
+    # a measurement.
+    require_git_index("m3-guard-deletion", REPO)
 
     unusable = unusable_outcomes(
         (suite_name, name, outcome) for suite_name, name, outcome, _ in results
