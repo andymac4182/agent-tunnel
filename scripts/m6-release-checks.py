@@ -205,13 +205,30 @@ SECRET_PATTERNS: dict[str, re.Pattern[bytes]] = {
     # authoritative store in this project, so this is a credential shape it
     # would plausibly carry. Requires a non-empty value, so a commented-out or
     # empty directive does not match.
-    "redis-requirepass": re.compile(rb"requirepass[ \t=]+[^\s\"'#]+"),
-    # A populated Authorization header. Bearer requires a long opaque token
-    # and Basic a base64-looking blob, so `Authorization: Bearer <token>` in
-    # prose or a placeholder like `Bearer TOKEN` does not match.
+    #
+    # **Anchored to the start of a line**, which is where a config directive
+    # lives. Without the anchor it matched the prose "the requirepass
+    # directive sets a password" -- found by the Fable review, and the reason
+    # `control_secret_patterns_are_not_universal` now carries that sentence.
+    "redis-requirepass": re.compile(rb"(?m)^[ \t]*requirepass[ \t=]+[^\s\"'#]+"),
+    # A populated Authorization header.
+    #
+    # **The token must contain a lowercase letter and a digit**, which is true
+    # of essentially every real opaque credential and false of the
+    # SHOUTING_PLACEHOLDER spellings documentation uses. The length bound
+    # alone was not enough: it matched
+    # `Authorization: Bearer YOUR_ACCESS_TOKEN_HERE_PLEASE`, contradicting the
+    # comment that claimed placeholders were excluded. The residual limit,
+    # stated rather than glossed: an all-uppercase or all-digit real token
+    # would be missed. That is a deliberate trade for not crying wolf on every
+    # README, and it is why this pattern is a supplement to the
+    # prefix-anchored vendor patterns rather than a replacement for them.
     "http-auth-header": re.compile(
-        rb"[Aa]uthorization:\s*(?:Bearer\s+[A-Za-z0-9._\-]{20,}"
-        rb"|Basic\s+[A-Za-z0-9+/]{16,}={0,2})"
+        rb"[Aa]uthorization:\s*(?:"
+        rb"Bearer\s+(?=[A-Za-z0-9._\-]{20,})(?=[A-Za-z0-9._\-]*[a-z])"
+        rb"(?=[A-Za-z0-9._\-]*[0-9])[A-Za-z0-9._\-]{20,}"
+        rb"|Basic\s+(?=[A-Za-z0-9+/]*[a-z])(?=[A-Za-z0-9+/]*[0-9])"
+        rb"[A-Za-z0-9+/]{16,}={0,2})"
     ),
     "jwt": re.compile(rb"\beyJ[A-Za-z0-9_\-]{10,}\.eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\b"),
 }
@@ -279,9 +296,11 @@ SECRET_CONTROL_FIXTURES: dict[str, tuple[bytes, ...]] = {
         b"requirepass " + b"s3cr3tpassw0rd",
         b"requirepass=" + b"s3cr3tpassw0rd",
     ),
+    # Mixed case with digits, as a real opaque credential is -- the pattern now
+    # requires that, so an all-uppercase fixture would not exercise it.
     "http-auth-header": (
-        b"Authorization: Bearer " + b"I" * 24,
-        b"Authorization: Basic " + b"c3ludGhldGljOnBhc3N3b3Jk",
+        b"Authorization: Bearer " + b"s3cr3tT0ken" + b"Abcdef0123456789",
+        b"Authorization: Basic " + b"c3ludGhldGljOnBhc3N3b3Jk0",
     ),
     "jwt": (
         b"eyJhbGciOiJIUzI1NiJ9."
@@ -954,6 +973,7 @@ def check_secrets(repo: Path | None = None) -> Result:
     ).stdout.splitlines()
     worktree_scanned = 0
     worktree_skipped: list[str] = []
+    worktree_oversized: list[str] = []
     for line in tracked_untracked:
         rel = line[3:].strip().strip('"')
         # **A rename entry is `R  old -> new`, and taking it whole produced a
@@ -970,7 +990,10 @@ def check_secrets(repo: Path | None = None) -> Result:
             worktree_skipped.append(rel)
             continue
         if candidate.stat().st_size > MAX_BLOB_BYTES:
-            worktree_skipped.append(f"{rel} (over cap)")
+            # Same rule as the history path: an unscanned file is a FAIL, not
+            # a note. Negligible at 64 MiB, but the two paths disagreeing is
+            # how one of them quietly becomes the lenient one.
+            worktree_oversized.append(rel)
             continue
         worktree_scanned += 1
         findings.extend(
@@ -980,7 +1003,16 @@ def check_secrets(repo: Path | None = None) -> Result:
         f"  working tree: {worktree_scanned} modified/untracked files scanned, "
         f"{len(worktree_skipped)} skipped (deleted or unreadable)"
         + (f": {worktree_skipped[:5]}" if worktree_skipped else "")
+        + f", {len(worktree_oversized)} over cap"
     )
+    if worktree_oversized:
+        result.note(
+            f"  FAIL: {len(worktree_oversized)} working-tree file(s) exceed the "
+            f"{MAX_BLOB_BYTES:,}-byte cap and were NOT scanned: "
+            f"{worktree_oversized[:5]}"
+        )
+        result.passed = False
+        return result
 
     if len(blobs) < HISTORY_BLOBS_FLOOR and repo == REPO:
         result.note(
@@ -1254,6 +1286,12 @@ def control_secret_patterns_are_not_universal() -> tuple[bool, str]:
     an unread list is indistinguishable from a clean one -- the same defect
     from the other side.
     """
+    # Every line here is text that must NOT be flagged. The last four were
+    # added after the Fable review found the three newest patterns firing on
+    # them: a pattern that cries wolf on prose and documentation placeholders
+    # produces a finding list nobody reads, and an unread list is
+    # indistinguishable from a clean one -- the same defect from the other
+    # side. They are kept as fixtures so the tightenings cannot regress.
     benign = b"""
     // Ordinary source. redis://127.0.0.1:63790/ is the test Redis URL.
     let url = "redis://127.0.0.1:6379/";
@@ -1261,14 +1299,19 @@ def control_secret_patterns_are_not_universal() -> tuple[bool, str]:
     fn secret_len() -> usize { 32 }
     password = ""
     base64 payload: SGVsbG8gd29ybGQ=
+    Prose: the requirepass directive sets a password on the Redis primary.
+    Docs: send Authorization: Bearer YOUR_ACCESS_TOKEN_HERE_PLEASE with each call.
+    Docs: send Authorization: Bearer TOKEN with each call.
+    # requirepass
     """
     noisy = [name for name, p in SECRET_PATTERNS.items() if p.search(benign)]
     if noisy:
         return False, f"patterns that fired on benign text: {noisy}"
     return True, (
-        "no pattern fired on benign source containing a passwordless redis URL, "
-        "the word `secret`, an empty password and base64 -- so a finding means "
-        "something"
+        "no pattern fired on benign text containing a passwordless redis URL, the "
+        "word `secret`, an empty password, base64, **prose mentioning "
+        "`requirepass`, a commented-out `requirepass`, and two SHOUTING_PLACEHOLDER "
+        "Bearer headers** -- so a finding means something"
     )
 
 
@@ -1346,11 +1389,12 @@ def control_shallow_history_fails_the_blob_floor() -> tuple[bool, str]:
     history scan reports zero findings over almost nothing -- output
     indistinguishable from a genuinely clean history.
 
-    Measured rather than assumed: a `--depth 1` clone of this repository has 1
-    commit, 827 objects from `rev-list --objects --all`, and 689 of those are
-    blobs -- against 779 commits and 4144 blobs at full depth. So the floor
-    has to fire, and this control requires that it does, and reports the two
-    figures it compared so a green result also says that it ran.
+    Both sides are measured at run time and printed, and **this docstring
+    quotes no figure on purpose.** It used to state "779 commits and 4144
+    blobs at full depth" as fact beside a printed line that measured -- the
+    same split the crate-floor control had, a number a reader trusts sitting
+    where nothing recomputes it. A figure in prose goes stale in silence; a
+    figure in the output cannot.
     """
     with tempfile.TemporaryDirectory() as tmp:
         clone = Path(tmp) / "shallow"
@@ -1402,27 +1446,54 @@ def control_shallow_history_fails_the_blob_floor() -> tuple[bool, str]:
         check=True,
         timeout=300,
     ).stdout.strip()
-    full_blobs = len(history_blobs(REPO))
+    # `history_blobs` returns every named object, trees included, so this is an
+    # object count and is labelled as one. The shallow figure beside it is a
+    # blob count, from the scan itself; the two are not the same measure and
+    # printing both as "blobs" invited a false comparison.
+    full_objects = len(history_blobs(REPO))
     return True, (
-        f"a depth-1 clone has {commits} commit and {blobs} blobs, below the "
+        f"a depth-1 clone has {commits} commit and {blobs} blobs scanned, below the "
         f"{HISTORY_BLOBS_FLOOR} floor; full depth right now is {full_commits} commits "
-        f"and {full_blobs} objects -- so a shallow CI checkout fails the gate instead "
-        "of reporting a clean history"
+        f"and {full_objects} named objects (trees included, so an upper bound on "
+        "blobs) -- so a shallow CI checkout fails the gate instead of reporting a "
+        "clean history"
     )
 
 
 def control_working_tree_branch_is_scanned() -> tuple[bool, str]:
-    """An uncommitted secret must be found, including through a rename.
+    """An uncommitted secret must be found, including through a real rename.
 
-    The working-tree branch had **no control at all**, which is how its
+    The working-tree branch had no control at all, which is how its
     rename-parsing bug survived: `git status --porcelain` writes a rename as
     `R  old -> new`, the whole string was taken as a path, and the resulting
-    non-existent file was skipped in silence. The renamed file is the one
-    someone just touched, so that is a bad thing to skip quietly.
+    non-existent file was skipped in silence.
 
-    Three cases in one throwaway repository: an untracked file, a modified
-    tracked file, and a **renamed** tracked file, each carrying a distinct
-    synthetic credential. All three must be reported as `worktree`.
+    **The first version of this control could not fail for the rename it
+    named, and that is M5-C11's twelfth instance.** It wrote a one-line file,
+    `git mv`d it, then *replaced the entire content* with the fixture and ran
+    `git add -A`. Git's rename detection needs roughly 50% similarity, so
+    porcelain emitted `A renamed.toml` / `D to-rename.toml` and **never an
+    `R ... -> ...` line at all**. The `" -> "` branch was never entered:
+    reverting the parser fix left this control green. Its message named a
+    mechanism it had not exercised -- the same tell as instances ten and
+    eleven, in the control added to close the previous round's minor.
+
+    The tell was in the control's own output and went unread: the scan printed
+    `1 skipped`, which a real rename does not produce, and the control never
+    looked at that number. So it does now.
+
+    Four properties, each asserted rather than assumed:
+
+      1. the file keeps enough content for git to detect the rename, and
+         porcelain is **asserted** to contain an `R` line with ` -> ` before
+         anything is scanned -- if git ever stops detecting it, this control
+         fails instead of quietly testing the `A`/`D` path;
+      2. **no `git add -A`**, so the untracked file stays `??` and the
+         modified file stays ` M`. Staging everything made the "untracked"
+         case an `A` entry, so that half was untested too;
+      3. all three secrets are reported as `worktree` findings;
+      4. the scan reports **0 skipped** -- the figure that would have exposed
+         the original defect immediately.
     """
     with tempfile.TemporaryDirectory() as tmp:
         repo = Path(tmp) / "wt"
@@ -1431,31 +1502,73 @@ def control_working_tree_branch_is_scanned() -> tuple[bool, str]:
         subprocess.run(["git", "init", "-q", "-b", "main"], **base)
         subprocess.run(["git", "config", "user.email", "control@example.invalid"], **base)
         subprocess.run(["git", "config", "user.name", "M6-04 control"], **base)
+
+        # Substantial, stable content: the rename is only detectable because
+        # most of the file survives it.
+        body = "".join(f"line {i} of stable content git can match on\n" for i in range(40))
         (repo / "README.md").write_text("harmless\n", encoding="utf-8")
-        (repo / "tracked.toml").write_text("harmless = true\n", encoding="utf-8")
-        (repo / "to-rename.toml").write_text("harmless = true\n", encoding="utf-8")
+        (repo / "tracked.toml").write_text(body, encoding="utf-8")
+        (repo / "to-rename.toml").write_text(body, encoding="utf-8")
         subprocess.run(["git", "add", "-A"], **base)
         subprocess.run(["git", "commit", "-qm", "clean base"], **base)
 
-        # Untracked.
+        # Untracked -- left unstaged, so it appears as `??`.
         (repo / "untracked.toml").write_bytes(
             b'token = "' + SECRET_CONTROL_FIXTURES["gitlab-pat"][0] + b'"\n'
         )
-        # Modified tracked.
-        (repo / "tracked.toml").write_bytes(
-            b'token = "' + SECRET_CONTROL_FIXTURES["npm-token"][0] + b'"\n'
-        )
-        # Renamed tracked, with a secret in the destination.
+        # Modified tracked -- appended, left unstaged, so it appears as ` M`.
+        with (repo / "tracked.toml").open("ab") as handle:
+            handle.write(b'token = "' + SECRET_CONTROL_FIXTURES["npm-token"][0] + b'"\n')
+        # Renamed tracked. `git mv` stages the rename; appending keeps the
+        # similarity high enough for git to report it as one.
         subprocess.run(["git", "mv", "to-rename.toml", "renamed.toml"], **base)
-        (repo / "renamed.toml").write_bytes(
-            b'url = "' + SECRET_CONTROL_FIXTURES["url-inline-password"][1] + b'"\n'
-        )
-        subprocess.run(["git", "add", "-A"], **base)
+        with (repo / "renamed.toml").open("ab") as handle:
+            handle.write(
+                b'url = "' + SECRET_CONTROL_FIXTURES["url-inline-password"][1] + b'"\n'
+            )
+
+        porcelain = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=all"],
+            cwd=str(repo),
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=120,
+        ).stdout
+        rename_lines = [
+            line for line in porcelain.splitlines() if line[:1] == "R" and " -> " in line
+        ]
+        untracked_lines = [line for line in porcelain.splitlines() if line.startswith("??")]
+        if not rename_lines:
+            return False, (
+                "git did not report a rename, so the ` -> ` parsing branch is NOT "
+                f"exercised and this control proves nothing. Porcelain was: "
+                f"{porcelain.splitlines()}"
+            )
+        if not untracked_lines:
+            return False, (
+                "no `??` entry, so the untracked branch is not exercised: "
+                f"{porcelain.splitlines()}"
+            )
 
         result = check_secrets(repo=repo)
 
     if result.passed is not False:
         return False, f"uncommitted secrets were not reported at all: {result.lines}"
+
+    worktree_line = next(
+        (line for line in result.lines if line.strip().startswith("working tree:")), ""
+    )
+    skipped = re.search(r"(\d+) skipped", worktree_line)
+    if not skipped:
+        return False, f"could not read a skipped count from {worktree_line!r}"
+    if int(skipped.group(1)) != 0:
+        return False, (
+            f"the scan skipped {skipped.group(1)} working-tree file(s) and still "
+            "passed this control. A skipped file is how the rename bug hid: "
+            f"{worktree_line.strip()}"
+        )
+
     found = " ".join(result.lines)
     missing = [
         name
@@ -1472,10 +1585,11 @@ def control_working_tree_branch_is_scanned() -> tuple[bool, str]:
             f"{[line.strip() for line in result.lines if 'worktree' in line]}"
         )
     return True, (
-        "an untracked file, a modified tracked file and a **renamed** tracked file "
-        "each carrying a different synthetic credential are all reported as "
-        "`worktree` findings -- the rename through its destination path, which the "
-        "`R old -> new` parsing bug used to drop silently"
+        f"git reported a real rename ({rename_lines[0].strip()}) and a `??` entry, and "
+        "an untracked file, a modified tracked file and a renamed tracked file each "
+        "carrying a different synthetic credential are all reported as `worktree` "
+        "findings, with **0 skipped** -- so the ` -> ` branch was actually entered "
+        "rather than named"
     )
 
 
