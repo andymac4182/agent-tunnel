@@ -1,0 +1,93 @@
+name: Main development release
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: main-release-${{ github.event.workflow_run.id }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: macos-15
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
+      - name: Install pinned toolchain
+        run: rustup toolchain install 1.95.0 --profile minimal --target "${{ matrix.target }}"
+      - name: Test packaging
+        run: python3 scripts/test_package_release.py
+      - name: Fetch locked dependencies and licence sources
+        run: cargo +1.95.0 fetch --locked
+      - name: Build release binaries
+        run: cargo +1.95.0 build --release --locked --target "${{ matrix.target }}" -p tunnel-client -p tunnel-relay -p tunnel-deadman --bins
+      - name: Smoke test native binaries
+        run: |
+          set -euo pipefail
+          target/${{ matrix.target }}/release/tunnel-client --help
+          target/${{ matrix.target }}/release/tunnel-client config check --config examples/m1-client.toml
+          target/${{ matrix.target }}/release/tunnel-relay check-serve-config --config examples/m1-relay.toml
+      - name: Package and checksum
+        env:
+          SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}
+          SOURCE_RUN: ${{ github.event.workflow_run.id }}
+        run: python3 scripts/package_release.py --target "${{ matrix.target }}" --sha "$SOURCE_SHA" --run "$SOURCE_RUN" --output dist
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+      - name: Publish complete development release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}
+          SOURCE_RUN: ${{ github.event.workflow_run.id }}
+        run: python3 scripts/publish_release.py --sha "$SOURCE_SHA" --run "$SOURCE_RUN" --directory dist

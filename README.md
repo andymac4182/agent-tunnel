@@ -1,4 +1,8 @@
-# Agent Tunnel
+# Agent Uplink
+
+Previously Agent Tunnel. The repository is now
+[`andymac4182/agentuplink`](https://github.com/andymac4182/agentuplink).
+Existing `tunnel-*` binaries, package names, and wire identifiers are unchanged.
 
 A Rust reverse tunnel that will let hosts and agents access MCP servers, virtual filesystems, computer-use services, and CLI agents on enrolled computers through outbound connections.
 

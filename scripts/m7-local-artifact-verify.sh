@@ -17,14 +17,18 @@ usage() {
 Usage:
   scripts/m7-local-artifact-verify.sh \
     --client-bin PATH \
-    [--harness-bin PATH] [--relay-bin PATH] [--profile NAME] \
+    [--harness-bin PATH] [--relay-bin PATH] [--deadman-bin PATH] \
+    [--profile NAME] \
     [--build-receipt PATH] \
     [--output-dir DIR] [--] ACCEPTANCE_COMMAND [ARG...]
 
 The command must be run from the repository checkout or with repository-
 relative binary paths.  --client-bin is required.  --harness-bin and
 --relay-bin are optional additional root-built binaries to put in the
-unpacked bundle.  --profile is normally debug or release and is inferred from
+unpacked bundle.  --deadman-bin names the parent-death sentinel and defaults
+to tunnel-deadman beside --client-bin; unlike the other two it is not
+optional, because the client resolves the sentinel relative to its own
+executable and a bundle without one ships degraded process containment.  --profile is normally debug or release and is inferred from
 the first binary path when omitted; pass it explicitly for a custom profile.
 
 --build-receipt consumes a trusted source-parity receipt produced by
@@ -177,9 +181,20 @@ caller_root=$(pwd -P)
 bounded_runner=$repo_root/scripts/m7-run-bounded.py
 preflight_timeout_seconds=10
 
+# The single shared statement of what a client bundle must contain beside the
+# client.  Shared as an assertion rather than as a binary list, because the
+# assemblers legitimately carry different binaries and what they must agree on
+# is narrower than any of their lists.  See the file's own header.
+client_bundle_sentinel_lib=$repo_root/scripts/client-bundle-sentinel.sh
+[ -f "$client_bundle_sentinel_lib" ] \
+    || die "missing $client_bundle_sentinel_lib; the client-bundle sentinel rule cannot be asserted"
+# shellcheck source=scripts/client-bundle-sentinel.sh
+. "$client_bundle_sentinel_lib"
+
 client_input=
 harness_input=
 relay_input=
+deadman_input=
 profile=
 build_receipt_input=
 output_base=$repo_root/work/m7-local-artifact-verify
@@ -200,6 +215,11 @@ while [ "$#" -gt 0 ]; do
         --relay-bin)
             [ "$#" -ge 2 ] || usage
             relay_input=$2
+            shift 2
+            ;;
+        --deadman-bin)
+            [ "$#" -ge 2 ] || usage
+            deadman_input=$2
             shift 2
             ;;
         --profile)
@@ -315,6 +335,23 @@ if [ -n "$relay_input" ]; then
     relay_file_type=$validate_binary_type
 fi
 
+# The sentinel is not an optional extra like the harness and the relay: the
+# client resolves it relative to its own current_exe(), so a bundle holding a
+# client without one ships degraded process containment (M6-C06).  This
+# script is an observer and does not build, so it cannot conjure the file --
+# but it does not need a new flag from the caller in the normal case either,
+# because every directory that contains a freshly built tunnel-client also
+# contains the tunnel-deadman built beside it.  Default to that, let
+# --deadman-bin override it, and fail rather than assemble a degraded bundle.
+if [ -z "$deadman_input" ]; then
+    deadman_input=$(dirname -- "$client_path")/tunnel-deadman
+    [ -f "$deadman_input" ] \
+        || die "no tunnel-deadman beside $client_path and no --deadman-bin given; the client resolves its sentinel relative to its own executable, so a bundle without one degrades process containment"
+fi
+validate_binary tunnel-deadman "$deadman_input"
+deadman_path=$validate_binary_path
+deadman_file_type=$validate_binary_type
+
 case "$output_base" in
     /*) ;;
     *) output_base=$caller_root/$output_base ;;
@@ -391,12 +428,15 @@ copy_binary() {
 }
 
 copy_binary tunnel-client "$client_path" "$client_file_type"
+copy_binary tunnel-deadman "$deadman_path" "$deadman_file_type"
 if [ -n "$harness_path" ]; then
     copy_binary tunnel-test-harness "$harness_path" "$harness_file_type"
 fi
 if [ -n "$relay_path" ]; then
     copy_binary tunnel-relay "$relay_path" "$relay_file_type"
 fi
+
+assert_client_sentinel_beside "$bin_dir" m7-local-artifact-verify
 
 # Read one `key=value` line from the immutable source-parity receipt.  The
 # receipt is produced by scripts/m7-local-source-parity-build.sh and only

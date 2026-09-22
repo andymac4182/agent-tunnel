@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Agent Uplink is building the connection between cloud agents and the tools, files, and local agents on your computers. Outbound connections. Explicit permissions.">
+  <meta name="theme-color" content="#f5f6f5">
+  <meta property="og:title" content="Agent Uplink - Your agents. Your machines.">
+  <meta property="og:description" content="A scoped connection from cloud agents to local capabilities. In development.">
+  <title>Agent Uplink - Your agents. Your machines.</title>
+  <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/theme.css">
+  <script src="/theme.js"></script>
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+  <header class="header wrap">
+    <a class="brand" href="#" aria-label="Agent Uplink home"><span class="mark" aria-hidden="true">↗</span> Agent Uplink</a>
+    <nav aria-label="Main navigation"><a href="/docs/">Documentation</a><a href="/docs/setup">Setup</a><a href="/docs/support">Support</a><a href="/brand-lab">Brand lab</a></nav>
+  </header>
+  <main id="main">
+    <section class="hero" aria-labelledby="hero-title">
+      <div class="wrap hero-content">
+        <p class="eyebrow"><span class="dot"></span> IN DEVELOPMENT</p>
+        <h1 id="hero-title">Agent Uplink</h1>
+        <p class="hero-line">Your agents.<br>Your machines.<br>Connected.</p>
+        <p class="hero-copy">Bring the tools and files on your computers within reach of your cloud agents. You choose what gets through.</p>
+        <a class="button" href="/docs/setup">Read the setup guide <span aria-hidden="true">↗</span></a>
+      </div>
+      <span class="photo-note">Illustrative workspace</span>
+    </section>
+    <section class="intro wrap" id="connection">
+      <p class="eyebrow">01 / THE CONNECTION</p>
+      <div class="section-heading"><h2>Keep your workflow.<br>Extend its reach.</h2><p>Your agent can run in the cloud. Your workspace can stay on your computer. Agent Uplink is building the permissioned connection between them.</p></div>
+      <ol class="flow">
+        <li><span class="step">01</span><h3>Your agent</h3><p>An authorized agent or application requests a specific device and service.</p></li>
+        <li><span class="step">02</span><h3>Agent Uplink</h3><p>The relay checks scoped grants and routes traffic to the enrolled machine.</p></li>
+        <li><span class="step">03</span><h3>Your computer</h3><p>The local client connects outbound and exposes only configured capabilities.</p></li>
+      </ol>
+      <div class="principles"><span>No inbound desktop port</span><span>Mutual TLS device identity</span><span>Explicit device and service grants</span></div>
+    </section>
+    <section class="capabilities" id="capabilities">
+      <div class="wrap">
+        <p class="eyebrow">02 / LOCAL CAPABILITIES, REMOTE REACH</p>
+        <div class="section-heading"><h2>A connection to what<br>your agent needs.</h2><p>One transport foundation, with purpose-built adapters. Capabilities are under active development, not a general-availability promise.</p></div>
+        <div class="capability-grid">
+          <article><span class="category">MCP</span><h3>Tools where they live.</h3><p>Connect authorized consumers to allowlisted local MCP services, with HTTP and stdio bridge work underway.</p><span class="state">Implementation in progress</span></article>
+          <article><span class="category">FILESYSTEM</span><h3>Your files. Defined boundaries.</h3><p>Scoped filesystem mounts over a shared TypeScript client, with adapters for Files SDK, Mastra, AI SDK and just-bash.</p><span class="state">Implementation in progress</span></article>
+          <article><span class="category">ACP</span><h3>Reach your local agents.</h3><p>Route agent sessions to allowlisted CLI agents supervised on your enrolled computer.</p><span class="state">Implementation in progress</span></article>
+          <article><span class="category">COMPUTER USE</span><h3>Beyond the terminal.</h3><p>Explicitly authorized computer-use adapters and synthetic fixtures. Dedicated desktop VM verification is still required.</p><a class="state" href="/docs/cua">Implementation and support limits</a></article>
+        </div>
+      </div>
+    </section>
+    <section class="boundaries wrap">
+      <p class="eyebrow">03 / A CLEAR BOUNDARY</p>
+      <div class="section-heading"><h2>A gateway.<br>Not another agent platform.</h2><p>Keep your model, orchestration and conversation history where they belong. Agent Uplink focuses on access to local capabilities.</p></div>
+      <div class="boundary-list"><p><strong>Deliberate access</strong><span>Device, service and operation scopes, backed by local configuration.</span></p><p><strong>Honest failure semantics</strong><span>Transport delivery is not proof of a completed action. Ambiguous effects are not automatically replayed.</span></p><p><strong>An explicit trust model</strong><span>The relay terminates encrypted connections and is trusted with service traffic. This is not end-to-end encryption.</span></p></div>
+    </section>
+    <section class="status" id="status"><div class="wrap status-inner"><div><p class="eyebrow">04 / BUILDING IN THE OPEN ABOUT OUR LIMITS</p><h2>Early days.<br>Solid boundaries.</h2></div><div><p>The authenticated transport and ordered rotation have local verification evidence. Adapter, cluster, platform and release work remain. Agent Uplink is not yet a production-ready release or a generally available hosted service.</p><p class="status-footnote">Previously Agent Tunnel. Same project, a new name.</p><a class="text-link" href="#capabilities">Explore the planned capabilities <span aria-hidden="true">↑</span></a></div></div></section>
+  </main>
+  <footer class="wrap"><a class="brand" href="#"><span class="mark" aria-hidden="true">↗</span> Agent Uplink</a><p>Cloud agents. Local capabilities.</p><a href="#status">In development</a></footer>
+</body>
+</html>
