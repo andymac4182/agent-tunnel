@@ -27,10 +27,21 @@ members = [
 ]
 resolver = "3"
 
-# The advertised release commitment.  **This table is the single referent for
+# The advertised release commitment.  **This table is the single AUTHORITY for
 # the word "advertised"**; before it existed, docs/tasks.md rows M6-01 and
 # M6-C04 recorded at length that the word had none, so any claim to have built
 # for "every advertised target" was a claim about a set the claimant chose.
+#
+# **"Single authority" does not mean "the only place the triples appear", and
+# saying it did was itself a defect (M6-C18).**  Two consumers cannot read this
+# table at the moment they need it -- `.github/workflows/release.yml`'s matrix
+# is evaluated by GitHub before any script runs, and `site/releases.js` runs in
+# a browser that has no access to this file.  Both therefore keep a literal
+# copy, and both are **machine-compared to this table** by
+# `scripts/m6-release-checks.py --check packaging`, which fails if either
+# diverges.  A copy that is bound is a different thing from a copy that is
+# unreconciled; `site/releases.js` was the second kind until M6-C18, and it is
+# the one that decides what the public is actually offered.
 #
 # **The set is the one `.github/workflows/release.yml` already builds and
 # `site/docs/downloads.html` already advertises, by owner decision (M6-C11):
@@ -49,8 +60,11 @@ resolver = "3"
 # `scripts/m6-release-checks.py` parse this file with `tomllib` -- both already
 # read it (`workspace_members()` and the lockfile beside it) -- and `cargo`
 # itself surfaces the same table at `cargo metadata --no-deps --format-version 1`
-# under `.metadata.release`, verified on this host to return exactly
-# `{"release": {"advertised-targets": [...]}}`.  A dedicated `release-targets.toml`
+# under `.metadata.release`, verified on this host to return this table's
+# contents -- `{"release": {"advertised-targets": [...], "repository-visibility":
+# "public"}}`, i.e. every key declared here, not `advertised-targets` alone, as
+# an earlier version of this comment claimed (M6-C19).  A dedicated
+# `release-targets.toml`
 # would have exactly one reader, the script's own parser, so "what is declared"
 # and "what the script parsed" would be the same act and a parser fault would be
 # invisible.  `scripts/m6-release-artifact.py verify --check targets` requires

@@ -1102,13 +1102,56 @@ def check_secrets(repo: Path | None = None) -> Result:
 # whatever it is named. `x86_64-pc-windows-msvc`, `aarch64-apple-darwin`, etc.
 TRIPLE_LITERAL = re.compile(r"\b(?:x86_64|aarch64|i686|armv7|riscv64gc|s390x|powerpc64le)-[a-z0-9_]+-[a-z0-9_.-]+\b")
 # `target: <triple>` inside the workflow's build matrix.
+# Matches ANY `target:` key at any indentation, not only matrix entries, so a
+# `with: target: ...` step elsewhere in the workflow would be counted as one.
+# Measured at this branch: all 4 matches are the matrix `include` entries and
+# no `with: target:` exists, so the "matrix" wording is accurate today. The
+# imprecision is left deliberately because it **fails closed** -- a stray
+# `target:` adds an entry the declaration does not contain and the comparison
+# FAILs; it can never hide a divergence. Scoping this to the matrix block
+# means parsing YAML structure, which is a larger change than the fault.
 WORKFLOW_MATRIX_TARGET = re.compile(r"(?m)^\s*target:\s*([A-Za-z0-9_][A-Za-z0-9_.-]*)\s*$")
 PACKAGER = "scripts/package_release.py"
 RELEASE_WORKFLOW = ".github/workflows/release.yml"
+SITE_RELEASES = "site/releases.js"
+DECLARED_TRIPLE_RE = re.compile(r"[0-9a-z_]+(?:-[0-9a-z_.]+){2,3}")
+
+# `site/releases.js` is loaded by every page under `site/docs/` and is the
+# **machine-readable public advertisement**: it shows a release only when an
+# asset exists for every triple in its own `targets` array, then labels each
+# one.  `downloads.html` is prose; this file is the consumer that decides what
+# the public is actually offered.  A browser cannot read `Cargo.toml` at
+# runtime, so -- exactly as for `release.yml`'s matrix, which has the same
+# constraint -- the literal stays and is **bound** here instead.
+#
+# Retiring a triple from the workflow and the manifest in one commit, with
+# this file left alone, makes the site require an asset that is no longer
+# built and render "No complete development release is published yet" for
+# every release from then on.  Adding one has the mirror failure: the site
+# never lists it.  Neither is visible to any other check.
+SITE_TARGETS_ARRAY = re.compile(r"(?m)^\s*const\s+targets\s*=\s*\[([^\]]*)\]\s*;")
+SITE_LABELS_ARRAY = re.compile(r"(?m)^\s*const\s+labels\s*=\s*\[([^\]]*)\]\s*;")
+
+
+def site_array(source: str, pattern: re.Pattern[str]) -> list[str] | None:
+    """The string items of a single-line JS array literal, or None if absent.
+
+    None is distinct from `[]` on purpose: "the array this check binds could
+    not be found" and "the array is empty" are different failures, and only
+    the second could ever be a real declaration. Returning `[]` for a renamed
+    or reformatted array would let it compare equal to nothing -- the
+    "scanned nothing" shape docs/tasks.md M5-C11 catalogues.
+    """
+    found = pattern.search(source)
+    if found is None:
+        return None
+    return [item.strip().strip("'\"") for item in found.group(1).split(",")
+            if item.strip()]
 
 
 def packaging_verdict(declared: list[str], matrix: list[str],
-                      packager_source: str) -> tuple[bool, list[str]]:
+                      packager_source: str,
+                      site_source: str) -> tuple[bool, list[str]]:
     """Compare the declaration against the workflow matrix and the packager.
 
     Pure, so `--self-test` can drive it in both directions with recorded
@@ -1151,6 +1194,44 @@ def packaging_verdict(declared: list[str], matrix: list[str],
         ok = False
     else:
         notes.append(f"  {PACKAGER} carries no target-triple literal; it derives the set")
+
+    # The public advertisement.  Bound rather than derived, because a browser
+    # cannot read the manifest at runtime -- the same constraint as the
+    # workflow matrix above, handled the same way.
+    site_targets = site_array(site_source, SITE_TARGETS_ARRAY)
+    site_labels = site_array(site_source, SITE_LABELS_ARRAY)
+    if site_targets is None:
+        notes.append(
+            f"  FAIL: no `const targets = [...]` array found in {SITE_RELEASES}. Either "
+            "the public advertisement stopped declaring one or this check's pattern no "
+            "longer matches it; an array that cannot be found must never compare equal "
+            "to the declaration."
+        )
+        ok = False
+    elif sorted(set(site_targets)) != declared_set:
+        missing = [t for t in declared_set if t not in site_targets]
+        extra = [t for t in sorted(set(site_targets)) if t not in declared_set]
+        notes.append(
+            f"  FAIL: {SITE_RELEASES} and the declaration disagree. Declared but not "
+            f"offered by the site: {missing or 'none'}. Offered but not declared: "
+            f"{extra or 'none'}. The site shows a release only when an asset exists for "
+            "every triple in its own array, so a declared target it does not list is "
+            "never offered, and one it lists but nobody builds hides every release."
+        )
+        ok = False
+    elif site_labels is None or len(site_labels) != len(site_targets):
+        notes.append(
+            f"  FAIL: {SITE_RELEASES} pairs `targets[i]` with `labels[i]` when it renders "
+            f"the download list, and it declares {len(site_targets)} target(s) against "
+            f"{'no labels array' if site_labels is None else str(len(site_labels)) + ' label(s)'}. "
+            "A length mismatch mislabels a download or throws while rendering."
+        )
+        ok = False
+    else:
+        notes.append(
+            f"  {SITE_RELEASES} advertises exactly the declared set, with "
+            f"{len(site_labels)} label(s) paired to {len(site_targets)} target(s)"
+        )
     return ok, notes
 
 
@@ -1165,7 +1246,8 @@ def check_packaging() -> Result:
 
     workflow = REPO / RELEASE_WORKFLOW
     packager = REPO / PACKAGER
-    for path in (workflow, packager):
+    site = REPO / SITE_RELEASES
+    for path in (workflow, packager, site):
         if not path.is_file():
             result.ran = False
             result.reason = (
@@ -1177,15 +1259,18 @@ def check_packaging() -> Result:
 
     matrix = WORKFLOW_MATRIX_TARGET.findall(workflow.read_text(encoding="utf-8"))
     result.note(f"  declared: [workspace.metadata.release] advertised-targets = {declared}")
-    ok, notes = packaging_verdict(declared, matrix, packager.read_text(encoding="utf-8"))
+    ok, notes = packaging_verdict(declared, matrix,
+                                  packager.read_text(encoding="utf-8"),
+                                  site.read_text(encoding="utf-8"))
     for line in notes:
         result.note(line)
     result.note(
         "  NOTE: this check reads the workflow as text. It has never run on a hosted "
         "runner -- Actions billing has blocked this repository since 2026-09-11 -- so "
-        "agreement here is agreement between two files, not evidence that the matrix "
-        "builds. `site/docs/downloads.html` states the platforms in prose and is NOT "
-        "machine-compared; that residue is recorded on M6-C11."
+        "agreement here is agreement between files, not evidence that the matrix "
+        f"builds. {SITE_RELEASES} -- the machine-readable public advertisement -- IS "
+        "compared here since M6-C18. `site/docs/downloads.html` states the platforms in "
+        "prose and is still NOT machine-compared; that residue is recorded on M6-C11."
     )
     result.passed = ok
     return result
@@ -1239,6 +1324,14 @@ def declared_targets() -> list[str]:
         raise ValueError("`advertised-targets` must be a non-empty list")
     if not all(isinstance(t, str) for t in targets):
         raise ValueError("`advertised-targets` must be a list of strings")
+    # Same acceptance rule as the other two readers of this declaration; see
+    # docs/tasks.md M6-C20 for why they had three.
+    duplicates = sorted({t for t in targets if targets.count(t) > 1})
+    if duplicates:
+        raise ValueError(f"`advertised-targets` repeats {duplicates}")
+    malformed = [t for t in targets if not DECLARED_TRIPLE_RE.fullmatch(t)]
+    if malformed:
+        raise ValueError(f"`advertised-targets` are not target triples: {malformed}")
     return sorted(targets)
 
 
@@ -1910,6 +2003,7 @@ def control_packaging_matrix_divergence_is_caught() -> tuple[bool, str]:
     """
     declared = declared_targets()
     clean = (REPO / PACKAGER).read_text(encoding="utf-8")
+    site = (REPO / SITE_RELEASES).read_text(encoding="utf-8")
     cases = [
         ("identical", declared, True),
         ("one target dropped from the matrix", declared[:-1], False),
@@ -1917,7 +2011,7 @@ def control_packaging_matrix_divergence_is_caught() -> tuple[bool, str]:
         ("an empty matrix", [], False),
     ]
     for label, matrix, want in cases:
-        got, notes = packaging_verdict(declared, matrix, clean)
+        got, notes = packaging_verdict(declared, matrix, clean, site)
         if got != want:
             return False, (
                 f"case {label!r}: verdict {got}, expected {want}. Notes: "
@@ -1940,14 +2034,15 @@ def control_packaging_a_second_copy_of_the_set_is_caught() -> tuple[bool, str]:
     """
     declared = declared_targets()
     clean = (REPO / PACKAGER).read_text(encoding="utf-8")
-    clean_ok, clean_notes = packaging_verdict(declared, declared, clean)
+    site = (REPO / SITE_RELEASES).read_text(encoding="utf-8")
+    clean_ok, clean_notes = packaging_verdict(declared, declared, clean, site)
     if not clean_ok:
         return False, (
             "the real packager does not pass its own check, so a red below would not "
             f"be attributable to the planted literal: {[n.strip() for n in clean_notes]}"
         )
     planted = clean + '\nTARGETS = ("x86_64-unknown-linux-gnu", "aarch64-apple-darwin")\n'
-    planted_ok, planted_notes = packaging_verdict(declared, declared, planted)
+    planted_ok, planted_notes = packaging_verdict(declared, declared, planted, site)
     if planted_ok:
         return False, (
             "a literal target tuple appended to the packager's source did NOT turn the "
@@ -1960,6 +2055,63 @@ def control_packaging_a_second_copy_of_the_set_is_caught() -> tuple[bool, str]:
         "same source with a two-triple `TARGETS` tuple appended goes red naming the "
         "literals it found -- so the packager reading the manifest is asserted, not "
         "assumed"
+    )
+
+
+def control_packaging_site_list_divergence_is_caught() -> tuple[bool, str]:
+    """The public advertisement drifting from the declaration must go red.
+
+    This is the control for M6-C18. `site/releases.js` decides what the public
+    is actually offered -- it shows a release only when an asset exists for
+    every triple in its own array -- and nothing compared it to the
+    declaration, so retiring a target would have made the site render "No
+    complete development release is published yet" for every release, with
+    every other check still green.
+
+    Driven with recorded sources in both directions, including the two shapes
+    that could pass by measuring nothing: an array this check can no longer
+    find, and a labels array that no longer pairs with the targets it labels.
+    """
+    declared = declared_targets()
+    clean_packager = (REPO / PACKAGER).read_text(encoding="utf-8")
+    clean_site = (REPO / SITE_RELEASES).read_text(encoding="utf-8")
+
+    def site_with(targets: list[str], labels: list[str] | None = None) -> str:
+        body = ", ".join(f"'{t}'" for t in targets)
+        names = labels if labels is not None else [f"Label {i}" for i in range(len(targets))]
+        return (f"  const targets = [{body}];\n"
+                f"  const labels = [{', '.join(repr(n) for n in names)}];\n")
+
+    baseline, notes = packaging_verdict(declared, declared, clean_packager, clean_site)
+    if not baseline:
+        return False, (
+            "the real site file does not pass its own check, so a red below would not "
+            f"be attributable to the planted drift: {[n.strip() for n in notes]}"
+        )
+
+    cases = [
+        ("identical to the declaration", site_with(declared), True),
+        ("a declared target the site never offers", site_with(declared[:-1]), False),
+        ("a target the site offers that nobody builds",
+         site_with(declared + ["i686-unknown-linux-gnu"]), False),
+        ("an empty array", site_with([]), False),
+        ("the array renamed so the pattern cannot find it",
+         clean_site.replace("const targets =", "const releaseTargets ="), False),
+        ("labels no longer paired with targets",
+         site_with(declared, labels=["only one label"]), False),
+    ]
+    for label, source, want in cases:
+        got, case_notes = packaging_verdict(declared, declared, clean_packager, source)
+        if got != want:
+            return False, (
+                f"case {label!r}: verdict {got}, expected {want}. Notes: "
+                f"{[n.strip() for n in case_notes]}"
+            )
+    return True, (
+        f"the comparison accepts the live {len(declared)}-target advertisement and "
+        "rejects a dropped target, an offered-but-unbuilt extra, an empty array, an "
+        "array it can no longer find, and labels that no longer pair with their "
+        "targets -- so a renamed or emptied array cannot pass by matching nothing"
     )
 
 
@@ -2153,6 +2305,10 @@ CONTROLS: dict[str, list[tuple[str, object]]] = {
         (
             "the packager resolves the manifest, not a copy",
             control_packaging_reads_the_manifest_not_a_tuple,
+        ),
+        (
+            "the public advertisement disagreeing with the declaration",
+            control_packaging_site_list_divergence_is_caught,
         ),
     ],
     "visibility": [

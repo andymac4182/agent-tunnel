@@ -2416,6 +2416,15 @@ def control_targets_second_reader_disagreement_is_not_absence(bundle: Path) -> t
                   "than the declaration is never reported as a reader that was absent")
 
 
+# A control that requires the check to REFUSE TO RUN, rather than to go red
+# with a planted witness.  It is neither of the other two things, and counting
+# it as a witness control credits the suite with an entry that does not meet
+# the definition the summary prints -- the same over-claim the two-figure
+# split was introduced to prevent (docs/tasks.md M6-C19).
+REFUSAL_CONTROLS = {
+    "cargo unfindable: the check must not report ok",
+}
+
 UNIT_PROBES = {
     "four cargo outcomes are four statuses, not one",
     "the lockfile parser is not universal",
@@ -2741,27 +2750,36 @@ def cmd_self_test(args: argparse.Namespace) -> int:
     failures = 0
     witness_total = 0
     probe_total = 0
+    refusal_total = 0
     for check in selected:
         print(f"--- {check} ---")
         for label, control in CONTROLS[check]:
             is_probe = label in UNIT_PROBES
+            is_refusal = label in REFUSAL_CONTROLS
             if is_probe:
                 probe_total += 1
+            elif is_refusal:
+                refusal_total += 1
             else:
                 witness_total += 1
             ok, detail = control(bundle)
             if not ok:
                 failures += 1
-            kind = "probe " if is_probe else "control"
+            kind = "probe  " if is_probe else ("refusal" if is_refusal else "control")
             print(f"  {'ok    ' if ok else 'FAILED'}  [{kind}] {label}: {detail}")
-    total = witness_total + probe_total
-    # Reported as two numbers on purpose.  A single "17 of 17 controls" would
-    # credit the suite with two entries that never invoke a check, which is a
+    total = witness_total + probe_total + refusal_total
+    # Reported as three numbers on purpose.  A single "17 of 17 controls" would
+    # credit the suite with entries that never invoke a check, which is a
     # message stating something the code did not measure -- the shape
-    # docs/tasks.md M5-C11 exists to track.
+    # docs/tasks.md M5-C11 exists to track.  The third figure exists for the
+    # same reason as the second: a control that requires the check to REFUSE
+    # TO RUN plants no witness, so folding it into the witness count would
+    # make that sentence false about it (M6-C19).
     print(f"\n{total - failures}/{total} passed: {witness_total} witness control(s) "
           f"that defeat a mechanism and require the named check to go red with the "
-          f"witness they plant, and {probe_total} unit probe(s) that exercise a pure "
+          f"witness they plant, {refusal_total} refusal control(s) that remove a "
+          f"reader the check depends on and require it to report DID NOT RUN rather "
+          f"than a pass, and {probe_total} unit probe(s) that exercise a pure "
           f"function's rule in both directions and invoke no check")
     return 0 if failures == 0 else 1
 
