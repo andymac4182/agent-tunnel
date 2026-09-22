@@ -1,0 +1,17 @@
+name: Release packaging tests
+on:
+  push:
+    paths: ['scripts/*release*.py', '.github/workflows/release*.yml']
+  pull_request:
+    paths: ['scripts/*release*.py', '.github/workflows/release*.yml']
+permissions:
+  contents: read
+jobs:
+  packaging:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - run: python3 scripts/test_package_release.py

@@ -1,0 +1,11 @@
+{
+  "reviewedOriginMain": "ec663a77a6fefc756ca8bf3bb9b52b54e336fa15",
+  "lastPublishedOriginMain": "ec663a77a6fefc756ca8bf3bb9b52b54e336fa15",
+  "lastReviewAt": "2026-09-22T17:16:02+10:00",
+  "lastReviewOutcome": "Reviewed e0a403b..ec663a7 client cause mappings, CLI tests and runtime documentation. Published client exit-code troubleshooting, reserved unreachable exit 6, doctor exception and separate relay 0/1 behavior. No runtime source merged or pushed.",
+  "reviewedDate": "2026-09-22",
+  "scope": "Setup, architecture, MCP, ACP, computer use, filesystems and support boundaries",
+  "verification": "Live Chrome homepage/support checks passed at 1440 and 390 pixels: source revision, client exit-code content, internal links, no horizontal overflow, light/dark modes. Runtime tests not rerun; upstream source and tests inspected, not promoted to new acceptance evidence.",
+  "verifiedAt": "2026-09-22T17:16:02+10:00",
+  "deploymentId": "dpl_9v4wyoQKe7dQW8DVykeVtSi2ojF1"
+}

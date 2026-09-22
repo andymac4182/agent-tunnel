@@ -1,0 +1,44 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="description" content="Install and connect an enrolled computer. Agent Uplink development documentation."><title>Setup | Agent Uplink Docs</title><link rel="stylesheet" href="/docs.css"><link rel="stylesheet" href="/theme.css"><script src="/theme.js"></script><script src="/releases.js" defer></script></head><body><a class="skip" href="#content">Skip to content</a><header class="docs-header"><a class="docs-brand" href="/">Agent Uplink</a><nav aria-label="Site"><a href="/docs/">Documentation</a><a href="/brand-lab">Brand lab</a></nav></header><div class="docs-layout"><aside class="docs-nav"><p>DOCUMENTATION</p><nav aria-label="Documentation"><a href="/docs/">Overview</a><a href="/docs/downloads">Downloads</a><a href="/docs/setup" aria-current="page">Setup</a><a href="/docs/architecture">Architecture</a><a href="/docs/mcp">MCP</a><a href="/docs/acp">ACP</a><a href="/docs/cua">Computer Use</a><a href="/docs/filesystems">Filesystems</a><a href="/docs/support">Support & Troubleshooting</a></nav></aside><main id="content"><p class="kicker">DEVELOPMENT DOCUMENTATION / SETUP</p><h1>Install and connect an enrolled computer.</h1>
+    <p class="lede">An operator-managed setup using installed Agent Uplink CLI binaries and a provisioned relay environment.</p>
+    <aside class="note">There is no one-command production installer or public relay supplied by this website. Do not use synthetic harness credentials, identities or grants in a real deployment.</aside>
+    <h2>1. Prepare the environment</h2><ul><li>Matching tunnel-client, tunnel-relay and tunnel-deadman binaries from the <a href="/docs/downloads">downloads page</a>, installed together on PATH.</li><li>A relay host with separate consumer HTTPS and device mTLS listeners.</li><li>An authoritative Redis catalog with persistence, TLS and a recovery policy.</li><li>An external identity issuer, configured JWT verification keys, tenant/user/device records and explicit service grants.</li><li>Device certificates and trusted CA material supplied through your operator's provisioning process.</li></ul>
+    <h2>2. Check the installed CLI</h2><div class="note" data-release-info aria-live="polite"><p>Checking published versions...</p><a href="https://github.com/andymac4182/agentuplink/releases">View GitHub releases</a></div><pre><code>tunnel-client --help
+tunnel-relay --help</code></pre>
+    <p>The product name changed; the <code>tunnel-client</code> and <code>tunnel-relay</code> binary names remain unchanged.</p>
+    <h2>3. Configure the relay</h2><p>Use <code>examples/m1-relay.toml</code> as a schema reference, not a ready deployment. Replace its placeholder values and certificate paths. Keep private material outside source control.</p>
+    <div class="table-scroll"><table><thead><tr><th>Configuration</th><th>Required operator decision</th></tr></thead><tbody><tr><td>consumer_bind / device_bind</td><td>Separate listener addresses; the device listener requires client certificates.</td></tr><tr><td>oidc_issuer / oidc_audience / oidc_jwks_path</td><td>Your consumer identity issuer, accepted audience and verification key file.</td></tr><tr><td>redis_url / redis_namespace</td><td>TLS Redis endpoint and a durable namespace. The namespace accepts 1–96 ASCII letters, digits, periods, underscores or hyphens.</td></tr><tr><td>TLS certificate, key and CA paths</td><td>Correct listener identities and the device certificate trust boundary.</td></tr><tr><td>node_id / boot_id / deployment_incarnation</td><td>Explicit relay identity and coordinated ownership/recovery values. Do not randomly change the deployment incarnation to bypass a recovery error.</td></tr></tbody></table></div>
+    <pre><code>tunnel-relay \
+  check-serve-config --config /absolute/path/relay.toml</code></pre>
+    <p>This dry run checks the serving configuration document. It does not read referenced credentials, connect to Redis, verify the deployment or provision authority records. The legacy <code>check-config</code> validates a different configuration type.</p>
+    <h2>4. Configure the device</h2><p>Start from <code>examples/m1-client.toml</code>. Resolve certificate paths relative to the client configuration file. Replace the device ID, relay URL and all credential references.</p>
+    <pre><code>device_id = "your-enrolled-device"
+relay_url = "wss://relay.example.test/v1/tunnel/control"
+
+[credentials]
+client_certificate = "credentials/device-cert-chain.pem"
+client_key = "credentials/device-key.pem"
+server_ca = "credentials/relay-ca.pem"</code></pre>
+    <p>This excerpt is not a complete configuration. Keep the example's required limits and rotation sections. Its synthetic echo export is for a controlled transport smoke test, not filesystem, MCP, ACP or desktop access.</p>
+    <h2>5. Provision and validate credentials</h2><pre><code>tunnel-client \
+  config check --config /absolute/path/client.toml
+
+tunnel-client \
+  credentials create --config /absolute/path/client.toml \
+  --csr-out /absolute/path/device.csr</code></pre>
+    <p>Have your operator sign the CSR with the approved device issuer and establish the matching catalog identity and grants. Creating a CSR does not enroll or authorize a device.</p>
+    <pre><code>tunnel-client \
+  credentials import --config /absolute/path/client.toml \
+  --certificate /absolute/path/device-cert-chain.pem \
+  --server-ca /absolute/path/relay-ca.pem
+
+tunnel-client \
+  doctor --config /absolute/path/client.toml --json</code></pre>
+    <p><code>doctor</code> performs local checks. A network doctor, enrollment-code workflow and managed credential renewal are not delivered commands in this reviewed CLI.</p>
+    <h2>6. Start the provisioned relay and device</h2><pre><code>tunnel-relay \
+  serve --config /absolute/path/relay.toml
+
+# On the enrolled computer, in a separate terminal:
+tunnel-client \
+  connect --config /absolute/path/client.toml --json</code></pre>
+    <p>The client runs in the foreground. Start only after catalog records, grants, identity and trust have been provisioned. Relay connectivity alone does not grant access to an export. Add capability-specific configuration only after checking its support boundaries.</p>
+    <h2>Acceptance before deployment</h2><p>A downloaded build is not a replacement for deployment-specific Redis/socket and capability acceptance. Cluster support and applicable adapter gates remain private-alpha requirements. Use dedicated disposable desktop VMs for computer-use tests. Developer build instructions are separate on the <a href="/docs/downloads">downloads page</a>.</p><section class="provenance"><h2>Source & review</h2><p>Reviewed against <code>ec663a77a6fe</code> on 2026-09-22. Based on <code>examples/m1-client.toml</code>, <code>examples/m1-relay.toml</code>, <code>crates/tunnel-client/src/main.rs</code>, <code>docs/runtime.md</code>, <code>docs/tasks.md</code>. Historical test evidence is not a new test run.</p></section><footer><a href="/docs/setup">Setup</a><a href="/docs/support">Support boundaries</a><a href="/">Agent Uplink home</a></footer></main></div></body></html>

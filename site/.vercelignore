@@ -1,3 +1,6 @@
 .vercel
 README.md
 verify.cjs
+build-docs.cjs
+provenance.json
+test-releases.cjs

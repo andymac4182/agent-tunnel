@@ -5,6 +5,24 @@ Production follows `main`, with `site` as the root directory and files outside
 that root excluded. Pushes to the production branch trigger Vercel builds.
 Both pages offer System, Light and Dark themes with browser-local persistence.
 
+## Documentation publishing
+
+The downloads/setup pages query public GitHub releases for the newest complete
+main development release. Drafts, incomplete matrices and other tag formats
+are excluded; failed API lookups do not invent a version. `test-releases.cjs`
+tests these states with synthetic responses. No browser credentials are used.
+Main release workflow activation requires landing `.github/workflows/release.yml`
+on the default branch, and all existing main CI gates must pass before packaging.
+Published builds are prereleases, not production or complete platform acceptance.
+
+Eight static documentation pages live in `docs/`. Their reviewed content is
+maintained in `build-docs.cjs`; regenerate with `node site/build-docs.cjs` from
+the repository root. `provenance.json` records the reviewed origin/main revision,
+not a claim that the runtime's entire acceptance suite passed at that revision.
+The hourly thread automation fetches and reviews upstream changes, updates
+public documentation when relevant, deploys website assets and verifies them.
+It must not overwrite local work, publish runtime source, or bypass Git approval.
+
 Standalone static marketing site. Deploy only this directory, never the repository root.
 No runtime credentials, backend, analytics, forms, or third-party scripts are used.
 The hardware photograph is AI-generated illustrative imagery, not a product screenshot.
