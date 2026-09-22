@@ -39,9 +39,12 @@ that is **not the build machine**.  Every check here therefore runs against the
                 resolution rule and then **executes** the result, because
                 `resolve_sentinel` accepts any `is_file()`: a decoy of the
                 right name makes the product itself report the sentinel
-                present.  It does not ask `doctor`: on an unprovisioned bundle
-                `doctor` computes the capability checks and then discards them
-                along with the rest of its result (docs/tasks.md M6-C07).
+                present.  It does not ask `doctor`, whose containment answer
+                comes from that same `is_file()` and so reports a decoy as
+                present (docs/tasks.md M6-C08).  `doctor` *can* now be read on
+                an unprovisioned bundle -- it reports its checks alongside the
+                error instead of discarding them (M6-C07) -- but reading it
+                here would inherit the weaker rule.
   `cli`         `--help`, `--version`, both `check-config` forms and
                 `check-serve-config` on every bundled `*-relay.toml`,
                 executed from the unpacked bundle and asserting **content**,
@@ -988,9 +991,12 @@ def check_assets(bundle: Path) -> Result:
     # instead of claimed.
     result.note("behaviour only: exit 2 on both probes does not identify the bytes; "
                 "checksums and provenance bind those, and a control measures the seam")
-    result.note("doctor is not used here: on an unprovisioned bundle it computes "
-                "the capability checks and then discards them with the rest of the "
-                "result, exiting CREDENTIAL_MISSING with result:null (M6-C07)")
+    result.note("doctor is not used here: its containment answer comes from "
+                "resolve_sentinel's bare is_file(), so it reports the sentinel "
+                "present for a decoy this check rejects (M6-C08). It can now be "
+                "read on an unprovisioned bundle -- it reports the checks "
+                "alongside the error rather than discarding them (M6-C07) -- but "
+                "reading it would inherit the weaker rule")
     return result
 
 
