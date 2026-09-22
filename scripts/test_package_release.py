@@ -13,7 +13,19 @@ class PackagingTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
-        (self.root / "Cargo.toml").write_text('[workspace.package]\nversion = "0.1.0"\n')
+        # The synthetic root carries the advertised-target declaration because
+        # `package()` now reads it from the manifest under `root` rather than
+        # from a literal tuple in the module. The list is **copied from the
+        # real declaration** via `TARGETS` rather than spelled out again here:
+        # a fixture that hard-coded four triples would reintroduce, in the
+        # tests, exactly the second source of truth this change removed from
+        # the script (docs/tasks.md M6-C11, M5-C11).
+        declaration = "".join(f'    "{target}",\n' for target in TARGETS)
+        (self.root / "Cargo.toml").write_text(
+            '[workspace.package]\nversion = "0.1.0"\n\n'
+            "[workspace.metadata.release]\n"
+            f"advertised-targets = [\n{declaration}]\n"
+        )
         (self.root / "LICENSE").write_text("Synthetic project licence")
         (self.root / "examples").mkdir()
         for name in ("m1-client.toml", "m1-relay.toml"):

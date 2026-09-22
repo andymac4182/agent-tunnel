@@ -16,11 +16,19 @@ Three obligations, three checks, and they want different evidence:
                 leaked the moment the repository is cloned -- and this
                 repository is public (see `visibility`), so history is the
                 live exposure surface rather than a future one.
-  `visibility`  Read-only.  Reports GitHub's answer for the `origin` remote.
-                **This check never changes a repository setting.**  AGENTS.md
-                requires the repository stay private unless the owner asks for
-                publication, so a public answer is a failure to report, not a
-                condition to fix unattended.
+  `visibility`  Read-only.  Compares GitHub's answer for the `origin` remote
+                against the visibility the owner **declared** in
+                `[workspace.metadata.release] repository-visibility` in the
+                root `Cargo.toml`, and fails on disagreement **in either
+                direction**.  The owner has explicitly requested publication,
+                so the declaration is now `public` -- but the check was not
+                changed by inverting a constant, because a check that asserts
+                "public" cannot go red for the reason it names and would keep
+                passing if the decision were reverted.  It is a comparison of
+                two observations, and its control drives every recorded
+                payload against both declarations.  **This check never changes
+                a repository setting**; which of the two disagreeing sides is
+                wrong is the owner's call, not this script's.
 
 Why every check here carries a positive control
 -----------------------------------------------
@@ -68,10 +76,16 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
+
+# The two answers `repository-visibility` may declare. `internal` is folded
+# into `private` when GitHub reports it; it is not a declarable value here,
+# because this repository is not in an organisation that can produce one.
+VISIBILITY_VALUES = ("public", "private")
 
 # cargo-deny is pinned: the `deny.toml` schema was read out of this version's
 # own `init` template, and a later version could rename a key.  A renamed key
@@ -419,9 +433,17 @@ class Finding:
     digest: str
 
     def render(self) -> str:
+        # `blob` is a 40-char object id for a history finding and the literal
+        # marker `(uncommitted)` for a working-tree one. Truncating to 12
+        # unconditionally cut that marker to `(uncommitted`, so every
+        # working-tree finding -- the ones a reader meets first, because they
+        # are the ones they can still fix before pushing -- printed what
+        # looked like a malformed object id (M6-C14). Shorten only what is
+        # actually a hash.
+        blob = self.blob[:12] if re.fullmatch(r"[0-9a-f]{40}", self.blob) else self.blob
         return (
             f"    {self.pattern_name}  {self.where}  path={self.path}  "
-            f"blob={self.blob[:12]}  len={self.match_len}  "
+            f"blob={blob}  len={self.match_len}  "
             f"sha256={self.digest[:16]}"
         )
 
@@ -1059,27 +1081,332 @@ def check_secrets(repo: Path | None = None) -> Result:
 
 
 # --------------------------------------------------------------------------
+# Check: packaging
+#
+# **Why this exists, and it is not tidiness.** Until now three places named
+# the advertised target set and nothing reconciled them: a literal tuple in
+# `scripts/package_release.py`, the `matrix.include` list in
+# `.github/workflows/release.yml`, and the public downloads page's prose.
+# docs/tasks.md row M6-C11 recorded that second packaging path and asked which
+# is authoritative. The owner's answer is that **the release workflow is**, so
+# `[workspace.metadata.release] advertised-targets` was brought into agreement
+# with it, `package_release.py` now reads that table, and this check makes the
+# agreement structural rather than a coincidence waiting to drift.
+#
+# **It runs locally and deliberately so.** GitHub Actions billing has blocked
+# this repository since 2026-09-11, so `release.yml` has not executed at all
+# and cannot be the thing that notices a divergence. This check reads the
+# workflow as text on the machine running it.
+#
+# A triple-shaped literal, so a tuple reintroduced into the packager is seen
+# whatever it is named. `x86_64-pc-windows-msvc`, `aarch64-apple-darwin`, etc.
+TRIPLE_LITERAL = re.compile(r"\b(?:x86_64|aarch64|i686|armv7|riscv64gc|s390x|powerpc64le)-[a-z0-9_]+-[a-z0-9_.-]+\b")
+# `target: <triple>` inside the workflow's build matrix.
+# Matches ANY `target:` key at any indentation, not only matrix entries, so a
+# `with: target: ...` step elsewhere in the workflow would be counted as one.
+# Measured at this branch: all 4 matches are the matrix `include` entries and
+# no `with: target:` exists, so the "matrix" wording is accurate today. The
+# imprecision is left deliberately because it **fails closed** -- a stray
+# `target:` adds an entry the declaration does not contain and the comparison
+# FAILs; it can never hide a divergence. Scoping this to the matrix block
+# means parsing YAML structure, which is a larger change than the fault.
+WORKFLOW_MATRIX_TARGET = re.compile(r"(?m)^\s*target:\s*([A-Za-z0-9_][A-Za-z0-9_.-]*)\s*$")
+PACKAGER = "scripts/package_release.py"
+RELEASE_WORKFLOW = ".github/workflows/release.yml"
+SITE_RELEASES = "site/releases.js"
+DECLARED_TRIPLE_RE = re.compile(r"[0-9a-z_]+(?:-[0-9a-z_.]+){2,3}")
+
+# `site/releases.js` is loaded by every page under `site/docs/` and is the
+# **machine-readable public advertisement**: it shows a release only when an
+# asset exists for every triple in its own `targets` array, then labels each
+# one.  `downloads.html` is prose; this file is the consumer that decides what
+# the public is actually offered.  A browser cannot read `Cargo.toml` at
+# runtime, so -- exactly as for `release.yml`'s matrix, which has the same
+# constraint -- the literal stays and is **bound** here instead.
+#
+# Retiring a triple from the workflow and the manifest in one commit, with
+# this file left alone, makes the site require an asset that is no longer
+# built and render "No complete development release is published yet" for
+# every release from then on.  Adding one has the mirror failure: the site
+# never lists it.  Neither is visible to any other check.
+SITE_TARGETS_ARRAY = re.compile(r"(?m)^\s*const\s+targets\s*=\s*\[([^\]]*)\]\s*;")
+SITE_LABELS_ARRAY = re.compile(r"(?m)^\s*const\s+labels\s*=\s*\[([^\]]*)\]\s*;")
+
+
+def site_array(source: str, pattern: re.Pattern[str]) -> list[str] | None:
+    """The string items of a single-line JS array literal, or None if absent.
+
+    None is distinct from `[]` on purpose: "the array this check binds could
+    not be found" and "the array is empty" are different failures, and only
+    the second could ever be a real declaration. Returning `[]` for a renamed
+    or reformatted array would let it compare equal to nothing -- the
+    "scanned nothing" shape docs/tasks.md M5-C11 catalogues.
+    """
+    found = pattern.findall(source)
+    if len(found) != 1:
+        return None
+    return [item.strip().strip("'\"") for item in found[0].split(",")
+            if item.strip()]
+
+
+def site_array_count(source: str, pattern: re.Pattern[str]) -> int:
+    """How many declarations of the bound array the source contains.
+
+    Binding the *first* match was a real evasion: a second `const targets`
+    later in the file -- an inner-scope shadow -- is what the rendering code
+    would actually use there, and `search` never saw it, so `packaging` stayed
+    green over a file whose effective list was wrong. The binding is only
+    meaningful if there is exactly one thing to bind to.
+    """
+    return len(pattern.findall(source))
+
+
+def packaging_verdict(declared: list[str], matrix: list[str],
+                      packager_source: str,
+                      site_source: str) -> tuple[bool, list[str]]:
+    """Compare the declaration against the workflow matrix and the packager.
+
+    Pure, so `--self-test` can drive it in both directions with recorded
+    inputs. A comparison that only ever sees agreeing inputs is a comparison
+    nobody has tested, which is the defect this whole file is about.
+    """
+    notes: list[str] = []
+    ok = True
+    declared_set, matrix_set = sorted(set(declared)), sorted(set(matrix))
+    if not matrix_set:
+        notes.append(
+            f"  FAIL: no `target:` entries found in {RELEASE_WORKFLOW}. Either the "
+            "workflow stopped declaring a matrix or this check's pattern no longer "
+            "matches it; an empty matrix must never compare equal to anything."
+        )
+        return False, notes
+    if declared_set != matrix_set:
+        missing = [t for t in matrix_set if t not in declared_set]
+        extra = [t for t in declared_set if t not in matrix_set]
+        notes.append(
+            f"  FAIL: the workflow matrix and the declaration disagree. Built but not "
+            f"declared: {missing or 'none'}. Declared but not built: {extra or 'none'}. "
+            "The release workflow is the authoritative packaging path (M6-C11), so the "
+            "declaration follows it, not the reverse."
+        )
+        ok = False
+    else:
+        notes.append(
+            f"  {len(declared_set)} advertised targets, and {RELEASE_WORKFLOW}'s matrix "
+            f"builds exactly those: {declared_set}"
+        )
+
+    literals = sorted(set(TRIPLE_LITERAL.findall(packager_source)))
+    if literals:
+        notes.append(
+            f"  FAIL: {PACKAGER} carries target-triple literals {literals}. It must read "
+            "`advertised-targets` from the manifest; a second copy is the defect M6-C11 "
+            "was filed for and M5-C11 catalogues."
+        )
+        ok = False
+    else:
+        notes.append(f"  {PACKAGER} carries no target-triple literal; it derives the set")
+
+    # The public advertisement.  Bound rather than derived, because a browser
+    # cannot read the manifest at runtime -- the same constraint as the
+    # workflow matrix above, handled the same way.
+    site_targets = site_array(site_source, SITE_TARGETS_ARRAY)
+    site_labels = site_array(site_source, SITE_LABELS_ARRAY)
+    target_decls = site_array_count(site_source, SITE_TARGETS_ARRAY)
+    label_decls = site_array_count(site_source, SITE_LABELS_ARRAY)
+    if target_decls > 1 or label_decls > 1:
+        notes.append(
+            f"  FAIL: {SITE_RELEASES} declares `const targets` {target_decls} time(s) and "
+            f"`const labels` {label_decls} time(s); each must be declared exactly once. "
+            "A second declaration -- an inner-scope shadow -- is what the code in that "
+            "scope renders, so binding only the first would compare the wrong list and "
+            "could pass over a file that advertises something else."
+        )
+        ok = False
+    elif site_targets is None:
+        notes.append(
+            f"  FAIL: no `const targets = [...]` array found in {SITE_RELEASES}. Either "
+            "the public advertisement stopped declaring one or this check's pattern no "
+            "longer matches it; an array that cannot be found must never compare equal "
+            "to the declaration."
+        )
+        ok = False
+    elif sorted(set(site_targets)) != declared_set:
+        missing = [t for t in declared_set if t not in site_targets]
+        extra = [t for t in sorted(set(site_targets)) if t not in declared_set]
+        notes.append(
+            f"  FAIL: {SITE_RELEASES} and the declaration disagree. Declared but not "
+            f"offered by the site: {missing or 'none'}. Offered but not declared: "
+            f"{extra or 'none'}. The site shows a release only when an asset exists for "
+            "every triple in its own array, so a declared target it does not list is "
+            "never offered, and one it lists but nobody builds hides every release."
+        )
+        ok = False
+    elif site_labels is None or len(site_labels) != len(site_targets):
+        notes.append(
+            f"  FAIL: {SITE_RELEASES} pairs `targets[i]` with `labels[i]` when it renders "
+            f"the download list, and it declares {len(site_targets)} target(s) against "
+            f"{'no labels array' if site_labels is None else str(len(site_labels)) + ' label(s)'}. "
+            "A length mismatch mislabels a download or throws while rendering."
+        )
+        ok = False
+    else:
+        notes.append(
+            f"  {SITE_RELEASES} advertises exactly the declared set, with "
+            f"{len(site_labels)} label(s) paired to {len(site_targets)} target(s)"
+        )
+    return ok, notes
+
+
+def check_packaging() -> Result:
+    result = Result("packaging")
+    try:
+        declared = declared_targets()
+    except ValueError as error:
+        result.ran = False
+        result.reason = f"no advertised-target declaration to compare against: {error}"
+        return result
+
+    workflow = REPO / RELEASE_WORKFLOW
+    packager = REPO / PACKAGER
+    site = REPO / SITE_RELEASES
+    for path in (workflow, packager, site):
+        if not path.is_file():
+            result.ran = False
+            result.reason = (
+                f"{path.relative_to(REPO)} is missing, so the second packaging path "
+                "could not be read. That is not a pass: it is the file this check exists "
+                "to reconcile against."
+            )
+            return result
+
+    matrix = WORKFLOW_MATRIX_TARGET.findall(workflow.read_text(encoding="utf-8"))
+    result.note(f"  declared: [workspace.metadata.release] advertised-targets = {declared}")
+    ok, notes = packaging_verdict(declared, matrix,
+                                  packager.read_text(encoding="utf-8"),
+                                  site.read_text(encoding="utf-8"))
+    for line in notes:
+        result.note(line)
+    result.note(
+        "  NOTE: this check reads the workflow as text. It has never run on a hosted "
+        "runner -- Actions billing has blocked this repository since 2026-09-11 -- so "
+        "agreement here is agreement between files, not evidence that the matrix "
+        f"builds. {SITE_RELEASES} -- the machine-readable public advertisement -- IS "
+        "compared here since M6-C18. `site/docs/downloads.html` states the platforms in "
+        "prose and is still NOT machine-compared; that residue is recorded on M6-C11."
+    )
+    result.passed = ok
+    return result
+
+
+# --------------------------------------------------------------------------
 # Check: repository visibility (read-only)
 # --------------------------------------------------------------------------
-def classify_visibility(payload: dict) -> tuple[bool, str]:
-    """Map a GitHub repository payload to pass/fail.
+def declared_visibility() -> str:
+    """The visibility the owner declared, read from the workspace manifest.
 
-    Split out from the network call so `--self-test` can drive it with
-    recorded payloads in both directions. A classifier that only ever sees one
-    answer is a classifier nobody has tested.
+    **The point of reading it rather than hard-coding it.** The owner has now
+    explicitly requested publication (AGENTS.md; docs/tasks.md M6-C01), so the
+    expected answer changed from private to public. Flipping a constant would
+    have produced a check that still cannot fail for the reason it names: it
+    would assert "public" whatever the repository actually is, and if the
+    owner reverted the decision the check would go on passing on a repository
+    that no longer matches the rule. So the expectation is data in
+    `[workspace.metadata.release] repository-visibility` and this check is a
+    **comparison of two observations** -- what the owner declared, and what
+    GitHub answers -- which can disagree in either direction.
+
+    Raises rather than defaulting. A default would be a second source of
+    truth, and `advertised-targets` in the same table exists precisely because
+    a second copy of a declaration is this repository's recurring defect
+    (M5-C11).
+    """
+    declared = release_table().get("repository-visibility")
+    if declared not in VISIBILITY_VALUES:
+        raise ValueError(
+            f"`repository-visibility` is {declared!r}; it must be one of "
+            f"{sorted(VISIBILITY_VALUES)}"
+        )
+    return declared
+
+
+def release_table() -> dict:
+    """`[workspace.metadata.release]`, the single referent this gate reads."""
+    table = tomllib.loads((REPO / "Cargo.toml").read_text(encoding="utf-8"))
+    release = table.get("workspace", {}).get("metadata", {}).get("release")
+    if release is None:
+        raise ValueError("root Cargo.toml carries no [workspace.metadata.release] table")
+    return release
+
+
+def declared_targets() -> list[str]:
+    """The advertised set. Raises rather than defaulting, for the same reason
+    `declared_visibility` does: a default is a second source of truth."""
+    targets = release_table().get("advertised-targets")
+    if not isinstance(targets, list) or not targets:
+        raise ValueError("`advertised-targets` must be a non-empty list")
+    if not all(isinstance(t, str) for t in targets):
+        raise ValueError("`advertised-targets` must be a list of strings")
+    # Same acceptance rule as the other two readers of this declaration; see
+    # docs/tasks.md M6-C20 for why they had three.
+    duplicates = sorted({t for t in targets if targets.count(t) > 1})
+    if duplicates:
+        raise ValueError(f"`advertised-targets` repeats {duplicates}")
+    malformed = [t for t in targets if not DECLARED_TRIPLE_RE.fullmatch(t)]
+    if malformed:
+        raise ValueError(f"`advertised-targets` are not target triples: {malformed}")
+    return sorted(targets)
+
+
+def observed_visibility(payload: dict) -> str | None:
+    """GitHub's answer reduced to `public`/`private`, or None if unreadable.
+
+    `internal` is an organisation-scoped form of not-public and is folded into
+    `private` rather than silently becoming a third value nothing compares.
     """
     private = payload.get("private")
     visibility = payload.get("visibility")
-    name = payload.get("full_name", "?")
-    if private is None and visibility is None:
-        return False, f"{name}: payload carries neither `private` nor `visibility`."
     if private is True or visibility in ("private", "internal"):
-        return True, f"{name}: private={private} visibility={visibility}"
-    return False, f"{name}: private={private} visibility={visibility}"
+        return "private"
+    if private is False or visibility == "public":
+        return "public"
+    return None
+
+
+def classify_visibility(payload: dict, expected: str) -> tuple[bool, str]:
+    """Does GitHub's answer match the declared expectation?
+
+    Split out from the network call so `--self-test` can drive it with
+    recorded payloads against both expectations. A classifier that only ever
+    sees one answer is a classifier nobody has tested, and one that only ever
+    sees one *expectation* is an inverted constant wearing a comparison's
+    clothes.
+    """
+    name = payload.get("full_name", "?")
+    private = payload.get("private")
+    visibility = payload.get("visibility")
+    observed = observed_visibility(payload)
+    described = f"{name}: private={private} visibility={visibility}"
+    if observed is None:
+        return False, (
+            f"{described} -- the payload carries neither `private` nor `visibility`, "
+            "so visibility is UNKNOWN and UNKNOWN is never a match."
+        )
+    if observed != expected:
+        return False, f"{described} -- observed {observed}, declared {expected}"
+    return True, f"{described} -- observed {observed}, matching the declared {expected}"
 
 
 def check_visibility() -> Result:
     result = Result("visibility")
+    try:
+        expected = declared_visibility()
+    except (ValueError, OSError, tomllib.TOMLDecodeError) as error:
+        result.ran = False
+        result.reason = f"no declared visibility to compare against: {error}"
+        return result
+    result.note(f"  declared: [workspace.metadata.release] repository-visibility = {expected!r}")
+
     remote = run(["git", "remote", "get-url", "origin"])
     if remote.returncode != 0:
         result.ran = False
@@ -1115,22 +1442,33 @@ def check_visibility() -> Result:
             "that trusted the remote's name would be reporting on a redirect."
         )
 
-    private, description = classify_visibility(payload)
+    matches, description = classify_visibility(payload, expected)
     result.note(f"  {description}")
     result.note(
         f"  created={payload.get('created_at')} pushed={payload.get('pushed_at')} "
         f"forks={payload.get('forks_count')} stars={payload.get('stargazers_count')}"
     )
-    if not private:
+    if not matches:
+        observed = observed_visibility(payload) or "UNKNOWN"
         result.note(
-            "  FAIL: the repository is NOT private. AGENTS.md requires it stay "
-            "private unless the owner explicitly requests publication. This check "
-            "deliberately does NOT change the setting -- flipping visibility is the "
-            "owner's decision, and flipping it back does not un-disclose anything "
-            "already cloned, cached or forked. Treat every secret-scan finding in "
-            "history as already disclosed and rotate rather than merely remove it."
+            f"  FAIL: the repository is {observed} and the declaration in root "
+            f"Cargo.toml says {expected}. One of the two is wrong, and this check "
+            "does NOT decide which -- it deliberately changes no setting, because "
+            "visibility is the owner's decision. If the repository should be "
+            f"{expected}, change it on GitHub; if the declaration is out of date, "
+            "change it here and in AGENTS.md **in the same commit**, so the rule "
+            "and the reality never disagree silently again."
         )
-    result.passed = private
+    if expected == "public":
+        result.note(
+            "  NOTE: a public repository makes a committed secret unrecoverable. "
+            "Deleting it, rewriting history or making the repository private later "
+            "undoes nothing already cloned, cached, forked or indexed. Treat every "
+            "secret-scan finding in this history as disclosed and rotate it rather "
+            "than merely removing it -- and read the `secrets` check's 0 findings as "
+            "'none in these formats', which is what its coverage line says."
+        )
+    result.passed = matches
     return result
 
 
@@ -1677,31 +2015,275 @@ def control_digest_allowlist_cannot_hide_another_secret() -> tuple[bool, str]:
     )
 
 
-def control_visibility_classifier_goes_both_ways() -> tuple[bool, str]:
-    """The classifier must distinguish public from private.
+def control_packaging_matrix_divergence_is_caught() -> tuple[bool, str]:
+    """A workflow matrix that disagrees with the declaration must go red.
 
-    Driven with recorded payloads in both directions plus a malformed one, so
-    that a classifier hard-wired to one answer is caught. This is the
-    `assert_eq!` whose halves move together (M5-C10), avoided by asserting on
-    three distinct inputs with three distinct required outputs.
+    Driven with recorded inputs in four directions, because this check's whole
+    value is that it fires when two files drift apart, and the live repository
+    only ever shows it the agreeing case. An empty matrix is included because
+    a pattern that stopped matching would otherwise compare equal to nothing
+    and pass -- the "scanned nothing" shape of M5-C11.
     """
+    declared = declared_targets()
+    clean = (REPO / PACKAGER).read_text(encoding="utf-8")
+    site = (REPO / SITE_RELEASES).read_text(encoding="utf-8")
     cases = [
-        ({"full_name": "o/private-repo", "private": True, "visibility": "private"}, True),
-        ({"full_name": "o/public-repo", "private": False, "visibility": "public"}, False),
-        ({"full_name": "o/internal", "private": False, "visibility": "internal"}, True),
-        ({"full_name": "o/malformed"}, False),
+        ("identical", declared, True),
+        ("one target dropped from the matrix", declared[:-1], False),
+        ("an extra target built but not declared", declared + ["i686-unknown-linux-gnu"], False),
+        ("an empty matrix", [], False),
     ]
-    for payload, expected in cases:
-        got, _ = classify_visibility(payload)
-        if got != expected:
+    for label, matrix, want in cases:
+        got, notes = packaging_verdict(declared, matrix, clean, site)
+        if got != want:
             return False, (
-                f"classifier returned private={got} for {payload.get('full_name')}, "
-                f"expected {expected}"
+                f"case {label!r}: verdict {got}, expected {want}. Notes: "
+                f"{[n.strip() for n in notes]}"
             )
     return True, (
-        "classifier maps private/internal -> pass and public/malformed -> fail "
-        f"across {len(cases)} recorded payloads, including a payload missing both "
-        "fields (UNKNOWN is never treated as private)"
+        f"the comparison accepts the live {len(declared)}-target matrix and rejects a "
+        "dropped target, an undeclared extra, and an empty matrix -- so a matrix that "
+        "no longer parses cannot pass by matching nothing"
+    )
+
+
+def control_packaging_a_second_copy_of_the_set_is_caught() -> tuple[bool, str]:
+    """A target-triple literal reintroduced into the packager must go red.
+
+    This is the control for the defect the change removed: `package_release.py`
+    used to carry `TARGETS = (...)` as a literal tuple beside the workflow's
+    matrix, with nothing reconciling them (M6-C11). Reverting that must be
+    caught rather than merely discouraged by a comment.
+    """
+    declared = declared_targets()
+    clean = (REPO / PACKAGER).read_text(encoding="utf-8")
+    site = (REPO / SITE_RELEASES).read_text(encoding="utf-8")
+    clean_ok, clean_notes = packaging_verdict(declared, declared, clean, site)
+    if not clean_ok:
+        return False, (
+            "the real packager does not pass its own check, so a red below would not "
+            f"be attributable to the planted literal: {[n.strip() for n in clean_notes]}"
+        )
+    planted = clean + '\nTARGETS = ("x86_64-unknown-linux-gnu", "aarch64-apple-darwin")\n'
+    planted_ok, planted_notes = packaging_verdict(declared, declared, planted, site)
+    if planted_ok:
+        return False, (
+            "a literal target tuple appended to the packager's source did NOT turn the "
+            "check red. The literal scan cannot fire."
+        )
+    if not any("target-triple literals" in note for note in planted_notes):
+        return False, f"it went red for another reason: {[n.strip() for n in planted_notes]}"
+    return True, (
+        "the real `scripts/package_release.py` passes with 0 triple literals, and the "
+        "same source with a two-triple `TARGETS` tuple appended goes red naming the "
+        "literals it found -- so the packager reading the manifest is asserted, not "
+        "assumed"
+    )
+
+
+def control_packaging_site_list_divergence_is_caught() -> tuple[bool, str]:
+    """The public advertisement drifting from the declaration must go red.
+
+    This is the control for M6-C18. `site/releases.js` decides what the public
+    is actually offered -- it shows a release only when an asset exists for
+    every triple in its own array -- and nothing compared it to the
+    declaration, so retiring a target would have made the site render "No
+    complete development release is published yet" for every release, with
+    every other check still green.
+
+    Driven with recorded sources in both directions, including the two shapes
+    that could pass by measuring nothing: an array this check can no longer
+    find, and a labels array that no longer pairs with the targets it labels.
+    """
+    declared = declared_targets()
+    clean_packager = (REPO / PACKAGER).read_text(encoding="utf-8")
+    clean_site = (REPO / SITE_RELEASES).read_text(encoding="utf-8")
+
+    def site_with(targets: list[str], labels: list[str] | None = None) -> str:
+        body = ", ".join(f"'{t}'" for t in targets)
+        names = labels if labels is not None else [f"Label {i}" for i in range(len(targets))]
+        return (f"  const targets = [{body}];\n"
+                f"  const labels = [{', '.join(repr(n) for n in names)}];\n")
+
+    baseline, notes = packaging_verdict(declared, declared, clean_packager, clean_site)
+    if not baseline:
+        return False, (
+            "the real site file does not pass its own check, so a red below would not "
+            f"be attributable to the planted drift: {[n.strip() for n in notes]}"
+        )
+
+    cases = [
+        ("identical to the declaration", site_with(declared), True),
+        ("a declared target the site never offers", site_with(declared[:-1]), False),
+        ("a target the site offers that nobody builds",
+         site_with(declared + ["i686-unknown-linux-gnu"]), False),
+        ("an empty array", site_with([]), False),
+        ("the array renamed so the pattern cannot find it",
+         clean_site.replace("const targets =", "const releaseTargets ="), False),
+        ("labels no longer paired with targets",
+         site_with(declared, labels=["only one label"]), False),
+        ("a later shadowing `const targets` after the real one",
+         clean_site + "\n  const targets = ['i686-unknown-linux-gnu'];\n", False),
+    ]
+    # Each red case must go red FOR ITS OWN REASON: a case that happened to be
+    # caught by a sibling rule would credit this control with a rule it never
+    # exercised.  The marker is a phrase only that rule's FAIL line contains.
+    reasons = {
+        "a later shadowing `const targets` after the real one": "each must be declared exactly once",
+    }
+    for label, source, want in cases:
+        got, case_notes = packaging_verdict(declared, declared, clean_packager, source)
+        if got != want:
+            return False, (
+                f"case {label!r}: verdict {got}, expected {want}. Notes: "
+                f"{[n.strip() for n in case_notes]}"
+            )
+        marker = reasons.get(label)
+        if marker and not any(marker in n for n in case_notes if "FAIL" in n):
+            return False, (
+                f"case {label!r} went red, but not for its own reason (expected a FAIL "
+                f"naming {marker!r}): {[n.strip() for n in case_notes if 'FAIL' in n]}"
+            )
+    return True, (
+        f"the comparison accepts the live {len(declared)}-target advertisement and "
+        "rejects a dropped target, an offered-but-unbuilt extra, an empty array, an "
+        "array it can no longer find, labels that no longer pair with their "
+        "targets, and a later shadowing declaration (red for its own reason: "
+        "declared more than once) -- so a renamed, emptied or shadowed array "
+        "cannot pass by binding the wrong thing"
+    )
+
+
+def control_packaging_reads_the_manifest_not_a_tuple() -> tuple[bool, str]:
+    """The packager's accepted set must follow the declaration.
+
+    The scan above proves no literal is present; this proves the value the
+    packager actually uses comes from the manifest, by importing it and
+    comparing against an independent read of the same table.
+    """
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("m6_package_release", REPO / PACKAGER)
+    if spec is None or spec.loader is None:
+        return False, f"could not load {PACKAGER}, so this control DID NOT RUN"
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["m6_package_release"] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception as error:  # noqa: BLE001 - a broken import is a failed control
+        return False, f"{PACKAGER} could not be imported, so this control DID NOT RUN: {error}"
+    accepted = sorted(module.advertised_targets())
+    declared = declared_targets()
+    if accepted != declared:
+        return False, (
+            f"the packager accepts {accepted} while the manifest declares {declared}"
+        )
+    if not hasattr(module, "advertised_targets"):
+        return False, "the packager no longer exposes a manifest reader"
+    return True, (
+        f"`package_release.advertised_targets()` returns exactly the {len(declared)} "
+        "triples an independent read of [workspace.metadata.release] gives, so the "
+        "packager and this gate resolve the same declaration rather than two copies"
+    )
+
+
+def control_visibility_classifier_goes_both_ways() -> tuple[bool, str]:
+    """The check must redden when reality disagrees with the declaration.
+
+    **This is the control for the change the owner's publication decision
+    forced, and the thing it exists to refuse is an inverted constant.** The
+    expected answer moved from private to public; a check that simply asserted
+    "public" would pass on any repository GitHub called public and would go on
+    passing if the declaration were later reverted -- a check that cannot go
+    red for the reason it names.
+
+    So every recorded payload is driven against **both** declarations, and the
+    required answer is `observed == declared` in all eight cells: public
+    matches public and fails private, private matches private and fails
+    public. A classifier hard-wired to either answer fails four of them. This
+    is the `assert_eq!` whose halves move together (M5-C10), avoided by
+    varying the two halves independently.
+    """
+    payloads = [
+        ("private", {"full_name": "o/private-repo", "private": True, "visibility": "private"}),
+        ("public", {"full_name": "o/public-repo", "private": False, "visibility": "public"}),
+        # `internal` folds into private; recorded so the fold is exercised
+        # rather than assumed.
+        ("private", {"full_name": "o/internal", "private": False, "visibility": "internal"}),
+        (None, {"full_name": "o/malformed"}),
+    ]
+    agreeing = 0
+    disagreeing = 0
+    for observed, payload in payloads:
+        for declared in VISIBILITY_VALUES:
+            want = observed == declared  # None never equals a declared value
+            got, detail = classify_visibility(payload, declared)
+            if got != want:
+                return False, (
+                    f"{payload.get('full_name')} observed={observed} declared={declared}: "
+                    f"classifier said {got}, expected {want} ({detail})"
+                )
+            if want:
+                agreeing += 1
+            else:
+                disagreeing += 1
+    if agreeing == 0 or disagreeing == 0:
+        return False, (
+            f"the case matrix produced {agreeing} matching and {disagreeing} "
+            "mismatching cells; a matrix with none of one kind proves nothing"
+        )
+    return True, (
+        f"{len(payloads)} recorded payloads x {len(VISIBILITY_VALUES)} declared "
+        f"expectations = {agreeing + disagreeing} cells, all correct: {agreeing} "
+        f"agree and {disagreeing} disagree, so a *public* repository fails a "
+        "`private` declaration AND a *private* repository fails the `public` one "
+        "now declared -- the check compares two observations rather than asserting "
+        "a constant. A payload carrying neither field is UNKNOWN and matches "
+        "neither declaration."
+    )
+
+
+def control_visibility_declaration_is_read_not_assumed() -> tuple[bool, str]:
+    """`declared_visibility` must read the manifest, and refuse junk.
+
+    Without this, `classify_visibility`'s matrix above could be perfect while
+    the expectation fed to it in a real run came from somewhere other than the
+    declaration -- which is the whole mechanism.
+    """
+    live = declared_visibility()
+    if live not in VISIBILITY_VALUES:
+        return False, f"the live declaration is {live!r}, which is not a valid value"
+    source = Path(__file__).read_text(encoding="utf-8")
+    if "expected = declared_visibility()" not in source:
+        return False, (
+            "`check_visibility` no longer obtains its expectation from "
+            "`declared_visibility()`, so this control is testing a function the "
+            "check does not use"
+        )
+    text = (REPO / "Cargo.toml").read_text(encoding="utf-8")
+    if f'repository-visibility = "{live}"' not in text:
+        return False, (
+            f"`declared_visibility()` returned {live!r} but root Cargo.toml does not "
+            "contain that assignment, so the value did not come from the manifest"
+        )
+    # And the parser must refuse a value it cannot compare, rather than
+    # defaulting to one of them.
+    for junk in ('repository-visibility = "secret"', "# no key"):
+        with tempfile.TemporaryDirectory() as tmp:
+            probe = Path(tmp) / "Cargo.toml"
+            probe.write_text(
+                "[workspace]\nmembers = []\n\n[workspace.metadata.release]\n" + junk + "\n",
+                encoding="utf-8",
+            )
+            table = tomllib.loads(probe.read_text(encoding="utf-8"))
+            value = table["workspace"]["metadata"]["release"].get("repository-visibility")
+            if value in VISIBILITY_VALUES:
+                return False, f"{junk!r} produced the comparable value {value!r}"
+    return True, (
+        f"the expectation is read from root Cargo.toml (`repository-visibility = "
+        f'"{live}"`, found verbatim in the file) rather than hard-coded, and a '
+        "declaration of an uncomparable value or of nothing at all yields no "
+        "expectation rather than defaulting to one"
     )
 
 
@@ -1750,14 +2332,40 @@ CONTROLS: dict[str, list[tuple[str, object]]] = {
             control_digest_allowlist_cannot_hide_another_secret,
         ),
     ],
+    "packaging": [
+        (
+            "a workflow matrix that disagrees with the declaration",
+            control_packaging_matrix_divergence_is_caught,
+        ),
+        (
+            "a target tuple reintroduced into the packager",
+            control_packaging_a_second_copy_of_the_set_is_caught,
+        ),
+        (
+            "the packager resolves the manifest, not a copy",
+            control_packaging_reads_the_manifest_not_a_tuple,
+        ),
+        (
+            "the public advertisement disagreeing with the declaration",
+            control_packaging_site_list_divergence_is_caught,
+        ),
+    ],
     "visibility": [
-        ("the classifier goes both ways", control_visibility_classifier_goes_both_ways),
+        (
+            "observed and declared are compared in all eight cells",
+            control_visibility_classifier_goes_both_ways,
+        ),
+        (
+            "the expectation is read from the manifest, not hard-coded",
+            control_visibility_declaration_is_read_not_assumed,
+        ),
         ("the check cannot change a repository setting", control_visibility_is_read_only),
     ],
 }
 
 CHECKS = {
     "deps": check_deps,
+    "packaging": check_packaging,
     "provenance": check_provenance,
     "secrets": check_secrets,
     "visibility": check_visibility,
