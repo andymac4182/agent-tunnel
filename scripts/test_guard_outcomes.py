@@ -284,7 +284,18 @@ EXPECTED_GUARD_ANCHORS = {
     # M6-C08 resolution rules and the `m6c08-doctor` suite for the surface
     # that reports them. (11 before the Fable review, which added the
     # access-versus-mode-bit rule as a case of its own.)
-    "m3-guard-deletion.py": 12,
+    #
+    # Was 12. Re-measured on `m3c1-suite-stability` after merging PR #81:
+    # **15 anchors across 4 suites**, the three added being the
+    # `m3c25-resign-pin-wait` cases (M3-25 / M7-C89). Taken from what
+    # `--check-anchors` reports, not by adding three, and shown live by
+    # setting it to 16 first and watching this file fail.
+    #
+    # Then **17**, after the Fable review of `3cf2c1e` added two cases that
+    # witness the pin wait's *application* (its call site and its bound), not
+    # only its decision. Re-measured the same way: 18 first, which fails
+    # naming m3, then 17, which passes.
+    "m3-guard-deletion.py": 17,
     # **Two harnesses that were never in this registry at all**, added by the
     # m6c3 worker (M6-C06/M6-C07).  Absence here is quieter than a stale
     # floor: every rule this file holds over a guard harness -- the
