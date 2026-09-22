@@ -108,9 +108,26 @@ fn diagnostic(output: &Output) -> Value {
     serde_json::from_str(line).expect("parse tunnel-client JSON diagnostic")
 }
 
-/// The error surface must not name the relay host, the private-key file, or
-/// any credential body. This is asserted over the whole process output, not
+/// The error surface must not name the private-key file, any credential
+/// body, or the relay endpoint. Asserted over the whole process output, not
 /// only the parsed JSON, so a stray `eprintln!` cannot slip past it.
+///
+/// **What this covers, measured rather than assumed.** These are *absence*
+/// assertions, and an absence assertion over a value the code could never
+/// emit is green over an empty domain -- the M5-C11 defect. So this
+/// fixture's error path was probed with both of the connector's redaction
+/// layers defeated at once (`sanitize_error` returning its input, and
+/// `ClientError::safe_message`'s generic transport arm appending `detail`).
+/// The worst output it then produces is
+/// `websocket handshake failed: IO error: Connection refused (os error 61)`
+/// -- **no path, no certificate, no endpoint**. Every entry below is
+/// therefore belt and braces on this path and none of them can redden here.
+///
+/// `assert_transport_message_is_bounded` is the assertion that *can* redden,
+/// and it is what the redaction case in `scripts/m0-guard-exit-codes.py`
+/// drives. This list stays because these tests will grow commands whose
+/// error paths do handle paths and endpoints, and because it costs nothing
+/// -- but it is not evidence, and nothing should count it as any.
 fn assert_redacted(output: &Output) {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -120,9 +137,6 @@ fn assert_redacted(output: &Output) {
         "BEGIN CERTIFICATE",
         "client-cert.pem",
         "server-ca.pem",
-        // The relay endpoint. `runtime.md` forbids endpoints in diagnostics,
-        // and a transport failure is the one place a socket address is most
-        // tempting to append to the message.
         "127.0.0.1",
     ] {
         assert!(
@@ -134,6 +148,30 @@ fn assert_redacted(output: &Output) {
             "stderr leaked {secret:?}: {stderr}"
         );
     }
+}
+
+/// A transport diagnostic must be the bounded scope label and nothing else.
+///
+/// `runtime.md` requires an external error to carry only a stable safe code,
+/// a short explanation, an identifier where available and a retry hint, and
+/// forbids leaking raw TLS or backend errors through it. The connector
+/// enforces that in **two independent places**: `sanitize_error` discards the
+/// underlying error at construction, and `safe_message`'s generic transport
+/// arm drops `detail` at display.
+///
+/// Defeating either one alone changes nothing observable -- measured, not
+/// inferred: the first run of the guard suite defeated the display arm by
+/// itself and this fixture stayed green. Both have to go before the OS error
+/// reaches an operator, which is why the harness case applies both edits.
+fn assert_transport_message_is_bounded(report: &Value) {
+    let message = report["error"]["message"]
+        .as_str()
+        .expect("error message is a string");
+    assert_eq!(
+        message, "websocket handshake failed",
+        "a transport diagnostic must be the bounded scope label alone; an \
+         underlying OS, TLS or backend error must not reach the operator"
+    );
 }
 
 #[test]
@@ -199,5 +237,6 @@ fn a_refused_relay_connection_exits_four_and_names_the_transport() {
         Value::Bool(true),
         "a refused connection is safe to retry once the relay returns"
     );
+    assert_transport_message_is_bounded(&report);
     assert_redacted(&output);
 }

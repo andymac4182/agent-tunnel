@@ -189,18 +189,38 @@ CASES: list[tuple[str, list[Edit], bool]] = [
     (
         # **Redaction is the hard constraint on these surfaces.**  An error
         # message's whole job is to describe internal state, so it is exactly
-        # where an endpoint escapes.  The generic transport arm deliberately
-        # drops `detail`; appending it puts the relay's socket address on
-        # stdout, which `docs/runtime.md` forbids.  This must redden
-        # `a_refused_relay_connection_exits_four_and_names_the_transport`'s
-        # redaction assertion, not merely its status assertion.
-        "a transport failure does not print the relay endpoint",
+        # where a backend error escapes.
+        #
+        # **This case applies two edits, and the reason is a measurement.**
+        # It was first written with only the second edit -- appending `detail`
+        # to the generic transport arm -- and the run reported `RED` against
+        # an unrelated `m2_runtime` rotation test while the redaction fixture
+        # it was written for **stayed green**.  A case that reddens something
+        # other than the rule it names is not evidence for that rule, so the
+        # first edit was found by probing rather than assumed: `sanitize_error`
+        # discards the underlying error at construction, so with it intact the
+        # appended `detail` is the constant `"transport failure"` and nothing
+        # leaks.  The redaction here is genuinely two independent layers, and
+        # only defeating both puts `IO error: Connection refused (os error 61)`
+        # in front of an operator.
+        #
+        # It must redden `assert_transport_message_is_bounded`, which is the
+        # assertion in that fixture that can redden at all.  The endpoint and
+        # path entries in `assert_redacted` cannot: this error path does not
+        # produce them even fully unredacted, and the fixture says so rather
+        # than letting them read as coverage.
+        "a transport failure does not print the underlying backend error",
         [
+            (
+                LIB,
+                '    let _ = error;\n    "transport failure".to_owned()',
+                "    error.to_owned()",
+            ),
             (
                 LIB,
                 '            Self::Transport { scope, .. } => format!("{scope} failed"),',
                 '            Self::Transport { scope, detail } => format!("{scope} failed: {detail}"),',
-            )
+            ),
         ],
         False,
     ),
