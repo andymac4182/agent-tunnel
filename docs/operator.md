@@ -82,6 +82,7 @@ while it runs (section 2.5). Anything larger is not supported yet:
 | Upgrade | Stop, replace the binaries from one bundle, start (section 4); **rolling or mixed-version upgrade: not supported in this alpha** | M6-C23 |
 | Supervisor IPC, `status` | **Not supported in this alpha** | M6-06 |
 | Backup and restore of the Redis catalog | Operator's Redis tooling only; restore goes through the recovery commands, which need an external signing authority that is not shipped | M6-C22 |
+| A Redis restart that keeps its data (one relay) | Supported: a serving relay with `redis_restart_continuity_seconds` re-binds by itself; a relay started after the restart needs `tunnel-relay rebind-redis-run` once (section 4). A Redis that came back empty or older is refused | M6-C65 |
 | Metrics endpoint and audit log | **Not supported in this alpha** | M6-C24 |
 | One relay and its Redis on Fly.io | Dockerfiles, `fly.toml` files, a runbook and a cost list in [deploy-fly.md](deploy-fly.md), proved with Docker on one machine and run on Fly: one relay serves from an image built from `main`, measured end to end from a Mac (reconnect through a relay restart included) | M6-C70 |
 
@@ -448,15 +449,19 @@ treat that namespace as partial. `initialize`, `recovery-initialize` and
 `recover` behave the same way (M6-C23).
 
 The activation also binds the namespace to the Redis server's run id, and
-Redis draws a new run id **every time it starts**. So any Redis restart makes
-`serve` refuse the namespace again with `stage=authority_identity`, even with
-persistence on and every key intact (measured in a dogfood run with AOF on:
-23 of 23 keys survived and `serve` still refused; M6-C65). A second activation
-is refused ("namespace already has a deployment incarnation; changing it
-requires recovery"). Recovery needs a `[recovery]` section and a signed approval
-from an external authority that is not shipped (section 4). **In this alpha,
-the only way back after a Redis restart is a new `redis_namespace`, provisioned
-from the start.** Devices connected at the time exit `4`.
+Redis draws a new run id **every time it starts**. The binding is a fence: a
+Redis that restarted may have come back without data, from an older backup, or
+as a stale replica, and a relay must not serve authorization from that. So
+after a Redis restart `serve` refuses the namespace with
+`stage=authority_identity class=run_changed` until something proves the data
+survived, even with persistence on and every key intact. A single relay has
+two ways back, both keeping the same namespace with nothing reprovisioned
+(M6-C65, section 4, "Redis restarts"): a serving relay configured with
+`redis_restart_continuity_seconds` re-binds by itself when Redis still holds
+the last token it wrote, and after any other restart the operator runs
+`tunnel-relay rebind-redis-run` once. A second activation is still refused
+("namespace already has a deployment incarnation; changing it requires
+recovery").
 
 Once `serve` and `connect` are running (section 3.1), a consumer calls
 `POST /v1/devices/<device.id>/services/<service.id>/echo` on the consumer
@@ -515,8 +520,13 @@ first connection and two lanes worked. `stage` is one of `tls_setup`,
 example a wrong CA), `tls_alert` (Redis refused the handshake, for example a
 missing or unaccepted client certificate), `tls`, `auth` (wrong user or
 password), `noperm` (the ACL user may not run the command, for example
-`INFO`), `reply`, `invalid_reply`, `run_id_conflict`, `config` (the
-configuration was rejected before any exchange) or `catalog`.
+`INFO`), `reply`, `invalid_reply`, `run_id_conflict`, `unbound` (the
+namespace has no incarnation or run binding: never activated, or Redis came
+back without its data), `run_changed` (the namespace is bound to an earlier
+Redis run: Redis restarted; section 4, "Redis restarts"), `continuity` (Redis
+restarted without the serving relay's last continuity token: it came back
+older, or lost acknowledged writes), `config` (the configuration was rejected
+before any exchange) or `catalog`.
 The recovery commands print `recovery Redis connection failed;` followed by
 the same `stage=` and `class=` words.
 
@@ -1026,9 +1036,66 @@ lapses (up to 30 s), so stop relays with SIGTERM, not SIGKILL.
 **Backup and restore.** Only the Redis catalog holds durable state. Back it up
 with your Redis tooling, using the durability settings in
 [cluster.md](cluster.md#redis-durability-backup-and-recovery). Leases, presence
-and tickets are not recoverable state. A restore, a restart with a different
-Redis identity, or any doubt about which Redis is authoritative must go through
-recovery. Do not just restart the relays.
+and tickets are not recoverable state. A restore, a cluster's Redis restart,
+or any doubt about which Redis is authoritative must go through recovery. Do
+not just restart the relays. A single relay's Redis that restarted in place
+has its own path, below.
+
+**Redis restarts (one relay, M6-C65).** Redis draws a new run id every time it
+starts, and the namespace is bound to the run it was activated or last
+re-bound on (section 2.3), so after a restart the relay needs proof that Redis
+came back with its data. What it accepts, by case:
+
+| Redis came back | A serving relay with `redis_restart_continuity_seconds` | A relay started afterwards, or one without it |
+| --- | --- | --- |
+| From its own AOF or RDB, with every write it acknowledged | Re-binds by itself and serves again; it prints `tunnel-relay: Redis authority restarted; namespace re-bound to the new Redis run after its continuity check` | Refused, `stage=authority_identity class=run_changed`, until you run `rebind-redis-run` once |
+| From an older snapshot, a stale replica, or having lost acknowledged writes | Refused, `class=continuity`; it keeps refusing | Refused, `class=run_changed`; do **not** run `rebind-redis-run` |
+| Empty | Refused, `class=unbound` | Refused, `class=unbound`, and `rebind-redis-run` refuses too |
+
+`redis_restart_continuity_seconds = N` (a top-level key, `1..=60`) makes a
+relay without `[cluster]` write a random token into its namespace every `N`
+seconds and remember the last one Redis acknowledged. After a restart, a lane
+that reaches the new Redis run re-binds the namespace only if Redis holds that
+token (or one whose write outcome the relay could not learn): Redis then holds
+the relay's last acknowledged write, and AOF replay and an RDB snapshot both
+restore a prefix of the command history, so it holds everything acknowledged
+before it too. A backup or replica older than the relay's last token has an
+older token and is refused. **It is sound only when Redis makes every write
+durable before acknowledging it** (`appendonly yes` with `appendfsync
+always`, as the Fly Redis in [deploy-fly.md](deploy-fly.md) is configured):
+with `everysec` a crash can lose up to a second of acknowledged writes -- a
+revocation, say -- made after the last token, which the token cannot show.
+Leave it unset on such a Redis. It is refused with `[cluster]`, where each
+relay would know only its own tokens. The relay itself stays up across the
+restart; device sessions end with `AUTHORITY_UNAVAILABLE` and the devices
+reconnect by themselves. Measured with the shipped binaries and `docker
+restart` of an AOF Redis (`scripts/m6-redis-restart-verify.sh`): the echo was
+served again 39 to 43 s after the restart, most of it the previous session's
+owner lease (M6-C40).
+
+A relay that was not running across the restart has no token to compare, so
+it refuses the namespace, and you re-attest it once, after checking that Redis
+restarted from its own data directory (not a restore, not a new or replaced
+volume, not a promoted replica):
+
+```sh shape-only
+tunnel-relay rebind-redis-run --config /etc/agent-tunnel/relay.toml --redis-restarted-in-place
+```
+
+It prints `Re-bound namespace NS (deployment incarnation INC) from Redis run
+OLD to NEW.`, or `... is already bound to Redis run RUN; nothing changed.`,
+and `serve` then starts on the same namespace; a relay that is still running
+picks the new binding up at its next Redis command, with no restart (from the
+code; the gate measures the stopped-relay case). Run ids are Redis's own random
+server identifiers, not secrets. It refuses a namespace with no incarnation or
+run binding (`class=unbound`: Redis came back empty; nothing is written), a
+namespace whose incarnation is not the configured one, a `[cluster]`
+configuration (a cluster recovers Redis with the commands below), and any run
+without `--redis-restarted-in-place`. **What it cannot check:** Redis restored
+from an older consistent backup looks exactly like Redis restarted in place,
+so the flag is your declaration, as `recover`'s fencing flags are. After a
+restore, re-binding would bring back whatever the backup had, such as a
+revoked credential or grant; use recovery or a new namespace instead.
 
 **Recovery** is three commands, specified in [recovery-cli.md](recovery-cli.md).
 `recovery-initialize` is shown in section 3.3. The other two need a live Redis,

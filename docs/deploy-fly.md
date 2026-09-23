@@ -23,7 +23,7 @@ nothing caches the lookup across processes. Since M6-C73 each startup
 connection gets 10 s. **The relay now runs `main-721ed2a`**, built from
 `721ed2a` with these deploy files, and started on a fresh VM without the
 workaround (section 6.3). A lane reconnect inside a running relay still has
-2 s (M6-C74); on Fly a Redis restart already ends the namespace (section 6.4).
+2 s (M6-C74), which matters after a Redis restart (section 6.4).
 
 Every `fly` command below is one the owner runs, in
 order, and each one that costs money is marked **Costs money**. The prices are
@@ -156,13 +156,16 @@ A self-hosted Redis (`redis:8.4.0-alpine`, the version every local harness here
 uses) meets every item and is what the local proof ran against.
 
 **What self-hosting costs in operations:** a Redis restart changes its
-`run_id`, and the relay then refuses that namespace until recovery, which this
-alpha cannot perform (M6-C22). Measured locally: a relay started after a Redis
-restart exits `1` with `Redis catalog connection failed; stage=authority_identity`,
-even though AOF kept all 24 keys. On Fly a machine restarts on host
-maintenance, on a `fly deploy` of the Redis app, and on a crash, so **every one
-of those is an outage** that ends with section 6.4, a new namespace and a
-re-provisioning (M6-C65).
+`run_id`, and the relay's namespace is bound to the run it was activated on.
+On Fly a machine restarts on host maintenance, on a `fly deploy` of the Redis
+app, and on a crash. Since M6-C65 the namespace survives a restart that kept
+Redis's data: a relay that stays up across it re-binds by itself, and a relay
+started after it needs one command (section 6.4). **Before M6-C65 every one
+of those restarts was an outage** that ended with a new namespace and a
+re-provisioning: measured locally, a relay started after a Redis restart
+exited `1` with `Redis catalog connection failed; stage=authority_identity`,
+even though AOF kept all 24 keys. The relay image must be built from a
+commit that has M6-C65 for any of this; `main-721ed2a` does not.
 
 ## 2. Before you start
 
@@ -328,8 +331,9 @@ daily snapshots.
 `maxmemory-policy noeviction` but no `maxmemory`, so the policy never applies
 and Redis can grow until the 256 MB VM runs out of memory (an out-of-memory
 kill is a Redis restart, section 6.4). The fix, `maxmemory 160mb` or similar,
-belongs in the next planned Redis rebuild. It is not made in place because
-redeploying Redis restarts it, which ends the live namespace (M6-C65).
+belongs in the next planned Redis rebuild. It was not made in place because
+redeploying Redis restarted it, which ended the live namespace; with a relay
+image that has M6-C65 a Redis redeploy is an ordinary restart (section 6.4).
 
 **Costs money: $2.47 a month** (one `shared-cpu-1x` 256 MB machine in `syd`).
 Run from the Redis directory, whose `fly.toml` and `Dockerfile` are the
@@ -472,7 +476,7 @@ exits `1` on failure. Read the message before running anything again:
 | 1, 2 | any | Yes. Neither contacts Redis. Fix `relay.toml` (then rebuild, section 6.1) or the records, and run it again. |
 | any | the entrypoint names a missing or invalid secret | Yes. Nothing ran. Fix the secret with `fly secrets import --stage` and run it again. |
 | 3 | `Redis catalog connection failed; stage=... class=...` | Yes. Every connection failure happens before the activation script runs, and the script checks the namespace is empty and writes both keys together, so nothing was written. The words say which failure it was (M6-C72): `class=auth` is a password that does not match Redis's, `class=tls_certificate` a CA that did not sign Redis's certificate, `class=dns` a host name that does not resolve, `class=timeout` a connection that did not open within 10 s (M6-C73). Fix that and retry; section 6.2.1 confirms it from Redis's side. An image from before PR #97 printed `stage=authority_connection` and nothing else for all of these. |
-| 3 | "namespace already has a deployment incarnation" | Do not repeat. If an earlier run of step 3 printed its success line, or its outcome is unknown and this is the rerun, the incarnation is written: go on to step 4. Otherwise the namespace was used before: choose a new one (section 6.4). |
+| 3 | "namespace already has a deployment incarnation" | Do not repeat. If an earlier run of step 3 printed its success line, or its outcome is unknown and this is the rerun, the incarnation is written: go on to step 4. Otherwise the namespace was used before: choose a new one (section 6.4.1). |
 | 3 | "namespace is not empty" | No. Choose a new namespace. |
 | 4 | fails connecting to Redis, or at `stage=authority_identity` because step 3 has not succeeded | Yes. `provision-catalog` makes the same connection and incarnation check as `serve` before it writes anything (`crates/tunnel-relay/src/provisioning.rs`, `provision_catalog`). |
 | 4 | "invalid provisioning records" or "invalid device certificate" | Yes. These are checked before Redis is contacted. |
@@ -659,7 +663,7 @@ Restarting system`; `Preparing to run: ... serve` at 12:51:09Z and `tunnel-relay
 listening: consumer=0.0.0.0:8443 device=0.0.0.0:9443` in the same second, on a
 fresh VM; and both checks logged failing at 12:51:09Z and passing at
 12:51:10Z. It ends the device sessions like any restart. Change
-`redis_namespace` or `deployment_incarnation` only when section 6.4 says so:
+`redis_namespace` or `deployment_incarnation` only when section 6.4.1 says so:
 a new value in `relay.toml` needs section 6.2 again.
 
 ### 6.4 After a Redis restart
@@ -667,26 +671,80 @@ a new value in `relay.toml` needs section 6.2 again.
 A Redis restart gives Redis a new `run_id`, and the relay's namespace is bound
 to the old one. Restarts happen on Fly host maintenance, on a crash, on any
 `fly deploy` of the Redis app, and on `fly secrets import` for the Redis app
-without `--stage` (which restarts its machine to apply the secret). What you
-will see depends on whether the relay restarts too (all measured locally,
-M6-C67 and M6-C65, except the Fly-side states):
+without `--stage` (which restarts its machine to apply the secret). The
+binding is a fence against a Redis that came back without its data, from an
+older snapshot, or as another machine, so the relay needs proof the data
+survived before it serves again ([operator.md](operator.md) section 4, "Redis
+restarts", M6-C65). **All of this needs a relay image built from a commit
+with M6-C65**; `main-721ed2a` does not have it, and with that image the only
+way back is section 6.4.1. The Redis image is unchanged.
 
-- **The relay keeps running.** `fly machine list -a agentuplink-relay` shows it
-  `started`, the `/readyz` check stays passing, and every consumer call fails
-  `503` with `{"code":"AUTHORIZATION_UNAVAILABLE","execution":"not_dispatched",...}`.
-  Device sessions end (`connect` exits `4`) and new ones are not admitted.
-- **The relay starts again after the restart** (a crash, a host move, a
-  deploy, a relay secret change). It exits `1` at once, each time, and
-  `fly logs -a agentuplink-relay --no-tail` shows
-  `tunnel-relay: Redis catalog connection failed; stage=authority_identity`
-  repeated. The `[[restart]]` policy tries 10 times and then leaves the
-  machine **stopped**: `fly machine list` shows it `stopped`, and
-  `min_machines_running = 1` does not start it (that setting governs
-  auto-stop, which is off). `fly machine start <id> -a agentuplink-relay`
-  fails the same way, every time, until the namespace changes.
+**The relay kept running across the restart.** `relay.toml` sets
+`redis_restart_continuity_seconds = 5`, which is sound here because the Redis
+entrypoint sets `appendfsync always`. Once Redis is back from its AOF, the
+relay re-binds the namespace by itself, and `fly logs -a agentuplink-relay
+--no-tail` shows `tunnel-relay: Redis authority restarted; namespace re-bound
+to the new Redis run after its continuity check`. Device sessions end with
+`AUTHORITY_UNAVAILABLE` when Redis goes away, and devices reconnect by
+themselves; a reconnect can wait out the previous session's owner lease, up
+to 30 s. Measured locally with `docker restart` of an AOF Redis and the
+shipped binaries (`scripts/m6-redis-restart-verify.sh`): the echo was served
+again 39 to 43 s after the restart, from the same relay process. **Not run on
+Fly.** Each re-binding attempt is a lane reconnect, which has 2 s including
+the DNS lookup of `agentuplink-redis.internal` (M6-C74); a lookup slower than
+that fails the attempt and the relay tries again on its next token, every
+5 s. While Redis is down or refused, `/readyz` still answers ready (M6-C67)
+and every consumer call gets `503` `AUTHORIZATION_UNAVAILABLE`.
 
-Until recovery ships (M6-C22), the way back is a new namespace. Redis's data
-and the device's key, certificate and profile are all kept:
+If the log shows `tunnel-relay: Redis authority continuity check failed;
+stage=authority_identity class=continuity` instead, Redis came back without
+the relay's last acknowledged write -- an older snapshot, or lost data. The
+relay keeps refusing it; do not run the command below. Go to section 6.4.1
+(or restore Redis properly and recover). `class=unbound` means Redis came back
+empty: section 6.4.1.
+
+**The relay started after the restart** (both machines moved, a crash, a
+deploy). It exits `1` each time with `tunnel-relay: Redis catalog connection
+failed; stage=authority_identity class=run_changed`. The `[[restart]]` policy
+tries 10 times and then leaves the machine **stopped**: `fly machine list`
+shows it `stopped`, and `min_machines_running = 1` does not start it (that
+setting governs auto-stop, which is off). A fresh relay has no token to
+compare, so you re-attest the namespace once. First check that Redis restarted
+from its own volume: `fly machine list -a agentuplink-redis` shows the same
+machine, and `fly volumes list -a agentuplink-redis` the same volume, as
+before; no volume was restored from a snapshot. Then, like section 6.2's
+steps:
+
+```text
+cd ~/agentuplink-fly
+IMAGE=registry.fly.io/agentuplink-relay:fly-1   # the image the relay runs
+fly machine run $IMAGE --name rebind -a agentuplink-relay -r syd --restart no --detach \
+  -- rebind-redis-run --redis-restarted-in-place
+mid rebind
+fly machine wait $ID -a agentuplink-relay --state stopped
+fly logs -a agentuplink-relay --machine $ID --no-tail
+fly machine status $ID -a agentuplink-relay
+fly machine destroy $ID -a agentuplink-relay
+fly machine list -a agentuplink-relay
+fly machine start <relay machine id> -a agentuplink-relay
+```
+
+Success is `Re-bound namespace <namespace> (deployment incarnation
+<incarnation>) from Redis run <old> to <new>.` (or `... already bound to Redis
+run <run>; nothing changed.`), exit `0`. `--redis-restarted-in-place` is your
+declaration that Redis was not restored or replaced: the command refuses an
+empty Redis (`class=unbound`) but cannot tell a restore of an older snapshot
+from a restart, and re-binding a restored Redis would bring back whatever it
+held, such as a revoked grant. After a restore, use section 6.4.1. The
+command was run locally against a restarted Redis by
+`scripts/m6-redis-restart-verify.sh`, not on Fly; the entrypoint's
+`rebind-redis-run` case is new with M6-C65 and was checked with `sh -n` only.
+
+#### 6.4.1 A new namespace
+
+For a Redis that came back empty or older, or a relay image without M6-C65,
+the way back is a new namespace. Redis's data and the device's key,
+certificate and profile are all kept:
 
 1. Stop the relay if it is still running, so nothing is served while you
    work: `fly machine stop <id> -a agentuplink-relay`.
@@ -721,10 +779,12 @@ Section 3.1 issues the relay's server certificate for 90 days and the CAs for
   relay each time it opens a Redis connection. After it expires, a relay that
   (re)connects to Redis fails its TLS handshake. Rotating it means
   `fly secrets import -a agentuplink-redis`, which restarts Redis, **which is
-  a Redis restart (section 6.4)**: the namespace can no longer be served and a
-  new one must be provisioned. Plan it as maintenance: rotate the Redis certificate, then
-  run section 6.4 steps 1 to 6. For that reason section 3.1 issues the Redis
-  certificate for 365 days, as long as its CA.
+  a Redis restart (section 6.4)**. With a relay image that has M6-C65 the
+  running relay re-binds the namespace by itself once Redis is back with its
+  AOF; with an older image the namespace can no longer be served and a new one
+  must be provisioned (section 6.4.1). Plan it as maintenance either way. For
+  that reason section 3.1 issues the Redis certificate for 365 days, as long
+  as its CA.
 - **The CAs** expire on day 366. A new relay CA must also be imported into
   every device (`credentials import --server-ca`).
 - **The device certificate** carries the validity your issuer gave it, and

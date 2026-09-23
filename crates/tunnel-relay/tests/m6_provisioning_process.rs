@@ -646,6 +646,48 @@ fn with_rotation(document: &str, rotation: Rotation) -> String {
     )
 }
 
+/// Start `serve` and wait for `tunnel-relay listening`; its stderr lines
+/// after that arrive on the returned channel.
+fn start_serve(
+    relay_bin: &Path,
+    relay_config: &Path,
+) -> (Running, std::sync::mpsc::Receiver<String>) {
+    let mut relay = Running(
+        Command::new(relay_bin)
+            .args(["serve", "--config"])
+            .arg(relay_config)
+            .env("RUST_LOG", "warn")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn serve"),
+    );
+    let relay_stderr = relay.0.stderr.take().expect("serve stderr");
+    let (listening_tx, listening_rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        for line in BufReader::new(relay_stderr).lines().map_while(Result::ok) {
+            let _ = listening_tx.send(line);
+        }
+    });
+    let deadline = Instant::now() + STEP_DEADLINE;
+    let mut relay_lines = Vec::new();
+    loop {
+        match listening_rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(line) if line.starts_with("tunnel-relay listening") => break,
+            Ok(line) => relay_lines.push(line),
+            Err(_) => {}
+        }
+        if let Ok(Some(status)) = relay.0.try_wait() {
+            panic!("step serve: exited {status} before listening: {relay_lines:?}");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "step serve: not listening within {STEP_DEADLINE:?}: {relay_lines:?}"
+        );
+    }
+    (relay, listening_rx)
+}
+
 /// One relay brought up from an empty Redis namespace with the shipped
 /// binaries: device key, CSR and certificate import, records dry run, first
 /// incarnation, catalog provisioning and a listening `serve`.  The device is
@@ -803,7 +845,29 @@ async fn provision_and_serve_kind(
     rotation: Option<Rotation>,
     kind: ServiceKind,
 ) -> Provisioned {
-    let redis_url = env::var("TEST_REDIS_URL").expect("TEST_REDIS_URL (plaintext) is required");
+    provision_and_serve_with(tag, rotation, kind, ProvisionOptions::default()).await
+}
+
+/// What a gate may change in the shared bring-up.
+#[derive(Default)]
+struct ProvisionOptions {
+    /// A plaintext Redis the gate owns, instead of `TEST_REDIS_URL`.
+    redis_url: Option<String>,
+    /// Top-level relay configuration lines added to the shipped example.
+    relay_top_level: String,
+    /// Skip the four M6-C72 failing activations (other gates prove them).
+    skip_stage_cases: bool,
+}
+
+async fn provision_and_serve_with(
+    tag: &str,
+    rotation: Option<Rotation>,
+    kind: ServiceKind,
+    options: ProvisionOptions,
+) -> Provisioned {
+    let redis_url = options.redis_url.clone().unwrap_or_else(|| {
+        env::var("TEST_REDIS_URL").expect("TEST_REDIS_URL (plaintext) is required")
+    });
     let client_bin = PathBuf::from(
         env::var_os("TUNNEL_CLIENT_BIN")
             .expect("TUNNEL_CLIENT_BIN must name a freshly built tunnel-client"),
@@ -969,8 +1033,9 @@ async fn provision_and_serve_kind(
         relay_toml = with_rotation(&relay_toml, rotation);
     }
     relay_toml = format!(
-        "redis_tls_root_ca_path = {}\n{relay_toml}{}",
+        "redis_tls_root_ca_path = {}\n{}{relay_toml}{}",
         toml_string(&server_ca),
+        options.relay_top_level,
         kind.relay_tables(&catalog_value)
     );
     let relay_config = work.join("relay.toml");
@@ -1048,44 +1113,51 @@ async fn provision_and_serve_kind(
         "create the no-INFO ACL user: {}",
         String::from_utf8_lossy(&created)
     );
-    for (case, toml, secret, expected) in [
-        (
-            "wrong Redis CA",
-            base_toml.replace(&toml_string(&server_ca), &toml_string(&wrong_ca)),
-            None,
-            "Redis catalog connection failed; stage=connection_establishment class=tls_certificate",
-        ),
-        (
-            "wrong Redis password",
-            set_key(
-                &base_toml,
-                "redis_url",
-                &format!("\"rediss://m6c72-nouser-{nonce}:{wrong_password}@{redis_authority}\""),
+    let stage_cases = if options.skip_stage_cases {
+        Vec::new()
+    } else {
+        vec![
+            (
+                "wrong Redis CA",
+                base_toml.replace(&toml_string(&server_ca), &toml_string(&wrong_ca)),
+                None,
+                "Redis catalog connection failed; stage=connection_establishment class=tls_certificate",
             ),
-            Some(wrong_password.as_str()),
-            "Redis catalog connection failed; stage=connection_establishment class=auth",
-        ),
-        (
-            "ACL user without INFO",
-            set_key(
-                &base_toml,
-                "redis_url",
-                &format!("\"rediss://{acl_user}:{acl_password}@{redis_authority}\""),
+            (
+                "wrong Redis password",
+                set_key(
+                    &base_toml,
+                    "redis_url",
+                    &format!(
+                        "\"rediss://m6c72-nouser-{nonce}:{wrong_password}@{redis_authority}\""
+                    ),
+                ),
+                Some(wrong_password.as_str()),
+                "Redis catalog connection failed; stage=connection_establishment class=auth",
             ),
-            Some(acl_password.as_str()),
-            "Redis catalog connection failed; stage=primary_identity class=noperm",
-        ),
-        (
-            "missing client certificate",
-            set_key(
-                &base_toml,
-                "redis_url",
-                &format!("\"rediss://localhost:{}/{database}\"", mtls_redis.port()),
+            (
+                "ACL user without INFO",
+                set_key(
+                    &base_toml,
+                    "redis_url",
+                    &format!("\"rediss://{acl_user}:{acl_password}@{redis_authority}\""),
+                ),
+                Some(acl_password.as_str()),
+                "Redis catalog connection failed; stage=primary_identity class=noperm",
             ),
-            None,
-            "Redis catalog connection failed; stage=connection_establishment class=tls_alert",
-        ),
-    ] {
+            (
+                "missing client certificate",
+                set_key(
+                    &base_toml,
+                    "redis_url",
+                    &format!("\"rediss://localhost:{}/{database}\"", mtls_redis.port()),
+                ),
+                None,
+                "Redis catalog connection failed; stage=connection_establishment class=tls_alert",
+            ),
+        ]
+    };
+    for (case, toml, secret, expected) in stage_cases {
         let config = work.join(format!("relay-{}.toml", case.replace(' ', "-")));
         fs::write(&config, toml).expect("case config");
         let output = Command::new(&relay_bin)
@@ -1133,39 +1205,7 @@ async fn provision_and_serve_kind(
         "{provisioned}"
     );
 
-    let mut relay = Running(
-        Command::new(&relay_bin)
-            .args(["serve", "--config"])
-            .arg(&relay_config)
-            .env("RUST_LOG", "warn")
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn serve"),
-    );
-    let relay_stderr = relay.0.stderr.take().expect("serve stderr");
-    let (listening_tx, listening_rx) = std::sync::mpsc::channel::<String>();
-    std::thread::spawn(move || {
-        for line in BufReader::new(relay_stderr).lines().map_while(Result::ok) {
-            let _ = listening_tx.send(line);
-        }
-    });
-    let deadline = Instant::now() + STEP_DEADLINE;
-    let mut relay_lines = Vec::new();
-    loop {
-        match listening_rx.recv_timeout(Duration::from_millis(200)) {
-            Ok(line) if line.starts_with("tunnel-relay listening") => break,
-            Ok(line) => relay_lines.push(line),
-            Err(_) => {}
-        }
-        if let Ok(Some(status)) = relay.0.try_wait() {
-            panic!("step serve: exited {status} before listening: {relay_lines:?}");
-        }
-        assert!(
-            Instant::now() < deadline,
-            "step serve: not listening within {STEP_DEADLINE:?}: {relay_lines:?}"
-        );
-    }
+    let (relay, listening_rx) = start_serve(&relay_bin, &relay_config);
 
     Provisioned {
         relay,
@@ -2881,4 +2921,684 @@ async fn m6c31_day2_catalog_changes_take_effect_on_a_serving_relay() {
          device_exit={} revoked_device_grant_refused=true",
         exit.unwrap_or(-1)
     );
+}
+
+// ---------------------------------------------------------------------------
+// Task row M6-C65: a Redis restart must not end the namespace.
+// ---------------------------------------------------------------------------
+
+/// The Redis image the gate runs (the Fly Redis image's base).
+const M6C65_REDIS_IMAGE: &str = "redis:8.4.0-alpine";
+/// Continuity interval the gate configures (`redis_restart_continuity_seconds`).
+const M6C65_CONTINUITY_SECONDS: u64 = 1;
+/// A device reconnect after a Redis restart can wait out the previous
+/// session's owner lease (30 s, M6-C40) before its claim succeeds.
+const M6C65_RECOVERY_DEADLINE: Duration = Duration::from_secs(75);
+
+/// A disposable Redis container this gate owns on a fixed loopback port, so
+/// it can be restarted, replaced by one loaded from an older RDB, and
+/// replaced by an empty one while the relay keeps the same address.  Every
+/// container it creates carries a label with the run's nonce and is removed
+/// with its volume on drop.  The shared `TEST_REDIS_URL` Redis is never
+/// touched.
+struct DockerRedis {
+    label: String,
+    name: String,
+    port: u16,
+    generation: u32,
+}
+
+impl DockerRedis {
+    fn docker(args: &[&str]) -> Output {
+        let output = Command::new("docker")
+            .args(args)
+            .output()
+            .unwrap_or_else(|error| panic!("docker {args:?}: could not start: {error}"));
+        assert!(
+            output.status.success(),
+            "docker {args:?}: exited {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    }
+
+    /// Start the first container: AOF on, `appendfsync always`,
+    /// `aof-load-truncated no`, as `deploy/fly/redis/entrypoint.sh` does.
+    fn start(nonce: &str) -> Self {
+        let port = free_port().port();
+        let mut redis = Self {
+            label: format!("agent-tunnel.m6c65-owner={nonce}"),
+            name: String::new(),
+            port,
+            generation: 0,
+        };
+        redis.create(&[
+            "--appendonly",
+            "yes",
+            "--appendfsync",
+            "always",
+            "--aof-load-truncated",
+            "no",
+        ]);
+        redis.start_current();
+        redis
+    }
+
+    fn create(&mut self, redis_args: &[&str]) {
+        self.generation += 1;
+        self.name = format!(
+            "agent-tunnel-m6c65-{}-{}",
+            self.label.rsplit('=').next().unwrap_or("run"),
+            self.generation
+        );
+        let publish = format!("127.0.0.1:{}:6379/tcp", self.port);
+        let mut args = vec![
+            "create",
+            "--name",
+            &self.name,
+            "--label",
+            &self.label,
+            "--publish",
+            &publish,
+            "--memory",
+            "256m",
+            M6C65_REDIS_IMAGE,
+            "redis-server",
+            "--protected-mode",
+            "no",
+            "--bind",
+            "0.0.0.0",
+            "--maxmemory-policy",
+            "noeviction",
+        ];
+        args.extend_from_slice(redis_args);
+        Self::docker(&args);
+    }
+
+    fn start_current(&self) {
+        Self::docker(&["start", &self.name]);
+        self.wait_ready();
+    }
+
+    fn upstream(&self) -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], self.port))
+    }
+
+    fn url(&self) -> String {
+        format!("redis://127.0.0.1:{}/0", self.port)
+    }
+
+    fn wait_ready(&self) {
+        let deadline = Instant::now() + STEP_DEADLINE;
+        loop {
+            let reply = redis_command(self.upstream(), 0, &["PING"]);
+            if String::from_utf8_lossy(&reply).contains("+PONG") {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Redis container {} did not answer PING",
+                self.name
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    fn run_id(&self) -> String {
+        let reply = redis_command(self.upstream(), 0, &["INFO", "server"]);
+        String::from_utf8_lossy(&reply)
+            .lines()
+            .find_map(|line| line.strip_prefix("run_id:"))
+            .map(|value| value.trim().to_owned())
+            .unwrap_or_else(|| panic!("INFO server without run_id from {}", self.name))
+    }
+
+    /// `docker restart`: SIGTERM, so Redis shuts down in order and writes
+    /// its AOF; the container keeps its volume.
+    fn restart(&self) {
+        Self::docker(&["restart", "--time", "30", &self.name]);
+        self.wait_ready();
+    }
+
+    /// `SAVE` now, then copy the RDB out: an older snapshot to restore later.
+    fn snapshot(&self, to: &Path) {
+        let reply = redis_command(self.upstream(), 0, &["SAVE"]);
+        assert!(
+            String::from_utf8_lossy(&reply).matches("+OK").count() >= 2,
+            "SAVE: {}",
+            String::from_utf8_lossy(&reply)
+        );
+        Self::docker(&[
+            "cp",
+            &format!("{}:/data/dump.rdb", self.name),
+            &to.display().to_string(),
+        ]);
+    }
+
+    /// Stop and remove the current container with its volume.
+    fn remove_current(&self) {
+        Self::docker(&["rm", "--force", "--volumes", &self.name]);
+    }
+
+    /// Replace the current container by one that starts from `rdb` alone
+    /// (AOF off, so Redis loads the RDB): a restore of an older backup.
+    fn replace_with_rdb(&mut self, rdb: &Path) {
+        self.remove_current();
+        self.create(&["--appendonly", "no"]);
+        Self::docker(&[
+            "cp",
+            &rdb.display().to_string(),
+            &format!("{}:/data/dump.rdb", self.name),
+        ]);
+        self.start_current();
+    }
+
+    /// Replace the current container by an empty one: Redis lost its data.
+    fn replace_empty(&mut self) {
+        self.remove_current();
+        self.create(&["--appendonly", "yes", "--appendfsync", "always"]);
+        self.start_current();
+    }
+}
+
+impl Drop for DockerRedis {
+    fn drop(&mut self) {
+        let listed = Command::new("docker")
+            .args(["ps", "--all", "--quiet", "--filter"])
+            .arg(format!("label={}", self.label))
+            .output();
+        if let Ok(listed) = listed {
+            for id in String::from_utf8_lossy(&listed.stdout).split_whitespace() {
+                let _ = Command::new("docker")
+                    .args(["rm", "--force", "--volumes", id])
+                    .output();
+            }
+        }
+    }
+}
+
+/// `connect --json` for the gate's device, respawned if it exits, so the
+/// gate measures the relay and not the device's own reconnect policy.
+struct Device {
+    process: Option<Running>,
+    bin: PathBuf,
+    config: PathBuf,
+    log: PathBuf,
+    spawns: u32,
+}
+
+impl Device {
+    fn start(fixture: &Provisioned) -> Self {
+        let mut device = Self {
+            process: None,
+            bin: fixture.client_bin.clone(),
+            config: fixture.client_config.clone(),
+            log: fixture.work.join("connect.log"),
+            spawns: 0,
+        };
+        device.ensure_running();
+        device
+    }
+
+    fn ensure_running(&mut self) {
+        if let Some(process) = self.process.as_mut()
+            && matches!(process.0.try_wait(), Ok(None))
+        {
+            return;
+        }
+        self.spawns += 1;
+        let log = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.log)
+            .expect("client log");
+        self.process = Some(Running(
+            Command::new(&self.bin)
+                .args(["connect", "--config"])
+                .arg(&self.config)
+                .arg("--json")
+                .stdout(log)
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn connect"),
+        ));
+    }
+
+    fn log(&self) -> String {
+        fs::read_to_string(&self.log).unwrap_or_default()
+    }
+}
+
+/// Echo until HTTP 200 with the canary, or panic after `deadline`.
+async fn m6c65_echo_until_served(
+    step: &str,
+    fixture: &Provisioned,
+    device: &mut Device,
+    token: &str,
+    deadline: Duration,
+) -> Duration {
+    let started = Instant::now();
+    let payload = format!("m6c65-{step}-{}", fixture.nonce);
+    loop {
+        device.ensure_running();
+        let last = match consumer_post(
+            fixture.consumer,
+            &fixture.pki.ca_pem,
+            &format!(
+                "/v1/devices/{}/services/{}/echo",
+                fixture.device, fixture.service
+            ),
+            token,
+            payload.as_bytes(),
+        )
+        .await
+        {
+            Ok((200, body)) => {
+                assert_eq!(
+                    String::from_utf8_lossy(&body),
+                    format!("{CANARY}{payload}"),
+                    "step {step}: the reply must be the canary and the bytes sent"
+                );
+                return started.elapsed();
+            }
+            Ok((status, body)) => format!("HTTP {status} {}", String::from_utf8_lossy(&body)),
+            Err(error) => error,
+        };
+        assert!(
+            started.elapsed() < deadline,
+            "step {step}: no 200 within {deadline:?}; last {last}; connect log: {}",
+            device.log()
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// Echo status only (a refusal is expected).
+async fn m6c65_echo_status(fixture: &Provisioned, token: &str) -> u16 {
+    consumer_post(
+        fixture.consumer,
+        &fixture.pki.ca_pem,
+        &format!(
+            "/v1/devices/{}/services/{}/echo",
+            fixture.device, fixture.service
+        ),
+        token,
+        b"m6c65-refused",
+    )
+    .await
+    .map_or(0, |(status, _)| status)
+}
+
+/// Wait for a relay stderr line containing `needle`; returns it.
+fn m6c65_wait_line(
+    log: &std::sync::mpsc::Receiver<String>,
+    seen: &mut Vec<String>,
+    needle: &str,
+    deadline: Duration,
+) -> String {
+    if let Some(line) = seen.iter().find(|line| line.contains(needle)) {
+        return line.clone();
+    }
+    let until = Instant::now() + deadline;
+    while Instant::now() < until {
+        if let Ok(line) = log.recv_timeout(Duration::from_millis(200)) {
+            let found = line.contains(needle);
+            seen.push(line.clone());
+            if found {
+                return line;
+            }
+        }
+    }
+    panic!("relay printed no line with `{needle}` within {deadline:?}: {seen:?}");
+}
+
+/// Collect relay stderr for `duration`, then require that no line since
+/// `from` reports a re-binding: a refused Redis must never be adopted, not
+/// even in memory.
+fn m6c65_assert_not_rebound(
+    log: &std::sync::mpsc::Receiver<String>,
+    seen: &mut Vec<String>,
+    from: usize,
+    duration: Duration,
+) {
+    let until = Instant::now() + duration;
+    while Instant::now() < until {
+        if let Ok(line) = log.recv_timeout(Duration::from_millis(200)) {
+            seen.push(line);
+        }
+    }
+    let rebound: Vec<&String> = seen[from..]
+        .iter()
+        .filter(|line| line.contains("re-bound"))
+        .collect();
+    assert!(
+        rebound.is_empty(),
+        "the relay adopted a Redis it must refuse: {rebound:?}"
+    );
+}
+
+/// Stop `serve` with SIGTERM and wait for its exit.
+fn m6c65_stop_relay(relay: &mut Running) {
+    let pid = relay.0.id().to_string();
+    let _ = Command::new("kill").args(["-TERM", &pid]).status();
+    let deadline = Instant::now() + STEP_DEADLINE;
+    loop {
+        if let Ok(Some(status)) = relay.0.try_wait() {
+            assert_eq!(status.code(), Some(0), "serve must stop cleanly on SIGTERM");
+            return;
+        }
+        assert!(Instant::now() < deadline, "serve did not stop on SIGTERM");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// `serve` must refuse to start: exit 1 with `expected` on stderr.
+fn m6c65_serve_refused(fixture: &Provisioned, expected: &str) -> String {
+    let output = Command::new(&fixture.relay_bin)
+        .args(["serve", "--config"])
+        .arg(&fixture.relay_config)
+        .output()
+        .expect("run serve");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        output.status.code() == Some(1) && stderr.contains(expected),
+        "serve must refuse with `{expected}`, got {:?}: {stderr}",
+        output.status.code()
+    );
+    stderr.lines().last().unwrap_or_default().to_owned()
+}
+
+/// Task row M6-C65: a single relay keeps serving the **same namespace**
+/// across Redis restarts, and still refuses a Redis that came back older or
+/// empty.  Everything is the shipped binaries against a Redis container this
+/// gate owns (AOF, `appendfsync always`, as the Fly Redis):
+///
+/// 1. provision, `serve` with `redis_restart_continuity_seconds`, `connect`,
+///    echo;
+/// 2. `docker restart` Redis (orderly shutdown, AOF kept, new `run_id`) with
+///    the relay running: the same relay process re-binds by itself and the
+///    echo answers again;
+/// 3. stop the relay, restart Redis, start `serve`: refused with
+///    `stage=authority_identity class=run_changed`; `rebind-redis-run`
+///    without the declaration is refused; with it, `serve` starts and the
+///    echo answers;
+/// 4. take an RDB snapshot, revoke the grant, let the relay write newer
+///    continuity tokens, then replace Redis by one loaded from the snapshot:
+///    the serving relay refuses it (`class=continuity`) and the echo is not
+///    served although the restored grant is active again; a fresh `serve`
+///    is refused too;
+/// 5. replace Redis by an empty one: refused with `class=unbound` by the
+///    serving relay, by a fresh `serve` and by `rebind-redis-run`.
+///
+/// Red without M6-C65: step 2's echo never answers (every lane refuses the
+/// new run for good), and step 3's `rebind-redis-run` does not exist.  The
+/// refusals in steps 4 and 5 are proved to be able to fail by defeating the
+/// continuity comparison and the binding check (recorded in docs/tasks.md).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Docker and TUNNEL_CLIENT_BIN; run by scripts/m6-redis-restart-verify.sh"]
+async fn m6c65_redis_restart_keeps_the_namespace_and_refuses_lost_data() {
+    let mut redis = DockerRedis::start(&Uuid::new_v4().simple().to_string());
+    let mut fixture = provision_and_serve_with(
+        "m6c65-restart",
+        None,
+        ServiceKind::Echo,
+        ProvisionOptions {
+            redis_url: Some(redis.url()),
+            relay_top_level: format!(
+                "redis_restart_continuity_seconds = {M6C65_CONTINUITY_SECONDS}\n"
+            ),
+            skip_stage_cases: true,
+        },
+    )
+    .await;
+    assert_eq!(fixture.upstream, redis.upstream());
+    let nonce = fixture.nonce.clone();
+    let records: toml::Value = toml::from_str(
+        &fs::read_to_string(repository().join("examples/m6-catalog.toml")).expect("records"),
+    )
+    .expect("parse records");
+    let id = |table: &str| -> String {
+        records[table]["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("m6-catalog.toml [{table}].id"))
+            .to_owned()
+    };
+    let (tenant, user) = (id("tenant"), id("user"));
+    let mut relay_lines = Vec::new();
+    let token = access_token(&fixture.issuer_key, &fixture.subject);
+
+    // --- 1. Provisioned, serving, echo. ---
+    m6c65_wait_line(
+        &fixture.relay_log,
+        &mut relay_lines,
+        "Redis restart continuity: interval_seconds=1",
+        STEP_DEADLINE,
+    );
+    let mut device = Device::start(&fixture);
+    m6c65_echo_until_served("first", &fixture, &mut device, &token, STEP_DEADLINE).await;
+    let run_1 = redis.run_id();
+    let relay_pid = fixture.relay.0.id();
+    let keys_before = redis_command(
+        redis.upstream(),
+        0,
+        &["KEYS", &format!("tunnel-catalog:{}:*", fixture.namespace)],
+    );
+    let keys_before = String::from_utf8_lossy(&keys_before)
+        .split("\r\n")
+        .filter(|line| line.starts_with("tunnel-catalog:"))
+        .count();
+
+    // --- 2. Redis restarts under the running relay. ---
+    redis.restart();
+    let run_2 = redis.run_id();
+    assert_ne!(run_1, run_2, "a Redis restart must draw a new run_id");
+    let unattended = m6c65_echo_until_served(
+        "unattended",
+        &fixture,
+        &mut device,
+        &token,
+        M6C65_RECOVERY_DEADLINE,
+    )
+    .await;
+    let rebound = m6c65_wait_line(
+        &fixture.relay_log,
+        &mut relay_lines,
+        "namespace re-bound to the new Redis run",
+        STEP_DEADLINE,
+    );
+    assert_eq!(
+        fixture.relay.0.id(),
+        relay_pid,
+        "the same relay process must serve across the Redis restart"
+    );
+    assert!(
+        matches!(fixture.relay.0.try_wait(), Ok(None)),
+        "serve must still be running"
+    );
+    assert_eq!(namespace_get(&fixture, "meta:redis_run_id"), run_2);
+    println!(
+        "m6c65-unattended ok nonce={nonce} run_before={run_1} run_after={run_2} \
+         keys={keys_before} echo_after_ms={} relay_restarts=0 line={rebound:?}",
+        unattended.as_millis()
+    );
+
+    // --- 3. Relay stopped, Redis restarted, relay started: operator command. ---
+    m6c65_stop_relay(&mut fixture.relay);
+    redis.restart();
+    let run_3 = redis.run_id();
+    assert_ne!(run_2, run_3);
+    let refused = m6c65_serve_refused(
+        &fixture,
+        "Redis catalog connection failed; stage=authority_identity class=run_changed",
+    );
+    let undeclared = relay_change_refused(
+        &fixture,
+        "rebind without declaration",
+        &["rebind-redis-run"],
+    );
+    assert!(
+        undeclared.contains("--redis-restarted-in-place"),
+        "{undeclared}"
+    );
+    let rebind = stdout(&step(
+        "rebind-redis-run",
+        Command::new(&fixture.relay_bin)
+            .args(["rebind-redis-run", "--config"])
+            .arg(&fixture.relay_config)
+            .arg("--redis-restarted-in-place"),
+    ));
+    assert!(
+        rebind.contains(&format!("from Redis run {run_2} to {run_3}"))
+            && rebind.contains(&fixture.namespace),
+        "{rebind}"
+    );
+    let again = stdout(&step(
+        "rebind-redis-run again",
+        Command::new(&fixture.relay_bin)
+            .args(["rebind-redis-run", "--config"])
+            .arg(&fixture.relay_config)
+            .arg("--redis-restarted-in-place"),
+    ));
+    assert!(again.contains("nothing changed"), "{again}");
+    let (relay, relay_log) = start_serve(&fixture.relay_bin, &fixture.relay_config);
+    fixture.relay = relay;
+    fixture.relay_log = relay_log;
+    relay_lines.clear();
+    let operator = m6c65_echo_until_served(
+        "operator",
+        &fixture,
+        &mut device,
+        &token,
+        M6C65_RECOVERY_DEADLINE,
+    )
+    .await;
+    println!(
+        "m6c65-operator ok nonce={nonce} run_before={run_2} run_after={run_3} \
+         refused={refused:?} echo_after_ms={}",
+        operator.as_millis()
+    );
+
+    // --- 4. A restore of an older snapshot is refused. ---
+    let snapshot = fixture.work.join("older.rdb");
+    redis.snapshot(&snapshot);
+    let revoked = relay_change(
+        &fixture,
+        "revoke-grant after the snapshot",
+        &[
+            "revoke-grant",
+            "--tenant",
+            &tenant,
+            "--user",
+            &user,
+            "--device",
+            &fixture.device.to_string(),
+            "--service",
+            &fixture.service.to_string(),
+        ],
+    );
+    assert!(revoked.contains("revision="), "{revoked}");
+    let status = m6c65_echo_status(&fixture, &token).await;
+    assert!(
+        matches!(status, 403 | 404),
+        "the revoked grant must be refused: HTTP {status}"
+    );
+    // Let the relay write continuity tokens after the snapshot.
+    let before_tokens = namespace_get(&fixture, "meta:continuity");
+    tokio::time::sleep(Duration::from_secs(3 * M6C65_CONTINUITY_SECONDS)).await;
+    assert_ne!(namespace_get(&fixture, "meta:continuity"), before_tokens);
+    let lines_before_restore = relay_lines.len();
+    redis.replace_with_rdb(&snapshot);
+    let run_4 = redis.run_id();
+    // The restored snapshot holds the grant as active again.  For as long
+    // as a device would take to come back (the owner lease included), the
+    // relay must never serve it.
+    let watched = Instant::now();
+    let mut statuses = std::collections::BTreeMap::<u16, u32>::new();
+    while watched.elapsed() < M6C65_RECOVERY_DEADLINE {
+        device.ensure_running();
+        let status = m6c65_echo_status(&fixture, &token).await;
+        assert_ne!(
+            status,
+            200,
+            "a relay served from a Redis restored to before the grant was revoked; connect log: {}",
+            device.log()
+        );
+        *statuses.entry(status).or_default() += 1;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let continuity = m6c65_wait_line(
+        &fixture.relay_log,
+        &mut relay_lines,
+        "Redis authority continuity check failed; stage=authority_identity class=continuity",
+        STEP_DEADLINE,
+    );
+    assert_eq!(
+        namespace_get(&fixture, "meta:redis_run_id"),
+        run_3,
+        "the refused relay must not re-bind the restored namespace"
+    );
+    m6c65_assert_not_rebound(
+        &fixture.relay_log,
+        &mut relay_lines,
+        lines_before_restore,
+        Duration::from_secs(2),
+    );
+    let fresh = m6c65_serve_refused(
+        &fixture,
+        "Redis catalog connection failed; stage=authority_identity class=run_changed",
+    );
+    println!(
+        "m6c65-rollback ok nonce={nonce} run={run_4} line={continuity:?} \
+         echo_statuses={statuses:?} watched_ms={} fresh_serve={fresh:?}",
+        watched.elapsed().as_millis()
+    );
+
+    // --- 5. An empty Redis is refused. ---
+    let lines_before_empty = relay_lines.len();
+    redis.replace_empty();
+    let unbound = m6c65_wait_line(
+        &fixture.relay_log,
+        &mut relay_lines,
+        "Redis authority continuity check failed; stage=authority_identity class=unbound",
+        STEP_DEADLINE,
+    );
+    assert_ne!(m6c65_echo_status(&fixture, &token).await, 200);
+    m6c65_assert_not_rebound(
+        &fixture.relay_log,
+        &mut relay_lines,
+        lines_before_empty,
+        Duration::from_secs(3),
+    );
+    let keys_left = redis_command(
+        redis.upstream(),
+        0,
+        &["KEYS", &format!("tunnel-catalog:{}:*", fixture.namespace)],
+    );
+    assert!(
+        !String::from_utf8_lossy(&keys_left).contains("tunnel-catalog:"),
+        "nothing may be written into the empty Redis: {}",
+        String::from_utf8_lossy(&keys_left)
+    );
+    let fresh = m6c65_serve_refused(
+        &fixture,
+        "Redis catalog connection failed; stage=authority_identity class=unbound",
+    );
+    let command = relay_change_refused(
+        &fixture,
+        "rebind on an empty Redis",
+        &["rebind-redis-run", "--redis-restarted-in-place"],
+    );
+    assert!(
+        command.contains("stage=authority_identity class=unbound"),
+        "{command}"
+    );
+    println!(
+        "m6c65-empty ok nonce={nonce} line={unbound:?} fresh_serve={fresh:?} \
+         device_spawns={}",
+        device.spawns
+    );
+    drop(device);
+    drop(fixture);
+    drop(redis);
 }

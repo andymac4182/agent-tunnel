@@ -27,8 +27,8 @@ pub use recovery::{
 };
 pub use redis::{
     DurableCatalogObservation, MAX_REDIS_NAMESPACE_BYTES, RedisCatalog, RedisMembershipPublisher,
-    RedisTlsOptions, validate_device_addition, validate_redis_namespace, validate_service_addition,
-    validate_user_addition,
+    RedisRunRebind, RedisTlsOptions, validate_device_addition, validate_redis_namespace,
+    validate_service_addition, validate_user_addition,
 };
 pub use types::{
     AttachmentPurpose, AttachmentTicket, AttachmentTicketBinding, AttachmentTicketConsumeRequest,

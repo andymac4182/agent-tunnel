@@ -756,6 +756,9 @@ mod tests {
             Failure::Reply,
             Failure::InvalidReply,
             Failure::RunIdConflict,
+            Failure::Unbound,
+            Failure::RunChanged,
+            Failure::Continuity,
             Failure::Config,
             Failure::Catalog,
         ];

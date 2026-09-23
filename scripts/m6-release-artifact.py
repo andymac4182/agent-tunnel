@@ -1582,6 +1582,10 @@ DOCS_SHAPE_ONLY_PERMITTED = {
     ("tunnel-relay", "revoke-grant"),
     ("tunnel-relay", "revoke-device"),
     ("tunnel-relay", "revoke-credential"),
+    # M6-C65: re-binding a namespace to a restarted Redis writes the Redis
+    # authority; `scripts/m6-redis-restart-verify.sh` runs it against a Redis
+    # it restarts, with cargo-built binaries.
+    ("tunnel-relay", "rebind-redis-run"),
 }
 #: Flags that make a permitted command runnable offline, so a shape-only
 #: command carrying one is a demoted executable command.
@@ -1617,7 +1621,9 @@ DOCS_PINNED_SECTIONS: dict[str, tuple[int, int, int]] = {
     # `--no-reconnect` one-shot (two lines, as the old example had): +2
     # commands, +5 assertions.
     "3. Deployment": (11, 15, 2),
-    "4. Service installation, upgrade, backup and recovery": (0, 0, 2),
+    # M6-C65 added `rebind-redis-run` to section 4 as a third shape-only
+    # command.
+    "4. Service installation, upgrade, backup and recovery": (0, 0, 3),
     "6. Diagnostics": (4, 7, 0),
 }
 DOCS_PINNED_PROSE_FENCES = 0

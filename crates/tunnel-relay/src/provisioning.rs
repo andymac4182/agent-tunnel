@@ -715,6 +715,89 @@ pub async fn activate_first_incarnation(config_path: &Path) -> Result<String, Bo
     ))
 }
 
+/// The declaration `rebind-redis-run` requires (M6-C65).
+pub const REDIS_RESTARTED_IN_PLACE_FLAG: &str = "--redis-restarted-in-place";
+
+/// `tunnel-relay rebind-redis-run --config RELAY.toml
+/// --redis-restarted-in-place` (task row M6-C65): after an orderly Redis
+/// restart that kept its data, move the namespace's run binding to the new
+/// Redis run so `serve` accepts the same namespace again, with nothing
+/// reprovisioned.
+///
+/// The catalog refuses a namespace without its incarnation or run binding
+/// (Redis came back empty) and one whose incarnation is not this relay's.  It
+/// cannot distinguish a restart that kept every acknowledged write from a
+/// restore of an older consistent backup, so the operator must declare, with
+/// the flag, that Redis restarted from its own persistence and was not
+/// restored or replaced.  A single relay only: a `[cluster]` deployment's
+/// Redis recovery is the approved `recover` workflow (M6-C22).
+pub async fn rebind_redis_run(args: &[OsString]) -> Result<String, Box<dyn Error>> {
+    const USAGE: &str = "rebind-redis-run requires --config PATH --redis-restarted-in-place";
+    let mut config_path = None;
+    let mut declared = false;
+    let mut index = 0;
+    while index < args.len() {
+        let argument = args[index]
+            .to_str()
+            .ok_or(ProvisioningError::Usage(USAGE))?;
+        match argument {
+            "--config" if config_path.is_none() => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .filter(|value| !value.is_empty())
+                    .ok_or(ProvisioningError::Usage(USAGE))?;
+                config_path = Some(PathBuf::from(value));
+            }
+            REDIS_RESTARTED_IN_PLACE_FLAG if !declared => declared = true,
+            _ => return Err(ProvisioningError::Usage(USAGE).into()),
+        }
+        index += 1;
+    }
+    let config_path = config_path.ok_or(ProvisioningError::Usage(USAGE))?;
+    if !declared {
+        return Err(ProvisioningError::Usage(
+            "rebind-redis-run requires --redis-restarted-in-place: declare that Redis restarted from its own persistence and was not restored from a backup, replaced or emptied",
+        )
+        .into());
+    }
+    let config = load_config(&config_path)?;
+    if config.cluster.is_some() {
+        return Err(ProvisioningError::Usage(
+            "rebind-redis-run is for a single relay; a [cluster] deployment recovers Redis with the recovery workflow",
+        )
+        .into());
+    }
+    let catalog: RedisCatalog = redis_connection::connect_for_first_activation(
+        &config.redis_url,
+        &config.redis_namespace,
+        &config.deployment_incarnation,
+        &tls_material(&config),
+    )
+    .await
+    .map_err(ProvisioningError::from)?;
+    let outcome = catalog
+        .rebind_restarted_redis_run()
+        .await
+        .map_err(|error| {
+            let class = tunnel_catalog::CatalogConnectionFailure::classify(&error).as_str();
+            format!("Redis run re-binding refused: {error}; stage=authority_identity class={class}")
+        })?;
+    Ok(match outcome {
+        tunnel_catalog::RedisRunRebind::AlreadyCurrent { run_id } => format!(
+            "Namespace {} is already bound to Redis run {run_id}; nothing changed.",
+            config.redis_namespace
+        ),
+        tunnel_catalog::RedisRunRebind::Rebound {
+            previous_run_id,
+            run_id,
+        } => format!(
+            "Re-bound namespace {} (deployment incarnation {}) from Redis run {previous_run_id} to {run_id}.",
+            config.redis_namespace, config.deployment_incarnation
+        ),
+    })
+}
+
 struct ProvisionArguments {
     config: PathBuf,
     records: PathBuf,

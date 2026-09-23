@@ -20,8 +20,9 @@ oidc_audience = ["agent-tunnel"]
 oidc_jwks_path = "/var/lib/agent-tunnel/secrets/oidc-jwks.json"
 
 # EDIT: a fresh namespace per provisioning (docs/operator.md section 2.3). A
-# namespace is provisioned once; after a Redis restart or a failed provisioning
-# choose a new one and rebuild.
+# namespace is provisioned once; after a failed provisioning, or a Redis that
+# came back empty or older, choose a new one and rebuild. A Redis restart that
+# kept its data keeps the namespace (docs/deploy-fly.md section 6.4).
 redis_namespace = "agentuplink-fly-1"
 redis_tls_root_ca_path = "/var/lib/agent-tunnel/secrets/redis-ca.pem"
 
@@ -38,6 +39,12 @@ deployment_incarnation = "fly-1"
 
 max_devices_per_user = 16
 max_queue_bytes = 4194304
+
+# Task row M6-C65: re-bind the namespace by itself after a Redis restart that
+# kept this relay's last acknowledged token (docs/operator.md section 4,
+# "Redis restarts"). Sound because the Fly Redis runs `appendfsync always`
+# (deploy/fly/redis/entrypoint.sh); never set it for a Redis that does not.
+redis_restart_continuity_seconds = 5
 
 [rotation]
 interval_seconds = 300

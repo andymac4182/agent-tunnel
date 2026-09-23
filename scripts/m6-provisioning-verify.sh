@@ -42,8 +42,15 @@
 #    namespace, a stale incarnation and every duplicate, and leaves the
 #    incarnation, run and reservation keys unchanged.
 #
+# 7. Runs task row M6-C65's catalog test in step 2: the `unbound` and
+#    `run_changed` classes of `serve`'s fence, `rebind-redis-run`'s catalog
+#    call with each refusal, and a single relay's continuity token.  The
+#    M6-C65 process gate restarts a Redis, so it is not run here (it never
+#    touches `TEST_REDIS_URL`); `scripts/m6-redis-restart-verify.sh` runs it
+#    against its own Redis container, and this step skips it by name.
+#
 # Every Redis test these steps run is `#[ignore]`d in the ordinary workspace
-# run because it needs Redis: the 4 catalog provisioning tests, the 3 Redis
+# run because it needs Redis: the 5 catalog provisioning tests, the 3 Redis
 # connection stage tests, and the 7 end-to-end tests (M6-C21, M7-C92, M7-C93,
 # the three M6-C57 service gates and M6-C31).  A filtered or skipped test
 # would print `0 passed` and exit 0, so this script requires each run's own
@@ -96,10 +103,11 @@ require() {
 }
 
 echo "m6-provisioning-verify: catalog first activation and provisioning" >&2
-cargo test -p tunnel-catalog --test redis_provisioning --locked -- --ignored --test-threads=1 \
+cargo test -p tunnel-catalog --test redis_provisioning --locked -- --ignored --nocapture --test-threads=1 \
   > "$scratch/catalog.log" 2>&1 || { cat "$scratch/catalog.log" >&2; exit 1; }
 cat "$scratch/catalog.log"
-require "catalog provisioning tests" "$scratch/catalog.log" "test result: ok. 4 passed"
+require "catalog provisioning tests" "$scratch/catalog.log" "test result: ok. 5 passed" \
+  "m6c65-catalog ok namespace="
 
 echo "m6-provisioning-verify: Redis connection stage, lane and class (M6-C72)" >&2
 cargo test -p tunnel-catalog --test redis_connection_stage --locked -- --ignored --nocapture \
@@ -111,7 +119,7 @@ require "Redis connection stage tests" "$scratch/stage.log" "test result: ok. 3 
 
 echo "m6-provisioning-verify: end-to-end shipped-binary gate" >&2
 cargo test -p tunnel-relay --test m6_provisioning_process --locked -- --ignored --nocapture \
-  --test-threads=1 > "$scratch/e2e.log" 2>&1 || { cat "$scratch/e2e.log" >&2; exit 1; }
+  --test-threads=1 --skip m6c65_ > "$scratch/e2e.log" 2>&1 || { cat "$scratch/e2e.log" >&2; exit 1; }
 cat "$scratch/e2e.log"
 require "end-to-end gate" "$scratch/e2e.log" "test result: ok. 7 passed" "m6c21-e2e ok nonce=" \
   "m6c57-mcp ok nonce=" "tools_call=200 marker_echoed=true" \
