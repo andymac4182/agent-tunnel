@@ -939,11 +939,13 @@ impl PeerRuntime {
     /// capability withdraw and recover together by construction, for
     /// `/readyz` and public admission alike, since both are this one call.
     ///
-    /// This never makes a correctly configured relay unready for having no
-    /// peers: a cluster relay's published set always carries its own key
-    /// while membership is `Ready` (startup refuses to serve otherwise), and
-    /// a relay without a peer runtime -- the M1/M2 profile -- never reaches
-    /// this method.
+    /// This does not make a relay unready for having no peers: a cluster
+    /// relay's published set carries its own key while membership is `Ready`
+    /// (startup refuses to serve otherwise), except where the refresh tick
+    /// already withdraws peer trust on the same empty set -- a stale
+    /// checkpoint or a lapsed local record, which empty the verified route
+    /// targets before stored readiness leaves `Ready`. A relay without a peer
+    /// runtime -- the M1/M2 profile -- never reaches this method.
     #[must_use]
     pub fn is_ready(&self) -> bool {
         !self.client.pin_snapshot().is_empty()
