@@ -96,6 +96,21 @@ async fn run() -> Result<(), Box<dyn Error>> {
         {
             initialize(Path::new(path)).await?;
         }
+        [command, flag, path]
+            if command == OsStr::new("activate-first-incarnation")
+                && flag == OsStr::new("--config") =>
+        {
+            println!(
+                "{}",
+                tunnel_relay::provisioning::activate_first_incarnation(Path::new(path)).await?
+            );
+        }
+        [command, rest @ ..] if command == OsStr::new("provision-catalog") => {
+            println!(
+                "{}",
+                tunnel_relay::provisioning::provision_catalog(rest).await?
+            );
+        }
         [command, rest @ ..] if command == OsStr::new("recovery-initialize") => {
             recovery_initialize(rest).await?;
         }
@@ -107,7 +122,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
         }
         _ => {
             return Err(
-                "usage: tunnel-relay [--help | check-config [PATH] | check-serve-config --config PATH | initialize --config PATH | recovery-initialize --config PATH | recovery-observe --config PATH | recover --config PATH --approval PATH --expected-nonce NONCE --acknowledgement-id ID --old-primary-fenced --old-relays-fenced | serve --config PATH]".into(),
+                "usage: tunnel-relay [--help | check-config [PATH] | check-serve-config --config PATH | initialize --config PATH | recovery-initialize --config PATH | recovery-observe --config PATH | recover --config PATH --approval PATH --expected-nonce NONCE --acknowledgement-id ID --old-primary-fenced --old-relays-fenced | activate-first-incarnation --config PATH | provision-catalog --config PATH --records PATH [--dry-run] | serve --config PATH]".into(),
             );
         }
     }
@@ -976,7 +991,7 @@ fn parse_jwks(bytes: &[u8]) -> Result<Vec<ApprovedJwk>, Box<dyn Error>> {
 fn print_help() {
     println!(
         "tunnel-relay — authenticated multi-user Agent Tunnel relay\n\n\
-         Usage: tunnel-relay [--help | check-config [PATH] | check-serve-config --config PATH | initialize --config PATH | recovery-initialize --config PATH | recovery-observe --config PATH | recover --config PATH --approval PATH --expected-nonce NONCE --acknowledgement-id ID --old-primary-fenced --old-relays-fenced | serve --config PATH]\n\n\
+         Usage: tunnel-relay [--help | check-config [PATH] | check-serve-config --config PATH | initialize --config PATH | recovery-initialize --config PATH | recovery-observe --config PATH | recover --config PATH --approval PATH --expected-nonce NONCE --acknowledgement-id ID --old-primary-fenced --old-relays-fenced | activate-first-incarnation --config PATH | provision-catalog --config PATH --records PATH [--dry-run] | serve --config PATH]\n\n\
          check-config [PATH]       Validate legacy relay TOML without opening listeners.\n\
          check-serve-config --config PATH\n\
                                   Dry-run the configuration serve uses: full validation,\n\
@@ -990,6 +1005,11 @@ fn print_help() {
          recover --config PATH --approval PATH --expected-nonce NONCE\n\
            --acknowledgement-id ID --old-primary-fenced --old-relays-fenced\n\
                                   Consume one approval and activate the candidate.\n\
+         activate-first-incarnation --config PATH\n\
+                                  Bind the configured incarnation to an empty namespace.\n\
+         provision-catalog --config PATH --records PATH [--dry-run]\n\
+                                  Write one tenant, user, device, credential, service\n\
+                                  and grant into a newly activated namespace.\n\
          serve --config PATH      Start consumer HTTPS and device mTLS WSS listeners."
     );
 }

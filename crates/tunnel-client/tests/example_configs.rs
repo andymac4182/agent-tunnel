@@ -41,6 +41,9 @@ const CLASSIFIED_EXAMPLES: &[(&str, ExampleParser)] = &[
     ("client.toml", ExampleParser::ClientLegacy),
     ("m1-client.toml", ExampleParser::ClientRuntime),
     ("m1-relay.toml", ExampleParser::Relay),
+    // The relay's provisioning records document (task row M6-C21); the relay
+    // walk parses it.
+    ("m6-catalog.toml", ExampleParser::Relay),
     ("m7-cluster-relay.toml", ExampleParser::Relay),
     ("relay.toml", ExampleParser::Relay),
 ];

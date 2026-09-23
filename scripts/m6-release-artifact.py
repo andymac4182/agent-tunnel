@@ -198,6 +198,9 @@ BUNDLE_EXAMPLES = (
     # `*-relay.toml`, and docs/operator.md runs `initialize` and
     # `recovery-initialize` against it (M6-02).
     "m7-cluster-relay.toml",
+    # The catalog records document `tunnel-relay provision-catalog` reads;
+    # docs/operator.md section 2.3 dry-runs it (M6-C21).
+    "m6-catalog.toml",
 )
 
 SHA256SUMS = "SHA256SUMS"
@@ -1547,12 +1550,27 @@ DOCS_ARCHIVE_NAME = "agentuplink-bundle"
 DOCS_PROSE_FENCES = ("toml", "text", "json")
 #: The only commands that may be shape-only: each needs a provisioned Redis
 #: authority or a live relay.  Everything else in the guide must execute.
+#:
+#: `activate-first-incarnation` and `provision-catalog` (M6-C21) are here
+#: because each *writes* the Redis authority and this check deliberately has
+#: none: it runs as a stranger against the bundle, and making a Redis server a
+#: prerequisite of `verify` would make the release check depend on the host.
+#: They are not left unexecuted: `scripts/m6-provisioning-verify.sh` runs both,
+#: then `serve`, `connect` and an echo, against a real Redis with the same two
+#: examples the guide uses -- with cargo-built binaries, not this bundle's,
+#: which is the gap that remains.  `provision-catalog --dry-run` contacts no
+#: Redis, so it may **not** be shape-only (`DOCS_SHAPE_ONLY_REFUSED_FLAGS`).
 DOCS_SHAPE_ONLY_PERMITTED = {
     ("tunnel-relay", "serve"),
     ("tunnel-client", "connect"),
     ("tunnel-relay", "recovery-observe"),
     ("tunnel-relay", "recover"),
+    ("tunnel-relay", "activate-first-incarnation"),
+    ("tunnel-relay", "provision-catalog"),
 }
+#: Flags that make a permitted command runnable offline, so a shape-only
+#: command carrying one is a demoted executable command.
+DOCS_SHAPE_ONLY_REFUSED_FLAGS = ("--dry-run",)
 DOCS_BINARIES = ("tunnel-client", "tunnel-relay", "tunnel-deadman")
 # **Pinned, not floored.**  The first version had a floor of 20 executed
 # commands against 35 measured, so 43% of the guide could vanish silently
@@ -1564,7 +1582,10 @@ DOCS_BINARIES = ("tunnel-client", "tunnel-relay", "tunnel-deadman")
 DOCS_PINNED_SECTIONS: dict[str, tuple[int, int, int]] = {
     # section title: (executed commands, output assertions, shape-only commands)
     "1. Download and verify": (9, 10, 0),
-    "2. Credential provisioning": (13, 10, 0),
+    # M6-C21 added section 2.3: `cp` of the records example (exit status
+    # only), the `provision-catalog --dry-run` transcript (one assertion), and
+    # the two Redis-writing commands as shape-only.
+    "2. Credential provisioning": (15, 11, 2),
     "3. Deployment": (9, 10, 2),
     "4. Service installation, upgrade, backup and recovery": (0, 0, 2),
     "6. Diagnostics": (4, 7, 0),
@@ -1703,6 +1724,12 @@ def classify_doc(text: str) -> tuple[list[DocCommand], list[DocCommand], int]:
                     words = shlex.split(stripped.replace("\\\n", " "))
                 except ValueError:
                     words = []
+                offline = [flag for flag in DOCS_SHAPE_ONLY_REFUSED_FLAGS if flag in words]
+                if offline:
+                    raise DocFormatError(
+                        "shape-only-not-permitted",
+                        f"docs/operator.md:{cmd_line}: `{stripped[:60]}` is marked "
+                        f"shape-only, but {offline[0]} runs offline; it must be executed")
                 if tuple(words[:2]) not in DOCS_SHAPE_ONLY_PERMITTED:
                     raise DocFormatError(
                         "shape-only-not-permitted",
@@ -3155,6 +3182,24 @@ def control_docs_demoted_to_shape_only(bundle: Path) -> tuple[bool, str]:
                               "shape-only-not-permitted", doc=doc)
 
 
+def control_docs_dry_run_demoted_to_shape_only(bundle: Path) -> tuple[bool, str]:
+    """`provision-catalog --dry-run` contacts no Redis, so although the command
+    is on the shape-only list, the dry run may not hide behind it (M6-C21)."""
+    text = read_exact(DOCS_OPERATOR)
+    marker = "$ tunnel-relay provision-catalog --config examples/m1-relay.toml"
+    edited, _ = _retag_block_containing(text, marker, "```sh shape-only")
+    start = edited.index("```sh shape-only\n$ cp examples/m6-catalog.toml")
+    end = edited.index("```", start + 3)
+    edited = (edited[:start]
+              + "```sh shape-only\ntunnel-relay provision-catalog --config "
+                "examples/m1-relay.toml --records trial/catalog.toml --dry-run\n"
+              + edited[end:])
+    with tempfile.TemporaryDirectory() as tmp:
+        doc = _doc_copy(tmp, lambda _: edited)
+        return _expect_red_at("--dry-run runs offline", bundle,
+                              "shape-only-not-permitted", doc=doc)
+
+
 def control_docs_sections_deleted(bundle: Path) -> tuple[bool, str]:
     """Deleting section 3.3 and section 6 outright must fail the pins."""
     def cut(text: str) -> str:
@@ -3332,6 +3377,8 @@ CONTROLS: dict[str, list[tuple[str, object]]] = {
         ("the credentials block misspelled, caught at its own fence",
          control_docs_misspelled_credentials_tag),
         ("an executable block demoted to shape-only", control_docs_demoted_to_shape_only),
+        ("a provisioning dry run demoted to shape-only",
+         control_docs_dry_run_demoted_to_shape_only),
         ("sections 3.3 and 6 deleted outright", control_docs_sections_deleted),
         ("a documented command moved into prose", control_docs_command_moved_to_prose),
         ("an expected line eroded to a bare `...`", control_docs_assertion_eroded),

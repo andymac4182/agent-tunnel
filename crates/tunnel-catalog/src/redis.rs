@@ -72,6 +72,15 @@ const MAX_AUTHORITY_CALLER_LAG_US: i64 = REDIS_OPERATION_TIMEOUT.as_micros() as 
 const MAX_TICKET_INDEX_ITEMS: usize = crate::MAX_ATTACHMENT_TICKETS_PER_DEVICE;
 const MAX_REDIS_TLS_PEM_BYTES: usize = 1024 * 1024;
 
+/// Outcome of the one-shot seed reservation script, mapped to a caller's own
+/// refusal wording by the fixture seed and the operator bootstrap.
+enum NamespaceReservation {
+    Reserved,
+    AlreadyReserved,
+    Occupied,
+    ScanBound,
+}
+
 /// The authoritative M1 catalog. Redis is the only durable state authority;
 /// this type deliberately uses plain multiplexed connections and does not
 /// enable redis-rs' reconnecting `ConnectionManager`. A connection error is
@@ -592,6 +601,116 @@ impl RedisCatalog {
         }
     }
 
+    /// Operator bootstrap: make the configured incarnation the first active
+    /// incarnation of a namespace that holds **no key at all** (task row
+    /// M6-C21).
+    ///
+    /// This is deliberately narrower than
+    /// [`Self::activate_deployment_incarnation`], which also *replaces* an
+    /// incarnation when no live owner exists -- a transition that, outside a
+    /// disposable fixture, belongs to the approved recovery workflow.  Here any
+    /// existing active incarnation, Redis run binding or other namespace key is
+    /// a refusal, so a shipped command built on this can never become a way to
+    /// move a live deployment to a new incarnation without recovery approval.
+    /// The incarnation and the Redis run id are written in the same script that
+    /// proves the namespace empty.
+    pub async fn activate_first_deployment_incarnation(&self) -> Result<(), CatalogError> {
+        let incarnation = self.configured_incarnation()?;
+        let reply: Vec<String> = self
+            .eval(
+                SCRIPT_ACTIVATE_FIRST_INCARNATION,
+                &[self.active_incarnation_key(), self.redis_run_id_key()],
+                &[
+                    self.prefix.clone(),
+                    incarnation.to_owned(),
+                    self.redis_run_id.clone(),
+                    MAX_SEED_SCAN_KEYS.to_string(),
+                ],
+            )
+            .await?;
+        match reply.first().map(String::as_str) {
+            Some("ok") => Ok(()),
+            Some("active") => Err(CatalogError::Conflict(
+                "namespace already has a deployment incarnation; changing it requires recovery",
+            )),
+            Some("occupied") => Err(CatalogError::Conflict(
+                "namespace is not empty; first activation requires an empty namespace",
+            )),
+            Some("bound") => Err(CatalogError::Conflict("namespace scan bound")),
+            _ => Err(CatalogError::Serialization(
+                "invalid Redis incarnation reply".into(),
+            )),
+        }
+    }
+
+    /// Operator bootstrap: write the first tenant-scoped authority records into
+    /// a namespace whose configured incarnation is active and which holds
+    /// nothing else (task row M6-C21).
+    ///
+    /// It shares every rule with the fixture seed rather than restating any:
+    /// the same `validate_fixture` relationship and bound checks, the same
+    /// one-shot reservation script and key, and the same record writer,
+    /// credential-fingerprint uniqueness script and grant upsert.  What differs
+    /// is the precondition: the fixture seed accepts only disposable
+    /// `test-`/`fixture-` namespaces, while this accepts any valid namespace but
+    /// first requires the same active-incarnation and Redis-run check `serve`
+    /// applies at startup, so records are never written where a relay could
+    /// not start.  The reservation key is the existing `meta:fixture_seeded`
+    /// marker because the recovery snapshot schema already classifies it; a
+    /// new marker would make every provisioned namespace unobservable by
+    /// `recovery-observe`.
+    ///
+    /// The reservation is taken before any record is written, so a second run
+    /// is refused even after a partial failure; a namespace left partial is
+    /// discarded, not repaired, exactly as the fixture seed's is.
+    pub async fn provision_initial_catalog(
+        &self,
+        records: &CatalogFixture,
+    ) -> Result<(), CatalogError> {
+        validate_fixture(records)?;
+        self.ensure_active_incarnation().await?;
+        match self.reserve_empty_namespace().await? {
+            NamespaceReservation::Reserved => {}
+            NamespaceReservation::AlreadyReserved => {
+                return Err(CatalogError::Conflict("namespace was already provisioned"));
+            }
+            NamespaceReservation::Occupied => {
+                return Err(CatalogError::Conflict(
+                    "namespace holds records other than its active incarnation",
+                ));
+            }
+            NamespaceReservation::ScanBound => {
+                return Err(CatalogError::Conflict("namespace scan bound"));
+            }
+        }
+        self.write_seed_records(records).await
+    }
+
+    /// Take the one-shot seed reservation of a namespace holding nothing but
+    /// its active incarnation and Redis run binding.
+    async fn reserve_empty_namespace(&self) -> Result<NamespaceReservation, CatalogError> {
+        let reply: Vec<String> = self
+            .eval(
+                SCRIPT_RESERVE_FIXTURE_NAMESPACE,
+                &[
+                    self.fixture_seed_guard_key(),
+                    self.active_incarnation_key(),
+                    self.redis_run_id_key(),
+                ],
+                &[self.prefix.clone(), MAX_SEED_SCAN_KEYS.to_string()],
+            )
+            .await?;
+        match reply.first().map(String::as_str) {
+            Some("ok") => Ok(NamespaceReservation::Reserved),
+            Some("used") => Ok(NamespaceReservation::AlreadyReserved),
+            Some("occupied") => Ok(NamespaceReservation::Occupied),
+            Some("bound") => Ok(NamespaceReservation::ScanBound),
+            _ => Err(CatalogError::Serialization(
+                "invalid Redis fixture reservation reply".into(),
+            )),
+        }
+    }
+
     async fn ensure_active_incarnation(&self) -> Result<(), CatalogError> {
         let incarnation = self.configured_incarnation()?;
         let reply: Vec<String> = self
@@ -865,6 +984,156 @@ impl RedisCatalog {
                 "partial Redis membership record".into(),
             )),
         }
+    }
+
+    /// Write every record of an already-validated seed into a namespace whose
+    /// one-shot reservation the caller has just taken.  Shared by the fixture
+    /// seed and the operator bootstrap so both write exactly one key layout.
+    async fn write_seed_records(&self, fixture: &CatalogFixture) -> Result<(), CatalogError> {
+        let mut pipeline = redis::pipe();
+        pipeline.atomic();
+        for tenant in &fixture.tenants {
+            pipeline
+                .cmd("HSET")
+                .arg(self.tenant_key(tenant.tenant_id))
+                .arg("tenant_id")
+                .arg(tenant.tenant_id.to_string())
+                .arg("display_name")
+                .arg(&tenant.display_name)
+                .arg("active")
+                .arg(bool_string(tenant.active));
+            pipeline
+                .cmd("SADD")
+                .arg(self.tenants_index())
+                .arg(tenant.tenant_id.to_string());
+        }
+        for user in &fixture.users {
+            pipeline
+                .cmd("HSET")
+                .arg(self.user_key(user.user_id))
+                .arg("user_id")
+                .arg(user.user_id.to_string())
+                .arg("display_name")
+                .arg(&user.display_name);
+            pipeline
+                .cmd("SADD")
+                .arg(self.users_index())
+                .arg(user.user_id.to_string());
+        }
+        for identity in &fixture.identities {
+            pipeline
+                .cmd("HSET")
+                .arg(self.identity_key(&identity.issuer, &identity.subject))
+                .arg("issuer")
+                .arg(&identity.issuer)
+                .arg("subject")
+                .arg(&identity.subject)
+                .arg("user_id")
+                .arg(identity.user_id.to_string());
+            pipeline
+                .cmd("SADD")
+                .arg(self.identities_index())
+                .arg(self.identity_key(&identity.issuer, &identity.subject));
+        }
+        for membership in &fixture.memberships {
+            pipeline
+                .cmd("HSET")
+                .arg(self.membership_key(membership.tenant_id, membership.user_id))
+                .arg("tenant_id")
+                .arg(membership.tenant_id.to_string())
+                .arg("user_id")
+                .arg(membership.user_id.to_string())
+                .arg("role")
+                .arg(membership.role.as_str())
+                .arg("active")
+                .arg(bool_string(membership.active));
+            pipeline
+                .cmd("SADD")
+                .arg(self.memberships_index(membership.tenant_id))
+                .arg(membership.user_id.to_string());
+            pipeline
+                .cmd("SADD")
+                .arg(self.user_tenants_index(membership.user_id))
+                .arg(membership.tenant_id.to_string());
+        }
+        for device in &fixture.devices {
+            pipeline
+                .cmd("HSET")
+                .arg(self.device_key(device.tenant_id, device.device_id))
+                .arg("tenant_id")
+                .arg(device.tenant_id.to_string())
+                .arg("device_id")
+                .arg(device.device_id.to_string())
+                .arg("owner_user_id")
+                .arg(device.owner_user_id.to_string())
+                .arg("display_name")
+                .arg(&device.display_name)
+                .arg("active")
+                .arg(bool_string(device.active))
+                .arg("last_seen_at_us")
+                .arg(
+                    device
+                        .last_seen_at
+                        .map(datetime_micros)
+                        .transpose()?
+                        .map_or_else(String::new, |value| value.to_string()),
+                );
+            pipeline
+                .cmd("HSETNX")
+                .arg(self.device_key(device.tenant_id, device.device_id))
+                .arg("device_version")
+                .arg("1");
+            pipeline
+                .cmd("SETNX")
+                .arg(self.owner_epoch_key(device.tenant_id, device.device_id))
+                .arg("0")
+                .ignore();
+            pipeline
+                .cmd("SADD")
+                .arg(self.devices_index(device.tenant_id))
+                .arg(device.device_id.to_string());
+        }
+        for service in &fixture.services {
+            pipeline
+                .cmd("HSET")
+                .arg(self.service_key(service.tenant_id, service.device_id, service.service_id))
+                .arg("tenant_id")
+                .arg(service.tenant_id.to_string())
+                .arg("device_id")
+                .arg(service.device_id.to_string())
+                .arg("service_id")
+                .arg(service.service_id.to_string())
+                .arg("service_type")
+                .arg(&service.service_type)
+                .arg("display_name")
+                .arg(&service.display_name)
+                .arg("capabilities")
+                .arg(serde_json::to_string(&service.capabilities)?)
+                .arg("version")
+                .arg(service.version.to_string())
+                .arg("active")
+                .arg(bool_string(service.active));
+            pipeline
+                .cmd("SADD")
+                .arg(self.services_index(service.tenant_id, service.device_id))
+                .arg(service.service_id.to_string());
+        }
+        pipeline
+            .cmd("EVAL")
+            .arg(format!(
+                "{LUA_DECIMAL_HELPERS}{SCRIPT_INCREMENT_CATALOG_GENERATION}"
+            ))
+            .arg(1_i64)
+            .arg(self.catalog_generation_key())
+            .ignore();
+        self.execute_seed_pipeline(pipeline).await?;
+        for credential in &fixture.credentials {
+            self.seed_credential(credential).await?;
+        }
+        for grant in &fixture.grants {
+            self.upsert_grant(grant).await?;
+        }
+        Ok(())
     }
 
     async fn execute_seed_pipeline(&self, pipeline: redis::Pipeline) -> Result<(), CatalogError> {
@@ -1402,178 +1671,19 @@ impl Catalog for RedisCatalog {
             return Err(CatalogError::InvalidInput("fixture namespace"));
         }
         validate_fixture(fixture)?;
-        let guard_reply: Vec<String> = self
-            .eval(
-                SCRIPT_RESERVE_FIXTURE_NAMESPACE,
-                &[
-                    self.fixture_seed_guard_key(),
-                    self.active_incarnation_key(),
-                    self.redis_run_id_key(),
-                ],
-                &[self.prefix.clone(), MAX_SEED_SCAN_KEYS.to_string()],
-            )
-            .await?;
-        match guard_reply.first().map(String::as_str) {
-            Some("ok") => {}
-            Some("used") => {
+        match self.reserve_empty_namespace().await? {
+            NamespaceReservation::Reserved => {}
+            NamespaceReservation::AlreadyReserved => {
                 return Err(CatalogError::Conflict("fixture namespace already seeded"));
             }
-            Some("occupied") => {
+            NamespaceReservation::Occupied => {
                 return Err(CatalogError::Conflict("fixture namespace is not empty"));
             }
-            Some("bound") => {
+            NamespaceReservation::ScanBound => {
                 return Err(CatalogError::Conflict("fixture namespace scan bound"));
             }
-            _ => {
-                return Err(CatalogError::Serialization(
-                    "invalid Redis fixture reservation reply".into(),
-                ));
-            }
         }
-        let mut pipeline = redis::pipe();
-        pipeline.atomic();
-        for tenant in &fixture.tenants {
-            pipeline
-                .cmd("HSET")
-                .arg(self.tenant_key(tenant.tenant_id))
-                .arg("tenant_id")
-                .arg(tenant.tenant_id.to_string())
-                .arg("display_name")
-                .arg(&tenant.display_name)
-                .arg("active")
-                .arg(bool_string(tenant.active));
-            pipeline
-                .cmd("SADD")
-                .arg(self.tenants_index())
-                .arg(tenant.tenant_id.to_string());
-        }
-        for user in &fixture.users {
-            pipeline
-                .cmd("HSET")
-                .arg(self.user_key(user.user_id))
-                .arg("user_id")
-                .arg(user.user_id.to_string())
-                .arg("display_name")
-                .arg(&user.display_name);
-            pipeline
-                .cmd("SADD")
-                .arg(self.users_index())
-                .arg(user.user_id.to_string());
-        }
-        for identity in &fixture.identities {
-            pipeline
-                .cmd("HSET")
-                .arg(self.identity_key(&identity.issuer, &identity.subject))
-                .arg("issuer")
-                .arg(&identity.issuer)
-                .arg("subject")
-                .arg(&identity.subject)
-                .arg("user_id")
-                .arg(identity.user_id.to_string());
-            pipeline
-                .cmd("SADD")
-                .arg(self.identities_index())
-                .arg(self.identity_key(&identity.issuer, &identity.subject));
-        }
-        for membership in &fixture.memberships {
-            pipeline
-                .cmd("HSET")
-                .arg(self.membership_key(membership.tenant_id, membership.user_id))
-                .arg("tenant_id")
-                .arg(membership.tenant_id.to_string())
-                .arg("user_id")
-                .arg(membership.user_id.to_string())
-                .arg("role")
-                .arg(membership.role.as_str())
-                .arg("active")
-                .arg(bool_string(membership.active));
-            pipeline
-                .cmd("SADD")
-                .arg(self.memberships_index(membership.tenant_id))
-                .arg(membership.user_id.to_string());
-            pipeline
-                .cmd("SADD")
-                .arg(self.user_tenants_index(membership.user_id))
-                .arg(membership.tenant_id.to_string());
-        }
-        for device in &fixture.devices {
-            pipeline
-                .cmd("HSET")
-                .arg(self.device_key(device.tenant_id, device.device_id))
-                .arg("tenant_id")
-                .arg(device.tenant_id.to_string())
-                .arg("device_id")
-                .arg(device.device_id.to_string())
-                .arg("owner_user_id")
-                .arg(device.owner_user_id.to_string())
-                .arg("display_name")
-                .arg(&device.display_name)
-                .arg("active")
-                .arg(bool_string(device.active))
-                .arg("last_seen_at_us")
-                .arg(
-                    device
-                        .last_seen_at
-                        .map(datetime_micros)
-                        .transpose()?
-                        .map_or_else(String::new, |value| value.to_string()),
-                );
-            pipeline
-                .cmd("HSETNX")
-                .arg(self.device_key(device.tenant_id, device.device_id))
-                .arg("device_version")
-                .arg("1");
-            pipeline
-                .cmd("SETNX")
-                .arg(self.owner_epoch_key(device.tenant_id, device.device_id))
-                .arg("0")
-                .ignore();
-            pipeline
-                .cmd("SADD")
-                .arg(self.devices_index(device.tenant_id))
-                .arg(device.device_id.to_string());
-        }
-        for service in &fixture.services {
-            pipeline
-                .cmd("HSET")
-                .arg(self.service_key(service.tenant_id, service.device_id, service.service_id))
-                .arg("tenant_id")
-                .arg(service.tenant_id.to_string())
-                .arg("device_id")
-                .arg(service.device_id.to_string())
-                .arg("service_id")
-                .arg(service.service_id.to_string())
-                .arg("service_type")
-                .arg(&service.service_type)
-                .arg("display_name")
-                .arg(&service.display_name)
-                .arg("capabilities")
-                .arg(serde_json::to_string(&service.capabilities)?)
-                .arg("version")
-                .arg(service.version.to_string())
-                .arg("active")
-                .arg(bool_string(service.active));
-            pipeline
-                .cmd("SADD")
-                .arg(self.services_index(service.tenant_id, service.device_id))
-                .arg(service.service_id.to_string());
-        }
-        pipeline
-            .cmd("EVAL")
-            .arg(format!(
-                "{LUA_DECIMAL_HELPERS}{SCRIPT_INCREMENT_CATALOG_GENERATION}"
-            ))
-            .arg(1_i64)
-            .arg(self.catalog_generation_key())
-            .ignore();
-        self.execute_seed_pipeline(pipeline).await?;
-        for credential in &fixture.credentials {
-            self.seed_credential(credential).await?;
-        }
-        for grant in &fixture.grants {
-            self.upsert_grant(grant).await?;
-        }
-        Ok(())
+        self.write_seed_records(fixture).await
     }
 
     async fn claim_owner(&self, request: &OwnerClaimRequest) -> Result<OwnerClaim, CatalogError> {
@@ -2241,7 +2351,7 @@ fn parse_device_summaries(reply: &[String]) -> Result<Vec<DeviceSummary>, Catalo
     Ok(result)
 }
 
-fn validate_fixture(fixture: &CatalogFixture) -> Result<(), CatalogError> {
+pub(crate) fn validate_fixture(fixture: &CatalogFixture) -> Result<(), CatalogError> {
     let total = fixture.tenants.len()
         + fixture.users.len()
         + fixture.identities.len()
@@ -2366,6 +2476,29 @@ local current_run = redis.call('GET', KEYS[3])
 if not current or not current_run then return {'mismatch'} end
 if current == ARGV[1] and current_run == ARGV[2] then return {'ok'} end
 return {'mismatch'}
+"#;
+
+/// First activation only: refuse an existing incarnation or run binding, then
+/// refuse any other key under the prefix, and only then bind both.
+const SCRIPT_ACTIVATE_FIRST_INCARNATION: &str = r#"
+if redis.call('EXISTS', KEYS[1]) == 1 or redis.call('EXISTS', KEYS[2]) == 1 then
+  return {'active'}
+end
+local cursor = '0'
+local examined = 0
+local limit = tonumber(ARGV[4])
+repeat
+  local result = redis.call('SCAN', cursor, 'MATCH', ARGV[1] .. '*', 'COUNT', 256)
+  cursor = result[1]
+  for _, key in ipairs(result[2]) do
+    examined = examined + 1
+    if examined > limit then return {'bound'} end
+    return {'occupied'}
+  end
+until cursor == '0'
+redis.call('SET', KEYS[1], ARGV[2])
+redis.call('SET', KEYS[2], ARGV[3])
+return {'ok'}
 "#;
 
 const SCRIPT_ACTIVATE_INCARNATION: &str = r#"

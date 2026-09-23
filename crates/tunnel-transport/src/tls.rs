@@ -287,6 +287,19 @@ pub(crate) fn parse_leaf_identity(
     })
 }
 
+/// Derive the metadata view of one DER leaf certificate with the same parser
+/// the device and peer listeners apply after a completed handshake: the role
+/// URI SAN, the SPKI SHA-256 pin, the serial and the validity window.
+///
+/// Like [`parse_leaf_identity`] this only parses; it verifies no chain,
+/// signature, validity or revocation.  It exists so an operator provisioning
+/// path can record a device credential from the certificate the listener will
+/// later see, instead of deriving any of those facts a second way (task row
+/// M6-C21).
+pub fn leaf_identity_from_der(der: &[u8]) -> Result<TlsIdentity, TlsIdentityError> {
+    parse_leaf_identity(&[CertificateDer::from(der)])
+}
+
 /// Derive an SPKI SHA-256 pin from a DER-encoded leaf certificate.
 pub fn spki_sha256_from_der(der: &[u8]) -> Result<SpkiSha256, TlsIdentityError> {
     let (_, certificate) = parse_x509_certificate(der)

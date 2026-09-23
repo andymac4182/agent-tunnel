@@ -1,8 +1,17 @@
 # M1 RuntimeConfig example for tunnel-client.
 # Paths are resolved relative to this file. Replace every placeholder before
 # using `connect`; this file does not contain a credential or private key.
+#
+# A relay identifies this device by the catalog records its operator
+# provisioned (see examples/m6-catalog.toml and docs/operator.md section 2.3),
+# so three values here must match them exactly:
+#   - device_id is the catalog device UUID; the relay refuses any other value;
+#   - the device certificate must carry the URI SAN
+#     urn:agent-tunnel:device:<that same UUID>;
+#   - each export table is named by the catalog service UUID it serves.
+# The UUIDs below are the synthetic placeholders examples/m6-catalog.toml uses.
 
-device_id = "m1-device-a"
+device_id = "33333333-3333-4333-8333-333333333333"
 relay_url = "wss://relay.example.test/v1/tunnel/control"
 
 [credentials]
@@ -10,8 +19,9 @@ client_certificate = "credentials/device-cert-chain.pem"
 client_key = "credentials/device-key.pem"
 server_ca = "credentials/relay-ca.pem"
 
-# M1 exposes the synthetic echo service only.
-[exports.echo]
+# M1 exposes the synthetic echo service only. The table name is the catalog
+# service UUID the relay sends when it opens a stream.
+[exports."44444444-4444-4444-8444-444444444444"]
 type = "echo"
 device_canary = "m1-device-a-synthetic"
 
