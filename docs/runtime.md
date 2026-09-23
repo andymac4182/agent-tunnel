@@ -122,7 +122,7 @@ These are the exit statuses `tunnel-client` selects, and they are implemented ra
 | 0 | Requested operation succeeded; foreground `connect` completed an orderly stop | — | nothing |
 | 1 | Unexpected internal failure | `PROTOCOL_ERROR`, `SUPERVISOR_FAILED`, `SIGNAL_ERROR`, and the codeless crypto-provider bail-out | report it; this is a defect or a version skew |
 | 2 | Invalid invocation or configuration; nothing was attempted | `INVALID_INVOCATION`, `CONFIG_ERROR`, `INVALID_CONFIG`; also `doctor`'s own `INVALID_CONFIG` | fix the command line or the profile |
-| 3 | Missing, invalid, expired, or untrusted credentials / authorization denied | `CREDENTIAL_ERROR`, `AUTHORIZATION_STALE`; also `doctor`'s `CREDENTIAL_*` family | run `doctor`; re-enroll or re-authorize |
+| 3 | Missing, invalid, expired, or untrusted credentials / authorization denied; also the relay refusing the device's identity (`device_id`, certificate SAN and catalog record disagree, M6-C32) | `CREDENTIAL_ERROR`, `AUTHORIZATION_STALE`; also `doctor`'s `CREDENTIAL_*` family | run `doctor`; re-enroll or re-authorize |
 | 4 | Network or service unavailable; the relay could not be reached or closed the session | `TRANSPORT_ERROR`, `SESSION_CLOSED` | check reachability, then retry |
 | 5 | Deadline exceeded | `DEADLINE_EXCEEDED` | check latency, or raise the bounded deadline |
 | 6 | Operation outcome unknown or incomplete drain requiring reconciliation | *(no producer today — see below)* | query the authorized operation status; never replay the mutation |

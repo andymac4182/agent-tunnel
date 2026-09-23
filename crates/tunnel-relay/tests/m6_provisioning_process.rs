@@ -380,6 +380,60 @@ async fn consumer_post(
     Ok((status, bytes))
 }
 
+/// Task row M6-C32: run `connect --json` for a profile the relay must refuse
+/// on identity, and require the typed, terminal refusal.  Before M6-C32 the
+/// relay dropped the socket and this printed a retryable `TRANSPORT_ERROR`
+/// "control read failed" with exit 4.
+fn expect_identity_refusal(name: &str, client_bin: &Path, config: &Path) {
+    let mut child = Command::new(client_bin)
+        .args(["connect", "--config"])
+        .arg(config)
+        .arg("--json")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap_or_else(|error| panic!("step {name}: could not start connect: {error}"));
+    let deadline = Instant::now() + STEP_DEADLINE;
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll connect") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("step {name}: connect did not exit within {STEP_DEADLINE:?}");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let mut out = String::new();
+    use std::io::Read as _;
+    child
+        .stdout
+        .take()
+        .expect("connect stdout")
+        .read_to_string(&mut out)
+        .expect("read connect stdout");
+    let last = out.lines().last().unwrap_or_default();
+    let diagnostic: serde_json::Value = serde_json::from_str(last)
+        .unwrap_or_else(|error| panic!("step {name}: not a JSON diagnostic ({error}): {out}"));
+    assert_eq!(
+        (
+            status.code(),
+            diagnostic["error"]["code"].as_str(),
+            diagnostic["error"]["retryable"].as_bool(),
+        ),
+        (Some(3), Some("CREDENTIAL_ERROR"), Some(false)),
+        "step {name}: the relay's identity refusal must reach the device as a terminal \
+         credential error: {out}"
+    );
+    let message = diagnostic["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("refused this device's identity"),
+        "step {name}: {message}"
+    );
+    println!("m6c32 {name} exit=3 code=CREDENTIAL_ERROR retryable=false");
+}
+
 struct Running(Child);
 
 impl Drop for Running {
@@ -701,6 +755,59 @@ async fn m6c21_shipped_binaries_provision_one_relay_and_one_device_end_to_end() 
     );
 
     drop(_device);
+
+    // --- M6-C32: identity refusals are terminal and say so. ---
+    // (a) The profile's device_id is not the certificate's device.  The
+    // certificate and catalog are the ones that just served the echo.
+    let other_device = Uuid::new_v4();
+    let mismatch_config = work.join("device/mismatched-device-id.toml");
+    fs::write(
+        &mismatch_config,
+        set_key(
+            &fs::read_to_string(&client_config).expect("read client config"),
+            "device_id",
+            &format!("\"{other_device}\""),
+        ),
+    )
+    .expect("mismatched profile");
+    expect_identity_refusal("device_id mismatch", &client_bin, &mismatch_config);
+
+    // (b) A correctly issued certificate for the provisioned device whose key
+    // the catalog does not know.
+    fs::create_dir_all(work.join("stranger")).expect("stranger dir");
+    let stranger_config = work.join("stranger/client.toml");
+    fs::copy(&client_config, &stranger_config).expect("stranger profile");
+    step(
+        "stranger key and CSR (tunnel-client credentials create)",
+        Command::new(&client_bin)
+            .args(["credentials", "create", "--config"])
+            .arg(&stranger_config)
+            .args(["--csr-out", "device.csr"]),
+    );
+    step(
+        "issue stranger certificate (openssl x509 -req)",
+        Command::new("openssl")
+            .args(["x509", "-req", "-in"])
+            .arg(work.join("stranger/device.csr"))
+            .arg("-CA")
+            .arg(&device_ca)
+            .arg("-CAkey")
+            .arg(&device_ca_key)
+            .args(["-CAcreateserial", "-days", "1", "-extfile"])
+            .arg(&extensions)
+            .arg("-out")
+            .arg(work.join("stranger/device-cert.pem")),
+    );
+    step(
+        "stranger certificate import (tunnel-client credentials import)",
+        Command::new(&client_bin)
+            .args(["credentials", "import", "--config"])
+            .arg(&stranger_config)
+            .args(["--certificate", "device-cert.pem", "--server-ca"])
+            .arg(&server_ca),
+    );
+    expect_identity_refusal("unknown credential key", &client_bin, &stranger_config);
+
     drop(relay);
     let removed = delete_namespace(upstream, database, &namespace);
     println!(

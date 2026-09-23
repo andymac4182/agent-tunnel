@@ -10,7 +10,9 @@
 #    (`crates/tunnel-catalog/tests/redis_provisioning.rs`).
 # 3. Runs the end-to-end gate (`crates/tunnel-relay/tests/m6_provisioning_process.rs`):
 #    empty namespace -> `activate-first-incarnation` -> `provision-catalog` ->
-#    `serve` + `connect` -> one echo through the tunnel.
+#    `serve` + `connect` -> one echo through the tunnel, then two identity
+#    refusals (task row M6-C32) that must reach the device as a terminal
+#    CREDENTIAL_ERROR, exit 3.
 #
 # Both tests are `#[ignore]`d in the ordinary workspace run because they need
 # Redis.  A filtered or skipped test would print `0 passed` and exit 0, so this
@@ -65,7 +67,9 @@ cargo test -p tunnel-relay --test m6_provisioning_process --locked -- --ignored 
   > "$scratch/e2e.log" 2>&1 || { cat "$scratch/e2e.log" >&2; exit 1; }
 cat "$scratch/e2e.log"
 require "end-to-end gate" "$scratch/e2e.log" "test result: ok. 1 passed" "m6c21-e2e ok nonce=" \
-  "client=$TUNNEL_CLIENT_BIN"
+  "client=$TUNNEL_CLIENT_BIN" \
+  "m6c32 device_id mismatch exit=3 code=CREDENTIAL_ERROR retryable=false" \
+  "m6c32 unknown credential key exit=3 code=CREDENTIAL_ERROR retryable=false"
 if [ -n "${TUNNEL_RELAY_BIN:-}" ]; then
   require "end-to-end gate ran the requested relay" "$scratch/e2e.log" "relay=$TUNNEL_RELAY_BIN"
 fi

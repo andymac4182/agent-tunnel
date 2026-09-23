@@ -63,6 +63,18 @@ pub const CONTROL_OWNER_BUSY_CLOSE_CODE: u16 = 1008;
 /// Bounded close reason for the owner-conflict admission result.  The reason
 /// is deliberately fixed so backend/catalog details never cross the socket.
 pub const CONTROL_OWNER_BUSY_CLOSE_REASON: &str = "OWNER_BUSY";
+/// WebSocket close status used when the relay authenticated the device's TLS
+/// connection and then refused the device session it asked for: the HELLO's
+/// `connector_id` does not name the certificate's device, or the catalog has
+/// no active device and credential for the certificate's key (task row
+/// M6-C32).  No retry of the same configuration can succeed, so the device
+/// must be told so rather than see an unexplained socket loss.
+pub const CONTROL_IDENTITY_REJECTED_CLOSE_CODE: u16 = 1008;
+/// Bounded, fixed close reason for [`CONTROL_IDENTITY_REJECTED_CLOSE_CODE`].
+/// It deliberately does not say which check failed: the unauthenticated
+/// half of that answer (whether a key is known to the catalog) is not the
+/// relay's to disclose over the socket.
+pub const CONTROL_IDENTITY_REJECTED_CLOSE_REASON: &str = "DEVICE_IDENTITY_REJECTED";
 
 /// Serde helper for u64 values represented as decimal JSON strings.
 pub mod decimal_u64 {
