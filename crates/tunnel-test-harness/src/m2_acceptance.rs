@@ -1036,7 +1036,7 @@ fn redacted_readiness(readiness: &Readiness) -> String {
 
 fn redacted_client_status(status: &ConnectionStatus) -> String {
     format!(
-        "phase={},session_id={:?},epoch={:?},active_generation={:?},active_connection_id={:?},candidate_generation={:?},candidate_connection_id={:?},rotation_id={:?},streams={},emitted_sequences={},received_sequences={},drain_fences={},drain_acks={},replay_frames={},replay_bytes={},queue_frames={},queue_bytes={},rotations_completed={},control_local_addr={:?},active_local_addr={:?},candidate_local_addr={:?}",
+        "phase={},session_id={:?},epoch={:?},active_generation={:?},active_connection_id={:?},candidate_generation={:?},candidate_connection_id={:?},rotation_id={:?},streams={},stream_auth={:?},emitted_sequences={},received_sequences={},drain_fences={},drain_acks={},replay_frames={},replay_bytes={},queue_frames={},queue_bytes={},rotations_completed={},control_local_addr={:?},active_local_addr={:?},candidate_local_addr={:?}",
         status.phase,
         status.session_id,
         status.epoch,
@@ -1046,6 +1046,7 @@ fn redacted_client_status(status: &ConnectionStatus) -> String {
         status.candidate_connection_id,
         status.rotation_id,
         status.streams,
+        status.stream_auth,
         status.emitted_sequences,
         status.received_sequences,
         status.drain_fences,
@@ -1084,7 +1085,7 @@ fn redacted_relay_snapshot(snapshot: &RelaySnapshot) -> String {
                 .iter()
                 .map(|stream| {
                     format!(
-                        "{{stream_id={},operation_id={:?},last_emitted={},peer_acked={},recv_contiguous={},delivered_contiguous={},replay_frames={},replay_bytes={},queue_bytes={},terminal={}}}",
+                        "{{stream_id={},operation_id={:?},last_emitted={},peer_acked={},recv_contiguous={},delivered_contiguous={},replay_frames={},replay_bytes={},queue_bytes={},terminal={},authorization_in_flight={},authorization_failure_code={:?}}}",
                         stream.stream_id,
                         stream.operation_id,
                         stream.last_emitted_relay_to_connector,
@@ -1095,6 +1096,8 @@ fn redacted_relay_snapshot(snapshot: &RelaySnapshot) -> String {
                         stream.replay_bytes_relay_to_connector,
                         stream.queue_bytes,
                         stream.terminal,
+                        stream.authorization_in_flight,
+                        stream.authorization_failure_code,
                     )
                 })
                 .collect::<Vec<_>>();
@@ -1121,7 +1124,31 @@ fn redacted_relay_snapshot(snapshot: &RelaySnapshot) -> String {
             )
         })
         .collect::<Vec<_>>();
-    format!("sessions={sessions:?}")
+    // Why each stream ended, and when: the relay's own bounded terminal
+    // record. A stream seen `terminal=true` above with no reason here is a
+    // different failure from one that names `AUTHORIZATION_STALE`.
+    let terminals = snapshot
+        .stream_terminal_events
+        .iter()
+        .map(|event| {
+            format!(
+                "{{session_id={:?},stream_id={},reason={},cause={:?},authorization_failure_code={:?},closed_at_ms={},active_generation={},rotations_completed={},last_emitted={},peer_acked={},recv_contiguous={},delivered_contiguous={}}}",
+                event.session_id,
+                event.stream_id,
+                event.reason,
+                event.cause,
+                event.authorization_failure_code,
+                event.closed_at_ms,
+                event.active_generation,
+                event.rotations_completed,
+                event.last_emitted_relay_to_connector,
+                event.peer_acked_relay_to_connector,
+                event.recv_contiguous_connector_to_relay,
+                event.delivered_contiguous_connector_to_relay,
+            )
+        })
+        .collect::<Vec<_>>();
+    format!("sessions={sessions:?}; stream_terminal_events={terminals:?}")
 }
 
 struct FaultScenario<'a> {
