@@ -717,16 +717,7 @@ async fn run_continuous_traffic_rotations(
     let proxy = harness.proxy.as_ref().ok_or_else(|| {
         HarnessError::InvalidInput("M2 continuous traffic requires its real TCP proxy".to_owned())
     })?;
-    let interval = Duration::from_secs(plan.rotation.interval_seconds);
-    // One arming of each kind per active generation: a hold that found no
-    // frozen phase is not retried until the next rotation.
-    let mut armed_while_active: Option<u64> = None;
-    let mut armed_while_preparing: Option<u64> = None;
-    // When the relay was first seen `active` again. The relay times its next
-    // rotation from the previous one's COMPLETE, which is when it returns to
-    // `active` -- not from the generation advance counted below, which the
-    // harness sees at `retiring`, up to an overlap earlier.
-    let mut active_since: Option<Instant> = None;
+    let mut arming = HoldArming::new(Duration::from_secs(plan.rotation.interval_seconds));
     while traffic.rotations_observed < plan.rotations {
         let sampled = wait_for_stream_snapshot(
             harness,
@@ -753,27 +744,12 @@ async fn run_continuous_traffic_rotations(
         if phase != "active" {
             traffic.handover_phases_observed.insert(phase.clone());
         }
-        // Arm the hold either on seeing the rotation begin, or just before
-        // the next one is due. `preparing` lasts only until the candidate
-        // attaches, a few milliseconds, and a run whose samples all missed it
-        // held nothing; arming on the schedule does not depend on catching it.
-        let generation_now = sampled.relay.active_generation;
-        if phase == "active" {
-            active_since.get_or_insert_with(Instant::now);
-        } else {
-            active_since = None;
-        }
-        let arm_on_schedule = phase == "active"
-            && armed_while_active != Some(generation_now)
-            && active_since.is_some_and(|since| since.elapsed() + HELD_FREEZE_ARM_LEAD >= interval);
-        let arm_on_preparing =
-            phase == "preparing" && armed_while_preparing != Some(generation_now);
-        if traffic.records_during_held_freeze == 0 && (arm_on_schedule || arm_on_preparing) {
-            if arm_on_schedule {
-                armed_while_active = Some(generation_now);
-            } else {
-                armed_while_preparing = Some(generation_now);
-            }
+        // Watch for the next rotation once it is nearly due, or as soon as one
+        // is seen beginning. Watching only polls; the control path is paused
+        // only after `preparing` is observed (see
+        // `write_record_inside_a_held_freeze`).
+        let watch = arming.observe(&phase, sampled.relay.active_generation, Instant::now());
+        if traffic.records_during_held_freeze == 0 && watch {
             let payload = record_payload(record_index);
             let held = write_record_inside_a_held_freeze(HeldFreeze {
                 harness,
@@ -831,16 +807,77 @@ async fn run_continuous_traffic_rotations(
     Ok(traffic)
 }
 
-/// Longest the harness waits, with the control path paused, for the relay to
-/// reach a frozen phase, and then for the held record to reach it. Well inside
-/// the accelerated plan's 2-second overlap budget, and far inside the proxy's
-/// own 30-second fail-closed bound.
-const HELD_FREEZE_BUDGET: Duration = Duration::from_millis(1_000);
-/// How long before a rotation is due the hold may be armed from `active`.
+/// Longest the control path stays paused, from the pause to the resume.
+///
+/// **Bounded by the connector's authorization refresh, not by the rotation.**
+/// The connector refreshes a stream's authorization on the control path once
+/// its confirmed window has `M2_AUTH_REFRESH_MARGIN` (1.5 s) left. A control
+/// stall longer than what remains lapses the authorization, which ends the
+/// stream (task row M6-C84): a 2 s stall lost an echo deterministically, a
+/// 1 s one did not. 300 ms leaves more than a second of that margin.
+const HELD_FREEZE_PAUSE_BUDGET: Duration = Duration::from_millis(300);
+/// How long before a rotation is due the harness starts watching for it.
 const HELD_FREEZE_ARM_LEAD: Duration = Duration::from_millis(500);
 /// The relay checks whether a rotation is due on its 500 ms maintenance tick,
 /// so a due rotation begins up to one tick late.
 const RELAY_ROTATION_TICK: Duration = Duration::from_millis(500);
+/// Poll interval while watching for `preparing`, which lasts only until the
+/// candidate data socket attaches.
+const HELD_FREEZE_WATCH_POLL: Duration = Duration::from_millis(1);
+
+/// When to start watching for a rotation to hold.
+///
+/// Pure, so the arming rule is tested apart from sockets. It fires at most
+/// once per active generation: once that generation's rotation is nearly due
+/// (timed from when the generation was first seen `active`, which is when the
+/// relay's own interval restarts), or as soon as `preparing` is seen.
+struct HoldArming {
+    interval: Duration,
+    /// The generation last seen `active`, and when it was first seen.
+    active_since: Option<(u64, Instant)>,
+    /// A generation this run has already tried to hold.
+    attempted: Option<u64>,
+}
+
+impl HoldArming {
+    fn new(interval: Duration) -> Self {
+        Self {
+            interval,
+            active_since: None,
+            attempted: None,
+        }
+    }
+
+    /// Record one sample; `true` means start watching now.
+    ///
+    /// `active_since` restarts on every **generation change**, not only on a
+    /// sampled non-active phase. Before M6-C84 only the latter reset it, so a
+    /// rotation that completed between two samples left it stale, the rule
+    /// fired at once with no rotation coming, and the control path was paused
+    /// for about 2 s of ordinary traffic -- long enough to lapse a stream's
+    /// authorization and lose an echo.
+    fn observe(&mut self, phase: &str, generation: u64, now: Instant) -> bool {
+        if phase == "active" {
+            if self
+                .active_since
+                .is_none_or(|(seen_generation, _)| seen_generation != generation)
+            {
+                self.active_since = Some((generation, now));
+            }
+        } else {
+            self.active_since = None;
+        }
+        let due_soon = phase == "active"
+            && self.active_since.is_some_and(|(_, since)| {
+                now.saturating_duration_since(since) + HELD_FREEZE_ARM_LEAD >= self.interval
+            });
+        if self.attempted == Some(generation) || !(due_soon || phase == "preparing") {
+            return false;
+        }
+        self.attempted = Some(generation);
+        true
+    }
+}
 
 struct HeldFreeze<'a> {
     harness: &'a RunningHarness,
@@ -859,7 +896,10 @@ struct HeldFreeze<'a> {
 /// Write one continuous record while the relay's writer is **held** frozen,
 /// and round-trip it once the rotation is allowed to finish.
 ///
-/// Armed just before a rotation is due, or once one has begun. The relay
+/// Called just before a rotation is due, or once one has begun. It first only
+/// **watches**, polling without writing or pausing, until the relay reports
+/// `preparing` for the current generation. Only then does it pause, so the
+/// control path is never stalled while no rotation is in progress. The relay
 /// quiesces as soon as the connector's candidate data socket attaches, which
 /// does not cross the control connection, and then waits for the connector's
 /// `ROTATE_FROZEN`, which does. Pausing the connector-to-relay direction of
@@ -888,6 +928,29 @@ async fn write_record_inside_a_held_freeze(held: HeldFreeze<'_>) -> Result<Optio
         armed_at,
         payload,
     } = held;
+    // Watch: poll until the rotation begins, without touching the path.
+    let watch_deadline =
+        Instant::now() + HELD_FREEZE_ARM_LEAD + RELAY_ROTATION_TICK + HELD_FREEZE_PAUSE_BUDGET;
+    loop {
+        let sampled = wait_for_stream_snapshot(
+            harness,
+            handle,
+            device_id,
+            session_id,
+            stream.stream_id_hint(),
+            SNAPSHOT_POLL,
+        )
+        .await?;
+        let same_rotation = sampled.relay.active_generation == armed_at.relay.active_generation;
+        match sampled.relay.phase.as_str() {
+            "preparing" if same_rotation => break,
+            "active" if same_rotation && Instant::now() < watch_deadline => {
+                sleep(HELD_FREEZE_WATCH_POLL).await;
+            }
+            // Past `preparing` already, or no rotation in time: try the next.
+            _ => return Ok(None),
+        }
+    }
     let control = wait_for_connection_for_addr(
         proxy,
         handle.status_snapshot().control_local_addr,
@@ -899,11 +962,8 @@ async fn write_record_inside_a_held_freeze(held: HeldFreeze<'_>) -> Result<Optio
         .pause(Direction::ClientToTarget, control)
         .await
         .map_err(|error| HarnessError::Proxy(format!("pausing the control path: {error}")))?;
+    let pause_deadline = Instant::now() + HELD_FREEZE_PAUSE_BUDGET;
     let outcome = async {
-        // Armed from `active`, the pause also covers the wait for the rotation
-        // to begin: the arming lead, plus up to one relay tick.
-        let deadline =
-            Instant::now() + HELD_FREEZE_ARM_LEAD + RELAY_ROTATION_TICK + HELD_FREEZE_BUDGET;
         let frozen = loop {
             let sampled = wait_for_stream_snapshot(
                 harness,
@@ -914,9 +974,6 @@ async fn write_record_inside_a_held_freeze(held: HeldFreeze<'_>) -> Result<Optio
                 SNAPSHOT_POLL,
             )
             .await?;
-            // The active generation moves only when a rotation completes; the
-            // candidate generation is not compared because it is first
-            // reported when the candidate attaches, after `preparing`.
             let same_rotation =
                 sampled.relay.active_generation == armed_at.relay.active_generation;
             match sampled.relay.phase.as_str() {
@@ -925,17 +982,16 @@ async fn write_record_inside_a_held_freeze(held: HeldFreeze<'_>) -> Result<Optio
                 // then the drain proof, then `COMMITTED`), so none can be left
                 // while the pause holds.
                 "quiescing" | "draining" | "committing" if same_rotation => break sampled,
-                "active" | "preparing" if same_rotation && Instant::now() < deadline => {
-                    sleep(Duration::from_millis(2)).await;
+                "preparing" if same_rotation && Instant::now() < pause_deadline => {
+                    sleep(HELD_FREEZE_WATCH_POLL).await;
                 }
                 _ => return Ok(None),
             }
         };
-        let deadline = Instant::now() + HELD_FREEZE_BUDGET;
         stream.send_record(payload).await?;
         // The record must be seen held at the fence: queued at the relay,
         // nothing further emitted toward the connector, and the relay still
-        // quiescing for this rotation.
+        // in the same frozen phase of this rotation.
         loop {
             let sampled = wait_for_stream_snapshot(
                 harness,
@@ -965,12 +1021,12 @@ async fn write_record_inside_a_held_freeze(held: HeldFreeze<'_>) -> Result<Optio
             if sampled.stream.queue_bytes > frozen.stream.queue_bytes {
                 return Ok(Some(frozen.relay.phase.clone()));
             }
-            if Instant::now() >= deadline {
+            if Instant::now() >= pause_deadline {
                 return Err(HarnessError::Timeout(
-                    "the held-freeze record never reached the relay's frozen queue".to_owned(),
+                    "the held-freeze record never reached the relay's frozen queue within the pause budget".to_owned(),
                 ));
             }
-            sleep(Duration::from_millis(2)).await;
+            sleep(HELD_FREEZE_WATCH_POLL).await;
         }
     }
     .await;
@@ -3245,10 +3301,12 @@ fn stream_id_hint(stream: &ConsumerStream) -> Option<u64> {
 #[cfg(test)]
 mod c17_validator_tests {
     use super::{
-        ContinuousTrafficEvidence, ProxyRetirementEvidence, assert_expected_control_loss,
-        require_m2_continuous_traffic_evidence, validate_proxy_retirement_evidence,
+        ContinuousTrafficEvidence, HoldArming, ProxyRetirementEvidence,
+        assert_expected_control_loss, require_m2_continuous_traffic_evidence,
+        validate_proxy_retirement_evidence,
     };
     use crate::acceptance_test_support::assert_rejected;
+    use std::time::{Duration, Instant};
     use tunnel_client::{ClientError, Readiness};
 
     /// Complete continuous-traffic evidence: three rotations carrying 100
@@ -3262,6 +3320,41 @@ mod c17_validator_tests {
             accepted: 5,
             peak_active: 3,
         }
+    }
+
+    /// A rotation that completes between two samples must restart the clock
+    /// the arming rule times the next rotation from. With the pre-M6-C84 rule
+    /// (reset only on a sampled non-active phase) this fired immediately
+    /// after the new generation appeared, pausing the control path with no
+    /// rotation coming.
+    #[test]
+    fn a_rotation_completed_between_samples_restarts_the_arming_clock() {
+        let interval = Duration::from_secs(3);
+        let mut arming = HoldArming::new(interval);
+        let start = Instant::now();
+        // Generation 1 active for a long time: due soon, fires once.
+        assert!(!arming.observe("active", 1, start));
+        assert!(arming.observe("active", 1, start + interval));
+        // The next samples see generation 2 already active: no non-active
+        // phase was ever sampled. It must not fire until generation 2 is
+        // itself nearly due.
+        assert!(!arming.observe("active", 2, start + interval + Duration::from_millis(100)));
+        assert!(!arming.observe("active", 2, start + interval + Duration::from_secs(1)));
+        assert!(arming.observe(
+            "active",
+            2,
+            start + interval + Duration::from_millis(100) + interval
+        ));
+    }
+
+    #[test]
+    fn the_arming_rule_fires_on_preparing_and_once_per_generation() {
+        let mut arming = HoldArming::new(Duration::from_secs(300));
+        let start = Instant::now();
+        assert!(!arming.observe("active", 1, start));
+        assert!(arming.observe("preparing", 1, start + Duration::from_secs(1)));
+        assert!(!arming.observe("preparing", 1, start + Duration::from_secs(1)));
+        assert!(!arming.observe("quiescing", 1, start + Duration::from_secs(1)));
     }
 
     fn valid_continuous_traffic_evidence() -> ContinuousTrafficEvidence {
