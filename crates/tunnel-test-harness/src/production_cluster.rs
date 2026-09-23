@@ -1568,6 +1568,9 @@ struct ProductionRelay {
     peer_runtime: Arc<PeerRuntime>,
     peer_capacity: usize,
     consumer_socket_diagnostics: Option<AcceptedSocketDiagnostics>,
+    /// Kernel-reported send buffer of the last accepted device socket, sampled
+    /// only when a gate pins it (`RunningHarness::device_send_buffer_bytes`).
+    device_socket_diagnostics: Option<AcceptedSocketDiagnostics>,
     peer_refresh_cancel: CancellationToken,
     peer_refresh: Option<JoinHandle<()>>,
 }
@@ -1765,6 +1768,12 @@ impl ProductionRelay {
 
     fn accepted_consumer_send_buffer_bytes(&self) -> Option<usize> {
         self.consumer_socket_diagnostics
+            .as_ref()
+            .and_then(AcceptedSocketDiagnostics::last_send_buffer_bytes)
+    }
+
+    fn accepted_device_send_buffer_bytes(&self) -> Option<usize> {
+        self.device_socket_diagnostics
             .as_ref()
             .and_then(AcceptedSocketDiagnostics::last_send_buffer_bytes)
     }
@@ -5746,6 +5755,9 @@ async fn start_relay(
     let consumer_listener = bind_consumer_listener(consumer_send_buffer_bytes)?;
     let consumer_socket_diagnostics =
         consumer_send_buffer_bytes.map(|_| AcceptedSocketDiagnostics::new());
+    let device_socket_diagnostics = harness
+        .device_send_buffer_bytes
+        .map(|_| AcceptedSocketDiagnostics::new());
     let device_listener = TcpListener::bind(("127.0.0.1", 0))
         .await
         .map_err(HarnessError::Io)?;
@@ -5855,7 +5867,7 @@ async fn start_relay(
                 },
                 device: AcceptedSocketOptions {
                     send_buffer_bytes: harness.device_send_buffer_bytes,
-                    diagnostics: None,
+                    diagnostics: device_socket_diagnostics.clone(),
                 },
                 consumer_upgrade_barrier,
                 consumer_peer_admission_barrier,
@@ -5890,6 +5902,7 @@ async fn start_relay(
         peer_runtime,
         peer_capacity,
         consumer_socket_diagnostics,
+        device_socket_diagnostics,
         peer_refresh_cancel: CancellationToken::new(),
         peer_refresh: None,
     })
