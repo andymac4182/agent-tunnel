@@ -1,0 +1,55 @@
+# Catalog records for `tunnel-relay provision-catalog` that provision one MCP
+# server export (docs/operator.md section 2.3, task row M6-C57). The tenant,
+# user and device are the ones in examples/m6-catalog.toml; see that file for
+# what each field means. Every UUID is a synthetic placeholder.
+#
+# An MCP server is an `http-forward` service. `http_forward_profile` names the
+# MCP revision the relay speaks for it, `mcp-2025-11-25` (sessions) or
+# `mcp-2026-07-28` (stateless), and the relay configuration given with
+# --config must list the same profile:
+#
+#   [http_forward]
+#   profiles = ["mcp-2025-11-25"]
+#
+# The device's client profile serves it with an export table named by
+# service.id, of the same profile, and an MCP server of its own choosing:
+#
+#   [exports."55555555-5555-4555-8555-555555555555"]
+#   type = "http-forward"
+#
+#   [exports."55555555-5555-4555-8555-555555555555".mcp]
+#   profile = "mcp-2025-11-25"
+#
+#   [exports."55555555-5555-4555-8555-555555555555".mcp.backend]
+#   kind = "stdio"
+#   command = "/absolute/path/to/an/mcp-server"
+#   workspace = "/absolute/path/to/its/working/directory"
+#
+# Consumers then call
+# https://<consumer listener>/v1/devices/<device.id>/services/<service.id>/http/mcp
+# with a token whose scope includes http:invoke.
+
+[tenant]
+id = "11111111-1111-4111-8111-111111111111"
+display_name = "Trial tenant"
+
+[user]
+id = "22222222-2222-4222-8222-222222222222"
+display_name = "Trial user"
+oidc_subject = "trial-user"
+role = "member"
+
+[device]
+id = "33333333-3333-4333-8333-333333333333"
+display_name = "Trial device"
+certificate = "device-cert.pem"
+
+[service]
+id = "55555555-5555-4555-8555-555555555555"
+type = "http-forward"
+display_name = "Trial MCP server"
+operations = ["http:invoke"]
+http_forward_profile = "mcp-2025-11-25"
+
+[grant]
+operations = ["http:invoke"]

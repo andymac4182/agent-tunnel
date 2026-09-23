@@ -14,7 +14,11 @@
 #    retried until it is; an expired one, which must exit 3 at once; and a
 #    device_id mismatch, which the relay refuses with 1008
 #    DEVICE_IDENTITY_REJECTED (M6-C32) and which must exit 3 without a retry;
-#    and a rogue device CA and a wrong server CA (M6-C54), each exit 3.
+#    and a rogue device CA and a wrong server CA (M6-C54), each exit 3; and
+#    (M6-C68) a device whose path is cut behind a proxy while the relay's side
+#    stays open, which the relay must evict within its idle timeout so the
+#    device's reconnect is admitted -- after a healthy idle session has first
+#    survived longer than that timeout.
 #
 # Both tests are `#[ignore]`d in the ordinary workspace run because they need
 # Redis.  A filtered or skipped test would print `0 passed` and exit 0, so this
@@ -45,9 +49,10 @@ echo "m6-reconnect-verify: reconnect gates" >&2
 cargo test -p tunnel-relay --test m6_reconnect_process --locked -- --ignored --nocapture --test-threads=1 \
   > "$scratch/reconnect.log" 2>&1 || { cat "$scratch/reconnect.log" >&2; exit 1; }
 cat "$scratch/reconnect.log"
-for needle in "test result: ok. 6 passed" "m6c23-reconnect ok label=restart nonce=" \
+for needle in "test result: ok. 7 passed" "m6c23-reconnect ok label=restart nonce=" \
   "m6c23-reconnect ok label=late-relay nonce=" "m6c23-reconnect ok label=not-yet-valid nonce=" \
   "m6c23-reconnect ok label=expired nonce=" "m6c23-reconnect ok label=identity nonce=" "m6c23-reconnect ok label=issuer nonce=" \
+  "m6c68-liveness ok label=cut-path nonce=" \
   "client=$TUNNEL_CLIENT_BIN"; do
   if ! grep -q -- "$needle" "$scratch/reconnect.log"; then
     echo "m6-reconnect-verify: FAILED: output lacks '$needle'" >&2

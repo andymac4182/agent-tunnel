@@ -82,6 +82,7 @@ Control messages use bounded UTF-8 JSON WebSocket messages for initial inspectab
 | `STREAM_FORGET` | Owner-ordered reclamation of terminal stream/tombstone state, serialized with drain snapshots. |
 | `CANCEL`, `CANCELLED`, `RESULT_STATUS` | Best-effort cancellation and explicit operation lifecycle status. |
 | `PING`, `PONG` | Check control health independently of data traffic. |
+| WebSocket Ping/Pong (transport frames, not control messages) | Relay liveness check on the device control socket (M6-C68). The relay sends a WebSocket Ping every 10 s (`DEVICE_CONTROL_PING_INTERVAL`). **Device obligation:** answer each WebSocket Ping with a Pong, or send some other frame, so that at least one inbound frame reaches the relay every 30 s (`DEVICE_CONTROL_IDLE_TIMEOUT`). Otherwise the relay ends the session and records closure cause `liveness_timeout`, releasing the owner slot as a device close does. |
 | Authorization challenge/confirmation | Independent, delay-safe device grant freshness with a five-second ceiling; see [cluster.md](cluster.md). |
 | Ownership challenge/confirmation | Challenge-bound lease confirmation and connector dispatch permission, as specified in [cluster.md](cluster.md); distinct from a heartbeat. |
 | `ROTATE_REQUEST`, `ROTATE_PREPARE`, `DATA_READY` | Request rotation, authorize one candidate and establish its readiness. |

@@ -77,7 +77,7 @@ const PEER_FAULT_SNAPSHOT_KEYS: [&str; 10] = [
 /// rings.  The scan holds them to the same standard as the fault labels: a
 /// closed set, bounded counts, and no payload-derived content.
 const TASK_CLOSURE_STAGES: [&str; 3] = ["control", "data", "consumer_stream"];
-const TASK_CLOSURE_CAUSES: [&str; 9] = [
+const TASK_CLOSURE_CAUSES: [&str; 10] = [
     "peer_closed",
     "write_failed",
     "protocol_error",
@@ -87,6 +87,7 @@ const TASK_CLOSURE_CAUSES: [&str; 9] = [
     "stream_closed",
     "expired",
     "stream_failed",
+    "liveness_timeout",
 ];
 const TASK_CLOSURE_EVENT_KEYS: [&str; 9] = [
     "sequence",

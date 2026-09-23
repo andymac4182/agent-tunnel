@@ -85,6 +85,10 @@ pub enum TaskClosureCause {
     Expired,
     /// A stream write returned a typed failure or an unusable response frame.
     StreamFailed,
+    /// Task row M6-C68: the device sent no frame of any kind -- not even the
+    /// Pong owed to the relay's Ping -- for the device control idle timeout,
+    /// so its path is presumed gone and the session is released.
+    LivenessTimeout,
 }
 
 impl TaskClosureCause {
@@ -100,6 +104,7 @@ impl TaskClosureCause {
             Self::StreamClosed => "stream_closed",
             Self::Expired => "expired",
             Self::StreamFailed => "stream_failed",
+            Self::LivenessTimeout => "liveness_timeout",
         }
     }
 }
