@@ -23,6 +23,10 @@
 //! * `m6c23_an_expired_device_certificate_exits_three_without_retrying` -- the
 //!   same alert for a certificate past `notAfter` on the client's clock too:
 //!   exit `3`, no backoff.
+//! * `m6c23_a_rogue_device_ca_and_a_wrong_server_ca_exit_three_without_retrying`
+//!   -- M6-C54's two issuer cases against a real relay: a device certificate
+//!   from a CA the relay does not trust, and a profile whose `server_ca` did
+//!   not sign the relay's certificate; each exits `3` after one attempt.
 //! * `m6c23_an_identity_mismatch_exits_three_without_retrying` -- the
 //!   integration with M6-C32: a `device_id` that is not the certificate's
 //!   device draws `1008 DEVICE_IDENTITY_REJECTED`, and the loop exits `3`
@@ -1161,6 +1165,133 @@ async fn m6c23_an_identity_mismatch_exits_three_without_retrying() {
     drop(relay);
     println!(
         "m6c23-reconnect ok label=identity nonce={} exit=3 code=CREDENTIAL_ERROR backoffs=0",
+        deployment.nonce
+    );
+}
+
+/// Wait for a terminal exit `3` `CREDENTIAL_ERROR` whose message contains
+/// `reason`, after one attempt and no backoff.
+fn expect_terminal_credential(client: &mut Client, step_name: &str, reason: &str) {
+    let exit = client.wait_exit(step_name);
+    let events: Vec<Value> = client
+        .events()
+        .into_iter()
+        .map(|(_, event)| event)
+        .collect();
+    let last = events.last().cloned().unwrap_or(Value::Null);
+    assert_eq!(exit.code(), Some(3), "step {step_name}: {events:?}");
+    assert_eq!(
+        last["error"]["code"], "CREDENTIAL_ERROR",
+        "step {step_name}: {events:?}"
+    );
+    assert_eq!(
+        last["error"]["retryable"], false,
+        "step {step_name}: {events:?}"
+    );
+    assert!(
+        last["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(reason),
+        "step {step_name}: expected {reason:?}: {events:?}"
+    );
+    assert!(
+        client.states("backoff").is_empty(),
+        "step {step_name}: {events:?}"
+    );
+    println!("m6c23-issuer {step_name} exit=3 code=CREDENTIAL_ERROR backoffs=0");
+}
+
+/// M6-C54's two issuer cases, re-measured against a real `serve` with
+/// reconnect on: a device certificate from a rogue CA (the relay's TLS
+/// verifier refuses it with an `unknown_ca` alert) and a profile whose
+/// `server_ca` did not sign the relay's certificate (this client refuses
+/// the relay: unknown issuer). Both are terminal: exit `3`, no backoff.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires TEST_REDIS_URL and TUNNEL_CLIENT_BIN; run by scripts/m6-reconnect-verify.sh"]
+async fn m6c23_a_rogue_device_ca_and_a_wrong_server_ca_exit_three_without_retrying() {
+    let deployment = Deployment::provision("issuer").await;
+    let credentials = deployment
+        .reissue
+        .installed
+        .parent()
+        .expect("credentials dir")
+        .to_path_buf();
+    let profile_text = fs::read_to_string(&deployment.client_config).expect("read profile");
+
+    // Wrong server CA: trust the device CA, which did not sign the relay.
+    let wrong_ca = credentials.join("wrong-server-ca.pem");
+    fs::copy(&deployment.reissue.ca, &wrong_ca).expect("wrong server CA");
+    let wrong_ca_profile = deployment
+        .client_config
+        .with_file_name("wrong-server-ca.toml");
+    fs::write(
+        &wrong_ca_profile,
+        set_key(
+            &profile_text,
+            "server_ca",
+            "\"credentials/wrong-server-ca.pem\"",
+        ),
+    )
+    .expect("wrong server CA profile");
+
+    // Rogue device CA: the same CSR signed by a CA the relay does not trust.
+    let rogue_key = credentials.join("rogue-ca-key.pem");
+    let rogue_ca = credentials.join("rogue-ca.pem");
+    step(
+        "rogue CA (openssl req -x509)",
+        Command::new("openssl")
+            .args([
+                "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "2",
+            ])
+            .args(["-subj", "/CN=M6-C23 synthetic rogue CA", "-keyout"])
+            .arg(&rogue_key)
+            .arg("-out")
+            .arg(&rogue_ca)
+            .stderr(Stdio::null()),
+    );
+    let rogue_cert = credentials.join("rogue-device-cert.pem");
+    step(
+        "rogue device certificate (openssl x509 -req)",
+        Command::new("openssl")
+            .args(["x509", "-req", "-in"])
+            .arg(&deployment.reissue.csr)
+            .arg("-CA")
+            .arg(&rogue_ca)
+            .arg("-CAkey")
+            .arg(&rogue_key)
+            .args(["-CAcreateserial", "-days", "1", "-extfile"])
+            .arg(&deployment.reissue.extensions)
+            .arg("-out")
+            .arg(&rogue_cert),
+    );
+    let rogue_profile = deployment.client_config.with_file_name("rogue-ca.toml");
+    fs::write(
+        &rogue_profile,
+        set_key(
+            &profile_text,
+            "client_certificate",
+            "\"credentials/rogue-device-cert.pem\"",
+        ),
+    )
+    .expect("rogue CA profile");
+
+    let relay = deployment.serve("serve");
+    let mut client = deployment.connect_with(&wrong_ca_profile);
+    expect_terminal_credential(
+        &mut client,
+        "wrong server CA",
+        "the relay's certificate was refused: unknown issuer",
+    );
+    let mut client = deployment.connect_with(&rogue_profile);
+    expect_terminal_credential(
+        &mut client,
+        "rogue device CA",
+        "the relay refused this device's certificate",
+    );
+    drop(relay);
+    println!(
+        "m6c23-reconnect ok label=issuer nonce={} wrong_server_ca=exit3 rogue_device_ca=exit3",
         deployment.nonce
     );
 }
