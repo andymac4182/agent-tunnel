@@ -486,9 +486,67 @@ impl Drop for Running {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires TEST_REDIS_URL and TUNNEL_CLIENT_BIN; run by scripts/m6-provisioning-verify.sh"]
-async fn m6c21_shipped_binaries_provision_one_relay_and_one_device_end_to_end() {
+/// Rotation timing written into both shipped examples' `[rotation]` tables.
+#[derive(Clone, Copy)]
+struct Rotation {
+    interval_seconds: u64,
+    handshake_timeout_seconds: u64,
+    overlap_seconds: u64,
+}
+
+fn with_rotation(document: &str, rotation: Rotation) -> String {
+    let document = set_key(
+        document,
+        "interval_seconds",
+        &rotation.interval_seconds.to_string(),
+    );
+    let document = set_key(
+        &document,
+        "handshake_timeout_seconds",
+        &rotation.handshake_timeout_seconds.to_string(),
+    );
+    set_key(
+        &document,
+        "overlap_seconds",
+        &rotation.overlap_seconds.to_string(),
+    )
+}
+
+/// One relay brought up from an empty Redis namespace with the shipped
+/// binaries: device key, CSR and certificate import, records dry run, first
+/// incarnation, catalog provisioning and a listening `serve`.  The device is
+/// not connected; each gate starts its own `connect`.
+///
+/// Fields drop in declaration order: the relay process stops before the
+/// namespace is deleted and the work directory removed.
+struct Provisioned {
+    relay: Running,
+    /// `serve`'s stderr lines after `tunnel-relay listening`, for failure
+    /// messages.
+    relay_log: std::sync::mpsc::Receiver<String>,
+    nonce: String,
+    namespace: String,
+    work: PathBuf,
+    pki: ServerPki,
+    issuer_key: jsonwebtoken::EncodingKey,
+    consumer: SocketAddr,
+    device: Uuid,
+    service: Uuid,
+    subject: String,
+    client_bin: PathBuf,
+    client_config: PathBuf,
+    server_ca: PathBuf,
+    device_ca: PathBuf,
+    device_ca_key: PathBuf,
+    extensions: PathBuf,
+    dry: String,
+    upstream: SocketAddr,
+    database: u32,
+    _namespace_guard: NamespaceGuard,
+    _dir: Workdir,
+}
+
+async fn provision_and_serve(tag: &str, rotation: Option<Rotation>) -> Provisioned {
     let redis_url = env::var("TEST_REDIS_URL").expect("TEST_REDIS_URL (plaintext) is required");
     let client_bin = PathBuf::from(
         env::var_os("TUNNEL_CLIENT_BIN")
@@ -502,8 +560,8 @@ async fn m6c21_shipped_binaries_provision_one_relay_and_one_device_end_to_end() 
     let (upstream, database) = parse_plaintext_redis(&redis_url);
 
     let nonce = Uuid::new_v4().simple().to_string();
-    let namespace = format!("m6c21-e2e-{nonce}");
-    let incarnation = format!("m6c21-e2e-{nonce}");
+    let namespace = format!("{tag}-{nonce}");
+    let incarnation = format!("{tag}-{nonce}");
     // The records and the device profile are the shipped examples, used as
     // docs/operator.md uses them: an example whose identifiers disagree with
     // its partner makes this gate red.
@@ -527,11 +585,11 @@ async fn m6c21_shipped_binaries_provision_one_relay_and_one_device_end_to_end() 
         database,
         namespace: namespace.clone(),
     };
-    let dir = Workdir(env::temp_dir().join(format!("m6c21-e2e-{nonce}")));
+    let dir = Workdir(env::temp_dir().join(format!("{tag}-{nonce}")));
     fs::create_dir_all(&dir.0).expect("create workdir");
     let work = dir.0.canonicalize().expect("canonical workdir");
     println!(
-        "m6c21-e2e start nonce={nonce} namespace={namespace} relay={} client={} workdir={}",
+        "{tag} start nonce={nonce} namespace={namespace} relay={} client={} workdir={}",
         relay_bin.display(),
         client_bin.display(),
         work.display()
@@ -562,6 +620,9 @@ async fn m6c21_shipped_binaries_provision_one_relay_and_one_device_end_to_end() 
             device_listener.port()
         ),
     );
+    if let Some(rotation) = rotation {
+        client_toml = with_rotation(&client_toml, rotation);
+    }
     fs::create_dir_all(work.join("device")).expect("device dir");
     let client_config = work.join("device/client.toml");
     fs::write(&client_config, client_toml).expect("client config");
@@ -643,6 +704,9 @@ async fn m6c21_shipped_binaries_provision_one_relay_and_one_device_end_to_end() 
         ("deployment_incarnation", format!("\"{incarnation}\"")),
     ] {
         relay_toml = set_key(&relay_toml, key, &value);
+    }
+    if let Some(rotation) = rotation {
+        relay_toml = with_rotation(&relay_toml, rotation);
     }
     relay_toml = format!(
         "redis_tls_root_ca_path = {}\n{relay_toml}",
@@ -740,6 +804,59 @@ async fn m6c21_shipped_binaries_provision_one_relay_and_one_device_end_to_end() 
         );
     }
 
+    Provisioned {
+        relay,
+        relay_log: listening_rx,
+        nonce,
+        namespace,
+        work,
+        pki,
+        issuer_key,
+        consumer,
+        device,
+        service,
+        subject,
+        client_bin,
+        client_config,
+        server_ca,
+        device_ca,
+        device_ca_key,
+        extensions,
+        dry,
+        upstream,
+        database,
+        _namespace_guard,
+        _dir: dir,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires TEST_REDIS_URL and TUNNEL_CLIENT_BIN; run by scripts/m6-provisioning-verify.sh"]
+async fn m6c21_shipped_binaries_provision_one_relay_and_one_device_end_to_end() {
+    let Provisioned {
+        relay,
+        relay_log: _,
+        nonce,
+        namespace,
+        work,
+        pki,
+        issuer_key,
+        consumer,
+        device,
+        service,
+        subject,
+        client_bin,
+        client_config,
+        server_ca,
+        device_ca,
+        device_ca_key,
+        extensions,
+        dry,
+        upstream,
+        database,
+        _namespace_guard,
+        _dir,
+    } = provision_and_serve("m6c21-e2e", None).await;
     let client_log = work.join("connect.log");
     let _device = Running(
         Command::new(&client_bin)
@@ -887,5 +1004,297 @@ async fn m6c21_shipped_binaries_provision_one_relay_and_one_device_end_to_end() 
         "m6c21-e2e ok nonce={nonce} namespace={namespace} echo_status={status} \
          echo_bytes={} stranger_status={stranger_status} keys_removed={removed}",
         body.len()
+    );
+}
+
+/// Parse the `--json` status lines `connect` has written so far and return
+/// the distinct session IDs and the highest completed-rotation count.
+fn connect_sessions_and_rotations(log: &Path) -> (Vec<String>, u64) {
+    let text = fs::read_to_string(log).unwrap_or_default();
+    let mut sessions: Vec<String> = Vec::new();
+    let mut rotations = 0;
+    for line in text.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let result = &value["result"];
+        if let Some(session) = result["session_id"].as_str()
+            && !sessions.iter().any(|known| known == session)
+        {
+            sessions.push(session.to_owned());
+        }
+        rotations = rotations.max(result["rotations_completed"].as_u64().unwrap_or(0));
+    }
+    (sessions, rotations)
+}
+
+/// The connector's OPEN retention: `retained_stream_limit(DEFAULT_MAX_STREAMS)`
+/// = min(64 x 2, `MAX_JOURNAL_ENTRIES` = 128).  Restated, not imported, so
+/// the gates keep their meaning if either constant moves.
+const CONNECTOR_OPEN_RETENTION: usize = 128;
+/// A rotation pauses echo admission with a retryable `RESOURCE_EXHAUSTED`
+/// that was `not_dispatched`; one request may be refused this many times.
+const MAX_FREEZE_REFUSALS: usize = 400;
+/// The shortest rotation timing the policy accepts (handshake < overlap <
+/// interval, whole seconds), in both the relay and the device profile.
+const FAST_ROTATION: Rotation = Rotation {
+    interval_seconds: 3,
+    handshake_timeout_seconds: 1,
+    overlap_seconds: 2,
+};
+
+/// What one sequential-echo gate must show.
+struct EchoRun {
+    tag: &'static str,
+    /// Echoes that must be answered 200, after one uncounted warm-up.
+    required_echoes: usize,
+    /// Completed data rotations the same session must also cross.
+    required_rotations: u64,
+    /// Pause after each echo, so a run spans rotations with few requests.
+    pace: Duration,
+    /// Upper bound on counted echoes; `None` for no bound.
+    max_echoes: Option<usize>,
+}
+
+struct EchoRunResult {
+    served: usize,
+    rotations: u64,
+    freeze_refusals: usize,
+    elapsed: Duration,
+    nonce: String,
+    namespace: String,
+}
+
+/// Bring up one relay and one device with the shipped binaries and send
+/// sequential unary echoes through one device session until `run` is
+/// satisfied.  Every echo must return 200 with the canary and exactly the
+/// bytes sent; the only tolerated refusal is a rotation freeze's retryable
+/// `RESOURCE_EXHAUSTED`/`not_dispatched`.  One session ID across the run
+/// proves nothing was served by a reconnect.
+async fn run_sequential_echoes(run: EchoRun) -> EchoRunResult {
+    let fixture = provision_and_serve(run.tag, Some(FAST_ROTATION)).await;
+    let client_log = fixture.work.join("connect.log");
+    let client_stderr = fixture.work.join("connect.stderr.log");
+    let mut device = Running(
+        Command::new(&fixture.client_bin)
+            .args(["connect", "--config"])
+            .arg(&fixture.client_config)
+            .arg("--json")
+            .env("RUST_LOG", "info")
+            .stdout(fs::File::create(&client_log).expect("client log"))
+            .stderr(fs::File::create(&client_stderr).expect("client stderr"))
+            .spawn()
+            .expect("spawn connect"),
+    );
+    let token = access_token(&fixture.issuer_key, &fixture.subject);
+    let path = format!(
+        "/v1/devices/{}/services/{}/echo",
+        fixture.device, fixture.service
+    );
+    // Failure context: the device's `--json` events, the tail of its log
+    // and the relay's warnings.
+    let log = || {
+        let stderr = fs::read_to_string(&client_stderr).unwrap_or_default();
+        let tail: Vec<&str> = stderr.lines().rev().take(40).collect();
+        format!(
+            "{}\nconnect stderr (last 40 lines, newest first):\n{}\nrelay stderr:\n{}",
+            fs::read_to_string(&client_log).unwrap_or_default(),
+            tail.join("\n"),
+            fixture.relay_log.try_iter().collect::<Vec<_>>().join("\n")
+        )
+    };
+
+    // Wait for the device: the first request is retried only until the
+    // session is up, and is not counted.
+    let deadline = Instant::now() + STEP_DEADLINE;
+    loop {
+        match consumer_post(
+            fixture.consumer,
+            &fixture.pki.ca_pem,
+            &path,
+            &token,
+            b"warm",
+        )
+        .await
+        {
+            Ok((200, _)) => break,
+            _ if Instant::now() >= deadline => {
+                panic!("step warm-up: device not serving; connect log: {}", log())
+            }
+            _ => tokio::time::sleep(Duration::from_millis(250)).await,
+        }
+    }
+    let (initial_sessions, _) = connect_sessions_and_rotations(&client_log);
+
+    let started = Instant::now();
+    let run_deadline = started + Duration::from_secs(120);
+    let mut served = 0_usize;
+    let mut freeze_refusals = 0_usize;
+    let mut rotations = 0;
+    while served < run.required_echoes || rotations < run.required_rotations {
+        assert!(
+            Instant::now() < run_deadline,
+            "step sequential echoes: {served} served and {rotations} rotations within 120 s; \
+             connect log: {}",
+            log()
+        );
+        if let Some(max_echoes) = run.max_echoes {
+            assert!(
+                served < max_echoes,
+                "step sequential echoes: {rotations} of {} rotations after the {max_echoes} \
+                 echoes this gate may send; connect log: {}",
+                run.required_rotations,
+                log()
+            );
+        }
+        if let Ok(Some(status)) = device.0.try_wait() {
+            panic!(
+                "step sequential echoes: connect exited {status} after {served} echoes; \
+                 connect log: {}",
+                log()
+            );
+        }
+        let request = served + 1;
+        // Vary the size so the defect cannot hide behind one body length:
+        // empty, small and the 64 KiB frame maximum all recur.
+        let size = match request % 4 {
+            0 => 0,
+            1 => 17,
+            2 => 4096,
+            _ => 65_536,
+        };
+        let payload: Vec<u8> = (0..size)
+            .map(|index| (index * 31 + request) as u8)
+            .collect();
+        let mut refusals = 0;
+        let (status, body) = loop {
+            let (status, body) = consumer_post(
+                fixture.consumer,
+                &fixture.pki.ca_pem,
+                &path,
+                &token,
+                &payload,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("step echo {request}: {error}; connect log: {}", log()));
+            let text = String::from_utf8_lossy(&body);
+            let frozen = status == 503
+                && text.contains("\"RESOURCE_EXHAUSTED\"")
+                && text.contains("\"not_dispatched\"");
+            if frozen && refusals < MAX_FREEZE_REFUSALS {
+                refusals += 1;
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                continue;
+            }
+            break (status, body);
+        };
+        freeze_refusals += refusals;
+        assert_eq!(
+            status,
+            200,
+            "step echo {request} (session request {}, after one warm-up): HTTP {status} {} \
+             after {refusals} rotation refusals, {rotations} rotations so far; connect log: {}",
+            request + 1,
+            String::from_utf8_lossy(&body),
+            log()
+        );
+        let mut expected = CANARY.as_bytes().to_vec();
+        expected.extend_from_slice(&payload);
+        assert!(
+            body == expected,
+            "step echo {request}: the reply must be the canary followed by the {size} bytes sent"
+        );
+        served = request;
+        if !run.pace.is_zero() {
+            tokio::time::sleep(run.pace).await;
+        }
+        if served.is_multiple_of(10) || served >= run.required_echoes {
+            rotations = connect_sessions_and_rotations(&client_log).1;
+        }
+    }
+    let elapsed = started.elapsed();
+    let (sessions, rotations) = connect_sessions_and_rotations(&client_log);
+    assert_eq!(
+        sessions.len(),
+        1,
+        "every echo must be served by one device session, not by reconnects: {sessions:?} \
+         (before the run: {initial_sessions:?})"
+    );
+    drop(device);
+    let nonce = fixture.nonce.clone();
+    let namespace = fixture.namespace.clone();
+    drop(fixture);
+    EchoRunResult {
+        served,
+        rotations,
+        freeze_refusals,
+        elapsed,
+        nonce,
+        namespace,
+    }
+}
+
+/// Task row M7-C92 (M6-C62 on branch `m6-dogfood-local`): the unary echo
+/// path must serve an unbounded number of sequential requests in one device
+/// session, across data rotations.  Before M7-C92 the relay never issued the
+/// owner `STREAM_FORGET` for a completed unary echo, so the connector's OPEN
+/// journal filled at 128 entries and request 129 of every session failed
+/// `503 DEVICE_REJECTED` until the device restarted.  The run sends more
+/// than twice the retention, so a fix that merely doubled it stays red.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires TEST_REDIS_URL and TUNNEL_CLIENT_BIN; run by scripts/m6-provisioning-verify.sh"]
+async fn m7c92_sequential_unary_echoes_outlive_the_connector_open_retention() {
+    let required = 2 * CONNECTOR_OPEN_RETENTION + 44;
+    let result = run_sequential_echoes(EchoRun {
+        tag: "m7c92-echo",
+        required_echoes: required,
+        required_rotations: 2,
+        pace: Duration::ZERO,
+        max_echoes: None,
+    })
+    .await;
+    println!(
+        "m7c92-echo ok nonce={} namespace={} echoes={} required={required} sessions=1 \
+         rotations={} freeze_refusals={} retention={CONNECTOR_OPEN_RETENTION} elapsed_ms={}",
+        result.nonce,
+        result.namespace,
+        result.served,
+        result.rotations,
+        result.freeze_refusals,
+        result.elapsed.as_millis()
+    );
+}
+
+/// Task row M7-C93: a unary echo in flight when a data rotation freezes the
+/// writers must neither kill the session nor be lost.  Before M7-C93 the
+/// relay fenced a dispatched echo at its DATA sequence although its FIN was
+/// already sent, so the connector failed the session with "local drain
+/// rejected: stream N acknowledgement 2 is above fence 1"; an echo that
+/// finished after QUIESCE vanished from the fence ("rotation fence rosters
+/// differ"); and an authorization result during the freeze dispatched DATA
+/// and FIN past the frozen fence.  The echoes are paced so two rotations
+/// fit inside the connector's 128-entry retention: this gate is red for the
+/// rotation defect alone, never for M7-C92's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires TEST_REDIS_URL and TUNNEL_CLIENT_BIN; run by scripts/m6-provisioning-verify.sh"]
+async fn m7c93_unary_echoes_in_flight_cross_data_rotations() {
+    let max_echoes = CONNECTOR_OPEN_RETENTION - 8;
+    let result = run_sequential_echoes(EchoRun {
+        tag: "m7c93-rotation",
+        required_echoes: 1,
+        required_rotations: 2,
+        pace: Duration::from_millis(60),
+        max_echoes: Some(max_echoes),
+    })
+    .await;
+    println!(
+        "m7c93-rotation ok nonce={} namespace={} echoes={} max={max_echoes} sessions=1 \
+         rotations={} freeze_refusals={} elapsed_ms={}",
+        result.nonce,
+        result.namespace,
+        result.served,
+        result.rotations,
+        result.freeze_refusals,
+        result.elapsed.as_millis()
     );
 }

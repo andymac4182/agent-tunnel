@@ -14,6 +14,11 @@
 #    refusals (task row M6-C32) that must reach the device as a terminal
 #    CREDENTIAL_ERROR, exit 3, and a not-yet-valid credential that must stay
 #    a retryable TRANSPORT_ERROR, exit 4.
+# 4. Runs task row M7-C92's gate in the same binary: 300 sequential unary
+#    echoes (more than twice the connector's 128-entry OPEN retention) and
+#    two data rotations in one device session, every one answered 200, and
+#    task row M7-C93's gate: echoes paced across two rotations, capped below
+#    the retention so it can only be red for the rotation defect.
 #
 # Both tests are `#[ignore]`d in the ordinary workspace run because they need
 # Redis.  A filtered or skipped test would print `0 passed` and exit 0, so this
@@ -65,13 +70,15 @@ require "catalog provisioning tests" "$scratch/catalog.log" "test result: ok. 3 
 
 echo "m6-provisioning-verify: end-to-end shipped-binary gate" >&2
 cargo test -p tunnel-relay --test m6_provisioning_process --locked -- --ignored --nocapture \
-  > "$scratch/e2e.log" 2>&1 || { cat "$scratch/e2e.log" >&2; exit 1; }
+  --test-threads=1 > "$scratch/e2e.log" 2>&1 || { cat "$scratch/e2e.log" >&2; exit 1; }
 cat "$scratch/e2e.log"
-require "end-to-end gate" "$scratch/e2e.log" "test result: ok. 1 passed" "m6c21-e2e ok nonce=" \
+require "end-to-end gate" "$scratch/e2e.log" "test result: ok. 3 passed" "m6c21-e2e ok nonce=" \
   "client=$TUNNEL_CLIENT_BIN" \
   "m6c32 device_id mismatch exit=3 code=CREDENTIAL_ERROR retryable=false" \
   "m6c32 unknown credential key exit=3 code=CREDENTIAL_ERROR retryable=false" \
-  "m6c32 credential not yet valid exit=4 code=TRANSPORT_ERROR retryable=true"
+  "m6c32 credential not yet valid exit=4 code=TRANSPORT_ERROR retryable=true" \
+  "m7c92-echo ok nonce=" "required=300 sessions=1" \
+  "m7c93-rotation ok nonce=" "max=120 sessions=1"
 if [ -n "${TUNNEL_RELAY_BIN:-}" ]; then
   require "end-to-end gate ran the requested relay" "$scratch/e2e.log" "relay=$TUNNEL_RELAY_BIN"
 fi
