@@ -1,11 +1,11 @@
 {
-  "reviewedOriginMain": "946bcdee1865351b537189fd04160e2d552a804a",
-  "lastPublishedOriginMain": "946bcdee1865351b537189fd04160e2d552a804a",
-  "lastReviewAt": "2026-09-24T00:01:29+10:00",
-  "lastReviewOutcome": "Reviewed Fly deployment templates, entrypoint, runbook and operator documentation through 946bcde. Published single-relay topology, passthrough TLS, provisioning order, restart and cost boundaries. Kept local Docker evidence separate from historical hosted serving evidence and explicitly marked fresh hosted provisioning with a main-built image unverified. No infrastructure changes or runtime tests; CI and release gates unchanged.",
-  "reviewedDate": "2026-09-23",
+  "reviewedOriginMain": "a2e8649cb3cec75031c4cb3ef41da7c68c76b459",
+  "lastPublishedOriginMain": "a2e8649cb3cec75031c4cb3ef41da7c68c76b459",
+  "lastReviewAt": "2026-09-24T01:01:31+10:00",
+  "lastReviewOutcome": "Reviewed capability provisioning, profile/grant validation, examples and regression tests, owner-local liveness eviction and remaining M6-C75 risk through a2e8649. Published MCP/ACP/filesystem setup and header/transport constraints, corrected the ACP consumer route, kept CUA provisioning unsupported and resolved the stale M6-C76 website guidance. CUA change is test-only, not new backend acceptance. No runtime tests, CI changes or release-gate changes.",
+  "reviewedDate": "2026-09-24",
   "scope": "Setup, architecture, MCP, ACP, computer use, filesystems and support boundaries",
-  "verification": "Local and live Chrome verification passed at 1440, 1920, 390 and 320 pixels: homepage, brand lab, nine docs pages, links, images, light/dark/system themes and overflow. Live setup exactly matched reviewed local assets. Fly, runtime, Redis and artifact acceptance not rerun; historical evidence not promoted to new acceptance.",
-  "verifiedAt": "2026-09-24T00:01:29+10:00",
-  "deploymentId": "dpl_8rFAV57c5LeVYuVYHf1n3igiBEbU"
+  "verification": "Local and live Chrome verification passed at 1440, 1920, 390 and 320 pixels: homepage, brand lab, nine docs pages, links, images, light/dark/system themes and overflow. Live setup, MCP, ACP, CUA, filesystems and support exactly matched reviewed local assets. Runtime, Redis and artifact acceptance not rerun; historical evidence not promoted to new acceptance.",
+  "verifiedAt": "2026-09-24T01:01:31+10:00",
+  "deploymentId": "dpl_34UfUyXc77HZKQ62VNtau6igRXow"
 }
