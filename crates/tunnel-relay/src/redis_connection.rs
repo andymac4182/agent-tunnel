@@ -573,7 +573,7 @@ fn reject_symlink_components(
             Component::Normal(name) => current.push(name),
         }
         let metadata =
-            Observed::path_no_follow(&current).map_err(|_| RedisConnectionError::FileIo(kind))?;
+            fs::symlink_metadata(&current).map_err(|_| RedisConnectionError::FileIo(kind))?;
         if metadata.file_type().is_symlink() {
             return Err(RedisConnectionError::SymlinkRejected(kind));
         }

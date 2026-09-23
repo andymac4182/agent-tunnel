@@ -97,6 +97,12 @@ that would build them has not run since 2026-09-11, and no GitHub release has
 been published, so the only way to get a verified bundle today is from a
 maintainer who built it with `scripts/m6-release-artifact.py bundle`.
 
+**The Windows bundle has no relay.** The relay runs on Linux and macOS only.
+`x86_64-pc-windows-msvc` ships `tunnel-client` and `tunnel-deadman`, the
+device half, and a Windows build of `tunnel-relay` exits 2 at once with
+`tunnel-relay: the relay runs only on Linux and macOS; on Windows, run the
+device binaries (tunnel-client) instead` (task row M6-C83).
+
 **The bundle carries no documentation**, not even this guide (M6-C50). Read
 this guide and every document it links from the repository at the `commit`
 line of the bundle's `PROVENANCE.txt`, for example

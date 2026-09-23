@@ -49,13 +49,25 @@ jobs:
       - name: Fetch locked dependencies and licence sources
         run: cargo +1.95.0 fetch --locked
       - name: Build release binaries
-        run: cargo +1.95.0 build --release --locked --target "${{ matrix.target }}" -p tunnel-client -p tunnel-relay -p tunnel-deadman --bins
+        # The relay is built for Unix targets only (task row M6-C83): it has
+        # never run on Windows, refuses to start there, and
+        # docs/architecture.md promises Linux relay images plus Windows
+        # *device* binaries. scripts/package_release.py packs the same set.
+        run: |
+          set -euo pipefail
+          packages=(-p tunnel-client -p tunnel-deadman)
+          if [[ "${{ matrix.target }}" != *windows* ]]; then
+            packages+=(-p tunnel-relay)
+          fi
+          cargo +1.95.0 build --release --locked --target "${{ matrix.target }}" "${packages[@]}" --bins
       - name: Smoke test native binaries
         run: |
           set -euo pipefail
           target/${{ matrix.target }}/release/tunnel-client --help
           target/${{ matrix.target }}/release/tunnel-client config check --config examples/m1-client.toml
-          target/${{ matrix.target }}/release/tunnel-relay check-serve-config --config examples/m1-relay.toml
+          if [[ "${{ matrix.target }}" != *windows* ]]; then
+            target/${{ matrix.target }}/release/tunnel-relay check-serve-config --config examples/m1-relay.toml
+          fi
       - name: Package and checksum
         env:
           SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}

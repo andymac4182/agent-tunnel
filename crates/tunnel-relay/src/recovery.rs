@@ -321,7 +321,7 @@ impl RecoveryApprovalVersionStore {
     fn create_initial(&self, bytes: &[u8]) -> Result<(), RecoveryFenceStoreError> {
         let parent = parent_directory(&self.path);
         let parent_metadata = ensure_parent_directory(parent)?;
-        match Observed::path_no_follow(&self.path) {
+        match fs::symlink_metadata(&self.path) {
             Ok(metadata) => {
                 if metadata.file_type().is_symlink() {
                     return Err(RecoveryFenceStoreError::SymlinkRejected);
@@ -740,8 +740,7 @@ fn ensure_no_symlink_components(path: &Path) -> Result<(), RecoveryFenceStoreErr
             Component::ParentDir => return Err(RecoveryFenceStoreError::InvalidPath),
             Component::Normal(name) => current.push(name),
         }
-        let metadata =
-            Observed::path_no_follow(&current).map_err(|_| RecoveryFenceStoreError::Io)?;
+        let metadata = fs::symlink_metadata(&current).map_err(|_| RecoveryFenceStoreError::Io)?;
         if metadata.file_type().is_symlink() {
             return Err(RecoveryFenceStoreError::SymlinkRejected);
         }
