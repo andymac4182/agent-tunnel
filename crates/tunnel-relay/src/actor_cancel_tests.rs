@@ -60,6 +60,7 @@ fn cancel_fixture(
     let (response_tx, response_rx) = oneshot::channel();
     let pending = PendingEcho {
         operation_id: "cancel-op".to_owned(),
+        forget: super::UnaryForgetIdentity::default(),
         send_sequence: 1,
         response: response_tx,
         response_sequence: 0,
@@ -88,6 +89,7 @@ fn cancel_fixture(
         created_at: Instant::now(),
         dispatched: true,
         authorization_in_flight: false,
+        deferred_authorization: None,
     };
     actor
         .sessions

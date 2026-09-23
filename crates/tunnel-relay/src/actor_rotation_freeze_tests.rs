@@ -16,11 +16,13 @@ use std::{
 use chrono::{DateTime, Duration, Utc};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
-use tunnel_catalog::{AuthenticatedConsumer, DeviceIdentity, GrantSnapshot, PermissionSet};
+use tunnel_catalog::{
+    AuthenticatedConsumer, DeviceIdentity, GrantSnapshot, OwnerClaim, PermissionSet,
+};
 use tunnel_protocol::rotation::RotationPhase;
 use tunnel_protocol::rotation_control::{
-    DrainProof, FenceSnapshot, RotateAborted, RotateCommitted, RotateDrained, RotateFrozen,
-    RotateRetired, RotationAttemptIdentity, StreamAck, StreamFence,
+    DrainProof, FenceSnapshot, ResumeDirectionState, RotateAborted, RotateCommitted, RotateDrained,
+    RotateFrozen, RotateRetired, RotationAttemptIdentity, StreamAck, StreamFence, StreamForget,
 };
 use tunnel_protocol::{
     ControlMessage, Direction, Frame, FrameKind, Rejected, StreamState, Terminal,
@@ -31,8 +33,8 @@ use super::stream_identity_tests::{
     admitted_control_actor, session_attempt, test_rotation_runtime,
 };
 use super::{
-    CarrierKey, ControlOutbound, DataCarrier, DataOutbound, DeviceSession, DispatchRequest,
-    EchoOutcome, M2Stream, RelayActor, RelayError, SessionKey, runtime, wire,
+    CarrierKey, ControlOutbound, DataCarrier, DataOutbound, DeviceChallenge, DeviceSession,
+    DispatchRequest, EchoOutcome, M2Stream, RelayActor, RelayError, SessionKey, runtime, wire,
 };
 
 const STREAM_ID: u64 = 7;
@@ -408,6 +410,11 @@ impl FreezeFixture {
     /// Enter `Quiescing` through the real coordinator path and capture the
     /// QUIESCE identity the connector stand-in must reply to.
     fn quiesce(&mut self) {
+        self.quiesce_roster(&[STREAM_ID]);
+    }
+
+    /// `quiesce` for a roster that also holds finite (unary) echoes.
+    fn quiesce_roster(&mut self, roster: &[u64]) {
         self.actor.begin_rotation_quiesce(&self.key);
         assert_eq!(self.phase(), RotationPhase::Quiescing);
         let quiesce = self
@@ -418,7 +425,7 @@ impl FreezeFixture {
                 _ => None,
             })
             .expect("relay queues ROTATE_QUIESCE");
-        assert_eq!(quiesce.roster.stream_ids, vec![STREAM_ID]);
+        assert_eq!(quiesce.roster.stream_ids, roster.to_vec());
         self.snapshot_id = quiesce.roster.snapshot_id.clone();
         self.quiesce_message_id = quiesce.message_id.clone();
     }
@@ -466,13 +473,21 @@ impl FreezeFixture {
     /// The connector reports its fence; the coordinator enters `Draining`
     /// and queues its own FROZEN.
     async fn connector_frozen(&mut self, connector_last_emitted: u64) {
+        self.connector_frozen_streams(&[(STREAM_ID, connector_last_emitted)])
+            .await;
+    }
+
+    /// `connector_frozen` for a roster that also holds finite echoes:
+    /// `(stream ID, connector last emitted)` per roster entry.
+    async fn connector_frozen_streams(&mut self, fences: &[(u64, u64)]) {
         let snapshot = FenceSnapshot::new(
             self.snapshot_id.clone(),
-            vec![StreamFence::new(
-                STREAM_ID,
-                Direction::ConnectorToRelay,
-                connector_last_emitted,
-            )],
+            fences
+                .iter()
+                .map(|(stream_id, last_emitted)| {
+                    StreamFence::new(*stream_id, Direction::ConnectorToRelay, *last_emitted)
+                })
+                .collect(),
         );
         self.actor
             .handle_rotate_frozen(
@@ -591,6 +606,121 @@ impl FreezeFixture {
                 .any(|message| matches!(message, ControlMessage::RotateComplete(_))),
             "relay queues ROTATE_COMPLETE after both old closures"
         );
+    }
+
+    /// Admit one finite (unary) echo through the real HTTP-facing path and
+    /// return its stream ID, operation ID, OPEN message ID and response.
+    async fn admit_unary_echo(
+        &mut self,
+        body: &[u8],
+    ) -> (u64, String, String, oneshot::Receiver<EchoOutcome>) {
+        let (response, receiver) = oneshot::channel();
+        self.actor
+            .dispatch_echo(DispatchRequest {
+                consumer: self.consumer.clone(),
+                device_id: self.device_id,
+                service_id: self.service_id,
+                grant: self.grant.clone(),
+                body: body.to_vec(),
+                consumer_expires_at: self.consumer_expires_at,
+                response,
+            })
+            .await;
+        let open = self
+            .drain_control()
+            .into_iter()
+            .find_map(|message| match message {
+                ControlMessage::Open(open) => Some(open),
+                _ => None,
+            })
+            .expect("relay queues the finite echo OPEN");
+        assert_eq!(open.operation, "echo");
+        (open.stream_id, open.operation_id, open.message_id, receiver)
+    }
+
+    /// The connector's authorization challenge for a finite echo succeeds;
+    /// the relay applies the result exactly as its authorization task would.
+    fn authorize_unary_echo(&mut self, stream_id: u64) {
+        let challenge_id = format!("unary-challenge-{stream_id}");
+        {
+            let pending = self
+                .actor
+                .sessions
+                .get_mut(&self.key.scope())
+                .and_then(|session| session.pending.get_mut(&stream_id))
+                .expect("finite echo is pending");
+            pending.authorization_in_flight = true;
+            pending.challenge_id = Some(challenge_id.clone());
+        }
+        let identity = self.session().identity.clone();
+        let owner = self.session().owner.clone();
+        let challenge = DeviceChallenge {
+            message_id: format!("unary-auth-{stream_id}"),
+            stream_id,
+            service_id: self.service_id.to_string(),
+            challenge_id,
+            nonce: format!("unary-nonce-{stream_id}"),
+            permission_digest: wire::permission_digest(&self.grant, &self.service_id.to_string()),
+            grant_revision: self.grant.revision,
+            received_at: Instant::now(),
+            lifetime: StdDuration::from_secs(30),
+        };
+        self.actor.finish_device_challenge(
+            self.key.clone(),
+            challenge,
+            Ok((
+                Some(self.grant.clone()),
+                Some(OwnerClaim {
+                    token: owner,
+                    lease_expires_at: Utc::now() + Duration::minutes(1),
+                }),
+                Some(identity),
+                Some(Instant::now() + StdDuration::from_secs(60)),
+            )),
+        );
+    }
+
+    /// One connector->relay frame on the old carrier.
+    async fn connector_frame(&mut self, frame: Frame) {
+        let bytes = frame.encode().expect("connector frame encodes");
+        self.actor
+            .inbound_data(self.old_carrier.clone(), bytes)
+            .await;
+    }
+
+    /// The connector's echo response, DATA then FIN, each carrying `ack` for
+    /// the relay->connector direction.
+    async fn connector_echo_response(&mut self, stream_id: u64, payload: &[u8], ack: u64) {
+        let generation = self.attempt.old_generation;
+        self.connector_frame(Frame::data(
+            1,
+            generation,
+            stream_id,
+            1,
+            ack,
+            payload.to_vec(),
+        ))
+        .await;
+        self.connector_frame(Frame::fin(1, generation, stream_id, 2, ack))
+            .await;
+    }
+
+    fn stream_forgets(messages: &[ControlMessage]) -> Vec<StreamForget> {
+        messages
+            .iter()
+            .filter_map(|message| match message {
+                ControlMessage::StreamForget(forget) => Some(forget.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn fence_of(&self, stream_id: u64) -> Option<u64> {
+        self.relay_fence()
+            .entries
+            .iter()
+            .find(|entry| entry.stream_id == stream_id)
+            .map(|entry| entry.last_emitted)
     }
 
     /// Physical candidate loss before commit: the coordinator decides ABORT.
@@ -2593,4 +2723,374 @@ async fn a_dead_carrier_under_another_reason_publishes_no_cause() {
         None,
         "the relay stopped, and the device went nowhere"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Finite (unary) echo: owner STREAM_FORGET (task row M7-C92) and rotation
+// fences (task row M7-C93).  Each test observes only control messages, data
+// frames and the relay fence, so the same file runs against the code before
+// either fix and goes red there for its own reason.
+// ---------------------------------------------------------------------------
+
+/// The relay's unary echo body and its connector reply.
+const UNARY_BODY: &[u8] = b"unary-echo-body";
+const UNARY_REPLY: &[u8] = b"canary-unary-echo-body";
+
+/// M7-C92: a completed unary echo is released at the connector only by the
+/// owner's STREAM_FORGET, and the owner may assert its terminal only once
+/// the connector has acknowledged the relay's FIN.  Before M7-C92 no FORGET
+/// was ever sent, so the connector's 128-entry OPEN retention filled.
+#[tokio::test]
+async fn completed_unary_echo_is_forgotten_once_its_fin_is_acknowledged() {
+    let mut fixture = FreezeFixture::new("unary-forget", false);
+    let (stream_id, operation_id, _, mut receiver) = fixture.admit_unary_echo(UNARY_BODY).await;
+    fixture.authorize_unary_echo(stream_id);
+    let generation = fixture.attempt.old_generation;
+    assert_eq!(
+        sequenced(&drain_data(&mut fixture.old_rx)),
+        vec![
+            (FrameKind::Data, 1, generation),
+            (FrameKind::Fin, 2, generation)
+        ],
+        "a unary echo is exactly DATA then FIN"
+    );
+
+    // The connector's FIN acknowledges only the relay's DATA.
+    fixture
+        .connector_echo_response(stream_id, UNARY_REPLY, 1)
+        .await;
+    match receiver.try_recv() {
+        Ok(EchoOutcome::Success(body)) => assert_eq!(body, UNARY_REPLY),
+        other => panic!("the consumer must receive the reply, got {other:?}"),
+    }
+    assert!(
+        FreezeFixture::stream_forgets(&fixture.drain_control()).is_empty(),
+        "the owner must not forget before the connector acknowledged its FIN"
+    );
+
+    fixture
+        .connector_frame(Frame::ack(1, generation, stream_id, 2))
+        .await;
+    let forgets = FreezeFixture::stream_forgets(&fixture.drain_control());
+    assert_eq!(forgets.len(), 1, "one FORGET for the completed echo");
+    let forget = &forgets[0];
+    assert_eq!(forget.stream_id, stream_id);
+    assert_eq!(forget.operation_id, operation_id);
+    assert_eq!(forget.direction, Direction::RelayToConnector);
+    let state = &forget.final_state;
+    assert_eq!(
+        (
+            state.last_emitted,
+            state.peer_acked,
+            state.sent_bytes,
+            state.recv_contiguous,
+            state.received_bytes,
+            state.replay_floor,
+        ),
+        (2, 2, UNARY_BODY.len() as u64, 0, 0, None),
+        "the proof is the fixed DATA+FIN exchange, fully acknowledged"
+    );
+    assert!(state.send_terminal.is_some() && state.receive_terminal.is_none());
+    assert_eq!(state.send_credit, wire::MAX_ECHO_WINDOW_BYTES as u64);
+    assert_eq!(state.receive_credit, wire::MAX_ECHO_WINDOW_BYTES as u64);
+    assert!(fixture.session().forgotten_stream_through >= stream_id);
+
+    // A repeated ACK after the FORGET is inert: no second FORGET.
+    fixture
+        .connector_frame(Frame::ack(1, generation, stream_id, 2))
+        .await;
+    assert!(FreezeFixture::stream_forgets(&fixture.drain_control()).is_empty());
+}
+
+/// M7-C92: a connector REJECTED for a unary echo OPEN is forgotten with the
+/// no-stream proof, and only for the REJECTED answering that OPEN's own
+/// message ID.
+#[tokio::test]
+async fn rejected_unary_echo_open_is_forgotten_with_no_stream_evidence() {
+    let mut fixture = FreezeFixture::new("unary-rejected", false);
+    let (stream_id, operation_id, open_message_id, mut receiver) =
+        fixture.admit_unary_echo(UNARY_BODY).await;
+    // A REJECTED naming a different OPEN message ID fails nothing forgettable.
+    let (other_stream, other_operation, _, _other_receiver) =
+        fixture.admit_unary_echo(UNARY_BODY).await;
+    fixture
+        .actor
+        .inbound_control(
+            fixture.key.clone(),
+            ControlMessage::Rejected(Rejected::new(
+                "connector-rejected-other",
+                "some-other-open",
+                fixture.key.session_id.clone(),
+                fixture.key.epoch,
+                other_stream,
+                other_operation,
+                "EXPORT_DENIED",
+                "service is not locally allowlisted",
+            )),
+        )
+        .await;
+    assert!(FreezeFixture::stream_forgets(&fixture.drain_control()).is_empty());
+
+    fixture
+        .actor
+        .inbound_control(
+            fixture.key.clone(),
+            ControlMessage::Rejected(Rejected::new(
+                "connector-rejected",
+                open_message_id,
+                fixture.key.session_id.clone(),
+                fixture.key.epoch,
+                stream_id,
+                operation_id.clone(),
+                "EXPORT_DENIED",
+                "service is not locally allowlisted",
+            )),
+        )
+        .await;
+    assert!(matches!(
+        receiver.try_recv(),
+        Ok(EchoOutcome::Failure {
+            code: "DEVICE_REJECTED",
+            execution: "not_dispatched"
+        })
+    ));
+    let forgets = FreezeFixture::stream_forgets(&fixture.drain_control());
+    assert_eq!(forgets.len(), 1);
+    assert_eq!(forgets[0].stream_id, stream_id);
+    assert_eq!(forgets[0].operation_id, operation_id);
+    assert_eq!(
+        forgets[0].final_state,
+        ResumeDirectionState {
+            stream_id,
+            ..ResumeDirectionState::default()
+        },
+        "a refused OPEN has no stream; its proof is the no-stream state"
+    );
+}
+
+/// M7-C93: a unary echo dispatched before QUIESCE has emitted DATA and FIN,
+/// so its relay fence is the FIN.  Before M7-C93 it was fenced at the DATA
+/// sequence and the connector failed the session with "acknowledgement 2 is
+/// above fence 1".
+#[tokio::test]
+async fn dispatched_unary_echo_is_fenced_at_its_fin() {
+    let mut fixture = FreezeFixture::new("unary-fence", false);
+    let (stream_id, _, _, _receiver) = fixture.admit_unary_echo(UNARY_BODY).await;
+    fixture.authorize_unary_echo(stream_id);
+    assert_eq!(sequenced(&drain_data(&mut fixture.old_rx)).len(), 2);
+    fixture.quiesce_roster(&[STREAM_ID, stream_id]);
+    assert!(fixture.complete_barrier().is_empty());
+    assert_eq!(
+        fixture.fence_of(stream_id),
+        Some(2),
+        "the relay fence must name the FIN it already emitted"
+    );
+}
+
+/// M7-C93 and M7-C92 together: a unary echo that completes after QUIESCE
+/// stays in the frozen roster's fence and drain proof, and its FORGET waits
+/// for the attempt to release the roster.  Before M7-C93 the completed echo
+/// vanished from the fence ("rotation fence rosters differ") and the relay
+/// could not freeze.
+#[tokio::test]
+async fn unary_echo_completing_during_freeze_keeps_the_roster_and_is_forgotten_after() {
+    let mut fixture = FreezeFixture::new("unary-freeze-complete", false);
+    let (stream_id, operation_id, _, mut receiver) = fixture.admit_unary_echo(UNARY_BODY).await;
+    fixture.authorize_unary_echo(stream_id);
+    assert_eq!(sequenced(&drain_data(&mut fixture.old_rx)).len(), 2);
+    fixture.quiesce_roster(&[STREAM_ID, stream_id]);
+
+    fixture
+        .connector_echo_response(stream_id, UNARY_REPLY, 2)
+        .await;
+    assert!(matches!(receiver.try_recv(), Ok(EchoOutcome::Success(_))));
+    assert!(
+        FreezeFixture::stream_forgets(&fixture.drain_control()).is_empty(),
+        "STREAM_FORGET is serialized after the attempt, never inside it"
+    );
+
+    assert!(fixture.complete_barrier().is_empty());
+    assert_eq!(
+        fixture
+            .relay_fence()
+            .entries
+            .iter()
+            .map(|entry| (entry.stream_id, entry.last_emitted))
+            .collect::<Vec<_>>(),
+        vec![(STREAM_ID, 0), (stream_id, 2)],
+        "the completed echo is still a member of the frozen roster"
+    );
+    // The relay's own drain proof acknowledges the connector's FIN (2);
+    // reaching COMMITTING below requires it to equal the connector fence.
+    fixture
+        .connector_frozen_streams(&[(STREAM_ID, 0), (stream_id, 2)])
+        .await;
+    fixture.connector_drained().await;
+    fixture.connector_committed().await;
+    fixture.retire_old_carrier().await;
+
+    assert!(fixture.actor.flush_owner_stream_forgets(&fixture.key));
+    let forgets = FreezeFixture::stream_forgets(&fixture.drain_control());
+    assert_eq!(
+        forgets
+            .iter()
+            .map(|forget| (forget.stream_id, forget.operation_id.clone()))
+            .collect::<Vec<_>>(),
+        vec![(stream_id, operation_id)],
+        "the echo is forgotten once the roster is released"
+    );
+}
+
+/// M7-C93: an authorization result that lands while the writer is frozen
+/// must not emit DATA/FIN past the fence.  The echo is fenced at nothing,
+/// and it is dispatched on the activated carrier after COMMITTED.
+#[tokio::test]
+async fn unary_echo_authorized_during_freeze_dispatches_after_commit() {
+    let mut fixture = FreezeFixture::new("unary-freeze-authorize", false);
+    let (stream_id, _, _, mut receiver) = fixture.admit_unary_echo(UNARY_BODY).await;
+    fixture.quiesce_roster(&[STREAM_ID, stream_id]);
+    fixture.authorize_unary_echo(stream_id);
+    assert!(
+        fixture.complete_barrier().is_empty(),
+        "no sequenced frame may precede the fence barrier"
+    );
+    assert_eq!(
+        fixture.fence_of(stream_id),
+        Some(0),
+        "an undispatched echo has emitted nothing"
+    );
+    assert!(
+        sequenced(&drain_data(&mut fixture.old_rx)).is_empty(),
+        "a frozen writer must not dispatch the echo"
+    );
+    assert!(receiver.try_recv().is_err(), "the echo is held, not failed");
+
+    fixture
+        .connector_frozen_streams(&[(STREAM_ID, 0), (stream_id, 0)])
+        .await;
+    fixture.connector_drained().await;
+    fixture.connector_committed().await;
+    let new_generation = fixture.attempt.new_generation;
+    assert_eq!(
+        sequenced(&drain_data(&mut fixture.candidate_rx)),
+        vec![
+            (FrameKind::Data, 1, new_generation),
+            (FrameKind::Fin, 2, new_generation)
+        ],
+        "the held echo is dispatched once, on the activated carrier"
+    );
+    assert!(
+        sequenced(&drain_data(&mut fixture.old_rx)).is_empty(),
+        "the retired carrier never receives the echo"
+    );
+    assert!(
+        fixture
+            .session()
+            .pending
+            .get(&stream_id)
+            .is_some_and(|pending| pending.dispatched)
+    );
+}
+
+/// M7-C92 and reconnect (M6-C23): a session that ends while a finite echo
+/// still waits for the ACK of the relay's FIN takes that tombstone with it.
+/// No FORGET is queued for the dead session, nothing is retained for its key,
+/// and a late frame naming it is inert.  The next session is a new session ID
+/// with a new connector journal, and the relay never re-sends an `OPEN`, so
+/// neither a replayed echo nor an old FORGET can reach it.
+#[tokio::test]
+async fn closing_a_session_drops_its_unforgotten_unary_echo_without_a_forget() {
+    let mut fixture = FreezeFixture::new("unary-close", false);
+    let (stream_id, _, _, mut receiver) = fixture.admit_unary_echo(UNARY_BODY).await;
+    fixture.authorize_unary_echo(stream_id);
+    assert_eq!(sequenced(&drain_data(&mut fixture.old_rx)).len(), 2);
+    // Complete the exchange, but acknowledge only the relay's DATA, so the
+    // FORGET is still owed when the session ends.
+    fixture
+        .connector_echo_response(stream_id, UNARY_REPLY, 1)
+        .await;
+    assert!(matches!(receiver.try_recv(), Ok(EchoOutcome::Success(_))));
+    assert!(FreezeFixture::stream_forgets(&fixture.drain_control()).is_empty());
+
+    let key = fixture.key.clone();
+    fixture.actor.close_session(&key, "TEST_RECONNECT").await;
+    assert!(!fixture.actor.sessions.contains_key(&key.scope()));
+    assert!(
+        !fixture.actor.owner_forgets.contains_key(&key),
+        "no FORGET identity outlives its session"
+    );
+    let mut queued = Vec::new();
+    while let Ok(item) = fixture.control_rx.try_recv() {
+        if let ControlOutbound::Text(mut text) = item {
+            queued.push(wire::parse_control(text.as_bytes()).expect("control decodes"));
+            text.release();
+        }
+    }
+    assert!(
+        FreezeFixture::stream_forgets(&queued).is_empty(),
+        "a closed session queues no FORGET: {queued:?}"
+    );
+    // The ACK the dead session was waiting for arrives late: inert.
+    let generation = fixture.attempt.old_generation;
+    fixture
+        .connector_frame(Frame::ack(1, generation, stream_id, 2))
+        .await;
+    assert!(!fixture.actor.sessions.contains_key(&key.scope()));
+    assert!(!fixture.actor.owner_forgets.contains_key(&key));
+}
+
+/// M7-C92, review F1: two concurrent finite echoes completing out of order.
+/// A's FIN acknowledges only the relay's DATA, so A waits for a standalone
+/// ACK; B (the higher stream ID) completes fully acknowledged and is
+/// forgotten, which raises the reclamation watermark past A.  A's late ACK
+/// must still reach A's tombstone and release it.  Without that, A leaks until
+/// the session closes, and 128 such leaks refuse `dispatch_echo`
+/// `RESOURCE_EXHAUSTED` -- the M6-C62 wedge by another route.
+#[tokio::test]
+async fn late_ack_below_the_watermark_still_forgets_an_out_of_order_unary_echo() {
+    let mut fixture = FreezeFixture::new("unary-out-of-order", false);
+    let (stream_a, operation_a, _, mut receiver_a) = fixture.admit_unary_echo(UNARY_BODY).await;
+    let (stream_b, operation_b, _, mut receiver_b) = fixture.admit_unary_echo(UNARY_BODY).await;
+    assert!(stream_a < stream_b);
+    fixture.authorize_unary_echo(stream_a);
+    fixture.authorize_unary_echo(stream_b);
+    assert_eq!(sequenced(&drain_data(&mut fixture.old_rx)).len(), 4);
+
+    fixture
+        .connector_echo_response(stream_a, UNARY_REPLY, 1)
+        .await;
+    assert!(matches!(receiver_a.try_recv(), Ok(EchoOutcome::Success(_))));
+    assert!(FreezeFixture::stream_forgets(&fixture.drain_control()).is_empty());
+
+    fixture
+        .connector_echo_response(stream_b, UNARY_REPLY, 2)
+        .await;
+    assert!(matches!(receiver_b.try_recv(), Ok(EchoOutcome::Success(_))));
+    let forgets = FreezeFixture::stream_forgets(&fixture.drain_control());
+    assert_eq!(
+        forgets
+            .iter()
+            .map(|forget| (forget.stream_id, forget.operation_id.clone()))
+            .collect::<Vec<_>>(),
+        vec![(stream_b, operation_b)]
+    );
+    assert!(
+        fixture.session().forgotten_stream_through >= stream_b,
+        "B's FORGET raised the watermark past A"
+    );
+
+    let generation = fixture.attempt.old_generation;
+    fixture
+        .connector_frame(Frame::ack(1, generation, stream_a, 2))
+        .await;
+    let forgets = FreezeFixture::stream_forgets(&fixture.drain_control());
+    assert_eq!(
+        forgets
+            .iter()
+            .map(|forget| (forget.stream_id, forget.operation_id.clone()))
+            .collect::<Vec<_>>(),
+        vec![(stream_a, operation_a)],
+        "A's late ACK below the watermark must release A's tombstone"
+    );
+    assert!(fixture.session().unary_tombstones.is_empty());
 }

@@ -1253,6 +1253,9 @@ pub(crate) enum EchoOutcome {
 
 struct PendingEcho {
     operation_id: String,
+    /// The connector-facing identity and owner sender evidence this unary
+    /// operation needs for its own `STREAM_FORGET` (task row M7-C92).
+    forget: UnaryForgetIdentity,
     send_sequence: u64,
     response: oneshot::Sender<EchoOutcome>,
     response_sequence: u64,
@@ -1266,6 +1269,127 @@ struct PendingEcho {
     created_at: Instant,
     dispatched: bool,
     authorization_in_flight: bool,
+    /// An authorization result that arrived while the relay writer was
+    /// frozen for a rotation.  Dispatching then would emit DATA/FIN past the
+    /// frozen fence; the result is re-applied, with every freshness check,
+    /// once the writer resumes (task row M7-C93).
+    deferred_authorization: Option<(DeviceChallenge, ChallengeAuthorizationResult)>,
+}
+
+/// Owner-side identity of one unary echo OPEN, kept so the relay can issue
+/// the owner `STREAM_FORGET` that releases the connector's OPEN journal entry
+/// and retained stream (task row M7-C92).
+///
+/// A unary echo is a fixed two-frame relay->connector exchange: DATA at
+/// [`UNARY_ECHO_DATA_SEQUENCE`] carrying the whole body, then FIN at
+/// [`UNARY_ECHO_FIN_SEQUENCE`]; the relay sends nothing else in that
+/// direction.  Its final sender cursor is therefore fully determined by the
+/// body length, the OPEN's windows and the connector's cumulative ACK, which
+/// is what this records.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct UnaryForgetIdentity {
+    /// The OPEN's own message ID; a REJECTED is matched on it, never on the
+    /// stream ID alone.
+    open_message_id: String,
+    body_len: u64,
+    initial_send_window: u64,
+    initial_receive_window: u64,
+    /// Highest cumulative ACK of the relay->connector direction the
+    /// connector has sent, from any DATA, FIN or ACK frame on this stream.
+    peer_acked: u64,
+    /// The connector->relay sequence received through the connector's FIN,
+    /// recorded at completion for a drain acknowledgement (M7-C93).
+    response_sequence: u64,
+}
+
+const UNARY_ECHO_DATA_SEQUENCE: u64 = 1;
+const UNARY_ECHO_FIN_SEQUENCE: u64 = 2;
+
+/// A unary echo that has left `session.pending` but whose connector-side
+/// OPEN journal entry (and, once admitted, its terminal stream) still awaits
+/// the owner's `STREAM_FORGET`.
+///
+/// Before M7-C92 nothing retained this, so the relay never forgot a unary
+/// echo and the connector's 128-entry OPEN retention filled after 128
+/// requests.  An entry is created only on the two exits whose connector
+/// state is fully proved: a completed exchange (the connector's FIN was
+/// received contiguously, delivered to the consumer and acknowledged) and a
+/// REJECTED OPEN.  It is forgotten under exactly the rules
+/// `flush_owner_stream_forgets` applies to M2 streams.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct UnaryTombstone {
+    operation_id: String,
+    evidence: UnaryTombstoneEvidence,
+    /// Set when the echo left `pending` while a rotation's writer was frozen:
+    /// it was then a member of that attempt's immutable QUIESCE roster, so
+    /// the fence snapshot and drain acknowledgements for that snapshot must
+    /// still name it (task row M7-C93).  Admission is paused while frozen,
+    /// so every pending entry of a frozen session is in its roster.
+    frozen_snapshot_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum UnaryTombstoneEvidence {
+    /// The connector admitted the OPEN and the exchange completed.
+    Completed(UnaryForgetIdentity),
+    /// The connector answered the OPEN with REJECTED; it holds at most a
+    /// journal entry and no stream, so the proof is the no-stream state.
+    Rejected,
+}
+
+impl UnaryTombstone {
+    /// The last sequence this tombstone's echo reached in `direction`: the
+    /// relay's FIN and the connector's FIN for a completed exchange, nothing
+    /// for a rejected OPEN.
+    fn fence_sequence(&self, direction: Direction) -> u64 {
+        match (&self.evidence, direction) {
+            (UnaryTombstoneEvidence::Completed(_), Direction::RelayToConnector) => {
+                UNARY_ECHO_FIN_SEQUENCE
+            }
+            (UnaryTombstoneEvidence::Completed(identity), Direction::ConnectorToRelay) => {
+                identity.response_sequence
+            }
+            (UnaryTombstoneEvidence::Rejected, _) => 0,
+        }
+    }
+
+    /// The owner sender evidence a `STREAM_FORGET` for this operation carries,
+    /// or `None` while it may not yet be sent.  A completed exchange waits for
+    /// the connector's cumulative ACK of the relay's FIN: the owner may not
+    /// assert a terminal it has not seen acknowledged, and the connector
+    /// validates exactly that (`peer_acked == last_emitted`, no replay floor).
+    fn final_state(&self, stream_id: u64) -> Option<ResumeDirectionState> {
+        match &self.evidence {
+            UnaryTombstoneEvidence::Rejected => Some(ResumeDirectionState {
+                stream_id,
+                ..ResumeDirectionState::default()
+            }),
+            UnaryTombstoneEvidence::Completed(identity) => {
+                if identity.peer_acked < UNARY_ECHO_FIN_SEQUENCE {
+                    return None;
+                }
+                let snapshot = tunnel_protocol::sequence::DirectionSnapshot {
+                    last_emitted: UNARY_ECHO_FIN_SEQUENCE,
+                    peer_acked: UNARY_ECHO_FIN_SEQUENCE,
+                    recv_contiguous: 0,
+                    delivered_contiguous: 0,
+                    send_credit: identity.initial_send_window,
+                    sent_bytes: identity.body_len,
+                    receive_credit: identity.initial_receive_window,
+                    received_bytes: 0,
+                    send_terminal: Some(tunnel_protocol::sequence::Terminal::Fin),
+                    send_terminal_sequence: Some(UNARY_ECHO_FIN_SEQUENCE),
+                    receive_terminal: None,
+                    receive_terminal_sequence: None,
+                    replay_floor: None,
+                    replay_bytes: 0,
+                    reorder_frames: 0,
+                    reorder_bytes: 0,
+                };
+                ResumeDirectionState::from_sequence_snapshot(stream_id, &snapshot).ok()
+            }
+        }
+    }
 }
 
 struct DeviceChallenge {
@@ -1713,6 +1837,10 @@ struct DeviceSession {
     owner_fence_deadline: Option<Instant>,
     next_stream_id: u64,
     pending: HashMap<u64, PendingEcho>,
+    /// Finished unary echoes awaiting their owner `STREAM_FORGET`
+    /// (M7-C92).  Bounded with `pending` by the retained-stream factor at
+    /// admission; see [`UnaryTombstone`].
+    unary_tombstones: HashMap<u64, UnaryTombstone>,
     streams: HashMap<u64, M2Stream>,
     /// Highest stream ID whose authenticated owner FORGET completed. Stream
     /// IDs never reuse, so late frames at or below this watermark are stale
@@ -3944,6 +4072,7 @@ impl RelayActor {
                 owner_fence_deadline,
                 next_stream_id: 1,
                 pending: HashMap::new(),
+                unary_tombstones: HashMap::new(),
                 streams: HashMap::new(),
                 forgotten_stream_through: 0,
                 owner_forget_deadline: None,
@@ -4525,8 +4654,24 @@ impl RelayActor {
             });
             return;
         }
+        // Finished unary echoes still awaiting their owner STREAM_FORGET
+        // hold a connector retention slot each; together with the live ones
+        // they obey the same retained-table factor as M2 streams, so a
+        // stalled FORGET publication degrades to a typed, retryable refusal
+        // here instead of a connector-side REJECTED (M7-C92).
+        let retained_limit = self
+            .options
+            .limits
+            .max_streams_per_device
+            .max(1)
+            .saturating_mul(RETAINED_ECHO_STREAM_FACTOR);
         if session.pending.len() >= self.options.limits.max_pending_operations
             || session.pending.len() >= self.options.limits.max_streams_per_device
+            || session
+                .pending
+                .len()
+                .saturating_add(session.unary_tombstones.len())
+                >= retained_limit
         {
             let _ = response.send(EchoOutcome::Failure {
                 code: "RESOURCE_EXHAUSTED",
@@ -4541,7 +4686,7 @@ impl RelayActor {
             });
             return;
         }
-        let sequence = 1;
+        let sequence = UNARY_ECHO_DATA_SEQUENCE;
         let Some(stream_id) = allocate_stream_id(&mut session.next_stream_id) else {
             let _ = response.send(EchoOutcome::Failure {
                 code: "STREAM_LIMIT",
@@ -4553,7 +4698,7 @@ impl RelayActor {
         let queued_len = body.len();
         let digest = wire::permission_digest(&grant, &service_id.to_string());
         let service_name = service_id.to_string();
-        let open = match wire::encode_control_message(&wire::open(wire::OpenRequest {
+        let open_message = wire::open(wire::OpenRequest {
             session_id: &session.key.session_id,
             epoch: session.key.epoch,
             stream_id,
@@ -4564,7 +4709,19 @@ impl RelayActor {
             digest: &digest,
             operation: "echo",
             fs_capabilities: None,
-        })) {
+        });
+        let forget = match &open_message {
+            ControlMessage::Open(open) => UnaryForgetIdentity {
+                open_message_id: open.message_id.clone(),
+                body_len: body.len() as u64,
+                initial_send_window: open.initial_send_window,
+                initial_receive_window: open.initial_receive_window,
+                peer_acked: 0,
+                response_sequence: 0,
+            },
+            _ => UnaryForgetIdentity::default(),
+        };
+        let open = match wire::encode_control_message(&open_message) {
             Ok(value) => value,
             Err(_) => {
                 let _ = response.send(EchoOutcome::Failure {
@@ -4585,6 +4742,7 @@ impl RelayActor {
             stream_id,
             PendingEcho {
                 operation_id: operation_id.clone(),
+                forget,
                 send_sequence: sequence,
                 response,
                 response_sequence: 0,
@@ -4598,6 +4756,7 @@ impl RelayActor {
                 created_at: Instant::now(),
                 dispatched: false,
                 authorization_in_flight: false,
+                deferred_authorization: None,
             },
         );
         session.queued_bytes = session.queued_bytes.saturating_add(queued_len);
@@ -5035,16 +5194,7 @@ impl RelayActor {
         if !stream.terminal || stream.open_pending {
             return None;
         }
-        // PREPARING is allowed because the caller queues FORGET before it
-        // constructs QUIESCE. Once quiescing or recovering, roster/replay
-        // references make reclamation unsafe.
-        if session.rotation.as_ref().is_some_and(|rotation| {
-            rotation.recovery.is_some()
-                || !matches!(
-                    rotation.state.phase(),
-                    RotationPhase::Active | RotationPhase::Preparing
-                )
-        }) {
+        if Self::rotation_blocks_owner_forget(session) {
             return None;
         }
         if !stream.response_bytes.is_empty()
@@ -5079,6 +5229,33 @@ impl RelayActor {
         ResumeDirectionState::from_sequence_snapshot(stream.sequence.stream_id(), sent).ok()
     }
 
+    /// PREPARING is allowed because the caller queues FORGET before it
+    /// constructs QUIESCE. Once quiescing or recovering, roster/replay
+    /// references make reclamation unsafe.  One rule for M2 streams and for
+    /// unary echo tombstones (M7-C92).
+    fn rotation_blocks_owner_forget(session: &DeviceSession) -> bool {
+        session.rotation.as_ref().is_some_and(|rotation| {
+            rotation.recovery.is_some()
+                || !matches!(
+                    rotation.state.phase(),
+                    RotationPhase::Active | RotationPhase::Preparing
+                )
+        })
+    }
+
+    /// The owner FORGET evidence for one unary echo tombstone under the same
+    /// rotation rule as [`Self::owner_stream_forget_state`].
+    fn unary_forget_state(
+        session: &DeviceSession,
+        stream_id: u64,
+        tombstone: &UnaryTombstone,
+    ) -> Option<ResumeDirectionState> {
+        if Self::rotation_blocks_owner_forget(session) {
+            return None;
+        }
+        tombstone.final_state(stream_id)
+    }
+
     /// Retain one owner FORGET identity before trying the control queue. A
     /// stable message ID makes queue-full retries idempotent; the bounded
     /// stream table, rather than an eviction policy, bounds this map.
@@ -5093,10 +5270,22 @@ impl RelayActor {
         let Some(session) = self.session_for(key) else {
             return false;
         };
-        let Some(stream) = session.streams.get(&stream_id) else {
+        // M2 streams and unary echo tombstones share one monotonic stream-ID
+        // allocator, so an ID names at most one of them.
+        let Some(retained_operation) = session
+            .streams
+            .get(&stream_id)
+            .map(|stream| stream.operation_id.as_str())
+            .or_else(|| {
+                session
+                    .unary_tombstones
+                    .get(&stream_id)
+                    .map(|tombstone| tombstone.operation_id.as_str())
+            })
+        else {
             return false;
         };
-        if stream.operation_id != operation_id || final_state.stream_id != stream_id {
+        if retained_operation != operation_id || final_state.stream_id != stream_id {
             return false;
         }
         let limit = self
@@ -5209,6 +5398,27 @@ impl RelayActor {
                             (*stream_id, stream.operation_id.clone(), final_state)
                         })
                     })
+                    // Finished unary echoes (M7-C92), each once its own
+                    // terminal proof is complete.  The rotation freeze guard
+                    // above already covers them.
+                    .chain(
+                        session
+                            .unary_tombstones
+                            .iter()
+                            .filter(|(stream_id, _)| {
+                                !self
+                                    .owner_forgets
+                                    .get(key)
+                                    .is_some_and(|pending| pending.contains_key(stream_id))
+                            })
+                            .filter_map(|(stream_id, tombstone)| {
+                                Self::unary_forget_state(session, *stream_id, tombstone).map(
+                                    |final_state| {
+                                        (*stream_id, tombstone.operation_id.clone(), final_state)
+                                    },
+                                )
+                            }),
+                    )
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
@@ -5240,7 +5450,28 @@ impl RelayActor {
                 .session_for(key)
                 .and_then(|session| session.streams.get(&stream_id))
                 .is_some_and(|stream| stream.open_pending);
-            if !is_rejected_open {
+            let unary_state = self.session_for(key).and_then(|session| {
+                session
+                    .unary_tombstones
+                    .get(&stream_id)
+                    .map(|tombstone| Self::unary_forget_state(session, stream_id, tombstone))
+            });
+            if let Some(unary_state) = unary_state {
+                // Refreshed under the stream rule: the ACK cursor only grows,
+                // and a rotation phase that forbids reclamation withholds the
+                // proof exactly as it does for a stream.
+                let Some(current_state) = unary_state else {
+                    self.arm_owner_forget_deadline(key);
+                    return false;
+                };
+                if let Some(pending) = self
+                    .owner_forgets
+                    .get_mut(key)
+                    .and_then(|pending| pending.get_mut(&stream_id))
+                {
+                    pending.final_state = current_state;
+                }
+            } else if !is_rejected_open {
                 let Some(current_state) = self.session_for(key).and_then(|session| {
                     session
                         .streams
@@ -5298,7 +5529,18 @@ impl RelayActor {
                     .streams
                     .get(&stream_id)
                     .is_some_and(|stream| stream.operation_id == pending.operation_id);
-                if !matches {
+                let unary_matches = session
+                    .unary_tombstones
+                    .get(&stream_id)
+                    .is_some_and(|tombstone| tombstone.operation_id == pending.operation_id);
+                if unary_matches {
+                    // The FORGET is queued: the owner can never retry this
+                    // OPEN, and nothing else references the tombstone.
+                    session.unary_tombstones.remove(&stream_id);
+                    session.forgotten_stream_through =
+                        session.forgotten_stream_through.max(stream_id);
+                    true
+                } else if !matches {
                     false
                 } else if let Some(mut stream) = session.streams.remove(&stream_id) {
                     // A connector RESET can make an HTTP stream reclaimable
@@ -5347,6 +5589,19 @@ impl RelayActor {
     /// writes the same way for the duration of `Recovering`.  DATA/FIN/RESET
     /// are held in the bounded per-stream FIFO while this holds; ACKs, window
     /// updates, heartbeats and rotation control remain responsive.
+    /// The snapshot ID of the rotation attempt whose writer is frozen, if
+    /// any: the roster a unary echo leaving `pending` now belongs to.
+    fn frozen_snapshot_id(session: &DeviceSession) -> Option<String> {
+        if !Self::rotation_frozen(session) {
+            return None;
+        }
+        session
+            .rotation
+            .as_ref()
+            .map(|rotation| rotation.snapshot_id.clone())
+            .filter(|snapshot_id| !snapshot_id.is_empty())
+    }
+
     fn rotation_frozen(session: &DeviceSession) -> bool {
         session.rotation.as_ref().is_some_and(|rotation| {
             matches!(
@@ -5457,6 +5712,28 @@ impl RelayActor {
         for stream_id in stream_ids {
             self.retry_pending_echo_records(key, stream_id);
             self.flush_pending_terminal(key, stream_id);
+        }
+        // Unary echoes whose authorization completed while frozen (M7-C93).
+        let deferred = self
+            .session_mut(key)
+            .map(|session| {
+                let mut deferred: Vec<(u64, DeviceChallenge, ChallengeAuthorizationResult)> =
+                    session
+                        .pending
+                        .iter_mut()
+                        .filter_map(|(stream_id, pending)| {
+                            pending
+                                .deferred_authorization
+                                .take()
+                                .map(|(challenge, result)| (*stream_id, challenge, result))
+                        })
+                        .collect();
+                deferred.sort_unstable_by_key(|(stream_id, _, _)| *stream_id);
+                deferred
+            })
+            .unwrap_or_default();
+        for (_, challenge, result) in deferred {
+            self.finish_device_challenge(key.clone(), challenge, result);
         }
     }
 
@@ -7630,6 +7907,15 @@ impl RelayActor {
                                 .get(&fence.stream_id)
                                 .map(|pending| pending.response_sequence)
                         })
+                        .or_else(|| {
+                            // Finished during this freeze (M7-C93).
+                            session
+                                .unary_tombstones
+                                .get(&fence.stream_id)
+                                .map(|tombstone| {
+                                    tombstone.fence_sequence(Direction::ConnectorToRelay)
+                                })
+                        })
                         .unwrap_or_default();
                     acks.push(tunnel_protocol::rotation_control::StreamAck::new(
                         fence.stream_id,
@@ -7727,11 +8013,17 @@ impl RelayActor {
         let mut entries = Vec::new();
         for (stream_id, pending) in &session.pending {
             if direction == Direction::RelayToConnector {
-                entries.push(StreamFence::new(
-                    *stream_id,
-                    direction,
-                    pending.send_sequence,
-                ));
+                // The relay's last emitted sequence for a unary echo: nothing
+                // before dispatch, and its FIN once DATA and FIN are queued.
+                // `send_sequence` is the DATA sequence only; fencing at it
+                // made every dispatched echo's FIN ACK "above fence" and the
+                // connector failed the session (task row M7-C93).
+                let last_emitted = if pending.dispatched {
+                    pending.send_sequence.saturating_add(1)
+                } else {
+                    0
+                };
+                entries.push(StreamFence::new(*stream_id, direction, last_emitted));
             } else {
                 entries.push(StreamFence::new(
                     *stream_id,
@@ -7743,6 +8035,16 @@ impl RelayActor {
         for (stream_id, stream) in &session.streams {
             let last = stream.sequence.direction(direction).last_emitted();
             entries.push(StreamFence::new(*stream_id, direction, last));
+        }
+        // A unary echo that finished after QUIESCE is still in this roster.
+        for (stream_id, tombstone) in &session.unary_tombstones {
+            if tombstone.frozen_snapshot_id.as_deref() == Some(snapshot_id) {
+                entries.push(StreamFence::new(
+                    *stream_id,
+                    direction,
+                    tombstone.fence_sequence(direction),
+                ));
+            }
         }
         entries.sort_by_key(|entry| entry.stream_id);
         entries.dedup_by_key(|entry| entry.stream_id);
@@ -10049,6 +10351,7 @@ impl RelayActor {
                 if rejected.session_id != key.session_id || rejected.epoch != key.epoch {
                     return;
                 }
+                let mut unary_rejected = false;
                 if let Some(session) = self.session_mut(&key)
                     && session
                         .pending
@@ -10066,10 +10369,33 @@ impl RelayActor {
                         phase = "stream_rejected",
                     );
                     release_pending_budget(session, &pending);
+                    // The connector journals most refusals, and that entry is
+                    // released only by the owner's STREAM_FORGET for this
+                    // exact OPEN; an unjournaled refusal makes the same
+                    // FORGET benign.  Retain the no-stream identity only for
+                    // the REJECTED that answers this OPEN's own message ID
+                    // (M7-C92), as the M2 path below does.
+                    if session.profile.supports_rotation()
+                        && !pending.forget.open_message_id.is_empty()
+                        && pending.forget.open_message_id == rejected.reply_to
+                    {
+                        session.unary_tombstones.insert(
+                            rejected.stream_id,
+                            UnaryTombstone {
+                                operation_id: pending.operation_id.clone(),
+                                evidence: UnaryTombstoneEvidence::Rejected,
+                                frozen_snapshot_id: Self::frozen_snapshot_id(session),
+                            },
+                        );
+                        unary_rejected = true;
+                    }
                     let _ = pending.response.send(EchoOutcome::Failure {
                         code: "DEVICE_REJECTED",
                         execution: "not_dispatched",
                     });
+                }
+                if unary_rejected {
+                    let _ = self.flush_owner_stream_forgets(&key);
                 }
                 // M2 OPENs are represented by `session.streams`, not the M1
                 // `pending` map. A connector can reject an OPEN after the
@@ -10565,6 +10891,19 @@ impl RelayActor {
             || pending.grant.revision != challenge.grant_revision
             || pending.service_id.to_string() != challenge.service_id
         {
+            return;
+        }
+        if Self::rotation_frozen(session) {
+            // A frozen writer emits no sequenced frame (docs/protocol.md
+            // "Freeze each writer").  Hold the result; `flush_frozen_writes`
+            // re-applies it when the writer resumes, and every check below,
+            // including authorization liveness, runs then.
+            if let Some(session) = self.session_mut(&key)
+                && let Some(pending) = session.pending.get_mut(&challenge.stream_id)
+                && pending.deferred_authorization.is_none()
+            {
+                pending.deferred_authorization = Some((challenge, result));
+            }
             return;
         }
         let consumer_expires_at = pending.consumer_expires_at;
@@ -11251,8 +11590,13 @@ impl RelayActor {
             // carrier boundary; they cannot reach stream state.
             return;
         }
+        // A finished unary echo still waiting for the ACK of the relay's FIN
+        // stays known to that ACK even after a later stream's FORGET raised
+        // the watermark past it; no other frame kind reaches a tombstone.
         let stream_is_known = session.streams.contains_key(&frame.stream_id)
-            || session.pending.contains_key(&frame.stream_id);
+            || session.pending.contains_key(&frame.stream_id)
+            || (frame.kind == FrameKind::Ack
+                && session.unary_tombstones.contains_key(&frame.stream_id));
         if !stream_is_known && frame.stream_id <= session.forgotten_stream_through {
             // An authenticated owner FORGET has already compacted this
             // monotonic stream ID. Late DATA/FIN/RESET cannot be allowed to
@@ -11283,10 +11627,15 @@ impl RelayActor {
                 {
                     return self.protocol_failure(&key, "UNKNOWN_STREAM").await;
                 }
+                // A completed exchange on an M2 session leaves a tombstone
+                // for its owner STREAM_FORGET; it is retained only once the
+                // connector's FIN has been acknowledged below (M7-C92).
+                let mut completed_tombstone = None;
                 let (update, data_tx, queue_budget, tenant_id, operation_id) = {
                     let Some(session) = self.session_mut(&key) else {
                         return;
                     };
+                    let forgets_unary = session.profile.supports_rotation();
                     let Some(pending) = session.pending.get_mut(&stream_id) else {
                         return;
                     };
@@ -11323,6 +11672,8 @@ impl RelayActor {
                         )
                     } else {
                         pending.response_sequence = frame.sequence;
+                        // Validated above as at most the relay's FIN.
+                        pending.forget.peer_acked = pending.forget.peer_acked.max(frame.ack);
                         if frame.kind == FrameKind::Data {
                             pending.response_body.extend_from_slice(&frame.payload);
                             (
@@ -11341,6 +11692,15 @@ impl RelayActor {
                             let released = pending.body.len().saturating_add(body.len());
                             session.queued_bytes = session.queued_bytes.saturating_sub(released);
                             session.queue_budget.release(released);
+                            if forgets_unary {
+                                let mut identity = pending.forget.clone();
+                                identity.response_sequence = pending.response_sequence;
+                                completed_tombstone = Some(UnaryTombstone {
+                                    operation_id: pending.operation_id.clone(),
+                                    evidence: UnaryTombstoneEvidence::Completed(identity),
+                                    frozen_snapshot_id: Self::frozen_snapshot_id(session),
+                                });
+                            }
                             (
                                 ResponseFrameUpdate::Complete(body, pending.response),
                                 data_tx,
@@ -11397,6 +11757,15 @@ impl RelayActor {
                     return;
                 }
                 if let ResponseFrameUpdate::Complete(body, response) = update {
+                    // The connector's FIN was received contiguously, is being
+                    // delivered and its ACK is queued: the owner holds no
+                    // receive or replay reference to this exchange, so it is
+                    // retained only until its STREAM_FORGET can be proved.
+                    if let Some(tombstone) = completed_tombstone
+                        && let Some(session) = self.session_mut(&key)
+                    {
+                        session.unary_tombstones.insert(stream_id, tombstone);
+                    }
                     let response_bytes = body.len();
                     let _ = response.send(EchoOutcome::Success(body));
                     tracing::debug!(
@@ -11409,6 +11778,7 @@ impl RelayActor {
                         bytes = response_bytes,
                         phase = "stream_completed",
                     );
+                    let _ = self.flush_owner_stream_forgets(&key);
                 }
             }
             FrameKind::Ack => {
@@ -11418,8 +11788,32 @@ impl RelayActor {
                     .is_some_and(|pending| {
                         !pending.dispatched || frame.ack > pending.send_sequence.saturating_add(1)
                     });
-                if stale_ack {
+                // An ACK can overtake the connector's response FIN or trail
+                // it; either way it is the evidence the unary FORGET waits
+                // for.  An ACK beyond the relay's FIN is stale as before.
+                let stale_tombstone_ack = self
+                    .session_for(&key)
+                    .and_then(|session| session.unary_tombstones.get(&stream_id))
+                    .is_some_and(|_| frame.ack > UNARY_ECHO_FIN_SEQUENCE);
+                if stale_ack || stale_tombstone_ack {
                     self.protocol_failure(&key, "STALE_ACK").await;
+                    return;
+                }
+                let mut acked_tombstone = false;
+                if let Some(session) = self.session_mut(&key) {
+                    if let Some(pending) = session.pending.get_mut(&stream_id) {
+                        pending.forget.peer_acked = pending.forget.peer_acked.max(frame.ack);
+                    } else if let Some(UnaryTombstone {
+                        evidence: UnaryTombstoneEvidence::Completed(identity),
+                        ..
+                    }) = session.unary_tombstones.get_mut(&stream_id)
+                    {
+                        identity.peer_acked = identity.peer_acked.max(frame.ack);
+                        acked_tombstone = true;
+                    }
+                }
+                if acked_tombstone {
+                    let _ = self.flush_owner_stream_forgets(&key);
                 }
             }
             FrameKind::WindowUpdate => {
@@ -15242,6 +15636,7 @@ mod stream_identity_tests {
             owner_fence_deadline: None,
             next_stream_id: 1,
             pending: HashMap::new(),
+            unary_tombstones: HashMap::new(),
             streams: HashMap::new(),
             forgotten_stream_through: 0,
             owner_forget_deadline: None,
@@ -17113,6 +17508,7 @@ mod stream_identity_tests {
                     owner_fence_deadline: None,
                     next_stream_id: 1,
                     pending: HashMap::new(),
+                    unary_tombstones: HashMap::new(),
                     streams: HashMap::new(),
                     forgotten_stream_through: 0,
                     owner_forget_deadline: None,
@@ -19543,6 +19939,7 @@ mod stream_identity_tests {
             owner_fence_deadline: None,
             next_stream_id: 1,
             pending: HashMap::new(),
+            unary_tombstones: HashMap::new(),
             streams: HashMap::new(),
             forgotten_stream_through: 0,
             owner_forget_deadline: None,

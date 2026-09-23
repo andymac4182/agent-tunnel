@@ -3,8 +3,9 @@
 protect, and restore it.
 
 This is the red-then-green evidence behind M3-09.  Two suites live here
-(later suites -- M6-C08's doctor, M3-25's pin wait and M7-C89's readiness
-against the pin set -- are described where they are defined):
+(later suites -- M6-C08's doctor, M3-25's pin wait, M7-C89's readiness
+against the pin set and M7-C92/M7-C93's finite echo -- are described where
+they are defined):
 
 * `m3c09` — `crates/tunnel-deadman` and the stdio export's child supervision
   in `crates/tunnel-mcp-export`, witnessed by the process-table measurements
@@ -659,12 +660,178 @@ READINESS_PINS_CASES: list[Case] = [
     ),
 ]
 
+#: **M7-C92 and M7-C93: the finite (unary) echo on an M2 session.**  M7-C92
+#: made the relay issue the owner `STREAM_FORGET` that releases a finite
+#: echo's connector OPEN journal entry, without which a device session
+#: refused request 129; M7-C93 made a finite echo in flight across a data
+#: rotation keep an honest fence.  It sits beside M7-C89 because both are
+#: relay-actor rules witnessed by the relay's own tests.
+#:
+#: The witnesses are the deterministic actor regressions in
+#: `actor_rotation_freeze_tests.rs`, which drive the real actor handlers with
+#: a connector stand-in.  Each one observes only control messages, data
+#: frames and the relay fence, which is what let the same file be run against
+#: the code before either fix and go red there.  The real-binary gates
+#: (`m7c92_...` and `m7c93_...` in `m6_provisioning_process.rs`) need Redis
+#: and are run by `scripts/m6-provisioning-verify.sh`, not here.
+ACTOR = RELAY / "src" / "actor.rs"
+UNARY_ECHO_TEST = [
+    "cargo",
+    "test",
+    "-p",
+    "tunnel-relay",
+    "--locked",
+    "--no-fail-fast",
+    "--lib",
+    "--",
+    "actor::rotation_freeze_tests::",
+]
+UNARY_FREEZE = "actor::rotation_freeze_tests::"
+UNARY_ECHO_CASES: list[Case] = [
+    Case(
+        # The whole of M7-C92.  Without the tombstone a completed echo leaves
+        # nothing for the FORGET flush to find -- the pre-fix relay -- and the
+        # connector's 128-entry retention fills.
+        "a completed unary echo is retained for its owner STREAM_FORGET",
+        [
+            (
+                ACTOR,
+                "                    if let Some(tombstone) = completed_tombstone\n"
+                "                        && let Some(session) = self.session_mut(&key)\n"
+                "                    {\n"
+                "                        session.unary_tombstones.insert(stream_id, tombstone);\n"
+                "                    }",
+                "                    let _ = completed_tombstone;",
+            )
+        ],
+        frozenset(
+            {
+                UNARY_FREEZE + "completed_unary_echo_is_forgotten_once_its_fin_is_acknowledged",
+                UNARY_FREEZE
+                + "unary_echo_completing_during_freeze_keeps_the_roster_and_is_forgotten_after",
+            }
+        ),
+    ),
+    Case(
+        # Idempotency: the owner may not assert a terminal the connector has
+        # not acknowledged.  Defeated, the FORGET goes out on the connector's
+        # FIN alone and the connector must defer or refuse its proof.
+        "the unary FORGET waits for the connector's ACK of the relay's FIN",
+        [
+            (
+                ACTOR,
+                "                if identity.peer_acked < UNARY_ECHO_FIN_SEQUENCE {\n"
+                "                    return None;\n"
+                "                }\n",
+                "",
+            )
+        ],
+        frozenset(
+            {UNARY_FREEZE + "completed_unary_echo_is_forgotten_once_its_fin_is_acknowledged"}
+        ),
+    ),
+    Case(
+        # A REJECTED is correlated by the OPEN's own message ID, never by the
+        # stream and operation alone.
+        "a REJECTED unary OPEN is forgotten only when it answers that OPEN",
+        [
+            (
+                ACTOR,
+                "                        && pending.forget.open_message_id == rejected.reply_to\n",
+                "",
+            )
+        ],
+        frozenset(
+            {UNARY_FREEZE + "rejected_unary_echo_open_is_forgotten_with_no_stream_evidence"}
+        ),
+    ),
+    Case(
+        # Review F1: a late ACK for a finite echo whose stream ID a later
+        # echo's FORGET already passed must still reach its tombstone.
+        # Defeated, the ACK is dropped as stale and the tombstone leaks until
+        # the session closes.
+        "a late ACK below the watermark still reaches its unary tombstone",
+        [
+            (
+                ACTOR,
+                "            || (frame.kind == FrameKind::Ack\n"
+                "                && session.unary_tombstones.contains_key(&frame.stream_id));",
+                ";",
+            )
+        ],
+        frozenset(
+            {
+                UNARY_FREEZE
+                + "late_ack_below_the_watermark_still_forgets_an_out_of_order_unary_echo"
+            }
+        ),
+    ),
+    Case(
+        # M7-C93's first defect, restored: a dispatched echo fenced at its DATA
+        # sequence although its FIN was already sent.
+        "a unary echo is fenced at the last sequence it emitted",
+        [
+            (
+                ACTOR,
+                "                let last_emitted = if pending.dispatched {\n"
+                "                    pending.send_sequence.saturating_add(1)\n"
+                "                } else {\n"
+                "                    0\n"
+                "                };",
+                "                let last_emitted = pending.send_sequence;",
+            )
+        ],
+        frozenset(
+            {
+                UNARY_FREEZE + "dispatched_unary_echo_is_fenced_at_its_fin",
+                UNARY_FREEZE + "unary_echo_authorized_during_freeze_dispatches_after_commit",
+            }
+        ),
+    ),
+    Case(
+        # M7-C93's third defect, restored: an authorization result during the
+        # freeze dispatches DATA and FIN past the frozen fence.
+        "a unary echo authorized while frozen is held until the writer resumes",
+        [
+            (
+                ACTOR,
+                "        if Self::rotation_frozen(session) {\n"
+                "            // A frozen writer emits no sequenced frame (docs/protocol.md\n",
+                "        if false {\n"
+                "            // A frozen writer emits no sequenced frame (docs/protocol.md\n",
+            )
+        ],
+        frozenset(
+            {UNARY_FREEZE + "unary_echo_authorized_during_freeze_dispatches_after_commit"}
+        ),
+    ),
+    Case(
+        # M7-C93's second defect, restored: an echo that completes after
+        # QUIESCE vanishes from the fence, and the relay cannot freeze.
+        "a unary echo completed during the freeze stays in that roster's fence",
+        [
+            (
+                ACTOR,
+                "            if tombstone.frozen_snapshot_id.as_deref() == Some(snapshot_id) {",
+                "            if false {",
+            )
+        ],
+        frozenset(
+            {
+                UNARY_FREEZE
+                + "unary_echo_completing_during_freeze_keeps_the_roster_and_is_forgotten_after"
+            }
+        ),
+    ),
+]
+
 SUITES: list[Suite] = [
     Suite("m3c09", [DEADMAN, EXPORT, FIXTURE], CARGO_TEST, CASES),
     Suite("m3c09-deadman", [DEADMAN], DEADMAN_TEST, DEADMAN_CASES),
     Suite("m6c08-doctor", [CLIENT], DOCTOR_TEST, DOCTOR_CASES),
     Suite("m3c25-resign-pin-wait", [HARNESS], PIN_WAIT_TEST, PIN_WAIT_CASES),
     Suite("m7c89-readiness-pins", [RELAY], READINESS_PINS_TEST, READINESS_PINS_CASES),
+    Suite("m7c92-unary-echo", [RELAY], UNARY_ECHO_TEST, UNARY_ECHO_CASES),
 ]
 
 #: Cases whose green result is itself the measurement.  Empty today, and kept

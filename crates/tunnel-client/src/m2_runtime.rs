@@ -14153,6 +14153,203 @@ mod tests {
         (responses, entries_while_live)
     }
 
+    /// The relay's unary echo window: `wire::MAX_ECHO_WINDOW_BYTES`, the
+    /// 64 KiB body bound plus the 256-byte canary.  Restated because the
+    /// relay crate is not a dependency of the connector.
+    const UNARY_ECHO_WINDOW: u64 = 64 * 1024 + 256;
+
+    /// The owner evidence the relay (task row M7-C92) derives for a completed
+    /// unary echo: its fixed DATA(1)+FIN(2) exchange, fully acknowledged.
+    fn unary_echo_owner_forget_state(stream_id: u64, body_len: u64) -> ResumeDirectionState {
+        let snapshot = DirectionSnapshot {
+            last_emitted: 2,
+            peer_acked: 2,
+            recv_contiguous: 0,
+            delivered_contiguous: 0,
+            send_credit: UNARY_ECHO_WINDOW,
+            sent_bytes: body_len,
+            receive_credit: UNARY_ECHO_WINDOW,
+            received_bytes: 0,
+            send_terminal: Some(tunnel_protocol::sequence::Terminal::Fin),
+            send_terminal_sequence: Some(2),
+            receive_terminal: None,
+            receive_terminal_sequence: None,
+            replay_floor: None,
+            replay_bytes: 0,
+            reorder_frames: 0,
+            reorder_bytes: 0,
+        };
+        ResumeDirectionState::from_sequence_snapshot(stream_id, &snapshot)
+            .expect("unary echo owner evidence is a valid resume state")
+    }
+
+    /// Frames the connector queued on its carrier since the last drain.
+    fn drain_carrier_frames(receiver: &mut mpsc::Receiver<CarrierCommand>) -> Vec<Frame> {
+        let mut frames = Vec::new();
+        while let Ok(command) = receiver.try_recv() {
+            if let CarrierCommand::Frame(frame) = command {
+                frames.push(Frame::decode(&frame.bytes).expect("carrier frame decodes"));
+            }
+        }
+        frames
+    }
+
+    /// M7-C92: the owner's STREAM_FORGET for a completed unary echo is what
+    /// releases its OPEN journal entry, and the idempotency guarantee the
+    /// journal exists for still holds on both sides of it.  Before the
+    /// FORGET a replayed OPEN is deduplicated without a second dispatch;
+    /// after it the replay is past the OPEN retry horizon and is refused
+    /// `STREAM_EXISTS`, again without a second dispatch, whatever carrier or
+    /// rotation it arrives after.  The FORGET carries exactly the evidence
+    /// the relay derives, so this also proves the connector accepts it.
+    #[tokio::test]
+    async fn forgotten_unary_echo_open_replay_is_refused_without_second_dispatch() {
+        let (mut actor, active_key, mut carrier_receiver, mut control_receiver) =
+            test_actor_with_control_capacity(M2_CARRIER_QUEUE_FRAMES, 16);
+        let stream_id = 1;
+        let body = b"unary-echo-body".to_vec();
+        let open = Open::new(
+            "unary-open-message",
+            "session",
+            1,
+            stream_id,
+            "unary-operation",
+            "echo",
+            "echo",
+            UNARY_ECHO_WINDOW,
+            UNARY_ECHO_WINDOW,
+        );
+        actor
+            .handle_control(ControlMessage::Open(open.clone()))
+            .await
+            .expect("the unary echo OPEN is admitted");
+        let challenge = drain_control_messages(&mut control_receiver)
+            .into_iter()
+            .find_map(|message| match message {
+                ControlMessage::AuthorizationChallenge(challenge) => Some(challenge),
+                _ => None,
+            })
+            .expect("the OPEN is challenged");
+        actor
+            .handle_authorization_confirmed(AuthorizationConfirmed::new(
+                "unary-confirmation",
+                challenge.message_id.clone(),
+                "session",
+                1,
+                stream_id,
+                challenge.challenge_id.clone(),
+                challenge.nonce.clone(),
+                challenge.permission_digest.clone(),
+                challenge.grant_revision,
+                5_000,
+            ))
+            .await
+            .expect("the challenge confirms");
+        actor
+            .handle_frame(
+                active_key.clone(),
+                Frame::data(1, 1, stream_id, 1, 0, body.clone()),
+            )
+            .await
+            .expect("the relay's DATA is accepted");
+        actor
+            .handle_frame(active_key.clone(), Frame::fin(1, 1, stream_id, 2, 0))
+            .await
+            .expect("the relay's FIN is accepted");
+        actor
+            .flush_pending_outputs()
+            .await
+            .expect("the echo response flushes");
+        actor
+            .flush_pending_carrier_controls()
+            .expect("the ACK feedback flushes");
+        let frames = drain_carrier_frames(&mut carrier_receiver);
+        let dispatches = |frames: &[Frame]| {
+            frames
+                .iter()
+                .filter(|frame| frame.kind == FrameKind::Data && frame.stream_id == stream_id)
+                .count()
+        };
+        assert!(dispatches(&frames) > 0, "the echo is dispatched once");
+        let response_fin = frames
+            .iter()
+            .find(|frame| frame.kind == FrameKind::Fin && frame.stream_id == stream_id)
+            .map(|frame| frame.sequence)
+            .expect("the connector finishes its response");
+        assert!(
+            frames
+                .iter()
+                .filter(|frame| frame.stream_id == stream_id)
+                .any(|frame| frame.ack == 2),
+            "the connector acknowledges the relay's FIN, which the owner's proof requires"
+        );
+        actor
+            .handle_frame(
+                active_key.clone(),
+                Frame::ack(1, 1, stream_id, response_fin),
+            )
+            .await
+            .expect("the relay acknowledges the connector's FIN");
+
+        // Inside the retention window a replay is deduplicated: the retained
+        // OPENED is replayed and nothing is dispatched again.
+        drain_control_messages(&mut control_receiver);
+        actor
+            .handle_control(ControlMessage::Open(open.clone()))
+            .await
+            .expect("a retained replay is answered from the journal");
+        let replayed = drain_control_messages(&mut control_receiver);
+        assert!(
+            replayed.iter().any(|message| matches!(
+                message,
+                ControlMessage::Opened(opened) if opened.reply_to == open.message_id
+            )),
+            "the retained reply is replayed: {replayed:?}"
+        );
+        assert_eq!(dispatches(&drain_carrier_frames(&mut carrier_receiver)), 0);
+
+        actor
+            .handle_stream_forget(tunnel_protocol::rotation_control::StreamForget {
+                message_id: "unary-forget".to_owned(),
+                reply_to: String::new(),
+                session_id: "session".to_owned(),
+                epoch: 1,
+                stream_id,
+                operation_id: open.operation_id.clone(),
+                direction: Direction::RelayToConnector,
+                final_state: unary_echo_owner_forget_state(stream_id, body.len() as u64),
+            })
+            .expect("the connector accepts the relay's unary evidence");
+        while carrier_receiver.try_recv().is_ok() {}
+        actor
+            .handle_barrier_complete(&active_key)
+            .expect("the FORGET barrier completes");
+        assert!(!actor.streams.contains_key(&stream_id));
+        assert_eq!(
+            actor.open_journal.entry_count(),
+            0,
+            "the FORGET releases the unary echo's journal entry"
+        );
+
+        // Past the horizon the same OPEN is refused, not dispatched again.
+        actor
+            .handle_control(ControlMessage::Open(open.clone()))
+            .await
+            .expect("a post-horizon replay is a typed refusal");
+        assert!(matches!(
+            drain_control_messages(&mut control_receiver).last(),
+            Some(ControlMessage::Rejected(rejected))
+                if rejected.code == "STREAM_EXISTS" && rejected.reply_to == open.message_id
+        ));
+        assert!(!actor.streams.contains_key(&stream_id));
+        assert_eq!(dispatches(&drain_carrier_frames(&mut carrier_receiver)), 0);
+        assert_eq!(
+            actor.open_journal.entry_count(),
+            0,
+            "the refusal is not journaled"
+        );
+    }
+
     /// M7-C82: a long-lived session serves an unbounded number of sequential
     /// streams.  Before the OPEN retry horizon this died at the 128th stream:
     /// the journal refused admission and the owner's next STREAM_FORGET for
