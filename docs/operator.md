@@ -278,7 +278,12 @@ Provisioning records are valid for namespace agent-tunnel-m1: tenant=11111111-11
 ```
 
 Then, against your Redis, activate the relay's incarnation and write the
-records, in that order. **Shape-only:** both write Redis, which this guide's
+records, in that order. **Do not start `serve` until `provision-catalog` has
+succeeded.** Provisioning refuses a namespace holding any key other than the
+incarnation binding, and nothing shipped removes a key a relay has written, so
+a relay started between the two commands can leave the namespace
+unprovisionable (M6-C34); if that happens, choose a new `redis_namespace` and
+start again. **Shape-only:** both write Redis, which this guide's
 check does not have. `scripts/m6-provisioning-verify.sh` runs them, `serve`,
 `connect` and an echo end to end with these binaries and the two examples
 against a real Redis:
