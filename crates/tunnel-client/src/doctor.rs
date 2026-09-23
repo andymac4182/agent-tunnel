@@ -564,7 +564,7 @@ fn containment_check(availability: tunnel_deadman::Availability) -> CapabilityCh
 
 /// Parse only the certificate validity sequence needed by the local doctor.
 /// The parser is deliberately strict and rejects indefinite-length BER.
-fn certificate_validity(der: &[u8]) -> Result<(i64, i64), ()> {
+pub(crate) fn certificate_validity(der: &[u8]) -> Result<(i64, i64), ()> {
     let mut certificate_offset = 0;
     let certificate = parse_tlv(der, &mut certificate_offset)?;
     if certificate.tag != 0x30 || certificate.end != der.len() {

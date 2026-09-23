@@ -1262,6 +1262,7 @@ fn write_client_config(
         )]),
         limits: LimitsConfig::default(),
         rotation: RotationConfig::default(),
+        reconnect: Default::default(),
     };
     config.validate().map_err(|error| {
         HarnessError::InvalidInput(format!("restoration client config: {error}"))
