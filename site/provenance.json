@@ -1,11 +1,11 @@
 {
-  "reviewedOriginMain": "dd12b1c4162fa822e57734ec6e58a4cebc6ff7bf",
-  "lastPublishedOriginMain": "dd12b1c4162fa822e57734ec6e58a4cebc6ff7bf",
-  "lastReviewAt": "2026-09-23T10:51:28+10:00",
-  "lastReviewOutcome": "Reviewed main through dd12b1c, including declared packaging targets, test-witness changes, harness pin-set waits and relay readiness. Published cluster readiness and public-admission pin-set requirements. No runtime acceptance rerun or broader cluster acceptance claim; CI and release gates unchanged.",
+  "reviewedOriginMain": "0da55ac24bf4fd88291a89ad24c7f25c91a613a5",
+  "lastPublishedOriginMain": "0da55ac24bf4fd88291a89ad24c7f25c91a613a5",
+  "lastReviewAt": "2026-09-23T11:52:46+10:00",
+  "lastReviewOutcome": "Reviewed operator guide, configuration examples and documentation checks through 0da55ac. Published missing catalog/bootstrap tooling, process lifecycle and operational-surface boundaries. No runtime acceptance rerun; CI and release gates unchanged.",
   "reviewedDate": "2026-09-23",
   "scope": "Setup, architecture, MCP, ACP, computer use, filesystems and support boundaries",
-  "verification": "Local and live Chrome verification passed at 1440, 1920, 390 and 320 pixels: homepage, brand lab, nine docs pages, links, images, light/dark/system themes and overflow. Live architecture content and source revision confirmed. Upstream runtime and artifact acceptance not rerun; historical evidence not promoted to new acceptance.",
-  "verifiedAt": "2026-09-23T10:51:28+10:00",
-  "deploymentId": "dpl_6hogWqbPzCYirNW9GfR8H7RQ2H2X"
+  "verification": "Local and live Chrome verification passed at 1440, 1920, 390 and 320 pixels: homepage, brand lab, nine docs pages, links, images, light/dark/system themes and overflow. Live setup content and source revision confirmed. Upstream runtime and artifact acceptance not rerun; historical evidence not promoted to new acceptance.",
+  "verifiedAt": "2026-09-23T11:52:46+10:00",
+  "deploymentId": "dpl_3z3176vgxLq53aHqg3TbiCNmTRKR"
 }
