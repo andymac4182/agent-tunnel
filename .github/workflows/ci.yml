@@ -41,7 +41,10 @@ jobs:
       - name: Check lints
         run: cargo +1.95.0 clippy --workspace --all-targets --locked -- -D warnings
       - name: Run tests
-        run: cargo +1.95.0 test --workspace --all-targets --locked
+        # `--no-fail-fast`: one failing test binary no longer hides every one
+        # after it. The first hosted runs after the billing block each showed
+        # only the first failure per OS, and the job still fails on any.
+        run: cargo +1.95.0 test --workspace --all-targets --locked --no-fail-fast
       - name: Validate example configurations
         run: |
           set -euo pipefail
