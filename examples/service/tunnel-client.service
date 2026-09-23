@@ -15,10 +15,14 @@
 # Restart=on-failure.
 #
 # **Exit 7 is restarted, and the start limit is off, on purpose.** When the
-# device's network path vanishes while the relay stays up, the relay keeps
-# the old session and refuses every reconnect OWNER_BUSY until it is
-# restarted (docs/runtime.md, M6-C68): the client exits 7 after its 60 s
-# window, and so does every fresh start. With a start limit the unit would
+# device's network path vanishes while the relay stays up, a relay with the
+# M6-C68 fix ends the old session within 30 s of the device's last frame and
+# the client reconnects inside its 60 s OWNER_BUSY window without exiting.
+# A relay that does not let go in time -- an older relay, or a device
+# attached through a non-owner cluster relay (not yet covered) -- keeps the
+# old session and refuses every reconnect OWNER_BUSY until it is restarted
+# (docs/runtime.md): the client exits 7 after its 60 s window, and so does
+# every fresh start. With a start limit the unit would
 # end up failed and quiet a few minutes later and stay that way after the
 # relay recovered; with RestartPreventExitStatus=7 it would do so at once.
 # Instead it keeps trying every RestartSec, each attempt logging the

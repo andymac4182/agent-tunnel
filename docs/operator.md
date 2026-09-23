@@ -631,12 +631,28 @@ whatever runs it (section 4). A `connect` started again straight after a
 relay restart was admitted at once. A second `connect` for a device whose
 session is still live exits `7` with `OWNER_BUSY`.
 
-Three limits, all measured (runtime.md has the detail). **After a network
-change while the relay stays up** -- a laptop waking on another network, a
-NAT or VPN change -- the relay does not notice the old session is gone and
-refuses every reconnect `OWNER_BUSY`; the client exits `7` after 60 s, and a
-restarted client is refused too, until the relay is restarted (M6-C68).
-**After a relay
+**After a network change while the relay stays up** -- a laptop waking on
+another network, a NAT or VPN change -- the relay notices within a stated
+bound (M6-C68). It sends a WebSocket Ping on every device control socket
+every **10 s** and ends a session from which nothing at all -- no message,
+no Ping, no Pong -- has arrived for **30 s**; its log line carries
+`phase="control_liveness_timeout"` and the closure is counted under cause
+`liveness_timeout` in the relay's task-closure diagnostics. That releases the
+device's owner slot exactly as a device's own close does, so the client,
+refused `OWNER_BUSY` meanwhile, is readmitted at its next attempt: measured
+at about 30 s after the path was cut, well inside the client's 60 s
+`OWNER_BUSY` window. The bound is 30 s from the device's last frame plus the
+relay's 5 s disconnect hand-off; neither value is configurable (both are
+`tunnel-protocol` constants, `DEVICE_CONTROL_PING_INTERVAL` and
+`DEVICE_CONTROL_IDLE_TIMEOUT`). A healthy idle device is not affected: it
+answers each Ping. Anything between a device and the relay -- a load
+balancer or proxy in TCP passthrough, as on Fly -- sees a control frame at
+least every 10 s, so an idle timeout of 30 s or more there never reaps a
+live session. This applies to a device attached to the relay that owns it;
+on a cluster, a device attached through a non-owner relay is not yet covered
+(M6-C68 records it).
+
+Two limits, both measured (runtime.md has the detail). **After a relay
 crash**, the relay's claim on the device outlives it in Redis for up to the
 owner lease (30 s by default), and reconnects are refused `OWNER_BUSY` until
 it lapses: a device reconnected about 30 s after a SIGKILLed relay was back,
@@ -796,16 +812,21 @@ Every setting follows from how the binaries stop and reconnect
   restarts it on failure after 10 s, and stops after five starts in ten
   minutes.
 - **The client unit has no start limit (`StartLimitIntervalSec=0`), and exit
-  `7` is restarted, deliberately.** When a device's network path vanishes
-  while its relay stays up -- a laptop waking on another network, a NAT or
-  VPN change -- the relay keeps the old session and refuses every reconnect
-  `OWNER_BUSY` until the relay itself is restarted (measured by the M6-C23
-  review: exit `7` after 60.7 s; M6-C68 is the relay fix). A restart cannot
-  help while that lasts, since a fresh process's first `OWNER_BUSY` is
-  terminal. With the usual start limit the unit would be **failed and quiet**
-  about three and a half minutes after the network change, and would stay
-  failed after the relay recovered; with `7` in `RestartPreventExitStatus` it
-  would fail at once. Instead it retries every 30 s, each attempt writes the
+  `7` is restarted, deliberately.** Before M6-C68, when a device's network
+  path vanished while its relay stayed up, the relay kept the old session and
+  refused every reconnect `OWNER_BUSY` until it was itself restarted
+  (measured by the M6-C23 review: exit `7` after 60.7 s). A relay with the
+  M6-C68 fix ends such a session within 30 s of the device's last frame
+  (section 3.1), inside the client's 60 s `OWNER_BUSY` window, so the client
+  reconnects without exiting. The unit settings stay, because they are what
+  keeps the state visible and self-healing wherever the relay does not let
+  go in time -- an older relay, or a device attached through a non-owner
+  cluster relay (not yet covered): a restart cannot help while the relay
+  holds the session, since a fresh process's first `OWNER_BUSY` is terminal.
+  With the usual start limit the unit would be **failed and quiet** about
+  three and a half minutes after the network change, and would stay failed
+  after the relay recovered; with `7` in `RestartPreventExitStatus` it would
+  fail at once. Instead it retries every 30 s, each attempt writes the
   `OWNER_BUSY` refusal to the journal, `systemctl status` shows it
   restarting, and it reconnects by itself once the relay lets go. If this
   happens, restarting the **relay** (SIGTERM) clears it.

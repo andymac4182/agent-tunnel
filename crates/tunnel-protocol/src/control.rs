@@ -70,6 +70,37 @@ pub const CONTROL_OWNER_BUSY_CLOSE_REASON: &str = "OWNER_BUSY";
 /// M6-C32).  No retry of the same configuration can succeed, so the device
 /// must be told so rather than see an unexplained socket loss.
 pub const CONTROL_IDENTITY_REJECTED_CLOSE_CODE: u16 = 1008;
+/// Task row M6-C68: how often a relay sends a WebSocket Ping on an admitted
+/// device control socket.  Every device answers a WebSocket Ping with a Pong
+/// (RFC 6455 section 5.5.2; `tunnel-client` does so explicitly), so a live
+/// path produces an inbound frame at least this often even when idle.  It is
+/// also well under the idle timeouts of the NATs and TCP proxies a device's
+/// path crosses, so the pings keep such a path from being reaped.
+pub const DEVICE_CONTROL_PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+/// Task row M6-C68: the longest a relay keeps an admitted device control
+/// socket after the last inbound frame of any kind (text, Ping or Pong).  A
+/// device whose network path vanished -- a laptop waking on another network,
+/// a NAT rebinding, a VPN drop -- sends nothing and answers no Ping, so its
+/// relay ends that session within this bound, releases its owner slot, and
+/// admits the device's reconnect.  A write is not evidence of life: it
+/// completes into the kernel's buffer on a dead path.
+pub const DEVICE_CONTROL_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+// The bounds the two values above must keep, checked when the crate builds:
+// * the interval is at least a second, so the relay never floods a device;
+// * the interval is at most 15 s, under the ~30--60 s idle timeouts of common
+//   NATs and proxies;
+// * one idle window holds three Ping intervals, so a live device must miss
+//   two consecutive Pongs (a transient stall) before it is evicted;
+// * the idle timeout is at most 30 s, so the relay's eviction plus its bounded
+//   5 s disconnect hand-off ends well inside the 60 s a reconnecting
+//   `tunnel-client` keeps retrying `OWNER_BUSY` (`OWNER_BUSY_RECONNECT_WINDOW`,
+//   which asserts the same relation from its side).
+const _: () = {
+    assert!(DEVICE_CONTROL_PING_INTERVAL.as_secs() >= 1);
+    assert!(DEVICE_CONTROL_PING_INTERVAL.as_secs() <= 15);
+    assert!(DEVICE_CONTROL_IDLE_TIMEOUT.as_secs() >= 3 * DEVICE_CONTROL_PING_INTERVAL.as_secs());
+    assert!(DEVICE_CONTROL_IDLE_TIMEOUT.as_secs() <= 30);
+};
 /// Bounded, fixed close reason for [`CONTROL_IDENTITY_REJECTED_CLOSE_CODE`].
 /// It deliberately does not say which check failed: the unauthenticated
 /// half of that answer (whether a key is known to the catalog) is not the

@@ -737,19 +737,28 @@ impl Cause {
 /// The relay bounds its owner lease to 6..=30 s (`owner_lease` in
 /// `tunnel-relay`'s config), which is how long a **dead relay's** owner
 /// record outlives it (measured about 30 s); twice the maximum covers that.
-/// It does **not** cover a relay that is still running and still holds the
-/// old session because the device's side of the path vanished (a network
-/// change, a NAT or VPN drop): that relay never notices -- it sends no pings,
-/// its control read has no timeout and no socket sets keepalive -- and keeps
-/// renewing the lease, so every reconnect is refused until this window ends
-/// and the process exits 7 (measured by the M6-C23 review: 78 refusals, exit
-/// 7 at 60.7 s; M6-C68, a relay-side fix). Outside the window -- including a
+/// It also covers a relay that is still running and still holds the old
+/// session because the device's side of the path vanished (a network change,
+/// a NAT or VPN drop): since M6-C68 that relay pings the control socket every
+/// `DEVICE_CONTROL_PING_INTERVAL` and ends a session that has sent nothing
+/// for `DEVICE_CONTROL_IDLE_TIMEOUT` (30 s), releasing the owner slot, so the
+/// refusals stop well inside this window (asserted below). Before M6-C68 the
+/// relay never noticed and every reconnect was refused until this window
+/// ended and the process exited 7 (measured by the M6-C23 review: 78
+/// refusals, exit 7 at 60.7 s). Outside the window -- including a
 /// fresh process's first attempt, which has no previous session --
 /// `OWNER_BUSY` is terminal, so a second connector for the same device still
 /// exits 7 at once; the only witness of that first-attempt rule with
 /// reconnect on is the unit test
 /// `owner_busy_is_retried_only_within_the_window_after_our_own_session`.
 const OWNER_BUSY_RECONNECT_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+// M6-C68: a relay that lost the device's path evicts it after at most
+// `DEVICE_CONTROL_IDLE_TIMEOUT` of silence plus its bounded 5 s disconnect
+// hand-off; the window must outlast that with room for a backoff step.
+const _: () = assert!(
+    OWNER_BUSY_RECONNECT_WINDOW.as_secs()
+        >= tunnel_protocol::DEVICE_CONTROL_IDLE_TIMEOUT.as_secs() + 5 + 15
+);
 
 /// The reconnect policy for this run: the profile's `[reconnect]` table,
 /// with `--no-reconnect` able to switch it off.
