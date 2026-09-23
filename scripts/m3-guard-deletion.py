@@ -746,6 +746,27 @@ UNARY_ECHO_CASES: list[Case] = [
         ),
     ),
     Case(
+        # Review F1: a late ACK for a finite echo whose stream ID a later
+        # echo's FORGET already passed must still reach its tombstone.
+        # Defeated, the ACK is dropped as stale and the tombstone leaks until
+        # the session closes.
+        "a late ACK below the watermark still reaches its unary tombstone",
+        [
+            (
+                ACTOR,
+                "            || (frame.kind == FrameKind::Ack\n"
+                "                && session.unary_tombstones.contains_key(&frame.stream_id));",
+                ";",
+            )
+        ],
+        frozenset(
+            {
+                UNARY_FREEZE
+                + "late_ack_below_the_watermark_still_forgets_an_out_of_order_unary_echo"
+            }
+        ),
+    ),
+    Case(
         # M7-C93's first defect, restored: a dispatched echo fenced at its DATA
         # sequence although its FIN was already sent.
         "a unary echo is fenced at the last sequence it emitted",

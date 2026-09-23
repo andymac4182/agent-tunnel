@@ -3038,3 +3038,59 @@ async fn closing_a_session_drops_its_unforgotten_unary_echo_without_a_forget() {
     assert!(!fixture.actor.sessions.contains_key(&key.scope()));
     assert!(!fixture.actor.owner_forgets.contains_key(&key));
 }
+
+/// M7-C92, review F1: two concurrent finite echoes completing out of order.
+/// A's FIN acknowledges only the relay's DATA, so A waits for a standalone
+/// ACK; B (the higher stream ID) completes fully acknowledged and is
+/// forgotten, which raises the reclamation watermark past A.  A's late ACK
+/// must still reach A's tombstone and release it.  Without that, A leaks until
+/// the session closes, and 128 such leaks refuse `dispatch_echo`
+/// `RESOURCE_EXHAUSTED` -- the M6-C62 wedge by another route.
+#[tokio::test]
+async fn late_ack_below_the_watermark_still_forgets_an_out_of_order_unary_echo() {
+    let mut fixture = FreezeFixture::new("unary-out-of-order", false);
+    let (stream_a, operation_a, _, mut receiver_a) = fixture.admit_unary_echo(UNARY_BODY).await;
+    let (stream_b, operation_b, _, mut receiver_b) = fixture.admit_unary_echo(UNARY_BODY).await;
+    assert!(stream_a < stream_b);
+    fixture.authorize_unary_echo(stream_a);
+    fixture.authorize_unary_echo(stream_b);
+    assert_eq!(sequenced(&drain_data(&mut fixture.old_rx)).len(), 4);
+
+    fixture
+        .connector_echo_response(stream_a, UNARY_REPLY, 1)
+        .await;
+    assert!(matches!(receiver_a.try_recv(), Ok(EchoOutcome::Success(_))));
+    assert!(FreezeFixture::stream_forgets(&fixture.drain_control()).is_empty());
+
+    fixture
+        .connector_echo_response(stream_b, UNARY_REPLY, 2)
+        .await;
+    assert!(matches!(receiver_b.try_recv(), Ok(EchoOutcome::Success(_))));
+    let forgets = FreezeFixture::stream_forgets(&fixture.drain_control());
+    assert_eq!(
+        forgets
+            .iter()
+            .map(|forget| (forget.stream_id, forget.operation_id.clone()))
+            .collect::<Vec<_>>(),
+        vec![(stream_b, operation_b)]
+    );
+    assert!(
+        fixture.session().forgotten_stream_through >= stream_b,
+        "B's FORGET raised the watermark past A"
+    );
+
+    let generation = fixture.attempt.old_generation;
+    fixture
+        .connector_frame(Frame::ack(1, generation, stream_a, 2))
+        .await;
+    let forgets = FreezeFixture::stream_forgets(&fixture.drain_control());
+    assert_eq!(
+        forgets
+            .iter()
+            .map(|forget| (forget.stream_id, forget.operation_id.clone()))
+            .collect::<Vec<_>>(),
+        vec![(stream_a, operation_a)],
+        "A's late ACK below the watermark must release A's tombstone"
+    );
+    assert!(fixture.session().unary_tombstones.is_empty());
+}

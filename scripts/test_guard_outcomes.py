@@ -303,7 +303,10 @@ EXPECTED_GUARD_ANCHORS = {
     # Then **24**, for the `m7c92-unary-echo` suite's six cases (M7-C92: the
     # finite echo's owner STREAM_FORGET; M7-C93: its rotation fence).
     # Re-measured the same way: 25 first, which fails naming m3, then 24.
-    "m3-guard-deletion.py": 24,
+    #
+    # Then **25**, for review F1's late-ACK-below-the-watermark case.
+    # Re-measured the same way: 26 first, which fails naming m3, then 25.
+    "m3-guard-deletion.py": 25,
     # **Two harnesses that were never in this registry at all**, added by the
     # m6c3 worker (M6-C06/M6-C07).  Absence here is quieter than a stale
     # floor: every rule this file holds over a guard harness -- the
