@@ -1,0 +1,53 @@
+# Example systemd unit for `tunnel-relay serve` (task row M6-C23).
+#
+# Install: copy to /etc/systemd/system/, adjust the paths and the account,
+# `systemctl daemon-reload`, `systemctl enable --now tunnel-relay`.
+# docs/operator.md section 4 explains every setting below; the values follow
+# the measured stop behaviour in docs/runtime.md ("Stopping `connect` and
+# `serve`").
+[Unit]
+Description=Agent Tunnel relay (tunnel-relay serve)
+Documentation=https://github.com/andymac4182/agentuplink/blob/main/docs/operator.md
+Wants=network-online.target
+After=network-online.target
+# Crash-loop guard: at most 5 starts in 10 minutes, then the unit stays
+# failed until an operator looks (`systemctl reset-failed`).
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=exec
+User=agent-tunnel
+Group=agent-tunnel
+ExecStart=/usr/local/bin/tunnel-relay serve --config /etc/agent-tunnel/relay.toml
+# Readiness is the relay's /readyz endpoint (operator.md section 3.2), not the
+# process start; point your load balancer at it.
+#
+# Stop: SIGTERM to the relay process only. It prints
+# `tunnel-relay stopping: signal=SIGTERM`, drains and exits 0. A stop while it
+# is still starting exits 130, which is a clean stop here too.
+KillSignal=SIGTERM
+KillMode=mixed
+SuccessExitStatus=130
+# `serve`'s drain joins the membership runtime with no deadline of its own
+# (runtime.md), so this is the real bound on a stop: after it systemd sends
+# SIGKILL. Stopping a relay ends the device sessions it owns; devices
+# reconnect by themselves.
+TimeoutStopSec=45s
+# The relay does not retry its own startup (a Redis that is not reachable yet
+# exits 1), so systemd does, with a delay.
+Restart=on-failure
+RestartSec=10s
+# `serve` logs JSON lines to stderr; journald keeps them.
+Environment=RUST_LOG=info
+# Hardening. The relay writes only its membership state directory; adjust
+# ReadWritePaths if your configuration puts state elsewhere.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+StateDirectory=agent-tunnel
+ReadWritePaths=/var/lib/agent-tunnel
+
+[Install]
+WantedBy=multi-user.target

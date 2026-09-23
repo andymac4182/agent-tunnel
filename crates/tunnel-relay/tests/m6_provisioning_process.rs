@@ -386,11 +386,13 @@ fn connect_refused(
     name: &str,
     client_bin: &Path,
     config: &Path,
+    extra: &[&str],
 ) -> (Option<i32>, serde_json::Value, String) {
     let mut child = Command::new(client_bin)
         .args(["connect", "--config"])
         .arg(config)
         .arg("--json")
+        .args(extra)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
@@ -427,8 +429,15 @@ fn connect_refused(
 /// exit 4.  The close code and reason are asserted transitively: the message
 /// below is produced only by `classify_initial_control_close`, which requires
 /// the exact `1008 DEVICE_IDENTITY_REJECTED` close.
+///
+/// Run with `connect`'s default reconnect policy on (M6-C23): the refusal
+/// must end the process after one attempt, with no `backoff` event.
 fn expect_identity_refusal(name: &str, client_bin: &Path, config: &Path) {
-    let (code, diagnostic, out) = connect_refused(name, client_bin, config);
+    let (code, diagnostic, out) = connect_refused(name, client_bin, config, &[]);
+    assert!(
+        !out.contains("\"state\":\"backoff\""),
+        "step {name}: a terminal identity refusal must not be retried: {out}"
+    );
     assert_eq!(
         (
             code,
@@ -450,8 +459,12 @@ fn expect_identity_refusal(name: &str, client_bin: &Path, config: &Path) {
 /// Review of M6-C32: a credential that is not valid *yet* is a clock
 /// disagreement that heals by itself, so the device must see a retryable
 /// failure, not the terminal identity refusal.
+///
+/// Run with `--no-reconnect`: with reconnect on (M6-C23) a retryable refusal
+/// is retried rather than reported as the exit, and this helper is about the
+/// status the first attempt selects.
 fn expect_retryable_refusal(name: &str, client_bin: &Path, config: &Path) {
-    let (code, diagnostic, out) = connect_refused(name, client_bin, config);
+    let (code, diagnostic, out) = connect_refused(name, client_bin, config, &["--no-reconnect"]);
     assert_eq!(
         (
             code,
