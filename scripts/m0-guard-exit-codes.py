@@ -107,6 +107,8 @@ CLIENT = REPO / "crates" / "tunnel-client"
 MAIN = CLIENT / "src" / "main.rs"
 LIB = CLIENT / "src" / "lib.rs"
 DOCTOR = CLIENT / "src" / "doctor.rs"
+CREDENTIALS = CLIENT / "src" / "credentials.rs"
+CLIENT_LIB = CLIENT / "src" / "lib.rs"
 
 #: The whole client suite.  It is seconds long, and the guards here are
 #: witnessed by both the binary's unit tests and the process fixtures, which
@@ -547,6 +549,62 @@ CASES: list[Case] = [
             )
         ],
         expect_build_failure=True,
+    ),
+    Case(
+        # **M6-C25, restored exactly.**  Every refusal of the certificate by
+        # the TLS stack becomes a key mismatch again and the version check is
+        # gone, so a v1 certificate whose key matches is reported as
+        # "does not match its private key" -- what `credentials import`
+        # printed before the row.
+        "a v1 certificate is not reported as a key mismatch",
+        [
+            (
+                CREDENTIALS,
+                "    if version != x509_parser::x509::X509Version::V3 {",
+                "    if version != version {",
+            ),
+            (
+                CREDENTIALS,
+                "        Err(error) => Err(CredentialError::CertificateRefused(error.to_string())),",
+                "        Err(error) => Err(CredentialError::KeyMismatch(error.to_string())),",
+            ),
+        ],
+        frozenset(
+            {
+                "credentials::tests::"
+                "a_v1_certificate_is_refused_for_its_version_not_as_a_key_mismatch"
+            }
+        ),
+    ),
+    Case(
+        # **M6-C42, restored exactly.**  The doctor's key-match check reports
+        # any refusal as `CREDENTIAL_KEY_MISMATCH`, as it did when it called
+        # `CertifiedKey::from_der` and discarded the error.
+        "the doctor reports only a real key mismatch as one",
+        [
+            (
+                DOCTOR,
+                "        Err(error) => failed(credential_code(&error)),",
+                '        Err(_) => failed("CREDENTIAL_KEY_MISMATCH"),',
+            )
+        ],
+        frozenset({"doctor::tests::an_unusable_certificate_is_invalid_not_a_key_mismatch"}),
+    ),
+    Case(
+        # **M6-C32.**  The relay's identity refusal is left unclassified, so
+        # the device reports the close as a retryable transport loss -- the
+        # row's measured symptom, and what an automatic reconnect would
+        # retry forever.  The process-level half of this rule needs a relay
+        # and Redis and is run by `scripts/m6-provisioning-verify.sh`.
+        "the relay's identity refusal is a terminal credential error",
+        [
+            (
+                CLIENT_LIB,
+                "        && &*frame.reason == CONTROL_IDENTITY_REJECTED_CLOSE_REASON)",
+                '        && &*frame.reason == "defeated")',
+            )
+        ],
+        frozenset({"tests::an_identity_rejected_close_is_a_non_retryable_credential_error"}),
     ),
     Case(
         # The rule that replaced the string table.  Removing an arm leaves
