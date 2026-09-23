@@ -1609,6 +1609,8 @@ struct M2Actor {
     pending_authorization_refreshes: BTreeMap<u64, PendingAuthorizationRefresh>,
     accepting: bool,
     writes_frozen: bool,
+    /// Streams ended because their operation authorization lapsed.
+    auth_expired_streams: u64,
     pending_outputs: VecDeque<PendingOutput>,
     pending_output_bytes: usize,
     peer_fence: Option<FenceSnapshot>,
@@ -1771,6 +1773,7 @@ async fn run_m2_session(
         pending_authorization_refreshes: BTreeMap::new(),
         accepting: true,
         writes_frozen: false,
+        auth_expired_streams: 0,
         pending_outputs: VecDeque::new(),
         pending_output_bytes: 0,
         peer_fence: None,
@@ -2390,6 +2393,24 @@ impl M2Actor {
             open_retired_ranges_coalesced: self.retired_streams.coalesced_gaps,
             emitted_sequences: emitted,
             received_sequences: received,
+            stream_auth: crate::StreamAuthCounters {
+                unconfirmed_streams: self
+                    .streams
+                    .values()
+                    .filter(|stream| !stream.auth.confirmed)
+                    .count(),
+                refreshes_in_flight: self
+                    .streams
+                    .values()
+                    .filter(|stream| stream.auth.refresh_in_flight)
+                    .count(),
+                buffered_inputs: self
+                    .streams
+                    .values()
+                    .map(|stream| stream.pending.len())
+                    .sum(),
+                expired_streams: self.auth_expired_streams,
+            },
             drain_fences: rotation_status
                 .writers_frozen
                 .iter()
@@ -8232,6 +8253,11 @@ impl M2Actor {
         }
         self.http_abort(stream_id, M2_RESET_AUTH_EXPIRED);
         if let Some(stream) = self.streams.get_mut(&stream_id) {
+            // Counted once per stream: `expire_stream` is currently re-run on
+            // every tick for a stream already expired (task row M6-C88).
+            if !stream.auth.invalidated {
+                self.auth_expired_streams = self.auth_expired_streams.saturating_add(1);
+            }
             stream.auth.invalidated = true;
             // An expired authorization deadline stops filesystem dispatch at
             // the provider too: its next host call closes the session instead.
@@ -8934,6 +8960,7 @@ mod tests {
             pending_authorization_refreshes: BTreeMap::new(),
             accepting: true,
             writes_frozen: false,
+            auth_expired_streams: 0,
             pending_outputs: VecDeque::new(),
             pending_output_bytes: 0,
             peer_fence: None,

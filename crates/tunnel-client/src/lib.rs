@@ -255,6 +255,27 @@ pub struct ConnectionStatus {
     /// is the counter a filesystem export has that nothing else does. Zero for
     /// a session that served no filesystem stream.
     pub fs: FsCounters,
+    /// Per-stream operation authorization, summed over live streams.
+    /// Counters only, like `fs`.
+    pub stream_auth: StreamAuthCounters,
+}
+
+/// The connector's view of stream operation authorization.
+///
+/// A stream's input is buffered, not dispatched, while its authorization is
+/// unconfirmed, and an authorization that lapses ends the stream with a RESET
+/// and discards what was buffered. These are the counters that tell those
+/// states apart when a request is lost (task row M6-C84).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct StreamAuthCounters {
+    /// Live streams whose authorization is not currently confirmed.
+    pub unconfirmed_streams: usize,
+    /// Live streams with an authorization refresh challenge in flight.
+    pub refreshes_in_flight: usize,
+    /// Inbound records buffered across live streams, awaiting authorization.
+    pub buffered_inputs: usize,
+    /// Streams this session ended because their authorization lapsed.
+    pub expired_streams: u64,
 }
 
 /// The filesystem mutation ledger as a session total.
@@ -338,6 +359,7 @@ impl Default for ConnectionStatus {
             active_local_addr: None,
             candidate_local_addr: None,
             fs: FsCounters::default(),
+            stream_auth: StreamAuthCounters::default(),
         }
     }
 }
