@@ -689,7 +689,7 @@ to the new Redis run after its continuity check`. Device sessions end with
 themselves; a reconnect can wait out the previous session's owner lease, up
 to 30 s. Measured locally with `docker restart` of an AOF Redis and the
 shipped binaries (`scripts/m6-redis-restart-verify.sh`): the echo was served
-again 39 to 43 s after the restart, from the same relay process. **Not run on
+again 39 to 52 s after the restart, from the same relay process. **Not run on
 Fly.** Each re-binding attempt is a lane reconnect, which has 2 s including
 the DNS lookup of `agentuplink-redis.internal` (M6-C74); a lookup slower than
 that fails the attempt and the relay tries again on its next token, every

@@ -1070,7 +1070,7 @@ relay would know only its own tokens. The relay itself stays up across the
 restart; device sessions end with `AUTHORITY_UNAVAILABLE` and the devices
 reconnect by themselves. Measured with the shipped binaries and `docker
 restart` of an AOF Redis (`scripts/m6-redis-restart-verify.sh`): the echo was
-served again 39 to 43 s after the restart, most of it the previous session's
+served again 39 to 52 s after the restart, most of it the previous session's
 owner lease (M6-C40).
 
 A relay that was not running across the restart has no token to compare, so
