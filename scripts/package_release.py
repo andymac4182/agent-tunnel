@@ -13,6 +13,15 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 BINARIES = ("tunnel-client", "tunnel-relay", "tunnel-deadman")
+# The relay ships only for Unix targets: it has never run on Windows, and
+# docs/architecture.md promises Linux relay images and Windows *device*
+# binaries (task row M6-C83). A Windows bundle is the device half.
+DEVICE_BINARIES = ("tunnel-client", "tunnel-deadman")
+
+
+def binaries_for(target):
+    """The binaries one target's bundle carries."""
+    return DEVICE_BINARIES if target.endswith("windows-msvc") else BINARIES
 
 
 TRIPLE_RE = re.compile(r"[0-9a-z_]+(?:-[0-9a-z_.]+){2,3}")
@@ -96,7 +105,7 @@ def package(root, target, sha, run, output, metadata):
     with tempfile.TemporaryDirectory() as temporary:
         staging = Path(temporary)
         (staging / "bin").mkdir()
-        for binary in BINARIES:
+        for binary in binaries_for(target):
             name = binary + (".exe" if windows else "")
             source = root / "target" / target / "release" / name
             if not source.is_file() or source.stat().st_size == 0:
@@ -104,7 +113,8 @@ def package(root, target, sha, run, output, metadata):
             shutil.copy2(source, staging / "bin" / name)
         shutil.copy2(root / "LICENSE", staging / "LICENSE")
         (staging / "examples").mkdir()
-        for name in ("m1-client.toml", "m1-relay.toml"):
+        examples = ("m1-client.toml",) if windows else ("m1-client.toml", "m1-relay.toml")
+        for name in examples:
             shutil.copy2(root / "examples" / name, staging / "examples" / name)
         notices = staging / "notices"
         notices.mkdir()
@@ -123,7 +133,12 @@ def package(root, target, sha, run, output, metadata):
         (notices / "dependencies.json").write_text(json.dumps(dependencies, indent=2) + "\n")
         manifest = {"version": tag, "sourceSha": sha, "ciRun": run, "target": target, "channel": "development"}
         (staging / "release.json").write_text(json.dumps(manifest, indent=2) + "\n")
-        (staging / "README.txt").write_text("Agent Uplink development build. Not production-certified.\nKeep all three binaries together, including tunnel-deadman.\nConfigure identity, relay and grants before connecting.\nLinux builds require a compatible glibc (Ubuntu 24.04 build host).\nmacOS binaries are not code-signed or notarized; Windows binaries are not Authenticode-signed.\nSetup and support: https://agentuplink.dev/docs/setup\n")
+        keep = (
+            "Keep tunnel-client and tunnel-deadman together. This Windows bundle is the device half: the relay runs only on Linux and macOS.\n"
+            if windows
+            else "Keep all three binaries together, including tunnel-deadman.\n"
+        )
+        (staging / "README.txt").write_text("Agent Uplink development build. Not production-certified.\n" + keep + "Configure identity, relay and grants before connecting.\nLinux builds require a compatible glibc (Ubuntu 24.04 build host).\nmacOS binaries are not code-signed or notarized; Windows binaries are not Authenticode-signed.\nSetup and support: https://agentuplink.dev/docs/setup\n")
         if windows:
             with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as handle:
                 for file in sorted(staging.rglob("*")):

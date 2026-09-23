@@ -746,7 +746,11 @@ mod tests {
             }
         ));
 
-        let connection = timeout(Duration::from_secs(1), TcpStream::connect(address))
+        // Five seconds, not one: Windows answers a connect to a closed
+        // loopback port only after retrying the refused SYN (about two
+        // seconds), where Unix refuses at once. The assertion below is what
+        // can fail; this bound only keeps the check from hanging.
+        let connection = timeout(Duration::from_secs(5), TcpStream::connect(address))
             .await
             .expect("released listener connection check timed out");
         assert!(
@@ -828,7 +832,11 @@ mod tests {
             TransportError::InvalidSocketConfiguration { requested_bytes: 0 }
         ));
 
-        let connection = timeout(Duration::from_secs(1), TcpStream::connect(address))
+        // Five seconds, not one: Windows answers a connect to a closed
+        // loopback port only after retrying the refused SYN (about two
+        // seconds), where Unix refuses at once. The assertion below is what
+        // can fail; this bound only keeps the check from hanging.
+        let connection = timeout(Duration::from_secs(5), TcpStream::connect(address))
             .await
             .expect("released listener connection check timed out");
         assert!(

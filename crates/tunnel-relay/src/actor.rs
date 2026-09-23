@@ -20195,6 +20195,21 @@ mod stream_identity_tests {
         attempt: RotationAttemptIdentity,
         deadline: u64,
     ) -> RotationRuntime {
+        test_rotation_runtime_with_config(now, attempt, deadline, RotationConfig::default())
+    }
+
+    /// [`test_rotation_runtime`] with an explicit policy. The rotation-due
+    /// tests use a short interval: making a rotation due means backdating
+    /// `last_rotation` by one interval, and `Instant` cannot go back further
+    /// than the host's monotonic clock, which starts near boot. The default
+    /// 300 s interval failed on a freshly booted Windows CI runner and would
+    /// on any host up for less than that.
+    pub(super) fn test_rotation_runtime_with_config(
+        now: u64,
+        attempt: RotationAttemptIdentity,
+        deadline: u64,
+        config: RotationConfig,
+    ) -> RotationRuntime {
         let session_id = attempt.session_id.clone();
         let owner_id = attempt.owner_id.clone();
         let epoch = attempt.epoch;
@@ -20205,7 +20220,7 @@ mod stream_identity_tests {
                 epoch,
                 attempt.old_generation,
                 attempt.old_connection_id.clone(),
-                RotationConfig::default(),
+                config,
             )
             .expect("test rotation state"),
             attempt: Some(attempt),
@@ -21608,6 +21623,12 @@ mod stream_identity_tests {
         }
     }
 
+    /// A valid policy whose interval is short enough to backdate on a freshly
+    /// booted host (see `test_rotation_runtime_with_config`).
+    fn due_test_config() -> RotationConfig {
+        RotationConfig::new(5_000, 1_000, 2_000).expect("short rotation-due policy")
+    }
+
     /// Install an M2 session whose pure rotation machine is `Active` on
     /// `old_connection_id` with no attempt, a live data carrier, and a policy
     /// timer that is already due, so the next maintenance tick starts a
@@ -21639,9 +21660,17 @@ mod stream_identity_tests {
         });
         session.queue_budget = queue_budget;
         session.rotation = Some(rotation);
+        // Due by exactly one configured interval, which the callers keep short
+        // (see `test_rotation_runtime_with_config`).
+        let interval = std::time::Duration::from_millis(
+            session
+                .rotation
+                .as_ref()
+                .map_or(0, |rotation| rotation.state.config().rotation_interval_ms),
+        );
         session.last_rotation = std::time::Instant::now()
-            .checked_sub(std::time::Duration::from_secs(600))
-            .expect("monotonic clock predates one rotation interval");
+            .checked_sub(interval)
+            .expect("the host's monotonic clock is younger than the test rotation interval");
         data_rx
     }
 
@@ -21673,7 +21702,8 @@ mod stream_identity_tests {
             .expect("owner identity");
         let attempt = session_attempt(&key, &owner_id, "local-prepare-queue", 1);
         let old_connection_id = attempt.old_connection_id.clone();
-        let mut rotation = test_rotation_runtime(now_ms, attempt, now_ms + 60_000);
+        let mut rotation =
+            test_rotation_runtime_with_config(now_ms, attempt, now_ms + 60_000, due_test_config());
         rotation.attempt = None;
         rotation.attempt_deadline_ms = None;
         rotation.old_connection_id = old_connection_id.clone();
@@ -21736,7 +21766,8 @@ mod stream_identity_tests {
             .expect("owner identity");
         let attempt = session_attempt(&key, &owner_id, "connection-history-exhausted", 1);
         let old_connection_id = attempt.old_connection_id.clone();
-        let mut rotation = test_rotation_runtime(now_ms, attempt, now_ms + 60_000);
+        let mut rotation =
+            test_rotation_runtime_with_config(now_ms, attempt, now_ms + 60_000, due_test_config());
         rotation.attempt = None;
         rotation.attempt_deadline_ms = None;
         rotation.old_connection_id = old_connection_id.clone();

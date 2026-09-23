@@ -41,12 +41,33 @@ jobs:
       - name: Check lints
         run: cargo +1.95.0 clippy --workspace --all-targets --locked -- -D warnings
       - name: Run tests
-        run: cargo +1.95.0 test --workspace --all-targets --locked
+        # `--no-fail-fast`: one failing test binary no longer hides every one
+        # after it. The first hosted runs after the billing block each showed
+        # only the first failure per OS, and the job still fails on any.
+        #
+        # Windows excludes tunnel-relay's own tests: the relay is not built
+        # for Windows and refuses to start there (task row M6-C83). It still
+        # compiles and passes clippy above, and its dependents' tests run.
+        run: |
+          set -euo pipefail
+          # A plain string, not an array: macOS runs bash 3.2, where an empty
+          # array under `set -u` is an unbound variable.
+          exclude=""
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            exclude="--exclude tunnel-relay"
+          fi
+          # shellcheck disable=SC2086
+          cargo +1.95.0 test --workspace --all-targets --locked --no-fail-fast $exclude
       - name: Validate example configurations
         run: |
           set -euo pipefail
           cargo +1.95.0 run --locked -p tunnel-client -- config check --config examples/m1-client.toml
           cargo +1.95.0 run --locked -p tunnel-client -- check-config examples/client.toml
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            # The relay refuses to start off Unix (task row M6-C83); the
+            # relay examples are validated on the Linux and macOS jobs.
+            exit 0
+          fi
           cargo +1.95.0 run --locked -p tunnel-relay -- check-config examples/relay.toml
           # Dry-run every runnable serving example with the ServeConfig that
           # `serve --config` itself constructs. The legacy `check-config` above

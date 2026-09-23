@@ -1,0 +1,6 @@
+# Check text out with LF on every host. The Windows CI runner's git defaults
+# to core.autocrlf=true, which rewrote checked-in fixtures that tests compare
+# byte for byte (docs/contracts/filesystem-capabilities.example.json,
+# packages/client/fuzz/*.jsonl) and failed them on Windows only. Every text
+# file in the index is already LF, so this changes no committed content.
+* text=auto eol=lf

@@ -1,3 +1,7 @@
+// Off Unix `main` refuses before running any command (task row M6-C83), so
+// everything it would have called is unused there rather than wrong.
+#![cfg_attr(not(unix), allow(dead_code, unused_imports))]
+
 use std::{
     env,
     error::Error,
@@ -52,7 +56,28 @@ use tunnel_transport::{
 /// exits have no blocking work left and do not wait at all.
 const RUNTIME_SHUTDOWN_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// The relay runs only on Unix hosts (task row M6-C83). It has never run on
+/// Windows: its private state files, permission checks and signal handling
+/// assume a Unix host, and docs/architecture.md promises Linux relay images
+/// and Windows *device* binaries. Refusing here, before any command, keeps a
+/// Windows build from starting a relay that cannot keep its own guarantees.
+#[cfg(not(unix))]
+const UNSUPPORTED_HOST: &str = "tunnel-relay: the relay runs only on Linux and macOS; on Windows, run the device binaries (tunnel-client) instead";
+
 fn main() -> ExitCode {
+    #[cfg(not(unix))]
+    {
+        eprintln!("{UNSUPPORTED_HOST}");
+        ExitCode::from(2)
+    }
+    #[cfg(unix)]
+    {
+        run_on_unix()
+    }
+}
+
+#[cfg(unix)]
+fn run_on_unix() -> ExitCode {
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

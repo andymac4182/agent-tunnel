@@ -9,10 +9,10 @@
 //!   metadata, exactly as before this module existed.
 //! * **Windows:** the volume serial number and the 64-bit file index that
 //!   `GetFileInformationByHandle` reports, read through `winapi-util`, which
-//!   has no unsafe code at this call site. A path is opened for this with
-//!   `FILE_FLAG_BACKUP_SEMANTICS`, which directories need, and
-//!   `FILE_FLAG_OPEN_REPARSE_POINT`, so a link is identified as itself and not
-//!   followed. `std`'s own `volume_serial_number` and `file_index` are
+//!   has no unsafe code at this call site. A path is opened once, with access
+//!   `0`, `FILE_FLAG_BACKUP_SEMANTICS` (which directories need) and
+//!   `FILE_FLAG_OPEN_REPARSE_POINT` (so a link is identified as itself and not
+//!   followed), and that one handle supplies both metadata and identity. `std`'s own `volume_serial_number` and `file_index` are
 //!   unstable (`windows_by_handle`), and a comparison of timestamps, size and
 //!   attributes is not an identity: a directory's last-write time moves on
 //!   every create and rename inside it, and every one of those fields can be
@@ -36,9 +36,7 @@ struct FileIdentity {
 impl Observed {
     /// Observe `path` without following a final symbolic link.
     pub(crate) fn path_no_follow(path: &Path) -> io::Result<Self> {
-        let metadata = fs::symlink_metadata(path)?;
-        let identity = identity_of_path(path, &metadata)?;
-        Ok(Self { metadata, identity })
+        observe_path_no_follow(path)
     }
 
     /// Observe an open file or directory handle.
@@ -63,8 +61,10 @@ impl Deref for Observed {
 }
 
 #[cfg(unix)]
-fn identity_of_path(_path: &Path, metadata: &fs::Metadata) -> io::Result<FileIdentity> {
-    Ok(unix_identity(metadata))
+fn observe_path_no_follow(path: &Path) -> io::Result<Observed> {
+    let metadata = fs::symlink_metadata(path)?;
+    let identity = unix_identity(&metadata);
+    Ok(Observed { metadata, identity })
 }
 
 #[cfg(unix)]
@@ -81,19 +81,23 @@ fn unix_identity(metadata: &fs::Metadata) -> FileIdentity {
     }
 }
 
+/// One handle, opened without following a final reparse point, supplies both
+/// the metadata and the identity, so the two cannot describe different files.
+/// Access `0` is what `std`'s own `symlink_metadata` requests: it asks for no
+/// rights on the file, so it cannot be refused where `FILE_READ_ATTRIBUTES`
+/// could be.
 #[cfg(windows)]
-fn identity_of_path(path: &Path, _metadata: &fs::Metadata) -> io::Result<FileIdentity> {
+fn observe_path_no_follow(path: &Path) -> io::Result<Observed> {
     use std::os::windows::fs::OpenOptionsExt;
-    // FILE_READ_ATTRIBUTES: enough for GetFileInformationByHandle, and
-    // grantable where read access is not.
-    const FILE_READ_ATTRIBUTES: u32 = 0x0080;
     const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
     let file = fs::OpenOptions::new()
-        .access_mode(FILE_READ_ATTRIBUTES)
+        .access_mode(0)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)?;
-    windows_identity(&file)
+    let metadata = file.metadata()?;
+    let identity = windows_identity(&file)?;
+    Ok(Observed { metadata, identity })
 }
 
 #[cfg(windows)]
@@ -111,7 +115,7 @@ fn windows_identity(file: &fs::File) -> io::Result<FileIdentity> {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn identity_of_path(_path: &Path, _metadata: &fs::Metadata) -> io::Result<FileIdentity> {
+fn observe_path_no_follow(_path: &Path) -> io::Result<Observed> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "file identity is not available on this host",

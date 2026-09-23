@@ -4,7 +4,7 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
-from package_release import BINARIES, TARGETS, package, version
+from package_release import BINARIES, TARGETS, binaries_for, package, version
 from publish_release import assets
 
 
@@ -34,7 +34,7 @@ class PackagingTests(unittest.TestCase):
         for target in TARGETS:
             directory = self.root / "target" / target / "release"
             directory.mkdir(parents=True)
-            for name in BINARIES:
+            for name in binaries_for(target):
                 binary = directory / (name + (".exe" if target.endswith("windows-msvc") else ""))
                 binary.write_bytes(b"synthetic binary")
                 binary.chmod(0o755)
@@ -64,6 +64,9 @@ class PackagingTests(unittest.TestCase):
             self.assertIn("notices/dependencies.json", names)
             self.assertIn("LICENSE", names)
             self.assertTrue(any("tunnel-deadman" in name for name in names))
+            # The relay is in every Unix bundle and in no Windows bundle.
+            has_relay = any("tunnel-relay" in name for name in names)
+            self.assertEqual(has_relay, not manifest["target"].endswith("windows-msvc"), file.name)
             self.assertEqual(manifest["sourceSha"], self.sha)
 
     def test_missing_helper_fails(self):
