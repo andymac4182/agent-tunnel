@@ -1159,6 +1159,12 @@ fn handle_connection_command(
             true
         }
         ConnectionCommand::Pause { direction, reply } => {
+            // Count before the direction control can acknowledge: callers
+            // read `stats()` as soon as `pause` returns to prove the exact
+            // direction was paused, and the reply wakes them on another
+            // worker thread (task row M7-C103).  The oneshot reply orders
+            // this increment before the caller's read.
+            increment_pause(stats, direction);
             match direction {
                 Direction::ClientToTarget => {
                     client_to_target.pause(reply, immediate_pause);
@@ -1167,7 +1173,6 @@ fn handle_connection_command(
                     target_to_client.pause(reply, immediate_pause);
                 }
             }
-            increment_pause(stats, direction);
             false
         }
         ConnectionCommand::Resume { direction, reply } => {
@@ -1693,6 +1698,67 @@ mod tests {
 
         control.shutdown().await.expect("control shutdown");
         data.shutdown().await.expect("data shutdown");
+        proxy.shutdown().await.expect("shutdown");
+        target_task.await.expect("target task");
+    }
+
+    /// Task row M7-C103: an acknowledged pause must already be counted.
+    ///
+    /// Callers read `stats()` straight after `pause` returns to prove the
+    /// exact direction was paused (the queue-saturation gate does).  The ack
+    /// used to be sent before the counter was incremented, so on a
+    /// multi-threaded runtime the woken caller could read the old count.  The
+    /// check runs many times because each iteration only opens the window.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_acknowledged_pause_is_already_counted() {
+        const ITERATIONS: u64 = 2_000;
+        let target = TcpListener::bind(("127.0.0.1", 0)).await.expect("target");
+        let target_addr = target.local_addr().expect("target addr");
+        let target_task = tokio::spawn(spawn_echo_target(target, 1));
+        let proxy = TcpProxy::bind(target_addr, ProxyConfig::default())
+            .await
+            .expect("proxy");
+        let mut client = tokio::net::TcpStream::connect(proxy.local_addr())
+            .await
+            .expect("client");
+        wait_for_accepts(&proxy, 1).await;
+        // One round trip, so the route is fully established before pausing.
+        client.write_all(b"x").await.expect("client write");
+        let mut byte = [0_u8; 1];
+        client.read_exact(&mut byte).await.expect("client read");
+        let id = proxy
+            .diagnostics()
+            .last_connection_id
+            .expect("connection id");
+
+        let mut uncounted = 0_u64;
+        for iteration in 1..=ITERATIONS {
+            proxy
+                .pause(Direction::TargetToClient, id)
+                .await
+                .expect("pause");
+            if proxy.stats().paused_target_to_client < iteration {
+                uncounted += 1;
+            }
+            proxy
+                .resume(Direction::TargetToClient, id)
+                .await
+                .expect("resume");
+            // Let the counter settle so every iteration starts from `iteration`.
+            for _ in 0..1_000 {
+                if proxy.stats().paused_target_to_client >= iteration {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        }
+        assert_eq!(
+            uncounted, 0,
+            "{uncounted} of {ITERATIONS} acknowledged pauses were not yet counted"
+        );
+        assert_eq!(proxy.stats().paused_target_to_client, ITERATIONS);
+
+        client.shutdown().await.expect("client shutdown");
         proxy.shutdown().await.expect("shutdown");
         target_task.await.expect("target task");
     }
