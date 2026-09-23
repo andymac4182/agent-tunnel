@@ -6448,7 +6448,11 @@ async fn start_cli_smoke(
             .arg("connect")
             .arg("--config")
             .arg(profile.config_path.to_string_lossy().to_string())
-            .arg("--json"),
+            .arg("--json")
+            // M6-C23: these gates assert what happens when the first
+            // session ends (a typed exit, the owner released), so the CLI
+            // must not reconnect by itself.
+            .arg("--no-reconnect"),
     )
     .await?;
     let mut process = process;

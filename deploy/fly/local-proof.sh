@@ -12,7 +12,8 @@
 #   - every secret reaches the containers as an environment variable, as
 #     `fly secrets import` delivers it;
 #   - provisioning runs in one-off containers of the relay image with the
-#     records copied in, as `fly machine run --rm --file-local` does.
+#     records copied in, as deploy-fly.md 6.2's `fly machine run --restart no
+#     --detach --file-local ...` does before the machine is destroyed.
 # A real tunnel-client on the host connects with a device certificate and a
 # consumer request is echoed through it. Then `docker stop` must end the relay
 # with its orderly SIGTERM path (exit 0), not a kill.
@@ -155,7 +156,7 @@ ok "redis durability and listener settings: appendonly yes, appendfsync always, 
 run_id_1=$(redis_authed INFO server | sed -n 's/^run_id://p' | tr -d '\r')
 echo "redis run_id=$run_id_1"
 
-echo "== provisioning in one-off relay containers (fly machine run --rm)"
+echo "== provisioning in one-off relay containers (as fly machine run, then destroy)"
 dev=$(uuidgen | tr 'A-Z' 'a-z')
 tenant=$(uuidgen | tr 'A-Z' 'a-z')
 user=$(uuidgen | tr 'A-Z' 'a-z')

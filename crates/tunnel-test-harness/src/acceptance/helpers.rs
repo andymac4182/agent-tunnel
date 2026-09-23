@@ -181,6 +181,7 @@ pub(crate) fn write_device_profile(
         .collect(),
         limits: LimitsConfig::default(),
         rotation: RotationConfig::default(),
+        reconnect: Default::default(),
     };
     config.validate().map_err(|error| {
         HarnessError::InvalidInput(format!("generated client config is invalid: {error}"))

@@ -304,8 +304,13 @@ fn recovery_observe_does_not_read_recovery_fence_or_trusted_keys() {
         .join()
         .expect("join loopback recovery fixture");
 
-    assert_failure(&output, "recovery Redis connection failed");
+    // M6-C72: the failure keeps its bounded stage and class.
+    assert_failure(
+        &output,
+        "recovery Redis connection failed; stage=connection_establishment class=io",
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains(&redis_url), "{stderr}");
     assert!(!stderr.contains("recovery fence is corrupt"), "{stderr}");
     assert!(
         !stderr.contains("trusted recovery key document"),

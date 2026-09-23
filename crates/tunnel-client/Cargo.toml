@@ -52,5 +52,9 @@ tempfile = "3.21"
 # in the tree can, and no key material is committed.
 ring = "0.17.14"
 
+# `reconnect_cli.rs` resets a connection mid-handshake (`SO_LINGER` 0).
+[target.'cfg(unix)'.dev-dependencies]
+rustix = { version = "1.1", default-features = false, features = ["net", "std"] }
+
 [lints]
 workspace = true

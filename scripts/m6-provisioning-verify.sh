@@ -7,13 +7,22 @@
 # 1. Builds `tunnel-relay` and `tunnel-client` into the caller's target
 #    directory, so the end-to-end gate never runs a stale client.
 # 2. Runs the catalog-level tests of first activation and provisioning
-#    (`crates/tunnel-catalog/tests/redis_provisioning.rs`).
+#    (`crates/tunnel-catalog/tests/redis_provisioning.rs`), and the Redis
+#    connection stage tests (`redis_connection_stage.rs`, task row M6-C72).
 # 3. Runs the end-to-end gate (`crates/tunnel-relay/tests/m6_provisioning_process.rs`):
 #    empty namespace -> `activate-first-incarnation` -> `provision-catalog` ->
 #    `serve` + `connect` -> one echo through the tunnel, then two identity
 #    refusals (task row M6-C32) that must reach the device as a terminal
 #    CREDENTIAL_ERROR, exit 3, and a not-yet-valid credential that must stay
-#    a retryable TRANSPORT_ERROR, exit 4.
+#    a retryable TRANSPORT_ERROR, exit 4.  Before activating, it also runs
+#    `activate-first-incarnation` against a wrong Redis CA, a wrong password,
+#    an ACL user without INFO and a Redis that requires a client certificate,
+#    and requires each to print its own stage and class (M6-C72).
+# 4. Runs task row M7-C92's gate in the same binary: 300 sequential unary
+#    echoes (more than twice the connector's 128-entry OPEN retention) and
+#    two data rotations in one device session, every one answered 200, and
+#    task row M7-C93's gate: echoes paced across two rotations, capped below
+#    the retention so it can only be red for the rotation defect.
 #
 # Both tests are `#[ignore]`d in the ordinary workspace run because they need
 # Redis.  A filtered or skipped test would print `0 passed` and exit 0, so this
@@ -63,15 +72,27 @@ cargo test -p tunnel-catalog --test redis_provisioning --locked -- --ignored --t
 cat "$scratch/catalog.log"
 require "catalog provisioning tests" "$scratch/catalog.log" "test result: ok. 3 passed"
 
+echo "m6-provisioning-verify: Redis connection stage, lane and class (M6-C72)" >&2
+cargo test -p tunnel-catalog --test redis_connection_stage --locked -- --ignored --nocapture \
+  > "$scratch/stage.log" 2>&1 || { cat "$scratch/stage.log" >&2; exit 1; }
+cat "$scratch/stage.log"
+require "Redis connection stage tests" "$scratch/stage.log" "test result: ok. 3 passed" \
+  "m6c72-real ok case=auth" "m6c72-real ok case=noperm" \
+  "m6c72-real ok case=lane-timeout stage=connection_establishment"
+
 echo "m6-provisioning-verify: end-to-end shipped-binary gate" >&2
 cargo test -p tunnel-relay --test m6_provisioning_process --locked -- --ignored --nocapture \
-  > "$scratch/e2e.log" 2>&1 || { cat "$scratch/e2e.log" >&2; exit 1; }
+  --test-threads=1 > "$scratch/e2e.log" 2>&1 || { cat "$scratch/e2e.log" >&2; exit 1; }
 cat "$scratch/e2e.log"
-require "end-to-end gate" "$scratch/e2e.log" "test result: ok. 1 passed" "m6c21-e2e ok nonce=" \
+require "end-to-end gate" "$scratch/e2e.log" "test result: ok. 3 passed" "m6c21-e2e ok nonce=" \
   "client=$TUNNEL_CLIENT_BIN" \
   "m6c32 device_id mismatch exit=3 code=CREDENTIAL_ERROR retryable=false" \
   "m6c32 unknown credential key exit=3 code=CREDENTIAL_ERROR retryable=false" \
-  "m6c32 credential not yet valid exit=4 code=TRANSPORT_ERROR retryable=true"
+  "m6c32 credential not yet valid exit=4 code=TRANSPORT_ERROR retryable=true" \
+  "m6c72-stage ok case=wrong Redis CA" "m6c72-stage ok case=wrong Redis password" \
+  "m6c72-stage ok case=ACL user without INFO" "m6c72-stage ok case=missing client certificate" \
+  "m7c92-echo ok nonce=" "required=300 sessions=1" \
+  "m7c93-rotation ok nonce=" "max=120 sessions=1"
 if [ -n "${TUNNEL_RELAY_BIN:-}" ]; then
   require "end-to-end gate ran the requested relay" "$scratch/e2e.log" "relay=$TUNNEL_RELAY_BIN"
 fi
