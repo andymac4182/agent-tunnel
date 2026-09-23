@@ -11,11 +11,10 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use rustls::sign::CertifiedKey;
 use serde::Serialize;
 use tunnel_client::{
     ConnectConfig,
-    credentials::{CredentialError, load_certificates, load_private_key},
+    credentials::{CredentialError, load_certificates, load_private_key, verify_certificate_key},
 };
 
 const SCHEMA_VERSION: u8 = 1;
@@ -230,9 +229,7 @@ fn inspection(result: DoctorResult, error: Option<DoctorError>, exit_code: u8) -
 
 fn credential_error(code: &'static str) -> DoctorError {
     let message = match code {
-        "CREDENTIAL_KEY_MISMATCH" => {
-            "client certificate and private key do not match or are invalid"
-        }
+        "CREDENTIAL_KEY_MISMATCH" => "client certificate does not match the private key",
         "CREDENTIAL_PERMISSIONS" => "private credential permissions are not owner-only",
         "CREDENTIAL_EXPIRED" => "a client certificate or server CA certificate is expired",
         "CREDENTIAL_NOT_YET_VALID" => {
@@ -270,9 +267,12 @@ fn check_key_match(config: &ConnectConfig) -> Check {
         Ok(key) => key,
         Err(error) => return failed(credential_code(&error)),
     };
-    match CertifiedKey::from_der(certificates, key, &rustls::crypto::ring::default_provider()) {
-        Ok(_) => ok(),
-        Err(_) => failed("CREDENTIAL_KEY_MISMATCH"),
+    // M6-C42: only a genuine public-key mismatch is CREDENTIAL_KEY_MISMATCH.
+    // A certificate the TLS stack refuses (a v1 certificate, say) is
+    // CREDENTIAL_INVALID, as `credentials import` now reports it.
+    match verify_certificate_key(&certificates, key) {
+        Ok(()) => ok(),
+        Err(error) => failed(credential_code(&error)),
     }
 }
 
@@ -287,6 +287,14 @@ fn credential_code(error: &CredentialError) -> &'static str {
         }
         CredentialError::InvalidPem(_) | CredentialError::Tls(_) => "CREDENTIAL_INVALID",
         CredentialError::KeyMismatch(_) => "CREDENTIAL_KEY_MISMATCH",
+        CredentialError::CertificateUnparseable(_)
+        | CredentialError::UnsupportedCertificateVersion(_)
+        | CredentialError::UnsupportedPrivateKey(_)
+        | CredentialError::CertificateRefused(_)
+        | CredentialError::MissingDeviceRole(_)
+        | CredentialError::DeviceIdNotUuid(_)
+        | CredentialError::DeviceIdMismatch { .. }
+        | CredentialError::RelayRefusedIdentity => "CREDENTIAL_INVALID",
         CredentialError::AlreadyExists(_)
         | CredentialError::Provision(_)
         | CredentialError::UnsupportedPlatform(_)
@@ -888,6 +896,30 @@ mod tests {
         let json = serde_json::to_string(&inspection.output).expect("doctor serializes");
         assert!(!json.contains("PRIVATE"));
         assert!(!json.contains("BEGIN"));
+    }
+
+    /// M6-C42: a certificate the TLS stack cannot use is not a key mismatch.
+    /// Before the fix every `CertifiedKey::from_der` refusal was reported as
+    /// `CREDENTIAL_KEY_MISMATCH`, so this certificate, which is not X.509 at
+    /// all, sent the operator to compare keys.
+    #[test]
+    fn an_unusable_certificate_is_invalid_not_a_key_mismatch() {
+        let fixture = fixture(false);
+        let cert_path = fixture.directory.path().join("client.pem");
+        fs::write(
+            &cert_path,
+            "-----BEGIN CERTIFICATE-----\nMAMCAQA=\n-----END CERTIFICATE-----\n",
+        )
+        .expect("replace fixture certificate");
+        let inspection = inspect(
+            &fixture.config,
+            UNIX_EPOCH + Duration::from_secs(1_800_000_000),
+        );
+        assert!(!inspection.output.ok);
+        assert_eq!(
+            inspection.output.result.credential_key_match.code,
+            Some("CREDENTIAL_INVALID")
+        );
     }
 
     #[test]

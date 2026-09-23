@@ -20,6 +20,9 @@ bytes = "1"
 http = "1"
 http-body-util = "0.1"
 tunnel-transport = { path = "../tunnel-transport" }
+# M6-C25: `credentials import` reads the certificate version itself, so a v1
+# certificate is reported as one instead of as a key mismatch.
+x509-parser = "0.17.0"
 futures-util = { version = "0.3.31", features = ["sink", "std"] }
 rcgen = "0.13"
 rustls = { version = "0.23.38", default-features = false, features = ["ring", "std"] }
@@ -45,6 +48,9 @@ tunnel-fs-host = { path = "../tunnel-fs-host" }
 
 [dev-dependencies]
 tempfile = "3.21"
+# M6-C25: signs a genuine X.509 v1 certificate at test time; no v1 generator
+# in the tree can, and no key material is committed.
+ring = "0.17.14"
 
 [lints]
 workspace = true

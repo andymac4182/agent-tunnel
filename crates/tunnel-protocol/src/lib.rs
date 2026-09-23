@@ -15,6 +15,7 @@ pub mod sequence;
 
 pub use control::{
     AuthorizationChallenge, AuthorizationConfirmed, AuthorizationInvalidated,
+    CONTROL_IDENTITY_REJECTED_CLOSE_CODE, CONTROL_IDENTITY_REJECTED_CLOSE_REASON,
     CONTROL_OWNER_BUSY_CLOSE_CODE, CONTROL_OWNER_BUSY_CLOSE_REASON, Cancel, Control, ControlError,
     ControlMessage, DataReady, GoAway, Hello, MAX_AUTHORIZATION_MESSAGE_BYTES,
     MAX_CONTROL_MESSAGE_BYTES, MAX_RESULT_DETAIL_BYTES, Message, Open, Opened, Ping, Pong,

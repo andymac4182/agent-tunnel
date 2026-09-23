@@ -163,9 +163,19 @@ named by the catalog service UUID. The example profile and
 `examples/m6-catalog.toml` share synthetic placeholder UUIDs; generate your own
 with `uuidgen` and change both files together. Before M6-C30 the example
 profile used `m1-device-a` and an export named `echo`, and could never be
-served. A mismatch is hard to diagnose: a wrong `device_id` makes `connect`
-exit with only `TRANSPORT_ERROR` "control read failed" (M6-C32), and a wrong
-export name makes every call fail with `DEVICE_REJECTED`:
+served. `credentials import` refuses a certificate whose SAN names a device
+other than `device_id`. It compares them as UUIDs, as the relay does, so case
+and hyphens do not matter. If the profile or the catalog changes afterwards, the
+relay refuses the session and `connect` exits `3` with a non-retryable
+`CREDENTIAL_ERROR`, "the relay refused this device's identity" (M6-C32). The
+relay gives the same refusal for a certificate key the catalog does not hold,
+and it does not say which check failed. A credential whose catalog
+`not_before` is still in the future is different. That is clock skew, not a
+wrong identity, so `connect` reports it as a retryable `TRANSPORT_ERROR`. A cluster relay is different. It
+looks the key up before routing and, for an unknown key, still closes the
+socket without a reason. That reads as a retryable `TRANSPORT_ERROR` (M6-C43,
+read from the source, not measured). A wrong export name still makes every
+call fail with `DEVICE_REJECTED`:
 
 ```console
 $ mkdir trial
@@ -193,12 +203,16 @@ exit=3
 The next four commands stand in for an issuer so this rehearsal can finish on
 one machine. They create a throwaway, synthetic CA that is valid for two days.
 Do not use it for anything else. The certificate must be X.509 v3 and carry the
-device's role SAN, which is why the extensions file is there. A v1 certificate
-is refused on import with a message that wrongly blames a key mismatch
-(M6-C25). A certificate without the SAN imports cleanly, but the relay's
-device listener cannot parse a device identity from it (read from the source);
-`provision-catalog` refuses such a certificate before anything is written
-(section 2.3):
+device's role SAN, which is why the extensions file is there. Without one,
+macOS's bundled `openssl` (LibreSSL) issues a v1 certificate. OpenSSL 3 issues
+v3, but with no role SAN. `credentials import` refuses both before installing
+anything, and names the fault each time (M6-C25): "client certificate is X.509
+v1; the relay accepts only v3 certificates", "client certificate has no device
+role URI SAN", or, for a SAN naming another device, "names device ... in its
+role SAN but the profile's device_id is ...". Only a certificate whose public
+key is not the pending key's is reported as "does not match its private key".
+`provision-catalog` also refuses a certificate without the SAN before it
+writes anything (section 2.3):
 
 ```console
 $ mkdir -m 700 trial-ca
@@ -269,7 +283,10 @@ reads the relay configuration, the records and the certificate, applies every
 rule the write applies, and contacts no Redis. It derives the credential's
 SPKI pin and validity from the certificate with the parser the relay's device
 listener uses, and refuses a certificate whose role SAN does not name
-`device.id`:
+`device.id`. Operation names are matched exactly. There are no wildcards, so
+the dry run refuses any name containing `*` with "wildcards are not
+supported" (M6-C36). Before that change, `operations = ["*"]` was accepted
+and provisioned a grant that authorized nothing:
 
 ```console
 $ cp examples/m6-catalog.toml trial/catalog.toml

@@ -234,6 +234,17 @@ fn operation_set(
                 "{field} entries must be non-empty names without surrounding whitespace"
             )));
         }
+        // M6-C36: a grant is checked by exact name (`PermissionSet::allows`)
+        // and the catalog stores names opaquely, so `*` would be kept as a
+        // literal operation that nothing ever asks for: a grant that looks
+        // like "everything" and authorizes nothing.  No adapter defines a
+        // name containing `*`, so refusing it rejects no real operation.
+        if operation.contains('*') {
+            return Err(ProvisioningError::Records(format!(
+                "{field} entry {operation:?} contains '*': wildcards are not supported; \
+                 list each operation by its exact name, such as echo:invoke"
+            )));
+        }
         if !set.insert(operation.clone()) {
             return Err(ProvisioningError::Records(format!(
                 "{field} lists an operation twice"
@@ -689,6 +700,14 @@ mod tests {
         assert!(operation_set("f", &["".into()]).is_err());
         assert!(operation_set("f", &[" echo:invoke".into()]).is_err());
         assert!(operation_set("f", &["a".into(), "a".into()]).is_err());
+        // M6-C36: wildcards, whole or partial, are refused by name.
+        for wildcard in ["*", "echo:*", "*:invoke"] {
+            let error = operation_set("f", &[wildcard.into()]).expect_err(wildcard);
+            assert!(
+                error.to_string().contains("wildcards are not supported"),
+                "{wildcard}: {error}"
+            );
+        }
         assert_eq!(
             operation_set("f", &["echo:invoke".into()])
                 .expect("one name")

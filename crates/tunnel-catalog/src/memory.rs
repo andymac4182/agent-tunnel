@@ -241,7 +241,6 @@ impl Catalog for MemoryCatalog {
             if credential.spki_fingerprint != spki_fingerprint
                 || !credential.active
                 || credential.revoked_at.is_some()
-                || credential.not_before > at
                 || credential.expires_at <= at
             {
                 continue;
@@ -254,6 +253,11 @@ impl Catalog for MemoryCatalog {
             };
             if !device.active {
                 continue;
+            }
+            // The same order as the Redis script: refused states first, and a
+            // not-yet-valid credential is a retryable conflict, not `None`.
+            if credential.not_before > at {
+                return Err(CatalogError::Conflict(crate::RESOLVE_NOT_YET_VALID));
             }
             let owner_epoch = state
                 .owner_epochs
