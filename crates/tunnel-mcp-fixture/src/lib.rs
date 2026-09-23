@@ -83,6 +83,19 @@ pub const WRAPPER_MODE: &str = "wrapper";
 /// The binary's first argument that runs a real export supervisor a test can
 /// `SIGKILL`: `supervise <workspace>`.
 pub const SUPERVISE_MODE: &str = "supervise";
+/// The binary's first argument that runs a real export supervisor which, on
+/// a trigger, requests its child's kill and then **returns from `main` at
+/// once**: `supervise-return <workspace> <wait|nowait> <multi|single>`.  That is the shape
+/// of `tunnel-client connect`'s orderly stop, whose session actor drops its
+/// handlers (requesting every child's kill) immediately before `main`
+/// returns and the runtime is torn down (task row M6-C29).  `wait` first
+/// waits, bounded, for the supervisor's `running` counter to reach zero.
+/// `multi` runs on the binary's multi-thread runtime, as `tunnel-client`
+/// does; `single` on a current-thread runtime of its own, where nothing can
+/// poll the supervisor task before teardown.
+pub const SUPERVISE_RETURN_MODE: &str = "supervise-return";
+/// The file whose appearance tells a `supervise-return` probe to stop.
+pub const SUPERVISE_RETURN_TRIGGER: &str = "supervise.return";
 /// The binary's first argument that runs a backend which starts one escaping
 /// descendant and then behaves like an ordinary stdio server:
 /// `detach-host <route> <pid-file>`.
@@ -413,6 +426,69 @@ pub async fn run_supervise(workspace: &Path) {
     }
     // Hold the handle so nothing drops it, and wait to be killed.
     std::future::pending::<()>().await;
+    drop(handle);
+}
+
+/// Supervise [`run_wrapper`] exactly as [`run_supervise`] does, then, once
+/// [`SUPERVISE_RETURN_TRIGGER`] appears, request the child's kill and return
+/// -- after waiting for `running` to reach zero when `wait_for_reap` is set.
+///
+/// The kill request is `ChildHandle::kill`, which is what an export's
+/// `shutdown_sessions` calls and therefore what dropping `HttpHandlers` does.
+/// Returning from `main` right after it tears the runtime down with the
+/// supervisor task's group kill, reap and sentinel stand-down possibly not
+/// yet run.
+pub async fn run_supervise_then_return(workspace: &Path, wait_for_reap: bool) {
+    let Ok(executable) = std::env::current_exe() else {
+        return;
+    };
+    let backend = tunnel_mcp_export::config::StdioBackend {
+        command: executable,
+        args: vec![
+            WRAPPER_MODE.to_owned(),
+            workspace.join(WRAPPER_PID_FILE).display().to_string(),
+            workspace.join(HELPER_PID_FILE).display().to_string(),
+        ],
+        env: std::collections::BTreeMap::new(),
+        inherit_env: Vec::new(),
+        workspace: workspace.to_path_buf(),
+        max_children: 1,
+        session_idle: Duration::from_secs(600),
+    };
+    let counters = std::sync::Arc::new(tunnel_mcp_export::child::ChildCounters::default());
+    let Ok((handle, _events)) = tunnel_mcp_export::child::spawn(&backend, 1 << 20, &counters)
+    else {
+        return;
+    };
+    let wrapper = read_pid(&workspace.join(WRAPPER_PID_FILE)).await;
+    let helper = read_pid(&workspace.join(HELPER_PID_FILE)).await;
+    let armed = counters
+        .deadman_armed
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let temporary = workspace.join("supervise.tmp");
+    if tokio::fs::write(&temporary, format!("{wrapper} {helper} {armed}"))
+        .await
+        .is_err()
+        || tokio::fs::rename(&temporary, workspace.join(SUPERVISE_REPORT))
+            .await
+            .is_err()
+    {
+        return;
+    }
+    let trigger = workspace.join(SUPERVISE_RETURN_TRIGGER);
+    let deadline = tokio::time::Instant::now() + DETACH_PUBLISH_WAIT;
+    while !trigger.exists() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(RELEASE_POLL).await;
+    }
+    handle.kill();
+    if wait_for_reap {
+        let deadline = tokio::time::Instant::now() + DETACH_PUBLISH_WAIT;
+        while counters.running.load(std::sync::atomic::Ordering::Acquire) != 0
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(RELEASE_POLL).await;
+        }
+    }
     drop(handle);
 }
 

@@ -587,6 +587,9 @@ async fn run_connect(path: PathBuf, json: bool) -> Result<(), CliError> {
             message: error.to_string(),
             retryable: false,
         })?;
+    // Kept across the move so the stop path can wait for supervised MCP
+    // children to be reaped (M6-C29).
+    let mcp_children = handlers.mcp_diagnostics_source();
     let cancellation = CancellationToken::new();
     let options = ConnectOptions {
         config,
@@ -609,6 +612,47 @@ async fn run_connect(path: PathBuf, json: bool) -> Result<(), CliError> {
             return Err(interrupted_before_ready(signal));
         }
     };
+    let outcome = run_session(&handle, &mut stop, &cancellation, json).await;
+    // The session actor dropped its handlers inside `handle.stop()`, which
+    // *requests* every supervised MCP child's group kill; the kill, the reap
+    // and the sentinel stand-down run on a spawned task. Returning from
+    // `main` now would tear the runtime down with that task possibly never
+    // polled -- measured (M6-C29) to leave an in-group helper alive in 3 of
+    // 10 runs when no sentinel is installed. So wait, bounded, for the reap.
+    // Not after a second stop request abandoned the drain: that operator has
+    // asked not to wait, and the kill was never requested.
+    if !matches!(
+        &outcome,
+        Err(CliError {
+            cause: Cause::Cancelled,
+            ..
+        })
+    ) {
+        wait_for_supervised_children(&mcp_children).await;
+    }
+    outcome
+}
+
+/// Bound on waiting for supervised MCP children to be reaped after the
+/// connector stops. Their kill is `SIGKILL` to the process group, so a reap
+/// takes milliseconds; the bound only caps a defect.
+const SUPERVISED_CHILD_REAP_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+
+async fn wait_for_supervised_children(mcp: &tunnel_client::http_forward::McpExportDiagnostics) {
+    let deadline = tokio::time::Instant::now() + SUPERVISED_CHILD_REAP_BOUND;
+    while mcp.children_running() > 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+/// The live session, from ready to its end: an orderly stop on request, or
+/// the connector's own terminal cause.
+async fn run_session(
+    handle: &tunnel_client::ConnectionHandle,
+    stop: &mut StopSignals,
+    cancellation: &CancellationToken,
+    json: bool,
+) -> Result<(), CliError> {
     let mut readiness = handle.readiness();
     let initial = readiness.borrow_and_update().clone();
     if let tunnel_client::Readiness::Closed { reason } = initial {
@@ -651,7 +695,7 @@ async fn run_connect(path: PathBuf, json: bool) -> Result<(), CliError> {
                 // loop runs for the whole life of the session.
                 let signal = signal?;
                 cancellation.cancel();
-                stop_after_signal(&handle, &mut stop, signal).await?;
+                stop_after_signal(handle, stop, signal).await?;
                 if json {
                     print_ok_json("connect", ConnectResult { state: "stopped", session_id: None, epoch: None, generation: None, failure_policy: M1_TRANSPORT_FAILURE_POLICY, signal: Some(signal.name()) });
                 } else {
@@ -661,7 +705,7 @@ async fn run_connect(path: PathBuf, json: bool) -> Result<(), CliError> {
             }
             changed = readiness.changed() => {
                 if changed.is_err() {
-                    return Err(stopped_connector_error(&mut readiness, &handle, "connector supervisor stopped").await);
+                    return Err(stopped_connector_error(&mut readiness, handle, "connector supervisor stopped").await);
                 }
                 let state = readiness.borrow_and_update().clone();
                 if let tunnel_client::Readiness::Closed { reason } = state {
@@ -672,7 +716,7 @@ async fn run_connect(path: PathBuf, json: bool) -> Result<(), CliError> {
                 if changed.is_err() {
                     // The status publisher stopping must not outrank the
                     // typed terminal cause the readiness channel still holds.
-                    return Err(stopped_connector_error(&mut readiness, &handle, "connector status publisher stopped").await);
+                    return Err(stopped_connector_error(&mut readiness, handle, "connector status publisher stopped").await);
                 }
                 let current = status.borrow_and_update().clone();
                 if json && should_emit_connect_status(&last_status, &current) {

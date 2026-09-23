@@ -22,7 +22,7 @@ mod common;
 use common::{
     CheckpointServer, FixtureFiles, ProcessConfigFixture, RedisTlsProxy, free_tcp_addr, hex_encode,
     jwks_json, parse_plaintext_upstream, process_diagnostic, relay_binary_path, send_sigint,
-    wait_for_exit, wait_for_ports_released, wait_for_ready,
+    send_sigterm, wait_for_exit, wait_for_ports_released, wait_for_ready,
 };
 
 const PROCESS_DEADLINE: Duration = Duration::from_secs(8);
@@ -47,10 +47,47 @@ struct ProcessCleanupContext {
 #[tokio::test]
 #[ignore = "requires TEST_REDIS_URL; run explicitly as the C06 process gate"]
 async fn m7_configured_relay_process_accepts_one_node_cluster() {
-    run_configured_relay().await.expect("M7 process acceptance");
+    run_configured_relay(StopSignal::Interrupt)
+        .await
+        .expect("M7 process acceptance");
 }
 
-async fn run_configured_relay() -> Result<()> {
+/// The same one-node cluster, stopped the way a service manager stops it
+/// (M6-C23). Before M6-C23 `serve` handled only SIGINT, so SIGTERM killed it
+/// without running `RunningRelay::shutdown` or joining the membership
+/// runtime; this requires exit `0`, the stop markers naming SIGTERM, and
+/// every listener released.
+#[tokio::test]
+#[ignore = "requires TEST_REDIS_URL; run explicitly as the M6-C23 serving-phase SIGTERM gate"]
+async fn m7_configured_relay_process_stops_orderly_on_sigterm() {
+    run_configured_relay(StopSignal::Terminate)
+        .await
+        .expect("M6-C23 serving-phase SIGTERM");
+}
+
+#[derive(Clone, Copy, Debug)]
+enum StopSignal {
+    Interrupt,
+    Terminate,
+}
+
+impl StopSignal {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Interrupt => "SIGINT",
+            Self::Terminate => "SIGTERM",
+        }
+    }
+
+    fn send(self, pid: u32) -> Result<()> {
+        match self {
+            Self::Interrupt => send_sigint(pid),
+            Self::Terminate => send_sigterm(pid),
+        }
+    }
+}
+
+async fn run_configured_relay(stop: StopSignal) -> Result<()> {
     let relay_binary = relay_binary_path()?;
     let upstream_url = env::var("TEST_REDIS_URL").map_err(|_| HarnessError::MissingRedisUrl {
         env_var: "TEST_REDIS_URL",
@@ -221,6 +258,7 @@ async fn run_configured_relay() -> Result<()> {
     }
 
     let process_result = serve_and_probe(
+        stop,
         &relay_binary,
         &config_path,
         consumer_bind,
@@ -349,6 +387,7 @@ async fn initialize_state(binary: &Path, config: &Path) -> Result<()> {
 }
 
 async fn serve_and_probe(
+    stop: StopSignal,
     binary: &Path,
     config: &Path,
     consumer_bind: SocketAddr,
@@ -372,36 +411,75 @@ async fn serve_and_probe(
         )));
     }
 
+    let signal = stop.name();
     let Some(pid) = process.id() else {
         let diagnostic = process_diagnostic(&process);
         let _ = process.shutdown(Duration::from_millis(100)).await;
         return Err(HarnessError::Process(format!(
-            "relay exited before SIGINT; {diagnostic}"
+            "relay exited before {signal}; {diagnostic}"
         )));
     };
-    if let Err(error) = send_sigint(pid) {
+    if let Err(error) = stop.send(pid) {
         let diagnostic = process_diagnostic(&process);
         let _ = process.shutdown(Duration::from_millis(100)).await;
         return Err(HarnessError::Process(format!(
-            "relay SIGINT request: {error}; {diagnostic}"
+            "relay {signal} request: {error}; {diagnostic}"
         )));
     }
+    let signalled = std::time::Instant::now();
     let status = match wait_for_exit(&mut process, SHUTDOWN_DEADLINE).await {
         Ok(status) => status,
         Err(error) => {
             let diagnostic = process_diagnostic(&process);
             let _ = process.shutdown(Duration::from_millis(100)).await;
             return Err(HarnessError::Process(format!(
-                "relay SIGINT shutdown: {error}; {diagnostic}"
+                "relay {signal} shutdown: {error}; {diagnostic}"
             )));
         }
+    };
+    let stop_ms = signalled.elapsed().as_millis();
+    // The orderly path's own markers, so a success status cannot be an exit
+    // that skipped the drain. Both lines are written by `serve`; the second
+    // only after `RunningRelay::shutdown`, the peer task and the membership
+    // runtime have all been joined. Read from the whole captured stderr (the
+    // bounded diagnostic keeps only its head), polled briefly because the
+    // pipe drain can trail the exit.
+    let markers = [
+        format!("tunnel-relay stopping: signal={signal}"),
+        format!("tunnel-relay stopped: signal={signal}"),
+    ];
+    let marker_deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let stderr = loop {
+        let stderr = String::from_utf8_lossy(&process.stderr()).into_owned();
+        if markers.iter().all(|marker| stderr.contains(marker))
+            || std::time::Instant::now() >= marker_deadline
+        {
+            break stderr;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
     };
     let diagnostic = process_diagnostic(&process);
     let _ = process.shutdown(Duration::from_millis(100)).await?;
     if !status.success() {
         return Err(HarnessError::Process(format!(
-            "relay SIGINT exited {status}; {diagnostic}"
+            "relay {signal} exited {status}; {diagnostic}"
         )));
     }
+    for marker in &markers {
+        if !stderr.contains(marker.as_str()) {
+            let tail: String = stderr
+                .chars()
+                .rev()
+                .take(2_048)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            return Err(HarnessError::Process(format!(
+                "relay {signal} exit did not report {marker:?}; stderr tail: {tail}"
+            )));
+        }
+    }
+    eprintln!("MEASURED relay {signal} orderly stop: exit {status} after {stop_ms} ms");
     wait_for_ports_released(consumer_bind, device_bind, peer_bind).await
 }

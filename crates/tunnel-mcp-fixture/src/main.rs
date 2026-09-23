@@ -26,7 +26,7 @@ use std::path::PathBuf;
 use rmcp::ServiceExt;
 use tunnel_mcp_fixture::{
     DAEMONIZER_MODE, DESCENDANT_MODE, DETACHED_MODE, DetachRoute, FixtureServer, SUPERVISE_MODE,
-    WRAPPER_MODE,
+    SUPERVISE_RETURN_MODE, WRAPPER_MODE,
 };
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
@@ -106,6 +106,46 @@ async fn main() -> std::process::ExitCode {
                 return std::process::ExitCode::from(2);
             };
             tunnel_mcp_fixture::run_detach_host(route, &PathBuf::from(&arguments[2])).await;
+            std::process::ExitCode::SUCCESS
+        }
+        Some(mode) if mode == SUPERVISE_RETURN_MODE && arguments.len() == 4 => {
+            let wait_for_reap = match arguments[2].as_str() {
+                "wait" => true,
+                "nowait" => false,
+                _ => return std::process::ExitCode::from(2),
+            };
+            let workspace = PathBuf::from(&arguments[1]);
+            match arguments[3].as_str() {
+                // This runtime, torn down when `main` returns: the flavour
+                // `tunnel-client` runs on, where whether the supervisor task
+                // is polled first is a race.
+                "multi" => {
+                    tunnel_mcp_fixture::run_supervise_then_return(&workspace, wait_for_reap).await;
+                }
+                // A current-thread runtime of its own, dropped as soon as the
+                // probe returns: nothing else can poll the supervisor task, so
+                // the race is always lost and the outcome is deterministic.
+                "single" => {
+                    let probe = std::thread::spawn(move || {
+                        let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                        else {
+                            return false;
+                        };
+                        runtime.block_on(tunnel_mcp_fixture::run_supervise_then_return(
+                            &workspace,
+                            wait_for_reap,
+                        ));
+                        drop(runtime);
+                        true
+                    });
+                    if !probe.join().unwrap_or(false) {
+                        return std::process::ExitCode::from(1);
+                    }
+                }
+                _ => return std::process::ExitCode::from(2),
+            }
             std::process::ExitCode::SUCCESS
         }
         Some(mode) if mode == SUPERVISE_MODE && arguments.len() == 2 => {

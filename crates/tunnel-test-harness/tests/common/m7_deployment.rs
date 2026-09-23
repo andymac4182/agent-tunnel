@@ -229,6 +229,33 @@ pub(crate) fn truncate(value: &str) -> String {
     value.chars().take(4_096).collect()
 }
 
+/// Send `SIGTERM`, what systemd and launchd send to stop a service
+/// (M6-C23).
+pub(crate) fn send_sigterm(pid: u32) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let status = std::process::Command::new("/bin/kill")
+            .arg("-TERM")
+            .arg(pid.to_string())
+            .status()
+            .map_err(|error| HarnessError::Process(format!("sending SIGTERM: {error}")))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(HarnessError::Process(format!(
+                "sending SIGTERM returned {status}"
+            )))
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        Err(HarnessError::Unsupported(
+            "SIGTERM is unavailable on this host".into(),
+        ))
+    }
+}
+
 pub(crate) fn send_sigint(pid: u32) -> Result<()> {
     #[cfg(unix)]
     {

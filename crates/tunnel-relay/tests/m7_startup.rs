@@ -619,10 +619,13 @@ impl Drop for SilentPeer {
 
 /// How long after the phase is reached the signal is sent.
 const SIGNAL_AFTER_PHASE: Duration = Duration::from_millis(100);
-/// The exit must follow the signal within this. Measured in microseconds to
-/// a few milliseconds; each held phase's own timeout is 2 s from when it is
-/// reached (`REDIS_OPERATION_TIMEOUT`, `MAX_CHECKPOINT_REQUEST_TIMEOUT`), so
-/// an exit inside this bound cannot be the phase ending by itself.
+/// The exit must follow the signal within this. Measured at a few
+/// milliseconds. Each held phase also ends by itself, and measured with the
+/// handler defeated (log nonce `m6c23-relay-startup-red-*`) that came about
+/// 0.9 s after a signal sent 100 ms into the Redis phase and 1.9 s into the
+/// checkpoint phase -- each with exit `1`, which the status assertion
+/// already refuses; this bound additionally refuses a `130` that only
+/// arrived when the phase gave up.
 const SIGNAL_PROMPT_EXIT: Duration = Duration::from_millis(500);
 /// Bound on reaching the phase. Generous because the first exec of a freshly
 /// linked binary on macOS can be delayed by the system's executable scan --

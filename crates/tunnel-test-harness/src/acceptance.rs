@@ -1150,15 +1150,21 @@ async fn verify_cli_smoke(
     )
     .await;
 
-    // ManagedProcess::shutdown sends the bounded kill/cleanup path and waits
-    // for the child to be reaped.  The relay must stop dispatching before the
-    // fresh library session is allowed to claim the same device.
-    let shutdown_result = process
-        .shutdown(Duration::from_secs(5))
-        .await
-        .map_err(|error| HarnessError::Process(format!("stopping CLI smoke process: {error}")));
-    live_result?;
-    shutdown_result?;
+    // Stop the live CLI the way a service manager does: SIGTERM (M6-C23).
+    // Before M6-C23 nothing handled SIGTERM and this smoke could only
+    // force-kill the process after a five-second grace. Now it must take the
+    // orderly path -- exit 0, a `stopped` event naming the signal, promptly
+    // -- and the relay checks below then observe an orderly release rather
+    // than a dead socket. `shutdown` stays the bounded fallback: if the
+    // signal were ignored it force-kills, and the status check reports it.
+    let stop_result = match live_result {
+        Ok(()) => stop_cli_with_sigterm(process).await,
+        Err(error) => {
+            let _ = process.shutdown(Duration::from_secs(5)).await;
+            Err(error)
+        }
+    };
+    stop_result?;
     let stopped_at = Instant::now();
     loop {
         let response = consumer_request(
@@ -1219,6 +1225,81 @@ async fn verify_cli_smoke(
     )?;
     evidence.echo_requests += 1;
     let _ = device_addr;
+    Ok(())
+}
+
+/// Bound on the CLI's orderly stop after SIGTERM. Measured in tens of
+/// milliseconds; well under the five-second grace after which `shutdown`
+/// force-kills, so a signal that was ignored cannot pass as a slow stop.
+const CLI_SIGTERM_STOP_BOUND: Duration = Duration::from_secs(3);
+
+async fn stop_cli_with_sigterm(process: crate::ManagedProcess) -> Result<()> {
+    let pid = process.id().ok_or_else(|| {
+        HarnessError::Process("tunnel-client exited before its SIGTERM stop".to_owned())
+    })?;
+    let signalled = Instant::now();
+    let kill = std::process::Command::new("/bin/kill")
+        .arg("-TERM")
+        .arg(pid.to_string())
+        .status()
+        .map_err(|error| HarnessError::Process(format!("sending SIGTERM: {error}")))?;
+    if !kill.success() {
+        return Err(HarnessError::Process(format!(
+            "sending SIGTERM returned {kill}"
+        )));
+    }
+    let mut process = process;
+    let status = loop {
+        if let Some(status) = process.try_wait()? {
+            break Some(status);
+        }
+        if signalled.elapsed() > CLI_SIGTERM_STOP_BOUND {
+            break None;
+        }
+        sleep(Duration::from_millis(10)).await;
+    };
+    let elapsed = signalled.elapsed();
+    // The `stopped` event is the last line the CLI prints; poll briefly
+    // because the pipe drain can trail the exit.
+    let mut stdout = String::new();
+    for _ in 0..100 {
+        stdout = String::from_utf8_lossy(&process.stdout()).into_owned();
+        if stdout.contains(r#""state":"stopped""#) {
+            break;
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+    let reaped = process
+        .shutdown(Duration::from_secs(5))
+        .await
+        .map_err(|error| HarnessError::Process(format!("reaping CLI smoke process: {error}")))?;
+    let Some(status) = status else {
+        return Err(HarnessError::Timeout(format!(
+            "tunnel-client did not stop within {CLI_SIGTERM_STOP_BOUND:?} of SIGTERM; forced stop status {reaped}"
+        )));
+    };
+    if !status.success() {
+        return Err(HarnessError::Process(format!(
+            "tunnel-client SIGTERM stop exited {status}, not the orderly 0"
+        )));
+    }
+    let stopped = stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .any(|event| {
+            event["command"] == "connect"
+                && event["result"]["state"] == "stopped"
+                && event["result"]["signal"] == "SIGTERM"
+        });
+    if !stopped {
+        return Err(HarnessError::Process(
+            "tunnel-client SIGTERM stop printed no `stopped` event naming SIGTERM".to_owned(),
+        ));
+    }
+    eprintln!(
+        "M1 CLI smoke: SIGTERM orderly stop exit 0 after {} ms",
+        elapsed.as_millis()
+    );
     Ok(())
 }
 
