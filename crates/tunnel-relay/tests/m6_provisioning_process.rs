@@ -1882,15 +1882,17 @@ async fn m6c57_provisioned_mcp_service_answers_initialize_and_a_tool_call() {
     );
     // The device-side server itself recorded the invocation in its
     // configured workspace, so the answer came from the export's backend.
+    // The fixture records only the tool name (`FixtureServer::call_tool`
+    // writes `request.name`), so the marker cannot appear here; what binds
+    // the record to this run is that the workspace was created empty for
+    // this run and must now hold exactly the one call this gate made.
     let invocations = fs::read_to_string(fixture.work.join("device/mcp-workspace/invocations.log"))
         .unwrap_or_default();
-    let backend_invocations = invocations
-        .lines()
-        .filter(|line| line.contains("echo"))
-        .count();
-    assert!(
-        backend_invocations > 0,
-        "step mcp tools/call: the fixture server recorded no echo invocation"
+    let backend_invocations = invocations.lines().count();
+    assert_eq!(
+        invocations, "echo\n",
+        "step mcp tools/call: the fixture server must have recorded exactly this gate's one \
+         echo call in its fresh workspace"
     );
 
     // Control: the same initialize with a token for an unprovisioned
@@ -1909,7 +1911,7 @@ async fn m6c57_provisioned_mcp_service_answers_initialize_and_a_tool_call() {
     .await
     .expect("stranger request completes");
     assert!(
-        matches!(stranger_status, 401 | 403 | 404),
+        stranger_status == 401,
         "step mcp stranger: an unprovisioned subject got HTTP {stranger_status}"
     );
 
@@ -2007,7 +2009,7 @@ async fn m6c57_provisioned_acp_service_answers_initialize() {
     .await
     .expect("stranger request completes");
     assert!(
-        matches!(stranger_status, 401 | 403 | 404),
+        stranger_status == 401,
         "step acp stranger: an unprovisioned subject got HTTP {stranger_status}"
     );
 
@@ -2275,7 +2277,7 @@ async fn m6c57_provisioned_fs_service_serves_a_file_read() {
     .await
     .expect("stranger request completes");
     assert!(
-        matches!(stranger_status, 401 | 403 | 404),
+        stranger_status == 401,
         "step fs stranger: an unprovisioned subject got HTTP {stranger_status}"
     );
 

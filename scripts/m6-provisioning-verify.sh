@@ -32,10 +32,15 @@
 #    MCP `initialize` and a `tools/call`, ACP `initialize`, and a 9P read of
 #    a synthetic file.
 #
-# Both tests are `#[ignore]`d in the ordinary workspace run because they need
-# Redis.  A filtered or skipped test would print `0 passed` and exit 0, so this
-# script requires each run's own pass count and the gate's `m6c21-e2e ok`
-# line, and exits 1 when either is missing: green here means the tests ran.
+# Every Redis test these steps run is `#[ignore]`d in the ordinary workspace
+# run because it needs Redis: the 3 catalog provisioning tests, the 3 Redis
+# connection stage tests, and the 6 end-to-end tests (M6-C21, M7-C92, M7-C93
+# and the three M6-C57 service gates).  A filtered or skipped test would print
+# `0 passed` and exit 0, so this script requires each run's own pass count and
+# each gate's own `ok` line (`m6c21-e2e`, `m7c92-echo`, `m7c93-rotation`,
+# `m6c57-mcp`, `m6c57-acp`, `m6c57-fs`, each M6-C57 line with the refused
+# stranger's exact `stranger_status=401`), and exits 1 when any is missing:
+# green here means the tests ran.
 set -eu
 
 if [ -z "${TEST_REDIS_URL:-}" ]; then
@@ -99,8 +104,9 @@ cargo test -p tunnel-relay --test m6_provisioning_process --locked -- --ignored 
 cat "$scratch/e2e.log"
 require "end-to-end gate" "$scratch/e2e.log" "test result: ok. 6 passed" "m6c21-e2e ok nonce=" \
   "m6c57-mcp ok nonce=" "tools_call=200 marker_echoed=true" \
-  "m6c57-acp ok nonce=" "agent_protocol_version=1 connection_id=present" \
-  "m6c57-fs ok nonce=" "matches_file=true" \
+  "backend_invocations=1 stranger_status=401" \
+  "m6c57-acp ok nonce=" "agent_protocol_version=1 connection_id=present stranger_status=401" \
+  "m6c57-fs ok nonce=" "matches_file=true stranger_status=401" \
   "client=$TUNNEL_CLIENT_BIN" \
   "m6c32 device_id mismatch exit=3 code=CREDENTIAL_ERROR retryable=false" \
   "m6c32 unknown credential key exit=3 code=CREDENTIAL_ERROR retryable=false" \

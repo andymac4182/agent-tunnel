@@ -469,7 +469,9 @@ rules, and each needs its own operation in the token's `scope`:
   HTTP_INVALID_HEAD`, and most HTTP clients send both by default (M6-C58).
 * **ACP**: `/v1/devices/<device.id>/services/<service.id>/http/acp`, scope
   `http:invoke`, over **HTTP/2** only. An HTTP/1.1 request gets `501
-  HTTP_UNSUPPORTED_FEATURE`.
+  HTTP_UNSUPPORTED_FEATURE`. As for MCP, the request must not carry a
+  `User-Agent` or `Accept-Encoding` header: the ACP profile refuses both
+  (M6-C58).
 * **Filesystem**: `/v1/devices/<device.id>/services/<service.id>/fs`, scope
   `fs:connect`. A `GET` returns the export's descriptor. A WebSocket upgrade
   with subprotocol `agent-tunnel.9p.v1` opens a 9P2000.L session
