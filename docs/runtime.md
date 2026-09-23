@@ -94,7 +94,7 @@ Keep the existing binary name `tunnel-client`. `check-config [PATH]`, `config ch
 | `tunnel-client credentials create --config PATH --csr-out PATH` | Generate a pending local key, write a public CSR without overwriting an existing credential |
 | `tunnel-client credentials import --config PATH --certificate PATH --server-ca PATH` | Validate/import the certificate for the pending key and trusted server bundle from explicit local inputs |
 | `tunnel-client enroll --server HTTPS_URL --code-stdin --server-ca PATH --config PATH` | Perform the gated enrollment flow above; omit `--server-ca` only for platform-trusted public PKI |
-| `tunnel-client connect --config PATH` | Foreground supervisor; establish the mTLS socket pair, register fixed exports, reconnect with bounded jitter until graceful shutdown |
+| `tunnel-client connect --config PATH` | Foreground supervisor; establish the mTLS socket pair, register fixed exports, and run until graceful shutdown. **Implemented without the reconnect loop:** today an unreachable relay exits `4` at once and a closed session ends the process (`SESSION_CLOSED`, exit `4`); only a failed *data* socket is retried within one session (the retained carrier-recovery path below). Reconnect with bounded jitter is not implemented (M6-C23) |
 | `tunnel-client status --config PATH --json` | Read the local supervisor's redacted status through authenticated local IPC; does not start a tunnel |
 | `tunnel-client doctor --config PATH --json` | Check local config, credential/key match, permissions, expiry, and local IPC; no exports are invoked |
 | `tunnel-client doctor --config PATH --network --json` | Additionally test DNS, server verification, mTLS, and a bounded non-owning readiness route; does not acquire a device epoch |
@@ -115,7 +115,7 @@ These are the exit statuses `tunnel-client` selects, and they are implemented ra
 
 **`Cause::exit_code` is the authority for everything except two paths, which are named here because "the authority" would otherwise be wrong.** `doctor` computes its own statuses in `crates/tunnel-client/src/doctor.rs` (`0`, `2`, `3`) and returns from `main` before the async command runner, so it never reaches `Cause`; and a failure to install the process crypto provider returns a bare `ExitCode::FAILURE` (`1`) with a message and **no diagnostic code**, because it happens before argument parsing and before any `--json` contract exists. Both are consistent with the table below; neither is derived from it.
 
-**This table is a copy, and nothing checks it against the code.** No guard compares this Markdown to that function, so it can fall behind exactly the way the chaos gate's own copy of the vocabulary did before M0-03 replaced it with an import. What *is* checked mechanically: `tunnel_client::CLI_DIAGNOSTIC_EXIT_CODES` is the single definition of the set of statuses, `every_exit_status_is_in_the_published_vocabulary` fails if any cause maps outside it, `the_cli_and_the_library_publish_the_same_diagnostic_code` pins `Cause::code` against `ClientError::code`, and `scripts/m0-guard-exit-codes.py` holds each individual mapping to its meaning with a named witness test. A reviewer changing a status must edit this table by hand.
+**This table is a copy, and since M6-02 it is checked against the code.** `scripts/m6-release-artifact.py verify --check docs` parses `Cause::code` and `Cause::exit_code` out of `crates/tunnel-client/src/main.rs` and fails unless every cause appears in exactly one row below whose status is the one the source selects, and unless every status the source produces has a row; its controls edit this table and the source in turn and require it to go red. It does not check the *Meaning* or *What the operator does* columns, nor `doctor`'s own statuses (those are executed instead, by [the operator guide](operator.md#6-diagnostics)). Also checked mechanically: `tunnel_client::CLI_DIAGNOSTIC_EXIT_CODES` is the single definition of the set of statuses, `every_exit_status_is_in_the_published_vocabulary` fails if any cause maps outside it, `the_cli_and_the_library_publish_the_same_diagnostic_code` pins `Cause::code` against `ClientError::code`, and `scripts/m0-guard-exit-codes.py` holds each individual mapping to its meaning with a named witness test. A reviewer changing a status must still edit this table by hand; the docs check then says whether the edit matches.
 
 | Code | Meaning | Diagnostic codes that select it | What the operator does |
 | --- | --- | --- | --- |
@@ -127,7 +127,7 @@ These are the exit statuses `tunnel-client` selects, and they are implemented ra
 | 5 | Deadline exceeded | `DEADLINE_EXCEEDED` | check latency, or raise the bounded deadline |
 | 6 | Operation outcome unknown or incomplete drain requiring reconciliation | *(no producer today — see below)* | query the authorized operation status; never replay the mutation |
 | 7 | Refused before dispatch: the device owner slot is already held, or a bounded local budget was exhausted. No session work started | `OWNER_BUSY`, `RESOURCE_EXHAUSTED` | stop the other connector, or wait and retry |
-| 130 | Interrupted before an orderly completion could be recorded | `CANCELLED` | re-run; an orderly `Ctrl-C` stop exits `0` instead |
+| 130 | Interrupted before an orderly completion could be recorded | `CANCELLED` | re-run; an orderly `Ctrl-C` stop exits `0` instead. **Not what Ctrl-C during the connect handshake produces:** the `ctrl_c` handler is armed only after connecting, so a SIGINT then either kills the process by signal with no diagnostic (a shell also reports that as 130) or, if inherited as ignored, is ignored until the handshake deadline exits `5` `DEADLINE_EXCEEDED` (measured; M6-C27) |
 
 `7` was added by task row M0-03. Before it, `OWNER_BUSY` and `RESOURCE_EXHAUSTED` fell through a `_ => 1` arm and were reported as "unexpected internal failure" — together with `CANCELLED`, `AUTHORIZATION_STALE`, `PROTOCOL_ERROR` and `SUPERVISOR_FAILED`, six live causes sharing one status. A refused-before-dispatch outcome is neither a network failure (`4`) nor a defect (`1`): nothing is wrong, something else holds the slot.
 
@@ -135,7 +135,7 @@ These are the exit statuses `tunnel-client` selects, and they are implemented ra
 
 The **relay** does not use this table. `tunnel-relay` still exits `0` or `1` per its bootstrap behavior; see the dry-run section below. Wiring the relay to this vocabulary waits for relay CLI parsing and its compatibility tests.
 
-Reconnectable network errors during `connect` remain supervised and visible rather than exiting immediately; permanent trust/configuration errors exit without an infinite retry loop.
+Permanent trust/configuration errors exit without a retry loop. **So, today, do reconnectable network errors:** `connect` exits `4` immediately when the relay cannot be reached (measured by [the operator guide](operator.md#31-one-relay)), and a closed session ends the process, so restarting it belongs to whatever supervises it. Supervised reconnection is design intent, not delivered behaviour (M6-C23).
 
 ### Relay configuration dry run
 

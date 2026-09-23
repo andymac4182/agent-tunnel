@@ -7,12 +7,14 @@ relay library. The commands below are deliberately separate from ordinary
 
 ## Commands
 
-The relay should expose three separate operator commands:
+The relay exposes three separate operator commands (implemented; the binary
+is `tunnel-relay`, and [the operator guide](operator.md#4-service-installation-upgrade-backup-and-recovery)
+shows them in the form its docs check holds to the real argument parser):
 
 ```text
-relay recovery-initialize --config CONFIG
-relay recovery-observe --config CONFIG
-relay recover --config CONFIG --approval PATH --expected-nonce NONCE \
+tunnel-relay recovery-initialize --config CONFIG
+tunnel-relay recovery-observe --config CONFIG
+tunnel-relay recover --config CONFIG --approval PATH --expected-nonce NONCE \
   --acknowledgement-id ID --old-primary-fenced --old-relays-fenced
 ```
 

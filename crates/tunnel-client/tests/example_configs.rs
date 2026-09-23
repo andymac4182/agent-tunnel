@@ -41,6 +41,7 @@ const CLASSIFIED_EXAMPLES: &[(&str, ExampleParser)] = &[
     ("client.toml", ExampleParser::ClientLegacy),
     ("m1-client.toml", ExampleParser::ClientRuntime),
     ("m1-relay.toml", ExampleParser::Relay),
+    ("m7-cluster-relay.toml", ExampleParser::Relay),
     ("relay.toml", ExampleParser::Relay),
 ];
 
