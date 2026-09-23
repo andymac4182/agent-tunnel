@@ -1092,7 +1092,7 @@ is refused with `[cluster]`: a cluster relay never adopts another Redis run,
 by token or by re-attestation. The relay itself stays up across the restart;
 device sessions end with `AUTHORITY_UNAVAILABLE` and the devices reconnect by
 themselves. Measured with the shipped binaries on an AOF Redis
-(`scripts/m6-redis-restart-verify.sh`): the echo was served again 40 to 54 s
+(`scripts/m6-redis-restart-verify.sh`): the echo was served again 36 to 54 s
 after a `docker restart` or a `docker kill` and start, most of it the previous
 session's owner lease (M6-C40).
 
