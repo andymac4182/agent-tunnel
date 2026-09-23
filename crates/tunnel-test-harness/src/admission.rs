@@ -716,10 +716,34 @@ async fn assert_data_attachment_denied(label: &str, mut socket: DeviceSocket) ->
     }
 }
 
+/// The next frame on `socket` within the quiet window that is **not** a
+/// WebSocket Ping or Pong, or `None` if the window passed without one.
+///
+/// Ping and Pong are liveness, not session traffic: since task row M6-C68 the
+/// relay pings every admitted control socket every
+/// `DEVICE_CONTROL_PING_INTERVAL` (10 s), and a probe that has held its
+/// control socket for longer than that -- `verify_ticket_expiry` sleeps past
+/// the 10 s ticket TTL first -- reads that buffered Ping here. Treating it as
+/// "unexpected" failed the M1 gate on the first CI run after #102; it proves
+/// nothing either way about a DATA_READY, a close or data, so it is skipped
+/// and the window keeps running. tungstenite queues the Pong reply itself.
+async fn next_non_liveness_frame(
+    socket: &mut DeviceSocket,
+) -> Option<Option<std::result::Result<Message, tokio_tungstenite::tungstenite::Error>>> {
+    let deadline = tokio::time::Instant::now() + QUIET_SOCKET_WINDOW;
+    loop {
+        match tokio::time::timeout_at(deadline, socket.next()).await {
+            Err(_) => return None,
+            Ok(Some(Ok(Message::Ping(_) | Message::Pong(_)))) => {}
+            Ok(other) => return Some(other),
+        }
+    }
+}
+
 async fn assert_no_data_ready(socket: &mut DeviceSocket) -> Result<()> {
-    match timeout(QUIET_SOCKET_WINDOW, socket.next()).await {
-        Err(_) => Ok(()),
-        Ok(Some(Ok(Message::Text(text)))) => {
+    match next_non_liveness_frame(socket).await {
+        None => Ok(()),
+        Some(Some(Ok(Message::Text(text)))) => {
             let message = decode_control(text.as_bytes()).map_err(|error| {
                 HarnessError::Http(format!("decoding unexpected control message: {error}"))
             })?;
@@ -728,22 +752,22 @@ async fn assert_no_data_ready(socket: &mut DeviceSocket) -> Result<()> {
                 message.kind_name()
             )))
         }
-        Ok(Some(Ok(Message::Close(_)))) | Ok(None) | Ok(Some(Err(_))) => Err(HarnessError::Http(
+        Some(Some(Ok(Message::Close(_))) | None | Some(Err(_))) => Err(HarnessError::Http(
             "control socket closed after a data attachment denial".to_owned(),
         )),
-        Ok(Some(Ok(_))) => Err(HarnessError::Http(
+        Some(Some(Ok(_))) => Err(HarnessError::Http(
             "unexpected WebSocket message after a data attachment denial".to_owned(),
         )),
     }
 }
 
 async fn assert_socket_quiet(label: &str, socket: &mut DeviceSocket) -> Result<()> {
-    match timeout(QUIET_SOCKET_WINDOW, socket.next()).await {
-        Err(_) => Ok(()),
-        Ok(Some(Ok(Message::Close(_)))) | Ok(None) | Ok(Some(Err(_))) => Err(HarnessError::Http(
+    match next_non_liveness_frame(socket).await {
+        None => Ok(()),
+        Some(Some(Ok(Message::Close(_))) | None | Some(Err(_))) => Err(HarnessError::Http(
             format!("{label} closed after a duplicate attachment"),
         )),
-        Ok(Some(Ok(_))) => Err(HarnessError::Http(format!(
+        Some(Some(Ok(_))) => Err(HarnessError::Http(format!(
             "{label} received unexpected data after a duplicate attachment"
         ))),
     }
@@ -921,4 +945,77 @@ where
 
 async fn close_socket(mut socket: DeviceSocket) {
     let _ = timeout(Duration::from_millis(500), socket.close(None)).await;
+}
+
+#[cfg(test)]
+mod quiet_window_tests {
+    use super::{DeviceSocket, Message, assert_no_data_ready, assert_socket_quiet};
+    use futures_util::SinkExt;
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, accept_async, client_async};
+
+    /// A plain loopback WebSocket pair: the harness side, and a stand-in relay
+    /// side that has already sent `sent` before the harness looks.
+    async fn pair_after(sent: Vec<Message>) -> (DeviceSocket, WebSocketStream<TcpStream>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let mut relay = accept_async(stream).await.expect("server handshake");
+            for message in sent {
+                relay.send(message).await.expect("relay send");
+            }
+            relay
+        });
+        let stream = TcpStream::connect(address).await.expect("connect");
+        let (device, _) = client_async(
+            format!("ws://{address}/v1/tunnel/control"),
+            MaybeTlsStream::Plain(stream),
+        )
+        .await
+        .expect("client handshake");
+        (device, server.await.expect("server task"))
+    }
+
+    #[tokio::test]
+    async fn a_liveness_ping_is_not_a_message_after_a_denial() {
+        // The M6-C68 relay Ping, buffered while the probe slept past the
+        // ticket TTL. Before the fix this was "unexpected WebSocket message".
+        let (mut device, _relay) = pair_after(vec![Message::Ping(Default::default())]).await;
+        assert_no_data_ready(&mut device)
+            .await
+            .expect("a Ping is liveness, not a DATA_READY");
+        let (mut data, _relay) = pair_after(vec![Message::Pong(Default::default())]).await;
+        assert_socket_quiet("data", &mut data)
+            .await
+            .expect("a Pong is liveness, not data");
+    }
+
+    #[tokio::test]
+    async fn the_quiet_window_still_reports_a_control_message_or_a_close() {
+        // Behind a Ping, so skipping liveness cannot skip what follows it.
+        let (mut device, _relay) = pair_after(vec![
+            Message::Ping(Default::default()),
+            Message::Text("{}".into()),
+        ])
+        .await;
+        assert!(assert_no_data_ready(&mut device).await.is_err());
+
+        let (mut device, _relay) = pair_after(vec![
+            Message::Ping(Default::default()),
+            Message::Close(None),
+        ])
+        .await;
+        let error = assert_no_data_ready(&mut device)
+            .await
+            .expect_err("a close after a denial must fail the probe");
+        assert!(error.to_string().contains("closed"), "{error}");
+
+        let (mut data, _relay) = pair_after(vec![
+            Message::Ping(Default::default()),
+            Message::Binary(vec![1_u8].into()),
+        ])
+        .await;
+        assert!(assert_socket_quiet("data", &mut data).await.is_err());
+    }
 }
