@@ -1195,7 +1195,7 @@ async fn run_sequential_echoes(run: EchoRun) -> EchoRunResult {
         if !run.pace.is_zero() {
             tokio::time::sleep(run.pace).await;
         }
-        if served % 10 == 0 || served >= run.required_echoes {
+        if served.is_multiple_of(10) || served >= run.required_echoes {
             rotations = connect_sessions_and_rotations(&client_log).1;
         }
     }
