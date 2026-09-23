@@ -8252,8 +8252,12 @@ impl M2Actor {
             return Ok(());
         }
         self.http_abort(stream_id, M2_RESET_AUTH_EXPIRED);
-        self.auth_expired_streams = self.auth_expired_streams.saturating_add(1);
         if let Some(stream) = self.streams.get_mut(&stream_id) {
+            // Counted once per stream: `expire_stream` is currently re-run on
+            // every tick for a stream already expired (task row M6-C88).
+            if !stream.auth.invalidated {
+                self.auth_expired_streams = self.auth_expired_streams.saturating_add(1);
+            }
             stream.auth.invalidated = true;
             // An expired authorization deadline stops filesystem dispatch at
             // the provider too: its next host call closes the session instead.

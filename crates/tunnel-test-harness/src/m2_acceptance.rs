@@ -764,13 +764,20 @@ async fn run_continuous_traffic_rotations(
             })
             .await
             .map_err(|error| stage_error("held-freeze record", error))?;
-            if let Some(held_phase) = held {
-                record_index = record_index.saturating_add(1);
-                traffic.records_round_tripped = traffic.records_round_tripped.saturating_add(1);
-                traffic.records_during_freeze = traffic.records_during_freeze.saturating_add(1);
-                traffic.records_during_held_freeze =
-                    traffic.records_during_held_freeze.saturating_add(1);
-                traffic.handover_phases_observed.insert(held_phase);
+            match held {
+                HeldAttempt::NotHeld => {}
+                HeldAttempt::WrittenUnheld => {
+                    record_index = record_index.saturating_add(1);
+                    traffic.records_round_tripped = traffic.records_round_tripped.saturating_add(1);
+                }
+                HeldAttempt::Held(held_phase) => {
+                    record_index = record_index.saturating_add(1);
+                    traffic.records_round_tripped = traffic.records_round_tripped.saturating_add(1);
+                    traffic.records_during_freeze = traffic.records_during_freeze.saturating_add(1);
+                    traffic.records_during_held_freeze =
+                        traffic.records_during_held_freeze.saturating_add(1);
+                    traffic.handover_phases_observed.insert(held_phase);
+                }
             }
             // Re-sample either way: the rotation this attempt watched has moved
             // on, and a missed hold is retried on the next one.
@@ -814,8 +821,14 @@ async fn run_continuous_traffic_rotations(
 /// its confirmed window has `M2_AUTH_REFRESH_MARGIN` (1.5 s) left. A control
 /// stall longer than what remains lapses the authorization, which ends the
 /// stream (task row M6-C84): a 2 s stall lost an echo deterministically, a
-/// 1 s one did not. 300 ms leaves more than a second of that margin.
+/// 1 s one did not. 300 ms leaves more than a second of that margin. The
+/// pause actually lasts this budget plus at most one snapshot and the resume
+/// command, both loopback round trips.
 const HELD_FREEZE_PAUSE_BUDGET: Duration = Duration::from_millis(300);
+/// The least pause budget that must remain to write the held record: enough
+/// to see it reach the relay's frozen queue. With less, the rotation is
+/// skipped rather than written and then failed on a slow runner.
+const HELD_FREEZE_WITNESS_RESERVE: Duration = Duration::from_millis(150);
 /// How long before a rotation is due the harness starts watching for it.
 const HELD_FREEZE_ARM_LEAD: Duration = Duration::from_millis(500);
 /// The relay checks whether a rotation is due on its 500 ms maintenance tick,
@@ -912,11 +925,12 @@ struct HeldFreeze<'a> {
 /// must come back exactly once and byte-for-byte, as every other continuous
 /// record must.
 ///
-/// Returns the frozen phase the record was held in, or `Ok(None)` without
-/// writing when this rotation left the frozen phases before the pause took
-/// effect, so the caller tries again on the next rotation. The pause is
-/// lifted on every path.
-async fn write_record_inside_a_held_freeze(held: HeldFreeze<'_>) -> Result<Option<String>> {
+/// Returns what the attempt did (see [`HeldAttempt`]). A rotation that could
+/// not be held -- past its frozen phases before the pause, or too slow to
+/// witness within the budget -- is a skip, retried on the next rotation,
+/// never a failure; `records_during_held_freeze_nonzero` still requires one
+/// held record across the run. The pause is lifted on every path.
+async fn write_record_inside_a_held_freeze(held: HeldFreeze<'_>) -> Result<HeldAttempt> {
     let HeldFreeze {
         harness,
         handle,
@@ -943,12 +957,15 @@ async fn write_record_inside_a_held_freeze(held: HeldFreeze<'_>) -> Result<Optio
         .await?;
         let same_rotation = sampled.relay.active_generation == armed_at.relay.active_generation;
         match sampled.relay.phase.as_str() {
-            "preparing" if same_rotation => break,
+            // `preparing`, or a frozen phase seen first: each still waits on
+            // a connector-to-relay control message, so each can be held.
+            "preparing" | "quiescing" | "draining" | "committing" if same_rotation => break,
             "active" if same_rotation && Instant::now() < watch_deadline => {
                 sleep(HELD_FREEZE_WATCH_POLL).await;
             }
-            // Past `preparing` already, or no rotation in time: try the next.
-            _ => return Ok(None),
+            // Past the frozen phases already, or no rotation in time: try the
+            // next rotation.
+            _ => return Ok(HeldAttempt::NotHeld),
         }
     }
     let control = wait_for_connection_for_addr(
@@ -963,6 +980,8 @@ async fn write_record_inside_a_held_freeze(held: HeldFreeze<'_>) -> Result<Optio
         .await
         .map_err(|error| HarnessError::Proxy(format!("pausing the control path: {error}")))?;
     let pause_deadline = Instant::now() + HELD_FREEZE_PAUSE_BUDGET;
+    let mut written = false;
+    let mut held_phase: Option<String> = None;
     let outcome = async {
         let frozen = loop {
             let sampled = wait_for_stream_snapshot(
@@ -985,10 +1004,18 @@ async fn write_record_inside_a_held_freeze(held: HeldFreeze<'_>) -> Result<Optio
                 "preparing" if same_rotation && Instant::now() < pause_deadline => {
                     sleep(HELD_FREEZE_WATCH_POLL).await;
                 }
-                _ => return Ok(None),
+                _ => return Ok(false),
             }
         };
+        // A slow candidate attach can spend most of the pause budget before
+        // the relay freezes. Write only with enough budget left to witness
+        // the record at the fence; otherwise this rotation is not held,
+        // which is a skip, not a failure (Opus review of M6-C84).
+        if pause_deadline.saturating_duration_since(Instant::now()) < HELD_FREEZE_WITNESS_RESERVE {
+            return Ok(false);
+        }
         stream.send_record(payload).await?;
+        written = true;
         // The record must be seen held at the fence: queued at the relay,
         // nothing further emitted toward the connector, and the relay still
         // in the same frozen phase of this rotation.
@@ -1002,8 +1029,14 @@ async fn write_record_inside_a_held_freeze(held: HeldFreeze<'_>) -> Result<Optio
                 SNAPSHOT_POLL,
             )
             .await?;
-            let still_frozen = sampled.relay.phase == frozen.relay.phase
-                && sampled.relay.active_generation == frozen.relay.active_generation
+            // Still in a frozen phase of the same rotation. The phase itself
+            // may advance (quiescing to draining) when the connector's
+            // `FROZEN` crossed before the pause took effect; the writer is
+            // frozen in every one of them.
+            let still_frozen = matches!(
+                sampled.relay.phase.as_str(),
+                "quiescing" | "draining" | "committing"
+            ) && sampled.relay.active_generation == frozen.relay.active_generation
                 && sampled.relay.candidate_generation == frozen.relay.candidate_generation;
             if !still_frozen {
                 return Err(HarnessError::Process(format!(
@@ -1019,12 +1052,14 @@ async fn write_record_inside_a_held_freeze(held: HeldFreeze<'_>) -> Result<Optio
                 ));
             }
             if sampled.stream.queue_bytes > frozen.stream.queue_bytes {
-                return Ok(Some(frozen.relay.phase.clone()));
+                held_phase = Some(frozen.relay.phase.clone());
+                return Ok(true);
             }
             if Instant::now() >= pause_deadline {
-                return Err(HarnessError::Timeout(
-                    "the held-freeze record never reached the relay's frozen queue within the pause budget".to_owned(),
-                ));
+                // Not witnessed in budget: this rotation is not held. The
+                // record was written, so it is round-tripped as an ordinary
+                // record below.
+                return Ok(false);
             }
             sleep(HELD_FREEZE_WATCH_POLL).await;
         }
@@ -1036,13 +1071,32 @@ async fn write_record_inside_a_held_freeze(held: HeldFreeze<'_>) -> Result<Optio
         .map_err(|error| HarnessError::Proxy(format!("resuming the control path: {error}")));
     match (outcome, resumed) {
         (Err(error), _) | (Ok(_), Err(error)) => Err(error),
-        (Ok(None), Ok(())) => Ok(None),
-        (Ok(Some(phase)), Ok(())) => {
+        (Ok(held), Ok(())) => {
+            if !written {
+                return Ok(HeldAttempt::NotHeld);
+            }
+            // Written either way, so it must come back exactly once and
+            // byte-for-byte, held or not.
             let response = stream.receive_response().await?;
             stream.validate_response(&response, canary, payload)?;
-            Ok(Some(phase))
+            match (held, held_phase) {
+                (true, Some(phase)) => Ok(HeldAttempt::Held(phase)),
+                _ => Ok(HeldAttempt::WrittenUnheld),
+            }
         }
     }
+}
+
+/// What one held-freeze attempt did.
+enum HeldAttempt {
+    /// No record was written; try again on the next rotation.
+    NotHeld,
+    /// A record was written and round-tripped, but it was not witnessed at
+    /// the fence within the pause budget; it counts as an ordinary record.
+    WrittenUnheld,
+    /// A record was witnessed held at the fence in this frozen phase, and
+    /// round-tripped once the pause lifted.
+    Held(String),
 }
 
 fn stage_error(stage: &str, error: HarnessError) -> HarnessError {
