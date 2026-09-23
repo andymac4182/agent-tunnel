@@ -297,7 +297,7 @@ Tenants, users, devices, device credential registrations, services and grants
 are records in the Redis catalog ([cluster.md](cluster.md#decisions-and-deployment-boundary)).
 `serve` refuses to start on a namespace until a deployment incarnation has been
 activated there: it exits `1` with `Redis catalog connection failed;
-stage=authority_identity`. Two `tunnel-relay` commands bring an **empty**
+stage=authority_identity class=catalog`. Two `tunnel-relay` commands bring an **empty**
 namespace to the point where one relay serves one device (task row M6-C21).
 Both read the relay's own serving configuration, so they reach Redis exactly as
 `serve` will: the same `redis_url`, TLS files, `redis_namespace` and
@@ -396,6 +396,35 @@ with 5 keys, none of them a tenant, device or credential. With `default`
 enabled behind the same password, the same file replayed to 69 keys. No least-privilege Redis ACL for the relay has been derived or
 tested; the Redis durability settings the design needs are in
 [cluster.md](cluster.md#redis-durability-backup-and-recovery).
+
+When `serve`, `activate-first-incarnation`, `provision-catalog`,
+`recovery-observe` or `recover` cannot open Redis, the error names where and
+how it failed, in fixed words only (M6-C72): `Redis catalog connection failed;
+stage=STAGE [lane=N/6] class=CLASS`. It never prints the URL, a host name, a
+password or text from Redis. The relay opens one connection and then six lane
+connections; `lane=` appears only when a lane failed, so `lane=3/6` means the
+first connection and two lanes worked. `stage` is one of `tls_setup`,
+`connection_establishment` (DNS, TCP, TLS handshake and `AUTH`), `ping`,
+`primary_identity` (`INFO server`), `authority_profile` or
+`authority_identity` (the incarnation check). `class` is `timeout`, `dns`
+(the Redis host name did not resolve), `refused`, `io`, `tls_certificate` (the server certificate was rejected, for
+example a wrong CA), `tls_alert` (Redis refused the handshake, for example a
+missing or unaccepted client certificate), `tls`, `auth` (wrong user or
+password), `noperm` (the ACL user may not run the command, for example
+`INFO`), `reply`, `invalid_reply`, `run_id_conflict`, `config` (the
+configuration was rejected before any exchange) or `catalog`.
+The recovery commands print `recovery Redis connection failed;` followed by
+the same `stage=` and `class=` words.
+
+Each Redis connection the relay opens at startup, and each recovery
+connection, gets **10 seconds** to open, covering the DNS lookup, TCP
+connect, TLS handshake and `AUTH`. After that, each command gets 2 seconds
+(M6-C73). A lane that reconnects inside a running relay, for example after a
+Redis restart, still has only 2 seconds for the whole reconnect, DNS lookup
+included (M6-C74). On a fresh Fly machine the first lookup of a `.internal`
+name took about 2 seconds. Before M6-C73 the connection budget was redis-rs's
+one-second default, so that lookup alone failed `activate-first-incarnation`
+with `stage=connection_establishment class=timeout`.
 
 ## 3. Deployment
 

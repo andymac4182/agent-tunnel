@@ -13,7 +13,10 @@ pub mod recovery;
 mod redis;
 mod types;
 
-pub use error::{CatalogConnectionError, CatalogConnectionStage, CatalogError, UnknownWriteCause};
+pub use error::{
+    CatalogConnectionError, CatalogConnectionFailure, CatalogConnectionLane,
+    CatalogConnectionStage, CatalogError, UnknownWriteCause,
+};
 pub use memory::MemoryCatalog;
 pub use oidc::{
     ApprovedJwk, OidcConfig, OidcError, OidcVerifier, ValidatedAccessToken, ValidatedClaims,

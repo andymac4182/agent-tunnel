@@ -409,6 +409,49 @@ SECRET_ALLOWLIST: tuple[Allow, ...] = (
             "2026-09-22."
         ),
     ),
+    # The three entries below are test fixtures from the M6-C72 commit
+    # 6f4a504, still reachable in history.  4283e18 rewrote all three so the
+    # working tree no longer contains them; rewriting history instead would
+    # change the commit the M6-C72 task row cites.  Each entry is scoped by
+    # the digest of one exact matched value.
+    Allow(
+        pattern_name="url-inline-password",
+        digest="62bb628c89f2cfef6b25a03454ec637ff5818e8a22a2099e74cf19f7a7eac243",
+        path_regex=r"^crates/tunnel-catalog/src/error\.rs$",
+        reason=(
+            "Synthetic URL-shaped text used as the message of an injected "
+            "`io::Error` in the unit test "
+            "`connection_failures_classify_by_typed_kind_only` (6f4a504), to show "
+            "that connection failures are classified by typed kind and never by "
+            "text. The user and password are placeholders and the host is not a "
+            "real name. Reviewed 2026-09-23; rewritten in 4283e18."
+        ),
+    ),
+    Allow(
+        pattern_name="url-inline-password",
+        digest="e3c0793fcf9496410250264db11a0ecfeec9b4d42f727220e707537067be8033",
+        path_regex=r"^crates/tunnel-relay/src/redis_connection\.rs$",
+        reason=(
+            "Synthetic `format!` template for a URL with a user and a password "
+            "placeholder, in the unit test "
+            "`staged_failures_never_print_the_url_or_password` (6f4a504). It "
+            "dials a closed loopback port to prove the diagnostic never prints "
+            "the URL or password. The template occurs twice in that blob. "
+            "Reviewed 2026-09-23; rewritten in 4283e18."
+        ),
+    ),
+    Allow(
+        pattern_name="url-inline-password",
+        digest="e6a8d54f68a6ecd13c039045eb5b890c7c7966e835dfb0b8a2ba316064dc6cf9",
+        path_regex=r"^crates/tunnel-relay/src/redis_connection\.rs$",
+        reason=(
+            "Synthetic `format!` template for Redis's default-user spelling (no "
+            "user, a placeholder password) in the same unit test "
+            "`staged_failures_never_print_the_url_or_password` (6f4a504), "
+            "dialling a closed loopback port. Reviewed 2026-09-23; rewritten "
+            "in 4283e18."
+        ),
+    ),
 )
 
 
