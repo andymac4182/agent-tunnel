@@ -2691,9 +2691,32 @@ impl M2Actor {
                 &prepare.attachment_purpose,
                 DataAttachmentPurpose::RotationCandidate
             ),
-            ControlMessage::DataReady(_) => !self.is_recovery_rotation_message(message),
+            // A late readiness for a recovery candidate this episode already
+            // released is not an ordinary rotation message either: it goes
+            // unjournaled to `handle_candidate_ready`, which ignores exactly
+            // that carrier (task row M7-C99).
+            ControlMessage::DataReady(ready) => {
+                !self.is_recovery_rotation_message(message)
+                    && !self.is_released_recovery_candidate_ready(ready)
+            }
             _ => true,
         }
+    }
+
+    /// A DATA_READY naming a recovery candidate that this episode has already
+    /// closed.  The relay attaches a recovery candidate and queues its
+    /// DATA_READY on the control socket; the candidate's data socket can be
+    /// lost before its handshake response reaches this connector, and that
+    /// loss travels on a different socket, so it can be observed first.  The
+    /// readiness is then late, not foreign.
+    fn is_released_recovery_candidate_ready(&self, ready: &DataReady) -> bool {
+        self.pending_candidate.is_none()
+            && self.recovery.is_some()
+            && ready.session_id == self.session.session_id
+            && ready.epoch == self.session.epoch
+            && self
+                .closed_for_recovery
+                .contains_key(ready.connection_id.as_str())
     }
 
     fn is_recovery_rotation_message(&self, message: &ControlMessage) -> bool {
@@ -6876,13 +6899,7 @@ impl M2Actor {
             // violation; the initial DATA_READY is consumed before the actor
             // starts and a stale readiness must not attach an untracked
             // socket.
-            let released_recovery_candidate = self.recovery.is_some()
-                && ready.session_id == self.session.session_id
-                && ready.epoch == self.session.epoch
-                && self
-                    .closed_for_recovery
-                    .contains_key(ready.connection_id.as_str());
-            if released_recovery_candidate {
+            if self.is_released_recovery_candidate_ready(&ready) {
                 return Ok(());
             }
             return Err(ClientError::Protocol("unexpected DATA_READY".to_owned()));
@@ -11853,6 +11870,74 @@ mod tests {
         assert!(matches!(
             actor.handle_candidate_ready(released).await,
             Err(ClientError::Protocol(message)) if message == "unexpected DATA_READY"
+        ));
+    }
+
+    /// Task row M7-C99: the late DATA_READY above must also survive the
+    /// actor's real dispatch, not only the handler.  `handle_control` routes
+    /// a DATA_READY that binds no pending recovery candidate into the
+    /// ordinary rotation journal, which refused it with "DATA_READY does not
+    /// bind a known rotation candidate" before `handle_candidate_ready`
+    /// could recognise the released candidate, so the CLI exited
+    /// `PROTOCOL_ERROR` in `verify-m7-i08-recovery-attempts` whenever the
+    /// fixture's candidate close overtook the owner's DATA_READY.
+    #[tokio::test]
+    async fn late_data_ready_for_released_recovery_candidate_survives_dispatch() {
+        let (mut actor, active_key, _receiver, _control_receiver) =
+            test_actor_with_carrier(M2_CARRIER_QUEUE_FRAMES);
+        installed_recovery_context(&mut actor, &active_key, 2, "candidate-1");
+        assert!(actor.pending_candidate.is_none());
+        let released = DataReady {
+            message_id: "late-ready".to_owned(),
+            reply_to: "late-prepare".to_owned(),
+            session_id: "session".to_owned(),
+            epoch: 1,
+            generation: active_key.generation + 1,
+            connection_id: "candidate-1".to_owned(),
+        };
+        actor
+            .handle_control(ControlMessage::DataReady(released.clone()))
+            .await
+            .expect("late readiness for a released candidate is ignored on dispatch");
+        assert!(actor.candidate.is_none() && actor.pending_candidate.is_none());
+        assert!(
+            actor.rotation_journal.is_none(),
+            "an ignored late DATA_READY must not open an ordinary rotation journal"
+        );
+        // Only the exact released candidate is exempt: a foreign carrier, a
+        // foreign session and a released one outside recovery still fail.
+        let foreign = DataReady {
+            message_id: "foreign-ready".to_owned(),
+            connection_id: "candidate-9".to_owned(),
+            ..released.clone()
+        };
+        assert!(matches!(
+            actor
+                .handle_control(ControlMessage::DataReady(foreign))
+                .await,
+            Err(ClientError::Protocol(_))
+        ));
+        let other_session = DataReady {
+            message_id: "other-session-ready".to_owned(),
+            session_id: "other-session".to_owned(),
+            ..released.clone()
+        };
+        assert!(matches!(
+            actor
+                .handle_control(ControlMessage::DataReady(other_session))
+                .await,
+            Err(ClientError::Protocol(_))
+        ));
+        actor.recovery = None;
+        let outside_recovery = DataReady {
+            message_id: "outside-recovery-ready".to_owned(),
+            ..released
+        };
+        assert!(matches!(
+            actor
+                .handle_control(ControlMessage::DataReady(outside_recovery))
+                .await,
+            Err(ClientError::Protocol(_))
         ));
     }
 
