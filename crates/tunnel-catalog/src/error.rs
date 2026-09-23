@@ -456,7 +456,7 @@ mod tests {
                 Failure::InvalidReply,
             ),
         ];
-        let dns: RedisError = io::Error::new(io::ErrorKind::Other, super::DnsLookupFailed).into();
+        let dns: RedisError = io::Error::other(super::DnsLookupFailed).into();
         let mut cases = cases.to_vec();
         cases.push((dns, Failure::Dns));
         for (error, expected) in cases {
