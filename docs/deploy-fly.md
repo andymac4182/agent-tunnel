@@ -318,8 +318,10 @@ Expect exactly one machine, and `Ready to accept connections tls` in the log.
 
 ### 6.1 Build the image once
 
-The build runs on Fly's remote builder. Fly's pricing page does not list a
-builder charge (section 8). The image label is what the provisioning machines
+The build runs natively on amd64 on Fly's remote builder (Depot). **May cost
+money:** Fly announced 300 free build minutes a month and $0.05 a minute after
+that; its pricing page does not list the charge (section 8). One build took
+about 3 minutes natively here. The image label is what the provisioning machines
 and the serving machine will both run:
 
 ```text
@@ -483,6 +485,28 @@ What the proof cannot show: Fly's proxy, its health checkers, its init as PID
 is IPv4), secrets delivered to `fly machine run` machines, and amd64, which is
 what Fly runs (section 7.1).
 
+### 7.1 amd64
+
+Fly runs amd64; this Mac is arm64. The Dockerfile names no platform, so the
+same file builds natively for arm64 here and natively for amd64 on Fly's
+remote builder. Building it here with `--platform linux/amd64` runs the whole
+release compile under QEMU: stopped after 1,008 s at `sha1_smol`, which the
+native build reaches at 56 s of 172 s, so it projected to roughly 50 minutes.
+
+A cross-compile instead, as a check only (not committed, and not what Fly
+builds): the same `rust:1.95.0` builder running natively, with
+`gcc-x86-64-linux-gnu`, `libc6-dev-amd64-cross`, the
+`x86_64-unknown-linux-gnu` target and
+`CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=x86_64-linux-gnu-gcc`, then
+`cargo build --locked --release -p tunnel-relay --target x86_64-unknown-linux-gnu`.
+It finished in 1 m 42 s (log nonce `m6c60-cross-amd64-20260923T093413Z-77648`,
+`b459155`), produced an `ELF 64-bit LSB pie executable, x86-64` dynamically
+linked against `/lib64/ld-linux-x86-64.so.2`, and that binary, run in an amd64
+`debian:trixie-slim` container, passed `check-serve-config` on this
+`relay.toml`. That shows the tree compiles, links and starts for amd64 against
+the runtime image's glibc. It does not show the amd64 image Fly will build,
+which is built from the committed Dockerfile on Fly's builder.
+
 ## 8. Cost list
 
 Prices from <https://fly.io/docs/about/pricing/>, read 2026-09-23 for region
@@ -502,7 +526,7 @@ figures are Fly's own 30-day figures.
 | Data between the two apps in one region; inbound data | — | free | $0.00 |
 | Stopped machines (if you stop one instead of destroying it) | — | $0.15 per GB of rootfs per 30 days | usage |
 | Fly-managed TLS certificates | not used (passthrough) | first 10 free | $0.00 |
-| Remote builder | `fly deploy --build-only` (section 6.1) | not listed on the pricing page | not verified |
+| Remote builder (Depot) | `fly deploy --build-only` (section 6.1) | not on the pricing page; Fly's 2024 announcement: 300 build minutes a month free, then $0.05 a minute (<https://community.fly.io/t/depot-remote-builders-becoming-the-default/21756>) | $0.00 expected: one build is about 3 minutes natively; at most about $0.15 a build past the allowance |
 
 **Standing total: $7.09 a month in `syd`**, plus outbound data. Upstash is not
 used, so its per-command pricing does not apply.
