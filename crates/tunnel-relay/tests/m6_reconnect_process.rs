@@ -32,6 +32,18 @@
 //!   device draws `1008 DEVICE_IDENTITY_REJECTED`, and the loop exits `3`
 //!   after one attempt instead of backing off.
 //!
+//! * `m6c68_a_relay_evicts_a_device_whose_path_vanished_and_admits_its_reconnect`
+//!   -- task row M6-C68, the M6-C23 reviewer's cut path: the client reaches
+//!   the relay through a TCP proxy. A healthy session is first left idle for
+//!   longer than the relay's idle timeout and must survive (the relay's Pings
+//!   are answered). Then the proxy drops the client's half of every
+//!   connection while holding the relay's half open and silent, as a laptop
+//!   changing networks or a NAT rebinding does. The client is refused
+//!   `OWNER_BUSY` while the relay still holds the dead session, and must see
+//!   a second `ready` within the relay's stated bound
+//!   (`DEVICE_CONTROL_IDLE_TIMEOUT` plus the disconnect hand-off), inside the
+//!   client's 60 s `OWNER_BUSY` window.
+//!
 //! Every step asserts on the client's `--json` events and on a real echo
 //! through the relay, and each run prints `m6c23-reconnect ok ...` only after
 //! all of it held, so a filtered or skipped run cannot be read as a pass.
@@ -58,6 +70,7 @@ use rcgen::{
 use serde_json::Value;
 use tokio::net::{TcpListener as TokioTcpListener, TcpStream};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
+use tunnel_protocol::{DEVICE_CONTROL_IDLE_TIMEOUT, DEVICE_CONTROL_PING_INTERVAL};
 use uuid::Uuid;
 
 const ISSUER: &str = "https://issuer.m6c23.invalid/";
@@ -418,6 +431,8 @@ struct Deployment {
     relay_config: PathBuf,
     client_config: PathBuf,
     consumer: SocketAddr,
+    /// The relay's device listener, for a test that puts a proxy in front.
+    device_listener: SocketAddr,
     server_ca_pem: String,
     issuer_key: jsonwebtoken::EncodingKey,
     subject: String,
@@ -605,6 +620,7 @@ impl Deployment {
             relay_config,
             client_config,
             consumer,
+            device_listener,
             server_ca_pem: pki.ca_pem,
             issuer_key,
             subject,
@@ -1293,5 +1309,161 @@ async fn m6c23_a_rogue_device_ca_and_a_wrong_server_ca_exit_three_without_retryi
     println!(
         "m6c23-reconnect ok label=issuer nonce={} wrong_server_ca=exit3 rogue_device_ca=exit3",
         deployment.nonce
+    );
+}
+
+/// A TCP proxy in front of the relay's device listener that can cut the
+/// device's side of every connection it carries while holding the relay's
+/// side open and silent -- what the relay sees when a device's network path
+/// vanishes without a FIN or RST reaching it.  Connections accepted after a
+/// cut are forwarded normally.
+struct CutPathProxy {
+    address: SocketAddr,
+    generation: tokio::sync::watch::Sender<u64>,
+    /// The relay-side halves of cut connections, never read or written again
+    /// until the test ends.
+    held: Arc<Mutex<Vec<TcpStream>>>,
+}
+
+impl CutPathProxy {
+    async fn start(upstream: SocketAddr) -> Self {
+        let listener = TokioTcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind cut-path proxy");
+        let address = listener.local_addr().expect("proxy address");
+        let (generation, _) = tokio::sync::watch::channel(0_u64);
+        let held = Arc::new(Mutex::new(Vec::new()));
+        let accept_generation = generation.clone();
+        let accept_held = Arc::clone(&held);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut device, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut cut = accept_generation.subscribe();
+                let born = *cut.borrow_and_update();
+                let held = Arc::clone(&accept_held);
+                tokio::spawn(async move {
+                    let Ok(mut relay) = TcpStream::connect(upstream).await else {
+                        return;
+                    };
+                    let was_cut = tokio::select! {
+                        _ = tokio::io::copy_bidirectional(&mut device, &mut relay) => false,
+                        _ = cut.wait_for(|now| *now > born) => true,
+                    };
+                    if was_cut {
+                        drop(device);
+                        held.lock().expect("held").push(relay);
+                    }
+                });
+            }
+        });
+        Self {
+            address,
+            generation,
+            held,
+        }
+    }
+
+    /// Cut every connection open now; returns how many relay-side halves are
+    /// held after the cut settles.
+    async fn cut(&self) -> usize {
+        self.generation.send_modify(|now| *now += 1);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        self.held.lock().expect("held").len()
+    }
+}
+
+impl Deployment {
+    /// Point the device profile at `address` instead of the relay itself.
+    fn route_client_through(&self, address: SocketAddr) {
+        let profile = fs::read_to_string(&self.client_config).expect("read profile");
+        fs::write(
+            &self.client_config,
+            set_key(
+                &profile,
+                "relay_url",
+                &format!("\"wss://127.0.0.1:{}/v1/tunnel/control\"", address.port()),
+            ),
+        )
+        .expect("rewrite profile");
+    }
+}
+
+/// The bound, stated in docs/operator.md, within which a relay ends the
+/// session of a device whose path vanished: its idle timeout, plus the
+/// bounded (5 s) disconnect hand-off to the actor, plus the client's largest
+/// backoff step in this run (1 s) and scheduling slack.  It must stay inside
+/// the client's 60 s `OWNER_BUSY` window, or the test would only measure the
+/// client giving up.
+const CUT_PATH_RECONNECT_BOUND: Duration =
+    Duration::from_secs(DEVICE_CONTROL_IDLE_TIMEOUT.as_secs() + 5 + 1 + 4);
+const _: () = assert!(CUT_PATH_RECONNECT_BOUND.as_secs() < 60);
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires TEST_REDIS_URL and TUNNEL_CLIENT_BIN; run by scripts/m6-reconnect-verify.sh"]
+async fn m6c68_a_relay_evicts_a_device_whose_path_vanished_and_admits_its_reconnect() {
+    let deployment = Deployment::provision("cut-path").await;
+    let proxy = CutPathProxy::start(deployment.device_listener).await;
+    deployment.route_client_through(proxy.address);
+    let relay = deployment.serve("serve");
+    let mut client = deployment.connect();
+    let first = session_id(&client.wait_for("session 1", "ready", 1)[0].1);
+    deployment.echo("echo 1", &client).await;
+
+    // 1. A healthy device that sends nothing for longer than the idle
+    //    timeout is not evicted: the relay's Pings draw Pongs, and a Pong is
+    //    an inbound frame.  Without the Pong arm the relay would drop the
+    //    session at its first Pong; without the deadline reset, at the idle
+    //    timeout.
+    let quiet = DEVICE_CONTROL_IDLE_TIMEOUT + DEVICE_CONTROL_PING_INTERVAL;
+    tokio::time::sleep(quiet).await;
+    assert!(
+        client.states("disconnected").is_empty() && client.states("backoff").is_empty(),
+        "a healthy idle session must survive {quiet:?}: {}",
+        client.context()
+    );
+    deployment.echo("echo after idle", &client).await;
+
+    // 2. The device's path vanishes; the relay's half stays open and silent.
+    let held = proxy.cut().await;
+    let cut = Instant::now();
+    assert!(held >= 2, "control and data relay halves held, got {held}");
+    let lost = client.wait_for("disconnect after the cut", "lost", 1);
+    assert_eq!(lost[0].1["result"]["session_id"], first.as_str());
+    let reconnected = client.wait_for_within(
+        "reconnect after the cut",
+        "reconnected",
+        1,
+        CUT_PATH_RECONNECT_BOUND,
+    );
+    let readies = client.wait_for("session 2", "ready", 2);
+    let second = session_id(&readies[1].1);
+    assert_ne!(second, first, "a new session, not the old one");
+    assert_eq!(session_id(&reconnected[0].1), second);
+    let reconnect_after_cut = reconnected[0].0.duration_since(cut);
+    let owner_busy = client
+        .states("backoff")
+        .iter()
+        .filter(|(_, event)| event["result"]["code"] == "OWNER_BUSY")
+        .count();
+    // The test reproduces the defect rather than passing around it: the
+    // relay really did hold the dead session for a while, and refused the
+    // device while it did.
+    assert!(
+        owner_busy >= 1,
+        "the relay must have refused OWNER_BUSY while it still held the dead session: {}",
+        client.context()
+    );
+    deployment.echo("echo after reconnect", &client).await;
+    client.stop();
+    drop(relay);
+    println!(
+        "m6c68-liveness ok label=cut-path nonce={} idle_survived_ms={} held_relay_halves={held} \
+         owner_busy_refusals={owner_busy} reconnect_after_cut_ms={} bound_ms={}",
+        deployment.nonce,
+        quiet.as_millis(),
+        reconnect_after_cut.as_millis(),
+        CUT_PATH_RECONNECT_BOUND.as_millis()
     );
 }

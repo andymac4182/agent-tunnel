@@ -29,7 +29,8 @@ use tokio::{
 use tunnel_catalog::{DeviceListFilter, OidcError, OidcVerifier, SharedCatalog};
 use tunnel_protocol::{
     CONTROL_IDENTITY_REJECTED_CLOSE_CODE, CONTROL_IDENTITY_REJECTED_CLOSE_REASON,
-    CONTROL_OWNER_BUSY_CLOSE_CODE, CONTROL_OWNER_BUSY_CLOSE_REASON,
+    CONTROL_OWNER_BUSY_CLOSE_CODE, CONTROL_OWNER_BUSY_CLOSE_REASON, DEVICE_CONTROL_IDLE_TIMEOUT,
+    DEVICE_CONTROL_PING_INTERVAL,
 };
 use tunnel_transport::{PeerTransportError, TlsIdentity};
 use uuid::Uuid;
@@ -3842,9 +3843,18 @@ async fn handle_control(
     // compiler prove that rather than a comment claim it.  A new exit path
     // that forgets to name its cause fails to compile.
     let closure_cause: TaskClosureCause;
+    // M6-C68: the relay, not the device, must notice a vanished path.  It
+    // pings every `DEVICE_CONTROL_PING_INTERVAL` and ends the session once
+    // nothing at all has arrived for `DEVICE_CONTROL_IDLE_TIMEOUT`; the exit
+    // is the same `finish_control_task` hand-off as a device's own close, so
+    // the owner slot is released exactly as it is then.
+    let mut liveness = ControlLiveness::new(tokio::time::Instant::now());
+    let mut pings = control_ping_ticker();
     loop {
+        let idle_deadline = liveness.deadline();
         tokio::select! {
             inbound = socket.next() => {
+                liveness.observe_inbound(tokio::time::Instant::now());
                 match inbound {
                     Some(Ok(Message::Text(text))) if text.len() <= MAX_CONTROL_BYTES => {
                         if let Ok(message) = wire::parse_control(text.as_bytes()) {
@@ -3852,6 +3862,9 @@ async fn handle_control(
                         } else { closure_cause = TaskClosureCause::ProtocolError; break; }
                     }
                     Some(Ok(Message::Ping(payload))) => { if !send_socket(&mut socket, Message::Pong(payload)).await { closure_cause = TaskClosureCause::WriteFailed; break; } }
+                    // The answer to the relay's own liveness Ping.  Its only
+                    // effect is the `observe_inbound` above.
+                    Some(Ok(Message::Pong(_))) => {}
                     Some(Ok(Message::Close(_))) | None | Some(Err(_)) => { closure_cause = TaskClosureCause::PeerClosed; break; }
                     // The guarded text arm above already took every in-window
                     // control frame, so this arm is exactly the over-window
@@ -3872,6 +3885,20 @@ async fn handle_control(
                     Some(crate::actor::ControlOutbound::Close) | None => { let _ = send_socket(&mut socket, Message::Close(None)).await; closure_cause = TaskClosureCause::ServerClose; break; }
                 }
             }
+            _ = pings.tick() => {
+                if !send_socket(&mut socket, Message::Ping(Default::default())).await { closure_cause = TaskClosureCause::WriteFailed; break; }
+            }
+            () = tokio::time::sleep_until(idle_deadline) => {
+                tracing::info!(
+                    device_id = %key.device_id,
+                    session_id = %key.session_id,
+                    epoch = key.epoch,
+                    idle_timeout_ms = u64::try_from(DEVICE_CONTROL_IDLE_TIMEOUT.as_millis()).unwrap_or(u64::MAX),
+                    phase = "control_liveness_timeout",
+                );
+                closure_cause = TaskClosureCause::LivenessTimeout;
+                break;
+            }
         }
     }
     // Close admission to this writer before releasing every queued charge.
@@ -3879,6 +3906,44 @@ async fn handle_control(
     rx.close();
     while rx.try_recv().is_ok() {}
     finish_control_task(&handle, key, closure_cause, &mut cleanup).await;
+}
+
+/// Task row M6-C68: the idle deadline of one device control socket.
+///
+/// Only inbound frames move the deadline.  A relay write completes into the
+/// kernel's send buffer whether or not anyone is still at the other end, so
+/// it proves nothing about the path; the device's Pong to the relay's Ping
+/// does.
+#[derive(Clone, Copy, Debug)]
+struct ControlLiveness {
+    last_inbound: tokio::time::Instant,
+}
+
+impl ControlLiveness {
+    fn new(admitted_at: tokio::time::Instant) -> Self {
+        Self {
+            last_inbound: admitted_at,
+        }
+    }
+
+    fn observe_inbound(&mut self, at: tokio::time::Instant) {
+        self.last_inbound = self.last_inbound.max(at);
+    }
+
+    fn deadline(&self) -> tokio::time::Instant {
+        self.last_inbound + DEVICE_CONTROL_IDLE_TIMEOUT
+    }
+}
+
+/// The relay's Ping schedule on one device control socket: the first Ping one
+/// interval after admission, and a late tick is delayed rather than burst.
+fn control_ping_ticker() -> tokio::time::Interval {
+    let mut pings = tokio::time::interval_at(
+        tokio::time::Instant::now() + DEVICE_CONTROL_PING_INTERVAL,
+        DEVICE_CONTROL_PING_INTERVAL,
+    );
+    pings.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    pings
 }
 
 /// EC-061: the single exit of the owner-local control task.
@@ -4414,6 +4479,28 @@ fn error_response(
 
 #[cfg(test)]
 mod tests {
+    // M6-C68: the device control idle deadline.  Only an inbound frame moves
+    // it, it never moves backwards, and a live device's Pong -- due every
+    // Ping interval -- keeps it ahead of the next Ping with room for two
+    // missed ones.
+    #[test]
+    fn control_liveness_deadline_follows_only_the_latest_inbound_frame() {
+        use super::{ControlLiveness, DEVICE_CONTROL_IDLE_TIMEOUT, DEVICE_CONTROL_PING_INTERVAL};
+        let admitted = tokio::time::Instant::now();
+        let mut liveness = ControlLiveness::new(admitted);
+        assert_eq!(liveness.deadline(), admitted + DEVICE_CONTROL_IDLE_TIMEOUT);
+        let pong = admitted + DEVICE_CONTROL_PING_INTERVAL;
+        liveness.observe_inbound(pong);
+        assert_eq!(liveness.deadline(), pong + DEVICE_CONTROL_IDLE_TIMEOUT);
+        liveness.observe_inbound(admitted);
+        assert_eq!(
+            liveness.deadline(),
+            pong + DEVICE_CONTROL_IDLE_TIMEOUT,
+            "an older observation must not pull the deadline back"
+        );
+        assert!(liveness.deadline() >= pong + DEVICE_CONTROL_PING_INTERVAL * 3);
+    }
+
     use super::{
         ConsumerUpgradeBarrier, ControlAttachBarrier, PeerAdmissionBarrier,
         PeerAdmissionBarrierError, PeerAdmissionScope, forwarded_bearer_token, is_no_live_owner,
