@@ -18,6 +18,9 @@
 //! deadlock on each other.  `Fault::UnreachablePeer` asserts that contract at
 //! process level instead of the exit-and-release flow the other faults use.
 
+// The harness library is Unix-only (see `src/entry.rs`).
+#![cfg(unix)]
+
 use std::{
     collections::BTreeMap,
     env, fs,

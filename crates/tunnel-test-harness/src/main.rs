@@ -6,7 +6,7 @@ use tunnel_test_harness::{
 };
 
 #[tokio::main]
-async fn main() -> ExitCode {
+pub(crate) async fn main() -> ExitCode {
     // The process-wide `rustls` provider is chosen here, explicitly, rather
     // than inferred from which provider features happen to be enabled across
     // the whole dependency graph (task row M8-C09). An error means something
@@ -3700,6 +3700,7 @@ mod tests {
             rotations_observed: 3,
             records_round_tripped: 900,
             records_during_freeze: 12,
+            records_during_held_freeze: 1,
             handover_phases_observed: [
                 "quiescing".to_owned(),
                 "draining".to_owned(),

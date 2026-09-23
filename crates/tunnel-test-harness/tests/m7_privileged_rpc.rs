@@ -7,6 +7,9 @@
 //! owner, assignment, generation, role, route, and body cases can be checked
 //! without introducing SQLite or starting a later adapter.
 
+// The harness library is Unix-only (see `src/entry.rs`).
+#![cfg(unix)]
+
 use std::{
     collections::{BTreeMap, HashMap},
     net::SocketAddr,

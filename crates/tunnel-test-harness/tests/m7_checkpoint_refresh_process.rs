@@ -9,6 +9,9 @@
 //! The test is ignored by the ordinary workspace suite because it requires
 //! TEST_REDIS_URL and the root-built relay binary.
 
+// The harness library is Unix-only (see `src/entry.rs`).
+#![cfg(unix)]
+
 use std::{
     collections::BTreeMap,
     env,

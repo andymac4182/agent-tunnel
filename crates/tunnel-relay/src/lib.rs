@@ -14,6 +14,7 @@ pub mod catalog_changes;
 mod config;
 mod consumer_framing;
 mod consumer_write_diagnostics;
+mod file_identity;
 mod health;
 mod http;
 pub mod http_forward_diagnostics;

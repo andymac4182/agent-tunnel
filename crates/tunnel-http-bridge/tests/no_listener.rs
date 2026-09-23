@@ -15,6 +15,10 @@
 //! The adapter API itself takes no address: `serve` receives frame queues and
 //! calls the handler directly.
 
+// `/dev/fd` and `fstat` socket classification are Unix-only, as in
+// `tunnel-acp-fixture`'s test of the same name.
+#![cfg(unix)]
+
 mod common;
 
 use std::os::unix::fs::FileTypeExt;

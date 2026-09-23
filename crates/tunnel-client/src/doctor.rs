@@ -6,10 +6,13 @@
 //! this command cannot be mistaken for the future full operations surface.
 
 use std::{
-    fs, io,
+    io,
     path::Path,
     time::{SystemTime, UNIX_EPOCH},
 };
+// Only the Unix permission check reads file metadata.
+#[cfg(unix)]
+use std::fs;
 
 use serde::Serialize;
 use tunnel_client::{

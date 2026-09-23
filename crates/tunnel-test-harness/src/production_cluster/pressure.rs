@@ -325,7 +325,7 @@ pub(super) async fn run(
         sibling_stream,
     )
     .await;
-    let (pressure, mut bulk_stream, mut sibling_stream) = match pressure_result {
+    let (pressure, mut sibling_stream) = match pressure_result {
         Ok(result) => result,
         Err(error) => {
             let client_diagnostics = client_terminal_diagnostics(&mut process).await;
@@ -334,7 +334,6 @@ pub(super) async fn run(
         }
     };
     sibling_stream.close().await?;
-    bulk_stream.close().await?;
     process
         .shutdown(Duration::from_secs(5))
         .await
@@ -433,7 +432,7 @@ async fn run_pressure_phase(
     canary: &[u8],
     bulk_stream: ConsumerStream,
     mut sibling_stream: ConsumerStream,
-) -> Result<(PressurePhase, ConsumerStream, ConsumerStream)> {
+) -> Result<(PressurePhase, ConsumerStream)> {
     let bulk_stream_id = identify_bulk_stream(owner_relay, device_id).await?;
     let cancellation = CancellationToken::new();
     let progress = Arc::new(PumpProgress::new());
@@ -490,7 +489,7 @@ async fn run_pressure_phase(
     };
     let cancel_started = Instant::now();
     cancellation.cancel();
-    let (mut bulk_stream, outcome) = reap_bulk(pump.take().expect("pressure pump")).await?;
+    let (bulk_stream, outcome) = reap_bulk(pump.take().expect("pressure pump")).await?;
     let cancellation_responsive = cancel_started.elapsed() <= PRESSURE_CANCEL_TIMEOUT
         && matches!(outcome, BulkPumpOutcome::Cancelled { .. });
     let bulk_records_attempted = match outcome {
@@ -502,7 +501,10 @@ async fn run_pressure_phase(
         outcome,
         BulkPumpOutcome::Cancelled { .. } | BulkPumpOutcome::SendFailed { .. }
     );
-    let _ = bulk_stream.close().await;
+    // The cancelled consumer resets its connection rather than queueing a
+    // Close behind the saturated backlog (see `ConsumerStream::abort`); the
+    // relay must then clean the stream up and dispatch nothing more.
+    bulk_stream.abort();
     let _ = sibling_stream.close().await;
     let cancellation_not_replayed = wait_for_cleanup_and_stable_dispatch(
         owner_relay,
@@ -523,7 +525,6 @@ async fn run_pressure_phase(
             cancellation_responsive,
             cancellation_not_replayed,
         },
-        bulk_stream,
         sibling_stream,
     ))
 }

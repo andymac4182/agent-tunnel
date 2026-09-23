@@ -3,6 +3,8 @@
 //! through authenticated sockets using isolated synthetic test identities.
 
 #![forbid(unsafe_code)]
+// Unix-only by declaration: see `src/entry.rs`.
+#![cfg(unix)]
 
 pub mod acceptance;
 pub mod admission;

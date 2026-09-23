@@ -364,10 +364,14 @@ fn a_run_of_unservable_entries_is_bounded_rather_than_walked() {
     fixture.file("/z-ordinary.txt", b"synthetic");
 
     let export = fixture.open(read_only(), FeatureSet::NONE, bounds());
-    // A budget of three cannot cross six FIFOs, whatever order the host
-    // returns them in, so the refusal is the answer rather than a race.
+    // A budget of two cannot cross six FIFOs, whatever order the host returns
+    // them in: the one ordinary file splits them into at most two runs, so one
+    // run is at least three long, and three skips exceed a budget of two. The
+    // budget used to be three, which a split of exactly three and three passes
+    // without a refusal -- the order an overlayfs directory returned on Linux
+    // (`.., p1, p3, p5, ., z-ordinary.txt, p0, p4, p2`), where the test failed.
     let mut reader = export
-        .read_directory(&vpath("/"), 3)
+        .read_directory(&vpath("/"), 2)
         .expect("enumerate the root");
     let mut refused = false;
     loop {

@@ -348,6 +348,10 @@ of these types that the relay could not serve, naming the field:
   with `fs_case_sensitivity` stating how the device's export directory treats
   letter case: `insensitive-preserving` for a default macOS volume, `sensitive`
   for a case-sensitive one.
+  **A filesystem export is served only by a device on a Unix host (Linux or
+  macOS).** On Windows, `tunnel-client config check` and `connect` refuse a
+  client profile with an `[exports.<service>.fs]` table:
+  `filesystem exports are unsupported on this host` (task row M6-C80).
 
 Before M6-C57 the dry run accepted any `type`, but the write recorded only the
 operation names. So an MCP, ACP or filesystem service was provisioned without
