@@ -57,7 +57,7 @@ use uuid::Uuid;
 
 pub use config::{
     CredentialConfig, ExportConfig as LocalExport, ExportKind as LocalExportKind, LimitsConfig,
-    RuntimeConfig as ConnectConfig, RuntimeConfigError,
+    ReconnectConfig, RuntimeConfig as ConnectConfig, RuntimeConfigError,
 };
 pub use credentials::{CsrOutput, ImportedCredential};
 pub use tokio_util::sync::CancellationToken as ConnectCancellation;
@@ -654,9 +654,14 @@ async fn open_socket(
         _ = cancellation.cancelled() => return Err(ClientError::Cancelled),
         result = &mut handshake => result
             .map_err(|_| ClientError::HandshakeTimeout)?
-            .map_err(|error| ClientError::Transport {
-                scope: "websocket handshake",
-                detail: sanitize_error(&error.to_string()),
+            .map_err(|error| match tls_refusal(&error) {
+                // Classified before `sanitize_error` erases it: a certificate
+                // verification refusal is terminal, anything else retryable.
+                Some(reason) => ClientError::TlsRefused(reason),
+                None => ClientError::Transport {
+                    scope: "websocket handshake",
+                    detail: sanitize_error(&error.to_string()),
+                },
             })?,
     };
     let selected_protocol = response
@@ -2132,6 +2137,86 @@ fn checked_echo_output_len(canary_len: usize, payload_len: usize) -> Option<usiz
     canary_len.checked_add(payload_len)
 }
 
+/// The certificate-verification refusals that **no retry can fix**, as a
+/// fixed reason (task row M6-C23, reconnect).
+///
+/// Everything a handshake can end with is otherwise one opaque
+/// `websocket handshake failed`, so a reconnecting `connect` could not tell a
+/// wrong `server_ca` from a relay that is still restarting. This picks out,
+/// **by rustls variant and never by message text**, the two refusals that
+/// are properties of the configured credentials rather than of the network:
+///
+/// * this client refused the relay's certificate: unknown issuer (the wrong
+///   `server_ca`), a bad signature, expired or not yet valid, revoked, not
+///   valid for the relay's name, or not valid for server authentication;
+/// * the relay refused this device's certificate with a certificate TLS
+///   alert: unknown CA, bad, unsupported, expired, revoked, unknown, or
+///   required and absent.
+///
+/// Every other handshake outcome -- a reset, an EOF, an I/O error, a timeout,
+/// a middlebox dropping the connection, an unclassified alert such as
+/// `handshake_failure` or `access_denied`, and certificate errors outside the
+/// list (`BadEncoding`, `Other`, and variants a later rustls adds) -- returns
+/// `None` and stays a retryable `TRANSPORT_ERROR`: those are what a laptop
+/// waking from sleep or a flaky network produce. The reason is a string
+/// written here; nothing from the peer or its certificate is carried.
+fn tls_refusal(error: &tokio_tungstenite::tungstenite::Error) -> Option<&'static str> {
+    use tokio_tungstenite::tungstenite::{Error as WsError, error::TlsError};
+    let rustls_error: &rustls::Error = match error {
+        WsError::Tls(TlsError::Rustls(error)) => error,
+        // tokio-rustls reports handshake and record errors as an I/O error
+        // whose inner error is the `rustls::Error`.
+        WsError::Io(error) => error.get_ref()?.downcast_ref::<rustls::Error>()?,
+        _ => return None,
+    };
+    classify_rustls_refusal(rustls_error)
+}
+
+fn classify_rustls_refusal(error: &rustls::Error) -> Option<&'static str> {
+    use rustls::{AlertDescription as Alert, CertificateError as Cert};
+    match error {
+        rustls::Error::InvalidCertificate(reason) => Some(match reason {
+            Cert::UnknownIssuer => {
+                "the relay's certificate was refused: unknown issuer (check credentials.server_ca)"
+            }
+            Cert::BadSignature => "the relay's certificate was refused: bad signature",
+            Cert::Expired | Cert::ExpiredContext { .. } => {
+                "the relay's certificate was refused: expired"
+            }
+            Cert::NotValidYet | Cert::NotValidYetContext { .. } => {
+                "the relay's certificate was refused: not yet valid"
+            }
+            Cert::Revoked => "the relay's certificate was refused: revoked",
+            Cert::NotValidForName | Cert::NotValidForNameContext { .. } => {
+                "the relay's certificate was refused: not valid for the relay_url host"
+            }
+            Cert::InvalidPurpose | Cert::InvalidPurposeContext { .. } => {
+                "the relay's certificate was refused: not valid for server authentication"
+            }
+            _ => return None,
+        }),
+        rustls::Error::AlertReceived(alert) => Some(match alert {
+            Alert::UnknownCA => {
+                "the relay refused this device's certificate: unknown CA (the relay does not trust its issuer)"
+            }
+            Alert::BadCertificate => "the relay refused this device's certificate: bad certificate",
+            Alert::UnsupportedCertificate => {
+                "the relay refused this device's certificate: unsupported certificate"
+            }
+            Alert::CertificateExpired => "the relay refused this device's certificate: expired",
+            Alert::CertificateRevoked => "the relay refused this device's certificate: revoked",
+            Alert::CertificateUnknown => {
+                "the relay refused this device's certificate: certificate unknown"
+            }
+            Alert::CertificateRequired => {
+                "the relay refused the connection: a device certificate is required"
+            }
+            _ => return None,
+        }),
+        _ => None,
+    }
+}
+
 fn sanitize_error(error: &str) -> String {
     // Transport diagnostics are intentionally generic. In particular, do not
     // echo a request URL, Authorization header, certificate, or payload.
@@ -2244,6 +2329,12 @@ pub enum ClientError {
     /// existing owner before starting another session; this is terminal and
     /// never eligible for an automatic reconnect or takeover.
     OwnerBusy,
+    /// TLS certificate verification refused, on either side, for a reason no
+    /// retry can fix (see `tls_refusal`).  The string is a fixed reason
+    /// written by this crate, never peer or certificate content.  Terminal:
+    /// `CREDENTIAL_ERROR`, not retryable, and `connect` does not reconnect
+    /// after it.
+    TlsRefused(&'static str),
     HandshakeTimeout,
     AuthorizationExpired,
     QueueLimit,
@@ -2265,6 +2356,7 @@ impl ClientError {
             Self::Protocol(_) => "PROTOCOL_ERROR",
             Self::Transport { .. } => "TRANSPORT_ERROR",
             Self::OwnerBusy => "OWNER_BUSY",
+            Self::TlsRefused(_) => "CREDENTIAL_ERROR",
             Self::HandshakeTimeout => "DEADLINE_EXCEEDED",
             Self::AuthorizationExpired => "AUTHORIZATION_STALE",
             Self::QueueLimit | Self::OpenRetentionFull => "RESOURCE_EXHAUSTED",
@@ -2303,6 +2395,7 @@ impl ClientError {
                 "device already has an active owner; stop it before starting another session"
                     .to_owned()
             }
+            Self::TlsRefused(reason) => (*reason).to_owned(),
             Self::HandshakeTimeout => "TLS/WebSocket handshake deadline exceeded".to_owned(),
             Self::AuthorizationExpired => "authorization confirmation deadline expired".to_owned(),
             Self::QueueLimit => "bounded connector queue limit reached".to_owned(),

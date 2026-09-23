@@ -46,5 +46,9 @@ tunnel-fs-host = { path = "../tunnel-fs-host" }
 [dev-dependencies]
 tempfile = "3.21"
 
+# `reconnect_cli.rs` resets a connection mid-handshake (`SO_LINGER` 0).
+[target.'cfg(unix)'.dev-dependencies]
+rustix = { version = "1.1", default-features = false, features = ["net", "std"] }
+
 [lints]
 workspace = true

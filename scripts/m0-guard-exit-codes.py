@@ -575,6 +575,194 @@ CASES: list[Case] = [
         ],
         expect_build_failure=True,
     ),
+    # ------------------------------------------ reconnect (M6-C23 part 2)
+    Case(
+        # The backoff wait not listening for a stop request: the process
+        # sleeps out the delay, and the pending signal is only seen by the
+        # next attempt's pre-ready select -- 130, but seconds late.  The
+        # witnesses go red at their promptness assertion.
+        "a stop request during backoff ends the wait at once",
+        [
+            (
+                MAIN,
+                "            signal = stop.recv() => {\n                return Err(interrupted_during_backoff(",
+                "            signal = std::future::pending::<Result<StopSignal, CliError>>() => {\n                return Err(interrupted_during_backoff(",
+            )
+        ],
+        frozenset(
+            {
+                "sigterm_during_backoff_exits_cancelled_promptly",
+                "sigint_during_backoff_exits_cancelled_promptly",
+            }
+        ),
+    ),
+    Case(
+        # Without the TLS classification every certificate refusal is the
+        # opaque, retryable `websocket handshake failed`: a wrong server_ca
+        # or a refused device certificate is retried forever.
+        "a certificate refusal is classified before it is sanitized",
+        [
+            (
+                LIB,
+                "    classify_rustls_refusal(rustls_error)\n}",
+                "    let _ = classify_rustls_refusal(rustls_error);\n    None\n}",
+            )
+        ],
+        frozenset(
+            {
+                "an_untrusted_relay_certificate_exits_credential_error_without_retrying",
+                "a_relay_refusing_the_device_certificate_exits_credential_error_without_retrying",
+            }
+        ),
+    ),
+    Case(
+        # The other side of the same line: classifying every I/O error in
+        # the handshake as a refusal makes a reset or an EOF -- a laptop
+        # waking, a flaky network -- terminal.
+        "only certificate refusals are terminal, not every handshake I/O error",
+        [
+            (
+                LIB,
+                "        WsError::Io(error) => error.get_ref()?.downcast_ref::<rustls::Error>()?,",
+                "        WsError::Io(_) => return Some(\"over-broad\"),",
+            )
+        ],
+        frozenset(
+            {
+                "a_relay_that_resets_mid_handshake_is_retried",
+                "a_relay_that_closes_mid_handshake_is_retried",
+            }
+        ),
+    ),
+    Case(
+        # A credential refusal classified retryable: the reconnect loop
+        # retries what no retry can fix, and the tester never sees the error.
+        "a credential refusal is terminal for the reconnect loop",
+        [
+            (
+                MAIN,
+                "            Self::CredentialError => ReconnectClass::Terminal,",
+                "            Self::CredentialError => ReconnectClass::Retryable,",
+            )
+        ],
+        frozenset(
+            {
+                "tests::reconnect_classification_matches_the_documented_table",
+                "an_untrusted_relay_certificate_exits_credential_error_without_retrying",
+                "a_relay_refusing_the_device_certificate_exits_credential_error_without_retrying",
+            }
+        ),
+    ),
+    Case(
+        # The defect M6-C23 part 2 recorded: a refused or dropped relay ends
+        # the process.
+        "a transport failure or a closed session is retried",
+        [
+            (
+                MAIN,
+                "            Self::TransportError | Self::SessionClosed => ReconnectClass::Retryable,",
+                "            Self::TransportError | Self::SessionClosed => ReconnectClass::Terminal,",
+            )
+        ],
+        frozenset(
+            {
+                "tests::reconnect_classification_matches_the_documented_table",
+                "a_refused_relay_backs_off_with_bounded_jittered_delays_and_gives_up_at_the_limit",
+                "a_relay_that_resets_mid_handshake_is_retried",
+                "sigterm_during_backoff_exits_cancelled_promptly",
+            }
+        ),
+    ),
+    Case(
+        # No jitter: every device that lost the same relay at the same
+        # instant retries at the same instants.
+        "the backoff delay is jittered",
+        [
+            (
+                MAIN,
+                "fn jitter_random() -> u64 {\n    uuid::Uuid::new_v4().as_u64_pair().0\n}",
+                "fn jitter_random() -> u64 {\n    0\n}",
+            )
+        ],
+        frozenset({"two_devices_failing_together_draw_different_delays"}),
+    ),
+    Case(
+        # `reconnect.max_attempts` ignored: an operator's retry limit never
+        # ends the process.
+        "the attempt limit ends the loop",
+        [
+            (
+                MAIN,
+                "        if policy.max_attempts != 0 && self.failures > policy.max_attempts {\n            return ReconnectDecision::Exit;",
+                "        if false && policy.max_attempts != 0 && self.failures > policy.max_attempts {\n            return ReconnectDecision::Exit;",
+            )
+        ],
+        frozenset(
+            {
+                "tests::attempt_limit_no_reconnect_and_terminal_causes_exit",
+                "a_refused_relay_backs_off_with_bounded_jittered_delays_and_gives_up_at_the_limit",
+            }
+        ),
+    ),
+    Case(
+        # OWNER_BUSY retried on a fresh process's first attempt: a second
+        # connector for the same device would sit in backoff instead of
+        # exiting 7 (the M7 ownership gate's contract).
+        "a first-attempt OWNER_BUSY is terminal",
+        [
+            (
+                MAIN,
+                "            ReconnectClass::OwnerBusy => self\n",
+                "            ReconnectClass::OwnerBusy => true || self\n",
+            )
+        ],
+        frozenset(
+            {"tests::owner_busy_is_retried_only_within_the_window_after_our_own_session"}
+        ),
+    ),
+    Case(
+        # OWNER_BUSY retried without end after our own session: a device
+        # held by another connector would never exit.
+        "OWNER_BUSY is retried only inside the stale-lease window",
+        [
+            (
+                MAIN,
+                "                .is_some_and(|ended| now.duration_since(ended) < OWNER_BUSY_RECONNECT_WINDOW),",
+                "                .is_some_and(|_| true),",
+            )
+        ],
+        frozenset(
+            {"tests::owner_busy_is_retried_only_within_the_window_after_our_own_session"}
+        ),
+    ),
+    Case(
+        # Any ready session resetting the backoff: a relay that accepts and
+        # then drops the session at once is retried at the first delay
+        # forever.
+        "only a session that stayed ready resets the backoff",
+        [
+            (
+                MAIN,
+                "            if lasted >= policy.max {",
+                "            if lasted >= std::time::Duration::ZERO {",
+            )
+        ],
+        frozenset({"tests::backoff_grows_is_capped_and_resets_only_after_a_stable_session"}),
+    ),
+    Case(
+        # The reconnect classification has no fallback arm: a new cause
+        # cannot compile until someone decides whether a retry could help.
+        # Reported separately and never counted as a red test.
+        "every cause must state its reconnect class or the crate does not compile",
+        [
+            (
+                MAIN,
+                "            Self::DeadlineExceeded => ReconnectClass::Retryable,\n",
+                "",
+            )
+        ],
+        expect_build_failure=True,
+    ),
 ]
 
 
