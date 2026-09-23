@@ -15,14 +15,28 @@ release bundle. All of those blocks form **one shell session**, in document
 order: it starts in an empty directory that holds only the downloaded archive,
 with `PATH` narrowed to the system directories, so each step depends on the
 steps before it exactly as it does in your terminal. Lines without a `$ `
-prompt are output the command must print; `...` stands for text that varies
-between runs. A command whose documented exit status is non-zero is written
-`...; echo "exit=$?"` and the status is part of the checked output. The check
-goes red when a command fails, when it stops printing what is shown, or when a
-shell block is neither executed nor marked `shape-only`.
+prompt are output the command must print, in order; `...` stands for text
+within a line that varies between runs, and a line that is only `...` is
+refused. Commands that print nothing (`cd`, `mkdir`, `tar -xzf` and the like)
+are checked by exit status alone; every command that runs a `tunnel-*` binary
+must also show output. A command whose documented exit status is non-zero is
+written `...; echo "exit=$?"` and the status is part of the checked output.
+The check goes red when a command fails, when it stops printing what is shown,
+when a fence carries any tag other than `console`, `sh shape-only` or a named
+prose tag, or when a section's number of commands, output lines or shape-only
+commands moves from the count pinned in the script.
+
+**The first step is only as real as the archive the check is given.** Run as
+`verify --bundle agentuplink-bundle.tar.gz`, the check copies that archive and
+the `.sha256` file beside it into the session untouched, so the checksum step
+below checks a real download. Run against an unpacked directory, it has to
+build an archive and a checksum itself, and it says in its output that the
+first step then could not have failed for a real download's reason.
 
 Commands marked **shape-only** need a provisioned Redis authority or a live
-relay, so the check cannot run them. It checks only that the real binary accepts
+relay, so the check cannot run them. Only four may be marked that way:
+`tunnel-relay serve`, `tunnel-client connect`, `tunnel-relay recovery-observe`
+and `tunnel-relay recover`. It checks only that the real binary accepts
 the documented subcommand and flags; **their runtime behaviour is not checked by
 this guide.**
 
@@ -256,7 +270,8 @@ provisioned Redis namespace (section 2.3):
 tunnel-relay serve --config /etc/agent-tunnel/relay.toml
 ```
 
-`serve` stops on Ctrl-C (SIGINT). It logs JSON lines to stderr; set
+`serve` stops on Ctrl-C (SIGINT); that is read from the source and has not been
+measured against a running relay here. It logs JSON lines to stderr; set
 `RUST_LOG` (default `info`) to change the level.
 
 The device side runs in the foreground until it stops. **Shape-only:**
@@ -291,10 +306,15 @@ deliberately minimal:
 A relay without `[cluster]` is always ready once it is serving. A cluster relay
 is ready only while its membership is current, its required peer routes are
 probed reachable, it has capacity, **and its set of approved peer keys is not
-empty** (M7-C89). Before M7-C89 a relay could answer `ready` for a few seconds
-after that set was emptied while it refused every request that needed another
-relay. `/readyz` and public admission are now the same check, so a relay that
-says `ready` can dial its peers.
+empty** (M7-C89). Before M7-C89, a relay whose membership went unready had the
+set emptied and already reported `unready`; the fault was on **recovery**: when
+membership returned to ready, nothing republished the set until the next peer
+refresh tick, so for that interval (`min(membership_reconcile_seconds, 5 s)`
+plus any probe pass in flight) the relay answered `ready` while refusing every
+request that needed another relay. `/readyz` and public admission are now the
+same check and it reads the set every peer dial reads. **A non-empty set is
+necessary for a peer dial, not sufficient:** a set that lacks one peer's key
+still reads ready, and a dial to that peer then fails its TLS pin check.
 
 What a load balancer should do:
 
@@ -366,9 +386,16 @@ each relay is the `serve` command from section 3.1.
 ## 4. Service installation, upgrade, backup and recovery
 
 **Service installation is not supported in this alpha** (M6-C23). No unit files
-are shipped. Both binaries shut down cleanly only on SIGINT (Ctrl-C).
-Service managers send SIGTERM by default, and neither binary handles it, so
-the process ends without an orderly shutdown. Because `connect` does not
+are shipped. Neither binary handles SIGTERM, which service managers send by
+default: `tunnel-client connect` sent SIGTERM mid-handshake died at once with no
+output and no `stopped` event (measured; M6-C23), and `tunnel-relay serve` is
+unmeasured but has no handler in its source. SIGINT (Ctrl-C) is handled only
+once `connect` has finished connecting: during the TLS/WebSocket handshake it
+either kills the process with no output or, when SIGINT arrives ignored (a
+background job of a non-interactive shell), does nothing until the handshake
+deadline (10 s with the example profile) ends the run with exit `5` (both measured; M6-C27). After
+connecting, the source handles Ctrl-C as an orderly stop that exits `0`; that
+needs a live relay and is not measured here. Because `connect` does not
 reconnect by itself (section 3.1), whatever supervises it must restart it.
 
 **In-place upgrade is not supported in this alpha.** Stopping a relay ends the
@@ -417,16 +444,17 @@ What an operator can read today:
 | --- | --- | --- |
 | Relay log | stderr of `tunnel-relay serve`, JSON lines, level from `RUST_LOG` | Bounded warnings and errors. No retention or rotation: that is your log shipper's job |
 | `/livez`, `/readyz` | Consumer listener | Section 3.2 |
-| `connect --json` | stdout of `tunnel-client connect` | One JSON object per lifecycle change: session, epoch, generation, connection IDs, rotation and recovery progress. No payloads or credentials |
+| `connect --json` | stdout of `tunnel-client connect` | One JSON object per lifecycle change: session, epoch, generation, connection IDs, rotation and recovery progress and deadlines, and the **local socket addresses** of the control, active and candidate connections. No payloads or credentials |
 | `doctor --json` | Section 6 | Local checks only |
 
-**Redaction.** These guarantees are claimed and tested today:
+**Redaction.** These guarantees are claimed and tested today. The
+`connect --json` events are **not** among them beyond carrying no payloads or
+credentials: they include local socket addresses and deadline timestamps.
 
 - `doctor` output holds only fixed codes, statuses, permission modes,
   certificate counts and timestamps, never a path or credential body.
-- Client error messages are bounded, with no paths, certificates or endpoints
-  (M0-03).
-- The `connect --json` event fields carry identifiers only.
+- A transport error message is pinned by a test to a bounded label with no
+  path, certificate or endpoint (M0-03).
 - Public error responses carry a code from an allowlist, which the
   fail-closed gate asserts (M7-I04), rather than backend error text.
 

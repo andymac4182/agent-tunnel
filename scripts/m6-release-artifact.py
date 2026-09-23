@@ -76,8 +76,13 @@ that is **not the build machine**.  Every check here therefore runs against the
   `docs`        docs/operator.md, executed.  Every `console` block runs, as
                 one shell session, against this bundle's archive and binaries
                 and must print what the guide shows; every `sh shape-only`
-                command must be accepted by the real binary's argument parser;
-                any other shell block is a failure.  It also holds
+                command -- only `serve`, `connect`, `recovery-observe` and
+                `recover` may be -- must be accepted by the real binary's
+                argument parser; a fence with any other tag than those two
+                or a named prose tag is a failure; and each section's counts
+                of commands, assertions and shape-only commands are pinned.
+                Given an archive, the guide's first step checks that archive
+                and its own sidecar.  It also holds
                 docs/runtime.md's client exit-code table to the `Cause`
                 mapping in the client source.  It reads the guide and the
                 source from the checkout, so unlike the checks above it needs
@@ -1479,9 +1484,10 @@ def check_targets(bundle: Path, manifest: Path | None = None) -> Result:
 #
 # `docs/operator.md` is the document an outside tester follows, and this
 # repository has repeatedly caught prose describing things the code does not
-# do.  So the guide is not trusted to be right; it is **run**.  Every fenced
-# shell block in it must be one of exactly two kinds, and a block that is
-# neither is a failure rather than something skipped:
+# do.  So the guide is not trusted to be right; it is **run**.  Every fence in
+# it must carry one of the two tags below or a prose tag named in
+# `DOCS_PROSE_FENCES`; any other tag, including none, is a failure rather than
+# something skipped (the first version skipped them -- see `classify_doc`):
 #
 #   ```console        A transcript.  Lines starting `$ ` are commands (a
 #                     trailing `\` continues one); every other non-blank line
@@ -1536,13 +1542,34 @@ DOCS_CLIENT_MAIN = REPO / "crates" / "tunnel-client" / "src" / "main.rs"
 #: The name the guide calls the downloaded archive; the check stages the
 #: bundle under it, with a sidecar digest in the format `bundle` writes.
 DOCS_ARCHIVE_NAME = "agentuplink-bundle"
-DOCS_SHELL_LANGS = ("console", "sh", "shell", "bash", "zsh")
+#: Fence tags that are prose, allowed by name and counted.  Any other tag
+#: that is not `console` or `sh shape-only` fails the check.
+DOCS_PROSE_FENCES = ("toml", "text", "json")
+#: The only commands that may be shape-only: each needs a provisioned Redis
+#: authority or a live relay.  Everything else in the guide must execute.
+DOCS_SHAPE_ONLY_PERMITTED = {
+    ("tunnel-relay", "serve"),
+    ("tunnel-client", "connect"),
+    ("tunnel-relay", "recovery-observe"),
+    ("tunnel-relay", "recover"),
+}
 DOCS_BINARIES = ("tunnel-client", "tunnel-relay", "tunnel-deadman")
-# Floors, measured on the first complete guide (see M6-02) and set below it:
-# a guide that lost most of its commands, or a table parse that matched almost
-# nothing, must not agree with itself over an empty set.
-MIN_DOC_EXECUTED_COMMANDS = 20
-MIN_DOC_SHAPE_COMMANDS = 3
+# **Pinned, not floored.**  The first version had a floor of 20 executed
+# commands against 35 measured, so 43% of the guide could vanish silently
+# (Fable review of `b041e0a`).  Each section's executed commands, output
+# assertions and shape-only commands are now pinned exactly, so deleting a
+# section, moving a command into prose or demoting a transcript changes a
+# number the check compares rather than one it merely prints.  An edit to the
+# guide must update this table in the same change; that is the point.
+DOCS_PINNED_SECTIONS: dict[str, tuple[int, int, int]] = {
+    # section title: (executed commands, output assertions, shape-only commands)
+    "1. Download and verify": (9, 10, 0),
+    "2. Credential provisioning": (13, 10, 0),
+    "3. Deployment": (9, 10, 2),
+    "4. Service installation, upgrade, backup and recovery": (0, 0, 2),
+    "6. Diagnostics": (4, 7, 0),
+}
+DOCS_PINNED_PROSE_FENCES = 0
 MIN_EXIT_CAUSES = 10
 MIN_EXIT_TABLE_ROWS = 6
 DOCS_SESSION_TIMEOUT = 300
@@ -1555,6 +1582,7 @@ class DocCommand:
     text: str
     line: int
     expected: list[str] = field(default_factory=list)
+    section: str = ""
 
     def invokes_product(self) -> bool:
         return any(re.search(rf"(^|[\s/;&|(]){name}(\s|$)", self.text)
@@ -1610,16 +1638,43 @@ def parse_transcript(body: str, first_line: int) -> list[DocCommand]:
     return commands
 
 
-def classify_doc(text: str) -> tuple[list[DocCommand], list[DocCommand]]:
-    """Split the guide into (session commands, shape-only commands)."""
+def _sections(text: str) -> list[tuple[int, str]]:
+    """(line, title) of every `## ` heading, in order."""
+    return [(number, line[3:].strip())
+            for number, line in enumerate(text.split("\n"), start=1)
+            if line.startswith("## ")]
+
+
+def _section_at(sections: list[tuple[int, str]], line: int) -> str:
+    title = ""
+    for heading_line, heading in sections:
+        if heading_line < line:
+            title = heading
+    return title
+
+
+def classify_doc(text: str) -> tuple[list[DocCommand], list[DocCommand], int]:
+    """Split the guide into (session commands, shape-only commands, prose fences).
+
+    **Every fence is classified by an allowlist, and anything else is a red.**
+    The first version checked only fences tagged as a shell language and
+    `continue`d past every other info string, so a mistyped `consol`, an
+    untagged fence and a transcript retagged as prose all vanished from the
+    session while the check stayed green -- the Fable review of `b041e0a`
+    showed five such edits green.  Prose fences (`toml`, `text`, `json`) are
+    allowed by name and counted, and the count is pinned with the rest.
+    """
     session: list[DocCommand] = []
     shape: list[DocCommand] = []
+    prose = 0
+    sections = _sections(text)
     for line, info, body in doc_blocks(text):
-        lang = info[0] if info else ""
-        attrs = info[1:]
-        if lang not in DOCS_SHELL_LANGS:
+        tag = " ".join(info)
+        section = _section_at(sections, line)
+        if tag in DOCS_PROSE_FENCES:
+            prose += 1
             continue
-        if lang == "console" and not attrs:
+        if tag == "console":
             commands = parse_transcript(body, line)
             if not commands:
                 raise DocFormatError("block-asserts-nothing",
@@ -1631,6 +1686,7 @@ def classify_doc(text: str) -> tuple[list[DocCommand], list[DocCommand]]:
                                      f"docs/operator.md:{line}: console block asserts "
                                      f"no output at all")
             for command in commands:
+                command.section = section
                 if command.invokes_product() and not assertions(command):
                     raise DocFormatError(
                         "block-asserts-nothing",
@@ -1638,19 +1694,29 @@ def classify_doc(text: str) -> tuple[list[DocCommand], list[DocCommand]]:
                         f"product binary and asserts no output; exit status alone "
                         f"would pass a binary that printed nothing")
             session.extend(commands)
-        elif lang == "sh" and attrs == ["shape-only"]:
+        elif tag == "sh shape-only":
             for cmd_line, text_ in _logical_lines(body, line):
                 stripped = text_.strip()
                 if not stripped or stripped.startswith("#"):
                     continue
-                shape.append(DocCommand(stripped, cmd_line))
+                try:
+                    words = shlex.split(stripped.replace("\\\n", " "))
+                except ValueError:
+                    words = []
+                if tuple(words[:2]) not in DOCS_SHAPE_ONLY_PERMITTED:
+                    raise DocFormatError(
+                        "shape-only-not-permitted",
+                        f"docs/operator.md:{cmd_line}: `{stripped[:60]}` is marked "
+                        f"shape-only, but only {sorted(' '.join(p) for p in DOCS_SHAPE_ONLY_PERMITTED)} "
+                        f"need a live deployment; anything else must be executed")
+                shape.append(DocCommand(stripped, cmd_line, section=section))
         else:
             raise DocFormatError(
                 "unclassified-block",
-                f"docs/operator.md:{line}: ```{' '.join(info)} is a shell block that is "
-                f"neither an executed `console` transcript nor `sh shape-only`; a "
-                f"command a reader can copy must be one or the other")
-    return session, shape
+                f"docs/operator.md:{line}: a fence tagged {tag!r} is not in the allowlist "
+                f"(`console`, `sh shape-only`, or prose: {', '.join(DOCS_PROSE_FENCES)}); "
+                f"a block the check does not recognise is a failure, not a skip")
+    return session, shape, prose
 
 
 def assertions(command: DocCommand) -> list[list[str]]:
@@ -1659,8 +1725,17 @@ def assertions(command: DocCommand) -> list[list[str]]:
     for line in command.expected:
         pieces = [piece.strip() for piece in line.split("...")]
         pieces = [piece for piece in pieces if piece]
-        if pieces:
-            out.append(pieces)
+        if not pieces:
+            # A bare `...` line asserts nothing, so replacing a real expected
+            # line with one erodes the check without changing any count the
+            # session reports.  It is refused rather than skipped (Fable
+            # review of `b041e0a`): `...` elides text *within* a line.
+            raise DocFormatError(
+                "assertion-eroded",
+                f"docs/operator.md: `{command.text[:60]}` (line {command.line}) has an "
+                f"expected line that is only `...`; `...` elides text within a line "
+                f"and cannot stand for a whole line")
+        out.append(pieces)
     return out
 
 
@@ -1674,13 +1749,35 @@ def _line_matches(pieces: list[str], line: str) -> bool:
     return True
 
 
-def stage_archive(bundle: Path, work: Path) -> None:
-    """Put the bundle where the guide says the operator downloaded it."""
-    archive = work / f"{DOCS_ARCHIVE_NAME}.tar.gz"
+def stage_archive(bundle: Path, work: Path, archive: Path | None = None) -> str:
+    """Put the archive where the guide says the operator downloaded it.
+
+    **Given the maintainer's real archive, it is copied with its real sidecar,
+    untouched**, so the guide's first step -- `shasum -c` on the sidecar --
+    checks bytes this check did not produce and can fail.  Without one (a
+    directory was verified, or a control is running) the bundle is re-tarred
+    and a sidecar written here; that step then checks an archive the check
+    itself made and cannot fail for a real download's reason, and the result
+    says so (Fable review of `b041e0a`).  Returns which of the two happened.
+    """
+    name = f"{DOCS_ARCHIVE_NAME}.tar.gz"
+    if archive is not None:
+        sidecar = archive.with_name(archive.name + ".sha256")
+        if archive.name != name or not sidecar.is_file():
+            raise FileNotFoundError(
+                f"the guide calls the archive {name!r} with a {name}.sha256 sidecar "
+                f"beside it; got {archive.name!r} "
+                f"(sidecar {'present' if sidecar.is_file() else 'absent'})")
+        shutil.copy2(archive, work / name)
+        shutil.copy2(sidecar, work / sidecar.name)
+        return "the supplied archive and its own sidecar"
+    archive = work / name
     with tarfile.open(archive, "w:gz") as tar:
         tar.add(bundle, arcname=DOCS_ARCHIVE_NAME)
     (work / f"{archive.name}.sha256").write_text(
         f"{sha256_file(archive)}  {archive.name}\n")
+    return ("an archive and sidecar this check made from the directory -- so the "
+            "guide's archive-checksum step could not fail for a real download's reason")
 
 
 def run_session(commands: list[DocCommand], work: Path, env: dict[str, str],
@@ -1808,7 +1905,8 @@ def check_exit_table(runtime_doc: Path, client_main: Path) -> Result | None:
 
 
 def check_docs(bundle: Path, doc: Path | None = None, runtime_doc: Path | None = None,
-               client_main: Path | None = None) -> Result:
+               client_main: Path | None = None, archive: Path | None = None,
+               pins: dict[str, tuple[int, int, int]] | None = None) -> Result:
     doc = doc or DOCS_OPERATOR
     runtime_doc = runtime_doc or DOCS_RUNTIME
     client_main = client_main or DOCS_CLIENT_MAIN
@@ -1818,15 +1916,33 @@ def check_docs(bundle: Path, doc: Path | None = None, runtime_doc: Path | None =
                           summary=f"{needed} is not present; this check reads the guide "
                                   f"and the client source from a repository checkout")
     try:
-        session, shape = classify_doc(read_exact(doc))
+        session, shape, prose = classify_doc(read_exact(doc))
+        measured: dict[str, list[int]] = {}
+        for command in session:
+            counts = measured.setdefault(command.section, [0, 0, 0])
+            counts[0] += 1
+            counts[1] += len(assertions(command))
+        for command in shape:
+            measured.setdefault(command.section, [0, 0, 0])[2] += 1
     except DocFormatError as error:
         return Result("docs", False, summary=str(error), witness=error.witness)
-    if len(session) < MIN_DOC_EXECUTED_COMMANDS or len(shape) < MIN_DOC_SHAPE_COMMANDS:
+    pins = DOCS_PINNED_SECTIONS if pins is None else pins
+    drift = []
+    for section in sorted(set(pins) | set(measured)):
+        want = pins.get(section, (0, 0, 0))
+        got = tuple(measured.get(section, [0, 0, 0]))
+        if got != want:
+            drift.append(f"{section!r}: pinned executed/assertions/shape-only {want}, "
+                         f"measured {got}")
+    if prose != DOCS_PINNED_PROSE_FENCES:
+        drift.append(f"prose fences: pinned {DOCS_PINNED_PROSE_FENCES}, measured {prose}")
+    if drift:
         return Result("docs", False,
-                      summary=f"the guide yields {len(session)} executed and "
-                              f"{len(shape)} shape-only commands, below the floors of "
-                              f"{MIN_DOC_EXECUTED_COMMANDS} and {MIN_DOC_SHAPE_COMMANDS}",
-                      witness="docs-floor")
+                      summary="the guide's inventory moved from its pins -- "
+                              + "; ".join(drift)
+                              + ". Update DOCS_PINNED_SECTIONS in the same change as "
+                                "an intended edit; an unintended one is what this catches",
+                      witness="docs-count-mismatch")
 
     table = check_exit_table(runtime_doc, client_main)
     if table is not None:
@@ -1843,7 +1959,10 @@ def check_docs(bundle: Path, doc: Path | None = None, runtime_doc: Path | None =
                           summary=f"cargo is still reachable on the narrowed PATH "
                                   f"{env['PATH']!r}",
                           witness="environment-not-scrubbed")
-        stage_archive(bundle, work)
+        try:
+            staged = stage_archive(bundle, work, archive)
+        except FileNotFoundError as error:
+            return Result("docs", False, ran=False, summary=str(error))
         nonce = sha256_bytes(os.urandom(16))[:16]
         outputs, codes, raw = run_session(session, work, env, nonce)
         asserted = 0
@@ -1888,7 +2007,10 @@ def check_docs(bundle: Path, doc: Path | None = None, runtime_doc: Path | None =
                     summary=f"{len(session)} documented commands executed as one session "
                             f"from the unpacked bundle with {asserted} output assertions; "
                             f"{len(shape)} shape-only commands accepted by the real binary "
-                            f"(NOT executed); the client exit-code table agrees with Cause")
+                            f"(NOT executed); {prose} prose fence(s) skipped by name; every "
+                            f"section matches its pinned inventory; the client exit-code "
+                            f"table agrees with Cause")
+    result.note(f"the guide's first step verified {staged}")
     result.note("shape-only commands need a provisioned Redis authority or a live relay; "
                 "their argument vocabulary is checked, their behaviour is not")
     result.note("session started in an empty directory holding only the archive, PATH "
@@ -2867,7 +2989,7 @@ def _doc_copy(tmp: Path, transform) -> Path:
 
 
 def _first_session_command(predicate) -> DocCommand | None:
-    session, _ = classify_doc(read_exact(DOCS_OPERATOR))
+    session, _, _ = classify_doc(read_exact(DOCS_OPERATOR))
     return next((command for command in session if predicate(command)), None)
 
 
@@ -2976,7 +3098,121 @@ def control_docs_too_few_commands(bundle: Path) -> tuple[bool, str]:
     """A guide stripped of its transcripts must not pass over an empty set."""
     with tempfile.TemporaryDirectory() as tmp:
         doc = _doc_copy(tmp, lambda text: text.replace("```console", "```text"))
-        return expect_red("docs", bundle, "docs-floor", doc=doc)
+        return expect_red("docs", bundle, "docs-count-mismatch", doc=doc)
+
+
+# The five edits the Fable review of `b041e0a` showed staying GREEN, plus the
+# assertion erosion and the step-1 archive it named.  Each must now go red for
+# its own reason, and each names where, so a sibling cannot credit it.
+
+
+def _retag_block_containing(text: str, marker: str, new_tag: str) -> tuple[str, int]:
+    """Retag the ```console fence of the block that contains `marker`."""
+    at = text.index(marker)
+    fence = text.rfind("```console\n", 0, at)
+    line = text.count("\n", 0, fence) + 1
+    return text[:fence] + new_tag + text[fence + len("```console"):], line
+
+
+def _control_retag(bundle: Path, marker: str, new_tag: str) -> tuple[bool, str]:
+    text = read_exact(DOCS_OPERATOR)
+    edited, line = _retag_block_containing(text, marker, new_tag)
+    with tempfile.TemporaryDirectory() as tmp:
+        doc = _doc_copy(tmp, lambda _: edited)
+        return _expect_red_at(f"docs/operator.md:{line + 1}: a fence tagged", bundle,
+                              "unclassified-block", doc=doc)
+
+
+def control_docs_misspelled_tag(bundle: Path) -> tuple[bool, str]:
+    """`consol` on the diagnostics block was skipped silently; it must fail."""
+    return _control_retag(bundle, "$ tunnel-client doctor --config trial/absent.toml",
+                          "```consol")
+
+
+def control_docs_untagged_fence(bundle: Path) -> tuple[bool, str]:
+    """A fence with no tag at all was skipped silently; it must fail."""
+    return _control_retag(bundle, "$ tunnel-client doctor --config trial/absent.toml", "```")
+
+
+def control_docs_misspelled_credentials_tag(bundle: Path) -> tuple[bool, str]:
+    """The credentials block retagged used to go red at a later sibling (the
+    skipped `mkdir trial`); it must now go red at its own fence, before any
+    command runs."""
+    return _control_retag(bundle, "$ mkdir trial\n", "```consol")
+
+
+def control_docs_demoted_to_shape_only(bundle: Path) -> tuple[bool, str]:
+    """`initialize` can run offline, so it may not hide behind shape-only."""
+    text = read_exact(DOCS_OPERATOR)
+    marker = "$ tunnel-relay initialize --config examples/m7-cluster-relay.toml\n"
+    edited, _ = _retag_block_containing(text, marker, "```sh shape-only")
+    edited = edited.replace(
+        "$ mkdir -m 700 state\n$ tunnel-relay initialize",
+        "tunnel-relay initialize", 1)
+    with tempfile.TemporaryDirectory() as tmp:
+        doc = _doc_copy(tmp, lambda _: edited)
+        return _expect_red_at("tunnel-relay initialize", bundle,
+                              "shape-only-not-permitted", doc=doc)
+
+
+def control_docs_sections_deleted(bundle: Path) -> tuple[bool, str]:
+    """Deleting section 3.3 and section 6 outright must fail the pins."""
+    def cut(text: str) -> str:
+        a = text.index("### 3.3 A cluster")
+        b = text.index("## 4. Service installation")
+        text = text[:a] + text[b:]
+        return text[:text.index("## 6. Diagnostics")]
+    with tempfile.TemporaryDirectory() as tmp:
+        doc = _doc_copy(tmp, cut)
+        return _expect_red_at("'6. Diagnostics'", bundle, "docs-count-mismatch", doc=doc)
+
+
+def control_docs_command_moved_to_prose(bundle: Path) -> tuple[bool, str]:
+    """A `config check` moved out of its transcript into prose must fail."""
+    line = ("$ tunnel-client config check --config trial/client.toml\n"
+            "Runtime client configuration is valid.\n")
+    def move(text: str) -> str:
+        if line not in text:
+            raise AssertionError("the guide no longer has the config check transcript")
+        text = text.replace(line, "", 1)
+        return text.replace("### 2.2 Relay listener identities",
+                            "Run `tunnel-client config check --config trial/client.toml`.\n\n"
+                            "### 2.2 Relay listener identities", 1)
+    with tempfile.TemporaryDirectory() as tmp:
+        doc = _doc_copy(tmp, move)
+        return _expect_red_at("'2. Credential provisioning'", bundle,
+                              "docs-count-mismatch", doc=doc)
+
+
+def control_docs_assertion_eroded(bundle: Path) -> tuple[bool, str]:
+    """An expected line replaced by a bare `...` asserts nothing and must fail."""
+    command = _first_session_command(lambda c: "PROVENANCE.txt" in c.text)
+    if command is None:
+        return False, "the guide has no PROVENANCE.txt transcript to erode"
+    with tempfile.TemporaryDirectory() as tmp:
+        doc = _doc_copy(tmp, lambda text: text.replace(
+            "rustc_version: rustc 1.95.0 ...\n", "...\n", 1))
+        return _expect_red_at(f"(line {command.line})", bundle, "assertion-eroded", doc=doc)
+
+
+def control_docs_real_archive_sidecar_mismatch(bundle: Path) -> tuple[bool, str]:
+    """Given a real archive, the guide's first step must be able to fail.
+
+    Builds an archive of the bundle under the guide's name and a sidecar
+    recording a different digest, supplies both as `verify --bundle ARCHIVE`
+    does, and requires the session to stop at the guide's `shasum -c` step.
+    """
+    command = _first_session_command(
+        lambda c: c.text.startswith(f"shasum -a 256 -c {DOCS_ARCHIVE_NAME}.tar.gz.sha256"))
+    if command is None:
+        return False, "the guide has no archive-checksum step to defeat"
+    with tempfile.TemporaryDirectory() as tmp:
+        archive = Path(tmp) / f"{DOCS_ARCHIVE_NAME}.tar.gz"
+        with tarfile.open(archive, "w:gz") as tar:
+            tar.add(bundle, arcname=DOCS_ARCHIVE_NAME)
+        (Path(tmp) / f"{archive.name}.sha256").write_text(f"{'0' * 64}  {archive.name}\n")
+        return _expect_red_at(f"docs/operator.md:{command.line} ", bundle,
+                              "documented-command-failed", archive=archive)
 
 
 def control_docs_exit_table_row_edited(bundle: Path) -> tuple[bool, str]:
@@ -3091,6 +3327,16 @@ CONTROLS: dict[str, list[tuple[str, object]]] = {
         ("a transcript that asserts no output", control_docs_block_asserting_nothing),
         ("a shape-only command with an unknown flag", control_docs_shape_flag_rejected),
         ("a guide stripped of its transcripts", control_docs_too_few_commands),
+        ("a misspelled `consol` fence tag", control_docs_misspelled_tag),
+        ("a fence with no tag at all", control_docs_untagged_fence),
+        ("the credentials block misspelled, caught at its own fence",
+         control_docs_misspelled_credentials_tag),
+        ("an executable block demoted to shape-only", control_docs_demoted_to_shape_only),
+        ("sections 3.3 and 6 deleted outright", control_docs_sections_deleted),
+        ("a documented command moved into prose", control_docs_command_moved_to_prose),
+        ("an expected line eroded to a bare `...`", control_docs_assertion_eroded),
+        ("a real archive whose sidecar does not match it",
+         control_docs_real_archive_sidecar_mismatch),
         ("the runtime.md exit table edited away from the code",
          control_docs_exit_table_row_edited),
         ("the code's exit mapping moved under the table", control_docs_exit_source_edited),
@@ -3334,7 +3580,8 @@ def cmd_verify(args: argparse.Namespace) -> int:
                 return 2
             print(f"unpacked {target.name} ({sha256_file(target)[:12]}) into a "
                   f"temporary directory as {bundle.name}")
-            results = [CHECKS[name](bundle) for name in selected]
+            results = [CHECKS[name](bundle, archive=target) if name == "docs"
+                       else CHECKS[name](bundle) for name in selected]
     elif target.is_dir():
         results = [CHECKS[name](target) for name in selected]
     else:

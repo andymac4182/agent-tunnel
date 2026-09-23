@@ -127,7 +127,7 @@ These are the exit statuses `tunnel-client` selects, and they are implemented ra
 | 5 | Deadline exceeded | `DEADLINE_EXCEEDED` | check latency, or raise the bounded deadline |
 | 6 | Operation outcome unknown or incomplete drain requiring reconciliation | *(no producer today — see below)* | query the authorized operation status; never replay the mutation |
 | 7 | Refused before dispatch: the device owner slot is already held, or a bounded local budget was exhausted. No session work started | `OWNER_BUSY`, `RESOURCE_EXHAUSTED` | stop the other connector, or wait and retry |
-| 130 | Interrupted before an orderly completion could be recorded | `CANCELLED` | re-run; an orderly `Ctrl-C` stop exits `0` instead |
+| 130 | Interrupted before an orderly completion could be recorded | `CANCELLED` | re-run; an orderly `Ctrl-C` stop exits `0` instead. **Not what Ctrl-C during the connect handshake produces:** the `ctrl_c` handler is armed only after connecting, so a SIGINT then either kills the process by signal with no diagnostic (a shell also reports that as 130) or, if inherited as ignored, is ignored until the handshake deadline exits `5` `DEADLINE_EXCEEDED` (measured; M6-C27) |
 
 `7` was added by task row M0-03. Before it, `OWNER_BUSY` and `RESOURCE_EXHAUSTED` fell through a `_ => 1` arm and were reported as "unexpected internal failure" — together with `CANCELLED`, `AUTHORIZATION_STALE`, `PROTOCOL_ERROR` and `SUPERVISOR_FAILED`, six live causes sharing one status. A refused-before-dispatch outcome is neither a network failure (`4`) nor a defect (`1`): nothing is wrong, something else holds the slot.
 
