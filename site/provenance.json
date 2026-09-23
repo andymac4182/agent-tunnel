@@ -1,11 +1,11 @@
 {
-  "reviewedOriginMain": "bce9687b5c56f3dcc1fc9ae99f37b90c0341315b",
-  "lastPublishedOriginMain": "bce9687b5c56f3dcc1fc9ae99f37b90c0341315b",
-  "lastReviewAt": "2026-09-24T06:02:58+10:00",
-  "lastReviewOutcome": "Reviewed single-relay Redis continuity configuration, run binding and refusal paths, process regression coverage, Fly templates and filesystem platform corrections through bce9687. Published in-place restart prerequisites, operator attestation and explicit restore/failover exclusions, persistence downgrade limits and new error classes. Clarified Windows filesystem refusal and Linux resolver scope. No runtime or recovery operations executed; CI and release gates not changed by this update.",
+  "reviewedOriginMain": "759f57653c92d28c7ba545acebdfc0ed0b85e97a",
+  "lastPublishedOriginMain": "759f57653c92d28c7ba545acebdfc0ed0b85e97a",
+  "lastReviewAt": "2026-09-24T07:05:20+10:00",
+  "lastReviewOutcome": "Reviewed Windows device-only release packaging, relay refusal, platform-specific test corrections and operator documentation through 759f576. Published separate device and Unix relay setup checks, platform-specific source fallback and upgrade guidance. Preserved filesystem and adapter limitations. No runtime operations executed; CI and release gates not changed by this update.",
   "reviewedDate": "2026-09-24",
   "scope": "Setup, architecture, MCP, ACP, computer use, filesystems and support boundaries",
-  "verification": "Local and live Chrome verification passed at 1440, 1920, 390 and 320 pixels: homepage, brand lab, nine docs pages, links, images, light/dark/system themes and overflow. Live setup, support, architecture, downloads and filesystems exactly matched reviewed local assets. Runtime, Redis and artifact acceptance not rerun; historical evidence not promoted to new acceptance.",
-  "verifiedAt": "2026-09-24T06:02:58+10:00",
-  "deploymentId": "dpl_EWEi6TpoiThVpwuLLG2SmeETMnBn"
+  "verification": "Local and live Chrome verification passed at 1440, 1920, 390 and 320 pixels: homepage, brand lab, nine docs pages, links, images, light/dark/system themes and overflow. Live setup and downloads exactly matched reviewed local assets. Runtime, Windows and artifact acceptance not rerun; historical evidence not promoted to new acceptance.",
+  "verifiedAt": "2026-09-24T07:05:20+10:00",
+  "deploymentId": "dpl_9Zr7pkqSp2unj3yaX6MDYAbBc2wM"
 }
