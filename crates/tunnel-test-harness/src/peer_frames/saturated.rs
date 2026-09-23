@@ -928,6 +928,10 @@ async fn run_gate(running: &RunningFixture) -> Result<SaturatedFrameEvidence> {
         "opening saturation streams"
     );
     let saturation_started = Instant::now();
+    // The named streams' records are already dispatched (each phase read its
+    // request frame above), so every dispatch from here until the revocation
+    // baseline belongs to a saturation stream.
+    let dispatches_before_fill = snapshot(running).await?.lifetime_application_dispatches;
     let mut occupants = Vec::with_capacity(SATURATION_STREAMS);
     for index in 0..SATURATION_STREAMS {
         occupants.push(open_saturation_stream(running, &mut control, &context, index).await?);
@@ -945,6 +949,12 @@ async fn run_gate(running: &RunningFixture) -> Result<SaturatedFrameEvidence> {
     evidence.configured_max_streams_per_device = evidence.streams_admitted;
 
     let peak = wait_for_saturation(running, &context.session_id).await?;
+    // The residency floor above is reached long before every saturation
+    // record has crossed the peer hop, and `lifetime_application_dispatches`
+    // counts the whole owner.  A saturation record dispatched after the
+    // revocation baseline was counted against the revoked stream (task row
+    // M7-C100), so the baseline waits for the exact saturation workload.
+    wait_for_saturation_dispatches(running, dispatches_before_fill).await?;
     evidence.data_queue_depth_high_water = peak.data_queue_depth_high_water;
     evidence.physically_resident_frames = peak.data_queue_depth_high_water.saturating_add(1);
     evidence.reserved_free_data_slots_at_peak = peak
@@ -1204,6 +1214,41 @@ async fn wait_for_saturation(
                 session.queue_bytes,
                 session.queue_messages,
                 session.streams.len(),
+            )));
+        }
+        sleep(POLL).await;
+    }
+}
+
+/// Wait until the owner has dispatched exactly the saturation workload: one
+/// record per saturation stream since `dispatches_before_fill`.  More than that
+/// is an unexplained dispatch and fails rather than being absorbed.
+async fn wait_for_saturation_dispatches(
+    running: &RunningFixture,
+    dispatches_before_fill: u64,
+) -> Result<()> {
+    let expected = dispatches_before_fill.saturating_add(SATURATION_STREAMS as u64);
+    let deadline = Instant::now() + SETTLE_TIMEOUT;
+    loop {
+        let dispatches = snapshot(running).await?.lifetime_application_dispatches;
+        if dispatches > expected {
+            return Err(HarnessError::Process(format!(
+                "saturated gate recorded {} dispatches after opening {SATURATION_STREAMS} saturation streams, more than one per stream",
+                dispatches.saturating_sub(dispatches_before_fill)
+            )));
+        }
+        if dispatches == expected {
+            tracing::info!(
+                phase = "saturated_dispatches_settled",
+                dispatches = dispatches.saturating_sub(dispatches_before_fill),
+                "every saturation record dispatched"
+            );
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(HarnessError::Timeout(format!(
+                "saturated gate dispatched only {} of {SATURATION_STREAMS} saturation records before the revocation baseline",
+                dispatches.saturating_sub(dispatches_before_fill)
             )));
         }
         sleep(POLL).await;
