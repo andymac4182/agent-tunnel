@@ -1,0 +1,53 @@
+# Catalog records for `tunnel-relay provision-catalog` that provision one ACP
+# agent export (docs/operator.md section 2.3, task row M6-C57). The tenant,
+# user and device are the ones in examples/m6-catalog.toml; see that file for
+# what each field means. Every UUID is a synthetic placeholder.
+#
+# An ACP agent is an `http-forward` service with the `acp-http-v1` profile,
+# and the relay configuration given with --config must list that profile:
+#
+#   [http_forward]
+#   profiles = ["acp-http-v1"]
+#
+# The device's client profile serves it with an export table named by
+# service.id, which supervises one fixed ACP agent over stdio:
+#
+#   [exports."66666666-6666-4666-8666-666666666666"]
+#   type = "http-forward"
+#
+#   [exports."66666666-6666-4666-8666-666666666666".acp]
+#   profile = "acp-http-v1"
+#
+#   [exports."66666666-6666-4666-8666-666666666666".acp.agent]
+#   command = "/absolute/path/to/an/acp-agent"
+#   workspace = "/absolute/path/to/a/dedicated/workspace"
+#
+# Consumers then call
+# https://<consumer listener>/v1/devices/<device.id>/services/<service.id>/http/acp
+# over HTTP/2 (the ACP profile refuses HTTP/1.1 with 501) with a token whose
+# scope includes http:invoke.
+
+[tenant]
+id = "11111111-1111-4111-8111-111111111111"
+display_name = "Trial tenant"
+
+[user]
+id = "22222222-2222-4222-8222-222222222222"
+display_name = "Trial user"
+oidc_subject = "trial-user"
+role = "member"
+
+[device]
+id = "33333333-3333-4333-8333-333333333333"
+display_name = "Trial device"
+certificate = "device-cert.pem"
+
+[service]
+id = "66666666-6666-4666-8666-666666666666"
+type = "http-forward"
+display_name = "Trial ACP agent"
+operations = ["http:invoke"]
+http_forward_profile = "acp-http-v1"
+
+[grant]
+operations = ["http:invoke"]

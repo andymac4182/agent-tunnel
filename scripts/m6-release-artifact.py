@@ -201,6 +201,11 @@ BUNDLE_EXAMPLES = (
     # The catalog records document `tunnel-relay provision-catalog` reads;
     # docs/operator.md section 2.3 dry-runs it (M6-C21).
     "m6-catalog.toml",
+    # One records document per further service type; section 2.3 displays
+    # and dry-runs each (M6-C57).
+    "m6-catalog-mcp.toml",
+    "m6-catalog-acp.toml",
+    "m6-catalog-fs.toml",
 )
 
 SHA256SUMS = "SHA256SUMS"
@@ -1584,8 +1589,13 @@ DOCS_PINNED_SECTIONS: dict[str, tuple[int, int, int]] = {
     "1. Download and verify": (9, 10, 0),
     # M6-C21 added section 2.3: `cp` of the records example (exit status
     # only), the `provision-catalog --dry-run` transcript (one assertion), and
-    # the two Redis-writing commands as shape-only.
-    "2. Credential provisioning": (15, 11, 2),
+    # the two Redis-writing commands as shape-only.  M6-C57 added the
+    # per-service-type block: 12 commands (`cp` of the three examples and of
+    # the relay example and a `printf` of its `[http_forward]` table, exit
+    # status only; three `sed` displays of eight lines each; four dry runs,
+    # two of them refusals of two lines each; and the `sed` that makes the
+    # unsupported type) and 31 assertions.
+    "2. Credential provisioning": (27, 42, 2),
     # M6-C23 (reconnect): section 3.1's unreachable-relay rehearsal now
     # appends a bounded `[reconnect]` table (`printf`, exit status only) and
     # shows the backoff events of one retry (five assertion lines), then the

@@ -57,6 +57,12 @@ h3-quinn = "0.0.10"
 http-body-util = "0.1"
 rcgen = "0.13"
 tokio = { version = "1.48", features = ["test-util"] }
+# M6-C57: the provisioning gate's filesystem consumer opens the relay's 9P
+# WebSocket, as tunnel-test-harness's does, with the version already locked.
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "__rustls-tls"] }
+# M6-C57: the ACP profile is HTTP/2 only, so the gate's ACP consumer is too.
+hyper = { version = "1.7", features = ["http1", "http2", "client"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 
 [lints]
 workspace = true

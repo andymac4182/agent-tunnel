@@ -16,7 +16,10 @@
 //!   the plaintext `TEST_REDIS_URL` because `serve` accepts only `rediss://`;
 //! * **the identity issuer** is an RSA key from `openssl genpkey` whose public
 //!   half is the relay's JWKS; this test signs the consumer's access token;
-//! * **the consumer** is an HTTPS request made from this test.
+//! * **the consumer** is an HTTPS request made from this test;
+//! * **the M6-C57 backends** are the repository's synthetic MCP server and
+//!   ACP agent (`TUNNEL_MCP_FIXTURE_BIN`, `TUNNEL_ACP_FIXTURE_BIN`) and a
+//!   temporary directory holding one generated file.
 //!
 //! The gate is ignored by the ordinary workspace run because it needs a
 //! disposable Redis (`TEST_REDIS_URL`) and a freshly built client
@@ -331,6 +334,10 @@ fn oidc_issuer(dir: &Path) -> (jsonwebtoken::EncodingKey, PathBuf) {
 }
 
 fn access_token(key: &jsonwebtoken::EncodingKey, subject: &str) -> String {
+    access_token_with_scope(key, subject, "echo:invoke")
+}
+
+fn access_token_with_scope(key: &jsonwebtoken::EncodingKey, subject: &str, scope: &str) -> String {
     let now = chrono::Utc::now().timestamp();
     let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
     header.kid = Some("m6c21-issuer".to_owned());
@@ -338,7 +345,7 @@ fn access_token(key: &jsonwebtoken::EncodingKey, subject: &str) -> String {
         &header,
         &serde_json::json!({
             "iss": ISSUER, "aud": AUDIENCE, "sub": subject,
-            "iat": now, "exp": now + 300, "scope": "echo:invoke"
+            "iat": now, "exp": now + 300, "scope": scope
         }),
         key,
     )
@@ -353,19 +360,107 @@ async fn consumer_post(
     token: &str,
     body: &[u8],
 ) -> Result<(u16, Vec<u8>), String> {
+    consumer_request(
+        consumer,
+        server_ca_pem,
+        "POST",
+        path,
+        token,
+        &[("content-type", "application/octet-stream")],
+        body,
+    )
+    .await
+    .map(|(status, _, body)| (status, body))
+}
+
+/// A TLS client configuration trusting only the synthetic server CA.
+fn consumer_tls(server_ca_pem: &str) -> Result<rustls::ClientConfig, String> {
     let mut roots = rustls::RootCertStore::empty();
     for certificate in rustls_pemfile::certs(&mut server_ca_pem.as_bytes()) {
         roots
             .add(certificate.map_err(|error| error.to_string())?)
             .map_err(|error| error.to_string())?;
     }
-    let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+    Ok(rustls::ClientConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
     .with_safe_default_protocol_versions()
     .map_err(|error| error.to_string())?
     .with_root_certificates(roots)
-    .with_no_client_auth();
+    .with_no_client_auth())
+}
+
+/// One HTTPS request to the relay's consumer listener with the caller's
+/// headers, bounded by [`STEP_DEADLINE`].  Sends no `User-Agent` (M6-C58).
+async fn consumer_request(
+    consumer: SocketAddr,
+    server_ca_pem: &str,
+    method: &str,
+    path: &str,
+    token: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> Result<(u16, hyper::HeaderMap, Vec<u8>), String> {
+    tokio::time::timeout(
+        STEP_DEADLINE,
+        consumer_request_unbounded(
+            consumer,
+            server_ca_pem,
+            false,
+            method,
+            path,
+            token,
+            headers,
+            body,
+        ),
+    )
+    .await
+    .map_err(|_| format!("consumer {method} {path}: no answer within {STEP_DEADLINE:?}"))?
+}
+
+/// [`consumer_request`] over HTTP/2 (ALPN `h2`), which the ACP profile
+/// requires.
+async fn consumer_request_h2(
+    consumer: SocketAddr,
+    server_ca_pem: &str,
+    method: &str,
+    path: &str,
+    token: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> Result<(u16, hyper::HeaderMap, Vec<u8>), String> {
+    tokio::time::timeout(
+        STEP_DEADLINE,
+        consumer_request_unbounded(
+            consumer,
+            server_ca_pem,
+            true,
+            method,
+            path,
+            token,
+            headers,
+            body,
+        ),
+    )
+    .await
+    .map_err(|_| format!("consumer {method} {path}: no answer within {STEP_DEADLINE:?}"))?
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn consumer_request_unbounded(
+    consumer: SocketAddr,
+    server_ca_pem: &str,
+    http2: bool,
+    method: &str,
+    path: &str,
+    token: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> Result<(u16, hyper::HeaderMap, Vec<u8>), String> {
+    let mut config = consumer_tls(server_ca_pem)?;
+    if http2 {
+        config.alpn_protocols = vec![b"h2".to_vec()];
+    }
     let tcp = TcpStream::connect(consumer)
         .await
         .map_err(|error| format!("consumer connect: {error}"))?;
@@ -376,21 +471,39 @@ async fn consumer_post(
         )
         .await
         .map_err(|error| format!("consumer TLS: {error}"))?;
-    let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(tls))
-        .await
-        .map_err(|error| format!("consumer HTTP: {error}"))?;
-    tokio::spawn(connection);
-    let request = hyper::Request::post(path)
-        .header("host", consumer.to_string())
-        .header("authorization", format!("Bearer {token}"))
-        .header("content-type", "application/octet-stream")
+    let mut request = hyper::Request::builder().method(method);
+    request = if http2 {
+        request
+            .version(hyper::Version::HTTP_2)
+            .uri(format!("https://127.0.0.1:{}{path}", consumer.port()))
+    } else {
+        request.uri(path).header("host", consumer.to_string())
+    };
+    request = request.header("authorization", format!("Bearer {token}"));
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    let request = request
         .body(Full::new(bytes::Bytes::copy_from_slice(body)))
         .map_err(|error| error.to_string())?;
-    let response = sender
-        .send_request(request)
-        .await
-        .map_err(|error| format!("consumer request: {error}"))?;
+    let io = TokioIo::new(tls);
+    let response = if http2 {
+        let (mut sender, connection) =
+            hyper::client::conn::http2::handshake(hyper_util::rt::TokioExecutor::new(), io)
+                .await
+                .map_err(|error| format!("consumer HTTP/2: {error}"))?;
+        tokio::spawn(connection);
+        sender.send_request(request).await
+    } else {
+        let (mut sender, connection) = hyper::client::conn::http1::handshake(io)
+            .await
+            .map_err(|error| format!("consumer HTTP: {error}"))?;
+        tokio::spawn(connection);
+        sender.send_request(request).await
+    }
+    .map_err(|error| format!("consumer request: {error}"))?;
     let status = response.status().as_u16();
+    let response_headers = response.headers().clone();
     let bytes = response
         .into_body()
         .collect()
@@ -398,7 +511,7 @@ async fn consumer_post(
         .map_err(|error| format!("consumer body: {error}"))?
         .to_bytes()
         .to_vec();
-    Ok((status, bytes))
+    Ok((status, response_headers, bytes))
 }
 
 /// Run `connect --json` once for a profile the relay must not admit, and
@@ -567,7 +680,126 @@ struct Provisioned {
     _dir: Workdir,
 }
 
+/// The service type one gate provisions (task row M6-C57), and what the relay
+/// configuration and the device profile need in order to serve it.  Each
+/// provisions from its own shipped records example, verbatim.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ServiceKind {
+    Echo,
+    Mcp,
+    Acp,
+    Fs,
+}
+
+/// The synthetic file the filesystem gate reads through the relay.
+const FS_FILE_NAME: &str = "synthetic.txt";
+
+impl ServiceKind {
+    fn records_example(self) -> &'static str {
+        match self {
+            Self::Echo => "m6-catalog.toml",
+            Self::Mcp => "m6-catalog-mcp.toml",
+            Self::Acp => "m6-catalog-acp.toml",
+            Self::Fs => "m6-catalog-fs.toml",
+        }
+    }
+
+    /// Tables appended to the relay configuration: the `[http_forward]`
+    /// profile the records example names, as that example's comment says.
+    fn relay_tables(self, records: &toml::Value) -> String {
+        match records["service"].get("http_forward_profile") {
+            Some(profile) => format!("\n[http_forward]\nprofiles = [{profile}]\n"),
+            None => String::new(),
+        }
+    }
+
+    /// The export table replacing `examples/m1-client.toml`'s echo export,
+    /// shaped as the records example's comment documents it.  Every backend
+    /// is synthetic: the repository's MCP and ACP fixture binaries and a
+    /// temporary directory holding one generated file.
+    fn client_export(self, work: &Path, service: Uuid, nonce: &str) -> Option<String> {
+        let fixture = |variable: &str| -> PathBuf {
+            PathBuf::from(
+                env::var_os(variable)
+                    .unwrap_or_else(|| panic!("{variable} must name a freshly built fixture")),
+            )
+        };
+        let workspace = |name: &str| -> PathBuf {
+            let path = work.join("device").join(name);
+            fs::create_dir_all(&path).expect("export workspace");
+            path
+        };
+        match self {
+            Self::Echo => None,
+            Self::Mcp => Some(format!(
+                "[exports.\"{service}\"]\ntype = \"http-forward\"\n\n\
+                 [exports.\"{service}\".mcp]\nprofile = \"mcp-2025-11-25\"\n\n\
+                 [exports.\"{service}\".mcp.backend]\nkind = \"stdio\"\ncommand = {}\n\
+                 args = [\"stdio\"]\nworkspace = {}\n",
+                toml_string(&fixture("TUNNEL_MCP_FIXTURE_BIN")),
+                toml_string(&workspace("mcp-workspace")),
+            )),
+            Self::Acp => Some(format!(
+                "[exports.\"{service}\"]\ntype = \"http-forward\"\n\n\
+                 [exports.\"{service}\".acp]\nprofile = \"acp-http-v1\"\n\n\
+                 [exports.\"{service}\".acp.agent]\ncommand = {}\nargs = [\"agent\"]\n\
+                 workspace = {}\n",
+                toml_string(&fixture("TUNNEL_ACP_FIXTURE_BIN")),
+                toml_string(&workspace("acp-workspace")),
+            )),
+            Self::Fs => {
+                let root = workspace("fs-root");
+                fs::write(
+                    root.join(FS_FILE_NAME),
+                    format!("m6c57 synthetic file {nonce}\n"),
+                )
+                .expect("synthetic file");
+                Some(format!(
+                    "[exports.\"{service}\"]\ntype = \"fs\"\n\n\
+                     [exports.\"{service}\".fs]\nroot = {}\ncapabilities = [\"read\", \"list\"]\n",
+                    toml_string(&root),
+                ))
+            }
+        }
+    }
+}
+
+/// Replace the one `[exports.*]` table of a shipped client example (the
+/// header and its lines up to the next blank line) with `export`.
+fn replace_export(document: &str, export: &str) -> String {
+    let lines: Vec<&str> = document.lines().collect();
+    let start = lines
+        .iter()
+        .position(|line| line.starts_with("[exports."))
+        .expect("the shipped client example has an [exports.*] table");
+    let end = lines[start..]
+        .iter()
+        .position(|line| line.trim().is_empty())
+        .map_or(lines.len(), |offset| start + offset);
+    assert!(
+        !lines[end..]
+            .iter()
+            .any(|line| line.starts_with("[exports.")),
+        "the shipped client example has more than one export table"
+    );
+    let mut out: Vec<String> = lines[..start]
+        .iter()
+        .map(|line| (*line).to_owned())
+        .collect();
+    out.push(export.trim_end().to_owned());
+    out.extend(lines[end..].iter().map(|line| (*line).to_owned()));
+    out.join("\n") + "\n"
+}
+
 async fn provision_and_serve(tag: &str, rotation: Option<Rotation>) -> Provisioned {
+    provision_and_serve_kind(tag, rotation, ServiceKind::Echo).await
+}
+
+async fn provision_and_serve_kind(
+    tag: &str,
+    rotation: Option<Rotation>,
+    kind: ServiceKind,
+) -> Provisioned {
     let redis_url = env::var("TEST_REDIS_URL").expect("TEST_REDIS_URL (plaintext) is required");
     let client_bin = PathBuf::from(
         env::var_os("TUNNEL_CLIENT_BIN")
@@ -587,19 +819,20 @@ async fn provision_and_serve(tag: &str, rotation: Option<Rotation>) -> Provision
     // docs/operator.md uses them: an example whose identifiers disagree with
     // its partner makes this gate red.
     let examples = repository().join("examples");
-    let catalog_example =
-        fs::read_to_string(examples.join("m6-catalog.toml")).expect("read m6-catalog.toml");
+    let records_example = kind.records_example();
+    let catalog_example = fs::read_to_string(examples.join(records_example))
+        .unwrap_or_else(|error| panic!("read {records_example}: {error}"));
     let catalog_value: toml::Value = toml::from_str(&catalog_example).expect("parse catalog");
     let id = |table: &str| -> Uuid {
         catalog_value[table]["id"]
             .as_str()
             .and_then(|value| value.parse().ok())
-            .unwrap_or_else(|| panic!("m6-catalog.toml [{table}].id"))
+            .unwrap_or_else(|| panic!("{records_example} [{table}].id"))
     };
     let (device, service) = (id("device"), id("service"));
     let subject = catalog_value["user"]["oidc_subject"]
         .as_str()
-        .expect("m6-catalog.toml [user].oidc_subject")
+        .unwrap_or_else(|| panic!("{records_example} [user].oidc_subject"))
         .to_owned();
     let _namespace_guard = NamespaceGuard {
         upstream,
@@ -645,6 +878,9 @@ async fn provision_and_serve(tag: &str, rotation: Option<Rotation>) -> Provision
         client_toml = with_rotation(&client_toml, rotation);
     }
     fs::create_dir_all(work.join("device")).expect("device dir");
+    if let Some(export) = kind.client_export(&work, service, &nonce) {
+        client_toml = replace_export(&client_toml, &export);
+    }
     let client_config = work.join("device/client.toml");
     fs::write(&client_config, client_toml).expect("client config");
     step(
@@ -730,8 +966,9 @@ async fn provision_and_serve(tag: &str, rotation: Option<Rotation>) -> Provision
         relay_toml = with_rotation(&relay_toml, rotation);
     }
     relay_toml = format!(
-        "redis_tls_root_ca_path = {}\n{relay_toml}",
-        toml_string(&server_ca)
+        "redis_tls_root_ca_path = {}\n{relay_toml}{}",
+        toml_string(&server_ca),
+        kind.relay_tables(&catalog_value)
     );
     let relay_config = work.join("relay.toml");
     fs::write(&relay_config, relay_toml).expect("relay config");
@@ -1419,5 +1656,638 @@ async fn m7c93_unary_echoes_in_flight_cross_data_rotations() {
         result.rotations,
         result.freeze_refusals,
         result.elapsed.as_millis()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Task row M6-C57: every service type the alpha serves can be provisioned.
+//
+// Before M6-C57 `provision-catalog` wrote `{"operations": [...]}` as every
+// service's capabilities, which serves echo only: the relay selects an
+// http-forward profile by `http_forward_profile` and describes a filesystem
+// export only with `fs_case_sensitivity`, so a provisioned MCP, ACP or
+// filesystem service was answered 404 on every request after a dry run and a
+// write that both succeeded.  Each gate below provisions from its shipped
+// records example with the shipped commands, starts `serve` and `connect`
+// with the export that example documents, and requires one real consumer
+// request to be answered by the device-side backend.
+
+/// Bring up the relay and the device for `kind`, returning the fixture and the
+/// running `connect` with its log paths.
+async fn serve_kind(tag: &str, kind: ServiceKind) -> (Provisioned, Running, PathBuf, PathBuf) {
+    let fixture = provision_and_serve_kind(tag, None, kind).await;
+    assert!(
+        fixture
+            .dry
+            .contains(&format!("service={}", fixture.service)),
+        "dry run output: {}",
+        fixture.dry
+    );
+    let client_log = fixture.work.join("connect.log");
+    let client_stderr = fixture.work.join("connect.stderr.log");
+    let device = Running(
+        Command::new(&fixture.client_bin)
+            .args(["connect", "--config"])
+            .arg(&fixture.client_config)
+            .arg("--json")
+            .env("RUST_LOG", "warn")
+            .stdout(fs::File::create(&client_log).expect("client log"))
+            .stderr(fs::File::create(&client_stderr).expect("client stderr"))
+            .spawn()
+            .expect("spawn connect"),
+    );
+    (fixture, device, client_log, client_stderr)
+}
+
+/// Failure context: the device's `--json` events and stderr tail.
+fn device_log(client_log: &Path, client_stderr: &Path) -> String {
+    let stderr = fs::read_to_string(client_stderr).unwrap_or_default();
+    let tail: Vec<&str> = stderr.lines().rev().take(20).collect();
+    format!(
+        "{}\nconnect stderr (last 20 lines, newest first):\n{}",
+        fs::read_to_string(client_log).unwrap_or_default(),
+        tail.join("\n")
+    )
+}
+
+/// The JSON-RPC reply carrying `id` in a JSON or `text/event-stream` body.
+fn jsonrpc_reply(body: &[u8], id: &serde_json::Value) -> Option<serde_json::Value> {
+    let text = String::from_utf8_lossy(body);
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+        return (value.get("id") == Some(id)).then_some(value);
+    }
+    text.split("\n\n").find_map(|event| {
+        let data: Vec<&str> = event
+            .lines()
+            .filter_map(|line| line.strip_prefix("data:"))
+            .map(str::trim_start)
+            .collect();
+        let value: serde_json::Value = serde_json::from_str(&data.join("\n")).ok()?;
+        (value.get("id") == Some(id)).then_some(value)
+    })
+}
+
+type Answer = (u16, hyper::HeaderMap, Vec<u8>);
+
+/// Send `request` until the device session is up: a refusal before the
+/// device registers is retried until [`STEP_DEADLINE`], then reported.
+async fn until_served<F, Fut>(name: &str, mut request: F, context: impl Fn() -> String) -> Answer
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<Answer, String>>,
+{
+    let deadline = Instant::now() + STEP_DEADLINE;
+    loop {
+        match request().await {
+            Ok(answer) if answer.0 == 200 => return answer,
+            Ok((status, _, body)) if Instant::now() >= deadline => panic!(
+                "step {name}: HTTP {status} {}; {}",
+                String::from_utf8_lossy(&body),
+                context()
+            ),
+            Err(error) if Instant::now() >= deadline => {
+                panic!("step {name}: {error}; {}", context())
+            }
+            _ => tokio::time::sleep(Duration::from_millis(250)).await,
+        }
+    }
+}
+
+const MCP_HEADERS: [(&str, &str); 2] = [
+    ("content-type", "application/json"),
+    ("accept", "application/json, text/event-stream"),
+];
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires TEST_REDIS_URL, TUNNEL_CLIENT_BIN and TUNNEL_MCP_FIXTURE_BIN; run by scripts/m6-provisioning-verify.sh"]
+async fn m6c57_provisioned_mcp_service_answers_initialize_and_a_tool_call() {
+    let (fixture, device, client_log, client_stderr) =
+        serve_kind("m6c57-mcp", ServiceKind::Mcp).await;
+    assert!(
+        fixture
+            .dry
+            .contains("service_type=http-forward http_forward_profile=mcp-2025-11-25"),
+        "dry run output: {}",
+        fixture.dry
+    );
+    let context = || device_log(&client_log, &client_stderr);
+    let token = access_token_with_scope(&fixture.issuer_key, &fixture.subject, "http:invoke");
+    let path = format!(
+        "/v1/devices/{}/services/{}/http/mcp",
+        fixture.device, fixture.service
+    );
+
+    // 1. initialize, retried only until the device session is up.
+    let initialize = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": {"name": "m6c57-gate", "version": "1"},
+        },
+    })
+    .to_string();
+    let (_, headers, body) = until_served(
+        "mcp initialize",
+        || {
+            consumer_request(
+                fixture.consumer,
+                &fixture.pki.ca_pem,
+                "POST",
+                &path,
+                &token,
+                &MCP_HEADERS,
+                initialize.as_bytes(),
+            )
+        },
+        context,
+    )
+    .await;
+    let initialized = jsonrpc_reply(&body, &serde_json::json!(1)).unwrap_or_else(|| {
+        panic!(
+            "step mcp initialize: no JSON-RPC reply with id 1: {}",
+            String::from_utf8_lossy(&body)
+        )
+    });
+    assert_eq!(
+        initialized["result"]["protocolVersion"].as_str(),
+        Some("2025-11-25"),
+        "step mcp initialize: {initialized}"
+    );
+    let session = headers
+        .get("mcp-session-id")
+        .and_then(|value| value.to_str().ok())
+        .expect("step mcp initialize: the 2025-11-25 profile returns an Mcp-Session-Id")
+        .to_owned();
+    let mut session_headers = MCP_HEADERS.to_vec();
+    session_headers.push(("mcp-protocol-version", "2025-11-25"));
+    session_headers.push(("mcp-session-id", session.as_str()));
+
+    // 2. notifications/initialized.
+    let (notification_status, _, body) = consumer_request(
+        fixture.consumer,
+        &fixture.pki.ca_pem,
+        "POST",
+        &path,
+        &token,
+        &session_headers,
+        br#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+    )
+    .await
+    .expect("step mcp initialized notification");
+    assert_eq!(
+        notification_status,
+        202,
+        "step mcp initialized notification: {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    // 3. tools/call of the fixture's `echo` tool with a per-run marker.
+    let marker = format!("m6c57-mcp-{}", fixture.nonce);
+    let call = serde_json::json!({
+        "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+        "params": {"name": "echo", "arguments": {"marker": marker}},
+    })
+    .to_string();
+    let (status, _, body) = consumer_request(
+        fixture.consumer,
+        &fixture.pki.ca_pem,
+        "POST",
+        &path,
+        &token,
+        &session_headers,
+        call.as_bytes(),
+    )
+    .await
+    .expect("step mcp tools/call");
+    assert_eq!(
+        status,
+        200,
+        "step mcp tools/call: {}; {}",
+        String::from_utf8_lossy(&body),
+        context()
+    );
+    let called = jsonrpc_reply(&body, &serde_json::json!(2)).unwrap_or_else(|| {
+        panic!(
+            "step mcp tools/call: no JSON-RPC reply with id 2: {}",
+            String::from_utf8_lossy(&body)
+        )
+    });
+    let text = called["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        text.contains(&marker),
+        "step mcp tools/call: the tool result must carry the marker sent: {called}"
+    );
+    // The device-side server itself recorded the invocation in its
+    // configured workspace, so the answer came from the export's backend.
+    // The fixture records only the tool name (`FixtureServer::call_tool`
+    // writes `request.name`), so the marker cannot appear here; what binds
+    // the record to this run is that the workspace was created empty for
+    // this run and must now hold exactly the one call this gate made.
+    let invocations = fs::read_to_string(fixture.work.join("device/mcp-workspace/invocations.log"))
+        .unwrap_or_default();
+    let backend_invocations = invocations.lines().count();
+    assert_eq!(
+        invocations, "echo\n",
+        "step mcp tools/call: the fixture server must have recorded exactly this gate's one \
+         echo call in its fresh workspace"
+    );
+
+    // Control: the same initialize with a token for an unprovisioned
+    // subject is refused, so the 200 above was the provisioned grant's.
+    let stranger =
+        access_token_with_scope(&fixture.issuer_key, "m6c57-unprovisioned", "http:invoke");
+    let (stranger_status, _, _) = consumer_request(
+        fixture.consumer,
+        &fixture.pki.ca_pem,
+        "POST",
+        &path,
+        &stranger,
+        &MCP_HEADERS,
+        initialize.as_bytes(),
+    )
+    .await
+    .expect("stranger request completes");
+    assert!(
+        stranger_status == 401,
+        "step mcp stranger: an unprovisioned subject got HTTP {stranger_status}"
+    );
+
+    drop(device);
+    let (nonce, namespace) = (fixture.nonce.clone(), fixture.namespace.clone());
+    drop(fixture);
+    println!(
+        "m6c57-mcp ok nonce={nonce} namespace={namespace} initialize=200 \
+         notification={notification_status} tools_call={status} marker_echoed=true \
+         backend_invocations={backend_invocations} stranger_status={stranger_status}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires TEST_REDIS_URL, TUNNEL_CLIENT_BIN and TUNNEL_ACP_FIXTURE_BIN; run by scripts/m6-provisioning-verify.sh"]
+async fn m6c57_provisioned_acp_service_answers_initialize() {
+    let (fixture, device, client_log, client_stderr) =
+        serve_kind("m6c57-acp", ServiceKind::Acp).await;
+    assert!(
+        fixture
+            .dry
+            .contains("service_type=http-forward http_forward_profile=acp-http-v1"),
+        "dry run output: {}",
+        fixture.dry
+    );
+    let context = || device_log(&client_log, &client_stderr);
+    let token = access_token_with_scope(&fixture.issuer_key, &fixture.subject, "http:invoke");
+    let path = format!(
+        "/v1/devices/{}/services/{}/http/acp",
+        fixture.device, fixture.service
+    );
+    let request_id = format!("m6c57-acp-{}", fixture.nonce);
+    let initialize = serde_json::json!({
+        "jsonrpc": "2.0", "id": request_id, "method": "initialize",
+        "params": {
+            "protocolVersion": 1,
+            "clientCapabilities": {},
+            "clientInfo": {"name": "m6c57-gate", "version": "1"},
+        },
+    })
+    .to_string();
+    let acp_headers = [
+        ("content-type", "application/json"),
+        ("accept", "application/json"),
+    ];
+    let (_, headers, body) = until_served(
+        "acp initialize",
+        || {
+            consumer_request_h2(
+                fixture.consumer,
+                &fixture.pki.ca_pem,
+                "POST",
+                &path,
+                &token,
+                &acp_headers,
+                initialize.as_bytes(),
+            )
+        },
+        context,
+    )
+    .await;
+    let reply = jsonrpc_reply(&body, &serde_json::json!(request_id)).unwrap_or_else(|| {
+        panic!(
+            "step acp initialize: no JSON-RPC reply with the request id: {}",
+            String::from_utf8_lossy(&body)
+        )
+    });
+    // The fixture agent answers initialize with exactly this result, so the
+    // reply came from the device-side agent the export supervises.
+    assert_eq!(
+        reply["result"],
+        serde_json::json!({"protocolVersion": 1, "agentCapabilities": {}}),
+        "step acp initialize: {reply}"
+    );
+    let connection = headers
+        .get("acp-connection-id")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    assert!(
+        !connection.is_empty(),
+        "step acp initialize: the bridge returns an Acp-Connection-Id"
+    );
+
+    let stranger =
+        access_token_with_scope(&fixture.issuer_key, "m6c57-unprovisioned", "http:invoke");
+    let (stranger_status, _, _) = consumer_request_h2(
+        fixture.consumer,
+        &fixture.pki.ca_pem,
+        "POST",
+        &path,
+        &stranger,
+        &acp_headers,
+        initialize.as_bytes(),
+    )
+    .await
+    .expect("stranger request completes");
+    assert!(
+        stranger_status == 401,
+        "step acp stranger: an unprovisioned subject got HTTP {stranger_status}"
+    );
+
+    drop(device);
+    let (nonce, namespace) = (fixture.nonce.clone(), fixture.namespace.clone());
+    drop(fixture);
+    println!(
+        "m6c57-acp ok nonce={nonce} namespace={namespace} initialize=200 \
+         agent_protocol_version=1 connection_id=present stranger_status={stranger_status}"
+    );
+}
+
+/// A minimal 9P2000.L consumer over the relay's filesystem WebSocket: every
+/// byte is encoded and decoded by `tunnel_fs_ninep`, as the M4 gates' client
+/// in `tunnel-test-harness` does.
+mod ninep {
+    use std::{net::SocketAddr, sync::Arc, time::Duration};
+
+    use futures_util::{SinkExt as _, StreamExt as _};
+    use tokio_tungstenite::{
+        Connector, MaybeTlsStream, WebSocketStream, connect_async_tls_with_config,
+        tungstenite::{Message as WsMessage, client::IntoClientRequest, http::HeaderValue},
+    };
+    use tunnel_fs_ninep::{DIALECT, Frame, MAX_MESSAGE_BYTES, Message, NOFID, NONUNAME, NOTAG};
+
+    const IO_TIMEOUT: Duration = Duration::from_secs(20);
+
+    pub struct Client {
+        socket: WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
+        msize: u32,
+        tag: u16,
+    }
+
+    fn unexpected(expected: &str, got: &Message) -> String {
+        format!("expected {expected}, got {:?}", got.message_type())
+    }
+
+    impl Client {
+        /// Upgrade; an HTTP answer instead of `101` is returned as an error
+        /// naming its status.
+        pub async fn connect(
+            consumer: SocketAddr,
+            path: &str,
+            tls: rustls::ClientConfig,
+            token: &str,
+        ) -> Result<Self, String> {
+            let mut request = format!("wss://127.0.0.1:{}{path}", consumer.port())
+                .into_client_request()
+                .map_err(|error| error.to_string())?;
+            request.headers_mut().insert(
+                "authorization",
+                HeaderValue::from_str(&format!("Bearer {token}"))
+                    .map_err(|error| error.to_string())?,
+            );
+            request.headers_mut().insert(
+                "sec-websocket-protocol",
+                HeaderValue::from_static(tunnel_fs_core::TRANSPORT_SUBPROTOCOL),
+            );
+            let connected = tokio::time::timeout(
+                IO_TIMEOUT,
+                connect_async_tls_with_config(
+                    request,
+                    None,
+                    false,
+                    Some(Connector::Rustls(Arc::new(tls))),
+                ),
+            )
+            .await
+            .map_err(|_| "fs upgrade timed out".to_owned())?;
+            match connected {
+                Ok((socket, _)) => Ok(Self {
+                    socket,
+                    msize: MAX_MESSAGE_BYTES,
+                    tag: 0,
+                }),
+                Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+                    Err(format!("fs upgrade answered HTTP {}", response.status()))
+                }
+                Err(error) => Err(format!("fs upgrade failed: {error}")),
+            }
+        }
+
+        async fn exchange(&mut self, tag: u16, message: Message) -> Result<Message, String> {
+            let bytes = Frame::new(tag, message)
+                .to_bytes(self.msize)
+                .map_err(|error| format!("9P encode: {error:?}"))?;
+            tokio::time::timeout(
+                IO_TIMEOUT,
+                self.socket.send(WsMessage::Binary(bytes.into())),
+            )
+            .await
+            .map_err(|_| "9P send timed out".to_owned())?
+            .map_err(|error| format!("9P send: {error}"))?;
+            loop {
+                let next = tokio::time::timeout(IO_TIMEOUT, self.socket.next())
+                    .await
+                    .map_err(|_| "9P receive timed out".to_owned())?;
+                match next {
+                    Some(Ok(WsMessage::Binary(bytes))) => {
+                        let frame = tunnel_fs_ninep::decode_exact(&bytes, MAX_MESSAGE_BYTES)
+                            .map_err(|error| format!("9P decode: {error:?}"))?;
+                        if frame.tag != tag {
+                            return Err(format!("9P reply tag {} for {tag}", frame.tag));
+                        }
+                        return Ok(frame.message);
+                    }
+                    Some(Ok(WsMessage::Ping(_) | WsMessage::Pong(_) | WsMessage::Frame(_))) => {}
+                    Some(Ok(WsMessage::Close(frame))) => {
+                        return Err(format!("9P socket closed: {frame:?}"));
+                    }
+                    Some(Ok(WsMessage::Text(_))) => {
+                        return Err("9P socket sent text".to_owned());
+                    }
+                    Some(Err(error)) => return Err(format!("9P socket failed: {error}")),
+                    None => return Err("9P socket ended".to_owned()),
+                }
+            }
+        }
+
+        async fn call(&mut self, message: Message) -> Result<Message, String> {
+            self.tag = self.tag.wrapping_add(1) % NOTAG;
+            self.exchange(self.tag, message).await
+        }
+
+        /// Version, attach the export root as fid 0, walk to `name` as fid 1,
+        /// open it read-only and read it whole.
+        pub async fn read_file(&mut self, name: &str) -> Result<Vec<u8>, String> {
+            let version = Message::Tversion {
+                msize: MAX_MESSAGE_BYTES,
+                version: DIALECT.to_owned(),
+            };
+            match self.exchange(NOTAG, version).await? {
+                Message::Rversion { msize, .. } => self.msize = msize,
+                other => return Err(unexpected("Rversion", &other)),
+            }
+            let attach = Message::Tattach {
+                fid: 0,
+                afid: NOFID,
+                uname: String::new(),
+                aname: String::new(),
+                n_uname: NONUNAME,
+            };
+            match self.call(attach).await? {
+                Message::Rattach { .. } => {}
+                other => return Err(unexpected("Rattach", &other)),
+            }
+            let walk = Message::Twalk {
+                fid: 0,
+                newfid: 1,
+                names: vec![name.to_owned()],
+            };
+            match self.call(walk).await? {
+                Message::Rwalk { .. } => {}
+                other => return Err(unexpected("Rwalk", &other)),
+            }
+            match self.call(Message::Tlopen { fid: 1, flags: 0 }).await? {
+                Message::Rlopen { .. } => {}
+                other => return Err(unexpected("Rlopen", &other)),
+            }
+            let count = self.msize - tunnel_fs_ninep::COUNTED_REPLY_OVERHEAD;
+            let mut data = Vec::new();
+            loop {
+                let read = Message::Tread {
+                    fid: 1,
+                    offset: data.len() as u64,
+                    count,
+                };
+                match self.call(read).await? {
+                    Message::Rread { data: chunk } if chunk.is_empty() => return Ok(data),
+                    Message::Rread { data: chunk } => data.extend_from_slice(&chunk),
+                    other => return Err(unexpected("Rread", &other)),
+                }
+            }
+        }
+
+        pub async fn close(mut self) {
+            let _ =
+                tokio::time::timeout(IO_TIMEOUT, self.socket.send(WsMessage::Close(None))).await;
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires TEST_REDIS_URL and TUNNEL_CLIENT_BIN; run by scripts/m6-provisioning-verify.sh"]
+async fn m6c57_provisioned_fs_service_serves_a_file_read() {
+    let (fixture, device, client_log, client_stderr) =
+        serve_kind("m6c57-fs", ServiceKind::Fs).await;
+    assert!(
+        fixture
+            .dry
+            .contains("service_type=fs fs_case_sensitivity=insensitive-preserving"),
+        "dry run output: {}",
+        fixture.dry
+    );
+    let context = || device_log(&client_log, &client_stderr);
+    let token = access_token_with_scope(&fixture.issuer_key, &fixture.subject, "fs:connect");
+    let path = format!(
+        "/v1/devices/{}/services/{}/fs",
+        fixture.device, fixture.service
+    );
+
+    // 1. The descriptor: a GET without an upgrade.  Before M6-C57 this was
+    // 404 EXPORT_NOT_FOUND for every provisioned filesystem service.
+    let (_, _, descriptor) = until_served(
+        "fs descriptor",
+        || {
+            consumer_request(
+                fixture.consumer,
+                &fixture.pki.ca_pem,
+                "GET",
+                &path,
+                &token,
+                &[],
+                b"",
+            )
+        },
+        context,
+    )
+    .await;
+    let described = String::from_utf8_lossy(&descriptor).into_owned();
+    assert!(
+        described.contains("insensitive-preserving"),
+        "step fs descriptor: the provisioned case behaviour must be reported: {described}"
+    );
+
+    // 2. A 9P session reading the synthetic file the export root holds.
+    let expected = fs::read(fixture.work.join("device/fs-root").join(FS_FILE_NAME))
+        .expect("read the synthetic file back");
+    let deadline = Instant::now() + STEP_DEADLINE;
+    let read = loop {
+        let tls = consumer_tls(&fixture.pki.ca_pem).expect("consumer TLS");
+        let attempt = match ninep::Client::connect(fixture.consumer, &path, tls, &token).await {
+            Ok(mut client) => {
+                let read = client.read_file(FS_FILE_NAME).await;
+                client.close().await;
+                read
+            }
+            Err(error) => Err(error),
+        };
+        match attempt {
+            Ok(bytes) => break bytes,
+            Err(error) if Instant::now() >= deadline => {
+                panic!("step fs read: {error}; {}", context())
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(250)).await,
+        }
+    };
+    assert_eq!(
+        read, expected,
+        "step fs read: the bytes read through the relay must be the synthetic file's"
+    );
+
+    // Control: an unprovisioned subject gets no descriptor.
+    let stranger =
+        access_token_with_scope(&fixture.issuer_key, "m6c57-unprovisioned", "fs:connect");
+    let (stranger_status, _, _) = consumer_request(
+        fixture.consumer,
+        &fixture.pki.ca_pem,
+        "GET",
+        &path,
+        &stranger,
+        &[],
+        b"",
+    )
+    .await
+    .expect("stranger request completes");
+    assert!(
+        stranger_status == 401,
+        "step fs stranger: an unprovisioned subject got HTTP {stranger_status}"
+    );
+
+    drop(device);
+    let (nonce, namespace) = (fixture.nonce.clone(), fixture.namespace.clone());
+    drop(fixture);
+    println!(
+        "m6c57-fs ok nonce={nonce} namespace={namespace} descriptor=200 \
+         case_sensitivity=insensitive-preserving read_bytes={} matches_file=true \
+         stranger_status={stranger_status}",
+        read.len()
     );
 }

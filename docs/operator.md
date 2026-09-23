@@ -4,7 +4,8 @@ Status: written for task row M6-02 on 2026-09-23 against `origin/main` at
 `dd12b1c`; section 2.3 (catalog provisioning and first incarnation activation)
 added for task row M6-C21 on 2026-09-23 against `0da55ac`; sections 3.1 and
 4 (reconnect, service units, upgrade) revised for M6-C23 on 2026-09-23
-against `da2a24d`. This is the guide
+against `da2a24d`; section 2.3 extended to MCP, ACP and filesystem services for
+M6-C57 on 2026-09-23 against `721ed2a`. This is the guide
 an outside tester follows first. It covers what to download and verify, device
 credentials, catalog provisioning, relay configuration, readiness, and the
 diagnostics the binaries have today. **Where the alpha cannot do something,
@@ -58,8 +59,9 @@ The same check also compares the client exit-code table in
 
 Read this first. With the release bundle, a Redis server that speaks TLS, an
 identity issuer and a certificate issuer, an outside tester can bring up **one
-relay and one device** and run the synthetic echo through them (sections 2
-and 3). Anything larger is not supported yet:
+relay and one device** and serve one service through them: the synthetic echo,
+an MCP server, an ACP agent or a filesystem export (sections 2 and 3). Anything
+larger is not supported yet:
 
 | Capability | State in this alpha | Row |
 | --- | --- | --- |
@@ -67,6 +69,7 @@ and 3). Anything larger is not supported yet:
 | Device key, CSR, certificate import, local `doctor` | Supported | — |
 | Relay and cluster configuration dry runs, local state initialization | Supported | — |
 | Creating one tenant, user, device, credential record, service and grant in the Redis catalog | Supported, once per namespace, with `tunnel-relay provision-catalog` (section 2.3) | M6-C21 |
+| Service types `provision-catalog` can create | The synthetic echo (`echo`), an MCP server or an ACP agent (`http-forward`, by `http_forward_profile`), and a filesystem export (`fs`), one per namespace (section 2.3); any other type is refused by the dry run | M6-C57 |
 | First activation of a deployment incarnation in a new Redis namespace | Supported with `tunnel-relay activate-first-incarnation` (section 2.3) | M6-C21 |
 | Adding, changing or revoking records after the first provisioning (more devices, users, grants) | **Not supported in this alpha**: no shipped command writes them | M6-C31 |
 | Cluster membership publishing and the HTTPS checkpoint authority | **Not supported in this alpha**: a cluster relay needs both and neither is shipped | M6-C22 |
@@ -322,8 +325,89 @@ and provisioned a grant that authorized nothing:
 ```console
 $ cp examples/m6-catalog.toml trial/catalog.toml
 $ tunnel-relay provision-catalog --config examples/m1-relay.toml --records trial/catalog.toml --dry-run
-Provisioning records are valid for namespace agent-tunnel-m1: tenant=11111111-1111-4111-8111-111111111111 user=22222222-2222-4222-8222-222222222222 device=33333333-3333-4333-8333-333333333333 credential=... service=44444444-4444-4444-8444-444444444444 spki_sha256=... grant_operations=echo:invoke. This dry run contacted no Redis authority and wrote nothing.
+Provisioning records are valid for namespace agent-tunnel-m1: tenant=11111111-1111-4111-8111-111111111111 user=22222222-2222-4222-8222-222222222222 device=33333333-3333-4333-8333-333333333333 credential=... service=44444444-4444-4444-8444-444444444444 service_type=echo spki_sha256=... grant_operations=echo:invoke. This dry run contacted no Redis authority and wrote nothing.
 ```
+
+**Service types (M6-C57).** The records document provisions one service, of
+one of these types; the dry run refuses any other type, and refuses a service
+of these types that the relay could not serve, naming the field:
+
+* `type = "echo"`, operation `echo:invoke`: the synthetic echo above.
+* `type = "http-forward"`, operation `http:invoke`, with `http_forward_profile`
+  naming the application protocol: `mcp-2025-11-25` or `mcp-2026-07-28` for an
+  MCP server, `acp-http-v1` for an ACP agent. The relay configuration given
+  with `--config` must list the same profile in `[http_forward] profiles`,
+  because the relay answers a service whose profile it does not serve with
+  `404`, so the dry run refuses it.
+* `type = "fs"`, operations `fs:connect` (admits a session, required in the
+  grant) and at least one of `fs:read`, `fs:list`, `fs:write` and `fs:delete`,
+  with `fs_case_sensitivity` stating how the device's export directory treats
+  letter case: `insensitive-preserving` for a default macOS volume, `sensitive`
+  for a case-sensitive one.
+
+Before M6-C57 the dry run accepted any `type`, but the write recorded only the
+operation names. So an MCP, ACP or filesystem service was provisioned without
+the field the relay serves it by, and every request got `404`.
+`examples/m6-catalog-mcp.toml`, `m6-catalog-acp.toml` and `m6-catalog-fs.toml`
+are complete records documents, one per type, with the same tenant, user and
+device as `m6-catalog.toml`. Each one's comment shows the export table the
+device's client profile needs. Their service and grant tables, and dry runs
+against a relay configuration that serves both HTTP profiles:
+
+```console
+$ cp examples/m6-catalog-mcp.toml examples/m6-catalog-acp.toml examples/m6-catalog-fs.toml trial/
+$ sed -n '/^\[service\]/,$p' trial/m6-catalog-mcp.toml
+[service]
+id = "55555555-5555-4555-8555-555555555555"
+type = "http-forward"
+display_name = "Trial MCP server"
+operations = ["http:invoke"]
+http_forward_profile = "mcp-2025-11-25"
+[grant]
+operations = ["http:invoke"]
+$ tunnel-relay provision-catalog --config examples/m1-relay.toml --records trial/m6-catalog-mcp.toml --dry-run; echo "exit=$?"
+tunnel-relay: invalid provisioning records: service.http_forward_profile "mcp-2025-11-25" is not served by this relay: add it to the [http_forward] profiles of the relay configuration given with --config
+exit=1
+$ cp examples/m1-relay.toml trial/relay.toml
+$ printf '\n[http_forward]\nprofiles = ["mcp-2025-11-25", "acp-http-v1"]\n' >> trial/relay.toml
+$ tunnel-relay provision-catalog --config trial/relay.toml --records trial/m6-catalog-mcp.toml --dry-run
+Provisioning records are valid for namespace agent-tunnel-m1: ... service=55555555-5555-4555-8555-555555555555 service_type=http-forward http_forward_profile=mcp-2025-11-25 spki_sha256=... grant_operations=http:invoke. This dry run contacted no Redis authority and wrote nothing.
+$ sed -n '/^\[service\]/,$p' trial/m6-catalog-acp.toml
+[service]
+id = "66666666-6666-4666-8666-666666666666"
+type = "http-forward"
+display_name = "Trial ACP agent"
+operations = ["http:invoke"]
+http_forward_profile = "acp-http-v1"
+[grant]
+operations = ["http:invoke"]
+$ tunnel-relay provision-catalog --config trial/relay.toml --records trial/m6-catalog-acp.toml --dry-run
+Provisioning records are valid for namespace agent-tunnel-m1: ... service=66666666-6666-4666-8666-666666666666 service_type=http-forward http_forward_profile=acp-http-v1 spki_sha256=... grant_operations=http:invoke. This dry run contacted no Redis authority and wrote nothing.
+$ sed -n '/^\[service\]/,$p' trial/m6-catalog-fs.toml
+[service]
+id = "77777777-7777-4777-8777-777777777777"
+type = "fs"
+display_name = "Trial files"
+operations = ["fs:connect", "fs:read", "fs:list"]
+fs_case_sensitivity = "insensitive-preserving"
+[grant]
+operations = ["fs:connect", "fs:read", "fs:list"]
+$ tunnel-relay provision-catalog --config trial/relay.toml --records trial/m6-catalog-fs.toml --dry-run
+Provisioning records are valid for namespace agent-tunnel-m1: ... service=77777777-7777-4777-8777-777777777777 service_type=fs fs_case_sensitivity=insensitive-preserving spki_sha256=... grant_operations=fs:connect,fs:list,fs:read. This dry run contacted no Redis authority and wrote nothing.
+$ sed 's/^type = "echo"/type = "files"/' trial/catalog.toml > trial/unsupported.toml
+$ tunnel-relay provision-catalog --config trial/relay.toml --records trial/unsupported.toml --dry-run; echo "exit=$?"
+tunnel-relay: invalid provisioning records: service.type "files" is not a type provision-catalog can create; it creates echo, http-forward (MCP and ACP, selected by http_forward_profile) and fs
+exit=1
+```
+
+The relay you run with `serve` must then use the same `[http_forward]` table.
+`scripts/m6-provisioning-verify.sh` provisions each of the three examples with
+the shipped commands and runs `serve` and `connect` against a real Redis, with
+the export each example's comment shows. The backends are the repository's
+synthetic MCP server and ACP agent and a temporary directory holding one
+generated file. For each type it checks that the device-side backend answers
+one real request through the relay: an MCP `initialize` and a `tools/call`, an
+ACP `initialize`, and a 9P read of the file.
 
 Then, against your Redis, activate the relay's incarnation and write the
 records, in that order. **Do not start `serve` until `provision-catalog` has
@@ -376,6 +460,23 @@ listener with `Authorization: Bearer <token>`. The token must be issued by
 `oidc_issuer` for one of `oidc_audience`, carry `sub` equal to `oidc_subject`,
 and have `echo:invoke` in its `scope`. The reply is the export's
 `device_canary` followed by the request body.
+
+The other types use other routes on the same listener, with the same token
+rules, and each needs its own operation in the token's `scope`:
+
+* **MCP**: `/v1/devices/<device.id>/services/<service.id>/http/mcp`, scope
+  `http:invoke`, speaking MCP's Streamable HTTP. The request must not carry a
+  `User-Agent` or `Accept-Encoding` header, or it gets `400
+  HTTP_INVALID_HEAD`, and most HTTP clients send both by default (M6-C58).
+* **ACP**: `/v1/devices/<device.id>/services/<service.id>/http/acp`, scope
+  `http:invoke`, over **HTTP/2** only. An HTTP/1.1 request gets `501
+  HTTP_UNSUPPORTED_FEATURE`. As for MCP, the request must not carry a
+  `User-Agent` or `Accept-Encoding` header: the ACP profile refuses both
+  (M6-C58).
+* **Filesystem**: `/v1/devices/<device.id>/services/<service.id>/fs`, scope
+  `fs:connect`. A `GET` returns the export's descriptor. A WebSocket upgrade
+  with subprotocol `agent-tunnel.9p.v1` opens a 9P2000.L session
+  ([filesystem-api.md](filesystem-api.md)). The bundle ships no client for it.
 
 **Not supported in this alpha:** anything after the first provisioning. There
 is no shipped command to add a second device, user or grant, to change a

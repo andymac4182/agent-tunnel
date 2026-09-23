@@ -57,6 +57,10 @@ const CLASSIFIED_EXAMPLES: &[(&str, ExampleParser)] = &[
     ("m1-client.toml", ExampleParser::Client),
     ("m1-relay.toml", ExampleParser::RelayServe),
     ("m6-catalog.toml", ExampleParser::CatalogRecords),
+    // One records document per further service type (task row M6-C57).
+    ("m6-catalog-acp.toml", ExampleParser::CatalogRecords),
+    ("m6-catalog-fs.toml", ExampleParser::CatalogRecords),
+    ("m6-catalog-mcp.toml", ExampleParser::CatalogRecords),
     ("m7-cluster-relay.toml", ExampleParser::RelayServe),
     ("relay.toml", ExampleParser::RelayLegacy),
 ];

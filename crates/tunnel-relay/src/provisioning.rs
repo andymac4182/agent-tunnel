@@ -18,7 +18,11 @@
 //!   [--dry-run]` writes exactly one tenant, one user, one device with one
 //!   credential, one service and one grant, using
 //!   `RedisCatalog::provision_initial_catalog`, which applies the fixture
-//!   seed's own validation, reservation and writer.
+//!   seed's own validation, reservation and writer.  The service is an
+//!   `echo`, an `http-forward` (MCP or ACP, by `http_forward_profile`) or an
+//!   `fs` export, written with the capability the relay serves its type by;
+//!   the dry run refuses any other type and any record of these types the
+//!   relay could not serve (task row M6-C57).
 //!
 //! **What this module decides, and what it deliberately does not.**  It reads
 //! the relay's own `ServeConfig` for the Redis authority, namespace,
@@ -161,6 +165,17 @@ pub struct ServiceSection {
     pub service_type: String,
     pub display_name: String,
     pub operations: Vec<String>,
+    /// Required on an `http-forward` service, refused on any other: the
+    /// pinned application profile (`mcp-2025-11-25`, `mcp-2026-07-28` or
+    /// `acp-http-v1`) the relay selects for it.  The relay's own
+    /// `[http_forward] profiles` must list it (task row M6-C57).
+    #[serde(default)]
+    pub http_forward_profile: Option<String>,
+    /// Required on an `fs` service, refused on any other: the export host's
+    /// case behaviour, `sensitive` or `insensitive-preserving`.  The relay
+    /// reports it and never guesses it (M6-C57).
+    #[serde(default)]
+    pub fs_case_sensitivity: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -187,15 +202,38 @@ pub struct ProvisioningPlan {
 }
 
 impl ProvisioningPlan {
+    /// The provisioned service's type and the capability the relay selects
+    /// it by, as `service_type=... [http_forward_profile=...|fs_case_sensitivity=...]`.
+    fn service_summary(&self) -> String {
+        let Some(service) = self.records.services.first() else {
+            return String::new();
+        };
+        let mut summary = format!("service_type={}", service.service_type);
+        for capability in [
+            crate::http::forward::HTTP_FORWARD_PROFILE_CAPABILITY,
+            crate::FS_CASE_SENSITIVITY_CAPABILITY,
+        ] {
+            if let Some(value) = service
+                .capabilities
+                .get(capability)
+                .and_then(serde_json::Value::as_str)
+            {
+                summary.push_str(&format!(" {capability}={value}"));
+            }
+        }
+        summary
+    }
+
     fn summary(&self) -> String {
         format!(
-            "tenant={} user={} device={} credential={} service={} spki_sha256={} \
+            "tenant={} user={} device={} credential={} service={} {} spki_sha256={} \
              credential_valid={}..{} grant_operations={}",
             self.tenant_id,
             self.user_id,
             self.device_id,
             self.credential_id,
             self.service_id,
+            self.service_summary(),
             self.spki_fingerprint,
             self.credential_not_before.to_rfc3339(),
             self.credential_expires_at.to_rfc3339(),
@@ -259,6 +297,163 @@ fn operation_set(
     Ok(set)
 }
 
+/// The service types `provision-catalog` can create, as the dry run names
+/// them in a refusal.
+pub const PROVISIONABLE_SERVICE_TYPES: &str =
+    "echo, http-forward (MCP and ACP, selected by http_forward_profile) and fs";
+
+/// The operations each provisionable service type defines.  A name outside
+/// its type's list is refused: the relay checks grants by exact name, so such
+/// an operation could never be asked for.
+const ECHO_OPERATIONS: &[&str] = &[crate::ECHO_OPERATION];
+const HTTP_FORWARD_OPERATIONS: &[&str] = &[crate::HTTP_FORWARD_OPERATION];
+const FS_OPERATIONS: &[&str] = &[
+    crate::FS_SESSION_OPERATION,
+    crate::FS_READ_OPERATION,
+    crate::FS_WRITE_OPERATION,
+    crate::FS_LIST_OPERATION,
+    crate::FS_DELETE_OPERATION,
+];
+/// The filesystem case behaviours the relay's descriptor can report.
+const FS_CASE_SENSITIVITIES: &[&str] = &["sensitive", "insensitive-preserving"];
+
+fn refuse_field(service_type: &str, field: &str) -> ProvisioningError {
+    ProvisioningError::Records(format!(
+        "service.{field} does not apply to a service of type {service_type:?}"
+    ))
+}
+
+fn require_known_operations(
+    service_type: &str,
+    known: &[&str],
+    operations: &BTreeSet<String>,
+) -> Result<(), ProvisioningError> {
+    if let Some(unknown) = operations
+        .iter()
+        .find(|operation| !known.contains(&operation.as_str()))
+    {
+        return Err(ProvisioningError::Records(format!(
+            "service.operations entry {unknown:?} is not an operation of a {service_type:?} \
+             service, which defines {}",
+            known.join(", ")
+        )));
+    }
+    Ok(())
+}
+
+/// The catalog capabilities of the one provisioned service: everything the
+/// relay reads from the service record to serve its type (task row M6-C57).
+///
+/// Before M6-C57 every service was written as `{"operations": [...]}`, which
+/// is all an echo service needs, so an `http-forward` service had no
+/// `http_forward_profile` and was answered 404 `NOT_FOUND`, and an `fs`
+/// service had no `fs_case_sensitivity` and was answered 404
+/// `EXPORT_NOT_FOUND` -- after a dry run and a write that both succeeded.
+/// Now the rules the relay applies when it serves each type are applied here,
+/// so the dry run refuses what the write could not serve.
+///
+/// `served_profiles` is the relay configuration's `[http_forward] profiles`,
+/// which `ServeConfig::parse` has already restricted to pinned profiles.
+fn service_capabilities(
+    service: &ServiceSection,
+    service_operations: &BTreeSet<String>,
+    grant_operations: &BTreeSet<String>,
+    served_profiles: &[String],
+) -> Result<serde_json::Value, ProvisioningError> {
+    let service_type = service.service_type.as_str();
+    let mut capabilities = serde_json::json!({ "operations": service_operations });
+    match service_type {
+        crate::ECHO_SERVICE_TYPE => {
+            if service.http_forward_profile.is_some() {
+                return Err(refuse_field(service_type, "http_forward_profile"));
+            }
+            if service.fs_case_sensitivity.is_some() {
+                return Err(refuse_field(service_type, "fs_case_sensitivity"));
+            }
+            require_known_operations(service_type, ECHO_OPERATIONS, service_operations)?;
+        }
+        crate::HTTP_FORWARD_SERVICE_TYPE => {
+            if service.fs_case_sensitivity.is_some() {
+                return Err(refuse_field(service_type, "fs_case_sensitivity"));
+            }
+            require_known_operations(service_type, HTTP_FORWARD_OPERATIONS, service_operations)?;
+            let Some(profile) = service.http_forward_profile.as_deref() else {
+                return Err(ProvisioningError::Records(
+                    "an http-forward service requires service.http_forward_profile: \
+                     mcp-2025-11-25 or mcp-2026-07-28 for an MCP server, acp-http-v1 for \
+                     an ACP agent; without it the relay answers every request 404"
+                        .into(),
+                ));
+            };
+            let pinned = tunnel_mcp::McpProfile::parse_id(profile).is_some()
+                || tunnel_acp::AcpProfile::parse_id(profile).is_some();
+            if !pinned {
+                return Err(ProvisioningError::Records(format!(
+                    "service.http_forward_profile {profile:?} is not a pinned profile; \
+                     the relay serves mcp-2025-11-25, mcp-2026-07-28 and acp-http-v1"
+                )));
+            }
+            if !served_profiles.iter().any(|served| served == profile) {
+                return Err(ProvisioningError::Records(format!(
+                    "service.http_forward_profile {profile:?} is not served by this relay: \
+                     add it to the [http_forward] profiles of the relay configuration \
+                     given with --config"
+                )));
+            }
+            capabilities[crate::http::forward::HTTP_FORWARD_PROFILE_CAPABILITY] =
+                serde_json::Value::String(profile.to_owned());
+        }
+        crate::FS_SERVICE_TYPE => {
+            if service.http_forward_profile.is_some() {
+                return Err(refuse_field(service_type, "http_forward_profile"));
+            }
+            require_known_operations(service_type, FS_OPERATIONS, service_operations)?;
+            let Some(case) = service.fs_case_sensitivity.as_deref() else {
+                return Err(ProvisioningError::Records(
+                    "an fs service requires service.fs_case_sensitivity: sensitive or \
+                     insensitive-preserving, as the export's host behaves; without it \
+                     the relay answers every request 404"
+                        .into(),
+                ));
+            };
+            if !FS_CASE_SENSITIVITIES.contains(&case) {
+                return Err(ProvisioningError::Records(format!(
+                    "service.fs_case_sensitivity {case:?} must be sensitive or \
+                     insensitive-preserving"
+                )));
+            }
+            // The relay admits a filesystem session only for a grant naming
+            // the session operation and at least one capability; a grant
+            // without both is refused 403 on every request.
+            if !grant_operations.contains(crate::FS_SESSION_OPERATION) {
+                return Err(ProvisioningError::Records(format!(
+                    "an fs grant must include {}, which admits a filesystem session",
+                    crate::FS_SESSION_OPERATION
+                )));
+            }
+            if grant_operations.len() < 2 {
+                return Err(ProvisioningError::Records(format!(
+                    "an fs grant must also name at least one of {}, {}, {} or {}; a grant \
+                     naming no capability admits no session",
+                    crate::FS_READ_OPERATION,
+                    crate::FS_WRITE_OPERATION,
+                    crate::FS_LIST_OPERATION,
+                    crate::FS_DELETE_OPERATION
+                )));
+            }
+            capabilities[crate::FS_CASE_SENSITIVITY_CAPABILITY] =
+                serde_json::Value::String(case.to_owned());
+        }
+        other => {
+            return Err(ProvisioningError::Records(format!(
+                "service.type {other:?} is not a type provision-catalog can create; \
+                 it creates {PROVISIONABLE_SERVICE_TYPES}"
+            )));
+        }
+    }
+    Ok(capabilities)
+}
+
 fn timestamp(seconds: i64, field: &str) -> Result<DateTime<Utc>, ProvisioningError> {
     Utc.timestamp_opt(seconds, 0).single().ok_or_else(|| {
         ProvisioningError::Certificate(format!("{field} is outside the supported range"))
@@ -268,11 +463,13 @@ fn timestamp(seconds: i64, field: &str) -> Result<DateTime<Utc>, ProvisioningErr
 /// Build the catalog seed for one records document without contacting Redis.
 ///
 /// `records_path` anchors the relative certificate path.  `issuer` is the
-/// relay's configured `oidc_issuer`; `now` is the instant the credential must
-/// still be valid at.
+/// relay's configured `oidc_issuer`; `served_profiles` is its
+/// `[http_forward] profiles` (empty when the table is absent); `now` is the
+/// instant the credential must still be valid at.
 pub fn plan_provisioning(
     records_path: &Path,
     issuer: &str,
+    served_profiles: &[String],
     now: DateTime<Utc>,
 ) -> Result<ProvisioningPlan, ProvisioningError> {
     let text =
@@ -289,6 +486,12 @@ pub fn plan_provisioning(
             "grant.operations must be a subset of service.operations".into(),
         ));
     }
+    let capabilities = service_capabilities(
+        &document.service,
+        &service_operations,
+        &grant_operations,
+        served_profiles,
+    )?;
     if document
         .grant
         .expires_at
@@ -391,7 +594,7 @@ pub fn plan_provisioning(
             service_id,
             service_type: document.service.service_type,
             display_name: document.service.display_name,
-            capabilities: serde_json::json!({ "operations": service_operations }),
+            capabilities,
             version: 1,
             active: true,
         }],
@@ -508,7 +711,16 @@ fn parse_provision_arguments(args: &[OsString]) -> Result<ProvisionArguments, Pr
 pub async fn provision_catalog(args: &[OsString]) -> Result<String, Box<dyn Error>> {
     let arguments = parse_provision_arguments(args)?;
     let config = load_config(&arguments.config)?;
-    let plan = plan_provisioning(&arguments.records, &config.oidc_issuer, Utc::now())?;
+    let served_profiles = config
+        .http_forward
+        .as_ref()
+        .map_or(&[][..], |http_forward| http_forward.profiles.as_slice());
+    let plan = plan_provisioning(
+        &arguments.records,
+        &config.oidc_issuer,
+        served_profiles,
+        Utc::now(),
+    )?;
     if arguments.dry_run {
         return Ok(format!(
             "Provisioning records are valid for namespace {}: {}. \
@@ -610,14 +822,30 @@ mod tests {
     }
 
     fn records(grant_operations: &str) -> String {
+        records_for(
+            "type = \"echo\"\noperations = [\"echo:invoke\"]",
+            grant_operations,
+        )
+    }
+
+    /// A records document whose `[service]` table carries `service_fields`
+    /// after its id and display name.
+    fn records_for(service_fields: &str, grant_operations: &str) -> String {
         format!(
             "[tenant]\nid = \"{TENANT}\"\ndisplay_name = \"t\"\n\n\
              [user]\nid = \"{USER}\"\ndisplay_name = \"u\"\noidc_subject = \"subject-1\"\n\n\
              [device]\nid = \"{DEVICE}\"\ndisplay_name = \"d\"\ncertificate = \"device.pem\"\n\n\
-             [service]\nid = \"{SERVICE}\"\ntype = \"echo\"\ndisplay_name = \"s\"\n\
-             operations = [\"echo:invoke\"]\n\n\
+             [service]\nid = \"{SERVICE}\"\ndisplay_name = \"s\"\n{service_fields}\n\n\
              [grant]\noperations = {grant_operations}\n"
         )
+    }
+
+    /// Every pinned `http-forward` profile, as a relay configured to serve
+    /// all of them lists it.
+    fn served() -> Vec<String> {
+        ["mcp-2025-11-25", "mcp-2026-07-28", "acp-http-v1"]
+            .map(str::to_owned)
+            .to_vec()
     }
 
     fn plan_with(
@@ -625,11 +853,228 @@ mod tests {
         san: Option<&str>,
         document: &str,
     ) -> (Result<ProvisioningPlan, ProvisioningError>, Vec<u8>) {
+        plan_serving(dir, san, document, &served())
+    }
+
+    fn plan_serving(
+        dir: &Path,
+        san: Option<&str>,
+        document: &str,
+        served_profiles: &[String],
+    ) -> (Result<ProvisioningPlan, ProvisioningError>, Vec<u8>) {
         let (pem, der) = certificate(san);
         fs::write(dir.join("device.pem"), pem).expect("write certificate");
         let path = dir.join("records.toml");
         fs::write(&path, document).expect("write records");
-        (plan_provisioning(&path, ISSUER, Utc::now()), der)
+        (
+            plan_provisioning(&path, ISSUER, served_profiles, Utc::now()),
+            der,
+        )
+    }
+
+    /// M6-C57: each service type the alpha serves is written with the
+    /// capability the relay selects it by.  Before M6-C57 the records schema
+    /// had no field for either capability (`deny_unknown_fields` refused the
+    /// document) and the writer stored `{"operations": [...]}` alone, so the
+    /// relay answered 404 for every MCP, ACP and filesystem request.
+    #[test]
+    fn plan_writes_the_capability_each_service_type_is_served_by() {
+        let dir = scratch();
+        let san = format!("urn:agent-tunnel:device:{DEVICE}");
+        for (fields, grant, key, value) in [
+            (
+                "type = \"http-forward\"\noperations = [\"http:invoke\"]\n\
+                 http_forward_profile = \"mcp-2025-11-25\"",
+                "[\"http:invoke\"]",
+                "http_forward_profile",
+                "mcp-2025-11-25",
+            ),
+            (
+                "type = \"http-forward\"\noperations = [\"http:invoke\"]\n\
+                 http_forward_profile = \"mcp-2026-07-28\"",
+                "[\"http:invoke\"]",
+                "http_forward_profile",
+                "mcp-2026-07-28",
+            ),
+            (
+                "type = \"http-forward\"\noperations = [\"http:invoke\"]\n\
+                 http_forward_profile = \"acp-http-v1\"",
+                "[\"http:invoke\"]",
+                "http_forward_profile",
+                "acp-http-v1",
+            ),
+            (
+                "type = \"fs\"\noperations = [\"fs:connect\", \"fs:read\", \"fs:list\"]\n\
+                 fs_case_sensitivity = \"insensitive-preserving\"",
+                "[\"fs:connect\", \"fs:read\"]",
+                "fs_case_sensitivity",
+                "insensitive-preserving",
+            ),
+        ] {
+            let (plan, _) = plan_with(&dir.0, Some(&san), &records_for(fields, grant));
+            let plan = plan.unwrap_or_else(|error| panic!("{value}: {error}"));
+            let capabilities = &plan.records.services[0].capabilities;
+            assert_eq!(
+                capabilities[key].as_str(),
+                Some(value),
+                "{value}: the service record must carry {key}: {capabilities}"
+            );
+            assert!(
+                plan.summary().contains(&format!("{key}={value}")),
+                "{value}: the printed summary must name what was provisioned"
+            );
+        }
+        // The echo record is unchanged: operations only.
+        let (plan, _) = plan_with(&dir.0, Some(&san), &records("[\"echo:invoke\"]"));
+        let capabilities = plan.expect("echo plans").records.services[0]
+            .capabilities
+            .clone();
+        assert_eq!(
+            capabilities,
+            serde_json::json!({"operations": ["echo:invoke"]})
+        );
+    }
+
+    /// M6-C57: the dry run refuses every service the relay could not serve,
+    /// naming the field, instead of accepting a record that is answered 404
+    /// forever.  Before M6-C57 the three cases naming neither new field
+    /// planned clean, and the rest were refused only because the old schema
+    /// did not know the field -- a refusal for the wrong reason.
+    #[test]
+    fn plan_refuses_a_service_the_relay_could_not_serve() {
+        let dir = scratch();
+        let san = format!("urn:agent-tunnel:device:{DEVICE}");
+        let http = "type = \"http-forward\"\noperations = [\"http:invoke\"]";
+        let fs_service = "type = \"fs\"\noperations = [\"fs:connect\", \"fs:read\"]";
+        let cases = [
+            (
+                "unknown type",
+                "type = \"files\"\noperations = [\"files:read\"]".to_owned(),
+                "[\"files:read\"]",
+                served(),
+                "is not a type provision-catalog can create",
+            ),
+            (
+                "http-forward without a profile",
+                http.to_owned(),
+                "[\"http:invoke\"]",
+                served(),
+                "requires service.http_forward_profile",
+            ),
+            (
+                "unpinned profile",
+                format!("{http}\nhttp_forward_profile = \"mcp-2024-11-05\""),
+                "[\"http:invoke\"]",
+                served(),
+                "is not a pinned profile",
+            ),
+            (
+                "profile the relay does not serve",
+                format!("{http}\nhttp_forward_profile = \"acp-http-v1\""),
+                "[\"http:invoke\"]",
+                vec!["mcp-2025-11-25".to_owned()],
+                "is not served by this relay",
+            ),
+            (
+                "relay without [http_forward]",
+                format!("{http}\nhttp_forward_profile = \"mcp-2025-11-25\""),
+                "[\"http:invoke\"]",
+                Vec::new(),
+                "is not served by this relay",
+            ),
+            (
+                "http-forward with an echo operation",
+                "type = \"http-forward\"\noperations = [\"echo:invoke\"]\n\
+                 http_forward_profile = \"mcp-2025-11-25\""
+                    .to_owned(),
+                "[\"echo:invoke\"]",
+                served(),
+                "is not an operation of a \"http-forward\" service",
+            ),
+            (
+                "fs without a case behaviour",
+                fs_service.to_owned(),
+                "[\"fs:connect\", \"fs:read\"]",
+                served(),
+                "requires service.fs_case_sensitivity",
+            ),
+            (
+                "fs with an unknown case behaviour",
+                format!("{fs_service}\nfs_case_sensitivity = \"insensitive\""),
+                "[\"fs:connect\", \"fs:read\"]",
+                served(),
+                "must be sensitive or insensitive-preserving",
+            ),
+            (
+                "fs grant without the session operation",
+                format!("{fs_service}\nfs_case_sensitivity = \"sensitive\""),
+                "[\"fs:read\"]",
+                served(),
+                "must include fs:connect",
+            ),
+            (
+                "fs grant naming no capability",
+                format!("{fs_service}\nfs_case_sensitivity = \"sensitive\""),
+                "[\"fs:connect\"]",
+                served(),
+                "admits no session",
+            ),
+            (
+                "fs with an http operation",
+                "type = \"fs\"\noperations = [\"fs:connect\", \"http:invoke\"]\n\
+                 fs_case_sensitivity = \"sensitive\""
+                    .to_owned(),
+                "[\"fs:connect\"]",
+                served(),
+                "is not an operation of a \"fs\" service",
+            ),
+            (
+                "echo with a profile",
+                "type = \"echo\"\noperations = [\"echo:invoke\"]\n\
+                 http_forward_profile = \"mcp-2025-11-25\""
+                    .to_owned(),
+                "[\"echo:invoke\"]",
+                served(),
+                "does not apply to a service of type \"echo\"",
+            ),
+            (
+                "echo with a case behaviour",
+                "type = \"echo\"\noperations = [\"echo:invoke\"]\n\
+                 fs_case_sensitivity = \"sensitive\""
+                    .to_owned(),
+                "[\"echo:invoke\"]",
+                served(),
+                "does not apply to a service of type \"echo\"",
+            ),
+        ];
+        let total = cases.len();
+        // Every case is tried, and every miss is reported with its reason,
+        // so a regression names each rule it broke rather than the first.
+        let mut misses = Vec::new();
+        for (case, fields, grant, served_profiles, expected) in cases {
+            let (plan, _) = plan_serving(
+                &dir.0,
+                Some(&san),
+                &records_for(&fields, grant),
+                &served_profiles,
+            );
+            match plan {
+                Ok(plan) => misses.push(format!(
+                    "{case}: planned a service the relay cannot serve: {}",
+                    plan.summary()
+                )),
+                Err(error) if !error.to_string().contains(expected) => {
+                    misses.push(format!("{case}: refused for another reason: {error}"));
+                }
+                Err(_) => {}
+            }
+        }
+        assert!(
+            misses.is_empty(),
+            "{} of {total} unservable services were not refused for their own reason:\n{}",
+            misses.len(),
+            misses.join("\n")
+        );
     }
 
     #[test]
