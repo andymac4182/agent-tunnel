@@ -47,6 +47,7 @@ use tokio_tungstenite::{
 use tokio_util::sync::CancellationToken;
 use tunnel_protocol::{
     AuthorizationChallenge, AuthorizationConfirmed, AuthorizationInvalidated,
+    CONTROL_IDENTITY_REJECTED_CLOSE_CODE, CONTROL_IDENTITY_REJECTED_CLOSE_REASON,
     CONTROL_OWNER_BUSY_CLOSE_CODE, CONTROL_OWNER_BUSY_CLOSE_REASON, Cancel, ControlMessage,
     DataReady, Frame, FrameKind, Hello, MAX_CONTROL_MESSAGE_BYTES, MAX_FRAME_LEN, MAX_PAYLOAD_LEN,
     Open, Opened, Ping, Pong, Rejected, ServiceAdvertisement, Welcome, decode_control,
@@ -783,9 +784,18 @@ async fn receive_welcome(
 }
 
 fn classify_initial_control_close(frame: &CloseFrame) -> Option<ClientError> {
-    (frame.code == CloseCode::from(CONTROL_OWNER_BUSY_CLOSE_CODE)
-        && &*frame.reason == CONTROL_OWNER_BUSY_CLOSE_REASON)
-        .then_some(ClientError::OwnerBusy)
+    if frame.code == CloseCode::from(CONTROL_OWNER_BUSY_CLOSE_CODE)
+        && &*frame.reason == CONTROL_OWNER_BUSY_CLOSE_REASON
+    {
+        return Some(ClientError::OwnerBusy);
+    }
+    // M6-C32: the relay refused this device's identity.  A credential
+    // error, so `CREDENTIAL_ERROR`, exit 3, and not retryable.
+    (frame.code == CloseCode::from(CONTROL_IDENTITY_REJECTED_CLOSE_CODE)
+        && &*frame.reason == CONTROL_IDENTITY_REJECTED_CLOSE_REASON)
+        .then_some(ClientError::Credential(
+            CredentialError::RelayRefusedIdentity,
+        ))
 }
 
 async fn receive_data_ready(
@@ -2779,6 +2789,30 @@ mod tests {
             reason: CONTROL_OWNER_BUSY_CLOSE_REASON.into(),
         };
         assert!(classify_initial_control_close(&wrong_code).is_none());
+    }
+
+    /// M6-C32: the relay's identity refusal is terminal and a credential
+    /// fault, never a retryable transport loss.
+    #[test]
+    fn an_identity_rejected_close_is_a_non_retryable_credential_error() {
+        let rejected = CloseFrame {
+            code: CloseCode::from(CONTROL_IDENTITY_REJECTED_CLOSE_CODE),
+            reason: CONTROL_IDENTITY_REJECTED_CLOSE_REASON.into(),
+        };
+        let error = classify_initial_control_close(&rejected).expect("classified");
+        assert!(matches!(
+            error,
+            ClientError::Credential(CredentialError::RelayRefusedIdentity)
+        ));
+        assert_eq!(error.code(), "CREDENTIAL_ERROR");
+        assert!(!error.retryable());
+        assert!(error.to_string().contains("device_id"));
+
+        let wrong_reason = CloseFrame {
+            code: rejected.code,
+            reason: "catalog lookup failed".into(),
+        };
+        assert!(classify_initial_control_close(&wrong_reason).is_none());
     }
 
     #[test]

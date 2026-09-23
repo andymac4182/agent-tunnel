@@ -23,6 +23,10 @@
 //! * `m6c23_an_expired_device_certificate_exits_three_without_retrying` -- the
 //!   same alert for a certificate past `notAfter` on the client's clock too:
 //!   exit `3`, no backoff.
+//! * `m6c23_an_identity_mismatch_exits_three_without_retrying` -- the
+//!   integration with M6-C32: a `device_id` that is not the certificate's
+//!   device draws `1008 DEVICE_IDENTITY_REJECTED`, and the loop exits `3`
+//!   after one attempt instead of backing off.
 //!
 //! Every step asserts on the client's `--json` events and on a real echo
 //! through the relay, and each run prints `m6c23-reconnect ok ...` only after
@@ -687,9 +691,13 @@ impl Deployment {
     }
 
     fn connect(&self) -> Client {
+        self.connect_with(&self.client_config)
+    }
+
+    fn connect_with(&self, profile: &Path) -> Client {
         let mut child = Command::new(&self.client_bin)
             .args(["connect", "--config"])
-            .arg(&self.client_config)
+            .arg(profile)
             .arg("--json")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -1105,6 +1113,54 @@ async fn m6c23_an_expired_device_certificate_exits_three_without_retrying() {
     drop(relay);
     println!(
         "m6c23-reconnect ok label=expired nonce={} exit=3 code=CREDENTIAL_ERROR backoffs=0",
+        deployment.nonce
+    );
+}
+
+/// The integration with M6-C32: the relay closes a `device_id` mismatch with
+/// `1008 DEVICE_IDENTITY_REJECTED`, the client reports `CREDENTIAL_ERROR`,
+/// and the reconnect loop -- on, with its default policy apart from short
+/// delays -- exits `3` after that one attempt instead of backing off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires TEST_REDIS_URL and TUNNEL_CLIENT_BIN; run by scripts/m6-reconnect-verify.sh"]
+async fn m6c23_an_identity_mismatch_exits_three_without_retrying() {
+    let deployment = Deployment::provision("identity").await;
+    let mismatched = deployment
+        .client_config
+        .with_file_name("mismatched-device-id.toml");
+    fs::write(
+        &mismatched,
+        set_key(
+            &fs::read_to_string(&deployment.client_config).expect("read profile"),
+            "device_id",
+            &format!("\"{}\"", Uuid::new_v4()),
+        ),
+    )
+    .expect("mismatched profile");
+    let relay = deployment.serve("serve");
+    let mut client = deployment.connect_with(&mismatched);
+    let exit = client.wait_exit("identity mismatch");
+    let events: Vec<Value> = client
+        .events()
+        .into_iter()
+        .map(|(_, event)| event)
+        .collect();
+    let last = events.last().cloned().unwrap_or(Value::Null);
+    assert_eq!(exit.code(), Some(3), "{events:?}");
+    assert_eq!(last["error"]["code"], "CREDENTIAL_ERROR", "{events:?}");
+    assert_eq!(last["error"]["retryable"], false, "{events:?}");
+    assert!(
+        last["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("refused this device's identity"),
+        "the message only the 1008 DEVICE_IDENTITY_REJECTED close produces: {events:?}"
+    );
+    assert!(client.states("backoff").is_empty(), "{events:?}");
+    assert!(client.states("disconnected").is_empty(), "{events:?}");
+    drop(relay);
+    println!(
+        "m6c23-reconnect ok label=identity nonce={} exit=3 code=CREDENTIAL_ERROR backoffs=0",
         deployment.nonce
     );
 }

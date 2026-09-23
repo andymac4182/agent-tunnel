@@ -1364,6 +1364,7 @@ impl Catalog for RedisCatalog {
         match reply.first().map(String::as_str) {
             Some("none") => Ok(None),
             Some("clock_skew") => Err(CatalogError::Conflict("authority clock skew")),
+            Some("not_yet_valid") => Err(CatalogError::Conflict(crate::RESOLVE_NOT_YET_VALID)),
             Some("ok") => parse_device_reply(&reply),
             _ => Err(CatalogError::Serialization(
                 "invalid Redis device reply".into(),
@@ -2547,7 +2548,12 @@ local device_active = h(device_key, 'active')
 local not_before = tonumber(h(credential_key, 'not_before_us'))
 local expires = tonumber(h(credential_key, 'expires_at_us'))
 if active ~= '1' or device_active ~= '1' or h(credential_key, 'revoked_at_us') ~= '' then return {'none'} end
-if not not_before or not expires or not_before > at or expires <= at then return {'none'} end
+if not not_before or not expires or expires <= at then return {'none'} end
+-- M6-C32 review: a credential that is not valid *yet* is not an unknown or
+-- refused identity.  A relay clock a few seconds behind the issuer's reaches
+-- it, and it heals by itself, so it must not share 'none' with a revoked,
+-- expired or unknown credential, which a device is told never to retry.
+if not_before > at then return {'not_yet_valid'} end
 return {
   'ok', tenant_id, device_id, h(device_key, 'owner_user_id'), credential_id,
   h(credential_key, 'spki_fingerprint'), string.format('%.0f', not_before - translation),

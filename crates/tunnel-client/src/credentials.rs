@@ -9,7 +9,6 @@ use crate::config::{CredentialConfig, RuntimeConfig};
 #[cfg(unix)]
 use rcgen::{CertificateParams, DnType, KeyPair};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-#[cfg(unix)]
 use rustls::sign::CertifiedKey;
 use rustls_pemfile::{certs, private_key};
 use std::{
@@ -24,6 +23,7 @@ use std::{
     fs::OpenOptions,
     io::{Read, Write},
 };
+use tunnel_transport::{CertificateRole, TlsIdentityError, leaf_identity_from_der};
 
 /// Result of creating a local key and CSR.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -96,15 +96,11 @@ pub fn import_certificate(
             certificate_source.to_owned(),
         ));
     }
-    // CertifiedKey::from_der uses the selected rustls crypto provider to
-    // compare the certificate SPKI with the private key.  This catches a
-    // mismatched certificate before any file is installed.
-    CertifiedKey::from_der(
-        certificate_chain.clone(),
-        key,
-        &rustls::crypto::ring::default_provider(),
-    )
-    .map_err(|error| CredentialError::KeyMismatch(error.to_string()))?;
+    // Every refusal below is classified before any file is installed, so an
+    // operator is told which of the certificate's properties is wrong rather
+    // than one catch-all "key mismatch" (task row M6-C25).
+    verify_certificate_key(&certificate_chain, key)?;
+    verify_device_role(&certificate_chain[0], &config.device_id)?;
 
     let ca_chain = load_certificates(server_ca_source)?;
     if ca_chain.is_empty() {
@@ -129,6 +125,88 @@ pub fn import_certificate(
         certificate_count: certificate_chain.len(),
         ca_certificate_count: ca_chain.len(),
     })
+}
+
+/// Check that a client certificate chain is usable with `key`, classifying
+/// each refusal separately (task row M6-C25).
+///
+/// In order: the end-entity certificate must parse as X.509, must be version
+/// 3 (the relay's verifier refuses v1 and v2, and only v3 can carry the
+/// device role SAN), the private key must be one the TLS provider can sign
+/// with, and the certificate's public key must be the key's own.  Only the
+/// last of these is reported as [`CredentialError::KeyMismatch`]; before
+/// M6-C25 every refusal was, including a v1 certificate whose key matched.
+pub fn verify_certificate_key(
+    chain: &[CertificateDer<'static>],
+    key: PrivateKeyDer<'static>,
+) -> Result<(), CredentialError> {
+    let leaf = chain.first().ok_or_else(|| {
+        CredentialError::CertificateUnparseable("the chain has no end-entity certificate".into())
+    })?;
+    let (_, parsed) = x509_parser::parse_x509_certificate(leaf.as_ref())
+        .map_err(|error| CredentialError::CertificateUnparseable(error.to_string()))?;
+    let version = parsed.version();
+    if version != x509_parser::x509::X509Version::V3 {
+        return Err(CredentialError::UnsupportedCertificateVersion(
+            version.0.saturating_add(1),
+        ));
+    }
+    let provider = rustls::crypto::ring::default_provider();
+    let signing_key = provider
+        .key_provider
+        .load_private_key(key)
+        .map_err(|error| CredentialError::UnsupportedPrivateKey(error.to_string()))?;
+    // The same comparison `CertifiedKey::from_der` makes, taken apart so a
+    // certificate the TLS stack refuses is not reported as a key mismatch.
+    // As there, a key that cannot report its public half is not a refusal.
+    match CertifiedKey::new(chain.to_vec(), signing_key).keys_match() {
+        Ok(()) | Err(rustls::Error::InconsistentKeys(rustls::InconsistentKeys::Unknown)) => Ok(()),
+        Err(rustls::Error::InconsistentKeys(rustls::InconsistentKeys::KeyMismatch)) => Err(
+            CredentialError::KeyMismatch("the certificate's public key is not this key's".into()),
+        ),
+        Err(error) => Err(CredentialError::CertificateRefused(error.to_string())),
+    }
+}
+
+/// Check that the end-entity certificate names `device_id` in its device role
+/// URI SAN, which the relay requires of every device session: it refuses a
+/// HELLO whose `connector_id` differs from the SAN's identifier.
+pub fn verify_device_role(
+    leaf: &CertificateDer<'_>,
+    device_id: &str,
+) -> Result<(), CredentialError> {
+    let identity = leaf_identity_from_der(leaf.as_ref()).map_err(|error| match error {
+        TlsIdentityError::Certificate(detail) => CredentialError::CertificateUnparseable(detail),
+        other => CredentialError::MissingDeviceRole(other.to_string()),
+    })?;
+    let CertificateRole::Device { id } = identity.role() else {
+        return Err(CredentialError::MissingDeviceRole(
+            "the certificate carries a relay peer role, not a device role".into(),
+        ));
+    };
+    // Compare as the relay does: it parses the SAN identifier and the HELLO's
+    // `connector_id` (which is `device_id`) with `str::parse::<Uuid>` and
+    // compares the values (`begin_register_control` and `validate_hello` in
+    // `crates/tunnel-relay/src/actor.rs`; `provision-catalog` parses
+    // `device.id` the same way).  A byte comparison refused an uppercase or
+    // hyphen-less `device_id` the relay accepts.  No crate shared by the
+    // client and the relay holds this parse, so it is repeated here.
+    let Ok(certificate) = id.parse::<uuid::Uuid>() else {
+        return Err(CredentialError::MissingDeviceRole(format!(
+            "the device role SAN names {id:?}, which is not a UUID; the relay refuses it"
+        )));
+    };
+    let Ok(configured) = device_id.parse::<uuid::Uuid>() else {
+        return Err(CredentialError::DeviceIdNotUuid(device_id.to_owned()));
+    };
+    if certificate == configured {
+        Ok(())
+    } else {
+        Err(CredentialError::DeviceIdMismatch {
+            certificate: id.clone(),
+            configured: device_id.to_owned(),
+        })
+    }
 }
 
 /// Local key creation is disabled until this platform has an owner-only ACL implementation.
@@ -263,7 +341,34 @@ pub enum CredentialError {
     NoCertificates(PathBuf),
     NoPrivateKey(PathBuf),
     AlreadyExists(PathBuf),
+    /// The certificate's public key is not the configured private key's.
     KeyMismatch(String),
+    /// The end-entity certificate is not parseable X.509 DER.
+    CertificateUnparseable(String),
+    /// The end-entity certificate is X.509 v1 or v2; the value is the
+    /// version number as written (1, 2), not the encoded field.
+    UnsupportedCertificateVersion(u32),
+    /// The TLS provider cannot sign with the private key.
+    UnsupportedPrivateKey(String),
+    /// The TLS stack refused the certificate for a reason other than those
+    /// above; the detail is the provider's.
+    CertificateRefused(String),
+    /// The certificate has no usable `urn:agent-tunnel:device:<id>` URI SAN.
+    MissingDeviceRole(String),
+    /// The profile's `device_id` is not a UUID, which the relay requires.
+    DeviceIdNotUuid(String),
+    /// The certificate's device role SAN names another device than the
+    /// profile's `device_id` (compared as UUIDs, as the relay compares them).
+    DeviceIdMismatch {
+        certificate: String,
+        configured: String,
+    },
+    /// The relay authenticated the TLS connection and then refused the
+    /// device session: the profile's `device_id` does not name the
+    /// certificate's device, or the catalog has no active device and
+    /// credential for this certificate's key (task row M6-C32).  Terminal:
+    /// no retry of the same configuration and catalog can succeed.
+    RelayRefusedIdentity,
     Tls(String),
     Provision(String),
     UnsupportedPlatform(&'static str),
@@ -287,6 +392,48 @@ impl fmt::Display for CredentialError {
             Self::KeyMismatch(error) => write!(
                 formatter,
                 "client certificate does not match its private key: {error}"
+            ),
+            Self::CertificateUnparseable(error) => write!(
+                formatter,
+                "client certificate is not a parseable X.509 certificate: {error}"
+            ),
+            Self::UnsupportedCertificateVersion(version) => write!(
+                formatter,
+                "client certificate is X.509 v{version}; the relay accepts only v3 \
+                 certificates, which carry the device role SAN (ask the issuer to sign \
+                 with extensions, for example `openssl x509 -req -extfile`)"
+            ),
+            Self::UnsupportedPrivateKey(error) => write!(
+                formatter,
+                "the private key is not a supported signing key: {error}"
+            ),
+            Self::CertificateRefused(error) => write!(
+                formatter,
+                "client certificate was refused by the TLS stack: {error}"
+            ),
+            Self::MissingDeviceRole(error) => write!(
+                formatter,
+                "client certificate has no device role URI SAN \
+                 urn:agent-tunnel:device:<device_id>: {error}"
+            ),
+            Self::DeviceIdNotUuid(device_id) => write!(
+                formatter,
+                "the profile's device_id {device_id:?} is not a UUID; the relay accepts \
+                 only the catalog device UUID"
+            ),
+            Self::DeviceIdMismatch {
+                certificate,
+                configured,
+            } => write!(
+                formatter,
+                "client certificate names device {certificate} in its role SAN but the \
+                 profile's device_id is {configured}; the relay refuses a device unless \
+                 they are equal"
+            ),
+            Self::RelayRefusedIdentity => formatter.write_str(
+                "the relay refused this device's identity: check that device_id equals the \
+                 certificate's urn:agent-tunnel:device SAN and that the catalog holds an \
+                 active device and credential for this certificate; retrying will not help",
             ),
             Self::Tls(error) => write!(
                 formatter,
@@ -357,6 +504,302 @@ mod tests {
             Err(CredentialError::UnsupportedPlatform(_))
         ));
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    /// Test-time certificate material for the M6-C25 cases.  Everything is
+    /// generated per test; no key or certificate is committed.
+    #[cfg(unix)]
+    mod material {
+        use rcgen::{CertificateParams, DnType, KeyPair, SanType};
+
+        pub(super) const DEVICE: &str = "33333333-3333-4333-8333-333333333333";
+
+        /// A v3 certificate for `key`, self-signed, carrying `sans`.
+        pub(super) fn v3_pem(key: &KeyPair, sans: Vec<SanType>) -> String {
+            let mut params = CertificateParams::default();
+            params
+                .distinguished_name
+                .push(DnType::CommonName, format!("device/{DEVICE}"));
+            params.subject_alt_names = sans;
+            params.self_signed(key).expect("v3 certificate").pem()
+        }
+
+        pub(super) fn device_san(id: &str) -> SanType {
+            SanType::URI(
+                format!("urn:agent-tunnel:device:{id}")
+                    .try_into()
+                    .expect("URI SAN"),
+            )
+        }
+
+        /// A genuine X.509 **v1** certificate for `key`: the TBSCertificate
+        /// of an rcgen certificate with its `[0]` version and `[3]`
+        /// extensions removed (which is exactly what v1 is), re-signed with
+        /// the same P-256 key so the signature is valid.  This is the shape
+        /// macOS's LibreSSL `openssl x509 -req` issues without an extensions
+        /// file, which is how the m6-02 worker met the defect.
+        pub(super) fn v1_pem(key: &KeyPair) -> String {
+            let v3 = CertificateParams::default()
+                .self_signed(key)
+                .expect("template certificate");
+            let (outer, _) = tlv(v3.der(), 0);
+            let (tbs, after_tbs) = tlv(outer, 0);
+            let (_, algorithm_end) = tlv(outer, after_tbs);
+            let signature_algorithm = &outer[after_tbs..algorithm_end];
+            let mut children = Vec::new();
+            let mut at = 0;
+            while at < tbs.len() {
+                let tag = tbs[at];
+                let (_, end) = tlv(tbs, at);
+                if tag != 0xa0 && tag != 0xa3 {
+                    children.extend_from_slice(&tbs[at..end]);
+                }
+                at = end;
+            }
+            let tbs_v1 = der(0x30, &children);
+            let rng = ring::rand::SystemRandom::new();
+            let signer = ring::signature::EcdsaKeyPair::from_pkcs8(
+                &ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
+                &key.serialize_der(),
+                &rng,
+            )
+            .expect("P-256 signer");
+            let signature = signer.sign(&rng, &tbs_v1).expect("sign TBS");
+            let mut bit_string = vec![0];
+            bit_string.extend_from_slice(signature.as_ref());
+            let mut body = tbs_v1;
+            body.extend_from_slice(signature_algorithm);
+            body.extend_from_slice(&der(0x03, &bit_string));
+            pem(&der(0x30, &body))
+        }
+
+        /// Return the content of the DER element at `at` and the offset just
+        /// past it.  Test-only, for well-formed rcgen output.
+        fn tlv(bytes: &[u8], at: usize) -> (&[u8], usize) {
+            let first = bytes[at + 1];
+            let (length, header) = if first < 0x80 {
+                (usize::from(first), 2)
+            } else {
+                let count = usize::from(first & 0x7f);
+                let length = bytes[at + 2..at + 2 + count]
+                    .iter()
+                    .fold(0usize, |value, byte| (value << 8) | usize::from(*byte));
+                (length, 2 + count)
+            };
+            let start = at + header;
+            (&bytes[start..start + length], start + length)
+        }
+
+        fn der(tag: u8, content: &[u8]) -> Vec<u8> {
+            let mut out = vec![tag];
+            let length = content.len();
+            if length < 0x80 {
+                out.push(u8::try_from(length).expect("short length"));
+            } else {
+                let bytes: Vec<u8> = length
+                    .to_be_bytes()
+                    .into_iter()
+                    .skip_while(|byte| *byte == 0)
+                    .collect();
+                out.push(0x80 | u8::try_from(bytes.len()).expect("length of length"));
+                out.extend_from_slice(&bytes);
+            }
+            out.extend_from_slice(content);
+            out
+        }
+
+        pub(super) fn pem(der: &[u8]) -> String {
+            const ALPHABET: &[u8; 64] =
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            let mut encoded = String::new();
+            for chunk in der.chunks(3) {
+                let block = [
+                    chunk[0],
+                    chunk.get(1).copied().unwrap_or(0),
+                    chunk.get(2).copied().unwrap_or(0),
+                ];
+                let value =
+                    (u32::from(block[0]) << 16) | (u32::from(block[1]) << 8) | u32::from(block[2]);
+                for index in 0..4 {
+                    if index <= chunk.len() {
+                        let sextet = (value >> (18 - 6 * index)) & 0x3f;
+                        encoded.push(char::from(ALPHABET[sextet as usize]));
+                    } else {
+                        encoded.push('=');
+                    }
+                }
+            }
+            let mut out = String::from("-----BEGIN CERTIFICATE-----\n");
+            for line in encoded.as_bytes().chunks(64) {
+                out.push_str(std::str::from_utf8(line).expect("ASCII"));
+                out.push('\n');
+            }
+            out.push_str("-----END CERTIFICATE-----\n");
+            out
+        }
+    }
+
+    /// One import attempt of `certificate_pem` against a pending `key`.
+    #[cfg(unix)]
+    fn import_with(
+        key: &rcgen::KeyPair,
+        certificate_pem: &str,
+    ) -> (
+        Result<ImportedCredential, CredentialError>,
+        tempfile::TempDir,
+    ) {
+        let dir = tempdir().expect("temporary directory");
+        let mut config = RuntimeConfig {
+            device_id: material::DEVICE.to_owned(),
+            ..RuntimeConfig::default()
+        };
+        config.credentials.client_key = dir.path().join("device-key.pem");
+        config.credentials.client_certificate = dir.path().join("installed-cert.pem");
+        config.credentials.server_ca = dir.path().join("installed-ca.pem");
+        fs::write(&config.credentials.client_key, key.serialize_pem()).expect("pending key");
+        let source = dir.path().join("issued.pem");
+        fs::write(&source, certificate_pem).expect("issued certificate");
+        let ca_key = rcgen::KeyPair::generate().expect("CA key");
+        let ca = dir.path().join("ca.pem");
+        fs::write(&ca, material::v3_pem(&ca_key, Vec::new())).expect("CA bundle");
+        (import_certificate(&config, &source, &ca), dir)
+    }
+
+    /// M6-C25: a v1 certificate whose key **matches** is refused as a v1
+    /// certificate.  Before the fix it was refused as a key mismatch.
+    #[test]
+    #[cfg(unix)]
+    fn a_v1_certificate_is_refused_for_its_version_not_as_a_key_mismatch() {
+        let key = rcgen::KeyPair::generate().expect("device key");
+        let v1 = material::v1_pem(&key);
+        // The fixture must really be v1 with this key, or the test proves
+        // nothing: check both with the same parser the product uses.
+        let chain = load_certificates_from(&v1);
+        let (_, parsed) = x509_parser::parse_x509_certificate(chain[0].as_ref()).expect("parses");
+        assert_eq!(parsed.version(), x509_parser::x509::X509Version::V1);
+        assert_eq!(parsed.public_key().raw, key.public_key_der().as_slice());
+
+        let (result, dir) = import_with(&key, &v1);
+        let error = result.expect_err("a v1 certificate must be refused");
+        assert!(
+            matches!(error, CredentialError::UnsupportedCertificateVersion(1)),
+            "a matching v1 certificate was classified as {error:?}"
+        );
+        let message = error.to_string();
+        assert!(message.contains("X.509 v1"), "{message}");
+        assert!(!message.contains("does not match"), "{message}");
+        assert!(!dir.path().join("installed-cert.pem").exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_genuine_key_mismatch_is_still_reported_as_one() {
+        let key = rcgen::KeyPair::generate().expect("device key");
+        let other = rcgen::KeyPair::generate().expect("other key");
+        let certificate = material::v3_pem(&other, vec![material::device_san(material::DEVICE)]);
+        let (result, _dir) = import_with(&key, &certificate);
+        assert!(
+            matches!(result, Err(CredentialError::KeyMismatch(_))),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn an_unparseable_certificate_is_not_a_key_mismatch() {
+        let key = rcgen::KeyPair::generate().expect("device key");
+        let garbage = material::pem(b"\x30\x03\x02\x01\x00not a certificate");
+        let (result, _dir) = import_with(&key, &garbage);
+        assert!(
+            matches!(result, Err(CredentialError::CertificateUnparseable(_))),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_certificate_without_the_device_role_san_is_refused_on_import() {
+        let key = rcgen::KeyPair::generate().expect("device key");
+        let certificate = material::v3_pem(&key, Vec::new());
+        let (result, _dir) = import_with(&key, &certificate);
+        let error = result.expect_err("no device SAN");
+        assert!(
+            matches!(error, CredentialError::MissingDeviceRole(_)),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains("urn:agent-tunnel:device:"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_certificate_naming_another_device_is_refused_on_import() {
+        let key = rcgen::KeyPair::generate().expect("device key");
+        let other = "44444444-4444-4444-8444-444444444444";
+        let certificate = material::v3_pem(&key, vec![material::device_san(other)]);
+        let (result, _dir) = import_with(&key, &certificate);
+        let error = result.expect_err("SAN names another device");
+        assert!(
+            matches!(
+                &error,
+                CredentialError::DeviceIdMismatch { certificate, configured }
+                    if certificate == other && configured == material::DEVICE
+            ),
+            "{error:?}"
+        );
+    }
+
+    /// The relay compares device identifiers as UUIDs, so an uppercase or
+    /// hyphen-less `device_id` naming the certificate's device is the same
+    /// device and must import.  A byte comparison refused both.
+    #[test]
+    #[cfg(unix)]
+    fn a_device_id_equal_as_a_uuid_imports_in_any_accepted_spelling() {
+        let san = "3a3b3c3d-3e3f-4a3b-8c3d-3e3f3a3b3c3d";
+        let key = rcgen::KeyPair::generate().expect("device key");
+        let certificate = material::v3_pem(&key, vec![material::device_san(san)]);
+        let leaf = load_certificates_from(&certificate).remove(0);
+        for spelling in [
+            san.to_owned(),
+            san.to_uppercase(),
+            san.replace('-', ""),
+            san.replace('-', "").to_uppercase(),
+        ] {
+            // The spelling must also be one the profile validation accepts.
+            let config = RuntimeConfig {
+                device_id: spelling.clone(),
+                ..RuntimeConfig::default()
+            };
+            assert!(
+                config.validate().is_ok(),
+                "{spelling} must be a valid device_id"
+            );
+            assert!(
+                verify_device_role(&leaf, &spelling).is_ok(),
+                "{spelling} names the certificate's device as the relay compares it"
+            );
+        }
+        assert!(matches!(
+            verify_device_role(&leaf, "not-a-uuid"),
+            Err(CredentialError::DeviceIdNotUuid(_))
+        ));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_matching_v3_device_certificate_imports() {
+        let key = rcgen::KeyPair::generate().expect("device key");
+        let certificate = material::v3_pem(&key, vec![material::device_san(material::DEVICE)]);
+        let (result, dir) = import_with(&key, &certificate);
+        let imported = result.expect("a matching certificate imports");
+        assert_eq!(imported.certificate_count, 1);
+        assert!(dir.path().join("installed-cert.pem").exists());
+    }
+
+    #[cfg(unix)]
+    fn load_certificates_from(pem: &str) -> Vec<CertificateDer<'static>> {
+        certs(&mut pem.as_bytes())
+            .collect::<Result<Vec<_>, _>>()
+            .expect("PEM certificates")
     }
 
     #[test]

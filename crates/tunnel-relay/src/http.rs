@@ -27,7 +27,10 @@ use tokio::{
     time::{timeout, timeout_at},
 };
 use tunnel_catalog::{DeviceListFilter, OidcError, OidcVerifier, SharedCatalog};
-use tunnel_protocol::{CONTROL_OWNER_BUSY_CLOSE_CODE, CONTROL_OWNER_BUSY_CLOSE_REASON};
+use tunnel_protocol::{
+    CONTROL_IDENTITY_REJECTED_CLOSE_CODE, CONTROL_IDENTITY_REJECTED_CLOSE_REASON,
+    CONTROL_OWNER_BUSY_CLOSE_CODE, CONTROL_OWNER_BUSY_CLOSE_REASON,
+};
 use tunnel_transport::{PeerTransportError, TlsIdentity};
 use uuid::Uuid;
 
@@ -3804,8 +3807,21 @@ async fn handle_control(
     let registration = match handle.register_control(identity, hello).await {
         Ok(value) => value,
         Err(error) => {
-            if matches!(error, RelayError::OwnerBusy) {
-                let _ = send_socket(&mut socket, owner_busy_close()).await;
+            match error {
+                RelayError::OwnerBusy => {
+                    let _ = send_socket(&mut socket, owner_busy_close()).await;
+                }
+                // M6-C32: `register_control` answers `Unauthorized` only for
+                // an identity it will never accept -- a HELLO whose
+                // `connector_id` is not the certificate's device, a
+                // non-device role, or no active catalog device and credential
+                // for this key.  Closing without a frame left the device
+                // reporting a retryable transport loss for a fault no retry
+                // can fix.
+                RelayError::Unauthorized => {
+                    let _ = send_socket(&mut socket, identity_rejected_close()).await;
+                }
+                _ => {}
             }
             return;
         }
@@ -3988,6 +4004,13 @@ fn owner_busy_close() -> Message {
     Message::Close(Some(CloseFrame {
         code: CONTROL_OWNER_BUSY_CLOSE_CODE,
         reason: CONTROL_OWNER_BUSY_CLOSE_REASON.into(),
+    }))
+}
+
+fn identity_rejected_close() -> Message {
+    Message::Close(Some(CloseFrame {
+        code: CONTROL_IDENTITY_REJECTED_CLOSE_CODE,
+        reason: CONTROL_IDENTITY_REJECTED_CLOSE_REASON.into(),
     }))
 }
 

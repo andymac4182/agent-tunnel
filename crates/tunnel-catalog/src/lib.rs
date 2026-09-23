@@ -51,6 +51,12 @@ pub trait Catalog: Send + Sync {
     /// Resolve a certificate's SPKI fingerprint to its currently usable
     /// device credential.  Expired, revoked, disabled, and unknown credentials
     /// resolve to `Ok(None)` so callers cannot accidentally treat them as live.
+    ///
+    /// A credential that is otherwise usable but whose `not_before` is still
+    /// ahead of `at` is `Err(CatalogError::Conflict(RESOLVE_NOT_YET_VALID))`,
+    /// not `Ok(None)`: it is a clock disagreement that heals by itself, and a
+    /// relay must not report it to the device as a refused identity (review of
+    /// task row M6-C32).
     async fn resolve_device(
         &self,
         spki_fingerprint: &str,
@@ -216,6 +222,10 @@ pub trait Catalog: Send + Sync {
 pub type SharedCatalog = std::sync::Arc<dyn Catalog>;
 
 /// The bounded authorization lifetime required by the cluster contract.
+/// The `CatalogError::Conflict` detail [`Catalog::resolve_device`] returns for
+/// a credential that is not valid yet.
+pub const RESOLVE_NOT_YET_VALID: &str = "device credential is not yet valid";
+
 pub const MAX_AUTHORIZATION_SNAPSHOT: chrono::Duration = chrono::Duration::seconds(5);
 
 #[cfg(test)]
@@ -374,6 +384,36 @@ mod tests {
                 },
             ],
         }
+    }
+
+    /// Review of M6-C32: a credential that is not valid *yet* is a
+    /// retryable conflict, never `Ok(None)`, which a relay reports to the
+    /// device as a refused identity.  Revoked and expired stay `Ok(None)`.
+    #[tokio::test]
+    async fn memory_catalog_reports_a_not_yet_valid_credential_as_a_conflict() {
+        let now = Utc::now();
+        let mut early = fixture();
+        early.credentials[0].not_before = now + Duration::minutes(10);
+        early.credentials[0].expires_at = now + Duration::hours(1);
+        let fingerprint = early.credentials[0].spki_fingerprint.clone();
+        let catalog = MemoryCatalog::new();
+        catalog.seed_fixture(&early).await.unwrap();
+        assert!(matches!(
+            catalog.resolve_device(&fingerprint, now).await,
+            Err(CatalogError::Conflict(RESOLVE_NOT_YET_VALID))
+        ));
+
+        let mut expired = fixture();
+        expired.credentials[0].not_before = now - Duration::hours(2);
+        expired.credentials[0].expires_at = now - Duration::hours(1);
+        let catalog = MemoryCatalog::new();
+        catalog.seed_fixture(&expired).await.unwrap();
+        assert!(matches!(
+            catalog
+                .resolve_device(&expired.credentials[0].spki_fingerprint, now)
+                .await,
+            Ok(None)
+        ));
     }
 
     #[tokio::test]
