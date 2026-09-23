@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 use tunnel_catalog::{
     AuthenticatedConsumer, Catalog, CatalogFixture, CredentialRecord, DeviceListFilter,
     FixtureDevice, GrantSpec, MembershipRecord, MembershipRole, OwnerClaimRequest, PermissionSet,
-    PrincipalIdentity, RedisCatalog, ServiceSpec, TenantRecord, UserRecord,
+    PrincipalIdentity, RESOLVE_NOT_YET_VALID, RedisCatalog, ServiceSpec, TenantRecord, UserRecord,
 };
 use uuid::Uuid;
 
@@ -638,4 +638,44 @@ async fn redis_authority_accepts_caller_lag_inside_the_authority_deadline() {
         .cleanup_fixture_namespace()
         .await
         .expect("cleanup lag fixture namespace");
+}
+
+/// Review of M6-C32: `SCRIPT_RESOLVE_DEVICE` answers a credential that is not
+/// valid *yet* with its own status, which `resolve_device` returns as a
+/// retryable conflict.  Before, it shared `none` with a revoked, expired or
+/// unknown credential, and the relay told the device its identity was
+/// refused and that retrying would not help -- over seconds of clock skew.
+#[tokio::test]
+#[ignore = "requires TUNNEL_CATALOG_REDIS_URL Redis primary fixture"]
+async fn redis_resolve_reports_a_not_yet_valid_credential_as_a_conflict() {
+    let url = std::env::var("TUNNEL_CATALOG_REDIS_URL")
+        .expect("M1 Redis harness must set TUNNEL_CATALOG_REDIS_URL");
+    let namespace = format!("test-fixture-{}", Uuid::new_v4());
+    let catalog = RedisCatalog::connect_for_recovery(&url, &namespace, "fixture-incarnation")
+        .await
+        .expect("connect Redis catalog");
+    catalog
+        .activate_deployment_incarnation()
+        .await
+        .expect("activate explicit fixture incarnation");
+    let now = Utc::now();
+    let mut fixture = fixture();
+    fixture.credentials[0].not_before = now + Duration::minutes(10);
+    catalog.seed_fixture(&fixture).await.expect("seed fixture");
+    let resolved = catalog
+        .resolve_device(&fixture.credentials[0].spki_fingerprint, Utc::now())
+        .await;
+    catalog
+        .cleanup_fixture_namespace()
+        .await
+        .expect("cleanup fixture namespace");
+    assert!(
+        matches!(
+            resolved,
+            Err(tunnel_catalog::CatalogError::Conflict(
+                RESOLVE_NOT_YET_VALID
+            ))
+        ),
+        "a not-yet-valid credential must be a conflict, not a refused identity: {resolved:?}"
+    );
 }

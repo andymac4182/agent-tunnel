@@ -164,11 +164,14 @@ named by the catalog service UUID. The example profile and
 with `uuidgen` and change both files together. Before M6-C30 the example
 profile used `m1-device-a` and an export named `echo`, and could never be
 served. `credentials import` refuses a certificate whose SAN names a device
-other than `device_id`. If the profile or the catalog changes afterwards, the
+other than `device_id`. It compares them as UUIDs, as the relay does, so case
+and hyphens do not matter. If the profile or the catalog changes afterwards, the
 relay refuses the session and `connect` exits `3` with a non-retryable
 `CREDENTIAL_ERROR`, "the relay refused this device's identity" (M6-C32). The
 relay gives the same refusal for a certificate key the catalog does not hold,
-and it does not say which check failed. A cluster relay is different. It
+and it does not say which check failed. A credential whose catalog
+`not_before` is still in the future is different. That is clock skew, not a
+wrong identity, so `connect` reports it as a retryable `TRANSPORT_ERROR`. A cluster relay is different. It
 looks the key up before routing and, for an unknown key, still closes the
 socket without a reason. That reads as a retryable `TRANSPORT_ERROR` (M6-C43,
 read from the source, not measured). A wrong export name still makes every

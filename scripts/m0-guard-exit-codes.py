@@ -577,6 +577,25 @@ CASES: list[Case] = [
         ),
     ),
     Case(
+        # **Review of M6-C25.**  The device SAN and `device_id` compared as
+        # bytes, as first shipped: an uppercase or hyphen-less `device_id`
+        # that the relay treats as the same UUID is refused on import.
+        "import compares device identifiers as the relay does",
+        [
+            (
+                CREDENTIALS,
+                "    if certificate == configured {",
+                "    if id == device_id && certificate == configured {",
+            )
+        ],
+        frozenset(
+            {
+                "credentials::tests::"
+                "a_device_id_equal_as_a_uuid_imports_in_any_accepted_spelling"
+            }
+        ),
+    ),
+    Case(
         # **M6-C42, restored exactly.**  The doctor's key-match check reports
         # any refusal as `CREDENTIAL_KEY_MISMATCH`, as it did when it called
         # `CertifiedKey::from_der` and discarded the error.

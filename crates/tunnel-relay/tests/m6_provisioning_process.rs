@@ -380,11 +380,13 @@ async fn consumer_post(
     Ok((status, bytes))
 }
 
-/// Task row M6-C32: run `connect --json` for a profile the relay must refuse
-/// on identity, and require the typed, terminal refusal.  Before M6-C32 the
-/// relay dropped the socket and this printed a retryable `TRANSPORT_ERROR`
-/// "control read failed" with exit 4.
-fn expect_identity_refusal(name: &str, client_bin: &Path, config: &Path) {
+/// Run `connect --json` once for a profile the relay must not admit, and
+/// return its exit status, its last JSON diagnostic and its raw stdout.
+fn connect_refused(
+    name: &str,
+    client_bin: &Path,
+    config: &Path,
+) -> (Option<i32>, serde_json::Value, String) {
     let mut child = Command::new(client_bin)
         .args(["connect", "--config"])
         .arg(config)
@@ -416,9 +418,20 @@ fn expect_identity_refusal(name: &str, client_bin: &Path, config: &Path) {
     let last = out.lines().last().unwrap_or_default();
     let diagnostic: serde_json::Value = serde_json::from_str(last)
         .unwrap_or_else(|error| panic!("step {name}: not a JSON diagnostic ({error}): {out}"));
+    (status.code(), diagnostic, out)
+}
+
+/// Task row M6-C32: a profile the relay must refuse on identity gets the
+/// typed, terminal refusal.  Before M6-C32 the relay dropped the socket and
+/// this printed a retryable `TRANSPORT_ERROR` "control read failed" with
+/// exit 4.  The close code and reason are asserted transitively: the message
+/// below is produced only by `classify_initial_control_close`, which requires
+/// the exact `1008 DEVICE_IDENTITY_REJECTED` close.
+fn expect_identity_refusal(name: &str, client_bin: &Path, config: &Path) {
+    let (code, diagnostic, out) = connect_refused(name, client_bin, config);
     assert_eq!(
         (
-            status.code(),
+            code,
             diagnostic["error"]["code"].as_str(),
             diagnostic["error"]["retryable"].as_bool(),
         ),
@@ -432,6 +445,23 @@ fn expect_identity_refusal(name: &str, client_bin: &Path, config: &Path) {
         "step {name}: {message}"
     );
     println!("m6c32 {name} exit=3 code=CREDENTIAL_ERROR retryable=false");
+}
+
+/// Review of M6-C32: a credential that is not valid *yet* is a clock
+/// disagreement that heals by itself, so the device must see a retryable
+/// failure, not the terminal identity refusal.
+fn expect_retryable_refusal(name: &str, client_bin: &Path, config: &Path) {
+    let (code, diagnostic, out) = connect_refused(name, client_bin, config);
+    assert_eq!(
+        (
+            code,
+            diagnostic["error"]["code"].as_str(),
+            diagnostic["error"]["retryable"].as_bool(),
+        ),
+        (Some(4), Some("TRANSPORT_ERROR"), Some(true)),
+        "step {name}: a not-yet-valid credential must stay retryable: {out}"
+    );
+    println!("m6c32 {name} exit=4 code=TRANSPORT_ERROR retryable=true");
 }
 
 struct Running(Child);
@@ -807,6 +837,36 @@ async fn m6c21_shipped_binaries_provision_one_relay_and_one_device_end_to_end() 
             .arg(&server_ca),
     );
     expect_identity_refusal("unknown credential key", &client_bin, &stranger_config);
+
+    // (c) The provisioned credential with its catalog `not_before` moved an
+    // hour ahead: the certificate still passes TLS, and the catalog says the
+    // credential is not valid yet.  This is the relay-behind-issuer clock
+    // case; it must not be reported as a refused identity.
+    let spki = dry
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix("spki_sha256="))
+        .expect("the dry run prints spki_sha256=")
+        .trim_end_matches('.')
+        .to_owned();
+    let index = format!("tunnel-catalog:{namespace}:idx:fingerprint:{spki}");
+    let reply = redis_command(upstream, database, &["GET", &index]);
+    let credential_key = String::from_utf8_lossy(&reply)
+        .split("\r\n")
+        .find(|line| line.starts_with("tunnel-catalog:"))
+        .expect("the provisioned credential's index resolves to its key")
+        .to_owned();
+    let future_us = (chrono::Utc::now().timestamp() + 3600) * 1_000_000;
+    redis_command(
+        upstream,
+        database,
+        &[
+            "HSET",
+            &credential_key,
+            "not_before_us",
+            &future_us.to_string(),
+        ],
+    );
+    expect_retryable_refusal("credential not yet valid", &client_bin, &client_config);
 
     drop(relay);
     let removed = delete_namespace(upstream, database, &namespace);

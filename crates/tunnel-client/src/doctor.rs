@@ -292,6 +292,7 @@ fn credential_code(error: &CredentialError) -> &'static str {
         | CredentialError::UnsupportedPrivateKey(_)
         | CredentialError::CertificateRefused(_)
         | CredentialError::MissingDeviceRole(_)
+        | CredentialError::DeviceIdNotUuid(_)
         | CredentialError::DeviceIdMismatch { .. }
         | CredentialError::RelayRefusedIdentity => "CREDENTIAL_INVALID",
         CredentialError::AlreadyExists(_)

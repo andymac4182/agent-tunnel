@@ -179,15 +179,33 @@ pub fn verify_device_role(
         TlsIdentityError::Certificate(detail) => CredentialError::CertificateUnparseable(detail),
         other => CredentialError::MissingDeviceRole(other.to_string()),
     })?;
-    match identity.role() {
-        CertificateRole::Device { id } if id == device_id => Ok(()),
-        CertificateRole::Device { id } => Err(CredentialError::DeviceIdMismatch {
+    let CertificateRole::Device { id } = identity.role() else {
+        return Err(CredentialError::MissingDeviceRole(
+            "the certificate carries a relay peer role, not a device role".into(),
+        ));
+    };
+    // Compare as the relay does: it parses the SAN identifier and the HELLO's
+    // `connector_id` (which is `device_id`) with `str::parse::<Uuid>` and
+    // compares the values (`begin_register_control` and `validate_hello` in
+    // `crates/tunnel-relay/src/actor.rs`; `provision-catalog` parses
+    // `device.id` the same way).  A byte comparison refused an uppercase or
+    // hyphen-less `device_id` the relay accepts.  No crate shared by the
+    // client and the relay holds this parse, so it is repeated here.
+    let Ok(certificate) = id.parse::<uuid::Uuid>() else {
+        return Err(CredentialError::MissingDeviceRole(format!(
+            "the device role SAN names {id:?}, which is not a UUID; the relay refuses it"
+        )));
+    };
+    let Ok(configured) = device_id.parse::<uuid::Uuid>() else {
+        return Err(CredentialError::DeviceIdNotUuid(device_id.to_owned()));
+    };
+    if certificate == configured {
+        Ok(())
+    } else {
+        Err(CredentialError::DeviceIdMismatch {
             certificate: id.clone(),
             configured: device_id.to_owned(),
-        }),
-        CertificateRole::Peer { .. } => Err(CredentialError::MissingDeviceRole(
-            "the certificate carries a relay peer role, not a device role".into(),
-        )),
+        })
     }
 }
 
@@ -337,8 +355,10 @@ pub enum CredentialError {
     CertificateRefused(String),
     /// The certificate has no usable `urn:agent-tunnel:device:<id>` URI SAN.
     MissingDeviceRole(String),
+    /// The profile's `device_id` is not a UUID, which the relay requires.
+    DeviceIdNotUuid(String),
     /// The certificate's device role SAN names another device than the
-    /// profile's `device_id`.
+    /// profile's `device_id` (compared as UUIDs, as the relay compares them).
     DeviceIdMismatch {
         certificate: String,
         configured: String,
@@ -395,6 +415,11 @@ impl fmt::Display for CredentialError {
                 formatter,
                 "client certificate has no device role URI SAN \
                  urn:agent-tunnel:device:<device_id>: {error}"
+            ),
+            Self::DeviceIdNotUuid(device_id) => write!(
+                formatter,
+                "the profile's device_id {device_id:?} is not a UUID; the relay accepts \
+                 only the catalog device UUID"
             ),
             Self::DeviceIdMismatch {
                 certificate,
@@ -721,6 +746,42 @@ mod tests {
             ),
             "{error:?}"
         );
+    }
+
+    /// The relay compares device identifiers as UUIDs, so an uppercase or
+    /// hyphen-less `device_id` naming the certificate's device is the same
+    /// device and must import.  A byte comparison refused both.
+    #[test]
+    #[cfg(unix)]
+    fn a_device_id_equal_as_a_uuid_imports_in_any_accepted_spelling() {
+        let san = "3a3b3c3d-3e3f-4a3b-8c3d-3e3f3a3b3c3d";
+        let key = rcgen::KeyPair::generate().expect("device key");
+        let certificate = material::v3_pem(&key, vec![material::device_san(san)]);
+        let leaf = load_certificates_from(&certificate).remove(0);
+        for spelling in [
+            san.to_owned(),
+            san.to_uppercase(),
+            san.replace('-', ""),
+            san.replace('-', "").to_uppercase(),
+        ] {
+            // The spelling must also be one the profile validation accepts.
+            let config = RuntimeConfig {
+                device_id: spelling.clone(),
+                ..RuntimeConfig::default()
+            };
+            assert!(
+                config.validate().is_ok(),
+                "{spelling} must be a valid device_id"
+            );
+            assert!(
+                verify_device_role(&leaf, &spelling).is_ok(),
+                "{spelling} names the certificate's device as the relay compares it"
+            );
+        }
+        assert!(matches!(
+            verify_device_role(&leaf, "not-a-uuid"),
+            Err(CredentialError::DeviceIdNotUuid(_))
+        ));
     }
 
     #[test]
