@@ -825,6 +825,64 @@ UNARY_ECHO_CASES: list[Case] = [
     ),
 ]
 
+#: **M7-C97: the connector resumes OPEN admission at COMMIT.**  The owner
+#: resumes admission when ROTATE_COMMITTED arrives; the connector used to wait
+#: for ROTATE_COMPLETE, so an OPEN landing between the two was refused
+#: `GOAWAY` and a healthy session answered `503 DEVICE_REJECTED`.  Witnessed by
+#: a connector actor test that drives a real commit into `Retiring`.
+RETIRING_ADMISSION_TEST = [
+    "cargo",
+    "test",
+    "-p",
+    "tunnel-client",
+    "--locked",
+    "--no-fail-fast",
+    "--lib",
+    "--",
+    "m2_runtime::tests::",
+]
+RETIRING_ADMISSION_CASES: list[Case] = [
+    Case(
+        "an OPEN the owner admits while retiring is not refused as draining",
+        [
+            (
+                CLIENT / "src" / "m2_runtime.rs",
+                "        self.accepting = matches!(\n"
+                "            self.rotation.phase(),\n"
+                "            RotationPhase::Active | RotationPhase::Retiring\n"
+                "        );",
+                "        self.accepting = can_resume;",
+            )
+        ],
+        frozenset(
+            {
+                "m2_runtime::tests::"
+                "an_open_admitted_by_the_owner_while_retiring_is_not_refused_as_draining"
+            }
+        ),
+    ),
+    Case(
+        # Review S2: losing the active carrier closes admission in every
+        # phase.  Defeated, a Retiring connector whose new carrier died keeps
+        # admitting onto the recovery placeholder.
+        "admission closes when the active carrier is lost, whatever the phase",
+        [
+            (
+                CLIENT / "src" / "m2_runtime.rs",
+                "            // COMMIT would otherwise keep admitting until RECOVERY_BEGIN.\n"
+                "            self.accepting = false;\n",
+                "            // COMMIT would otherwise keep admitting until RECOVERY_BEGIN.\n",
+            )
+        ],
+        frozenset(
+            {
+                "m2_runtime::tests::"
+                "an_open_after_the_active_carrier_dies_while_retiring_is_refused_as_draining"
+            }
+        ),
+    ),
+]
+
 SUITES: list[Suite] = [
     Suite("m3c09", [DEADMAN, EXPORT, FIXTURE], CARGO_TEST, CASES),
     Suite("m3c09-deadman", [DEADMAN], DEADMAN_TEST, DEADMAN_CASES),
@@ -832,6 +890,12 @@ SUITES: list[Suite] = [
     Suite("m3c25-resign-pin-wait", [HARNESS], PIN_WAIT_TEST, PIN_WAIT_CASES),
     Suite("m7c89-readiness-pins", [RELAY], READINESS_PINS_TEST, READINESS_PINS_CASES),
     Suite("m7c92-unary-echo", [RELAY], UNARY_ECHO_TEST, UNARY_ECHO_CASES),
+    Suite(
+        "m7c97-retiring-admission",
+        [CLIENT],
+        RETIRING_ADMISSION_TEST,
+        RETIRING_ADMISSION_CASES,
+    ),
 ]
 
 #: Cases whose green result is itself the measurement.  Empty today, and kept
