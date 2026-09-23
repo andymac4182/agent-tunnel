@@ -493,8 +493,8 @@ impl ExportRoot {
             Err(errno) if errno == rustix::io::Errno::NOSYS || errno == rustix::io::Errno::PERM => {
                 self.walk_components(path, intent)
             }
-            // `RESOLVE_IN_ROOT` answers `EAGAIN` when a rename or a mount moved
-            // part of the path while the kernel was walking it. That is the
+            // `openat2` answers `EAGAIN` when a rename or a mount moved part of
+            // the path while the kernel was walking it. That is the
             // race, not a malformed request, so it takes the same uniform
             // answer as a component that changed under the per-component walk
             // rather than falling through to `EINVAL`.
@@ -536,8 +536,9 @@ impl ExportRoot {
         // because comparing the final `st_dev` with the root's cannot see a
         // boundary that was crossed and then crossed back. `NO_MAGICLINKS`
         // refuses the `/proc` links that are re-openings of an existing
-        // descriptor rather than names, which `RESOLVE_IN_ROOT` would
-        // otherwise follow.
+        // descriptor rather than names. (`NO_SYMLINKS` already refuses every
+        // link; `NO_MAGICLINKS` is kept so the refusal does not depend on
+        // which of the two flags a future change keeps.)
         //
         // `NO_SYMLINKS` unconditionally, not chosen by the feature: `walk`
         // never calls this with the feature on, and if it ever did, a link

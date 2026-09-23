@@ -25,7 +25,7 @@
 //! | Host | Mechanism | Exercised |
 //! | --- | --- | --- |
 //! | macOS and other BSDs | Per-component `openat` with `O_NOFOLLOW`, links re-rooted by this crate, bounded at `policy::MAX_LINK_HOPS` | Yes — every test in this crate runs here |
-//! | Linux | `openat2` with `RESOLVE_NO_SYMLINKS` plus `RESOLVE_NO_XDEV` and `RESOLVE_NO_MAGICLINKS` when the `symlinks` feature is **off**; the same per-component walk as macOS when it is **on** (where `RESOLVE_IN_ROOT` would leave the hop and link-target bounds to the kernel), and without `openat2` or `/proc` | Yes — the crate's tests run on the hosted Linux CI job, where their first run found the `RESOLVE_IN_ROOT` bound gap (task row M4-45) |
+//! | Linux | `openat2` with `RESOLVE_NO_SYMLINKS` plus `RESOLVE_NO_XDEV` and `RESOLVE_NO_MAGICLINKS` when the `symlinks` feature is **off**; the same per-component walk as macOS when it is **on** (where `RESOLVE_IN_ROOT` would leave the hop and link-target bounds to the kernel), and without `openat2` or `/proc` | **Awaiting a hosted run.** The first hosted Linux CI run found the `RESOLVE_IN_ROOT` bound gap (task row M4-45); the fixed path has run in a Linux container mirroring that job, not yet on hosted CI |
 //! | Windows | **Filesystem exports are unsupported.** Type-checked the same way for `x86_64-pc-windows-msvc`, where this crate is the declaration and nothing else. See below |
 //!
 //! ## Windows
