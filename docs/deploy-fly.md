@@ -729,9 +729,14 @@ Section 3.1 issues the relay's server certificate for 90 days and the CAs for
   every device (`credentials import --server-ca`).
 - **The device certificate** carries the validity your issuer gave it, and
   `provision-catalog` copies that window into the credential record. After it
-  expires the relay refuses the device. Certificate renewal is not implemented
-  and no shipped command adds a credential after the first provisioning
-  (M6-C31), so a new device certificate also means a new namespace.
+  expires the relay refuses the device. Renewing the certificate of the
+  *same* device is not implemented (M6-C56). A new key and certificate can be
+  registered as a **new device**, with a new device UUID, by `tunnel-relay
+  add-device` (with `add-service` and `set-grant` for its export and grant)
+  on the running relay, and the old device revoked with `revoke-device`
+  ([operator.md section 2.5](operator.md), M6-C31). The device profile's
+  `device_id` and export names change to the new UUIDs; the namespace is
+  kept.
 
 ### 6.6 Teardown
 

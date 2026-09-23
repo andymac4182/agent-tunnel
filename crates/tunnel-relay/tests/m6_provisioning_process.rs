@@ -2772,6 +2772,13 @@ async fn m6c31_day2_catalog_changes_take_effect_on_a_serving_relay() {
             fs::read_to_string(&log_b).unwrap_or_default()
         )
     });
+    // The revocation is the cause, whether or not a lease renewal landed on
+    // the same maintenance tick (M6-C31 review: that race used to report
+    // OWNER_FENCED).
+    assert_eq!(
+        close_reason, "AUTHORIZATION_REVOKED",
+        "step revoke-device: the relay must report the revocation"
+    );
     let (device_end_ms, device_end_event) = device_end.unwrap_or_else(|| {
         panic!(
             "step revoke-device: the second device did not see its session end within 5 s; \
@@ -2805,6 +2812,17 @@ async fn m6c31_day2_catalog_changes_take_effect_on_a_serving_relay() {
             .0,
         200
     );
+    // A grant on the revoked device is refused, not reported as added.
+    let regrant = relay_change_refused(
+        &fixture,
+        "set-grant on a revoked device",
+        &[
+            "set-grant",
+            "--records",
+            grant_b_doc.to_str().expect("path"),
+        ],
+    );
+    assert!(regrant.contains("the device is revoked"), "{regrant}");
     // revoke-credential and a revocation of nothing are refused clearly.
     let missing = relay_change_refused(
         &fixture,
@@ -2860,7 +2878,7 @@ async fn m6c31_day2_catalog_changes_take_effect_on_a_serving_relay() {
          device_revoked_request_status={after_device_revoke} \
          relay_session_close_ms={relay_close_ms} close_reason={close_reason} \
          device_session_end_ms={device_end_ms} device_end={device_end_event} \
-         device_exit={}",
+         device_exit={} revoked_device_grant_refused=true",
         exit.unwrap_or(-1)
     );
 }

@@ -620,6 +620,30 @@ pub async fn set_grant(args: &[OsString]) -> Result<String, Box<dyn Error>> {
     let catalog = connect(&config).await?;
     let grant = &plan.grant;
     let what = format!("service {} on device {}", grant.service_id, grant.device_id);
+    // `upsert_grant` requires only that the device exists.  A grant on a
+    // revoked device authorizes nothing, so reporting "Added grant" for one
+    // would mislead the operator (M6-C31 review): refuse it.
+    match catalog
+        .device_active(grant.tenant_id, grant.device_id)
+        .await
+        .map_err(|error| refused("set-grant", &what, error))?
+    {
+        Some(true) => {}
+        Some(false) => {
+            return Err(ProvisioningError::Records(format!(
+                "set-grant refused for {what}: the device is revoked; a revoked device \
+                 cannot be granted anything"
+            ))
+            .into());
+        }
+        None => {
+            return Err(ProvisioningError::Records(format!(
+                "set-grant refused for {what}: no device with that identifier in tenant {}",
+                grant.tenant_id
+            ))
+            .into());
+        }
+    }
     // The service's type and operations decide which grants authorize
     // anything; the catalog's grant script checks only that it exists.
     let service = catalog

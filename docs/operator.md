@@ -6,7 +6,8 @@ added for task row M6-C21 on 2026-09-23 against `0da55ac`; sections 3.1 and
 4 (reconnect, service units, upgrade) revised for M6-C23 on 2026-09-23
 against `da2a24d`; section 2.3 extended to MCP, ACP and filesystem services for
 M6-C57 on 2026-09-23 against `721ed2a`; section 2.5 (day-2 catalog changes)
-added for M6-C31 on 2026-09-24 against `0921c8c`. This is the guide
+added for M6-C31 on 2026-09-24 against `6091f4c` and merged forward to
+`8f486bf`. This is the guide
 an outside tester follows first. It covers what to download and verify, device
 credentials, catalog provisioning, relay configuration, readiness, and the
 diagnostics the binaries have today. **Where the alpha cannot do something,
@@ -630,11 +631,14 @@ tunnel-relay revoke-credential --config /etc/agent-tunnel/relay.toml --tenant 11
 ```
 
 Each addition prints `Added to namespace ...:` and the identifiers it wrote.
+**Keep `add-device`'s output:** the `credential=` identifier it prints is
+what `revoke-credential` needs, and no command lists credentials.
 `set-grant` prints `Added grant` or `Replaced grant` with the grant's
 `revision=`. Each revocation prints what it revoked. A refusal exits `1` and
 names the record, for example `add-user refused for user ...: catalog
 conflict: user already exists`, or `revoke-grant refused: no grant (...) in
-this namespace`. A revoked device's identifier cannot be added again, because
+this namespace`. `set-grant` refuses a revoked device ("the device is
+revoked"). A revoked device's identifier cannot be added again, because
 its lease fence must never go backwards, so give a replacement device a new
 UUID. As with `provision-catalog`, a first SIGTERM or Ctrl-C lets a command
 finish, and a second abandons it with exit `130` and an unknown outcome.
@@ -655,7 +659,10 @@ looks up the user and authorizes the grant, in Redis. So:
   given for at most 5 seconds.
 * **`revoke-device` and `revoke-credential`**: the next request is refused,
   and the relay also **closes the device's live session** at its next
-  maintenance check, with close reason `AUTHORIZATION_REVOKED`. Checks run
+  maintenance check, with close reason `AUTHORIZATION_REVOKED`. That holds
+  even when a lease renewal lands on the same check: `revoke-device` deletes
+  the device's owner lease, and before the M6-C31 review such a check
+  reported `OWNER_FENCED` instead. Checks run
   every 500 ms for up to 64 sessions at a time on each relay, so the bound is
   about 500 ms plus one Redis round trip for up to 64 connected devices, and
   another 500 ms for each further 64 (read from the source; only one session

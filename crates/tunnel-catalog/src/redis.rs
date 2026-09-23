@@ -927,6 +927,23 @@ impl RedisCatalog {
         day2_reply(&reply)
     }
 
+    /// Whether a device record exists and is active (M6-C31): `None` when it
+    /// does not exist.  `set-grant` refuses a device that is not active,
+    /// because `upsert_grant` requires only that the device exists and a
+    /// grant on a revoked device authorizes nothing.
+    pub async fn device_active(
+        &self,
+        tenant_id: Uuid,
+        device_id: Uuid,
+    ) -> Result<Option<bool>, CatalogError> {
+        let mut command = redis::cmd("HGET");
+        command
+            .arg(self.device_key(tenant_id, device_id))
+            .arg("active");
+        let active: Option<String> = self.connection.query(&command).await?;
+        Ok(active.map(|value| value == "1"))
+    }
+
     /// Read one service record (M6-C31), so a grant can be checked against
     /// the service type and operations it will authorize.  `None` when the
     /// record does not exist.
