@@ -783,6 +783,22 @@ impl ReconnectPolicy {
     }
 }
 
+/// The `failure_policy` a `ready` or `stopped` event publishes. The library's
+/// [`M1_TRANSPORT_FAILURE_POLICY`] says "no automatic reconnect", which is
+/// true of one `connect` call and was true of this binary before M6-C23; with
+/// the reconnect loop on it is not, so the event says what this process does.
+const RECONNECTING_FAILURE_POLICY: &str = "close control and data and require a fresh session; no retained replay; a retryable end is retried as a fresh session after bounded backoff";
+
+impl ReconnectPolicy {
+    fn failure_policy(&self) -> &'static str {
+        if self.enabled {
+            RECONNECTING_FAILURE_POLICY
+        } else {
+            M1_TRANSPORT_FAILURE_POLICY
+        }
+    }
+}
+
 /// A random value for the jitter. `uuid`'s v4 generator draws from the
 /// operating system's generator, which is what jitter needs: independent
 /// across devices, not reproducible.
@@ -904,7 +920,16 @@ async fn run_connect(path: PathBuf, json: bool, no_reconnect: bool) -> Result<()
     // The retry in progress, if this attempt follows a failure.
     let mut retry: Option<u32> = None;
     loop {
-        let end = run_one_session(&config, &mut stop, stop_bound, json, retry, &state).await?;
+        let end = run_one_session(
+            &config,
+            &mut stop,
+            stop_bound,
+            json,
+            policy.failure_policy(),
+            retry,
+            &state,
+        )
+        .await?;
         let (error, ready) = match end {
             SessionEnd::Stopped => return Ok(()),
             SessionEnd::Failed { error, ready } => (error, ready),
@@ -1006,6 +1031,7 @@ async fn run_one_session(
     stop: &mut StopSignals,
     stop_bound: std::time::Duration,
     json: bool,
+    failure_policy: &'static str,
     retry: Option<u32>,
     state: &ReconnectState,
 ) -> Result<SessionEnd, CliError> {
@@ -1094,7 +1120,7 @@ async fn run_one_session(
                     },
                 );
             }
-            run_session(&handle, stop, stop_bound, json).await
+            run_session(&handle, stop, stop_bound, json, failure_policy).await
         }
     };
     match outcome {
@@ -1115,7 +1141,7 @@ async fn run_one_session(
                         session_id: None,
                         epoch: None,
                         generation: None,
-                        failure_policy: M1_TRANSPORT_FAILURE_POLICY,
+                        failure_policy,
                         signal: Some(first.name()),
                     },
                 );
@@ -1213,6 +1239,7 @@ async fn run_session(
     stop: &mut StopSignals,
     bound: std::time::Duration,
     json: bool,
+    failure_policy: &'static str,
 ) -> Result<StopSignal, CliError> {
     let mut readiness = handle.readiness();
     let initial = readiness.borrow_and_update().clone();
@@ -1231,7 +1258,7 @@ async fn run_session(
                     session_id: Some(&info.session_id),
                     epoch: Some(info.epoch),
                     generation: Some(info.generation),
-                    failure_policy: M1_TRANSPORT_FAILURE_POLICY,
+                    failure_policy,
                     signal: None,
                 },
             );

@@ -704,7 +704,7 @@ ca = "ca.pem"
 
     #[test]
     fn reconnect_defaults_and_bounds() {
-        let config = RuntimeConfig::parse(&valid_toml()).expect("valid default");
+        let config = RuntimeConfig::parse(valid_toml()).expect("valid default");
         assert_eq!(config.reconnect, ReconnectConfig::default());
         assert!(config.reconnect.enabled);
         let input = format!(

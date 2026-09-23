@@ -2,7 +2,9 @@
 
 Status: written for task row M6-02 on 2026-09-23 against `origin/main` at
 `dd12b1c`; section 2.3 (catalog provisioning and first incarnation activation)
-added for task row M6-C21 on 2026-09-23 against `0da55ac`. This is the guide
+added for task row M6-C21 on 2026-09-23 against `0da55ac`; sections 3.1 and
+4 (reconnect, service units, upgrade) revised for M6-C23 on 2026-09-23
+against `da2a24d`. This is the guide
 an outside tester follows first. It covers what to download and verify, device
 credentials, catalog provisioning, relay configuration, readiness, and the
 diagnostics the binaries have today. **Where the alpha cannot do something,
@@ -44,7 +46,9 @@ so the check cannot run them. Only six may be marked that way:
 checks only that the real binary accepts the documented subcommand and flags;
 **their runtime behaviour is not checked by this guide.** The two provisioning
 commands, `serve` and `connect` are instead run end to end, against a real
-Redis, by `scripts/m6-provisioning-verify.sh` (section 2.3).
+Redis, by `scripts/m6-provisioning-verify.sh` (section 2.3), and `connect`'s
+reconnect across a relay restart by `scripts/m6-reconnect-verify.sh`
+(section 3.1).
 
 The same check also compares the client exit-code table in
 [runtime.md](runtime.md#client-exit-codes) with the `Cause` mapping in
@@ -66,8 +70,10 @@ and 3). Anything larger is not supported yet:
 | First activation of a deployment incarnation in a new Redis namespace | Supported with `tunnel-relay activate-first-incarnation` (section 2.3) | M6-C21 |
 | Adding, changing or revoking records after the first provisioning (more devices, users, grants) | **Not supported in this alpha**: no shipped command writes them | M6-C31 |
 | Cluster membership publishing and the HTTPS checkpoint authority | **Not supported in this alpha**: a cluster relay needs both and neither is shipped | M6-C22 |
-| Service installation (systemd, launchd, Windows service) | **Not supported in this alpha** | M6-C23 |
-| In-place upgrade, supervisor IPC, `status` | **Not supported in this alpha** | M6-C23, M6-06 |
+| Automatic reconnect of `connect` after a relay restart or a network loss | Supported, with bounded jittered backoff (section 3.1) | M6-C23 |
+| Service installation | Example systemd units (relay and client) and a launchd agent (client) in `examples/service/`, checked but not packaged in the bundle (section 4); **Windows service: not supported in this alpha** | M6-C23 |
+| Upgrade | Stop, replace the binaries from one bundle, start (section 4); **rolling or mixed-version upgrade: not supported in this alpha** | M6-C23 |
+| Supervisor IPC, `status` | **Not supported in this alpha** | M6-06 |
 | Backup and restore of the Redis catalog | Operator's Redis tooling only; restore goes through the recovery commands, which need an external signing authority that is not shipped | M6-C22 |
 | Metrics endpoint and audit log | **Not supported in this alpha** | M6-C24 |
 
@@ -379,18 +385,49 @@ The device side runs in the foreground until it stops. **Shape-only:**
 tunnel-client connect --config /etc/agent-tunnel/client.toml --json
 ```
 
-`connect` does **not** reconnect by itself. If the relay cannot be reached, it
-exits at once with status `4`:
+`connect` **reconnects by itself** (M6-C23). When the relay cannot be
+reached, or a session ends because the relay restarted or the network
+dropped, it waits and tries again: about 1 s, then doubling to a 60 s cap,
+each delay jittered so devices that lost the same relay do not return
+together. Under `--json` it prints a `disconnected` and a `backoff` event for
+each failure, `reconnecting` when it tries again and `reconnected` (then the
+usual `ready`) when a new session is up. Causes no retry can fix -- a bad
+profile, a relay certificate your `server_ca` does not trust, a relay that
+refuses the device certificate -- exit at once with their own status; the
+full classification and its reasons are in
+[runtime.md](runtime.md#reconnecting-connect). The profile's `[reconnect]`
+table sets the policy. This rehearsal gives up after one retry so it ends:
 
 ```console
 $ sed 's#wss://relay.example.test/#wss://127.0.0.1:9/#' trial/client.toml > trial/unreachable.toml
+$ printf '\n[reconnect]\ninitial_delay_ms = 100\nmax_delay_ms = 200\nmax_attempts = 1\n' >> trial/unreachable.toml
 $ tunnel-client connect --config trial/unreachable.toml --json; echo "exit=$?"
+{"schema_version":1,"command":"connect","ok":true,"result":{"state":"disconnected","attempt":1,"sessions":0,"code":"TRANSPORT_ERROR","message":"websocket handshake failed"},"error":null}
+{"schema_version":1,"command":"connect","ok":true,"result":{"state":"backoff","attempt":1,"sessions":0,"code":"TRANSPORT_ERROR","delay_ms":...},"error":null}
+{"schema_version":1,"command":"connect","ok":true,"result":{"state":"reconnecting","attempt":1,"sessions":0},"error":null}
+{"schema_version":1,"command":"connect","ok":false,"result":null,"error":{"code":"TRANSPORT_ERROR","message":"websocket handshake failed (gave up after 1 consecutive reconnect attempts)","retryable":true}}
+exit=4
+```
+
+With `--no-reconnect` (or `enabled = false` in `[reconnect]`) the first
+failure is the exit, as it was before M6-C23, for a supervisor that prefers
+to own restarts:
+
+```console
+$ tunnel-client connect --config trial/unreachable.toml --json --no-reconnect; echo "exit=$?"
 {"schema_version":1,"command":"connect","ok":false,"result":null,"error":{"code":"TRANSPORT_ERROR",...,"retryable":true}}
 exit=4
 ```
 
-A session the relay closes also ends the process (`SESSION_CLOSED`, exit `4`).
-Restarting it is up to whatever runs it (section 4).
+Two limits, both measured (runtime.md has the detail). **After a relay
+crash**, the relay's claim on the device outlives it in Redis for up to the
+owner lease (30 s by default), and reconnects are refused `OWNER_BUSY` until
+it lapses: a device reconnected 30.4 s after a SIGKILLed relay was back, and
+0.75 s after one stopped with SIGTERM. **A refusal after TLS** -- a revoked or
+inactive catalog credential, a `device_id` that does not match the
+certificate, a protocol version the relay does not speak -- looks to the
+client like a relay that dropped the connection, and is retried (M6-C38,
+waiting on M6-C32); set `max_attempts` if a supervisor should see it fail.
 
 ### 3.2 Health endpoints and load balancers
 
@@ -484,37 +521,94 @@ each relay is the `serve` command from section 3.1.
 
 ## 4. Service installation, upgrade, backup and recovery
 
-**Service installation is not supported in this alpha** (M6-C23). No unit files
-are shipped. What a unit needs from the binaries is now there: both stop on
-SIGTERM, which service managers send by default, and on SIGINT, through one
-orderly path, in every phase, and whatever disposition they inherited
-([runtime.md](runtime.md#stopping-connect-and-serve) has the table). A
-`connect` whose session is live drains, prints its `stopped` event naming the
-signal and exits `0`; one stopped before its session is ready exits `130`
-`CANCELLED` with a diagnostic; a `serve` that is serving drains and exits `0`,
-one stopped during startup exits `130`. `connect`'s drain is bounded by the
-profile's `rotation.handshake_timeout_seconds + rotation.overlap_seconds` (40 s
-with the defaults; an overrun exits `130`), its wait for MCP child processes by
-5 s, and each binary waits at most 5 s more for blocking work after its command
-has returned. A second stop request during any of those waits, or during
-`serve`'s drain, exits `130` at once. `serve`'s drain has no deadline of its
-own (it joins the membership runtime), so set your unit's stop timeout
-(`TimeoutStopSec` under systemd) to escalate. If your unit can stop the service
-while it is still starting, count `130` as a clean stop
-(`SuccessExitStatus=130` under systemd). runtime.md lists what is measured and
-what is not; in short, the handshake and startup phases and a live stop are
-measured on the real binaries, the second-signal and bound logic of
-`connect`'s waits only by unit tests, and a stop during a data rotation, the
-later handshake sub-phases, `serve`'s binding phase, a non-cluster `serve`
-while serving and `provision-catalog` stopped mid-write are not measured.
-SIGHUP is not handled. Because `connect` does not reconnect by
-itself (section 3.1), whatever supervises it must restart it.
+**Example service units are in `examples/service/` of the source tree**
+(M6-C23): `tunnel-relay.service` and `tunnel-client.service` for systemd, and
+`local.agent-tunnel.tunnel-client.plist`, a launchd agent for the client on
+macOS. They are examples: adjust the paths, the account and the hardening
+lines, and they are **not** in the release bundle. **Windows service
+installation is not supported in this alpha**: Windows builds handle Ctrl-C
+only, and no service wrapper is shipped. How the units were checked:
+`systemd-analyze verify` (systemd 257, in a Debian container) accepts both
+systemd units with no warning, and `plutil -lint` accepts the plist, by
+`scripts/m6-service-units-check.sh`, which also proves each check can fail by
+running it on broken copies. Its `--live` mode boots systemd in a privileged
+container with a Linux build of `tunnel-client` and **measured the client
+unit**: against an unreachable relay the service stays active while the
+client backs off, and `systemctl stop` records exit `130` as a clean stop
+(`Result=success`; a failure without `SuccessExitStatus=130`); an invalid
+profile exits `2` and is not restarted (restarted five times without
+`RestartPreventExitStatus`). The relay unit is checked statically only
+(running it needs Redis), and the launchd agent was linted, not loaded.
 
-**In-place upgrade is not supported in this alpha.** Stopping a relay ends the
-device sessions it owns. Devices must start a fresh session, and in-flight
-operations can end with an unknown outcome
-([protocol.md](protocol.md)). Keep the relay's `state/` files across the
-upgrade (section 3.3). Replace all three binaries from one bundle together.
+Every setting follows from how the binaries stop and reconnect
+([runtime.md](runtime.md#stopping-connect-and-serve)):
+
+- **`KillSignal=SIGTERM`, `KillMode=mixed`.** Both binaries treat SIGTERM as an
+  orderly stop in every phase. `mixed` sends it to the main process only, so
+  `connect` ends its supervised MCP/ACP children itself instead of racing
+  systemd for them; whatever is left at the timeout gets SIGKILL.
+- **`SuccessExitStatus=130`.** A stop before a session is ready, while
+  `connect` waits to reconnect, or while `serve` is still starting exits `130`
+  `CANCELLED`. That is a clean stop, not a failure. A stop with a live
+  session, or of a serving relay, exits `0`.
+- **`TimeoutStopSec=`** is the real bound on a stop. `connect` bounds its own
+  drain at `rotation.handshake_timeout_seconds + rotation.overlap_seconds`
+  (40 s by default) plus 5 s for the child reap and 5 s for blocking work, so
+  its unit allows 60 s. `serve`'s drain has no deadline of its own, so its
+  unit's 45 s is the bound. Raise them together with those settings.
+- **`Restart=` complements reconnect; it does not replace it.** The client
+  retries relay restarts and network loss inside the process, with backoff
+  (section 3.1), so the unit restarts it only for what the process cannot
+  handle: a crash, an internal failure (exit `1`), an `OWNER_BUSY` that
+  outlived the stale-lease window (exit `7`), or an attempt limit you set
+  (exit `4` or `5`), after `RestartSec=30s`. **`RestartPreventExitStatus=2 3`**
+  keeps a configuration or credential error (a certificate refused on either
+  side) from restarting in a loop: the unit stays failed and
+  `journalctl -u tunnel-client` shows the error. If your supervisor should own
+  every restart instead, add `--no-reconnect` to `ExecStart`. The relay does
+  not retry its own startup (an unreachable Redis exits `1`), so its unit
+  restarts it on failure after 10 s. Both units stop restarting after five
+  starts in ten minutes.
+- **launchd** sends SIGTERM and waits `ExitTimeOut` seconds (default 20; the
+  plist sets 60, for the same reason as `TimeoutStopSec`) before SIGKILL.
+  `KeepAlive` with `SuccessfulExit = false` restarts the client after an
+  unsuccessful exit, at most every `ThrottleInterval` (30 s). launchd has no
+  equivalent of `RestartPreventExitStatus`, so a configuration or credential
+  error is retried every 30 s: read the log file the plist names. Whether
+  launchd resets the signal dispositions it starts a job with was not checked
+  here; the binaries override an inherited `SIG_IGN` anyway.
+
+SIGHUP is not handled by either binary; neither reloads its configuration.
+runtime.md lists what is measured and what is not; in short, the handshake,
+startup and backoff phases, a live stop and a reconnect across a relay
+restart are measured on the real binaries, the second-signal and bound logic
+of `connect`'s waits only by unit tests.
+
+**Upgrade.** What the code supports is **stop, replace, start**:
+
+1. Stop the service (`systemctl stop`, or `launchctl bootout`). Stopping a
+   relay ends the device sessions it owns; the devices back off and
+   reconnect by themselves when it returns (measured: 0.75 s after an
+   orderly restart). In-flight operations on those sessions end with them,
+   and a mutation's outcome can be unknown ([protocol.md](protocol.md)).
+2. Replace **all three binaries from one bundle** together
+   (`tunnel-client`, `tunnel-relay`, and `tunnel-deadman`, which the client
+   finds beside itself).
+3. Start it again with the same configuration.
+
+**What carries over:** the Redis catalog (tenants, devices, credential
+records, grants, the active incarnation), the relay's configuration and
+`state/` files (section 3.3; keep them), and the device's profile, key and
+certificate. **What does not:** sessions, owner leases, attachment tickets
+and supervised MCP/ACP child processes -- every device starts a new session
+with new children. **Not supported in this alpha:** an in-place or rolling
+upgrade without ending sessions; relays of different versions against one
+Redis namespace, or a client and a relay from different bundles -- nothing
+versions the catalog records, and the only version check is the protocol
+major, which a relay refuses at HELLO without a reason the client can read,
+so a mismatched client retries it (M6-C38); and a downgrade. A relay that
+dies instead of stopping holds its devices' owner records until their lease
+lapses (up to 30 s), so stop relays with SIGTERM, not SIGKILL.
 
 **Backup and restore.** Only the Redis catalog holds durable state. Back it up
 with your Redis tooling, using the durability settings in
