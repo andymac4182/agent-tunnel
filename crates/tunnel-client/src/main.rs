@@ -454,6 +454,8 @@ fn run_legacy_check_config(path: Option<PathBuf>) -> Result<(), CliError> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StopSignal {
     Interrupt,
+    // SIGTERM has no Windows counterpart here: Ctrl-C arrives as `Interrupt`.
+    #[cfg_attr(not(unix), allow(dead_code))]
     Terminate,
 }
 

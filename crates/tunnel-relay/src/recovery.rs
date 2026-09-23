@@ -753,11 +753,19 @@ fn same_file_metadata(first: &Metadata, second: &Metadata) -> bool {
         use std::os::unix::fs::MetadataExt;
         first.dev() == second.dev() && first.ino() == second.ino()
     }
+    // `volume_serial_number` and `file_index` -- the Windows `(dev, ino)` --
+    // are unstable (`windows_by_handle`), so the relay did not compile for
+    // `x86_64-pc-windows-msvc` at all. On stable Rust a `Metadata` offers only
+    // these, which a replacement made between the two reads would have to
+    // match exactly, creation time included. That is weaker than a file
+    // index, and it is the most `Metadata` can say on this host.
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
-        first.volume_serial_number() == second.volume_serial_number()
-            && first.file_index() == second.file_index()
+        first.file_attributes() == second.file_attributes()
+            && first.creation_time() == second.creation_time()
+            && first.last_write_time() == second.last_write_time()
+            && first.file_size() == second.file_size()
     }
     #[cfg(not(any(unix, windows)))]
     {

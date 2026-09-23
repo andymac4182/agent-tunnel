@@ -10,6 +10,9 @@
 //! boundary. The fixture checks both the bounded stage and independent sink
 //! counters, without guessing from backend error text.
 
+// The harness library is Unix-only (see `src/entry.rs`).
+#![cfg(unix)]
+
 use std::{
     env,
     net::SocketAddr,

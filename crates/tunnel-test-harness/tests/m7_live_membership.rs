@@ -7,6 +7,8 @@
 //! test therefore exercises the same trust boundary that the production pin
 //! coordinator owns without requiring Redis or an external authority.
 
+// The harness library is Unix-only (see `src/entry.rs`).
+#![cfg(unix)]
 #![allow(clippy::too_many_arguments)]
 
 use std::{
