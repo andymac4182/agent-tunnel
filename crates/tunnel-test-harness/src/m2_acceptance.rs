@@ -819,9 +819,10 @@ async fn run_continuous_traffic_rotations(
 /// **Bounded by the connector's authorization refresh, not by the rotation.**
 /// The connector refreshes a stream's authorization on the control path once
 /// its confirmed window has `M2_AUTH_REFRESH_MARGIN` (1.5 s) left. A control
-/// stall longer than what remains lapses the authorization, which ends the
-/// stream (task row M6-C84): a 2 s stall lost an echo deterministically, a
-/// 1 s one did not. 300 ms leaves more than a second of that margin. The
+/// stall longer than what remains can lapse the authorization and end the
+/// stream (task rows M6-C84, M6-C87). Measured with a true fixed-length stall,
+/// 2 s and 3 s stalls lost nothing and 4 s or longer could end the stream, so
+/// 300 ms is conservative, leaving more than a second of the margin. The
 /// pause actually lasts this budget plus at most one snapshot and the resume
 /// command, both loopback round trips.
 const HELD_FREEZE_PAUSE_BUDGET: Duration = Duration::from_millis(300);
