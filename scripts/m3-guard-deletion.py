@@ -2,7 +2,9 @@
 """Defeat one process-containment guard at a time, run the tests it should
 protect, and restore it.
 
-This is the red-then-green evidence behind M3-09.  Two suites live here:
+This is the red-then-green evidence behind M3-09.  Two suites live here
+(later suites -- M6-C08's doctor, M3-25's pin wait and M7-C89's readiness
+against the pin set -- are described where they are defined):
 
 * `m3c09` — `crates/tunnel-deadman` and the stdio export's child supervision
   in `crates/tunnel-mcp-export`, witnessed by the process-table measurements
@@ -614,11 +616,55 @@ PIN_WAIT_CASES: list[Case] = [
     ),
 ]
 
+#: **M7-C89, the product half of the condition `m3c25-resign-pin-wait` guards
+#: in the fixture.**  That suite proves the harness waits for an emptied pin
+#: set before dispatching; this one proves the relay stops *claiming* to be
+#: ready while the set is empty.  It lives beside its sibling because the two
+#: are one condition seen from two sides, and because PR #82's fixture wait
+#: removed the only thing that ever noticed the product half -- so the
+#: product half has to be guarded somewhere a suite run will reach.
+#:
+#: The witness drives the production Axum router and the real
+#: `PeerRuntime::is_ready`, with every other readiness input held true, and
+#: shows the transport refusing a real dial with the same empty set.
+RELAY = REPO / "crates" / "tunnel-relay"
+PEER_RUNTIME = RELAY / "src" / "peer_runtime.rs"
+
+READINESS_PINS_TEST = [
+    "cargo",
+    "test",
+    "-p",
+    "tunnel-relay",
+    "--locked",
+    "--no-fail-fast",
+    "--test",
+    "m7_health_endpoints",
+]
+
+READINESS_PINS_CASES: list[Case] = [
+    Case(
+        # The whole fix.  Defeated, readiness reads membership and route
+        # state only -- the pre-M7-C89 predicate -- and `/readyz` answers 200
+        # while every peer dial is refused `PinsUnavailable`.
+        "readiness and public admission answer against the transport pin set",
+        [
+            (
+                PEER_RUNTIME,
+                "        !self.client.pin_snapshot().is_empty()\n"
+                "            && self.bindings.is_ready()",
+                "        self.bindings.is_ready()",
+            )
+        ],
+        frozenset({"readiness_and_admission_withdraw_with_the_transport_pin_set"}),
+    ),
+]
+
 SUITES: list[Suite] = [
     Suite("m3c09", [DEADMAN, EXPORT, FIXTURE], CARGO_TEST, CASES),
     Suite("m3c09-deadman", [DEADMAN], DEADMAN_TEST, DEADMAN_CASES),
     Suite("m6c08-doctor", [CLIENT], DOCTOR_TEST, DOCTOR_CASES),
     Suite("m3c25-resign-pin-wait", [HARNESS], PIN_WAIT_TEST, PIN_WAIT_CASES),
+    Suite("m7c89-readiness-pins", [RELAY], READINESS_PINS_TEST, READINESS_PINS_CASES),
 ]
 
 #: Cases whose green result is itself the measurement.  Empty today, and kept
@@ -805,7 +851,7 @@ def main() -> int:
         ),
     )
     parser.add_argument("--case", help="run only cases whose name contains this text")
-    parser.add_argument("--suite", help="run only this suite (m3c09, m3c09-deadman)")
+    parser.add_argument("--suite", help="run only this suite (see --list)")
     arguments = parser.parse_args()
 
     # **M4-36, and this is the load-bearing line.**  Write capability is

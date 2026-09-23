@@ -925,9 +925,31 @@ impl PeerRuntime {
     /// Return the current bounded admission state supplied by the membership
     /// provider. This is deliberately a boolean so health output cannot leak
     /// backend errors, endpoints, membership records, or key pins.
+    ///
+    /// **The transport pin set is read here, from this runtime's own client,
+    /// and that is the point (M7-C89).** Every peer dial begins by refusing
+    /// an empty pin snapshot (`PinsUnavailable`), so an empty set means no
+    /// peer-hop request can be dispatched however healthy the rest of this
+    /// state looks. The membership invalidation callback empties that set
+    /// synchronously, while the route and capacity state below is only
+    /// withdrawn on the next peer refresh tick; reading readiness from the
+    /// other views alone therefore reported ready, and admitted public work,
+    /// for up to one tick after every dial had become impossible. Reading the
+    /// very `SharedPeerPins` the dial reads makes readiness and dispatch
+    /// capability withdraw and recover together by construction, for
+    /// `/readyz` and public admission alike, since both are this one call.
+    ///
+    /// This does not make a relay unready for having no peers: a cluster
+    /// relay's published set carries its own key while membership is `Ready`
+    /// (startup refuses to serve otherwise), except where the refresh tick
+    /// already withdraws peer trust on the same empty set -- a stale
+    /// checkpoint or a lapsed local record, which empty the verified route
+    /// targets before stored readiness leaves `Ready`. A relay without a peer
+    /// runtime -- the M1/M2 profile -- never reaches this method.
     #[must_use]
     pub fn is_ready(&self) -> bool {
-        self.bindings.is_ready()
+        !self.client.pin_snapshot().is_empty()
+            && self.bindings.is_ready()
             && self
                 .readiness
                 .as_ref()
