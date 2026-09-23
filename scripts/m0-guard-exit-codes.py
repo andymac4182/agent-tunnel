@@ -624,7 +624,7 @@ CASES: list[Case] = [
             (
                 LIB,
                 "        WsError::Io(error) => error.get_ref()?.downcast_ref::<rustls::Error>()?,",
-                "        WsError::Io(_) => return Some(\"over-broad\"),",
+                "        WsError::Io(_) => return Some(TlsFailure::Refused(\"over-broad\")),",
             )
         ],
         frozenset(
@@ -759,7 +759,7 @@ CASES: list[Case] = [
             (
                 MAIN,
                 "        Some((_, not_after)) if not_after <= now => CliError {",
-                "        Some((_, _not_after)) => CliError {",
+                "        Some((_, not_after)) if not_after <= now || true => CliError {",
             )
         ],
         frozenset({"a_device_certificate_not_yet_valid_is_retried_until_the_relay_accepts_it"}),
