@@ -1,0 +1,94 @@
+# Fly.io configuration for the agent-tunnel relay (docs/deploy-fly.md).
+# Deploy from the repository root:
+#
+#   fly deploy . --config deploy/fly/relay/fly.toml \
+#     --dockerfile deploy/fly/relay/Dockerfile \
+#     --ignorefile deploy/fly/relay/Dockerfile.dockerignore --ha=false
+#
+# The build context is the repository root; the Dockerfile and its context
+# allowlist are named on the command line so no path here depends on how
+# flyctl resolves [build] paths.
+#
+# One relay only. A second machine would be a second, unclustered relay on the
+# same Redis namespace, which this alpha does not support (M6-C22); keep
+# `--ha=false` and never scale above one.
+
+app = "agentuplink-relay"      # EDIT if the name is taken
+primary_region = "syd"         # EDIT; keep the Redis app in the same region
+
+# serve drains on SIGTERM and exits 0 (docs/operator.md section 4). Its drain
+# has no deadline of its own, so this is the bound: after it Fly kills the VM.
+# The local proof measured the drain with one connected device (M6-C60).
+kill_signal = "SIGTERM"
+kill_timeout = 60
+
+[env]
+  RUST_LOG = "info"
+
+[deploy]
+  # A relay has one machine and no second one to hand over to; replace it in
+  # place. bluegreen would start a second relay beside the first.
+  strategy = "immediate"
+
+[[restart]]
+  policy = "on-failure"
+  retries = 10
+
+# The local proof measured 2.6 MiB for the relay with one device connected
+# (docker stats); raise this before admitting many devices.
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
+
+# Consumer HTTPS. The relay terminates TLS itself (consumer_tls_* in
+# relay.toml), so Fly must pass the TCP stream through untouched: no handlers.
+# Passthrough needs the app's dedicated IPv4 (or its IPv6) address.
+[[services]]
+  protocol = "tcp"
+  internal_port = 8443
+  auto_stop_machines = "off"
+  auto_start_machines = false
+  min_machines_running = 1
+
+  [[services.ports]]
+    port = 443
+
+  [services.concurrency]
+    type = "connections"
+    soft_limit = 900
+    hard_limit = 1000
+
+  # /readyz on the consumer listener: 200 when this relay should receive public
+  # work, 503 otherwise (docs/operator.md section 3.2). The relay's certificate
+  # names its public host, not the machine address, so verification is skipped
+  # for this private-network probe only.
+  [[services.http_checks]]
+    interval = "15s"
+    timeout = "5s"
+    grace_period = "20s"
+    method = "get"
+    path = "/readyz"
+    protocol = "https"
+    tls_skip_verify = true
+
+# Device mTLS WebSocket. The client certificate is the device's identity, so
+# Fly's TLS or HTTP handler must never terminate this stream: no handlers.
+[[services]]
+  protocol = "tcp"
+  internal_port = 9443
+  auto_stop_machines = "off"
+  auto_start_machines = false
+  min_machines_running = 1
+
+  [[services.ports]]
+    port = 9443
+
+  [services.concurrency]
+    type = "connections"
+    soft_limit = 900
+    hard_limit = 1000
+
+  [[services.tcp_checks]]
+    interval = "15s"
+    timeout = "5s"
+    grace_period = "20s"

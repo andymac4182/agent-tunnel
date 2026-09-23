@@ -70,6 +70,7 @@ and 3). Anything larger is not supported yet:
 | In-place upgrade, supervisor IPC, `status` | **Not supported in this alpha** | M6-C23, M6-06 |
 | Backup and restore of the Redis catalog | Operator's Redis tooling only; restore goes through the recovery commands, which need an external signing authority that is not shipped | M6-C22 |
 | Metrics endpoint and audit log | **Not supported in this alpha** | M6-C24 |
+| One relay and its Redis on Fly.io | Dockerfiles, `fly.toml` files, a runbook and a cost list in [deploy-fly.md](deploy-fly.md), proved with Docker on one machine; **not yet run on Fly** | M6-C60 |
 
 ## 1. Download and verify
 
@@ -419,7 +420,9 @@ deliberately minimal:
 | `GET /livez` | `200 {"status":"live"}` | The process answers HTTP. It consults nothing else. |
 | `GET /readyz` | `200 {"status":"ready"}` or `503 {"status":"unready"}` | Whether this relay should receive new public work |
 
-A relay without `[cluster]` is always ready once it is serving. A cluster relay
+A relay without `[cluster]` is always ready once it is serving, **including
+while its Redis authority is down or has restarted**, when it refuses every
+public request with `503` (measured, M6-C61). A cluster relay
 is ready only while its membership is current, its required peer routes are
 probed reachable, it has capacity, **and its set of approved peer keys is not
 empty** (M7-C89). Before M7-C89, a relay whose membership went unready had the
@@ -446,7 +449,9 @@ What a load balancer should do:
   over UDP between relays ([runtime.md](runtime.md#debugging-and-deployment-contract)).
 - The device listener needs direct TLS termination in the relay or layer-4
   passthrough. An HTTP proxy in front of it strips the device's client
-  certificate.
+  certificate. [deploy-fly.md](deploy-fly.md) does this on Fly.io with TCP
+  services that have no handlers, for the consumer listener as well, because
+  the relay terminates consumer TLS itself.
 
 A relay that is not ready refuses public work with `503` and
 `not_dispatched`, so nothing is executed and lost. Open rows on this path:
