@@ -957,9 +957,13 @@ async fn write_record_inside_a_held_freeze(held: HeldFreeze<'_>) -> Result<HeldA
         .await?;
         let same_rotation = sampled.relay.active_generation == armed_at.relay.active_generation;
         match sampled.relay.phase.as_str() {
-            // `preparing`, or a frozen phase seen first: each still waits on
-            // a connector-to-relay control message, so each can be held.
-            "preparing" | "quiescing" | "draining" | "committing" if same_rotation => break,
+            // `preparing`, or a frozen phase seen first that the pause can
+            // still hold: each waits on a connector-to-relay control message.
+            // Not `committing`: its next step, the connector's COMMITTED,
+            // leaves the frozen set, and if that message is already past the
+            // proxy the relay would leave the freeze after the write and read
+            // as a false violation (Opus review of #114).
+            "preparing" | "quiescing" | "draining" if same_rotation => break,
             "active" if same_rotation && Instant::now() < watch_deadline => {
                 sleep(HELD_FREEZE_WATCH_POLL).await;
             }
@@ -1000,7 +1004,7 @@ async fn write_record_inside_a_held_freeze(held: HeldFreeze<'_>) -> Result<HeldA
                 // waits on a connector-to-relay control message (`FROZEN`,
                 // then the drain proof, then `COMMITTED`), so none can be left
                 // while the pause holds.
-                "quiescing" | "draining" | "committing" if same_rotation => break sampled,
+                "quiescing" | "draining" if same_rotation => break sampled,
                 "preparing" if same_rotation && Instant::now() < pause_deadline => {
                     sleep(HELD_FREEZE_WATCH_POLL).await;
                 }
