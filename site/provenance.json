@@ -1,11 +1,11 @@
 {
-  "reviewedOriginMain": "8f486bfdffab10b547931756009c77d19ca0c8b8",
-  "lastPublishedOriginMain": "8f486bfdffab10b547931756009c77d19ca0c8b8",
-  "lastReviewAt": "2026-09-24T02:00:56+10:00",
-  "lastReviewOutcome": "Reviewed connector rotation admission changes and regression tests through 8f486bf. Published admission-at-COMMIT and active-carrier-loss refusal behavior, with the remaining writer hold until COMPLETE and timeout ambiguity explicitly separated. Runtime tests not rerun; M7-C97/C98 and full rotation acceptance not promoted. CI and release gates unchanged.",
+  "reviewedOriginMain": "b7cb09fc1c0b469afd6629cf4c3eb92c8d12b4f5",
+  "lastPublishedOriginMain": "b7cb09fc1c0b469afd6629cf4c3eb92c8d12b4f5",
+  "lastReviewAt": "2026-09-24T03:01:30+10:00",
+  "lastReviewOutcome": "Reviewed catalog-change CLI schemas, provisioning and revocation behavior, regression tests and operator documentation through b7cb09f. Replaced obsolete first-provisioning-only limits with seven catalog-change commands, dry-run boundaries, replacement-device workflow and explicit unsupported edits/renewal. Documented revocation timing and credential-only session-close evidence gap. No runtime or catalog commands executed; CI and release gates unchanged.",
   "reviewedDate": "2026-09-24",
   "scope": "Setup, architecture, MCP, ACP, computer use, filesystems and support boundaries",
-  "verification": "Local and live Chrome verification passed at 1440, 1920, 390 and 320 pixels: homepage, brand lab, nine docs pages, links, images, light/dark/system themes and overflow. Live support exactly matched reviewed local assets. Runtime, Redis and artifact acceptance not rerun; historical evidence not promoted to new acceptance.",
-  "verifiedAt": "2026-09-24T02:00:56+10:00",
-  "deploymentId": "dpl_DpxR3FREmUNzB5MSNTws1ENMWDa6"
+  "verification": "Local and live Chrome verification passed at 1440, 1920, 390 and 320 pixels: homepage, brand lab, nine docs pages, links, images, light/dark/system themes and overflow. Live setup and support exactly matched reviewed local assets. Runtime, Redis and artifact acceptance not rerun; historical evidence not promoted to new acceptance.",
+  "verifiedAt": "2026-09-24T03:01:30+10:00",
+  "deploymentId": "dpl_78jdmNQiwZrN8FB6HguwyzSvs67F"
 }
