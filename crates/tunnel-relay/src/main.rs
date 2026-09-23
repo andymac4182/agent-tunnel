@@ -149,6 +149,11 @@ struct ServeInterrupted {
 enum ServePhase {
     Startup,
     Drain(StopSignal),
+    /// A finite writing command abandoned by a second stop request.
+    Command {
+        name: &'static str,
+        first: StopSignal,
+    },
 }
 
 impl std::fmt::Display for ServeInterrupted {
@@ -165,11 +170,55 @@ impl std::fmt::Display for ServeInterrupted {
                 self.signal.name(),
                 first.name()
             ),
+            ServePhase::Command { name, first } => write!(
+                formatter,
+                "{} received while {name} was finishing after {}; exiting without waiting for it, so its outcome is unknown",
+                self.signal.name(),
+                first.name()
+            ),
         }
     }
 }
 
 impl Error for ServeInterrupted {}
+
+/// Run a finite command that **writes** -- Redis authority records or local
+/// state files -- with the stop handlers armed (M6-C23).
+///
+/// These commands end by themselves within their own bounded timeouts, and
+/// what they write cannot be half-undone: `provision-catalog` reserves the
+/// namespace before its first record and a namespace left partial is
+/// discarded, not repaired (M6-C35); `recover` consumes an approval. Taking
+/// the default action on SIGTERM part-way would leave exactly that state and
+/// print nothing. So a **first** stop request is acknowledged on stderr and
+/// the command runs to its own outcome, which is printed and sets the exit
+/// status as usual; a **second** abandons it at once with exit `130` and says
+/// the outcome is unknown. Read-only commands (`check-config`,
+/// `check-serve-config`, `recovery-observe`) are left at the default action:
+/// there is nothing for a stop to damage.
+async fn run_to_completion<F, T>(name: &'static str, command: F) -> Result<T, Box<dyn Error>>
+where
+    F: std::future::Future<Output = Result<T, Box<dyn Error>>>,
+{
+    let mut stop = StopSignals::install()?;
+    tokio::pin!(command);
+    let first = tokio::select! {
+        result = &mut command => return result,
+        signal = stop.recv() => signal?,
+    };
+    eprintln!(
+        "tunnel-relay: {} received during {name}; letting it finish, because an interrupted write cannot be undone (send the signal again to abandon it)",
+        first.name()
+    );
+    tokio::select! {
+        result = &mut command => result,
+        second = stop.recv() => Err(ServeInterrupted {
+            signal: second?,
+            phase: ServePhase::Command { name, first },
+        }
+        .into()),
+    }
+}
 
 /// Run an orderly shutdown to completion unless a **second** stop request
 /// arrives first, in which case the drain is abandoned and `serve` exits
@@ -225,20 +274,39 @@ async fn run() -> Result<(), Box<dyn Error>> {
         [command, flag, path]
             if command == OsStr::new("initialize") && flag == OsStr::new("--config") =>
         {
-            initialize(Path::new(path)).await?;
+            run_to_completion("initialize", initialize(Path::new(path))).await?;
+        }
+        [command, flag, path]
+            if command == OsStr::new("activate-first-incarnation")
+                && flag == OsStr::new("--config") =>
+        {
+            let line = run_to_completion(
+                "activate-first-incarnation",
+                tunnel_relay::provisioning::activate_first_incarnation(Path::new(path)),
+            )
+            .await?;
+            println!("{line}");
+        }
+        [command, rest @ ..] if command == OsStr::new("provision-catalog") => {
+            let line = run_to_completion(
+                "provision-catalog",
+                tunnel_relay::provisioning::provision_catalog(rest),
+            )
+            .await?;
+            println!("{line}");
         }
         [command, rest @ ..] if command == OsStr::new("recovery-initialize") => {
-            recovery_initialize(rest).await?;
+            run_to_completion("recovery-initialize", recovery_initialize(rest)).await?;
         }
         [command, rest @ ..] if command == OsStr::new("recovery-observe") => {
             recovery_observe(rest).await?;
         }
         [command, rest @ ..] if command == OsStr::new("recover") => {
-            recover(rest).await?;
+            run_to_completion("recover", recover(rest)).await?;
         }
         _ => {
             return Err(
-                "usage: tunnel-relay [--help | check-config [PATH] | check-serve-config --config PATH | initialize --config PATH | recovery-initialize --config PATH | recovery-observe --config PATH | recover --config PATH --approval PATH --expected-nonce NONCE --acknowledgement-id ID --old-primary-fenced --old-relays-fenced | serve --config PATH]".into(),
+                "usage: tunnel-relay [--help | check-config [PATH] | check-serve-config --config PATH | initialize --config PATH | recovery-initialize --config PATH | recovery-observe --config PATH | recover --config PATH --approval PATH --expected-nonce NONCE --acknowledgement-id ID --old-primary-fenced --old-relays-fenced | activate-first-incarnation --config PATH | provision-catalog --config PATH --records PATH [--dry-run] | serve --config PATH]".into(),
             );
         }
     }
@@ -1191,7 +1259,7 @@ fn parse_jwks(bytes: &[u8]) -> Result<Vec<ApprovedJwk>, Box<dyn Error>> {
 fn print_help() {
     println!(
         "tunnel-relay — authenticated multi-user Agent Tunnel relay\n\n\
-         Usage: tunnel-relay [--help | check-config [PATH] | check-serve-config --config PATH | initialize --config PATH | recovery-initialize --config PATH | recovery-observe --config PATH | recover --config PATH --approval PATH --expected-nonce NONCE --acknowledgement-id ID --old-primary-fenced --old-relays-fenced | serve --config PATH]\n\n\
+         Usage: tunnel-relay [--help | check-config [PATH] | check-serve-config --config PATH | initialize --config PATH | recovery-initialize --config PATH | recovery-observe --config PATH | recover --config PATH --approval PATH --expected-nonce NONCE --acknowledgement-id ID --old-primary-fenced --old-relays-fenced | activate-first-incarnation --config PATH | provision-catalog --config PATH --records PATH [--dry-run] | serve --config PATH]\n\n\
          check-config [PATH]       Validate legacy relay TOML without opening listeners.\n\
          check-serve-config --config PATH\n\
                                   Dry-run the configuration serve uses: full validation,\n\
@@ -1205,6 +1273,11 @@ fn print_help() {
          recover --config PATH --approval PATH --expected-nonce NONCE\n\
            --acknowledgement-id ID --old-primary-fenced --old-relays-fenced\n\
                                   Consume one approval and activate the candidate.\n\
+         activate-first-incarnation --config PATH\n\
+                                  Bind the configured incarnation to an empty namespace.\n\
+         provision-catalog --config PATH --records PATH [--dry-run]\n\
+                                  Write one tenant, user, device, credential, service\n\
+                                  and grant into a newly activated namespace.\n\
          serve --config PATH      Start consumer HTTPS and device mTLS WSS listeners."
     );
 }

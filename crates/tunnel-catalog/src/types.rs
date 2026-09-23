@@ -376,6 +376,17 @@ pub struct CatalogFixture {
     pub grants: Vec<GrantSpec>,
 }
 
+impl CatalogFixture {
+    /// Apply the relationship, uniqueness, fingerprint and size rules every
+    /// seed must pass before the Redis catalog writes it, without contacting
+    /// Redis.  This is the same function `seed_fixture` and
+    /// `RedisCatalog::provision_initial_catalog` call first, exposed so an
+    /// operator dry run reports the verdict the write would reach.
+    pub fn validate(&self) -> Result<(), crate::CatalogError> {
+        crate::redis::validate_fixture(self)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FixtureDevice {
     pub tenant_id: TenantId,

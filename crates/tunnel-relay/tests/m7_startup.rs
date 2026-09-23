@@ -804,6 +804,161 @@ fn serve_sigterm_during_the_membership_bootstrap_exits_interrupted() {
     fixture.assert_bindings_available();
 }
 
+// ------------------------------------------------------------------------
+// Stop requests during a finite writing command (M6-C23, after M6-C21).
+//
+// `activate-first-incarnation`, `provision-catalog`, `initialize`,
+// `recovery-initialize` and `recover` write state that cannot be half-undone,
+// so a first stop request lets the bounded command finish and report its own
+// outcome, and a second abandons it with 130. Held here in the Redis TLS
+// handshake of `activate-first-incarnation`, which is the same wrapper every
+// one of those commands goes through.
+
+/// Spawn `tunnel-relay <args>`, wait for `phase_peer` to witness the Redis
+/// connection, send each signal in turn (100 ms apart), and return the
+/// output and the time from the **last** signal to the exit.
+fn signal_relay_command(
+    args: &[&OsStr],
+    phase_peer: &SilentPeer,
+    signals: &[&str],
+) -> (Output, Duration) {
+    let mut child = Command::new(relay_binary())
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn tunnel-relay command");
+    let started = Instant::now();
+    while phase_peer.accepted.load(Ordering::Acquire) == 0 {
+        if child.try_wait().expect("poll tunnel-relay").is_some() {
+            let output = child.wait_with_output().expect("collect early exit");
+            panic!(
+                "the command exited before reaching the held phase: status={} stderr={}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        assert!(
+            started.elapsed() <= SIGNAL_PHASE_BOUND,
+            "the command did not reach the held phase within {SIGNAL_PHASE_BOUND:?}"
+        );
+        thread::sleep(Duration::from_millis(2));
+    }
+    let mut signalled = Instant::now();
+    for signal in signals {
+        thread::sleep(SIGNAL_AFTER_PHASE);
+        assert!(
+            child.try_wait().expect("poll tunnel-relay").is_none(),
+            "the command exited before SIG{signal} was sent"
+        );
+        let status = Command::new("/bin/kill")
+            .arg(format!("-{signal}"))
+            .arg(child.id().to_string())
+            .status()
+            .expect("run kill");
+        assert!(status.success(), "kill -{signal} failed: {status}");
+        signalled = Instant::now();
+    }
+    loop {
+        if child.try_wait().expect("poll tunnel-relay").is_some() {
+            break;
+        }
+        if started.elapsed() > SIGNAL_RUN_BOUND {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the command did not exit within {SIGNAL_RUN_BOUND:?}");
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    let after_signal = signalled.elapsed();
+    (
+        child.wait_with_output().expect("collect command output"),
+        after_signal,
+    )
+}
+
+/// A first SIGTERM does not kill a writing command: it is acknowledged, the
+/// command reaches its own outcome -- here the Redis connection's own
+/// failure, because the peer never answers -- and that outcome sets the exit
+/// status. With the handler defeated the process dies by the signal instead.
+#[cfg(unix)]
+#[test]
+fn a_writing_command_finishes_and_reports_its_own_outcome_after_one_sigterm() {
+    let fixture = StartupFixture::new();
+    let redis = SilentPeer::start();
+    let config = fixture.valid_config(&format!(
+        "rediss://{DIAGNOSTIC_SECRET}@127.0.0.1:{}/0",
+        redis.address.port()
+    ));
+    let (output, _) = signal_relay_command(
+        &[
+            OsStr::new("activate-first-incarnation"),
+            OsStr::new("--config"),
+            config.as_os_str(),
+        ],
+        &redis,
+        &["TERM"],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let context = format!("status={} stderr={stderr}", output.status);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "the command's own outcome (the Redis connection failing) must set the \
+         status, not the signal: {context}"
+    );
+    assert!(
+        stderr.contains(
+            "tunnel-relay: SIGTERM received during activate-first-incarnation; letting it finish"
+        ),
+        "the stop request must be acknowledged: {context}"
+    );
+    assert!(
+        stderr.contains("Redis catalog connection failed"),
+        "the command's own outcome must still be reported: {context}"
+    );
+    assert!(!stderr.contains(DIAGNOSTIC_SECRET), "{context}");
+}
+
+/// A second stop request abandons the write at once, with 130 and a
+/// diagnostic saying the outcome is unknown.
+#[cfg(unix)]
+#[test]
+fn a_second_stop_request_abandons_a_writing_command() {
+    let fixture = StartupFixture::new();
+    let redis = SilentPeer::start();
+    let config = fixture.valid_config(&format!(
+        "rediss://{DIAGNOSTIC_SECRET}@127.0.0.1:{}/0",
+        redis.address.port()
+    ));
+    let (output, after_signal) = signal_relay_command(
+        &[
+            OsStr::new("activate-first-incarnation"),
+            OsStr::new("--config"),
+            config.as_os_str(),
+        ],
+        &redis,
+        &["TERM", "INT"],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let context = format!(
+        "status={} after_signal={after_signal:?} stderr={stderr}",
+        output.status
+    );
+    assert_eq!(output.status.code(), Some(130), "{context}");
+    assert!(
+        stderr.contains(
+            "tunnel-relay: SIGINT received while activate-first-incarnation was finishing after SIGTERM; exiting without waiting for it, so its outcome is unknown"
+        ),
+        "{context}"
+    );
+    assert!(
+        after_signal <= SIGNAL_PROMPT_EXIT,
+        "the second request must end the command promptly, not at the Redis timeout: {context}"
+    );
+}
+
 struct FakeRedisTls {
     address: SocketAddr,
     stop: Arc<AtomicBool>,

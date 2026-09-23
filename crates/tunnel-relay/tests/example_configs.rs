@@ -23,7 +23,7 @@ use std::{
 };
 
 use tunnel_core::RelayConfig;
-use tunnel_relay::ServeConfig;
+use tunnel_relay::{ServeConfig, provisioning::ProvisioningRecords};
 
 /// The shell glob the CI dry-run step expands. Every `RelayServe` example must
 /// match it and nothing else may, so a newly added serving example is covered
@@ -39,6 +39,9 @@ enum ExampleParser {
     /// `tunnel_core::RelayConfig`: the legacy `check-config [PATH]` type. It
     /// configures no listener and is not a serving document.
     RelayLegacy,
+    /// `tunnel_relay::provisioning::ProvisioningRecords`: the records document
+    /// `provision-catalog --records PATH` reads (task row M6-C21).
+    CatalogRecords,
     /// A `tunnel-client` type. Covered by the matching walk in
     /// `crates/tunnel-client/tests/example_configs.rs`; the relay crate cannot
     /// construct those parsers.
@@ -53,6 +56,7 @@ const CLASSIFIED_EXAMPLES: &[(&str, ExampleParser)] = &[
     ("client.toml", ExampleParser::Client),
     ("m1-client.toml", ExampleParser::Client),
     ("m1-relay.toml", ExampleParser::RelayServe),
+    ("m6-catalog.toml", ExampleParser::CatalogRecords),
     ("m7-cluster-relay.toml", ExampleParser::RelayServe),
     ("relay.toml", ExampleParser::RelayLegacy),
 ];
@@ -124,6 +128,15 @@ fn every_checked_in_example_is_classified_and_parsed_by_its_serving_parser() {
                 RelayConfig::parse(&input).unwrap_or_else(|error| {
                     panic!("example {name} is not a valid legacy relay configuration: {error}")
                 });
+            }
+            ExampleParser::CatalogRecords => {
+                toml::from_str::<ProvisioningRecords>(&input).unwrap_or_else(|error| {
+                    panic!("example {name} is not a valid provisioning records document: {error}")
+                });
+                assert!(
+                    ServeConfig::parse(&input).is_err(),
+                    "records example {name} parsed as a relay serving configuration"
+                );
             }
             ExampleParser::Client => {
                 // Asserted by the tunnel-client walk. Confirm only that the

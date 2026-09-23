@@ -1,0 +1,45 @@
+# Catalog records for `tunnel-relay provision-catalog` (docs/operator.md
+# section 2.3, task row M6-C21): exactly one tenant, one user, one device with
+# one credential, one service and one grant.
+#
+# Every UUID below is a synthetic placeholder. Generate your own (`uuidgen`)
+# and keep them consistent with the device's client profile: device.id is the
+# profile's device_id and the device certificate's
+# urn:agent-tunnel:device:<id> SAN, and service.id names the profile's
+# [exports."<id>"] table. examples/m1-client.toml uses these same values.
+#
+# The relay's configuration supplies everything else: the Redis authority,
+# namespace and deployment incarnation, and the OIDC issuer the user's
+# identity is bound to.
+
+[tenant]
+id = "11111111-1111-4111-8111-111111111111"
+display_name = "Trial tenant"
+
+[user]
+id = "22222222-2222-4222-8222-222222222222"
+display_name = "Trial user"
+# The `sub` claim your identity issuer (the relay's oidc_issuer) puts in this
+# user's access tokens.
+oidc_subject = "trial-user"
+# "member" (the default) or "admin". Neither grants anything by itself; the
+# [grant] below is the only authorization.
+role = "member"
+
+[device]
+id = "33333333-3333-4333-8333-333333333333"
+display_name = "Trial device"
+# The certificate your issuer signed for this device, relative to this file.
+# Its SPKI pin, serial and validity become the credential record.
+certificate = "device-cert.pem"
+
+[service]
+id = "44444444-4444-4444-8444-444444444444"
+type = "echo"
+display_name = "Trial echo"
+operations = ["echo:invoke"]
+
+[grant]
+# What the user may do on the service; a subset of service.operations.
+operations = ["echo:invoke"]
+# Optional RFC 3339 expiry, e.g. expires_at = "2026-12-31T00:00:00Z".

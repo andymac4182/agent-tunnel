@@ -337,6 +337,37 @@ pub async fn connect(
     .map_err(map_catalog_connection_error)
 }
 
+/// Connect the same Redis authority as [`connect`], with the same URL and TLS
+/// material rules, but **without** requiring an active deployment
+/// incarnation.
+///
+/// Only the operator's first-incarnation bootstrap uses this (task row
+/// M6-C21): it is the one caller whose job is to create the incarnation
+/// `connect` requires.  The catalog method it then calls refuses any namespace
+/// that already has one, so this cannot be used to skip `serve`'s fence.
+pub async fn connect_for_first_activation(
+    redis_url: &str,
+    namespace: &str,
+    deployment_incarnation: &str,
+    material: &RedisTlsMaterialPaths,
+) -> Result<RedisCatalog, RedisConnectionError> {
+    reject_insecure_tls_url(redis_url)?;
+    if !material.is_configured() {
+        return RedisCatalog::connect_for_recovery(redis_url, namespace, deployment_incarnation)
+            .await
+            .map_err(RedisConnectionError::from);
+    }
+    validate_verified_rediss_url(redis_url)?;
+    let Some(tls) = material.load()? else {
+        return Err(RedisConnectionError::InvalidInput(
+            "Redis TLS material selection is inconsistent",
+        ));
+    };
+    RedisCatalog::connect_for_recovery_with_tls(redis_url, namespace, deployment_incarnation, tls)
+        .await
+        .map_err(RedisConnectionError::from)
+}
+
 fn validate_verified_rediss_url(redis_url: &str) -> Result<(), RedisConnectionError> {
     let Some(rest) = redis_url.strip_prefix("rediss://") else {
         return Err(RedisConnectionError::PlaintextUrlWithTlsMaterial);
