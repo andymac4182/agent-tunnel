@@ -393,7 +393,9 @@ together. Under `--json` it prints a `disconnected` and a `backoff` event for
 each failure, `reconnecting` when it tries again and `reconnected` (then the
 usual `ready`) when a new session is up. Causes no retry can fix -- a bad
 profile, a relay certificate your `server_ca` does not trust, a relay that
-refuses the device certificate -- exit at once with their own status; the
+refuses the device certificate, a device certificate that has expired -- exit
+at once with their own status. A certificate that is only not yet valid on
+somebody's clock is clock skew and is retried, with a message saying so. The
 full classification and its reasons are in
 [runtime.md](runtime.md#reconnecting-connect). The profile's `[reconnect]`
 table sets the policy. This rehearsal gives up after one retry so it ends:
@@ -422,12 +424,15 @@ exit=4
 Two limits, both measured (runtime.md has the detail). **After a relay
 crash**, the relay's claim on the device outlives it in Redis for up to the
 owner lease (30 s by default), and reconnects are refused `OWNER_BUSY` until
-it lapses: a device reconnected 30.4 s after a SIGKILLed relay was back, and
-0.75 s after one stopped with SIGTERM. **A refusal after TLS** -- a revoked or
+it lapses: a device reconnected about 30 s after a SIGKILLed relay was back,
+and in under a second after one stopped with SIGTERM (M6-C40). **A refusal after TLS** -- a revoked or
 inactive catalog credential, a `device_id` that does not match the
 certificate, a protocol version the relay does not speak -- looks to the
-client like a relay that dropped the connection, and is retried (M6-C38,
-waiting on M6-C32); set `max_attempts` if a supervisor should see it fail.
+client like a relay that dropped the connection, and is retried (M6-C38;
+M6-C32 makes the single-relay identity refusals terminal, M6-C43 tracks the
+cluster case). Each retry prints its `disconnected` and `backoff` events with
+the cause, and `attempt` counts them; set `max_attempts` if a supervisor
+should see it fail.
 
 ### 3.2 Health endpoints and load balancers
 
@@ -588,8 +593,8 @@ of `connect`'s waits only by unit tests.
 
 1. Stop the service (`systemctl stop`, or `launchctl bootout`). Stopping a
    relay ends the device sessions it owns; the devices back off and
-   reconnect by themselves when it returns (measured: 0.75 s after an
-   orderly restart). In-flight operations on those sessions end with them,
+   reconnect by themselves when it returns (measured: under a second after
+   an orderly restart, about 30 s after a crash; M6-C40). In-flight operations on those sessions end with them,
    and a mutation's outcome can be unknown ([protocol.md](protocol.md)).
 2. Replace **all three binaries from one bundle** together
    (`tunnel-client`, `tunnel-relay`, and `tunnel-deadman`, which the client

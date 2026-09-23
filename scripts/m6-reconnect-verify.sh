@@ -10,7 +10,8 @@
 #    SIGKILLed and restarted, then stopped with SIGTERM and restarted, under a
 #    running `connect` that must reconnect and serve an echo each time; and a
 #    `connect` started before its relay, which must back off until `serve`
-#    appears.
+#    appears; a device certificate not yet valid (clock skew), which must be
+#    retried until it is; and an expired one, which must exit 3 at once.
 #
 # Both tests are `#[ignore]`d in the ordinary workspace run because they need
 # Redis.  A filtered or skipped test would print `0 passed` and exit 0, so this
@@ -41,8 +42,9 @@ echo "m6-reconnect-verify: reconnect gates" >&2
 cargo test -p tunnel-relay --test m6_reconnect_process --locked -- --ignored --nocapture --test-threads=1 \
   > "$scratch/reconnect.log" 2>&1 || { cat "$scratch/reconnect.log" >&2; exit 1; }
 cat "$scratch/reconnect.log"
-for needle in "test result: ok. 2 passed" "m6c23-reconnect ok label=restart nonce=" \
-  "m6c23-reconnect ok label=late-relay nonce=" "client=$TUNNEL_CLIENT_BIN"; do
+for needle in "test result: ok. 4 passed" "m6c23-reconnect ok label=restart nonce=" \
+  "m6c23-reconnect ok label=late-relay nonce=" "m6c23-reconnect ok label=not-yet-valid nonce=" \
+  "m6c23-reconnect ok label=expired nonce=" "client=$TUNNEL_CLIENT_BIN"; do
   if ! grep -q -- "$needle" "$scratch/reconnect.log"; then
     echo "m6-reconnect-verify: FAILED: output lacks '$needle'" >&2
     exit 1

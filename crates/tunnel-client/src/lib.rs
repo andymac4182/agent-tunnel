@@ -656,8 +656,14 @@ async fn open_socket(
             .map_err(|_| ClientError::HandshakeTimeout)?
             .map_err(|error| match tls_refusal(&error) {
                 // Classified before `sanitize_error` erases it: a certificate
-                // verification refusal is terminal, anything else retryable.
-                Some(reason) => ClientError::TlsRefused(reason),
+                // verification refusal is terminal, a certificate that is
+                // only not current on someone's clock is retryable with its
+                // reason, and anything else is an opaque retryable failure.
+                Some(TlsFailure::Refused(reason)) => ClientError::TlsRefused(reason),
+                Some(TlsFailure::NotCurrent { scope, detail }) => ClientError::Transport {
+                    scope,
+                    detail: detail.to_owned(),
+                },
                 None => ClientError::Transport {
                     scope: "websocket handshake",
                     detail: sanitize_error(&error.to_string()),
@@ -2137,30 +2143,65 @@ fn checked_echo_output_len(canary_len: usize, payload_len: usize) -> Option<usiz
     canary_len.checked_add(payload_len)
 }
 
-/// The certificate-verification refusals that **no retry can fix**, as a
-/// fixed reason (task row M6-C23, reconnect).
+/// `Transport` scope of a handshake the relay refused with a
+/// `certificate_expired` TLS alert. rustls sends that one alert for **both**
+/// an expired and a not-yet-valid client certificate (`impl
+/// From<CertificateError> for AlertDescription`), judged on the **relay's**
+/// clock, so the alert alone cannot say whether the certificate is expired or
+/// the two clocks disagree. It is therefore reported retryable here, and
+/// `tunnel-client connect` decides with the one thing it has that the relay
+/// does not: this device's certificate, read against this host's clock
+/// (task row M6-C23).
+pub const DEVICE_CERTIFICATE_NOT_CURRENT_SCOPE: &str = "device certificate validity";
+
+/// `Transport` scope of a relay certificate this client found expired or not
+/// yet valid on **its own** clock. Retryable: either this host's clock is
+/// wrong or the relay's certificate is due for renewal, and both are fixed
+/// without touching the device.
+pub const RELAY_CERTIFICATE_NOT_CURRENT_SCOPE: &str = "relay certificate validity";
+
+/// How a TLS handshake failure is classified before sanitization.
+enum TlsFailure {
+    /// A refusal no retry can fix; the reason is fixed text.
+    Refused(&'static str),
+    /// A certificate valid except for the time; retryable, with a fixed
+    /// reason under a scope `safe_message` reveals.
+    NotCurrent {
+        scope: &'static str,
+        detail: &'static str,
+    },
+}
+
+/// The certificate-verification failures of a handshake, classified **by
+/// rustls variant and never by message text** (task row M6-C23, reconnect).
 ///
-/// Everything a handshake can end with is otherwise one opaque
-/// `websocket handshake failed`, so a reconnecting `connect` could not tell a
-/// wrong `server_ca` from a relay that is still restarting. This picks out,
-/// **by rustls variant and never by message text**, the two refusals that
-/// are properties of the configured credentials rather than of the network:
+/// Every handshake failure is otherwise one opaque `websocket handshake
+/// failed`, so a reconnecting `connect` could not tell a wrong `server_ca`
+/// from a relay that is still restarting. Three outcomes:
 ///
-/// * this client refused the relay's certificate: unknown issuer (the wrong
-///   `server_ca`), a bad signature, expired or not yet valid, revoked, not
-///   valid for the relay's name, or not valid for server authentication;
-/// * the relay refused this device's certificate with a certificate TLS
-///   alert: unknown CA, bad, unsupported, expired, revoked, unknown, or
-///   required and absent.
+/// * **Terminal** (`TlsFailure::Refused`): this client refused the relay's
+///   certificate as from an unknown issuer (the wrong `server_ca`), badly
+///   signed, revoked, not valid for the relay's name, or not for server
+///   authentication; or the relay refused this device's certificate with an
+///   unknown-CA, bad, unsupported, revoked, unknown or required-but-absent
+///   certificate alert. These are properties of the identities, not of time
+///   or the network.
+/// * **Retryable with its reason** (`TlsFailure::NotCurrent`): a certificate
+///   that is expired or not yet valid **on somebody's clock** -- the relay's
+///   certificate on ours, or ours on the relay's (the `certificate_expired`
+///   alert). Clock skew between a CA, a relay and a device is ordinary, and a
+///   relay certificate can be renewed; `connect` settles the device side
+///   against its own certificate (see `DEVICE_CERTIFICATE_NOT_CURRENT_SCOPE`).
+/// * **Opaque and retryable** (`None`): a reset, an EOF, an I/O error, a
+///   timeout, a middlebox dropping the connection, an unclassified alert such
+///   as `handshake_failure`, `decrypt_error` or `access_denied`, and
+///   certificate errors outside the lists (`BadEncoding`, `Other`, variants a
+///   later rustls adds). Those are what a laptop waking from sleep or a flaky
+///   network produce.
 ///
-/// Every other handshake outcome -- a reset, an EOF, an I/O error, a timeout,
-/// a middlebox dropping the connection, an unclassified alert such as
-/// `handshake_failure` or `access_denied`, and certificate errors outside the
-/// list (`BadEncoding`, `Other`, and variants a later rustls adds) -- returns
-/// `None` and stays a retryable `TRANSPORT_ERROR`: those are what a laptop
-/// waking from sleep or a flaky network produce. The reason is a string
-/// written here; nothing from the peer or its certificate is carried.
-fn tls_refusal(error: &tokio_tungstenite::tungstenite::Error) -> Option<&'static str> {
+/// Every reason is a string written here; nothing from the peer or its
+/// certificate is carried.
+fn tls_refusal(error: &tokio_tungstenite::tungstenite::Error) -> Option<TlsFailure> {
     use tokio_tungstenite::tungstenite::{Error as WsError, error::TlsError};
     let rustls_error: &rustls::Error = match error {
         WsError::Tls(TlsError::Rustls(error)) => error,
@@ -2172,47 +2213,61 @@ fn tls_refusal(error: &tokio_tungstenite::tungstenite::Error) -> Option<&'static
     classify_rustls_refusal(rustls_error)
 }
 
-fn classify_rustls_refusal(error: &rustls::Error) -> Option<&'static str> {
+fn classify_rustls_refusal(error: &rustls::Error) -> Option<TlsFailure> {
     use rustls::{AlertDescription as Alert, CertificateError as Cert};
+    let refused = |reason| Some(TlsFailure::Refused(reason));
+    let relay_not_current = |detail| {
+        Some(TlsFailure::NotCurrent {
+            scope: RELAY_CERTIFICATE_NOT_CURRENT_SCOPE,
+            detail,
+        })
+    };
     match error {
-        rustls::Error::InvalidCertificate(reason) => Some(match reason {
-            Cert::UnknownIssuer => {
-                "the relay's certificate was refused: unknown issuer (check credentials.server_ca)"
-            }
-            Cert::BadSignature => "the relay's certificate was refused: bad signature",
-            Cert::Expired | Cert::ExpiredContext { .. } => {
-                "the relay's certificate was refused: expired"
-            }
-            Cert::NotValidYet | Cert::NotValidYetContext { .. } => {
-                "the relay's certificate was refused: not yet valid"
-            }
-            Cert::Revoked => "the relay's certificate was refused: revoked",
+        rustls::Error::InvalidCertificate(reason) => match reason {
+            Cert::UnknownIssuer => refused(
+                "the relay's certificate was refused: unknown issuer (check credentials.server_ca)",
+            ),
+            Cert::BadSignature => refused("the relay's certificate was refused: bad signature"),
+            Cert::Revoked => refused("the relay's certificate was refused: revoked"),
             Cert::NotValidForName | Cert::NotValidForNameContext { .. } => {
-                "the relay's certificate was refused: not valid for the relay_url host"
+                refused("the relay's certificate was refused: not valid for the relay_url host")
             }
             Cert::InvalidPurpose | Cert::InvalidPurposeContext { .. } => {
-                "the relay's certificate was refused: not valid for server authentication"
+                refused("the relay's certificate was refused: not valid for server authentication")
             }
-            _ => return None,
-        }),
-        rustls::Error::AlertReceived(alert) => Some(match alert {
-            Alert::UnknownCA => {
-                "the relay refused this device's certificate: unknown CA (the relay does not trust its issuer)"
+            Cert::Expired | Cert::ExpiredContext { .. } => relay_not_current(
+                "the relay's certificate is expired on this host's clock: the relay's certificate needs renewing, or this host's clock is ahead; retrying",
+            ),
+            Cert::NotValidYet | Cert::NotValidYetContext { .. } => relay_not_current(
+                "the relay's certificate is not yet valid on this host's clock: this host's clock is likely behind; retrying",
+            ),
+            _ => None,
+        },
+        rustls::Error::AlertReceived(alert) => match alert {
+            Alert::UnknownCA => refused(
+                "the relay refused this device's certificate: unknown CA (the relay does not trust its issuer)",
+            ),
+            Alert::BadCertificate => {
+                refused("the relay refused this device's certificate: bad certificate")
             }
-            Alert::BadCertificate => "the relay refused this device's certificate: bad certificate",
             Alert::UnsupportedCertificate => {
-                "the relay refused this device's certificate: unsupported certificate"
+                refused("the relay refused this device's certificate: unsupported certificate")
             }
-            Alert::CertificateExpired => "the relay refused this device's certificate: expired",
-            Alert::CertificateRevoked => "the relay refused this device's certificate: revoked",
+            Alert::CertificateRevoked => {
+                refused("the relay refused this device's certificate: revoked")
+            }
             Alert::CertificateUnknown => {
-                "the relay refused this device's certificate: certificate unknown"
+                refused("the relay refused this device's certificate: certificate unknown")
             }
             Alert::CertificateRequired => {
-                "the relay refused the connection: a device certificate is required"
+                refused("the relay refused the connection: a device certificate is required")
             }
-            _ => return None,
-        }),
+            Alert::CertificateExpired => Some(TlsFailure::NotCurrent {
+                scope: DEVICE_CERTIFICATE_NOT_CURRENT_SCOPE,
+                detail: "the relay refused this device's certificate as expired or not yet valid on the relay's clock",
+            }),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -2389,6 +2444,13 @@ impl ClientError {
             // different gates unexplainable.
             Self::Transport { scope, detail } if *scope == "stream forget barrier" => {
                 format!("{scope} failed: {}", safe_barrier_detail(detail))
+            }
+            // Fixed reasons written by `classify_rustls_refusal`.
+            Self::Transport { scope, detail }
+                if *scope == DEVICE_CERTIFICATE_NOT_CURRENT_SCOPE
+                    || *scope == RELAY_CERTIFICATE_NOT_CURRENT_SCOPE =>
+            {
+                detail.clone()
             }
             Self::Transport { scope, .. } => format!("{scope} failed"),
             Self::OwnerBusy => {

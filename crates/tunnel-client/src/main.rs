@@ -799,6 +799,85 @@ impl ReconnectPolicy {
     }
 }
 
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX)
+        })
+}
+
+/// The validity window of this device's certificate chain -- the latest
+/// `notBefore` and the earliest `notAfter`, as unix seconds, the rule
+/// `doctor` applies -- or `None` if it cannot be read.
+fn device_certificate_window(config: &ConnectConfig) -> Option<(i64, i64)> {
+    let chain =
+        tunnel_client::credentials::load_certificates(&config.credentials.client_certificate)
+            .ok()?;
+    let mut window: Option<(i64, i64)> = None;
+    for certificate in &chain {
+        let (not_before, not_after) = doctor::certificate_validity(certificate.as_ref()).ok()?;
+        window = Some(match window {
+            None => (not_before, not_after),
+            Some((before, after)) => (before.max(not_before), after.min(not_after)),
+        });
+    }
+    window
+}
+
+/// Classify a failed connect attempt, which differs from
+/// `CliError::from_client` in exactly one case (task row M6-C23).
+///
+/// The relay refused this device's certificate with `certificate_expired`,
+/// which rustls sends for an expired **and** for a not-yet-valid
+/// certificate, judged on the relay's clock. The relay cannot say which; this
+/// process can, because it holds the certificate and its own clock:
+///
+/// * `notAfter` has passed here too: the certificate is expired. No retry
+///   fixes that, so it is terminal `CREDENTIAL_ERROR` (exit `3`) naming the
+///   time -- the tester needs to see this error, not a backoff loop.
+/// * Otherwise -- not yet valid here either (a CA clock ahead, or a
+///   `notBefore` stamped at signing time), or valid here (the relay's clock
+///   differs from this host's): retryable `TRANSPORT_ERROR`, and the message
+///   says clock skew is the likely cause. A certificate that becomes valid
+///   is then accepted on a later attempt without anyone restarting anything.
+///
+/// A certificate that cannot be read here keeps the retryable transport
+/// classification: nothing proves it expired.
+fn attempt_error(error: ClientError, config: &ConnectConfig, now: i64) -> CliError {
+    let ClientError::Transport { scope, .. } = &error else {
+        return CliError::from_client(error);
+    };
+    if *scope != tunnel_client::DEVICE_CERTIFICATE_NOT_CURRENT_SCOPE {
+        return CliError::from_client(error);
+    }
+    let reported = error.to_string();
+    match device_certificate_window(config) {
+        Some((_, not_after)) if not_after <= now => CliError {
+            cause: Cause::CredentialError,
+            message: format!(
+                "{reported}; this device's certificate expired at unix time {not_after} on this host's clock too: renew it"
+            ),
+            retryable: false,
+        },
+        Some((not_before, _)) if not_before > now => CliError {
+            cause: Cause::TransportError,
+            message: format!(
+                "{reported}; it is not valid until unix time {not_before} on this host's clock either (its issuer's clock is likely ahead); retrying"
+            ),
+            retryable: true,
+        },
+        Some((not_before, not_after)) => CliError {
+            cause: Cause::TransportError,
+            message: format!(
+                "{reported}; it is valid on this host's clock (unix time {not_before} to {not_after}), so the relay's clock likely differs from this host's; retrying"
+            ),
+            retryable: true,
+        },
+        None => CliError::from_client(error),
+    }
+}
+
 /// A random value for the jitter. `uuid`'s v4 generator draws from the
 /// operating system's generator, which is what jitter needs: independent
 /// across devices, not reproducible.
@@ -1077,7 +1156,7 @@ async fn run_one_session(
             // The attempt failed before a session was ready; the handlers
             // went with it, and no child was started.
             Err(error) => {
-                return Ok(SessionEnd::Failed { error: CliError::from_client(error), ready: None });
+                return Ok(SessionEnd::Failed { error: attempt_error(error, config, unix_now()), ready: None });
             }
         },
         signal = stop.recv() => {

@@ -61,8 +61,22 @@ struct Pki {
     device_key_pem: String,
 }
 
+/// Unix seconds now, and offsets from it for certificate validity windows.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after 1970")
+        .as_secs()
+}
+
 impl Pki {
     fn new(name: &str) -> Self {
+        Self::with_windows(name, None, None)
+    }
+
+    /// `server` and `device` override a leaf's validity window, as unix
+    /// seconds `(not_before, not_after)`.
+    fn with_windows(name: &str, server: Option<(u64, u64)>, device: Option<(u64, u64)>) -> Self {
         let ca_key = KeyPair::generate().expect("reconnect fixture CA key");
         let mut ca_params = CertificateParams::default();
         ca_params
@@ -81,6 +95,12 @@ impl Pki {
             "127.0.0.1".parse().expect("loopback SAN"),
         ));
         server_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        if let Some((not_before, not_after)) = server {
+            server_params.not_before =
+                rcgen::date_time_ymd(1970, 1, 1) + Duration::from_secs(not_before);
+            server_params.not_after =
+                rcgen::date_time_ymd(1970, 1, 1) + Duration::from_secs(not_after);
+        }
         let server = server_params
             .signed_by(&server_key, &ca, &ca_key)
             .expect("reconnect fixture relay leaf");
@@ -91,6 +111,12 @@ impl Pki {
             .distinguished_name
             .push(DnType::CommonName, "reconnect-fixture-device");
         device_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        if let Some((not_before, not_after)) = device {
+            device_params.not_before =
+                rcgen::date_time_ymd(1970, 1, 1) + Duration::from_secs(not_before);
+            device_params.not_after =
+                rcgen::date_time_ymd(1970, 1, 1) + Duration::from_secs(not_after);
+        }
         let device = device_params
             .signed_by(&device_key, &ca, &ca_key)
             .expect("reconnect fixture device leaf");
@@ -180,6 +206,7 @@ struct FakeRelay {
     stop: Arc<AtomicBool>,
     accepted: Arc<AtomicUsize>,
     tls_errors: Arc<Mutex<Vec<String>>>,
+    tls_completed: Arc<AtomicUsize>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
@@ -193,10 +220,12 @@ impl FakeRelay {
         let stop = Arc::new(AtomicBool::new(false));
         let accepted = Arc::new(AtomicUsize::new(0));
         let tls_errors = Arc::new(Mutex::new(Vec::new()));
+        let tls_completed = Arc::new(AtomicUsize::new(0));
         let thread = {
             let stop = Arc::clone(&stop);
             let accepted = Arc::clone(&accepted);
             let tls_errors = Arc::clone(&tls_errors);
+            let tls_completed = Arc::clone(&tls_completed);
             thread::spawn(move || {
                 while !stop.load(Ordering::Acquire) {
                     match listener.accept() {
@@ -205,8 +234,14 @@ impl FakeRelay {
                             stream
                                 .set_nonblocking(false)
                                 .expect("fake relay blocking stream");
-                            if let Some(error) = serve(stream, &mode) {
-                                tls_errors.lock().expect("tls errors").push(error);
+                            match serve(stream, &mode) {
+                                Some(error) => {
+                                    tls_errors.lock().expect("tls errors").push(error);
+                                }
+                                None if matches!(mode, Mode::Tls(_)) => {
+                                    tls_completed.fetch_add(1, Ordering::AcqRel);
+                                }
+                                None => {}
                             }
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -222,6 +257,7 @@ impl FakeRelay {
             stop,
             accepted,
             tls_errors,
+            tls_completed,
             thread: Some(thread),
         }
     }
@@ -272,7 +308,14 @@ fn serve(mut stream: TcpStream, mode: &Mode) -> Option<String> {
                     return Some(error.to_string());
                 }
             }
-            // Let the client act on the completed handshake, then close.
+            // Read the client's first record, so a client-certificate
+            // refusal (sent after a TLS 1.3 client's Finished) surfaces here
+            // rather than being counted as a completed handshake.
+            let mut tls = rustls::Stream::new(&mut connection, &mut stream);
+            let mut byte = [0_u8; 1];
+            if let Err(error) = tls.read_exact(&mut byte) {
+                return Some(error.to_string());
+            }
             thread::sleep(Duration::from_millis(200));
             None
         }
@@ -779,4 +822,136 @@ fn reconnect_disabled_in_the_profile_exits_on_the_first_failure() {
     let context = run.context();
     assert_eq!(status.code(), Some(4), "{context}");
     assert!(run.states("backoff").is_empty(), "{context}");
+}
+
+/// Clock skew, the device side: the relay refuses a certificate whose
+/// `notBefore` is still ahead with the same `certificate_expired` alert it
+/// sends for an expired one. The client reads its own certificate, finds it
+/// not yet valid rather than expired, retries with a message naming the
+/// clock -- and once the certificate becomes valid the relay accepts it,
+/// with nothing restarted.
+#[test]
+fn a_device_certificate_not_yet_valid_is_retried_until_the_relay_accepts_it() {
+    let now = unix_now();
+    let pki = Pki::with_windows("skew", None, Some((now + 5, now + 86_400)));
+    let relay = FakeRelay::start(Mode::Tls(server_requiring_devices_of(&pki, &pki)));
+    let profile = profile(
+        &relay.url(),
+        &pki,
+        &pki,
+        "initial_delay_ms = 500\nmax_delay_ms = 1000",
+    );
+    let mut run = Run::start(&profile, &[]);
+    let first = run.wait_for_state("disconnected");
+    fn context(relay: &FakeRelay, run: &Run) -> String {
+        format!(
+            "accepted={} tls_completed={} relay_errors={:?} {}",
+            relay.accepted(),
+            relay.tls_completed.load(Ordering::Acquire),
+            relay.tls_errors.lock().expect("tls errors"),
+            run.context()
+        )
+    }
+    assert_eq!(
+        first["result"]["code"],
+        "TRANSPORT_ERROR",
+        "{}",
+        context(&relay, &run)
+    );
+    let message = first["result"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("as expired or not yet valid on the relay's clock")
+            && message.contains("not valid until unix time"),
+        "the event must say the certificate is not yet valid, not expired: {}",
+        context(&relay, &run)
+    );
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while relay.tls_completed.load(Ordering::Acquire) == 0 {
+        assert!(
+            run.child.try_wait().expect("poll").is_none(),
+            "the client exited instead of retrying: {}",
+            context(&relay, &run)
+        );
+        assert!(
+            Instant::now() < deadline,
+            "the relay never accepted the certificate: {}",
+            context(&relay, &run)
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        !relay.tls_errors.lock().expect("tls errors").is_empty(),
+        "the relay refused it first: {}",
+        context(&relay, &run)
+    );
+    run.signal("TERM");
+    let (status, _) = run.wait_exit(Instant::now());
+    assert_eq!(status.code(), Some(130), "{}", context(&relay, &run));
+}
+
+/// The device side, genuinely expired: past `notAfter` on this host's clock
+/// too. Terminal, exit `3`, naming the expiry, after one connection.
+#[test]
+fn an_expired_device_certificate_exits_credential_error_without_retrying() {
+    let now = unix_now();
+    let pki = Pki::with_windows("expired", None, Some((now - 172_800, now - 3_600)));
+    let relay = FakeRelay::start(Mode::Tls(server_requiring_devices_of(&pki, &pki)));
+    let profile = profile(
+        &relay.url(),
+        &pki,
+        &pki,
+        "initial_delay_ms = 100\nmax_delay_ms = 200",
+    );
+    let mut run = Run::start(&profile, &[]);
+    let (status, _) = run.wait_exit(run.started);
+    thread::sleep(Duration::from_millis(400));
+    let context = format!(
+        "accepted={} relay_errors={:?} {}",
+        relay.accepted(),
+        relay.tls_errors.lock().expect("tls errors"),
+        run.context()
+    );
+    assert_eq!(status.code(), Some(3), "{context}");
+    let error = run.final_error();
+    assert_eq!(error["code"], "CREDENTIAL_ERROR", "{context}");
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("this device's certificate expired at unix time"),
+        "{context}"
+    );
+    assert!(run.states("backoff").is_empty(), "{context}");
+    assert_eq!(relay.accepted(), 1, "exactly one attempt: {context}");
+}
+
+/// The relay side: its certificate is expired on this host's clock. The
+/// relay's certificate can be renewed and this host's clock can be wrong,
+/// so it is retried, with the reason, not treated as a wrong `server_ca`.
+#[test]
+fn a_relay_certificate_expired_on_this_clock_is_retried() {
+    let now = unix_now();
+    let pki = Pki::with_windows("relay-expired", Some((now - 172_800, now - 3_600)), None);
+    let relay = FakeRelay::start(Mode::Tls(server_without_client_auth(&pki)));
+    let profile = profile(
+        &relay.url(),
+        &pki,
+        &pki,
+        "initial_delay_ms = 100\nmax_delay_ms = 200\nmax_attempts = 2",
+    );
+    let mut run = Run::start(&profile, &[]);
+    let (status, _) = run.wait_exit(run.started);
+    let context = format!("accepted={} {}", relay.accepted(), run.context());
+    assert_eq!(status.code(), Some(4), "{context}");
+    let error = run.final_error();
+    assert_eq!(error["code"], "TRANSPORT_ERROR", "{context}");
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("the relay's certificate is expired on this host's clock"),
+        "{context}"
+    );
+    assert_eq!(run.states("backoff").len(), 2, "{context}");
+    assert_eq!(relay.accepted(), 3, "{context}");
 }

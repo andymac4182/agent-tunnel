@@ -750,6 +750,67 @@ CASES: list[Case] = [
         frozenset({"tests::backoff_grows_is_capped_and_resets_only_after_a_stable_session"}),
     ),
     Case(
+        # Clock skew, device side: the relay sends `certificate_expired` for
+        # a not-yet-valid certificate too.  Treating every such alert as an
+        # expiry makes a few seconds of skew a permanent exit -- the case the
+        # client's own reading of its certificate exists to separate.
+        "a device certificate not yet valid is not treated as expired",
+        [
+            (
+                MAIN,
+                "        Some((_, not_after)) if not_after <= now => CliError {",
+                "        Some((_, _not_after)) => CliError {",
+            )
+        ],
+        frozenset({"a_device_certificate_not_yet_valid_is_retried_until_the_relay_accepts_it"}),
+    ),
+    Case(
+        # The other side: an expired device certificate retried forever,
+        # when no retry can fix it and the tester needs to see the error.
+        "an expired device certificate is terminal",
+        [
+            (
+                MAIN,
+                "        Some((_, not_after)) if not_after <= now => CliError {",
+                "        Some((_, not_after)) if false && not_after <= now => CliError {",
+            )
+        ],
+        frozenset({"an_expired_device_certificate_exits_credential_error_without_retrying"}),
+    ),
+    Case(
+        # The alert itself classified terminal in the library: both the
+        # skewed and the expired certificate exit 3 with the library's
+        # reason, and the not-yet-valid one is never retried.
+        "a certificate_expired alert is not terminal by itself",
+        [
+            (
+                LIB,
+                "            Alert::CertificateExpired => Some(TlsFailure::NotCurrent {\n                scope: DEVICE_CERTIFICATE_NOT_CURRENT_SCOPE,\n                detail:",
+                "            Alert::CertificateExpired => Some(TlsFailure::Refused(\"defeated\")), Alert::Unknown(u8::MAX) => Some(TlsFailure::NotCurrent {\n                scope: DEVICE_CERTIFICATE_NOT_CURRENT_SCOPE,\n                detail:",
+            )
+        ],
+        frozenset(
+            {
+                "a_device_certificate_not_yet_valid_is_retried_until_the_relay_accepts_it",
+                "an_expired_device_certificate_exits_credential_error_without_retrying",
+            }
+        ),
+    ),
+    Case(
+        # A relay certificate expired on this host's clock made terminal:
+        # a relay renewal, or this host's clock being corrected, would then
+        # need someone to restart every device.
+        "a relay certificate that is only out of date is retried",
+        [
+            (
+                LIB,
+                "            Cert::Expired | Cert::ExpiredContext { .. } => relay_not_current(",
+                "            Cert::Expired | Cert::ExpiredContext { .. } => refused(",
+            )
+        ],
+        frozenset({"a_relay_certificate_expired_on_this_clock_is_retried"}),
+    ),
+    Case(
         # The reconnect classification has no fallback arm: a new cause
         # cannot compile until someone decides whether a retry could help.
         # Reported separately and never counted as a red test.

@@ -16,6 +16,13 @@
 //! * `m6c23_connect_started_before_its_relay_backs_off_until_the_relay_appears`
 //!   -- the client starts while nothing listens, backs off at least twice with
 //!   `TRANSPORT_ERROR`, and connects once `serve` starts.
+//! * `m6c23_a_device_certificate_not_yet_valid_is_retried_until_it_is` --
+//!   clock skew: a device certificate re-issued with `notBefore` 20 s ahead is
+//!   refused by `serve`'s TLS verifier with `certificate_expired`, retried,
+//!   and accepted once valid.
+//! * `m6c23_an_expired_device_certificate_exits_three_without_retrying` -- the
+//!   same alert for a certificate past `notAfter` on the client's clock too:
+//!   exit `3`, no backoff.
 //!
 //! Every step asserts on the client's `--json` events and on a real echo
 //! through the relay, and each run prints `m6c23-reconnect ok ...` only after
@@ -407,6 +414,9 @@ struct Deployment {
     issuer_key: jsonwebtoken::EncodingKey,
     subject: String,
     echo_path: String,
+    /// What re-issuing the device certificate needs: the CSR, the device CA
+    /// and its key, the extensions file, and the path the profile reads.
+    reissue: Reissue,
     _namespace: NamespaceGuard,
     _workdir: Workdir,
 }
@@ -591,6 +601,13 @@ impl Deployment {
             issuer_key,
             subject,
             echo_path: format!("/v1/devices/{device}/services/{service}/echo"),
+            reissue: Reissue {
+                csr: work.join("device/device.csr"),
+                ca: device_ca,
+                ca_key: device_ca_key,
+                extensions,
+                installed: work.join("device/credentials/device-cert-chain.pem"),
+            },
             _namespace: namespace_guard,
             _workdir: dir,
         }
@@ -698,6 +715,52 @@ impl Deployment {
     }
 }
 
+struct Reissue {
+    csr: PathBuf,
+    ca: PathBuf,
+    ca_key: PathBuf,
+    extensions: PathBuf,
+    installed: PathBuf,
+}
+
+impl Deployment {
+    /// The issuer re-signs the same CSR (same key, so the catalog's SPKI
+    /// still matches) with the validity window `[not_before, not_after]`,
+    /// unix seconds, and it replaces the certificate the profile reads.
+    fn reissue_device_certificate(&self, not_before: i64, not_after: i64) {
+        let stamp = |unix: i64| {
+            chrono::DateTime::from_timestamp(unix, 0)
+                .expect("representable time")
+                .format("%Y%m%d%H%M%SZ")
+                .to_string()
+        };
+        let issued = self.reissue.installed.with_extension("reissued.pem");
+        step(
+            "re-issue the device certificate (openssl x509 -req -not_before -not_after)",
+            Command::new("openssl")
+                .args(["x509", "-req", "-in"])
+                .arg(&self.reissue.csr)
+                .arg("-CA")
+                .arg(&self.reissue.ca)
+                .arg("-CAkey")
+                .arg(&self.reissue.ca_key)
+                .args(["-CAcreateserial", "-not_before"])
+                .arg(stamp(not_before))
+                .arg("-not_after")
+                .arg(stamp(not_after))
+                .arg("-extfile")
+                .arg(&self.reissue.extensions)
+                .arg("-out")
+                .arg(&issued),
+        );
+        fs::copy(&issued, &self.reissue.installed).expect("install re-issued certificate");
+    }
+}
+
+fn unix_now() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+
 /// A running `tunnel-client connect --json` and its timestamped events.
 struct Client {
     process: Running,
@@ -759,6 +822,23 @@ impl Client {
             assert!(
                 Instant::now() < deadline,
                 "step {step_name}: fewer than {count} `{state}` events within {within:?}: {}",
+                self.context()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Wait for the process to exit by itself.
+    fn wait_exit(&mut self, step_name: &str) -> std::process::ExitStatus {
+        let deadline = Instant::now() + STEP_DEADLINE;
+        loop {
+            if let Some(exit) = self.process.0.try_wait().expect("poll client") {
+                std::thread::sleep(Duration::from_millis(100));
+                return exit;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "step {step_name}: the client did not exit: {}",
                 self.context()
             );
             std::thread::sleep(Duration::from_millis(20));
@@ -951,5 +1031,80 @@ async fn m6c23_connect_started_before_its_relay_backs_off_until_the_relay_appear
         deployment.nonce,
         backoffs.len(),
         waited.as_millis()
+    );
+}
+
+/// Clock skew against a real relay: a device certificate whose `notBefore`
+/// is 20 s ahead is refused by `serve`'s TLS verifier with
+/// `certificate_expired` -- the same alert as a genuinely expired one. The
+/// client, reading its own certificate, finds it not yet valid, retries with
+/// a message naming the clock, and connects once it is valid.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires TEST_REDIS_URL and TUNNEL_CLIENT_BIN; run by scripts/m6-reconnect-verify.sh"]
+async fn m6c23_a_device_certificate_not_yet_valid_is_retried_until_it_is() {
+    let deployment = Deployment::provision("not-yet-valid").await;
+    let valid_from = unix_now() + 20;
+    deployment.reissue_device_certificate(valid_from, valid_from + 86_400);
+    let relay = deployment.serve("serve");
+    let mut client = deployment.connect();
+    let refused = client.wait_for("refused while not yet valid", "disconnected", 1);
+    let first = &refused[0].1["result"];
+    assert_eq!(first["code"], "TRANSPORT_ERROR", "{first}");
+    let message = first["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("as expired or not yet valid on the relay's clock")
+            && message.contains("not valid until unix time"),
+        "the relay's alert, and the client's own reading of its certificate: {first}"
+    );
+    let ready = client.wait_for_within("connect once valid", "ready", 1, Duration::from_secs(60));
+    let ready_at = unix_now();
+    assert!(
+        ready_at >= valid_from,
+        "a session before the certificate was valid: {}",
+        client.context()
+    );
+    let backoffs = client.states("backoff").len();
+    deployment.echo("echo", &client).await;
+    client.stop();
+    drop(relay);
+    println!(
+        "m6c23-reconnect ok label=not-yet-valid nonce={} session={} backoffs_before_valid={backoffs} \
+         ready_after_not_before_s={}",
+        deployment.nonce,
+        session_id(&ready[0].1),
+        ready_at - valid_from
+    );
+}
+
+/// A genuinely expired device certificate against a real relay: the same
+/// alert, but past `notAfter` on the client's clock too, so terminal --
+/// exit `3`, `CREDENTIAL_ERROR` naming the expiry, no backoff.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires TEST_REDIS_URL and TUNNEL_CLIENT_BIN; run by scripts/m6-reconnect-verify.sh"]
+async fn m6c23_an_expired_device_certificate_exits_three_without_retrying() {
+    let deployment = Deployment::provision("expired").await;
+    let now = unix_now();
+    deployment.reissue_device_certificate(now - 172_800, now - 3_600);
+    let relay = deployment.serve("serve");
+    let mut client = deployment.connect();
+    let exit = client.wait_exit("expired certificate");
+    let events: Vec<Value> = client
+        .events()
+        .into_iter()
+        .map(|(_, event)| event)
+        .collect();
+    let last = events.last().cloned().unwrap_or(Value::Null);
+    assert_eq!(exit.code(), Some(3), "{events:?}");
+    assert_eq!(last["error"]["code"], "CREDENTIAL_ERROR", "{events:?}");
+    let message = last["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("this device's certificate expired at unix time"),
+        "{events:?}"
+    );
+    assert!(client.states("backoff").is_empty(), "{events:?}");
+    drop(relay);
+    println!(
+        "m6c23-reconnect ok label=expired nonce={} exit=3 code=CREDENTIAL_ERROR backoffs=0",
+        deployment.nonce
     );
 }
