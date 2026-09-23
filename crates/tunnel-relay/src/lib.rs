@@ -22,6 +22,7 @@ mod peer_consumer_transport_diagnostics;
 pub mod peer_fault_diagnostics;
 pub mod peer_runtime;
 mod peer_transport_diagnostics;
+pub mod provisioning;
 pub mod recovery;
 pub mod redis_connection;
 pub mod routing;

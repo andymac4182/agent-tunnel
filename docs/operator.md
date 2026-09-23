@@ -1,9 +1,11 @@
 # Operator guide (private alpha)
 
 Status: written for task row M6-02 on 2026-09-23 against `origin/main` at
-`dd12b1c`. This is the guide an outside tester follows first. It covers what to
-download and verify, device credentials, relay configuration, readiness, and
-the diagnostics the binaries have today. **Where the alpha cannot do something,
+`dd12b1c`; section 2.3 (catalog provisioning and first incarnation activation)
+added for task row M6-C21 on 2026-09-23 against `0da55ac`. This is the guide
+an outside tester follows first. It covers what to download and verify, device
+credentials, catalog provisioning, relay configuration, readiness, and the
+diagnostics the binaries have today. **Where the alpha cannot do something,
 this guide says "not supported in this alpha" and names the task row, instead of
 describing a procedure the code does not have.**
 
@@ -33,12 +35,16 @@ below checks a real download. Run against an unpacked directory, it has to
 build an archive and a checksum itself, and it says in its output that the
 first step then could not have failed for a real download's reason.
 
-Commands marked **shape-only** need a provisioned Redis authority or a live
-relay, so the check cannot run them. Only four may be marked that way:
-`tunnel-relay serve`, `tunnel-client connect`, `tunnel-relay recovery-observe`
-and `tunnel-relay recover`. It checks only that the real binary accepts
-the documented subcommand and flags; **their runtime behaviour is not checked by
-this guide.**
+Commands marked **shape-only** need a live Redis authority or a live relay,
+so the check cannot run them. Only six may be marked that way:
+`tunnel-relay serve`, `tunnel-client connect`, `tunnel-relay recovery-observe`,
+`tunnel-relay recover`, and the two provisioning commands that write Redis,
+`tunnel-relay activate-first-incarnation` and `tunnel-relay provision-catalog`
+(never with `--dry-run`, which contacts no Redis and is executed below). It
+checks only that the real binary accepts the documented subcommand and flags;
+**their runtime behaviour is not checked by this guide.** The two provisioning
+commands, `serve` and `connect` are instead run end to end, against a real
+Redis, by `scripts/m6-provisioning-verify.sh` (section 2.3).
 
 The same check also compares the client exit-code table in
 [runtime.md](runtime.md#client-exit-codes) with the `Cause` mapping in
@@ -46,16 +52,19 @@ The same check also compares the client exit-code table in
 
 ## What the alpha can and cannot do today
 
-Read this first. An outside tester cannot bring up a working relay and device
-from the release bundle alone:
+Read this first. With the release bundle, a Redis server that speaks TLS, an
+identity issuer and a certificate issuer, an outside tester can bring up **one
+relay and one device** and run the synthetic echo through them (sections 2
+and 3). Anything larger is not supported yet:
 
 | Capability | State in this alpha | Row |
 | --- | --- | --- |
 | Download, checksum, provenance and licence notices | Supported for `aarch64-apple-darwin` only | M6-01, M6-C13 |
 | Device key, CSR, certificate import, local `doctor` | Supported | — |
 | Relay and cluster configuration dry runs, local state initialization | Supported | — |
-| Creating tenants, users, devices, credential records and grants in the Redis catalog | **Not supported in this alpha**: no shipped command writes them | M6-C21 |
-| First activation of a deployment incarnation in a new Redis namespace | **Not supported in this alpha** | M6-C21 |
+| Creating one tenant, user, device, credential record, service and grant in the Redis catalog | Supported, once per namespace, with `tunnel-relay provision-catalog` (section 2.3) | M6-C21 |
+| First activation of a deployment incarnation in a new Redis namespace | Supported with `tunnel-relay activate-first-incarnation` (section 2.3) | M6-C21 |
+| Adding, changing or revoking records after the first provisioning (more devices, users, grants) | **Not supported in this alpha**: no shipped command writes them | M6-C31 |
 | Cluster membership publishing and the HTTPS checkpoint authority | **Not supported in this alpha**: a cluster relay needs both and neither is shipped | M6-C22 |
 | Service installation (systemd, launchd, Windows service) | **Not supported in this alpha** | M6-C23 |
 | In-place upgrade, supervisor IPC, `status` | **Not supported in this alpha** | M6-C23, M6-06 |
@@ -135,15 +144,28 @@ above cover it (M6-C11, M6-01).
 
 ## 2. Credential provisioning
 
-Four kinds of credential are involved. Only the first can be provisioned with
-the shipped binaries.
+Four kinds of credential are involved. The device credential and the catalog
+records that authorize it can be provisioned with the shipped binaries; the
+relay's listener identities and the Redis credentials are files you supply.
 
 ### 2.1 Device credentials
 
 The device creates its private key locally and never sends it anywhere. Your
 issuer signs a certificate signing request (CSR), and the client imports the
 certificate only if it matches the pending key. Start from the example profile.
-Relative paths in a profile resolve from the profile's own directory:
+Relative paths in a profile resolve from the profile's own directory.
+
+**Three values in the profile must match the catalog records of section 2.3,
+or the relay will not serve the device:** `device_id` is the catalog device
+UUID (the relay refuses anything else), the certificate must carry the URI SAN
+`urn:agent-tunnel:device:<that UUID>`, and each `[exports."<id>"]` table is
+named by the catalog service UUID. The example profile and
+`examples/m6-catalog.toml` share synthetic placeholder UUIDs; generate your own
+with `uuidgen` and change both files together. Before M6-C30 the example
+profile used `m1-device-a` and an export named `echo`, and could never be
+served. A mismatch is hard to diagnose: a wrong `device_id` makes `connect`
+exit with only `TRANSPORT_ERROR` "control read failed" (M6-C32), and a wrong
+export name makes every call fail with `DEVICE_REJECTED`:
 
 ```console
 $ mkdir trial
@@ -170,17 +192,21 @@ exit=3
 **Signing is your issuer's job; the project ships no certificate authority.**
 The next four commands stand in for an issuer so this rehearsal can finish on
 one machine. They create a throwaway, synthetic CA that is valid for two days.
-Do not use it for anything else. The certificate must be X.509 v3, which is why
-the extensions file is there. A v1 certificate is refused on import with a
-message that wrongly blames a key mismatch (M6-C25):
+Do not use it for anything else. The certificate must be X.509 v3 and carry the
+device's role SAN, which is why the extensions file is there. A v1 certificate
+is refused on import with a message that wrongly blames a key mismatch
+(M6-C25). A certificate without the SAN imports cleanly, but the relay's
+device listener cannot parse a device identity from it (read from the source);
+`provision-catalog` refuses such a certificate before anything is written
+(section 2.3):
 
 ```console
 $ mkdir -m 700 trial-ca
 $ openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj "/CN=Synthetic trial CA" -keyout trial-ca/ca-key.pem -out trial-ca/ca.pem
-$ printf 'basicConstraints=CA:FALSE\nkeyUsage=digitalSignature\nextendedKeyUsage=clientAuth\n' > trial-ca/device-ext.cnf
+$ printf 'basicConstraints=CA:FALSE\nkeyUsage=digitalSignature\nextendedKeyUsage=clientAuth\nsubjectAltName=URI:urn:agent-tunnel:device:33333333-3333-4333-8333-333333333333\n' > trial-ca/device-ext.cnf
 $ openssl x509 -req -in trial/device.csr -CA trial-ca/ca.pem -CAkey trial-ca/ca-key.pem -CAcreateserial -days 1 -extfile trial-ca/device-ext.cnf -out trial/device-cert.pem
 $ openssl x509 -in trial/device-cert.pem -noout -subject
-...device/m1-device-a
+...device/33333333-3333-4333-8333-333333333333
 ```
 
 Import the signed certificate with the CA bundle that the device should trust
@@ -198,9 +224,9 @@ exit=0
 
 A healthy local `doctor` does **not** mean the relay will admit the device. The
 relay also needs the device's CA in its `device_tls_client_ca` file, and a
-matching device and credential record in the Redis catalog. No shipped command
-creates that record (section 2.3). Certificate renewal and self-service
-enrollment are not implemented (`credentials renew` and `enroll` in
+matching device and credential record in the Redis catalog, which section 2.3
+creates. Certificate renewal and self-service enrollment are not implemented
+(`credentials renew` and `enroll` in
 [runtime.md](runtime.md#proposed-cli-surface)).
 
 ### 2.2 Relay listener identities
@@ -221,17 +247,79 @@ Keep private keys owner-only and outside source control. Use separate CAs for
 server identity, device clients and cluster peers
 ([runtime.md](runtime.md#device-authentication-contract)).
 
-### 2.3 Tenant-scoped authorization
+### 2.3 Tenant-scoped authorization and the first incarnation
 
 Tenants, users, devices, device credential registrations, services and grants
 are records in the Redis catalog ([cluster.md](cluster.md#decisions-and-deployment-boundary)).
-**Creating them is not supported in this alpha.** The only code that writes
-them is the test harness's fixture seeding, which is not in the bundle. The
-same is true of the first activation of a deployment incarnation in an empty
-namespace: `serve` refuses to start without it (derived from the catalog's
-startup check, not measured here). This is M6-C21, and it is
-the main reason an outside tester cannot yet run an end-to-end tunnel from the
-bundle.
+`serve` refuses to start on a namespace until a deployment incarnation has been
+activated there: it exits `1` with `Redis catalog connection failed;
+stage=authority_identity`. Two `tunnel-relay` commands bring an **empty**
+namespace to the point where one relay serves one device (task row M6-C21).
+Both read the relay's own serving configuration, so they reach Redis exactly as
+`serve` will: the same `redis_url`, TLS files, `redis_namespace` and
+`deployment_incarnation`, and the user's identity is bound to its
+`oidc_issuer`.
+
+The records are one TOML document: one tenant, one user with the `sub` claim
+your identity issuer gives them, one device and its certificate, one service,
+and one grant. `examples/m6-catalog.toml` is a complete example whose UUIDs
+match the example client profile. Put it beside the device certificate, because
+its `certificate` path is relative to the document. Then dry-run it. The dry run
+reads the relay configuration, the records and the certificate, applies every
+rule the write applies, and contacts no Redis. It derives the credential's
+SPKI pin and validity from the certificate with the parser the relay's device
+listener uses, and refuses a certificate whose role SAN does not name
+`device.id`:
+
+```console
+$ cp examples/m6-catalog.toml trial/catalog.toml
+$ tunnel-relay provision-catalog --config examples/m1-relay.toml --records trial/catalog.toml --dry-run
+Provisioning records are valid for namespace agent-tunnel-m1: tenant=11111111-1111-4111-8111-111111111111 user=22222222-2222-4222-8222-222222222222 device=33333333-3333-4333-8333-333333333333 credential=... service=44444444-4444-4444-8444-444444444444 spki_sha256=... grant_operations=echo:invoke. This dry run contacted no Redis authority and wrote nothing.
+```
+
+Then, against your Redis, activate the relay's incarnation and write the
+records, in that order. **Do not start `serve` until `provision-catalog` has
+succeeded.** Provisioning refuses a namespace holding any key other than the
+incarnation binding, and nothing shipped removes a key a relay has written, so
+a relay started between the two commands can leave the namespace
+unprovisionable (M6-C34); if that happens, choose a new `redis_namespace` and
+start again. **Shape-only:** both write Redis, which this guide's
+check does not have. `scripts/m6-provisioning-verify.sh` runs them, `serve`,
+`connect` and an echo end to end with these binaries and the two examples
+against a real Redis:
+
+```sh shape-only
+tunnel-relay activate-first-incarnation --config /etc/agent-tunnel/relay.toml
+tunnel-relay provision-catalog --config /etc/agent-tunnel/relay.toml --records /etc/agent-tunnel/catalog.toml
+```
+
+`activate-first-incarnation` prints `Activated deployment incarnation ... as the
+first incarnation of namespace ...`. It refuses a namespace that holds any key
+at all, including one that already has an incarnation: changing an
+incarnation is recovery's job (section 4), and this command cannot be used to
+skip it. `provision-catalog` prints `Provisioned namespace ...` with the
+identifiers it wrote. It refuses a namespace without an active incarnation,
+and it runs **once** per namespace: a second run, or a run after a partial
+failure, is refused, and a namespace left partly written is discarded, not
+repaired. Choose a new `redis_namespace` and start again. No identifier it
+prints is secret; it prints no certificate, key or token.
+
+The activation also binds the namespace to the Redis server's run id. A Redis
+restart that loses the run (no persistence, or a restore) makes `serve` refuse
+again, and the way back is recovery, not a second activation.
+
+Once `serve` and `connect` are running (section 3.1), a consumer calls
+`POST /v1/devices/<device.id>/services/<service.id>/echo` on the consumer
+listener with `Authorization: Bearer <token>`. The token must be issued by
+`oidc_issuer` for one of `oidc_audience`, carry `sub` equal to `oidc_subject`,
+and have `echo:invoke` in its `scope`. The reply is the export's
+`device_canary` followed by the request body.
+
+**Not supported in this alpha:** anything after the first provisioning. There
+is no shipped command to add a second device, user or grant, to change a
+grant, or to revoke a device or credential (M6-C31); the catalog library has
+the revocation and grant operations, but no command exposes them. A cluster
+also needs the authorities in section 3.3 (M6-C22).
 
 ### 2.4 Redis credentials
 
@@ -264,7 +352,8 @@ exit=1
 
 The relay exits `0` or `1` only. It does not use the client's exit-code table.
 Then start it. **Shape-only:** this command needs your provisioned files and a
-provisioned Redis namespace (section 2.3):
+provisioned Redis namespace (section 2.3). `scripts/m6-provisioning-verify.sh`
+runs it end to end:
 
 ```sh shape-only
 tunnel-relay serve --config /etc/agent-tunnel/relay.toml
