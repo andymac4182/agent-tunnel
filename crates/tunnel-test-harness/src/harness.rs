@@ -486,6 +486,7 @@ impl Harness {
             mcp_services,
             acp_services,
             fs_services,
+            device_send_buffer_bytes: None,
         })
     }
 }
@@ -517,6 +518,10 @@ pub struct RunningHarness {
     pub acp_services: Vec<AcpServiceFixture>,
     /// The seeded filesystem services, when requested.
     pub fs_services: Vec<FsServiceFixture>,
+    /// A test-only send-buffer request applied to every accepted device
+    /// socket of production cluster relays started from this harness. `None`
+    /// keeps the operating-system default, as production does.
+    pub(crate) device_send_buffer_bytes: Option<u32>,
 }
 
 /// One seeded filesystem service and the grant operations it carries.

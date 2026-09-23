@@ -217,6 +217,12 @@ const MIN_SATURATION_HEADROOM_BYTES: usize = EXPECTED_QUEUE_BYTES_LIMIT / 4;
 /// the owner's physical writer blocks after bounded absorption.
 const PAUSED_TARGET_RECEIVE_BUFFER_BYTES: u32 = 1_024;
 
+/// The send buffer requested on every relay's accepted device sockets for
+/// this gate: a small request (the transport accepts 1 KiB to 1 MiB), so the kernel can
+/// absorb about one 20 KB record on the blackholed carrier rather than the
+/// many an autotuned Linux buffer holds.
+pub(super) const DEVICE_SEND_BUFFER_BYTES: u32 = 4_096;
+
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const SATURATION_TIMEOUT: Duration = Duration::from_secs(8);
 const ADMISSION_TIMEOUT: Duration = Duration::from_secs(5);

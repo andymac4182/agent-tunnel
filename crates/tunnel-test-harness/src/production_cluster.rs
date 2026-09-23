@@ -952,6 +952,13 @@ pub async fn verify_queue_saturation() -> Result<QueueSaturationEvidence> {
         .map_err(|_| {
             HarnessError::Timeout("queue saturation harness startup timed out".into())
         })??;
+    // Pin the relays' device-socket send buffer, as the stall gate pins the
+    // consumer's (M7-C101). The gate's floor is on frames resident in the
+    // relay's bounded data channel, and resident plus kernel-absorbed equals
+    // the admitted workload; Linux autotunes the relay's send buffer large
+    // enough to absorb over half of it, which failed the floor about two runs
+    // in five. The floor itself is unchanged.
+    harness.device_send_buffer_bytes = Some(queue_saturation::DEVICE_SEND_BUFFER_BYTES);
     let mut cluster = match ProductionCluster::start(&mut harness).await {
         Ok(cluster) => cluster,
         Err(error) => {
@@ -5845,6 +5852,10 @@ async fn start_relay(
                 consumer: AcceptedSocketOptions {
                     send_buffer_bytes: consumer_send_buffer_bytes,
                     diagnostics: consumer_socket_diagnostics.clone(),
+                },
+                device: AcceptedSocketOptions {
+                    send_buffer_bytes: harness.device_send_buffer_bytes,
+                    diagnostics: None,
                 },
                 consumer_upgrade_barrier,
                 consumer_peer_admission_barrier,

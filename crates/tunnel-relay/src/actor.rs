@@ -14546,6 +14546,11 @@ pub struct Relay;
 pub struct ListenerSocketOptions {
     /// Options applied to each accepted public consumer TCP socket.
     pub consumer: tunnel_transport::AcceptedSocketOptions,
+    /// Options applied to each accepted device TCP socket. Empty in
+    /// production; the queue-saturation harness gate pins the send buffer so
+    /// the kernel's autotuned buffer (large on Linux) cannot absorb frames
+    /// the bounded data channel is meant to hold (task row M7-C101).
+    pub device: tunnel_transport::AcceptedSocketOptions,
     /// Optional one-shot fixture gate after authenticated consumer admission
     /// and before Axum constructs the public WebSocket upgrade response.
     pub consumer_upgrade_barrier: Option<Arc<crate::http::ConsumerUpgradeBarrier>>,
@@ -14792,6 +14797,7 @@ impl Relay {
         let consumer_cancel = cancel.child_token();
         let device_cancel = cancel.child_token();
         let consumer_socket_options = listener_options.consumer;
+        let device_socket_options = listener_options.device;
         let consumer_task = spawn_transport_listener(cancel.clone(), async move {
             tunnel_transport::serve_with_socket_options(
                 consumer_listener,
@@ -14803,7 +14809,14 @@ impl Relay {
             .await
         });
         let device_task = spawn_transport_listener(cancel.clone(), async move {
-            tunnel_transport::serve(device_listener, device_router, device_tls, device_cancel).await
+            tunnel_transport::serve_with_socket_options(
+                device_listener,
+                device_router,
+                device_tls,
+                device_cancel,
+                device_socket_options,
+            )
+            .await
         });
         Ok(RunningRelay {
             handle,
