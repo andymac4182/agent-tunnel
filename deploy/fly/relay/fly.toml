@@ -18,7 +18,7 @@ primary_region = "syd"         # EDIT; keep the Redis app in the same region
 
 # serve drains on SIGTERM and exits 0 (docs/operator.md section 4). Its drain
 # has no deadline of its own, so this is the bound: after it Fly kills the VM.
-# The local proof measured the drain with one connected device (M6-C60).
+# The local proof measured the drain with one connected device (M6-C70).
 kill_signal = "SIGTERM"
 kill_timeout = 60
 

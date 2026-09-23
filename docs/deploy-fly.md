@@ -1,6 +1,6 @@
 # Deploying one relay on Fly.io (private alpha)
 
-Status: written for task row M6-C60 on 2026-09-23 against `origin/main` at
+Status: written for task row M6-C70 on 2026-09-23 against `origin/main` at
 `496396e`, with flyctl `v0.4.106`. **Nothing here has been run against Fly.**
 The images, the configuration and the provisioning path were proved locally
 with Docker (section 7). Every `fly` command below is one the owner runs, in
@@ -71,7 +71,7 @@ The decisions, and what each rests on:
   its public host). The device service has a bare TCP check; the local proof
   measured that a bare connect adds no relay log line. **`/readyz` does not
   cover Redis on a non-cluster relay:** it stays `200` while Redis is down or
-  has restarted, and every request then fails `503` (measured, M6-C61).
+  has restarted, and every request then fails `503` (measured, M6-C67).
 - **Stopping.** `kill_signal = "SIGTERM"`, `kill_timeout = 60`. Fly's default
   signal is SIGINT and its default timeout 5 s, at most 300 s
   (<https://fly.io/docs/reference/configuration/>). `serve` handles both
@@ -140,7 +140,7 @@ restart exits `1` with `Redis catalog connection failed; stage=authority_identit
 even though AOF kept all 24 keys. On Fly a machine restarts on host
 maintenance, on a `fly deploy` of the Redis app, and on a crash, so **every one
 of those is an outage** that ends with section 6.4, a new namespace and a
-re-provisioning (M6-C62).
+re-provisioning (M6-C65).
 
 ## 2. Before you start
 
@@ -341,17 +341,30 @@ of the relay app. The machine gets the app's secrets and reaches Redis over
 the private network, and it has no services, so nothing public reaches it.
 
 **`fly machine run` returns once the machine has started, not when it has
-finished.** So each step is four commands: run it detached, wait for the
-machine to stop, read its log and exit status, then destroy it. Do not start a
-step until the one before it has printed its success line. `$ID` is the
-machine ID that `fly machine run` prints.
+finished.** So each step runs the machine detached under a fixed name, finds
+its ID by that name, waits for it to stop, reads its log and exit status, and
+destroys it. Do not start a step until the one before it has printed its
+success line.
+
+**Everything after `--` is the relay's command line.** Without it, flyctl
+reads the relay's own flags (`--dry-run`) as its own and refuses them with
+`Error: unknown flag` before creating anything. The `mid` helper needs `jq`;
+if it prints `STOP`, do not go on: `fly logs --machine ""` waits forever.
+Machine names must be unique in the app, so destroy each step's machine before
+reusing its name.
 
 ```text
 cd ~/agentuplink-fly
 IMAGE=registry.fly.io/agentuplink-relay:fly-1
+mid() {
+  ID=$(fly machine list -a agentuplink-relay --json | jq -r --arg n "$1" '.[] | select(.name == $n) | .id')
+  if [ -n "$ID" ]; then echo "ID=$ID"; else echo "STOP: no machine named $1"; fi
+}
 
 # Step 1, validates only and writes nothing.
-fly machine run $IMAGE check-serve-config -a agentuplink-relay -r syd --restart no --detach
+fly machine run $IMAGE --name step1 -a agentuplink-relay -r syd --restart no --detach \
+  -- check-serve-config
+mid step1
 fly machine wait $ID -a agentuplink-relay --state stopped
 fly logs -a agentuplink-relay --machine $ID --no-tail
 fly machine status $ID -a agentuplink-relay
@@ -365,10 +378,11 @@ same configuration without contacting Redis:
 
 ```text
 # Step 2, validates the records only and writes nothing.
-fly machine run $IMAGE provision-catalog /tmp/provision/catalog.toml --dry-run \
-  -a agentuplink-relay -r syd --restart no --detach \
+fly machine run $IMAGE --name step2 -a agentuplink-relay -r syd --restart no --detach \
   --file-local /tmp/provision/catalog.toml=catalog.toml \
-  --file-local /tmp/provision/device-cert.pem=device-cert.pem
+  --file-local /tmp/provision/device-cert.pem=device-cert.pem \
+  -- provision-catalog /tmp/provision/catalog.toml --dry-run
+mid step2
 fly machine wait $ID -a agentuplink-relay --state stopped
 fly logs -a agentuplink-relay --machine $ID --no-tail
 fly machine destroy $ID -a agentuplink-relay
@@ -380,7 +394,9 @@ Steps 3 and 4 write Redis, in this order:
 
 ```text
 # Step 3, writes the incarnation.
-fly machine run $IMAGE activate-first-incarnation -a agentuplink-relay -r syd --restart no --detach
+fly machine run $IMAGE --name step3 -a agentuplink-relay -r syd --restart no --detach \
+  -- activate-first-incarnation
+mid step3
 fly machine wait $ID -a agentuplink-relay --state stopped
 fly logs -a agentuplink-relay --machine $ID --no-tail
 fly machine status $ID -a agentuplink-relay
@@ -392,10 +408,11 @@ incarnation of namespace <namespace>.`
 
 ```text
 # Step 4, writes the catalog records.
-fly machine run $IMAGE provision-catalog /tmp/provision/catalog.toml \
-  -a agentuplink-relay -r syd --restart no --detach \
+fly machine run $IMAGE --name step4 -a agentuplink-relay -r syd --restart no --detach \
   --file-local /tmp/provision/catalog.toml=catalog.toml \
-  --file-local /tmp/provision/device-cert.pem=device-cert.pem
+  --file-local /tmp/provision/device-cert.pem=device-cert.pem \
+  -- provision-catalog /tmp/provision/catalog.toml
+mid step4
 fly machine wait $ID -a agentuplink-relay --state stopped
 fly logs -a agentuplink-relay --machine $ID --no-tail
 fly machine status $ID -a agentuplink-relay
@@ -415,6 +432,7 @@ exits `1` on failure. Read the message before running anything again:
 | 1, 2 | any | Yes. Neither contacts Redis. Fix `relay.toml` (then rebuild, section 6.1) or the records, and run it again. |
 | any | the entrypoint names a missing or invalid secret | Yes. Nothing ran. Fix the secret with `fly secrets import --stage` and run it again. |
 | 3 | fails connecting to Redis (a `stage=` other than a conflict) | Yes. Activation is one Lua script that checks the namespace is empty and writes both keys together, so it wrote all or nothing. |
+| 3 | `Redis catalog connection failed; stage=authority_connection` | Yes. On this path every connection failure prints this one stage, before the activation script runs: an unresolvable name, a TLS verification failure and a wrong password all print it (measured locally, M6-C71), and a refused or timed-out connection takes the same path in the code. Nothing was written. Find which one it is with section 6.2.1 before retrying. |
 | 3 | "namespace already has a deployment incarnation" | Do not repeat. If an earlier run of step 3 printed its success line, or its outcome is unknown and this is the rerun, the incarnation is written: go on to step 4. Otherwise the namespace was used before: choose a new one (section 6.4). |
 | 3 | "namespace is not empty" | No. Choose a new namespace. |
 | 4 | fails connecting to Redis, or at `stage=authority_identity` because step 3 has not succeeded | Yes. `provision-catalog` makes the same connection and incarnation check as `serve` before it writes anything (`crates/tunnel-relay/src/provisioning.rs`, `provision_catalog`). |
@@ -426,6 +444,59 @@ Stopping a step's machine part-way is also covered by the binary: a writing
 command finishes its current bounded Redis step on the first stop signal and
 exits with its own outcome; a second signal abandons it with exit `130`, and
 the namespace must then be treated as partial ([operator.md section 2.3](operator.md#23-tenant-scoped-authorization-and-the-first-incarnation)).
+
+#### 6.2.1 When step 3 or 4 cannot reach Redis
+
+The relay's own message does not say why (M6-C71, M6-C59). Two checks do,
+without changing anything that step 3 or 4 wrote.
+
+**What Redis saw**, read on the Redis machine; this does not restart it. Open
+a shell there, then run the second line inside it (it reads the password from
+Redis's own configuration, so it never appears on a command line):
+
+```text
+fly ssh console -a agentuplink-redis
+REDISCLI_AUTH=$(sed -n "s/^requirepass //p" /run/agentuplink-redis/redis.conf) redis-cli --tls --insecure --no-auth-warning INFO stats | grep -E "^(total_connections_received|acl_access_denied_auth):"
+```
+
+Then, back on the Mac, `fly logs -a agentuplink-redis --no-tail`.
+
+Measured locally against this image: `acl_access_denied_auth` goes up by one
+for each attempt with a wrong password. `total_connections_received` counts
+only connections that completed TLS: a correct relay attempt adds about seven
+(its main connection and lanes), a wrong password adds one, and a bare TCP
+connect (the health check) or a failed TLS handshake adds none. A TLS
+verification failure appears in the Redis log as `Error accepting a client
+connection: ... alert unknown ca`; an unresolvable name or a connection that
+never arrives leaves no trace in either.
+
+**What the relay's secrets can do**, from a one-off machine in the relay app
+using the Redis image (it has `redis-cli`), with the relay's own
+`AT_REDIS_URL` and `AT_REDIS_CA_B64`. **Costs money: a few seconds of a
+machine.** It prints the host, the password's length and never its value, how
+long the name took to resolve, then a `PING` and Redis's `run_id`:
+
+```text
+fly machine run redis:8.4.0-alpine@sha256:4eec4565e45aa0b3966554c866bc73211e281b0b3d89fe9a33c982e6faca809d --name probe -a agentuplink-relay -r syd --restart no --detach \
+  --entrypoint sh -- -c 'printf %s "$AT_REDIS_CA_B64" | base64 -d > /tmp/ca.pem; rest="${AT_REDIS_URL#rediss://}"; creds="${rest%%@*}"; export REDISCLI_AUTH="${creds#:}"; hostport="${rest#*@}"; host="${hostport%%:*}"; echo "host=$host password_chars=${#REDISCLI_AUTH}"; time getent hosts "$host"; redis-cli --tls --cacert /tmp/ca.pem --sni "$host" -h "$host" -p 6379 --no-auth-warning PING; redis-cli --tls --cacert /tmp/ca.pem --sni "$host" -h "$host" -p 6379 --no-auth-warning INFO server | grep -E "^(run_id|redis_version):"'
+mid probe
+fly machine wait $ID -a agentuplink-relay --state stopped
+fly logs -a agentuplink-relay --machine $ID --no-tail
+fly machine destroy $ID -a agentuplink-relay
+```
+
+| Probe prints | Meaning |
+| --- | --- |
+| `PONG` and a `run_id` | The relay's secrets, the name and the network are fine; the fault is inside the relay process. Stop and report it. |
+| `AUTH failed: WRONGPASS ...` | `AT_REDIS_URL`'s password is not Redis's `REDIS_PASSWORD`. Re-import the relay's `AT_REDIS_URL` from the same `redis-password.txt` (section 4) and retry step 3. |
+| `SSL_connect failed: certificate verify failed` | `AT_REDIS_CA_B64` is not the CA that signed Redis's certificate. Re-import it and retry. |
+| no address from `getent`, or a long `time` | Name resolution; check the host in `AT_REDIS_URL` against the Redis app's name. |
+
+The first three outputs were produced locally with this probe, with the
+relay's real secrets and a wrong password and a wrong CA substituted (log
+nonce `m6c60-diag-20260923T102308Z-27180`). Every one of these
+failures happens before the activation script runs, so step 3 is safe to
+retry after the fix.
 
 `fly ssh console` is not an option at this point: there is no relay machine
 to connect to, because `serve` refuses to start on a namespace with no
@@ -477,7 +548,7 @@ curl --cacert ~/agentuplink-fly/relay-ca.pem \
 
 The reply is the export's `device_canary` followed by `hello`. `/readyz`
 answering `200` is not enough on its own: a non-cluster relay answers `200`
-even when Redis is unusable (M6-C61), so the echo is the check.
+even when Redis is unusable (M6-C67), so the echo is the check.
 
 ### 6.4 After a Redis restart
 
@@ -486,7 +557,7 @@ to the old one. Restarts happen on Fly host maintenance, on a crash, on any
 `fly deploy` of the Redis app, and on `fly secrets import` for the Redis app
 without `--stage` (which restarts its machine to apply the secret). What you
 will see depends on whether the relay restarts too (all measured locally,
-M6-C61 and M6-C62, except the Fly-side states):
+M6-C67 and M6-C65, except the Fly-side states):
 
 - **The relay keeps running.** `fly machine list -a agentuplink-relay` shows it
   `started`, the `/readyz` check stays passing, and every consumer call fails

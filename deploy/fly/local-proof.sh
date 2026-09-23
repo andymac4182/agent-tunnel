@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Local proof of the Fly.io deployment (docs/deploy-fly.md, task row M6-C60).
+# Local proof of the Fly.io deployment (docs/deploy-fly.md, task row M6-C70).
 #
 #   TUNNEL_CLIENT=/path/to/tunnel-client deploy/fly/local-proof.sh
 #
@@ -202,23 +202,23 @@ cp "$device_dir/device-cert.pem" "$provision/device-cert.pem"
 cat > "$provision/catalog.toml" <<EOF
 [tenant]
 id = "$tenant"
-display_name = "M6-C60 proof tenant"
+display_name = "M6-C70 proof tenant"
 
 [user]
 id = "$user"
-display_name = "M6-C60 proof user"
+display_name = "M6-C70 proof user"
 oidc_subject = "m6c60-user"
 role = "member"
 
 [device]
 id = "$dev"
-display_name = "M6-C60 proof device"
+display_name = "M6-C70 proof device"
 certificate = "device-cert.pem"
 
 [service]
 id = "$svc"
 type = "echo"
-display_name = "M6-C60 proof echo"
+display_name = "M6-C70 proof echo"
 operations = ["echo:invoke"]
 
 [grant]

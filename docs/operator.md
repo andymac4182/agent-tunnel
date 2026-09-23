@@ -70,7 +70,7 @@ and 3). Anything larger is not supported yet:
 | In-place upgrade, supervisor IPC, `status` | **Not supported in this alpha** | M6-C23, M6-06 |
 | Backup and restore of the Redis catalog | Operator's Redis tooling only; restore goes through the recovery commands, which need an external signing authority that is not shipped | M6-C22 |
 | Metrics endpoint and audit log | **Not supported in this alpha** | M6-C24 |
-| One relay and its Redis on Fly.io | Dockerfiles, `fly.toml` files, a runbook and a cost list in [deploy-fly.md](deploy-fly.md), proved with Docker on one machine; **not yet run on Fly** | M6-C60 |
+| One relay and its Redis on Fly.io | Dockerfiles, `fly.toml` files, a runbook and a cost list in [deploy-fly.md](deploy-fly.md), proved with Docker on one machine; **not yet run on Fly** | M6-C70 |
 
 ## 1. Download and verify
 
@@ -83,6 +83,12 @@ their checks (M6-C13), so treat any build for them as unverified. The hosted CI
 that would build them has not run since 2026-09-11, and no GitHub release has
 been published, so the only way to get a verified bundle today is from a
 maintainer who built it with `scripts/m6-release-artifact.py bundle`.
+
+**The bundle carries no documentation**, not even this guide (M6-C50). Read
+this guide and every document it links from the repository at the `commit`
+line of the bundle's `PROVENANCE.txt`, for example
+`https://github.com/andymac4182/agentuplink/blob/<commit>/docs/operator.md`,
+so the guide and the binaries describe the same code.
 
 A bundle is one `.tar.gz` plus a `.sha256` file beside it. This guide calls
 them `agentuplink-bundle.tar.gz` and `agentuplink-bundle.tar.gz.sha256`;
@@ -258,6 +264,22 @@ See `examples/m1-relay.toml`:
 | `device_tls_client_ca` | CA that issued device certificates (section 2.1) |
 | `oidc_issuer`, `oidc_audience`, `oidc_jwks_path` | Your consumer identity issuer, accepted audiences, and a local JWKS file of its public verification keys |
 
+**What the relay accepts from your identity issuer** (M6-C51; the rules below
+are read from the source and were met by a hand-made issuer in a dogfood run,
+not tested one by one). `oidc_jwks_path` is a local JSON file
+`{"keys":[...]}` of **RSA keys only**: each needs `kty = "RSA"`, a non-empty
+`kid`, `n` and `e`, and an `alg` that is `RS256` or absent. Any other key type
+makes `serve` refuse to start. The relay never fetches the issuer's JWKS URL,
+so a key rotation at the issuer means editing this file and restarting `serve`.
+A token is accepted only if its header has `alg` `RS256` and a `kid` from that
+file, and its claims have `iss` equal to `oidc_issuer` **byte for byte**
+(including any trailing `/`), an `aud` in `oidc_audience`, a non-empty `sub`,
+and an unexpired `exp`. `nbf` is checked if present. There is no clock leeway.
+`scope` is one space-separated string. Every refusal of these, and a `sub`
+without a catalog user, gets the same `401`, and the relay logs nothing about
+it (M6-C52), so check the claims before looking anywhere else. The project
+ships no issuer and no token tool.
+
 Keep private keys owner-only and outside source control. Use separate CAs for
 server identity, device clients and cluster peers
 ([runtime.md](runtime.md#device-authentication-contract)).
@@ -329,9 +351,16 @@ signal abandons it at once with exit `130` and says the outcome is unknown;
 treat that namespace as partial. `initialize`, `recovery-initialize` and
 `recover` behave the same way (M6-C23).
 
-The activation also binds the namespace to the Redis server's run id. A Redis
-restart that loses the run (no persistence, or a restore) makes `serve` refuse
-again, and the way back is recovery, not a second activation.
+The activation also binds the namespace to the Redis server's run id, and
+Redis draws a new run id **every time it starts**. So any Redis restart makes
+`serve` refuse the namespace again with `stage=authority_identity`, even with
+persistence on and every key intact (measured in a dogfood run with AOF on:
+23 of 23 keys survived and `serve` still refused; M6-C65). A second activation
+is refused ("namespace already has a deployment incarnation; changing it
+requires recovery"). Recovery needs a `[recovery]` section and a signed approval
+from an external authority that is not shipped (section 4). **In this alpha,
+the only way back after a Redis restart is a new `redis_namespace`, provisioned
+from the start.** Devices connected at the time exit `4`.
 
 Once `serve` and `connect` are running (section 3.1), a consumer calls
 `POST /v1/devices/<device.id>/services/<service.id>/echo` on the consumer
@@ -352,7 +381,12 @@ The relay connects to Redis over `rediss://` with the URL in `redis_url`, plus
 optional CA and client-certificate files. [redis-tls.md](redis-tls.md) gives the
 fields and the file rules. If the URL carries a password, the relay redacts it
 from its errors, but the URL is still in the configuration file, so protect that
-file like a key. No least-privilege Redis ACL for the relay has been derived or
+file like a key. **Do not disable Redis's `default` user when the append-only
+file is on** (M6-C66): with `user default off` and the relay on its own ACL
+user, Redis 8.4.0 refused to replay the relay's `MULTI`/`EXEC` transactions from
+the append-only file on restart (1,298 `NOPERM` errors in its log) and came back
+with 5 keys, none of them a tenant, device or credential. With `default`
+enabled behind the same password, the same file replayed to 69 keys. No least-privilege Redis ACL for the relay has been derived or
 tested; the Redis durability settings the design needs are in
 [cluster.md](cluster.md#redis-durability-backup-and-recovery).
 
@@ -376,6 +410,13 @@ exit=1
 ```
 
 The relay exits `0` or `1`, and `130` when a stop request ends `serve` before an orderly completion or a second one abandons a writing command (section 4). It does not otherwise use the client's exit-code table.
+`examples/m1-relay.toml` sets `boot_id = "replace-with-a-unique-boot-id"`.
+For one relay, **delete that line** rather than choosing a value. A `boot_id`
+must be fresh for every process ([cluster.md](cluster.md)), so a fixed value
+written into a configuration file is reused on every restart. Without the line,
+`serve` generates a fresh one each time it starts (measured: `check-serve-config`
+and `serve` both accept a configuration without it; M6-C61).
+
 Then start it. **Shape-only:** this command needs your provisioned files and a
 provisioned Redis namespace (section 2.3). `scripts/m6-provisioning-verify.sh`
 runs it end to end:
@@ -384,10 +425,18 @@ runs it end to end:
 tunnel-relay serve --config /etc/agent-tunnel/relay.toml
 ```
 
+Once in each `rotation.interval_seconds`, the device's data socket rotates.
+Around that moment a new request can be refused with `503`
+`{"code":"PEER_UNAVAILABLE",...,"retryable":true,"retry_after_ms":250}`, even on
+a single relay. Consumers must retry it. In a 32-minute run this happened at 4
+of 7 MCP rotations (M6-C64; what a consumer should see there is still open as
+M3-15).
+
 `serve` stops on SIGTERM or SIGINT (Ctrl-C), the same way for both: it prints
 `tunnel-relay stopping: signal=SIGTERM`, drains its listeners and, in a
 cluster, its peer and membership tasks, prints `tunnel-relay stopped:
-signal=SIGTERM` and exits `0` (measured on a one-node cluster; M6-C23). A stop
+signal=SIGTERM` and exits `0` (measured on a one-node cluster; M6-C23; and on
+a one-node relay without `[cluster]`, for both signals, in a dogfood run; M6-C60). A stop
 request during startup exits `130` with nothing bound. It logs JSON lines to
 stderr; set `RUST_LOG` (default `info`) to change the level.
 
@@ -407,8 +456,14 @@ $ tunnel-client connect --config trial/unreachable.toml --json; echo "exit=$?"
 exit=4
 ```
 
-A session the relay closes also ends the process (`SESSION_CLOSED`, exit `4`).
-Restarting it is up to whatever runs it (section 4).
+A session the relay closes also ends the process with exit `4`. When the relay
+is stopped or restarted (SIGTERM or SIGINT), the relay logs the session closed
+with reason `SHUTDOWN`, but the device reports only `{"code":"TRANSPORT_ERROR",
+"message":"control read failed","retryable":true}`, the same as a network
+failure (measured in a dogfood run; M6-C60). Restarting it is up to whatever
+runs it (section 4). A `connect` started again straight after a relay restart
+was admitted at once. A second `connect` for a device whose session is still
+live exits `7` with `OWNER_BUSY`.
 
 ### 3.2 Health endpoints and load balancers
 
@@ -420,9 +475,10 @@ deliberately minimal:
 | `GET /livez` | `200 {"status":"live"}` | The process answers HTTP. It consults nothing else. |
 | `GET /readyz` | `200 {"status":"ready"}` or `503 {"status":"unready"}` | Whether this relay should receive new public work |
 
-A relay without `[cluster]` is always ready once it is serving, **including
-while its Redis authority is down or has restarted**, when it refuses every
-public request with `503` (measured, M6-C61). A cluster relay
+A relay without `[cluster]` is always ready once it is serving, even while
+its Redis authority is unavailable: after a Redis restart it answered `200`
+on `/readyz` while every request got `503` `AUTHORIZATION_UNAVAILABLE`
+(M6-C67). A cluster relay
 is ready only while its membership is current, its required peer routes are
 probed reachable, it has capacity, **and its set of approved peer keys is not
 empty** (M7-C89). Before M7-C89, a relay whose membership went unready had the
@@ -527,8 +583,10 @@ while it is still starting, count `130` as a clean stop
 what is not; in short, the handshake and startup phases and a live stop are
 measured on the real binaries, the second-signal and bound logic of
 `connect`'s waits only by unit tests, and a stop during a data rotation, the
-later handshake sub-phases, `serve`'s binding phase, a non-cluster `serve`
-while serving and `provision-catalog` stopped mid-write are not measured.
+later handshake sub-phases, `serve`'s binding phase and `provision-catalog`
+stopped mid-write are not measured. A non-cluster `serve` stopped while
+serving, with a device connected, printed its `stopping` and `stopped` lines and
+exited `0` for both SIGTERM and SIGINT (dogfood run; M6-C60).
 SIGHUP is not handled. Because `connect` does not reconnect by
 itself (section 3.1), whatever supervises it must restart it.
 
@@ -634,7 +692,9 @@ exit=2
 [runtime.md](runtime.md#client-exit-codes). That table is checked against the
 code by this guide's check. This guide runs real processes that exit `0`, `2`,
 `3` and `4`. Exit `7` (`OWNER_BUSY`, `RESOURCE_EXHAUSTED`) and `130`
-(`CANCELLED`) need a live relay and are covered by unit tests only. Exit `6`
+(`CANCELLED`) need a live relay, so this guide's check does not run them.
+`OWNER_BUSY`, exit `7`, was measured by hand against a live relay: a second
+`connect` for a device that already has a live session (M6-C60). Exit `6`
 has no producer today. With `--json`, `config check` and `connect` print
 exactly one result object:
 

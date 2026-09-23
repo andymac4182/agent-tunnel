@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 #
-# The agent-tunnel relay image for Fly.io (docs/deploy-fly.md, task row M6-C60).
+# The agent-tunnel relay image for Fly.io (docs/deploy-fly.md, task row M6-C70).
 # Build from the repository root:
 #
 #   docker build -f deploy/fly/relay/Dockerfile -t agentuplink-relay .

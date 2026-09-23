@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 #
-# The relay's Redis authority on Fly.io (docs/deploy-fly.md, task row M6-C60):
+# The relay's Redis authority on Fly.io (docs/deploy-fly.md, task row M6-C70):
 # TLS only, password required, AOF with appendfsync always, no eviction, data
 # on a Fly volume at /data. Build from this directory:
 #
