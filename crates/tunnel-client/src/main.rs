@@ -129,8 +129,10 @@ impl Cause {
     ///   because nothing is wrong with the build: the operator's action is
     ///   to stop the other connector, or to wait.
     /// * `130` — interrupted before an orderly completion could be
-    ///   recorded. An orderly `Ctrl-C` stop exits `0`; this is the case
-    ///   where cancellation won the race against the drain.
+    ///   recorded: a stop request (SIGINT or SIGTERM) that arrived before
+    ///   the session was ready, or a second one that abandoned the drain.
+    ///   A stop request while the session is live drains and exits `0`
+    ///   with a `stopped` event instead (M6-C23, M6-C27).
     /// * `1` — genuinely unexpected: a protocol violation, a failed
     ///   supervisor, or a signal subsystem error. After this change `1`
     ///   means what it says.
@@ -228,6 +230,9 @@ struct ConnectResult<'a> {
     epoch: Option<u64>,
     generation: Option<u64>,
     failure_policy: &'a str,
+    /// Which stop request ended the session, on the `stopped` event only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    signal: Option<&'static str>,
 }
 
 /// Bounded `--json` status events used by real-process acceptance probes.
@@ -404,7 +409,165 @@ fn run_legacy_check_config(path: Option<PathBuf>) -> Result<(), CliError> {
     Ok(())
 }
 
+/// A request to stop, as delivered to this process.
+///
+/// SIGINT and SIGTERM are **one** request with two spellings: Ctrl-C at a
+/// terminal sends the first, and a service manager (systemd, launchd) sends
+/// the second by default. Both take the same orderly path below; the name is
+/// kept only so the diagnostic can say which one arrived.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StopSignal {
+    Interrupt,
+    Terminate,
+}
+
+impl StopSignal {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Interrupt => "SIGINT",
+            Self::Terminate => "SIGTERM",
+        }
+    }
+}
+
+/// The process's stop requests, armed **before** anything else `connect`
+/// does (task rows M6-C23 and M6-C27).
+///
+/// Before this, the only handler was a `tokio::signal::ctrl_c()` future
+/// created inside the post-connect select loop. Until that line ran, SIGINT
+/// kept the disposition the process inherited and SIGTERM always did: a
+/// signal during the TLS/WebSocket handshake either killed the process with
+/// no output (default disposition) or was ignored until the handshake
+/// deadline reported `DEADLINE_EXCEEDED` (inherited `SIG_IGN`), and SIGTERM
+/// killed it in every phase.
+///
+/// **Inherited `SIG_IGN` is overridden, deliberately.** Installing a handler
+/// replaces whatever disposition the process inherited, so a `tunnel-client`
+/// started as a background job of a non-interactive shell (which sets SIGINT
+/// and SIGQUIT to ignored) now stops on SIGINT too. The reasons, and the
+/// alternative that was rejected, are in `docs/runtime.md` ("Stopping
+/// `connect`"); in short, a stop request that is silently ignored for ten
+/// seconds and then reported as a deadline is the defect M6-C27 recorded, and
+/// a process that must survive a terminal's Ctrl-C belongs in its own session
+/// or under a service manager, not behind an inherited disposition. SIGHUP is
+/// **not** handled, so `nohup` keeps working.
+struct StopSignals {
+    #[cfg(unix)]
+    interrupt: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    terminate: tokio::signal::unix::Signal,
+    #[cfg(windows)]
+    ctrl_c: tokio::signal::windows::CtrlC,
+}
+
+impl StopSignals {
+    fn install() -> Result<Self, CliError> {
+        let signal_error = |error: std::io::Error| CliError {
+            cause: Cause::SignalError,
+            message: format!("could not install the stop-signal handlers: {error}"),
+            retryable: false,
+        };
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            Ok(Self {
+                interrupt: signal(SignalKind::interrupt()).map_err(signal_error)?,
+                terminate: signal(SignalKind::terminate()).map_err(signal_error)?,
+            })
+        }
+        #[cfg(windows)]
+        {
+            Ok(Self {
+                ctrl_c: tokio::signal::windows::ctrl_c().map_err(signal_error)?,
+            })
+        }
+    }
+
+    /// Wait for the next stop request. Cancel-safe, so it can sit in a
+    /// `select!` loop without losing a delivery.
+    async fn recv(&mut self) -> Result<StopSignal, CliError> {
+        let closed = || CliError {
+            cause: Cause::SignalError,
+            message: "the stop-signal stream closed".to_owned(),
+            retryable: false,
+        };
+        #[cfg(unix)]
+        {
+            tokio::select! {
+                received = self.interrupt.recv() => received.map(|()| StopSignal::Interrupt).ok_or_else(closed),
+                received = self.terminate.recv() => received.map(|()| StopSignal::Terminate).ok_or_else(closed),
+            }
+        }
+        #[cfg(windows)]
+        {
+            self.ctrl_c
+                .recv()
+                .await
+                .map(|()| StopSignal::Interrupt)
+                .ok_or_else(closed)
+        }
+    }
+}
+
+/// How long a cancelled connect attempt may take to unwind before it is
+/// dropped. The attempt observes its cancellation token at every await, so
+/// this is a ceiling on a defect, not an expected wait; dropping the future
+/// closes whatever socket it still owns either way.
+const CANCELLED_CONNECT_UNWIND: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The diagnostic for a stop request that arrived before the session was
+/// ready: `CANCELLED`, exit `130`. Nothing was established, so there is no
+/// orderly completion to record -- which is exactly what `130` means.
+fn interrupted_before_ready(signal: StopSignal) -> CliError {
+    CliError {
+        cause: Cause::Cancelled,
+        message: format!(
+            "{} received before the session was ready; the connect attempt was cancelled",
+            signal.name()
+        ),
+        retryable: false,
+    }
+}
+
+/// Join the connector after a stop request, unless a **second** request
+/// arrives first.
+///
+/// Once the handlers are installed a signal no longer kills the process, so
+/// without this a drain that hung would leave an interactive operator with
+/// nothing short of `SIGKILL`. A second SIGINT or SIGTERM during the stop
+/// abandons the join and reports `CANCELLED` (exit `130`): the drain did not
+/// complete, which is what that status means. A service manager's own
+/// escalation (systemd's `TimeoutStopSec`, then `SIGKILL`) is unaffected.
+async fn stop_after_signal(
+    handle: &tunnel_client::ConnectionHandle,
+    stop: &mut StopSignals,
+    first: StopSignal,
+) -> Result<(), CliError> {
+    tokio::select! {
+        // The stop's own result is not the operator's diagnostic: the stop
+        // was requested, and the connector reports a requested stop as
+        // success. That is unchanged from the SIGINT-only path.
+        _ = handle.stop() => Ok(()),
+        second = stop.recv() => {
+            let second = second?;
+            Err(CliError {
+                cause: Cause::Cancelled,
+                message: format!(
+                    "{} received during the orderly stop {} began; exiting without waiting for the drain",
+                    second.name(),
+                    first.name()
+                ),
+                retryable: false,
+            })
+        }
+    }
+}
+
 async fn run_connect(path: PathBuf, json: bool) -> Result<(), CliError> {
+    // First, before any file is read or socket opened: from here on a stop
+    // request in any phase reaches the orderly path below instead of the
+    // inherited disposition.
+    let mut stop = StopSignals::install()?;
     let config = load_runtime_config(&path)?;
     // Configured MCP and ACP exports become in-process http-forward/1
     // handlers; an http-forward export without one is still refused at OPEN.
@@ -430,11 +593,20 @@ async fn run_connect(path: PathBuf, json: bool) -> Result<(), CliError> {
         cancellation: cancellation.clone(),
         profile: tunnel_client::TransportProfile::M2,
     };
-    let handle = match tunnel_client::connect_with_http_handlers(options, handlers).await {
-        Ok(handle) => handle,
-        Err(error) => {
-            let error = CliError::from_client(error);
-            return Err(error);
+    let connect = tunnel_client::connect_with_http_handlers(options, handlers);
+    tokio::pin!(connect);
+    let handle = tokio::select! {
+        result = &mut connect => result.map_err(CliError::from_client)?,
+        signal = stop.recv() => {
+            let signal = signal?;
+            // Cancel, then let the attempt unwind so the sockets it opened
+            // are closed by their owner rather than by process exit. An
+            // attempt that completed in the same instant is stopped properly.
+            cancellation.cancel();
+            if let Ok(Ok(handle)) = tokio::time::timeout(CANCELLED_CONNECT_UNWIND, &mut connect).await {
+                let _ = handle.stop().await;
+            }
+            return Err(interrupted_before_ready(signal));
         }
     };
     let mut readiness = handle.readiness();
@@ -452,6 +624,7 @@ async fn run_connect(path: PathBuf, json: bool) -> Result<(), CliError> {
                     epoch: Some(info.epoch),
                     generation: Some(info.generation),
                     failure_policy: M1_TRANSPORT_FAILURE_POLICY,
+                    signal: None,
                 },
             );
         } else {
@@ -472,12 +645,15 @@ async fn run_connect(path: PathBuf, json: bool) -> Result<(), CliError> {
     }
     loop {
         tokio::select! {
-            signal = tokio::signal::ctrl_c() => {
-                signal.map_err(|error| CliError { cause: Cause::SignalError, message: error.to_string(), retryable: false })?;
+            signal = stop.recv() => {
+                // The same orderly path for SIGINT and SIGTERM, and for every
+                // phase a live session can be in, rotation included: this
+                // loop runs for the whole life of the session.
+                let signal = signal?;
                 cancellation.cancel();
-                let _ = handle.stop().await;
+                stop_after_signal(&handle, &mut stop, signal).await?;
                 if json {
-                    print_ok_json("connect", ConnectResult { state: "stopped", session_id: None, epoch: None, generation: None, failure_policy: M1_TRANSPORT_FAILURE_POLICY });
+                    print_ok_json("connect", ConnectResult { state: "stopped", session_id: None, epoch: None, generation: None, failure_policy: M1_TRANSPORT_FAILURE_POLICY, signal: Some(signal.name()) });
                 } else {
                     println!("Stopped.");
                 }

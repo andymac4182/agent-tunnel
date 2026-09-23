@@ -381,6 +381,105 @@ CASES: list[Case] = [
             }
         ),
     ),
+    # ------------------------------------------- stop requests (M6-C23/C27)
+    Case(
+        # **M6-C23.**  SIGTERM is what systemd and launchd send to stop a
+        # service.  Before this row nothing handled it, and a service stop
+        # killed the connector with no output and no `stopped` event.
+        # Listening for a signal nobody sends in its place is that defect:
+        # SIGTERM keeps its default action (or its inherited `SIG_IGN`).
+        "SIGTERM reaches the orderly stop path",
+        [
+            (
+                MAIN,
+                "                terminate: signal(SignalKind::terminate()).map_err(signal_error)?,",
+                "                terminate: signal(SignalKind::user_defined2()).map_err(signal_error)?,",
+            )
+        ],
+        # Every SIGTERM fixture, and only those: the default-disposition ones
+        # die by the signal (no exit status), the inherited-ignored one runs
+        # out the 10 s handshake deadline and exits 5.
+        frozenset(
+            {
+                "sigterm_during_the_tls_handshake_exits_cancelled",
+                "sigterm_during_the_websocket_upgrade_exits_cancelled",
+                "sigterm_inherited_as_ignored_still_cancels_the_handshake",
+                "sigterm_without_json_reports_the_cancellation_on_stderr",
+            }
+        ),
+    ),
+    Case(
+        # The same rule for SIGINT, which `ctrl_c()` already covered -- but
+        # only after the session was ready.
+        "SIGINT reaches the orderly stop path",
+        [
+            (
+                MAIN,
+                "                interrupt: signal(SignalKind::interrupt()).map_err(signal_error)?,",
+                "                interrupt: signal(SignalKind::user_defined1()).map_err(signal_error)?,",
+            )
+        ],
+        frozenset(
+            {
+                "sigint_during_the_tls_handshake_exits_cancelled",
+                "sigint_during_the_websocket_upgrade_exits_cancelled",
+                "sigint_inherited_as_ignored_still_cancels_the_handshake",
+            }
+        ),
+    ),
+    Case(
+        # **M6-C27's mechanism, restored exactly.**  The handlers are still
+        # installed, but nothing listens for them until the session is ready
+        # -- the pre-fix shape, where the `ctrl_c` select was armed only after
+        # `connect_with_http_handlers` returned.  A signal during the
+        # handshake is then swallowed and the run ends at the 10 s deadline
+        # with exit 5 `DEADLINE_EXCEEDED`.
+        "a stop request during the handshake is listened for",
+        [
+            (
+                MAIN,
+                "        signal = stop.recv() => {\n            let signal = signal?;\n            // Cancel, then",
+                "        signal = std::future::pending::<Result<StopSignal, CliError>>() => {\n            let signal = signal?;\n            // Cancel, then",
+            )
+        ],
+        frozenset(
+            {
+                "sigterm_during_the_tls_handshake_exits_cancelled",
+                "sigterm_during_the_websocket_upgrade_exits_cancelled",
+                "sigterm_inherited_as_ignored_still_cancels_the_handshake",
+                "sigterm_without_json_reports_the_cancellation_on_stderr",
+                "sigint_during_the_tls_handshake_exits_cancelled",
+                "sigint_during_the_websocket_upgrade_exits_cancelled",
+                "sigint_inherited_as_ignored_still_cancels_the_handshake",
+            }
+        ),
+    ),
+    Case(
+        # **The timing assertion's own case.**  A handler that reports
+        # `CANCELLED` but never cancels the attempt still exits 130 -- after
+        # the 2 s bounded unwind rather than at once.  Only the "promptly"
+        # assertion can see that, so this is the case that proves it is not
+        # decoration: without it every fixture here would stay green.
+        "a stop request cancels the connect attempt rather than waiting it out",
+        [
+            (
+                MAIN,
+                "            cancellation.cancel();\n            if let Ok(Ok(handle))",
+                "            if let Ok(Ok(handle))",
+            )
+        ],
+        frozenset(
+            {
+                "sigterm_during_the_tls_handshake_exits_cancelled",
+                "sigterm_during_the_websocket_upgrade_exits_cancelled",
+                "sigterm_inherited_as_ignored_still_cancels_the_handshake",
+                "sigterm_without_json_reports_the_cancellation_on_stderr",
+                "sigint_during_the_tls_handshake_exits_cancelled",
+                "sigint_during_the_websocket_upgrade_exits_cancelled",
+                "sigint_inherited_as_ignored_still_cancels_the_handshake",
+            }
+        ),
+    ),
     # ------------------------------------------------- totality, by compiler
     Case(
         # **The structural half of M6-C07, and the reason the fix was a type
