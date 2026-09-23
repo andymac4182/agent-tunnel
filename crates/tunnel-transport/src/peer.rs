@@ -765,6 +765,30 @@ type ServerStream = h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes
 type ServerSendStream = h3::server::RequestStream<h3_quinn::SendStream<Bytes>, Bytes>;
 type ServerRecvStream = h3::server::RequestStream<h3_quinn::RecvStream, Bytes>;
 
+/// Classify how a connection ended while its client driver was in a planned
+/// GOAWAY drain.
+///
+/// Every local close of a pooled client connection -- `shutdown_until`, the
+/// handle's `Drop` and the pin watcher -- cancels the connection's token
+/// before it closes the connection.  So once that token is cancelled, the
+/// close this driver observed may be the local one, which quinn reports as
+/// `LocallyClosed` and h3 as `Remote error: Error undefined by h3: closed`.
+/// That is the end the local side asked for, not a transport failure.  The
+/// driver's cancellation arms are polled first, but on a multi-threaded
+/// runtime the cancellation can land after the driver polled that arm and
+/// before it polled the idle one, so the race has to be settled here (task
+/// row M7-C105).  Without a local cancellation the peer's close is classified
+/// by [`planned_idle_result`].
+fn planned_drain_result(
+    connection_result: h3::error::ConnectionError,
+    cancel: &CancellationToken,
+) -> Result<(), PeerTransportError> {
+    if cancel.is_cancelled() {
+        return Ok(());
+    }
+    planned_idle_result(connection_result)
+}
+
 fn planned_idle_result(
     connection_result: h3::error::ConnectionError,
 ) -> Result<(), PeerTransportError> {
@@ -2415,7 +2439,8 @@ impl PeerClient {
                                 // same way here is what keeps a benign close
                                 // from being reported as a transport failure
                                 // depending on which branch of this race wins.
-                                let result = planned_idle_result(connection_result);
+                                let result =
+                                    planned_drain_result(connection_result, &driver_cancel);
                                 driver_connection.close(
                                     quinn::VarInt::from_u32(0),
                                     if result.is_ok() {
@@ -2453,6 +2478,10 @@ impl PeerClient {
                         };
                         match shutdown {
                             Ok(Ok(())) => {}
+                            // This connection's own shutdown, drop or pin
+                            // withdrawal closed it while the acknowledgement
+                            // was being written (M7-C105).
+                            Ok(Err(_)) if driver_cancel.is_cancelled() => return Ok(()),
                             Ok(Err(error)) => {
                                 driver_connection.close(
                                     quinn::VarInt::from_u32(0),
@@ -2488,7 +2517,8 @@ impl PeerClient {
                                 Err(PeerTransportError::Timeout)
                             }
                             Ok(connection_result) => {
-                                let result = planned_idle_result(connection_result);
+                                let result =
+                                    planned_drain_result(connection_result, &driver_cancel);
                                 if result.is_err() {
                                     driver_connection.close(
                                         quinn::VarInt::from_u32(0),
