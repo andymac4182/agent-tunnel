@@ -415,6 +415,13 @@ password), `noperm` (the ACL user may not run the command, for example
 The recovery commands print `recovery Redis connection failed;` followed by
 the same `stage=` and `class=` words.
 
+Each Redis connection gets **10 seconds** to open, covering the DNS lookup,
+TCP connect, TLS handshake and `AUTH`. After that, each command gets
+2 seconds (M6-C73). On a fresh Fly machine the first lookup of a `.internal`
+name took about 2 seconds. Before M6-C73 the connection budget was redis-rs's
+one-second default, so that lookup alone failed `activate-first-incarnation`
+with `stage=connection_establishment class=timeout`.
+
 ## 3. Deployment
 
 Redis is the only coordination store. There is no second store and no local

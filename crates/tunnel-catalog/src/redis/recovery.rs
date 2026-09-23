@@ -215,9 +215,14 @@ enum ActivationResult {
 async fn open_recovery_connection(
     catalog: &RedisCatalog,
 ) -> Result<MultiplexedConnection, CatalogError> {
+    // Same explicit connect budget as every catalog connection (M6-C73).
     tokio::time::timeout(
-        REDIS_OPERATION_TIMEOUT,
-        catalog.client.get_multiplexed_async_connection(),
+        super::REDIS_CONNECT_TIMEOUT,
+        catalog
+            .client
+            .get_multiplexed_async_connection_with_config(&super::connection_config(
+                super::REDIS_CONNECT_TIMEOUT,
+            )),
     )
     .await
     .map_err(|_| redis_timeout())?

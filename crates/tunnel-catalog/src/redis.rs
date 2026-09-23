@@ -41,6 +41,15 @@ const MAX_IDENTIFIER_BYTES: usize = 128;
 /// Maximum accepted length of the authoritative Redis key namespace.
 pub const MAX_REDIS_NAMESPACE_BYTES: usize = 96;
 const REDIS_OPERATION_TIMEOUT: Duration = Duration::from_secs(2);
+/// The budget for opening one authority connection: DNS resolution, TCP
+/// connect, the TLS handshake and redis-rs's setup exchange (`AUTH`,
+/// `CLIENT SETINFO`).  It is separate from the two-second per-command
+/// [`REDIS_OPERATION_TIMEOUT`], and it is set explicitly both inside
+/// redis-rs and around it (M6-C73): redis-rs's own default is one second and
+/// covers DNS, and the first lookup on a fresh Fly machine was measured at
+/// 2,038 ms, so the old budget expired before TCP connect began.  Ten seconds
+/// is that cold lookup with about 4x headroom, and still bounded.
+pub(crate) const REDIS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const AUTHORIZATION_CONNECTIONS: usize = 4;
 /// Physical lanes reserved for the relay's per-session maintenance reads
 /// (`resolve_device`) and owner renewals (`renew_owner`).  Two lanes keep
@@ -2151,7 +2160,7 @@ pub fn validate_redis_namespace(namespace: &str) -> Result<(), CatalogError> {
     Ok(())
 }
 
-/// Open one lane connection and verify the primary's identity.
+/// The redis-rs connection configuration every authority connection uses.
 ///
 /// redis-rs applies its own per-command response deadline inside the
 /// multiplexed connection, measured from the moment the command is written
@@ -2159,15 +2168,25 @@ pub fn validate_redis_namespace(namespace: &str) -> Result<(), CatalogError> {
 /// authority bound here (the library default is 500 ms) so that deadline,
 /// like the catalog's outer one, bounds the authority's reply and nothing
 /// else; a reply slower than that is reported as a timeout distinct from a
-/// severed connection.
-async fn open_verified_connection(
+/// severed connection.  The connection timeout is set to `connect_budget`
+/// (the library default is one second, M6-C73), and callers apply the same
+/// budget around the call, so neither deadline undercuts the other.
+pub(crate) fn connection_config(connect_budget: Duration) -> redis::AsyncConnectionConfig {
+    redis::AsyncConnectionConfig::new()
+        .set_response_timeout(Some(REDIS_OPERATION_TIMEOUT))
+        .set_connection_timeout(Some(connect_budget))
+}
+
+/// Open one multiplexed connection within `connect_budget`, applied both
+/// inside redis-rs (through `config`) and around it.
+async fn connect_within(
     client: &redis::Client,
-) -> Result<(MultiplexedConnection, String), CatalogConnectionError> {
-    let config =
-        redis::AsyncConnectionConfig::new().set_response_timeout(Some(REDIS_OPERATION_TIMEOUT));
-    let connection = tokio::time::timeout(
-        REDIS_OPERATION_TIMEOUT,
-        client.get_multiplexed_async_connection_with_config(&config),
+    config: &redis::AsyncConnectionConfig,
+    connect_budget: Duration,
+) -> Result<MultiplexedConnection, CatalogConnectionError> {
+    tokio::time::timeout(
+        connect_budget,
+        client.get_multiplexed_async_connection_with_config(config),
     )
     .await
     .map_err(|_| {
@@ -2178,7 +2197,19 @@ async fn open_verified_connection(
     })?
     .map_err(|error| {
         catalog_connection_error(CatalogConnectionStage::ConnectionEstablishment, error)
-    })?;
+    })
+}
+
+/// Open one lane connection and verify the primary's identity.
+async fn open_verified_connection(
+    client: &redis::Client,
+) -> Result<(MultiplexedConnection, String), CatalogConnectionError> {
+    let connection = connect_within(
+        client,
+        &connection_config(REDIS_CONNECT_TIMEOUT),
+        REDIS_CONNECT_TIMEOUT,
+    )
+    .await?;
     verify_connection_identity(connection).await
 }
 
@@ -3143,7 +3174,7 @@ mod tests {
         time::Duration,
     };
 
-    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+    use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
     /// `examples/m1-relay.toml` shipped `agent-tunnel/m1`, which this rule
     /// refuses: the documented `serve --config` therefore failed at startup.
@@ -3617,6 +3648,170 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A resolver that answers after `delay`, standing in for the cold first
+    /// DNS lookup measured on a fresh Fly machine (M6-C73).
+    struct SlowResolver {
+        delay: Duration,
+        address: std::net::SocketAddr,
+    }
+
+    impl redis::io::AsyncDNSResolver for SlowResolver {
+        fn resolve<'a, 'b: 'a>(
+            &'a self,
+            _host: &'b str,
+            _port: u16,
+        ) -> redis::RedisFuture<'a, Box<dyn Iterator<Item = std::net::SocketAddr> + Send + 'a>>
+        {
+            Box::pin(async move {
+                tokio::time::sleep(self.delay).await;
+                Ok(Box::new(std::iter::once(self.address))
+                    as Box<dyn Iterator<Item = std::net::SocketAddr> + Send>)
+            })
+        }
+    }
+
+    /// A minimal RESP peer: answers every command with `+OK`, which is all
+    /// redis-rs's connection setup needs.
+    async fn answering_peer() -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind answering peer");
+        let address = listener.local_addr().expect("peer address");
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let (read, mut write) = socket.into_split();
+                    let mut reader = tokio::io::BufReader::new(read);
+                    let mut line = String::new();
+                    loop {
+                        line.clear();
+                        match reader.read_line(&mut line).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(_) => {}
+                        }
+                        let Some(count) = line
+                            .strip_prefix('*')
+                            .and_then(|rest| rest.trim_end().parse::<usize>().ok())
+                        else {
+                            continue;
+                        };
+                        // Each argument is a length line and a data line.
+                        for _ in 0..count * 2 {
+                            line.clear();
+                            if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                                return;
+                            }
+                        }
+                        if write.write_all(b"+OK\r\n").await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        address
+    }
+
+    /// A peer that accepts TCP and never answers.
+    async fn silent_peer() -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind silent peer");
+        let address = listener.local_addr().expect("peer address");
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        address
+    }
+
+    const COLD_DNS: Duration = Duration::from_millis(2_000);
+
+    fn slow_dns_client() -> redis::Client {
+        redis::Client::open("redis://cold-dns.invalid:6379/").expect("client")
+    }
+
+    /// M6-C73: a cold two-second DNS lookup fits the catalog's connect budget.
+    #[tokio::test]
+    async fn m6c73_cold_dns_lookup_connects_within_the_catalog_budget() {
+        let address = answering_peer().await;
+        let config =
+            super::connection_config(super::REDIS_CONNECT_TIMEOUT).set_dns_resolver(SlowResolver {
+                delay: COLD_DNS,
+                address,
+            });
+        let started = std::time::Instant::now();
+        let connected =
+            super::connect_within(&slow_dns_client(), &config, super::REDIS_CONNECT_TIMEOUT).await;
+        let elapsed = started.elapsed();
+        assert!(
+            connected.is_ok(),
+            "connect with a cold DNS lookup: {:?}",
+            connected
+                .err()
+                .map(|error| (error.stage(), error.failure()))
+        );
+        assert!(
+            elapsed >= COLD_DNS,
+            "the resolver delay applied: {elapsed:?}"
+        );
+    }
+
+    /// The pre-M6-C73 configuration: redis-rs's default connection timeout
+    /// (one second, covering DNS) inside the two-second outer deadline.  The
+    /// same cold lookup fails as a connection-establishment timeout before
+    /// TCP connect starts, which is what the Fly deployment printed.
+    #[tokio::test]
+    async fn m6c73_library_default_connect_budget_fails_the_cold_lookup_as_a_timeout() {
+        let address = answering_peer().await;
+        let config = redis::AsyncConnectionConfig::new()
+            .set_response_timeout(Some(super::REDIS_OPERATION_TIMEOUT))
+            .set_dns_resolver(SlowResolver {
+                delay: COLD_DNS,
+                address,
+            });
+        let started = std::time::Instant::now();
+        let error =
+            super::connect_within(&slow_dns_client(), &config, super::REDIS_OPERATION_TIMEOUT)
+                .await
+                .expect_err("the library default must not fit a two-second lookup");
+        let elapsed = started.elapsed();
+        assert_eq!(
+            error.stage(),
+            CatalogConnectionStage::ConnectionEstablishment
+        );
+        assert_eq!(error.failure(), crate::CatalogConnectionFailure::Timeout);
+        assert!(elapsed < COLD_DNS, "expired before the lookup: {elapsed:?}");
+    }
+
+    /// The effective connect budget is the configured one, inside redis-rs
+    /// and around it, so a library default cannot silently shrink it again.
+    #[tokio::test]
+    async fn m6c73_effective_connect_budget_is_the_configured_one() {
+        const BUDGET: Duration = Duration::from_secs(3);
+        let address = silent_peer().await;
+        let client = redis::Client::open(format!("redis://{address}/")).expect("client");
+        let started = std::time::Instant::now();
+        let error = super::connect_within(&client, &super::connection_config(BUDGET), BUDGET)
+            .await
+            .expect_err("a silent peer never completes setup");
+        let elapsed = started.elapsed();
+        assert_eq!(error.failure(), crate::CatalogConnectionFailure::Timeout);
+        assert!(
+            elapsed >= BUDGET - Duration::from_millis(100)
+                && elapsed < BUDGET + Duration::from_millis(1_500),
+            "the configured {BUDGET:?} decided, not a library default: {elapsed:?}"
+        );
+        // The production budget covers the measured 2,038 ms cold lookup
+        // with headroom, and is separate from the per-command deadline.
+        const _: () = assert!(super::REDIS_CONNECT_TIMEOUT.as_millis() >= 4 * 2_038);
+        const _: () = assert!(
+            super::REDIS_CONNECT_TIMEOUT.as_millis() > super::REDIS_OPERATION_TIMEOUT.as_millis()
+        );
     }
 
     #[tokio::test]

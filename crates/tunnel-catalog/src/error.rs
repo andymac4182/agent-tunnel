@@ -339,7 +339,7 @@ mod tests {
     }
 
     fn io_error(kind: io::ErrorKind) -> RedisError {
-        io::Error::new(kind, "peer text redis://user:secret@host").into()
+        io::Error::new(kind, "peer-supplied text that is never printed").into()
     }
 
     fn tls_error(error: rustls::Error) -> RedisError {
