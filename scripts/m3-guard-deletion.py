@@ -847,7 +847,10 @@ RETIRING_ADMISSION_CASES: list[Case] = [
         [
             (
                 CLIENT / "src" / "m2_runtime.rs",
-                "        self.accepting = can_resume || self.rotation.phase() == RotationPhase::Retiring;",
+                "        self.accepting = matches!(\n"
+                "            self.rotation.phase(),\n"
+                "            RotationPhase::Active | RotationPhase::Retiring\n"
+                "        );",
                 "        self.accepting = can_resume;",
             )
         ],
@@ -855,6 +858,26 @@ RETIRING_ADMISSION_CASES: list[Case] = [
             {
                 "m2_runtime::tests::"
                 "an_open_admitted_by_the_owner_while_retiring_is_not_refused_as_draining"
+            }
+        ),
+    ),
+    Case(
+        # Review S2: losing the active carrier closes admission in every
+        # phase.  Defeated, a Retiring connector whose new carrier died keeps
+        # admitting onto the recovery placeholder.
+        "admission closes when the active carrier is lost, whatever the phase",
+        [
+            (
+                CLIENT / "src" / "m2_runtime.rs",
+                "            // COMMIT would otherwise keep admitting until RECOVERY_BEGIN.\n"
+                "            self.accepting = false;\n",
+                "            // COMMIT would otherwise keep admitting until RECOVERY_BEGIN.\n",
+            )
+        ],
+        frozenset(
+            {
+                "m2_runtime::tests::"
+                "an_open_after_the_active_carrier_dies_while_retiring_is_refused_as_draining"
             }
         ),
     ),
