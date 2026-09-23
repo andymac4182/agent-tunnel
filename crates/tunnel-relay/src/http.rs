@@ -3852,7 +3852,18 @@ async fn handle_control(
     let mut pings = control_ping_ticker();
     loop {
         let idle_deadline = liveness.deadline();
+        // `biased`: arms are polled in the order written.  An unbiased select
+        // picks at random among ready arms, so an inbound frame already
+        // buffered when the idle deadline fires could lose to it and a live
+        // device would be evicted.  Inbound therefore comes first and the
+        // deadline last.  Under a constant inbound stream the Ping and
+        // deadline arms may never be polled; that is intended, because every
+        // inbound frame moves the deadline and a Ping would prove nothing
+        // more.  The outbound arm can be delayed the same way, but only by
+        // this device's own inbound traffic, so a device can slow nobody's
+        // session but its own.
         tokio::select! {
+            biased;
             inbound = socket.next() => {
                 liveness.observe_inbound(tokio::time::Instant::now());
                 match inbound {
