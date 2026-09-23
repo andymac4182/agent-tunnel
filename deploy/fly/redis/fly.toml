@@ -1,0 +1,47 @@
+# Fly.io configuration for the relay's Redis authority (docs/deploy-fly.md).
+# Deploy from this directory, where this file and the Dockerfile are the
+# defaults:
+#
+#   cd deploy/fly/redis && fly deploy --ha=false --no-public-ips
+#
+# Private only: there is no [[services]] section and the app gets no public
+# address. The relay reaches it over Fly's private network at
+# <app>.internal:6379 with rediss:// and the password.
+#
+# Exactly one machine. `.internal` resolves to every machine of the app, and
+# two machines would be two unrelated Redis servers, each with its own volume.
+
+app = "agentuplink-redis"      # EDIT if the name is taken; the relay's AT_REDIS_URL names it
+primary_region = "syd"         # EDIT; the same region as the relay
+
+# Redis saves and closes the AOF on SIGTERM.
+kill_signal = "SIGTERM"
+kill_timeout = 30
+
+[build]
+  dockerfile = "Dockerfile"
+
+[deploy]
+  # A volume cannot be attached to two machines, so there is nothing to roll to.
+  strategy = "immediate"
+
+[[restart]]
+  policy = "on-failure"
+  retries = 10
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
+
+[mounts]
+  source = "agentuplink_redis_data"
+  destination = "/data"
+  initial_size = "1gb"
+
+# A machine check over the private network: the TLS port accepts connections.
+[checks.redis_tls]
+  type = "tcp"
+  port = 6379
+  interval = "30s"
+  timeout = "5s"
+  grace_period = "10s"

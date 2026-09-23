@@ -1,11 +1,11 @@
 {
-  "reviewedOriginMain": "ee1e285733800d999eb4d03e09d251263be1abfd",
-  "lastPublishedOriginMain": "ee1e285733800d999eb4d03e09d251263be1abfd",
-  "lastReviewAt": "2026-09-23T21:03:51+10:00",
-  "lastReviewOutcome": "Reviewed reconnect implementation, configuration, process tests, service examples and operator dogfood findings through ee1e285. Published reconnect policy and limits, service and upgrade boundaries, version-matched docs, local JWKS requirements, fresh boot identity, Redis restart fencing, AOF/ACL observations, readiness limitations and rotation refusals. No runtime acceptance rerun; CI and release gates unchanged.",
+  "reviewedOriginMain": "721ed2a86a47ea0cd2eaf0ec1ba32211489b09de",
+  "lastPublishedOriginMain": "721ed2a86a47ea0cd2eaf0ec1ba32211489b09de",
+  "lastReviewAt": "2026-09-23T23:02:00+10:00",
+  "lastReviewOutcome": "Reviewed Redis connection stage/lane/class diagnostics and connect budgets, finite-echo reclamation and rotation fixes, relevant regression gates and operator documentation through 721ed2a. Published diagnostic guidance and distinguished the 10-second startup connect budget from the unresolved 2-second live lane reconnect limit. Documented finite-echo fixes without claiming completion of cancellation, retention exhaustion or rotation acceptance. Runtime tests not rerun; CI and release gates unchanged.",
   "reviewedDate": "2026-09-23",
   "scope": "Setup, architecture, MCP, ACP, computer use, filesystems and support boundaries",
-  "verification": "Local and live Chrome verification passed at 1440, 1920, 390 and 320 pixels: homepage, brand lab, nine docs pages, links, images, light/dark/system themes and overflow. Live setup, support, architecture and downloads exactly matched reviewed local assets. Release lookup tests passed empty, latest complete, partial and unavailable states. Upstream runtime and artifact acceptance not rerun; historical evidence not promoted to new acceptance.",
-  "verifiedAt": "2026-09-23T21:03:51+10:00",
-  "deploymentId": "dpl_5KPxDfCaaE27UuG3ENTWuy5hfznu"
+  "verification": "Local and live Chrome verification passed at 1440, 1920, 390 and 320 pixels: homepage, brand lab, nine docs pages, links, images, light/dark/system themes and overflow. Live support and architecture exactly matched reviewed local assets. Runtime, Redis and artifact acceptance not rerun; historical evidence not promoted to new acceptance.",
+  "verifiedAt": "2026-09-23T23:02:00+10:00",
+  "deploymentId": "dpl_5twrAmsHUaoUSJgTAoDHABJJV84f"
 }

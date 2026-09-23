@@ -1,0 +1,45 @@
+# The relay's serving configuration on Fly.io (docs/deploy-fly.md).
+#
+# This file is baked into the image as /etc/agent-tunnel/relay.toml.in. It is
+# deliberately incomplete: the entrypoint writes `redis_url` (from the
+# AT_REDIS_URL secret, which carries the Redis password) above these lines and
+# the result to /var/lib/agent-tunnel/run/relay.toml. Nothing here is secret.
+#
+# Edit the four values marked EDIT before the first build. Every machine built
+# from one image, including the one-off provisioning machines, then reads the
+# same namespace and incarnation, so provisioning and `serve` cannot disagree.
+
+# Fly Proxy forwards the two TCP-passthrough services to these ports, and the
+# health checks require them on 0.0.0.0.
+consumer_bind = "0.0.0.0:8443"
+device_bind = "0.0.0.0:9443"
+
+# EDIT: your consumer identity issuer and the audience its tokens carry.
+oidc_issuer = "https://issuer.example.test/"
+oidc_audience = ["agent-tunnel"]
+oidc_jwks_path = "/var/lib/agent-tunnel/secrets/oidc-jwks.json"
+
+# EDIT: a fresh namespace per provisioning (docs/operator.md section 2.3). A
+# namespace is provisioned once; after a Redis restart or a failed provisioning
+# choose a new one and rebuild.
+redis_namespace = "agentuplink-fly-1"
+redis_tls_root_ca_path = "/var/lib/agent-tunnel/secrets/redis-ca.pem"
+
+device_tls_cert_chain = "/var/lib/agent-tunnel/secrets/device-server-chain.pem"
+device_tls_private_key = "/var/lib/agent-tunnel/secrets/device-server-key.pem"
+device_tls_client_ca = "/var/lib/agent-tunnel/secrets/device-client-ca.pem"
+consumer_tls_cert_chain = "/var/lib/agent-tunnel/secrets/consumer-server-chain.pem"
+consumer_tls_private_key = "/var/lib/agent-tunnel/secrets/consumer-server-key.pem"
+
+# EDIT: this relay's name and the deployment incarnation it activates.
+node_id = "relay-fly-1"
+deployment_incarnation = "fly-1"
+# No boot_id: without one the relay generates a fresh identifier per process.
+
+max_devices_per_user = 16
+max_queue_bytes = 4194304
+
+[rotation]
+interval_seconds = 300
+handshake_timeout_seconds = 10
+overlap_seconds = 30
