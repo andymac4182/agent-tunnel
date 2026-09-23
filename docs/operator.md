@@ -76,6 +76,7 @@ and 3). Anything larger is not supported yet:
 | Supervisor IPC, `status` | **Not supported in this alpha** | M6-06 |
 | Backup and restore of the Redis catalog | Operator's Redis tooling only; restore goes through the recovery commands, which need an external signing authority that is not shipped | M6-C22 |
 | Metrics endpoint and audit log | **Not supported in this alpha** | M6-C24 |
+| One relay and its Redis on Fly.io | Dockerfiles, `fly.toml` files, a runbook and a cost list in [deploy-fly.md](deploy-fly.md), proved with Docker on one machine and run on Fly: one relay serves from an image built from `main`, measured end to end from a Mac (reconnect through a relay restart included) | M6-C70 |
 
 ## 1. Download and verify
 
@@ -605,7 +606,9 @@ What a load balancer should do:
   over UDP between relays ([runtime.md](runtime.md#debugging-and-deployment-contract)).
 - The device listener needs direct TLS termination in the relay or layer-4
   passthrough. An HTTP proxy in front of it strips the device's client
-  certificate.
+  certificate. [deploy-fly.md](deploy-fly.md) does this on Fly.io with TCP
+  services that have no handlers, for the consumer listener as well, because
+  the relay terminates consumer TLS itself.
 
 A relay that is not ready refuses public work with `503` and
 `not_dispatched`, so nothing is executed and lost. Open rows on this path:
