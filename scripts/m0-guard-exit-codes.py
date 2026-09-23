@@ -201,7 +201,17 @@ CASES: list[Case] = [
         # indistinguishable from a crash.
         "an interrupted session is not reported as an internal failure",
         [(MAIN, "            Self::Cancelled => 130,", "            Self::Cancelled => 1,")],
-        frozenset({"tests::causes_needing_different_actions_do_not_share_an_exit_code"}),
+        # Since M6-C23/M6-C27 the status also has a process-level witness: a
+        # real `connect` stopped during its handshake must exit 130, and the
+        # unit test alone could not show that value reaching `$?`.  Measured
+        # red in the first run of the new stop-request cases (log nonce
+        # `m6c23-m0guard-20260923T011929Z-10280`).
+        frozenset(
+            {
+                "tests::causes_needing_different_actions_do_not_share_an_exit_code",
+                "sigterm_during_the_tls_handshake_exits_cancelled",
+            }
+        ),
     ),
     Case(
         # A stale authorization is an authorization decision, not a bug.  The
@@ -380,6 +390,141 @@ CASES: list[Case] = [
                 "doctor_binary_returns_exit_three_for_permissive_credential_directory",
             }
         ),
+    ),
+    # ------------------------------------------- stop requests (M6-C23/C27)
+    Case(
+        # **M6-C23.**  SIGTERM is what systemd and launchd send to stop a
+        # service.  Before this row nothing handled it, and a service stop
+        # killed the connector with no output and no `stopped` event.
+        # Listening for a signal nobody sends in its place is that defect:
+        # SIGTERM keeps its default action (or its inherited `SIG_IGN`).
+        "SIGTERM reaches the orderly stop path",
+        [
+            (
+                MAIN,
+                "                terminate: signal(SignalKind::terminate()).map_err(signal_error)?,",
+                "                terminate: signal(SignalKind::user_defined2()).map_err(signal_error)?,",
+            )
+        ],
+        # Every SIGTERM fixture, and only those: the default-disposition ones
+        # die by the signal (no exit status), the inherited-ignored one runs
+        # out the 10 s handshake deadline and exits 5.
+        frozenset(
+            {
+                "sigterm_during_the_tls_handshake_exits_cancelled",
+                "sigterm_during_the_websocket_upgrade_exits_cancelled",
+                "sigterm_inherited_as_ignored_still_cancels_the_handshake",
+                "sigterm_without_json_reports_the_cancellation_on_stderr",
+            }
+        ),
+    ),
+    Case(
+        # The same rule for SIGINT, which `ctrl_c()` already covered -- but
+        # only after the session was ready.
+        "SIGINT reaches the orderly stop path",
+        [
+            (
+                MAIN,
+                "                interrupt: signal(SignalKind::interrupt()).map_err(signal_error)?,",
+                "                interrupt: signal(SignalKind::user_defined1()).map_err(signal_error)?,",
+            )
+        ],
+        frozenset(
+            {
+                "sigint_during_the_tls_handshake_exits_cancelled",
+                "sigint_during_the_websocket_upgrade_exits_cancelled",
+                "sigint_inherited_as_ignored_still_cancels_the_handshake",
+            }
+        ),
+    ),
+    Case(
+        # **M6-C27's mechanism, restored exactly.**  The handlers are still
+        # installed, but nothing listens for them until the session is ready
+        # -- the pre-fix shape, where the `ctrl_c` select was armed only after
+        # `connect_with_http_handlers` returned.  A signal during the
+        # handshake is then swallowed and the run ends at the 10 s deadline
+        # with exit 5 `DEADLINE_EXCEEDED`.
+        "a stop request during the handshake is listened for",
+        [
+            (
+                MAIN,
+                "        signal = stop.recv() => {\n            let signal = signal?;\n            // Cancel, then",
+                "        signal = std::future::pending::<Result<StopSignal, CliError>>() => {\n            let signal = signal?;\n            // Cancel, then",
+            )
+        ],
+        frozenset(
+            {
+                "sigterm_during_the_tls_handshake_exits_cancelled",
+                "sigterm_during_the_websocket_upgrade_exits_cancelled",
+                "sigterm_inherited_as_ignored_still_cancels_the_handshake",
+                "sigterm_without_json_reports_the_cancellation_on_stderr",
+                "sigint_during_the_tls_handshake_exits_cancelled",
+                "sigint_during_the_websocket_upgrade_exits_cancelled",
+                "sigint_inherited_as_ignored_still_cancels_the_handshake",
+            }
+        ),
+    ),
+    Case(
+        # **The timing assertion's own case.**  A handler that reports
+        # `CANCELLED` but never cancels the attempt still exits 130 -- after
+        # the 2 s bounded unwind rather than at once.  Only the "promptly"
+        # assertion can see that, so this is the case that proves it is not
+        # decoration: without it every fixture here would stay green.
+        "a stop request cancels the connect attempt rather than waiting it out",
+        [
+            (
+                MAIN,
+                "            cancellation.cancel();\n            match bounded(&mut connect",
+                "            match bounded(&mut connect",
+            )
+        ],
+        frozenset(
+            {
+                "sigterm_during_the_tls_handshake_exits_cancelled",
+                "sigterm_during_the_websocket_upgrade_exits_cancelled",
+                "sigterm_inherited_as_ignored_still_cancels_the_handshake",
+                "sigterm_without_json_reports_the_cancellation_on_stderr",
+                "sigint_during_the_tls_handshake_exits_cancelled",
+                "sigint_during_the_websocket_upgrade_exits_cancelled",
+                "sigint_inherited_as_ignored_still_cancels_the_handshake",
+            }
+        ),
+    ),
+    Case(
+        # **The M6-C23 review's first finding.**  Every wait on the stop path
+        # -- the drain join, the pre-ready unwind, the MCP reap wait, the
+        # closed-session join -- goes through `bounded`, whose first arm is
+        # the next stop request.  With that arm never firing, a second
+        # SIGINT or SIGTERM no longer ends a wait: the operator is back to
+        # `SIGKILL`.
+        "a second stop request ends every wait on the stop path",
+        [
+            (
+                MAIN,
+                "        second = next_stop => Ok(Bounded::Interrupted(second?)),",
+                "        second = std::future::pending::<Result<StopSignal, CliError>>() => Ok(Bounded::Interrupted(second?)),",
+            )
+        ],
+        frozenset(
+            {
+                "tests::a_second_stop_during_the_reap_wait_exits_cancelled_promptly",
+                "tests::a_second_stop_during_a_hung_join_exits_cancelled_promptly",
+            }
+        ),
+    ),
+    Case(
+        # "Nothing may wait forever": the same waits with their bound
+        # stretched far past the test's patience.  The hung-join test then
+        # waits out the stretched bound and reddens on its timing assertion.
+        "a wait on the stop path is bounded",
+        [
+            (
+                MAIN,
+                "        result = tokio::time::timeout(bound, work) => {",
+                "        result = tokio::time::timeout(bound * 30, work) => {",
+            )
+        ],
+        frozenset({"tests::a_stop_whose_join_hangs_exits_cancelled_within_the_bound"}),
     ),
     # ------------------------------------------------- totality, by compiler
     Case(

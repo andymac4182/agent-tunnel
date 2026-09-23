@@ -196,6 +196,18 @@ impl McpExportDiagnostics {
             .get(service_id)
             .map(tunnel_mcp_export::McpExport::diagnostics)
     }
+
+    /// Supervised session children not yet killed **and reaped**, across
+    /// every registered MCP export. A child leaves this count only after its
+    /// supervisor has signalled its process group and reaped its leader, so
+    /// zero means the group kill has actually been sent (M6-C29).
+    #[must_use]
+    pub fn children_running(&self) -> u64 {
+        self.exports
+            .values()
+            .map(|export| export.diagnostics().children_running)
+            .sum()
+    }
 }
 
 /// The handler registry passed to [`crate::connect_with_http_handlers`].

@@ -36,8 +36,37 @@ use tunnel_transport::{
     load_peer_server_config_from_pem, load_server_config_from_pem, spki_sha256_from_der,
 };
 
-#[tokio::main]
-async fn main() -> ExitCode {
+/// How long `main` waits, after the command has returned, for work still
+/// running on the runtime's **blocking** pool before exiting anyway.
+///
+/// `#[tokio::main]` dropped the runtime, and dropping a runtime waits
+/// **indefinitely** for blocking tasks (M6-C23 review): a stop request that
+/// abandoned startup while a `spawn_blocking` file open or write sat on a
+/// hung mount would print its diagnostic and then never exit. With this
+/// bound the process exits at most this long after its diagnostic; the
+/// blocking work still in flight is abandoned with the process -- a state
+/// file write already guarded by its own write-then-rename discipline, or a
+/// sentinel stand-down whose sentinel then fires on end of file. Ordinary
+/// exits have no blocking work left and do not wait at all.
+const RUNTIME_SHUTDOWN_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+
+fn main() -> ExitCode {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("tunnel-relay: could not start the async runtime: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let status = runtime.block_on(async_main());
+    runtime.shutdown_timeout(RUNTIME_SHUTDOWN_BOUND);
+    status
+}
+
+async fn async_main() -> ExitCode {
     // The process-wide `rustls` provider is chosen here, explicitly, rather
     // than inferred from which provider features happen to be enabled across
     // the whole dependency graph (task row M8-C09). An error means something
@@ -53,8 +82,188 @@ async fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("tunnel-relay: {error}");
-            ExitCode::FAILURE
+            // A stop request that arrived before `serve` was ready, or a
+            // second one that abandoned the drain, is not a failure of the
+            // relay; it is reported as the client reports `CANCELLED`.
+            if error.downcast_ref::<ServeInterrupted>().is_some() {
+                ExitCode::from(SERVE_INTERRUPTED_EXIT)
+            } else {
+                ExitCode::FAILURE
+            }
         }
+    }
+}
+
+/// Exit status of a `serve` that a stop request ended before it could
+/// complete an orderly shutdown; the same value `tunnel-client` uses for
+/// `CANCELLED`.
+const SERVE_INTERRUPTED_EXIT: u8 = 130;
+
+/// A request to stop `serve`. SIGINT (Ctrl-C) and SIGTERM (what systemd and
+/// launchd send) are the same request and take the same path (M6-C23).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StopSignal {
+    Interrupt,
+    Terminate,
+}
+
+impl StopSignal {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Interrupt => "SIGINT",
+            Self::Terminate => "SIGTERM",
+        }
+    }
+}
+
+/// `serve`'s stop requests, armed before the configuration is read so that
+/// no phase -- startup, serving or the drain -- is left at the inherited
+/// disposition. Before M6-C23 the only handler was `tokio::signal::ctrl_c()`
+/// awaited after the listeners were up: SIGTERM killed the relay in every
+/// phase without running `RunningRelay::shutdown`, and SIGINT during startup
+/// did the same.
+///
+/// Installing the handlers replaces an inherited `SIG_IGN` as well, for the
+/// reason `docs/runtime.md` gives under "Stopping `connect` and `serve`": a stop request
+/// is honoured whatever disposition the process inherited. SIGHUP is not
+/// handled.
+struct StopSignals {
+    #[cfg(unix)]
+    interrupt: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    terminate: tokio::signal::unix::Signal,
+    #[cfg(windows)]
+    ctrl_c: tokio::signal::windows::CtrlC,
+}
+
+impl StopSignals {
+    fn install() -> Result<Self, Box<dyn Error>> {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            Ok(Self {
+                interrupt: signal(SignalKind::interrupt())?,
+                terminate: signal(SignalKind::terminate())?,
+            })
+        }
+        #[cfg(windows)]
+        {
+            Ok(Self {
+                ctrl_c: tokio::signal::windows::ctrl_c()?,
+            })
+        }
+    }
+
+    /// Wait for the next stop request. Cancel-safe.
+    async fn recv(&mut self) -> Result<StopSignal, Box<dyn Error>> {
+        #[cfg(unix)]
+        let received = tokio::select! {
+            received = self.interrupt.recv() => received.map(|()| StopSignal::Interrupt),
+            received = self.terminate.recv() => received.map(|()| StopSignal::Terminate),
+        };
+        #[cfg(windows)]
+        let received = self.ctrl_c.recv().await.map(|()| StopSignal::Interrupt);
+        received.ok_or_else(|| "the stop-signal stream closed".into())
+    }
+}
+
+/// `serve` ended by a stop request before an orderly completion.
+#[derive(Debug)]
+struct ServeInterrupted {
+    signal: StopSignal,
+    phase: ServePhase,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ServePhase {
+    Startup,
+    Drain(StopSignal),
+    /// A finite writing command abandoned by a second stop request.
+    Command {
+        name: &'static str,
+        first: StopSignal,
+    },
+}
+
+impl std::fmt::Display for ServeInterrupted {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.phase {
+            ServePhase::Startup => write!(
+                formatter,
+                "{} received during startup; serve stopped before any listener was serving",
+                self.signal.name()
+            ),
+            ServePhase::Drain(first) => write!(
+                formatter,
+                "{} received during the orderly shutdown {} began; exiting without waiting for the drain",
+                self.signal.name(),
+                first.name()
+            ),
+            ServePhase::Command { name, first } => write!(
+                formatter,
+                "{} received while {name} was finishing after {}; exiting without waiting for it, so its outcome is unknown",
+                self.signal.name(),
+                first.name()
+            ),
+        }
+    }
+}
+
+impl Error for ServeInterrupted {}
+
+/// Run a finite command that **writes** -- Redis authority records or local
+/// state files -- with the stop handlers armed (M6-C23).
+///
+/// These commands end by themselves within their own bounded timeouts, and
+/// what they write cannot be half-undone: `provision-catalog` reserves the
+/// namespace before its first record and a namespace left partial is
+/// discarded, not repaired (M6-C35); `recover` consumes an approval. Taking
+/// the default action on SIGTERM part-way would leave exactly that state and
+/// print nothing. So a **first** stop request is acknowledged on stderr and
+/// the command runs to its own outcome, which is printed and sets the exit
+/// status as usual; a **second** abandons it at once with exit `130` and says
+/// the outcome is unknown. Read-only commands (`check-config`,
+/// `check-serve-config`, `recovery-observe`) are left at the default action:
+/// there is nothing for a stop to damage.
+async fn run_to_completion<F, T>(name: &'static str, command: F) -> Result<T, Box<dyn Error>>
+where
+    F: std::future::Future<Output = Result<T, Box<dyn Error>>>,
+{
+    let mut stop = StopSignals::install()?;
+    tokio::pin!(command);
+    let first = tokio::select! {
+        result = &mut command => return result,
+        signal = stop.recv() => signal?,
+    };
+    eprintln!(
+        "tunnel-relay: {} received during {name}; letting it finish, because an interrupted write cannot be undone (send the signal again to abandon it)",
+        first.name()
+    );
+    tokio::select! {
+        result = &mut command => result,
+        second = stop.recv() => Err(ServeInterrupted {
+            signal: second?,
+            phase: ServePhase::Command { name, first },
+        }
+        .into()),
+    }
+}
+
+/// Run an orderly shutdown to completion unless a **second** stop request
+/// arrives first, in which case the drain is abandoned and `serve` exits
+/// `130`. Without this, an operator whose drain hung would have nothing
+/// short of `SIGKILL` once the handlers are installed.
+async fn drain_unless_interrupted<F>(
+    stop: &mut StopSignals,
+    first: StopSignal,
+    drain: F,
+) -> Result<(), Box<dyn Error>>
+where
+    F: std::future::Future<Output = Result<(), Box<dyn Error>>>,
+{
+    tokio::select! {
+        result = drain => result,
+        second = stop.recv() => Err(ServeInterrupted { signal: second?, phase: ServePhase::Drain(first) }.into()),
     }
 }
 
@@ -94,31 +303,35 @@ async fn run() -> Result<(), Box<dyn Error>> {
         [command, flag, path]
             if command == OsStr::new("initialize") && flag == OsStr::new("--config") =>
         {
-            initialize(Path::new(path)).await?;
+            run_to_completion("initialize", initialize(Path::new(path))).await?;
         }
         [command, flag, path]
             if command == OsStr::new("activate-first-incarnation")
                 && flag == OsStr::new("--config") =>
         {
-            println!(
-                "{}",
-                tunnel_relay::provisioning::activate_first_incarnation(Path::new(path)).await?
-            );
+            let line = run_to_completion(
+                "activate-first-incarnation",
+                tunnel_relay::provisioning::activate_first_incarnation(Path::new(path)),
+            )
+            .await?;
+            println!("{line}");
         }
         [command, rest @ ..] if command == OsStr::new("provision-catalog") => {
-            println!(
-                "{}",
-                tunnel_relay::provisioning::provision_catalog(rest).await?
-            );
+            let line = run_to_completion(
+                "provision-catalog",
+                tunnel_relay::provisioning::provision_catalog(rest),
+            )
+            .await?;
+            println!("{line}");
         }
         [command, rest @ ..] if command == OsStr::new("recovery-initialize") => {
-            recovery_initialize(rest).await?;
+            run_to_completion("recovery-initialize", recovery_initialize(rest)).await?;
         }
         [command, rest @ ..] if command == OsStr::new("recovery-observe") => {
             recovery_observe(rest).await?;
         }
         [command, rest @ ..] if command == OsStr::new("recover") => {
-            recover(rest).await?;
+            run_to_completion("recover", recover(rest)).await?;
         }
         _ => {
             return Err(
@@ -411,6 +624,41 @@ async fn recover(args: &[OsString]) -> Result<(), Box<dyn Error>> {
 }
 
 async fn serve(path: &Path) -> Result<(), Box<dyn Error>> {
+    // Armed first: a stop request during startup (reading files, the Redis
+    // connection, the membership bootstrap, binding) abandons startup with a
+    // diagnostic instead of taking the default action. Startup work is
+    // dropped, not drained -- nothing is serving yet -- and blocking work
+    // already handed to the runtime (the membership state store) still
+    // completes, because dropping the runtime waits for blocking tasks.
+    let mut stop = StopSignals::install()?;
+    let serving = tokio::select! {
+        started = start_serving(path) => started?,
+        signal = stop.recv() => {
+            return Err(ServeInterrupted { signal: signal?, phase: ServePhase::Startup }.into());
+        }
+    };
+    match serving {
+        Serving::Single(running) => {
+            let signal = stop.recv().await?;
+            eprintln!("tunnel-relay stopping: signal={}", signal.name());
+            drain_unless_interrupted(&mut stop, signal, async move {
+                running.shutdown().await.map_err(Into::into)
+            })
+            .await?;
+            eprintln!("tunnel-relay stopped: signal={}", signal.name());
+            Ok(())
+        }
+        Serving::Cluster(cluster) => cluster.run_until_stopped(&mut stop).await,
+    }
+}
+
+/// A relay that finished startup and is serving.
+enum Serving {
+    Single(tunnel_relay::RunningRelay),
+    Cluster(ClusterServing),
+}
+
+async fn start_serving(path: &Path) -> Result<Serving, Box<dyn Error>> {
     let config = ServeConfig::parse(&fs::read_to_string(path)?)?;
     let jwks = parse_jwks(&fs::read(&config.oidc_jwks_path)?)?;
     let oidc = Arc::new(OidcVerifier::new(OidcConfig::new(
@@ -448,7 +696,7 @@ async fn serve(path: &Path) -> Result<(), Box<dyn Error>> {
     let device_ca = fs::read(&config.device_tls_client_ca)?;
     let device_tls = load_server_config_from_pem(&device_cert, &device_key, Some(&device_ca))?;
     if config.cluster.is_some() {
-        serve_cluster(
+        return start_cluster(
             &config,
             options,
             catalog,
@@ -457,8 +705,8 @@ async fn serve(path: &Path) -> Result<(), Box<dyn Error>> {
             consumer_tls,
             device_tls,
         )
-        .await?;
-        return Ok(());
+        .await
+        .map(Serving::Cluster);
     }
     let running = config
         .start(
@@ -474,9 +722,7 @@ async fn serve(path: &Path) -> Result<(), Box<dyn Error>> {
         "tunnel-relay listening: consumer={} device={}",
         running.consumer_addr, running.device_addr
     );
-    tokio::signal::ctrl_c().await?;
-    running.shutdown().await?;
-    Ok(())
+    Ok(Serving::Single(running))
 }
 
 /// Start the M7 private peer path after constructing every trust input from
@@ -488,7 +734,7 @@ async fn serve(path: &Path) -> Result<(), Box<dyn Error>> {
 /// verified dynamic pin set, and a typed owner runtime.  Redis records never
 /// become trust anchors and an unready membership runtime never starts public
 /// listeners.
-async fn serve_cluster(
+async fn start_cluster(
     config: &ServeConfig,
     mut options: RelayOptions,
     catalog: SharedCatalog,
@@ -496,7 +742,7 @@ async fn serve_cluster(
     device_listener: TcpListener,
     consumer_tls: Arc<rustls::ServerConfig>,
     device_tls: Arc<rustls::ServerConfig>,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<ClusterServing, Box<dyn Error>> {
     let cluster = config
         .cluster
         .as_ref()
@@ -665,23 +911,74 @@ async fn serve_cluster(
         "tunnel-relay listening: consumer={} device={} peer={}",
         running.consumer_addr, running.device_addr, cluster.peer_bind
     );
-    let signal_result = tokio::select! {
-        result = tokio::signal::ctrl_c() => result,
-        () = shutdown.cancelled() => Ok(()),
-    };
-    peer_runtime.set_peer_listener_state(PeerListenerState::Draining);
-    shutdown.cancel();
-    membership_handle.cancel();
-    let running_result = running.shutdown().await;
-    let peer_result = peer_task
-        .await
-        .map_err(|error| format!("peer readiness task failed: {error}"));
-    let membership_result = membership_handle.shutdown().await;
-    signal_result?;
-    running_result?;
-    peer_result?;
-    membership_result?;
-    Ok(())
+    Ok(ClusterServing {
+        running,
+        peer_runtime,
+        peer_task,
+        membership_handle,
+        shutdown,
+    })
+}
+
+/// A serving cluster relay and everything its orderly shutdown must join.
+struct ClusterServing {
+    running: tunnel_relay::RunningRelay,
+    peer_runtime: Arc<PeerRuntime>,
+    peer_task: tokio::task::JoinHandle<()>,
+    membership_handle: tunnel_relay::MembershipRuntimeHandle,
+    shutdown: CancellationToken,
+}
+
+impl ClusterServing {
+    async fn run_until_stopped(self, stop: &mut StopSignals) -> Result<(), Box<dyn Error>> {
+        let Self {
+            running,
+            peer_runtime,
+            peer_task,
+            membership_handle,
+            shutdown,
+        } = self;
+        // The relay's own shutdown token takes the same drain as a stop
+        // request, as it did before M6-C23.
+        let requested = tokio::select! {
+            requested = stop.recv() => Some(requested),
+            () = shutdown.cancelled() => None,
+        };
+        let first = match &requested {
+            Some(Ok(signal)) => {
+                eprintln!("tunnel-relay stopping: signal={}", signal.name());
+                *signal
+            }
+            // Nothing to name. A later stop request still abandons the drain;
+            // the diagnostic then reads as if SIGTERM had begun it.
+            Some(Err(_)) | None => {
+                eprintln!("tunnel-relay stopping: internal shutdown requested");
+                StopSignal::Terminate
+            }
+        };
+        drain_unless_interrupted(stop, first, async move {
+            peer_runtime.set_peer_listener_state(PeerListenerState::Draining);
+            shutdown.cancel();
+            membership_handle.cancel();
+            let running_result = running.shutdown().await;
+            let peer_result = peer_task
+                .await
+                .map_err(|error| format!("peer readiness task failed: {error}"));
+            let membership_result = membership_handle.shutdown().await;
+            running_result?;
+            peer_result?;
+            membership_result?;
+            Ok(())
+        })
+        .await?;
+        match requested {
+            Some(requested) => {
+                eprintln!("tunnel-relay stopped: signal={}", requested?.name());
+            }
+            None => eprintln!("tunnel-relay stopped"),
+        }
+        Ok(())
+    }
 }
 
 fn membership_bootstrap_error(

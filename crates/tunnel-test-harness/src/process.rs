@@ -167,9 +167,10 @@ impl ManagedProcess {
             .map_err(|error| HarnessError::Process(format!("waiting for {}: {error}", self.name)))
     }
 
-    /// Request the process's normal shutdown path.  The I08 CLI handles
-    /// SIGINT through `tokio::signal::ctrl_c`; generic fixtures still use
-    /// [`Self::shutdown`] when a forced stop is the intended behavior.
+    /// Request the process's normal shutdown path.  The CLI and the relay
+    /// handle SIGINT and SIGTERM through one orderly stop path (M6-C23);
+    /// generic fixtures still use [`Self::shutdown`] when a forced stop is
+    /// the intended behavior.
     #[cfg(unix)]
     pub async fn request_stop(&mut self) -> Result<()> {
         if self.try_wait()?.is_some() {

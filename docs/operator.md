@@ -304,6 +304,13 @@ failure, is refused, and a namespace left partly written is discarded, not
 repaired. Choose a new `redis_namespace` and start again. No identifier it
 prints is secret; it prints no certificate, key or token.
 
+Because an interrupted write cannot be undone, neither command stops part-way
+on the first SIGTERM or Ctrl-C: it says it received the signal, finishes (each
+Redis step is bounded), and prints and exits with its own outcome. A second
+signal abandons it at once with exit `130` and says the outcome is unknown;
+treat that namespace as partial. `initialize`, `recovery-initialize` and
+`recover` behave the same way (M6-C23).
+
 The activation also binds the namespace to the Redis server's run id. A Redis
 restart that loses the run (no persistence, or a restore) makes `serve` refuse
 again, and the way back is recovery, not a second activation.
@@ -350,7 +357,7 @@ tunnel-relay: invalid relay TOML: unknown field `credentials` ...
 exit=1
 ```
 
-The relay exits `0` or `1` only. It does not use the client's exit-code table.
+The relay exits `0` or `1`, and `130` when a stop request ends `serve` before an orderly completion or a second one abandons a writing command (section 4). It does not otherwise use the client's exit-code table.
 Then start it. **Shape-only:** this command needs your provisioned files and a
 provisioned Redis namespace (section 2.3). `scripts/m6-provisioning-verify.sh`
 runs it end to end:
@@ -359,9 +366,12 @@ runs it end to end:
 tunnel-relay serve --config /etc/agent-tunnel/relay.toml
 ```
 
-`serve` stops on Ctrl-C (SIGINT); that is read from the source and has not been
-measured against a running relay here. It logs JSON lines to stderr; set
-`RUST_LOG` (default `info`) to change the level.
+`serve` stops on SIGTERM or SIGINT (Ctrl-C), the same way for both: it prints
+`tunnel-relay stopping: signal=SIGTERM`, drains its listeners and, in a
+cluster, its peer and membership tasks, prints `tunnel-relay stopped:
+signal=SIGTERM` and exits `0` (measured on a one-node cluster; M6-C23). A stop
+request during startup exits `130` with nothing bound. It logs JSON lines to
+stderr; set `RUST_LOG` (default `info`) to change the level.
 
 The device side runs in the foreground until it stops. **Shape-only:**
 
@@ -475,17 +485,30 @@ each relay is the `serve` command from section 3.1.
 ## 4. Service installation, upgrade, backup and recovery
 
 **Service installation is not supported in this alpha** (M6-C23). No unit files
-are shipped. Neither binary handles SIGTERM, which service managers send by
-default: `tunnel-client connect` sent SIGTERM mid-handshake died at once with no
-output and no `stopped` event (measured; M6-C23), and `tunnel-relay serve` is
-unmeasured but has no handler in its source. SIGINT (Ctrl-C) is handled only
-once `connect` has finished connecting: during the TLS/WebSocket handshake it
-either kills the process with no output or, when SIGINT arrives ignored (a
-background job of a non-interactive shell), does nothing until the handshake
-deadline (10 s with the example profile) ends the run with exit `5` (both measured; M6-C27). After
-connecting, the source handles Ctrl-C as an orderly stop that exits `0`; that
-needs a live relay and is not measured here. Because `connect` does not
-reconnect by itself (section 3.1), whatever supervises it must restart it.
+are shipped. What a unit needs from the binaries is now there: both stop on
+SIGTERM, which service managers send by default, and on SIGINT, through one
+orderly path, in every phase, and whatever disposition they inherited
+([runtime.md](runtime.md#stopping-connect-and-serve) has the table). A
+`connect` whose session is live drains, prints its `stopped` event naming the
+signal and exits `0`; one stopped before its session is ready exits `130`
+`CANCELLED` with a diagnostic; a `serve` that is serving drains and exits `0`,
+one stopped during startup exits `130`. `connect`'s drain is bounded by the
+profile's `rotation.handshake_timeout_seconds + rotation.overlap_seconds` (40 s
+with the defaults; an overrun exits `130`), its wait for MCP child processes by
+5 s, and each binary waits at most 5 s more for blocking work after its command
+has returned. A second stop request during any of those waits, or during
+`serve`'s drain, exits `130` at once. `serve`'s drain has no deadline of its
+own (it joins the membership runtime), so set your unit's stop timeout
+(`TimeoutStopSec` under systemd) to escalate. If your unit can stop the service
+while it is still starting, count `130` as a clean stop
+(`SuccessExitStatus=130` under systemd). runtime.md lists what is measured and
+what is not; in short, the handshake and startup phases and a live stop are
+measured on the real binaries, the second-signal and bound logic of
+`connect`'s waits only by unit tests, and a stop during a data rotation, the
+later handshake sub-phases, `serve`'s binding phase, a non-cluster `serve`
+while serving and `provision-catalog` stopped mid-write are not measured.
+SIGHUP is not handled. Because `connect` does not reconnect by
+itself (section 3.1), whatever supervises it must restart it.
 
 **In-place upgrade is not supported in this alpha.** Stopping a relay ends the
 device sessions it owns. Devices must start a fresh session, and in-flight

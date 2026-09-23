@@ -549,6 +549,416 @@ fn serve_rejects_unavailable_checkpoint_before_public_serving() {
     fixture.assert_bindings_available();
 }
 
+// ------------------------------------------------------------------------
+// Stop requests during startup (task row M6-C23).
+//
+// Before M6-C23 `serve` awaited `tokio::signal::ctrl_c()` only after its
+// listeners were up. A SIGTERM -- what systemd and launchd send -- killed it
+// in every phase without running `RunningRelay::shutdown`, and a SIGINT did
+// the same during startup. These hold the real binary in a startup phase
+// with a peer that accepts and never answers, send the signal, and require:
+// (1) the peer the phase waits on has accepted the relay's connection and
+// the process is still running when signalled, so the phase was held;
+// (2) exit `130` with the startup-interruption diagnostic and no serving
+// marker -- a defeated handler reddens here (death by signal has no status);
+// (3) the exit followed the signal promptly, not the phase's own timeout;
+// (4) nothing was left bound.
+
+/// A TCP peer that accepts every connection and never sends a byte, holding
+/// each socket open so the relay is never released by a close.
+struct SilentPeer {
+    address: SocketAddr,
+    accepted: Arc<AtomicU64>,
+    stop: Arc<AtomicBool>,
+    task: Option<JoinHandle<()>>,
+}
+
+impl SilentPeer {
+    fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind silent peer");
+        listener
+            .set_nonblocking(true)
+            .expect("make silent peer pollable");
+        let address = listener.local_addr().expect("silent peer address");
+        let accepted = Arc::new(AtomicU64::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let task_stop = Arc::clone(&stop);
+        let task_accepted = Arc::clone(&accepted);
+        let task = thread::spawn(move || {
+            let mut held = Vec::new();
+            while !task_stop.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        held.push(stream);
+                        task_accepted.fetch_add(1, Ordering::AcqRel);
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+        Self {
+            address,
+            accepted,
+            stop,
+            task: Some(task),
+        }
+    }
+}
+
+impl Drop for SilentPeer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(task) = self.task.take() {
+            let _ = task.join();
+        }
+    }
+}
+
+/// How long after the phase is reached the signal is sent.
+const SIGNAL_AFTER_PHASE: Duration = Duration::from_millis(100);
+/// The exit must follow the signal within this. Measured at a few
+/// milliseconds. Each held phase also ends by itself, and measured with the
+/// handler defeated (log nonce `m6c23-relay-startup-red-*`) that came about
+/// 0.9 s after a signal sent 100 ms into the Redis phase and 1.9 s into the
+/// checkpoint phase -- each with exit `1`, which the status assertion
+/// already refuses; this bound additionally refuses a `130` that only
+/// arrived when the phase gave up.
+const SIGNAL_PROMPT_EXIT: Duration = Duration::from_millis(500);
+/// Bound on reaching the phase. Generous because the first exec of a freshly
+/// linked binary on macOS can be delayed by the system's executable scan --
+/// which is exactly why the phase is witnessed by the peer rather than
+/// assumed from elapsed time: a first run of these tests that signalled on
+/// a fixed 800 ms timer signalled a process that had not reached `main` yet.
+const SIGNAL_PHASE_BOUND: Duration = Duration::from_secs(20);
+const SIGNAL_RUN_BOUND: Duration = Duration::from_secs(30);
+
+/// Start `serve`, wait until `phase_peer` has accepted its connection (the
+/// witness that the startup phase is reached and held), signal it, and
+/// return the output plus the time from the signal to the exit.
+fn signal_serve_during_startup(
+    config: &Path,
+    phase_peer: &SilentPeer,
+    signal: &str,
+    inherited_ignored: bool,
+) -> (Output, Duration) {
+    let mut command = if inherited_ignored {
+        // `trap ''` sets SIG_IGN, which survives `exec`.
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("trap '' INT TERM; exec \"$0\" \"$@\"")
+            .arg(relay_binary());
+        command
+    } else {
+        Command::new(relay_binary())
+    };
+    let mut child = command
+        .arg("serve")
+        .arg("--config")
+        .arg(config)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn tunnel-relay serve");
+    let started = Instant::now();
+    while phase_peer.accepted.load(Ordering::Acquire) == 0 {
+        if child.try_wait().expect("poll tunnel-relay").is_some() {
+            let output = child.wait_with_output().expect("collect early exit");
+            panic!(
+                "serve exited before reaching the held phase: status={} stderr={}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        if started.elapsed() > SIGNAL_PHASE_BOUND {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("serve did not reach the held phase within {SIGNAL_PHASE_BOUND:?}");
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    thread::sleep(SIGNAL_AFTER_PHASE);
+    if child.try_wait().expect("poll tunnel-relay").is_some() {
+        let output = child.wait_with_output().expect("collect early exit");
+        panic!(
+            "serve exited before the signal, so the startup phase was not held: status={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let status = Command::new("/bin/kill")
+        .arg(format!("-{signal}"))
+        .arg(child.id().to_string())
+        .status()
+        .expect("run kill");
+    assert!(status.success(), "kill -{signal} failed: {status}");
+    let signalled = Instant::now();
+    loop {
+        if child.try_wait().expect("poll tunnel-relay").is_some() {
+            break;
+        }
+        if started.elapsed() > SIGNAL_RUN_BOUND {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("serve did not exit within {SIGNAL_RUN_BOUND:?}");
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    let after_signal = signalled.elapsed();
+    (
+        child.wait_with_output().expect("collect serve output"),
+        after_signal,
+    )
+}
+
+fn assert_interrupted_during_startup(output: &Output, after_signal: Duration, signal: &str) {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let context = format!(
+        "status={} after_signal={after_signal:?} stderr={stderr}",
+        output.status
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(130),
+        "a stop request during startup must exit 130, not die by the signal: {context}"
+    );
+    assert!(
+        stderr.contains(&format!(
+            "tunnel-relay: SIG{signal} received during startup; serve stopped before any listener was serving"
+        )),
+        "the diagnostic must name the signal and the phase: {context}"
+    );
+    assert!(
+        !stderr.contains("tunnel-relay listening:"),
+        "serve reported serving before it was stopped: {context}"
+    );
+    assert!(
+        !stderr.contains(DIAGNOSTIC_SECRET),
+        "the startup diagnostic leaked the fixture secret: {context}"
+    );
+    assert!(
+        after_signal <= SIGNAL_PROMPT_EXIT,
+        "the exit must follow the signal promptly, not the phase's own timeout: {context}"
+    );
+}
+
+/// Held in the TLS handshake of the Redis catalog connection.
+fn signal_while_connecting_to_redis(signal: &str, inherited_ignored: bool) {
+    let fixture = StartupFixture::new();
+    let redis = SilentPeer::start();
+    let config = fixture.valid_config(&format!(
+        "rediss://{DIAGNOSTIC_SECRET}@127.0.0.1:{}/0",
+        redis.address.port()
+    ));
+    let (output, after_signal) =
+        signal_serve_during_startup(&config, &redis, signal, inherited_ignored);
+    assert_interrupted_during_startup(&output, after_signal, signal);
+    fixture.assert_bindings_available();
+}
+
+#[cfg(unix)]
+#[test]
+fn serve_sigterm_while_connecting_to_redis_exits_interrupted() {
+    signal_while_connecting_to_redis("TERM", false);
+}
+
+#[cfg(unix)]
+#[test]
+fn serve_sigint_while_connecting_to_redis_exits_interrupted() {
+    signal_while_connecting_to_redis("INT", false);
+}
+
+/// The binary installs its handlers over an inherited `SIG_IGN`, as the
+/// client does; see `docs/runtime.md`, "Stopping `connect` and `serve`".
+#[cfg(unix)]
+#[test]
+fn serve_sigterm_inherited_as_ignored_still_stops_startup() {
+    signal_while_connecting_to_redis("TERM", true);
+}
+
+/// Held later in startup: Redis answers (the fake), and the membership
+/// bootstrap waits on a checkpoint authority that never answers.
+#[cfg(unix)]
+#[test]
+fn serve_sigterm_during_the_membership_bootstrap_exits_interrupted() {
+    let fixture = StartupFixture::new();
+    initialize_state(&fixture, "rediss://127.0.0.1:1/0");
+    let redis = FakeRedisTls::start(&fixture);
+    let checkpoint = SilentPeer::start();
+    let config = fixture.write_config(
+        &redis.url(),
+        &format!(
+            "https://127.0.0.1:{}/v1/checkpoint",
+            checkpoint.address.port()
+        ),
+        "relay-startup",
+        None,
+        true,
+    );
+    let (output, after_signal) = signal_serve_during_startup(&config, &checkpoint, "TERM", false);
+    assert_interrupted_during_startup(&output, after_signal, "TERM");
+    fixture.assert_bindings_available();
+}
+
+// ------------------------------------------------------------------------
+// Stop requests during a finite writing command (M6-C23, after M6-C21).
+//
+// `activate-first-incarnation`, `provision-catalog`, `initialize`,
+// `recovery-initialize` and `recover` write state that cannot be half-undone,
+// so a first stop request lets the bounded command finish and report its own
+// outcome, and a second abandons it with 130. Held here in the Redis TLS
+// handshake of `activate-first-incarnation`, which is the same wrapper every
+// one of those commands goes through.
+
+/// Spawn `tunnel-relay <args>`, wait for `phase_peer` to witness the Redis
+/// connection, send each signal in turn (100 ms apart), and return the
+/// output and the time from the **last** signal to the exit.
+fn signal_relay_command(
+    args: &[&OsStr],
+    phase_peer: &SilentPeer,
+    signals: &[&str],
+) -> (Output, Duration) {
+    let mut child = Command::new(relay_binary())
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn tunnel-relay command");
+    let started = Instant::now();
+    while phase_peer.accepted.load(Ordering::Acquire) == 0 {
+        if child.try_wait().expect("poll tunnel-relay").is_some() {
+            let output = child.wait_with_output().expect("collect early exit");
+            panic!(
+                "the command exited before reaching the held phase: status={} stderr={}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        assert!(
+            started.elapsed() <= SIGNAL_PHASE_BOUND,
+            "the command did not reach the held phase within {SIGNAL_PHASE_BOUND:?}"
+        );
+        thread::sleep(Duration::from_millis(2));
+    }
+    let mut signalled = Instant::now();
+    for signal in signals {
+        thread::sleep(SIGNAL_AFTER_PHASE);
+        assert!(
+            child.try_wait().expect("poll tunnel-relay").is_none(),
+            "the command exited before SIG{signal} was sent"
+        );
+        let status = Command::new("/bin/kill")
+            .arg(format!("-{signal}"))
+            .arg(child.id().to_string())
+            .status()
+            .expect("run kill");
+        assert!(status.success(), "kill -{signal} failed: {status}");
+        signalled = Instant::now();
+    }
+    loop {
+        if child.try_wait().expect("poll tunnel-relay").is_some() {
+            break;
+        }
+        if started.elapsed() > SIGNAL_RUN_BOUND {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the command did not exit within {SIGNAL_RUN_BOUND:?}");
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    let after_signal = signalled.elapsed();
+    (
+        child.wait_with_output().expect("collect command output"),
+        after_signal,
+    )
+}
+
+/// A first SIGTERM does not kill a writing command: it is acknowledged, the
+/// command reaches its own outcome -- here the Redis connection's own
+/// failure, because the peer never answers -- and that outcome sets the exit
+/// status. With the handler defeated the process dies by the signal instead.
+#[cfg(unix)]
+#[test]
+fn a_writing_command_finishes_and_reports_its_own_outcome_after_one_sigterm() {
+    let fixture = StartupFixture::new();
+    let redis = SilentPeer::start();
+    let config = fixture.valid_config(&format!(
+        "rediss://{DIAGNOSTIC_SECRET}@127.0.0.1:{}/0",
+        redis.address.port()
+    ));
+    let (output, _) = signal_relay_command(
+        &[
+            OsStr::new("activate-first-incarnation"),
+            OsStr::new("--config"),
+            config.as_os_str(),
+        ],
+        &redis,
+        &["TERM"],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let context = format!("status={} stderr={stderr}", output.status);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "the command's own outcome (the Redis connection failing) must set the \
+         status, not the signal: {context}"
+    );
+    assert!(
+        stderr.contains(
+            "tunnel-relay: SIGTERM received during activate-first-incarnation; letting it finish"
+        ),
+        "the stop request must be acknowledged: {context}"
+    );
+    assert!(
+        stderr.contains("Redis catalog connection failed"),
+        "the command's own outcome must still be reported: {context}"
+    );
+    assert!(!stderr.contains(DIAGNOSTIC_SECRET), "{context}");
+}
+
+/// A second stop request abandons the write at once, with 130 and a
+/// diagnostic saying the outcome is unknown.
+#[cfg(unix)]
+#[test]
+fn a_second_stop_request_abandons_a_writing_command() {
+    let fixture = StartupFixture::new();
+    let redis = SilentPeer::start();
+    let config = fixture.valid_config(&format!(
+        "rediss://{DIAGNOSTIC_SECRET}@127.0.0.1:{}/0",
+        redis.address.port()
+    ));
+    let (output, after_signal) = signal_relay_command(
+        &[
+            OsStr::new("activate-first-incarnation"),
+            OsStr::new("--config"),
+            config.as_os_str(),
+        ],
+        &redis,
+        &["TERM", "INT"],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let context = format!(
+        "status={} after_signal={after_signal:?} stderr={stderr}",
+        output.status
+    );
+    assert_eq!(output.status.code(), Some(130), "{context}");
+    assert!(
+        stderr.contains(
+            "tunnel-relay: SIGINT received while activate-first-incarnation was finishing after SIGTERM; exiting without waiting for it, so its outcome is unknown"
+        ),
+        "{context}"
+    );
+    assert!(
+        after_signal <= SIGNAL_PROMPT_EXIT,
+        "the second request must end the command promptly, not at the Redis timeout: {context}"
+    );
+}
+
 struct FakeRedisTls {
     address: SocketAddr,
     stop: Arc<AtomicBool>,

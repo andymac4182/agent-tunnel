@@ -129,8 +129,11 @@ impl Cause {
     ///   because nothing is wrong with the build: the operator's action is
     ///   to stop the other connector, or to wait.
     /// * `130` — interrupted before an orderly completion could be
-    ///   recorded. An orderly `Ctrl-C` stop exits `0`; this is the case
-    ///   where cancellation won the race against the drain.
+    ///   recorded: a stop request (SIGINT or SIGTERM) that arrived before
+    ///   the session was ready, a second one that abandoned the drain, or
+    ///   an orderly stop whose join overran its bound.
+    ///   A stop request while the session is live drains and exits `0`
+    ///   with a `stopped` event instead (M6-C23, M6-C27).
     /// * `1` — genuinely unexpected: a protocol violation, a failed
     ///   supervisor, or a signal subsystem error. After this change `1`
     ///   means what it says.
@@ -228,6 +231,9 @@ struct ConnectResult<'a> {
     epoch: Option<u64>,
     generation: Option<u64>,
     failure_policy: &'a str,
+    /// Which stop request ended the session, on the `stopped` event only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    signal: Option<&'static str>,
 }
 
 /// Bounded `--json` status events used by real-process acceptance probes.
@@ -259,8 +265,37 @@ struct ConnectStatusResult {
     drain_acks: usize,
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
+/// How long `main` waits, after the command has returned, for work still
+/// running on the runtime's **blocking** pool before exiting anyway.
+///
+/// `#[tokio::main]` dropped the runtime, and dropping a runtime waits
+/// **indefinitely** for blocking tasks (M6-C23 review): a stop request that
+/// abandoned startup while a `spawn_blocking` file open or write sat on a
+/// hung mount would print its diagnostic and then never exit. With this
+/// bound the process exits at most this long after its diagnostic; the
+/// blocking work still in flight is abandoned with the process -- a state
+/// file write already guarded by its own write-then-rename discipline, or a
+/// sentinel stand-down whose sentinel then fires on end of file. Ordinary
+/// exits have no blocking work left and do not wait at all.
+const RUNTIME_SHUTDOWN_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+
+fn main() -> ExitCode {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("tunnel-client: could not start the async runtime: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let status = runtime.block_on(async_main());
+    runtime.shutdown_timeout(RUNTIME_SHUTDOWN_BOUND);
+    status
+}
+
+async fn async_main() -> ExitCode {
     // The process-wide `rustls` provider is chosen here, explicitly, rather
     // than inferred from which provider features happen to be enabled across
     // the whole dependency graph (task row M8-C09). An error means something
@@ -404,8 +439,236 @@ fn run_legacy_check_config(path: Option<PathBuf>) -> Result<(), CliError> {
     Ok(())
 }
 
+/// A request to stop, as delivered to this process.
+///
+/// SIGINT and SIGTERM are **one** request with two spellings: Ctrl-C at a
+/// terminal sends the first, and a service manager (systemd, launchd) sends
+/// the second by default. Both take the same orderly path below; the name is
+/// kept only so the diagnostic can say which one arrived.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StopSignal {
+    Interrupt,
+    Terminate,
+}
+
+impl StopSignal {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Interrupt => "SIGINT",
+            Self::Terminate => "SIGTERM",
+        }
+    }
+}
+
+/// The process's stop requests, armed **before** anything else `connect`
+/// does (task rows M6-C23 and M6-C27).
+///
+/// Before this, the only handler was a `tokio::signal::ctrl_c()` future
+/// created inside the post-connect select loop. Until that line ran, SIGINT
+/// kept the disposition the process inherited and SIGTERM always did: a
+/// signal during the TLS/WebSocket handshake either killed the process with
+/// no output (default disposition) or was ignored until the handshake
+/// deadline reported `DEADLINE_EXCEEDED` (inherited `SIG_IGN`), and SIGTERM
+/// killed it in every phase.
+///
+/// **Inherited `SIG_IGN` is overridden, deliberately.** Installing a handler
+/// replaces whatever disposition the process inherited, so a `tunnel-client`
+/// started as a background job of a non-interactive shell (which sets SIGINT
+/// and SIGQUIT to ignored) now stops on SIGINT too. The reasons, and the
+/// alternative that was rejected, are in `docs/runtime.md` ("Stopping
+/// `connect` and `serve`"); in short, a stop request that is silently ignored for ten
+/// seconds and then reported as a deadline is the defect M6-C27 recorded, and
+/// a process that must survive a terminal's Ctrl-C belongs in its own session
+/// or under a service manager, not behind an inherited disposition. SIGHUP is
+/// **not** handled, so `nohup` keeps working.
+struct StopSignals {
+    #[cfg(unix)]
+    interrupt: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    terminate: tokio::signal::unix::Signal,
+    #[cfg(windows)]
+    ctrl_c: tokio::signal::windows::CtrlC,
+}
+
+impl StopSignals {
+    fn install() -> Result<Self, CliError> {
+        let signal_error = |error: std::io::Error| CliError {
+            cause: Cause::SignalError,
+            message: format!("could not install the stop-signal handlers: {error}"),
+            retryable: false,
+        };
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            Ok(Self {
+                interrupt: signal(SignalKind::interrupt()).map_err(signal_error)?,
+                terminate: signal(SignalKind::terminate()).map_err(signal_error)?,
+            })
+        }
+        #[cfg(windows)]
+        {
+            Ok(Self {
+                ctrl_c: tokio::signal::windows::ctrl_c().map_err(signal_error)?,
+            })
+        }
+    }
+
+    /// Wait for the next stop request. Cancel-safe, so it can sit in a
+    /// `select!` loop without losing a delivery.
+    async fn recv(&mut self) -> Result<StopSignal, CliError> {
+        let closed = || CliError {
+            cause: Cause::SignalError,
+            message: "the stop-signal stream closed".to_owned(),
+            retryable: false,
+        };
+        #[cfg(unix)]
+        {
+            tokio::select! {
+                received = self.interrupt.recv() => received.map(|()| StopSignal::Interrupt).ok_or_else(closed),
+                received = self.terminate.recv() => received.map(|()| StopSignal::Terminate).ok_or_else(closed),
+            }
+        }
+        #[cfg(windows)]
+        {
+            self.ctrl_c
+                .recv()
+                .await
+                .map(|()| StopSignal::Interrupt)
+                .ok_or_else(closed)
+        }
+    }
+}
+
+/// How long a cancelled connect attempt may take to unwind before it is
+/// dropped. The attempt observes its cancellation token at every await, so
+/// this is a ceiling on a defect, not an expected wait; dropping the future
+/// closes whatever socket it still owns either way.
+const CANCELLED_CONNECT_UNWIND: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The diagnostic for a stop request that arrived before the session was
+/// ready: `CANCELLED`, exit `130`. Nothing was established, so there is no
+/// orderly completion to record -- which is exactly what `130` means.
+fn interrupted_before_ready(signal: StopSignal) -> CliError {
+    CliError {
+        cause: Cause::Cancelled,
+        message: format!(
+            "{} received before the session was ready; the connect attempt was cancelled",
+            signal.name()
+        ),
+        retryable: false,
+    }
+}
+
+/// How a bounded wait ended.
+#[derive(Debug)]
+enum Bounded<T> {
+    Done(T),
+    TimedOut,
+    /// Another stop request arrived first.
+    Interrupted(StopSignal),
+}
+
+/// Wait for `work` for at most `bound`, unless another stop request arrives
+/// first -- **every** wait on the stop path goes through this, so that "a
+/// second signal always exits at once" and "nothing waits forever" hold in
+/// each window rather than in the ones someone remembered (M6-C23 review).
+/// `biased` so a stop request that is already pending wins over work that
+/// happens to be ready in the same poll.
+async fn bounded<F, S>(
+    work: F,
+    bound: std::time::Duration,
+    next_stop: S,
+) -> Result<Bounded<F::Output>, CliError>
+where
+    F: std::future::Future,
+    S: std::future::Future<Output = Result<StopSignal, CliError>>,
+{
+    tokio::select! {
+        biased;
+        second = next_stop => Ok(Bounded::Interrupted(second?)),
+        result = tokio::time::timeout(bound, work) => {
+            Ok(result.map_or(Bounded::TimedOut, Bounded::Done))
+        }
+    }
+}
+
+/// `CANCELLED` for a stop request that abandoned a wait on the stop path.
+fn abandoned(second: StopSignal, first: Option<StopSignal>, waiting_for: &str) -> CliError {
+    let message = match first {
+        Some(first) => format!(
+            "{} received during the orderly stop {} began, while waiting for {waiting_for}; exiting without waiting",
+            second.name(),
+            first.name()
+        ),
+        None => format!(
+            "{} received while waiting for {waiting_for}; exiting without waiting",
+            second.name()
+        ),
+    };
+    CliError {
+        cause: Cause::Cancelled,
+        message,
+        retryable: false,
+    }
+}
+
+/// Join the connector after a stop request: bounded by `bound`, and
+/// abandoned at once by a **second** request.
+///
+/// Once the handlers are installed a signal no longer kills the process, so
+/// without this a drain that hung would leave an operator with nothing short
+/// of `SIGKILL`. Either way out reports `CANCELLED` (exit `130`): the drain
+/// did not complete, which is what that status means. The join's own result
+/// is not the diagnostic: the stop was requested, and the connector reports
+/// a requested stop as success, unchanged from the SIGINT-only path.
+async fn join_after_stop<J, S>(
+    join: J,
+    bound: std::time::Duration,
+    next_stop: S,
+    first: StopSignal,
+) -> Result<(), CliError>
+where
+    J: std::future::Future,
+    S: std::future::Future<Output = Result<StopSignal, CliError>>,
+{
+    match bounded(join, bound, next_stop).await? {
+        Bounded::Done(_) => Ok(()),
+        Bounded::Interrupted(second) => {
+            Err(abandoned(second, Some(first), "the connector to drain"))
+        }
+        Bounded::TimedOut => Err(CliError {
+            cause: Cause::Cancelled,
+            message: format!(
+                "the orderly stop {} began did not complete within {} s; exiting without it",
+                first.name(),
+                bound.as_secs()
+            ),
+            retryable: false,
+        }),
+    }
+}
+
+/// Bound on joining the connector after a stop request: the configured
+/// replacement handshake deadline plus the rotation overlap, the longest a
+/// drain that was mid-rotation can legitimately need (40 s with the
+/// defaults). The same derivation as the M7 liveness gate's join bound,
+/// minus the interval, which a stop does not wait for.
+fn stop_join_bound(config: &ConnectConfig) -> std::time::Duration {
+    std::time::Duration::from_secs(
+        config
+            .rotation
+            .handshake_timeout_seconds
+            .saturating_add(config.rotation.overlap_seconds),
+    )
+}
+
 async fn run_connect(path: PathBuf, json: bool) -> Result<(), CliError> {
+    // First, before any file is read or socket opened: from here on a stop
+    // request in any phase reaches the orderly path below instead of the
+    // inherited disposition.
+    let mut stop = StopSignals::install()?;
     let config = load_runtime_config(&path)?;
+    let stop_bound = stop_join_bound(&config);
     // Configured MCP and ACP exports become in-process http-forward/1
     // handlers; an http-forward export without one is still refused at OPEN.
     // **Both registrations run**, because an `[exports.<id>.acp]` table that
@@ -424,23 +687,168 @@ async fn run_connect(path: PathBuf, json: bool) -> Result<(), CliError> {
             message: error.to_string(),
             retryable: false,
         })?;
+    // Kept across the move so the stop path can wait for supervised MCP
+    // children to be reaped (M6-C29).
+    let mcp_children = handlers.mcp_diagnostics_source();
     let cancellation = CancellationToken::new();
     let options = ConnectOptions {
         config,
         cancellation: cancellation.clone(),
         profile: tunnel_client::TransportProfile::M2,
     };
-    let handle = match tunnel_client::connect_with_http_handlers(options, handlers).await {
-        Ok(handle) => handle,
-        Err(error) => {
-            let error = CliError::from_client(error);
-            return Err(error);
+    let connect = tunnel_client::connect_with_http_handlers(options, handlers);
+    tokio::pin!(connect);
+    // `biased`, connect first: when the attempt completes in the same poll
+    // as a stop request, the session **is** ready (`connect_m2` published
+    // `Readiness::Ready` before returning), so it must take the orderly path
+    // and print its `stopped` event rather than be reported as a pre-ready
+    // cancellation. The pending signal is not lost; the session loop's first
+    // poll receives it.
+    let (handle, stop_requested) = tokio::select! {
+        biased;
+        result = &mut connect => (result.map_err(CliError::from_client)?, None),
+        signal = stop.recv() => {
+            let signal = signal?;
+            // Cancel, then let the attempt unwind so the sockets it opened
+            // are closed by their owner rather than by process exit.
+            cancellation.cancel();
+            match bounded(&mut connect, CANCELLED_CONNECT_UNWIND, stop.recv()).await? {
+                // It finished before it saw the cancellation: that session
+                // was ready, so it is stopped in order, `stopped` included.
+                Bounded::Done(Ok(handle)) => (handle, Some(signal)),
+                Bounded::Interrupted(second) => {
+                    return Err(abandoned(second, Some(signal), "the cancelled connect attempt to unwind"));
+                }
+                Bounded::Done(Err(_)) | Bounded::TimedOut => {
+                    return Err(interrupted_before_ready(signal));
+                }
+            }
         }
     };
+    let outcome = match stop_requested {
+        Some(signal) => Ok(signal),
+        None => run_session(&handle, &mut stop, stop_bound, json).await,
+    };
+    match outcome {
+        Ok(first) => {
+            cancellation.cancel();
+            join_after_stop(handle.stop(), stop_bound, stop.recv(), first).await?;
+            wait_for_supervised_children(
+                || mcp_children.children_running(),
+                stop.recv(),
+                Some(first),
+            )
+            .await?;
+            if json {
+                print_ok_json(
+                    "connect",
+                    ConnectResult {
+                        state: "stopped",
+                        session_id: None,
+                        epoch: None,
+                        generation: None,
+                        failure_policy: M1_TRANSPORT_FAILURE_POLICY,
+                        signal: Some(first.name()),
+                    },
+                );
+            } else {
+                println!("Stopped.");
+            }
+            Ok(())
+        }
+        // A second stop request already abandoned the drain; that operator
+        // has asked not to wait, and the children's kill was never requested.
+        Err(error) if error.cause == Cause::Cancelled => Err(error),
+        Err(error) => {
+            wait_for_supervised_children(|| mcp_children.children_running(), stop.recv(), None)
+                .await?;
+            Err(error)
+        }
+    }
+}
+
+/// Bound on waiting for supervised MCP children to be reaped after the
+/// connector stops. Their kill is `SIGKILL` to the process group, so a reap
+/// takes milliseconds; the bound only caps a defect, and when it fires the
+/// process exits anyway and the sentinel, if installed, fires.
+const SUPERVISED_CHILD_REAP_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Wait, bounded, until `running()` reaches zero, unless another stop
+/// request arrives first.
+///
+/// The session actor dropped its handlers inside `handle.stop()`, which
+/// *requests* every supervised MCP child's group kill; the kill, the reap
+/// and the sentinel stand-down run on a spawned task. Returning from `main`
+/// before they ran would tear the runtime down with that task possibly
+/// never polled -- measured (M6-C29) to leave an in-group helper alive in 7
+/// of 50 runs on this runtime flavour, and every time on a current-thread
+/// one, when no sentinel is installed. A timed-out wait is not an error.
+async fn wait_for_supervised_children<R, S>(
+    running: R,
+    next_stop: S,
+    first: Option<StopSignal>,
+) -> Result<(), CliError>
+where
+    R: Fn() -> u64,
+    S: std::future::Future<Output = Result<StopSignal, CliError>>,
+{
+    let reaped = async {
+        while running() > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    };
+    match bounded(reaped, SUPERVISED_CHILD_REAP_BOUND, next_stop).await? {
+        Bounded::Done(()) | Bounded::TimedOut => Ok(()),
+        Bounded::Interrupted(second) => Err(abandoned(
+            second,
+            first,
+            "supervised MCP children to be reaped",
+        )),
+    }
+}
+
+/// Join a connector whose session ended by itself, bounded and abandonable
+/// like every other wait on the stop path. Its supervisor has normally
+/// returned already, so this is immediate; the bound caps a defect.
+async fn join_after_close(
+    handle: &tunnel_client::ConnectionHandle,
+    stop: &mut StopSignals,
+    bound: std::time::Duration,
+) -> Result<Result<(), ClientError>, CliError> {
+    match bounded(handle.stop(), bound, stop.recv()).await? {
+        Bounded::Done(result) => Ok(result),
+        Bounded::Interrupted(second) => {
+            Err(abandoned(second, None, "the closed connector to join"))
+        }
+        Bounded::TimedOut => Err(CliError {
+            cause: Cause::SupervisorFailed,
+            message: format!(
+                "the connector did not join within {} s after its session closed",
+                bound.as_secs()
+            ),
+            retryable: false,
+        }),
+    }
+}
+
+/// The live session, from ready to its end: an orderly stop on request, or
+/// the connector's own terminal cause.
+///
+/// Returns the stop request that ended it; the caller runs the orderly stop,
+/// so the ready-boundary case in `run_connect` shares it exactly.
+async fn run_session(
+    handle: &tunnel_client::ConnectionHandle,
+    stop: &mut StopSignals,
+    bound: std::time::Duration,
+    json: bool,
+) -> Result<StopSignal, CliError> {
     let mut readiness = handle.readiness();
     let initial = readiness.borrow_and_update().clone();
     if let tunnel_client::Readiness::Closed { reason } = initial {
-        return Err(closed_session_error(reason, handle.stop().await));
+        return Err(closed_session_error(
+            reason,
+            join_after_close(handle, stop, bound).await?,
+        ));
     }
     if let tunnel_client::Readiness::Ready(info) = &initial {
         if json {
@@ -452,6 +860,7 @@ async fn run_connect(path: PathBuf, json: bool) -> Result<(), CliError> {
                     epoch: Some(info.epoch),
                     generation: Some(info.generation),
                     failure_policy: M1_TRANSPORT_FAILURE_POLICY,
+                    signal: None,
                 },
             );
         } else {
@@ -472,31 +881,26 @@ async fn run_connect(path: PathBuf, json: bool) -> Result<(), CliError> {
     }
     loop {
         tokio::select! {
-            signal = tokio::signal::ctrl_c() => {
-                signal.map_err(|error| CliError { cause: Cause::SignalError, message: error.to_string(), retryable: false })?;
-                cancellation.cancel();
-                let _ = handle.stop().await;
-                if json {
-                    print_ok_json("connect", ConnectResult { state: "stopped", session_id: None, epoch: None, generation: None, failure_policy: M1_TRANSPORT_FAILURE_POLICY });
-                } else {
-                    println!("Stopped.");
-                }
-                return Ok(());
+            signal = stop.recv() => {
+                // The same orderly path for SIGINT and SIGTERM, and for every
+                // phase a live session can be in, rotation included: this
+                // loop runs for the whole life of the session.
+                return signal;
             }
             changed = readiness.changed() => {
                 if changed.is_err() {
-                    return Err(stopped_connector_error(&mut readiness, &handle, "connector supervisor stopped").await);
+                    return Err(stopped_connector_error(&mut readiness, handle, stop, bound, "connector supervisor stopped").await?);
                 }
                 let state = readiness.borrow_and_update().clone();
                 if let tunnel_client::Readiness::Closed { reason } = state {
-                    return Err(closed_session_error(reason, handle.stop().await));
+                    return Err(closed_session_error(reason, join_after_close(handle, stop, bound).await?));
                 }
             }
             changed = status.changed() => {
                 if changed.is_err() {
                     // The status publisher stopping must not outrank the
                     // typed terminal cause the readiness channel still holds.
-                    return Err(stopped_connector_error(&mut readiness, &handle, "connector status publisher stopped").await);
+                    return Err(stopped_connector_error(&mut readiness, handle, stop, bound, "connector status publisher stopped").await?);
                 }
                 let current = status.borrow_and_update().clone();
                 if json && should_emit_connect_status(&last_status, &current) {
@@ -600,16 +1004,18 @@ fn retained_closed_reason(
 async fn stopped_connector_error(
     readiness: &mut tokio::sync::watch::Receiver<tunnel_client::Readiness>,
     handle: &tunnel_client::ConnectionHandle,
+    stop: &mut StopSignals,
+    bound: std::time::Duration,
     fallback_message: &'static str,
-) -> CliError {
-    match retained_closed_reason(readiness) {
-        Some(reason) => closed_session_error(reason, handle.stop().await),
+) -> Result<CliError, CliError> {
+    Ok(match retained_closed_reason(readiness) {
+        Some(reason) => closed_session_error(reason, join_after_close(handle, stop, bound).await?),
         None => CliError {
             cause: Cause::SupervisorFailed,
             message: fallback_message.to_owned(),
             retryable: false,
         },
-    }
+    })
 }
 
 fn closed_session_error(reason: String, stop_result: Result<(), ClientError>) -> CliError {
@@ -834,6 +1240,106 @@ closes both sockets and requires a fresh session; rotation and resume are M2."
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---------------------------------------------- bounded stop-path waits
+    //
+    // Every wait on the stop path goes through `bounded`, with the next stop
+    // request as its competitor. These drive the three waits the review
+    // named with a synthetic stop request, because reaching them in a real
+    // process needs a relay (and, for the reap, a live MCP session). They
+    // prove the waits' own logic and bounds; that `run_connect` calls them
+    // is source-read (M6-C23).
+
+    /// A stop request that fires after `delay`.
+    async fn stop_after(delay: std::time::Duration) -> Result<StopSignal, CliError> {
+        tokio::time::sleep(delay).await;
+        Ok(StopSignal::Interrupt)
+    }
+
+    async fn never_stops() -> Result<StopSignal, CliError> {
+        std::future::pending().await
+    }
+
+    /// A second signal during the reap wait exits 130 promptly, even while
+    /// a child is still "running" and the 5 s bound is far away.
+    #[tokio::test]
+    async fn a_second_stop_during_the_reap_wait_exits_cancelled_promptly() {
+        let started = std::time::Instant::now();
+        let error = wait_for_supervised_children(
+            || 1,
+            stop_after(std::time::Duration::from_millis(50)),
+            Some(StopSignal::Terminate),
+        )
+        .await
+        .expect_err("a second stop request must abandon the reap wait");
+        assert_eq!(error.exit_code(), 130);
+        assert!(
+            error
+                .message
+                .contains("SIGINT received during the orderly stop SIGTERM began"),
+            "{}",
+            error.message
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "the second stop request must end the wait at once, not at its {SUPERVISED_CHILD_REAP_BOUND:?} bound"
+        );
+    }
+
+    /// A drain that never completes still ends within its bound, as 130.
+    #[tokio::test]
+    async fn a_stop_whose_join_hangs_exits_cancelled_within_the_bound() {
+        let started = std::time::Instant::now();
+        let error = join_after_stop(
+            std::future::pending::<()>(),
+            std::time::Duration::from_millis(100),
+            never_stops(),
+            StopSignal::Terminate,
+        )
+        .await
+        .expect_err("a join that never completes must time out");
+        assert_eq!(error.exit_code(), 130);
+        assert!(
+            error.message.contains("did not complete within"),
+            "{}",
+            error.message
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    /// And a second stop request ends that hung join at once, long before
+    /// its bound.
+    #[tokio::test]
+    async fn a_second_stop_during_a_hung_join_exits_cancelled_promptly() {
+        let started = std::time::Instant::now();
+        let error = join_after_stop(
+            std::future::pending::<()>(),
+            std::time::Duration::from_secs(60),
+            stop_after(std::time::Duration::from_millis(50)),
+            StopSignal::Terminate,
+        )
+        .await
+        .expect_err("a second stop request must abandon the join");
+        assert_eq!(error.exit_code(), 130);
+        assert!(
+            error
+                .message
+                .contains("SIGINT received during the orderly stop"),
+            "{}",
+            error.message
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    /// The default derivation: 10 s handshake plus 30 s overlap.
+    #[test]
+    fn the_stop_join_bound_is_the_handshake_deadline_plus_the_overlap() {
+        let config = ConnectConfig {
+            rotation: tunnel_core::RotationConfig::default(),
+            ..ConnectConfig::default()
+        };
+        assert_eq!(stop_join_bound(&config), std::time::Duration::from_secs(40));
+    }
 
     #[test]
     fn doctor_parser_accepts_only_local_config_and_json_flags() {
