@@ -50,11 +50,14 @@ jobs:
         # compiles and passes clippy above, and its dependents' tests run.
         run: |
           set -euo pipefail
-          exclude=()
+          # A plain string, not an array: macOS runs bash 3.2, where an empty
+          # array under `set -u` is an unbound variable.
+          exclude=""
           if [[ "$RUNNER_OS" == "Windows" ]]; then
-            exclude=(--exclude tunnel-relay)
+            exclude="--exclude tunnel-relay"
           fi
-          cargo +1.95.0 test --workspace --all-targets --locked --no-fail-fast "${exclude[@]}"
+          # shellcheck disable=SC2086
+          cargo +1.95.0 test --workspace --all-targets --locked --no-fail-fast $exclude
       - name: Validate example configurations
         run: |
           set -euo pipefail
