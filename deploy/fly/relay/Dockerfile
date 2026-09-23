@@ -5,8 +5,9 @@
 #
 #   docker build -f deploy/fly/relay/Dockerfile -t agentuplink-relay .
 #
-# BuildKit reads the context allowlist Dockerfile.dockerignore beside this file;
-# `fly deploy` is given the same file by `[build] ignorefile` in fly.toml.
+# BuildKit reads the context allowlist Dockerfile.dockerignore beside this file.
+# `fly deploy` is given the same file with `--ignorefile` on its command line
+# (docs/deploy-fly.md section 6.1); fly.toml has no [build] section.
 #
 # The image holds no key, certificate, password or deployment secret. The
 # entrypoint writes them at start-up from Fly secrets (environment variables)

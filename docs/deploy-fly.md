@@ -78,7 +78,7 @@ The decisions, and what each rests on:
   signals the same way and its drain has no deadline of its own
   ([operator.md](operator.md#4-service-installation-upgrade-backup-and-recovery)).
   Measured locally: with one device connected, `docker stop` ended the relay
-  with exit `0` in 338 ms. Both images' entrypoints `exec` the server, so on
+  with exit `0` in 407 ms. Both images' entrypoints `exec` the server, so on
   Fly the server is the process Fly's init signals.
 - **`[deploy] strategy = "immediate"`.** `bluegreen` would boot a second relay
   beside the first and cannot be used with a volume; `rolling` has nothing to
@@ -196,17 +196,19 @@ for ca in relay-ca device-ca redis-ca; do
     -addext basicConstraints=critical,CA:TRUE -addext keyUsage=critical,keyCertSign,cRLSign \
     -keyout $ca-key.pem -out $ca.pem
 done
-server_cert() {  # NAME CA SAN
+server_cert() {  # NAME CA SAN DAYS
   openssl req -new -newkey rsa:2048 -nodes -subj "/CN=$1" -keyout $1-key.pem -out $1.csr
   printf 'basicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectAltName=%s\n' "$3" > $1.ext
-  openssl x509 -req -in $1.csr -CA $2.pem -CAkey $2-key.pem -CAcreateserial -days 90 -extfile $1.ext -out $1.pem
+  openssl x509 -req -in $1.csr -CA $2.pem -CAkey $2-key.pem -CAcreateserial -days $4 -extfile $1.ext -out $1.pem
 }
-server_cert relay-server relay-ca DNS:agentuplink-relay.fly.dev
-server_cert redis-server redis-ca DNS:agentuplink-redis.internal
+server_cert relay-server relay-ca DNS:agentuplink-relay.fly.dev 90
+server_cert redis-server redis-ca DNS:agentuplink-redis.internal 365
 openssl rand -hex 24 > redis-password.txt
 ```
 
-This uses one server certificate for both relay listeners; the relay accepts
+The relay certificate lasts 90 days and the Redis one 365, because replacing
+the Redis certificate restarts Redis (section 6.5). This uses one server
+certificate for both relay listeners; the relay accepts
 separate ones (section 4 names both pairs). Anyone calling the consumer listener
 must trust `relay-ca.pem`, because the certificate is not from a public CA.
 
@@ -334,38 +336,103 @@ fly deploy . --config deploy/fly/relay/fly.toml \
 ### 6.2 Activate and provision (before any relay serves)
 
 **Costs money: a few seconds of a `shared-cpu-1x` machine each**, well under
-one cent. Each command runs the image's entrypoint in a one-off machine that
-is removed when it exits, with the app's secrets, and reaches Redis over the
-private network. The first command only validates. The other two write Redis,
-must run in this order, and neither may be repeated
-([operator.md section 2.3](operator.md#23-tenant-scoped-authorization-and-the-first-incarnation)):
+one cent in total. Each step runs the image's entrypoint in a one-off machine
+of the relay app. The machine gets the app's secrets and reaches Redis over
+the private network, and it has no services, so nothing public reaches it.
+
+**`fly machine run` returns once the machine has started, not when it has
+finished.** So each step is four commands: run it detached, wait for the
+machine to stop, read its log and exit status, then destroy it. Do not start a
+step until the one before it has printed its success line. `$ID` is the
+machine ID that `fly machine run` prints.
 
 ```text
-fly machine run registry.fly.io/agentuplink-relay:fly-1 check-serve-config \
-  -a agentuplink-relay -r syd --rm
-fly machine run registry.fly.io/agentuplink-relay:fly-1 activate-first-incarnation \
-  -a agentuplink-relay -r syd --rm
 cd ~/agentuplink-fly
-fly machine run registry.fly.io/agentuplink-relay:fly-1 provision-catalog /tmp/provision/catalog.toml \
-  -a agentuplink-relay -r syd --rm \
+IMAGE=registry.fly.io/agentuplink-relay:fly-1
+
+# Step 1, validates only and writes nothing.
+fly machine run $IMAGE check-serve-config -a agentuplink-relay -r syd --restart no --detach
+fly machine wait $ID -a agentuplink-relay --state stopped
+fly logs -a agentuplink-relay --machine $ID --no-tail
+fly machine status $ID -a agentuplink-relay
+fly machine destroy $ID -a agentuplink-relay
+```
+
+Success is `Relay serving configuration is valid: consumer_bind=0.0.0.0:8443
+device_bind=0.0.0.0:9443 cluster=absent recovery=absent.` in the log, and an
+exit code of `0` in the status events. Step 2 checks the records against the
+same configuration without contacting Redis:
+
+```text
+# Step 2, validates the records only and writes nothing.
+fly machine run $IMAGE provision-catalog /tmp/provision/catalog.toml --dry-run \
+  -a agentuplink-relay -r syd --restart no --detach \
   --file-local /tmp/provision/catalog.toml=catalog.toml \
   --file-local /tmp/provision/device-cert.pem=device-cert.pem
-fly logs -a agentuplink-relay --no-tail
+fly machine wait $ID -a agentuplink-relay --state stopped
+fly logs -a agentuplink-relay --machine $ID --no-tail
+fly machine destroy $ID -a agentuplink-relay
+```
+
+Success is `Provisioning records are valid for namespace <your namespace>:
+...`, ending `This dry run contacted no Redis authority and wrote nothing.`
+Steps 3 and 4 write Redis, in this order:
+
+```text
+# Step 3, writes the incarnation.
+fly machine run $IMAGE activate-first-incarnation -a agentuplink-relay -r syd --restart no --detach
+fly machine wait $ID -a agentuplink-relay --state stopped
+fly logs -a agentuplink-relay --machine $ID --no-tail
+fly machine status $ID -a agentuplink-relay
+fly machine destroy $ID -a agentuplink-relay
+```
+
+Success is `Activated deployment incarnation <incarnation> as the first
+incarnation of namespace <namespace>.`
+
+```text
+# Step 4, writes the catalog records.
+fly machine run $IMAGE provision-catalog /tmp/provision/catalog.toml \
+  -a agentuplink-relay -r syd --restart no --detach \
+  --file-local /tmp/provision/catalog.toml=catalog.toml \
+  --file-local /tmp/provision/device-cert.pem=device-cert.pem
+fly machine wait $ID -a agentuplink-relay --state stopped
+fly logs -a agentuplink-relay --machine $ID --no-tail
+fly machine status $ID -a agentuplink-relay
+fly machine destroy $ID -a agentuplink-relay
 fly machine list -a agentuplink-relay
 ```
 
-The log must show `Activated deployment incarnation ... as the first
-incarnation of namespace ...` and then `Provisioned namespace ...`. **The
-machine list must be empty before the next step:** a leftover one-off machine
-would be updated into a second relay by `fly deploy`. Remove one with
-`fly machine destroy <id> -a agentuplink-relay`.
+Success is `Provisioned namespace <namespace> for deployment incarnation
+<incarnation>: ...`. **The machine list must be empty before section 6.3:**
+`fly deploy` would update a leftover one-off machine into a second relay.
+
+**Which failures can be repeated.** Every step prints `tunnel-relay: ...` and
+exits `1` on failure. Read the message before running anything again:
+
+| Step | Failure | Repeat? |
+| --- | --- | --- |
+| 1, 2 | any | Yes. Neither contacts Redis. Fix `relay.toml` (then rebuild, section 6.1) or the records, and run it again. |
+| any | the entrypoint names a missing or invalid secret | Yes. Nothing ran. Fix the secret with `fly secrets import --stage` and run it again. |
+| 3 | fails connecting to Redis (a `stage=` other than a conflict) | Yes. Activation is one Lua script that checks the namespace is empty and writes both keys together, so it wrote all or nothing. |
+| 3 | "namespace already has a deployment incarnation" | Do not repeat. If an earlier run of step 3 printed its success line, or its outcome is unknown and this is the rerun, the incarnation is written: go on to step 4. Otherwise the namespace was used before: choose a new one (section 6.4). |
+| 3 | "namespace is not empty" | No. Choose a new namespace. |
+| 4 | fails connecting to Redis, or at `stage=authority_identity` because step 3 has not succeeded | Yes. `provision-catalog` makes the same connection and incarnation check as `serve` before it writes anything (`crates/tunnel-relay/src/provisioning.rs`, `provision_catalog`). |
+| 4 | "invalid provisioning records" or "invalid device certificate" | Yes. These are checked before Redis is contacted. |
+| 4 | "namespace was already provisioned" | No. The one-shot reservation is taken before any record is written, so this means an earlier run got at least that far. If that run printed `Provisioned namespace`, you are done. If its outcome is unknown, or it failed part-way, the namespace may be partly written and nothing shipped repairs it (M6-C35): choose a new namespace. |
+| 4 | "namespace holds records other than its active incarnation" | No. Something wrote the namespace between steps 3 and 4, for example a relay started too early (M6-C34). Choose a new namespace. |
+
+Stopping a step's machine part-way is also covered by the binary: a writing
+command finishes its current bounded Redis step on the first stop signal and
+exits with its own outcome; a second signal abandons it with exit `130`, and
+the namespace must then be treated as partial ([operator.md section 2.3](operator.md#23-tenant-scoped-authorization-and-the-first-incarnation)).
 
 `fly ssh console` is not an option at this point: there is no relay machine
 to connect to, because `serve` refuses to start on a namespace with no
-incarnation, and a relay started between the two commands can leave the
+incarnation, and a relay started between steps 3 and 4 can leave the
 namespace unprovisionable (M6-C34).
 
-Two things here were not measured on Fly. That the one-off machines receive
+Three things here were not measured on Fly. That the one-off machines receive
 the app's secrets rests on Fly's documentation: "An app's secrets are
 available as environment variables at runtime on every Machine belonging to
 that Fly App, whether the Machine is managed by Fly Launch or not"
@@ -373,11 +440,11 @@ that Fly App, whether the Machine is managed by Fly Launch or not"
 `[env]`: "fly machine run doesn't read your fly.toml" (Fly staff,
 <https://community.fly.io/t/why-does-fly-machine-run-shell-see-secrets-but-not-the-environment/25793>),
 which is why the namespace and incarnation are baked into the image rather
-than set in `[env]`. If a secret is missing, the entrypoint exits naming it
-and nothing is written to Redis; stop there, do not deploy the relay, and
-report it. And the positional command replacing the image's `CMD` while keeping its
-`ENTRYPOINT` is the documented shape `fly machine run <image> [command]`
-(`fly machine run --help`, `v0.4.106`), not something run here.
+than set in `[env]`. The positional command replacing the image's `CMD` while
+keeping its `ENTRYPOINT` is the documented shape `fly machine run <image>
+[command]`. And that `fly machine status` lists the exit code among its events
+is from flyctl's behaviour as generally documented, not from a run here; the
+log's success line is the check that matters.
 
 ### 6.3 Serve
 
@@ -414,27 +481,89 @@ even when Redis is unusable (M6-C61), so the echo is the check.
 
 ### 6.4 After a Redis restart
 
-The relay refuses the namespace from then on; `/readyz` still says ready and
-consumer calls fail `503 AUTHORIZATION_UNAVAILABLE`. Until recovery ships
-(M6-C22), the way back is a new namespace:
+A Redis restart gives Redis a new `run_id`, and the relay's namespace is bound
+to the old one. Restarts happen on Fly host maintenance, on a crash, on any
+`fly deploy` of the Redis app, and on `fly secrets import` for the Redis app
+without `--stage` (which restarts its machine to apply the secret). What you
+will see depends on whether the relay restarts too (all measured locally,
+M6-C61 and M6-C62, except the Fly-side states):
 
-1. Edit `redis_namespace` and `deployment_incarnation` in
-   `deploy/fly/relay/relay.toml`.
-2. Section 6.1 with a new `--image-label`, section 6.2 with that label, then
-   section 6.3 with that label.
+- **The relay keeps running.** `fly machine list -a agentuplink-relay` shows it
+  `started`, the `/readyz` check stays passing, and every consumer call fails
+  `503` with `{"code":"AUTHORIZATION_UNAVAILABLE","execution":"not_dispatched",...}`.
+  Device sessions end (`connect` exits `4`) and new ones are not admitted.
+- **The relay starts again after the restart** (a crash, a host move, a
+  deploy, a relay secret change). It exits `1` at once, each time, and
+  `fly logs -a agentuplink-relay --no-tail` shows
+  `tunnel-relay: Redis catalog connection failed; stage=authority_identity`
+  repeated. The `[[restart]]` policy tries 10 times and then leaves the
+  machine **stopped**: `fly machine list` shows it `stopped`, and
+  `min_machines_running = 1` does not start it (that setting governs
+  auto-stop, which is off). `fly machine start <id> -a agentuplink-relay`
+  fails the same way, every time, until the namespace changes.
 
-The device's key, certificate and profile are unchanged. The old namespace's
-keys stay in Redis; nothing shipped removes them.
+Until recovery ships (M6-C22), the way back is a new namespace. Redis's data
+and the device's key, certificate and profile are all kept:
 
-### 6.5 Teardown
+1. Stop the relay if it is still running, so nothing is served while you
+   work: `fly machine stop <id> -a agentuplink-relay`.
+2. Edit `redis_namespace` and `deployment_incarnation` in
+   `deploy/fly/relay/relay.toml` to values never used before.
+3. Section 6.1 with a new `--image-label` (for example `fly-2`).
+4. Section 6.2 with that label: all four steps, with the same `catalog.toml`
+   and `device-cert.pem`. The UUIDs can be reused because the records go into
+   the new namespace.
+5. Section 6.3 with that label. If `fly machine list` then shows the relay
+   `stopped`, start it with `fly machine start <id> -a agentuplink-relay`.
+6. Reconnect the device and repeat the echo.
 
-Irreversible, and the only way to stop all charges. The IPv4 is released with
-its app:
+The old namespace's keys stay in Redis; nothing shipped removes them.
+
+### 6.5 Certificate expiry and rotation
+
+Section 3.1 issues the relay's server certificate for 90 days and the CAs for
+365. Nothing here renews anything. Read from the code, not measured:
+
+- **The relay's server certificate** (`relay-server.pem`) expires on day 91.
+  The relay keeps serving it; every new TLS handshake from a device or a
+  consumer is then refused by the client, because rustls checks the validity
+  window. `connect` fails to reach the relay, and `curl` reports an expired
+  certificate. Sessions already open are not affected until they reconnect.
+  To rotate: issue a new `relay-server.pem` from the same `relay-ca.pem`
+  (section 3.1's `server_cert` line) and set the four relay certificate
+  secrets again with `fly secrets import -a agentuplink-relay` **without**
+  `--stage`. That restarts the relay machine, which ends every device session;
+  devices must reconnect. Redis is not touched, so the namespace survives.
+- **The Redis server certificate** (`redis-server.pem`) is checked by the
+  relay each time it opens a Redis connection. After it expires, a relay that
+  (re)connects to Redis fails its TLS handshake. Rotating it means
+  `fly secrets import -a agentuplink-redis`, which restarts Redis, **which is
+  a Redis restart (section 6.4)**: the namespace can no longer be served and a
+  new one must be provisioned. Plan it as maintenance: rotate the Redis certificate, then
+  run section 6.4 steps 1 to 6. For that reason section 3.1 issues the Redis
+  certificate for 365 days, as long as its CA.
+- **The CAs** expire on day 366. A new relay CA must also be imported into
+  every device (`credentials import --server-ca`).
+- **The device certificate** carries the validity your issuer gave it, and
+  `provision-catalog` copies that window into the credential record. After it
+  expires the relay refuses the device. Certificate renewal is not implemented
+  and no shipped command adds a credential after the first provisioning
+  (M6-C31), so a new device certificate also means a new namespace.
+
+### 6.6 Teardown
+
+Irreversible, and the only way to stop all charges. The IPv4, the volume and
+its snapshots, and the machines go with their app:
 
 ```text
 fly apps destroy agentuplink-relay
 fly apps destroy agentuplink-redis
+fly apps list
 ```
+
+`fly apps list` should then show no app of yours. If it shows a
+`fly-builder-...` app, a classic remote builder was created for your
+organization; destroy it the same way.
 
 ## 7. The local proof
 
@@ -452,8 +581,10 @@ containers, the network and the volume when it exits.
 TUNNEL_CLIENT=/path/to/tunnel-client deploy/fly/local-proof.sh
 ```
 
-Measured on `496396e` plus these files (log nonce
-`m6c60-proof-20260923T092514Z-69923`, arm64 images):
+Measured on the committed tree: log nonce
+`m6c60-proof-20260923T093131Z-75524`, head `b459155`, 0 uncommitted paths,
+arm64 images (relay `73077e81d2f2`, Redis `72c903b23e8d`). Earlier runs during
+development differ only in the stop time.
 
 | Check | Result |
 | --- | --- |
@@ -465,7 +596,7 @@ Measured on `496396e` plus these files (log nonce
 | PID 1 in the relay container | `tunnel-relay`, uid 10001, no `AT_` variable in its environment |
 | Device listener, TLS client without a certificate | `tlsv13 alert certificate required` |
 | Host `tunnel-client` with its device certificate, then a consumer echo | HTTP 200, body = canary + payload |
-| `docker stop -t 60` on the relay with the device connected | `tunnel-relay stopping: signal=SIGTERM`, `stopped: signal=SIGTERM`, exit `0`, 338 ms |
+| `docker stop -t 60` on the relay with the device connected | `tunnel-relay stopping: signal=SIGTERM`, `stopped: signal=SIGTERM`, exit `0`, 407 ms |
 | The device when the relay stopped | exit `4`, `TRANSPORT_ERROR`, retryable |
 | A second relay on the same Redis | serves; the device reconnects and echoes |
 | `docker stop` on Redis | exit `0`, "Redis is now ready to exit" |
@@ -509,9 +640,16 @@ which is built from the committed Dockerfile on Fly's builder.
 
 ## 8. Cost list
 
-Prices from <https://fly.io/docs/about/pricing/>, read 2026-09-23 for region
-`syd` (other regions differ; `iad` is $1.94 for the same machine). Monthly
-figures are Fly's own 30-day figures.
+Prices from <https://fly.io/docs/about/pricing/>, read 2026-09-23. Machine
+prices are per region: the page has one table per region, and a script scales
+a base price by a per-region `markup_ratio`. **The machine figure, worked
+out:** `iad` has ratio `1` and lists `shared-cpu-1x` 256 MB at $1.94 a month
+($0.00000075 a second). `syd` has ratio `1.269230769`, and
+$1.944 × 1.269230769 = $2.467, which is the $2.47 (`$0.00000095` a second)
+the `syd` table lists. The page's first table, for `ams` (ratio
+`1.038461538`), lists $2.02 ($0.00000078 a second); that is not the base, so
+$2.02 × 1.2692 = $2.56 over-counts. Monthly figures are Fly's own 30-day
+figures ($ per second × 2,592,000).
 
 | Resource | Created by | Price | Monthly |
 | --- | --- | --- | --- |
@@ -528,5 +666,6 @@ figures are Fly's own 30-day figures.
 | Fly-managed TLS certificates | not used (passthrough) | first 10 free | $0.00 |
 | Remote builder (Depot) | `fly deploy --build-only` (section 6.1) | not on the pricing page; Fly's 2024 announcement: 300 build minutes a month free, then $0.05 a minute (<https://community.fly.io/t/depot-remote-builders-becoming-the-default/21756>) | $0.00 expected: one build is about 3 minutes natively; at most about $0.15 a build past the allowance |
 
-**Standing total: $7.09 a month in `syd`**, plus outbound data. Upstash is not
+**Standing total: $7.09 a month in `syd`** ($2.00 + $2.47 + $2.47 + $0.15),
+plus outbound data and any builder minutes past the allowance. Upstash is not
 used, so its per-command pricing does not apply.

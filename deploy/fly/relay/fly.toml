@@ -1,13 +1,13 @@
 # Fly.io configuration for the agent-tunnel relay (docs/deploy-fly.md).
-# Deploy from the repository root:
 #
-#   fly deploy . --config deploy/fly/relay/fly.toml \
-#     --dockerfile deploy/fly/relay/Dockerfile \
-#     --ignorefile deploy/fly/relay/Dockerfile.dockerignore --ha=false
-#
-# The build context is the repository root; the Dockerfile and its context
-# allowlist are named on the command line so no path here depends on how
-# flyctl resolves [build] paths.
+# Do NOT deploy this with a plain `fly deploy`. That builds and starts a
+# serving relay at once, and a relay that serves between
+# `activate-first-incarnation` and `provision-catalog` can leave the namespace
+# unprovisionable (M6-C34). Follow docs/deploy-fly.md section 6, in order:
+#   6.1  build and push the image only (`fly deploy ... --build-only --push`);
+#   6.2  run check-serve-config, activate-first-incarnation and
+#        provision-catalog in one-off machines, confirming each succeeded;
+#   6.3  only then deploy that exact image (`fly deploy ... --image ...`).
 #
 # One relay only. A second machine would be a second, unclustered relay on the
 # same Redis namespace, which this alpha does not support (M6-C22); keep
@@ -30,6 +30,10 @@ kill_timeout = 60
   # place. bluegreen would start a second relay beside the first.
   strategy = "immediate"
 
+# After 10 failed starts the machine stays stopped, and min_machines_running
+# does not start it again. A relay that starts after a Redis restart exits 1
+# at stage=authority_identity every time, so it ends here: see
+# docs/deploy-fly.md section 6.4 for what that looks like and the way back.
 [[restart]]
   policy = "on-failure"
   retries = 10
