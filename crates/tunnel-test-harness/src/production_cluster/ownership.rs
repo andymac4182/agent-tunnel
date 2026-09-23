@@ -4,8 +4,9 @@
 //! process is observed as ready.  Their identical tenant/device/certificate
 //! scope enters two different relay device listeners, so the Redis owner claim
 //! is the only authority that can select a winner.  The losing process must
-//! terminate after the failed control admission; the client has no automatic
-//! reconnect policy.
+//! terminate after the failed control admission.  Both are spawned with
+//! `--no-reconnect` (M6-C23), and a first-attempt `OWNER_BUSY` is terminal
+//! even with reconnect on, so the loser exits either way.
 
 use super::{
     ConsumerStream, ProductionCluster, RunningHarness, SCENARIO_TIMEOUT, STARTUP_TIMEOUT,
@@ -837,7 +838,11 @@ pub(super) async fn spawn_cli(name: &str, profile: &DeviceProfile) -> Result<Man
             .arg("connect")
             .arg("--config")
             .arg(profile.config_path.to_string_lossy().to_string())
-            .arg("--json"),
+            .arg("--json")
+            // M6-C23: these gates assert what happens when the first
+            // session ends (a typed exit, the owner released), so the CLI
+            // must not reconnect by itself.
+            .arg("--no-reconnect"),
     )
     .await
 }

@@ -201,11 +201,15 @@ fn an_unreadable_configuration_exits_two_through_the_cli_error_path() {
 #[test]
 fn a_refused_relay_connection_exits_four_and_names_the_transport() {
     let fixture = DeadRelayFixture::new();
+    // `--no-reconnect`: with the default policy a refused relay is retried
+    // (M6-C23, `reconnect_cli.rs`); this test is about the status the first
+    // failure selects.
     let output = run(&[
         "connect",
         "--config",
         fixture.config.to_str().expect("utf-8 path"),
         "--json",
+        "--no-reconnect",
     ]);
     assert_eq!(
         output.status.code(),

@@ -42,6 +42,9 @@ pub struct RuntimeConfig {
     /// Validated M2 data-socket rotation policy.  The connector runtime does
     /// not consume this policy until rotation is integrated.
     pub rotation: RotationConfig,
+    /// `tunnel-client connect`'s reconnect policy (M6-C23).  Only the CLI's
+    /// supervisor loop reads it; the library's `connect` makes one attempt.
+    pub reconnect: ReconnectConfig,
 }
 
 impl<'de> Deserialize<'de> for RuntimeConfig {
@@ -115,6 +118,7 @@ impl RuntimeConfig {
         self.rotation
             .validate()
             .map_err(RuntimeConfigError::Rotation)?;
+        self.reconnect.validate()?;
         if self.exports.is_empty() {
             return Err(RuntimeConfigError::Invalid(
                 "at least one local export must be configured",
@@ -235,6 +239,7 @@ impl Default for RuntimeConfig {
             exports,
             limits: LimitsConfig::default(),
             rotation: RotationConfig::default(),
+            reconnect: ReconnectConfig::default(),
         }
     }
 }
@@ -439,6 +444,64 @@ impl LimitsConfig {
     }
 }
 
+/// Smallest `reconnect.initial_delay_ms`: below this a retry loop against a
+/// relay that refuses at once is a busy loop in all but name.
+pub const MIN_RECONNECT_DELAY_MS: u64 = 100;
+/// Largest `reconnect.max_delay_ms` (5 minutes): a device may not stay away
+/// from a relay that came back for longer than this after its last attempt.
+pub const MAX_RECONNECT_DELAY_MS: u64 = 300_000;
+
+/// How `tunnel-client connect` reconnects after a retryable end of session
+/// (task row M6-C23).  The defaults are the documented policy in
+/// docs/runtime.md ("Reconnecting"): first delay about 1 s, doubling, capped
+/// at 60 s, jittered, and no attempt limit.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ReconnectConfig {
+    /// `false` makes `connect` exit on the first end of session, as it did
+    /// before M6-C23, for a supervisor that prefers to own restarts.  The
+    /// `--no-reconnect` flag sets it for one run.
+    pub enabled: bool,
+    /// Upper bound of the first delay; the n-th consecutive failed attempt's
+    /// bound is `initial_delay_ms * 2^(n-1)`, capped at `max_delay_ms`.
+    pub initial_delay_ms: u64,
+    /// Cap on every delay.
+    pub max_delay_ms: u64,
+    /// Consecutive failed attempts after which `connect` gives up and exits
+    /// with the last attempt's cause; `0` means no limit.  The count resets
+    /// when a session has stayed ready for `max_delay_ms`.
+    pub max_attempts: u32,
+}
+
+impl Default for ReconnectConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            initial_delay_ms: 1_000,
+            max_delay_ms: 60_000,
+            max_attempts: 0,
+        }
+    }
+}
+
+impl ReconnectConfig {
+    fn validate(&self) -> Result<(), RuntimeConfigError> {
+        if self.initial_delay_ms < MIN_RECONNECT_DELAY_MS
+            || self.initial_delay_ms > MAX_RECONNECT_DELAY_MS
+        {
+            return Err(RuntimeConfigError::Invalid(
+                "reconnect.initial_delay_ms must be between 100 and 300000",
+            ));
+        }
+        if self.max_delay_ms < self.initial_delay_ms || self.max_delay_ms > MAX_RECONNECT_DELAY_MS {
+            return Err(RuntimeConfigError::Invalid(
+                "reconnect.max_delay_ms must be between reconnect.initial_delay_ms and 300000",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawRuntimeConfig {
@@ -464,6 +527,8 @@ struct RawRuntimeConfig {
     limits: LimitsConfig,
     #[serde(default)]
     rotation: RotationConfig,
+    #[serde(default)]
+    reconnect: ReconnectConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -528,6 +593,7 @@ impl TryFrom<RawRuntimeConfig> for RuntimeConfig {
             exports,
             limits: raw.limits,
             rotation: raw.rotation,
+            reconnect: raw.reconnect,
         })
     }
 }
@@ -632,6 +698,35 @@ ca = "ca.pem"
             assert!(
                 RuntimeConfig::parse(&input).is_err(),
                 "accepted invalid input"
+            );
+        }
+    }
+
+    #[test]
+    fn reconnect_defaults_and_bounds() {
+        let config = RuntimeConfig::parse(valid_toml()).expect("valid default");
+        assert_eq!(config.reconnect, ReconnectConfig::default());
+        assert!(config.reconnect.enabled);
+        let input = format!(
+            "{}\n[reconnect]\nenabled = false\ninitial_delay_ms = 200\nmax_delay_ms = 400\nmax_attempts = 3",
+            valid_toml()
+        );
+        let config = RuntimeConfig::parse(&input).expect("valid reconnect override");
+        assert!(!config.reconnect.enabled);
+        assert_eq!(config.reconnect.initial_delay_ms, 200);
+        assert_eq!(config.reconnect.max_delay_ms, 400);
+        assert_eq!(config.reconnect.max_attempts, 3);
+        for bad in [
+            "initial_delay_ms = 99",
+            "initial_delay_ms = 300001",
+            "initial_delay_ms = 2000\nmax_delay_ms = 1000",
+            "max_delay_ms = 300001",
+            "jitter = 0",
+        ] {
+            let input = format!("{}\n[reconnect]\n{bad}", valid_toml());
+            assert!(
+                RuntimeConfig::parse(&input).is_err(),
+                "{bad} must be refused"
             );
         }
     }

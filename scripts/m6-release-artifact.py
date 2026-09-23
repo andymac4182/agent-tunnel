@@ -1586,7 +1586,12 @@ DOCS_PINNED_SECTIONS: dict[str, tuple[int, int, int]] = {
     # only), the `provision-catalog --dry-run` transcript (one assertion), and
     # the two Redis-writing commands as shape-only.
     "2. Credential provisioning": (15, 11, 2),
-    "3. Deployment": (9, 10, 2),
+    # M6-C23 (reconnect): section 3.1's unreachable-relay rehearsal now
+    # appends a bounded `[reconnect]` table (`printf`, exit status only) and
+    # shows the backoff events of one retry (five assertion lines), then the
+    # `--no-reconnect` one-shot (two lines, as the old example had): +2
+    # commands, +5 assertions.
+    "3. Deployment": (11, 15, 2),
     "4. Service installation, upgrade, backup and recovery": (0, 0, 2),
     "6. Diagnostics": (4, 7, 0),
 }

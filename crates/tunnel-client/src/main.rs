@@ -31,6 +31,7 @@ enum Command {
     Connect {
         path: PathBuf,
         json: bool,
+        no_reconnect: bool,
     },
     CreateCredentials {
         config: PathBuf,
@@ -166,6 +167,7 @@ impl Cause {
             ClientError::Protocol(_) => Self::ProtocolError,
             ClientError::Transport { .. } => Self::TransportError,
             ClientError::OwnerBusy => Self::OwnerBusy,
+            ClientError::TlsRefused(_) => Self::CredentialError,
             ClientError::HandshakeTimeout => Self::DeadlineExceeded,
             ClientError::AuthorizationExpired => Self::AuthorizationStale,
             ClientError::QueueLimit | ClientError::OpenRetentionFull => Self::ResourceExhausted,
@@ -352,7 +354,11 @@ async fn run(command: Command) -> Result<(), CliError> {
             }
             Ok(())
         }
-        Command::Connect { path, json } => run_connect(path, json).await,
+        Command::Connect {
+            path,
+            json,
+            no_reconnect,
+        } => run_connect(path, json, no_reconnect).await,
         Command::CreateCredentials { config, csr_out } => {
             let runtime = load_runtime_config(&config)?;
             let csr_out = resolve_cli_path(&config, &csr_out);
@@ -662,26 +668,475 @@ fn stop_join_bound(config: &ConnectConfig) -> std::time::Duration {
     )
 }
 
-async fn run_connect(path: PathBuf, json: bool) -> Result<(), CliError> {
+/// How one session of `connect` ended, as the reconnect loop needs it.
+enum SessionEnd {
+    /// A stop request ended it in order; the `stopped` event is printed.
+    Stopped,
+    /// It ended by itself, or never became ready.
+    Failed {
+        error: CliError,
+        /// The session that was ready, if one was, and for how long.
+        ready: Option<(String, std::time::Duration)>,
+    },
+}
+
+/// Whether `connect` may reconnect after a session ended with this cause
+/// (task row M6-C23). **Exhaustive with no fallback arm**, like
+/// `Cause::exit_code`: a new cause cannot compile until someone decides
+/// whether retrying it could ever help. The justification of each arm, from
+/// the code that produces the cause, is in docs/runtime.md ("Reconnecting").
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReconnectClass {
+    Retryable,
+    /// Retryable only while the owner slot the relay reports busy can be
+    /// this process's own previous session, whose lease has not yet lapsed.
+    OwnerBusy,
+    Terminal,
+}
+
+impl Cause {
+    fn reconnect_class(self) -> ReconnectClass {
+        match self {
+            // Local input: nothing a retry does changes the file or the flags,
+            // and the profile is not re-read.
+            Self::InvalidInvocation | Self::ConfigError | Self::InvalidConfig => {
+                ReconnectClass::Terminal
+            }
+            // The local credential could not be loaded, or TLS verification
+            // refused a certificate on either side (`ClientError::TlsRefused`).
+            Self::CredentialError => ReconnectClass::Terminal,
+            // Refused TCP, a reset, EOF, a closed socket, a failed rotation or
+            // retained recovery, a relay that closed the session: exactly what a
+            // relay restart, a network change or a laptop waking produce.
+            Self::TransportError | Self::SessionClosed => ReconnectClass::Retryable,
+            // A handshake that did not finish in 10 s: a blackholed route or a
+            // relay too busy to answer; a later attempt can succeed.
+            Self::DeadlineExceeded => ReconnectClass::Retryable,
+            // Produced when one stream's operation-authorization deadline
+            // lapsed with a frame already queued (lib.rs, the data writer and
+            // `dispatch_fin`): the session is failed so the queued side effect
+            // cannot be replayed. It is not a revoked credential; a fresh
+            // session starts with no streams and fresh authorizations.
+            Self::AuthorizationStale => ReconnectClass::Retryable,
+            // A per-session local budget (queue or OPEN retention); the
+            // library's own doc says the caller must start a fresh session.
+            Self::ResourceExhausted => ReconnectClass::Retryable,
+            Self::OwnerBusy => ReconnectClass::OwnerBusy,
+            // Our own cancellation; a protocol violation (version skew or a
+            // defect: TLS rules out corruption); a panicked supervisor; a
+            // broken signal subsystem. A retry repeats each of them.
+            Self::Cancelled | Self::ProtocolError | Self::SupervisorFailed | Self::SignalError => {
+                ReconnectClass::Terminal
+            }
+        }
+    }
+}
+
+/// How long after this process's own session ended an `OWNER_BUSY` refusal
+/// is still read as that session's lease rather than another connector.
+/// The relay bounds its owner lease to 6..=30 s (`owner_lease` in
+/// `tunnel-relay`'s config), which is how long a **dead relay's** owner
+/// record outlives it (measured about 30 s); twice the maximum covers that.
+/// It does **not** cover a relay that is still running and still holds the
+/// old session because the device's side of the path vanished (a network
+/// change, a NAT or VPN drop): that relay never notices -- it sends no pings,
+/// its control read has no timeout and no socket sets keepalive -- and keeps
+/// renewing the lease, so every reconnect is refused until this window ends
+/// and the process exits 7 (measured by the M6-C23 review: 78 refusals, exit
+/// 7 at 60.7 s; M6-C68, a relay-side fix). Outside the window -- including a
+/// fresh process's first attempt, which has no previous session --
+/// `OWNER_BUSY` is terminal, so a second connector for the same device still
+/// exits 7 at once; the only witness of that first-attempt rule with
+/// reconnect on is the unit test
+/// `owner_busy_is_retried_only_within_the_window_after_our_own_session`.
+const OWNER_BUSY_RECONNECT_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The reconnect policy for this run: the profile's `[reconnect]` table,
+/// with `--no-reconnect` able to switch it off.
+#[derive(Clone, Copy, Debug)]
+struct ReconnectPolicy {
+    enabled: bool,
+    initial: std::time::Duration,
+    max: std::time::Duration,
+    max_attempts: u32,
+}
+
+impl ReconnectPolicy {
+    fn new(config: &tunnel_client::ReconnectConfig, no_reconnect: bool) -> Self {
+        Self {
+            enabled: config.enabled && !no_reconnect,
+            initial: std::time::Duration::from_millis(config.initial_delay_ms),
+            max: std::time::Duration::from_millis(config.max_delay_ms),
+            max_attempts: config.max_attempts,
+        }
+    }
+
+    /// The upper bound of the delay before the `attempt`-th consecutive
+    /// retry: `initial * 2^(attempt-1)`, capped at `max`.
+    fn ceiling(&self, attempt: u32) -> std::time::Duration {
+        let factor = 1u32
+            .checked_shl(attempt.saturating_sub(1).min(31))
+            .unwrap_or(u32::MAX);
+        self.initial.saturating_mul(factor).min(self.max)
+    }
+
+    /// The delay before the `attempt`-th consecutive retry: uniform in
+    /// `[ceiling/2, ceiling]` ("equal jitter"). The floor keeps a relay that
+    /// refuses at once from turning the loop into a busy loop; the spread of
+    /// half the ceiling is what separates devices that lost the same relay at
+    /// the same instant.
+    fn delay(&self, attempt: u32, random: u64) -> std::time::Duration {
+        let ceiling = u64::try_from(self.ceiling(attempt).as_millis()).unwrap_or(u64::MAX);
+        let floor = ceiling / 2;
+        let spread = ceiling - floor;
+        std::time::Duration::from_millis(floor + random % (spread + 1))
+    }
+}
+
+/// The `failure_policy` a `ready` or `stopped` event publishes. The library's
+/// [`M1_TRANSPORT_FAILURE_POLICY`] says "no automatic reconnect", which is
+/// true of one `connect` call and was true of this binary before M6-C23; with
+/// the reconnect loop on it is not, so the event says what this process does.
+const RECONNECTING_FAILURE_POLICY: &str = "close control and data and require a fresh session; no retained replay; a retryable end is retried as a fresh session after bounded backoff";
+
+impl ReconnectPolicy {
+    fn failure_policy(&self) -> &'static str {
+        if self.enabled {
+            RECONNECTING_FAILURE_POLICY
+        } else {
+            M1_TRANSPORT_FAILURE_POLICY
+        }
+    }
+}
+
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX)
+        })
+}
+
+/// The validity window of this device's certificate chain -- the latest
+/// `notBefore` and the earliest `notAfter`, as unix seconds, the rule
+/// `doctor` applies -- or `None` if it cannot be read.
+fn device_certificate_window(config: &ConnectConfig) -> Option<(i64, i64)> {
+    let chain =
+        tunnel_client::credentials::load_certificates(&config.credentials.client_certificate)
+            .ok()?;
+    let mut window: Option<(i64, i64)> = None;
+    for certificate in &chain {
+        let (not_before, not_after) = doctor::certificate_validity(certificate.as_ref()).ok()?;
+        window = Some(match window {
+            None => (not_before, not_after),
+            Some((before, after)) => (before.max(not_before), after.min(not_after)),
+        });
+    }
+    window
+}
+
+/// Classify a failed connect attempt, which differs from
+/// `CliError::from_client` in exactly one case (task row M6-C23).
+///
+/// The relay refused this device's certificate with `certificate_expired`,
+/// which rustls sends for an expired **and** for a not-yet-valid
+/// certificate, judged on the relay's clock. The relay cannot say which; this
+/// process can, because it holds the certificate and its own clock:
+///
+/// * `notAfter` has passed here too: the certificate is expired. No retry
+///   fixes that, so it is terminal `CREDENTIAL_ERROR` (exit `3`) naming the
+///   time -- the tester needs to see this error, not a backoff loop.
+/// * Otherwise -- not yet valid here either (a CA clock ahead, or a
+///   `notBefore` stamped at signing time), or valid here (the relay's clock
+///   differs from this host's): retryable `TRANSPORT_ERROR`, and the message
+///   says clock skew is the likely cause. A certificate that becomes valid
+///   is then accepted on a later attempt without anyone restarting anything.
+///
+/// A certificate that cannot be read here keeps the retryable transport
+/// classification: nothing proves it expired.
+fn attempt_error(error: ClientError, config: &ConnectConfig, now: i64) -> CliError {
+    let ClientError::Transport { scope, .. } = &error else {
+        return CliError::from_client(error);
+    };
+    if *scope != tunnel_client::DEVICE_CERTIFICATE_NOT_CURRENT_SCOPE {
+        return CliError::from_client(error);
+    }
+    let reported = error.to_string();
+    match device_certificate_window(config) {
+        Some((_, not_after)) if not_after <= now => CliError {
+            cause: Cause::CredentialError,
+            message: format!(
+                "{reported}; this device's certificate expired at unix time {not_after} on this host's clock too: renew it"
+            ),
+            retryable: false,
+        },
+        Some((not_before, _)) if not_before > now => CliError {
+            cause: Cause::TransportError,
+            message: format!(
+                "{reported}; it is not valid until unix time {not_before} on this host's clock either (its issuer's clock is likely ahead); retrying"
+            ),
+            retryable: true,
+        },
+        Some((not_before, not_after)) => CliError {
+            cause: Cause::TransportError,
+            message: format!(
+                "{reported}; it is valid on this host's clock (unix time {not_before} to {not_after}), so the relay's clock likely differs from this host's; retrying"
+            ),
+            retryable: true,
+        },
+        None => CliError::from_client(error),
+    }
+}
+
+/// A random value for the jitter. `uuid`'s v4 generator draws from the
+/// operating system's generator, which is what jitter needs: independent
+/// across devices, not reproducible.
+fn jitter_random() -> u64 {
+    uuid::Uuid::new_v4().as_u64_pair().0
+}
+
+/// What the loop decided after a session ended.
+#[derive(Debug, Eq, PartialEq)]
+enum ReconnectDecision {
+    Exit,
+    Retry {
+        attempt: u32,
+        delay: std::time::Duration,
+    },
+}
+
+/// The loop's memory between sessions.
+#[derive(Debug, Default)]
+struct ReconnectState {
+    /// Consecutive attempts that failed, or whose session did not stay ready
+    /// for `max` (so a relay that accepts and drops at once still backs off).
+    failures: u32,
+    /// Sessions that became ready in this process.
+    sessions: u64,
+    /// When this process's most recent ready session ended.
+    last_ready_end: Option<tokio::time::Instant>,
+}
+
+impl ReconnectState {
+    fn decide(
+        &mut self,
+        policy: &ReconnectPolicy,
+        cause: Cause,
+        ready: Option<std::time::Duration>,
+        now: tokio::time::Instant,
+        random: u64,
+    ) -> ReconnectDecision {
+        if let Some(lasted) = ready {
+            self.sessions += 1;
+            self.last_ready_end = Some(now);
+            if lasted >= policy.max {
+                self.failures = 0;
+            }
+        }
+        let retryable = match cause.reconnect_class() {
+            ReconnectClass::Retryable => true,
+            ReconnectClass::Terminal => false,
+            ReconnectClass::OwnerBusy => self
+                .last_ready_end
+                .is_some_and(|ended| now.duration_since(ended) < OWNER_BUSY_RECONNECT_WINDOW),
+        };
+        if !policy.enabled || !retryable {
+            return ReconnectDecision::Exit;
+        }
+        self.failures = self.failures.saturating_add(1);
+        if policy.max_attempts != 0 && self.failures > policy.max_attempts {
+            return ReconnectDecision::Exit;
+        }
+        ReconnectDecision::Retry {
+            attempt: self.failures,
+            delay: policy.delay(self.failures, random),
+        }
+    }
+}
+
+/// `--json` events of the reconnect loop. Identifiers, counters, durations
+/// and the cause's code and bounded message only -- never payloads.
+#[derive(Serialize)]
+struct ReconnectEvent<'a> {
+    state: &'static str,
+    /// The retry this event belongs to: 1 for the first after a failure.
+    attempt: u32,
+    /// Sessions that became ready in this process so far.
+    sessions: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ready_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    delay_ms: Option<u64>,
+}
+
+fn millis(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// `CANCELLED` for a stop request that arrived while waiting to reconnect.
+///
+/// Exit `130`, not `0`: no session is live, so there is no orderly stop to
+/// complete -- the same phase rule as a stop before the first session was
+/// ready, and the same status a stop 1 ms later, during the next attempt's
+/// handshake, gives.
+fn interrupted_during_backoff(signal: StopSignal, attempt: u32, last: &CliError) -> CliError {
+    CliError {
+        cause: Cause::Cancelled,
+        message: format!(
+            "{} received while waiting to reconnect (attempt {attempt}, after {}); no session was live",
+            signal.name(),
+            last.code()
+        ),
+        retryable: false,
+    }
+}
+
+async fn run_connect(path: PathBuf, json: bool, no_reconnect: bool) -> Result<(), CliError> {
     // First, before any file is read or socket opened: from here on a stop
     // request in any phase reaches the orderly path below instead of the
     // inherited disposition.
     let mut stop = StopSignals::install()?;
     let config = load_runtime_config(&path)?;
     let stop_bound = stop_join_bound(&config);
+    let policy = ReconnectPolicy::new(&config.reconnect, no_reconnect);
+    let mut state = ReconnectState::default();
+    // The retry in progress, if this attempt follows a failure.
+    let mut retry: Option<u32> = None;
+    loop {
+        let end = run_one_session(
+            &config,
+            &mut stop,
+            stop_bound,
+            json,
+            policy.failure_policy(),
+            retry,
+            &state,
+        )
+        .await?;
+        let (error, ready) = match end {
+            SessionEnd::Stopped => return Ok(()),
+            SessionEnd::Failed { error, ready } => (error, ready),
+        };
+        let decision = state.decide(
+            &policy,
+            error.cause,
+            ready.as_ref().map(|(_, lasted)| *lasted),
+            tokio::time::Instant::now(),
+            jitter_random(),
+        );
+        let ReconnectDecision::Retry { attempt, delay } = decision else {
+            if policy.enabled && policy.max_attempts != 0 && state.failures > policy.max_attempts {
+                return Err(CliError {
+                    message: format!(
+                        "{} (gave up after {} consecutive reconnect attempts)",
+                        error.message, policy.max_attempts
+                    ),
+                    ..error
+                });
+            }
+            return Err(error);
+        };
+        let session_id = ready.as_ref().map(|(id, _)| id.as_str());
+        if json {
+            print_ok_json(
+                "connect",
+                ReconnectEvent {
+                    state: "disconnected",
+                    attempt,
+                    sessions: state.sessions,
+                    session_id,
+                    ready_ms: ready.as_ref().map(|(_, lasted)| millis(*lasted)),
+                    code: Some(error.code()),
+                    message: Some(&error.message),
+                    delay_ms: None,
+                },
+            );
+            print_ok_json(
+                "connect",
+                ReconnectEvent {
+                    state: "backoff",
+                    attempt,
+                    sessions: state.sessions,
+                    session_id: None,
+                    ready_ms: None,
+                    code: Some(error.code()),
+                    message: None,
+                    delay_ms: Some(millis(delay)),
+                },
+            );
+        } else {
+            eprintln!(
+                "tunnel-client: session ended ({}: {}); reconnecting in {} ms (attempt {attempt})",
+                error.code(),
+                error.message,
+                millis(delay)
+            );
+        }
+        // The wait races the stop request, `biased` toward it: a process
+        // sleeping in backoff exits on the first signal, not after the delay.
+        tokio::select! {
+            biased;
+            signal = stop.recv() => {
+                return Err(interrupted_during_backoff(signal?, attempt, &error));
+            }
+            () = tokio::time::sleep(delay) => {}
+        }
+        if json {
+            print_ok_json(
+                "connect",
+                ReconnectEvent {
+                    state: "reconnecting",
+                    attempt,
+                    sessions: state.sessions,
+                    session_id: None,
+                    ready_ms: None,
+                    code: None,
+                    message: None,
+                    delay_ms: None,
+                },
+            );
+        }
+        retry = Some(attempt);
+    }
+}
+
+/// One connect attempt and, if it becomes ready, its session, up to its end.
+///
+/// **Handlers, and so supervised MCP and ACP children, are per session.**
+/// They are built here for each attempt and dropped with the connector when
+/// the session ends, which ends every MCP/ACP protocol session and kills each
+/// child's process group; the loop waits (bounded) for MCP children to be
+/// reaped before it backs off. A child therefore never outlives the device
+/// session its consumer's requests arrived on, which is the M3-04 rule, and
+/// a reconnect is to the children exactly what a process restart would be.
+async fn run_one_session(
+    config: &ConnectConfig,
+    stop: &mut StopSignals,
+    stop_bound: std::time::Duration,
+    json: bool,
+    failure_policy: &'static str,
+    retry: Option<u32>,
+    state: &ReconnectState,
+) -> Result<SessionEnd, CliError> {
     // Configured MCP and ACP exports become in-process http-forward/1
     // handlers; an http-forward export without one is still refused at OPEN.
     // **Both registrations run**, because an `[exports.<id>.acp]` table that
     // was parsed and validated and then never registered would be an export
     // the operator configured and the binary silently refused.
     let handlers = tunnel_client::http_forward::HttpHandlers::new()
-        .with_mcp_exports(&config)
+        .with_mcp_exports(config)
         .map_err(|error| CliError {
             cause: Cause::ConfigError,
             message: error.to_string(),
             retryable: false,
         })?
-        .with_acp_exports(&config)
+        .with_acp_exports(config)
         .map_err(|error| CliError {
             cause: Cause::ConfigError,
             message: error.to_string(),
@@ -692,7 +1147,7 @@ async fn run_connect(path: PathBuf, json: bool) -> Result<(), CliError> {
     let mcp_children = handlers.mcp_diagnostics_source();
     let cancellation = CancellationToken::new();
     let options = ConnectOptions {
-        config,
+        config: config.clone(),
         cancellation: cancellation.clone(),
         profile: tunnel_client::TransportProfile::M2,
     };
@@ -706,7 +1161,14 @@ async fn run_connect(path: PathBuf, json: bool) -> Result<(), CliError> {
     // poll receives it.
     let (handle, stop_requested) = tokio::select! {
         biased;
-        result = &mut connect => (result.map_err(CliError::from_client)?, None),
+        result = &mut connect => match result {
+            Ok(handle) => (handle, None),
+            // The attempt failed before a session was ready; the handlers
+            // went with it, and no child was started.
+            Err(error) => {
+                return Ok(SessionEnd::Failed { error: attempt_error(error, config, unix_now()), ready: None });
+            }
+        },
         signal = stop.recv() => {
             let signal = signal?;
             // Cancel, then let the attempt unwind so the sockets it opened
@@ -725,20 +1187,42 @@ async fn run_connect(path: PathBuf, json: bool) -> Result<(), CliError> {
             }
         }
     };
+    let ready_at = tokio::time::Instant::now();
+    let session_id = handle.status().borrow().session_id.clone();
     let outcome = match stop_requested {
         Some(signal) => Ok(signal),
-        None => run_session(&handle, &mut stop, stop_bound, json).await,
+        None => {
+            if let Some(attempt) = retry
+                && json
+            {
+                print_ok_json(
+                    "connect",
+                    ReconnectEvent {
+                        state: "reconnected",
+                        attempt,
+                        sessions: state.sessions + 1,
+                        session_id: session_id.as_deref(),
+                        ready_ms: None,
+                        code: None,
+                        message: None,
+                        delay_ms: None,
+                    },
+                );
+            }
+            run_session(&handle, stop, stop_bound, json, failure_policy).await
+        }
     };
     match outcome {
         Ok(first) => {
             cancellation.cancel();
             join_after_stop(handle.stop(), stop_bound, stop.recv(), first).await?;
-            wait_for_supervised_children(
+            let unreaped = wait_for_supervised_children(
                 || mcp_children.children_running(),
                 stop.recv(),
                 Some(first),
             )
             .await?;
+            report_unreaped(json, unreaped);
             if json {
                 print_ok_json(
                     "connect",
@@ -747,22 +1231,28 @@ async fn run_connect(path: PathBuf, json: bool) -> Result<(), CliError> {
                         session_id: None,
                         epoch: None,
                         generation: None,
-                        failure_policy: M1_TRANSPORT_FAILURE_POLICY,
+                        failure_policy,
                         signal: Some(first.name()),
                     },
                 );
             } else {
                 println!("Stopped.");
             }
-            Ok(())
+            Ok(SessionEnd::Stopped)
         }
         // A second stop request already abandoned the drain; that operator
         // has asked not to wait, and the children's kill was never requested.
         Err(error) if error.cause == Cause::Cancelled => Err(error),
         Err(error) => {
-            wait_for_supervised_children(|| mcp_children.children_running(), stop.recv(), None)
-                .await?;
-            Err(error)
+            let lasted = ready_at.elapsed();
+            let unreaped =
+                wait_for_supervised_children(|| mcp_children.children_running(), stop.recv(), None)
+                    .await?;
+            report_unreaped(json, unreaped);
+            Ok(SessionEnd::Failed {
+                error,
+                ready: Some((session_id.unwrap_or_default(), lasted)),
+            })
         }
     }
 }
@@ -782,12 +1272,29 @@ const SUPERVISED_CHILD_REAP_BOUND: std::time::Duration = std::time::Duration::fr
 /// before they ran would tear the runtime down with that task possibly
 /// never polled -- measured (M6-C29) to leave an in-group helper alive in 7
 /// of 50 runs on this runtime flavour, and every time on a current-thread
-/// one, when no sentinel is installed. A timed-out wait is not an error.
+/// one, when no sentinel is installed. A timed-out wait is not an error, but
+/// it is not silent either: the result is how many children were still
+/// unreaped at the bound, and the caller reports a non-zero count
+/// (`report_unreaped`).
 async fn wait_for_supervised_children<R, S>(
     running: R,
     next_stop: S,
     first: Option<StopSignal>,
-) -> Result<(), CliError>
+) -> Result<u64, CliError>
+where
+    R: Fn() -> u64,
+    S: std::future::Future<Output = Result<StopSignal, CliError>>,
+{
+    wait_for_supervised_children_within(running, SUPERVISED_CHILD_REAP_BOUND, next_stop, first)
+        .await
+}
+
+async fn wait_for_supervised_children_within<R, S>(
+    running: R,
+    bound: std::time::Duration,
+    next_stop: S,
+    first: Option<StopSignal>,
+) -> Result<u64, CliError>
 where
     R: Fn() -> u64,
     S: std::future::Future<Output = Result<StopSignal, CliError>>,
@@ -797,13 +1304,45 @@ where
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     };
-    match bounded(reaped, SUPERVISED_CHILD_REAP_BOUND, next_stop).await? {
-        Bounded::Done(()) | Bounded::TimedOut => Ok(()),
+    match bounded(reaped, bound, next_stop).await? {
+        Bounded::Done(()) => Ok(0),
+        Bounded::TimedOut => Ok(running()),
         Bounded::Interrupted(second) => Err(abandoned(
             second,
             first,
             "supervised MCP children to be reaped",
         )),
+    }
+}
+
+/// The event for supervised MCP children still unreaped when the reap wait's
+/// bound ran out (M6-C23 review): the process goes on -- to exit, or to back
+/// off and reconnect -- and the sentinel, if installed, is what ends them.
+#[derive(Serialize)]
+struct UnreapedEvent {
+    state: &'static str,
+    unreaped: u64,
+    bound_ms: u64,
+}
+
+fn report_unreaped(json: bool, unreaped: u64) {
+    if unreaped == 0 {
+        return;
+    }
+    let bound_ms = millis(SUPERVISED_CHILD_REAP_BOUND);
+    if json {
+        print_ok_json(
+            "connect",
+            UnreapedEvent {
+                state: "children_unreaped",
+                unreaped,
+                bound_ms,
+            },
+        );
+    } else {
+        eprintln!(
+            "tunnel-client: {unreaped} supervised MCP child process(es) not reaped within {bound_ms} ms; continuing"
+        );
     }
 }
 
@@ -841,6 +1380,7 @@ async fn run_session(
     stop: &mut StopSignals,
     bound: std::time::Duration,
     json: bool,
+    failure_policy: &'static str,
 ) -> Result<StopSignal, CliError> {
     let mut readiness = handle.readiness();
     let initial = readiness.borrow_and_update().clone();
@@ -859,7 +1399,7 @@ async fn run_session(
                     session_id: Some(&info.session_id),
                     epoch: Some(info.epoch),
                     generation: Some(info.generation),
-                    failure_policy: M1_TRANSPORT_FAILURE_POLICY,
+                    failure_policy,
                     signal: None,
                 },
             );
@@ -1102,8 +1642,24 @@ fn parse_config_command(args: &[OsString]) -> Result<Command, CliError> {
 }
 
 fn parse_connect_command(args: &[OsString]) -> Result<Command, CliError> {
-    let (path, json) = parse_path_and_json(&args[1..], "connect")?;
-    Ok(Command::Connect { path, json })
+    // `--no-reconnect` is `connect`'s own flag; the rest is the shared
+    // `--config PATH [--json]` grammar.
+    let mut no_reconnect = false;
+    let rest: Vec<OsString> = args[1..]
+        .iter()
+        .filter(|arg| {
+            let flag = arg.to_str() == Some("--no-reconnect");
+            no_reconnect |= flag;
+            !flag
+        })
+        .cloned()
+        .collect();
+    let (path, json) = parse_path_and_json(&rest, "connect")?;
+    Ok(Command::Connect {
+        path,
+        json,
+        no_reconnect,
+    })
 }
 
 fn parse_path_and_json(args: &[OsString], command: &str) -> Result<(PathBuf, bool), CliError> {
@@ -1230,7 +1786,7 @@ Usage:\n\
   tunnel-client check-config [PATH]\n\
   tunnel-client config check --config PATH [--json]\n\
   tunnel-client doctor --config PATH --json\n\
-  tunnel-client connect --config PATH [--json]\n\
+  tunnel-client connect --config PATH [--json] [--no-reconnect]\n\
   tunnel-client credentials create --config PATH --csr-out PATH\n\
   tunnel-client credentials import --config PATH --certificate PATH --server-ca PATH\n\n\
 M1 uses one mTLS control socket and one mTLS data socket. Transport failure\n\
@@ -1284,6 +1840,31 @@ mod tests {
             started.elapsed() < std::time::Duration::from_secs(1),
             "the second stop request must end the wait at once, not at its {SUPERVISED_CHILD_REAP_BOUND:?} bound"
         );
+    }
+
+    /// A reap wait that runs out its bound reports how many children are
+    /// still running, so the caller can say so, instead of returning as if
+    /// they were reaped.
+    #[tokio::test]
+    async fn a_timed_out_reap_wait_reports_the_unreaped_count() {
+        let unreaped = wait_for_supervised_children_within(
+            || 2,
+            std::time::Duration::from_millis(50),
+            never_stops(),
+            None,
+        )
+        .await
+        .expect("a timed-out reap wait is not an error");
+        assert_eq!(unreaped, 2);
+        let reaped = wait_for_supervised_children_within(
+            || 0,
+            std::time::Duration::from_millis(50),
+            never_stops(),
+            None,
+        )
+        .await
+        .expect("reaped");
+        assert_eq!(reaped, 0);
     }
 
     /// A drain that never completes still ends within its bound, as 130.
@@ -1387,7 +1968,7 @@ mod tests {
     /// string the test chose itself.
     #[test]
     fn every_client_error_variant_maps_to_an_actionable_exit_code() {
-        let cases: [(ClientError, &str, u8); 11] = [
+        let cases: [(ClientError, &str, u8); 12] = [
             (
                 ClientError::Config(tunnel_client::RuntimeConfigError::Invalid("synthetic")),
                 "INVALID_CONFIG",
@@ -1415,6 +1996,11 @@ mod tests {
                 4,
             ),
             (ClientError::OwnerBusy, "OWNER_BUSY", 7),
+            (
+                ClientError::TlsRefused("synthetic fixed reason"),
+                "CREDENTIAL_ERROR",
+                3,
+            ),
             (ClientError::HandshakeTimeout, "DEADLINE_EXCEEDED", 5),
             (ClientError::AuthorizationExpired, "AUTHORIZATION_STALE", 3),
             (ClientError::QueueLimit, "RESOURCE_EXHAUSTED", 7),
@@ -1429,7 +2015,7 @@ mod tests {
             assert_eq!(cli.exit_code(), expected_exit, "exit code for {described}");
             seen.insert(expected_code);
         }
-        // `SupervisorPanicked` is the twelfth variant and is covered by
+        // `SupervisorPanicked` is the thirteenth variant and is covered by
         // `only_protocol_and_supervisor_failures_exit_one` below, which also
         // states why it is one of the two that may stay at `1`.
         assert_eq!(
@@ -1437,7 +2023,7 @@ mod tests {
             1,
             "a failed supervisor is genuinely internal"
         );
-        assert_eq!(seen.len(), 10, "ten distinct codes across eleven variants");
+        assert_eq!(seen.len(), 10, "ten distinct codes across twelve variants");
     }
 
     /// The point of the change: causes that need different operator actions
@@ -1720,5 +2306,214 @@ mod tests {
             .expect("a non-terminal readiness is published");
         drop(readiness_tx);
         assert!(retained_closed_reason(&mut readiness).is_none());
+    }
+
+    // ------------------------------------------------ reconnect (M6-C23)
+
+    fn policy(initial_ms: u64, max_ms: u64, max_attempts: u32) -> ReconnectPolicy {
+        ReconnectPolicy::new(
+            &tunnel_client::ReconnectConfig {
+                enabled: true,
+                initial_delay_ms: initial_ms,
+                max_delay_ms: max_ms,
+                max_attempts,
+            },
+            false,
+        )
+    }
+
+    /// The classification docs/runtime.md publishes, cause by cause. A
+    /// change to any arm must change this table and the document together.
+    #[test]
+    fn reconnect_classification_matches_the_documented_table() {
+        use ReconnectClass::{OwnerBusy, Retryable, Terminal};
+        let table = [
+            (Cause::InvalidInvocation, Terminal),
+            (Cause::ConfigError, Terminal),
+            (Cause::InvalidConfig, Terminal),
+            (Cause::CredentialError, Terminal),
+            (Cause::AuthorizationStale, Retryable),
+            (Cause::TransportError, Retryable),
+            (Cause::SessionClosed, Retryable),
+            (Cause::DeadlineExceeded, Retryable),
+            (Cause::OwnerBusy, OwnerBusy),
+            (Cause::ResourceExhausted, Retryable),
+            (Cause::Cancelled, Terminal),
+            (Cause::ProtocolError, Terminal),
+            (Cause::SupervisorFailed, Terminal),
+            (Cause::SignalError, Terminal),
+        ];
+        for (cause, class) in table {
+            assert_eq!(cause.reconnect_class(), class, "{cause:?}");
+        }
+        // A TLS certificate refusal is a credential error, so terminal.
+        let refused = CliError::from_client(ClientError::TlsRefused("synthetic"));
+        assert_eq!(refused.cause.reconnect_class(), Terminal);
+        assert!(!refused.retryable);
+    }
+
+    /// `OWNER_BUSY` on a fresh process's first attempt is another
+    /// connector: exit `7` at once, as before. After this process's own
+    /// session ended it is that session's lease, retried -- but only inside
+    /// the window.
+    #[test]
+    fn owner_busy_is_retried_only_within_the_window_after_our_own_session() {
+        let policy = policy(1_000, 60_000, 0);
+        let start = tokio::time::Instant::now();
+        let mut fresh = ReconnectState::default();
+        assert_eq!(
+            fresh.decide(&policy, Cause::OwnerBusy, None, start, 0),
+            ReconnectDecision::Exit
+        );
+
+        let mut state = ReconnectState::default();
+        let lost = start;
+        assert!(matches!(
+            state.decide(
+                &policy,
+                Cause::TransportError,
+                Some(std::time::Duration::from_secs(5)),
+                lost,
+                0
+            ),
+            ReconnectDecision::Retry { attempt: 1, .. }
+        ));
+        assert!(matches!(
+            state.decide(
+                &policy,
+                Cause::OwnerBusy,
+                None,
+                lost + std::time::Duration::from_secs(30),
+                0
+            ),
+            ReconnectDecision::Retry { attempt: 2, .. }
+        ));
+        assert_eq!(
+            state.decide(
+                &policy,
+                Cause::OwnerBusy,
+                None,
+                lost + OWNER_BUSY_RECONNECT_WINDOW,
+                0
+            ),
+            ReconnectDecision::Exit
+        );
+    }
+
+    /// Consecutive failures double the ceiling; a session that stayed ready
+    /// for `max_delay` resets it, a shorter one does not (a relay that
+    /// accepts and drops at once still backs off).
+    #[test]
+    fn backoff_grows_is_capped_and_resets_only_after_a_stable_session() {
+        let policy = policy(1_000, 60_000, 0);
+        let ceilings: Vec<u64> = (1..=9)
+            .map(|attempt| policy.ceiling(attempt).as_millis() as u64)
+            .collect();
+        assert_eq!(
+            ceilings,
+            [
+                1_000, 2_000, 4_000, 8_000, 16_000, 32_000, 60_000, 60_000, 60_000
+            ]
+        );
+        assert_eq!(policy.ceiling(u32::MAX).as_millis(), 60_000);
+        for random in [0, 1, 499, 500, 501, u64::MAX] {
+            let delay = policy.delay(3, random).as_millis() as u64;
+            assert!((2_000..=4_000).contains(&delay), "{random} -> {delay}");
+        }
+        assert_eq!(policy.delay(3, 0).as_millis(), 2_000);
+        assert_eq!(policy.delay(3, 2_000).as_millis(), 4_000);
+
+        let now = tokio::time::Instant::now();
+        let mut state = ReconnectState::default();
+        for expected in 1..=3 {
+            assert!(matches!(
+                state.decide(&policy, Cause::TransportError, None, now, 0),
+                ReconnectDecision::Retry { attempt, .. } if attempt == expected
+            ));
+        }
+        // Ready for 10 s, less than max_delay: keeps counting.
+        assert!(matches!(
+            state.decide(
+                &policy,
+                Cause::SessionClosed,
+                Some(std::time::Duration::from_secs(10)),
+                now,
+                0
+            ),
+            ReconnectDecision::Retry { attempt: 4, .. }
+        ));
+        // Ready for max_delay: starts again at 1.
+        assert!(matches!(
+            state.decide(
+                &policy,
+                Cause::SessionClosed,
+                Some(std::time::Duration::from_secs(60)),
+                now,
+                0
+            ),
+            ReconnectDecision::Retry { attempt: 1, .. }
+        ));
+        assert_eq!(state.sessions, 2);
+    }
+
+    /// `max_attempts` bounds consecutive retries; `--no-reconnect` and a
+    /// terminal cause never retry.
+    #[test]
+    fn attempt_limit_no_reconnect_and_terminal_causes_exit() {
+        let now = tokio::time::Instant::now();
+        let limited = policy(100, 200, 2);
+        let mut state = ReconnectState::default();
+        for _ in 0..2 {
+            assert!(matches!(
+                state.decide(&limited, Cause::TransportError, None, now, 0),
+                ReconnectDecision::Retry { .. }
+            ));
+        }
+        assert_eq!(
+            state.decide(&limited, Cause::TransportError, None, now, 0),
+            ReconnectDecision::Exit
+        );
+
+        let off = ReconnectPolicy::new(&tunnel_client::ReconnectConfig::default(), true);
+        assert!(!off.enabled);
+        assert_eq!(
+            ReconnectState::default().decide(&off, Cause::TransportError, None, now, 0),
+            ReconnectDecision::Exit
+        );
+        assert_eq!(
+            ReconnectState::default().decide(
+                &policy(100, 200, 0),
+                Cause::CredentialError,
+                None,
+                now,
+                0
+            ),
+            ReconnectDecision::Exit
+        );
+    }
+
+    #[test]
+    fn connect_accepts_no_reconnect_anywhere_among_its_flags() {
+        for args in [
+            &["connect", "--no-reconnect", "--config", "p.toml", "--json"][..],
+            &["connect", "--config", "p.toml", "--no-reconnect"][..],
+        ] {
+            let args: Vec<OsString> = args.iter().map(OsString::from).collect();
+            let Ok(Command::Connect { no_reconnect, .. }) = parse_command(&args) else {
+                panic!("{args:?} did not parse as connect");
+            };
+            assert!(no_reconnect);
+        }
+        let args: Vec<OsString> = ["connect", "--config", "p.toml"]
+            .iter()
+            .map(OsString::from)
+            .collect();
+        assert!(matches!(
+            parse_command(&args),
+            Ok(Command::Connect {
+                no_reconnect: false,
+                ..
+            })
+        ));
     }
 }

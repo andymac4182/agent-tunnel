@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Example launchd agent for `tunnel-client connect` on macOS (task row M6-C23).
+
+  Install for the logged-in user: copy to ~/Library/LaunchAgents/, adjust the
+  paths, then
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.agent-tunnel.tunnel-client.plist
+  Stop and remove with `launchctl bootout gui/$(id -u)/local.agent-tunnel.tunnel-client`.
+  docs/operator.md section 4 explains every key.
+
+  The client reconnects by itself; KeepAlive restarts it only after an
+  unsuccessful exit. launchd has no equivalent of systemd's
+  RestartPreventExitStatus, so a configuration or credential error (exit 2 or
+  3) is retried every ThrottleInterval seconds: read the log file below.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>local.agent-tunnel.tunnel-client</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/tunnel-client</string>
+    <string>connect</string>
+    <string>--config</string>
+    <string>/usr/local/etc/agent-tunnel/client.toml</string>
+    <string>--json</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+  <!-- launchd sends SIGTERM, then SIGKILL after this many seconds (default
+       20). The client's own bounded stop can take up to about 50 s with the
+       default rotation settings. -->
+  <key>ExitTimeOut</key>
+  <integer>60</integer>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>/usr/local/var/log/agent-tunnel/tunnel-client.log</string>
+  <key>StandardErrorPath</key>
+  <string>/usr/local/var/log/agent-tunnel/tunnel-client.log</string>
+</dict>
+</plist>

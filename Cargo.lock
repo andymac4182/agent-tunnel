@@ -3522,6 +3522,7 @@ dependencies = [
  "http-body-util",
  "rcgen",
  "ring",
+ "rustix",
  "rustls",
  "rustls-pemfile",
  "serde",

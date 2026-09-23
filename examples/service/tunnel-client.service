@@ -1,0 +1,64 @@
+# Example systemd unit for `tunnel-client connect` (task row M6-C23).
+#
+# Install: copy to /etc/systemd/system/, adjust the paths and the account the
+# device's exports should run as, `systemctl daemon-reload`,
+# `systemctl enable --now tunnel-client`. docs/operator.md section 4 explains
+# every setting below.
+#
+# **The client reconnects by itself** (the profile's `[reconnect]` table,
+# docs/runtime.md "Reconnecting"): a relay restart, a network change or a
+# lost session is retried with bounded, jittered backoff inside the process.
+# `Restart=` below does not duplicate that; it covers what the process cannot:
+# a crash, an internal failure (exit 1), OWNER_BUSY (exit 7), or an attempt
+# limit the operator configured (exit 4 or 5). A supervisor that prefers to
+# own every restart can add `--no-reconnect` to ExecStart and keep
+# Restart=on-failure.
+#
+# **Exit 7 is restarted, and the start limit is off, on purpose.** When the
+# device's network path vanishes while the relay stays up, the relay keeps
+# the old session and refuses every reconnect OWNER_BUSY until it is
+# restarted (docs/runtime.md, M6-C68): the client exits 7 after its 60 s
+# window, and so does every fresh start. With a start limit the unit would
+# end up failed and quiet a few minutes later and stay that way after the
+# relay recovered; with RestartPreventExitStatus=7 it would do so at once.
+# Instead it keeps trying every RestartSec, each attempt logging the
+# OWNER_BUSY refusal to the journal (`systemctl status` shows
+# "activating (auto-restart)"), and reconnects by itself once the relay lets
+# go. Exits 2 and 3 are still never restarted: no restart fixes them.
+[Unit]
+Description=Agent Tunnel device connector (tunnel-client connect)
+Documentation=https://github.com/andymac4182/agentuplink/blob/main/docs/operator.md
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=exec
+User=agent-tunnel
+Group=agent-tunnel
+ExecStart=/usr/local/bin/tunnel-client connect --config /etc/agent-tunnel/client.toml --json
+# Stop: SIGTERM to the client only (KillMode=mixed), which then ends its
+# supervised MCP/ACP children itself. A live session drains and exits 0 with
+# a `stopped` event; a stop before a session is ready, or while it waits to
+# reconnect, exits 130 CANCELLED -- a clean stop, not a failure.
+KillSignal=SIGTERM
+KillMode=mixed
+SuccessExitStatus=130
+# The client's own stop is bounded: the drain by the profile's
+# rotation.handshake_timeout_seconds + rotation.overlap_seconds (40 s by
+# default), the child reap by 5 s, blocking work by 5 s. 60 s lets it finish
+# before systemd's SIGKILL; raise it if you raise those settings.
+TimeoutStopSec=60s
+Restart=on-failure
+RestartSec=30s
+# 2 = invalid invocation or configuration, 3 = the credential or the relay's
+# certificate was refused: no restart fixes either. The unit stays failed and
+# `journalctl -u tunnel-client` shows the real error.
+RestartPreventExitStatus=2 3
+# Hardening that leaves the exports' files alone. Add ProtectHome=yes and
+# ProtectSystem=strict if your exports need neither.
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
