@@ -77,6 +77,13 @@ case "$command" in
     [ "$#" -eq 0 ] || die "$command takes no arguments"
     exec /usr/local/bin/tunnel-relay "$command" --config "$config"
     ;;
+  rebind-redis-run)
+    # docs/deploy-fly.md section 6.4 (M6-C65): only after a Redis restart
+    # that kept its data, never after a restore.
+    [ "$#" -eq 1 ] && [ "$1" = --redis-restarted-in-place ] \
+      || die "usage: rebind-redis-run --redis-restarted-in-place"
+    exec /usr/local/bin/tunnel-relay rebind-redis-run --config "$config" --redis-restarted-in-place
+    ;;
   provision-catalog)
     [ "$#" -ge 1 ] || die "usage: provision-catalog RECORDS [--dry-run]"
     records=$1
@@ -84,6 +91,6 @@ case "$command" in
     exec /usr/local/bin/tunnel-relay provision-catalog --config "$config" --records "$records" "$@"
     ;;
   *)
-    die "unknown command '$command' (serve, check-serve-config, activate-first-incarnation, provision-catalog)"
+    die "unknown command '$command' (serve, check-serve-config, activate-first-incarnation, provision-catalog, rebind-redis-run)"
     ;;
 esac

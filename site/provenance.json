@@ -1,11 +1,11 @@
 {
-  "reviewedOriginMain": "b7cb09fc1c0b469afd6629cf4c3eb92c8d12b4f5",
-  "lastPublishedOriginMain": "b7cb09fc1c0b469afd6629cf4c3eb92c8d12b4f5",
-  "lastReviewAt": "2026-09-24T03:01:30+10:00",
-  "lastReviewOutcome": "Reviewed catalog-change CLI schemas, provisioning and revocation behavior, regression tests and operator documentation through b7cb09f. Replaced obsolete first-provisioning-only limits with seven catalog-change commands, dry-run boundaries, replacement-device workflow and explicit unsupported edits/renewal. Documented revocation timing and credential-only session-close evidence gap. No runtime or catalog commands executed; CI and release gates unchanged.",
+  "reviewedOriginMain": "bce9687b5c56f3dcc1fc9ae99f37b90c0341315b",
+  "lastPublishedOriginMain": "bce9687b5c56f3dcc1fc9ae99f37b90c0341315b",
+  "lastReviewAt": "2026-09-24T06:02:58+10:00",
+  "lastReviewOutcome": "Reviewed single-relay Redis continuity configuration, run binding and refusal paths, process regression coverage, Fly templates and filesystem platform corrections through bce9687. Published in-place restart prerequisites, operator attestation and explicit restore/failover exclusions, persistence downgrade limits and new error classes. Clarified Windows filesystem refusal and Linux resolver scope. No runtime or recovery operations executed; CI and release gates not changed by this update.",
   "reviewedDate": "2026-09-24",
   "scope": "Setup, architecture, MCP, ACP, computer use, filesystems and support boundaries",
-  "verification": "Local and live Chrome verification passed at 1440, 1920, 390 and 320 pixels: homepage, brand lab, nine docs pages, links, images, light/dark/system themes and overflow. Live setup and support exactly matched reviewed local assets. Runtime, Redis and artifact acceptance not rerun; historical evidence not promoted to new acceptance.",
-  "verifiedAt": "2026-09-24T03:01:30+10:00",
-  "deploymentId": "dpl_78jdmNQiwZrN8FB6HguwyzSvs67F"
+  "verification": "Local and live Chrome verification passed at 1440, 1920, 390 and 320 pixels: homepage, brand lab, nine docs pages, links, images, light/dark/system themes and overflow. Live setup, support, architecture, downloads and filesystems exactly matched reviewed local assets. Runtime, Redis and artifact acceptance not rerun; historical evidence not promoted to new acceptance.",
+  "verifiedAt": "2026-09-24T06:02:58+10:00",
+  "deploymentId": "dpl_EWEi6TpoiThVpwuLLG2SmeETMnBn"
 }

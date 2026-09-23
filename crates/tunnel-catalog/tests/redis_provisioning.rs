@@ -580,3 +580,175 @@ async fn m6c31_day2_additions_are_atomic_refuse_duplicates_and_keep_the_authorit
         .expect("recovery can observe a namespace with day-2 additions");
     delete_namespace(&namespace).await;
 }
+
+/// Whether the shared Redis shows the persistence continuity requires.
+async fn shared_redis_is_durable() -> bool {
+    let client = redis::Client::open(url()).expect("open Redis client");
+    let mut connection = client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("connect Redis");
+    let pairs: Vec<String> = redis::cmd("CONFIG")
+        .arg("GET")
+        .arg("appendonly")
+        .arg("appendfsync")
+        .arg("no-appendfsync-on-rewrite")
+        .query_async(&mut connection)
+        .await
+        .expect("CONFIG GET");
+    let value = |name: &str| {
+        pairs
+            .chunks(2)
+            .find(|pair| pair[0] == name)
+            .map(|pair| pair[1].clone())
+    };
+    value("appendonly").as_deref() == Some("yes")
+        && value("appendfsync").as_deref() == Some("always")
+        && value("no-appendfsync-on-rewrite").as_deref() == Some("no")
+}
+
+async fn set(namespace: &str, key: &str, value: &str) {
+    let client = redis::Client::open(url()).expect("open Redis client");
+    let mut connection = client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("connect Redis");
+    let _: () = connection
+        .set(format!("tunnel-catalog:{namespace}:{key}"), value)
+        .await
+        .expect("SET");
+}
+
+/// Task row M6-C65, at the catalog: the class `serve`'s fence reports for
+/// an empty namespace and for one bound to an earlier Redis run, the
+/// operator re-binding (`rebind-redis-run`) with each of its refusals, and
+/// the continuity token a single relay writes.  A Redis restart itself is
+/// proved by the process-level gate (`scripts/m6-redis-restart-verify.sh`);
+/// here "an earlier run" is a binding this test writes, on the shared Redis
+/// it must not restart.
+#[tokio::test]
+#[ignore = "requires TUNNEL_CATALOG_REDIS_URL Redis primary fixture"]
+async fn m6c65_run_binding_classes_operator_rebind_and_continuity_token() {
+    use tunnel_catalog::{CatalogConnectionFailure, RedisRunRebind};
+    let namespace = fresh_namespace();
+    let bootstrap = RedisCatalog::connect_for_recovery(&url(), &namespace, INCARNATION)
+        .await
+        .expect("connect for bootstrap");
+
+    // An empty namespace: `serve` refuses it as `unbound`, and so does the
+    // operator re-binding, which writes nothing.
+    let Err(refused) =
+        RedisCatalog::connect_with_deployment_incarnation_staged(&url(), &namespace, INCARNATION)
+            .await
+    else {
+        panic!("serve's fence refuses an empty namespace");
+    };
+    assert_eq!(refused.failure(), CatalogConnectionFailure::Unbound);
+    let empty = bootstrap
+        .rebind_restarted_redis_run()
+        .await
+        .expect_err("re-binding refuses an empty namespace");
+    assert_eq!(
+        CatalogConnectionFailure::classify(&empty),
+        CatalogConnectionFailure::Unbound
+    );
+    assert!(keys(&namespace).await.is_empty(), "nothing may be written");
+
+    bootstrap
+        .activate_first_deployment_incarnation()
+        .await
+        .expect("first activation");
+    let live_run = get(&namespace, "meta:redis_run_id").await.expect("run");
+
+    // Continuity needs run re-binding first, and then a Redis whose
+    // persistence makes every acknowledged write durable.  This shared Redis
+    // is not changed by the test; which answer is right depends on its
+    // settings, read here.  The process gate (`m6-redis-restart-verify.sh`)
+    // proves the `everysec` refusal on a Redis it owns.
+    let serving =
+        RedisCatalog::connect_with_deployment_incarnation(&url(), &namespace, INCARNATION)
+            .await
+            .expect("serve's fence accepts the activated namespace");
+    let interval = std::time::Duration::from_secs(5);
+    assert!(matches!(
+        serving.enable_restart_continuity(interval).await,
+        Err(CatalogError::InvalidInput(_))
+    ));
+    serving.enable_run_rebinding().expect("run re-binding");
+    let durable = shared_redis_is_durable().await;
+    match serving.enable_restart_continuity(interval).await {
+        Ok(()) => {
+            assert!(durable, "continuity enabled on a Redis that is not durable");
+            let token = get(&namespace, "meta:continuity").await.expect("token");
+            assert_eq!(token.len(), 32, "a hex UUID v4, 122 random bits: {token}");
+        }
+        Err(error) => {
+            assert!(!durable, "continuity refused on a durable Redis: {error}");
+            assert_eq!(
+                CatalogConnectionFailure::classify(&error),
+                CatalogConnectionFailure::Persistence
+            );
+            assert_eq!(get(&namespace, "meta:continuity").await, None);
+        }
+    }
+    // A continuity token left by a relay that served before provisioning:
+    // the one-shot reservation still accepts the namespace.
+    set(
+        &namespace,
+        "meta:continuity",
+        "0123456789abcdef0123456789abcdef",
+    )
+    .await;
+    let (records, _) = records();
+    bootstrap
+        .provision_initial_catalog(&records)
+        .await
+        .expect("provisioning accepts a namespace holding a continuity token");
+    let observation = serving
+        .observe_durable_catalog()
+        .await
+        .expect("recovery observes a namespace holding a continuity token");
+    assert!(observation.key_count() > 0);
+
+    // The namespace bound to an earlier Redis run, as after a restart.
+    set(&namespace, "meta:redis_run_id", "m6c65-earlier-run").await;
+    let Err(refused) =
+        RedisCatalog::connect_with_deployment_incarnation_staged(&url(), &namespace, INCARNATION)
+            .await
+    else {
+        panic!("serve's fence refuses a namespace bound to an earlier run");
+    };
+    assert_eq!(refused.failure(), CatalogConnectionFailure::RunChanged);
+    // Another incarnation cannot re-bind it.
+    let other = RedisCatalog::connect_for_recovery(&url(), &namespace, "m6c65-other")
+        .await
+        .expect("connect with another incarnation");
+    assert!(matches!(
+        other.rebind_restarted_redis_run().await,
+        Err(CatalogError::Conflict("active deployment incarnation"))
+    ));
+
+    // The configured one can, once; then it is current.
+    assert_eq!(
+        bootstrap
+            .rebind_restarted_redis_run()
+            .await
+            .expect("rebind"),
+        RedisRunRebind::Rebound {
+            previous_run_id: "m6c65-earlier-run".into(),
+            run_id: live_run.clone(),
+        }
+    );
+    assert_eq!(
+        bootstrap
+            .rebind_restarted_redis_run()
+            .await
+            .expect("rebind again"),
+        RedisRunRebind::AlreadyCurrent { run_id: live_run }
+    );
+    RedisCatalog::connect_with_deployment_incarnation(&url(), &namespace, INCARNATION)
+        .await
+        .expect("serve's fence accepts the re-bound namespace");
+    println!("m6c65-catalog ok namespace={namespace}");
+    delete_namespace(&namespace).await;
+}

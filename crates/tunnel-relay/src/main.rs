@@ -20,7 +20,9 @@ use serde::Deserialize;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::{EnvFilter, fmt};
-use tunnel_catalog::{ApprovedJwk, OidcConfig, OidcVerifier, SharedCatalog};
+use tunnel_catalog::{
+    ApprovedJwk, CatalogConnectionFailure, OidcConfig, OidcVerifier, RedisCatalog, SharedCatalog,
+};
 use tunnel_cluster::membership::TrustedPublisherKey;
 use tunnel_core::RelayConfig;
 use tunnel_relay::{
@@ -341,6 +343,17 @@ async fn run() -> Result<(), Box<dyn Error>> {
             .await?;
             println!("{line}");
         }
+        // M6-C65: re-attest a namespace to a Redis that restarted in place.
+        // One atomic script, so like `provision-catalog` a first stop
+        // request lets it finish.
+        [command, rest @ ..] if command == OsStr::new("rebind-redis-run") => {
+            let line = run_to_completion(
+                "rebind-redis-run",
+                tunnel_relay::provisioning::rebind_redis_run(rest),
+            )
+            .await?;
+            println!("{line}");
+        }
         [command, rest @ ..] if command == OsStr::new("provision-catalog") => {
             let line = run_to_completion(
                 "provision-catalog",
@@ -414,7 +427,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
         }
         _ => {
             return Err(
-                "usage: tunnel-relay [--help | check-config [PATH] | check-serve-config --config PATH | initialize --config PATH | recovery-initialize --config PATH | recovery-observe --config PATH | recover --config PATH --approval PATH --expected-nonce NONCE --acknowledgement-id ID --old-primary-fenced --old-relays-fenced | activate-first-incarnation --config PATH | provision-catalog --config PATH --records PATH [--dry-run] | add-user|add-device|add-service|set-grant --config PATH --records PATH [--dry-run] | revoke-grant|revoke-device|revoke-credential --config PATH --tenant UUID ... [--dry-run] | serve --config PATH]".into(),
+                "usage: tunnel-relay [--help | check-config [PATH] | check-serve-config --config PATH | initialize --config PATH | recovery-initialize --config PATH | recovery-observe --config PATH | recover --config PATH --approval PATH --expected-nonce NONCE --acknowledgement-id ID --old-primary-fenced --old-relays-fenced | activate-first-incarnation --config PATH | rebind-redis-run --config PATH --redis-restarted-in-place | provision-catalog --config PATH --records PATH [--dry-run] | add-user|add-device|add-service|set-grant --config PATH --records PATH [--dry-run] | revoke-grant|revoke-device|revoke-credential --config PATH --tenant UUID ... [--dry-run] | serve --config PATH]".into(),
             );
         }
     }
@@ -717,9 +730,12 @@ async fn serve(path: &Path) -> Result<(), Box<dyn Error>> {
         }
     };
     match serving {
-        Serving::Single(running) => {
+        Serving::Single(running, continuity) => {
             let signal = stop.recv().await?;
             eprintln!("tunnel-relay stopping: signal={}", signal.name());
+            if let Some(continuity) = continuity {
+                continuity.stop();
+            }
             drain_unless_interrupted(&mut stop, signal, async move {
                 running.shutdown().await.map_err(Into::into)
             })
@@ -733,7 +749,9 @@ async fn serve(path: &Path) -> Result<(), Box<dyn Error>> {
 
 /// A relay that finished startup and is serving.
 enum Serving {
-    Single(tunnel_relay::RunningRelay),
+    /// A relay without `[cluster]`, and its Redis restart continuity task
+    /// when `redis_restart_continuity_seconds` is set (M6-C65).
+    Single(tunnel_relay::RunningRelay, Option<ContinuityTask>),
     Cluster(ClusterServing),
 }
 
@@ -757,6 +775,32 @@ async fn start_serving(path: &Path) -> Result<Serving, Box<dyn Error>> {
         &redis_tls_material,
     )
     .await?;
+    // M6-C65: a single relay may adopt a restarted Redis run the namespace
+    // allows; a cluster relay never does (recovery stays the cluster's path).
+    if config.cluster.is_none() {
+        catalog.enable_run_rebinding()?;
+    }
+    // A single relay that opted in also keeps a continuity witness, so a
+    // Redis restart that kept this relay's last acknowledged write is
+    // re-bound without an operator.  The first token is written before the
+    // relay listens; a failure here, including a Redis whose persistence does
+    // not make acknowledged writes durable, refuses to start.
+    let continuity = match config.redis_restart_continuity_seconds {
+        Some(seconds) if config.cluster.is_none() => {
+            let interval = Duration::from_secs(seconds);
+            catalog
+                .enable_restart_continuity(interval)
+                .await
+                .map_err(|error| {
+                    format!(
+                        "Redis restart continuity could not start; {}",
+                        continuity_stage(&error)
+                    )
+                })?;
+            Some((catalog.clone(), interval))
+        }
+        _ => None,
+    };
     let catalog: SharedCatalog = Arc::new(catalog);
     let options = RelayOptions::new(oidc);
     let consumer_listener = TcpListener::bind(config.consumer_bind).await?;
@@ -801,7 +845,120 @@ async fn start_serving(path: &Path) -> Result<Serving, Box<dyn Error>> {
         "tunnel-relay listening: consumer={} device={}",
         running.consumer_addr, running.device_addr
     );
-    Ok(Serving::Single(running))
+    let continuity = continuity.map(|(catalog, interval)| {
+        eprintln!(
+            "tunnel-relay Redis restart continuity: interval_seconds={}",
+            interval.as_secs()
+        );
+        ContinuityTask::spawn(catalog, interval)
+    });
+    Ok(Serving::Single(running, continuity))
+}
+
+/// The continuity token loop and the supervisor that watches it (M6-C65
+/// review).  If the loop ever ends while the relay serves -- a panic, or any
+/// return -- tokens stop, so the last one no longer bounds what Redis
+/// acknowledged: the supervisor then turns token re-binding off, so a later
+/// Redis restart fails closed as `run_changed` until an operator re-attests
+/// it, and says so.  (The lanes also refuse a token re-binding whose last
+/// acknowledged token is older than one interval plus the command deadlines
+/// before the relay's last reply from Redis, which covers a loop that keeps
+/// running but keeps failing.)
+struct ContinuityTask {
+    worker: tokio::task::AbortHandle,
+    supervisor: tokio::task::JoinHandle<()>,
+}
+
+impl ContinuityTask {
+    fn spawn(catalog: RedisCatalog, interval: Duration) -> Self {
+        let worker = tokio::spawn(restart_continuity_loop(catalog.clone(), interval));
+        let abort = worker.abort_handle();
+        let supervisor = tokio::spawn(async move {
+            let how = supervise_continuity(worker, || catalog.disable_restart_continuity()).await;
+            eprintln!(
+                "tunnel-relay: Redis restart continuity task {how}; token re-binding is off, so a Redis restart now needs rebind-redis-run"
+            );
+        });
+        Self {
+            worker: abort,
+            supervisor,
+        }
+    }
+
+    /// An orderly stop: neither task reports anything.
+    fn stop(self) {
+        self.supervisor.abort();
+        self.worker.abort();
+    }
+}
+
+/// Wait for the token loop to end, however it ends, then turn token
+/// re-binding off with `disable`; returns how it ended.
+async fn supervise_continuity(
+    worker: tokio::task::JoinHandle<()>,
+    disable: impl FnOnce(),
+) -> &'static str {
+    let outcome = worker.await;
+    disable();
+    match &outcome {
+        Err(error) if error.is_panic() => "panicked",
+        Err(_) => "was cancelled",
+        Ok(()) => "returned",
+    }
+}
+
+/// `stage=... class=...` for a continuity failure, fixed words only: a
+/// refusal of the namespace is `authority_identity`, anything else (Redis
+/// down, a timeout) `authority_connection`.
+fn continuity_stage(error: &tunnel_catalog::CatalogError) -> String {
+    let class = CatalogConnectionFailure::classify(error);
+    let stage = match class {
+        CatalogConnectionFailure::Unbound
+        | CatalogConnectionFailure::RunChanged
+        | CatalogConnectionFailure::Continuity
+        | CatalogConnectionFailure::Persistence
+        | CatalogConnectionFailure::Catalog => "authority_identity",
+        _ => "authority_connection",
+    };
+    format!("stage={stage} class={}", class.as_str())
+}
+
+/// Write a new continuity token every `interval` (M6-C65) and report, once
+/// per change, a re-binding to a restarted Redis run, a failure and a
+/// recovery.  It never exits the relay: while Redis is refused, requests
+/// fail closed as they would without it.
+async fn restart_continuity_loop(catalog: RedisCatalog, interval: Duration) {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The first tick completes at once; startup already wrote a token.
+    ticker.tick().await;
+    let mut rebinds = catalog.redis_run_rebinds();
+    let mut failing: Option<String> = None;
+    loop {
+        ticker.tick().await;
+        let result = catalog.advance_restart_continuity().await;
+        let current = catalog.redis_run_rebinds();
+        if current != rebinds {
+            rebinds = current;
+            eprintln!(
+                "tunnel-relay: Redis authority restarted; namespace re-bound to the new Redis run: rebinds={current}"
+            );
+        }
+        match result {
+            Ok(()) => {
+                if failing.take().is_some() {
+                    eprintln!("tunnel-relay: Redis authority continuity restored");
+                }
+            }
+            Err(error) => {
+                let line = continuity_stage(&error);
+                if failing.as_deref() != Some(line.as_str()) {
+                    eprintln!("tunnel-relay: Redis authority continuity check failed; {line}");
+                    failing = Some(line);
+                }
+            }
+        }
+    }
 }
 
 /// Start the M7 private peer path after constructing every trust input from
@@ -1367,7 +1524,7 @@ fn parse_jwks(bytes: &[u8]) -> Result<Vec<ApprovedJwk>, Box<dyn Error>> {
 fn print_help() {
     println!(
         "tunnel-relay — authenticated multi-user Agent Tunnel relay\n\n\
-         Usage: tunnel-relay [--help | check-config [PATH] | check-serve-config --config PATH | initialize --config PATH | recovery-initialize --config PATH | recovery-observe --config PATH | recover --config PATH --approval PATH --expected-nonce NONCE --acknowledgement-id ID --old-primary-fenced --old-relays-fenced | activate-first-incarnation --config PATH | provision-catalog --config PATH --records PATH [--dry-run] | add-user|add-device|add-service|set-grant --config PATH --records PATH [--dry-run] | revoke-grant|revoke-device|revoke-credential --config PATH --tenant UUID ... [--dry-run] | serve --config PATH]\n\n\
+         Usage: tunnel-relay [--help | check-config [PATH] | check-serve-config --config PATH | initialize --config PATH | recovery-initialize --config PATH | recovery-observe --config PATH | recover --config PATH --approval PATH --expected-nonce NONCE --acknowledgement-id ID --old-primary-fenced --old-relays-fenced | activate-first-incarnation --config PATH | rebind-redis-run --config PATH --redis-restarted-in-place | provision-catalog --config PATH --records PATH [--dry-run] | add-user|add-device|add-service|set-grant --config PATH --records PATH [--dry-run] | revoke-grant|revoke-device|revoke-credential --config PATH --tenant UUID ... [--dry-run] | serve --config PATH]\n\n\
          check-config [PATH]       Validate legacy relay TOML without opening listeners.\n\
          check-serve-config --config PATH\n\
                                   Dry-run the configuration serve uses: full validation,\n\
@@ -1383,6 +1540,9 @@ fn print_help() {
                                   Consume one approval and activate the candidate.\n\
          activate-first-incarnation --config PATH\n\
                                   Bind the configured incarnation to an empty namespace.\n\
+         rebind-redis-run --config PATH --redis-restarted-in-place\n\
+                                  After Redis restarted from its own persistence, bind\n\
+                                  the namespace to the new Redis run (single relay).\n\
          provision-catalog --config PATH --records PATH [--dry-run]\n\
                                   Write one tenant, user, device, credential, service\n\
                                   and grant into a newly activated namespace.\n\
@@ -1397,6 +1557,35 @@ fn print_help() {
                                   live session) or one device credential.\n\
          serve --config PATH      Start consumer HTTPS and device mTLS WSS listeners."
     );
+}
+
+#[cfg(test)]
+mod continuity_supervision_tests {
+    use super::supervise_continuity;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    /// M6-C65 review: a token loop that dies while the relay serves must turn
+    /// token re-binding off, whether it panics or returns.
+    #[tokio::test]
+    async fn a_dead_token_loop_turns_token_rebinding_off() {
+        for (worker, expected) in [
+            (
+                tokio::spawn(async { panic!("synthetic continuity loop failure") }),
+                "panicked",
+            ),
+            (tokio::spawn(async {}), "returned"),
+        ] {
+            let disabled = Arc::new(AtomicBool::new(false));
+            let flag = Arc::clone(&disabled);
+            let how =
+                supervise_continuity(worker, move || flag.store(true, Ordering::SeqCst)).await;
+            assert_eq!(how, expected);
+            assert!(disabled.load(Ordering::SeqCst), "{expected}: not disabled");
+        }
+    }
 }
 
 #[cfg(test)]

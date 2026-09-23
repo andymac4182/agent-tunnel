@@ -6,10 +6,43 @@
 //! and recovery callers keep their fail-closed and unknown-outcome semantics;
 //! nothing is replayed and nothing reconnects in the background.  A lane
 //! re-establishes its connection only for a *later* command, and only after
-//! repeating the bounded PING/INFO identity check used at startup.  A primary
-//! whose `run_id` differs from the one the catalog verified when it connected
-//! is refused, so a Redis restart, restore or promotion stays an operator
-//! recovery event rather than a silent resume.
+//! repeating the bounded PING/INFO identity check used at startup.
+//!
+//! A primary whose `run_id` differs from the one the catalog is bound to has
+//! restarted, been restored or been replaced.  The lanes of one catalog share
+//! one [`RunBinding`].  A catalog that did not opt in (every `[cluster]`
+//! catalog, every library caller) refuses any other run, as before task row
+//! M6-C65.  A single relay's catalog (`enable_run_rebinding`) decides with one
+//! atomic script on the new connection, before any caller command runs there:
+//!
+//! * it adopts the new run when the namespace's stored run binding already
+//!   names it -- an operator re-attested it (`tunnel-relay rebind-redis-run`)
+//!   or a sibling lane has just re-bound it -- and its incarnation is the
+//!   configured one, which is exactly what a relay started now would accept;
+//!   except that a run this process already refused for continuity stays
+//!   refused, whatever an operator later declares;
+//! * with a continuity witness (`redis_restart_continuity_seconds`), it moves
+//!   the binding when the namespace's continuity token is one this process
+//!   wrote and Redis acknowledged (or one whose write outcome it could not
+//!   learn), the last acknowledgement was at most one token interval plus the
+//!   command deadlines before this process's last reply from the old run, and
+//!   `CONFIG GET` on the new run shows `appendonly yes`, `appendfsync always`
+//!   and `no-appendfsync-on-rewrite no`.
+//!
+//! **What the token proves, and what it does not.**  It is sound for one
+//! Redis restarting from its own AOF: AOF replay restores a prefix of the
+//! command history, so a Redis holding this process's last acknowledged token
+//! holds every write acknowledged before it, and with `appendfsync always`
+//! nothing acknowledged after it was lost.  It only detects a copy **older
+//! than the last token**: an empty Redis, or a snapshot, backup or replica
+//! taken before it.  It is **not** sound across failover or replica
+//! promotion: an asynchronous replica usually holds the last token and can
+//! still lack writes the old primary acknowledged after it.  Likewise a
+//! restore or a replica taken within about one interval before Redis went
+//! away (plus any time the token loop was failing while Redis still
+//! answered) holds the token and can lack writes acknowledged after it,
+//! including operator-CLI revocations.  Anything that is not an in-place
+//! restart must go through recovery or a new namespace.
 //!
 //! Lanes of one catalog share a loss generation.  When one lane observes a
 //! transport loss, every sibling lane probes its own connection with the same
@@ -27,29 +60,396 @@
 //! reported as an authority timeout, while a stalled or severed authority
 //! still fails exactly the commands that observed it.
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
+use std::{
+    collections::VecDeque,
+    sync::{
+        Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
 };
 
 use redis::{FromRedisValue, RedisError, aio::MultiplexedConnection};
 use tokio::sync::Mutex;
 
-use super::{REDIS_OPERATION_TIMEOUT, open_verified_connection, redis_timeout};
+use super::{
+    BOUND_RUN_MARKER, REDIS_OPERATION_TIMEOUT, bound_run_id, eval_command,
+    open_verified_connection, redis_timeout,
+};
 use crate::{CatalogConnectionError, CatalogError, UnknownWriteCause};
 
 /// The closed conflict label returned when a reconnect reaches a primary
-/// whose `run_id` differs from the verified startup identity.
+/// whose `run_id` differs from the bound identity and the namespace does not
+/// allow the new run to be adopted.
 pub(super) const RUN_ID_CONFLICT: &str = "Redis server run id";
 
-/// Transport-loss signal shared by every lane of one catalog.
+/// The namespace has no deployment incarnation or no run binding: it was
+/// never activated, or Redis came back without its data (M6-C65).
+pub(crate) const NAMESPACE_UNBOUND: &str =
+    "namespace has no deployment incarnation or Redis run binding";
+
+/// The namespace is bound to an earlier Redis server run: Redis restarted
+/// since the binding was written, and nothing re-attested it (M6-C65).
+pub(crate) const RUN_BINDING_CHANGED: &str = "namespace is bound to an earlier Redis server run";
+
+/// The namespace's continuity token is not one this relay wrote: Redis came
+/// back without this relay's last acknowledged write (M6-C65).
+pub(crate) const CONTINUITY_MISMATCH: &str = "Redis authority continuity token";
+
+/// The restarted Redis does not prove its acknowledged writes are durable
+/// (`appendonly yes`, `appendfsync always`, `no-appendfsync-on-rewrite no`,
+/// read with `CONFIG GET`), so a continuity token proves nothing (M6-C65).
+pub(crate) const PERSISTENCE_UNSOUND: &str =
+    "Redis persistence does not make acknowledged writes durable";
+
+/// Most continuity tokens whose write outcome is unknown that a witness keeps
+/// as candidates.  Beyond it the oldest is forgotten, which can only make a
+/// later re-binding refuse.
+const MAX_CONTINUITY_CANDIDATES: usize = 8;
+
+/// Most Redis runs a binding remembers having refused for continuity.
+const MAX_CONTINUITY_REFUSED_RUNS: usize = 8;
+
+/// The Redis persistence a token re-binding requires, read with `CONFIG GET`
+/// on the new run: every acknowledged write is on disk before the reply,
+/// including while the AOF is being rewritten.
+const REQUIRED_PERSISTENCE: [(&str, &str); 3] = [
+    ("appendonly", "yes"),
+    ("appendfsync", "always"),
+    ("no-appendfsync-on-rewrite", "no"),
+];
+
+/// One atomic re-binding decision on a connection to a new Redis run.
+///
+/// KEYS[1] active incarnation, [2] run binding, [3] continuity token.
+/// ARGV[1] configured incarnation, [2] the new run id, [3] `1` when a
+/// continuity witness may re-bind, [4..] the witness's candidate tokens.
+const SCRIPT_REBIND_RUN: &str = r#"
+local incarnation = redis.call('GET', KEYS[1])
+local run = redis.call('GET', KEYS[2])
+if not incarnation or not run then return {'unbound'} end
+if incarnation ~= ARGV[1] then return {'incarnation'} end
+if run == ARGV[2] then return {'ok'} end
+if ARGV[3] ~= '1' then return {'run'} end
+local token = redis.call('GET', KEYS[3])
+if not token then return {'continuity'} end
+for index = 4, #ARGV do
+  if token == ARGV[index] then
+    redis.call('SET', KEYS[2], ARGV[2])
+    return {'rebound'}
+  end
+end
+return {'continuity'}
+"#;
+
+/// The keys and incarnation a lane needs to decide a re-binding on its own
+/// connection.  Set only for a single relay (`enable_run_rebinding`); a
+/// catalog without it refuses every other run, as before M6-C65.
+#[derive(Clone)]
+pub(super) struct RebindScope {
+    pub(super) incarnation: String,
+    pub(super) incarnation_key: String,
+    pub(super) run_key: String,
+    pub(super) continuity_key: String,
+}
+
+/// Continuity tokens this process wrote: the last one Redis acknowledged and
+/// any written since whose outcome is unknown.  Only these can be in Redis
+/// if Redis still holds this process's acknowledged writes.
+struct ContinuityWitness {
+    candidates: VecDeque<String>,
+    /// The token interval the relay runs, which bounds how stale the last
+    /// acknowledged token may be when Redis went away.
+    interval: Duration,
+    /// When Redis last acknowledged a token, in the binding's clock.
+    last_ack_ms: Option<u64>,
+}
+
+#[derive(Default)]
+struct BindingState {
+    run_id: String,
+    scope: Option<RebindScope>,
+    witness: Option<ContinuityWitness>,
+    /// Runs refused for continuity; they stay refused in this process even if
+    /// an operator later re-attests them (M6-C65 review).
+    continuity_refused: VecDeque<String>,
+    /// Advanced every time the binding moves to a new run.
+    rebinds: u64,
+}
+
+/// Whether a token re-binding is still sound: the last acknowledged token
+/// was written at most one interval plus the command deadlines before the
+/// last reply this process had from the bound Redis run.  A token loop that
+/// stopped or kept failing while Redis still answered leaves a larger gap,
+/// in which writes the witness never saw may have been acknowledged.
+pub(super) fn token_is_fresh(
+    last_ack_ms: Option<u64>,
+    last_contact_ms: u64,
+    interval: Duration,
+) -> bool {
+    let Some(last_ack_ms) = last_ack_ms else {
+        return false;
+    };
+    let bound = interval + 2 * REDIS_OPERATION_TIMEOUT + Duration::from_secs(1);
+    let bound_ms = u64::try_from(bound.as_millis()).unwrap_or(u64::MAX);
+    last_contact_ms.saturating_sub(last_ack_ms) <= bound_ms
+}
+
+/// Whether `CONFIG GET` pairs show the persistence a token re-binding needs.
+pub(super) fn persistence_is_sound(pairs: &[String]) -> bool {
+    REQUIRED_PERSISTENCE.iter().all(|(name, required)| {
+        pairs
+            .chunks(2)
+            .any(|pair| pair.len() == 2 && pair[0] == *name && pair[1] == *required)
+    })
+}
+
+/// Read the persistence settings on `connection` (M6-C65).  A refused
+/// `CONFIG GET` (for example an ACL user without `+config|get`) is unsound,
+/// not an error: nothing proves the writes are durable.
+pub(super) async fn persistence_verified(connection: &mut MultiplexedConnection) -> bool {
+    let mut command = redis::cmd("CONFIG");
+    command.arg("GET");
+    for (name, _) in REQUIRED_PERSISTENCE {
+        command.arg(name);
+    }
+    match command.query_async::<Vec<String>>(connection).await {
+        Ok(pairs) => persistence_is_sound(&pairs),
+        Err(_) => false,
+    }
+}
+
+/// The Redis server run a catalog is bound to, shared by all of its lanes.
+pub(super) struct RunBinding {
+    state: RwLock<BindingState>,
+    /// The binding's clock origin.
+    origin: Instant,
+    /// Milliseconds since `origin` of the last reply any lane received from
+    /// the bound run.  Updated lock-free on every successful command.
+    last_contact_ms: AtomicU64,
+}
+
+impl Default for RunBinding {
+    fn default() -> Self {
+        Self {
+            state: RwLock::default(),
+            origin: Instant::now(),
+            last_contact_ms: AtomicU64::new(0),
+        }
+    }
+}
+
+impl RunBinding {
+    fn read(&self) -> RwLockReadGuard<'_, BindingState> {
+        self.state.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn write(&self) -> RwLockWriteGuard<'_, BindingState> {
+        self.state.write().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn now_ms(&self) -> u64 {
+        u64::try_from(self.origin.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// A lane received a reply from the bound run.
+    pub(super) fn contact(&self) {
+        self.last_contact_ms
+            .fetch_max(self.now_ms(), Ordering::AcqRel);
+    }
+
+    /// The run the catalog is currently bound to.
+    pub(super) fn run_id(&self) -> String {
+        self.read().run_id.clone()
+    }
+
+    /// How many times the binding has moved to a new run in this process.
+    pub(super) fn rebinds(&self) -> u64 {
+        self.read().rebinds
+    }
+
+    fn initialize(&self, run_id: &str) {
+        let mut state = self.write();
+        if state.run_id.is_empty() {
+            run_id.clone_into(&mut state.run_id);
+        }
+    }
+
+    pub(super) fn set_scope(&self, scope: RebindScope) {
+        self.write().scope = Some(scope);
+    }
+
+    pub(super) fn has_scope(&self) -> bool {
+        self.read().scope.is_some()
+    }
+
+    /// Start keeping a continuity witness.  Idempotent.
+    pub(super) fn enable_witness(&self, interval: Duration) {
+        let mut state = self.write();
+        if state.witness.is_none() {
+            state.witness = Some(ContinuityWitness {
+                candidates: VecDeque::new(),
+                interval,
+                last_ack_ms: None,
+            });
+        }
+    }
+
+    /// Stop re-binding on tokens: the token loop is gone (M6-C65 review).
+    pub(super) fn disable_witness(&self) {
+        self.write().witness = None;
+    }
+
+    pub(super) fn witness_enabled(&self) -> bool {
+        self.read().witness.is_some()
+    }
+
+    /// Record a token about to be written, before it is dispatched, so a
+    /// re-binding that races the write still recognizes it.
+    pub(super) fn continuity_dispatching(&self, token: &str) {
+        if let Some(witness) = self.write().witness.as_mut() {
+            witness.candidates.push_back(token.to_owned());
+            while witness.candidates.len() > MAX_CONTINUITY_CANDIDATES {
+                witness.candidates.pop_front();
+            }
+        }
+    }
+
+    /// Redis acknowledged `token`: it is now the only candidate.
+    pub(super) fn continuity_acknowledged(&self, token: &str) {
+        let now = self.now_ms();
+        self.contact();
+        if let Some(witness) = self.write().witness.as_mut() {
+            witness.candidates.clear();
+            witness.candidates.push_back(token.to_owned());
+            witness.last_ack_ms = Some(now);
+        }
+    }
+
+    /// The write of `token` definitely did not happen.
+    pub(super) fn continuity_not_written(&self, token: &str) {
+        if let Some(witness) = self.write().witness.as_mut() {
+            witness.candidates.retain(|candidate| candidate != token);
+        }
+    }
+
+    fn adopt(&self, run_id: &str) {
+        let mut state = self.write();
+        if state.run_id != run_id {
+            run_id.clone_into(&mut state.run_id);
+            state.rebinds += 1;
+        }
+    }
+
+    fn refuse_for_continuity(&self, run_id: &str) {
+        let mut state = self.write();
+        if !state.continuity_refused.iter().any(|run| run == run_id) {
+            state.continuity_refused.push_back(run_id.to_owned());
+            while state.continuity_refused.len() > MAX_CONTINUITY_REFUSED_RUNS {
+                state.continuity_refused.pop_front();
+            }
+        }
+    }
+
+    /// Decide on `connection`, already verified to be Redis run `run_id`,
+    /// whether the catalog may move its binding there.
+    async fn rebind(
+        &self,
+        connection: &mut MultiplexedConnection,
+        run_id: &str,
+    ) -> Result<(), CatalogError> {
+        // Decide, under the lock, whether a token re-binding is even
+        // possible; the persistence read happens after it is released.
+        let (keys, incarnation, candidates) = {
+            let state = self.read();
+            if state.run_id == run_id {
+                return Ok(());
+            }
+            let Some(scope) = state.scope.as_ref() else {
+                return Err(CatalogError::Conflict(RUN_ID_CONFLICT));
+            };
+            if state.continuity_refused.iter().any(|run| run == run_id) {
+                return Err(CatalogError::Conflict(CONTINUITY_MISMATCH));
+            }
+            let candidates = state.witness.as_ref().and_then(|witness| {
+                token_is_fresh(
+                    witness.last_ack_ms,
+                    self.last_contact_ms.load(Ordering::Acquire),
+                    witness.interval,
+                )
+                .then(|| witness.candidates.iter().cloned().collect::<Vec<_>>())
+            });
+            (
+                vec![
+                    scope.incarnation_key.clone(),
+                    scope.run_key.clone(),
+                    scope.continuity_key.clone(),
+                ],
+                scope.incarnation.clone(),
+                candidates,
+            )
+        };
+        let mut persistence_unsound = false;
+        let candidates = match candidates {
+            Some(candidates) if persistence_verified(connection).await => Some(candidates),
+            Some(_) => {
+                persistence_unsound = true;
+                None
+            }
+            None => None,
+        };
+        let mut args = vec![incarnation, run_id.to_owned()];
+        match candidates {
+            Some(candidates) => {
+                args.push("1".to_owned());
+                args.extend(candidates);
+            }
+            None => args.push("0".to_owned()),
+        }
+        let reply: Vec<String> = eval_command(SCRIPT_REBIND_RUN, &keys, &args)
+            .query_async(connection)
+            .await
+            .map_err(CatalogError::Database)?;
+        match reply.first().map(String::as_str) {
+            Some("ok" | "rebound") => {
+                self.adopt(run_id);
+                Ok(())
+            }
+            Some("unbound") => Err(CatalogError::Conflict(NAMESPACE_UNBOUND)),
+            Some("continuity") => {
+                self.refuse_for_continuity(run_id);
+                Err(CatalogError::Conflict(CONTINUITY_MISMATCH))
+            }
+            Some("incarnation") => Err(CatalogError::Conflict(
+                "active deployment incarnation or Redis authority run",
+            )),
+            // No token re-binding was attempted: why not decides the class.
+            Some("run") if persistence_unsound => Err(CatalogError::Conflict(PERSISTENCE_UNSOUND)),
+            Some("run") => Err(CatalogError::Conflict(RUN_BINDING_CHANGED)),
+            _ => Err(CatalogError::Serialization(
+                "invalid Redis run binding reply".into(),
+            )),
+        }
+    }
+}
+
+/// Transport-loss signal and run binding shared by every lane of one catalog.
 #[derive(Default)]
 pub(super) struct LaneGroup {
     loss_generation: AtomicU64,
+    binding: RunBinding,
+}
+
+impl LaneGroup {
+    pub(super) fn binding(&self) -> &RunBinding {
+        &self.binding
+    }
 }
 
 struct LaneState {
     connection: Option<MultiplexedConnection>,
+    /// The Redis run the current connection was verified against.
+    verified_run_id: String,
     /// The group loss generation this connection was last verified against.
     verified_generation: u64,
     /// Advanced whenever the connection slot is cleared or replaced, so a
@@ -60,25 +460,32 @@ struct LaneState {
 
 pub(super) struct AuthorityLane {
     client: redis::Client,
-    expected_run_id: String,
     group: Arc<LaneGroup>,
     state: Mutex<LaneState>,
+}
+
+/// A verified connection handed to one caller, and the run it belongs to.
+struct Admitted {
+    connection: MultiplexedConnection,
+    connection_generation: u64,
+    run_id: String,
 }
 
 impl AuthorityLane {
     pub(super) fn new(
         client: redis::Client,
         connection: MultiplexedConnection,
-        expected_run_id: String,
+        verified_run_id: String,
         group: Arc<LaneGroup>,
     ) -> Self {
+        group.binding.initialize(&verified_run_id);
         let verified_generation = group.loss_generation.load(Ordering::Acquire);
         Self {
             client,
-            expected_run_id,
             group,
             state: Mutex::new(LaneState {
                 connection: Some(connection),
+                verified_run_id,
                 verified_generation,
                 connection_generation: 0,
             }),
@@ -95,29 +502,66 @@ impl AuthorityLane {
         command: &redis::Cmd,
     ) -> Result<T, CatalogError> {
         self.execute(
-            async |connection| command.query_async::<T>(connection).await,
+            async |connection, _run_id| command.query_async::<T>(connection).await,
             DispatchedFailure::Definite,
         )
         .await
     }
 
-    /// Run one owner-affecting write on this lane.
+    /// Run one script on this lane.  Every argument equal to
+    /// `bound_run_id()` is replaced, after the lane has verified its
+    /// connection, by the run that connection was verified against, so a
+    /// script's run fence always names the run it executes on -- including
+    /// the first command after the lane adopted a new run.
     ///
-    /// Once the command has been dispatched, a lost reply no longer proves
-    /// the write failed: the script may have committed on the authority
-    /// before the reply deadline passed or the connection was severed.  Those
-    /// two failures are reported as the typed
-    /// [`CatalogError::WriteOutcomeUnknown`] so the caller can stay unready
-    /// until it re-reads the authority; a failure before dispatch (lane
-    /// admission) and an actual authority reply keep their definite shapes.
-    /// The write itself is never replayed.
-    pub(super) async fn query_owner_write<T: FromRedisValue>(
+    /// With `owner_write` the script is an owner-affecting write.  Once it
+    /// has been dispatched, a lost reply no longer proves the write failed:
+    /// the script may have committed on the authority before the reply
+    /// deadline passed or the connection was severed.  Those two failures are
+    /// reported as the typed [`CatalogError::WriteOutcomeUnknown`] so the
+    /// caller can stay unready until it re-reads the authority; a failure
+    /// before dispatch (lane admission) and an actual authority reply keep
+    /// their definite shapes.  The write itself is never replayed.
+    pub(super) async fn query_eval<T: FromRedisValue>(
         &self,
-        command: &redis::Cmd,
+        script: &str,
+        keys: &[String],
+        args: &[String],
+        owner_write: bool,
     ) -> Result<T, CatalogError> {
+        let dispatched = if owner_write {
+            DispatchedFailure::Unknown
+        } else {
+            DispatchedFailure::Definite
+        };
+        let placeholder = bound_run_id();
+        // Only the catalog's own placeholder may start with the marker, so no
+        // caller-supplied value is ever taken for it.
+        if args
+            .iter()
+            .any(|arg| arg.starts_with(BOUND_RUN_MARKER) && arg != placeholder)
+        {
+            return Err(CatalogError::InvalidInput(
+                "script argument starts with a reserved control character",
+            ));
+        }
         self.execute(
-            async |connection| command.query_async::<T>(connection).await,
-            DispatchedFailure::Unknown,
+            async |connection, run_id| {
+                let args: Vec<String> = args
+                    .iter()
+                    .map(|arg| {
+                        if arg == placeholder {
+                            run_id.to_owned()
+                        } else {
+                            arg.clone()
+                        }
+                    })
+                    .collect();
+                eval_command(script, keys, &args)
+                    .query_async::<T>(connection)
+                    .await
+            },
+            dispatched,
         )
         .await
     }
@@ -129,7 +573,7 @@ impl AuthorityLane {
         pipeline: &redis::Pipeline,
     ) -> Result<T, CatalogError> {
         self.execute(
-            async |connection| pipeline.query_async::<T>(connection).await,
+            async |connection, _run_id| pipeline.query_async::<T>(connection).await,
             DispatchedFailure::Definite,
         )
         .await
@@ -137,16 +581,25 @@ impl AuthorityLane {
 
     async fn execute<T>(
         &self,
-        operation: impl AsyncFnOnce(&mut MultiplexedConnection) -> Result<T, RedisError>,
+        operation: impl AsyncFnOnce(&mut MultiplexedConnection, &str) -> Result<T, RedisError>,
         dispatched: DispatchedFailure,
     ) -> Result<T, CatalogError> {
-        let (mut connection, connection_generation) = self.admit().await?;
+        let Admitted {
+            mut connection,
+            connection_generation,
+            run_id,
+        } = self.admit().await?;
         // The lane lock is no longer held: this deadline covers only the
         // authority's handling of the caller's own command.  From here on the
         // command may have reached the authority, so `dispatched` decides
         // how a lost reply is reported.
-        match tokio::time::timeout(REDIS_OPERATION_TIMEOUT, operation(&mut connection)).await {
-            Ok(Ok(value)) => Ok(value),
+        match tokio::time::timeout(REDIS_OPERATION_TIMEOUT, operation(&mut connection, &run_id))
+            .await
+        {
+            Ok(Ok(value)) => {
+                self.group.binding.contact();
+                Ok(value)
+            }
             Ok(Err(error)) => {
                 let lost = lane_lost(&error);
                 if lost {
@@ -169,17 +622,14 @@ impl AuthorityLane {
     /// such verification and then shares the same multiplexed connection.
     /// A verification that exceeds its deadline keeps the connection exactly
     /// as a timed-out command does.
-    async fn admit(&self) -> Result<(MultiplexedConnection, u64), CatalogError> {
+    async fn admit(&self) -> Result<Admitted, CatalogError> {
         let mut state = self.state.lock().await;
         tokio::time::timeout(REDIS_OPERATION_TIMEOUT, self.verify(&mut state))
             .await
             .map_err(|_| CatalogError::Database(redis_timeout()))?
     }
 
-    async fn verify(
-        &self,
-        state: &mut LaneState,
-    ) -> Result<(MultiplexedConnection, u64), CatalogError> {
+    async fn verify(&self, state: &mut LaneState) -> Result<Admitted, CatalogError> {
         let loss_generation = self.group.loss_generation.load(Ordering::Acquire);
         if state.verified_generation != loss_generation
             && let Some(connection) = state.connection.as_mut()
@@ -198,7 +648,9 @@ impl AuthorityLane {
             }
         }
         if state.connection.is_none() {
-            state.connection = Some(self.reconnect().await?);
+            let (connection, run_id) = self.reconnect().await?;
+            state.connection = Some(connection);
+            state.verified_run_id = run_id;
             state.connection_generation += 1;
         }
         state.verified_generation = loss_generation;
@@ -206,7 +658,11 @@ impl AuthorityLane {
             .connection
             .clone()
             .ok_or(CatalogError::Conflict("Redis authority lane"))?;
-        Ok((connection, state.connection_generation))
+        Ok(Admitted {
+            connection,
+            connection_generation: state.connection_generation,
+            run_id: state.verified_run_id.clone(),
+        })
     }
 
     /// Release the connection a caller observed a transport loss on, unless a
@@ -221,14 +677,15 @@ impl AuthorityLane {
         }
     }
 
-    async fn reconnect(&self) -> Result<MultiplexedConnection, CatalogError> {
-        let (connection, run_id) = open_verified_connection(&self.client)
+    async fn reconnect(&self) -> Result<(MultiplexedConnection, String), CatalogError> {
+        let (mut connection, run_id) = open_verified_connection(&self.client)
             .await
             .map_err(CatalogConnectionError::into_catalog_error)?;
-        if run_id != self.expected_run_id {
-            return Err(CatalogError::Conflict(RUN_ID_CONFLICT));
-        }
-        Ok(connection)
+        // A different run is adopted only when the namespace proves it may
+        // (see the module documentation); until then no caller command runs
+        // on this connection.
+        self.group.binding.rebind(&mut connection, &run_id).await?;
+        Ok((connection, run_id))
     }
 }
 
@@ -832,5 +1289,44 @@ mod tests {
             redis::ErrorKind::Parse,
             "malformed reply"
         ))));
+    }
+
+    /// M6-C65 review: a token re-binding needs a token acknowledged at most
+    /// one interval plus the command deadlines (and one second) before the
+    /// last reply from Redis; a loop that stopped or kept failing while
+    /// Redis answered leaves a larger gap and is refused.
+    #[test]
+    fn a_token_is_fresh_only_within_one_interval_of_the_last_reply() {
+        let interval = Duration::from_secs(5);
+        let bound = 5_000 + 2 * 2_000 + 1_000;
+        assert!(token_is_fresh(Some(10_000), 10_000, interval));
+        assert!(token_is_fresh(Some(10_000), 10_000 + bound, interval));
+        assert!(!token_is_fresh(Some(10_000), 10_000 + bound + 1, interval));
+        assert!(!token_is_fresh(None, 0, interval), "no acknowledged token");
+        // A reply recorded before the acknowledgement is not a gap.
+        assert!(token_is_fresh(Some(10_000), 9_000, interval));
+    }
+
+    /// M6-C65 review: all three settings, exactly.
+    #[test]
+    fn persistence_needs_aof_always_and_fsync_during_rewrite() {
+        let pairs = |fsync: &str, rewrite: &str, aof: &str| -> Vec<String> {
+            [
+                "appendonly",
+                aof,
+                "appendfsync",
+                fsync,
+                "no-appendfsync-on-rewrite",
+                rewrite,
+            ]
+            .map(str::to_owned)
+            .to_vec()
+        };
+        assert!(persistence_is_sound(&pairs("always", "no", "yes")));
+        assert!(!persistence_is_sound(&pairs("everysec", "no", "yes")));
+        assert!(!persistence_is_sound(&pairs("no", "no", "yes")));
+        assert!(!persistence_is_sound(&pairs("always", "yes", "yes")));
+        assert!(!persistence_is_sound(&pairs("always", "no", "no")));
+        assert!(!persistence_is_sound(&[]), "a refused or empty CONFIG GET");
     }
 }
