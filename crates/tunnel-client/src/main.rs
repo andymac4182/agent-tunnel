@@ -130,7 +130,8 @@ impl Cause {
     ///   to stop the other connector, or to wait.
     /// * `130` — interrupted before an orderly completion could be
     ///   recorded: a stop request (SIGINT or SIGTERM) that arrived before
-    ///   the session was ready, or a second one that abandoned the drain.
+    ///   the session was ready, a second one that abandoned the drain, or
+    ///   an orderly stop whose join overran its bound.
     ///   A stop request while the session is live drains and exits `0`
     ///   with a `stopped` event instead (M6-C23, M6-C27).
     /// * `1` — genuinely unexpected: a protocol violation, a failed
