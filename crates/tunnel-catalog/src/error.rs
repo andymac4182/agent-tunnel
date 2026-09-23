@@ -88,6 +88,23 @@ pub enum CatalogConnectionFailure {
     /// A lane connected to a different Redis server run than the primary
     /// connection.
     RunIdConflict,
+    /// The namespace has no deployment incarnation or no Redis run binding:
+    /// it was never activated, or Redis came back without its data (M6-C65).
+    Unbound,
+    /// The namespace is bound to an earlier Redis server run: Redis
+    /// restarted and nothing re-attested the namespace (M6-C65).
+    RunChanged,
+    /// Redis restarted without the serving relay's last acknowledged
+    /// continuity token: it came back from a copy older than that token (an
+    /// earlier snapshot or backup, or a replica that had not received it), or
+    /// a run already refused for this (M6-C65).  A copy that does hold the
+    /// token is not caught: the token is no proof across failover or replica
+    /// promotion.
+    Continuity,
+    /// A token re-binding was not attempted because the restarted Redis does
+    /// not show `appendonly yes`, `appendfsync always` and
+    /// `no-appendfsync-on-rewrite no` to `CONFIG GET`, or refused it (M6-C65).
+    Persistence,
     /// The connection configuration was rejected before any exchange.
     Config,
     /// A catalog-level refusal (for example a missing or mismatched
@@ -110,6 +127,10 @@ impl CatalogConnectionFailure {
             Self::Reply => "reply",
             Self::InvalidReply => "invalid_reply",
             Self::RunIdConflict => "run_id_conflict",
+            Self::Unbound => "unbound",
+            Self::RunChanged => "run_changed",
+            Self::Continuity => "continuity",
+            Self::Persistence => "persistence",
             Self::Config => "config",
             Self::Catalog => "catalog",
         }
@@ -124,6 +145,18 @@ impl CatalogConnectionFailure {
             CatalogError::InvalidInput(_) => Self::Config,
             CatalogError::Serialization(_) => Self::InvalidReply,
             CatalogError::Unauthorized => Self::Auth,
+            CatalogError::Conflict(label) if *label == crate::redis::NAMESPACE_UNBOUND => {
+                Self::Unbound
+            }
+            CatalogError::Conflict(label) if *label == crate::redis::RUN_BINDING_CHANGED => {
+                Self::RunChanged
+            }
+            CatalogError::Conflict(label) if *label == crate::redis::CONTINUITY_MISMATCH => {
+                Self::Continuity
+            }
+            CatalogError::Conflict(label) if *label == crate::redis::PERSISTENCE_UNSOUND => {
+                Self::Persistence
+            }
             CatalogError::NotFound
             | CatalogError::Conflict(_)
             | CatalogError::OwnerBusy
@@ -521,6 +554,26 @@ mod tests {
         }
     }
 
+    /// M6-C65: the run-binding refusals carry their own classes; any other
+    /// conflict stays `catalog`.
+    #[test]
+    fn run_binding_refusals_are_classified_by_their_label() {
+        for (label, class) in [
+            (crate::redis::NAMESPACE_UNBOUND, Failure::Unbound),
+            (crate::redis::RUN_BINDING_CHANGED, Failure::RunChanged),
+            (crate::redis::CONTINUITY_MISMATCH, Failure::Continuity),
+            (crate::redis::PERSISTENCE_UNSOUND, Failure::Persistence),
+            ("active deployment incarnation", Failure::Catalog),
+            ("Redis server run id", Failure::Catalog),
+        ] {
+            assert_eq!(
+                Failure::classify(&CatalogError::Conflict(label)),
+                class,
+                "{label}"
+            );
+        }
+    }
+
     #[test]
     fn failure_class_names_are_distinct_fixed_words() {
         let all = [
@@ -536,6 +589,10 @@ mod tests {
             Failure::Reply,
             Failure::InvalidReply,
             Failure::RunIdConflict,
+            Failure::Unbound,
+            Failure::RunChanged,
+            Failure::Continuity,
+            Failure::Persistence,
             Failure::Config,
             Failure::Catalog,
         ];

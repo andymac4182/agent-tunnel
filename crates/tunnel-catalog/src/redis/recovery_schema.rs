@@ -287,6 +287,8 @@ enum EphemeralZsetClass {
 enum MetadataClass {
     ActiveIncarnation,
     RedisRunId,
+    /// A single relay's restart continuity token (M6-C65).
+    Continuity,
     CatalogGeneration,
     FixtureSeeded,
 }
@@ -589,6 +591,7 @@ fn classify_key(prefix: &str, key: &str) -> Result<ParsedClass, SnapshotSchemaEr
             return Ok(ParsedClass::Metadata(MetadataClass::ActiveIncarnation));
         }
         "meta:redis_run_id" => return Ok(ParsedClass::Metadata(MetadataClass::RedisRunId)),
+        "meta:continuity" => return Ok(ParsedClass::Metadata(MetadataClass::Continuity)),
         "meta:catalog_generation" => {
             return Ok(ParsedClass::Metadata(MetadataClass::CatalogGeneration));
         }
@@ -1569,7 +1572,9 @@ fn validate_ticket_fields(
 
 fn validate_metadata(class: &MetadataClass, value: &str) -> Result<(), SnapshotSchemaError> {
     match class {
-        MetadataClass::ActiveIncarnation | MetadataClass::RedisRunId => {
+        MetadataClass::ActiveIncarnation
+        | MetadataClass::RedisRunId
+        | MetadataClass::Continuity => {
             identifier(value, MAX_IDENTIFIER_BYTES)?;
         }
         MetadataClass::CatalogGeneration => {

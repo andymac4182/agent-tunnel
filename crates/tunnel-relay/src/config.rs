@@ -678,6 +678,16 @@ pub struct ServeConfig {
     /// Absent, the public HTTP route answers 404 as before.
     #[serde(default)]
     pub http_forward: Option<HttpForwardServeConfig>,
+    /// Task row M6-C65: seconds between a single relay's Redis continuity
+    /// tokens, `1..=60`.  Absent, a Redis restart leaves the namespace
+    /// refused until an operator runs `tunnel-relay rebind-redis-run`.
+    /// Present, a serving relay re-binds to a restarted Redis by itself when
+    /// Redis still holds its last acknowledged token.  Sound only with a
+    /// Redis that makes every acknowledged write durable before replying
+    /// (`appendonly yes`, `appendfsync always`), and only for one relay, so
+    /// it is refused together with `[cluster]`.
+    #[serde(default)]
+    pub redis_restart_continuity_seconds: Option<u64>,
 }
 
 /// The `[http_forward]` table: the pinned application profiles a relay
@@ -893,6 +903,18 @@ impl ServeConfig {
         }
         if let Some(http_forward) = &self.http_forward {
             http_forward.exports()?;
+        }
+        if let Some(seconds) = self.redis_restart_continuity_seconds {
+            if !(1..=60).contains(&seconds) {
+                return Err(ConfigError::Invalid(
+                    "redis_restart_continuity_seconds must be 1..=60",
+                ));
+            }
+            if self.cluster.is_some() {
+                return Err(ConfigError::Invalid(
+                    "redis_restart_continuity_seconds is for a single relay and cannot be combined with [cluster]",
+                ));
+            }
         }
         Ok(())
     }
@@ -1595,6 +1617,40 @@ consumer_tls_private_key = "consumer-key.pem"
                 "max_pending_operations_per_owner must be 1..=128"
             );
         }
+    }
+
+    /// M6-C65: the continuity interval is optional, bounded, and refused
+    /// with `[cluster]`, where two relays would each hold only their own
+    /// tokens.
+    #[test]
+    fn redis_restart_continuity_is_bounded_and_single_relay_only() {
+        let config = ServeConfig::parse(valid_toml()).expect("valid serve configuration");
+        assert_eq!(config.redis_restart_continuity_seconds, None);
+        let configured = format!("redis_restart_continuity_seconds = 5\n{}", valid_toml());
+        let config = ServeConfig::parse(&configured).expect("interval parses");
+        assert_eq!(config.redis_restart_continuity_seconds, Some(5));
+        for invalid in ["0", "61"] {
+            let input = format!(
+                "redis_restart_continuity_seconds = {invalid}\n{}",
+                valid_toml()
+            );
+            let error = ServeConfig::parse(&input).expect_err("accepted an out-of-range interval");
+            assert_eq!(
+                error.to_string(),
+                "redis_restart_continuity_seconds must be 1..=60"
+            );
+        }
+        let clustered = format!(
+            "redis_restart_continuity_seconds = 5\n{}",
+            valid_cluster_toml()
+        );
+        let error = ServeConfig::parse(&clustered).expect_err("accepted continuity with [cluster]");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot be combined with [cluster]"),
+            "{error}"
+        );
     }
 
     #[test]

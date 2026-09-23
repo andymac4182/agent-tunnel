@@ -132,7 +132,8 @@ jobs:
   m1-acceptance:
     name: M1 real-socket acceptance (Redis)
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    # The M6-C65 restart gate adds a test build and about five minutes.
+    timeout-minutes: 40
     services:
       redis:
         image: redis:8.4.0-alpine@sha256:6cbef353e480a8a6e7f10ec545f13d7d3fa85a212cdcc5ffaf5a1c818b9d3798
@@ -163,6 +164,10 @@ jobs:
         run: cargo +1.95.0 run --locked -p tunnel-test-harness -- verify
       - name: Verify Redis AOF restart and explicit recovery
         run: bash scripts/m1-redis-restart-verify.sh
+      # M6-C65: owns its own Redis container, like the step above; the
+      # service Redis is not used.
+      - name: Verify a single relay keeps its namespace across Redis restarts
+        run: sh scripts/m6-redis-restart-verify.sh
 
   m2-acceptance:
     name: M2 rotation and recovery (Redis)
