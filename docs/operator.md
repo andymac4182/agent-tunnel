@@ -492,12 +492,22 @@ orderly path, in every phase, and whatever disposition they inherited
 `connect` whose session is live drains, prints its `stopped` event naming the
 signal and exits `0`; one stopped before its session is ready exits `130`
 `CANCELLED` with a diagnostic; a `serve` that is serving drains and exits `0`,
-one stopped during startup exits `130`. A second stop request during the drain
-abandons it with `130`. If your unit can stop the service while it is still
-starting, count `130` as a clean stop (`SuccessExitStatus=130` under systemd).
-Measured by process-level tests for every phase named in runtime.md; a stop
-during a data rotation and a non-cluster `serve` while serving are not
-measured. SIGHUP is not handled. Because `connect` does not reconnect by
+one stopped during startup exits `130`. `connect`'s drain is bounded by the
+profile's `rotation.handshake_timeout_seconds + rotation.overlap_seconds` (40 s
+with the defaults; an overrun exits `130`), its wait for MCP child processes by
+5 s, and each binary waits at most 5 s more for blocking work after its command
+has returned. A second stop request during any of those waits, or during
+`serve`'s drain, exits `130` at once. `serve`'s drain has no deadline of its
+own (it joins the membership runtime), so set your unit's stop timeout
+(`TimeoutStopSec` under systemd) to escalate. If your unit can stop the service
+while it is still starting, count `130` as a clean stop
+(`SuccessExitStatus=130` under systemd). runtime.md lists what is measured and
+what is not; in short, the handshake and startup phases and a live stop are
+measured on the real binaries, the second-signal and bound logic of
+`connect`'s waits only by unit tests, and a stop during a data rotation, the
+later handshake sub-phases, `serve`'s binding phase, a non-cluster `serve`
+while serving and `provision-catalog` stopped mid-write are not measured.
+SIGHUP is not handled. Because `connect` does not reconnect by
 itself (section 3.1), whatever supervises it must restart it.
 
 **In-place upgrade is not supported in this alpha.** Stopping a relay ends the

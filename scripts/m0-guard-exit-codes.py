@@ -474,8 +474,8 @@ CASES: list[Case] = [
         [
             (
                 MAIN,
-                "            cancellation.cancel();\n            if let Ok(Ok(handle))",
-                "            if let Ok(Ok(handle))",
+                "            cancellation.cancel();\n            match bounded(&mut connect",
+                "            match bounded(&mut connect",
             )
         ],
         frozenset(
@@ -489,6 +489,42 @@ CASES: list[Case] = [
                 "sigint_inherited_as_ignored_still_cancels_the_handshake",
             }
         ),
+    ),
+    Case(
+        # **The M6-C23 review's first finding.**  Every wait on the stop path
+        # -- the drain join, the pre-ready unwind, the MCP reap wait, the
+        # closed-session join -- goes through `bounded`, whose first arm is
+        # the next stop request.  With that arm never firing, a second
+        # SIGINT or SIGTERM no longer ends a wait: the operator is back to
+        # `SIGKILL`.
+        "a second stop request ends every wait on the stop path",
+        [
+            (
+                MAIN,
+                "        second = next_stop => Ok(Bounded::Interrupted(second?)),",
+                "        second = std::future::pending::<Result<StopSignal, CliError>>() => Ok(Bounded::Interrupted(second?)),",
+            )
+        ],
+        frozenset(
+            {
+                "tests::a_second_stop_during_the_reap_wait_exits_cancelled_promptly",
+                "tests::a_second_stop_during_a_hung_join_exits_cancelled_promptly",
+            }
+        ),
+    ),
+    Case(
+        # "Nothing may wait forever": the same waits with their bound
+        # stretched far past the test's patience.  The hung-join test then
+        # waits out the stretched bound and reddens on its timing assertion.
+        "a wait on the stop path is bounded",
+        [
+            (
+                MAIN,
+                "        result = tokio::time::timeout(bound, work) => {",
+                "        result = tokio::time::timeout(bound * 30, work) => {",
+            )
+        ],
+        frozenset({"tests::a_stop_whose_join_hangs_exits_cancelled_within_the_bound"}),
     ),
     # ------------------------------------------------- totality, by compiler
     Case(

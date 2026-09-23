@@ -36,8 +36,37 @@ use tunnel_transport::{
     load_peer_server_config_from_pem, load_server_config_from_pem, spki_sha256_from_der,
 };
 
-#[tokio::main]
-async fn main() -> ExitCode {
+/// How long `main` waits, after the command has returned, for work still
+/// running on the runtime's **blocking** pool before exiting anyway.
+///
+/// `#[tokio::main]` dropped the runtime, and dropping a runtime waits
+/// **indefinitely** for blocking tasks (M6-C23 review): a stop request that
+/// abandoned startup while a `spawn_blocking` file open or write sat on a
+/// hung mount would print its diagnostic and then never exit. With this
+/// bound the process exits at most this long after its diagnostic; the
+/// blocking work still in flight is abandoned with the process -- a state
+/// file write already guarded by its own write-then-rename discipline, or a
+/// sentinel stand-down whose sentinel then fires on end of file. Ordinary
+/// exits have no blocking work left and do not wait at all.
+const RUNTIME_SHUTDOWN_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+
+fn main() -> ExitCode {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("tunnel-relay: could not start the async runtime: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let status = runtime.block_on(async_main());
+    runtime.shutdown_timeout(RUNTIME_SHUTDOWN_BOUND);
+    status
+}
+
+async fn async_main() -> ExitCode {
     // The process-wide `rustls` provider is chosen here, explicitly, rather
     // than inferred from which provider features happen to be enabled across
     // the whole dependency graph (task row M8-C09). An error means something
