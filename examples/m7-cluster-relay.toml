@@ -1,0 +1,47 @@
+# M7 cluster ServeConfig example for one relay of a cluster.
+# Every value is a synthetic placeholder: replace it before `serve`. Paths are
+# resolved from the working directory. No credential, key or secret is
+# embedded here; the files these paths name are operator-provisioned.
+# Validate an edit with:
+#   tunnel-relay check-serve-config --config examples/m7-cluster-relay.toml
+# docs/operator.md walks through this file; docs/cluster.md is the contract.
+
+consumer_bind = "127.0.0.1:8443"
+device_bind = "127.0.0.1:9443"
+
+oidc_issuer = "https://issuer.example.test/"
+oidc_audience = ["agent-tunnel"]
+oidc_jwks_path = "examples/credentials/oidc-jwks.json"
+redis_url = "rediss://redis.example.internal:6379/0"
+redis_namespace = "agent-tunnel-cluster"
+
+device_tls_cert_chain = "examples/credentials/relay-device-cert-chain.pem"
+device_tls_private_key = "examples/credentials/relay-device-key.pem"
+device_tls_client_ca = "examples/credentials/device-ca.pem"
+consumer_tls_cert_chain = "examples/credentials/relay-consumer-cert-chain.pem"
+consumer_tls_private_key = "examples/credentials/relay-consumer-key.pem"
+
+# Unique per relay. Cluster mode refuses a configured boot_id: each process
+# generates a fresh one, so a restarted relay can never reuse an old identity.
+node_id = "relay-a"
+deployment_incarnation = "example-incarnation-1"
+
+[cluster]
+deployment_id = "example-deployment"
+peer_bind = "127.0.0.1:7443"
+peer_tls_cert_chain = "examples/credentials/relay-peer-cert-chain.pem"
+peer_tls_private_key = "examples/credentials/relay-peer-key.pem"
+peer_tls_client_ca = "examples/credentials/relay-peer-ca.pem"
+# Public Ed25519 verification keys of the membership publisher; see
+# docs/cluster.md for the JSON document shape.
+membership_signer_trust_path = "examples/credentials/membership-signers.json"
+checkpoint_authority_endpoint = "https://checkpoint.example.internal/v1/checkpoint"
+checkpoint_authority_trust_path = "examples/credentials/checkpoint-ca.pem"
+# Created once by `tunnel-relay initialize`; its parent directory must be
+# owner-only (mode 0700).
+membership_version_state_path = "state/membership-version-state.json"
+
+[recovery]
+# Created once by `tunnel-relay recovery-initialize`; never reset it.
+fence_path = "state/recovery-approval-fence.json"
+trusted_keys_path = "examples/credentials/recovery-approval-keys.json"

@@ -73,6 +73,15 @@ that is **not the build machine**.  Every check here therefore runs against the
                 the build tree works only beside `target/`, which is exactly
                 the failure this gate exists to catch, and it is invisible to
                 every other check here because the binary runs fine *here*.
+  `docs`        docs/operator.md, executed.  Every `console` block runs, as
+                one shell session, against this bundle's archive and binaries
+                and must print what the guide shows; every `sh shape-only`
+                command must be accepted by the real binary's argument parser;
+                any other shell block is a failure.  It also holds
+                docs/runtime.md's client exit-code table to the `Cause`
+                mapping in the client source.  It reads the guide and the
+                source from the checkout, so unlike the checks above it needs
+                a repository beside the bundle (docs/tasks.md M6-02).
 
 Why every check carries a control
 ---------------------------------
@@ -124,6 +133,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -179,6 +189,10 @@ BUNDLE_EXAMPLES = (
     "relay.toml",
     "m1-client.toml",
     "m1-relay.toml",
+    # The cluster serving example: `cli` dry-runs it with every other
+    # `*-relay.toml`, and docs/operator.md runs `initialize` and
+    # `recovery-initialize` against it (M6-02).
+    "m7-cluster-relay.toml",
 )
 
 SHA256SUMS = "SHA256SUMS"
@@ -1460,6 +1474,428 @@ def check_targets(bundle: Path, manifest: Path | None = None) -> Result:
     return result
 
 
+# --------------------------------------------------------------------------
+# The operator guide, executed.  docs/tasks.md row M6-02.
+#
+# `docs/operator.md` is the document an outside tester follows, and this
+# repository has repeatedly caught prose describing things the code does not
+# do.  So the guide is not trusted to be right; it is **run**.  Every fenced
+# shell block in it must be one of exactly two kinds, and a block that is
+# neither is a failure rather than something skipped:
+#
+#   ```console        A transcript.  Lines starting `$ ` are commands (a
+#                     trailing `\` continues one); every other non-blank line
+#                     is output the command must print, matched in order as a
+#                     substring, with `...` eliding the text between two
+#                     fragments of one line.  All `console` blocks in the file
+#                     are **one shell session**, in document order, started in
+#                     an empty directory holding the release archive and with
+#                     PATH narrowed to the system directories -- so `cd` and
+#                     `export PATH=...` in one block carry into the next exactly
+#                     as they would in the operator's terminal, and the guide's
+#                     own `export PATH` is what puts the bundled binaries on
+#                     it.  A command exiting non-zero ends the session red; a
+#                     documented non-zero exit is written `...; echo "exit=$?"`
+#                     with `exit=N` as its expected output, so the status is
+#                     asserted as content.  A command invoking a `tunnel-*`
+#                     binary must assert at least one output line: a binary
+#                     that exits 0 printing nothing must not pass.
+#
+#   ```sh shape-only  Commands that need a live, provisioned deployment --
+#                     `serve`, `connect` to a real relay, the Redis recovery
+#                     commands.  They cannot be run here, and saying so is the
+#                     point of the marker.  What *is* checked is that the real
+#                     binary accepts the documented argument vocabulary: each
+#                     command is run with its `--config` value replaced by a
+#                     path that does not exist, and must fail **reading that
+#                     file** (`os error 2`) rather than printing its usage.
+#                     A renamed subcommand or flag therefore goes red; the
+#                     command's runtime behaviour is NOT checked, and the
+#                     summary counts these separately so nobody reads them as
+#                     executed.
+#
+# Why a docs check that runs blocks rather than a curated command list: the
+# existing `cli` check already holds a curated list (`CLI_PROBES`), and a list
+# kept beside the prose is a second copy of it -- the defect docs/tasks.md
+# M5-C11 catalogues.  Extracting from the guide itself means the thing
+# executed is the thing a tester reads.  It reuses this file's `Result`,
+# `stranger_env` and `cargo_is_unreachable`, and runs against the unpacked
+# bundle like every other check here.
+#
+# **The client exit-code table in docs/runtime.md is checked against the code
+# too.**  That table said of itself "nothing checks it against the code"; this
+# parses `Cause::code` and `Cause::exit_code` out of
+# `crates/tunnel-client/src/main.rs` and requires every cause to sit in exactly
+# one table row whose status is the one the source selects.  A parse that
+# finds too few arms is a red, never a vacuous agreement.
+# --------------------------------------------------------------------------
+
+DOCS_OPERATOR = REPO / "docs" / "operator.md"
+DOCS_RUNTIME = REPO / "docs" / "runtime.md"
+DOCS_CLIENT_MAIN = REPO / "crates" / "tunnel-client" / "src" / "main.rs"
+#: The name the guide calls the downloaded archive; the check stages the
+#: bundle under it, with a sidecar digest in the format `bundle` writes.
+DOCS_ARCHIVE_NAME = "agentuplink-bundle"
+DOCS_SHELL_LANGS = ("console", "sh", "shell", "bash", "zsh")
+DOCS_BINARIES = ("tunnel-client", "tunnel-relay", "tunnel-deadman")
+# Floors, measured on the first complete guide (see M6-02) and set below it:
+# a guide that lost most of its commands, or a table parse that matched almost
+# nothing, must not agree with itself over an empty set.
+MIN_DOC_EXECUTED_COMMANDS = 20
+MIN_DOC_SHAPE_COMMANDS = 3
+MIN_EXIT_CAUSES = 10
+MIN_EXIT_TABLE_ROWS = 6
+DOCS_SESSION_TIMEOUT = 300
+
+_FENCE_RE = re.compile(r"^```([^\n`]*)\n(.*?)^```[ \t]*$", re.M | re.S)
+
+
+@dataclass
+class DocCommand:
+    text: str
+    line: int
+    expected: list[str] = field(default_factory=list)
+
+    def invokes_product(self) -> bool:
+        return any(re.search(rf"(^|[\s/;&|(]){name}(\s|$)", self.text)
+                   for name in DOCS_BINARIES)
+
+
+class DocFormatError(Exception):
+    def __init__(self, witness: str, message: str):
+        super().__init__(message)
+        self.witness = witness
+
+
+def doc_blocks(text: str) -> list[tuple[int, list[str], str]]:
+    """Every fenced block as (first body line number, info words, body)."""
+    blocks = []
+    for match in _FENCE_RE.finditer(text):
+        line = text.count("\n", 0, match.start()) + 2
+        blocks.append((line, match.group(1).split(), match.group(2)))
+    return blocks
+
+
+def _logical_lines(body: str, first_line: int) -> list[tuple[int, str]]:
+    """Join `\\`-continued lines, keeping the line number of the first."""
+    out: list[tuple[int, str]] = []
+    pending: list[str] = []
+    start = first_line
+    for offset, raw in enumerate(body.split("\n")):
+        if not pending:
+            start = first_line + offset
+        pending.append(raw)
+        if raw.endswith("\\"):
+            continue
+        out.append((start, "\n".join(pending)))
+        pending = []
+    if pending:
+        out.append((start, "\n".join(pending)))
+    return out
+
+
+def parse_transcript(body: str, first_line: int) -> list[DocCommand]:
+    commands: list[DocCommand] = []
+    for line, text in _logical_lines(body, first_line):
+        if text.startswith("$ "):
+            commands.append(DocCommand(text[2:], line))
+        elif not text.strip():
+            continue
+        elif not commands:
+            raise DocFormatError("unclassified-block",
+                                 f"docs/operator.md:{line}: output line before any "
+                                 f"`$ ` command")
+        else:
+            commands[-1].expected.append(text.strip())
+    return commands
+
+
+def classify_doc(text: str) -> tuple[list[DocCommand], list[DocCommand]]:
+    """Split the guide into (session commands, shape-only commands)."""
+    session: list[DocCommand] = []
+    shape: list[DocCommand] = []
+    for line, info, body in doc_blocks(text):
+        lang = info[0] if info else ""
+        attrs = info[1:]
+        if lang not in DOCS_SHELL_LANGS:
+            continue
+        if lang == "console" and not attrs:
+            commands = parse_transcript(body, line)
+            if not commands:
+                raise DocFormatError("block-asserts-nothing",
+                                     f"docs/operator.md:{line}: console block has no "
+                                     f"`$ ` command")
+            asserted = [c for c in commands if assertions(c)]
+            if not asserted:
+                raise DocFormatError("block-asserts-nothing",
+                                     f"docs/operator.md:{line}: console block asserts "
+                                     f"no output at all")
+            for command in commands:
+                if command.invokes_product() and not assertions(command):
+                    raise DocFormatError(
+                        "block-asserts-nothing",
+                        f"docs/operator.md:{command.line}: `{command.text[:60]}` runs a "
+                        f"product binary and asserts no output; exit status alone "
+                        f"would pass a binary that printed nothing")
+            session.extend(commands)
+        elif lang == "sh" and attrs == ["shape-only"]:
+            for cmd_line, text_ in _logical_lines(body, line):
+                stripped = text_.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                shape.append(DocCommand(stripped, cmd_line))
+        else:
+            raise DocFormatError(
+                "unclassified-block",
+                f"docs/operator.md:{line}: ```{' '.join(info)} is a shell block that is "
+                f"neither an executed `console` transcript nor `sh shape-only`; a "
+                f"command a reader can copy must be one or the other")
+    return session, shape
+
+
+def assertions(command: DocCommand) -> list[list[str]]:
+    """The expected lines of a command as fragment lists; `...` alone asserts nothing."""
+    out = []
+    for line in command.expected:
+        pieces = [piece.strip() for piece in line.split("...")]
+        pieces = [piece for piece in pieces if piece]
+        if pieces:
+            out.append(pieces)
+    return out
+
+
+def _line_matches(pieces: list[str], line: str) -> bool:
+    at = 0
+    for piece in pieces:
+        found = line.find(piece, at)
+        if found < 0:
+            return False
+        at = found + len(piece)
+    return True
+
+
+def stage_archive(bundle: Path, work: Path) -> None:
+    """Put the bundle where the guide says the operator downloaded it."""
+    archive = work / f"{DOCS_ARCHIVE_NAME}.tar.gz"
+    with tarfile.open(archive, "w:gz") as tar:
+        tar.add(bundle, arcname=DOCS_ARCHIVE_NAME)
+    (work / f"{archive.name}.sha256").write_text(
+        f"{sha256_file(archive)}  {archive.name}\n")
+
+
+def run_session(commands: list[DocCommand], work: Path, env: dict[str, str],
+                nonce: str) -> tuple[dict[int, str], dict[int, int], str]:
+    script = ["set +e"]
+    for index, command in enumerate(commands):
+        script.append(f"printf '\\n@@{nonce}:{index}:begin@@\\n'")
+        script.append(command.text)
+        script.append(f"__rc=$?; printf '\\n@@{nonce}:{index}:rc=%s@@\\n' \"$__rc\"; "
+                      f"[ \"$__rc\" -eq 0 ] || exit 97")
+    path = work.parent / f"session-{nonce}.sh"
+    path.write_text("\n".join(script) + "\n")
+    try:
+        completed = subprocess.run(["/bin/sh", str(path)], cwd=str(work), env=env,
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                   stderr=subprocess.STDOUT, timeout=DOCS_SESSION_TIMEOUT,
+                                   check=False)
+        raw = completed.stdout.decode("utf-8", errors="replace")
+    except subprocess.TimeoutExpired as error:
+        raw = (error.stdout or b"").decode("utf-8", errors="replace")
+    outputs: dict[int, str] = {}
+    codes: dict[int, int] = {}
+    marker = re.compile(rf"\n?@@{nonce}:(\d+):(begin|rc=(\d+))@@\n")
+    current = None
+    last = 0
+    for match in marker.finditer(raw):
+        if current is not None:
+            outputs[current] = outputs.get(current, "") + raw[last:match.start()]
+        index = int(match.group(1))
+        if match.group(2) == "begin":
+            current = index
+            outputs.setdefault(index, "")
+        else:
+            codes[index] = int(match.group(3))
+            current = None
+        last = match.end()
+    if current is not None:
+        outputs[current] = outputs.get(current, "") + raw[last:]
+    return outputs, codes, raw
+
+
+def shape_check(command: DocCommand, bundle: Path, work: Path,
+                env: dict[str, str]) -> str | None:
+    """None when the binary accepts the documented vocabulary, else why not."""
+    try:
+        words = shlex.split(command.text.replace("\\\n", " "))
+    except ValueError as error:
+        return f"cannot be split as a shell command: {error}"
+    if not words or words[0] not in ("tunnel-client", "tunnel-relay"):
+        return ("a shape-only command must invoke tunnel-client or tunnel-relay; "
+                "nothing else can be shape-checked")
+    if "--config" not in words or words.index("--config") + 1 >= len(words):
+        return "has no --config PATH to replace, so it cannot be run safely"
+    absent = work / "absent" / "config.toml"
+    words[words.index("--config") + 1] = str(absent)
+    completed = run([str(bundle / "bin" / words[0])] + words[1:], cwd=work, env=env,
+                    timeout=30)
+    output = completed.stdout + completed.stderr
+    if completed.returncode != 0 and "(os error 2)" in output and "usage:" not in output:
+        return None
+    return (f"exited {completed.returncode} without failing on the absent "
+            f"configuration: {output.strip()[:200]!r}")
+
+
+def exit_code_table(runtime_text: str) -> dict[int, set[str]]:
+    section = runtime_text.split("### Client exit codes", 1)
+    if len(section) != 2:
+        return {}
+    body = section[1].split("\n### ", 1)[0].split("\n## ", 1)[0]
+    rows: dict[int, set[str]] = {}
+    for line in body.splitlines():
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        if len(cells) >= 3 and cells[0].isdigit():
+            rows[int(cells[0])] = set(re.findall(r"`([A-Z][A-Z0-9_]+)`", cells[2]))
+    return rows
+
+
+def source_exit_codes(source: str) -> dict[str, int]:
+    """`Cause` diagnostic code -> exit status, read from the two match blocks."""
+    def body_of(signature: str) -> str:
+        start = source.find(signature)
+        if start < 0:
+            return ""
+        end = source.find("\n    }\n", start)
+        return source[start:end if end > 0 else len(source)]
+
+    names = dict(re.findall(r'Self::(\w+)\s*=>\s*"([A-Z][A-Z0-9_]+)"',
+                            body_of("fn code(self) -> &'static str")))
+    exits: dict[str, int] = {}
+    for arm, status in re.findall(r"((?:Self::\w+\s*\|\s*)*Self::\w+)\s*=>\s*(\d+)",
+                                  body_of("fn exit_code(self) -> u8")):
+        for variant in re.findall(r"Self::(\w+)", arm):
+            exits[variant] = int(status)
+    return {names[v]: exits[v] for v in names if v in exits}
+
+
+def check_exit_table(runtime_doc: Path, client_main: Path) -> Result | None:
+    table = exit_code_table(read_exact(runtime_doc))
+    source = source_exit_codes(read_exact(client_main))
+    if len(source) < MIN_EXIT_CAUSES:
+        return Result("docs", False,
+                      summary=f"parsed {len(source)} Cause code/exit pairs from "
+                              f"{client_main.name}, below the floor of {MIN_EXIT_CAUSES}; "
+                              f"the table would be compared against nothing",
+                      witness="exit-code-source-unparsed")
+    if len(table) < MIN_EXIT_TABLE_ROWS:
+        return Result("docs", False,
+                      summary=f"parsed {len(table)} rows from the `Client exit codes` "
+                              f"table in {runtime_doc.name}, below the floor of "
+                              f"{MIN_EXIT_TABLE_ROWS}",
+                      witness="exit-code-table-unparsed")
+    problems = []
+    for code, status in sorted(source.items()):
+        rows = sorted(row for row, codes in table.items() if code in codes)
+        if rows != [status]:
+            problems.append(f"{code}: source exits {status}, table rows {rows or 'none'}")
+    for status in sorted(set(source.values()) - set(table)):
+        problems.append(f"exit {status} is produced by the source and has no table row")
+    if problems:
+        return Result("docs", False,
+                      summary=f"{runtime_doc.name}'s client exit-code table disagrees "
+                              f"with Cause in {client_main.name}: " + "; ".join(problems),
+                      witness="exit-code-table-mismatch")
+    return None
+
+
+def check_docs(bundle: Path, doc: Path | None = None, runtime_doc: Path | None = None,
+               client_main: Path | None = None) -> Result:
+    doc = doc or DOCS_OPERATOR
+    runtime_doc = runtime_doc or DOCS_RUNTIME
+    client_main = client_main or DOCS_CLIENT_MAIN
+    for needed in (doc, runtime_doc, client_main):
+        if not needed.is_file():
+            return Result("docs", False, ran=False,
+                          summary=f"{needed} is not present; this check reads the guide "
+                                  f"and the client source from a repository checkout")
+    try:
+        session, shape = classify_doc(read_exact(doc))
+    except DocFormatError as error:
+        return Result("docs", False, summary=str(error), witness=error.witness)
+    if len(session) < MIN_DOC_EXECUTED_COMMANDS or len(shape) < MIN_DOC_SHAPE_COMMANDS:
+        return Result("docs", False,
+                      summary=f"the guide yields {len(session)} executed and "
+                              f"{len(shape)} shape-only commands, below the floors of "
+                              f"{MIN_DOC_EXECUTED_COMMANDS} and {MIN_DOC_SHAPE_COMMANDS}",
+                      witness="docs-floor")
+
+    table = check_exit_table(runtime_doc, client_main)
+    if table is not None:
+        return table
+
+    with tempfile.TemporaryDirectory() as tmp:
+        home = Path(tmp) / "home"
+        work = Path(tmp) / "download"
+        home.mkdir()
+        work.mkdir()
+        env = stranger_env(home)
+        if not cargo_is_unreachable(env):
+            return Result("docs", False,
+                          summary=f"cargo is still reachable on the narrowed PATH "
+                                  f"{env['PATH']!r}",
+                          witness="environment-not-scrubbed")
+        stage_archive(bundle, work)
+        nonce = sha256_bytes(os.urandom(16))[:16]
+        outputs, codes, raw = run_session(session, work, env, nonce)
+        asserted = 0
+        for index, command in enumerate(session):
+            where = f"docs/operator.md:{command.line} `{command.text[:70]}`"
+            if index not in codes:
+                return Result("docs", False,
+                              summary=f"{where} did not complete (session output tail: "
+                                      f"{raw.strip()[-200:]!r})",
+                              witness="documented-command-failed")
+            output = outputs.get(index, "")
+            if codes[index] != 0:
+                return Result("docs", False,
+                              summary=f"{where} exited {codes[index]}: "
+                                      f"{output.strip()[:240]!r}",
+                              witness="documented-command-failed")
+            lines = output.splitlines()
+            position = 0
+            for pieces in assertions(command):
+                hit = next((i for i in range(position, len(lines))
+                            if _line_matches(pieces, lines[i])), None)
+                if hit is None:
+                    return Result("docs", False,
+                                  summary=f"{where} did not print {' ... '.join(pieces)!r} "
+                                          f"(after its line {position}); it printed "
+                                          f"{output.strip()[:240]!r}",
+                                  witness="documented-output-missing")
+                position = hit + 1
+                asserted += 1
+
+        shape_work = Path(tmp) / "shape"
+        shape_work.mkdir()
+        for command in shape:
+            problem = shape_check(command, bundle, shape_work, env)
+            if problem is not None:
+                return Result("docs", False,
+                              summary=f"docs/operator.md:{command.line} `{command.text[:70]}` "
+                                      f"{problem}",
+                              witness="documented-command-shape-rejected")
+
+    result = Result("docs", True,
+                    summary=f"{len(session)} documented commands executed as one session "
+                            f"from the unpacked bundle with {asserted} output assertions; "
+                            f"{len(shape)} shape-only commands accepted by the real binary "
+                            f"(NOT executed); the client exit-code table agrees with Cause")
+    result.note("shape-only commands need a provisioned Redis authority or a live relay; "
+                "their argument vocabulary is checked, their behaviour is not")
+    result.note("session started in an empty directory holding only the archive, PATH "
+                "narrowed to the system directories, cargo proven unfindable")
+    return result
+
+
 CHECKS = {
     "checksums": check_checksums,
     "provenance": check_provenance,
@@ -1468,6 +1904,7 @@ CHECKS = {
     "targets": check_targets,
     "cli": check_cli,
     "portability": check_portability,
+    "docs": check_docs,
 }
 
 
@@ -2421,6 +2858,164 @@ def control_targets_second_reader_disagreement_is_not_absence(bundle: Path) -> t
 # it as a witness control credits the suite with an entry that does not meet
 # the definition the summary prints -- the same over-claim the two-figure
 # split was introduced to prevent (docs/tasks.md M6-C19).
+def _doc_copy(tmp: Path, transform) -> Path:
+    """A throwaway copy of the guide with one mechanism defeated."""
+    path = Path(tmp) / "operator.md"
+    text = transform(read_exact(DOCS_OPERATOR))
+    write_exact(path, text)
+    return path
+
+
+def _first_session_command(predicate) -> DocCommand | None:
+    session, _ = classify_doc(read_exact(DOCS_OPERATOR))
+    return next((command for command in session if predicate(command)), None)
+
+
+def _expect_red_at(needle: str, bundle: Path, witness: str, **kwargs) -> tuple[bool, str]:
+    """`expect_red`, and the red must also name the command the control broke.
+
+    A witness string alone is not enough here: every command in the session
+    shares `documented-output-missing`, so an earlier, unrelated command going
+    red would carry the right witness for the wrong reason.  The first draft
+    of the silent-client control did exactly that -- it went red at the
+    `shasum -c` step, because the stub no longer matched `SHA256SUMS`, and
+    never reached a `tunnel-client` command at all.
+    """
+    ok, detail = expect_red("docs", bundle, witness, **kwargs)
+    if ok and needle not in detail:
+        return False, (f"docs went red with witness {witness!r} but not at {needle!r}; "
+                       f"a sibling command's failure credited this control: {detail}")
+    return ok, detail
+
+
+def _replace_at_line(text: str, line: int, old: str, new: str) -> str:
+    lines = text.split("\n")
+    index = line - 1
+    if old not in lines[index]:
+        raise AssertionError(f"line {line} does not contain {old!r}")
+    lines[index] = lines[index].replace(old, new, 1)
+    return "\n".join(lines)
+
+
+def control_docs_renamed_subcommand(bundle: Path) -> tuple[bool, str]:
+    """A documented command the binary no longer accepts must go red.
+
+    Renames the subcommand of the first documented `tunnel-client` command
+    that asserts success without `echo "exit=$?"` -- the shape of an operator
+    doc left behind by a CLI rename.  The session must stop there with the
+    command's own non-zero exit, not merely miss some later output.
+    """
+    command = _first_session_command(
+        lambda c: c.text.startswith("tunnel-client config check") and "exit=" not in c.text)
+    if command is None:
+        return False, "the guide documents no plain `tunnel-client config check` to rename"
+    with tempfile.TemporaryDirectory() as tmp:
+        doc = _doc_copy(tmp, lambda text: _replace_at_line(
+            text, command.line, "config check", "config verify"))
+        return _expect_red_at(f"docs/operator.md:{command.line} ", bundle,
+                              "documented-command-failed", doc=doc)
+
+
+def control_docs_wrong_expected_output(bundle: Path) -> tuple[bool, str]:
+    """Output the binary does not print must go red, so content is asserted."""
+    command = _first_session_command(lambda c: c.text.startswith("tunnel-client --version"))
+    if command is None or not command.expected:
+        return False, "the guide documents no `tunnel-client --version` transcript"
+    expected = command.expected[0]
+    with tempfile.TemporaryDirectory() as tmp:
+        doc = _doc_copy(tmp, lambda text: text.replace(
+            f"$ {command.text}\n{expected}\n",
+            f"$ {command.text}\ntunnel-client printed-something-else\n", 1))
+        return _expect_red_at(f"docs/operator.md:{command.line} ", bundle,
+                              "documented-output-missing", doc=doc)
+
+
+def control_docs_silent_binary(bundle: Path) -> tuple[bool, str]:
+    """A client that exits 0 printing nothing must not satisfy the guide."""
+    with tempfile.TemporaryDirectory() as tmp:
+        copy = copy_bundle(bundle, Path(tmp))
+        stub = copy / "bin" / "tunnel-client"
+        stub.write_text("#!/bin/sh\nexit 0\n")
+        stub.chmod(stub.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        # Re-list the stub in SHA256SUMS, as a tampered bundle would, so the
+        # guide's own `shasum -c` step passes and the session reaches the
+        # first `tunnel-client` command -- the one this control is about.
+        sums = copy / SHA256SUMS
+        lines = [line for line in sums.read_text().splitlines()
+                 if not line.endswith("  bin/tunnel-client")]
+        lines.append(f"{sha256_file(stub)}  bin/tunnel-client")
+        sums.write_text("\n".join(sorted(lines)) + "\n")
+        return _expect_red_at("`tunnel-client --version`", copy,
+                              "documented-output-missing")
+
+
+def control_docs_unclassified_block(bundle: Path) -> tuple[bool, str]:
+    """A shell block that is neither executed nor shape-checked must go red."""
+    with tempfile.TemporaryDirectory() as tmp:
+        doc = _doc_copy(tmp, lambda text: text + "\n```sh\ntunnel-client --version\n```\n")
+        return expect_red("docs", bundle, "unclassified-block", doc=doc)
+
+
+def control_docs_block_asserting_nothing(bundle: Path) -> tuple[bool, str]:
+    """A transcript that runs a product binary and asserts no output must go red."""
+    with tempfile.TemporaryDirectory() as tmp:
+        doc = _doc_copy(tmp, lambda text: text +
+                        "\n```console\n$ tunnel-client --version\n$ true\nx\n```\n")
+        return expect_red("docs", bundle, "block-asserts-nothing", doc=doc)
+
+
+def control_docs_shape_flag_rejected(bundle: Path) -> tuple[bool, str]:
+    """A shape-only command with a flag the binary does not know must go red."""
+    with tempfile.TemporaryDirectory() as tmp:
+        doc = _doc_copy(tmp, lambda text: text.replace(
+            "tunnel-relay serve --config", "tunnel-relay serve --verbose --config", 1))
+        return expect_red("docs", bundle, "documented-command-shape-rejected", doc=doc)
+
+
+def control_docs_too_few_commands(bundle: Path) -> tuple[bool, str]:
+    """A guide stripped of its transcripts must not pass over an empty set."""
+    with tempfile.TemporaryDirectory() as tmp:
+        doc = _doc_copy(tmp, lambda text: text.replace("```console", "```text"))
+        return expect_red("docs", bundle, "docs-floor", doc=doc)
+
+
+def control_docs_exit_table_row_edited(bundle: Path) -> tuple[bool, str]:
+    """The runtime.md table edited away from the code must go red."""
+    with tempfile.TemporaryDirectory() as tmp:
+        runtime_doc = Path(tmp) / "runtime.md"
+        text = read_exact(DOCS_RUNTIME)
+        edited = re.sub(r"^\| 7 \|", "| 5 |", text, count=1, flags=re.M)
+        if edited == text:
+            return False, "control could not find the exit-7 row to edit"
+        write_exact(runtime_doc, edited)
+        return expect_red("docs", bundle, "exit-code-table-mismatch",
+                          runtime_doc=runtime_doc)
+
+
+def control_docs_exit_source_edited(bundle: Path) -> tuple[bool, str]:
+    """The code's mapping moved under an unchanged table must go red."""
+    with tempfile.TemporaryDirectory() as tmp:
+        client_main = Path(tmp) / "main.rs"
+        text = read_exact(DOCS_CLIENT_MAIN)
+        edited = text.replace("Self::OwnerBusy | Self::ResourceExhausted => 7",
+                              "Self::OwnerBusy | Self::ResourceExhausted => 4", 1)
+        if edited == text:
+            return False, "control could not find the exit-7 arm to edit"
+        write_exact(client_main, edited)
+        return expect_red("docs", bundle, "exit-code-table-mismatch",
+                          client_main=client_main)
+
+
+def control_docs_exit_source_unparsed(bundle: Path) -> tuple[bool, str]:
+    """A source the parser cannot read must be a red, not an empty agreement."""
+    with tempfile.TemporaryDirectory() as tmp:
+        client_main = Path(tmp) / "main.rs"
+        write_exact(client_main, read_exact(DOCS_CLIENT_MAIN).replace(
+            "fn exit_code(self) -> u8", "fn renamed_exit_code(self) -> u8", 1))
+        return expect_red("docs", bundle, "exit-code-source-unparsed",
+                          client_main=client_main)
+
+
 REFUSAL_CONTROLS = {
     "cargo unfindable: the check must not report ok",
 }
@@ -2488,6 +3083,18 @@ CONTROLS: dict[str, list[tuple[str, object]]] = {
     ],
     "portability": [
         ("the dynamic-dependency classifier's rule", control_portability_non_system_dependency),
+    ],    "docs": [
+        ("a documented subcommand the binary no longer has", control_docs_renamed_subcommand),
+        ("documented output the binary does not print", control_docs_wrong_expected_output),
+        ("a client that exits 0 printing nothing", control_docs_silent_binary),
+        ("a shell block neither executed nor shape-checked", control_docs_unclassified_block),
+        ("a transcript that asserts no output", control_docs_block_asserting_nothing),
+        ("a shape-only command with an unknown flag", control_docs_shape_flag_rejected),
+        ("a guide stripped of its transcripts", control_docs_too_few_commands),
+        ("the runtime.md exit table edited away from the code",
+         control_docs_exit_table_row_edited),
+        ("the code's exit mapping moved under the table", control_docs_exit_source_edited),
+        ("an exit mapping the parser cannot find", control_docs_exit_source_unparsed),
     ],
 }
 

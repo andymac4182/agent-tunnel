@@ -16,8 +16,10 @@ Agent in the cloud → Agent Tunnel Server → WebSocket tunnel → Desktop mach
 
 The desktop CLI initiates the tunnel with mTLS. Authorized cloud agents call server endpoints; no inbound desktop port is required. Service traffic flows in both directions over the data channel.
 
-**Status: M1 and M2 are locally verified. M7 implementation and integration
-verification are in progress.** On
+**Status: M1, M2 and M7 are locally verified against the gate each declared;
+M3, M4, M8, M5 and M6 are not complete. See [the roadmap](docs/roadmap.md) for
+the current state, which supersedes the historical figures below.** Outside
+testers start with [the operator guide](docs/operator.md). On
 2026-09-09, macOS arm64 with Rust 1.95.0 and Redis 8.4 passed formatting,
 strict Clippy, 62 workspace tests, five real Redis integration tests, the
 five-client/two-tenant HTTPS/WSS/CLI acceptance harness, the private H3 probe
@@ -28,7 +30,7 @@ fencing, dynamic peer pins, private mTLS HTTP/3 routing, cluster startup
 wiring, and a reusable three-relay Redis acceptance harness. See [M7 evidence
 and repeatable commands](docs/m7-verification.md). M3/M4/M5/M8 adapters and
 M6 release packaging remain subsequent milestones.
-The repository remains private; its MIT license prepares for a future OSS release.
+The repository is public, on the owner's publication decision (task row M6-C01); it is MIT-licensed.
 
 Hosted verification: [M1 CI checks](https://github.com/andymac4182/agent-tunnel/pull/10/checks).
 
@@ -73,6 +75,7 @@ restoration of arbitrary backups.
 | --- | --- |
 | [Architecture](docs/architecture.md) | Components, users/devices, routing, trust boundaries, scaling |
 | [Tunnel protocol](docs/protocol.md) | Pairing, rotation, replay, failure semantics, limits |
+| [Operator guide](docs/operator.md) | Download, verify, credentials, deployment, readiness and diagnostics, executed by a docs check; what the alpha cannot do yet |
 | [Runtime and client CLI](docs/runtime.md) | Axum listeners, device mTLS, commands, debug surfaces |
 | [M1 acceptance harness](docs/m1-harness.md) | Redis-backed real-socket verification, credentials, fixtures, and evidence |
 | [M2 verification](docs/m2-verification.md) | Rotation implementation status and required recovery/real-socket evidence |
