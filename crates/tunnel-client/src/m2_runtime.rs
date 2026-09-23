@@ -4479,7 +4479,18 @@ impl M2Actor {
         self.barrier_queued = false;
         self.pending_retire = None;
         let can_resume = self.rotation.phase() == RotationPhase::Active;
-        self.accepting = can_resume;
+        // OPEN admission resumes at COMMIT, on the activated carrier, which is
+        // when the owner resumes it too: the owner's admission freeze ends at
+        // COMMITTED (`rotation_frozen` on the relay excludes `Retiring`, task
+        // row M7-C37), and `RotationState::old_socket_closed` records that
+        // "payload admission already resumed on the new generation at
+        // COMMIT".  `committed()` has just moved the phase to `Retiring`, so
+        // gating admission on `Active` (as `can_resume` does) kept it closed
+        // until ROTATE_COMPLETE, and an OPEN the owner admitted inside that
+        // window was refused `GOAWAY` "connector is draining" -- a
+        // `503 DEVICE_REJECTED` for a consumer of a healthy session (task row
+        // M7-C97).  The writer resumption below is deliberately unchanged.
+        self.accepting = can_resume || self.rotation.phase() == RotationPhase::Retiring;
         self.writes_frozen = !can_resume;
         self.rotation
             .retire(&commit.attempt, self.now_ms())
@@ -15332,6 +15343,48 @@ mod tests {
             + tunnel_protocol::rotation::DEFAULT_HANDSHAKE_TIMEOUT_MS
             + 1_000;
         actor.rotation_started = Instant::now() - Duration::from_millis(elapsed);
+    }
+
+    /// Task row M7-C97: an OPEN the owner admits after ROTATE_COMMITTED and
+    /// before ROTATE_COMPLETE is admitted, not refused `GOAWAY` "connector is
+    /// draining".  The owner resumes admission at COMMITTED; before M7-C97
+    /// the connector resumed it only at COMPLETE, and the shipped-binary echo
+    /// gate failed about one run in seven with `503 DEVICE_REJECTED` when a
+    /// request landed in that window.
+    #[tokio::test]
+    async fn an_open_admitted_by_the_owner_while_retiring_is_not_refused_as_draining() {
+        let (
+            mut actor,
+            _attempt,
+            _candidate_key,
+            _old_closed,
+            _old_carrier_task,
+            _candidate_receiver,
+            mut control_receiver,
+        ) = retiring_connector_actor().await;
+        assert_eq!(actor.rotation.phase(), RotationPhase::Retiring);
+        drain_control_messages(&mut control_receiver);
+        let open = test_open(2);
+        actor
+            .handle_control(ControlMessage::Open(open.clone()))
+            .await
+            .expect("an OPEN while retiring is handled");
+        let responses = drain_control_messages(&mut control_receiver);
+        assert!(
+            responses.iter().all(|message| !matches!(
+                message,
+                ControlMessage::Rejected(rejected) if rejected.reply_to == open.message_id
+            )),
+            "an OPEN the owner admitted after COMMITTED must not be refused: {responses:?}"
+        );
+        assert!(
+            responses.iter().any(|message| matches!(
+                message,
+                ControlMessage::Opened(opened) if opened.reply_to == open.message_id
+            )),
+            "the OPEN is admitted on the activated carrier: {responses:?}"
+        );
+        assert!(actor.streams.contains_key(&open.stream_id));
     }
 
     /// protocol.md, reply-target table: "Owner COMPLETE | Connector RETIRED;
