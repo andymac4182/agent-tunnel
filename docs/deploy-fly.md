@@ -687,7 +687,9 @@ Fly snapshot, is not a restart: section 6.4.1.
 `redis_restart_continuity_seconds = 5`. The relay checks with `CONFIG GET`,
 when it starts and again before each re-binding, that Redis runs `appendonly
 yes`, `appendfsync always` and `no-appendfsync-on-rewrite no`, and refuses
-otherwise (`class=persistence`). The Redis entrypoint sets the first two;
+otherwise (`class=persistence`); it also reads them on the running Redis after
+every token, so a runtime `CONFIG SET` downgrade is caught too. Do not change
+them at runtime. The Redis entrypoint sets the first two;
 `no-appendfsync-on-rewrite no` is Redis's default and is set explicitly only
 from this commit on, so the running Fly Redis gets the explicit line at its
 next rebuild (its `CONFIG GET` should already show `no`; not checked on Fly).

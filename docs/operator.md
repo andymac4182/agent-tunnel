@@ -1072,7 +1072,16 @@ still answered does not count; and `CONFIG GET` on the new run shows
 `appendonly yes`, `appendfsync always` and `no-appendfsync-on-rewrite no`.
 `serve` checks the same three settings when it starts and refuses to start
 with continuity on a Redis that does not show them, or whose ACL user may not
-run `CONFIG GET` (grant `+config|get`). If the token loop ever ends while the
+run `CONFIG GET` (grant `+config|get`). The relay also reads the three
+settings on the **running** Redis after every token it writes, and counts a
+token only while they hold: a runtime `CONFIG SET appendfsync everysec` (not
+written back with `CONFIG REWRITE`) comes back as `always` after a crash, so
+the new run's check alone would miss the window in which acknowledged writes
+were not durable. The relay logs `class=persistence` at once, and a restart
+more than one interval plus 5 s after the downgrade is refused as
+`run_changed` until you re-attest it. A crash inside that bound is still
+accepted and can lose about the last second of writes; do not change these
+settings at runtime. If the token loop ever ends while the
 relay serves, the relay prints `Redis restart continuity task ...; token
 re-binding is off` and a later restart needs `rebind-redis-run`.
 
@@ -1110,8 +1119,8 @@ OLD to NEW, on the operator's declaration that Redis restarted in place; not
 verified.`, or `... is already bound to Redis run RUN; nothing changed.`, and
 `serve` then starts on the same namespace. A relay that is still running and
 has not refused that run for continuity picks the new binding up at its next
-Redis command, with no restart (from the code; the gate measures the
-stopped-relay case and the refusal). Run ids are Redis's own random server
+Redis command, with no restart (measured by the gate after a runtime
+downgrade and a crash). Run ids are Redis's own random server
 identifiers, not secrets. It refuses a namespace with no incarnation or run
 binding (`class=unbound`: Redis came back empty; nothing is written), a
 namespace whose incarnation is not the configured one, a `[cluster]`

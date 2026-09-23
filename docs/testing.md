@@ -604,7 +604,9 @@ binaries and a relay configured with `redis_restart_continuity_seconds = 1`,
 it requires: the same relay process to serve again after a `docker restart`
 and after a `docker kill` and start; a copy of the same data under
 `appendfsync everysec` to be refused (`class=persistence`) with nothing
-re-bound, and the durable Redis to be accepted again; a relay started after a
+re-bound, and the durable Redis to be accepted again; after a runtime
+`CONFIG SET appendfsync everysec` and a crash, a refusal (`class=run_changed`)
+until `rebind-redis-run`, which the serving relay then adopts; a relay started after a
 restart to be refused (`class=run_changed`), `rebind-redis-run` without its
 declaration refused, and with it the relay to serve; `serve` with continuity
 to refuse to start on `everysec`; a Redis restored from an RDB snapshot taken

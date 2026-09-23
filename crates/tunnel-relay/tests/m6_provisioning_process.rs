@@ -3416,6 +3416,11 @@ fn m6c65_serve_refused(fixture: &Provisioned, expected: &str) -> String {
 /// 2c. the same data in a Redis with `appendfsync everysec`: refused
 ///    (`class=persistence`), nothing re-bound; back on the durable Redis the
 ///    relay re-binds;
+/// 2d. `CONFIG SET appendfsync everysec` at runtime on the bound Redis
+///    (`class=persistence` from the token loop), then a crash that brings it
+///    back with `always`: refused as `run_changed`, because no token was
+///    acknowledged as durable within the freshness bound; `rebind-redis-run`
+///    then lets the serving relay adopt the run without a restart;
 /// 3. stop the relay, restart Redis, start `serve`: refused with
 ///    `class=run_changed`; `rebind-redis-run` without the declaration is
 ///    refused; with it, it says the declaration was not verified; `serve`
@@ -3582,6 +3587,75 @@ async fn m6c65_redis_restart_keeps_the_namespace_and_refuses_lost_data() {
          durable_run={run_2} echo_after_ms={}",
         back.as_millis()
     );
+
+    // --- 2d. A runtime downgrade of the bound Redis, then a crash. ---
+    // `CONFIG SET appendfsync everysec` on the running Redis, not written to
+    // its configuration: after a crash it comes back with `always`, so only
+    // the relay's check of the *bound* run can have noticed the window in
+    // which acknowledged writes were not durable.
+    // Only lines printed from here on count.
+    m6c65_mark(&fixture.relay_log, &mut relay_lines);
+    relay_lines.clear();
+    redis.config_set("appendfsync", "everysec");
+    let downgrade = m6c65_wait_line(
+        &fixture.relay_log,
+        &mut relay_lines,
+        "Redis authority continuity check failed; stage=authority_identity class=persistence",
+        STEP_DEADLINE,
+    );
+    // Past the freshness bound: one interval plus 5 s.
+    tokio::time::sleep(Duration::from_secs(M6C65_CONTINUITY_SECONDS + 7)).await;
+    let lines_before_downgrade_crash = m6c65_mark(&fixture.relay_log, &mut relay_lines);
+    let run_before_downgrade = redis.run_id();
+    redis.crash_and_start();
+    let run_after_downgrade = redis.run_id();
+    let stale = m6c65_wait_line(
+        &fixture.relay_log,
+        &mut relay_lines,
+        "Redis authority continuity check failed; stage=authority_identity class=run_changed",
+        STEP_DEADLINE,
+    );
+    m6c65_assert_not_rebound(
+        &fixture.relay_log,
+        &mut relay_lines,
+        lines_before_downgrade_crash,
+        Duration::from_secs(4),
+    );
+    assert_eq!(
+        namespace_get(&fixture, "meta:redis_run_id"),
+        run_before_downgrade,
+        "a relay whose last durable token is stale must not re-bind"
+    );
+    // The operator re-attests it; the serving relay, which refused the run
+    // as `run_changed` and not for continuity, picks the binding up.
+    let reattested = stdout(&step(
+        "rebind-redis-run after the downgrade",
+        Command::new(&fixture.relay_bin)
+            .args(["rebind-redis-run", "--config"])
+            .arg(&fixture.relay_config)
+            .arg("--redis-restarted-in-place"),
+    ));
+    assert!(
+        reattested.contains(&format!(
+            "from Redis run {run_before_downgrade} to {run_after_downgrade}"
+        )),
+        "{reattested}"
+    );
+    let adopted = m6c65_echo_until_served(
+        "adopt-reattested",
+        &fixture,
+        &mut device,
+        &token,
+        M6C65_RECOVERY_DEADLINE,
+    )
+    .await;
+    assert_eq!(fixture.relay.0.id(), relay_pid);
+    println!(
+        "m6c65-downgrade ok nonce={nonce} downgrade={downgrade:?} refused={stale:?} \
+         adopted_after_rebind_ms={} relay_restarts=0",
+        adopted.as_millis()
+    );
+    let run_2 = run_after_downgrade;
 
     // --- 3. Relay stopped, Redis restarted, relay started: operator command. ---
     m6c65_stop_relay(&mut fixture.relay);

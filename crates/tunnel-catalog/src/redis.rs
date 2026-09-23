@@ -880,24 +880,28 @@ impl RedisCatalog {
                 "restart continuity requires run re-binding",
             ));
         }
+        if !self.bound_persistence_is_sound().await? {
+            return Err(CatalogError::Conflict(PERSISTENCE_UNSOUND));
+        }
+        self.lane_group.binding().enable_witness(interval);
+        self.advance_restart_continuity().await
+    }
+
+    /// `CONFIG GET` on the bound run: whether it makes every acknowledged
+    /// write durable (M6-C65).  A refusal from Redis (`NOPERM`, an unknown or
+    /// renamed command) is `false`: nothing proves the writes durable.
+    async fn bound_persistence_is_sound(&self) -> Result<bool, CatalogError> {
         let mut command = redis::cmd("CONFIG");
         command
             .arg("GET")
             .arg("appendonly")
             .arg("appendfsync")
             .arg("no-appendfsync-on-rewrite");
-        let sound = match self.connection.query::<Vec<String>>(&command).await {
-            Ok(pairs) => lane::persistence_is_sound(&pairs),
-            // Redis answered with a refusal (`NOPERM`, an unknown or renamed
-            // command): nothing proves the writes durable.
-            Err(CatalogError::Database(error)) if error.code().is_some() => false,
-            Err(error) => return Err(error),
-        };
-        if !sound {
-            return Err(CatalogError::Conflict(PERSISTENCE_UNSOUND));
+        match self.connection.query::<Vec<String>>(&command).await {
+            Ok(pairs) => Ok(lane::persistence_is_sound(&pairs)),
+            Err(CatalogError::Database(error)) if error.code().is_some() => Ok(false),
+            Err(error) => Err(error),
         }
-        self.lane_group.binding().enable_witness(interval);
-        self.advance_restart_continuity().await
     }
 
     /// Stop re-binding on continuity tokens (M6-C65): the relay's token loop
@@ -910,8 +914,10 @@ impl RedisCatalog {
 
     /// Write a new continuity token (M6-C65).  The token is recorded as a
     /// candidate before dispatch, becomes the only candidate once Redis
-    /// acknowledges it, is dropped when the write definitely did not happen,
-    /// and stays a candidate when its outcome is unknown.  The script writes
+    /// acknowledges it and the bound run still shows durable persistence
+    /// (only then does its acknowledgement count for freshness), is dropped
+    /// when the write definitely did not happen, and stays a candidate when
+    /// its outcome is unknown or the bound run is not durable.  The script writes
     /// only while the namespace is bound to this configured incarnation and
     /// to the run the lane verified.
     pub async fn advance_restart_continuity(&self) -> Result<(), CatalogError> {
@@ -940,8 +946,23 @@ impl RedisCatalog {
         let refused = match result {
             Ok(reply) => match reply.first().map(String::as_str) {
                 Some("ok") => {
-                    binding.continuity_acknowledged(&token);
-                    return Ok(());
+                    // The token is in Redis, but it bounds the loss window
+                    // only if the run that holds it is durable *now*: a
+                    // runtime `CONFIG SET appendfsync everysec` on the bound
+                    // run is invisible to the new run's check after a crash.
+                    // Record the acknowledgement only after the bound run
+                    // still shows the durable settings (M6-C65 review), so
+                    // the freshness bound refuses a token re-binding within
+                    // one interval plus the deadlines of a downgrade.  The
+                    // token stays a candidate either way.
+                    return match self.bound_persistence_is_sound().await {
+                        Ok(true) => {
+                            binding.continuity_acknowledged(&token);
+                            Ok(())
+                        }
+                        Ok(false) => Err(CatalogError::Conflict(PERSISTENCE_UNSOUND)),
+                        Err(error) => Err(error),
+                    };
                 }
                 Some("unbound") => CatalogError::Conflict(NAMESPACE_UNBOUND),
                 Some("incarnation") => CatalogError::Conflict("active deployment incarnation"),

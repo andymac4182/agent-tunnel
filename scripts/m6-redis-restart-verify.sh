@@ -62,6 +62,7 @@ cargo test -p tunnel-relay --test m6_provisioning_process --locked -- --ignored 
 cat "$scratch/restart.log"
 for needle in "test result: ok. 1 passed" "m6c65-unattended ok nonce=" "relay_restarts=0" \
   "m6c65-crash ok nonce=" "m6c65-persistence ok nonce=" "class=persistence" \
+  "m6c65-downgrade ok nonce=" \
   "m6c65-operator ok nonce=" "class=run_changed" \
   "m6c65-reattest-refused ok nonce=" \
   "m6c65-rollback ok nonce=" "class=continuity" \
