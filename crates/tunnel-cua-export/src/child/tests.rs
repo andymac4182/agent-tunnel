@@ -96,14 +96,38 @@ async fn a_backend_is_started_as_the_leader_of_its_own_process_group() {
 async fn dropping_the_handle_ends_the_backend() {
     // The safe direction: an unexpected drop kills the group rather than
     // leaking it. For a CUA backend the leak is a process that can type.
+    //
+    // **Wait for the supervisor, not for the process table.** `is_live` counts
+    // a zombie as gone, and the drop path's first, pre-reap `kill_group` makes
+    // the leader a zombie *before* the supervisor task reaps it and sends the
+    // post-reap group signal that `group_kills` counts. Reading the counter as
+    // soon as `ps` showed `Z` was a race the counter lost about one run in
+    // twenty (`docs/tasks.md` M5-C18). The supervisor's own completion signal
+    // is sent after every counter below has moved, so a clone of it is held
+    // across the drop and waited on under a bound.
     let workspace = tempfile::tempdir().expect("workspace");
     let counters = Arc::new(ChildCounters::default());
-    let pid = {
+    let (pid, mut finished) = {
         let child = spawn(&sleeper(workspace.path()), &counters).expect("started");
-        child.pid()
+        (child.pid(), child.exited.clone())
     };
+    tokio::time::timeout(Duration::from_secs(10), finished.wait_for(|done| *done))
+        .await
+        .expect("the supervisor finished within the bound after the drop")
+        .expect("the supervisor reported its end rather than vanishing");
     assert!(!is_live(wait_not_alive(pid).await.as_ref()));
+    assert_eq!(
+        counters.killed.load(Ordering::Relaxed),
+        1,
+        "the drop drove the end of life; the backend did not exit on its own"
+    );
     assert_eq!(counters.group_kills.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        counters.deadman_stood_down.load(Ordering::Relaxed),
+        counters.deadman_armed.load(Ordering::Relaxed),
+        "an armed sentinel stood down rather than fired, so it was not what \
+         ended the backend"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
