@@ -2991,3 +2991,50 @@ async fn unary_echo_authorized_during_freeze_dispatches_after_commit() {
             .is_some_and(|pending| pending.dispatched)
     );
 }
+
+/// M7-C92 and reconnect (M6-C23): a session that ends while a finite echo
+/// still waits for the ACK of the relay's FIN takes that tombstone with it.
+/// No FORGET is queued for the dead session, nothing is retained for its key,
+/// and a late frame naming it is inert.  The next session is a new session ID
+/// with a new connector journal, and the relay never re-sends an `OPEN`, so
+/// neither a replayed echo nor an old FORGET can reach it.
+#[tokio::test]
+async fn closing_a_session_drops_its_unforgotten_unary_echo_without_a_forget() {
+    let mut fixture = FreezeFixture::new("unary-close", false);
+    let (stream_id, _, _, mut receiver) = fixture.admit_unary_echo(UNARY_BODY).await;
+    fixture.authorize_unary_echo(stream_id);
+    assert_eq!(sequenced(&drain_data(&mut fixture.old_rx)).len(), 2);
+    // Complete the exchange, but acknowledge only the relay's DATA, so the
+    // FORGET is still owed when the session ends.
+    fixture
+        .connector_echo_response(stream_id, UNARY_REPLY, 1)
+        .await;
+    assert!(matches!(receiver.try_recv(), Ok(EchoOutcome::Success(_))));
+    assert!(FreezeFixture::stream_forgets(&fixture.drain_control()).is_empty());
+
+    let key = fixture.key.clone();
+    fixture.actor.close_session(&key, "TEST_RECONNECT").await;
+    assert!(!fixture.actor.sessions.contains_key(&key.scope()));
+    assert!(
+        !fixture.actor.owner_forgets.contains_key(&key),
+        "no FORGET identity outlives its session"
+    );
+    let mut queued = Vec::new();
+    while let Ok(item) = fixture.control_rx.try_recv() {
+        if let ControlOutbound::Text(mut text) = item {
+            queued.push(wire::parse_control(text.as_bytes()).expect("control decodes"));
+            text.release();
+        }
+    }
+    assert!(
+        FreezeFixture::stream_forgets(&queued).is_empty(),
+        "a closed session queues no FORGET: {queued:?}"
+    );
+    // The ACK the dead session was waiting for arrives late: inert.
+    let generation = fixture.attempt.old_generation;
+    fixture
+        .connector_frame(Frame::ack(1, generation, stream_id, 2))
+        .await;
+    assert!(!fixture.actor.sessions.contains_key(&key.scope()));
+    assert!(!fixture.actor.owner_forgets.contains_key(&key));
+}
