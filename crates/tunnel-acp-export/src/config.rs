@@ -263,15 +263,25 @@ impl AcpExportConfig {
 mod tests {
     use super::*;
 
+    // Absolute paths in the host's own spelling: `/opt/...` is not absolute
+    // on Windows, which is what the validator is right to refuse.
+    #[cfg(not(windows))]
+    const COMMAND: &str = "/opt/acp/bin/agent";
+    #[cfg(windows)]
+    const COMMAND: &str = "C:\\\\acp\\\\bin\\\\agent.exe";
+    #[cfg(not(windows))]
+    const WORKSPACE: &str = "/srv/acp-workspace";
+    #[cfg(windows)]
+    const WORKSPACE: &str = "C:\\\\acp-workspace";
+    #[cfg(not(windows))]
+    const PARENT_ESCAPE: &str = "/opt/../etc/agent";
+    #[cfg(windows)]
+    const PARENT_ESCAPE: &str = "C:\\\\acp\\\\..\\\\etc\\\\agent.exe";
+
     fn valid() -> String {
-        concat!(
-            "profile = \"acp-http-v1\"\n",
-            "[agent]\n",
-            "command = \"/opt/acp/bin/agent\"\n",
-            "args = [\"agent\"]\n",
-            "workspace = \"/srv/acp-workspace\"\n",
+        format!(
+            "profile = \"acp-http-v1\"\n[agent]\ncommand = \"{COMMAND}\"\nargs = [\"agent\"]\nworkspace = \"{WORKSPACE}\"\n"
         )
-        .to_owned()
     }
 
     #[test]
@@ -290,9 +300,9 @@ mod tests {
     fn every_rejected_shape_is_rejected() {
         for broken in [
             valid().replace("acp-http-v1", "acp-http-v2"),
-            valid().replace("/opt/acp/bin/agent", "agent"),
-            valid().replace("/srv/acp-workspace", "workspace"),
-            valid().replace("/opt/acp/bin/agent", "/opt/../etc/agent"),
+            valid().replace(COMMAND, "agent"),
+            valid().replace(WORKSPACE, "workspace"),
+            valid().replace(COMMAND, PARENT_ESCAPE),
             format!("{}[deadlines]\nsubscribe_ms = 0\n", valid()),
             format!("{}[deadlines]\npermission_ms = 0\n", valid()),
             format!("{}[deadlines]\nsubscribe_ms = 600001\n", valid()),

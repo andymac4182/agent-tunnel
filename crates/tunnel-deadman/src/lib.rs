@@ -671,6 +671,9 @@ mod tests {
     /// against it would fail.  The exact artefact from the row is rebuilt
     /// here -- zero bytes, mode 0644 -- rather than a merely-similar one, so
     /// this fails if the rule is relaxed back.
+    // Executability is a Unix notion here: off Unix `availability` is
+    // `UnsupportedPlatform` and any regular file resolves as usable.
+    #[cfg(unix)]
     #[test]
     fn a_zero_byte_decoy_wearing_the_sentinels_name_is_not_a_sentinel() {
         let directory = tempfile::tempdir().expect("directory");
@@ -764,6 +767,9 @@ mod tests {
     /// Asserted as an inequality against the *other* two answers rather than
     /// only as an equality, because a rule that collapsed every candidate to
     /// `Unusable` would satisfy an equality-only test.
+    // Executability is a Unix notion here: off Unix `availability` is
+    // `UnsupportedPlatform` and any regular file resolves as usable.
+    #[cfg(unix)]
     #[test]
     fn a_file_that_is_there_and_unusable_is_reported_apart_from_nothing_being_there() {
         let occupied = tempfile::tempdir().expect("directory");
@@ -811,6 +817,9 @@ mod tests {
     /// The old rule returned on the first `is_file()`, so a decoy in `deps`
     /// would have hidden a working sentinel in `target/debug` and turned
     /// every containment measurement into a measurement of nothing.
+    // Executability is a Unix notion here: off Unix `availability` is
+    // `UnsupportedPlatform` and any regular file resolves as usable.
+    #[cfg(unix)]
     #[test]
     fn a_decoy_in_deps_does_not_shadow_the_real_sentinel_above_it() {
         let directory = tempfile::tempdir().expect("directory");
@@ -833,6 +842,9 @@ mod tests {
     /// than reporting it -- which is the shape of M6-C08 itself.  The
     /// executable sentinel beside the binary is what a fallback would find,
     /// so its presence is what makes this test able to fail.
+    // Executability is a Unix notion here: off Unix `availability` is
+    // `UnsupportedPlatform` and any regular file resolves as usable.
+    #[cfg(unix)]
     #[test]
     fn an_explicit_unusable_path_does_not_fall_back_to_the_search() {
         let directory = tempfile::tempdir().expect("directory");

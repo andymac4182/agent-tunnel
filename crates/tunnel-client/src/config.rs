@@ -854,6 +854,17 @@ ca = "ca.pem"
         assert!(config.validate().is_ok());
     }
 
+    /// The same configuration with every quoted absolute Unix path made
+    /// absolute on this host: `"/opt/x"` becomes `"C:/opt/x"` on Windows, where
+    /// `/opt/x` has no drive and is rightly refused as not absolute.
+    fn host(text: &str) -> String {
+        if cfg!(windows) {
+            text.replace("\"/", "\"C:/")
+        } else {
+            text.to_owned()
+        }
+    }
+
     const MCP_EXPORT: &str = r#"
 [exports.22222222-2222-4222-8222-222222222222]
 type = "http-forward"
@@ -871,10 +882,10 @@ env = { SYNTHETIC_SECRET = "synthetic-env-value" }
 
     #[test]
     fn mcp_exports_parse_validate_and_register_handlers() {
-        let input = valid_toml().replace(
+        let input = host(&valid_toml().replace(
             "[exports.echo]\ntype = \"echo\"\ndevice_canary = \"fixture-one\"\n",
             MCP_EXPORT,
-        );
+        ));
         let config = RuntimeConfig::parse(&input).expect("mcp export");
         let export = &config.exports["22222222-2222-4222-8222-222222222222"];
         assert_eq!(export.kind, ExportKind::HttpForward);
@@ -899,7 +910,7 @@ env = { SYNTHETIC_SECRET = "synthetic-env-value" }
             input.replace("mcp-2026-07-28", "mcp-2024-11-05"),
             input.replace("/opt/synthetic/mcp-server", "mcp-server"),
             input.replace(
-                "kind = \"stdio\"\ncommand = \"/opt/synthetic/mcp-server\"\nargs = [\"stdio\"]\nworkspace = \"/srv/synthetic-workspace\"\nenv = { SYNTHETIC_SECRET = \"synthetic-env-value\" }",
+                &host("kind = \"stdio\"\ncommand = \"/opt/synthetic/mcp-server\"\nargs = [\"stdio\"]\nworkspace = \"/srv/synthetic-workspace\"\nenv = { SYNTHETIC_SECRET = \"synthetic-env-value\" }"),
                 "kind = \"streamable-http\"\nurl = \"http://192.0.2.10:8080/mcp\"",
             ),
             input.replace("args = [\"stdio\"]", "args = [\"stdio\"]\nshell = \"/bin/sh\""),
@@ -912,10 +923,10 @@ env = { SYNTHETIC_SECRET = "synthetic-env-value" }
 
     #[test]
     fn acp_exports_parse_validate_and_register_handlers() {
-        let input = valid_toml().replace(
+        let input = host(&valid_toml().replace(
             "[exports.echo]\ntype = \"echo\"\ndevice_canary = \"fixture-one\"\n",
             ACP_EXPORT,
-        );
+        ));
         let config = RuntimeConfig::parse(&input).expect("acp export");
         let export = &config.exports["33333333-3333-4333-8333-333333333333"];
         assert_eq!(export.kind, ExportKind::HttpForward);
@@ -971,6 +982,7 @@ env = { SYNTHETIC_SECRET = "synthetic-env-value" }
             );
         // Not vacuous: the edit really did put both tables on one export.
         assert!(both.contains(".acp]") && both.contains(".mcp]"), "{both}");
+        let both = host(&both);
         let error = RuntimeConfig::parse(&both).expect_err("both tables are refused");
         assert!(
             format!("{error}").contains("never both"),

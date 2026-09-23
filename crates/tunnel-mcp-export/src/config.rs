@@ -412,8 +412,16 @@ fn tunnel_http_bridge_path_ok(path: &str) -> Result<(), ()> {
 mod tests {
     use super::*;
 
+    /// Parse with every quoted absolute Unix path made absolute on this host:
+    /// `"/opt/x"` becomes `"C:/opt/x"` on Windows, where `/opt/x` has no drive
+    /// and is rightly refused as not absolute.
     fn parse(text: &str) -> Result<ValidatedExport, String> {
-        let config: McpExportConfig = toml::from_str(text).map_err(|error| error.to_string())?;
+        let text = if cfg!(windows) {
+            text.replace("\"/", "\"C:/")
+        } else {
+            text.to_owned()
+        };
+        let config: McpExportConfig = toml::from_str(&text).map_err(|error| error.to_string())?;
         config.validate().map_err(|error| error.to_string())
     }
 
