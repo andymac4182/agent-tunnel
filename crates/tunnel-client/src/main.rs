@@ -617,8 +617,9 @@ async fn run_connect(path: PathBuf, json: bool) -> Result<(), CliError> {
     // *requests* every supervised MCP child's group kill; the kill, the reap
     // and the sentinel stand-down run on a spawned task. Returning from
     // `main` now would tear the runtime down with that task possibly never
-    // polled -- measured (M6-C29) to leave an in-group helper alive in 3 of
-    // 10 runs when no sentinel is installed. So wait, bounded, for the reap.
+    // polled -- measured (M6-C29) to leave an in-group helper alive in 7 of
+    // 50 runs on this runtime flavour, and every time on a current-thread
+    // one, when no sentinel is installed. So wait, bounded, for the reap.
     // Not after a second stop request abandoned the drain: that operator has
     // asked not to wait, and the kill was never requested.
     if !matches!(
