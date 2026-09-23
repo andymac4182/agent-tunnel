@@ -7,9 +7,10 @@ use crate::types::valid_principal_identity;
 use crate::{
     AttachmentTicket, AttachmentTicketConsumeRequest, AttachmentTicketIssueRequest,
     AuthenticatedConsumer, Catalog, CatalogError, CatalogFixture, ConsumedAttachmentTicket,
-    CredentialRecord, DeviceIdentity, DeviceListFilter, DeviceSummary, GrantSnapshot, GrantSpec,
-    MAX_SIGNED_MEMBERSHIP_RECORDS, OwnerClaim, OwnerClaimRequest, OwnerToken, ServiceRecord,
-    SignedMembershipRecord,
+    CredentialRecord, DeviceIdentity, DeviceListFilter, DeviceSummary, FixtureDevice,
+    GrantSnapshot, GrantSpec, MAX_SIGNED_MEMBERSHIP_RECORDS, MembershipRecord, OwnerClaim,
+    OwnerClaimRequest, OwnerToken, PrincipalIdentity, ServiceRecord, ServiceSpec,
+    SignedMembershipRecord, UserRecord,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -777,6 +778,208 @@ impl RedisCatalog {
             }
         }
         self.write_seed_records(records).await
+    }
+
+    /// Day-2 catalog change (task row M6-C31): add one user, bound to one
+    /// issuer identity, as a member of one existing tenant.
+    ///
+    /// One Lua script checks and writes everything, so the change is atomic:
+    /// the namespace must already be provisioned (`meta:fixture_seeded`, so a
+    /// day-2 write can never make `provision-catalog` refuse a namespace it
+    /// has not run on yet), the configured incarnation and Redis run must be
+    /// the active ones (the fence `serve` applies), the tenant must be active,
+    /// and the user, the identity and the membership must all be new.  A
+    /// duplicate of any of them is refused and nothing is written; nothing
+    /// existing is ever overwritten.  The key layout and fields are exactly
+    /// those `write_seed_records` writes, and the catalog generation advances
+    /// as for every other catalog mutation.  The incarnation and run keys
+    /// are read, never written.
+    pub async fn add_user(
+        &self,
+        user: &UserRecord,
+        identity: &PrincipalIdentity,
+        membership: &MembershipRecord,
+    ) -> Result<(), CatalogError> {
+        validate_user_addition(user, identity, membership)?;
+        let incarnation = self.configured_incarnation()?;
+        let identity_key = self.identity_key(&identity.issuer, &identity.subject);
+        let reply: Vec<String> = self
+            .eval(
+                &format!("{LUA_DECIMAL_HELPERS}{LUA_DAY2_PRECONDITIONS}{SCRIPT_ADD_USER_BODY}"),
+                &[
+                    self.fixture_seed_guard_key(),
+                    self.active_incarnation_key(),
+                    self.redis_run_id_key(),
+                    self.catalog_generation_key(),
+                    self.tenant_key(membership.tenant_id),
+                    self.user_key(user.user_id),
+                    identity_key.clone(),
+                    self.membership_key(membership.tenant_id, user.user_id),
+                    self.users_index(),
+                    self.identities_index(),
+                    self.memberships_index(membership.tenant_id),
+                    self.user_tenants_index(user.user_id),
+                ],
+                &[
+                    incarnation.to_owned(),
+                    self.redis_run_id.clone(),
+                    membership.tenant_id.to_string(),
+                    user.user_id.to_string(),
+                    user.display_name.clone(),
+                    identity.issuer.clone(),
+                    identity.subject.clone(),
+                    membership.role.as_str().to_owned(),
+                    identity_key,
+                ],
+            )
+            .await?;
+        day2_reply(&reply)
+    }
+
+    /// Day-2 catalog change (M6-C31): add one device, owned by an existing
+    /// active member of an existing active tenant, with its one credential.
+    ///
+    /// Device and credential are written by one script, with the same
+    /// preconditions as [`Self::add_user`].  The device must be new in its
+    /// tenant (a revoked device is not reused: its owner epoch and version
+    /// must never go backwards), and the SPKI pin must not be bound to any
+    /// credential, as `SCRIPT_SEED_CREDENTIAL` requires.  The owner epoch is
+    /// created with `SETNX`, exactly as the seed does.
+    pub async fn add_device(
+        &self,
+        device: &FixtureDevice,
+        credential: &CredentialRecord,
+    ) -> Result<(), CatalogError> {
+        validate_device_addition(device, credential)?;
+        let incarnation = self.configured_incarnation()?;
+        let credential_key = self.credential_key(
+            credential.tenant_id,
+            credential.device_id,
+            credential.credential_id,
+        );
+        let reply: Vec<String> = self
+            .eval(
+                &format!("{LUA_DECIMAL_HELPERS}{LUA_DAY2_PRECONDITIONS}{SCRIPT_ADD_DEVICE_BODY}"),
+                &[
+                    self.fixture_seed_guard_key(),
+                    self.active_incarnation_key(),
+                    self.redis_run_id_key(),
+                    self.catalog_generation_key(),
+                    self.tenant_key(device.tenant_id),
+                    self.membership_key(device.tenant_id, device.owner_user_id),
+                    self.device_key(device.tenant_id, device.device_id),
+                    self.devices_index(device.tenant_id),
+                    self.owner_epoch_key(device.tenant_id, device.device_id),
+                    credential_key.clone(),
+                    self.fingerprint_index(&credential.spki_fingerprint),
+                    self.credentials_index(device.tenant_id, device.device_id),
+                ],
+                &[
+                    incarnation.to_owned(),
+                    self.redis_run_id.clone(),
+                    device.tenant_id.to_string(),
+                    device.device_id.to_string(),
+                    device.owner_user_id.to_string(),
+                    device.display_name.clone(),
+                    credential.credential_id.to_string(),
+                    credential.spki_fingerprint.clone(),
+                    credential.serial.clone().unwrap_or_default(),
+                    datetime_micros(credential.not_before)?.to_string(),
+                    datetime_micros(credential.expires_at)?.to_string(),
+                    credential_key,
+                ],
+            )
+            .await?;
+        day2_reply(&reply)
+    }
+
+    /// Day-2 catalog change (M6-C31): add one service to an existing active
+    /// device, with the preconditions of [`Self::add_user`].  The service
+    /// must be new; its record is the seed's layout at version 1.
+    pub async fn add_service(&self, service: &ServiceSpec) -> Result<(), CatalogError> {
+        validate_service_addition(service)?;
+        let incarnation = self.configured_incarnation()?;
+        let reply: Vec<String> = self
+            .eval(
+                &format!("{LUA_DECIMAL_HELPERS}{LUA_DAY2_PRECONDITIONS}{SCRIPT_ADD_SERVICE_BODY}"),
+                &[
+                    self.fixture_seed_guard_key(),
+                    self.active_incarnation_key(),
+                    self.redis_run_id_key(),
+                    self.catalog_generation_key(),
+                    self.tenant_key(service.tenant_id),
+                    self.device_key(service.tenant_id, service.device_id),
+                    self.service_key(service.tenant_id, service.device_id, service.service_id),
+                    self.services_index(service.tenant_id, service.device_id),
+                ],
+                &[
+                    incarnation.to_owned(),
+                    self.redis_run_id.clone(),
+                    service.tenant_id.to_string(),
+                    service.device_id.to_string(),
+                    service.service_id.to_string(),
+                    service.service_type.clone(),
+                    service.display_name.clone(),
+                    serde_json::to_string(&service.capabilities)?,
+                ],
+            )
+            .await?;
+        day2_reply(&reply)
+    }
+
+    /// Whether a device record exists and is active (M6-C31): `None` when it
+    /// does not exist.  `set-grant` refuses a device that is not active,
+    /// because `upsert_grant` requires only that the device exists and a
+    /// grant on a revoked device authorizes nothing.
+    pub async fn device_active(
+        &self,
+        tenant_id: Uuid,
+        device_id: Uuid,
+    ) -> Result<Option<bool>, CatalogError> {
+        let mut command = redis::cmd("HGET");
+        command
+            .arg(self.device_key(tenant_id, device_id))
+            .arg("active");
+        let active: Option<String> = self.connection.query(&command).await?;
+        Ok(active.map(|value| value == "1"))
+    }
+
+    /// Read one service record (M6-C31), so a grant can be checked against
+    /// the service type and operations it will authorize.  `None` when the
+    /// record does not exist.
+    pub async fn read_service(
+        &self,
+        tenant_id: Uuid,
+        device_id: Uuid,
+        service_id: Uuid,
+    ) -> Result<Option<ServiceSpec>, CatalogError> {
+        let mut command = redis::cmd("HMGET");
+        command
+            .arg(self.service_key(tenant_id, device_id, service_id))
+            .arg("service_type")
+            .arg("display_name")
+            .arg("capabilities")
+            .arg("version")
+            .arg("active");
+        let fields: Vec<Option<String>> = self.connection.query(&command).await?;
+        let [service_type, display_name, capabilities, version, active] = fields.as_slice() else {
+            return Err(CatalogError::Serialization(
+                "invalid Redis service reply".into(),
+            ));
+        };
+        let Some(service_type) = service_type else {
+            return Ok(None);
+        };
+        Ok(Some(ServiceSpec {
+            tenant_id,
+            device_id,
+            service_id,
+            service_type: service_type.clone(),
+            display_name: display_name.clone().unwrap_or_default(),
+            capabilities: serde_json::from_str(capabilities.as_deref().unwrap_or("{}"))?,
+            version: parse_u64_decimal(version.as_deref().unwrap_or("0"))?,
+            active: active.as_deref() == Some("1"),
+        }))
     }
 
     /// Take the one-shot seed reservation of a namespace holding nothing but
@@ -3190,6 +3393,161 @@ local result = {'ok'}
 for _, value in ipairs(entries) do result[#result + 1] = value end
 return result
 "#;
+
+/// Shared head of every day-2 addition script (M6-C31).  KEYS[1] is the
+/// provisioning reservation, KEYS[2] and KEYS[3] the incarnation and Redis run
+/// bindings, KEYS[4] the catalog generation; ARGV[1] and ARGV[2] the
+/// configured incarnation and the connection's Redis run id.  Nothing here
+/// writes; `next_generation` is the value the body sets last.
+const LUA_DAY2_PRECONDITIONS: &str = r#"
+local function h(key, field)
+  return redis.call('HGET', key, field) or ''
+end
+if redis.call('EXISTS', KEYS[1]) ~= 1 then return {'unprovisioned'} end
+if redis.call('GET', KEYS[2]) ~= ARGV[1] or redis.call('GET', KEYS[3]) ~= ARGV[2] then
+  return {'incarnation'}
+end
+local next_generation = decimal_increment(redis.call('GET', KEYS[4]))
+if not next_generation then return {'overflow'} end
+"#;
+
+/// KEYS[5] tenant, [6] user, [7] identity, [8] membership, [9] users index,
+/// [10] identities index, [11] tenant memberships index, [12] user tenants
+/// index.  ARGV[3] tenant, [4] user, [5] display name, [6] issuer,
+/// [7] subject, [8] role, [9] identity key.
+const SCRIPT_ADD_USER_BODY: &str = r#"
+if h(KEYS[5], 'active') ~= '1' then return {'tenant'} end
+if redis.call('EXISTS', KEYS[6]) == 1 then return {'user_exists'} end
+if redis.call('EXISTS', KEYS[7]) == 1 then return {'identity_exists'} end
+if redis.call('EXISTS', KEYS[8]) == 1 then return {'membership_exists'} end
+redis.call('HSET', KEYS[6], 'user_id', ARGV[4], 'display_name', ARGV[5])
+redis.call('SADD', KEYS[9], ARGV[4])
+redis.call('HSET', KEYS[7], 'issuer', ARGV[6], 'subject', ARGV[7], 'user_id', ARGV[4])
+redis.call('SADD', KEYS[10], ARGV[9])
+redis.call('HSET', KEYS[8], 'tenant_id', ARGV[3], 'user_id', ARGV[4], 'role', ARGV[8], 'active', '1')
+redis.call('SADD', KEYS[11], ARGV[4])
+redis.call('SADD', KEYS[12], ARGV[3])
+redis.call('SET', KEYS[4], next_generation)
+return {'ok'}
+"#;
+
+/// KEYS[5] tenant, [6] owner membership, [7] device, [8] tenant devices
+/// index, [9] owner epoch, [10] credential, [11] fingerprint index,
+/// [12] device credentials index.  ARGV[3] tenant, [4] device, [5] owner,
+/// [6] display name, [7] credential id, [8] SPKI pin, [9] serial,
+/// [10] not_before_us, [11] expires_at_us, [12] credential key.
+const SCRIPT_ADD_DEVICE_BODY: &str = r#"
+if h(KEYS[5], 'active') ~= '1' then return {'tenant'} end
+if h(KEYS[6], 'active') ~= '1' then return {'owner'} end
+if redis.call('EXISTS', KEYS[7]) == 1 then return {'device_exists'} end
+if redis.call('EXISTS', KEYS[11]) == 1 then return {'fingerprint_exists'} end
+if redis.call('EXISTS', KEYS[10]) == 1 then return {'credential_exists'} end
+redis.call('HSET', KEYS[7], 'tenant_id', ARGV[3], 'device_id', ARGV[4], 'owner_user_id', ARGV[5], 'display_name', ARGV[6], 'active', '1', 'last_seen_at_us', '', 'device_version', '1')
+redis.call('SETNX', KEYS[9], '0')
+redis.call('SADD', KEYS[8], ARGV[4])
+redis.call('HSET', KEYS[10], 'tenant_id', ARGV[3], 'device_id', ARGV[4], 'credential_id', ARGV[7], 'spki_fingerprint', ARGV[8], 'serial', ARGV[9], 'not_before_us', ARGV[10], 'expires_at_us', ARGV[11], 'revoked_at_us', '', 'active', '1')
+redis.call('SET', KEYS[11], ARGV[12])
+redis.call('SADD', KEYS[12], ARGV[7])
+redis.call('SET', KEYS[4], next_generation)
+return {'ok'}
+"#;
+
+/// KEYS[5] tenant, [6] device, [7] service, [8] device services index.
+/// ARGV[3] tenant, [4] device, [5] service, [6] type, [7] display name,
+/// [8] capabilities JSON.
+const SCRIPT_ADD_SERVICE_BODY: &str = r#"
+if h(KEYS[5], 'active') ~= '1' then return {'tenant'} end
+if h(KEYS[6], 'active') ~= '1' then return {'device'} end
+if redis.call('EXISTS', KEYS[7]) == 1 then return {'service_exists'} end
+redis.call('HSET', KEYS[7], 'tenant_id', ARGV[3], 'device_id', ARGV[4], 'service_id', ARGV[5], 'service_type', ARGV[6], 'display_name', ARGV[7], 'capabilities', ARGV[8], 'version', '1', 'active', '1')
+redis.call('SADD', KEYS[8], ARGV[5])
+redis.call('SET', KEYS[4], next_generation)
+return {'ok'}
+"#;
+
+/// The record rules of [`RedisCatalog::add_user`], applied before any Redis
+/// call.  Public so an operator command's dry run applies exactly these rules
+/// without contacting Redis (task row M6-C31).
+pub fn validate_user_addition(
+    user: &UserRecord,
+    identity: &PrincipalIdentity,
+    membership: &MembershipRecord,
+) -> Result<(), CatalogError> {
+    if identity.user_id != user.user_id
+        || membership.user_id != user.user_id
+        || !membership.active
+        || !valid_principal_identity(&identity.issuer, &identity.subject)
+    {
+        return Err(CatalogError::InvalidInput("user addition"));
+    }
+    Ok(())
+}
+
+/// The record rules of [`RedisCatalog::add_device`], applied before any
+/// Redis call (M6-C31).
+pub fn validate_device_addition(
+    device: &FixtureDevice,
+    credential: &CredentialRecord,
+) -> Result<(), CatalogError> {
+    if credential.tenant_id != device.tenant_id
+        || credential.device_id != device.device_id
+        || !device.active
+        || !credential.active
+        || credential.revoked_at.is_some()
+        || !valid_fingerprint(&credential.spki_fingerprint)
+        || credential.expires_at <= credential.not_before
+    {
+        return Err(CatalogError::InvalidInput("device addition"));
+    }
+    Ok(())
+}
+
+/// The record rules of [`RedisCatalog::add_service`], applied before any
+/// Redis call (M6-C31).
+pub fn validate_service_addition(service: &ServiceSpec) -> Result<(), CatalogError> {
+    if service.service_type.trim().is_empty() || !service.active {
+        return Err(CatalogError::InvalidInput("service addition"));
+    }
+    Ok(())
+}
+
+/// Map a day-2 addition script's reply to its outcome.  Every refusal is
+/// static text naming the record, never a Redis error string.
+fn day2_reply(reply: &[String]) -> Result<(), CatalogError> {
+    match reply.first().map(String::as_str) {
+        Some("ok") => Ok(()),
+        Some("unprovisioned") => Err(CatalogError::Conflict(
+            "namespace has not been provisioned; run provision-catalog first",
+        )),
+        Some("incarnation") => Err(CatalogError::Conflict(
+            "active deployment incarnation or Redis authority run",
+        )),
+        Some("overflow") => Err(CatalogError::RevisionOverflow),
+        Some("tenant") => Err(CatalogError::Conflict(
+            "tenant does not exist or is inactive",
+        )),
+        Some("owner") => Err(CatalogError::Conflict(
+            "owner is not an active member of the tenant",
+        )),
+        Some("device") => Err(CatalogError::Conflict(
+            "device does not exist or is inactive",
+        )),
+        Some("user_exists") => Err(CatalogError::Conflict("user already exists")),
+        Some("identity_exists") => Err(CatalogError::Conflict(
+            "the issuer subject is already bound to a user",
+        )),
+        Some("membership_exists") => Err(CatalogError::Conflict("membership already exists")),
+        Some("device_exists") => Err(CatalogError::Conflict(
+            "device already exists in the tenant (a revoked device id is not reused)",
+        )),
+        Some("fingerprint_exists") => Err(CatalogError::Conflict("duplicate SPKI fingerprint")),
+        Some("credential_exists") => Err(CatalogError::Conflict("credential already exists")),
+        Some("service_exists") => Err(CatalogError::Conflict("service already exists")),
+        _ => Err(CatalogError::Serialization(
+            "invalid Redis catalog change reply".into(),
+        )),
+    }
+}
 
 const SCRIPT_SEED_CREDENTIAL: &str = r#"
 local existing = redis.call('GET', KEYS[2])

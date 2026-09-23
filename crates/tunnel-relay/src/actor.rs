@@ -13012,11 +13012,17 @@ impl RelayActor {
                         && current.credential_revoked_at.is_none() => {}
                 Ok(None) | Ok(Some(_)) => {
                     // A confirmed authorization denial is more specific than
-                    // an independent authority error, while an exact owner
-                    // fence remains the strongest terminal signal.
-                    if !matches!(close_reason, Some("OWNER_FENCED")) {
-                        close_reason = Some("AUTHORIZATION_REVOKED");
-                    }
+                    // an independent authority error, and it also outranks a
+                    // failed renewal seen in the same round: revoking a
+                    // device deletes its owner lease in the same script
+                    // (`revoke_device`), so a renewal that lands on that tick
+                    // fails *because of* the revocation.  Reporting
+                    // OWNER_FENCED there would tell the device to find its
+                    // new owner and retry, when the true cause -- and the
+                    // one the operator acted on -- is that it is no longer
+                    // authorized (task row M6-C31 review).  An owner fence
+                    // with a still-authorized identity stays OWNER_FENCED.
+                    close_reason = Some("AUTHORIZATION_REVOKED");
                 }
                 Err(error) => {
                     authority_failure.get_or_insert(error);
@@ -19849,6 +19855,20 @@ mod stream_identity_tests {
             ),
             (Some(Ok(false)), Ok(Some(identity.clone())), "OWNER_FENCED"),
             (None, Ok(None), "AUTHORIZATION_REVOKED"),
+            // M6-C31 review: `revoke_device` deletes the owner lease in the
+            // same script that deactivates the device, so a renewal landing
+            // on that tick fails.  The revocation, not the fence, is the
+            // cause, in both shapes the identity read can take.
+            (Some(Ok(false)), Ok(None), "AUTHORIZATION_REVOKED"),
+            (
+                Some(Ok(false)),
+                Ok(Some(DeviceIdentity {
+                    device_active: false,
+                    device_version: identity.device_version + 1,
+                    ..identity.clone()
+                })),
+                "AUTHORIZATION_REVOKED",
+            ),
             (
                 None,
                 Err(MaintenanceAuthorityFailure {

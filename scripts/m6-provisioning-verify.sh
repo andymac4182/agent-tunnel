@@ -31,16 +31,27 @@
 #    Each must answer one real consumer request from the device-side backend:
 #    MCP `initialize` and a `tools/call`, ACP `initialize`, and a 9P read of
 #    a synthetic file.
+# 6. Runs task row M6-C31's gate in the same binary: with `serve` running and
+#    never restarted, `add-user`, `add-device` (a new key and a certificate
+#    from the test's synthetic device CA), `add-service` and `set-grant` add a
+#    second user and device; the second device connects and serves the
+#    second user an echo; the first request after `set-grant` is served and
+#    the first after `revoke-grant` refused; `revoke-device` closes the live
+#    session (`AUTHORIZATION_REVOKED`) and the device exits 3.  Its catalog
+#    test (M6-C31, in step 2) proves each addition refuses an unprovisioned
+#    namespace, a stale incarnation and every duplicate, and leaves the
+#    incarnation, run and reservation keys unchanged.
 #
 # Every Redis test these steps run is `#[ignore]`d in the ordinary workspace
-# run because it needs Redis: the 3 catalog provisioning tests, the 3 Redis
-# connection stage tests, and the 6 end-to-end tests (M6-C21, M7-C92, M7-C93
-# and the three M6-C57 service gates).  A filtered or skipped test would print
-# `0 passed` and exit 0, so this script requires each run's own pass count and
-# each gate's own `ok` line (`m6c21-e2e`, `m7c92-echo`, `m7c93-rotation`,
-# `m6c57-mcp`, `m6c57-acp`, `m6c57-fs`, each M6-C57 line with the refused
-# stranger's exact `stranger_status=401`), and exits 1 when any is missing:
-# green here means the tests ran.
+# run because it needs Redis: the 4 catalog provisioning tests, the 3 Redis
+# connection stage tests, and the 7 end-to-end tests (M6-C21, M7-C92, M7-C93,
+# the three M6-C57 service gates and M6-C31).  A filtered or skipped test
+# would print `0 passed` and exit 0, so this script requires each run's own
+# pass count and each gate's own `ok` line (`m6c21-e2e`, `m7c92-echo`,
+# `m7c93-rotation`, `m6c57-mcp`, `m6c57-acp`, `m6c57-fs`, each M6-C57 line
+# with the refused stranger's exact `stranger_status=401`, `m6c31-catalog`
+# with its measured fields), and exits 1 when any is missing: green here
+# means the tests ran.
 set -eu
 
 if [ -z "${TEST_REDIS_URL:-}" ]; then
@@ -88,7 +99,7 @@ echo "m6-provisioning-verify: catalog first activation and provisioning" >&2
 cargo test -p tunnel-catalog --test redis_provisioning --locked -- --ignored --test-threads=1 \
   > "$scratch/catalog.log" 2>&1 || { cat "$scratch/catalog.log" >&2; exit 1; }
 cat "$scratch/catalog.log"
-require "catalog provisioning tests" "$scratch/catalog.log" "test result: ok. 3 passed"
+require "catalog provisioning tests" "$scratch/catalog.log" "test result: ok. 4 passed"
 
 echo "m6-provisioning-verify: Redis connection stage, lane and class (M6-C72)" >&2
 cargo test -p tunnel-catalog --test redis_connection_stage --locked -- --ignored --nocapture \
@@ -102,7 +113,7 @@ echo "m6-provisioning-verify: end-to-end shipped-binary gate" >&2
 cargo test -p tunnel-relay --test m6_provisioning_process --locked -- --ignored --nocapture \
   --test-threads=1 > "$scratch/e2e.log" 2>&1 || { cat "$scratch/e2e.log" >&2; exit 1; }
 cat "$scratch/e2e.log"
-require "end-to-end gate" "$scratch/e2e.log" "test result: ok. 6 passed" "m6c21-e2e ok nonce=" \
+require "end-to-end gate" "$scratch/e2e.log" "test result: ok. 7 passed" "m6c21-e2e ok nonce=" \
   "m6c57-mcp ok nonce=" "tools_call=200 marker_echoed=true" \
   "backend_invocations=1 stranger_status=401" \
   "m6c57-acp ok nonce=" "agent_protocol_version=1 connection_id=present stranger_status=401" \
@@ -114,7 +125,10 @@ require "end-to-end gate" "$scratch/e2e.log" "test result: ok. 6 passed" "m6c21-
   "m6c72-stage ok case=wrong Redis CA" "m6c72-stage ok case=wrong Redis password" \
   "m6c72-stage ok case=ACL user without INFO" "m6c72-stage ok case=missing client certificate" \
   "m7c92-echo ok nonce=" "required=300 sessions=1" \
-  "m7c93-rotation ok nonce=" "max=120 sessions=1"
+  "m7c93-rotation ok nonce=" "max=120 sessions=1" \
+  "m6c31-catalog ok nonce=" "serve_restarts=0 grant_pickup_ms=" \
+  "grant_pickup_attempts=1" "revoke_grant_attempts=1" \
+  "close_reason=AUTHORIZATION_REVOKED" "device_exit=3 revoked_device_grant_refused=true"
 if [ -n "${TUNNEL_RELAY_BIN:-}" ]; then
   require "end-to-end gate ran the requested relay" "$scratch/e2e.log" "relay=$TUNNEL_RELAY_BIN"
 fi

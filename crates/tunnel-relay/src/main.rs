@@ -324,6 +324,60 @@ async fn run() -> Result<(), Box<dyn Error>> {
             .await?;
             println!("{line}");
         }
+        // Day-2 catalog changes on a provisioned namespace (M6-C31).  Each is
+        // one atomic Redis script, so like `provision-catalog` a first stop
+        // request lets it finish rather than abandoning it part-way.
+        [command, rest @ ..] if command == OsStr::new("add-user") => {
+            let line = run_to_completion("add-user", tunnel_relay::catalog_changes::add_user(rest))
+                .await?;
+            println!("{line}");
+        }
+        [command, rest @ ..] if command == OsStr::new("add-device") => {
+            let line = run_to_completion(
+                "add-device",
+                tunnel_relay::catalog_changes::add_device(rest),
+            )
+            .await?;
+            println!("{line}");
+        }
+        [command, rest @ ..] if command == OsStr::new("add-service") => {
+            let line = run_to_completion(
+                "add-service",
+                tunnel_relay::catalog_changes::add_service(rest),
+            )
+            .await?;
+            println!("{line}");
+        }
+        [command, rest @ ..] if command == OsStr::new("set-grant") => {
+            let line =
+                run_to_completion("set-grant", tunnel_relay::catalog_changes::set_grant(rest))
+                    .await?;
+            println!("{line}");
+        }
+        [command, rest @ ..] if command == OsStr::new("revoke-grant") => {
+            let line = run_to_completion(
+                "revoke-grant",
+                tunnel_relay::catalog_changes::revoke_grant(rest),
+            )
+            .await?;
+            println!("{line}");
+        }
+        [command, rest @ ..] if command == OsStr::new("revoke-device") => {
+            let line = run_to_completion(
+                "revoke-device",
+                tunnel_relay::catalog_changes::revoke_device(rest),
+            )
+            .await?;
+            println!("{line}");
+        }
+        [command, rest @ ..] if command == OsStr::new("revoke-credential") => {
+            let line = run_to_completion(
+                "revoke-credential",
+                tunnel_relay::catalog_changes::revoke_credential(rest),
+            )
+            .await?;
+            println!("{line}");
+        }
         [command, rest @ ..] if command == OsStr::new("recovery-initialize") => {
             run_to_completion("recovery-initialize", recovery_initialize(rest)).await?;
         }
@@ -335,7 +389,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
         }
         _ => {
             return Err(
-                "usage: tunnel-relay [--help | check-config [PATH] | check-serve-config --config PATH | initialize --config PATH | recovery-initialize --config PATH | recovery-observe --config PATH | recover --config PATH --approval PATH --expected-nonce NONCE --acknowledgement-id ID --old-primary-fenced --old-relays-fenced | activate-first-incarnation --config PATH | provision-catalog --config PATH --records PATH [--dry-run] | serve --config PATH]".into(),
+                "usage: tunnel-relay [--help | check-config [PATH] | check-serve-config --config PATH | initialize --config PATH | recovery-initialize --config PATH | recovery-observe --config PATH | recover --config PATH --approval PATH --expected-nonce NONCE --acknowledgement-id ID --old-primary-fenced --old-relays-fenced | activate-first-incarnation --config PATH | provision-catalog --config PATH --records PATH [--dry-run] | add-user|add-device|add-service|set-grant --config PATH --records PATH [--dry-run] | revoke-grant|revoke-device|revoke-credential --config PATH --tenant UUID ... [--dry-run] | serve --config PATH]".into(),
             );
         }
     }
@@ -1288,7 +1342,7 @@ fn parse_jwks(bytes: &[u8]) -> Result<Vec<ApprovedJwk>, Box<dyn Error>> {
 fn print_help() {
     println!(
         "tunnel-relay — authenticated multi-user Agent Tunnel relay\n\n\
-         Usage: tunnel-relay [--help | check-config [PATH] | check-serve-config --config PATH | initialize --config PATH | recovery-initialize --config PATH | recovery-observe --config PATH | recover --config PATH --approval PATH --expected-nonce NONCE --acknowledgement-id ID --old-primary-fenced --old-relays-fenced | activate-first-incarnation --config PATH | provision-catalog --config PATH --records PATH [--dry-run] | serve --config PATH]\n\n\
+         Usage: tunnel-relay [--help | check-config [PATH] | check-serve-config --config PATH | initialize --config PATH | recovery-initialize --config PATH | recovery-observe --config PATH | recover --config PATH --approval PATH --expected-nonce NONCE --acknowledgement-id ID --old-primary-fenced --old-relays-fenced | activate-first-incarnation --config PATH | provision-catalog --config PATH --records PATH [--dry-run] | add-user|add-device|add-service|set-grant --config PATH --records PATH [--dry-run] | revoke-grant|revoke-device|revoke-credential --config PATH --tenant UUID ... [--dry-run] | serve --config PATH]\n\n\
          check-config [PATH]       Validate legacy relay TOML without opening listeners.\n\
          check-serve-config --config PATH\n\
                                   Dry-run the configuration serve uses: full validation,\n\
@@ -1307,6 +1361,15 @@ fn print_help() {
          provision-catalog --config PATH --records PATH [--dry-run]\n\
                                   Write one tenant, user, device, credential, service\n\
                                   and grant into a newly activated namespace.\n\
+         add-user | add-device | add-service | set-grant --config PATH --records PATH [--dry-run]\n\
+                                  Add one user, device (with its certificate's\n\
+                                  credential) or service, or add or replace one grant,\n\
+                                  in a provisioned namespace while the relay serves.\n\
+         revoke-grant --config PATH --tenant UUID --user UUID --device UUID --service UUID [--dry-run]\n\
+         revoke-device --config PATH --tenant UUID --device UUID [--dry-run]\n\
+         revoke-credential --config PATH --tenant UUID --device UUID --credential UUID [--dry-run]\n\
+                                  Revoke a grant, a device (its credentials, grants and\n\
+                                  live session) or one device credential.\n\
          serve --config PATH      Start consumer HTTPS and device mTLS WSS listeners."
     );
 }

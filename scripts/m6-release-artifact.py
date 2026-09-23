@@ -1572,6 +1572,16 @@ DOCS_SHAPE_ONLY_PERMITTED = {
     ("tunnel-relay", "recover"),
     ("tunnel-relay", "activate-first-incarnation"),
     ("tunnel-relay", "provision-catalog"),
+    # M6-C31: the day-2 catalog commands write the Redis authority for the
+    # same reason; `scripts/m6-provisioning-verify.sh` runs them against a
+    # real Redis while `serve` runs, and each `--dry-run` is executed.
+    ("tunnel-relay", "add-user"),
+    ("tunnel-relay", "add-device"),
+    ("tunnel-relay", "add-service"),
+    ("tunnel-relay", "set-grant"),
+    ("tunnel-relay", "revoke-grant"),
+    ("tunnel-relay", "revoke-device"),
+    ("tunnel-relay", "revoke-credential"),
 }
 #: Flags that make a permitted command runnable offline, so a shape-only
 #: command carrying one is a demoted executable command.
@@ -1594,8 +1604,13 @@ DOCS_PINNED_SECTIONS: dict[str, tuple[int, int, int]] = {
     # the relay example and a `printf` of its `[http_forward]` table, exit
     # status only; three `sed` displays of eight lines each; four dry runs,
     # two of them refusals of two lines each; and the `sed` that makes the
-    # unsupported type) and 31 assertions.
-    "2. Credential provisioning": (27, 42, 2),
+    # unsupported type) and 31 assertions.  M6-C31 added section 2.5: 17
+    # commands (four `printf` records documents, the `printf` extensions file,
+    # `mkdir`, the client-profile `sed`, `openssl x509 -req` and the
+    # wrong-certificate `sed`, exit status only; `credentials create`; seven dry
+    # runs, one of them a two-line refusal), 9 assertions, and the seven
+    # Redis-writing day-2 commands as shape-only.
+    "2. Credential provisioning": (44, 51, 9),
     # M6-C23 (reconnect): section 3.1's unreachable-relay rehearsal now
     # appends a bounded `[reconnect]` table (`printf`, exit status only) and
     # shows the backoff events of one retry (five assertion lines), then the

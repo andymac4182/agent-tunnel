@@ -5,7 +5,9 @@ Status: written for task row M6-02 on 2026-09-23 against `origin/main` at
 added for task row M6-C21 on 2026-09-23 against `0da55ac`; sections 3.1 and
 4 (reconnect, service units, upgrade) revised for M6-C23 on 2026-09-23
 against `da2a24d`; section 2.3 extended to MCP, ACP and filesystem services for
-M6-C57 on 2026-09-23 against `721ed2a`. This is the guide
+M6-C57 on 2026-09-23 against `721ed2a`; section 2.5 (day-2 catalog changes)
+added for M6-C31 on 2026-09-24 against `6091f4c` and merged forward to
+`8f486bf`. This is the guide
 an outside tester follows first. It covers what to download and verify, device
 credentials, catalog provisioning, relay configuration, readiness, and the
 diagnostics the binaries have today. **Where the alpha cannot do something,
@@ -39,17 +41,18 @@ build an archive and a checksum itself, and it says in its output that the
 first step then could not have failed for a real download's reason.
 
 Commands marked **shape-only** need a live Redis authority or a live relay,
-so the check cannot run them. Only six may be marked that way:
+so the check cannot run them. Only thirteen may be marked that way:
 `tunnel-relay serve`, `tunnel-client connect`, `tunnel-relay recovery-observe`,
-`tunnel-relay recover`, and the two provisioning commands that write Redis,
-`tunnel-relay activate-first-incarnation` and `tunnel-relay provision-catalog`
-(never with `--dry-run`, which contacts no Redis and is executed below). It
+`tunnel-relay recover`, the two provisioning commands that write Redis,
+`tunnel-relay activate-first-incarnation` and `tunnel-relay provision-catalog`,
+and the seven day-2 catalog commands of section 2.5 (never with `--dry-run`,
+which contacts no Redis and is executed below). It
 checks only that the real binary accepts the documented subcommand and flags;
-**their runtime behaviour is not checked by this guide.** The two provisioning
-commands, `serve` and `connect` are instead run end to end, against a real
-Redis, by `scripts/m6-provisioning-verify.sh` (section 2.3), and `connect`'s
-reconnect across a relay restart by `scripts/m6-reconnect-verify.sh`
-(section 3.1).
+**their runtime behaviour is not checked by this guide.** The provisioning
+and day-2 commands, `serve` and `connect` are instead run end to end, against
+a real Redis, by `scripts/m6-provisioning-verify.sh` (sections 2.3 and 2.5),
+and `connect`'s reconnect across a relay restart by
+`scripts/m6-reconnect-verify.sh` (section 3.1).
 
 The same check also compares the client exit-code table in
 [runtime.md](runtime.md#client-exit-codes) with the `Cause` mapping in
@@ -60,8 +63,9 @@ The same check also compares the client exit-code table in
 Read this first. With the release bundle, a Redis server that speaks TLS, an
 identity issuer and a certificate issuer, an outside tester can bring up **one
 relay and one device** and serve one service through them: the synthetic echo,
-an MCP server, an ACP agent or a filesystem export (sections 2 and 3). Anything
-larger is not supported yet:
+an MCP server, an ACP agent or a filesystem export (sections 2 and 3). Further
+users, devices, services and grants are added to that relay, and revoked,
+while it runs (section 2.5). Anything larger is not supported yet:
 
 | Capability | State in this alpha | Row |
 | --- | --- | --- |
@@ -71,7 +75,7 @@ larger is not supported yet:
 | Creating one tenant, user, device, credential record, service and grant in the Redis catalog | Supported, once per namespace, with `tunnel-relay provision-catalog` (section 2.3) | M6-C21 |
 | Service types `provision-catalog` can create | The synthetic echo (`echo`), an MCP server or an ACP agent (`http-forward`, by `http_forward_profile`), and a filesystem export (`fs`), one per namespace (section 2.3); any other type is refused by the dry run | M6-C57 |
 | First activation of a deployment incarnation in a new Redis namespace | Supported with `tunnel-relay activate-first-incarnation` (section 2.3) | M6-C21 |
-| Adding, changing or revoking records after the first provisioning (more devices, users, grants) | **Not supported in this alpha**: no shipped command writes them | M6-C31 |
+| Adding users, devices, services and grants after the first provisioning, replacing a grant, and revoking a grant, device or credential | Supported while `serve` runs, with `add-user`, `add-device`, `add-service`, `set-grant`, `revoke-grant`, `revoke-device` and `revoke-credential` (section 2.5); a second tenant, and changing or deactivating a user or service, are **not supported in this alpha** | M6-C31 |
 | Cluster membership publishing and the HTTPS checkpoint authority | **Not supported in this alpha**: a cluster relay needs both and neither is shipped | M6-C22 |
 | Automatic reconnect of `connect` after a relay restart or a network loss | Supported, with bounded jittered backoff (section 3.1) | M6-C23 |
 | Service installation | Example systemd units (relay and client) and a launchd agent (client) in `examples/service/`, checked but not packaged in the bundle (section 4); **Windows service: not supported in this alpha** | M6-C23 |
@@ -478,11 +482,9 @@ rules, and each needs its own operation in the token's `scope`:
   with subprotocol `agent-tunnel.9p.v1` opens a 9P2000.L session
   ([filesystem-api.md](filesystem-api.md)). The bundle ships no client for it.
 
-**Not supported in this alpha:** anything after the first provisioning. There
-is no shipped command to add a second device, user or grant, to change a
-grant, or to revoke a device or credential (M6-C31); the catalog library has
-the revocation and grant operations, but no command exposes them. A cluster
-also needs the authorities in section 3.3 (M6-C22).
+Further users, devices, services and grants, grant changes and revocations
+are section 2.5's commands, run against the same namespace while `serve` runs
+(M6-C31). A cluster also needs the authorities in section 3.3 (M6-C22).
 
 ### 2.4 Redis credentials
 
@@ -527,6 +529,154 @@ included (M6-C74). On a fresh Fly machine the first lookup of a `.internal`
 name took about 2 seconds. Before M6-C73 the connection budget was redis-rs's
 one-second default, so that lookup alone failed `activate-first-incarnation`
 with `stage=connection_establishment class=timeout`.
+
+### 2.5 Day-2 catalog changes: more users and devices, grants, revocation
+
+`provision-catalog` runs once per namespace. After that, seven `tunnel-relay`
+commands change the catalog **while `serve` is running**, with no restart
+(task row M6-C31). This is how each further tester gets their own user and
+device on your relay:
+
+| Command | What it does |
+| --- | --- |
+| `add-user --records USER.toml` | Adds one user, bound to the `sub` your identity issuer gives them, as a member of an existing tenant |
+| `add-device --records DEVICE.toml` | Adds one device, owned by an existing member, with the credential of its issued certificate |
+| `add-service --records SERVICE.toml` | Adds one service to an existing device, of the types in section 2.3 |
+| `set-grant --records GRANT.toml` | Adds the grant of one user on one service, or replaces it (the revision goes up) |
+| `revoke-grant --tenant T --user U --device D --service S` | Revokes one grant |
+| `revoke-device --tenant T --device D` | Revokes a device, every credential and grant it has, and its owner lease |
+| `revoke-credential --tenant T --device D --credential C` | Revokes one credential of a device, for example a lost key |
+
+Each command also takes `--config`, the relay's own serving configuration,
+exactly as `provision-catalog` does, and `--dry-run`. A dry run applies every
+rule the write applies to the records themselves and contacts no Redis: the
+service types and operations of section 2.3, the device certificate's SAN and
+validity, and the no-wildcard rule. What depends on what the namespace already
+holds (the tenant exists, the device's owner is an active member, every
+identifier is new, the service a grant names has those operations) is checked
+by the write. Each write is one Redis script, so it happens completely or not
+at all. It refuses a namespace `provision-catalog` has not run on, a relay
+configuration whose incarnation is not the active one, and any duplicate: an
+existing user, `sub`, device, certificate key or service is refused by name and
+nothing is overwritten. None of the commands changes the incarnation. Records
+documents refuse unknown fields, like section 2.3's.
+
+A second tester, in the tenant of `examples/m6-catalog.toml`. Their user:
+
+```console
+$ printf '[user]\ntenant = "11111111-1111-4111-8111-111111111111"\nid = "88888888-8888-4888-8888-888888888888"\ndisplay_name = "Second tester"\noidc_subject = "second-tester"\n' > trial/user-2.toml
+$ tunnel-relay add-user --config examples/m1-relay.toml --records trial/user-2.toml --dry-run
+Catalog change is valid for namespace agent-tunnel-m1: add-user tenant=11111111-1111-4111-8111-111111111111 user=88888888-8888-4888-8888-888888888888 role=member. This dry run contacted no Redis authority and wrote nothing.
+```
+
+Their device is set up exactly as in section 2.1, with its own `device_id` and
+export name, and its certificate is signed by the same issuer. The records
+document names the owner and the certificate; like section 2.3's, the path is
+relative to the document. The dry run refuses a certificate issued for another
+device:
+
+```console
+$ mkdir trial-2
+$ sed -e 's/33333333-3333-4333-8333-333333333333/99999999-9999-4999-8999-999999999999/' -e 's/44444444-4444-4444-8444-444444444444/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/' examples/m1-client.toml > trial-2/client.toml
+$ tunnel-client credentials create --config trial-2/client.toml --csr-out device.csr
+Created local credential request at trial-2/device.csr and private key at trial-2/credentials/device-key.pem.
+$ printf 'basicConstraints=CA:FALSE\nkeyUsage=digitalSignature\nextendedKeyUsage=clientAuth\nsubjectAltName=URI:urn:agent-tunnel:device:99999999-9999-4999-8999-999999999999\n' > trial-ca/device-2-ext.cnf
+$ openssl x509 -req -in trial-2/device.csr -CA trial-ca/ca.pem -CAkey trial-ca/ca-key.pem -CAcreateserial -days 1 -extfile trial-ca/device-2-ext.cnf -out trial-2/device-cert.pem
+$ printf '[device]\ntenant = "11111111-1111-4111-8111-111111111111"\nowner = "88888888-8888-4888-8888-888888888888"\nid = "99999999-9999-4999-8999-999999999999"\ndisplay_name = "Second tester device"\ncertificate = "device-cert.pem"\n' > trial-2/device.toml
+$ tunnel-relay add-device --config examples/m1-relay.toml --records trial-2/device.toml --dry-run
+Catalog change is valid for namespace agent-tunnel-m1: add-device tenant=11111111-1111-4111-8111-111111111111 device=99999999-9999-4999-8999-999999999999 owner=88888888-8888-4888-8888-888888888888 credential=... spki_sha256=... credential_valid=.... This dry run contacted no Redis authority and wrote nothing.
+$ sed 's/"device-cert.pem"/"..\/trial\/device-cert.pem"/' trial-2/device.toml > trial-2/wrong-device.toml
+$ tunnel-relay add-device --config examples/m1-relay.toml --records trial-2/wrong-device.toml --dry-run; echo "exit=$?"
+tunnel-relay: invalid device certificate: its urn:agent-tunnel:device: SAN must name device.id 99999999-9999-4999-8999-999999999999
+exit=1
+```
+
+Its service and the second tester's grant on it. The grant document names the
+user, device and service; `set-grant` with the same four identifiers later
+replaces it:
+
+```console
+$ printf '[service]\ntenant = "11111111-1111-4111-8111-111111111111"\ndevice = "99999999-9999-4999-8999-999999999999"\nid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"\ntype = "echo"\ndisplay_name = "Second tester echo"\noperations = ["echo:invoke"]\n' > trial-2/service.toml
+$ tunnel-relay add-service --config examples/m1-relay.toml --records trial-2/service.toml --dry-run
+Catalog change is valid for namespace agent-tunnel-m1: add-service tenant=11111111-1111-4111-8111-111111111111 device=99999999-9999-4999-8999-999999999999 service=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa service_type=echo operations=echo:invoke. This dry run contacted no Redis authority and wrote nothing.
+$ printf '[grant]\ntenant = "11111111-1111-4111-8111-111111111111"\nuser = "88888888-8888-4888-8888-888888888888"\ndevice = "99999999-9999-4999-8999-999999999999"\nservice = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"\noperations = ["echo:invoke"]\n' > trial-2/grant.toml
+$ tunnel-relay set-grant --config examples/m1-relay.toml --records trial-2/grant.toml --dry-run
+Catalog change is valid for namespace agent-tunnel-m1: set-grant tenant=11111111-1111-4111-8111-111111111111 user=88888888-8888-4888-8888-888888888888 device=99999999-9999-4999-8999-999999999999 service=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa grant_operations=echo:invoke. This dry run contacted no Redis authority and wrote nothing.
+```
+
+Revocations take identifiers, not a document. `add-device` prints the
+credential identifier `revoke-credential` needs:
+
+```console
+$ tunnel-relay revoke-grant --config examples/m1-relay.toml --tenant 11111111-1111-4111-8111-111111111111 --user 88888888-8888-4888-8888-888888888888 --device 99999999-9999-4999-8999-999999999999 --service aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa --dry-run
+Catalog change is valid for namespace agent-tunnel-m1: revoke-grant tenant=11111111-1111-4111-8111-111111111111 user=88888888-8888-4888-8888-888888888888 device=99999999-9999-4999-8999-999999999999 service=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa. This dry run contacted no Redis authority and wrote nothing.
+$ tunnel-relay revoke-device --config examples/m1-relay.toml --tenant 11111111-1111-4111-8111-111111111111 --device 99999999-9999-4999-8999-999999999999 --dry-run
+Catalog change is valid for namespace agent-tunnel-m1: revoke-device tenant=11111111-1111-4111-8111-111111111111 device=99999999-9999-4999-8999-999999999999. This dry run contacted no Redis authority and wrote nothing.
+```
+
+Then, against your Redis, the writes. **Shape-only:** they write Redis, which
+this guide's check does not have. `scripts/m6-provisioning-verify.sh` runs
+the four additions, `revoke-grant` and `revoke-device` end to end against a
+real Redis while `serve` is running, and `revoke-credential`'s refusal of a
+credential that is no longer active:
+
+```sh shape-only
+tunnel-relay add-user --config /etc/agent-tunnel/relay.toml --records /etc/agent-tunnel/user-2.toml
+tunnel-relay add-device --config /etc/agent-tunnel/relay.toml --records /etc/agent-tunnel/device-2.toml
+tunnel-relay add-service --config /etc/agent-tunnel/relay.toml --records /etc/agent-tunnel/service-2.toml
+tunnel-relay set-grant --config /etc/agent-tunnel/relay.toml --records /etc/agent-tunnel/grant-2.toml
+tunnel-relay revoke-grant --config /etc/agent-tunnel/relay.toml --tenant 11111111-1111-4111-8111-111111111111 --user 88888888-8888-4888-8888-888888888888 --device 99999999-9999-4999-8999-999999999999 --service aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa
+tunnel-relay revoke-device --config /etc/agent-tunnel/relay.toml --tenant 11111111-1111-4111-8111-111111111111 --device 99999999-9999-4999-8999-999999999999
+tunnel-relay revoke-credential --config /etc/agent-tunnel/relay.toml --tenant 11111111-1111-4111-8111-111111111111 --device 99999999-9999-4999-8999-999999999999 --credential bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb
+```
+
+Each addition prints `Added to namespace ...:` and the identifiers it wrote.
+**Keep `add-device`'s output:** the `credential=` identifier it prints is
+what `revoke-credential` needs, and no command lists credentials.
+`set-grant` prints `Added grant` or `Replaced grant` with the grant's
+`revision=`. Each revocation prints what it revoked. A refusal exits `1` and
+names the record, for example `add-user refused for user ...: catalog
+conflict: user already exists`, or `revoke-grant refused: no grant (...) in
+this namespace`. `set-grant` refuses a revoked device ("the device is
+revoked"). A revoked device's identifier cannot be added again, because
+its lease fence must never go backwards, so give a replacement device a new
+UUID. As with `provision-catalog`, a first SIGTERM or Ctrl-C lets a command
+finish, and a second abandons it with exit `130` and an unknown outcome.
+
+**When a change takes effect.** The relay caches no catalog record. Every
+device connection looks up its certificate's key, and every consumer request
+looks up the user and authorizes the grant, in Redis. So:
+
+* **A new user, device, service or grant** is used by the next connection or
+  request, with no restart. Measured in 8 runs of the end-to-end gate at
+  `72ae080`, with `serve` running throughout: the first request after
+  `set-grant` was served every time, 16 to 226 ms after the command exited
+  (six of the eight under 30 ms), and the second device's first echo was
+  served 131 to 145 ms after its `connect` started.
+* **`revoke-grant`**: the next request is refused (`403` or `404`). Measured:
+  the first request after the command was refused every time, 9 to 26 ms
+  after it exited. A request already admitted keeps the authorization it was
+  given for at most 5 seconds.
+* **`revoke-device` and `revoke-credential`**: the next request is refused,
+  and the relay also **closes the device's live session** at its next
+  maintenance check, with close reason `AUTHORIZATION_REVOKED`. That holds
+  even when a lease renewal lands on the same check: `revoke-device` deletes
+  the device's owner lease, and before the M6-C31 review such a check
+  reported `OWNER_FENCED` instead. Checks run
+  every 500 ms for up to 64 sessions at a time on each relay, so the bound is
+  about 500 ms plus one Redis round trip for up to 64 connected devices, and
+  another 500 ms for each further 64 (read from the source; only one session
+  was measured). Measured for `revoke-device`: the first request after it was
+  refused every time, and the session closed 102 to 486 ms after the command
+  exited; the device then reported the refused reconnect, `connect` exiting
+  `3` with a non-retryable `CREDENTIAL_ERROR`. `revoke-credential` uses the
+  same maintenance check but its session close was not measured.
+
+**Not supported in this alpha:** a second tenant, changing or deactivating a
+user or a membership, changing a service's type or operations, and
+reactivating a revoked device or credential. Renewing a device certificate is
+M6-C56. A namespace left partly provisioned (M6-C35) can take these additions,
+but it is still not repaired.
 
 ## 3. Deployment
 
