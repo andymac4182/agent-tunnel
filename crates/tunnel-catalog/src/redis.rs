@@ -49,7 +49,18 @@ const REDIS_OPERATION_TIMEOUT: Duration = Duration::from_secs(2);
 /// covers DNS, and the first lookup on a fresh Fly machine was measured at
 /// 2,038 ms, so the old budget expired before TCP connect began.  Ten seconds
 /// is that cold lookup with about 4x headroom, and still bounded.
+///
+/// It governs the connections a catalog opens (the primary and its lanes)
+/// and recovery connections.  **It does not reach a lane reconnect inside a
+/// running relay**: `AuthorityLane::admit` caps the whole verification,
+/// reconnect included, at [`REDIS_OPERATION_TIMEOUT`] while holding the lane
+/// lock, deliberately, so sibling callers never queue behind a ten-second
+/// connect (M6-C74).
 pub(crate) const REDIS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+// The budget covers the measured 2,038 ms cold lookup with headroom and is
+// separate from, and longer than, the per-command deadline (M6-C73).
+const _: () = assert!(REDIS_CONNECT_TIMEOUT.as_millis() >= 4 * 2_038);
+const _: () = assert!(REDIS_CONNECT_TIMEOUT.as_millis() > REDIS_OPERATION_TIMEOUT.as_millis());
 const AUTHORIZATION_CONNECTIONS: usize = 4;
 /// Physical lanes reserved for the relay's per-session maintenance reads
 /// (`resolve_device`) and owner renewals (`renew_owner`).  Two lanes keep
@@ -2170,11 +2181,42 @@ pub fn validate_redis_namespace(namespace: &str) -> Result<(), CatalogError> {
 /// else; a reply slower than that is reported as a timeout distinct from a
 /// severed connection.  The connection timeout is set to `connect_budget`
 /// (the library default is one second, M6-C73), and callers apply the same
-/// budget around the call, so neither deadline undercuts the other.
+/// budget around the call, so neither deadline undercuts the other.  (A lane
+/// reconnect inside a running relay is additionally capped by
+/// `AuthorityLane::admit`; see [`REDIS_CONNECT_TIMEOUT`].)  Host names are
+/// resolved by [`CatalogResolver`], so a lookup failure is classified `dns`.
 pub(crate) fn connection_config(connect_budget: Duration) -> redis::AsyncConnectionConfig {
     redis::AsyncConnectionConfig::new()
         .set_response_timeout(Some(REDIS_OPERATION_TIMEOUT))
         .set_connection_timeout(Some(connect_budget))
+        .set_dns_resolver(CatalogResolver)
+}
+
+/// The system resolver, with a failed or empty lookup reported as the typed
+/// [`crate::error::DnsLookupFailed`] instead of redis-rs's generic
+/// "invalid client config" or an untyped I/O error.
+struct CatalogResolver;
+
+impl redis::io::AsyncDNSResolver for CatalogResolver {
+    fn resolve<'a, 'b: 'a>(
+        &'a self,
+        host: &'b str,
+        port: u16,
+    ) -> redis::RedisFuture<'a, Box<dyn Iterator<Item = std::net::SocketAddr> + Send + 'a>> {
+        Box::pin(async move {
+            let lookup_failed =
+                || redis::RedisError::from(std::io::Error::other(crate::error::DnsLookupFailed));
+            let addresses: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host, port))
+                .await
+                .map_err(|_| lookup_failed())?
+                .collect();
+            if addresses.is_empty() {
+                return Err(lookup_failed());
+            }
+            Ok(Box::new(addresses.into_iter())
+                as Box<dyn Iterator<Item = std::net::SocketAddr> + Send>)
+        })
+    }
 }
 
 /// Open one multiplexed connection within `connect_budget`, applied both
@@ -3785,7 +3827,33 @@ mod tests {
             CatalogConnectionStage::ConnectionEstablishment
         );
         assert_eq!(error.failure(), crate::CatalogConnectionFailure::Timeout);
-        assert!(elapsed < COLD_DNS, "expired before the lookup: {elapsed:?}");
+        // The library's one-second default decided, not the two-second
+        // outer deadline around it.
+        assert!(
+            elapsed < Duration::from_millis(1_500),
+            "redis-rs's one-second default expired first: {elapsed:?}"
+        );
+    }
+
+    /// M6-C74 review: a host name that does not resolve is classified `dns`,
+    /// not `config` (redis-rs's own resolver reports an empty lookup as an
+    /// invalid client configuration).
+    #[tokio::test]
+    async fn unresolvable_host_is_classified_dns() {
+        let client =
+            redis::Client::open("redis://m6c74-no-such-host.invalid:6379/").expect("client");
+        let error = super::connect_within(
+            &client,
+            &super::connection_config(super::REDIS_CONNECT_TIMEOUT),
+            super::REDIS_CONNECT_TIMEOUT,
+        )
+        .await
+        .expect_err("an .invalid host never resolves");
+        assert_eq!(
+            error.stage(),
+            CatalogConnectionStage::ConnectionEstablishment
+        );
+        assert_eq!(error.failure(), crate::CatalogConnectionFailure::Dns);
     }
 
     /// The effective connect budget is the configured one, inside redis-rs
@@ -3805,12 +3873,6 @@ mod tests {
             elapsed >= BUDGET - Duration::from_millis(100)
                 && elapsed < BUDGET + Duration::from_millis(1_500),
             "the configured {BUDGET:?} decided, not a library default: {elapsed:?}"
-        );
-        // The production budget covers the measured 2,038 ms cold lookup
-        // with headroom, and is separate from the per-command deadline.
-        const _: () = assert!(super::REDIS_CONNECT_TIMEOUT.as_millis() >= 4 * 2_038);
-        const _: () = assert!(
-            super::REDIS_CONNECT_TIMEOUT.as_millis() > super::REDIS_OPERATION_TIMEOUT.as_millis()
         );
     }
 

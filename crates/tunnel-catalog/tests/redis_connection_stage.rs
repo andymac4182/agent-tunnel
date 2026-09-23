@@ -6,7 +6,8 @@
 //! establishing the connection), an ACL user without `INFO` (`noperm` at the
 //! primary-identity check), and a lane connection that a forwarder accepts
 //! but never answers (`timeout` on lane 3 of 6, after the primary connection
-//! and two lanes succeeded).  None of these writes a catalog key.
+//! and two lanes succeeded, once the ten-second connect budget of M6-C73
+//! expires).  None of these writes a catalog key.
 
 use std::{
     net::SocketAddr,
@@ -189,12 +190,11 @@ async fn m6c72_silent_lane_reports_its_lane_and_a_timeout() {
         4,
         "no lane after the silent one"
     );
-    // redis-rs bounds connection setup with its own one-second default
-    // connection timeout, which fires before the catalog's two-second
-    // operation deadline; either is a `timeout`.
+    // The catalog's explicit ten-second connect budget decided (M6-C73),
+    // not redis-rs's one-second default.
     assert!(
-        elapsed >= Duration::from_millis(900) && elapsed < Duration::from_secs(10),
-        "a bounded deadline decided the failure: {elapsed:?}"
+        elapsed >= Duration::from_millis(9_500) && elapsed < Duration::from_secs(13),
+        "the ten-second connect budget decided the failure: {elapsed:?}"
     );
     println!(
         "m6c72-real ok case=lane-timeout stage={} nonce={nonce}",

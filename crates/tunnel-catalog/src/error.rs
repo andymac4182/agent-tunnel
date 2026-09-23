@@ -29,7 +29,11 @@ impl CatalogConnectionStage {
 /// methods continue to return [`CatalogError`]; the relay's startup path uses
 /// this wrapper so its bounded diagnostic can identify the explicit operation
 /// boundary without retaining a URL, credential, or backend error string.
-#[derive(Debug)]
+///
+/// Its `Debug` and `Display` print only the stage, lane and failure class,
+/// and it exposes no `source()`: the wrapped [`CatalogError`] can hold a raw
+/// `RedisError` whose text includes server replies or I/O messages, so it is
+/// reachable only by consuming the wrapper with [`Self::into_catalog_error`].
 pub struct CatalogConnectionError {
     stage: CatalogConnectionStage,
     lane: Option<CatalogConnectionLane>,
@@ -56,6 +60,9 @@ pub struct CatalogConnectionLane {
 pub enum CatalogConnectionFailure {
     /// The bounded operation deadline elapsed.
     Timeout,
+    /// The Redis host name did not resolve: the lookup failed or returned no
+    /// address.
+    Dns,
     /// The TCP connection was refused.
     Refused,
     /// The connection closed or failed at the transport layer.
@@ -92,6 +99,7 @@ impl CatalogConnectionFailure {
     pub const fn as_str(&self) -> &'static str {
         match self {
             Self::Timeout => "timeout",
+            Self::Dns => "dns",
             Self::Refused => "refused",
             Self::Io => "io",
             Self::TlsCertificate => "tls_certificate",
@@ -126,6 +134,20 @@ impl CatalogConnectionFailure {
     }
 }
 
+/// The typed marker the catalog's own DNS resolver wraps in the I/O error it
+/// returns when a Redis host name does not resolve, so the failure is
+/// classified by type rather than by redis-rs's or the resolver's text.
+#[derive(Debug)]
+pub(crate) struct DnsLookupFailed;
+
+impl fmt::Display for DnsLookupFailed {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("Redis host name lookup failed")
+    }
+}
+
+impl Error for DnsLookupFailed {}
+
 fn classify_redis_error(error: &redis::RedisError) -> CatalogConnectionFailure {
     use redis::{ErrorKind, ServerErrorKind};
     match error.kind() {
@@ -159,6 +181,12 @@ fn classify_redis_error(error: &redis::RedisError) -> CatalogConnectionFailure {
     }) else {
         return CatalogConnectionFailure::Io;
     };
+    if io_error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<DnsLookupFailed>())
+    {
+        return CatalogConnectionFailure::Dns;
+    }
     if let Some(tls) = io_error
         .get_ref()
         .and_then(|inner| inner.downcast_ref::<rustls::Error>())
@@ -220,17 +248,33 @@ impl CatalogConnectionError {
     }
 }
 
-impl fmt::Display for CatalogConnectionError {
+impl fmt::Debug for CatalogConnectionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(&self.source, formatter)
+        formatter
+            .debug_struct("CatalogConnectionError")
+            .field("stage", &self.stage)
+            .field("lane", &self.lane)
+            .field("failure", &self.failure)
+            .finish_non_exhaustive()
     }
 }
 
-impl Error for CatalogConnectionError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        Some(&self.source)
+impl fmt::Display for CatalogConnectionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "Redis catalog connection failed; stage={}",
+            self.stage.as_str()
+        )?;
+        if let Some(lane) = self.lane {
+            write!(formatter, " lane={}/{}", lane.index, lane.total)?;
+        }
+        write!(formatter, " class={}", self.failure.as_str())
     }
 }
+
+/// No `source()`: see the type's documentation.
+impl Error for CatalogConnectionError {}
 
 impl From<CatalogConnectionError> for CatalogError {
     fn from(error: CatalogConnectionError) -> Self {
@@ -412,6 +456,9 @@ mod tests {
                 Failure::InvalidReply,
             ),
         ];
+        let dns: RedisError = io::Error::new(io::ErrorKind::Other, super::DnsLookupFailed).into();
+        let mut cases = cases.to_vec();
+        cases.push((dns, Failure::Dns));
         for (error, expected) in cases {
             let shown = error.to_string();
             assert_eq!(classify(error), expected, "{shown}");
@@ -432,10 +479,53 @@ mod tests {
         );
     }
 
+    /// `Debug`, `Display` and the error chain of a connection error print
+    /// only the bounded stage, lane and class, whatever the wrapped error
+    /// carries.
+    #[test]
+    fn connection_error_formatting_never_includes_the_wrapped_text() {
+        use super::{CatalogConnectionError, CatalogConnectionLane, CatalogConnectionStage};
+        let leaky = concat!(
+            "peer text ",
+            "rediss",
+            "://m6c74-user:",
+            "m6c74-synthetic-pass",
+            "@redis.example.test/0"
+        );
+        for source in [
+            RedisError::from(io::Error::new(io::ErrorKind::ConnectionReset, leaky)),
+            server_reply(&format!("ERR {leaky}")),
+        ] {
+            let error = CatalogConnectionError::new(
+                CatalogConnectionStage::Ping,
+                CatalogError::Database(source),
+            )
+            .with_lane(CatalogConnectionLane { index: 2, total: 6 });
+            for shown in [
+                format!("{error:?}"),
+                format!("{error:#?}"),
+                error.to_string(),
+            ] {
+                assert!(!shown.contains("m6c74-synthetic-pass"), "{shown}");
+                assert!(!shown.contains("rediss"), "{shown}");
+                assert!(!shown.contains("peer text"), "{shown}");
+            }
+            assert!(std::error::Error::source(&error).is_none());
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "Redis catalog connection failed; stage=ping lane=2/6 class={}",
+                    error.failure().as_str()
+                )
+            );
+        }
+    }
+
     #[test]
     fn failure_class_names_are_distinct_fixed_words() {
         let all = [
             Failure::Timeout,
+            Failure::Dns,
             Failure::Refused,
             Failure::Io,
             Failure::TlsCertificate,

@@ -745,6 +745,7 @@ mod tests {
         ];
         let failures = [
             Failure::Timeout,
+            Failure::Dns,
             Failure::Refused,
             Failure::Io,
             Failure::TlsCertificate,

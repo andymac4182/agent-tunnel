@@ -404,20 +404,24 @@ stage=STAGE [lane=N/6] class=CLASS`. It never prints the URL, a host name, a
 password or text from Redis. The relay opens one connection and then six lane
 connections; `lane=` appears only when a lane failed, so `lane=3/6` means the
 first connection and two lanes worked. `stage` is one of `tls_setup`,
-`connection_establishment` (TCP, TLS handshake and `AUTH`), `ping`,
+`connection_establishment` (DNS, TCP, TLS handshake and `AUTH`), `ping`,
 `primary_identity` (`INFO server`), `authority_profile` or
-`authority_identity` (the incarnation check). `class` is `timeout`,
-`refused`, `io`, `tls_certificate` (the server certificate was rejected, for
+`authority_identity` (the incarnation check). `class` is `timeout`, `dns`
+(the Redis host name did not resolve), `refused`, `io`, `tls_certificate` (the server certificate was rejected, for
 example a wrong CA), `tls_alert` (Redis refused the handshake, for example a
 missing or unaccepted client certificate), `tls`, `auth` (wrong user or
 password), `noperm` (the ACL user may not run the command, for example
-`INFO`), `reply`, `invalid_reply`, `run_id_conflict`, `config` or `catalog`.
+`INFO`), `reply`, `invalid_reply`, `run_id_conflict`, `config` (the
+configuration was rejected before any exchange) or `catalog`.
 The recovery commands print `recovery Redis connection failed;` followed by
 the same `stage=` and `class=` words.
 
-Each Redis connection gets **10 seconds** to open, covering the DNS lookup,
-TCP connect, TLS handshake and `AUTH`. After that, each command gets
-2 seconds (M6-C73). On a fresh Fly machine the first lookup of a `.internal`
+Each Redis connection the relay opens at startup, and each recovery
+connection, gets **10 seconds** to open, covering the DNS lookup, TCP
+connect, TLS handshake and `AUTH`. After that, each command gets 2 seconds
+(M6-C73). A lane that reconnects inside a running relay, for example after a
+Redis restart, still has only 2 seconds for the whole reconnect, DNS lookup
+included (M6-C74). On a fresh Fly machine the first lookup of a `.internal`
 name took about 2 seconds. Before M6-C73 the connection budget was redis-rs's
 one-second default, so that lookup alone failed `activate-first-incarnation`
 with `stage=connection_establishment class=timeout`.
