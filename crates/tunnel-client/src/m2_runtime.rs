@@ -1882,6 +1882,9 @@ async fn run_m2_session(
         // freeze this event may have started or ended.
         actor.publish_http_freeze();
     };
+    // Read before this loop cancels the token itself below: only a stop or a
+    // dropped handle has cancelled it at this point.
+    let result = m2_session_result(cancellation.is_cancelled(), result);
     readiness.send(Readiness::Stopping).ok();
     cancellation.cancel();
     actor.close_all_carriers().await;
@@ -1894,6 +1897,27 @@ async fn run_m2_session(
     actor.publish_closed(reason.clone());
     readiness.send(Readiness::Closed { reason }).ok();
     result
+}
+
+/// The M2 session's result once its loop has ended (task row M7-C84).
+///
+/// A stop cancels the shared token, and the carrier writers exit on that same
+/// token.  The loop selects on cancellation first, but a stop that lands while
+/// a deadline tick or an event is being handled resumes that body into a
+/// writer that has already gone, so the body fails with, for example,
+/// `stream forget barrier: data writer stopped before barrier completion`.
+/// That error is the stop's own teardown, not a session fault, so once the
+/// token was cancelled before the loop ended the session reports a stop, as
+/// the M1 supervisor already does through `session_failure_result`.  Without
+/// a stop every error still fails the session.
+fn m2_session_result(
+    cancellation_requested: bool,
+    result: Result<(), ClientError>,
+) -> Result<(), ClientError> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) => super::session_failure_result(cancellation_requested, error),
+    }
 }
 
 fn spawn_carrier(
@@ -11040,6 +11064,54 @@ mod tests {
             .await
             .expect("late forgotten frame is ignored");
         assert!(receiver.try_recv().is_err());
+    }
+
+    /// Task row M7-C84: a stop that lands while a STREAM_FORGET barrier is
+    /// pending.  The stop's cancellation has already stopped the carrier
+    /// writer, so queuing the barrier fails with exactly the error hosted
+    /// `verify-m7-membership-hint-drop` cleanup reported; the session must
+    /// report that as the stop it is, and without a stop still fail.
+    #[tokio::test]
+    async fn a_stop_during_a_pending_forget_barrier_ends_the_session_as_stopped() {
+        let (mut actor, _key, receiver, _control_receiver) =
+            test_actor_with_carrier(M2_CARRIER_QUEUE_FRAMES);
+        let (stream, final_state) = test_stream_with_owner_forget_proof(1);
+        actor.streams.insert(1, stream);
+        let forget = tunnel_protocol::rotation_control::StreamForget {
+            message_id: "forget".to_owned(),
+            reply_to: String::new(),
+            session_id: "session".to_owned(),
+            epoch: 1,
+            stream_id: 1,
+            operation_id: "operation".to_owned(),
+            direction: Direction::RelayToConnector,
+            final_state,
+        };
+        // The carrier writer exits on the shared token, dropping its receiver.
+        drop(receiver);
+        let error = actor
+            .handle_stream_forget(forget)
+            .expect_err("a barrier cannot be queued to a stopped writer");
+        assert!(matches!(
+            &error,
+            ClientError::Transport { scope: "stream forget barrier", detail }
+                if detail == "data writer stopped before barrier completion"
+        ));
+        assert!(
+            m2_session_result(true, Err(error)).is_ok(),
+            "after a stop, the stop's own teardown error is a stop"
+        );
+        assert!(matches!(
+            m2_session_result(
+                false,
+                Err(ClientError::Transport {
+                    scope: "stream forget barrier",
+                    detail: "data writer stopped before barrier completion".to_owned(),
+                })
+            ),
+            Err(ClientError::Transport { .. })
+        ));
+        assert!(m2_session_result(false, Ok(())).is_ok());
     }
 
     #[test]
