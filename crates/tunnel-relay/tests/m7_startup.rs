@@ -773,7 +773,7 @@ fn serve_sigint_while_connecting_to_redis_exits_interrupted() {
 }
 
 /// The binary installs its handlers over an inherited `SIG_IGN`, as the
-/// client does; see `docs/runtime.md`, "Stopping `connect`".
+/// client does; see `docs/runtime.md`, "Stopping `connect` and `serve`".
 #[cfg(unix)]
 #[test]
 fn serve_sigterm_inherited_as_ignored_still_stops_startup() {

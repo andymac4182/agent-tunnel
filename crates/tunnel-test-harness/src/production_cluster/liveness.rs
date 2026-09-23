@@ -438,9 +438,9 @@ pub(super) struct CliShutdownJoin {
 pub(super) async fn join_cli_after_interrupt(
     mut process: ManagedProcess,
 ) -> Result<CliShutdownJoin> {
-    // SIGINT is the interrupt the connector CLI actually handles; SIGTERM is
-    // unhandled and would terminate the process without exercising the
-    // connector's own stop path.
+    // SIGINT and, since M6-C23, SIGTERM both take the connector CLI's own
+    // orderly stop path; SIGINT is kept here so this measurement is
+    // unchanged from the one its evidence records.
     super::send_managed_process_signal(&mut process, "-INT")?;
     let started = Instant::now();
     let status = process

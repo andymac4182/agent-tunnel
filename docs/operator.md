@@ -262,7 +262,7 @@ tunnel-relay: invalid relay TOML: unknown field `credentials` ...
 exit=1
 ```
 
-The relay exits `0` or `1` only. It does not use the client's exit-code table.
+The relay exits `0` or `1`, and `130` when a stop request ends `serve` before an orderly completion (section 4). It does not otherwise use the client's exit-code table.
 Then start it. **Shape-only:** this command needs your provisioned files and a
 provisioned Redis namespace (section 2.3):
 
@@ -270,9 +270,12 @@ provisioned Redis namespace (section 2.3):
 tunnel-relay serve --config /etc/agent-tunnel/relay.toml
 ```
 
-`serve` stops on Ctrl-C (SIGINT); that is read from the source and has not been
-measured against a running relay here. It logs JSON lines to stderr; set
-`RUST_LOG` (default `info`) to change the level.
+`serve` stops on SIGTERM or SIGINT (Ctrl-C), the same way for both: it prints
+`tunnel-relay stopping: signal=SIGTERM`, drains its listeners and, in a
+cluster, its peer and membership tasks, prints `tunnel-relay stopped:
+signal=SIGTERM` and exits `0` (measured on a one-node cluster; M6-C23). A stop
+request during startup exits `130` with nothing bound. It logs JSON lines to
+stderr; set `RUST_LOG` (default `info`) to change the level.
 
 The device side runs in the foreground until it stops. **Shape-only:**
 
@@ -386,17 +389,20 @@ each relay is the `serve` command from section 3.1.
 ## 4. Service installation, upgrade, backup and recovery
 
 **Service installation is not supported in this alpha** (M6-C23). No unit files
-are shipped. Neither binary handles SIGTERM, which service managers send by
-default: `tunnel-client connect` sent SIGTERM mid-handshake died at once with no
-output and no `stopped` event (measured; M6-C23), and `tunnel-relay serve` is
-unmeasured but has no handler in its source. SIGINT (Ctrl-C) is handled only
-once `connect` has finished connecting: during the TLS/WebSocket handshake it
-either kills the process with no output or, when SIGINT arrives ignored (a
-background job of a non-interactive shell), does nothing until the handshake
-deadline (10 s with the example profile) ends the run with exit `5` (both measured; M6-C27). After
-connecting, the source handles Ctrl-C as an orderly stop that exits `0`; that
-needs a live relay and is not measured here. Because `connect` does not
-reconnect by itself (section 3.1), whatever supervises it must restart it.
+are shipped. What a unit needs from the binaries is now there: both stop on
+SIGTERM, which service managers send by default, and on SIGINT, through one
+orderly path, in every phase, and whatever disposition they inherited
+([runtime.md](runtime.md#stopping-connect-and-serve) has the table). A
+`connect` whose session is live drains, prints its `stopped` event naming the
+signal and exits `0`; one stopped before its session is ready exits `130`
+`CANCELLED` with a diagnostic; a `serve` that is serving drains and exits `0`,
+one stopped during startup exits `130`. A second stop request during the drain
+abandons it with `130`. If your unit can stop the service while it is still
+starting, count `130` as a clean stop (`SuccessExitStatus=130` under systemd).
+Measured by process-level tests for every phase named in runtime.md; a stop
+during a data rotation and a non-cluster `serve` while serving are not
+measured. SIGHUP is not handled. Because `connect` does not reconnect by
+itself (section 3.1), whatever supervises it must restart it.
 
 **In-place upgrade is not supported in this alpha.** Stopping a relay ends the
 device sessions it owns. Devices must start a fresh session, and in-flight

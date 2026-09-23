@@ -201,7 +201,17 @@ CASES: list[Case] = [
         # indistinguishable from a crash.
         "an interrupted session is not reported as an internal failure",
         [(MAIN, "            Self::Cancelled => 130,", "            Self::Cancelled => 1,")],
-        frozenset({"tests::causes_needing_different_actions_do_not_share_an_exit_code"}),
+        # Since M6-C23/M6-C27 the status also has a process-level witness: a
+        # real `connect` stopped during its handshake must exit 130, and the
+        # unit test alone could not show that value reaching `$?`.  Measured
+        # red in the first run of the new stop-request cases (log nonce
+        # `m6c23-m0guard-20260923T011929Z-10280`).
+        frozenset(
+            {
+                "tests::causes_needing_different_actions_do_not_share_an_exit_code",
+                "sigterm_during_the_tls_handshake_exits_cancelled",
+            }
+        ),
     ),
     Case(
         # A stale authorization is an authorization decision, not a bug.  The

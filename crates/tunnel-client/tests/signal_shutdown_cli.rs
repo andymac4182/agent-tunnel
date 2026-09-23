@@ -532,7 +532,7 @@ fn sigint_during_the_websocket_upgrade_exits_cancelled() {
 
 /// The disposition M6-C27 measured being ignored for ten seconds. The binary
 /// installs its handler over an inherited `SIG_IGN` on purpose; see
-/// `docs/runtime.md`, "Stopping `connect`".
+/// `docs/runtime.md`, "Stopping `connect` and `serve`".
 #[test]
 fn sigint_inherited_as_ignored_still_cancels_the_handshake() {
     let fixture = Fixture::new(Phase::TlsHandshake);

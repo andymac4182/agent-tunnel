@@ -95,7 +95,7 @@ impl StopSignal {
 /// did the same.
 ///
 /// Installing the handlers replaces an inherited `SIG_IGN` as well, for the
-/// reason `docs/runtime.md` gives under "Stopping `connect`": a stop request
+/// reason `docs/runtime.md` gives under "Stopping `connect` and `serve`": a stop request
 /// is honoured whatever disposition the process inherited. SIGHUP is not
 /// handled.
 struct StopSignals {

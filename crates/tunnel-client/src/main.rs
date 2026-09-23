@@ -446,7 +446,7 @@ impl StopSignal {
 /// started as a background job of a non-interactive shell (which sets SIGINT
 /// and SIGQUIT to ignored) now stops on SIGINT too. The reasons, and the
 /// alternative that was rejected, are in `docs/runtime.md` ("Stopping
-/// `connect`"); in short, a stop request that is silently ignored for ten
+/// `connect` and `serve`"); in short, a stop request that is silently ignored for ten
 /// seconds and then reported as a deadline is the defect M6-C27 recorded, and
 /// a process that must survive a terminal's Ctrl-C belongs in its own session
 /// or under a service manager, not behind an inherited disposition. SIGHUP is
