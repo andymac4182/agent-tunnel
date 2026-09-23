@@ -23,6 +23,14 @@
 #    two data rotations in one device session, every one answered 200, and
 #    task row M7-C93's gate: echoes paced across two rotations, capped below
 #    the retention so it can only be red for the rotation defect.
+# 5. Runs task row M6-C57's gates in the same binary: an MCP, an ACP and a
+#    filesystem service, each provisioned from its shipped records example
+#    (examples/m6-catalog-{mcp,acp,fs}.toml) with the shipped commands and
+#    served by `connect` with the export that example documents, backed by
+#    the repository's MCP and ACP fixture binaries and a temporary directory.
+#    Each must answer one real consumer request from the device-side backend:
+#    MCP `initialize` and a `tools/call`, ACP `initialize`, and a 9P read of
+#    a synthetic file.
 #
 # Both tests are `#[ignore]`d in the ordinary workspace run because they need
 # Redis.  A filtered or skipped test would print `0 passed` and exit 0, so this
@@ -47,11 +55,16 @@ if [ -n "${M6_PROVISIONING_BIN_DIR:-}" ]; then
 else
   export TUNNEL_CLIENT_BIN="$target_dir/debug/tunnel-client"
 fi
+# The M6-C57 backends are test fixtures, never bundled, so they are always
+# the pair this script builds.
+export TUNNEL_MCP_FIXTURE_BIN="$target_dir/debug/tunnel-mcp-fixture"
+export TUNNEL_ACP_FIXTURE_BIN="$target_dir/debug/tunnel-acp-fixture"
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/m6-provisioning-verify.XXXXXX")
 trap 'rm -rf "$scratch"' EXIT
 
-echo "m6-provisioning-verify: build tunnel-relay and tunnel-client" >&2
-cargo build --locked -p tunnel-relay -p tunnel-client --bins
+echo "m6-provisioning-verify: build tunnel-relay, tunnel-client and the MCP and ACP fixtures" >&2
+cargo build --locked -p tunnel-relay -p tunnel-client -p tunnel-mcp-fixture \
+  -p tunnel-acp-fixture --bins
 
 require() {
   label=$1
@@ -84,7 +97,10 @@ echo "m6-provisioning-verify: end-to-end shipped-binary gate" >&2
 cargo test -p tunnel-relay --test m6_provisioning_process --locked -- --ignored --nocapture \
   --test-threads=1 > "$scratch/e2e.log" 2>&1 || { cat "$scratch/e2e.log" >&2; exit 1; }
 cat "$scratch/e2e.log"
-require "end-to-end gate" "$scratch/e2e.log" "test result: ok. 3 passed" "m6c21-e2e ok nonce=" \
+require "end-to-end gate" "$scratch/e2e.log" "test result: ok. 6 passed" "m6c21-e2e ok nonce=" \
+  "m6c57-mcp ok nonce=" "tools_call=200 marker_echoed=true" \
+  "m6c57-acp ok nonce=" "agent_protocol_version=1 connection_id=present" \
+  "m6c57-fs ok nonce=" "matches_file=true" \
   "client=$TUNNEL_CLIENT_BIN" \
   "m6c32 device_id mismatch exit=3 code=CREDENTIAL_ERROR retryable=false" \
   "m6c32 unknown credential key exit=3 code=CREDENTIAL_ERROR retryable=false" \

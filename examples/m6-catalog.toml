@@ -35,6 +35,8 @@ certificate = "device-cert.pem"
 
 [service]
 id = "44444444-4444-4444-8444-444444444444"
+# The synthetic echo. examples/m6-catalog-mcp.toml, m6-catalog-acp.toml and
+# m6-catalog-fs.toml provision the other service types (M6-C57).
 type = "echo"
 display_name = "Trial echo"
 operations = ["echo:invoke"]

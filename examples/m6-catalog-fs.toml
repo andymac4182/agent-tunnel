@@ -1,0 +1,50 @@
+# Catalog records for `tunnel-relay provision-catalog` that provision one
+# filesystem export (docs/operator.md section 2.3, task row M6-C57). The
+# tenant, user and device are the ones in examples/m6-catalog.toml; see that
+# file for what each field means. Every UUID is a synthetic placeholder.
+#
+# `fs_case_sensitivity` states how the device's export directory treats
+# letter case: `insensitive-preserving` for a default macOS (APFS) volume,
+# `sensitive` for a case-sensitive one. The relay reports it to consumers and
+# never guesses it.
+#
+# Operations: `fs:connect` admits a session and is required in the grant;
+# `fs:read`, `fs:list`, `fs:write` and `fs:delete` are the capabilities, and
+# the grant must name at least one. The device can narrow them further:
+#
+#   [exports."77777777-7777-4777-8777-777777777777"]
+#   type = "fs"
+#
+#   [exports."77777777-7777-4777-8777-777777777777".fs]
+#   root = "/absolute/path/to/the/exported/directory"
+#   capabilities = ["read", "list"]
+#
+# Consumers reach it at
+# wss://<consumer listener>/v1/devices/<device.id>/services/<service.id>/fs
+# (a GET without an upgrade returns its descriptor) with a token whose scope
+# includes fs:connect, speaking 9P2000.L; see docs/filesystem-api.md.
+
+[tenant]
+id = "11111111-1111-4111-8111-111111111111"
+display_name = "Trial tenant"
+
+[user]
+id = "22222222-2222-4222-8222-222222222222"
+display_name = "Trial user"
+oidc_subject = "trial-user"
+role = "member"
+
+[device]
+id = "33333333-3333-4333-8333-333333333333"
+display_name = "Trial device"
+certificate = "device-cert.pem"
+
+[service]
+id = "77777777-7777-4777-8777-777777777777"
+type = "fs"
+display_name = "Trial files"
+operations = ["fs:connect", "fs:read", "fs:list"]
+fs_case_sensitivity = "insensitive-preserving"
+
+[grant]
+operations = ["fs:connect", "fs:read", "fs:list"]
