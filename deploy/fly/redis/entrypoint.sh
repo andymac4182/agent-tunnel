@@ -60,6 +60,9 @@ protected-mode yes
 # docs/cluster.md, "Redis durability, backup, and recovery".
 appendonly yes
 appendfsync always
+# Keep fsyncing while the AOF is rewritten; the relay's Redis restart
+# continuity (M6-C65) checks all three settings with CONFIG GET.
+no-appendfsync-on-rewrite no
 aof-load-truncated no
 maxmemory-policy noeviction
 dir $data

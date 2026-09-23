@@ -759,6 +759,7 @@ mod tests {
             Failure::Unbound,
             Failure::RunChanged,
             Failure::Continuity,
+            Failure::Persistence,
             Failure::Config,
             Failure::Catalog,
         ];

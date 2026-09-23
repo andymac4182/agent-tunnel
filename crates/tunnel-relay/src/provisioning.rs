@@ -792,7 +792,7 @@ pub async fn rebind_redis_run(args: &[OsString]) -> Result<String, Box<dyn Error
             previous_run_id,
             run_id,
         } => format!(
-            "Re-bound namespace {} (deployment incarnation {}) from Redis run {previous_run_id} to {run_id}.",
+            "Re-bound namespace {} (deployment incarnation {}) from Redis run {previous_run_id} to {run_id}, on the operator's declaration that Redis restarted in place; not verified.",
             config.redis_namespace, config.deployment_incarnation
         ),
     })

@@ -2927,8 +2927,10 @@ async fn m6c31_day2_catalog_changes_take_effect_on_a_serving_relay() {
 // Task row M6-C65: a Redis restart must not end the namespace.
 // ---------------------------------------------------------------------------
 
-/// The Redis image the gate runs (the Fly Redis image's base).
-const M6C65_REDIS_IMAGE: &str = "redis:8.4.0-alpine";
+/// The Redis image the gate runs (the Fly Redis image's base), pinned by
+/// digest as the M1 and M7 restart gates pin it.
+const M6C65_REDIS_IMAGE: &str =
+    "redis:8.4.0-alpine@sha256:6cbef353e480a8a6e7f10ec545f13d7d3fa85a212cdcc5ffaf5a1c818b9d3798";
 /// Continuity interval the gate configures (`redis_restart_continuity_seconds`).
 const M6C65_CONTINUITY_SECONDS: u64 = 1;
 /// A device reconnect after a Redis restart can wait out the previous
@@ -3076,13 +3078,62 @@ impl DockerRedis {
         ]);
     }
 
+    /// `docker kill`: SIGKILL, a crash with no orderly shutdown; then start
+    /// the same container from its volume.
+    fn crash_and_start(&self) {
+        Self::docker(&["kill", &self.name]);
+        self.start_current();
+    }
+
+    /// `CONFIG SET` on this gate's own Redis.
+    fn config_set(&self, name: &str, value: &str) {
+        let reply = redis_command(self.upstream(), 0, &["CONFIG", "SET", name, value]);
+        assert!(
+            String::from_utf8_lossy(&reply).matches("+OK").count() >= 2,
+            "CONFIG SET {name} {value}: {}",
+            String::from_utf8_lossy(&reply)
+        );
+    }
+
+    /// Stop the current container in order, copy its data into a new
+    /// container started with `redis_args`, and keep the old one stopped;
+    /// returns the old container's name for [`Self::switch_back`].
+    fn swap_to_copy(&mut self, copy_dir: &Path, redis_args: &[&str]) -> String {
+        Self::docker(&["stop", "--time", "30", &self.name]);
+        fs::create_dir_all(copy_dir).expect("copy dir");
+        Self::docker(&[
+            "cp",
+            &format!("{}:/data/.", self.name),
+            &copy_dir.display().to_string(),
+        ]);
+        let previous = self.name.clone();
+        self.create(redis_args);
+        Self::docker(&[
+            "cp",
+            &format!("{}/.", copy_dir.display()),
+            &format!("{}:/data", self.name),
+        ]);
+        self.start_current();
+        previous
+    }
+
+    /// Remove the current container and start `previous` again.
+    fn switch_back(&mut self, previous: String) {
+        self.remove_current();
+        self.name = previous;
+        self.start_current();
+    }
+
     /// Stop and remove the current container with its volume.
     fn remove_current(&self) {
         Self::docker(&["rm", "--force", "--volumes", &self.name]);
     }
 
     /// Replace the current container by one that starts from `rdb` alone
-    /// (AOF off, so Redis loads the RDB): a restore of an older backup.
+    /// (AOF off, so Redis loads the RDB): a restore of an older backup.  AOF
+    /// with `appendfsync always` is then switched on, so the restored Redis
+    /// passes the persistence check and only the continuity token can
+    /// refuse it.
     fn replace_with_rdb(&mut self, rdb: &Path) {
         self.remove_current();
         self.create(&["--appendonly", "no"]);
@@ -3092,6 +3143,8 @@ impl DockerRedis {
             &format!("{}:/data/dump.rdb", self.name),
         ]);
         self.start_current();
+        self.config_set("appendfsync", "always");
+        self.config_set("appendonly", "yes");
     }
 
     /// Replace the current container by an empty one: Redis lost its data.
@@ -3253,6 +3306,17 @@ fn m6c65_wait_line(
     panic!("relay printed no line with `{needle}` within {deadline:?}: {seen:?}");
 }
 
+/// Take every relay stderr line already printed, then return how many
+/// lines have been seen: lines after this mark were printed after it.
+fn m6c65_mark(log: &std::sync::mpsc::Receiver<String>, seen: &mut Vec<String>) -> usize {
+    // Anything already in flight on the reader thread lands within this.
+    std::thread::sleep(Duration::from_millis(200));
+    while let Ok(line) = log.try_recv() {
+        seen.push(line);
+    }
+    seen.len()
+}
+
 /// Collect relay stderr for `duration`, then require that no line since
 /// `from` reports a re-binding: a refused Redis must never be adopted, not
 /// even in memory.
@@ -3294,12 +3358,40 @@ fn m6c65_stop_relay(relay: &mut Running) {
 }
 
 /// `serve` must refuse to start: exit 1 with `expected` on stderr.
+/// A `serve` that starts instead is stopped after `STEP_DEADLINE` and fails
+/// the gate, rather than hanging it.
 fn m6c65_serve_refused(fixture: &Provisioned, expected: &str) -> String {
-    let output = Command::new(&fixture.relay_bin)
-        .args(["serve", "--config"])
-        .arg(&fixture.relay_config)
-        .output()
-        .expect("run serve");
+    let stderr_path = fixture
+        .work
+        .join(format!("serve-refused-{}.log", Uuid::new_v4().simple()));
+    let mut child = Running(
+        Command::new(&fixture.relay_bin)
+            .args(["serve", "--config"])
+            .arg(&fixture.relay_config)
+            .stdout(Stdio::null())
+            .stderr(fs::File::create(&stderr_path).expect("serve stderr file"))
+            .spawn()
+            .expect("run serve"),
+    );
+    let deadline = Instant::now() + STEP_DEADLINE;
+    let status = loop {
+        if let Ok(Some(status)) = child.0.try_wait() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            drop(child);
+            panic!(
+                "serve must refuse with `{expected}`, but it was still running after {STEP_DEADLINE:?}: {}",
+                fs::read_to_string(&stderr_path).unwrap_or_default()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let output = std::process::Output {
+        status,
+        stdout: Vec::new(),
+        stderr: fs::read(&stderr_path).unwrap_or_default(),
+    };
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     assert!(
         output.status.code() == Some(1) && stderr.contains(expected),
@@ -3310,31 +3402,38 @@ fn m6c65_serve_refused(fixture: &Provisioned, expected: &str) -> String {
 }
 
 /// Task row M6-C65: a single relay keeps serving the **same namespace**
-/// across Redis restarts, and still refuses a Redis that came back older or
-/// empty.  Everything is the shipped binaries against a Redis container this
-/// gate owns (AOF, `appendfsync always`, as the Fly Redis):
+/// across in-place Redis restarts, and still refuses a Redis that came back
+/// older, empty or not durable.  Everything is the shipped binaries against
+/// a Redis container this gate owns (AOF, `appendfsync always`, as the Fly
+/// Redis), pinned by digest:
 ///
 /// 1. provision, `serve` with `redis_restart_continuity_seconds`, `connect`,
 ///    echo;
 /// 2. `docker restart` Redis (orderly shutdown, AOF kept, new `run_id`) with
 ///    the relay running: the same relay process re-binds by itself and the
 ///    echo answers again;
+/// 2b. `docker kill` Redis (a crash) and start it again: the same;
+/// 2c. the same data in a Redis with `appendfsync everysec`: refused
+///    (`class=persistence`), nothing re-bound; back on the durable Redis the
+///    relay re-binds;
 /// 3. stop the relay, restart Redis, start `serve`: refused with
-///    `stage=authority_identity class=run_changed`; `rebind-redis-run`
-///    without the declaration is refused; with it, `serve` starts and the
-///    echo answers;
+///    `class=run_changed`; `rebind-redis-run` without the declaration is
+///    refused; with it, it says the declaration was not verified; `serve`
+///    with continuity refuses a Redis set to `everysec` (`class=persistence`)
+///    and starts on `always`, and the echo answers;
 /// 4. take an RDB snapshot, revoke the grant, let the relay write newer
 ///    continuity tokens, then replace Redis by one loaded from the snapshot:
-///    the serving relay refuses it (`class=continuity`) and the echo is not
-///    served although the restored grant is active again; a fresh `serve`
-///    is refused too;
+///    the serving relay refuses it (`class=continuity`) and never serves the
+///    restored grant; a fresh `serve` is refused too; an operator who wrongly
+///    re-attests it with `rebind-redis-run` does not make the serving relay
+///    accept it;
 /// 5. replace Redis by an empty one: refused with `class=unbound` by the
 ///    serving relay, by a fresh `serve` and by `rebind-redis-run`.
 ///
 /// Red without M6-C65: step 2's echo never answers (every lane refuses the
-/// new run for good), and step 3's `rebind-redis-run` does not exist.  The
-/// refusals in steps 4 and 5 are proved to be able to fail by defeating the
-/// continuity comparison and the binding check (recorded in docs/tasks.md).
+/// new run for good), and step 3's `rebind-redis-run` does not exist.  Each
+/// refusal is proved able to fail by defeating its own check (recorded in
+/// docs/tasks.md).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires Docker and TUNNEL_CLIENT_BIN; run by scripts/m6-redis-restart-verify.sh"]
 async fn m6c65_redis_restart_keeps_the_namespace_and_refuses_lost_data() {
@@ -3423,6 +3522,67 @@ async fn m6c65_redis_restart_keeps_the_namespace_and_refuses_lost_data() {
         unattended.as_millis()
     );
 
+    // --- 2b. Redis crashes (SIGKILL) under the running relay. ---
+    redis.crash_and_start();
+    let run_crash = redis.run_id();
+    assert_ne!(run_2, run_crash);
+    let crash = m6c65_echo_until_served(
+        "crash",
+        &fixture,
+        &mut device,
+        &token,
+        M6C65_RECOVERY_DEADLINE,
+    )
+    .await;
+    assert_eq!(fixture.relay.0.id(), relay_pid);
+    assert_eq!(namespace_get(&fixture, "meta:redis_run_id"), run_crash);
+    println!(
+        "m6c65-crash ok nonce={nonce} run_before={run_2} run_after={run_crash} \
+         echo_after_ms={} relay_restarts=0",
+        crash.as_millis()
+    );
+
+    // --- 2c. The same data under `appendfsync everysec` is refused. ---
+    // The copy holds the relay's last token, so only the persistence check
+    // can refuse it.
+    let lines_before_everysec = m6c65_mark(&fixture.relay_log, &mut relay_lines);
+    let durable = redis.swap_to_copy(
+        &fixture.work.join("everysec-copy"),
+        &["--appendonly", "yes", "--appendfsync", "everysec"],
+    );
+    let run_everysec = redis.run_id();
+    let persistence = m6c65_wait_line(
+        &fixture.relay_log,
+        &mut relay_lines,
+        "Redis authority continuity check failed; stage=authority_identity class=persistence",
+        STEP_DEADLINE,
+    );
+    m6c65_assert_not_rebound(
+        &fixture.relay_log,
+        &mut relay_lines,
+        lines_before_everysec,
+        Duration::from_secs(3),
+    );
+    assert_eq!(namespace_get(&fixture, "meta:redis_run_id"), run_crash);
+    assert_ne!(m6c65_echo_status(&fixture, &token).await, 200);
+    // Back to the durable Redis, restarted from its own AOF: accepted.
+    redis.switch_back(durable);
+    let run_2 = redis.run_id();
+    let back = m6c65_echo_until_served(
+        "back-from-everysec",
+        &fixture,
+        &mut device,
+        &token,
+        M6C65_RECOVERY_DEADLINE,
+    )
+    .await;
+    assert_eq!(namespace_get(&fixture, "meta:redis_run_id"), run_2);
+    println!(
+        "m6c65-persistence ok nonce={nonce} everysec_run={run_everysec} line={persistence:?} \
+         durable_run={run_2} echo_after_ms={}",
+        back.as_millis()
+    );
+
     // --- 3. Relay stopped, Redis restarted, relay started: operator command. ---
     m6c65_stop_relay(&mut fixture.relay);
     redis.restart();
@@ -3461,6 +3621,17 @@ async fn m6c65_redis_restart_keeps_the_namespace_and_refuses_lost_data() {
             .arg("--redis-restarted-in-place"),
     ));
     assert!(again.contains("nothing changed"), "{again}");
+    assert!(
+        rebind.contains("on the operator's declaration") && rebind.contains("not verified"),
+        "{rebind}"
+    );
+    // Continuity refuses to start on a Redis that acknowledges before fsync.
+    redis.config_set("appendfsync", "everysec");
+    let unsound = m6c65_serve_refused(
+        &fixture,
+        "Redis restart continuity could not start; stage=authority_identity class=persistence",
+    );
+    redis.config_set("appendfsync", "always");
     let (relay, relay_log) = start_serve(&fixture.relay_bin, &fixture.relay_config);
     fixture.relay = relay;
     fixture.relay_log = relay_log;
@@ -3475,7 +3646,7 @@ async fn m6c65_redis_restart_keeps_the_namespace_and_refuses_lost_data() {
     .await;
     println!(
         "m6c65-operator ok nonce={nonce} run_before={run_2} run_after={run_3} \
-         refused={refused:?} echo_after_ms={}",
+         refused={refused:?} unsound={unsound:?} echo_after_ms={}",
         operator.as_millis()
     );
 
@@ -3507,7 +3678,7 @@ async fn m6c65_redis_restart_keeps_the_namespace_and_refuses_lost_data() {
     let before_tokens = namespace_get(&fixture, "meta:continuity");
     tokio::time::sleep(Duration::from_secs(3 * M6C65_CONTINUITY_SECONDS)).await;
     assert_ne!(namespace_get(&fixture, "meta:continuity"), before_tokens);
-    let lines_before_restore = relay_lines.len();
+    let lines_before_restore = m6c65_mark(&fixture.relay_log, &mut relay_lines);
     redis.replace_with_rdb(&snapshot);
     let run_4 = redis.run_id();
     // The restored snapshot holds the grant as active again.  For as long
@@ -3548,6 +3719,37 @@ async fn m6c65_redis_restart_keeps_the_namespace_and_refuses_lost_data() {
         &fixture,
         "Redis catalog connection failed; stage=authority_identity class=run_changed",
     );
+    // An operator who wrongly re-attests the restored Redis changes the
+    // binding, but a relay that already refused that run for continuity
+    // keeps refusing it.
+    let wrongly = stdout(&step(
+        "rebind-redis-run on the restored Redis",
+        Command::new(&fixture.relay_bin)
+            .args(["rebind-redis-run", "--config"])
+            .arg(&fixture.relay_config)
+            .arg("--redis-restarted-in-place"),
+    ));
+    assert!(
+        wrongly.contains(&format!("from Redis run {run_3} to {run_4}")),
+        "{wrongly}"
+    );
+    let lines_before_attest = m6c65_mark(&fixture.relay_log, &mut relay_lines);
+    m6c65_assert_not_rebound(
+        &fixture.relay_log,
+        &mut relay_lines,
+        lines_before_attest,
+        Duration::from_secs(4),
+    );
+    for _ in 0..5 {
+        device.ensure_running();
+        assert_ne!(
+            m6c65_echo_status(&fixture, &token).await,
+            200,
+            "a relay that refused a run for continuity served it after an operator re-attested it"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    println!("m6c65-reattest-refused ok nonce={nonce} run={run_4}");
     println!(
         "m6c65-rollback ok nonce={nonce} run={run_4} line={continuity:?} \
          echo_statuses={statuses:?} watched_ms={} fresh_serve={fresh:?}",
@@ -3555,7 +3757,7 @@ async fn m6c65_redis_restart_keeps_the_namespace_and_refuses_lost_data() {
     );
 
     // --- 5. An empty Redis is refused. ---
-    let lines_before_empty = relay_lines.len();
+    let lines_before_empty = m6c65_mark(&fixture.relay_log, &mut relay_lines);
     redis.replace_empty();
     let unbound = m6c65_wait_line(
         &fixture.relay_log,

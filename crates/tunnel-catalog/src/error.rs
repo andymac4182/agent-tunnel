@@ -95,9 +95,16 @@ pub enum CatalogConnectionFailure {
     /// restarted and nothing re-attested the namespace (M6-C65).
     RunChanged,
     /// Redis restarted without the serving relay's last acknowledged
-    /// continuity token: it came back from an older snapshot or a stale
-    /// replica, or lost acknowledged writes (M6-C65).
+    /// continuity token: it came back from a copy older than that token (an
+    /// earlier snapshot or backup, or a replica that had not received it), or
+    /// a run already refused for this (M6-C65).  A copy that does hold the
+    /// token is not caught: the token is no proof across failover or replica
+    /// promotion.
     Continuity,
+    /// A token re-binding was not attempted because the restarted Redis does
+    /// not show `appendonly yes`, `appendfsync always` and
+    /// `no-appendfsync-on-rewrite no` to `CONFIG GET`, or refused it (M6-C65).
+    Persistence,
     /// The connection configuration was rejected before any exchange.
     Config,
     /// A catalog-level refusal (for example a missing or mismatched
@@ -123,6 +130,7 @@ impl CatalogConnectionFailure {
             Self::Unbound => "unbound",
             Self::RunChanged => "run_changed",
             Self::Continuity => "continuity",
+            Self::Persistence => "persistence",
             Self::Config => "config",
             Self::Catalog => "catalog",
         }
@@ -145,6 +153,9 @@ impl CatalogConnectionFailure {
             }
             CatalogError::Conflict(label) if *label == crate::redis::CONTINUITY_MISMATCH => {
                 Self::Continuity
+            }
+            CatalogError::Conflict(label) if *label == crate::redis::PERSISTENCE_UNSOUND => {
+                Self::Persistence
             }
             CatalogError::NotFound
             | CatalogError::Conflict(_)
@@ -551,6 +562,7 @@ mod tests {
             (crate::redis::NAMESPACE_UNBOUND, Failure::Unbound),
             (crate::redis::RUN_BINDING_CHANGED, Failure::RunChanged),
             (crate::redis::CONTINUITY_MISMATCH, Failure::Continuity),
+            (crate::redis::PERSISTENCE_UNSOUND, Failure::Persistence),
             ("active deployment incarnation", Failure::Catalog),
             ("Redis server run id", Failure::Catalog),
         ] {
@@ -580,6 +592,7 @@ mod tests {
             Failure::Unbound,
             Failure::RunChanged,
             Failure::Continuity,
+            Failure::Persistence,
             Failure::Config,
             Failure::Catalog,
         ];

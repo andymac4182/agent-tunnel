@@ -40,10 +40,12 @@ deployment_incarnation = "fly-1"
 max_devices_per_user = 16
 max_queue_bytes = 4194304
 
-# Task row M6-C65: re-bind the namespace by itself after a Redis restart that
-# kept this relay's last acknowledged token (docs/operator.md section 4,
-# "Redis restarts"). Sound because the Fly Redis runs `appendfsync always`
-# (deploy/fly/redis/entrypoint.sh); never set it for a Redis that does not.
+# Task row M6-C65: re-bind the namespace by itself after an in-place Redis
+# restart that kept this relay's last acknowledged token (docs/operator.md
+# section 4, "Redis restarts"). The relay checks with CONFIG GET that Redis
+# runs `appendonly yes`, `appendfsync always` and `no-appendfsync-on-rewrite
+# no` (deploy/fly/redis/entrypoint.sh) and refuses otherwise. Not a failover
+# or restore path.
 redis_restart_continuity_seconds = 5
 
 [rotation]

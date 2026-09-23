@@ -679,27 +679,39 @@ restarts", M6-C65). **All of this needs a relay image built from a commit
 with M6-C65**; `main-721ed2a` does not have it, and with that image the only
 way back is section 6.4.1. The Redis image is unchanged.
 
+This is for the one Redis machine restarting on its own volume. There is no
+replica here; a Redis rebuilt on a new volume, or a volume restored from a
+Fly snapshot, is not a restart: section 6.4.1.
+
 **The relay kept running across the restart.** `relay.toml` sets
-`redis_restart_continuity_seconds = 5`, which is sound here because the Redis
-entrypoint sets `appendfsync always`. Once Redis is back from its AOF, the
-relay re-binds the namespace by itself, and `fly logs -a agentuplink-relay
---no-tail` shows `tunnel-relay: Redis authority restarted; namespace re-bound
-to the new Redis run after its continuity check`. Device sessions end with
-`AUTHORITY_UNAVAILABLE` when Redis goes away, and devices reconnect by
-themselves; a reconnect can wait out the previous session's owner lease, up
-to 30 s. Measured locally with `docker restart` of an AOF Redis and the
-shipped binaries (`scripts/m6-redis-restart-verify.sh`): the echo was served
-again 39 to 52 s after the restart, from the same relay process. **Not run on
-Fly.** Each re-binding attempt is a lane reconnect, which has 2 s including
+`redis_restart_continuity_seconds = 5`. The relay checks with `CONFIG GET`,
+when it starts and again before each re-binding, that Redis runs `appendonly
+yes`, `appendfsync always` and `no-appendfsync-on-rewrite no`, and refuses
+otherwise (`class=persistence`). The Redis entrypoint sets the first two;
+`no-appendfsync-on-rewrite no` is Redis's default and is set explicitly only
+from this commit on, so the running Fly Redis gets the explicit line at its
+next rebuild (its `CONFIG GET` should already show `no`; not checked on Fly).
+Once Redis is back from its AOF, the relay re-binds the namespace by itself,
+and `fly logs -a agentuplink-relay --no-tail` shows `tunnel-relay: Redis
+authority restarted; namespace re-bound to the new Redis run`. Device
+sessions end with `AUTHORITY_UNAVAILABLE` when Redis goes away, and devices
+reconnect by themselves; a reconnect can wait out the previous session's
+owner lease, up to 30 s. Measured locally with `docker restart` and with
+`docker kill` then `docker start` of an AOF Redis and the shipped binaries
+(`scripts/m6-redis-restart-verify.sh`): the echo was served again 40 to 54 s
+after the restart, from the same relay process. **Not run on Fly.** Each re-binding attempt is a lane reconnect, which has 2 s including
 the DNS lookup of `agentuplink-redis.internal` (M6-C74); a lookup slower than
 that fails the attempt and the relay tries again on its next token, every
 5 s. While Redis is down or refused, `/readyz` still answers ready (M6-C67)
 and every consumer call gets `503` `AUTHORIZATION_UNAVAILABLE`.
 
 If the log shows `tunnel-relay: Redis authority continuity check failed;
-stage=authority_identity class=continuity` instead, Redis came back without
-the relay's last acknowledged write -- an older snapshot, or lost data. The
-relay keeps refusing it; do not run the command below. Go to section 6.4.1
+stage=authority_identity class=continuity` instead, Redis came back older
+than the relay's last acknowledged token -- an older snapshot, or lost data.
+The relay keeps refusing that run even if you re-attest it; do not run the
+command below. `class=persistence` means the Redis configuration lost
+`appendfsync always` or one of the other two settings: fix the Redis image
+and restart it. Go to section 6.4.1
 (or restore Redis properly and recover). `class=unbound` means Redis came back
 empty: section 6.4.1.
 
@@ -730,7 +742,8 @@ fly machine start <relay machine id> -a agentuplink-relay
 ```
 
 Success is `Re-bound namespace <namespace> (deployment incarnation
-<incarnation>) from Redis run <old> to <new>.` (or `... already bound to Redis
+<incarnation>) from Redis run <old> to <new>, on the operator's declaration that
+Redis restarted in place; not verified.` (or `... already bound to Redis
 run <run>; nothing changed.`), exit `0`. `--redis-restarted-in-place` is your
 declaration that Redis was not restored or replaced: the command refuses an
 empty Redis (`class=unbound`) but cannot tell a restore of an older snapshot

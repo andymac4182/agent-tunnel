@@ -31,7 +31,9 @@ mod recovery;
 mod recovery_scanner;
 mod recovery_schema;
 use lane::{AuthorityLane, LaneGroup, RebindScope};
-pub(crate) use lane::{CONTINUITY_MISMATCH, NAMESPACE_UNBOUND, RUN_BINDING_CHANGED};
+pub(crate) use lane::{
+    CONTINUITY_MISMATCH, NAMESPACE_UNBOUND, PERSISTENCE_UNSOUND, RUN_BINDING_CHANGED,
+};
 pub use recovery::DurableCatalogObservation;
 
 const MAX_SAFE_REDIS_TIME: i64 = 9_000_000_000_000_000;
@@ -47,8 +49,17 @@ const REDIS_OPERATION_TIMEOUT: Duration = Duration::from_secs(2);
 /// runs the script replaces it with the run its connection was verified
 /// against (see `AuthorityLane::query_eval`), so a script's run fence never
 /// carries a run the catalog has since moved away from (M6-C65).  It starts
-/// with a control character, which no Redis run id contains.
-const BOUND_RUN_ID: &str = "\u{1}bound-run-id";
+/// with a control character and carries a per-process random suffix, and
+/// `query_eval` refuses any other argument that starts with that character,
+/// so no caller-supplied value can be taken for it.
+fn bound_run_id() -> &'static str {
+    static PLACEHOLDER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PLACEHOLDER
+        .get_or_init(|| format!("{BOUND_RUN_MARKER}bound-run-id-{}", Uuid::new_v4().simple()))
+}
+
+/// The first character of [`bound_run_id`].
+const BOUND_RUN_MARKER: char = '\u{1}';
 /// The budget for opening one authority connection: DNS resolution, TCP
 /// connect, the TLS handshake and redis-rs's setup exchange (`AUTH`,
 /// `CLIENT SETINFO`).  It is separate from the two-second per-command
@@ -695,8 +706,19 @@ impl RedisCatalog {
             ));
         }
         self.deployment_incarnation = Some(deployment_incarnation.to_owned());
+        Ok(())
+    }
+
+    /// Single relay only (M6-C65): let this catalog's lanes adopt a new Redis
+    /// run the namespace allows -- one an operator re-attested with
+    /// `rebind-redis-run`, or, with a continuity witness, one holding this
+    /// process's last acknowledged token.  A catalog that never calls this,
+    /// including every `[cluster]` relay's, refuses any run but the one it
+    /// connected to, as before M6-C65.
+    pub fn enable_run_rebinding(&self) -> Result<(), CatalogError> {
+        let incarnation = self.configured_incarnation()?;
         self.lane_group.binding().set_scope(RebindScope {
-            incarnation: deployment_incarnation.to_owned(),
+            incarnation: incarnation.to_owned(),
             incarnation_key: self.active_incarnation_key(),
             run_key: self.redis_run_id_key(),
             continuity_key: self.continuity_key(),
@@ -725,7 +747,7 @@ impl RedisCatalog {
                 &[
                     self.prefix.clone(),
                     incarnation.to_owned(),
-                    BOUND_RUN_ID.to_owned(),
+                    bound_run_id().to_owned(),
                 ],
             )
             .await?;
@@ -762,7 +784,7 @@ impl RedisCatalog {
                 &[
                     self.prefix.clone(),
                     incarnation.to_owned(),
-                    BOUND_RUN_ID.to_owned(),
+                    bound_run_id().to_owned(),
                     MAX_SEED_SCAN_KEYS.to_string(),
                 ],
             )
@@ -814,7 +836,7 @@ impl RedisCatalog {
             .eval(
                 SCRIPT_OPERATOR_REBIND_RUN,
                 &[self.active_incarnation_key(), self.redis_run_id_key()],
-                &[incarnation.to_owned(), BOUND_RUN_ID.to_owned()],
+                &[incarnation.to_owned(), bound_run_id().to_owned()],
             )
             .await?;
         match reply.as_slice() {
@@ -836,20 +858,54 @@ impl RedisCatalog {
     }
 
     /// Single relay only (M6-C65): keep a continuity witness in this process
-    /// and write its first token, so that after a Redis restart the lanes can
-    /// re-bind to the new run when, and only when, Redis still holds this
-    /// process's last acknowledged token.  The caller then calls
-    /// [`Self::advance_restart_continuity`] periodically.
+    /// and write its first token, so that after an in-place Redis restart the
+    /// lanes can re-bind to the new run when, and only when, Redis still holds
+    /// this process's last acknowledged token.  The caller then calls
+    /// [`Self::advance_restart_continuity`] every `interval`, and
+    /// [`Self::disable_restart_continuity`] if it stops doing so.
     ///
-    /// Sound only when every write Redis acknowledges is durable before the
-    /// reply (`appendonly yes` with `appendfsync always`, as the Fly Redis is
-    /// configured): with a looser policy a crash can lose acknowledged writes
-    /// made after the last token, which the witness cannot see.  And it is for
-    /// one relay: two relays would each hold only their own tokens.
-    pub async fn enable_restart_continuity(&self) -> Result<(), CatalogError> {
+    /// Refused unless run re-binding is enabled
+    /// ([`Self::enable_run_rebinding`]) and `CONFIG GET` shows `appendonly
+    /// yes`, `appendfsync always` and `no-appendfsync-on-rewrite no`: with a
+    /// looser policy a crash can lose acknowledged writes made after the last
+    /// token, which the witness cannot see.  A refused `CONFIG GET` is refused
+    /// the same way.  The lanes check the same settings again on the new run
+    /// before every token re-binding.  Sound for one Redis restarting from its
+    /// own AOF only, not across failover or replica promotion (see
+    /// `lane.rs`).
+    pub async fn enable_restart_continuity(&self, interval: Duration) -> Result<(), CatalogError> {
         self.configured_incarnation()?;
-        self.lane_group.binding().enable_witness();
+        if !self.lane_group.binding().has_scope() {
+            return Err(CatalogError::InvalidInput(
+                "restart continuity requires run re-binding",
+            ));
+        }
+        let mut command = redis::cmd("CONFIG");
+        command
+            .arg("GET")
+            .arg("appendonly")
+            .arg("appendfsync")
+            .arg("no-appendfsync-on-rewrite");
+        let sound = match self.connection.query::<Vec<String>>(&command).await {
+            Ok(pairs) => lane::persistence_is_sound(&pairs),
+            // Redis answered with a refusal (`NOPERM`, an unknown or renamed
+            // command): nothing proves the writes durable.
+            Err(CatalogError::Database(error)) if error.code().is_some() => false,
+            Err(error) => return Err(error),
+        };
+        if !sound {
+            return Err(CatalogError::Conflict(PERSISTENCE_UNSOUND));
+        }
+        self.lane_group.binding().enable_witness(interval);
         self.advance_restart_continuity().await
+    }
+
+    /// Stop re-binding on continuity tokens (M6-C65): the relay's token loop
+    /// ended, so the last token no longer bounds what Redis acknowledged.  A
+    /// restarted Redis is then refused as `run_changed` until an operator
+    /// re-attests it.
+    pub fn disable_restart_continuity(&self) {
+        self.lane_group.binding().disable_witness();
     }
 
     /// Write a new continuity token (M6-C65).  The token is recorded as a
@@ -877,7 +933,7 @@ impl RedisCatalog {
                     self.redis_run_id_key(),
                     self.continuity_key(),
                 ],
-                &[incarnation, BOUND_RUN_ID.to_owned(), token.clone()],
+                &[incarnation, bound_run_id().to_owned(), token.clone()],
                 true,
             )
             .await;
@@ -888,9 +944,8 @@ impl RedisCatalog {
                     return Ok(());
                 }
                 Some("unbound") => CatalogError::Conflict(NAMESPACE_UNBOUND),
-                Some("mismatch") => {
-                    CatalogError::Conflict("active deployment incarnation or Redis authority run")
-                }
+                Some("incarnation") => CatalogError::Conflict("active deployment incarnation"),
+                Some("run") => CatalogError::Conflict(RUN_BINDING_CHANGED),
                 _ => CatalogError::Serialization("invalid Redis continuity reply".into()),
             },
             Err(error @ CatalogError::WriteOutcomeUnknown(_)) => return Err(error),
@@ -985,7 +1040,7 @@ impl RedisCatalog {
                 ],
                 &[
                     incarnation.to_owned(),
-                    BOUND_RUN_ID.to_owned(),
+                    bound_run_id().to_owned(),
                     membership.tenant_id.to_string(),
                     user.user_id.to_string(),
                     user.display_name.clone(),
@@ -1039,7 +1094,7 @@ impl RedisCatalog {
                 ],
                 &[
                     incarnation.to_owned(),
-                    BOUND_RUN_ID.to_owned(),
+                    bound_run_id().to_owned(),
                     device.tenant_id.to_string(),
                     device.device_id.to_string(),
                     device.owner_user_id.to_string(),
@@ -1077,7 +1132,7 @@ impl RedisCatalog {
                 ],
                 &[
                     incarnation.to_owned(),
-                    BOUND_RUN_ID.to_owned(),
+                    bound_run_id().to_owned(),
                     service.tenant_id.to_string(),
                     service.device_id.to_string(),
                     service.service_id.to_string(),
@@ -1199,7 +1254,7 @@ impl RedisCatalog {
                     self.tenants_index(),
                     self.redis_run_id_key(),
                 ],
-                &[incarnation.to_owned(), BOUND_RUN_ID.to_owned()],
+                &[incarnation.to_owned(), bound_run_id().to_owned()],
             )
             .await
             .map_err(|error| (error, None))?;
@@ -2206,7 +2261,7 @@ impl Catalog for RedisCatalog {
                 ],
                 &[
                     incarnation.to_owned(),
-                    BOUND_RUN_ID.to_owned(),
+                    bound_run_id().to_owned(),
                     request.node_id.clone(),
                     request.boot_id.clone(),
                     request.session_id.clone(),
@@ -2267,7 +2322,7 @@ impl Catalog for RedisCatalog {
                 ],
                 &[
                     incarnation.to_owned(),
-                    BOUND_RUN_ID.to_owned(),
+                    bound_run_id().to_owned(),
                     token.epoch.to_string(),
                     token.node_id.clone(),
                     token.boot_id.clone(),
@@ -2306,7 +2361,7 @@ impl Catalog for RedisCatalog {
                 ],
                 &[
                     incarnation.to_owned(),
-                    BOUND_RUN_ID.to_owned(),
+                    bound_run_id().to_owned(),
                     token.epoch.to_string(),
                     token.node_id.clone(),
                     token.boot_id.clone(),
@@ -2340,7 +2395,7 @@ impl Catalog for RedisCatalog {
                     self.active_incarnation_key(),
                     self.redis_run_id_key(),
                 ],
-                &[incarnation.to_owned(), BOUND_RUN_ID.to_owned()],
+                &[incarnation.to_owned(), bound_run_id().to_owned()],
             )
             .await?;
         match reply.first().map(String::as_str) {
@@ -2400,7 +2455,7 @@ impl Catalog for RedisCatalog {
                 ],
                 &[
                     incarnation.to_owned(),
-                    BOUND_RUN_ID.to_owned(),
+                    bound_run_id().to_owned(),
                     request.owner.epoch.to_string(),
                     request.owner.node_id.clone(),
                     request.owner.boot_id.clone(),
@@ -2474,7 +2529,7 @@ impl Catalog for RedisCatalog {
                 ],
                 &[
                     incarnation.to_owned(),
-                    BOUND_RUN_ID.to_owned(),
+                    bound_run_id().to_owned(),
                     request.owner.epoch.to_string(),
                     request.owner.node_id.clone(),
                     request.owner.boot_id.clone(),
@@ -3091,7 +3146,8 @@ const SCRIPT_ADVANCE_CONTINUITY: &str = r#"
 local incarnation = redis.call('GET', KEYS[1])
 local run = redis.call('GET', KEYS[2])
 if not incarnation or not run then return {'unbound'} end
-if incarnation ~= ARGV[1] or run ~= ARGV[2] then return {'mismatch'} end
+if incarnation ~= ARGV[1] then return {'incarnation'} end
+if run ~= ARGV[2] then return {'run'} end
 redis.call('SET', KEYS[3], ARGV[3])
 return {'ok'}
 "#;

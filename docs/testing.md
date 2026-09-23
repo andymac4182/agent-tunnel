@@ -584,6 +584,40 @@ is one payload-free line naming both run identifiers and the per-command outcome
 sequence. This is the process-level counterpart to `redis_lane_reconnect`, which
 severs the socket without changing the primary.
 
+That gate's catalog never calls `enable_run_rebinding`, so it still proves the
+pre-M6-C65 refusal for every catalog that does not opt in, including every
+`[cluster]` relay's.
+
+### Single-relay Redis restart (M6-C65)
+
+```sh
+scripts/m6-redis-restart-verify.sh
+```
+
+Requires Docker and `openssl`; it needs no `TEST_REDIS_URL` and never touches
+one. It builds `tunnel-relay` and `tunnel-client`, then runs
+`m6c65_redis_restart_keeps_the_namespace_and_refuses_lost_data` against its
+own `redis:8.4.0-alpine` container, pinned by digest, on a free loopback port
+(AOF, `appendfsync always`, `aof-load-truncated no`), labelled with the run's
+nonce and removed with its volume however the test ends. With the shipped
+binaries and a relay configured with `redis_restart_continuity_seconds = 1`,
+it requires: the same relay process to serve again after a `docker restart`
+and after a `docker kill` and start; a copy of the same data under
+`appendfsync everysec` to be refused (`class=persistence`) with nothing
+re-bound, and the durable Redis to be accepted again; a relay started after a
+restart to be refused (`class=run_changed`), `rebind-redis-run` without its
+declaration refused, and with it the relay to serve; `serve` with continuity
+to refuse to start on `everysec`; a Redis restored from an RDB snapshot taken
+before a `revoke-grant` to be refused (`class=continuity`) and the restored
+grant never served for 75 s, also after an operator wrongly re-attests it;
+and an empty Redis to be refused (`class=unbound`) by the serving relay, a
+fresh `serve` and `rebind-redis-run`. The script requires the pass count and
+each phase's `m6c65-... ok` line. The catalog half, `m6c65_run_binding_...`
+in `crates/tunnel-catalog/tests/redis_provisioning.rs`, needs
+`TUNNEL_CATALOG_REDIS_URL` (`scripts/m6-provisioning-verify.sh` sets it from
+`TEST_REDIS_URL`); it reads that Redis's persistence settings and never
+changes them.
+
 ## Deterministic transport and state-machine tests
 
 Keep protocol transitions separable from socket I/O so ordinary unit and property tests can drive them. Cover `Connecting`, `Active(g)`, `Preparing(g,n)`, `Quiescing(g,n)`, `Draining(g,n)`, `Committing(g,n)`, `Retiring(g,n)`, `Aborting(g,n)`, `Recovering`, and `Closed`, with control ownership, connection deadlines, and operation status modeled separately. Candidate `n` is fresh and greater than prior attempts, including aborted attempts. Use Tokio's paused clock and explicit advancement for rotation tests; wall-clock sleeps are unsuitable for these assertions.

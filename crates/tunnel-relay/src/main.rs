@@ -709,7 +709,7 @@ async fn serve(path: &Path) -> Result<(), Box<dyn Error>> {
             let signal = stop.recv().await?;
             eprintln!("tunnel-relay stopping: signal={}", signal.name());
             if let Some(continuity) = continuity {
-                continuity.abort();
+                continuity.stop();
             }
             drain_unless_interrupted(&mut stop, signal, async move {
                 running.shutdown().await.map_err(Into::into)
@@ -726,10 +726,7 @@ async fn serve(path: &Path) -> Result<(), Box<dyn Error>> {
 enum Serving {
     /// A relay without `[cluster]`, and its Redis restart continuity task
     /// when `redis_restart_continuity_seconds` is set (M6-C65).
-    Single(
-        tunnel_relay::RunningRelay,
-        Option<tokio::task::JoinHandle<()>>,
-    ),
+    Single(tunnel_relay::RunningRelay, Option<ContinuityTask>),
     Cluster(ClusterServing),
 }
 
@@ -753,19 +750,29 @@ async fn start_serving(path: &Path) -> Result<Serving, Box<dyn Error>> {
         &redis_tls_material,
     )
     .await?;
-    // M6-C65: a single relay that opted in keeps a continuity witness, so a
+    // M6-C65: a single relay may adopt a restarted Redis run the namespace
+    // allows; a cluster relay never does (recovery stays the cluster's path).
+    if config.cluster.is_none() {
+        catalog.enable_run_rebinding()?;
+    }
+    // A single relay that opted in also keeps a continuity witness, so a
     // Redis restart that kept this relay's last acknowledged write is
     // re-bound without an operator.  The first token is written before the
-    // relay listens; a failure here refuses to start.
+    // relay listens; a failure here, including a Redis whose persistence does
+    // not make acknowledged writes durable, refuses to start.
     let continuity = match config.redis_restart_continuity_seconds {
         Some(seconds) if config.cluster.is_none() => {
-            catalog.enable_restart_continuity().await.map_err(|error| {
-                format!(
-                    "Redis restart continuity could not start; {}",
-                    continuity_stage(&error)
-                )
-            })?;
-            Some((catalog.clone(), Duration::from_secs(seconds)))
+            let interval = Duration::from_secs(seconds);
+            catalog
+                .enable_restart_continuity(interval)
+                .await
+                .map_err(|error| {
+                    format!(
+                        "Redis restart continuity could not start; {}",
+                        continuity_stage(&error)
+                    )
+                })?;
+            Some((catalog.clone(), interval))
         }
         _ => None,
     };
@@ -818,9 +825,61 @@ async fn start_serving(path: &Path) -> Result<Serving, Box<dyn Error>> {
             "tunnel-relay Redis restart continuity: interval_seconds={}",
             interval.as_secs()
         );
-        tokio::spawn(restart_continuity_loop(catalog, interval))
+        ContinuityTask::spawn(catalog, interval)
     });
     Ok(Serving::Single(running, continuity))
+}
+
+/// The continuity token loop and the supervisor that watches it (M6-C65
+/// review).  If the loop ever ends while the relay serves -- a panic, or any
+/// return -- tokens stop, so the last one no longer bounds what Redis
+/// acknowledged: the supervisor then turns token re-binding off, so a later
+/// Redis restart fails closed as `run_changed` until an operator re-attests
+/// it, and says so.  (The lanes also refuse a token re-binding whose last
+/// acknowledged token is older than one interval plus the command deadlines
+/// before the relay's last reply from Redis, which covers a loop that keeps
+/// running but keeps failing.)
+struct ContinuityTask {
+    worker: tokio::task::AbortHandle,
+    supervisor: tokio::task::JoinHandle<()>,
+}
+
+impl ContinuityTask {
+    fn spawn(catalog: RedisCatalog, interval: Duration) -> Self {
+        let worker = tokio::spawn(restart_continuity_loop(catalog.clone(), interval));
+        let abort = worker.abort_handle();
+        let supervisor = tokio::spawn(async move {
+            let how = supervise_continuity(worker, || catalog.disable_restart_continuity()).await;
+            eprintln!(
+                "tunnel-relay: Redis restart continuity task {how}; token re-binding is off, so a Redis restart now needs rebind-redis-run"
+            );
+        });
+        Self {
+            worker: abort,
+            supervisor,
+        }
+    }
+
+    /// An orderly stop: neither task reports anything.
+    fn stop(self) {
+        self.supervisor.abort();
+        self.worker.abort();
+    }
+}
+
+/// Wait for the token loop to end, however it ends, then turn token
+/// re-binding off with `disable`; returns how it ended.
+async fn supervise_continuity(
+    worker: tokio::task::JoinHandle<()>,
+    disable: impl FnOnce(),
+) -> &'static str {
+    let outcome = worker.await;
+    disable();
+    match &outcome {
+        Err(error) if error.is_panic() => "panicked",
+        Err(_) => "was cancelled",
+        Ok(()) => "returned",
+    }
 }
 
 /// `stage=... class=...` for a continuity failure, fixed words only: a
@@ -832,6 +891,7 @@ fn continuity_stage(error: &tunnel_catalog::CatalogError) -> String {
         CatalogConnectionFailure::Unbound
         | CatalogConnectionFailure::RunChanged
         | CatalogConnectionFailure::Continuity
+        | CatalogConnectionFailure::Persistence
         | CatalogConnectionFailure::Catalog => "authority_identity",
         _ => "authority_connection",
     };
@@ -856,7 +916,7 @@ async fn restart_continuity_loop(catalog: RedisCatalog, interval: Duration) {
         if current != rebinds {
             rebinds = current;
             eprintln!(
-                "tunnel-relay: Redis authority restarted; namespace re-bound to the new Redis run after its continuity check: rebinds={current}"
+                "tunnel-relay: Redis authority restarted; namespace re-bound to the new Redis run: rebinds={current}"
             );
         }
         match result {
@@ -1472,6 +1532,35 @@ fn print_help() {
                                   live session) or one device credential.\n\
          serve --config PATH      Start consumer HTTPS and device mTLS WSS listeners."
     );
+}
+
+#[cfg(test)]
+mod continuity_supervision_tests {
+    use super::supervise_continuity;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    /// M6-C65 review: a token loop that dies while the relay serves must turn
+    /// token re-binding off, whether it panics or returns.
+    #[tokio::test]
+    async fn a_dead_token_loop_turns_token_rebinding_off() {
+        for (worker, expected) in [
+            (
+                tokio::spawn(async { panic!("synthetic continuity loop failure") }),
+                "panicked",
+            ),
+            (tokio::spawn(async {}), "returned"),
+        ] {
+            let disabled = Arc::new(AtomicBool::new(false));
+            let flag = Arc::clone(&disabled);
+            let how =
+                supervise_continuity(worker, move || flag.store(true, Ordering::SeqCst)).await;
+            assert_eq!(how, expected);
+            assert!(disabled.load(Ordering::SeqCst), "{expected}: not disabled");
+        }
+    }
 }
 
 #[cfg(test)]

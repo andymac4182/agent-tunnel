@@ -581,6 +581,32 @@ async fn m6c31_day2_additions_are_atomic_refuse_duplicates_and_keep_the_authorit
     delete_namespace(&namespace).await;
 }
 
+/// Whether the shared Redis shows the persistence continuity requires.
+async fn shared_redis_is_durable() -> bool {
+    let client = redis::Client::open(url()).expect("open Redis client");
+    let mut connection = client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("connect Redis");
+    let pairs: Vec<String> = redis::cmd("CONFIG")
+        .arg("GET")
+        .arg("appendonly")
+        .arg("appendfsync")
+        .arg("no-appendfsync-on-rewrite")
+        .query_async(&mut connection)
+        .await
+        .expect("CONFIG GET");
+    let value = |name: &str| {
+        pairs
+            .chunks(2)
+            .find(|pair| pair[0] == name)
+            .map(|pair| pair[1].clone())
+    };
+    value("appendonly").as_deref() == Some("yes")
+        && value("appendfsync").as_deref() == Some("always")
+        && value("no-appendfsync-on-rewrite").as_deref() == Some("no")
+}
+
 async fn set(namespace: &str, key: &str, value: &str) {
     let client = redis::Client::open(url()).expect("open Redis client");
     let mut connection = client
@@ -634,24 +660,45 @@ async fn m6c65_run_binding_classes_operator_rebind_and_continuity_token() {
         .expect("first activation");
     let live_run = get(&namespace, "meta:redis_run_id").await.expect("run");
 
-    // A single relay's continuity token, written before provisioning: the
-    // one-shot reservation still accepts the namespace.
+    // Continuity needs run re-binding first, and then a Redis whose
+    // persistence makes every acknowledged write durable.  This shared Redis
+    // is not changed by the test; which answer is right depends on its
+    // settings, read here.  The process gate (`m6-redis-restart-verify.sh`)
+    // proves the `everysec` refusal on a Redis it owns.
     let serving =
         RedisCatalog::connect_with_deployment_incarnation(&url(), &namespace, INCARNATION)
             .await
             .expect("serve's fence accepts the activated namespace");
-    serving
-        .enable_restart_continuity()
-        .await
-        .expect("enable continuity");
-    let first = get(&namespace, "meta:continuity").await.expect("token");
-    assert_eq!(first.len(), 32, "a 128-bit hex token: {first}");
-    serving
-        .advance_restart_continuity()
-        .await
-        .expect("advance continuity");
-    let second = get(&namespace, "meta:continuity").await.expect("token");
-    assert_ne!(first, second, "each advance writes a new token");
+    let interval = std::time::Duration::from_secs(5);
+    assert!(matches!(
+        serving.enable_restart_continuity(interval).await,
+        Err(CatalogError::InvalidInput(_))
+    ));
+    serving.enable_run_rebinding().expect("run re-binding");
+    let durable = shared_redis_is_durable().await;
+    match serving.enable_restart_continuity(interval).await {
+        Ok(()) => {
+            assert!(durable, "continuity enabled on a Redis that is not durable");
+            let token = get(&namespace, "meta:continuity").await.expect("token");
+            assert_eq!(token.len(), 32, "a hex UUID v4, 122 random bits: {token}");
+        }
+        Err(error) => {
+            assert!(!durable, "continuity refused on a durable Redis: {error}");
+            assert_eq!(
+                CatalogConnectionFailure::classify(&error),
+                CatalogConnectionFailure::Persistence
+            );
+            assert_eq!(get(&namespace, "meta:continuity").await, None);
+        }
+    }
+    // A continuity token left by a relay that served before provisioning:
+    // the one-shot reservation still accepts the namespace.
+    set(
+        &namespace,
+        "meta:continuity",
+        "0123456789abcdef0123456789abcdef",
+    )
+    .await;
     let (records, _) = records();
     bootstrap
         .provision_initial_catalog(&records)
@@ -672,16 +719,6 @@ async fn m6c65_run_binding_classes_operator_rebind_and_continuity_token() {
         panic!("serve's fence refuses a namespace bound to an earlier run");
     };
     assert_eq!(refused.failure(), CatalogConnectionFailure::RunChanged);
-    // A continuity token is written only under the current binding.
-    serving
-        .advance_restart_continuity()
-        .await
-        .expect_err("no token under a stale binding");
-    assert_eq!(
-        get(&namespace, "meta:continuity").await.as_deref(),
-        Some(second.as_str())
-    );
-
     // Another incarnation cannot re-bind it.
     let other = RedisCatalog::connect_for_recovery(&url(), &namespace, "m6c65-other")
         .await

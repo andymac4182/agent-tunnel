@@ -9,21 +9,25 @@
 #    directory, so the gate never runs a stale client.
 # 2. Runs `m6c65_redis_restart_keeps_the_namespace_and_refuses_lost_data`
 #    (`crates/tunnel-relay/tests/m6_provisioning_process.rs`).  It starts its
-#    own `redis:8.4.0-alpine` container (AOF, `appendfsync always`,
+#    own `redis:8.4.0-alpine` container, pinned by digest (AOF, `appendfsync always`,
 #    `aof-load-truncated no`, as deploy/fly/redis/entrypoint.sh configures the
 #    Fly Redis) on a free loopback port, labelled with the run's nonce and
 #    removed with its volume however the test ends.  It never reads or
 #    restarts `TEST_REDIS_URL`'s Redis: that one is shared.  In order:
 #    provision, `serve` with `redis_restart_continuity_seconds = 1`,
 #    `connect`, echo; `docker restart` Redis under the running relay, which
-#    must re-bind by itself and serve the echo again from the same process;
+#    must re-bind by itself and serve the echo again from the same process,
+#    and again after `docker kill` and start; a copy of the data under
+#    `appendfsync everysec` must be refused (`class=persistence`), as must
+#    `serve` with continuity on such a Redis;
 #    stop the relay, restart Redis, and require `serve` to refuse with
 #    `stage=authority_identity class=run_changed`, `rebind-redis-run` without
 #    its declaration to be refused, and with it the echo to be served again;
 #    snapshot the RDB, revoke the grant, then replace Redis with one loaded
 #    from that snapshot: the serving relay must refuse it (`class=continuity`)
 #    and never serve the resurrected grant for 75 s, and a fresh `serve` must
-#    refuse it; finally replace Redis with an empty one: refused as
+#    refuse it, also after an operator wrongly re-attests it; finally replace
+#    Redis with an empty one: refused as
 #    `class=unbound` by the serving relay, a fresh `serve` and
 #    `rebind-redis-run`, with nothing written into it.
 #
@@ -57,7 +61,9 @@ cargo test -p tunnel-relay --test m6_provisioning_process --locked -- --ignored 
   > "$scratch/restart.log" 2>&1 || { cat "$scratch/restart.log" >&2; exit 1; }
 cat "$scratch/restart.log"
 for needle in "test result: ok. 1 passed" "m6c65-unattended ok nonce=" "relay_restarts=0" \
+  "m6c65-crash ok nonce=" "m6c65-persistence ok nonce=" "class=persistence" \
   "m6c65-operator ok nonce=" "class=run_changed" \
+  "m6c65-reattest-refused ok nonce=" \
   "m6c65-rollback ok nonce=" "class=continuity" \
   "m6c65-empty ok nonce=" "class=unbound" \
   "client=$TUNNEL_CLIENT_BIN"; do
