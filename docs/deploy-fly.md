@@ -700,7 +700,7 @@ sessions end with `AUTHORITY_UNAVAILABLE` when Redis goes away, and devices
 reconnect by themselves; a reconnect can wait out the previous session's
 owner lease, up to 30 s. Measured locally with `docker restart` and with
 `docker kill` then `docker start` of an AOF Redis and the shipped binaries
-(`scripts/m6-redis-restart-verify.sh`): the echo was served again 36 to 54 s
+(`scripts/m6-redis-restart-verify.sh`): the echo was served again 0.3 to 54 s
 after the restart, from the same relay process. **Not run on Fly.** Each re-binding attempt is a lane reconnect, which has 2 s including
 the DNS lookup of `agentuplink-redis.internal` (M6-C74); a lookup slower than
 that fails the attempt and the relay tries again on its next token, every
