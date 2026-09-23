@@ -32,11 +32,13 @@ use base64::{
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tunnel_catalog::{
-    CatalogError, DurableCatalogObservation, RecoveryApprovalVerifier, RecoveryPolicy,
-    RedisCatalog, TrustedRecoveryKey,
+    CatalogConnectionError, CatalogConnectionStage, CatalogError, DurableCatalogObservation,
+    RecoveryApprovalVerifier, RecoveryPolicy, RedisCatalog, TrustedRecoveryKey,
 };
 
-use crate::redis_connection::RedisTlsMaterialPaths;
+use crate::redis_connection::{
+    RedisConnectionError, RedisTlsMaterialPaths, map_catalog_connection_error,
+};
 
 use tokio::task::JoinHandle;
 
@@ -1027,6 +1029,9 @@ pub enum RecoveryWorkflowError {
     TrustedKeysRejected,
     QuiescenceRequired,
     RedisConnection,
+    /// The Redis connection failed; carries only the bounded stage, lane and
+    /// failure class (M6-C72), never a URL, credential or server text.
+    RedisConnectionStaged(RedisConnectionError),
     CatalogUnavailable,
     CatalogDigestMismatch,
     ActivationFailed,
@@ -1052,6 +1057,10 @@ impl fmt::Display for RecoveryWorkflowError {
                 "explicit operator acknowledgement that the old primary and relays are fenced is required",
             ),
             Self::RedisConnection => formatter.write_str("recovery Redis connection failed"),
+            Self::RedisConnectionStaged(error) => match error.stage_detail() {
+                Some(detail) => write!(formatter, "recovery Redis connection failed; {detail}"),
+                None => formatter.write_str("recovery Redis connection failed"),
+            },
             Self::CatalogUnavailable => formatter.write_str("recovery catalog operation failed"),
             Self::CatalogDigestMismatch => {
                 formatter.write_str("recovery approval does not match the live catalog observation")
@@ -1261,23 +1270,33 @@ async fn connect_for_recovery(
             .load()
             .map_err(|_| RecoveryWorkflowError::RedisConnection)?
             .ok_or(RecoveryWorkflowError::RedisConnection)?;
-        RedisCatalog::connect_for_recovery_with_tls(
+        RedisCatalog::connect_for_recovery_with_tls_staged(
             &config.redis_url,
             &config.redis_namespace,
             &config.deployment_incarnation,
             tls,
         )
         .await
-        .map_err(map_catalog_error)
+        .map_err(map_connection_error)
     } else {
-        RedisCatalog::connect_for_recovery(
+        RedisCatalog::connect_for_recovery_staged(
             &config.redis_url,
             &config.redis_namespace,
             &config.deployment_incarnation,
         )
         .await
-        .map_err(map_catalog_error)
+        .map_err(map_connection_error)
     }
+}
+
+/// A failure while opening the Redis authority keeps its bounded stage, lane
+/// and class (M6-C72).  A refused local profile (namespace or incarnation
+/// shape) keeps the classification `map_catalog_error` gives it.
+fn map_connection_error(error: CatalogConnectionError) -> RecoveryWorkflowError {
+    if error.stage() == CatalogConnectionStage::AuthorityProfile {
+        return map_catalog_error(error.into_catalog_error());
+    }
+    RecoveryWorkflowError::RedisConnectionStaged(map_catalog_connection_error(&error))
 }
 
 fn map_catalog_error(error: CatalogError) -> RecoveryWorkflowError {

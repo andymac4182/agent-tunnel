@@ -21,7 +21,8 @@ use std::{
 };
 
 use tunnel_catalog::{
-    CatalogConnectionError, CatalogConnectionStage, RedisCatalog, RedisTlsOptions,
+    CatalogConnectionError, CatalogConnectionFailure, CatalogConnectionLane,
+    CatalogConnectionStage, RedisCatalog, RedisTlsOptions,
 };
 
 /// Maximum size accepted for each Redis TLS PEM file.
@@ -100,6 +101,14 @@ pub enum RedisConnectionError {
     InsecurePermissions(RedisTlsMaterialKind),
     CatalogConnection,
     CatalogConnectionStage(RedisConnectionStage),
+    /// A catalog connection failure with its bounded stage, the lane that
+    /// failed (`None` for the primary connection), and a fixed failure
+    /// class derived from typed error kinds only (M6-C72).
+    CatalogConnectionFailed {
+        stage: RedisConnectionStage,
+        lane: Option<CatalogConnectionLane>,
+        failure: CatalogConnectionFailure,
+    },
 }
 
 impl fmt::Display for RedisConnectionError {
@@ -161,15 +170,72 @@ impl fmt::Display for RedisConnectionError {
             Self::CatalogConnectionStage(stage) => {
                 write!(formatter, "Redis catalog connection failed; stage={}", stage.as_str())
             }
+            Self::CatalogConnectionFailed {
+                stage,
+                lane,
+                failure,
+            } => {
+                formatter.write_str("Redis catalog connection failed; ")?;
+                write_stage_detail(formatter, *stage, *lane, *failure)
+            }
         }
     }
+}
+
+impl RedisConnectionError {
+    /// The bounded `stage=... [lane=N/M] class=...` detail of a catalog
+    /// connection failure, for callers that keep their own message prefix.
+    pub(crate) fn stage_detail(&self) -> Option<StageDetail> {
+        match *self {
+            Self::CatalogConnectionFailed {
+                stage,
+                lane,
+                failure,
+            } => Some(StageDetail {
+                stage,
+                lane,
+                failure,
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// Displays as `stage=... [lane=N/M] class=...`, fixed words only.
+pub(crate) struct StageDetail {
+    stage: RedisConnectionStage,
+    lane: Option<CatalogConnectionLane>,
+    failure: CatalogConnectionFailure,
+}
+
+impl fmt::Display for StageDetail {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write_stage_detail(formatter, self.stage, self.lane, self.failure)
+    }
+}
+
+fn write_stage_detail(
+    formatter: &mut fmt::Formatter<'_>,
+    stage: RedisConnectionStage,
+    lane: Option<CatalogConnectionLane>,
+    failure: CatalogConnectionFailure,
+) -> fmt::Result {
+    write!(formatter, "stage={}", stage.as_str())?;
+    if let Some(lane) = lane {
+        write!(formatter, " lane={}/{}", lane.index, lane.total)?;
+    }
+    write!(formatter, " class={}", failure.as_str())
 }
 
 impl std::error::Error for RedisConnectionError {}
 
 impl From<tunnel_catalog::CatalogError> for RedisConnectionError {
-    fn from(_error: tunnel_catalog::CatalogError) -> Self {
-        Self::CatalogConnectionStage(RedisConnectionStage::AuthorityConnection)
+    fn from(error: tunnel_catalog::CatalogError) -> Self {
+        Self::CatalogConnectionFailed {
+            stage: RedisConnectionStage::AuthorityConnection,
+            lane: None,
+            failure: CatalogConnectionFailure::classify(&error),
+        }
     }
 }
 
@@ -186,8 +252,13 @@ impl From<CatalogConnectionStage> for RedisConnectionStage {
     }
 }
 
-fn map_catalog_connection_error(error: CatalogConnectionError) -> RedisConnectionError {
-    RedisConnectionError::CatalogConnectionStage(error.stage().into())
+/// Keep the catalog's stage, lane and failure class; never its source text.
+pub(crate) fn map_catalog_connection_error(error: &CatalogConnectionError) -> RedisConnectionError {
+    RedisConnectionError::CatalogConnectionFailed {
+        stage: error.stage().into(),
+        lane: error.lane(),
+        failure: error.failure(),
+    }
 }
 
 /// Optional operator-provisioned Redis TLS file paths.
@@ -319,7 +390,7 @@ pub async fn connect(
             deployment_incarnation,
         )
         .await
-        .map_err(map_catalog_connection_error);
+        .map_err(|error| map_catalog_connection_error(&error));
     }
     validate_verified_rediss_url(redis_url)?;
     let Some(tls) = material.load()? else {
@@ -334,7 +405,7 @@ pub async fn connect(
         tls,
     )
     .await
-    .map_err(map_catalog_connection_error)
+    .map_err(|error| map_catalog_connection_error(&error))
 }
 
 /// Connect the same Redis authority as [`connect`], with the same URL and TLS
@@ -353,9 +424,13 @@ pub async fn connect_for_first_activation(
 ) -> Result<RedisCatalog, RedisConnectionError> {
     reject_insecure_tls_url(redis_url)?;
     if !material.is_configured() {
-        return RedisCatalog::connect_for_recovery(redis_url, namespace, deployment_incarnation)
-            .await
-            .map_err(RedisConnectionError::from);
+        return RedisCatalog::connect_for_recovery_staged(
+            redis_url,
+            namespace,
+            deployment_incarnation,
+        )
+        .await
+        .map_err(|error| map_catalog_connection_error(&error));
     }
     validate_verified_rediss_url(redis_url)?;
     let Some(tls) = material.load()? else {
@@ -363,9 +438,14 @@ pub async fn connect_for_first_activation(
             "Redis TLS material selection is inconsistent",
         ));
     };
-    RedisCatalog::connect_for_recovery_with_tls(redis_url, namespace, deployment_incarnation, tls)
-        .await
-        .map_err(RedisConnectionError::from)
+    RedisCatalog::connect_for_recovery_with_tls_staged(
+        redis_url,
+        namespace,
+        deployment_incarnation,
+        tls,
+    )
+    .await
+    .map_err(|error| map_catalog_connection_error(&error))
 }
 
 fn validate_verified_rediss_url(redis_url: &str) -> Result<(), RedisConnectionError> {
@@ -627,11 +707,15 @@ mod tests {
             tunnel_catalog::CatalogError::InvalidInput("redis URL").into();
         assert_eq!(
             catalog_error,
-            RedisConnectionError::CatalogConnectionStage(RedisConnectionStage::AuthorityConnection)
+            RedisConnectionError::CatalogConnectionFailed {
+                stage: RedisConnectionStage::AuthorityConnection,
+                lane: None,
+                failure: CatalogConnectionFailure::Config,
+            }
         );
         assert_eq!(
             catalog_error.to_string(),
-            "Redis catalog connection failed; stage=authority_connection"
+            "Redis catalog connection failed; stage=authority_connection class=config"
         );
         assert_eq!(
             RedisConnectionError::InvalidTlsUrl.to_string(),
@@ -643,6 +727,135 @@ mod tests {
         );
         assert!(!catalog_error.to_string().contains("redis://"));
         assert!(!catalog_error.to_string().contains("redis URL"));
+    }
+
+    /// M6-C72 (M6-C71 on `m6-fly-deploy`, M6-C59): each stage, lane and
+    /// class prints its own line, built from fixed words only.
+    #[test]
+    fn each_stage_lane_and_class_prints_a_distinct_bounded_line() {
+        use CatalogConnectionFailure as Failure;
+        let stages = [
+            RedisConnectionStage::ConnectionEstablishment,
+            RedisConnectionStage::TlsSetup,
+            RedisConnectionStage::Ping,
+            RedisConnectionStage::PrimaryIdentity,
+            RedisConnectionStage::AuthorityProfile,
+            RedisConnectionStage::AuthorityIdentity,
+            RedisConnectionStage::AuthorityConnection,
+        ];
+        let failures = [
+            Failure::Timeout,
+            Failure::Refused,
+            Failure::Io,
+            Failure::TlsCertificate,
+            Failure::TlsAlert,
+            Failure::Tls,
+            Failure::Auth,
+            Failure::NoPerm,
+            Failure::Reply,
+            Failure::InvalidReply,
+            Failure::RunIdConflict,
+            Failure::Config,
+            Failure::Catalog,
+        ];
+        let lanes = [
+            None,
+            Some(CatalogConnectionLane { index: 1, total: 6 }),
+            Some(CatalogConnectionLane { index: 3, total: 6 }),
+        ];
+        let mut seen = std::collections::BTreeSet::new();
+        for stage in stages {
+            for failure in failures {
+                for lane in lanes {
+                    let line = RedisConnectionError::CatalogConnectionFailed {
+                        stage,
+                        lane,
+                        failure,
+                    }
+                    .to_string();
+                    assert!(seen.insert(line.clone()), "duplicate line {line}");
+                    assert!(line.starts_with("Redis catalog connection failed; stage="));
+                    assert!(
+                        line.ends_with(&format!(" class={}", failure.as_str())),
+                        "{line}"
+                    );
+                    assert_eq!(
+                        line.contains(" lane="),
+                        lane.is_some(),
+                        "lane shown only for a lane failure: {line}"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            RedisConnectionError::CatalogConnectionFailed {
+                stage: RedisConnectionStage::ConnectionEstablishment,
+                lane: Some(CatalogConnectionLane { index: 3, total: 6 }),
+                failure: Failure::Timeout,
+            }
+            .to_string(),
+            "Redis catalog connection failed; stage=connection_establishment lane=3/6 class=timeout"
+        );
+        // M6-C59: a wrong password, a wrong CA and a refused client
+        // certificate no longer print the same line.
+        let establishment = |failure| {
+            RedisConnectionError::CatalogConnectionFailed {
+                stage: RedisConnectionStage::ConnectionEstablishment,
+                lane: None,
+                failure,
+            }
+            .to_string()
+        };
+        let wrong_password = establishment(Failure::Auth);
+        let wrong_ca = establishment(Failure::TlsCertificate);
+        let refused_certificate = establishment(Failure::TlsAlert);
+        assert_ne!(wrong_password, wrong_ca);
+        assert_ne!(wrong_password, refused_certificate);
+        assert_ne!(wrong_ca, refused_certificate);
+    }
+
+    /// The staged connectors carry no URL or password into the diagnostic,
+    /// whatever the failure.
+    #[tokio::test]
+    async fn staged_failures_never_print_the_url_or_password() {
+        let secret = "m6c72-secret-password";
+        for url in [
+            format!("redis://m6c72-user:{secret}@127.0.0.1:1/0"),
+            format!("redis://m6c72-user:{secret}@"),
+            format!("redis://:{secret}@127.0.0.1:1/0"),
+        ] {
+            for error in [
+                connect(
+                    &url,
+                    "test-m6c72",
+                    "test-incarnation",
+                    &RedisTlsMaterialPaths::default(),
+                )
+                .await
+                .expect_err("nothing listens on port 1"),
+                connect_for_first_activation(
+                    &url,
+                    "test-m6c72",
+                    "test-incarnation",
+                    &RedisTlsMaterialPaths::default(),
+                )
+                .await
+                .expect_err("nothing listens on port 1"),
+            ] {
+                let line = error.to_string();
+                let debug = format!("{error:?}");
+                assert!(
+                    line.starts_with("Redis catalog connection failed; stage="),
+                    "{line}"
+                );
+                for shown in [&line, &debug] {
+                    assert!(!shown.contains(secret), "{shown}");
+                    assert!(!shown.contains("redis://"), "{shown}");
+                    assert!(!shown.contains("127.0.0.1"), "{shown}");
+                    assert!(!shown.contains("m6c72-user"), "{shown}");
+                }
+            }
+        }
     }
 
     #[tokio::test]

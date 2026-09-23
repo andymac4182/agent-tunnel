@@ -1,5 +1,7 @@
 use crate::cluster;
-use crate::error::{CatalogConnectionError, CatalogConnectionStage};
+use crate::error::{
+    CatalogConnectionError, CatalogConnectionFailure, CatalogConnectionLane, CatalogConnectionStage,
+};
 use crate::memory::valid_fingerprint;
 use crate::types::valid_principal_identity;
 use crate::{
@@ -47,6 +49,8 @@ const AUTHORIZATION_CONNECTIONS: usize = 4;
 /// maintains per tick, so the lane count is a transport choice, not a
 /// concurrency limit.
 const MAINTENANCE_CONNECTIONS: usize = 2;
+/// Every lane opened after the primary connection, for diagnostics.
+const LANE_CONNECTIONS: usize = AUTHORIZATION_CONNECTIONS + MAINTENANCE_CONNECTIONS;
 /// How far a caller's clock may run *ahead* of the authority before a
 /// timestamped read is refused. This is the genuine clock-skew direction: the
 /// scripts evaluate validity at `math.max(caller_at, now)`, so a caller ahead of
@@ -335,9 +339,18 @@ impl RedisCatalog {
     /// `namespace` is durable identity state and must not be changed when a
     /// deployment incarnation changes after an uncertain Redis restore.
     pub async fn connect(redis_url: &str, namespace: &str) -> Result<Self, CatalogError> {
-        Self::connect_inner(redis_url, namespace, None)
+        Self::connect_staged(redis_url, namespace)
             .await
             .map_err(CatalogConnectionError::into_catalog_error)
+    }
+
+    /// [`Self::connect`] keeping the bounded stage, lane and failure class
+    /// for operator diagnostics.
+    pub async fn connect_staged(
+        redis_url: &str,
+        namespace: &str,
+    ) -> Result<Self, CatalogConnectionError> {
+        Self::connect_inner(redis_url, namespace, None).await
     }
 
     /// Connect to Redis over verified TLS with an explicit trust bundle and,
@@ -349,9 +362,19 @@ impl RedisCatalog {
         namespace: &str,
         tls: RedisTlsOptions,
     ) -> Result<Self, CatalogError> {
-        Self::connect_inner(redis_url, namespace, Some(tls))
+        Self::connect_with_tls_staged(redis_url, namespace, tls)
             .await
             .map_err(CatalogConnectionError::into_catalog_error)
+    }
+
+    /// [`Self::connect_with_tls`] keeping the bounded stage, lane and failure
+    /// class for operator diagnostics.
+    pub async fn connect_with_tls_staged(
+        redis_url: &str,
+        namespace: &str,
+        tls: RedisTlsOptions,
+    ) -> Result<Self, CatalogConnectionError> {
+        Self::connect_inner(redis_url, namespace, Some(tls)).await
     }
 
     async fn connect_inner(
@@ -400,28 +423,40 @@ impl RedisCatalog {
         };
         let (connection, redis_run_id) = open_verified_connection(&client).await?;
         let lane_group = Arc::new(LaneGroup::default());
-        let open_lanes =
-            async |count: usize| -> Result<Vec<AuthorityLane>, CatalogConnectionError> {
-                let mut lanes = Vec::with_capacity(count);
-                for _ in 0..count {
-                    let (lane_connection, lane_run_id) = open_verified_connection(&client).await?;
-                    if lane_run_id != redis_run_id {
-                        return Err(catalog_connection_error(
-                            CatalogConnectionStage::PrimaryIdentity,
-                            CatalogError::Conflict(lane::RUN_ID_CONFLICT),
-                        ));
-                    }
-                    lanes.push(AuthorityLane::new(
-                        client.clone(),
-                        lane_connection,
-                        redis_run_id.clone(),
-                        Arc::clone(&lane_group),
-                    ));
+        // Lanes are numbered 1..=LANE_CONNECTIONS in opening order so a
+        // failure after the primary connection names the lane that failed.
+        let open_lanes = async |first: usize,
+                                count: usize|
+               -> Result<Vec<AuthorityLane>, CatalogConnectionError> {
+            let mut lanes = Vec::with_capacity(count);
+            for offset in 0..count {
+                let lane_number = CatalogConnectionLane {
+                    index: u8::try_from(first + offset).unwrap_or(u8::MAX),
+                    total: u8::try_from(LANE_CONNECTIONS).unwrap_or(u8::MAX),
+                };
+                let (lane_connection, lane_run_id) = open_verified_connection(&client)
+                    .await
+                    .map_err(|error| error.with_lane(lane_number))?;
+                if lane_run_id != redis_run_id {
+                    return Err(catalog_connection_error(
+                        CatalogConnectionStage::PrimaryIdentity,
+                        CatalogError::Conflict(lane::RUN_ID_CONFLICT),
+                    )
+                    .with_failure(CatalogConnectionFailure::RunIdConflict)
+                    .with_lane(lane_number));
                 }
-                Ok(lanes)
-            };
-        let authorization_connections = open_lanes(AUTHORIZATION_CONNECTIONS).await?;
-        let maintenance_connections = open_lanes(MAINTENANCE_CONNECTIONS).await?;
+                lanes.push(AuthorityLane::new(
+                    client.clone(),
+                    lane_connection,
+                    redis_run_id.clone(),
+                    Arc::clone(&lane_group),
+                ));
+            }
+            Ok(lanes)
+        };
+        let authorization_connections = open_lanes(1, AUTHORIZATION_CONNECTIONS).await?;
+        let maintenance_connections =
+            open_lanes(1 + AUTHORIZATION_CONNECTIONS, MAINTENANCE_CONNECTIONS).await?;
         let connection = Arc::new(AuthorityLane::new(
             client.clone(),
             connection,
@@ -527,8 +562,24 @@ impl RedisCatalog {
         namespace: &str,
         deployment_incarnation: &str,
     ) -> Result<Self, CatalogError> {
-        let mut catalog = Self::connect(redis_url, namespace).await?;
-        catalog.configure_deployment_incarnation(deployment_incarnation)?;
+        Self::connect_for_recovery_staged(redis_url, namespace, deployment_incarnation)
+            .await
+            .map_err(CatalogConnectionError::into_catalog_error)
+    }
+
+    /// [`Self::connect_for_recovery`] keeping the bounded stage, lane and
+    /// failure class for operator diagnostics.
+    pub async fn connect_for_recovery_staged(
+        redis_url: &str,
+        namespace: &str,
+        deployment_incarnation: &str,
+    ) -> Result<Self, CatalogConnectionError> {
+        let mut catalog = Self::connect_inner(redis_url, namespace, None).await?;
+        catalog
+            .configure_deployment_incarnation(deployment_incarnation)
+            .map_err(|error| {
+                catalog_connection_error(CatalogConnectionStage::AuthorityProfile, error)
+            })?;
         Ok(catalog)
     }
 
@@ -539,8 +590,30 @@ impl RedisCatalog {
         deployment_incarnation: &str,
         tls: RedisTlsOptions,
     ) -> Result<Self, CatalogError> {
-        let mut catalog = Self::connect_with_tls(redis_url, namespace, tls).await?;
-        catalog.configure_deployment_incarnation(deployment_incarnation)?;
+        Self::connect_for_recovery_with_tls_staged(
+            redis_url,
+            namespace,
+            deployment_incarnation,
+            tls,
+        )
+        .await
+        .map_err(CatalogConnectionError::into_catalog_error)
+    }
+
+    /// [`Self::connect_for_recovery_with_tls`] keeping the bounded stage,
+    /// lane and failure class for operator diagnostics.
+    pub async fn connect_for_recovery_with_tls_staged(
+        redis_url: &str,
+        namespace: &str,
+        deployment_incarnation: &str,
+        tls: RedisTlsOptions,
+    ) -> Result<Self, CatalogConnectionError> {
+        let mut catalog = Self::connect_inner(redis_url, namespace, Some(tls)).await?;
+        catalog
+            .configure_deployment_incarnation(deployment_incarnation)
+            .map_err(|error| {
+                catalog_connection_error(CatalogConnectionStage::AuthorityProfile, error)
+            })?;
         Ok(catalog)
     }
 
@@ -2137,6 +2210,7 @@ async fn verify_connection_identity(
     .map_err(|error| catalog_connection_error(CatalogConnectionStage::PrimaryIdentity, error))?;
     let redis_run_id = parse_redis_run_id(&info).map_err(|error| {
         catalog_connection_error(CatalogConnectionStage::PrimaryIdentity, error)
+            .with_failure(CatalogConnectionFailure::InvalidReply)
     })?;
     Ok((connection, redis_run_id))
 }

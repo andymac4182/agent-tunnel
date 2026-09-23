@@ -157,11 +157,15 @@ fn server_pki() -> ServerPki {
 
 /// A TLS terminator in front of the plaintext test Redis.  It stands in for a
 /// `rediss://` Redis; it neither reads nor alters the RESP stream.
-async fn redis_tls_forwarder(upstream: SocketAddr, pki: &ServerPki) -> SocketAddr {
+async fn redis_tls_forwarder(
+    upstream: SocketAddr,
+    pki: &ServerPki,
+    client_ca_pem: Option<&str>,
+) -> SocketAddr {
     let server_config = tunnel_transport::load_server_config_from_pem(
         pki.chain_pem.as_bytes(),
         pki.key_pem.as_bytes(),
-        None,
+        client_ca_pem.map(str::as_bytes),
     )
     .expect("Redis forwarder TLS config");
     let acceptor = TlsAcceptor::from(server_config);
@@ -246,6 +250,23 @@ fn delete_namespace(upstream: SocketAddr, database: u32, namespace: &str) -> usi
         redis_command(upstream, database, &command);
     }
     keys.len()
+}
+
+/// Removes this run's ACL user however the test ends.
+struct AclUserGuard {
+    upstream: SocketAddr,
+    database: u32,
+    user: String,
+}
+
+impl Drop for AclUserGuard {
+    fn drop(&mut self) {
+        redis_command(
+            self.upstream,
+            self.database,
+            &["ACL", "DELUSER", &self.user],
+        );
+    }
 }
 
 /// Removes the run's namespace however the test ends.
@@ -532,7 +553,7 @@ async fn m6c21_shipped_binaries_provision_one_relay_and_one_device_end_to_end() 
     fs::write(&server_chain, &pki.chain_pem).expect("server chain");
     let server_key = work.join("relay-key.pem");
     fs::write(&server_key, &pki.key_pem).expect("server key");
-    let redis_tls = redis_tls_forwarder(upstream, &pki).await;
+    let redis_tls = redis_tls_forwarder(upstream, &pki, None).await;
     let (issuer_key, jwks) = oidc_issuer(&work);
 
     let consumer = free_port();
@@ -671,6 +692,108 @@ async fn m6c21_shipped_binaries_provision_one_relay_and_one_device_end_to_end() 
         "step serve-before-activation: expected the incarnation fence refusal, got {:?}: {refused_stderr}",
         refused.status.code()
     );
+
+    // M6-C72 (M6-C71 on `m6-fly-deploy`, M6-C59): a Redis connection
+    // failure during the first activation names its own stage and class,
+    // and prints neither the URL nor a password.  Each case fails before any
+    // write, so the namespace stays empty for the real activation below.
+    let redis_authority = format!("localhost:{}/{database}", redis_tls.port());
+    let wrong_ca = work.join("unrelated-ca.pem");
+    fs::write(&wrong_ca, server_pki().ca_pem).expect("unrelated CA");
+    let base_toml = fs::read_to_string(&relay_config).expect("relay config");
+    // A Redis endpoint that requires a client certificate the relay does not
+    // present (the configuration has no client certificate fields).
+    let mtls_redis = redis_tls_forwarder(upstream, &pki, Some(&server_pki().ca_pem)).await;
+    let wrong_password = format!("m6c72-wrong-{nonce}");
+    let acl_user = format!("m6c72-noinfo-{nonce}");
+    let acl_password = format!("m6c72-pass-{nonce}");
+    let _acl_guard = AclUserGuard {
+        upstream,
+        database,
+        user: acl_user.clone(),
+    };
+    let created = redis_command(
+        upstream,
+        database,
+        &[
+            "ACL",
+            "SETUSER",
+            &acl_user,
+            "on",
+            &format!(">{acl_password}"),
+            "~*",
+            "+@all",
+            "-info",
+        ],
+    );
+    assert!(
+        String::from_utf8_lossy(&created).matches("+OK").count() >= 2,
+        "create the no-INFO ACL user: {}",
+        String::from_utf8_lossy(&created)
+    );
+    for (case, toml, secret, expected) in [
+        (
+            "wrong Redis CA",
+            base_toml.replace(&toml_string(&server_ca), &toml_string(&wrong_ca)),
+            None,
+            "Redis catalog connection failed; stage=connection_establishment class=tls_certificate",
+        ),
+        (
+            "wrong Redis password",
+            set_key(
+                &base_toml,
+                "redis_url",
+                &format!("\"rediss://m6c72-nouser-{nonce}:{wrong_password}@{redis_authority}\""),
+            ),
+            Some(wrong_password.as_str()),
+            "Redis catalog connection failed; stage=connection_establishment class=auth",
+        ),
+        (
+            "ACL user without INFO",
+            set_key(
+                &base_toml,
+                "redis_url",
+                &format!("\"rediss://{acl_user}:{acl_password}@{redis_authority}\""),
+            ),
+            Some(acl_password.as_str()),
+            "Redis catalog connection failed; stage=primary_identity class=noperm",
+        ),
+        (
+            "missing client certificate",
+            set_key(
+                &base_toml,
+                "redis_url",
+                &format!("\"rediss://localhost:{}/{database}\"", mtls_redis.port()),
+            ),
+            None,
+            "Redis catalog connection failed; stage=connection_establishment class=tls_alert",
+        ),
+    ] {
+        let config = work.join(format!("relay-{}.toml", case.replace(' ', "-")));
+        fs::write(&config, toml).expect("case config");
+        let output = Command::new(&relay_bin)
+            .args(["activate-first-incarnation", "--config"])
+            .arg(&config)
+            .output()
+            .expect("run activate-first-incarnation");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.code() == Some(1) && stderr.contains(expected),
+            "step activate with {case}: expected `{expected}`, got {:?}: {stderr}",
+            output.status.code()
+        );
+        assert!(
+            !stderr.contains("rediss://") && !stderr.contains(&redis_authority),
+            "step activate with {case}: stderr names the Redis URL: {stderr}"
+        );
+        if let Some(secret) = secret {
+            assert!(
+                !stderr.contains(secret),
+                "step activate with {case}: stderr prints the password"
+            );
+        }
+        println!("m6c72-stage ok case={case} expected={expected}");
+    }
 
     let activated = stdout(&step(
         "first incarnation (tunnel-relay activate-first-incarnation)",
