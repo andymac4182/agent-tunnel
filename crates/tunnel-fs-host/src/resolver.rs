@@ -465,9 +465,20 @@ impl ExportRoot {
 
     /// Resolve using `openat2` where the host has it, and the per-component
     /// walk everywhere else.
+    ///
+    /// **With the `symlinks` feature on, Linux takes the per-component walk
+    /// too.** `RESOLVE_IN_ROOT` hands link following to the kernel, and the
+    /// kernel enforces its own bound (`MAXSYMLINKS`, 40) and no bound at all
+    /// on a link target's component count. The contract's bounds are 32 hops
+    /// and `maxPathComponents` per target, and they are the provider's to
+    /// enforce: under `openat2` a 40-link chain resolved and a six-component
+    /// target was walked under a four-component bound, which the first Linux
+    /// run of `tests/symlinks.rs` showed. `openat2` stays the mechanism with
+    /// the feature off, where `RESOLVE_NO_SYMLINKS` follows no link and so
+    /// neither bound can arise.
     #[cfg(target_os = "linux")]
     fn walk(&self, path: &VirtualPath, intent: Intent) -> Result<Handle, FsError> {
-        if !self.anchored_open {
+        if !self.anchored_open || self.features.has(Feature::Symlinks) {
             return self.walk_components(path, intent);
         }
         match self.walk_openat2(path, intent) {
@@ -500,19 +511,16 @@ impl ExportRoot {
 
     /// The Linux anchoring primitive the contract names.
     ///
-    /// The `resolve` flag follows the `symlinks` feature and the two are
-    /// mutually exclusive: `RESOLVE_NO_SYMLINKS` with the feature off, so a
-    /// link met during the walk fails with `ELOOP` rather than being followed,
-    /// and `RESOLVE_IN_ROOT` with it on, so an absolute link target is
-    /// re-rooted at the export root. `RESOLVE_BENEATH` is **not** used: it
-    /// answers `EXDEV` to an absolute link target instead of re-rooting it, so
-    /// it cannot satisfy the re-rooting rule.
+    /// Used only with the `symlinks` feature **off**, so the flag is always
+    /// `RESOLVE_NO_SYMLINKS`: a link met during the walk fails with `ELOOP`
+    /// rather than being followed. With the feature on, [`Self::walk`] takes
+    /// the per-component walk instead, because `RESOLVE_IN_ROOT` would leave
+    /// the hop and link-target bounds to the kernel's own limits.
+    /// `RESOLVE_BENEATH` is not used either way: it answers `EXDEV` to an
+    /// absolute link target instead of re-rooting it.
     ///
     /// The outer `Result` is the host errno, so the caller can recognise the
     /// fallback cases before they are flattened into the closed vocabulary.
-    ///
-    /// **Not exercised by this crate's tests.** The only host available is
-    /// macOS; this path compiles but has not been run.
     #[cfg(target_os = "linux")]
     fn walk_openat2(
         &self,
@@ -530,13 +538,12 @@ impl ExportRoot {
         // refuses the `/proc` links that are re-openings of an existing
         // descriptor rather than names, which `RESOLVE_IN_ROOT` would
         // otherwise follow.
-        let boundaries = ResolveFlags::NO_XDEV | ResolveFlags::NO_MAGICLINKS;
-        let resolve = boundaries
-            | if self.features.has(Feature::Symlinks) {
-                ResolveFlags::IN_ROOT
-            } else {
-                ResolveFlags::NO_SYMLINKS
-            };
+        //
+        // `NO_SYMLINKS` unconditionally, not chosen by the feature: `walk`
+        // never calls this with the feature on, and if it ever did, a link
+        // would be refused rather than followed past the provider's bounds.
+        let resolve =
+            ResolveFlags::NO_XDEV | ResolveFlags::NO_MAGICLINKS | ResolveFlags::NO_SYMLINKS;
         let relative = relative_spelling(path);
         // `O_PATH` first: it opens no device, blocks on no FIFO and starts no
         // driver, so the node kind is decided before anything is really
