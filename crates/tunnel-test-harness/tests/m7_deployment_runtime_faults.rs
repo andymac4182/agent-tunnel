@@ -7,6 +7,9 @@
 //! The relay is stopped with SIGINT and every socket and Redis fixture namespace
 //! is cleaned up before the case returns, including failed probe paths.
 
+// The harness library is Unix-only (see `src/entry.rs`).
+#![cfg(unix)]
+
 use std::{
     collections::BTreeMap,
     env,

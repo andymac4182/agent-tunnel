@@ -15,6 +15,9 @@
 //! public canary.  Every assertion is local to this source build; evidence is
 //! payload-free.
 
+// The harness library is Unix-only (see `src/entry.rs`).
+#![cfg(unix)]
+
 use std::{
     collections::BTreeMap,
     env,

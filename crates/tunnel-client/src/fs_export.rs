@@ -38,15 +38,21 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+#[cfg(unix)]
 use bytes::Bytes;
 
 use tunnel_fs_core::{Capability, CapabilitySet, Feature, FeatureSet, Limits, SessionErrorCode};
+use tunnel_fs_provider::{Authority, Authorization, ProviderStats, default_limits};
+use tunnel_http_bridge::{FrameReceiver, FrameSender};
+// The serving half needs the Unix-only dispatcher; on any other host `serve`
+// answers no session, and `RuntimeConfig::validate` has already refused an fs
+// export there with "filesystem exports are unsupported on this host".
+#[cfg(unix)]
 use tunnel_fs_ninep::{FrameDecoder, MAX_MESSAGE_BYTES};
-use tunnel_fs_provider::{
-    Authority, Authorization, Outbound, Provider, ProviderStats, RECORD_HEADER_LEN, default_limits,
-    encode_close, encode_message,
-};
-use tunnel_http_bridge::{Frame, FrameReceiver, FrameSender};
+#[cfg(unix)]
+use tunnel_fs_provider::{Outbound, Provider, RECORD_HEADER_LEN, encode_close, encode_message};
+#[cfg(unix)]
+use tunnel_http_bridge::Frame;
 
 /// What an operator configured for one filesystem export.
 #[derive(Clone, Debug)]
@@ -450,6 +456,7 @@ async fn emit(
     false
 }
 
+#[cfg(unix)]
 async fn emit_close(outbound: &FrameSender, code: SessionErrorCode) {
     let mut record = Vec::with_capacity(6);
     encode_close(code, &mut record);

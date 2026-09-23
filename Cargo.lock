@@ -3778,6 +3778,7 @@ dependencies = [
  "tunnel-protocol",
  "tunnel-transport",
  "uuid",
+ "winapi-util",
 ]
 
 [[package]]

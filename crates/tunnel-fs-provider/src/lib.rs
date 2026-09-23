@@ -64,14 +64,18 @@
 //! building. [`ProviderStats`] is counters. Every error is a gate-1 [`FsError`]
 //! or a [`SessionErrorCode`], both `Copy` over field-free enums.
 
+// Deliberately **not** `cfg(unix)`: `tunnel-client` names these on every
+// host, including one that serves no filesystem export.
+mod authority;
 #[cfg(unix)]
 mod provider;
 // Deliberately **not** `cfg(unix)`: the relay decodes this framing too, and a
 // relay is not required to be a host that can serve a filesystem export.
 pub mod record;
 
+pub use authority::{Authority, Authorization, ProviderStats};
 #[cfg(unix)]
-pub use provider::{Authority, Authorization, Outbound, Provider, ProviderStats};
+pub use provider::{Outbound, Provider};
 pub use record::{
     KIND_CLOSE, KIND_MESSAGE, MAX_RECORD_BYTES, RECORD_HEADER_LEN, Record, RecordDecoder,
     RecordError, encode_close, encode_message,

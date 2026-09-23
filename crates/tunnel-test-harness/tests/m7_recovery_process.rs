@@ -7,6 +7,9 @@
 //! session afterward.  A separate device is revoked before the approval and
 //! remains unauthorized after the candidate starts.
 
+// The harness library is Unix-only (see `src/entry.rs`).
+#![cfg(unix)]
+
 use std::{
     collections::BTreeMap,
     env,

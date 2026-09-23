@@ -12,6 +12,10 @@
 //! response.  The ignored binary workflow terminates a synthetic TLS listener
 //! and forwards to that same Redis authority; it does not use a fake catalog.
 
+// The binary workflow and its TLS forwarder are Unix-only (they set POSIX file
+// modes), so off Unix their helpers are unused rather than wrong.
+#![cfg_attr(not(unix), allow(dead_code))]
+
 use std::{
     collections::BTreeSet,
     future::Future,

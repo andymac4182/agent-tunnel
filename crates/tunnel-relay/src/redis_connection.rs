@@ -7,6 +7,7 @@
 //! remains the authority for the authenticated connection and deployment
 //! incarnation fence.
 
+use crate::file_identity::Observed;
 use std::{
     fmt,
     fs::{self, File},
@@ -487,7 +488,7 @@ fn read_material(
     }
     reject_symlink_components(path, kind)?;
     let path_metadata =
-        fs::symlink_metadata(path).map_err(|_| RedisConnectionError::FileIo(kind))?;
+        Observed::path_no_follow(path).map_err(|_| RedisConnectionError::FileIo(kind))?;
     if path_metadata.file_type().is_symlink() {
         return Err(RedisConnectionError::SymlinkRejected(kind));
     }
@@ -499,9 +500,7 @@ fn read_material(
     }
 
     let file = open_readonly_nofollow(path).map_err(|_| RedisConnectionError::FileIo(kind))?;
-    let opened_metadata = file
-        .metadata()
-        .map_err(|_| RedisConnectionError::FileIo(kind))?;
+    let opened_metadata = Observed::file(&file).map_err(|_| RedisConnectionError::FileIo(kind))?;
     if !same_file_metadata(&path_metadata, &opened_metadata) {
         return Err(RedisConnectionError::PathChanged(kind));
     }
@@ -574,7 +573,7 @@ fn reject_symlink_components(
             Component::Normal(name) => current.push(name),
         }
         let metadata =
-            fs::symlink_metadata(&current).map_err(|_| RedisConnectionError::FileIo(kind))?;
+            Observed::path_no_follow(&current).map_err(|_| RedisConnectionError::FileIo(kind))?;
         if metadata.file_type().is_symlink() {
             return Err(RedisConnectionError::SymlinkRejected(kind));
         }
@@ -582,24 +581,9 @@ fn reject_symlink_components(
     Ok(())
 }
 
-fn same_file_metadata(first: &fs::Metadata, second: &fs::Metadata) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        first.dev() == second.dev() && first.ino() == second.ino()
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        first.volume_serial_number() == second.volume_serial_number()
-            && first.file_index() == second.file_index()
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        first.is_file() == second.is_file()
-            && first.is_dir() == second.is_dir()
-            && first.len() == second.len()
-    }
+fn same_file_metadata(first: &Observed, second: &Observed) -> bool {
+    // A real file identity on every host; see `crate::file_identity`.
+    first.same_file(second)
 }
 
 #[cfg(test)]

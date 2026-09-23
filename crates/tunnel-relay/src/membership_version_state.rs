@@ -7,6 +7,7 @@
 //! credentials, and is never treated as optional when opened in persisted
 //! mode.
 
+use crate::file_identity::Observed;
 use std::{
     collections::BTreeMap,
     error::Error,
@@ -266,7 +267,7 @@ impl MembershipVersionStateStore {
     fn create_initial(&self, bytes: &[u8]) -> Result<(), MembershipVersionStateStoreError> {
         let parent = parent_directory(&self.path);
         let parent_metadata = ensure_parent_directory(parent)?;
-        match fs::symlink_metadata(&self.path) {
+        match Observed::path_no_follow(&self.path) {
             Ok(metadata) => {
                 if metadata.file_type().is_symlink() {
                     return Err(MembershipVersionStateStoreError::SymlinkRejected);
@@ -466,7 +467,7 @@ fn decode_envelope(
 fn read_bounded_file(path: &Path) -> Result<Vec<u8>, MembershipVersionStateStoreError> {
     let parent = parent_directory(path);
     let parent_metadata = ensure_parent_directory(parent)?;
-    let path_metadata = fs::symlink_metadata(path).map_err(|error| {
+    let path_metadata = Observed::path_no_follow(path).map_err(|error| {
         if error.kind() == io::ErrorKind::NotFound {
             MembershipVersionStateStoreError::Missing
         } else {
@@ -481,14 +482,13 @@ fn read_bounded_file(path: &Path) -> Result<Vec<u8>, MembershipVersionStateStore
             MembershipVersionStateStoreError::Io
         }
     })?;
-    let opened_metadata = file
-        .metadata()
-        .map_err(|_| MembershipVersionStateStoreError::Io)?;
+    let opened_metadata =
+        Observed::file(&file).map_err(|_| MembershipVersionStateStoreError::Io)?;
     validate_file_metadata(&opened_metadata)?;
     if !same_file_metadata(&path_metadata, &opened_metadata) {
         return Err(MembershipVersionStateStoreError::PathChanged);
     }
-    let current_path_metadata = fs::symlink_metadata(path).map_err(|error| {
+    let current_path_metadata = Observed::path_no_follow(path).map_err(|error| {
         if error.kind() == io::ErrorKind::NotFound {
             MembershipVersionStateStoreError::Missing
         } else {
@@ -548,7 +548,7 @@ fn lock_path(path: &Path) -> Result<PathBuf, MembershipVersionStateStoreError> {
 fn open_lock_file(path: &Path) -> Result<File, MembershipVersionStateStoreError> {
     let parent = parent_directory(path);
     let parent_metadata = ensure_parent_directory(parent)?;
-    let previous_metadata = match fs::symlink_metadata(path) {
+    let previous_metadata = match Observed::path_no_follow(path) {
         Ok(metadata) => {
             validate_file_metadata(&metadata)?;
             if metadata.len() != 0 {
@@ -575,9 +575,8 @@ fn open_lock_file(path: &Path) -> Result<File, MembershipVersionStateStoreError>
             MembershipVersionStateStoreError::Io
         }
     })?;
-    let opened_metadata = file
-        .metadata()
-        .map_err(|_| MembershipVersionStateStoreError::Io)?;
+    let opened_metadata =
+        Observed::file(&file).map_err(|_| MembershipVersionStateStoreError::Io)?;
     validate_file_metadata(&opened_metadata)?;
     if opened_metadata.len() != 0 {
         return Err(MembershipVersionStateStoreError::Corrupt);
@@ -588,7 +587,7 @@ fn open_lock_file(path: &Path) -> Result<File, MembershipVersionStateStoreError>
     {
         return Err(MembershipVersionStateStoreError::PathChanged);
     }
-    let current_metadata = fs::symlink_metadata(path).map_err(|error| {
+    let current_metadata = Observed::path_no_follow(path).map_err(|error| {
         if error.kind() == io::ErrorKind::NotFound {
             MembershipVersionStateStoreError::Missing
         } else {
@@ -630,9 +629,10 @@ fn validate_file_metadata(metadata: &Metadata) -> Result<(), MembershipVersionSt
     Ok(())
 }
 
-fn ensure_parent_directory(path: &Path) -> Result<Metadata, MembershipVersionStateStoreError> {
+fn ensure_parent_directory(path: &Path) -> Result<Observed, MembershipVersionStateStoreError> {
     ensure_no_symlink_components(path)?;
-    let metadata = fs::symlink_metadata(path).map_err(|_| MembershipVersionStateStoreError::Io)?;
+    let metadata =
+        Observed::path_no_follow(path).map_err(|_| MembershipVersionStateStoreError::Io)?;
     if metadata.file_type().is_symlink() {
         return Err(MembershipVersionStateStoreError::SymlinkRejected);
     }
@@ -665,7 +665,7 @@ fn ensure_no_symlink_components(path: &Path) -> Result<(), MembershipVersionStat
             Component::Normal(name) => current.push(name),
         }
         let metadata =
-            fs::symlink_metadata(&current).map_err(|_| MembershipVersionStateStoreError::Io)?;
+            Observed::path_no_follow(&current).map_err(|_| MembershipVersionStateStoreError::Io)?;
         if metadata.file_type().is_symlink() {
             return Err(MembershipVersionStateStoreError::SymlinkRejected);
         }
@@ -673,24 +673,9 @@ fn ensure_no_symlink_components(path: &Path) -> Result<(), MembershipVersionStat
     Ok(())
 }
 
-fn same_file_metadata(first: &Metadata, second: &Metadata) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        first.dev() == second.dev() && first.ino() == second.ino()
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        first.volume_serial_number() == second.volume_serial_number()
-            && first.file_index() == second.file_index()
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        first.is_file() == second.is_file()
-            && first.is_dir() == second.is_dir()
-            && first.len() == second.len()
-    }
+fn same_file_metadata(first: &Observed, second: &Observed) -> bool {
+    // A real file identity on every host; see `crate::file_identity`.
+    first.same_file(second)
 }
 
 fn parent_directory(path: &Path) -> &Path {
@@ -701,7 +686,7 @@ fn parent_directory(path: &Path) -> &Path {
 
 fn sync_parent_directory(
     path: &Path,
-    expected: &Metadata,
+    expected: &Observed,
 ) -> Result<(), MembershipVersionStateStoreError> {
     let current = ensure_parent_directory(path)?;
     if !same_file_metadata(expected, &current) {
@@ -711,9 +696,8 @@ fn sync_parent_directory(
     {
         let directory =
             open_readonly_nofollow(path).map_err(|_| MembershipVersionStateStoreError::Io)?;
-        let opened = directory
-            .metadata()
-            .map_err(|_| MembershipVersionStateStoreError::Io)?;
+        let opened =
+            Observed::file(&directory).map_err(|_| MembershipVersionStateStoreError::Io)?;
         if !same_file_metadata(expected, &opened) {
             return Err(MembershipVersionStateStoreError::PathChanged);
         }

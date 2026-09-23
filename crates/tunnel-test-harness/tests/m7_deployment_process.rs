@@ -8,6 +8,9 @@
 //! and health is observed over the relay's consumer TLS listener.  The relay
 //! binary may be supplied explicitly or discovered beside the built test.
 
+// The harness library is Unix-only (see `src/entry.rs`).
+#![cfg(unix)]
+
 use std::{collections::BTreeMap, env, net::SocketAddr, path::Path, sync::Arc, time::Duration};
 
 use tunnel_catalog::{RedisCatalog, RedisMembershipPublisher};

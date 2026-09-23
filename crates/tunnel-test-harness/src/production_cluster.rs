@@ -7194,6 +7194,27 @@ impl ConsumerStream {
         }
     }
 
+    /// End the connection the way a client that has given up does: a TCP
+    /// reset, not a WebSocket close handshake.
+    ///
+    /// A Close frame is delivered **in order**, behind every frame already
+    /// in the kernel buffers between the consumer and the relay. Under
+    /// saturation that backlog is whatever the host's socket buffers hold,
+    /// and Linux autotunes them far larger than macOS: in the M7 pressure
+    /// gate the consumer had 100 to 170 64 KiB records accepted on Linux
+    /// against 33 to 48 on macOS, the Close took 2 s to leave, and the relay
+    /// had not answered it 5 s later. A zero-linger close makes the kernel
+    /// send RST, which the relay sees on its next read or write whatever is
+    /// queued ahead of it.
+    fn abort(self) {
+        if let MaybeTlsStream::Rustls(tls) = self.socket.get_ref() {
+            let _ = tls.get_ref().0.set_zero_linger();
+        } else if let MaybeTlsStream::Plain(tcp) = self.socket.get_ref() {
+            let _ = tcp.set_zero_linger();
+        }
+        drop(self);
+    }
+
     async fn close(&mut self) -> Result<()> {
         if self.closed {
             return Ok(());

@@ -8,6 +8,9 @@
 //! readiness on that approved address before its joined shutdown and fixture
 //! cleanup.
 
+// The harness library is Unix-only (see `src/entry.rs`).
+#![cfg(unix)]
+
 use std::{
     collections::BTreeMap,
     env,

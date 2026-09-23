@@ -5,6 +5,10 @@
 //! process exits promptly, emits the typed/redacted reason, and leaves no
 //! public or peer listener behind.
 
+// The stop-signal cases are Unix-only (they send SIGTERM and SIGINT), so off
+// Unix their helpers are unused rather than wrong.
+#![cfg_attr(not(unix), allow(dead_code))]
+
 use std::{
     ffi::OsStr,
     fs, io,
@@ -549,6 +553,31 @@ fn serve_rejects_unavailable_checkpoint_before_public_serving() {
     fixture.assert_bindings_available();
 }
 
+/// The four fake-Redis tests above failed on the GitHub Linux runner with
+/// `stage=authority_identity class=io`: the fixture closed the relay's primary
+/// connection while the relay was opening its other lanes. This holds each
+/// handshake for 50 ms, so the primary is idle for about 300 ms, and requires
+/// startup still to reach the membership check the fixture exists to reach.
+#[test]
+fn serve_reaches_the_membership_check_when_redis_lanes_open_slowly() {
+    let fixture = StartupFixture::new();
+    initialize_state(&fixture, "rediss://127.0.0.1:1/0");
+    fixture.files.write(
+        "startup-membership-state.json",
+        DIAGNOSTIC_SECRET.as_bytes(),
+    );
+
+    let redis = FakeRedisTls::start_with_handshake_delay(&fixture, Duration::from_millis(50));
+    let config = fixture.valid_config(&redis.url());
+    let output = run_relay_bounded([
+        OsStr::new("serve"),
+        OsStr::new("--config"),
+        config.as_os_str(),
+    ]);
+    assert_failure(&output, "membership state is corrupt");
+    fixture.assert_bindings_available();
+}
+
 // ------------------------------------------------------------------------
 // Stop requests during startup (task row M6-C23).
 //
@@ -967,6 +996,14 @@ struct FakeRedisTls {
 
 impl FakeRedisTls {
     fn start(fixture: &StartupFixture) -> Self {
+        Self::start_with_handshake_delay(fixture, Duration::ZERO)
+    }
+
+    /// A fake whose every TLS handshake is held for `handshake_delay` first,
+    /// standing in for a slower host. The relay opens its primary connection,
+    /// then six more lanes one at a time, so the primary sits idle for about
+    /// six of these delays before its next command.
+    fn start_with_handshake_delay(fixture: &StartupFixture, handshake_delay: Duration) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake Redis TLS listener");
         listener
             .set_nonblocking(true)
@@ -1008,6 +1045,7 @@ impl FakeRedisTls {
                             let acceptor = acceptor.clone();
                             let connection_stop = Arc::clone(&task_stop);
                             connections.spawn(async move {
+                                sleep(handshake_delay).await;
                                 let Ok(mut tls) = acceptor.accept(stream).await else { return };
                                 serve_fake_redis(&mut tls, &connection_stop).await;
                             });
@@ -1044,7 +1082,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     while !stop.load(Ordering::Acquire) {
-        let Some(command) = read_resp_command(stream).await else {
+        let Some(command) = read_resp_command(stream, stop).await else {
             return;
         };
         let name = command
@@ -1065,15 +1103,37 @@ where
     }
 }
 
-async fn read_resp_command<S>(stream: &mut S) -> Option<Vec<Vec<u8>>>
+/// Read one command. Waiting for it to **start** is unbounded, as it is for a
+/// real Redis (whose idle `timeout` defaults to 0): a connection is closed
+/// only when the fixture stops. Once a command has started, every further
+/// byte is bounded, so a half-sent command cannot hold the fixture.
+///
+/// The wait used to be bounded too, at 250 ms, which closed the relay's
+/// **primary** connection while it legitimately sat idle: after its
+/// `PING`/`INFO` the relay opens six more lanes before its next command on
+/// the primary. On a fast host that took about 20 ms; on the GitHub Linux
+/// runner it took longer than 250 ms, and every test that reaches the
+/// incarnation `EVAL` failed with `stage=authority_identity class=io` instead
+/// of the diagnostic it targets.
+async fn read_resp_command<S>(stream: &mut S, stop: &AtomicBool) -> Option<Vec<Vec<u8>>>
 where
     S: AsyncRead + Unpin,
 {
+    let mut first = [0_u8; 1];
+    loop {
+        match tokio::time::timeout(Duration::from_millis(250), stream.read_exact(&mut first)).await
+        {
+            Ok(Ok(_)) => break,
+            Ok(Err(_)) => return None,
+            Err(_) if stop.load(Ordering::Acquire) => return None,
+            Err(_) => {}
+        }
+    }
+    if first[0] != b'*' {
+        return None;
+    }
     let line = read_resp_line(stream).await?;
-    let count = std::str::from_utf8(line.strip_prefix(b"*")?)
-        .ok()?
-        .parse::<usize>()
-        .ok()?;
+    let count = std::str::from_utf8(&line).ok()?.parse::<usize>().ok()?;
     if count == 0 || count > 64 {
         return None;
     }

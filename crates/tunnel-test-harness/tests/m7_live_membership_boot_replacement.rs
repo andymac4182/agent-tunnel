@@ -17,6 +17,8 @@
 //! request; RPC/adapter lease semantics remain covered by the planned
 //! `verify_scope` slice and are out of scope here.
 
+// The harness library is Unix-only (see `src/entry.rs`).
+#![cfg(unix)]
 #![allow(clippy::too_many_arguments)]
 
 use std::{

@@ -23,6 +23,10 @@ const DEFAULT_MAX_STREAMS: usize = 64;
 const DEFAULT_QUEUE_FRAMES: usize = 128;
 const DEFAULT_QUEUE_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_GRANT_TIMEOUT_MS: u64 = 5_000;
+/// Why an fs export is refused off Unix; the same words
+/// `tunnel_fs_host::unsupported_host_reason` uses.
+pub const FS_EXPORT_UNSUPPORTED_ON_THIS_HOST: &str =
+    "filesystem exports are unsupported on this host";
 const MAX_GRANT_TIMEOUT_MS: u64 = 5_000;
 
 /// Runtime configuration for one foreground connector.
@@ -179,6 +183,16 @@ impl RuntimeConfig {
                     ));
                 }
                 (ExportKind::Fs, Some(fs)) => {
+                    // Gate 2 declares filesystem exports unsupported off Unix
+                    // (`tunnel_fs_host::unsupported_host_reason`). Refused
+                    // here, at `config check` and at startup, so a configured
+                    // export is a named error rather than one that silently
+                    // answers every session `root_unavailable`.
+                    if cfg!(not(unix)) {
+                        return Err(RuntimeConfigError::Invalid(
+                            FS_EXPORT_UNSUPPORTED_ON_THIS_HOST,
+                        ));
+                    }
                     if fs.root.as_os_str().is_empty() {
                         return Err(RuntimeConfigError::Invalid(
                             "an fs export must name a root directory",
@@ -644,6 +658,41 @@ impl From<toml::de::Error> for RuntimeConfigError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An fs export is valid configuration on a Unix host and a named refusal
+    /// everywhere else. Both halves run somewhere in CI: the Unix half on the
+    /// Linux and macOS jobs, the refusal on the Windows job, so the Windows
+    /// connector cannot quietly accept an export it will never serve.
+    #[test]
+    fn an_fs_export_is_refused_by_name_where_filesystem_exports_are_unsupported() {
+        let result = RuntimeConfig::parse(
+            r#"
+device_id = "fixture-one"
+relay_url = "wss://relay.example.test/v1/tunnel/control"
+client_cert = "client.pem"
+private_key = "client-key.pem"
+server_ca = "ca.pem"
+
+[exports.files]
+type = "fs"
+
+[exports.files.fs]
+root = "/srv/export"
+capabilities = ["read", "list"]
+"#,
+        );
+        if cfg!(unix) {
+            result.expect("an fs export is valid configuration on a Unix host");
+        } else {
+            let error = result.expect_err("an fs export must be refused off Unix");
+            assert!(
+                error
+                    .to_string()
+                    .contains(FS_EXPORT_UNSUPPORTED_ON_THIS_HOST),
+                "{error}"
+            );
+        }
+    }
 
     fn valid_toml() -> &'static str {
         r#"

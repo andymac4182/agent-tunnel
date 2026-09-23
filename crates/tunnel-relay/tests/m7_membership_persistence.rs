@@ -31,8 +31,12 @@ use tunnel_relay::{
     CheckpointAuthority, CheckpointAuthorityError, CheckpointRequest, CheckpointResponse,
     MembershipPeerIdentity, MembershipReadiness, MembershipRecordSource, MembershipRuntime,
     MembershipRuntimeConfig, MembershipRuntimeError, MembershipVersionStateIdentity,
-    MembershipVersionStateStore, MembershipVersionStateStoreError,
+    MembershipVersionStateStore,
 };
+// Only the Unix-only insecure-permissions case names it; unconditionally it is
+// an unused import on Windows, where `clippy -D warnings` refuses the target.
+#[cfg(unix)]
+use tunnel_relay::MembershipVersionStateStoreError;
 
 const DEPLOYMENT_ID: &str = "m7-persistence-deployment";
 const DEPLOYMENT_INCARNATION: &str = "m7-persistence-incarnation";
@@ -129,6 +133,8 @@ impl CheckpointAuthority for TestCheckpointAuthority {
 struct TestMembershipSource {
     records: Arc<RwLock<Vec<CatalogMembershipRecord>>>,
     make_state_insecure_on_read: Arc<AtomicBool>,
+    // Read only by the Unix-only permission fault below.
+    #[cfg_attr(not(unix), allow(dead_code))]
     state_path: PathBuf,
 }
 
@@ -145,6 +151,7 @@ impl TestMembershipSource {
         *self.records.write().await = records;
     }
 
+    #[cfg_attr(not(unix), allow(dead_code))]
     fn fail_next_persistence(&self) {
         self.make_state_insecure_on_read
             .store(true, Ordering::Release);

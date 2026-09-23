@@ -446,17 +446,19 @@ async fn run_connected_scenario(context: ConnectedScenario<'_>) -> Result<()> {
         rotations_observed = traffic.rotations_observed,
         records_round_tripped = traffic.records_round_tripped,
         records_during_freeze = traffic.records_during_freeze,
+        records_during_held_freeze = traffic.records_during_held_freeze,
         handover_phases = ?traffic.handover_phases_observed,
         relay_last_emitted = traffic.relay_last_emitted,
         relay_recv_contiguous = traffic.relay_recv_contiguous,
         "M2 continuous traffic evidence"
     );
     println!(
-        "M2 continuous traffic passed: plan={} rotations={} records={} records_during_freeze={} handover_phases={:?} relay_emitted_delta={} relay_received_delta={} replayed_frames={}",
+        "M2 continuous traffic passed: plan={} rotations={} records={} records_during_freeze={} records_during_held_freeze={} handover_phases={:?} relay_emitted_delta={} relay_received_delta={} replayed_frames={}",
         plan.name,
         traffic.rotations_observed,
         traffic.records_round_tripped,
         traffic.records_during_freeze,
+        traffic.records_during_held_freeze,
         traffic.handover_phases_observed,
         traffic.relay_emitted_delta,
         traffic.relay_received_delta,
@@ -583,6 +585,15 @@ pub struct ContinuousTrafficEvidence {
     /// Records written while the relay reported `quiescing`, `draining` or
     /// `committing`, i.e. while its old writer had to be frozen.
     pub records_during_freeze: u64,
+    /// Of those, records written while the harness **held** the freeze open
+    /// (see [`write_record_inside_a_held_freeze`]): the relay reported the
+    /// same frozen phase of the same rotation before the write and after it, with
+    /// the record's bytes queued at the relay and not yet emitted. This is
+    /// the deterministic half of `records_during_freeze`; the sampled half
+    /// depends on how long an unheld freeze lasts, which is a few
+    /// milliseconds, and on the first CI run it caught none in three
+    /// rotations.
+    pub records_during_held_freeze: u64,
     pub handover_phases_observed: BTreeSet<String>,
     pub relay_emitted_delta: u64,
     pub relay_received_delta: u64,
@@ -614,6 +625,11 @@ pub fn require_m2_continuous_traffic_evidence(evidence: &ContinuousTrafficEviden
         (
             "records_during_freeze_nonzero",
             evidence.records_during_freeze > 0,
+        ),
+        (
+            "records_during_held_freeze_nonzero",
+            evidence.records_during_held_freeze > 0
+                && evidence.records_during_held_freeze <= evidence.records_during_freeze,
         ),
         (
             "relay_emitted_contiguous",
@@ -698,6 +714,19 @@ async fn run_continuous_traffic_rotations(
     let mut record_index = 0_u64;
     let rotation_budget = plan.clean_rotation_wait();
     let mut last_rotation = Instant::now();
+    let proxy = harness.proxy.as_ref().ok_or_else(|| {
+        HarnessError::InvalidInput("M2 continuous traffic requires its real TCP proxy".to_owned())
+    })?;
+    let interval = Duration::from_secs(plan.rotation.interval_seconds);
+    // One arming of each kind per active generation: a hold that found no
+    // frozen phase is not retried until the next rotation.
+    let mut armed_while_active: Option<u64> = None;
+    let mut armed_while_preparing: Option<u64> = None;
+    // When the relay was first seen `active` again. The relay times its next
+    // rotation from the previous one's COMPLETE, which is when it returns to
+    // `active` -- not from the generation advance counted below, which the
+    // harness sees at `retiring`, up to an overlap earlier.
+    let mut active_since: Option<Instant> = None;
     while traffic.rotations_observed < plan.rotations {
         let sampled = wait_for_stream_snapshot(
             harness,
@@ -723,6 +752,53 @@ async fn run_continuous_traffic_rotations(
         let frozen_phase = matches!(phase.as_str(), "quiescing" | "draining" | "committing");
         if phase != "active" {
             traffic.handover_phases_observed.insert(phase.clone());
+        }
+        // Arm the hold either on seeing the rotation begin, or just before
+        // the next one is due. `preparing` lasts only until the candidate
+        // attaches, a few milliseconds, and a run whose samples all missed it
+        // held nothing; arming on the schedule does not depend on catching it.
+        let generation_now = sampled.relay.active_generation;
+        if phase == "active" {
+            active_since.get_or_insert_with(Instant::now);
+        } else {
+            active_since = None;
+        }
+        let arm_on_schedule = phase == "active"
+            && armed_while_active != Some(generation_now)
+            && active_since.is_some_and(|since| since.elapsed() + HELD_FREEZE_ARM_LEAD >= interval);
+        let arm_on_preparing =
+            phase == "preparing" && armed_while_preparing != Some(generation_now);
+        if traffic.records_during_held_freeze == 0 && (arm_on_schedule || arm_on_preparing) {
+            if arm_on_schedule {
+                armed_while_active = Some(generation_now);
+            } else {
+                armed_while_preparing = Some(generation_now);
+            }
+            let payload = record_payload(record_index);
+            let held = write_record_inside_a_held_freeze(HeldFreeze {
+                harness,
+                handle,
+                proxy,
+                stream: &mut *stream,
+                device_id,
+                session_id,
+                canary,
+                armed_at: &sampled,
+                payload: &payload,
+            })
+            .await
+            .map_err(|error| stage_error("held-freeze record", error))?;
+            if let Some(held_phase) = held {
+                record_index = record_index.saturating_add(1);
+                traffic.records_round_tripped = traffic.records_round_tripped.saturating_add(1);
+                traffic.records_during_freeze = traffic.records_during_freeze.saturating_add(1);
+                traffic.records_during_held_freeze =
+                    traffic.records_during_held_freeze.saturating_add(1);
+                traffic.handover_phases_observed.insert(held_phase);
+            }
+            // Re-sample either way: the rotation this attempt watched has moved
+            // on, and a missed hold is retried on the next one.
+            continue;
         }
         let payload = record_payload(record_index);
         stream.round_trip(&payload, canary).await.map_err(|error| {
@@ -753,6 +829,164 @@ async fn run_continuous_traffic_rotations(
         sleep(CONTINUOUS_TRAFFIC_PACING).await;
     }
     Ok(traffic)
+}
+
+/// Longest the harness waits, with the control path paused, for the relay to
+/// reach a frozen phase, and then for the held record to reach it. Well inside
+/// the accelerated plan's 2-second overlap budget, and far inside the proxy's
+/// own 30-second fail-closed bound.
+const HELD_FREEZE_BUDGET: Duration = Duration::from_millis(1_000);
+/// How long before a rotation is due the hold may be armed from `active`.
+const HELD_FREEZE_ARM_LEAD: Duration = Duration::from_millis(500);
+/// The relay checks whether a rotation is due on its 500 ms maintenance tick,
+/// so a due rotation begins up to one tick late.
+const RELAY_ROTATION_TICK: Duration = Duration::from_millis(500);
+
+struct HeldFreeze<'a> {
+    harness: &'a RunningHarness,
+    handle: &'a ConnectionHandle,
+    proxy: &'a ProxyHandle,
+    stream: &'a mut ConsumerStream,
+    device_id: Uuid,
+    session_id: &'a str,
+    canary: &'a [u8],
+    /// The sample the hold was armed on: `active` just before a rotation is
+    /// due, or `preparing` once one has begun.
+    armed_at: &'a StreamSnapshot,
+    payload: &'a [u8],
+}
+
+/// Write one continuous record while the relay's writer is **held** frozen,
+/// and round-trip it once the rotation is allowed to finish.
+///
+/// Armed just before a rotation is due, or once one has begun. The relay
+/// quiesces as soon as the connector's candidate data socket attaches, which
+/// does not cross the control connection, and then waits for the connector's
+/// `ROTATE_FROZEN`, which does. Pausing the connector-to-relay direction of
+/// the control connection (through the real TCP proxy every device socket
+/// already crosses) therefore lets the relay freeze and keeps it frozen:
+/// nothing it waits on can arrive until the pause is lifted. The record is
+/// written into that window and must be observed queued at the relay,
+/// unemitted, with the relay still in the same frozen phase of the same
+/// rotation. Then the pause is lifted, the rotation completes, and the echo
+/// must come back exactly once and byte-for-byte, as every other continuous
+/// record must.
+///
+/// Returns the frozen phase the record was held in, or `Ok(None)` without
+/// writing when this rotation left the frozen phases before the pause took
+/// effect, so the caller tries again on the next rotation. The pause is
+/// lifted on every path.
+async fn write_record_inside_a_held_freeze(held: HeldFreeze<'_>) -> Result<Option<String>> {
+    let HeldFreeze {
+        harness,
+        handle,
+        proxy,
+        stream,
+        device_id,
+        session_id,
+        canary,
+        armed_at,
+        payload,
+    } = held;
+    let control = wait_for_connection_for_addr(
+        proxy,
+        handle.status_snapshot().control_local_addr,
+        "control",
+        Duration::from_secs(5),
+    )
+    .await?;
+    proxy
+        .pause(Direction::ClientToTarget, control)
+        .await
+        .map_err(|error| HarnessError::Proxy(format!("pausing the control path: {error}")))?;
+    let outcome = async {
+        // Armed from `active`, the pause also covers the wait for the rotation
+        // to begin: the arming lead, plus up to one relay tick.
+        let deadline =
+            Instant::now() + HELD_FREEZE_ARM_LEAD + RELAY_ROTATION_TICK + HELD_FREEZE_BUDGET;
+        let frozen = loop {
+            let sampled = wait_for_stream_snapshot(
+                harness,
+                handle,
+                device_id,
+                session_id,
+                stream.stream_id_hint(),
+                SNAPSHOT_POLL,
+            )
+            .await?;
+            // The active generation moves only when a rotation completes; the
+            // candidate generation is not compared because it is first
+            // reported when the candidate attaches, after `preparing`.
+            let same_rotation =
+                sampled.relay.active_generation == armed_at.relay.active_generation;
+            match sampled.relay.phase.as_str() {
+                // Every phase the relay's writer is frozen in, and each one
+                // waits on a connector-to-relay control message (`FROZEN`,
+                // then the drain proof, then `COMMITTED`), so none can be left
+                // while the pause holds.
+                "quiescing" | "draining" | "committing" if same_rotation => break sampled,
+                "active" | "preparing" if same_rotation && Instant::now() < deadline => {
+                    sleep(Duration::from_millis(2)).await;
+                }
+                _ => return Ok(None),
+            }
+        };
+        let deadline = Instant::now() + HELD_FREEZE_BUDGET;
+        stream.send_record(payload).await?;
+        // The record must be seen held at the fence: queued at the relay,
+        // nothing further emitted toward the connector, and the relay still
+        // quiescing for this rotation.
+        loop {
+            let sampled = wait_for_stream_snapshot(
+                harness,
+                handle,
+                device_id,
+                session_id,
+                stream.stream_id_hint(),
+                SNAPSHOT_POLL,
+            )
+            .await?;
+            let still_frozen = sampled.relay.phase == frozen.relay.phase
+                && sampled.relay.active_generation == frozen.relay.active_generation
+                && sampled.relay.candidate_generation == frozen.relay.candidate_generation;
+            if !still_frozen {
+                return Err(HarnessError::Process(format!(
+                    "the relay left the held freeze (phase {}) before the paused control path was resumed",
+                    sampled.relay.phase
+                )));
+            }
+            if sampled.stream.last_emitted_relay_to_connector
+                != frozen.stream.last_emitted_relay_to_connector
+            {
+                return Err(HarnessError::Process(
+                    "the relay emitted a record past its rotation fence while frozen".to_owned(),
+                ));
+            }
+            if sampled.stream.queue_bytes > frozen.stream.queue_bytes {
+                return Ok(Some(frozen.relay.phase.clone()));
+            }
+            if Instant::now() >= deadline {
+                return Err(HarnessError::Timeout(
+                    "the held-freeze record never reached the relay's frozen queue".to_owned(),
+                ));
+            }
+            sleep(Duration::from_millis(2)).await;
+        }
+    }
+    .await;
+    let resumed = proxy
+        .resume(Direction::ClientToTarget, control)
+        .await
+        .map_err(|error| HarnessError::Proxy(format!("resuming the control path: {error}")));
+    match (outcome, resumed) {
+        (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+        (Ok(None), Ok(())) => Ok(None),
+        (Ok(Some(phase)), Ok(())) => {
+            let response = stream.receive_response().await?;
+            stream.validate_response(&response, canary, payload)?;
+            Ok(Some(phase))
+        }
+    }
 }
 
 fn stage_error(stage: &str, error: HarnessError) -> HarnessError {
@@ -3009,6 +3243,7 @@ mod c17_validator_tests {
             rotations_observed: 3,
             records_round_tripped: 100,
             records_during_freeze: 2,
+            records_during_held_freeze: 1,
             handover_phases_observed: ["quiescing".to_owned(), "draining".to_owned()]
                 .into_iter()
                 .collect(),
@@ -3039,7 +3274,7 @@ mod c17_validator_tests {
         // condition, so a guard that stopped being load-bearing shows up as a
         // case that no longer fails.
         type Mutate = fn(&mut ContinuousTrafficEvidence);
-        let cases: [(&str, Mutate); 11] = [
+        let cases: [(&str, Mutate); 12] = [
             ("rotations_observed_at_least_required", |e| {
                 e.rotations_observed = e.rotations_required - 1
             }),
@@ -3057,7 +3292,15 @@ mod c17_validator_tests {
                 e.client_received_sequences = 0;
             }),
             ("records_during_freeze_nonzero", |e| {
-                e.records_during_freeze = 0
+                // The held record is one of these, so it goes too: a run can
+                // only reach zero here by also holding none.
+                e.records_during_freeze = 0;
+                e.records_during_held_freeze = 0;
+            }),
+            ("records_during_held_freeze_nonzero", |e| {
+                // Sampled hits alone no longer pass: the held record is the
+                // deterministic evidence and its absence must be named.
+                e.records_during_held_freeze = 0
             }),
             ("relay_emitted_contiguous", |e| e.relay_emitted_delta -= 1),
             ("relay_received_contiguous", |e| e.relay_received_delta -= 1),

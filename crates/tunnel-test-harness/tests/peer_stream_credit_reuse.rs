@@ -8,6 +8,9 @@
 //! times, matching the production pressure shape where seven completions were
 //! insufficient to pass quinn-proto's old one-eighth hysteresis threshold.
 
+// The harness library is Unix-only (see `src/entry.rs`).
+#![cfg(unix)]
+
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use bytes::Bytes;

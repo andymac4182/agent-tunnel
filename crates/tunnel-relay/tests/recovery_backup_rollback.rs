@@ -7,6 +7,10 @@
 //! activation. It never flushes Redis or touches keys outside its namespace,
 //! apart from one sentinel key created by the test.
 
+// Its one test is Unix-only (it invokes the recovery CLI with POSIX-private
+// files), so off Unix every fixture here is unused rather than wrong.
+#![cfg_attr(not(unix), allow(dead_code, unused_imports))]
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     future::Future,
