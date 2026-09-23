@@ -440,7 +440,12 @@ $ tunnel-client connect --config trial/unreachable.toml --json --no-reconnect; e
 exit=4
 ```
 
-Two limits, both measured (runtime.md has the detail). **After a relay
+Three limits, all measured (runtime.md has the detail). **After a network
+change while the relay stays up** -- a laptop waking on another network, a
+NAT or VPN change -- the relay does not notice the old session is gone and
+refuses every reconnect `OWNER_BUSY`; the client exits `7` after 60 s, and a
+restarted client is refused too, until the relay is restarted (M6-C68).
+**After a relay
 crash**, the relay's claim on the device outlives it in Redis for up to the
 owner lease (30 s by default), and reconnects are refused `OWNER_BUSY` until
 it lapses: a device reconnected about 30 s after a SIGKILLed relay was back,
@@ -585,16 +590,29 @@ Every setting follows from how the binaries stop and reconnect
 - **`Restart=` complements reconnect; it does not replace it.** The client
   retries relay restarts and network loss inside the process, with backoff
   (section 3.1), so the unit restarts it only for what the process cannot
-  handle: a crash, an internal failure (exit `1`), an `OWNER_BUSY` that
-  outlived the stale-lease window (exit `7`), or an attempt limit you set
-  (exit `4` or `5`), after `RestartSec=30s`. **`RestartPreventExitStatus=2 3`**
+  handle: a crash, an internal failure (exit `1`), `OWNER_BUSY` (exit `7`), or
+  an attempt limit you set (exit `4` or `5`), after `RestartSec=30s`. **`RestartPreventExitStatus=2 3`**
   keeps a configuration or credential error (a certificate refused on either
   side) from restarting in a loop: the unit stays failed and
   `journalctl -u tunnel-client` shows the error. If your supervisor should own
   every restart instead, add `--no-reconnect` to `ExecStart`. The relay does
   not retry its own startup (an unreachable Redis exits `1`), so its unit
-  restarts it on failure after 10 s. Both units stop restarting after five
-  starts in ten minutes.
+  restarts it on failure after 10 s, and stops after five starts in ten
+  minutes.
+- **The client unit has no start limit (`StartLimitIntervalSec=0`), and exit
+  `7` is restarted, deliberately.** When a device's network path vanishes
+  while its relay stays up -- a laptop waking on another network, a NAT or
+  VPN change -- the relay keeps the old session and refuses every reconnect
+  `OWNER_BUSY` until the relay itself is restarted (measured by the M6-C23
+  review: exit `7` after 60.7 s; M6-C68 is the relay fix). A restart cannot
+  help while that lasts, since a fresh process's first `OWNER_BUSY` is
+  terminal. With the usual start limit the unit would be **failed and quiet**
+  about three and a half minutes after the network change, and would stay
+  failed after the relay recovered; with `7` in `RestartPreventExitStatus` it
+  would fail at once. Instead it retries every 30 s, each attempt writes the
+  `OWNER_BUSY` refusal to the journal, `systemctl status` shows it
+  restarting, and it reconnects by itself once the relay lets go. If this
+  happens, restarting the **relay** (SIGTERM) clears it.
 - **launchd** sends SIGTERM and waits `ExitTimeOut` seconds (default 20; the
   plist sets 60, for the same reason as `TimeoutStopSec`) before SIGKILL.
   `KeepAlive` with `SuccessfulExit = false` restarts the client after an

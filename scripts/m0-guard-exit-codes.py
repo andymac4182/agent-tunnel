@@ -888,6 +888,20 @@ CASES: list[Case] = [
         frozenset({"a_relay_certificate_expired_on_this_clock_is_retried"}),
     ),
     Case(
+        # A reap wait that ran out its bound reported as if every child were
+        # reaped: the operator never learns a supervised child outlived the
+        # session (M6-C23 review).
+        "a timed-out child reap is reported, not silent",
+        [
+            (
+                MAIN,
+                "        Bounded::TimedOut => Ok(running()),",
+                "        Bounded::TimedOut => Ok(0),",
+            )
+        ],
+        frozenset({"tests::a_timed_out_reap_wait_reports_the_unreaped_count"}),
+    ),
+    Case(
         # The reconnect classification has no fallback arm: a new cause
         # cannot compile until someone decides whether a retry could help.
         # Reported separately and never counted as a red test.

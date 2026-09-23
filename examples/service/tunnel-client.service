@@ -9,17 +9,28 @@
 # docs/runtime.md "Reconnecting"): a relay restart, a network change or a
 # lost session is retried with bounded, jittered backoff inside the process.
 # `Restart=` below does not duplicate that; it covers what the process cannot:
-# a crash, an internal failure (exit 1), an OWNER_BUSY that outlived the
-# stale-lease window (exit 7), or an attempt limit the operator configured
-# (exit 4 or 5). A supervisor that prefers to own every restart can add
-# `--no-reconnect` to ExecStart and keep Restart=on-failure.
+# a crash, an internal failure (exit 1), OWNER_BUSY (exit 7), or an attempt
+# limit the operator configured (exit 4 or 5). A supervisor that prefers to
+# own every restart can add `--no-reconnect` to ExecStart and keep
+# Restart=on-failure.
+#
+# **Exit 7 is restarted, and the start limit is off, on purpose.** When the
+# device's network path vanishes while the relay stays up, the relay keeps
+# the old session and refuses every reconnect OWNER_BUSY until it is
+# restarted (docs/runtime.md, M6-C68): the client exits 7 after its 60 s
+# window, and so does every fresh start. With a start limit the unit would
+# end up failed and quiet a few minutes later and stay that way after the
+# relay recovered; with RestartPreventExitStatus=7 it would do so at once.
+# Instead it keeps trying every RestartSec, each attempt logging the
+# OWNER_BUSY refusal to the journal (`systemctl status` shows
+# "activating (auto-restart)"), and reconnects by itself once the relay lets
+# go. Exits 2 and 3 are still never restarted: no restart fixes them.
 [Unit]
 Description=Agent Tunnel device connector (tunnel-client connect)
 Documentation=https://github.com/andymac4182/agentuplink/blob/main/docs/operator.md
 Wants=network-online.target
 After=network-online.target
-StartLimitIntervalSec=600
-StartLimitBurst=5
+StartLimitIntervalSec=0
 
 [Service]
 Type=exec

@@ -735,10 +735,20 @@ impl Cause {
 /// How long after this process's own session ended an `OWNER_BUSY` refusal
 /// is still read as that session's lease rather than another connector.
 /// The relay bounds its owner lease to 6..=30 s (`owner_lease` in
-/// `tunnel-relay`'s config); twice the maximum leaves room for the relay to
-/// notice the dead socket. Outside it -- including a fresh process's first
-/// attempt, which has no previous session -- `OWNER_BUSY` is terminal, so a
-/// second connector for the same device still exits 7 at once.
+/// `tunnel-relay`'s config), which is how long a **dead relay's** owner
+/// record outlives it (measured about 30 s); twice the maximum covers that.
+/// It does **not** cover a relay that is still running and still holds the
+/// old session because the device's side of the path vanished (a network
+/// change, a NAT or VPN drop): that relay never notices -- it sends no pings,
+/// its control read has no timeout and no socket sets keepalive -- and keeps
+/// renewing the lease, so every reconnect is refused until this window ends
+/// and the process exits 7 (measured by the M6-C23 review: 78 refusals, exit
+/// 7 at 60.7 s; M6-C68, a relay-side fix). Outside the window -- including a
+/// fresh process's first attempt, which has no previous session --
+/// `OWNER_BUSY` is terminal, so a second connector for the same device still
+/// exits 7 at once; the only witness of that first-attempt rule with
+/// reconnect on is the unit test
+/// `owner_busy_is_retried_only_within_the_window_after_our_own_session`.
 const OWNER_BUSY_RECONNECT_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The reconnect policy for this run: the profile's `[reconnect]` table,
@@ -1206,12 +1216,13 @@ async fn run_one_session(
         Ok(first) => {
             cancellation.cancel();
             join_after_stop(handle.stop(), stop_bound, stop.recv(), first).await?;
-            wait_for_supervised_children(
+            let unreaped = wait_for_supervised_children(
                 || mcp_children.children_running(),
                 stop.recv(),
                 Some(first),
             )
             .await?;
+            report_unreaped(json, unreaped);
             if json {
                 print_ok_json(
                     "connect",
@@ -1234,8 +1245,10 @@ async fn run_one_session(
         Err(error) if error.cause == Cause::Cancelled => Err(error),
         Err(error) => {
             let lasted = ready_at.elapsed();
-            wait_for_supervised_children(|| mcp_children.children_running(), stop.recv(), None)
-                .await?;
+            let unreaped =
+                wait_for_supervised_children(|| mcp_children.children_running(), stop.recv(), None)
+                    .await?;
+            report_unreaped(json, unreaped);
             Ok(SessionEnd::Failed {
                 error,
                 ready: Some((session_id.unwrap_or_default(), lasted)),
@@ -1259,12 +1272,29 @@ const SUPERVISED_CHILD_REAP_BOUND: std::time::Duration = std::time::Duration::fr
 /// before they ran would tear the runtime down with that task possibly
 /// never polled -- measured (M6-C29) to leave an in-group helper alive in 7
 /// of 50 runs on this runtime flavour, and every time on a current-thread
-/// one, when no sentinel is installed. A timed-out wait is not an error.
+/// one, when no sentinel is installed. A timed-out wait is not an error, but
+/// it is not silent either: the result is how many children were still
+/// unreaped at the bound, and the caller reports a non-zero count
+/// (`report_unreaped`).
 async fn wait_for_supervised_children<R, S>(
     running: R,
     next_stop: S,
     first: Option<StopSignal>,
-) -> Result<(), CliError>
+) -> Result<u64, CliError>
+where
+    R: Fn() -> u64,
+    S: std::future::Future<Output = Result<StopSignal, CliError>>,
+{
+    wait_for_supervised_children_within(running, SUPERVISED_CHILD_REAP_BOUND, next_stop, first)
+        .await
+}
+
+async fn wait_for_supervised_children_within<R, S>(
+    running: R,
+    bound: std::time::Duration,
+    next_stop: S,
+    first: Option<StopSignal>,
+) -> Result<u64, CliError>
 where
     R: Fn() -> u64,
     S: std::future::Future<Output = Result<StopSignal, CliError>>,
@@ -1274,13 +1304,45 @@ where
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     };
-    match bounded(reaped, SUPERVISED_CHILD_REAP_BOUND, next_stop).await? {
-        Bounded::Done(()) | Bounded::TimedOut => Ok(()),
+    match bounded(reaped, bound, next_stop).await? {
+        Bounded::Done(()) => Ok(0),
+        Bounded::TimedOut => Ok(running()),
         Bounded::Interrupted(second) => Err(abandoned(
             second,
             first,
             "supervised MCP children to be reaped",
         )),
+    }
+}
+
+/// The event for supervised MCP children still unreaped when the reap wait's
+/// bound ran out (M6-C23 review): the process goes on -- to exit, or to back
+/// off and reconnect -- and the sentinel, if installed, is what ends them.
+#[derive(Serialize)]
+struct UnreapedEvent {
+    state: &'static str,
+    unreaped: u64,
+    bound_ms: u64,
+}
+
+fn report_unreaped(json: bool, unreaped: u64) {
+    if unreaped == 0 {
+        return;
+    }
+    let bound_ms = millis(SUPERVISED_CHILD_REAP_BOUND);
+    if json {
+        print_ok_json(
+            "connect",
+            UnreapedEvent {
+                state: "children_unreaped",
+                unreaped,
+                bound_ms,
+            },
+        );
+    } else {
+        eprintln!(
+            "tunnel-client: {unreaped} supervised MCP child process(es) not reaped within {bound_ms} ms; continuing"
+        );
     }
 }
 
@@ -1778,6 +1840,31 @@ mod tests {
             started.elapsed() < std::time::Duration::from_secs(1),
             "the second stop request must end the wait at once, not at its {SUPERVISED_CHILD_REAP_BOUND:?} bound"
         );
+    }
+
+    /// A reap wait that runs out its bound reports how many children are
+    /// still running, so the caller can say so, instead of returning as if
+    /// they were reaped.
+    #[tokio::test]
+    async fn a_timed_out_reap_wait_reports_the_unreaped_count() {
+        let unreaped = wait_for_supervised_children_within(
+            || 2,
+            std::time::Duration::from_millis(50),
+            never_stops(),
+            None,
+        )
+        .await
+        .expect("a timed-out reap wait is not an error");
+        assert_eq!(unreaped, 2);
+        let reaped = wait_for_supervised_children_within(
+            || 0,
+            std::time::Duration::from_millis(50),
+            never_stops(),
+            None,
+        )
+        .await
+        .expect("reaped");
+        assert_eq!(reaped, 0);
     }
 
     /// A drain that never completes still ends within its bound, as 130.
