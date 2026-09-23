@@ -246,7 +246,7 @@ impl ProvisioningPlan {
     }
 }
 
-fn read_bounded(path: &Path, what: &str) -> Result<Vec<u8>, String> {
+pub(crate) fn read_bounded(path: &Path, what: &str) -> Result<Vec<u8>, String> {
     let file = fs::File::open(path).map_err(|error| format!("could not read {what}: {error}"))?;
     let mut bytes = Vec::new();
     file.take(MAX_PROVISIONING_FILE_BYTES + 1)
@@ -260,7 +260,7 @@ fn read_bounded(path: &Path, what: &str) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-fn operation_set(
+pub(crate) fn operation_set(
     field: &str,
     operations: &[String],
 ) -> Result<BTreeSet<String>, ProvisioningError> {
@@ -354,10 +354,9 @@ fn require_known_operations(
 ///
 /// `served_profiles` is the relay configuration's `[http_forward] profiles`,
 /// which `ServeConfig::parse` has already restricted to pinned profiles.
-fn service_capabilities(
+pub(crate) fn service_capabilities(
     service: &ServiceSection,
     service_operations: &BTreeSet<String>,
-    grant_operations: &BTreeSet<String>,
     served_profiles: &[String],
 ) -> Result<serde_json::Value, ProvisioningError> {
     let service_type = service.service_type.as_str();
@@ -422,25 +421,6 @@ fn service_capabilities(
                      insensitive-preserving"
                 )));
             }
-            // The relay admits a filesystem session only for a grant naming
-            // the session operation and at least one capability; a grant
-            // without both is refused 403 on every request.
-            if !grant_operations.contains(crate::FS_SESSION_OPERATION) {
-                return Err(ProvisioningError::Records(format!(
-                    "an fs grant must include {}, which admits a filesystem session",
-                    crate::FS_SESSION_OPERATION
-                )));
-            }
-            if grant_operations.len() < 2 {
-                return Err(ProvisioningError::Records(format!(
-                    "an fs grant must also name at least one of {}, {}, {} or {}; a grant \
-                     naming no capability admits no session",
-                    crate::FS_READ_OPERATION,
-                    crate::FS_WRITE_OPERATION,
-                    crate::FS_LIST_OPERATION,
-                    crate::FS_DELETE_OPERATION
-                )));
-            }
             capabilities[crate::FS_CASE_SENSITIVITY_CAPABILITY] =
                 serde_json::Value::String(case.to_owned());
         }
@@ -452,6 +432,115 @@ fn service_capabilities(
         }
     }
     Ok(capabilities)
+}
+
+/// The rules a grant must meet to authorize anything on its service: its
+/// operations are a subset of the service's, and a filesystem grant names the
+/// session operation and at least one capability.  Shared by
+/// `provision-catalog` and `set-grant` (task row M6-C31); `set-grant` applies
+/// it to the service record it reads from the catalog.
+pub(crate) fn check_grant(
+    service_type: &str,
+    service_operations: &BTreeSet<String>,
+    grant_operations: &BTreeSet<String>,
+) -> Result<(), ProvisioningError> {
+    if !grant_operations.is_subset(service_operations) {
+        return Err(ProvisioningError::Records(
+            "grant.operations must be a subset of service.operations".into(),
+        ));
+    }
+    if service_type == crate::FS_SERVICE_TYPE {
+        // The relay admits a filesystem session only for a grant naming the
+        // session operation and at least one capability; a grant without
+        // both is refused 403 on every request.
+        if !grant_operations.contains(crate::FS_SESSION_OPERATION) {
+            return Err(ProvisioningError::Records(format!(
+                "an fs grant must include {}, which admits a filesystem session",
+                crate::FS_SESSION_OPERATION
+            )));
+        }
+        if grant_operations.len() < 2 {
+            return Err(ProvisioningError::Records(format!(
+                "an fs grant must also name at least one of {}, {}, {} or {}; a grant \
+                 naming no capability admits no session",
+                crate::FS_READ_OPERATION,
+                crate::FS_WRITE_OPERATION,
+                crate::FS_LIST_OPERATION,
+                crate::FS_DELETE_OPERATION
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Refuse a grant expiry that has already passed.
+pub(crate) fn check_grant_expiry(
+    expires_at: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> Result<(), ProvisioningError> {
+    if expires_at.is_some_and(|expires_at| expires_at <= now) {
+        return Err(ProvisioningError::Records(
+            "grant.expires_at is already in the past".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// A device credential as the device listener will see it, derived from the
+/// device's issued certificate.
+#[derive(Clone, Debug)]
+pub(crate) struct DeviceCredential {
+    pub spki_fingerprint: String,
+    pub serial: String,
+    pub not_before: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+}
+
+/// Read a device certificate (PEM, leaf first) and derive its credential,
+/// refusing one the relay would not register for `device_id`.  Shared by
+/// `provision-catalog` and `add-device` (M6-C31).
+pub(crate) fn device_credential(
+    certificate_path: &Path,
+    device_id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<DeviceCredential, ProvisioningError> {
+    let pem = read_bounded(certificate_path, "device.certificate")
+        .map_err(ProvisioningError::Certificate)?;
+    let leaf = rustls_pemfile::certs(&mut pem.as_slice())
+        .next()
+        .ok_or_else(|| ProvisioningError::Certificate("no PEM certificate found".into()))?
+        .map_err(|_| ProvisioningError::Certificate("malformed PEM certificate".into()))?;
+    let identity = leaf_identity_from_der(leaf.as_ref())
+        .map_err(|error| ProvisioningError::Certificate(error.to_string()))?;
+    // The device listener parses this SAN into the device identifier and
+    // registration refuses a credential whose catalog device differs, so a
+    // mismatch here is a device that could never connect.
+    let named = match identity.role() {
+        CertificateRole::Device { id } => id.parse::<Uuid>().ok(),
+        CertificateRole::Peer { .. } => {
+            return Err(ProvisioningError::Certificate(
+                "certificate carries a relay peer role, not a device role".into(),
+            ));
+        }
+    };
+    if named != Some(device_id) {
+        return Err(ProvisioningError::Certificate(format!(
+            "its urn:agent-tunnel:device: SAN must name device.id {device_id}"
+        )));
+    }
+    let not_before = timestamp(identity.certificate_not_before(), "notBefore")?;
+    let expires_at = timestamp(identity.certificate_expires_at(), "notAfter")?;
+    if expires_at <= now {
+        return Err(ProvisioningError::Certificate(
+            "certificate has already expired".into(),
+        ));
+    }
+    Ok(DeviceCredential {
+        spki_fingerprint: identity.spki_sha256().to_hex(),
+        serial: identity.certificate_serial().to_owned(),
+        not_before,
+        expires_at,
+    })
 }
 
 fn timestamp(seconds: i64, field: &str) -> Result<DateTime<Utc>, ProvisioningError> {
@@ -486,65 +575,31 @@ pub fn plan_provisioning(
             "grant.operations must be a subset of service.operations".into(),
         ));
     }
-    let capabilities = service_capabilities(
-        &document.service,
+    let capabilities =
+        service_capabilities(&document.service, &service_operations, served_profiles)?;
+    check_grant(
+        &document.service.service_type,
         &service_operations,
         &grant_operations,
-        served_profiles,
     )?;
-    if document
-        .grant
-        .expires_at
-        .is_some_and(|expires_at| expires_at <= now)
-    {
-        return Err(ProvisioningError::Records(
-            "grant.expires_at is already in the past".into(),
-        ));
-    }
+    check_grant_expiry(document.grant.expires_at, now)?;
 
     let certificate_path = records_path
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join(&document.device.certificate);
-    let pem = read_bounded(&certificate_path, "device.certificate")
-        .map_err(ProvisioningError::Certificate)?;
-    let leaf = rustls_pemfile::certs(&mut pem.as_slice())
-        .next()
-        .ok_or_else(|| ProvisioningError::Certificate("no PEM certificate found".into()))?
-        .map_err(|_| ProvisioningError::Certificate("malformed PEM certificate".into()))?;
-    let identity = leaf_identity_from_der(leaf.as_ref())
-        .map_err(|error| ProvisioningError::Certificate(error.to_string()))?;
-    // The device listener parses this SAN into the device identifier and
-    // registration refuses a credential whose catalog device differs, so a
-    // mismatch here is a device that could never connect.
-    let named = match identity.role() {
-        CertificateRole::Device { id } => id.parse::<Uuid>().ok(),
-        CertificateRole::Peer { .. } => {
-            return Err(ProvisioningError::Certificate(
-                "certificate carries a relay peer role, not a device role".into(),
-            ));
-        }
-    };
-    if named != Some(document.device.id) {
-        return Err(ProvisioningError::Certificate(format!(
-            "its urn:agent-tunnel:device: SAN must name device.id {}",
-            document.device.id
-        )));
-    }
-    let not_before = timestamp(identity.certificate_not_before(), "notBefore")?;
-    let expires_at = timestamp(identity.certificate_expires_at(), "notAfter")?;
-    if expires_at <= now {
-        return Err(ProvisioningError::Certificate(
-            "certificate has already expired".into(),
-        ));
-    }
+    let DeviceCredential {
+        spki_fingerprint,
+        serial,
+        not_before,
+        expires_at,
+    } = device_credential(&certificate_path, document.device.id, now)?;
 
     let tenant_id = document.tenant.id;
     let user_id = document.user.id;
     let device_id = document.device.id;
     let service_id = document.service.id;
     let credential_id = document.device.credential_id.unwrap_or_else(Uuid::new_v4);
-    let spki_fingerprint = identity.spki_sha256().to_hex();
     let records = CatalogFixture {
         tenants: vec![TenantRecord {
             tenant_id,
@@ -582,7 +637,7 @@ pub fn plan_provisioning(
             device_id,
             credential_id,
             spki_fingerprint: spki_fingerprint.clone(),
-            serial: Some(identity.certificate_serial().to_owned()),
+            serial: Some(serial),
             not_before,
             expires_at,
             revoked_at: None,
@@ -626,11 +681,11 @@ pub fn plan_provisioning(
     })
 }
 
-fn load_config(path: &Path) -> Result<ServeConfig, Box<dyn Error>> {
+pub(crate) fn load_config(path: &Path) -> Result<ServeConfig, Box<dyn Error>> {
     Ok(ServeConfig::parse(&fs::read_to_string(path)?)?)
 }
 
-fn tls_material(config: &ServeConfig) -> RedisTlsMaterialPaths {
+pub(crate) fn tls_material(config: &ServeConfig) -> RedisTlsMaterialPaths {
     RedisTlsMaterialPaths {
         root_ca_path: config.redis_tls_root_ca_path.clone(),
         client_cert_path: config.redis_tls_client_cert_path.clone(),

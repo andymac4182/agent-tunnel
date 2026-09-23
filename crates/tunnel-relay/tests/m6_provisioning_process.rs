@@ -678,6 +678,9 @@ struct Provisioned {
     database: u32,
     _namespace_guard: NamespaceGuard,
     _dir: Workdir,
+    /// The relay binary and configuration the day-2 commands use (M6-C31).
+    relay_bin: PathBuf,
+    relay_config: PathBuf,
 }
 
 /// The service type one gate provisions (task row M6-C57), and what the relay
@@ -1187,6 +1190,8 @@ async fn provision_and_serve_kind(
         database,
         _namespace_guard,
         _dir: dir,
+        relay_bin,
+        relay_config,
     }
 }
 
@@ -1216,6 +1221,7 @@ async fn m6c21_shipped_binaries_provision_one_relay_and_one_device_end_to_end() 
         database,
         _namespace_guard,
         _dir,
+        ..
     } = provision_and_serve("m6c21-e2e", None).await;
     let client_log = work.join("connect.log");
     let _device = Running(
@@ -2289,5 +2295,572 @@ async fn m6c57_provisioned_fs_service_serves_a_file_read() {
          case_sensitivity=insensitive-preserving read_bytes={} matches_file=true \
          stranger_status={stranger_status}",
         read.len()
+    );
+}
+
+/// Run one day-2 `tunnel-relay` command to success; returns its stdout.
+fn relay_change(fixture: &Provisioned, name: &str, args: &[&str]) -> String {
+    stdout(&step(
+        name,
+        Command::new(&fixture.relay_bin)
+            .args(args)
+            .arg("--config")
+            .arg(&fixture.relay_config),
+    ))
+}
+
+/// Run one day-2 command that must be refused; returns its stderr.
+fn relay_change_refused(fixture: &Provisioned, name: &str, args: &[&str]) -> String {
+    let output = Command::new(&fixture.relay_bin)
+        .args(args)
+        .arg("--config")
+        .arg(&fixture.relay_config)
+        .output()
+        .unwrap_or_else(|error| panic!("step {name}: could not start: {error}"));
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "step {name}: must be refused with exit 1: {stderr}"
+    );
+    stderr
+}
+
+/// One echo; the HTTP status and body.
+async fn echo_once(
+    fixture: &Provisioned,
+    token: &str,
+    device: Uuid,
+    service: Uuid,
+    payload: &str,
+) -> (u16, Vec<u8>) {
+    consumer_post(
+        fixture.consumer,
+        &fixture.pki.ca_pem,
+        &format!("/v1/devices/{device}/services/{service}/echo"),
+        token,
+        payload.as_bytes(),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("echo to {device}: {error}"))
+}
+
+/// Read one Redis string of the run's namespace with the raw RESP client.
+fn namespace_get(fixture: &Provisioned, key: &str) -> String {
+    let reply = redis_command(
+        fixture.upstream,
+        fixture.database,
+        &[
+            "GET",
+            &format!("tunnel-catalog:{}:{key}", fixture.namespace),
+        ],
+    );
+    // SELECT's `+OK`, then the bulk string's header and value.
+    String::from_utf8_lossy(&reply)
+        .split("\r\n")
+        .skip(1)
+        .nth(1)
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// Task row M6-C31: with `serve` running and never restarted, the shipped
+/// day-2 commands add a second user, a second device (a new certificate from
+/// this test's synthetic device CA), its service and grants; the second
+/// device connects and serves the second user an echo; then a grant
+/// revocation and a device revocation each take effect within the bound
+/// docs/operator.md states, measured here.
+///
+/// Red without the commands: every step below `add-user` is a `tunnel-relay`
+/// subcommand that did not exist, and each effect -- the second user's
+/// identity, the second device's credential, the grants, the revocations --
+/// is asserted through the relay, not read back from Redis.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires TEST_REDIS_URL and TUNNEL_CLIENT_BIN; run by scripts/m6-provisioning-verify.sh"]
+async fn m6c31_day2_catalog_changes_take_effect_on_a_serving_relay() {
+    let mut fixture = provision_and_serve("m6c31-e2e", None).await;
+    let nonce = fixture.nonce.clone();
+    let records: toml::Value = toml::from_str(
+        &fs::read_to_string(repository().join("examples/m6-catalog.toml")).expect("records"),
+    )
+    .expect("parse records");
+    let tenant: Uuid = records["tenant"]["id"]
+        .as_str()
+        .and_then(|id| id.parse().ok())
+        .expect("tenant id");
+    let (device_a, service_a) = (fixture.device, fixture.service);
+    let relay_pid = fixture.relay.0.id();
+    let operator = fixture.work.join("operator");
+    fs::create_dir_all(&operator).expect("operator dir");
+
+    // --- The first device serves the first user, as provisioned. ---
+    let log_a = fixture.work.join("connect-a.log");
+    let _device_a = Running(
+        Command::new(&fixture.client_bin)
+            .args(["connect", "--config"])
+            .arg(&fixture.client_config)
+            .arg("--json")
+            .stdout(fs::File::create(&log_a).expect("client log"))
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn connect"),
+    );
+    let token_a = access_token(&fixture.issuer_key, &fixture.subject);
+    let deadline = Instant::now() + STEP_DEADLINE;
+    loop {
+        let (status, _) = echo_once(&fixture, &token_a, device_a, service_a, "warm-up").await;
+        if status == 200 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "step first echo: HTTP {status}; {}",
+            fs::read_to_string(&log_a).unwrap_or_default()
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    // --- add-user: a second user in the provisioned tenant. ---
+    let user_b = Uuid::new_v4();
+    let subject_b = format!("m6c31-second-user-{nonce}");
+    let token_b = access_token(&fixture.issuer_key, &subject_b);
+    let (before_user, _) = echo_once(&fixture, &token_b, device_a, service_a, "x").await;
+    assert_eq!(
+        before_user, 401,
+        "an unknown subject is refused before add-user"
+    );
+    let user_doc = operator.join("user.toml");
+    fs::write(
+        &user_doc,
+        format!(
+            "[user]\ntenant = \"{tenant}\"\nid = \"{user_b}\"\ndisplay_name = \"Second user\"\n\
+             oidc_subject = \"{subject_b}\"\n"
+        ),
+    )
+    .expect("user document");
+    let user_doc_arg = user_doc.to_str().expect("path");
+    let dry = relay_change(
+        &fixture,
+        "add-user --dry-run",
+        &["add-user", "--records", user_doc_arg, "--dry-run"],
+    );
+    assert!(
+        dry.contains(&format!("user={user_b}")) && dry.contains("contacted no Redis"),
+        "{dry}"
+    );
+    let (after_dry, _) = echo_once(&fixture, &token_b, device_a, service_a, "x").await;
+    assert_eq!(after_dry, 401, "the dry run wrote nothing");
+    let added = relay_change(
+        &fixture,
+        "add-user",
+        &["add-user", "--records", user_doc_arg],
+    );
+    assert!(added.contains(&format!("user={user_b}")), "{added}");
+    let (no_grant, _) = echo_once(&fixture, &token_b, device_a, service_a, "x").await;
+    assert!(
+        matches!(no_grant, 403 | 404),
+        "the added user is known but has no grant yet: HTTP {no_grant}"
+    );
+    let duplicate = relay_change_refused(
+        &fixture,
+        "add-user again",
+        &["add-user", "--records", user_doc_arg],
+    );
+    assert!(duplicate.contains("user already exists"), "{duplicate}");
+
+    // --- set-grant on the running first device: pickup with no restart. ---
+    let grant_a_doc = operator.join("grant-a.toml");
+    fs::write(
+        &grant_a_doc,
+        format!(
+            "[grant]\ntenant = \"{tenant}\"\nuser = \"{user_b}\"\ndevice = \"{device_a}\"\n\
+             service = \"{service_a}\"\noperations = [\"echo:invoke\"]\n"
+        ),
+    )
+    .expect("grant document");
+    let grant_a_arg = grant_a_doc.to_str().expect("path");
+    let granted = relay_change(
+        &fixture,
+        "set-grant",
+        &["set-grant", "--records", grant_a_arg],
+    );
+    let granted_at = Instant::now();
+    assert!(
+        granted.contains("Added grant") && granted.contains("revision=1"),
+        "{granted}"
+    );
+    let (grant_pickup_status, _) =
+        echo_once(&fixture, &token_b, device_a, service_a, "pickup").await;
+    let grant_pickup_ms = granted_at.elapsed().as_millis();
+    assert_eq!(
+        grant_pickup_status, 200,
+        "the first request after set-grant must be served: the relay caches no grant"
+    );
+    // Replacing it advances the revision.
+    let replaced = relay_change(
+        &fixture,
+        "set-grant replace",
+        &["set-grant", "--records", grant_a_arg],
+    );
+    assert!(
+        replaced.contains("Replaced grant") && replaced.contains("revision=2"),
+        "{replaced}"
+    );
+
+    // --- add-device, add-service, set-grant: a second device for the second
+    // user, with a new key and a certificate from the test's device CA. ---
+    let device_b = Uuid::new_v4();
+    let service_b = Uuid::new_v4();
+    let dir_b = fixture.work.join("device-b");
+    fs::create_dir_all(&dir_b).expect("device b dir");
+    let profile_b = fs::read_to_string(&fixture.client_config)
+        .expect("client config")
+        .replace(&device_a.to_string(), &device_b.to_string())
+        .replace(&service_a.to_string(), &service_b.to_string());
+    let config_b = dir_b.join("client.toml");
+    fs::write(&config_b, profile_b).expect("device b profile");
+    step(
+        "device b key and CSR (tunnel-client credentials create)",
+        Command::new(&fixture.client_bin)
+            .args(["credentials", "create", "--config"])
+            .arg(&config_b)
+            .args(["--csr-out", "device.csr"]),
+    );
+    let extensions_b = fixture.work.join("device-b-ext.cnf");
+    fs::write(
+        &extensions_b,
+        format!(
+            "basicConstraints=CA:FALSE\nkeyUsage=digitalSignature\nextendedKeyUsage=clientAuth\n\
+             subjectAltName=URI:urn:agent-tunnel:device:{device_b}\n"
+        ),
+    )
+    .expect("device b extensions");
+    step(
+        "issue device b certificate (openssl x509 -req)",
+        Command::new("openssl")
+            .args(["x509", "-req", "-in"])
+            .arg(dir_b.join("device.csr"))
+            .arg("-CA")
+            .arg(&fixture.device_ca)
+            .arg("-CAkey")
+            .arg(&fixture.device_ca_key)
+            .args(["-CAcreateserial", "-days", "1", "-extfile"])
+            .arg(&extensions_b)
+            .arg("-out")
+            .arg(dir_b.join("device-cert.pem")),
+    );
+    step(
+        "device b certificate import (tunnel-client credentials import)",
+        Command::new(&fixture.client_bin)
+            .args(["credentials", "import", "--config"])
+            .arg(&config_b)
+            .args(["--certificate", "device-cert.pem", "--server-ca"])
+            .arg(&fixture.server_ca),
+    );
+    let device_doc = dir_b.join("device.toml");
+    fs::write(
+        &device_doc,
+        format!(
+            "[device]\ntenant = \"{tenant}\"\nowner = \"{user_b}\"\nid = \"{device_b}\"\n\
+             display_name = \"Second device\"\ncertificate = \"device-cert.pem\"\n"
+        ),
+    )
+    .expect("device document");
+    let device_doc_arg = device_doc.to_str().expect("path");
+    let dry = relay_change(
+        &fixture,
+        "add-device --dry-run",
+        &["add-device", "--records", device_doc_arg, "--dry-run"],
+    );
+    assert!(dry.contains(&format!("device={device_b}")), "{dry}");
+    let added = relay_change(
+        &fixture,
+        "add-device",
+        &["add-device", "--records", device_doc_arg],
+    );
+    let credential_b: Uuid = added
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix("credential="))
+        .and_then(|id| id.parse().ok())
+        .unwrap_or_else(|| panic!("add-device prints credential=: {added}"));
+    let duplicate = relay_change_refused(
+        &fixture,
+        "add-device again",
+        &["add-device", "--records", device_doc_arg],
+    );
+    assert!(duplicate.contains("already exists"), "{duplicate}");
+    let service_doc = operator.join("service.toml");
+    fs::write(
+        &service_doc,
+        format!(
+            "[service]\ntenant = \"{tenant}\"\ndevice = \"{device_b}\"\nid = \"{service_b}\"\n\
+             type = \"echo\"\ndisplay_name = \"Second echo\"\noperations = [\"echo:invoke\"]\n"
+        ),
+    )
+    .expect("service document");
+    relay_change(
+        &fixture,
+        "add-service",
+        &[
+            "add-service",
+            "--records",
+            service_doc.to_str().expect("path"),
+        ],
+    );
+    let grant_b_doc = operator.join("grant-b.toml");
+    fs::write(
+        &grant_b_doc,
+        format!(
+            "[grant]\ntenant = \"{tenant}\"\nuser = \"{user_b}\"\ndevice = \"{device_b}\"\n\
+             service = \"{service_b}\"\noperations = [\"echo:invoke\"]\n"
+        ),
+    )
+    .expect("grant document");
+    relay_change(
+        &fixture,
+        "set-grant device b",
+        &[
+            "set-grant",
+            "--records",
+            grant_b_doc.to_str().expect("path"),
+        ],
+    );
+
+    let log_b = fixture.work.join("connect-b.log");
+    let started_b = Instant::now();
+    let mut device_b_process = Running(
+        Command::new(&fixture.client_bin)
+            .args(["connect", "--config"])
+            .arg(&config_b)
+            .arg("--json")
+            .stdout(fs::File::create(&log_b).expect("client b log"))
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn connect b"),
+    );
+    let payload = format!("m6c31-second-device-{nonce}");
+    let deadline = Instant::now() + STEP_DEADLINE;
+    let body_b = loop {
+        let (status, body) = echo_once(&fixture, &token_b, device_b, service_b, &payload).await;
+        if status == 200 {
+            break body;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "step second device echo: HTTP {status} {}; connect log: {}",
+            String::from_utf8_lossy(&body),
+            fs::read_to_string(&log_b).unwrap_or_default()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    let device_pickup_ms = started_b.elapsed().as_millis();
+    assert_eq!(
+        String::from_utf8_lossy(&body_b),
+        format!("{CANARY}{payload}"),
+        "the second device's echo"
+    );
+    // Isolation: the first user has no grant on the second device.
+    let (cross, _) = echo_once(&fixture, &token_a, device_b, service_b, "x").await;
+    assert!(
+        matches!(cross, 403 | 404),
+        "the first user must not reach the second user's device: HTTP {cross}"
+    );
+    assert!(
+        fixture.relay.0.try_wait().expect("poll serve").is_none()
+            && fixture.relay.0.id() == relay_pid,
+        "serve must still be the process started before the changes"
+    );
+
+    // --- revoke-grant: the next request is refused. ---
+    let revoked = relay_change(
+        &fixture,
+        "revoke-grant",
+        &[
+            "revoke-grant",
+            "--tenant",
+            &tenant.to_string(),
+            "--user",
+            &user_b.to_string(),
+            "--device",
+            &device_a.to_string(),
+            "--service",
+            &service_a.to_string(),
+        ],
+    );
+    let revoked_at = Instant::now();
+    assert!(revoked.contains("revision=3"), "{revoked}");
+    let (after_revoke, _) = echo_once(&fixture, &token_b, device_a, service_a, "x").await;
+    let revoke_grant_ms = revoked_at.elapsed().as_millis();
+    assert!(
+        matches!(after_revoke, 403 | 404),
+        "the first request after revoke-grant must be refused: HTTP {after_revoke}"
+    );
+    // Only that grant: the same user's other grant and the first user's
+    // grant on the same service still serve.
+    assert_eq!(
+        echo_once(&fixture, &token_b, device_b, service_b, "x")
+            .await
+            .0,
+        200
+    );
+    assert_eq!(
+        echo_once(&fixture, &token_a, device_a, service_a, "x")
+            .await
+            .0,
+        200
+    );
+
+    // --- revoke-device: the live session is closed within the bound. ---
+    while fixture.relay_log.try_recv().is_ok() {}
+    let revoked = relay_change(
+        &fixture,
+        "revoke-device",
+        &[
+            "revoke-device",
+            "--tenant",
+            &tenant.to_string(),
+            "--device",
+            &device_b.to_string(),
+        ],
+    );
+    let device_revoked_at = Instant::now();
+    assert!(revoked.contains(&format!("device={device_b}")), "{revoked}");
+    let (after_device_revoke, _) = echo_once(&fixture, &token_b, device_b, service_b, "x").await;
+    let device_request_ms = device_revoked_at.elapsed().as_millis();
+    assert!(
+        matches!(after_device_revoke, 403 | 404 | 503),
+        "the first request after revoke-device must be refused: HTTP {after_device_revoke}"
+    );
+    // The relay's owner actor closes the session at its next maintenance
+    // check; the device reports the end of its session.
+    let close_deadline = device_revoked_at + Duration::from_secs(5);
+    let mut relay_close: Option<(u128, String)> = None;
+    let mut device_end: Option<(u128, String)> = None;
+    while (relay_close.is_none() || device_end.is_none()) && Instant::now() < close_deadline {
+        while let Ok(line) = fixture.relay_log.try_recv() {
+            if relay_close.is_none()
+                && line.contains("owner_check_failed")
+                && line.contains(&device_b.to_string())
+            {
+                let reason = serde_json::from_str::<serde_json::Value>(&line)
+                    .ok()
+                    .and_then(|value| value["fields"]["reason"].as_str().map(str::to_owned))
+                    .unwrap_or_else(|| "unparsed".to_owned());
+                relay_close = Some((device_revoked_at.elapsed().as_millis(), reason));
+            }
+        }
+        if device_end.is_none() {
+            let log = fs::read_to_string(&log_b).unwrap_or_default();
+            if log.contains("\"state\":\"disconnected\"") {
+                device_end = Some((
+                    device_revoked_at.elapsed().as_millis(),
+                    "disconnected".to_owned(),
+                ));
+            } else if let Some(status) = device_b_process.0.try_wait().expect("poll connect b") {
+                device_end = Some((
+                    device_revoked_at.elapsed().as_millis(),
+                    format!("exit={}", status.code().unwrap_or(-1)),
+                ));
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let (relay_close_ms, close_reason) = relay_close.unwrap_or_else(|| {
+        panic!(
+            "step revoke-device: the relay did not close the second device's session within \
+             5 s; connect log: {}",
+            fs::read_to_string(&log_b).unwrap_or_default()
+        )
+    });
+    let (device_end_ms, device_end_event) = device_end.unwrap_or_else(|| {
+        panic!(
+            "step revoke-device: the second device did not see its session end within 5 s; \
+             connect log: {}",
+            fs::read_to_string(&log_b).unwrap_or_default()
+        )
+    });
+    // The device may not come back: its reconnect is an identity refusal.
+    let exit_deadline = Instant::now() + STEP_DEADLINE;
+    let exit = loop {
+        if let Some(status) = device_b_process.0.try_wait().expect("poll connect b") {
+            break status.code();
+        }
+        assert!(
+            Instant::now() < exit_deadline,
+            "step revoke-device: the revoked device kept retrying: {}",
+            fs::read_to_string(&log_b).unwrap_or_default()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert_eq!(
+        exit,
+        Some(3),
+        "a revoked device ends with a terminal credential refusal: {}",
+        fs::read_to_string(&log_b).unwrap_or_default()
+    );
+    // The first device and user are untouched.
+    assert_eq!(
+        echo_once(&fixture, &token_a, device_a, service_a, "x")
+            .await
+            .0,
+        200
+    );
+    // revoke-credential and a revocation of nothing are refused clearly.
+    let missing = relay_change_refused(
+        &fixture,
+        "revoke-credential of a revoked device",
+        &[
+            "revoke-credential",
+            "--tenant",
+            &tenant.to_string(),
+            "--device",
+            &device_b.to_string(),
+            "--credential",
+            &credential_b.to_string(),
+        ],
+    );
+    assert!(missing.contains("no active credential"), "{missing}");
+    let missing = relay_change_refused(
+        &fixture,
+        "revoke-grant of nothing",
+        &[
+            "revoke-grant",
+            "--tenant",
+            &tenant.to_string(),
+            "--user",
+            &Uuid::new_v4().to_string(),
+            "--device",
+            &device_a.to_string(),
+            "--service",
+            &service_a.to_string(),
+        ],
+    );
+    assert!(missing.contains("no grant"), "{missing}");
+
+    // The authority records are intact, and serve never restarted.
+    assert_eq!(
+        namespace_get(&fixture, "meta:active_incarnation"),
+        format!("m6c31-e2e-{nonce}")
+    );
+    assert_eq!(namespace_get(&fixture, "meta:fixture_seeded"), "1");
+    assert!(
+        fixture.relay.0.try_wait().expect("poll serve").is_none(),
+        "serve kept running through every change"
+    );
+
+    let namespace = fixture.namespace.clone();
+    drop(device_b_process);
+    drop(_device_a);
+    drop(fixture);
+    println!(
+        "m6c31-catalog ok nonce={nonce} namespace={namespace} serve_restarts=0 \
+         grant_pickup_ms={grant_pickup_ms} grant_pickup_attempts=1 \
+         device_pickup_ms={device_pickup_ms} revoke_grant_ms={revoke_grant_ms} \
+         revoke_grant_attempts=1 device_revoked_request_ms={device_request_ms} \
+         device_revoked_request_status={after_device_revoke} \
+         relay_session_close_ms={relay_close_ms} close_reason={close_reason} \
+         device_session_end_ms={device_end_ms} device_end={device_end_event} \
+         device_exit={}",
+        exit.unwrap_or(-1)
     );
 }

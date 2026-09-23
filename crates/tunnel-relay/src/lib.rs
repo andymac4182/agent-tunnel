@@ -10,6 +10,7 @@
 #![deny(unsafe_code)]
 
 mod actor;
+pub mod catalog_changes;
 mod config;
 mod consumer_framing;
 mod consumer_write_diagnostics;
