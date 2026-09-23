@@ -1307,11 +1307,43 @@ async fn run_saturation(
             "queue saturation had no live stream to cancel".into(),
         ));
     }
-    if let Some(mut stream) = surviving.pop() {
-        let _ = timeout(Duration::from_secs(5), stream.close()).await;
+    // Hold the cancelled stream's tombstone for the first terminal
+    // observation. The relay reclaims it once the connector's FIN receipt and
+    // STREAM_FORGET arrive, which on a fast host can happen before the first
+    // snapshot below, leaving nothing to observe (task row M7-C101). The
+    // connector-to-relay direction of every device connection is paused
+    // before the close, so the relay still marks the stream terminal and
+    // sends its FIN, but cannot reclaim it until the pause is lifted after
+    // the first observation. Every later sample still runs unheld.
+    let held_connections = device_proxy
+        .diagnostics()
+        .active_connections
+        .into_iter()
+        .map(|connection| connection.id)
+        .collect::<Vec<_>>();
+    for connection in &held_connections {
+        device_proxy
+            .pause(Direction::ClientToTarget, *connection)
+            .await?;
     }
-    let cancellation_accepted_after_resume =
-        wait_for_stream_retirement(owner_relay, device_id, live_before_cancel.len()).await?;
+    let held = async {
+        if let Some(mut stream) = surviving.pop() {
+            let _ = timeout(Duration::from_secs(5), stream.close()).await;
+        }
+        wait_for_stream_retirement(owner_relay, device_id, live_before_cancel.len()).await
+    }
+    .await;
+    let cancellation_accepted_after_resume = match held {
+        Ok(accepted) => accepted,
+        Err(error) => {
+            for connection in &held_connections {
+                let _ = device_proxy
+                    .resume(Direction::ClientToTarget, *connection)
+                    .await;
+            }
+            return Err(error);
+        }
+    };
     // The public stream carries no owner stream id, so the cancelled stream is
     // the exact one that left the live set: the terminal observation below
     // must sample that stream, not whichever live stream sorts first.
@@ -1341,7 +1373,13 @@ async fn run_saturation(
     // required to be monotonic and bounded rather than frozen, and the
     // stream may leave the live set exactly once and never return.
     let first_terminal =
-        read_terminal_observation(owner_relay, device_id, cancelled_stream_id).await?;
+        read_terminal_observation(owner_relay, device_id, cancelled_stream_id).await;
+    for connection in &held_connections {
+        device_proxy
+            .resume(Direction::ClientToTarget, *connection)
+            .await?;
+    }
+    let first_terminal = first_terminal?;
     let mut terminal_observations = 0usize;
     let mut first_terminal_observation_immutable = true;
     let mut previous = first_terminal.clone();
