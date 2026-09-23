@@ -1303,8 +1303,47 @@ fn owner_snapshot_diagnostic(snapshot: &RelaySnapshot, device_id: Uuid) -> Strin
         })
         .collect::<Vec<_>>()
         .join(",");
+    // The newest task closures and stream terminal latches for this device
+    // (EC-061): which exit each stream adapter took and why the actor closed
+    // each stream, so a failed phase names its cause (task row M7-C106).
+    let closures = snapshot
+        .peer_fault_diagnostics
+        .closures
+        .iter()
+        .rev()
+        .filter(|closure| closure.device_id == device_id)
+        .take(DIAGNOSTIC_STREAM_LIMIT * 2)
+        .map(|closure| {
+            format!(
+                "{{stream={:?},stage={:?},cause={:?},at_ms={}}}",
+                closure.stream_id, closure.stage, closure.cause, closure.observed_at_ms
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let device = device_id.to_string();
+    let terminals = snapshot
+        .stream_terminal_events
+        .iter()
+        .rev()
+        .filter(|event| event.device_id == device)
+        .take(DIAGNOSTIC_STREAM_LIMIT)
+        .map(|event| {
+            format!(
+                "{{stream={},reason={},cause={:?},emitted={},recv={},delivered={},at_ms={}}}",
+                event.stream_id,
+                event.reason,
+                event.cause,
+                event.last_emitted_relay_to_connector,
+                event.recv_contiguous_connector_to_relay,
+                event.delivered_contiguous_connector_to_relay,
+                event.closed_at_ms
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
     format!(
-        "session=present,session_id={:?},epoch={},phase={},active_generation={},candidate_generation={:?},rotation_recovery_reason={:?},rotation_deadline_forced_retirement={},sockets={},active={},retained={},queue_bytes={},queue_messages={},stream_sample=tail,streams=[{}],omitted_streams={},dispatches={},consumer_write_timeouts={},peer_owner_send_count={},peer_ingress_receive_count={},peer_last_owner_send={},peer_last_ingress_receive={}",
+        "session=present,session_id={:?},epoch={},phase={},active_generation={},candidate_generation={:?},rotation_recovery_reason={:?},rotation_deadline_forced_retirement={},sockets={},active={},retained={},queue_bytes={},queue_messages={},stream_sample=tail,streams=[{}],omitted_streams={},task_closures=[{closures}],stream_terminals=[{terminals}],dispatches={},consumer_write_timeouts={},peer_owner_send_count={},peer_ingress_receive_count={},peer_last_owner_send={},peer_last_ingress_receive={}",
         session.session_id,
         session.epoch,
         session.phase,
