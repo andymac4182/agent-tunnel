@@ -50,6 +50,12 @@ tunnel-fs-core = { path = "../tunnel-fs-core" }
 tunnel-fs-ninep = { path = "../tunnel-fs-ninep" }
 tunnel-fs-provider = { path = "../tunnel-fs-provider" }
 
+# File identity (volume serial number and file index) for the private state
+# files, read from a handle without unsafe code; already in Cargo.lock through
+# `same-file`. See `src/file_identity.rs` and task row M6-C80.
+[target.'cfg(windows)'.dependencies]
+winapi-util = "0.1.11"
+
 [dev-dependencies]
 async-trait = "0.1.89"
 h3 = "0.0.8"

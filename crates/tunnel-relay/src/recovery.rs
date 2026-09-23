@@ -14,6 +14,7 @@
 //! missing or corrupt fence is an error.  Only the explicit
 //! `recovery-initialize` command may create a new fence.
 
+use crate::file_identity::Observed;
 use std::{
     collections::BTreeSet,
     error::Error,
@@ -320,7 +321,7 @@ impl RecoveryApprovalVersionStore {
     fn create_initial(&self, bytes: &[u8]) -> Result<(), RecoveryFenceStoreError> {
         let parent = parent_directory(&self.path);
         let parent_metadata = ensure_parent_directory(parent)?;
-        match fs::symlink_metadata(&self.path) {
+        match Observed::path_no_follow(&self.path) {
             Ok(metadata) => {
                 if metadata.file_type().is_symlink() {
                     return Err(RecoveryFenceStoreError::SymlinkRejected);
@@ -513,7 +514,7 @@ fn read_bounded_control_file(path: &Path, max_bytes: usize) -> Result<Vec<u8>, C
     validate_path(path).map_err(|_| ControlFileError::Io)?;
     let parent = parent_directory(path);
     let parent_metadata = ensure_parent_directory(parent).map_err(map_fence_path_error)?;
-    let path_metadata = fs::symlink_metadata(path).map_err(|error| {
+    let path_metadata = Observed::path_no_follow(path).map_err(|error| {
         if error.kind() == io::ErrorKind::NotFound {
             ControlFileError::Missing
         } else {
@@ -536,12 +537,12 @@ fn read_bounded_control_file(path: &Path, max_bytes: usize) -> Result<Vec<u8>, C
             ControlFileError::Io
         }
     })?;
-    let opened_metadata = file.metadata().map_err(|_| ControlFileError::Io)?;
+    let opened_metadata = Observed::file(&file).map_err(|_| ControlFileError::Io)?;
     validate_control_file_metadata(&opened_metadata)?;
     if !same_file_metadata(&path_metadata, &opened_metadata) {
         return Err(ControlFileError::PathChanged);
     }
-    let current_path_metadata = fs::symlink_metadata(path).map_err(|error| {
+    let current_path_metadata = Observed::path_no_follow(path).map_err(|error| {
         if error.kind() == io::ErrorKind::NotFound {
             ControlFileError::Missing
         } else {
@@ -628,7 +629,7 @@ fn lock_path(path: &Path) -> Result<PathBuf, RecoveryFenceStoreError> {
 fn open_lock_file(path: &Path) -> Result<File, RecoveryFenceStoreError> {
     let parent = parent_directory(path);
     let parent_metadata = ensure_parent_directory(parent)?;
-    let previous_metadata = match fs::symlink_metadata(path) {
+    let previous_metadata = match Observed::path_no_follow(path) {
         Ok(metadata) => {
             validate_file_metadata(&metadata)?;
             if metadata.len() != 0 {
@@ -654,7 +655,7 @@ fn open_lock_file(path: &Path) -> Result<File, RecoveryFenceStoreError> {
             RecoveryFenceStoreError::Io
         }
     })?;
-    let opened_metadata = file.metadata().map_err(|_| RecoveryFenceStoreError::Io)?;
+    let opened_metadata = Observed::file(&file).map_err(|_| RecoveryFenceStoreError::Io)?;
     validate_file_metadata(&opened_metadata)?;
     if opened_metadata.len() != 0 {
         return Err(RecoveryFenceStoreError::Corrupt);
@@ -665,7 +666,7 @@ fn open_lock_file(path: &Path) -> Result<File, RecoveryFenceStoreError> {
     {
         return Err(RecoveryFenceStoreError::PathChanged);
     }
-    let current_metadata = fs::symlink_metadata(path).map_err(|error| {
+    let current_metadata = Observed::path_no_follow(path).map_err(|error| {
         if error.kind() == io::ErrorKind::NotFound {
             RecoveryFenceStoreError::Missing
         } else {
@@ -706,9 +707,9 @@ fn validate_file_metadata(metadata: &Metadata) -> Result<(), RecoveryFenceStoreE
     Ok(())
 }
 
-fn ensure_parent_directory(path: &Path) -> Result<Metadata, RecoveryFenceStoreError> {
+fn ensure_parent_directory(path: &Path) -> Result<Observed, RecoveryFenceStoreError> {
     ensure_no_symlink_components(path)?;
-    let metadata = fs::symlink_metadata(path).map_err(|_| RecoveryFenceStoreError::Io)?;
+    let metadata = Observed::path_no_follow(path).map_err(|_| RecoveryFenceStoreError::Io)?;
     if metadata.file_type().is_symlink() {
         return Err(RecoveryFenceStoreError::SymlinkRejected);
     }
@@ -739,7 +740,8 @@ fn ensure_no_symlink_components(path: &Path) -> Result<(), RecoveryFenceStoreErr
             Component::ParentDir => return Err(RecoveryFenceStoreError::InvalidPath),
             Component::Normal(name) => current.push(name),
         }
-        let metadata = fs::symlink_metadata(&current).map_err(|_| RecoveryFenceStoreError::Io)?;
+        let metadata =
+            Observed::path_no_follow(&current).map_err(|_| RecoveryFenceStoreError::Io)?;
         if metadata.file_type().is_symlink() {
             return Err(RecoveryFenceStoreError::SymlinkRejected);
         }
@@ -747,30 +749,9 @@ fn ensure_no_symlink_components(path: &Path) -> Result<(), RecoveryFenceStoreErr
     Ok(())
 }
 
-fn same_file_metadata(first: &Metadata, second: &Metadata) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        first.dev() == second.dev() && first.ino() == second.ino()
-    }
-    // `volume_serial_number` and `file_index` -- the Windows `(dev, ino)` --
-    // are unstable (`windows_by_handle`), so the relay did not compile for
-    // `x86_64-pc-windows-msvc` at all. On stable Rust a `Metadata` offers only
-    // these, which a replacement made between the two reads would have to
-    // match exactly, creation time included. That is weaker than a file
-    // index, and it is the most `Metadata` can say on this host.
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        first.file_attributes() == second.file_attributes()
-            && first.creation_time() == second.creation_time()
-            && first.last_write_time() == second.last_write_time()
-            && first.file_size() == second.file_size()
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        first.is_file() == second.is_file() && first.len() == second.len()
-    }
+fn same_file_metadata(first: &Observed, second: &Observed) -> bool {
+    // A real file identity on every host; see `crate::file_identity`.
+    first.same_file(second)
 }
 
 fn parent_directory(path: &Path) -> &Path {
@@ -779,7 +760,7 @@ fn parent_directory(path: &Path) -> &Path {
         .unwrap_or_else(|| Path::new("."))
 }
 
-fn sync_parent_directory(path: &Path, expected: &Metadata) -> Result<(), RecoveryFenceStoreError> {
+fn sync_parent_directory(path: &Path, expected: &Observed) -> Result<(), RecoveryFenceStoreError> {
     let current = ensure_parent_directory(path)?;
     if !same_file_metadata(expected, &current) {
         return Err(RecoveryFenceStoreError::PathChanged);
@@ -787,9 +768,7 @@ fn sync_parent_directory(path: &Path, expected: &Metadata) -> Result<(), Recover
     #[cfg(unix)]
     {
         let directory = open_readonly_nofollow(path).map_err(|_| RecoveryFenceStoreError::Io)?;
-        let opened = directory
-            .metadata()
-            .map_err(|_| RecoveryFenceStoreError::Io)?;
+        let opened = Observed::file(&directory).map_err(|_| RecoveryFenceStoreError::Io)?;
         if !same_file_metadata(expected, &opened) {
             return Err(RecoveryFenceStoreError::PathChanged);
         }

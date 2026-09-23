@@ -7,6 +7,7 @@
 //! remains the authority for the authenticated connection and deployment
 //! incarnation fence.
 
+use crate::file_identity::Observed;
 use std::{
     fmt,
     fs::{self, File},
@@ -487,7 +488,7 @@ fn read_material(
     }
     reject_symlink_components(path, kind)?;
     let path_metadata =
-        fs::symlink_metadata(path).map_err(|_| RedisConnectionError::FileIo(kind))?;
+        Observed::path_no_follow(path).map_err(|_| RedisConnectionError::FileIo(kind))?;
     if path_metadata.file_type().is_symlink() {
         return Err(RedisConnectionError::SymlinkRejected(kind));
     }
@@ -499,9 +500,7 @@ fn read_material(
     }
 
     let file = open_readonly_nofollow(path).map_err(|_| RedisConnectionError::FileIo(kind))?;
-    let opened_metadata = file
-        .metadata()
-        .map_err(|_| RedisConnectionError::FileIo(kind))?;
+    let opened_metadata = Observed::file(&file).map_err(|_| RedisConnectionError::FileIo(kind))?;
     if !same_file_metadata(&path_metadata, &opened_metadata) {
         return Err(RedisConnectionError::PathChanged(kind));
     }
@@ -574,7 +573,7 @@ fn reject_symlink_components(
             Component::Normal(name) => current.push(name),
         }
         let metadata =
-            fs::symlink_metadata(&current).map_err(|_| RedisConnectionError::FileIo(kind))?;
+            Observed::path_no_follow(&current).map_err(|_| RedisConnectionError::FileIo(kind))?;
         if metadata.file_type().is_symlink() {
             return Err(RedisConnectionError::SymlinkRejected(kind));
         }
@@ -582,32 +581,9 @@ fn reject_symlink_components(
     Ok(())
 }
 
-fn same_file_metadata(first: &fs::Metadata, second: &fs::Metadata) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        first.dev() == second.dev() && first.ino() == second.ino()
-    }
-    // `volume_serial_number` and `file_index` -- the Windows `(dev, ino)` --
-    // are unstable (`windows_by_handle`), so the relay did not compile for
-    // `x86_64-pc-windows-msvc` at all. On stable Rust a `Metadata` offers only
-    // these, which a replacement made between the two reads would have to
-    // match exactly, creation time included. That is weaker than a file
-    // index, and it is the most `Metadata` can say on this host.
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        first.file_attributes() == second.file_attributes()
-            && first.creation_time() == second.creation_time()
-            && first.last_write_time() == second.last_write_time()
-            && first.file_size() == second.file_size()
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        first.is_file() == second.is_file()
-            && first.is_dir() == second.is_dir()
-            && first.len() == second.len()
-    }
+fn same_file_metadata(first: &Observed, second: &Observed) -> bool {
+    // A real file identity on every host; see `crate::file_identity`.
+    first.same_file(second)
 }
 
 #[cfg(test)]
