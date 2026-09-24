@@ -10180,9 +10180,11 @@ impl RelayActor {
         }
         self.flush_recovered_records(key);
         // A consumer read taken while no carrier was active could not
-        // advertise the credit it released; pay it on the successor now, or
-        // the connector's next write waits for it forever (M4-29).
-        self.redrive_owed_http_credit(key);
+        // advertise the credit it released (M4-29), and an update queued on
+        // the carrier that died was lost with it (M4-52): reissue each live
+        // stream's whole credit, owed debt included, on the successor, or the
+        // connector's next write waits for it forever.
+        self.reissue_receive_credit_after_recovery(key);
     }
 
     /// Re-run every candidate frame held for the connector's
@@ -19178,6 +19180,54 @@ mod stream_identity_tests {
         );
         assert_eq!(owed(&actor), 0, "and the debt is settled");
         assert!(actor.sessions.contains_key(&key.scope()));
+        drop(registration);
+    }
+
+    /// Task row M4-52, measured on hosted x86_64 Linux: a WINDOW_UPDATE the
+    /// owner queued on the data socket that then died was recorded as
+    /// advertised and lost with the socket; recovery reconciles cursors but
+    /// not credit, so the connector parked a 65,536-byte `Rread` for credit
+    /// the owner believed it had granted. Activation must reissue each live
+    /// stream's whole credit on the successor, not only a debt it knows of.
+    #[tokio::test]
+    async fn recovery_activation_reissues_credit_a_dead_carrier_swallowed() {
+        let (mut actor, _control, mut data_rx, carrier, key, registration) =
+            m4_37_opened_echo_stream(4_521, "m4-52-lost-credit").await;
+        let stream_id = registration.stream_id;
+        let granted = {
+            let session = actor.sessions.get_mut(&key.scope()).expect("session");
+            let stream = session.streams.get_mut(&stream_id).expect("stream");
+            let current = stream
+                .sequence
+                .direction(Direction::ConnectorToRelay)
+                .receive_credit();
+            // An update the owner queued and recorded, then lost with the
+            // socket: the sequence says advertised, the connector never saw it.
+            let lost =
+                Frame::window_update(key.epoch, carrier.generation, stream_id, current + 4_096);
+            stream
+                .sequence
+                .send_frame(Direction::RelayToConnector, &lost)
+                .expect("recorded as advertised");
+            current + 4_096
+        };
+        while data_rx.try_recv().is_ok() {}
+        actor.reissue_receive_credit_after_recovery(&key);
+        let mut reissued = None;
+        while let Ok(outbound) = data_rx.try_recv() {
+            if let DataOutbound::Binary(mut bytes) = outbound {
+                let frame = Frame::decode(bytes.as_slice()).expect("frame decodes");
+                bytes.release();
+                if frame.kind == FrameKind::WindowUpdate && frame.stream_id == stream_id {
+                    reissued = Some(frame.window);
+                }
+            }
+        }
+        assert_eq!(
+            reissued,
+            Some(granted),
+            "the successor carries the whole advertised credit again"
+        );
         drop(registration);
     }
 

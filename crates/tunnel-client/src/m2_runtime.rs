@@ -8262,12 +8262,6 @@ impl M2Actor {
             .recovery
             .as_ref()
             .map(|recovery| recovery.begin.attempt_no);
-        let frozen_snapshots = self.local_resume_snapshots(&roster)?;
-        self.rotation
-            .reconcile_validated(&attempt, verdicts, self.now_ms())
-            .map_err(|error| {
-                ClientError::Protocol(format!("recovery activation rejected: {error}"))
-            })?;
         let candidate = self
             .candidate
             .take()
@@ -8290,7 +8284,21 @@ impl M2Actor {
                 });
             }
         }
+        // Reissued **before** the READY snapshot is taken, and the order is
+        // load-bearing (M4-50): the relay validates READY against the credit
+        // it has already applied, and the update below travels on the data
+        // socket while READY travels on control, so either may arrive first.
+        // Taken after, a READY carrying less credit than an update the relay
+        // had already applied was refused as `RECOVERY_READY_CONFLICT`
+        // (measured on hosted Linux).  Taken after the reissue, READY carries
+        // at least what any update does.
         self.reissue_active_receive_controls()?;
+        let frozen_snapshots = self.local_resume_snapshots(&roster)?;
+        self.rotation
+            .reconcile_validated(&attempt, verdicts, self.now_ms())
+            .map_err(|error| {
+                ClientError::Protocol(format!("recovery activation rejected: {error}"))
+            })?;
         let mut ready_messages = Vec::new();
         for direction in [Direction::RelayToConnector, Direction::ConnectorToRelay] {
             let index = direction_index(direction);

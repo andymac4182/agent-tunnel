@@ -589,12 +589,34 @@ impl RelayActor {
         epoch: u64,
         generation: u64,
     ) -> bool {
-        let Some(owed) = stream.http.as_ref().map(HttpStreamState::credit_owed) else {
-            return true;
-        };
+        let owed = stream.http.as_ref().map_or(0, HttpStreamState::credit_owed);
         if owed == 0 {
             return true;
         }
+        Self::advertise_receive_credit(
+            stream,
+            stream_id,
+            owed,
+            data_tx,
+            queue_budget,
+            epoch,
+            generation,
+        )
+    }
+
+    /// Queue one WINDOW_UPDATE carrying the stream's whole advertised
+    /// connector-to-relay credit plus `owed`, and settle any HTTP debt once
+    /// it is queued.  The update is absolute and only ever increases, so
+    /// resending credit the connector already has is harmless on the wire.
+    fn advertise_receive_credit(
+        stream: &mut M2Stream,
+        stream_id: u64,
+        owed: u64,
+        data_tx: &mpsc::Sender<DataOutbound>,
+        queue_budget: &QueueBudget,
+        epoch: u64,
+        generation: u64,
+    ) -> bool {
         let current = stream
             .sequence
             .direction(Direction::ConnectorToRelay)
@@ -665,6 +687,59 @@ impl RelayActor {
             ) {
                 // The queue refused: keep the remaining debts for the next
                 // tick rather than spending more refusals on this one.
+                break;
+            }
+        }
+    }
+
+    /// Reissue every live stream's cumulative connector-to-relay receive
+    /// credit on the carrier a retained recovery has just activated (task
+    /// row M4-52).
+    ///
+    /// The relay records credit as advertised the moment its WINDOW_UPDATE is
+    /// queued, and a data socket that dies with that update still queued
+    /// takes it with it. Recovery reconciles cursors and acknowledgements but
+    /// never credit, so the connector could be left short of credit the relay
+    /// believes it granted -- measured on hosted x86_64 Linux as a
+    /// 65,536-byte `Rread` parked on the connector after recovery completed.
+    /// The connector already does the same for its own direction
+    /// (`reissue_active_receive_controls`). Owed HTTP credit is paid in the
+    /// same update.
+    pub(super) fn reissue_receive_credit_after_recovery(&mut self, key: &SessionKey) {
+        let Some(session) = self.session_mut(key) else {
+            return;
+        };
+        let Some(data_tx) = session.data_tx.clone() else {
+            return;
+        };
+        let queue_budget = session.queue_budget.clone();
+        let generation = session.generation;
+        let epoch = session.key.epoch;
+        for (&stream_id, stream) in &mut session.streams {
+            if stream.terminal {
+                continue;
+            }
+            let owed = stream.http.as_ref().map_or(0, HttpStreamState::credit_owed);
+            if stream
+                .sequence
+                .direction(Direction::ConnectorToRelay)
+                .receive_credit()
+                == 0
+                && owed == 0
+            {
+                continue;
+            }
+            if !Self::advertise_receive_credit(
+                stream,
+                stream_id,
+                owed,
+                &data_tx,
+                &queue_budget,
+                epoch,
+                generation,
+            ) {
+                // Refused: owed HTTP credit stays owed for the tick; the
+                // reissue of already-advertised credit is best effort.
                 break;
             }
         }
