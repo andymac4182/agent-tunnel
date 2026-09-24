@@ -452,8 +452,10 @@ async fn verify_with_redis(redis: &RedisLease) -> Result<ClusterAcceptanceEviden
         "m7-cluster-harness-deployment",
         REDIS_DEPLOYMENT_INCARNATION,
     )?;
+    // Each peer listener takes its node's reserved UDP socket (M7-C118).
+    let mut peer_sockets = HashMap::new();
     for node in &mut cluster.nodes {
-        node.release_ports();
+        peer_sockets.insert(node.node_id.to_string(), node.take_quic_socket()?);
     }
 
     let shared_catalog: SharedCatalog = Arc::new(catalog.clone());
@@ -487,7 +489,7 @@ async fn verify_with_redis(redis: &RedisLease) -> Result<ClusterAcceptanceEviden
         consumer_auth,
         observations.clone(),
     );
-    let mut peers = start_peers(&cluster, shared_catalog, bindings, callback).await?;
+    let mut peers = start_peers(&cluster, peer_sockets, shared_catalog, bindings, callback).await?;
     sleep(Duration::from_millis(50)).await;
 
     let scenario = run_route_scenarios(&topology, &owners, &peers).await;
@@ -809,6 +811,7 @@ async fn claim_three_owners(
 
 async fn start_peers(
     cluster: &ClusterFixture,
+    mut peer_sockets: HashMap<String, std::net::UdpSocket>,
     catalog: SharedCatalog,
     bindings: Arc<HashMap<(String, String), VerifiedPeerBinding>>,
     callback: impl tunnel_relay::PeerIngressHandler + Clone,
@@ -832,7 +835,10 @@ async fn start_peers(
         limits
             .apply_to_server_config(&mut server_config)
             .map_err(|error| HarnessError::Http(format!("M7 peer server limits: {error}")))?;
-        let endpoint = quinn::Endpoint::server(server_config, node.addresses.udp)
+        let socket = peer_sockets
+            .remove(node.node_id.as_str())
+            .ok_or_else(|| HarnessError::InvalidInput("M7 peer has no reserved socket".into()))?;
+        let endpoint = crate::cluster_fixture::quic_server_on(server_config, socket)
             .map_err(|error| HarnessError::Http(format!("M7 peer bind: {error}")))?;
         let mut client_endpoint =
             quinn::Endpoint::client((std::net::Ipv4Addr::LOCALHOST, 0).into())

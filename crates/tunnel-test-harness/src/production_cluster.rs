@@ -2200,8 +2200,11 @@ impl ProductionCluster {
     ) -> Result<Self> {
         let mut fixture =
             ClusterFixture::with_deployment(&harness.pki, DEPLOYMENT_ID, DEPLOYMENT_INCARCATION)?;
+        // Each relay's QUIC listener takes its node's reserved UDP socket
+        // rather than rebinding a released address (M7-C118).
+        let mut reserved_peer_sockets = BTreeMap::new();
         for node in &mut fixture.nodes {
-            node.release_ports();
+            reserved_peer_sockets.insert(node.node_id.clone(), node.take_quic_socket()?);
         }
 
         // Keep the relay's real QUIC listeners on the fixture's reserved
@@ -2445,10 +2448,26 @@ impl ProductionCluster {
                     .and_then(|(target_node_id, barrier)| {
                         (*target_node_id == node.node_id.as_str()).then(|| Arc::clone(barrier))
                     });
+            let Some(peer_socket) = reserved_peer_sockets.remove(&node.node_id) else {
+                let cleanup_errors = shutdown_startup_resources_until(
+                    &mut relays,
+                    &mut peer_proxies,
+                    startup_cleanup_deadline,
+                )
+                .await;
+                return Err(startup_cleanup_error(
+                    HarnessError::InvalidInput(format!(
+                        "relay {} has no reserved peer socket",
+                        node.node_id
+                    )),
+                    cleanup_errors,
+                ));
+            };
             match start_relay(
                 harness,
                 &fixture,
                 node,
+                peer_socket,
                 &files_path,
                 signer_trust_path.clone(),
                 server_ca_path.clone(),
@@ -5516,6 +5535,7 @@ async fn start_relay(
     harness: &RunningHarness,
     fixture: &ClusterFixture,
     node: &crate::cluster_fixture::RelayNodeFixture,
+    peer_socket: std::net::UdpSocket,
     files: &Path,
     signer_trust_path: PathBuf,
     server_ca_path: PathBuf,
@@ -5712,7 +5732,7 @@ async fn start_relay(
         .max_connections
         .min(peer_limits.max_streams_per_connection);
     let peer_endpoint =
-        quinn::Endpoint::server(peer_server, node.addresses.udp).map_err(|error| {
+        crate::cluster_fixture::quic_server_on(peer_server, peer_socket).map_err(|error| {
             HarnessError::Process(format!("binding peer {}: {error}", node.node_id))
         })?;
     let client_bind = SocketAddr::new(node.addresses.udp.ip(), 0);

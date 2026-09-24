@@ -285,17 +285,18 @@ async fn verify_inner() -> Result<PeerFragmentationEvidence> {
             "peer-fragmentation fixture did not create three relays".to_owned(),
         ));
     }
-    cluster
+    // The owner's listener takes its reserved UDP socket (M7-C118).
+    let owner_socket = cluster
         .node_mut(OWNER_NODE_ID)
         .ok_or_else(|| HarnessError::InvalidInput("peer-fragmentation owner missing".to_owned()))?
-        .release_ports();
+        .take_quic_socket()?;
     cluster
         .node_mut(SOURCE_NODE_ID)
         .ok_or_else(|| HarnessError::InvalidInput("peer-fragmentation source missing".to_owned()))?
         .release_ports();
 
     let source_binding = verified_binding(&cluster, SOURCE_NODE_ID)?;
-    let running = start_fixture(&cluster, source_binding)?;
+    let running = start_fixture(&cluster, source_binding, owner_socket)?;
     let run_result = match timeout(CASE_TIMEOUT.saturating_mul(16), run_cases(&running)).await {
         Ok(result) => result,
         Err(_) => Err(HarnessError::Timeout(
@@ -746,6 +747,7 @@ async fn run_malformed_case_inner(
 fn start_fixture(
     cluster: &ClusterFixture,
     source_binding: VerifiedPeerBinding,
+    owner_socket: std::net::UdpSocket,
 ) -> Result<RunningFixture> {
     let owner = cluster
         .node(OWNER_NODE_ID)
@@ -765,8 +767,8 @@ fn start_fixture(
         owner.peer_ca_pem().as_bytes(),
     )
     .map_err(|error| HarnessError::Pki(format!("peer-fragmentation server TLS: {error}")))?;
-    let server_endpoint =
-        quinn::Endpoint::server(server_config, owner.addresses.udp).map_err(|error| {
+    let server_endpoint = crate::cluster_fixture::quic_server_on(server_config, owner_socket)
+        .map_err(|error| {
             HarnessError::Http(format!("binding peer-fragmentation server: {error}"))
         })?;
 
