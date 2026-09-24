@@ -600,6 +600,20 @@ impl AuthorityLane {
                 self.group.binding.contact();
                 Ok(value)
             }
+            // A reply that missed the deadline is a timeout however it was
+            // observed.  redis-rs's own response timeout (set to the same
+            // bound, and surfacing as an I/O `TimedOut`) and this outer
+            // deadline race for the same instant; which one wins used to
+            // decide whether the lane kept a connection that still owes the
+            // stalled reply (M7-C113).  Both now release it, so the next
+            // command re-verifies the primary on a fresh connection instead
+            // of queueing its reply behind the stalled one, and both report
+            // the typed timeout rather than, for an owner write, a lost
+            // connection.  The command itself is never replayed.
+            Ok(Err(error)) if error.is_timeout() => {
+                self.release_lost(connection_generation).await;
+                Err(dispatched.timeout())
+            }
             Ok(Err(error)) => {
                 let lost = lane_lost(&error);
                 if lost {
@@ -610,7 +624,10 @@ impl AuthorityLane {
                 }
                 Err(dispatched.classify(error, lost))
             }
-            Err(_) => Err(dispatched.timeout()),
+            Err(_) => {
+                self.release_lost(connection_generation).await;
+                Err(dispatched.timeout())
+            }
         }
     }
 
@@ -620,8 +637,9 @@ impl AuthorityLane {
     /// lock is only ever held across the bounded probe or reconnect in
     /// [`Self::verify`], so a caller queued behind a sibling waits at most one
     /// such verification and then shares the same multiplexed connection.
-    /// A verification that exceeds its deadline keeps the connection exactly
-    /// as a timed-out command does.
+    /// A verification that exceeds its deadline leaves the lane state as it
+    /// found it; a caller's command that times out releases the connection
+    /// (see [`Self::execute`]).
     async fn admit(&self) -> Result<Admitted, CatalogError> {
         let mut state = self.state.lock().await;
         tokio::time::timeout(REDIS_OPERATION_TIMEOUT, self.verify(&mut state))
@@ -723,7 +741,8 @@ impl DispatchedFailure {
 }
 
 /// Whether a command failure means the physical connection is gone.  Server
-/// replies, parse failures and caller-side deadlines keep the connection.
+/// replies and parse failures keep the connection; a reply timeout is
+/// classified before this is consulted and releases it.
 fn lane_lost(error: &RedisError) -> bool {
     error.is_io_error() || error.is_connection_dropped()
 }
