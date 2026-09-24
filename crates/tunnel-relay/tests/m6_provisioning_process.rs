@@ -3306,6 +3306,29 @@ fn m6c65_wait_line(
     panic!("relay printed no line with `{needle}` within {deadline:?}: {seen:?}");
 }
 
+/// Wait for the relay's report of its `count`-th re-binding in this process.
+///
+/// The relay prints `... re-bound to the new Redis run: rebinds=N` on its
+/// continuity loop's next tick, up to one interval plus that tick's token
+/// write after the re-binding itself, so an echo can be served before the
+/// line exists (236 ms after a crash on the hosted Linux runner).  Every
+/// phase that expects an adoption waits for its own numbered line here,
+/// before the next phase opens a window in which no re-binding may be
+/// reported; otherwise a late line from the phase before lands in that
+/// window (the first hosted run of this gate, M6-C65).
+fn m6c65_expect_rebinds(
+    log: &std::sync::mpsc::Receiver<String>,
+    seen: &mut Vec<String>,
+    count: u32,
+) -> String {
+    m6c65_wait_line(
+        log,
+        seen,
+        &format!("namespace re-bound to the new Redis run: rebinds={count}"),
+        STEP_DEADLINE,
+    )
+}
+
 /// Take every relay stderr line already printed, then return how many
 /// lines have been seen: lines after this mark were printed after it.
 fn m6c65_mark(log: &std::sync::mpsc::Receiver<String>, seen: &mut Vec<String>) -> usize {
@@ -3505,12 +3528,7 @@ async fn m6c65_redis_restart_keeps_the_namespace_and_refuses_lost_data() {
         M6C65_RECOVERY_DEADLINE,
     )
     .await;
-    let rebound = m6c65_wait_line(
-        &fixture.relay_log,
-        &mut relay_lines,
-        "namespace re-bound to the new Redis run",
-        STEP_DEADLINE,
-    );
+    let rebound = m6c65_expect_rebinds(&fixture.relay_log, &mut relay_lines, 1);
     assert_eq!(
         fixture.relay.0.id(),
         relay_pid,
@@ -3541,6 +3559,7 @@ async fn m6c65_redis_restart_keeps_the_namespace_and_refuses_lost_data() {
     .await;
     assert_eq!(fixture.relay.0.id(), relay_pid);
     assert_eq!(namespace_get(&fixture, "meta:redis_run_id"), run_crash);
+    m6c65_expect_rebinds(&fixture.relay_log, &mut relay_lines, 2);
     println!(
         "m6c65-crash ok nonce={nonce} run_before={run_2} run_after={run_crash} \
          echo_after_ms={} relay_restarts=0",
@@ -3582,6 +3601,7 @@ async fn m6c65_redis_restart_keeps_the_namespace_and_refuses_lost_data() {
     )
     .await;
     assert_eq!(namespace_get(&fixture, "meta:redis_run_id"), run_2);
+    m6c65_expect_rebinds(&fixture.relay_log, &mut relay_lines, 3);
     println!(
         "m6c65-persistence ok nonce={nonce} everysec_run={run_everysec} line={persistence:?} \
          durable_run={run_2} echo_after_ms={}",
@@ -3650,6 +3670,7 @@ async fn m6c65_redis_restart_keeps_the_namespace_and_refuses_lost_data() {
     )
     .await;
     assert_eq!(fixture.relay.0.id(), relay_pid);
+    m6c65_expect_rebinds(&fixture.relay_log, &mut relay_lines, 4);
     println!(
         "m6c65-downgrade ok nonce={nonce} downgrade={downgrade:?} refused={stale:?} \
          adopted_after_rebind_ms={} relay_restarts=0",
