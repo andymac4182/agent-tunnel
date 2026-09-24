@@ -63,7 +63,17 @@ pub struct ManagedProcess {
     stderr_read_error: Arc<AtomicBool>,
     stdout_task: Option<JoinHandle<()>>,
     stderr_task: Option<JoinHandle<()>>,
+    streams_logged: bool,
 }
+
+/// Opt-in directory for every managed child's bounded streams.
+///
+/// Ordinary runs write nothing. A diagnostic run (a CI probe, or an operator
+/// chasing an intermittent gate) sets this so a failing gate leaves the CLI's
+/// own stderr behind instead of only the harness's summary line. The files
+/// hold fixture output, which can include synthetic per-run credentials, so
+/// the variable must name a private directory and nothing prints them.
+const PROCESS_LOG_DIR_ENV: &str = "TUNNEL_HARNESS_PROCESS_LOG_DIR";
 
 impl std::fmt::Debug for ManagedProcess {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -129,7 +139,44 @@ impl ManagedProcess {
             stderr_read_error,
             stdout_task,
             stderr_task,
+            streams_logged: false,
         })
+    }
+
+    /// Write this child's bounded streams to [`PROCESS_LOG_DIR_ENV`], once.
+    /// Best effort: a diagnostic write never changes a gate's outcome.
+    fn log_streams(&mut self, ending: &str) {
+        if self.streams_logged {
+            return;
+        }
+        self.streams_logged = true;
+        let Some(directory) = std::env::var_os(PROCESS_LOG_DIR_ENV).map(PathBuf::from) else {
+            return;
+        };
+        if std::fs::create_dir_all(&directory).is_err() {
+            return;
+        }
+        let millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_millis());
+        let safe_name: String = self
+            .name
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .take(64)
+            .collect();
+        let stem = format!(
+            "{millis}-{safe_name}-{}-{ending}",
+            self.pid.unwrap_or_default()
+        );
+        let _ = std::fs::write(directory.join(format!("{stem}.stdout")), self.stdout());
+        let _ = std::fs::write(directory.join(format!("{stem}.stderr")), self.stderr());
     }
 
     pub fn id(&self) -> Option<u32> {
@@ -247,6 +294,7 @@ impl ManagedProcess {
             },
         };
         let output = self.join_output_tasks().await;
+        self.log_streams("shutdown");
         let capture = crate::c11_capture::record_process_streams(
             self.pid,
             &self.name,
@@ -332,6 +380,9 @@ async fn join_output_slot(
 
 impl Drop for ManagedProcess {
     fn drop(&mut self) {
+        // A gate that fails drops its children without `shutdown`; keep what
+        // they wrote so far, since that is exactly the failure being chased.
+        self.log_streams("dropped");
         if self.child.id().is_some() {
             let _ = self.child.start_kill();
         }

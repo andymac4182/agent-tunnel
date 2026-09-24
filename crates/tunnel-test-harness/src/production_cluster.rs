@@ -3231,9 +3231,12 @@ impl ProductionCluster {
             {
                 true
             }
-            Err(StreamConnectFailure::Status { status, .. }) => {
+            Err(StreamConnectFailure::Status { status, body }) => {
+                // M7-C108: name the typed code so the next red says which
+                // refusal the ingress chose instead of only its status.
                 return Err(HarnessError::Http(format!(
-                    "owner-death probe returned unexpected HTTP status {status}"
+                    "owner-death probe returned unexpected HTTP status {status}: {}",
+                    typed_error_fields(body.as_deref())
                 )));
             }
             Err(StreamConnectFailure::Harness(error)) => return Err(error),
@@ -6882,6 +6885,29 @@ fn is_expected_revocation_close(error: &HarnessError) -> bool {
         }
         _ => false,
     }
+}
+
+/// The typed `code` and `execution` of a relay error envelope, for a failure
+/// message. Only those two fields cross; message text and payload never do.
+fn typed_error_fields(body: Option<&[u8]>) -> String {
+    let Some(value) = body.and_then(|body| serde_json::from_slice::<serde_json::Value>(body).ok())
+    else {
+        return "untyped".to_owned();
+    };
+    let field = |name: &str| {
+        value
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .filter(|text| {
+                text.len() <= 64
+                    && text
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            })
+            .unwrap_or("absent")
+            .to_owned()
+    };
+    format!("code={} execution={}", field("code"), field("execution"))
 }
 
 fn is_explicit_no_owner_response(status: u16, body: Option<&[u8]>) -> bool {

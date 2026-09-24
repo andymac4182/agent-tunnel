@@ -2292,8 +2292,15 @@ async fn echo_http(probe: EchoProbe<'_>) -> Result<()> {
     let payload = probe.payload.to_vec();
     let (status, body) = post_echo(probe).await?;
     if status != 200 {
+        // Name the typed envelope's code and execution when the body is one
+        // (M7-C111: two 503s were unattributable with only a digest). Only
+        // the two typed fields cross; message text and payload never do.
+        let typed = serde_json::from_slice::<WireError>(&body).map_or_else(
+            |_| "untyped".to_owned(),
+            |wire| format!("code={} execution={}", wire.code, wire.execution),
+        );
         return Err(HarnessError::Http(format!(
-            "{phase} echo returned HTTP {status}: body_len={} body_sha256={}",
+            "{phase} echo returned HTTP {status}: {typed} body_len={} body_sha256={}",
             body.len(),
             digest_hex(&body),
         )));
