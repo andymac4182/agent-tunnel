@@ -1304,10 +1304,11 @@ impl PeerRuntime {
         {
             return Err(PeerRuntimeError::PeerIdentityMismatch);
         }
-        // Re-run the router with the binding.  This also prevents a cached
-        // remote owner from being used without current signed trust evidence.
+        // Attach the binding to the owner just read, never to an older cached
+        // generation of the same node (M7-C107).  A cached remote owner is
+        // still never used without current signed trust evidence.
         self.router
-            .resolve(scope, now, Some(&binding))
+            .bind_remote(scope, owner.clone(), now, &binding)
             .await
             .map_err(Into::into)
     }
