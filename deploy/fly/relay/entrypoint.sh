@@ -15,6 +15,15 @@
 #   check-serve-config
 #   activate-first-incarnation
 #   provision-catalog RECORDS [--dry-run]
+#   rebind-redis-run --redis-restarted-in-place
+#   add-user | add-device | add-service | set-grant --records PATH [--dry-run]
+#   revoke-grant | revoke-device | revoke-credential --tenant UUID ... [--dry-run]
+#
+# The seven catalog commands (docs/operator.md section 2.5, M6-C31) run in a
+# one-off machine of the relay app while `serve` runs elsewhere, the same way
+# provisioning does (docs/deploy-fly.md section 6.6, M6-C91). Their arguments
+# go to tunnel-relay unchanged, each as its own argv entry, after the
+# `--config` this script writes; this shell never evaluates them.
 set -eu
 
 base=/var/lib/agent-tunnel
@@ -90,7 +99,18 @@ case "$command" in
     shift
     exec /usr/local/bin/tunnel-relay provision-catalog --config "$config" --records "$records" "$@"
     ;;
+  add-user | add-device | add-service | set-grant | revoke-grant | revoke-device | revoke-credential)
+    # docs/deploy-fly.md section 6.6 (M6-C91). tunnel-relay parses and checks
+    # the arguments; the configuration is always the one written above.
+    [ "$#" -ge 1 ] || die "usage: $command --records PATH [--dry-run], or $command --tenant UUID ... [--dry-run]"
+    for argument in "$@"; do
+      case "$argument" in
+        --config | --config=*) die "$command: the entrypoint sets --config; do not pass it" ;;
+      esac
+    done
+    exec /usr/local/bin/tunnel-relay "$command" --config "$config" "$@"
+    ;;
   *)
-    die "unknown command '$command' (serve, check-serve-config, activate-first-incarnation, provision-catalog, rebind-redis-run)"
+    die "unknown command '$command' (serve, check-serve-config, activate-first-incarnation, provision-catalog, rebind-redis-run, add-user, add-device, add-service, set-grant, revoke-grant, revoke-device, revoke-credential)"
     ;;
 esac
