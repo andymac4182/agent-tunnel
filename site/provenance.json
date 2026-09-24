@@ -1,11 +1,11 @@
 {
-  "reviewedOriginMain": "7e1534adbd1fefd2e2b3f3d697c478ba6fa28189",
-  "lastPublishedOriginMain": "7e1534adbd1fefd2e2b3f3d697c478ba6fa28189",
-  "lastReviewAt": "2026-09-24T09:02:37+10:00",
-  "lastReviewOutcome": "Reviewed echo terminal waiter failure handling, idempotent expiry selection, regression coverage and corrected stall measurements through 7e1534a. Replaced the incorrect two-second loss claim, documented typed echo failure outcomes and bounded local evidence without implying full or hosted transport acceptance. No runtime operations executed; CI and release gates unchanged.",
+  "reviewedOriginMain": "0ddbf42a9823704434d2a287876c8ffb5a46c9d2",
+  "lastPublishedOriginMain": "0ddbf42a9823704434d2a287876c8ffb5a46c9d2",
+  "lastReviewAt": "2026-09-24T15:03:33+10:00",
+  "lastReviewOutcome": "Reviewed Redis test synchronization, ACP cleanup accounting, M7 recovery and shutdown fixes, fresh-owner routing, saturation fixtures and recorded residual defects through 0ddbf42. Published admission-close, shared-peer refusal and graceful-cancellation limits, separating fixture socket bounds from production behavior and scoped evidence from complete cluster acceptance. No runtime operations executed; CI and release gates unchanged.",
   "reviewedDate": "2026-09-24",
   "scope": "Setup, architecture, MCP, ACP, computer use, filesystems and support boundaries",
   "verification": "Local and live Chrome verification passed at 1440, 1920, 390 and 320 pixels: homepage, brand lab, nine docs pages, links, images, light/dark/system themes and overflow. Live support exactly matched reviewed local content. Runtime and artifact acceptance not rerun; historical evidence not promoted to new acceptance.",
-  "verifiedAt": "2026-09-24T09:02:37+10:00",
-  "deploymentId": "dpl_PW8CeWLReDzPWvmUpzXJuYPvzWVB"
+  "verifiedAt": "2026-09-24T15:03:33+10:00",
+  "deploymentId": "dpl_4fuJatoUUy5NzMxYK3cyeih1xbDH"
 }
