@@ -550,6 +550,15 @@ pub fn validate_mcp_cloud_client_evidence(evidence: &McpCloudClientEvidence) -> 
                 c.wire.drained("tools/call:sleep") == 0,
             ),
             (
+                // M3-14: a cancellation the owner recorded as RESET(CANCELLED)
+                // is recorded by the ingress too, including when the consumer
+                // left before any response head (the 2026 stdio case).
+                format!("{name} cancellation: the ingress recorded the cancellation"),
+                c.owner_release != "reset"
+                    || c.owner_reset_reason != Some(CANCELLED)
+                    || c.ingress_record.as_deref() == Some("HTTP_CANCELLED"),
+            ),
+            (
                 format!("{name} cancellation: profile signal"),
                 match (current, stdio) {
                     // Closing the response stream is the cancellation: the
@@ -1609,12 +1618,22 @@ impl Gate<'_> {
             {
                 evidence.descendant_killed = Some(wait_process_gone(pid, PROCESS_EXIT_BOUND).await);
             }
-            // A consumer that leaves before any response head is recorded by
-            // the owner (RESET) but not by the ingress (M3-14), so the ingress
-            // record is read once and reported, not required.
-            let records = self
+            // A consumer that leaves before any response head used to be
+            // recorded by the owner (RESET) but not by the ingress (M3-14).
+            // The ingress now records it however the consumer leaves, so once
+            // the owner has recorded the cancellation the ingress record is
+            // waited for and required (see the validator).
+            let mut records = self
                 .stream_records(evidence.stream_id, &evidence.operation_id, Duration::ZERO)
                 .await;
+            if records.owner_release == "reset"
+                && records.owner_reset_reason == Some(CANCELLED)
+                && !records.ingress_seen
+            {
+                records = self
+                    .stream_records(evidence.stream_id, &evidence.operation_id, WAIT)
+                    .await;
+            }
             evidence.owner_release = records.owner_release;
             evidence.owner_reset_reason = records.owner_reset_reason;
             evidence.ingress_record = records
@@ -2467,7 +2486,7 @@ mod tests {
                 descendant_killed: stdio.then_some(true),
                 owner_release: "reset".to_owned(),
                 owner_reset_reason: Some(CANCELLED),
-                ingress_record: None,
+                ingress_record: Some("HTTP_CANCELLED".to_owned()),
                 follow_up_ok: true,
                 wire: counts(&[("notifications/cancelled", u64::from(!current))], &[]),
             },
@@ -2783,6 +2802,9 @@ mod tests {
             }),
             ("cancel owner release", |e| {
                 e.combos[0].cancellation.owner_release = "fin".into();
+            }),
+            ("cancel ingress record missing", |e| {
+                e.combos[0].cancellation.ingress_record = None;
             }),
             ("2025 cancel post", |e| {
                 e.combos[1].cancellation.wire.posts.clear();

@@ -169,6 +169,9 @@ impl ConnectOptions {
     }
 }
 
+/// How many retained OPEN journal stream IDs a status snapshot reports.
+pub const OPEN_JOURNAL_STREAM_IDS_REPORTED: usize = 8;
+
 /// A bounded, payload-free status snapshot owned by the connector actor.
 /// Identifiers are useful for diagnosing a handover; credentials and frame
 /// bodies are deliberately absent.
@@ -189,6 +192,11 @@ pub struct ConnectionStatus {
     /// session has served, because an entry is released at the OPEN retry
     /// horizon in docs/protocol.md.
     pub open_journal_entries: usize,
+    /// The stream IDs of those entries, lowest first, at most
+    /// [`OPEN_JOURNAL_STREAM_IDS_REPORTED`] of them.  Identifiers only: which
+    /// streams a session still retains is what separates a slow reclamation
+    /// from a leak (M3-31).
+    pub open_journal_stream_ids: Vec<u64>,
     /// Stream IDs whose OPEN state has been reclaimed at that horizon, or
     /// refused before it could be journaled.  Monotonic for the session.
     pub open_streams_retired: u64,
@@ -334,6 +342,7 @@ impl Default for ConnectionStatus {
             rotation_id: None,
             streams: 0,
             open_journal_entries: 0,
+            open_journal_stream_ids: Vec::new(),
             open_streams_retired: 0,
             open_retired_ranges_coalesced: 0,
             emitted_sequences: 0,

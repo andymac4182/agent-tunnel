@@ -94,11 +94,26 @@ const SEQUENTIAL_CONNECTION_REQUESTS: usize = 32;
 /// inside the loop; it is deliberately not also a validator rule, which
 /// could only restate the cap the loop already enforces.
 const SEQUENTIAL_RETRY_CAP: usize = 12;
-/// The sequential loop runs one request at a time, so the connector can hold
-/// the in-flight request's entry plus at most one whose reclamation has not
-/// completed.  Observed: 1.
-const SEQUENTIAL_JOURNAL_ENTRY_BOUND: usize = 2;
 const SEQUENTIAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+/// The most OPEN journal entries the sequential phase may retain at once:
+/// one sixteenth of the journal cap, 8 (M3-31).
+///
+/// **Chosen, not derived, and chosen to catch one regression.**  No request
+/// count bounds the peak by construction (see the reclamation rule below), so
+/// this is a ceiling with margin: 4x the largest peak measured with forgets
+/// published at close (1 locally; 2 on hosted Linux, from a settled baseline
+/// of 0).  It is set to go red on a relay that publishes `STREAM_FORGET` only
+/// on its 500 ms maintenance tick: with the close-time and
+/// after-every-inbound-frame flushes both removed, two local runs peaked at
+/// **23** and **25**, which a quarter of the cap (32) let through.  It cannot tell the
+/// close-time flush alone from its absence, because the after-every-frame
+/// flush bounds the lag at about one request either way; that rule is
+/// witnessed by the relay actor test
+/// `an_http_stream_is_forgotten_at_its_own_close_once_its_proof_is_complete`.
+pub const SEQUENTIAL_JOURNAL_PEAK_BOUND: usize = OPEN_JOURNAL_TRACKED_ENTRIES / 16;
+/// How long the earlier phases' OPEN journal entries may take to be
+/// reclaimed before the sequential phase reads its baseline.
+const JOURNAL_SETTLE_WAIT: Duration = Duration::from_secs(15);
 
 /// The bounded evidence one gate run produces.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -126,7 +141,9 @@ pub struct HttpForwardRealPathEvidence {
     pub cancel_owner_release: String,
     pub cancel_owner_reset_reason: Option<u16>,
     pub cancel_ingress_error: Option<String>,
-    pub cancel_ingress_response_aborted: bool,
+    /// The ingress recorded the consumer's release of the `/events` body after
+    /// its head as `released` (M3-32), not as an ordinary abort.
+    pub cancel_ingress_response_released: bool,
     pub cancel_device_response_aborted: bool,
     pub cancel_device_response_completed: bool,
     // (e) consumer disconnect cancels the handler.
@@ -176,7 +193,27 @@ pub struct HttpForwardRealPathEvidence {
     pub sequential_session_id_stable: bool,
     pub sequential_phase_after: String,
     pub sequential_ready_after: bool,
+    /// The most OPEN journal entries seen after any sequential response.  No
+    /// request-count bound on it can be derived (M3-31): an entry is released
+    /// by the owner's `STREAM_FORGET` after its carrier barriers, which nothing
+    /// orders before the next request's admission.  The gate still holds it to
+    /// a *chosen* ceiling of a sixteenth of the journal cap, which catches
+    /// forgets published only on the maintenance tick.  Measured 1 or 2.
     pub open_journal_entries_peak: usize,
+    /// The connector's OPEN journal entries when the sequential phase began
+    /// (after waiting for the earlier phases' entries to be reclaimed), and
+    /// once every sequential stream had been retired.
+    pub open_journal_entries_before_sequential: usize,
+    pub open_journal_entries_after_sequential: usize,
+    /// The stream IDs behind those two counts, lowest first (bounded).
+    pub open_journal_stream_ids_before: Vec<u64>,
+    pub open_journal_stream_ids_after: Vec<u64>,
+    /// How long the earlier phases' entries took to be reclaimed, or the
+    /// whole wait when they were not.
+    pub open_journal_settle_ms: u64,
+    /// The earlier phases' owner streams, `id:release[:reason][:role]`, so a
+    /// retained entry can be named (M3-31).
+    pub earlier_phase_streams: Vec<String>,
     pub open_streams_retired_before_sequential: u64,
     pub open_streams_retired: u64,
     pub open_retired_ranges_coalesced: u64,
@@ -191,7 +228,7 @@ pub fn validate_http_forward_real_path_evidence(
     evidence: &HttpForwardRealPathEvidence,
 ) -> Result<()> {
     let body_queue_bound = BODY_QUEUE_CHUNKS * MAX_BODY_PAYLOAD_LEN;
-    let checks: [(&str, bool); 52] = [
+    let checks: [(&str, bool); 54] = [
         (
             "owner-local ingress answers the permission request",
             evidence.owner_local_permission_exact,
@@ -240,8 +277,10 @@ pub fn validate_http_forward_real_path_evidence(
             evidence.cancel_ingress_error.as_deref() == Some(HttpErrorCode::Cancelled.as_str()),
         ),
         (
-            "cancelled ingress response aborted",
-            evidence.cancel_ingress_response_aborted,
+            // A release after the head is its own outcome (M3-32); the next
+            // rule, the device's record, is what says the call was cut short.
+            "cancelled ingress response released",
+            evidence.cancel_ingress_response_released,
         ),
         (
             "cancelled device response aborted, not completed",
@@ -386,13 +425,34 @@ pub fn validate_http_forward_real_path_evidence(
                 ),
         ),
         (
-            // One request at a time, so at most the in-flight request's own
-            // entry and one whose reclamation has not finished.  The cap
-            // itself would be vacuous: the journal refuses at the cap by
-            // construction.
-            "the OPEN journal held at most two entries while serving them",
-            evidence.open_journal_entries_peak <= SEQUENTIAL_JOURNAL_ENTRY_BOUND
-                && SEQUENTIAL_JOURNAL_ENTRY_BOUND < OPEN_JOURNAL_TRACKED_ENTRIES,
+            // M3-31.  Every stream the earlier phases opened is reclaimed
+            // before the sequential phase starts, so its baseline is not an
+            // entry that happens to be in flight -- and an entry that is never
+            // reclaimed is a retention leak (M7-C82's class), not a baseline.
+            "the earlier phases' OPEN journal entries were all reclaimed",
+            evidence.open_journal_entries_before_sequential == 0,
+        ),
+        (
+            "the OPEN journal stayed within a sixteenth of its cap while serving them",
+            evidence.open_journal_entries_peak <= SEQUENTIAL_JOURNAL_PEAK_BOUND
+                && SEQUENTIAL_JOURNAL_PEAK_BOUND < OPEN_JOURNAL_TRACKED_ENTRIES,
+        ),
+        (
+            // M3-31.  The rule this replaces bounded the *peak* at two, which
+            // assumed request k's entry is reclaimed before request k+2 is
+            // admitted.  Nothing orders that: the owner's STREAM_FORGET
+            // follows the stream's close and the connector releases after the
+            // FORGET's carrier barriers, while the consumer already has its
+            // response and sends the next request (docs/protocol.md, "OPEN
+            // retry horizon and journal reclamation").  So a peak is a
+            // latency, and a bound on it could only be tuned to a host.  What
+            // the phase must prove is that the journal does not accumulate:
+            // read from the entry count itself, independently of the retired
+            // counter below, it returns to where it started.  A leak of even
+            // one entry fails this, which the peak rule never guaranteed.
+            "the OPEN journal returned to its starting size once every sequential stream retired",
+            evidence.open_journal_entries_after_sequential
+                == evidence.open_journal_entries_before_sequential,
         ),
         (
             // Exactly, not at least: every stream this phase opened was
@@ -1320,6 +1380,26 @@ async fn exercise(
     }
     let echo_owner = owner_for(&echo_ingress.request_id)
         .ok_or_else(|| HarnessError::Process("no owner record for /echo".into()))?;
+    let cancel_stream_id = cancel_ingress
+        .as_ref()
+        .and_then(|record| owner_for(&record.request_id))
+        .and_then(|record| record.stream_id);
+    evidence.earlier_phase_streams = owner_streams
+        .iter()
+        .map(|stream| {
+            let role = if Some(stream.stream_id) == echo_owner.stream_id {
+                ":echo"
+            } else if Some(stream.stream_id) == cancel_stream_id {
+                ":cancelled"
+            } else {
+                ""
+            };
+            match stream.reset_reason {
+                Some(reason) => format!("{}:{}:{reason}{role}", stream.stream_id, stream.release),
+                None => format!("{}:{}{role}", stream.stream_id, stream.release),
+            }
+        })
+        .collect();
     let echo_stream = stream_for(echo_owner.stream_id)
         .ok_or_else(|| HarnessError::Process("no owner stream for /echo".into()))?;
     let echo_device = device_for(echo_owner.stream_id)
@@ -1330,7 +1410,7 @@ async fn exercise(
     evidence.echo_device_receive_buffer = echo_device.receive_buffer_high_water;
     if let Some(cancel_ingress) = cancel_ingress {
         evidence.cancel_ingress_error = cancel_ingress.error_code.map(str::to_owned);
-        evidence.cancel_ingress_response_aborted = cancel_ingress.response_outcome == "aborted";
+        evidence.cancel_ingress_response_released = cancel_ingress.response_outcome == "released";
         if let Some(cancel_owner) = owner_for(&cancel_ingress.request_id) {
             if let Some(stream) = stream_for(cancel_owner.stream_id) {
                 evidence.cancel_owner_release = stream.release.to_owned();
@@ -1452,7 +1532,20 @@ async fn sequential_streams(
 ) -> Result<()> {
     let dispatches_before = state.invocations.load(Ordering::SeqCst) as u64;
     evidence.sequential_requests = SEQUENTIAL_REQUESTS;
-    evidence.open_streams_retired_before_sequential = client.status_snapshot().open_streams_retired;
+    // M3-31: let the earlier phases' reclamation settle before reading the
+    // baseline, so the baseline is not an entry in flight.  An entry still
+    // retained at the end of the wait is reported, not waited for forever.
+    let settle_started = Instant::now();
+    let mut before = client.status_snapshot();
+    while before.open_journal_entries > 0 && settle_started.elapsed() < JOURNAL_SETTLE_WAIT {
+        sleep(Duration::from_millis(20)).await;
+        before = client.status_snapshot();
+    }
+    evidence.open_journal_settle_ms =
+        u64::try_from(settle_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    evidence.open_streams_retired_before_sequential = before.open_streams_retired;
+    evidence.open_journal_entries_before_sequential = before.open_journal_entries;
+    evidence.open_journal_stream_ids_before = before.open_journal_stream_ids.clone();
     let mut connection: Option<(Sender, tokio::task::JoinHandle<()>)> = None;
     let mut on_connection = 0;
     let mut index = 0;
@@ -1562,6 +1655,8 @@ async fn sequential_streams(
     evidence.open_journal_entries_peak = evidence
         .open_journal_entries_peak
         .max(final_status.open_journal_entries);
+    evidence.open_journal_entries_after_sequential = final_status.open_journal_entries;
+    evidence.open_journal_stream_ids_after = final_status.open_journal_stream_ids.clone();
     evidence.open_streams_retired = final_status.open_streams_retired;
     evidence.open_retired_ranges_coalesced = final_status.open_retired_ranges_coalesced;
     evidence.sequential_session_id_stable = final_status.session_id.as_deref() == Some(session_id);
@@ -1598,7 +1693,7 @@ mod tests {
             cancel_owner_release: "reset".into(),
             cancel_owner_reset_reason: Some(CANCEL_REASON),
             cancel_ingress_error: Some("HTTP_CANCELLED".into()),
-            cancel_ingress_response_aborted: true,
+            cancel_ingress_response_released: true,
             cancel_device_response_aborted: true,
             cancel_device_response_completed: false,
             handler_cancellation_observed: true,
@@ -1643,7 +1738,13 @@ mod tests {
             sequential_session_id_stable: true,
             sequential_phase_after: "active".into(),
             sequential_ready_after: true,
-            open_journal_entries_peak: SEQUENTIAL_JOURNAL_ENTRY_BOUND,
+            open_journal_entries_peak: 3,
+            open_journal_entries_before_sequential: 0,
+            open_journal_entries_after_sequential: 0,
+            open_journal_stream_ids_before: Vec::new(),
+            open_journal_stream_ids_after: Vec::new(),
+            open_journal_settle_ms: 40,
+            earlier_phase_streams: vec!["1:fin:echo".into(), "3:reset:4005:cancelled".into()],
             open_streams_retired_before_sequential: 3,
             open_streams_retired: SEQUENTIAL_REQUESTS as u64 + 3,
             open_retired_ranges_coalesced: 0,
@@ -1680,8 +1781,8 @@ mod tests {
                 e.cancel_owner_reset_reason = Some(tunnel_protocol::reset_reason::ADAPTER_FAILURE);
             }),
             ("cancel ingress code", |e| e.cancel_ingress_error = None),
-            ("cancel ingress aborted", |e| {
-                e.cancel_ingress_response_aborted = false;
+            ("cancel ingress released", |e| {
+                e.cancel_ingress_response_released = false;
             }),
             ("cancel device completed", |e| {
                 e.cancel_device_response_completed = true;
@@ -1769,8 +1870,20 @@ mod tests {
                 e.sequential_phase_after = "failed".into()
             }),
             ("sequential readiness", |e| e.sequential_ready_after = false),
-            ("journal bound", |e| {
-                e.open_journal_entries_peak = SEQUENTIAL_JOURNAL_ENTRY_BOUND + 1;
+            ("journal leak", |e| {
+                e.open_journal_entries_after_sequential =
+                    e.open_journal_entries_before_sequential + 1;
+            }),
+            ("journal shrank below its baseline", |e| {
+                e.open_journal_entries_before_sequential = 1;
+                e.open_journal_entries_after_sequential = 0;
+            }),
+            ("earlier-phase entry never reclaimed", |e| {
+                e.open_journal_entries_before_sequential = 1;
+                e.open_journal_entries_after_sequential = 1;
+            }),
+            ("journal peak over a sixteenth of the cap", |e| {
+                e.open_journal_entries_peak = SEQUENTIAL_JOURNAL_PEAK_BOUND + 1;
             }),
             ("journal reclamation short", |e| e.open_streams_retired -= 1),
             ("journal reclamation extra", |e| e.open_streams_retired += 1),

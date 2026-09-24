@@ -134,7 +134,13 @@ change, owner change and session loss end every message ID's retry window with
 the session that scopes the journal. A connector may therefore release a
 journal entry — canonical request, retained reply bytes and tombstone — once
 the `STREAM_FORGET` naming its stream and operation has completed its carrier
-barriers. A session's journal is then bounded by its unreclaimed entries
+barriers. The owner publishes a stream's `STREAM_FORGET` as soon as the stream's
+own close makes it provable, rather than at the session's next inbound frame
+or maintenance tick (M3-31). Reclamation is still not ordered before any later
+`OPEN`: a sequential client can have its next requests admitted while earlier
+entries wait for their FORGET's barriers, so the number of unreclaimed entries
+at any instant is a latency, not a count a client's request pattern fixes.
+A session's journal is then bounded by its unreclaimed entries
 rather than by the number of streams it has ever admitted, which is what makes
 "idempotent for an identical `message_id` within a bounded retention period"
 an explicit period for `OPEN` rather than the whole session lifetime.

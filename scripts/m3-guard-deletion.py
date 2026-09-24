@@ -303,6 +303,38 @@ DEADMAN_CASES: list[Case] = [
         ],
         frozenset({"tests::an_explicit_path_to_a_non_file_resolves_to_no_sentinel"}),
     ),
+    # ------------------------------------------------------------- M3-18
+    Case(
+        # The whole of M3-18.  Without the pin the sentinel watches a group it
+        # holds no member of, so once the watched child is reaped the id is
+        # free and a late firing could land on a stranger.  The witness asks
+        # the kernel whether the group still exists after its leader is
+        # reaped, which only a member the sentinel has not reaped can make
+        # true.
+        "the sentinel pins the watched group with a member it does not reap",
+        [
+            (
+                DEADMAN_LIB,
+                "    let pin = GroupPin::join(leader);",
+                "    let pin: Option<GroupPin> = None;",
+            )
+        ],
+        frozenset({"the_watched_group_id_stays_allocated_after_its_last_member_is_reaped"}),
+    ),
+    Case(
+        # A group that had already emptied when the sentinel started can
+        # never be pinned, and its id belongs to nobody the sentinel watches:
+        # without this refusal the bare end of file signals it anyway.
+        "a sentinel that could pin nothing never signals the id it was given",
+        [
+            (
+                DEADMAN_LIB,
+                "    if !watched {\n        return EXIT_NOTHING_WATCHED;\n    }\n",
+                "",
+            )
+        ],
+        frozenset({"a_sentinel_given_a_group_that_no_longer_exists_never_signals_that_id"}),
+    ),
     # ------------------------------------------------------------- M6-C08
     Case(
         # **The defect the row measured.**  Without the execute test, a
@@ -883,6 +915,142 @@ RETIRING_ADMISSION_CASES: list[Case] = [
     ),
 ]
 
+#: **M3-32: a consumer release after the response head is its own recorded
+#: outcome.**  The ingress cannot tell a release after the application's final
+#: message from one in the middle of it without interpreting the body, so it
+#: records `released` and leaves the call's outcome to the device's record.
+#: The witnesses are the bridge's in-process exchanges: one holds the device's
+#: END and FIN back until after the consumer lets go of a completed SSE call,
+#: the other releases mid-stream.
+BRIDGE = REPO / "crates" / "tunnel-http-bridge"
+BRIDGE_OWNER = BRIDGE / "src" / "owner.rs"
+RELEASE_TEST = [
+    "cargo",
+    "test",
+    "-p",
+    "tunnel-http-bridge",
+    "--locked",
+    "--no-fail-fast",
+    "--test",
+    "streaming",
+]
+RELEASE_CASES: list[Case] = [
+    Case(
+        "a consumer that releases the response body after its head is recorded as released",
+        [
+            (
+                BRIDGE_OWNER,
+                "            let _ = self.exchange.release(HttpErrorCode::Cancelled);",
+                "            self.fail(Origin::Consumer, HttpErrorCode::Cancelled);",
+            )
+        ],
+        frozenset(
+            {
+                "a_release_after_the_final_event_and_before_end_is_recorded_as_released",
+                "consumer_drop_mid_body_resets_both_directions_and_the_handler_observes_it",
+            }
+        ),
+    ),
+]
+
+#: **M3-33: the cloud-client gate resends only the owner-not-ready refusal.**
+#: The gate's classifier used to accept any retryable `not_dispatched` 503,
+#: which M7-C83's empty-pin-set refusal also is, so a freeze could have
+#: masked that signature.  Narrowed as M3-30 narrowed the isolation gate's.
+WIRE = HARNESS / "src" / "production_cluster" / "mcp_cloud_client" / "wire.rs"
+WIRE_TEST = [
+    "cargo",
+    "test",
+    "-p",
+    "tunnel-test-harness",
+    "--locked",
+    "--lib",
+    "--no-fail-fast",
+    "--",
+    "production_cluster::mcp_cloud_client::wire::tests::",
+]
+WIRE_CASES: list[Case] = [
+    Case(
+        "the cloud-client gate resends only a refusal carrying the owner-not-ready message and hint",
+        [
+            (
+                WIRE,
+                '        && value["message"] == OWNER_NOT_READY_MESSAGE\n'
+                "        && (1..=MIN_RETRY_HINT_MS).contains(&hint))",
+                "        && hint > 0)",
+            )
+        ],
+        frozenset(
+            {
+                "production_cluster::mcp_cloud_client::wire::tests::"
+                "only_the_owner_not_ready_503_carries_a_retry_hint"
+            }
+        ),
+    ),
+]
+
+#: **M3-31: an HTTP stream's owner STREAM_FORGET is published by its own
+#: close.**  The close is usually the event that makes the FORGET provable,
+#: and before M3-31 it published nothing, so the connector's OPEN journal held
+#: the entry until the session's next inbound frame or the 500 ms tick.
+FORGET_AT_CLOSE_TEST = [
+    "cargo",
+    "test",
+    "-p",
+    "tunnel-relay",
+    "--locked",
+    "--no-fail-fast",
+    "--lib",
+    "--",
+    "actor::rotation_freeze_tests::an_http_stream_is_forgotten_at_its_own_close",
+]
+FORGET_AT_CLOSE_CASES: list[Case] = [
+    Case(
+        "an owner close publishes the STREAM_FORGET it made provable",
+        [
+            (
+                ACTOR,
+                "                let _ = self.flush_owner_stream_forgets(&key);\n"
+                "                let _ = response.send(closed);",
+                "                let _ = response.send(closed);",
+            )
+        ],
+        frozenset(
+            {
+                "actor::rotation_freeze_tests::"
+                "an_http_stream_is_forgotten_at_its_own_close_once_its_proof_is_complete"
+            }
+        ),
+    ),
+]
+
+#: The M3-32 review's race: a head the consumer had already dropped is not a
+#: release.  Witnessed by the owner module's own unit tests.
+RELEASE_RACE_TEST = [
+    "cargo",
+    "test",
+    "-p",
+    "tunnel-http-bridge",
+    "--locked",
+    "--no-fail-fast",
+    "--lib",
+    "--",
+    "owner::tests::",
+]
+RELEASE_RACE_CASES: list[Case] = [
+    Case(
+        "a head the consumer never took does not make leaving a release",
+        [
+            (
+                BRIDGE_OWNER,
+                "            self.committed.store(false, Ordering::SeqCst);\n",
+                "",
+            )
+        ],
+        frozenset({"owner::tests::a_head_the_consumer_never_took_is_not_a_release"}),
+    ),
+]
+
 SUITES: list[Suite] = [
     Suite("m3c09", [DEADMAN, EXPORT, FIXTURE], CARGO_TEST, CASES),
     Suite("m3c09-deadman", [DEADMAN], DEADMAN_TEST, DEADMAN_CASES),
@@ -896,6 +1064,10 @@ SUITES: list[Suite] = [
         RETIRING_ADMISSION_TEST,
         RETIRING_ADMISSION_CASES,
     ),
+    Suite("m3c32-release", [BRIDGE], RELEASE_TEST, RELEASE_CASES),
+    Suite("m3c32-release-race", [BRIDGE], RELEASE_RACE_TEST, RELEASE_RACE_CASES),
+    Suite("m3c33-owner-not-ready-resend", [HARNESS], WIRE_TEST, WIRE_CASES),
+    Suite("m3c31-forget-at-close", [RELAY], FORGET_AT_CLOSE_TEST, FORGET_AT_CLOSE_CASES),
 ]
 
 #: Cases whose green result is itself the measurement.  Empty today, and kept

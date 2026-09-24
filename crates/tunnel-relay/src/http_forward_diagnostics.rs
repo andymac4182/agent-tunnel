@@ -319,7 +319,9 @@ pub struct HttpExchangeRecord {
     pub peer_coincident: HopBytePair,
     /// The peer hop's per-direction credit window, when a peer hop exists.
     pub peer_window: usize,
-    /// Terminal labels: `complete`, `aborted` or `pending`.
+    /// Terminal labels: `complete`, `aborted` or `pending`, and for the
+    /// response direction also `released` (the consumer let go of the body
+    /// after its head, M3-32).
     pub request_outcome: &'static str,
     pub response_outcome: &'static str,
     /// The first sanitized `HTTP_*` code, when any.  An `owner_peer` record

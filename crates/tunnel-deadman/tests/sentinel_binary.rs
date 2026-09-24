@@ -203,3 +203,95 @@ fn argv_that_is_not_one_process_group_id_is_refused() {
         );
     }
 }
+
+/// Members of process group `group` other than `except`, from the process
+/// table (zombies included: an unreaped zombie is still a member).
+fn group_members(group: &str, except: &str) -> Vec<String> {
+    let Ok(output) = Command::new("/bin/ps")
+        .args(["-A", "-o", "pid=,pgid="])
+        .output()
+    else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let (pid, pgid) = (fields.next()?, fields.next()?);
+            (pgid == group && pid != except).then(|| pid.to_owned())
+        })
+        .collect()
+}
+
+fn group_allocated(group: &str) -> bool {
+    let pid = group
+        .parse::<i32>()
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+        .expect("a group id");
+    rustix::process::test_kill_process_group(pid).is_ok()
+}
+
+#[test]
+fn the_watched_group_id_stays_allocated_after_its_last_member_is_reaped() {
+    // M3-18.  The reuse race: the watched child exits and is reaped before
+    // the sentinel fires, so its group id is free and could be reissued to a
+    // stranger that the sentinel would then SIGKILL.  The sentinel closes it
+    // by holding a member of the group (the pin) that it does not reap until
+    // it has decided, so the id stays this group's for as long as anyone
+    // could signal it.  The witness is the kernel's own answer: after the
+    // only child is reaped, the group still exists.
+    let (mut child, pid) = victim();
+    let _guard = PidGuard(pid.clone());
+    let mut watcher = sentinel(&pid);
+    let mut pins = Vec::new();
+    for _ in 0..500 {
+        pins = group_members(&pid, &pid);
+        if !pins.is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let _pin_guards: Vec<PidGuard> = pins.iter().cloned().map(PidGuard).collect();
+    // Not asserted to be exactly one here: the kernel's answer below is the
+    // witness, and a sentinel that joined no pin must fail *that*.
+    assert!(
+        pins.len() <= 1,
+        "at most one pin joined the group: {pins:?}"
+    );
+
+    // The watched child exits and is reaped: its own pid is gone.
+    child.kill().expect("the victim was killed");
+    child.wait().expect("the victim was reaped");
+    assert!(!alive(&pid), "the leader is gone");
+    assert!(
+        group_allocated(&pid),
+        "the group id is still allocated after its leader was reaped, so it \
+         cannot have been reissued to anything the sentinel might signal"
+    );
+
+    // A bare end of file: the sentinel fires at its own, still-pinned group
+    // and then releases the pin.
+    drop(watcher.stdin.take());
+    let status = watcher.wait().expect("the sentinel exited");
+    assert_eq!(status.code(), Some(EXIT_FIRED));
+    assert!(
+        !group_allocated(&pid),
+        "once the sentinel has decided the pin is reaped and the id is free"
+    );
+}
+
+#[test]
+fn a_sentinel_given_a_group_that_no_longer_exists_never_signals_that_id() {
+    // M3-18.  If nothing is left in the group by the time the sentinel
+    // starts, the id belongs to nobody it watches: a later bare end of file
+    // must not signal it, because by then it may be a stranger's.
+    let (mut child, pid) = victim();
+    child.kill().expect("the victim was killed");
+    child.wait().expect("the victim was reaped");
+    assert!(!group_allocated(&pid), "the group is gone before arming");
+    let mut watcher = sentinel(&pid);
+    drop(watcher.stdin.take());
+    let status = watcher.wait().expect("the sentinel exited");
+    assert_eq!(status.code(), Some(tunnel_deadman::EXIT_NOTHING_WATCHED));
+}
