@@ -20,10 +20,11 @@ Redis client allowed 1 s for the whole connection including the lookup, so
 cold machine with a connection timeout (M6-C72, M6-C73; measured on Fly with a
 diagnostic build). Resolving the name first with `getent hosts` does not help:
 nothing caches the lookup across processes. Since M6-C73 each startup
-connection gets 10 s. **The relay now runs `main-af23c2f`**, built from
-`af23c2f` with these deploy files. It replaced `main-721ed2a` in place on
-2026-09-24 with no re-provisioning, and it has M6-C65 continuity on
-(section 6.3, "Upgrade to `main-af23c2f`"). A lane reconnect inside a running relay still has
+connection gets 10 s. **The relay now runs `main-77bfd28`**, built from
+`77bfd28` (M6-C91's entrypoint) with these deploy files. It replaced
+`main-af23c2f` in place on 2026-09-24, which had replaced `main-721ed2a`
+earlier that day, with no re-provisioning; M6-C65 continuity is on
+(section 6.3, "Upgrade to `main-af23c2f`"; section 6.6 for the day-2 proof). A lane reconnect inside a running relay still has
 2 s (M6-C74), which matters after a Redis restart (section 6.4).
 
 Every `fly` command below is one the owner runs, in
@@ -858,7 +859,13 @@ Section 3.1 issues the relay's server certificate for 90 days and the CAs for
 
 ### 6.6 Day-2 catalog changes: onboarding a tester, and revocation
 
-**Not yet run on Fly** (M6-C91). The route is proven locally by
+**Run on Fly** (M6-C91, 2026-09-24, coordinator): with the relay serving
+`main-77bfd28`, `add-user --records /tmp/provision/user.toml --dry-run` in a
+one-off machine of that image logged `Catalog change is valid for namespace
+agentuplink-fly-1: add-user … This dry run contacted no Redis authority and
+wrote nothing.` and exited `0` (`fly machine status`: `exit_code=0`); the
+machine was destroyed and `fly machine list` showed only the serving relay.
+No write command has been run on Fly yet. The route is also proven locally by
 `deploy/fly/local-proof.sh` (section 7): with `serve` running, each command
 ran in a one-off container of the relay image through its entrypoint, with its
 records copied in, and the new tester's echo succeeded.
@@ -885,9 +892,9 @@ rewrite the secrets directory the running relay reads.
 `redis_namespace` and `deployment_incarnation` baked into it are what the
 command writes to; a command run with another image's values is refused
 (`the relay configuration's incarnation is not active`) or goes to another
-namespace. The relay now serves `main-af23c2f`, which has no M6-C91: build a
-new image (section 6.1) and upgrade the relay to it (section 6.3, "Upgrading
-the relay image"), then use that label here. The catalog code did not change
+namespace. The relay now serves `main-77bfd28`, which has M6-C91; use that
+label here. An image built before M6-C91, such as `main-af23c2f`, refuses these
+commands. The catalog code did not change
 between `af23c2f` and M6-C91; only the entrypoint did.
 
 **Costs money: a few seconds of a `shared-cpu-1x` machine per command**,
