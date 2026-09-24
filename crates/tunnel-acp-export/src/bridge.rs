@@ -641,6 +641,17 @@ impl AcpExport {
             .cloned()
     }
 
+    /// Take a connection out of the map, counting it closed once.
+    ///
+    /// **Call this before releasing the counter that announces why the
+    /// connection ended.** A reader waits on that counter (`output_stalls`,
+    /// `connection_subscribe_expired`, `connections_ended_by_child`,
+    /// `connections_ended_by_subscriber_loss`) with an `Acquire` load and then
+    /// reads `live_connections` under this same mutex, so a removal sequenced
+    /// before the `Release` is guaranteed visible to it. Released first, the
+    /// count announced an ended connection that was still listed live, and a
+    /// reader that landed in the gap saw both (M8-C31). Idempotent: a second
+    /// call finds nothing and counts nothing.
     fn remove(&self, id: &str) -> Option<Arc<Connection>> {
         let removed = self
             .inner
@@ -1202,6 +1213,14 @@ async fn dispatch_outbound(
                 // into the send future and is gone with it: nothing here
                 // skips it and continues.
                 let elapsed = u64::try_from(waited.elapsed().as_micros()).unwrap_or(u64::MAX);
+                // **Out of the map before the counter is released**, so a
+                // reader that sees `output_stalls` also sees the connection
+                // gone (see [`AcpExport::remove`]). Released first, the count
+                // announced an ended connection that `live_connections` still
+                // listed, and a reader in that gap failed (M8-C31). The
+                // `remove` inside `end_with_subscriber_loss` is then a no-op
+                // and counts nothing a second time.
+                export.remove(&connection.id);
                 connection
                     .counters
                     .last_stall_elapsed_us
@@ -1359,7 +1378,9 @@ async fn watch_deadlines(export: AcpExport, connection: Arc<Connection>) {
             // The measurement is published **before** the counter that makes it
             // findable. A reader that sees the count and then reads a stale
             // elapsed would compare 0 against 0 and pass; that is not the
-            // observation this is for.
+            // observation this is for. The connection leaves the map before
+            // either, for the reason [`AcpExport::remove`] gives.
+            export.remove(&connection.id);
             connection
                 .counters
                 .last_expiry_elapsed_us
@@ -1372,7 +1393,6 @@ async fn watch_deadlines(export: AcpExport, connection: Arc<Connection>) {
                 .counters
                 .connection_subscribe_expired
                 .fetch_add(1, Ordering::Release);
-            export.remove(&connection.id);
             close_connection(&connection).await;
             return;
         }
@@ -1438,6 +1458,9 @@ async fn watch_deadlines(export: AcpExport, connection: Arc<Connection>) {
 /// End a connection because its child did, folding the child's own refusal
 /// counters in first so they outlive the connection that carried them.
 async fn end_with_child(export: &AcpExport, connection: &Arc<Connection>) {
+    // Out of the map before the counter a reader waits on is released, for
+    // the reason [`AcpExport::remove`] gives.
+    export.remove(&connection.id);
     let child = connection.supervisor.diagnostics();
     connection
         .counters
@@ -1453,7 +1476,6 @@ async fn end_with_child(export: &AcpExport, connection: &Arc<Connection>) {
         .counters
         .connections_ended_by_child
         .fetch_add(1, Ordering::Release);
-    export.remove(&connection.id);
     close_connection(connection).await;
 }
 
