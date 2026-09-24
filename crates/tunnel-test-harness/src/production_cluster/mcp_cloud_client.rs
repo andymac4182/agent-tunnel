@@ -161,7 +161,12 @@ pub struct DiscoveryEvidence {
 /// `notifications`.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct NotificationEvidence {
+    /// The progress value of every notification the client handler received,
+    /// sorted: rmcp may run notification handlers concurrently, so only the
+    /// wire order in `wire.progress_values` is ordering evidence (M3-29).
     pub progress_values: Vec<u64>,
+    /// Whether the handler also saw the progress in order (reported only).
+    pub progress_handler_order_exact: bool,
     pub progress_result_exact: bool,
     /// The `seq` of every log the client handler received, sorted: rmcp may
     /// run notification handlers concurrently, so only the wire order in
@@ -493,6 +498,7 @@ pub fn validate_mcp_cloud_client_evidence(evidence: &McpCloudClientEvidence) -> 
             (
                 format!("{name} notifications: ordered progress"),
                 n.progress_values == (1..=PROGRESS_STEPS).collect::<Vec<_>>()
+                    && n.wire.progress_values == (1..=PROGRESS_STEPS).collect::<Vec<_>>()
                     && n.progress_result_exact,
             ),
             (
@@ -1490,13 +1496,21 @@ impl Gate<'_> {
                 })
                 .await;
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            {
-                evidence.progress_values = handler
-                    .progress()
-                    .iter()
-                    .map(|(value, _)| *value as u64)
-                    .collect();
-            }
+            let received = handler
+                .progress()
+                .iter()
+                .map(|(value, _)| *value as u64)
+                .collect::<Vec<_>>();
+            // The handler proves the multiset; the wire ledger proves the
+            // order (M3-29: rmcp ran two handlers out of order on a hosted
+            // runner while the wire order was exact).
+            evidence.progress_handler_order_exact =
+                received == (1..=PROGRESS_STEPS).collect::<Vec<_>>();
+            evidence.progress_values = {
+                let mut sorted = received;
+                sorted.sort_unstable();
+                sorted
+            };
             let logged = timeout(
                 WAIT,
                 client.call_tool(CallToolRequestParams::new("log").with_arguments(arguments(
@@ -2418,12 +2432,14 @@ mod tests {
             },
             notifications: NotificationEvidence {
                 progress_values: (1..=PROGRESS_STEPS).collect(),
+                progress_handler_order_exact: true,
                 progress_result_exact: true,
                 log_seqs: (0..LOG_COUNT).collect(),
                 log_data_exact: true,
                 log_handler_order_exact: true,
                 log_result_exact: true,
                 wire: WireCounts {
+                    progress_values: (1..=PROGRESS_STEPS).collect(),
                     log_seqs: (0..LOG_COUNT).collect(),
                     logs_on_request_streams: if current { LOG_COUNT } else { 0 },
                     logs_on_standalone_streams: if current { 0 } else { LOG_COUNT },
@@ -2692,8 +2708,11 @@ mod tests {
             ("2025 no session header", |e| {
                 e.combos[1].discovery.wire.session_headers = 0;
             }),
-            ("progress order", |e| {
-                e.combos[0].notifications.progress_values.swap(0, 1);
+            ("progress multiset", |e| {
+                e.combos[0].notifications.progress_values.pop();
+            }),
+            ("progress wire order", |e| {
+                e.combos[0].notifications.wire.progress_values.swap(0, 1);
             }),
             ("progress result", |e| {
                 e.combos[0].notifications.progress_result_exact = false;
