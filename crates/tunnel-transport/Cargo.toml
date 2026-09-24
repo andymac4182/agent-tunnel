@@ -30,6 +30,9 @@ x509-parser = "0.17.0"
 
 [dev-dependencies]
 rcgen = "0.13"
+# Races between a peer driver and a concurrent shutdown only exist when two
+# tasks can poll at once (M7-C105).
+tokio = { version = "1.47.1", features = ["rt-multi-thread"] }
 
 [lints.rust]
 unsafe_code = "forbid"

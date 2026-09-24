@@ -464,6 +464,44 @@ where
         Ok(route)
     }
 
+    /// Attach a verified peer binding to a remote owner the caller has just
+    /// read from the catalog, and return the route to use (task row M7-C107).
+    ///
+    /// A remote route is never served from the cache without a binding, so a
+    /// caller first resolves without one (a catalog read) and then needs the
+    /// binding for that owner's node.  Re-resolving with the binding instead
+    /// consulted the cache, which keeps a route for up to the cache TTL and
+    /// matches it by node and boot only: after the same node took a new owner
+    /// epoch (a device reconnecting to the same relay), it returned the
+    /// superseded epoch that the read had just replaced, and the owner refused
+    /// every request naming it.  This caches the read through the generation
+    /// fence and returns the cache's view, which is that generation or a newer
+    /// one already observed, never an older one.
+    pub async fn bind_remote(
+        &self,
+        scope: OwnerScope,
+        owner: OwnerClaim,
+        now: DateTime<Utc>,
+        binding: &VerifiedPeerBinding,
+    ) -> Result<OwnerRoute, OwnerRoutingError> {
+        let route = self.classify(scope, owner, now, Some(binding))?;
+        if route.is_local() {
+            return Ok(route);
+        }
+        self.cache_owner(
+            scope,
+            route.owner().clone(),
+            now,
+            Some(binding.valid_until()),
+        )
+        .await;
+        Ok(self
+            .try_cached(scope, now, Some(binding))
+            .await
+            .filter(|cached| cached.owner_token().epoch >= route.owner_token().epoch)
+            .unwrap_or(route))
+    }
+
     /// Drop one cached route.  This is used after a peer returns an
     /// authenticated `OWNER_CHANGED`/`NOT_DISPATCHED` admission result.
     pub async fn invalidate(&self, scope: OwnerScope) {
@@ -846,6 +884,152 @@ mod tests {
             Err(OwnerRoutingError::NoLiveOwner(found)) if found == scope
         ));
         assert_eq!(directory.lookups(), 2, "expired lease must force a reread");
+    }
+
+    /// A signed membership binding for one remote node, from a synthetic key
+    /// digest: routing only compares the binding's node, boot and validity.
+    fn remote_binding(node_id: &str, boot_id: &str, now: DateTime<Utc>) -> VerifiedPeerBinding {
+        use std::collections::BTreeMap;
+        use tunnel_cluster::membership::{
+            MEMBERSHIP_SCHEMA_VERSION, MembershipCheckpoint, MembershipIssuer, MembershipPolicy,
+            MembershipRecord, MembershipVerifier, PrivateEndpointPolicy, RELAY_PEER_ROLE, RelayKey,
+            TrustedPublisherKey,
+        };
+        const DEPLOYMENT: &str = "routing-test";
+        const NONCE: &str = "routing-test-nonce";
+        let spki = "ab".repeat(32);
+        let endpoint_policy =
+            PrivateEndpointPolicy::allowlisted(["127.0.0.1"], ["localhost"], [4433])
+                .expect("endpoint policy");
+        let policy =
+            MembershipPolicy::new(DEPLOYMENT, "inc-1", endpoint_policy).expect("membership policy");
+        let (issuer, _) = MembershipIssuer::generate("routing-test-publisher").expect("issuer");
+        let trusted = TrustedPublisherKey::new(
+            "routing-test-publisher",
+            issuer.public_key().expect("publisher key"),
+        )
+        .expect("trusted publisher");
+        let mut verifier = MembershipVerifier::new(policy, [trusted]).expect("verifier");
+        let checkpoint = issuer
+            .sign_checkpoint_bytes(MembershipCheckpoint {
+                schema_version: MEMBERSHIP_SCHEMA_VERSION,
+                deployment_id: DEPLOYMENT.to_owned(),
+                deployment_incarnation: "inc-1".to_owned(),
+                checkpoint_version: 1,
+                nonce: NONCE.to_owned(),
+                minimum_versions: BTreeMap::from([(node_id.to_owned(), 1)]),
+                issued_at: now - ChronoDuration::seconds(1),
+                not_before: now - ChronoDuration::seconds(1),
+                expires_at: now + ChronoDuration::seconds(30),
+            })
+            .expect("signed checkpoint");
+        verifier
+            .verify_checkpoint(&checkpoint, NONCE, now)
+            .expect("verified checkpoint");
+        let record = issuer
+            .sign_membership_bytes(MembershipRecord {
+                schema_version: MEMBERSHIP_SCHEMA_VERSION,
+                deployment_id: DEPLOYMENT.to_owned(),
+                deployment_incarnation: "inc-1".to_owned(),
+                node_id: node_id.to_owned(),
+                record_version: 1,
+                roles: vec![RELAY_PEER_ROLE.to_owned()],
+                peer_endpoint: "127.0.0.1:4433".to_owned(),
+                server_name: "localhost".to_owned(),
+                keys: vec![RelayKey {
+                    key_id: format!("{node_id}-key"),
+                    spki_sha256: spki.clone(),
+                    not_before: now - ChronoDuration::seconds(1),
+                    expires_at: now + ChronoDuration::seconds(30),
+                    revoked: false,
+                }],
+                issued_at: now - ChronoDuration::seconds(1),
+                not_before: now - ChronoDuration::seconds(1),
+                expires_at: now + ChronoDuration::seconds(30),
+            })
+            .expect("signed membership");
+        verifier
+            .verify_membership(&record, now)
+            .expect("verified membership")
+            .bind_peer(node_id, boot_id, &spki, now)
+            .expect("peer binding")
+    }
+
+    /// Task row M7-C107: a device that reconnects to the same owner relay
+    /// gets a new owner epoch on the same node and boot.  An ingress that had
+    /// routed its previous session keeps that route cached; the catalog read
+    /// that precedes binding sees the new epoch, and the route returned with
+    /// the binding must be that epoch, not the superseded cached one, or the
+    /// owner refuses every request naming it.
+    #[tokio::test]
+    async fn binding_a_fresh_remote_read_never_returns_a_superseded_cached_epoch() {
+        let now = Utc::now();
+        let scope = OwnerScope::new(Uuid::from_u128(1), Uuid::from_u128(2));
+        let lease = now + ChronoDuration::seconds(30);
+        let directory = Arc::new(TestDirectory::new(owner_with_epoch(
+            "node-b", "boot-b", 1, lease,
+        )));
+        let router =
+            OwnerRouter::with_cache_ttl(directory.clone(), identity(), Duration::from_secs(5))
+                .expect("cache policy");
+        let binding = remote_binding("node-b", "boot-b", now);
+
+        // The previous session's route: read, then bound and cached.
+        let first = router.resolve(scope, now, None).await.expect("first read");
+        let first = router
+            .bind_remote(scope, first.owner().clone(), now, &binding)
+            .await
+            .expect("first binding");
+        assert_eq!(first.owner_token().epoch, 1);
+
+        // The device reconnects to the same node: a new owner epoch.
+        directory.set_owner(Some(owner_with_epoch("node-b", "boot-b", 2, lease)));
+        let read = router.resolve(scope, now, None).await.expect("second read");
+        assert_eq!(
+            read.owner_token().epoch,
+            2,
+            "a remote read bypasses the cache"
+        );
+
+        // What the pre-fix second step did: re-resolve with the binding, which
+        // the cache answered with the superseded epoch.
+        let stale = router
+            .resolve(scope, now, Some(&binding))
+            .await
+            .expect("cached re-resolution");
+        assert_eq!(
+            stale.owner_token().epoch,
+            1,
+            "the cache still holds the superseded generation for this node"
+        );
+
+        let bound = router
+            .bind_remote(scope, read.owner().clone(), now, &binding)
+            .await
+            .expect("binding the fresh read");
+        assert_eq!(bound.owner_token().epoch, 2);
+        assert_eq!(
+            router
+                .resolve(scope, now, Some(&binding))
+                .await
+                .expect("cached route")
+                .owner_token()
+                .epoch,
+            2,
+            "the fresh generation replaced the superseded one in the cache"
+        );
+
+        // A delayed read of the older generation cannot be bound over it.
+        let older = router
+            .bind_remote(
+                scope,
+                owner_with_epoch("node-b", "boot-b", 1, lease),
+                now,
+                &binding,
+            )
+            .await
+            .expect("binding a delayed older read");
+        assert_eq!(older.owner_token().epoch, 2);
     }
 
     #[tokio::test]

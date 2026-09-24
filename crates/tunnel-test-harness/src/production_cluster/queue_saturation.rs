@@ -213,9 +213,56 @@ const MIN_RESIDENT_FRAMES: usize = EXPECTED_QUEUE_MESSAGES / 4;
 /// `2_141_696` bytes, twice that floor.
 const MIN_SATURATION_HEADROOM_BYTES: usize = EXPECTED_QUEUE_BYTES_LIMIT / 4;
 
-/// The paused proxy requests the smallest permitted target receive buffer so
-/// the owner's physical writer blocks after bounded absorption.
-const PAUSED_TARGET_RECEIVE_BUFFER_BYTES: u32 = 1_024;
+/// The receive buffer the device proxy requests on its relay-facing sockets,
+/// so the owner's physical writer blocks after bounded absorption (task row
+/// M7-C104).
+///
+/// Requesting it locks the size: Linux would otherwise autotune it upwards
+/// while the warm-up records flow and could absorb most of the workload
+/// during the pause.  It must still be large next to the loopback MSS (about
+/// 64 KiB).  The previous 1 KiB request, with the 4 KiB device send buffer,
+/// left every proxied device connection with windows far below one segment
+/// for its whole life.  On hosted runners that path then stalled for seconds
+/// at a time: 9 of 18 probe drains ran into the relay's five-second physical
+/// write bound after the pause was lifted, and 4 more lost the first
+/// scheduled rotation to its three-second overlap deadline.  The container
+/// mirror never stalled.  The kernel mechanism is inferred, not traced.
+const PAUSED_TARGET_RECEIVE_BUFFER_BYTES: u32 = 128 * 1024;
+
+/// The send buffer requested on every relay's accepted device sockets for
+/// this gate (task rows M7-C101 and M7-C104).
+///
+/// This is a **fixture** pin, like the consumer send buffer the stall gate
+/// requests; production relays keep the operating-system default.  The gate
+/// measures the relay's own bound, its bounded data channel and session byte
+/// budget, and reads residency from relay diagnostics.  A kernel send buffer
+/// holds bytes the relay has already released, so every frame it absorbs is
+/// one fewer resident frame: Linux autotunes the device socket's buffer
+/// (`tcp_wmem`) large enough to absorb most of the 64-record workload, which
+/// left 15 to 27 frames resident against the floor of 32.  Pinning it here
+/// bounds that absorption.  Together with the locked proxy receive buffer the
+/// kernel can hold at most about 96 KiB + 256 KiB on Linux (each request is
+/// doubled), fewer than 18 of the 64 records, so at least 46 stay resident
+/// against the floor of 32; macOS holds half that.  48 KiB rather than 4 KiB
+/// keeps the device path's windows near the loopback MSS instead of far below
+/// it (M7-C104).
+///
+/// Production deliberately does not pin it.  A send buffer caps a TCP
+/// connection's throughput at roughly buffer / round-trip time, so a 4 KiB
+/// cap would hold a 100 ms path to about 40 KiB/s, and a 48 KiB cap to under
+/// 0.5 MiB/s; the relay's queues are the
+/// product bound, and the kernel adds an OS-bounded amount of slack
+/// (`tcp_wmem[2]` on Linux) on top of them per device socket.
+pub(super) const DEVICE_SEND_BUFFER_BYTES: u32 = 48 * 1024;
+
+/// The kernel-reported send buffer sizes that prove the pin took effect:
+/// macOS reports the request itself and Linux doubles it for bookkeeping.
+/// Neither platform's unpinned default matches (Linux starts at
+/// `tcp_wmem[1]`, 16 KiB by default, and grows; macOS reports 128 KiB).
+const EFFECTIVE_DEVICE_SEND_BUFFER_BYTES: [usize; 2] = [
+    DEVICE_SEND_BUFFER_BYTES as usize,
+    2 * DEVICE_SEND_BUFFER_BYTES as usize,
+];
 
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const SATURATION_TIMEOUT: Duration = Duration::from_secs(8);
@@ -384,6 +431,11 @@ pub struct QueueSaturationEvidence {
     pub first_terminal_observation_immutable: bool,
     /// Re-samples compared against that first observation.
     pub terminal_observations: usize,
+    /// Samples, the first included, that still found the cancelled stream's
+    /// tombstone and checked it against the relay's first-terminal latch.
+    /// Reported rather than required: the connector's FIN receipt can reclaim
+    /// the tombstone before the first sample, and the latch outlives it.
+    pub terminal_tombstone_observations: usize,
     /// The proxy acknowledged a pause on the exact correlated data direction.
     pub paused_target_to_client: u64,
     /// The paused proxy connection was correlated to the carrier's own local
@@ -420,6 +472,9 @@ pub struct QueueSaturationEvidence {
     pub rotation_deadline_within_configured_overlap: bool,
     /// Peak simultaneously open device sockets at the controlling proxy.
     pub device_socket_peak_open: usize,
+    /// Kernel-reported send buffer of the owner relay's last accepted device
+    /// socket: the fixture pin actually applied, not merely requested.
+    pub device_send_buffer_bytes: usize,
     /// Application dispatches recorded across a fixed window after the drain;
     /// a saturated and drained queue must not replay.
     pub dispatch_delta_after_drain: u64,
@@ -874,6 +929,12 @@ pub fn validate_queue_saturation_evidence(evidence: &QueueSaturationEvidence) ->
                 .into(),
         ));
     }
+    if !EFFECTIVE_DEVICE_SEND_BUFFER_BYTES.contains(&evidence.device_send_buffer_bytes) {
+        return Err(HarnessError::Process(format!(
+            "queue saturation owner device socket send buffer was {} bytes, not the pinned {DEVICE_SEND_BUFFER_BYTES}-byte request (reported as one of {EFFECTIVE_DEVICE_SEND_BUFFER_BYTES:?})",
+            evidence.device_send_buffer_bytes
+        )));
+    }
     if evidence.device_socket_peak_open > 3 {
         return Err(HarnessError::Process(format!(
             "queue saturation device sockets exceeded the bounded three-socket peak: {}",
@@ -889,6 +950,20 @@ pub fn validate_queue_saturation_evidence(evidence: &QueueSaturationEvidence) ->
     Ok(())
 }
 
+/// The relay's first-terminal latch for one stream: the payload-free fields
+/// of its `StreamTerminalEvent`, recorded when the stream turned terminal.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TerminalLatch {
+    operation_id: String,
+    last_emitted_relay_to_connector: u64,
+    peer_acked_relay_to_connector: u64,
+    recv_contiguous_connector_to_relay: u64,
+    delivered_contiguous_connector_to_relay: u64,
+    closed_at_ms: u64,
+    reason: &'static str,
+    cause: Option<tunnel_relay::StreamTerminalCause>,
+}
+
 /// One bounded, comparable terminal observation for the cancelled stream.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct TerminalObservation {
@@ -899,23 +974,30 @@ struct TerminalObservation {
     recv_contiguous_connector_to_relay: u64,
     delivered_contiguous_connector_to_relay: u64,
     terminal_events: usize,
+    /// The latch, when exactly one terminal event names the stream.
+    latch: Option<TerminalLatch>,
     terminal_receipts: usize,
 }
 
 impl TerminalObservation {
-    /// The first terminal observation is retained: the terminal event count
-    /// never changes, and while the tombstone is still present it remains
-    /// terminal at the same relay-side final emitted sequence.  A reclaimed
-    /// stream (STREAM_FORGET after the connector's receipt) is absent with
-    /// its retained terminal event intact.
+    /// This sample carries exactly one relay first-terminal latch, and a
+    /// still-present tombstone is terminal at the latched final emitted
+    /// sequence.  A reclaimed stream (STREAM_FORGET after the connector's
+    /// receipt) is absent with its latch intact.
+    fn anchors_terminal(&self) -> bool {
+        self.terminal_events == 1
+            && self.latch.as_ref().is_some_and(|latch| {
+                !self.stream_present
+                    || (self.terminal
+                        && self.last_emitted_relay_to_connector
+                            == latch.last_emitted_relay_to_connector)
+            })
+    }
+
+    /// The first terminal observation is retained: both samples anchor on a
+    /// latch, and the latch never changes.
     fn retains_first_terminal(&self, first: &Self) -> bool {
-        self.terminal_events == first.terminal_events
-            && first.stream_present
-            && first.terminal
-            && (!self.stream_present
-                || (self.terminal
-                    && self.last_emitted_relay_to_connector
-                        == first.last_emitted_relay_to_connector))
+        first.anchors_terminal() && self.anchors_terminal() && self.latch == first.latch
     }
 
     /// Connector-side progress since `previous` must be monotonic while the
@@ -1097,9 +1179,18 @@ async fn run_with_proxy(
     )
     .await;
     let _ = device_proxy.resume_all().await;
+    let phase = client.status_snapshot().phase;
     let stop = client.stop().await;
     match (outcome, stop) {
-        (Err(error), _) => Err(error),
+        // The client's own view of a failed scenario: its last published
+        // phase and the error its session ended with, if any.
+        (Err(error), stop) => Err(HarnessError::Process(format!(
+            "{error}; client_phase={phase}; client_stop={}",
+            match stop {
+                Ok(()) => "ok".to_owned(),
+                Err(stop_error) => stop_error.to_string(),
+            }
+        ))),
         (Ok(_), Err(error)) => Err(HarnessError::Process(format!(
             "queue saturation client shutdown failed: {error}"
         ))),
@@ -1284,7 +1375,7 @@ async fn run_saturation(
     device_proxy
         .resume(Direction::TargetToClient, paused_connection)
         .await?;
-    let drain = wait_for_physical_drain(owner_relay, device_id).await?;
+    let drain = wait_for_physical_drain(owner_relay, device_id, paused_generation).await?;
     cancellation.cancel();
     let mut surviving = Vec::new();
     for pump in pumps {
@@ -1325,24 +1416,44 @@ async fn run_saturation(
         }
     };
 
-    // An immutable first-terminal observation for the cancelled stream: the
-    // retained terminal event count may not change once observed, and while
-    // the tombstone is present it stays terminal at the relay's final
-    // emitted sequence.  The connector may still deliver the ACK for the
-    // relay's FIN, the reply to a record it already held when the owner
-    // cancelled, and its own FIN receipt, after which STREAM_FORGET reclaims
-    // the tombstone: connector-side cursors and the receipt are therefore
+    // An immutable first-terminal observation for the cancelled stream,
+    // anchored on the relay's own first-terminal latch (`StreamTerminalEvent`).
+    // The actor records that latch in the same step that marks the stream
+    // terminal and keeps it after STREAM_FORGET reclaims the tombstone, so
+    // every snapshot taken once the stream has left the live set carries it.
+    // The tombstone itself is not a deterministic anchor: the connector's FIN
+    // receipt and STREAM_FORGET can reclaim it before the first snapshot on a
+    // fast host (task row M7-C101).  The latch may never change and must be
+    // the only terminal event for the stream, and whenever the tombstone is
+    // still present it must be terminal at the latched final emitted
+    // sequence.  The connector may still deliver the ACK for the relay's
+    // FIN, the reply to a record it already held when the owner cancelled,
+    // and its own FIN receipt, so connector-side cursors and the receipt are
     // required to be monotonic and bounded rather than frozen, and the
     // stream may leave the live set exactly once and never return.
     let first_terminal =
-        read_terminal_observation(owner_relay, device_id, cancelled_stream_id).await?;
+        read_terminal_observation(owner_relay, device_id, session_id, cancelled_stream_id).await?;
     let mut terminal_observations = 0usize;
-    let mut first_terminal_observation_immutable = true;
+    let mut terminal_tombstone_observations = usize::from(first_terminal.stream_present);
+    let mut first_terminal_observation_immutable = first_terminal.anchors_terminal();
+    if !first_terminal_observation_immutable {
+        tracing::warn!(
+            stream_id = cancelled_stream_id,
+            first = ?first_terminal,
+            "queue saturation first terminal observation carried no consistent relay latch"
+        );
+    }
     let mut previous = first_terminal.clone();
     for _ in 0..TERMINAL_IMMUTABILITY_SAMPLES {
+        if !first_terminal_observation_immutable {
+            break;
+        }
         sleep(TERMINAL_SAMPLE_INTERVAL).await;
-        let again = read_terminal_observation(owner_relay, device_id, cancelled_stream_id).await?;
+        let again =
+            read_terminal_observation(owner_relay, device_id, session_id, cancelled_stream_id)
+                .await?;
         terminal_observations += 1;
+        terminal_tombstone_observations += usize::from(again.stream_present);
         if !again.retains_first_terminal(&first_terminal) || !again.advances_bounded(&previous) {
             tracing::warn!(
                 stream_id = cancelled_stream_id,
@@ -1426,6 +1537,7 @@ async fn run_saturation(
 
     let device_socket_peak_open =
         usize::try_from(device_proxy.diagnostics().peak_active).unwrap_or(usize::MAX);
+    let device_send_buffer_bytes = owner_relay.accepted_device_send_buffer_bytes().unwrap_or(0);
     let physically_resident_frames = measured.data_depth_high_water.saturating_add(1);
 
     Ok(QueueSaturationEvidence {
@@ -1490,6 +1602,7 @@ async fn run_saturation(
         sibling_stream_survived,
         first_terminal_observation_immutable,
         terminal_observations,
+        terminal_tombstone_observations,
         paused_target_to_client,
         paused_connection_correlated: true,
         paused_generation,
@@ -1504,6 +1617,7 @@ async fn run_saturation(
         rotation_deadline_never_extended: rotation.deadline_never_extended,
         rotation_deadline_within_configured_overlap: rotation.deadline_within_configured_overlap,
         device_socket_peak_open,
+        device_send_buffer_bytes,
         dispatch_delta_after_drain,
         elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
     })
@@ -1723,13 +1837,25 @@ struct DrainOutcome {
 }
 
 /// Require physical occupancy to return to zero within a fixed bounded number
-/// of observations after the exact paused direction is resumed.
-async fn wait_for_physical_drain(owner: &ProductionRelay, device_id: Uuid) -> Result<DrainOutcome> {
+/// of observations after the exact paused direction is resumed, on the
+/// carrier that was paused.  A carrier torn down before it drained is a
+/// failure, not a drain: its channel is simply gone (task row M7-C104).
+async fn wait_for_physical_drain(
+    owner: &ProductionRelay,
+    device_id: Uuid,
+    paused_generation: u64,
+) -> Result<DrainOutcome> {
     let mut last = read_queue_observation(owner, device_id).await?;
     for observation in 1..=DRAIN_OBSERVATION_BOUND {
         let current = read_queue_observation(owner, device_id).await?;
         last = current;
-        if current.data_depth.is_none_or(|depth| depth == 0) {
+        if current.data_depth.is_none() || current.active_generation != paused_generation {
+            return Err(HarnessError::Process(format!(
+                "queue saturation lost the paused carrier before it drained: observation={observation} depth={:?} active_generation={} paused_generation={paused_generation} queue_bytes={}",
+                current.data_depth, current.active_generation, current.queue_bytes
+            )));
+        }
+        if current.data_depth == Some(0) {
             return Ok(DrainOutcome {
                 observations: observation,
                 completed: true,
@@ -1890,6 +2016,36 @@ async fn wait_for_correlated_rotation(
     }
 }
 
+/// The owner's payload-free record of how this device's session ended: every
+/// retained task closure (stage and cause, EC-061) and the session terminal
+/// reasons, in the owner's own order.
+fn session_loss(snapshot: &tunnel_relay::RelaySnapshot, device_id: Uuid) -> HarnessError {
+    let device = device_id.to_string();
+    let closures = snapshot
+        .peer_fault_diagnostics
+        .closures
+        .iter()
+        .filter(|closure| closure.device_id == device_id)
+        .map(|closure| {
+            format!(
+                "{:?}/{:?}@{}ms",
+                closure.stage, closure.cause, closure.observed_at_ms
+            )
+        })
+        .collect::<Vec<_>>();
+    let terminals = snapshot
+        .session_terminal_events
+        .iter()
+        .filter(|event| event.device_id == device)
+        .map(|event| format!("{}@{}ms", event.reason, event.closed_at_ms))
+        .collect::<Vec<_>>();
+    HarnessError::Process(format!(
+        "queue saturation owner snapshot lost the live device session: task_closures=[{}] session_terminals=[{}]",
+        closures.join(","),
+        terminals.join(",")
+    ))
+}
+
 async fn read_queue_observation(
     owner: &ProductionRelay,
     device_id: Uuid,
@@ -1899,11 +2055,7 @@ async fn read_queue_observation(
         .sessions
         .iter()
         .find(|session| session.device_id == device_id.to_string())
-        .ok_or_else(|| {
-            HarnessError::Process(
-                "queue saturation owner snapshot lost the live device session".into(),
-            )
-        })?;
+        .ok_or_else(|| session_loss(&snapshot, device_id))?;
     Ok(QueueObservation {
         queue_bytes: session.queue_bytes,
         queue_bytes_limit: session.queue_bytes_limit,
@@ -1941,11 +2093,7 @@ async fn owner_live_stream_ids(owner: &ProductionRelay, device_id: Uuid) -> Resu
         .sessions
         .iter()
         .find(|session| session.device_id == device_id.to_string())
-        .ok_or_else(|| {
-            HarnessError::Process(
-                "queue saturation owner snapshot lost the live device session".into(),
-            )
-        })?;
+        .ok_or_else(|| session_loss(&snapshot, device_id))?;
     Ok(session
         .streams
         .iter()
@@ -1957,6 +2105,7 @@ async fn owner_live_stream_ids(owner: &ProductionRelay, device_id: Uuid) -> Resu
 async fn read_terminal_observation(
     owner: &ProductionRelay,
     device_id: Uuid,
+    session_id: &str,
     stream_id: u64,
 ) -> Result<TerminalObservation> {
     let snapshot = owner.snapshot().await?;
@@ -1970,6 +2119,32 @@ async fn read_terminal_observation(
             .iter()
             .find(|stream| stream.stream_id == stream_id)
     });
+    // Terminal events are relay-wide; the cancelled stream is named by its
+    // stream id within this device's session.
+    let device = device_id.to_string();
+    let events = snapshot
+        .stream_terminal_events
+        .iter()
+        .filter(|event| {
+            event.stream_id == stream_id
+                && event.device_id == device
+                && event.session_id == session_id
+        })
+        .collect::<Vec<_>>();
+    let terminal_events = events.len();
+    let latch = match events.as_slice() {
+        [event] => Some(TerminalLatch {
+            operation_id: event.operation_id.clone(),
+            last_emitted_relay_to_connector: event.last_emitted_relay_to_connector,
+            peer_acked_relay_to_connector: event.peer_acked_relay_to_connector,
+            recv_contiguous_connector_to_relay: event.recv_contiguous_connector_to_relay,
+            delivered_contiguous_connector_to_relay: event.delivered_contiguous_connector_to_relay,
+            closed_at_ms: event.closed_at_ms,
+            reason: event.reason,
+            cause: event.cause,
+        }),
+        _ => None,
+    };
     Ok(TerminalObservation {
         stream_present: stream.is_some(),
         terminal: stream.is_some_and(|stream| stream.terminal),
@@ -1981,11 +2156,8 @@ async fn read_terminal_observation(
             .map_or(0, |stream| stream.recv_contiguous_connector_to_relay),
         delivered_contiguous_connector_to_relay: stream
             .map_or(0, |stream| stream.delivered_contiguous_connector_to_relay),
-        terminal_events: snapshot
-            .stream_terminal_events
-            .iter()
-            .filter(|event| event.stream_id == stream_id)
-            .count(),
+        terminal_events,
+        latch,
         terminal_receipts: snapshot
             .stream_terminal_receipt_events
             .iter()
@@ -2103,16 +2275,16 @@ async fn connect_client(config: tunnel_client::ConnectConfig) -> Result<Connecti
 
 #[cfg(test)]
 mod tests {
-    use super::TerminalObservation;
     use super::{
-        DRAIN_OBSERVATION_BOUND, EXPECTED_CONTROL_RESERVED_BYTES, EXPECTED_DATA_BYTES_LIMIT,
-        EXPECTED_MAX_STREAMS_PER_DEVICE, EXPECTED_QUEUE_BYTES_LIMIT, EXPECTED_QUEUE_MESSAGES,
-        M2_INITIAL_WINDOW_BYTES, MAX_ABSORBED_WIRE_BYTES, MAX_PAYLOAD_BYTES, MIN_RESIDENT_FRAMES,
-        MIN_SATURATION_HEADROOM_BYTES, QueueSaturationEvidence, SATURATION_RECORD_BYTES,
-        SATURATION_ROTATION_COUNT, TERMINAL_IMMUTABILITY_SAMPLES, charge_per_record,
-        frames_per_record, reachable_entries, records_per_stream_by_credit,
-        validate_queue_saturation_evidence, wire_bytes_per_record,
+        DEVICE_SEND_BUFFER_BYTES, DRAIN_OBSERVATION_BOUND, EXPECTED_CONTROL_RESERVED_BYTES,
+        EXPECTED_DATA_BYTES_LIMIT, EXPECTED_MAX_STREAMS_PER_DEVICE, EXPECTED_QUEUE_BYTES_LIMIT,
+        EXPECTED_QUEUE_MESSAGES, M2_INITIAL_WINDOW_BYTES, MAX_ABSORBED_WIRE_BYTES,
+        MAX_PAYLOAD_BYTES, MIN_RESIDENT_FRAMES, MIN_SATURATION_HEADROOM_BYTES,
+        QueueSaturationEvidence, SATURATION_RECORD_BYTES, SATURATION_ROTATION_COUNT,
+        TERMINAL_IMMUTABILITY_SAMPLES, charge_per_record, frames_per_record, reachable_entries,
+        records_per_stream_by_credit, validate_queue_saturation_evidence, wire_bytes_per_record,
     };
+    use super::{TerminalLatch, TerminalObservation};
     use crate::acceptance_test_support::assert_rejected;
 
     /// The maximum-record workload an independent review rejected: prove with
@@ -2313,6 +2485,7 @@ mod tests {
             sibling_stream_survived: true,
             first_terminal_observation_immutable: true,
             terminal_observations: TERMINAL_IMMUTABILITY_SAMPLES,
+            terminal_tombstone_observations: 1,
             paused_target_to_client: 1,
             paused_connection_correlated: true,
             paused_generation: 1,
@@ -2327,6 +2500,7 @@ mod tests {
             rotation_deadline_never_extended: true,
             rotation_deadline_within_configured_overlap: true,
             device_socket_peak_open: 3,
+            device_send_buffer_bytes: 2 * DEVICE_SEND_BUFFER_BYTES as usize,
             dispatch_delta_after_drain: 0,
             elapsed_ms: 12_345,
         }
@@ -2518,6 +2692,15 @@ mod tests {
             },
             |e: &mut QueueSaturationEvidence| e.rotation_committed_generation = e.paused_generation,
             |e: &mut QueueSaturationEvidence| e.device_socket_peak_open = 4,
+            // The device send-buffer pin never applied: nothing observed, an
+            // unpinned Linux buffer (tcp_wmem[1] = 16 KiB), the unpinned
+            // macOS default (128 KiB), or any size the pin cannot produce.
+            |e: &mut QueueSaturationEvidence| e.device_send_buffer_bytes = 0,
+            |e: &mut QueueSaturationEvidence| e.device_send_buffer_bytes = 16_384,
+            |e: &mut QueueSaturationEvidence| e.device_send_buffer_bytes = 131_072,
+            |e: &mut QueueSaturationEvidence| {
+                e.device_send_buffer_bytes = DEVICE_SEND_BUFFER_BYTES as usize + 1
+            },
             |e: &mut QueueSaturationEvidence| {
                 e.rotations_completed_after_drain = SATURATION_ROTATION_COUNT - 1
             },
@@ -2531,6 +2714,19 @@ mod tests {
                 validate_queue_saturation_evidence(&evidence),
                 "queue saturation",
             );
+        }
+    }
+
+    fn latch() -> TerminalLatch {
+        TerminalLatch {
+            operation_id: "operation-1".into(),
+            last_emitted_relay_to_connector: 3,
+            peer_acked_relay_to_connector: 1,
+            recv_contiguous_connector_to_relay: 1,
+            delivered_contiguous_connector_to_relay: 1,
+            closed_at_ms: 1_000,
+            reason: "STREAM_CLOSED",
+            cause: None,
         }
     }
 
@@ -2549,6 +2745,7 @@ mod tests {
             recv_contiguous_connector_to_relay: recv,
             delivered_contiguous_connector_to_relay: delivered,
             terminal_events: 1,
+            latch: Some(latch()),
             terminal_receipts: receipts,
         }
     }
@@ -2593,6 +2790,40 @@ mod tests {
             ("relay final sequence moved", {
                 let mut sample = first.clone();
                 sample.last_emitted_relay_to_connector = 4;
+                sample
+            }),
+            ("latch lost", {
+                let mut sample = first.clone();
+                sample.latch = None;
+                sample
+            }),
+            ("latched final sequence changed", {
+                let mut sample = first.clone();
+                if let Some(latch) = sample.latch.as_mut() {
+                    latch.last_emitted_relay_to_connector = 4;
+                }
+                sample.last_emitted_relay_to_connector = 4;
+                sample
+            }),
+            ("latch re-stamped", {
+                let mut sample = first.clone();
+                if let Some(latch) = sample.latch.as_mut() {
+                    latch.closed_at_ms = 1_001;
+                }
+                sample
+            }),
+            ("latch reason changed", {
+                let mut sample = first.clone();
+                if let Some(latch) = sample.latch.as_mut() {
+                    latch.reason = "AUTHORIZATION_REVOKED";
+                }
+                sample
+            }),
+            ("latch names another operation", {
+                let mut sample = first.clone();
+                if let Some(latch) = sample.latch.as_mut() {
+                    latch.operation_id = "operation-2".into();
+                }
                 sample
             }),
         ];
@@ -2645,10 +2876,45 @@ mod tests {
                 "{label}: must be rejected as unbounded or non-monotonic progress"
             );
         }
+        let mut unlatched = terminal_sample(false, 0, 0, 0, 0);
+        unlatched.latch = None;
+        unlatched.terminal_events = 0;
         assert!(
-            !terminal_sample(false, 0, 0, 0, 0)
-                .retains_first_terminal(&terminal_sample(false, 0, 0, 0, 0)),
-            "a first sample that never saw the tombstone cannot anchor immutability"
+            !unlatched.anchors_terminal() && !unlatched.retains_first_terminal(&unlatched),
+            "a first sample without the relay latch cannot anchor immutability"
+        );
+    }
+
+    /// Task row M7-C101: the connector's FIN receipt and STREAM_FORGET can
+    /// reclaim the tombstone before the first sample.  The relay's latch
+    /// survives reclamation, so such a first sample still anchors, while a
+    /// present tombstone that disagrees with its latch never does.
+    #[test]
+    fn terminal_observation_anchors_on_the_relay_latch_not_the_tombstone() {
+        let reclaimed_first = terminal_sample(false, 0, 0, 0, 1);
+        assert!(reclaimed_first.anchors_terminal());
+        assert!(
+            terminal_sample(false, 0, 0, 0, 1).retains_first_terminal(&reclaimed_first),
+            "a reclaimed first sample anchors on its latch"
+        );
+        let mut live = terminal_sample(true, 1, 1, 1, 0);
+        live.terminal = false;
+        assert!(
+            !live.anchors_terminal(),
+            "a present stream that is not terminal cannot anchor"
+        );
+        let mut disagreeing = terminal_sample(true, 1, 1, 1, 0);
+        disagreeing.last_emitted_relay_to_connector = 2;
+        assert!(
+            !disagreeing.anchors_terminal(),
+            "a tombstone behind its latched final sequence cannot anchor"
+        );
+        let mut twice = terminal_sample(false, 0, 0, 0, 1);
+        twice.terminal_events = 2;
+        twice.latch = None;
+        assert!(
+            !twice.anchors_terminal(),
+            "two terminal events for one stream cannot anchor"
         );
     }
 }

@@ -1013,6 +1013,10 @@ async fn run_inner(
         .await);
     }
 
+    // The streams the release phase is about to close: every live stream
+    // except the CLI's own, which stays live.  Read before closing, so the
+    // wait below names them exactly instead of inferring them from counts.
+    let releasing = live_stream_ids(owner_relay, device.tenant_id, device.id).await?;
     resources.close_non_cli_streams().await?;
     let (released_active, _, released_identity) = match wait_for_stream_counts(
         owner_relay,
@@ -1042,6 +1046,38 @@ async fn run_inner(
         return Err(HarnessError::Process(
             "owner-local capacity release did not preserve the live CLI owner session".into(),
         ));
+    }
+    // The owner counts a released stream as free once it is terminal on its
+    // side, but the connector charges it against its own `max_streams` until
+    // it has processed the owner's terminal frame for it (the same ledger
+    // `wait_for_connector_stream_retirement` documents for one stream).  All
+    // 63 released streams free their slots in one burst, so a fresh OPEN can
+    // reach the connector while it still counts some of them, and it refuses
+    // that OPEN; the owner then closes the already upgraded canary and the
+    // consumer reads a Close before its echo (task row M7-C106).  A released
+    // stream leaves the owner's table only through STREAM_FORGET, which
+    // follows the connector's own terminal frame, so waiting for that
+    // removal waits for the connector's ledger.  It is a precondition on the
+    // fresh canary, not a retry: the canary still has to succeed first time.
+    if let Err(error) = wait_for_streams_forgotten(
+        owner_relay,
+        device.tenant_id,
+        device.id,
+        &owner_identity,
+        &releasing,
+        STREAM_COUNT_TIMEOUT,
+    )
+    .await
+    {
+        return Err(phase_failure(
+            error,
+            "releaseforget",
+            0,
+            owner_relay,
+            device.id,
+            resources.process.as_mut(),
+        )
+        .await);
     }
     let fresh = open_phase_stream(
         owner_addr,
@@ -1303,8 +1339,47 @@ fn owner_snapshot_diagnostic(snapshot: &RelaySnapshot, device_id: Uuid) -> Strin
         })
         .collect::<Vec<_>>()
         .join(",");
+    // The newest task closures and stream terminal latches for this device
+    // (EC-061): which exit each stream adapter took and why the actor closed
+    // each stream, so a failed phase names its cause (task row M7-C106).
+    let closures = snapshot
+        .peer_fault_diagnostics
+        .closures
+        .iter()
+        .rev()
+        .filter(|closure| closure.device_id == device_id)
+        .take(DIAGNOSTIC_STREAM_LIMIT * 2)
+        .map(|closure| {
+            format!(
+                "{{stream={:?},stage={:?},cause={:?},at_ms={}}}",
+                closure.stream_id, closure.stage, closure.cause, closure.observed_at_ms
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let device = device_id.to_string();
+    let terminals = snapshot
+        .stream_terminal_events
+        .iter()
+        .rev()
+        .filter(|event| event.device_id == device)
+        .take(DIAGNOSTIC_STREAM_LIMIT)
+        .map(|event| {
+            format!(
+                "{{stream={},reason={},cause={:?},emitted={},recv={},delivered={},at_ms={}}}",
+                event.stream_id,
+                event.reason,
+                event.cause,
+                event.last_emitted_relay_to_connector,
+                event.recv_contiguous_connector_to_relay,
+                event.delivered_contiguous_connector_to_relay,
+                event.closed_at_ms
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
     format!(
-        "session=present,session_id={:?},epoch={},phase={},active_generation={},candidate_generation={:?},rotation_recovery_reason={:?},rotation_deadline_forced_retirement={},sockets={},active={},retained={},queue_bytes={},queue_messages={},stream_sample=tail,streams=[{}],omitted_streams={},dispatches={},consumer_write_timeouts={},peer_owner_send_count={},peer_ingress_receive_count={},peer_last_owner_send={},peer_last_ingress_receive={}",
+        "session=present,session_id={:?},epoch={},phase={},active_generation={},candidate_generation={:?},rotation_recovery_reason={:?},rotation_deadline_forced_retirement={},sockets={},active={},retained={},queue_bytes={},queue_messages={},stream_sample=tail,streams=[{}],omitted_streams={},task_closures=[{closures}],stream_terminals=[{terminals}],dispatches={},consumer_write_timeouts={},peer_owner_send_count={},peer_ingress_receive_count={},peer_last_owner_send={},peer_last_ingress_receive={}",
         session.session_id,
         session.epoch,
         session.phase,
@@ -1768,6 +1843,88 @@ async fn wait_for_connector_stream_retirement(
             )));
         }
         sleep(STREAM_COUNT_POLL.min(remaining)).await;
+    }
+}
+
+/// The IDs of the device session's live (non-terminal) streams.
+async fn live_stream_ids(
+    relay: &ProductionRelay,
+    tenant_id: Uuid,
+    device_id: Uuid,
+) -> Result<Vec<u64>> {
+    let snapshot = relay.snapshot().await?;
+    let session = snapshot
+        .sessions
+        .iter()
+        .find(|session| {
+            session.tenant_id == tenant_id.to_string() && session.device_id == device_id.to_string()
+        })
+        .ok_or_else(|| HarnessError::Process("owner-local device session is missing".into()))?;
+    Ok(session
+        .streams
+        .iter()
+        .filter(|stream| !stream.terminal)
+        .map(|stream| stream.stream_id)
+        .collect())
+}
+
+/// Wait until every stream in `released` that is terminal has left the
+/// owner's table, which it does only through STREAM_FORGET after the
+/// connector's own terminal frame.  A stream in `released` that is still live
+/// (the CLI's own) is not waited on.
+async fn wait_for_streams_forgotten(
+    relay: &ProductionRelay,
+    tenant_id: Uuid,
+    device_id: Uuid,
+    expected_identity: &SessionIdentity,
+    released: &[u64],
+    budget: Duration,
+) -> Result<()> {
+    let deadline = Instant::now() + budget;
+    loop {
+        let snapshot = match timeout(
+            deadline.saturating_duration_since(Instant::now()),
+            relay.snapshot(),
+        )
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => {
+                return Err(HarnessError::Timeout(
+                    "owner-local snapshot timed out before the released streams were forgotten"
+                        .into(),
+                ));
+            }
+        };
+        let session = snapshot
+            .sessions
+            .iter()
+            .find(|session| {
+                session.tenant_id == tenant_id.to_string()
+                    && session.device_id == device_id.to_string()
+            })
+            .ok_or_else(|| HarnessError::Process("owner-local device session is missing".into()))?;
+        if session.session_id != expected_identity.session_id
+            || session.epoch != expected_identity.epoch
+        {
+            return Err(HarnessError::Process(
+                "owner-local release phase changed session identity".into(),
+            ));
+        }
+        let outstanding = session
+            .streams
+            .iter()
+            .filter(|stream| stream.terminal && released.contains(&stream.stream_id))
+            .count();
+        if outstanding == 0 {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(HarnessError::Timeout(format!(
+                "owner-local connector did not retire {outstanding} released streams within bound"
+            )));
+        }
+        sleep(STREAM_COUNT_POLL).await;
     }
 }
 

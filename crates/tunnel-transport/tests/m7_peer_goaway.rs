@@ -1663,6 +1663,85 @@ async fn exhausted_connection_pool_is_typed_capacity_not_a_timeout() -> TestResu
     Ok(())
 }
 
+/// Task row M7-C105: a client shutdown that races the connection's end during
+/// a planned GOAWAY drain must still join cleanly.
+///
+/// After a peer's GOAWAY the client driver waits in its planned-drain branch
+/// for the stream leases and then for the connection to close.  When the
+/// relay shuts its client pool down at the same moment the lease is released
+/// and the remote side goes away (a gate's cleanup does exactly this), the
+/// shutdown's own local close can be the close the driver observes: quinn
+/// reports it as `LocallyClosed`, which h3 surfaces as `Remote error: Error
+/// undefined by h3: closed`, and the planned-drain classifier reported it as
+/// a transport failure.  A select that polls the cancellation arm first does
+/// not prevent that on a multi-threaded runtime, because the cancellation can
+/// land between the driver's poll of that arm and its poll of the idle arm.
+/// The interleaving is timing-dependent, so the case runs many times.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn peer_client_shutdown_racing_a_planned_drain_close_joins_cleanly() -> TestResult {
+    const ITERATIONS: usize = 200;
+    let pki = FixturePki::new();
+    let client_leaf = pki.issue_peer("racing-drain-client");
+    let server_leaf = pki.issue_peer("racing-drain-server");
+    let mut failures = Vec::new();
+    for iteration in 0..ITERATIONS {
+        let server = PlannedPeerServerFixture::start(&pki, &server_leaf, &client_leaf);
+        let mut client_endpoint = quinn::Endpoint::client(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .expect("racing drain client endpoint");
+        let client_config = load_peer_client_config_from_pem(
+            pki.chain(&client_leaf).as_bytes(),
+            client_leaf.private_key_pem.as_bytes(),
+            pki.ca_pem.as_bytes(),
+        )
+        .expect("racing drain client TLS config");
+        client_endpoint.set_default_client_config(client_config);
+        let pins = ApprovedPeerPins::new([
+            spki_sha256_from_der(&server_leaf.der).expect("racing drain server pin")
+        ])
+        .expect("racing drain client pins");
+        let client = Arc::new(
+            PeerClient::new(client_endpoint, pins, limits()).expect("racing drain client"),
+        );
+
+        let connection = client.connect(server.destination.clone()).await?;
+        let mut admitted = connection.open(request()).await?;
+        admitted.finish().await?;
+        timeout(CASE_TIMEOUT, server.admitted.notified())
+            .await
+            .map_err(|_| "racing drain handler did not admit the stream")?;
+        server.cancel.cancel();
+        server.wait_for_goaway_sent().await?;
+        // Let the client driver observe the GOAWAY and enter its planned
+        // drain while the admitted lease is still held.
+        sleep(Duration::from_millis(20)).await;
+
+        // Release the lease, take the server away and shut the client down,
+        // each on its own worker, so the driver's wake-ups race the shutdown.
+        let release = tokio::spawn(async move { drop(admitted) });
+        let remote = tokio::spawn(async move { drop(server) });
+        let shutdown_client = Arc::clone(&client);
+        let shutdown = tokio::spawn(async move { shutdown_client.shutdown().await });
+        let _ = release.await;
+        let _ = remote.await;
+        match shutdown.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => failures.push(format!("iteration {iteration}: {error}")),
+            Err(error) => failures.push(format!("iteration {iteration}: join {error}")),
+        }
+        drop(connection);
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} of {ITERATIONS} shutdowns racing a planned drain close failed: {}",
+            failures.len(),
+            failures.join("; ")
+        )
+        .into())
+    }
+}
+
 /// A raw authenticated HTTP/3 owner that admits one request, announces its
 /// planned close, and then ends the connection cleanly while the client still
 /// holds that stream's lease.

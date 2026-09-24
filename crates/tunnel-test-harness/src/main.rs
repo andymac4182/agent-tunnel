@@ -2911,7 +2911,7 @@ pub(crate) async fn main() -> ExitCode {
                 Ok(result) => result.and_then(|evidence| {
                     require_m7_queue_saturation_evidence(&evidence)?;
                     println!(
-                        "M7 queue saturation passed: relays={} ready={} non_owner_ingress={} queue_bytes_limit={} data_slots={} control_slots={} max_streams={} record_bytes={} charge_per_record={} frames_per_record={} credit_records_per_stream={} reachable_entries={} route_maximum_entries={} streams_admitted={} stream_cap_refused_one_more={} data_depth_observed={} data_depth_high_water={} data_enqueues_during_blackhole={} physically_resident_frames={} absorbed_frames={} absorbed_wire_bytes={} reachable_bound_saturated={} reserved_free_data_slots={} reserved_data_slot_accepted={} queue_bytes_high_water={} headroom_at_peak={} control_reserved_bytes={} data_bytes_limit={} data_bytes_high_water={} control_bytes_available_at_data_peak={} control_depth_at_peak={} control_depth_high_water={} control_refusals={} control_enqueues_during_blackhole={} cancellation_accepted={} fresh_stream_admitted={} sibling_survived={} first_terminal_immutable={} terminal_observations={} paused_target_to_client={} paused_generation={} drain_observations={}/{} drained={} rotation_replaced_paused_carrier={} rotation_generation={} rotations_after_drain={} final_generation={} attempts_with_deadline={} deadline_never_extended={} deadline_within_overlap={} device_sockets={} dispatch_delta_after_drain={} elapsed_ms={}",
+                        "M7 queue saturation passed: relays={} ready={} non_owner_ingress={} queue_bytes_limit={} data_slots={} control_slots={} max_streams={} record_bytes={} charge_per_record={} frames_per_record={} credit_records_per_stream={} reachable_entries={} route_maximum_entries={} streams_admitted={} stream_cap_refused_one_more={} data_depth_observed={} data_depth_high_water={} data_enqueues_during_blackhole={} physically_resident_frames={} absorbed_frames={} absorbed_wire_bytes={} reachable_bound_saturated={} reserved_free_data_slots={} reserved_data_slot_accepted={} queue_bytes_high_water={} headroom_at_peak={} control_reserved_bytes={} data_bytes_limit={} data_bytes_high_water={} control_bytes_available_at_data_peak={} control_depth_at_peak={} control_depth_high_water={} control_refusals={} control_enqueues_during_blackhole={} cancellation_accepted={} fresh_stream_admitted={} sibling_survived={} first_terminal_immutable={} terminal_observations={} terminal_tombstone_observations={} paused_target_to_client={} paused_generation={} drain_observations={}/{} drained={} rotation_replaced_paused_carrier={} rotation_generation={} rotations_after_drain={} final_generation={} attempts_with_deadline={} deadline_never_extended={} deadline_within_overlap={} device_sockets={} device_send_buffer_bytes={} dispatch_delta_after_drain={} elapsed_ms={}",
                         evidence.relay_count,
                         evidence.membership_ready_relays,
                         evidence.non_owner_ingress,
@@ -2951,6 +2951,7 @@ pub(crate) async fn main() -> ExitCode {
                         evidence.sibling_stream_survived,
                         evidence.first_terminal_observation_immutable,
                         evidence.terminal_observations,
+                        evidence.terminal_tombstone_observations,
                         evidence.paused_target_to_client,
                         evidence.paused_generation,
                         evidence.physical_drain_observations,
@@ -2964,6 +2965,7 @@ pub(crate) async fn main() -> ExitCode {
                         evidence.rotation_deadline_never_extended,
                         evidence.rotation_deadline_within_configured_overlap,
                         evidence.device_socket_peak_open,
+                        evidence.device_send_buffer_bytes,
                         evidence.dispatch_delta_after_drain,
                         evidence.elapsed_ms,
                     );
@@ -3766,6 +3768,7 @@ mod tests {
             sibling_stream_survived: true,
             first_terminal_observation_immutable: true,
             terminal_observations: 8,
+            terminal_tombstone_observations: 1,
             paused_target_to_client: 1,
             paused_connection_correlated: true,
             paused_generation: 1,
@@ -3780,6 +3783,7 @@ mod tests {
             rotation_deadline_never_extended: true,
             rotation_deadline_within_configured_overlap: true,
             device_socket_peak_open: 3,
+            device_send_buffer_bytes: 98_304,
             dispatch_delta_after_drain: 0,
             elapsed_ms: 12_345,
         }
@@ -4102,7 +4106,7 @@ mod tests {
         assert_saturation_flag!(rotation_deadline_within_configured_overlap);
 
         type Mutate = fn(&mut tunnel_test_harness::production_cluster::QueueSaturationEvidence);
-        let bounds: [Mutate; 22] = [
+        let bounds: [Mutate; 25] = [
             // Reserved control bytes at the data-byte peak (M7-C49): no
             // reservation, a data-lane peak that consumed the reservation, and
             // a derived control capacity that does not follow from the bounds.
@@ -4147,6 +4151,9 @@ mod tests {
             |e| e.physical_drain_observations = 201,
             |e| e.dispatch_delta_after_drain = 1,
             |e| e.device_socket_peak_open = 4,
+            |e| e.device_send_buffer_bytes = 0,
+            |e| e.device_send_buffer_bytes = 16_384,
+            |e| e.device_send_buffer_bytes = 131_072,
             |e| e.rotations_completed_after_drain = 2,
             |e| e.final_generation = 2,
             |e| e.rotation_attempts_with_observed_deadline = 0,

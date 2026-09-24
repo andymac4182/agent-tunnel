@@ -1890,6 +1890,9 @@ async fn run_m2_session(
         // freeze this event may have started or ended.
         actor.publish_http_freeze();
     };
+    // Read before this loop cancels the token itself below: only a stop or a
+    // dropped handle has cancelled it at this point.
+    let result = m2_session_result(cancellation.is_cancelled(), result);
     readiness.send(Readiness::Stopping).ok();
     cancellation.cancel();
     actor.close_all_carriers().await;
@@ -1902,6 +1905,27 @@ async fn run_m2_session(
     actor.publish_closed(reason.clone());
     readiness.send(Readiness::Closed { reason }).ok();
     result
+}
+
+/// The M2 session's result once its loop has ended (task row M7-C84).
+///
+/// A stop cancels the shared token, and the carrier writers exit on that same
+/// token.  The loop selects on cancellation first, but a stop that lands while
+/// a deadline tick or an event is being handled resumes that body into a
+/// writer that has already gone, so the body fails with, for example,
+/// `stream forget barrier: data writer stopped before barrier completion`.
+/// That error is the stop's own teardown, not a session fault, so once the
+/// token was cancelled before the loop ended the session reports a stop, as
+/// the M1 supervisor already does through `session_failure_result`.  Without
+/// a stop every error still fails the session.
+fn m2_session_result(
+    cancellation_requested: bool,
+    result: Result<(), ClientError>,
+) -> Result<(), ClientError> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) => super::session_failure_result(cancellation_requested, error),
+    }
 }
 
 fn spawn_carrier(
@@ -2717,9 +2741,32 @@ impl M2Actor {
                 &prepare.attachment_purpose,
                 DataAttachmentPurpose::RotationCandidate
             ),
-            ControlMessage::DataReady(_) => !self.is_recovery_rotation_message(message),
+            // A late readiness for a recovery candidate this episode already
+            // released is not an ordinary rotation message either: it goes
+            // unjournaled to `handle_candidate_ready`, which ignores exactly
+            // that carrier (task row M7-C99).
+            ControlMessage::DataReady(ready) => {
+                !self.is_recovery_rotation_message(message)
+                    && !self.is_released_recovery_candidate_ready(ready)
+            }
             _ => true,
         }
+    }
+
+    /// A DATA_READY naming a recovery candidate that this episode has already
+    /// closed.  The relay attaches a recovery candidate and queues its
+    /// DATA_READY on the control socket; the candidate's data socket can be
+    /// lost before its handshake response reaches this connector, and that
+    /// loss travels on a different socket, so it can be observed first.  The
+    /// readiness is then late, not foreign.
+    fn is_released_recovery_candidate_ready(&self, ready: &DataReady) -> bool {
+        self.pending_candidate.is_none()
+            && self.recovery.is_some()
+            && ready.session_id == self.session.session_id
+            && ready.epoch == self.session.epoch
+            && self
+                .closed_for_recovery
+                .contains_key(ready.connection_id.as_str())
     }
 
     fn is_recovery_rotation_message(&self, message: &ControlMessage) -> bool {
@@ -6906,13 +6953,7 @@ impl M2Actor {
             // violation; the initial DATA_READY is consumed before the actor
             // starts and a stale readiness must not attach an untracked
             // socket.
-            let released_recovery_candidate = self.recovery.is_some()
-                && ready.session_id == self.session.session_id
-                && ready.epoch == self.session.epoch
-                && self
-                    .closed_for_recovery
-                    .contains_key(ready.connection_id.as_str());
-            if released_recovery_candidate {
+            if self.is_released_recovery_candidate_ready(&ready) {
                 return Ok(());
             }
             return Err(ClientError::Protocol("unexpected DATA_READY".to_owned()));
@@ -11104,6 +11145,54 @@ mod tests {
         assert!(receiver.try_recv().is_err());
     }
 
+    /// Task row M7-C84: a stop that lands while a STREAM_FORGET barrier is
+    /// pending.  The stop's cancellation has already stopped the carrier
+    /// writer, so queuing the barrier fails with exactly the error hosted
+    /// `verify-m7-membership-hint-drop` cleanup reported; the session must
+    /// report that as the stop it is, and without a stop still fail.
+    #[tokio::test]
+    async fn a_stop_during_a_pending_forget_barrier_ends_the_session_as_stopped() {
+        let (mut actor, _key, receiver, _control_receiver) =
+            test_actor_with_carrier(M2_CARRIER_QUEUE_FRAMES);
+        let (stream, final_state) = test_stream_with_owner_forget_proof(1);
+        actor.streams.insert(1, stream);
+        let forget = tunnel_protocol::rotation_control::StreamForget {
+            message_id: "forget".to_owned(),
+            reply_to: String::new(),
+            session_id: "session".to_owned(),
+            epoch: 1,
+            stream_id: 1,
+            operation_id: "operation".to_owned(),
+            direction: Direction::RelayToConnector,
+            final_state,
+        };
+        // The carrier writer exits on the shared token, dropping its receiver.
+        drop(receiver);
+        let error = actor
+            .handle_stream_forget(forget)
+            .expect_err("a barrier cannot be queued to a stopped writer");
+        assert!(matches!(
+            &error,
+            ClientError::Transport { scope: "stream forget barrier", detail }
+                if detail == "data writer stopped before barrier completion"
+        ));
+        assert!(
+            m2_session_result(true, Err(error)).is_ok(),
+            "after a stop, the stop's own teardown error is a stop"
+        );
+        assert!(matches!(
+            m2_session_result(
+                false,
+                Err(ClientError::Transport {
+                    scope: "stream forget barrier",
+                    detail: "data writer stopped before barrier completion".to_owned(),
+                })
+            ),
+            Err(ClientError::Transport { .. })
+        ));
+        assert!(m2_session_result(false, Ok(())).is_ok());
+    }
+
     #[test]
     fn stream_forget_drains_a_ready_candidate_before_removal() {
         let (mut actor, active_key, mut active_receiver, _control_receiver) =
@@ -11932,6 +12021,74 @@ mod tests {
         assert!(matches!(
             actor.handle_candidate_ready(released).await,
             Err(ClientError::Protocol(message)) if message == "unexpected DATA_READY"
+        ));
+    }
+
+    /// Task row M7-C99: the late DATA_READY above must also survive the
+    /// actor's real dispatch, not only the handler.  `handle_control` routes
+    /// a DATA_READY that binds no pending recovery candidate into the
+    /// ordinary rotation journal, which refused it with "DATA_READY does not
+    /// bind a known rotation candidate" before `handle_candidate_ready`
+    /// could recognise the released candidate, so the CLI exited
+    /// `PROTOCOL_ERROR` in `verify-m7-i08-recovery-attempts` whenever the
+    /// fixture's candidate close overtook the owner's DATA_READY.
+    #[tokio::test]
+    async fn late_data_ready_for_released_recovery_candidate_survives_dispatch() {
+        let (mut actor, active_key, _receiver, _control_receiver) =
+            test_actor_with_carrier(M2_CARRIER_QUEUE_FRAMES);
+        installed_recovery_context(&mut actor, &active_key, 2, "candidate-1");
+        assert!(actor.pending_candidate.is_none());
+        let released = DataReady {
+            message_id: "late-ready".to_owned(),
+            reply_to: "late-prepare".to_owned(),
+            session_id: "session".to_owned(),
+            epoch: 1,
+            generation: active_key.generation + 1,
+            connection_id: "candidate-1".to_owned(),
+        };
+        actor
+            .handle_control(ControlMessage::DataReady(released.clone()))
+            .await
+            .expect("late readiness for a released candidate is ignored on dispatch");
+        assert!(actor.candidate.is_none() && actor.pending_candidate.is_none());
+        assert!(
+            actor.rotation_journal.is_none(),
+            "an ignored late DATA_READY must not open an ordinary rotation journal"
+        );
+        // Only the exact released candidate is exempt: a foreign carrier, a
+        // foreign session and a released one outside recovery still fail.
+        let foreign = DataReady {
+            message_id: "foreign-ready".to_owned(),
+            connection_id: "candidate-9".to_owned(),
+            ..released.clone()
+        };
+        assert!(matches!(
+            actor
+                .handle_control(ControlMessage::DataReady(foreign))
+                .await,
+            Err(ClientError::Protocol(_))
+        ));
+        let other_session = DataReady {
+            message_id: "other-session-ready".to_owned(),
+            session_id: "other-session".to_owned(),
+            ..released.clone()
+        };
+        assert!(matches!(
+            actor
+                .handle_control(ControlMessage::DataReady(other_session))
+                .await,
+            Err(ClientError::Protocol(_))
+        ));
+        actor.recovery = None;
+        let outside_recovery = DataReady {
+            message_id: "outside-recovery-ready".to_owned(),
+            ..released
+        };
+        assert!(matches!(
+            actor
+                .handle_control(ControlMessage::DataReady(outside_recovery))
+                .await,
+            Err(ClientError::Protocol(_))
         ));
     }
 
