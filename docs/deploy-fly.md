@@ -1115,7 +1115,7 @@ one-off container, with `serve` running:
 
 | Check | Result |
 | --- | --- |
-| An unknown command; `add-user ... --config X`; `add-user ... --config=X` | all refused by the entrypoint, exit `1` |
+| An unknown command; `add-user ... --config X` | both refused by the entrypoint, exit `1`. The `--config=X` form was added to the proof in review, after this run, and has not run yet |
 | All seven catalog commands with `--dry-run` | exit `0`, each `This dry run contacted no Redis authority and wrote nothing.` |
 | `add-user`, with a records path holding a space, `$(...)`, a backquote and a quote | exit `0`, so `tunnel-relay` read exactly that path, unexpanded; the same again exit `1`, `catalog conflict: user already exists` |
 | `add-device` (certificate from the proof's device CA), `add-service`, `set-grant` | exit `0` each; the grant `revision=1` |
