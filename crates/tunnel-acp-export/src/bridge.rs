@@ -585,21 +585,24 @@ impl AcpExport {
     /// Dropping the export's last handle does the same through the
     /// supervisor's own `Drop`; this is the explicit form, for a connector
     /// that stops its handlers before dropping them.  Idempotent.
+    ///
+    /// **The map is emptied under one lock, and exactly what was taken is
+    /// ended and counted** (M8-C33). This used to snapshot under one lock and
+    /// clear under a second, then count every snapshot entry, so a connection
+    /// [`Self::remove`]d between the two was counted closed twice, and one
+    /// inserted between them was cleared without being killed or counted.
+    /// Taking the map is the same removal [`Self::remove`] performs, for every
+    /// entry at once; no ending counter is released here, so the ordering rule
+    /// on `remove` has nothing further to order.
     pub fn shutdown(&self) {
-        let connections: Vec<Arc<Connection>> = self
-            .inner
-            .connections
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .values()
-            .cloned()
-            .collect();
-        self.inner
-            .connections
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clear();
-        for connection in connections {
+        let connections = std::mem::take(
+            &mut *self
+                .inner
+                .connections
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
+        for connection in connections.into_values() {
             connection.with(|state| state.closed = true);
             connection.shutdown.cancel();
             connection.supervisor.kill();
@@ -651,7 +654,13 @@ impl AcpExport {
     /// before the `Release` is guaranteed visible to it. Released first, the
     /// count announced an ended connection that was still listed live, and a
     /// reader that landed in the gap saw both (M8-C31). Idempotent: a second
-    /// call finds nothing and counts nothing.
+    /// call finds nothing and counts nothing, and a caller that gets `None`
+    /// back did not end the connection and must not count an ending for it
+    /// (M8-C32).
+    ///
+    /// [`Self::shutdown`] is the one path that does not call this: it takes
+    /// the whole map under one lock and counts exactly what it took, which is
+    /// the same removal for every entry at once (M8-C33).
     fn remove(&self, id: &str) -> Option<Arc<Connection>> {
         let removed = self
             .inner
@@ -1213,13 +1222,7 @@ async fn dispatch_outbound(
                 // into the send future and is gone with it: nothing here
                 // skips it and continues.
                 let elapsed = u64::try_from(waited.elapsed().as_micros()).unwrap_or(u64::MAX);
-                // **Out of the map before the counter is released**, so a
-                // reader that sees `output_stalls` also sees the connection
-                // gone (see [`AcpExport::remove`]). Released first, the count
-                // announced an ended connection that `live_connections` still
-                // listed, and a reader in that gap failed (M8-C31). The
-                // `remove` inside `end_with_subscriber_loss` is then a no-op
-                // and counts nothing a second time.
+                // Out of the map before the counter: see [`AcpExport::remove`].
                 export.remove(&connection.id);
                 connection
                     .counters
@@ -1460,7 +1463,17 @@ async fn watch_deadlines(export: AcpExport, connection: Arc<Connection>) {
 async fn end_with_child(export: &AcpExport, connection: &Arc<Connection>) {
     // Out of the map before the counter a reader waits on is released, for
     // the reason [`AcpExport::remove`] gives.
-    export.remove(&connection.id);
+    //
+    // **And only if this call is the one that removed it** (M8-C32). Every
+    // other ending — a stall, a lost subscriber, an expiry, a DELETE,
+    // `shutdown` — removes the connection and then kills the child in
+    // `close_connection`, which cancels `shutdown` first and kills second. A
+    // watchdog whose `select!` wakes with both of those ready may take this
+    // branch for a connection the child did not end, and it used to count
+    // `connections_ended_by_child` for it regardless.
+    if export.remove(&connection.id).is_none() {
+        return;
+    }
     let child = connection.supervisor.diagnostics();
     connection
         .counters
@@ -1667,5 +1680,199 @@ mod capacity_tests {
                 "a full table admitted a newcomer holding {held}"
             );
         }
+    }
+}
+
+/// How a connection's ending is counted: once, by the path that ended it.
+///
+/// These build real connections around a real child, `/bin/cat`, which reads
+/// its stdin until it is killed and writes nothing on its own. The bridge's own
+/// tasks are never spawned, so each test drives exactly the ending it names
+/// and no watchdog or dispatcher can race it.
+#[cfg(test)]
+mod ending_tests {
+    use std::path::Path;
+    use std::time::Duration;
+
+    use tokio_util::sync::CancellationToken;
+
+    use super::{
+        AcpExport, Arc, Connection, ConnectionScope, ConnectionState, Mutex, Ordering, Supervisor,
+        SupervisorConfig, Target, end_with_child,
+    };
+    use crate::child::ChildConfig;
+    use crate::config::AcpExportConfig;
+
+    fn export(workspace: &Path) -> AcpExport {
+        let text = format!(
+            "profile = \"acp-http-v1\"\n[agent]\ncommand = \"/bin/cat\"\nworkspace = \"{}\"\n",
+            workspace.display()
+        );
+        let config: AcpExportConfig = toml::from_str(&text).expect("export config");
+        AcpExport::from_config(&config).expect("valid acp export")
+    }
+
+    /// A connection around a live `/bin/cat`, **not** yet in the export's map.
+    fn connection(export: &AcpExport, workspace: &Path, id: &str) -> Arc<Connection> {
+        let child = ChildConfig {
+            command: "/bin/cat".into(),
+            args: Vec::new(),
+            workspace: workspace.to_path_buf(),
+            inherit_env: Vec::new(),
+            env: std::collections::BTreeMap::new(),
+            message_limit: 1 << 20,
+            stderr_cap: 1 << 16,
+        };
+        let scope = ConnectionScope {
+            tenant: "tenant-a".to_owned(),
+            principal: "principal-a".to_owned(),
+            device: "device-a".to_owned(),
+            service: "service-a".to_owned(),
+            connection: id.to_owned(),
+        };
+        let (supervisor, mut events) =
+            Supervisor::start(SupervisorConfig::new(child, scope)).expect("/bin/cat starts");
+        tokio::spawn(async move { while events.recv().await.is_some() {} });
+        Arc::new(Connection {
+            id: id.to_owned(),
+            supervisor,
+            principal: None,
+            workspace: workspace.to_string_lossy().into_owned(),
+            limits: export.inner.validated.limits,
+            subscribe_deadline: export.inner.validated.subscribe_deadline,
+            state: Mutex::new(ConnectionState {
+                connection: Arc::new(Target::new()),
+                sessions: std::collections::BTreeMap::new(),
+                closed: false,
+            }),
+            counters: Arc::clone(&export.inner.counters),
+            shutdown: CancellationToken::new(),
+        })
+    }
+
+    fn insert(export: &AcpExport, connection: &Arc<Connection>) {
+        export
+            .inner
+            .connections
+            .lock()
+            .expect("map")
+            .insert(connection.id.clone(), Arc::clone(connection));
+        export
+            .inner
+            .counters
+            .connections_opened
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The control: a child that ends its own connection is counted as such.
+    /// Without this the test below could pass by `end_with_child` counting
+    /// nothing at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_child_that_ends_its_connection_is_counted_once() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let export = export(workspace.path());
+        let connection = connection(&export, workspace.path(), "c-1");
+        insert(&export, &connection);
+
+        end_with_child(&export, &connection).await;
+
+        let diagnostics = export.diagnostics();
+        assert_eq!(diagnostics.connections_ended_by_child, 1, "{diagnostics:?}");
+        assert_eq!(diagnostics.connections_closed, 1, "{diagnostics:?}");
+        assert_eq!(diagnostics.live_connections, 0, "{diagnostics:?}");
+    }
+
+    /// **A connection some other ending already removed is not credited to
+    /// its child** (M8-C32). This is the state the watchdog is in when its
+    /// `select!` finds `wait_exited` ready because `close_connection` killed
+    /// the child for a stall, a lost subscriber, an expiry or a DELETE.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_connection_already_ended_elsewhere_is_not_counted_as_ended_by_its_child() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let export = export(workspace.path());
+        let ended = connection(&export, workspace.path(), "c-1");
+        insert(&export, &ended);
+        // Another ending got there first.
+        assert!(export.remove(&ended.id).is_some());
+        ended.supervisor.kill();
+
+        end_with_child(&export, &ended).await;
+
+        let diagnostics = export.diagnostics();
+        assert_eq!(
+            diagnostics.connections_ended_by_child, 0,
+            "the child did not end this connection: {diagnostics:?}"
+        );
+        assert_eq!(
+            diagnostics.connections_closed, 1,
+            "and it is closed exactly once: {diagnostics:?}"
+        );
+        ended.supervisor.drain().await;
+    }
+
+    /// **`shutdown` counts a connection removed concurrently exactly once**
+    /// (M8-C33). It used to snapshot the map under one lock and clear it under
+    /// a second, then count every snapshot entry, so a `remove` between the
+    /// two was counted by both.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_and_a_concurrent_remove_count_a_connection_once() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let export = export(workspace.path());
+        let first = connection(&export, workspace.path(), "c-1");
+        let second = connection(&export, workspace.path(), "c-2");
+        insert(&export, &first);
+        insert(&export, &second);
+
+        let stopping = export.clone();
+        let shutdown = std::thread::spawn(move || stopping.shutdown());
+        std::thread::sleep(Duration::from_millis(50));
+        let _ = export.remove(&first.id);
+        shutdown.join().expect("shutdown");
+
+        let diagnostics = export.diagnostics();
+        assert_eq!(
+            diagnostics.connections_closed, 2,
+            "two connections, each closed once: {diagnostics:?}"
+        );
+        assert_eq!(diagnostics.live_connections, 0, "{diagnostics:?}");
+        first.supervisor.kill();
+        first.supervisor.drain().await;
+        second.supervisor.drain().await;
+    }
+
+    /// **`shutdown` never clears a connection it does not end** (M8-C33). A
+    /// connection inserted between its snapshot and its clear used to leave
+    /// the map uncounted, with its child still running and nothing left that
+    /// could find it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_connection_inserted_during_shutdown_is_ended_or_kept_never_dropped() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let export = export(workspace.path());
+        let first = connection(&export, workspace.path(), "c-1");
+        let late = connection(&export, workspace.path(), "c-2");
+        insert(&export, &first);
+
+        let stopping = export.clone();
+        let shutdown = std::thread::spawn(move || stopping.shutdown());
+        std::thread::sleep(Duration::from_millis(50));
+        insert(&export, &late);
+        shutdown.join().expect("shutdown");
+
+        let diagnostics = export.diagnostics();
+        let late_live = export.connection(&late.id).is_some();
+        assert!(
+            late_live || late.shutdown.is_cancelled(),
+            "the late connection is either still held or was ended, never silently dropped: \
+             {diagnostics:?}"
+        );
+        assert_eq!(
+            diagnostics.connections_closed + diagnostics.live_connections,
+            diagnostics.connections_opened,
+            "every opened connection is closed or live: {diagnostics:?}"
+        );
+        export.shutdown();
+        first.supervisor.drain().await;
+        late.supervisor.kill();
+        late.supervisor.drain().await;
     }
 }
