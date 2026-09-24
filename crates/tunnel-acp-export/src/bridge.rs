@@ -1688,8 +1688,9 @@ mod capacity_tests {
 /// These build real connections around a real child, `/bin/cat`, which reads
 /// its stdin until it is killed and writes nothing on its own. The bridge's own
 /// tasks are never spawned, so each test drives exactly the ending it names
-/// and no watchdog or dispatcher can race it.
-#[cfg(test)]
+/// and no watchdog or dispatcher can race it. Unix-only: the child is
+/// `/bin/cat`, which Windows does not have.
+#[cfg(all(test, unix))]
 mod ending_tests {
     use std::path::Path;
     use std::time::Duration;
