@@ -1076,7 +1076,7 @@ async fn device_does_not_end_the_request_body_at_end_without_fin() {
     assert_eq!(within(device).await.unwrap().request, Outcome::Aborted);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(start_paused = true)]
 async fn owner_does_not_end_the_response_body_at_end_without_fin() {
     let Link {
         to_device,
