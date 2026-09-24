@@ -1058,6 +1058,36 @@ development differ only in the stop time.
 | A fresh relay on the restarted Redis | exit `1`, `Redis catalog connection failed; stage=authority_identity` |
 | Memory with one device connected (`docker stats`) | relay 2.6 MiB, Redis 6.1 MiB |
 
+**Re-run for M6-C91** on the committed tree: log nonce
+`m6c60-proof-20260924T111646Z-86279`, head `332cf39`, 0 uncommitted paths,
+arm64 relay image `ddb0496c8ea8`, a `tunnel-client` built from the same tree,
+exit `0`. Every check above that the script asserts passed again. Two rows of
+the table above describe the older binaries and are superseded by this run:
+a device with reconnect (M6-C23) does not exit when the relay stops, so the
+proof now gives it 5 s and then stops it (M6-C92; it printed `sent it
+SIGTERM`, device exit `130`); and with M6-C65 a fresh relay on the restarted
+Redis kept running (`Redis restart continuity: interval_seconds=5`). The day-2
+phase, each command in its own one-off container, with `serve` running:
+
+| Check | Result |
+| --- | --- |
+| An unknown command; `add-user ... --config ...` | both refused by the entrypoint, exit `1` |
+| All seven catalog commands with `--dry-run` | exit `0`, each `This dry run contacted no Redis authority and wrote nothing.` |
+| `add-user`, with a records path holding a space, `$(...)`, a backquote and a quote | exit `0`; the same again exit `1`, `catalog conflict: user already exists` |
+| `add-device` (certificate from the proof's device CA), `add-service`, `set-grant` | exit `0` each; the grant `revision=1` |
+| The new tester's echo through the new device | HTTP 200, body = canary + payload, no relay restart |
+| `revoke-grant`, then that echo | exit `0`; HTTP 404 `DEVICE_NOT_FOUND` |
+| `revoke-device` | exit `0`; the device's session ended and its reconnect was refused, `connect` exit `3`, `CREDENTIAL_ERROR` |
+| `revoke-credential` of a third device's credential, then again | exit `0`; exit `1`, `no active credential` |
+| The first tester's echo afterwards | HTTP 200 |
+| Key lines or the Redis password in any day-2 output; a leftover one-off container | none; none |
+
+**The day-2 phase can go red.** With the relay image's entrypoint replaced by
+the one before M6-C91 (`PROOF_SKIP_BUILD=1 RELAY_IMAGE=...`, log nonce
+`m6c60-proof-20260924T111650Z-86369`), the first catalog command answered
+`unknown command 'add-user'` and the proof stopped at `FAILED no --config
+refusal`, exit `1`.
+
 **The proof can go red.** Run against a copy of the relay image whose
 entrypoint calls `tunnel-relay` without `exec` (`PROOF_SKIP_BUILD=1
 RELAY_IMAGE=...`), it stopped at `FAILED PID 1 is not tunnel-relay as uid
