@@ -36,16 +36,19 @@ echo "nonce=$nonce head=$(git -C "$repo" rev-parse --short HEAD) uncommitted_pat
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/m6c60-proof.XXXXXX")
 case "$work/" in "$repo"/*) echo "refusing: key directory $work is inside the repository" >&2; exit 1 ;; esac
-prefix="m6c60-$$"
+# PROOF_PREFIX names the containers, network and volume (default m6c60).
+prefix="${PROOF_PREFIX:-m6c60}-$$"
 net=$prefix-net
 volume=$prefix-redis-data
 redis=$prefix-redis
 relay=$prefix-relay
 client_pid=""
+client2_pid=""
 
 cleanup() {
   status=$?
   [ -n "$client_pid" ] && kill "$client_pid" 2>/dev/null || true
+  [ -n "$client2_pid" ] && kill "$client2_pid" 2>/dev/null || true
   docker rm -f "$relay" "$redis" "$prefix-provision" >/dev/null 2>&1 || true
   docker network rm "$net" >/dev/null 2>&1 || true
   docker volume rm "$volume" >/dev/null 2>&1 || true
@@ -226,9 +229,9 @@ operations = ["echo:invoke"]
 operations = ["echo:invoke"]
 EOF
 chmod 644 "$provision"/*
-one_off() { # args passed to the entrypoint
+one_off() { # args passed to the entrypoint; copies ${one_off_files:-$provision} to /tmp/provision
   docker create --name "$prefix-provision" --network "$net" --env-file "$work/relay.env" "$relay_image" "$@" >/dev/null
-  docker cp "$provision/." "$prefix-provision:/tmp/provision" >/dev/null
+  docker cp "${one_off_files:-$provision}/." "$prefix-provision:/tmp/provision" >/dev/null
   set +e
   docker start -a "$prefix-provision" 2>&1
   code=$?
@@ -286,11 +289,14 @@ echo "log lines added by two bare TCP connects (what a tcp_check does): $((lines
 echo "== device connects from the host with its certificate"
 "$client" connect --config "$device_dir/client.toml" --json > "$work/connect.log" 2> "$work/connect.err" &
 client_pid=$!
-now=$(date +%s)
-header=$(printf '{"alg":"RS256","kid":"m6c60-issuer","typ":"JWT"}' | b64url)
-claims=$(printf '{"iss":"https://issuer.example.test/","aud":"agent-tunnel","sub":"m6c60-user","iat":%s,"exp":%s,"scope":"echo:invoke"}' "$now" "$((now + 300))" | b64url)
-signature=$(printf '%s.%s' "$header" "$claims" | openssl dgst -sha256 -sign "$pki/oidc-key.pem" -binary | b64url)
-token="$header.$claims.$signature"
+mint_token() { # SUB: a synthetic RS256 token from the proof's own issuer key
+  now=$(date +%s)
+  header=$(printf '{"alg":"RS256","kid":"m6c60-issuer","typ":"JWT"}' | b64url)
+  claims=$(printf '{"iss":"https://issuer.example.test/","aud":"agent-tunnel","sub":"%s","iat":%s,"exp":%s,"scope":"echo:invoke"}' "$1" "$now" "$((now + 300))" | b64url)
+  signature=$(printf '%s.%s' "$header" "$claims" | openssl dgst -sha256 -sign "$pki/oidc-key.pem" -binary | b64url)
+  printf '%s.%s.%s' "$header" "$claims" "$signature"
+}
+token=$(mint_token m6c60-user)
 payload="m6c60-payload-$nonce"
 echo_once() {
   curl -sS --max-time 10 --cacert "$pki/relay-ca.pem" -o "$work/echo.body" -w '%{http_code}' \
@@ -309,6 +315,186 @@ body=$(cat "$work/echo.body")
 ok "consumer HTTPS -> relay -> device mTLS WebSocket -> echo: HTTP 200, body = canary + payload ($body)"
 docker stats --no-stream --format '{{.Name}} mem={{.MemUsage}}' "$relay" "$redis"
 
+echo "== day-2 catalog commands in one-off relay containers while serve runs (M6-C91)"
+# Each command runs exactly as deploy-fly.md section 6.6's `fly machine run
+# IMAGE ... --file-local /tmp/provision/NAME=FILE -- COMMAND ARGS` does: the
+# entrypoint materialises the same secrets as `serve`, then execs tunnel-relay.
+day2=$work/day2
+mkdir -p "$day2"
+day2_out=$work/day2-outputs.log
+: > "$day2_out"
+# day2_run EXPECTED_EXIT LABEL ARGS...: one one-off container, its exit code checked.
+day2_run() {
+  expected=$1
+  label=$2
+  shift 2
+  set +e
+  out=$(one_off_files=$day2 one_off "$@")
+  code=$?
+  set -e
+  printf '%s\n' "$out" >> "$day2_out"
+  echo "$label: exit=$code"
+  printf '%s\n' "$out" | sed 's/^/  | /'
+  [ "$code" = "$expected" ] || fail "$label exited $code, expected $expected"
+}
+set +e
+out=$(one_off no-such-command --dry-run)
+code=$?
+set -e
+echo "unknown command: exit=$code: $out"
+[ "$code" = 1 ] || fail "an unknown command exited $code"
+case "$out" in *"unknown command 'no-such-command'"*) ;; *) fail "unknown command output" ;; esac
+ok "the entrypoint refuses an unknown command, exit 1"
+
+user2=$(uuidgen | tr 'A-Z' 'a-z')
+dev2=$(uuidgen | tr 'A-Z' 'a-z')
+svc2=$(uuidgen | tr 'A-Z' 'a-z')
+dev3=$(uuidgen | tr 'A-Z' 'a-z')
+canary2="m6c91-canary-$nonce"
+device2_dir=$work/device2
+mkdir -p "$device2_dir"
+sed -e "s/$dev/$dev2/" -e "s/$svc/$svc2/" -e "s/$canary/$canary2/" "$device_dir/client.toml" > "$device2_dir/client.toml"
+"$client" credentials create --config "$device2_dir/client.toml" --csr-out device.csr
+printf 'basicConstraints=CA:FALSE\nkeyUsage=digitalSignature\nextendedKeyUsage=clientAuth\nsubjectAltName=URI:urn:agent-tunnel:device:%s\n' "$dev2" > "$pki/device2.ext"
+openssl x509 -req -in "$device2_dir/device.csr" -CA "$pki/device-ca.pem" -CAkey "$pki/device-ca-key.pem" \
+  -CAcreateserial -days 1 -extfile "$pki/device2.ext" -out "$device2_dir/device-cert.pem" 2>/dev/null
+"$client" credentials import --config "$device2_dir/client.toml" --certificate device-cert.pem --server-ca "$pki/relay-ca.pem"
+cp "$device2_dir/device-cert.pem" "$day2/device-2-cert.pem"
+# A third device, only so revoke-credential has an active credential to revoke.
+openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -subj "/CN=m6c91 device 3" \
+  -keyout "$pki/device3-key.pem" -out "$pki/device3.csr" 2>/dev/null
+printf 'basicConstraints=CA:FALSE\nkeyUsage=digitalSignature\nextendedKeyUsage=clientAuth\nsubjectAltName=URI:urn:agent-tunnel:device:%s\n' "$dev3" > "$pki/device3.ext"
+openssl x509 -req -in "$pki/device3.csr" -CA "$pki/device-ca.pem" -CAkey "$pki/device-ca-key.pem" \
+  -CAcreateserial -days 1 -extfile "$pki/device3.ext" -out "$day2/device-3-cert.pem" 2>/dev/null
+# The user's file name carries a space, `$(...)`, a backquote and a quote, and
+# the display names shell syntax: the path must reach tunnel-relay verbatim,
+# and nothing in a records file is ever evaluated.
+user_file='tester 2 $(touch pwned) `id` '"'"'q'"'"'.toml'
+cat > "$day2/$user_file" <<EOF
+[user]
+tenant = "$tenant"
+id = "$user2"
+display_name = "Second tester \$(touch /tmp/pwned) \`id\`"
+oidc_subject = "m6c91-tester-2"
+EOF
+cat > "$day2/device-2.toml" <<EOF
+[device]
+tenant = "$tenant"
+owner = "$user2"
+id = "$dev2"
+display_name = "M6-C91 second device"
+certificate = "device-2-cert.pem"
+EOF
+cat > "$day2/device-3.toml" <<EOF
+[device]
+tenant = "$tenant"
+owner = "$user2"
+id = "$dev3"
+display_name = "M6-C91 third device"
+certificate = "device-3-cert.pem"
+EOF
+cat > "$day2/service-2.toml" <<EOF
+[service]
+tenant = "$tenant"
+device = "$dev2"
+id = "$svc2"
+type = "echo"
+display_name = "M6-C91 second echo"
+operations = ["echo:invoke"]
+EOF
+cat > "$day2/grant-2.toml" <<EOF
+[grant]
+tenant = "$tenant"
+user = "$user2"
+device = "$dev2"
+service = "$svc2"
+operations = ["echo:invoke"]
+EOF
+chmod 644 "$day2"/*
+
+day2_run 1 "add-user with --config" add-user --records "/tmp/provision/$user_file" --config /tmp/provision/device-2.toml
+grep -q "the entrypoint sets --config" "$day2_out" || fail "no --config refusal"
+day2_run 1 "add-user with --config=" add-user --records "/tmp/provision/$user_file" --config=/tmp/provision/device-2.toml
+[ "$(grep -c "the entrypoint sets --config" "$day2_out")" = 2 ] || fail "no --config= refusal"
+for pair in "add-user:/tmp/provision/$user_file" add-device:/tmp/provision/device-2.toml \
+  add-service:/tmp/provision/service-2.toml set-grant:/tmp/provision/grant-2.toml; do
+  day2_run 0 "${pair%%:*} --dry-run" "${pair%%:*}" --records "${pair#*:}" --dry-run
+done
+day2_run 0 "revoke-grant --dry-run" revoke-grant --tenant "$tenant" --user "$user2" --device "$dev2" --service "$svc2" --dry-run
+day2_run 0 "revoke-device --dry-run" revoke-device --tenant "$tenant" --device "$dev2" --dry-run
+day2_run 0 "revoke-credential --dry-run" revoke-credential --tenant "$tenant" --device "$dev2" \
+  --credential "$(uuidgen | tr 'A-Z' 'a-z')" --dry-run
+[ "$(grep -c 'This dry run contacted no Redis authority and wrote nothing.' "$day2_out")" = 7 ] || fail "not seven dry runs"
+ok "all seven catalog commands pass --dry-run through the entrypoint, exit 0"
+
+day2_run 0 add-user add-user --records "/tmp/provision/$user_file"
+day2_run 1 "add-user again (refused duplicate)" add-user --records "/tmp/provision/$user_file"
+day2_run 0 add-device add-device --records /tmp/provision/device-2.toml
+day2_run 0 add-service add-service --records /tmp/provision/service-2.toml
+day2_run 0 set-grant set-grant --records /tmp/provision/grant-2.toml
+day2_run 0 "add-device (third)" add-device --records /tmp/provision/device-3.toml
+credential3=$(printf '%s\n' "$out" | sed -n 's/.* credential=\([0-9a-f-]*\).*/\1/p')
+[ -n "$credential3" ] || fail "add-device printed no credential"
+ok "add-user, add-device, add-service and set-grant wrote the namespace; a duplicate add-user exits 1"
+
+"$client" connect --config "$device2_dir/client.toml" --json > "$work/connect-2.log" 2> "$work/connect-2.err" &
+client2_pid=$!
+token2=$(mint_token m6c91-tester-2)
+echo2_once() {
+  curl -sS --max-time 10 --cacert "$pki/relay-ca.pem" -o "$work/echo2.body" -w '%{http_code}' \
+    -H "Authorization: Bearer $token2" --data-binary "$payload" \
+    "https://127.0.0.1:$consumer_port/v1/devices/$dev2/services/$svc2/echo" 2>/dev/null || true
+}
+code=""
+for _ in $(seq 1 60); do
+  code=$(echo2_once)
+  [ "$code" = 200 ] && break
+  sleep 0.5
+done
+[ "$code" = 200 ] || { cat "$work/connect-2.log" "$work/connect-2.err"; fail "new tester's echo returned HTTP $code"; }
+[ "$(cat "$work/echo2.body")" = "$canary2$payload" ] || fail "new tester's echo body"
+ok "the new tester's echo through the new device: HTTP 200, body = canary + payload, no relay restart"
+
+day2_run 0 revoke-grant revoke-grant --tenant "$tenant" --user "$user2" --device "$dev2" --service "$svc2"
+code=$(echo2_once)
+echo "echo after revoke-grant: HTTP $code $(head -c 200 "$work/echo2.body")"
+case "$code" in 403 | 404) ;; *) fail "echo after revoke-grant returned HTTP $code" ;; esac
+ok "revoke-grant: the next request is refused (HTTP $code)"
+day2_run 0 revoke-device revoke-device --tenant "$tenant" --device "$dev2"
+for _ in $(seq 1 60); do
+  kill -0 "$client2_pid" 2>/dev/null || break
+  sleep 0.5
+done
+if kill -0 "$client2_pid" 2>/dev/null; then fail "the revoked device's session is still open after 30 s"; fi
+set +e
+wait "$client2_pid"
+client2_exit=$?
+set -e
+client2_pid=""
+echo "revoked device: connect exit=$client2_exit"
+grep -h -o '"code":"[A-Z_]*"' "$work/connect-2.log" "$work/connect-2.err" | uniq -c || true
+# The session ends (TRANSPORT_ERROR), the device reconnects, and the relay
+# refuses the revoked credential: CREDENTIAL_ERROR, exit 3 (operator.md 2.5).
+[ "$client2_exit" = 3 ] || fail "the revoked device's connect exited $client2_exit, not 3"
+grep -q '"code":"CREDENTIAL_ERROR"' "$work/connect-2.log" "$work/connect-2.err" || fail "no CREDENTIAL_ERROR from the revoked device"
+ok "revoke-device: the live session closed and the reconnect was refused, CREDENTIAL_ERROR, connect exit 3"
+day2_run 0 revoke-credential revoke-credential --tenant "$tenant" --device "$dev3" --credential "$credential3"
+day2_run 1 "revoke-credential again (refused)" revoke-credential --tenant "$tenant" --device "$dev3" --credential "$credential3"
+ok "revoke-credential revoked the third device's credential; again it exits 1"
+code=$(echo_once)
+[ "$code" = 200 ] || fail "the first tester's echo returned HTTP $code after the day-2 changes"
+ok "the first tester is untouched: echo HTTP 200"
+
+for key in redis-server-key device-server-key consumer-server-key; do
+  needle=$(sed -n 2p "$pki/$key.pem")
+  ! grep -q -F -- "$needle" "$day2_out" || fail "a line of $key.pem was printed"
+done
+! grep -q -F -- "$redis_password" "$day2_out" || fail "the Redis password was printed"
+[ -z "$(docker ps -a --filter "name=^$prefix-provision\$" -q)" ] || fail "a one-off container was left behind"
+# The hostile records path is evidenced above: add-user succeeded reading
+# exactly that path, which it could not have if a shell had expanded it.
+ok "no key line or Redis password in any day-2 output, no one-off container left"
+
 echo "== docker stop sends SIGTERM; the relay must drain and exit 0"
 ms() { python3 -c 'import time; print(int(time.time() * 1000))'; }
 start=$(ms)
@@ -320,6 +506,20 @@ echo "relay after docker stop: $state after ${elapsed} ms (docker would kill at 
 [ "$state" = "exit=0 oom=false" ] || fail "relay did not exit 0 on SIGTERM"
 docker logs "$relay" 2>&1 | grep -q "tunnel-relay stopped: signal=SIGTERM" || fail "no orderly stop line"
 ok "orderly SIGTERM stop, exit 0, in ${elapsed} ms with one device connected"
+# A tunnel-client with reconnect (M6-C23) does not exit when the relay stops:
+# it backs off and retries. Give it 5 s, then stop it, so this wait is bounded.
+for _ in $(seq 1 10); do
+  kill -0 "$client_pid" 2>/dev/null || break
+  sleep 0.5
+done
+if kill -0 "$client_pid" 2>/dev/null; then
+  if grep -q -E '"state":"(backoff|reconnecting)"' "$work/connect.log"; then
+    echo "device still running after the relay stopped, reconnecting ($(grep -c -E '"state":"(backoff|reconnecting)"' "$work/connect.log") backoff/reconnecting events); sent it SIGTERM"
+  else
+    echo "device still running after the relay stopped with NO backoff or reconnect event (a hang, not a reconnect); sent it SIGTERM"
+  fi
+  kill -TERM "$client_pid"
+fi
 set +e
 wait "$client_pid"
 client_exit=$?
