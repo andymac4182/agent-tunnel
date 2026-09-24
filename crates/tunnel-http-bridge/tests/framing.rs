@@ -1015,7 +1015,10 @@ fn normalization_names_the_specific_rejection() {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+// A paused clock on the current-thread runtime: the timer below fires only
+// once every task is parked, so "nothing arrived" is observed at quiescence
+// rather than after a wall-clock guess.
+#[tokio::test(start_paused = true)]
 async fn device_does_not_end_the_request_body_at_end_without_fin() {
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
     let Link {
@@ -1031,10 +1034,16 @@ async fn device_does_not_end_the_request_body_at_end_without_fin() {
         device_rx,
         to_owner,
         move |request: Request<ChannelBody>| async move {
-            let body = collect(request.into_body())
-                .await
-                .map_err(|error| error.code());
-            result_tx.send(body).unwrap();
+            // The RESET aborts this handler future, as designed, possibly
+            // before it is polled again to see the failed body.  The body is
+            // therefore read, and its outcome reported, by a task the abort
+            // does not reach; the outcome is then the bridge's alone.
+            let body = request.into_body();
+            let reader = tokio::spawn(async move {
+                let outcome = collect(body).await.map_err(|error| error.code());
+                result_tx.send(outcome).unwrap();
+            });
+            let _ = reader.await;
             Ok::<_, TestError>(Response::new(empty_body()))
         },
     ));
@@ -1044,7 +1053,8 @@ async fn device_does_not_end_the_request_body_at_end_without_fin() {
     encode_body(b"hello", &mut records);
     records.extend_from_slice(&END_RECORD);
     to_device.send_data(Bytes::from(records)).await.unwrap();
-    // END arrived, FIN did not: the handler's read must still be pending.
+    // END arrived, FIN did not: once the bridge and the reader are idle, the
+    // read must still be pending.
     let mut result_rx = result_rx;
     assert!(
         tokio::time::timeout(std::time::Duration::from_millis(150), &mut result_rx)
