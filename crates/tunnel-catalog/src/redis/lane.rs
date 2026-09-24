@@ -1348,4 +1348,54 @@ mod tests {
         assert!(!persistence_is_sound(&pairs("always", "no", "no")));
         assert!(!persistence_is_sound(&[]), "a refused or empty CONFIG GET");
     }
+
+    /// M7-C113 regression: a reply timeout reported by the lane's own outer
+    /// deadline releases the connection exactly as one reported by redis-rs.
+    ///
+    /// The startup connection here has no redis-rs response timeout, so the
+    /// outer deadline is the only one that can fire.  Before the fix that
+    /// branch kept the connection still owed the stalled reply, and the next
+    /// command queued behind it instead of re-verifying on a fresh one.
+    #[tokio::test]
+    async fn an_outer_deadline_timeout_releases_the_connection() {
+        let server = FakeAuthority::start("lane-run-a").await;
+        let client = redis::Client::open(server.url()).expect("fake authority URL");
+        let group = Arc::new(LaneGroup::default());
+        let config = redis::AsyncConnectionConfig::new().set_response_timeout(None);
+        let connection = tokio::time::timeout(
+            TEST_DEADLINE,
+            client.get_multiplexed_async_connection_with_config(&config),
+        )
+        .await
+        .expect("bounded startup connection")
+        .expect("startup connection without a response timeout");
+        let lane = AuthorityLane::new(
+            client.clone(),
+            connection,
+            "lane-run-a".to_owned(),
+            Arc::clone(&group),
+        );
+        assert_eq!(server.accepted(), 1);
+
+        server.set_reply_delay(STALLED_REPLY_DELAY);
+        match ping(&lane).await {
+            Err(CatalogError::Database(error)) => assert!(
+                timed_out(&error),
+                "the outer deadline reported {error} instead of a timeout"
+            ),
+            other => panic!("stalled authority reported {other:?} instead of a timeout"),
+        }
+        server.set_reply_delay(Duration::ZERO);
+        assert_eq!(
+            ping(&lane)
+                .await
+                .expect("the command after a timeout re-verifies the primary"),
+            "PONG"
+        );
+        assert_eq!(
+            server.accepted(),
+            2,
+            "the timed-out connection must be replaced, not reused"
+        );
+    }
 }

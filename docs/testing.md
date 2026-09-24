@@ -49,15 +49,15 @@ cargo run -p tunnel-test-harness --locked -- verify-m7-queue-saturation
 cargo run -p tunnel-test-harness --locked -- verify-m7-remote-body-limits
 ```
 
-**Keeping a failing gate's evidence.** Two opt-in variables make a red
-self-explaining after the run, and the CI M7 job sets both and uploads the
-directory as the `m7-failure-diagnostics` artifact only when the job fails:
-`TUNNEL_HARNESS_PROCESS_LOG_DIR` makes every managed child (the CLI, above
+**Keeping a failing gate's evidence.** Two opt-in variables make a local red
+self-explaining after the run: `TUNNEL_HARNESS_PROCESS_LOG_DIR` makes every managed child (the CLI, above
 all) write its bounded stdout and stderr there when it is shut down or
 dropped, and `C11_CHILD_FAILURE_DIR` keeps a failing C11/OG-02 child's own
-streams and those of its managed processes. Both hold fixture output, which
-can include the run's synthetic credentials, so point them at a private
-directory. Without them, a failing C11/OG-02 child still reports its own
+streams and those of its managed processes. Both write unredacted fixture
+output, which includes the run's synthetic credentials and private keys, so
+point them at a private local directory and never publish it: CI deliberately
+sets neither and uploads no artifact, because this repository is public.
+Without them, and on CI, a failing C11/OG-02 child still reports its own
 typed failure line in the parent's error, with every value from its sentinel
 manifest redacted (M7-C112).
 

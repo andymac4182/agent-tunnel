@@ -246,18 +246,4 @@ jobs:
       - name: Install Rust 1.95.0
         run: rustup toolchain install 1.95.0 --profile minimal
       - name: Run M7 harness and Redis acceptance gates
-        env:
-          # Keep every managed child's streams and a failing C11/OG-02
-          # child's own capture, so a hosted red can be diagnosed after the
-          # runner is gone. Uploaded only when the job fails.
-          TUNNEL_HARNESS_PROCESS_LOG_DIR: ${{ runner.temp }}/m7-diagnostics/processes
-          C11_CHILD_FAILURE_DIR: ${{ runner.temp }}/m7-diagnostics/c11-children
         run: sh scripts/m7-harness-verify.sh
-      - name: Upload M7 failure diagnostics
-        if: failure()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: m7-failure-diagnostics
-          path: ${{ runner.temp }}/m7-diagnostics
-          retention-days: 7
-          if-no-files-found: warn

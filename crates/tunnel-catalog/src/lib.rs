@@ -535,6 +535,39 @@ mod tests {
         assert!(replacement.token.epoch > claim.token.epoch);
     }
 
+    /// M7-C114: as in Redis, an owner past its lease cannot release, even
+    /// while its claim is still stored; a live owner's release is the control.
+    #[tokio::test]
+    async fn memory_expired_owner_release_is_refused() {
+        let catalog = MemoryCatalog::new();
+        let fixture = fixture();
+        catalog.seed_fixture(&fixture).await.unwrap();
+        let request = |session: &str, lease: Duration| OwnerClaimRequest {
+            deployment_incarnation: "inc-1".into(),
+            tenant_id: fixture.devices[0].tenant_id,
+            device_id: fixture.devices[0].device_id,
+            node_id: "node-a".into(),
+            boot_id: "boot-a".into(),
+            session_id: session.into(),
+            lease_expires_at: Utc::now() + lease,
+        };
+        let live = catalog
+            .claim_owner(&request("live", Duration::seconds(30)))
+            .await
+            .unwrap();
+        assert!(catalog.release_owner(&live.token).await.unwrap());
+
+        let expiring = catalog
+            .claim_owner(&request("expiring", Duration::milliseconds(50)))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !catalog.release_owner(&expiring.token).await.unwrap(),
+            "an expired owner's release was accepted"
+        );
+    }
+
     #[tokio::test]
     async fn memory_device_revocation_fences_owner_and_advances_epoch() {
         let catalog = MemoryCatalog::new();
